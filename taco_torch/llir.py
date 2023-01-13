@@ -330,18 +330,14 @@ class WhileLoop(Stmt):
         self.body = body
 
 
+@dataclass(frozen=False)
 class IfThenElse(Stmt):
     """An if-then-else statement in C/C++."""
 
-    def __init__(
-        self,
-        cond: Expr,
-        then_body: Optional[List[Stmt]] = None,
-        else_body: Optional[List[Stmt]] = None,
-    ):
-        self.cond = cond
-        self.then_body = then_body
-        self.else_body = else_body
+    cond: Optional[Union[Expr, List[Expr]]] = None
+    then_body: Optional[Union[List[Stmt], List[List[Stmt]]]] = None
+    else_body: Optional[List[Stmt]] = None
+    make_last_case_else: bool = False
 
 
 class Case(Stmt):

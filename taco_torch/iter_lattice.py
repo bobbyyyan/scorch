@@ -1,21 +1,21 @@
-from typing import List, Optional, Any, Iterable, Dict
+from dataclasses import dataclass, field
 from itertools import chain, product
+from typing import List, Optional, Any, Iterable, Dict
 
 from taco_torch import llir
 from taco_torch.cin import (
     IndexVar,
     ForAll,
-    TensorVar,
     TensorAccess,
     IndexStmt,
     TensorAssign,
     CIN,
     BinaryOp,
     Operation,
+    IndexExpr,
 )
 from taco_torch.format import LevelType
-from taco_torch.iterator import TensorIterators, ModeIterator
-from dataclasses import dataclass, field
+from taco_torch.iterator import ModeIterator
 
 
 @dataclass(frozen=False)
@@ -117,6 +117,105 @@ class LatticePoint:
                 )
             )
 
+        return stmts
+
+    def get_simplified_cin(self, cin: CIN) -> Optional[CIN]:
+        # Rewrite the CIN to eliminate tensors that have run out of values
+        # Based on the lattice_point we are currently at
+        if isinstance(cin, TensorAccess):
+            if cin in self.sparse_tensor_accesses or cin in self.dense_tensor_accesses:
+                return cin
+            else:
+                return None
+
+        elif isinstance(cin, BinaryOp):
+
+            left_new = self.get_simplified_cin(cin.left)
+            right_new = self.get_simplified_cin(cin.right)
+
+            if left_new is None and right_new is None:
+                return None
+
+            if left_new and right_new:
+                assert isinstance(left_new, IndexExpr) and isinstance(
+                    right_new, IndexExpr
+                ), "Expected IndexExpr for left and right"
+                return BinaryOp(
+                    op=cin.op,
+                    left=left_new,
+                    right=right_new,
+                )
+
+            # At this point, one of left_new or right_new is None
+
+            if cin.op == Operation.ADD:
+                return left_new or right_new
+            elif cin.op == Operation.MUL:
+                return None
+
+        elif isinstance(cin, ForAll):
+            rewritten_inner_stmt = self.get_simplified_cin(cin.stmt)
+            assert isinstance(
+                rewritten_inner_stmt, IndexStmt
+            ), "Rewritten inner stmt is not an index stmt"
+            return ForAll(
+                index_var=cin.index_var,
+                stmt=rewritten_inner_stmt,
+            )
+
+        elif isinstance(cin, TensorAssign):
+            rewritten_rhs = self.get_simplified_cin(cin.rhs)
+            assert isinstance(
+                rewritten_rhs, IndexExpr
+            ), "Rewritten rhs is not an index expr"
+            return TensorAssign(
+                lhs=cin.lhs,
+                rhs=rewritten_rhs,
+            )
+
+    def get_child_subregion_loops(self, cin_lowerer, cin: CIN) -> List[llir.Stmt]:
+        # TODO: implement this
+        stmts = []
+        if self.child_lattice_points:
+            if_conditions = []
+            then_body_list = []
+
+            for child_lp in [self] + self.child_lattice_points:
+                candidate_coord_var_llirs = map(
+                    lambda it: it.coord_var_llir, child_lp.iterators
+                )
+                if_condition = None
+                then_body = []
+
+                for coord_var_llir in candidate_coord_var_llirs:
+                    this_condition = llir.BinOp(
+                        op="==",
+                        left=coord_var_llir,
+                        right=self.index_var_llir,
+                    )
+                    if if_condition is None:
+                        if_condition = this_condition
+                    else:
+                        if_condition = llir.BinOp(
+                            op="&&", left=if_condition, right=this_condition
+                        )
+
+                then_body.append(
+                    cin_lowerer.lower_CIN(child_lp.get_simplified_cin(cin))
+                )
+
+                if_conditions.append(if_condition)
+                then_body_list.append(then_body)
+
+            stmts.append(
+                llir.IfThenElse(
+                    cond=if_conditions,
+                    then_body=then_body_list,
+                    else_body=[],
+                )
+            )
+        else:
+            stmts.append(cin_lowerer.lower_CIN(self.get_simplified_cin(cin)))
         return stmts
 
     def get_candidate_coordinate_stmts(self) -> List[llir.Stmt]:

@@ -13,6 +13,7 @@ from taco_torch.cin import (
     IndexExpr,
     BinaryOp,
     CIN,
+    Operation,
 )
 from taco_torch.format import LevelType
 from taco_torch.iter_lattice import IterationLattice, LatticePoint
@@ -87,27 +88,61 @@ class LLIRLowerer:
                 + self.lower_llir("}", indent_level)
             )
         elif isinstance(ir, llir.IfThenElse):
-            if ir.else_body is None:
-                return (
+            # Handle the case where cond is a list of conditions and then_body is a list of list
+            # of statements
+            result = ""
+            if isinstance(ir.cond, list):
+                assert isinstance(ir.then_body, list)
+                assert len(ir.cond) == len(
+                    ir.then_body
+                ), f"Number of conditions and then_body's must be the same"
+
+                total_num_conds = len(ir.cond) + (1 if ir.else_body else 0)
+
+                for i, cond in enumerate(ir.cond):
+                    if i == 0:
+                        result += (
+                            self.lower_llir(
+                                f"if ({self.lower_llir(cond)}) {{", indent_level
+                            )
+                            + "\n"
+                            + self.lower_llir(ir.then_body[i], indent_level + 1)
+                            + "\n"
+                        )
+                    elif ir.make_last_case_else and i == total_num_conds - 1:
+                        result += (
+                            self.lower_llir(f"}} else {{", indent_level)
+                            + "\n"
+                            + self.lower_llir(ir.then_body[i], indent_level + 1)
+                            + "\n"
+                        )
+                    else:
+                        result += (
+                            self.lower_llir(
+                                f"}} else if ({self.lower_llir(cond)}) {{", indent_level
+                            )
+                            + "\n"
+                            + self.lower_llir(ir.then_body[i], indent_level + 1)
+                            + "\n"
+                        )
+            else:
+                result += (
                     self.lower_llir(f"if ({self.lower_llir(ir.cond)}) {{", indent_level)
                     + "\n"
                     + self.lower_llir(ir.then_body, indent_level + 1)
                     + "\n"
-                    + self.lower_llir("}", indent_level)
                 )
 
-            return (
-                self.lower_llir(f"if ({self.lower_llir(ir.cond)}) {{", indent_level)
-                + "\n"
-                + self.lower_llir(ir.then_body, indent_level + 1)
-                + "\n"
-                + self.lower_llir("} else {", indent_level)
-                + "\n"
-                + self.lower_llir(ir.else_body, indent_level + 1)
-                + "\n"
-                + self.lower_llir("}", indent_level)
-                + "\n"
-            )
+            if ir.else_body:
+                result += (
+                    self.lower_llir(f"}} else {{", indent_level)
+                    + "\n"
+                    + self.lower_llir(ir.else_body, indent_level + 1)
+                    + "\n"
+                )
+
+            result += self.lower_llir("}", indent_level)
+            return result
 
         elif isinstance(ir, llir.Var):
             return ir.name
@@ -455,8 +490,9 @@ class CINLowerer:
                         return cin
                     else:
                         return None
+
                 elif isinstance(cin, BinaryOp):
-                    # TODO: this is the case for addition, need to handle the multiplication case
+
                     left_new = rewrite_cin(cin.left)
                     right_new = rewrite_cin(cin.right)
 
@@ -473,7 +509,12 @@ class CINLowerer:
                             right=right_new,
                         )
 
-                    return left_new or right_new
+                    # At this point, one of left_new or right_new is None
+
+                    if cin.op == Operation.ADD:
+                        return left_new or right_new
+                    elif cin.op == Operation.MUL:
+                        return None
 
                 elif isinstance(cin, ForAll):
                     rewritten_inner_stmt = rewrite_cin(cin.stmt)
@@ -502,7 +543,8 @@ class CINLowerer:
                 body=[
                     *lattice_point.get_candidate_coordinate_stmts(),
                     # TODO: iterate over children lattice points, and rewrite/simplify inner statement for each case
-                    self.lower_CIN(rewritten_cin),
+                    # self.lower_CIN(rewritten_cin),
+                    *lattice_point.get_child_subregion_loops(self, stmt.stmt),
                     *lattice_point.get_iterators_advance_stmts(),
                 ],
             )
