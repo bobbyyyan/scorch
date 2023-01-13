@@ -96,8 +96,6 @@ class IterationLattice:
             left_lattice_points: List[LatticePoint],
             right_lattice_points: List[LatticePoint],
         ) -> List[LatticePoint]:
-            print("left lattice points", left_lattice_points)
-            print("right lattice points", right_lattice_points)
             return [
                 *map(sum, product(left_lattice_points, right_lattice_points)),
             ]

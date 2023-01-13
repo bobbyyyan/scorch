@@ -14,7 +14,7 @@ from taco_torch.cin import (
     BinaryOp,
 )
 from taco_torch.format import LevelType
-from taco_torch.iter_lattice import IterationLattice
+from taco_torch.iter_lattice import IterationLattice, LatticePoint
 from taco_torch.iterator import ModeIterator, ModeAccess
 from taco_torch.utils import dtype_to_datatype
 
@@ -40,6 +40,9 @@ class LLIRLowerer:
 
         elif isinstance(ir, llir.Comment):
             return self.lower_llir(f"// {ir.value}", indent_level)
+
+        elif isinstance(ir, llir.BlankLine):
+            return self.lower_llir("", indent_level)
 
         elif isinstance(ir, llir.Literal):
             return self.lower_llir(str(ir.value), indent_level)
@@ -110,12 +113,15 @@ class LLIRLowerer:
             # args must be llir.Var's
             assert [isinstance(arg, llir.Var) for arg in ir.args]
             return (
-                f"{ir.return_type.value} {ir.name}"
-                + f"({', '.join([f'{arg.type.value} {arg.name}' for arg in ir.args])}) {{"
+                self.lower_llir(
+                    f"{ir.return_type.value} {ir.name}"
+                    + f"({', '.join([f'{arg.type.value} {arg.name}' for arg in ir.args])}) {{",
+                    indent_level,
+                )
                 + "\n"
-                + f"{self.lower_llir(ir.body, indent_level + 1)}"
+                + self.lower_llir(ir.body, indent_level + 1)
                 + "\n"
-                + f"}}"
+                + self.lower_llir("}", indent_level)
             )
         return self.lower_llir(
             f"No code gen implemented for node type: {ir.__class__.__name__}",
@@ -130,6 +136,8 @@ class CINLowerer:
 
     def __init__(self):
 
+        self.seen_outermost_forall = False
+        self.processed_index_vars: List[IndexVar] = []
         self.result_value_array_sparse_index_llir = None
         self.index_var_to_rhs_tensor_level_type = None
         self.index_var_to_result_tensor_level_type = None
@@ -208,7 +216,6 @@ class CINLowerer:
         )
 
     def lower_IndexExpr(self, index_expr: IndexExpr) -> llir.Expr:
-        print(f"lower_IndexExpr: {index_expr}")
         if isinstance(index_expr, BinaryOp):
             return llir.BinOp(
                 op=index_expr.op,
@@ -329,6 +336,7 @@ class CINLowerer:
             if level_type == LevelType.COMPRESSED:
                 result_last_compressed_index_var = index_var
         result_index_init_stmts = []
+
         if result_last_compressed_index_var is not None:
             self.result_value_array_sparse_index_llir = llir.Var(
                 name=f"{result_last_compressed_index_var.name}_{self.result_tensor_var.name}",
@@ -349,6 +357,10 @@ class CINLowerer:
 
         # Finally, return function that computes the result
         if isinstance(stmt, ForAll):
+            if self.seen_outermost_forall:
+                return self.lower_ForAll(stmt)
+            else:
+                self.seen_outermost_forall = True
             return llir.Function(
                 return_type=llir.DataType.TACO_TENSOR,
                 name=f"compute",
@@ -356,9 +368,13 @@ class CINLowerer:
                 body=[
                     llir.Comment("Get tensor level arrays"),
                     *tensor_level_array_assign_stmts,
+                    llir.BlankLine(),
                     llir.Comment("Get tensor value arrays"),
                     *tensor_value_array_assign_stmts,
+                    llir.BlankLine(),
+                    llir.Comment("Initialize result value array index"),
                     *result_index_init_stmts,
+                    llir.BlankLine(),
                     *self.lower_ForAll(stmt),
                 ],
             )
@@ -376,7 +392,7 @@ class CINLowerer:
         """
         # Get index variable at this forall
         index_var = stmt.get_index_var()
-        print(index_var)
+
         assert (
             index_var in self.index_var_to_rhs_tensor_level_type
         ), f"Index var {{{index_var.name}}} not found in rhs tensor level types"
@@ -397,162 +413,178 @@ class CINLowerer:
             )
         )
 
+        # We can just use the first lattice point to determine what to initialize
+        # since the list is sorted by number of iterators
+        iterator_tensor_accesses = iter_lattice.lattice_points[0].iterators
+
         sparse_level_index_init_stmts = []
-        sparse_level_index_var_bound_pairs = []
-        for tensor_var, level, level_type in filtered_tensor_level_type_list:
-            sparse_level_index_var = llir.Var(
-                name=f"{index_var.name}_{tensor_var.name}",
-                type=llir.DataType.INT,
+
+        iterators = []
+
+        for tensor_access in iterator_tensor_accesses:
+            mode_iterator = ModeIterator(
+                tensor_access=tensor_access,
+                index_var=index_var,
             )
-            sparse_level_index_var_upper_bound = llir.Var(
-                name=f"{tensor_var.name}{level}_pos[{parent_index_var.name}]"
-                if parent_index_var
-                else f"p{tensor_var.name}{level}_end",
-                type=llir.DataType.INT,
-            )
-            sparse_level_index_var_bound_pairs.append(
-                (sparse_level_index_var, sparse_level_index_var_upper_bound)
-            )
-            sparse_level_index_init_stmts.extend(
-                [
-                    llir.VarAssign(
-                        var=sparse_level_index_var,
-                        value=llir.Var(
-                            name=f"{tensor_var.name}{level}_pos[0]",
-                            type=llir.DataType.INT,
-                        ),
-                    ),
-                    llir.VarAssign(
-                        var=sparse_level_index_var_upper_bound,
-                        value=llir.Var(
-                            name=f"{tensor_var.name}{level}_pos[{parent_index_var.name}+1]"
-                            if parent_index_var
-                            else f"{tensor_var.name}{level}_pos[1]",
-                            type=llir.DataType.INT,
-                        ),
-                    ),
-                ]
-            )
+            iterators.append(mode_iterator)
+            sparse_level_index_init_stmts.extend(mode_iterator.get_init_stmts())
 
-        while_loop_condition = None
+        def generate_while_loop_from_lattice_point(lattice_point: LatticePoint):
+            # TODO: implement this
+            while_loop_condition = None
 
-        for (
-            sparse_level_index_var,
-            sparse_level_index_var_upper_bound,
-        ) in sparse_level_index_var_bound_pairs:
-            bound_cond = llir.BinOp(
-                op="<",
-                left=sparse_level_index_var,
-                right=sparse_level_index_var_upper_bound,
-            )
-            if while_loop_condition is None:
-                while_loop_condition = bound_cond
-            else:
-                while_loop_condition = llir.BinOp(
-                    op="&&",
-                    left=while_loop_condition,
-                    right=bound_cond,
-                )
+            while_loop_condition = []
 
-        while_loop_body: List[llir.Stmt] = []
+            # for (iterator_var, iterator_upper_bound) in iterator_var_to_upper_bound.items():
+            #     bound_cond = llir.BinOp(
+            #         op="<",
+            #         left=iterator_var,
+            #         right=iterator_upper_bound,
+            #     )
+            #     if while_loop_condition is None:
+            #         while_loop_condition = bound_cond
+            #     else:
+            #         while_loop_condition = llir.BinOp(
+            #             op="&&",
+            #             left=while_loop_condition,
+            #             right=bound_cond,
+            #         )
 
-        # Get actual coordinate for this index var
-        index_var_llir = llir.Var(
-            name=f"{index_var.name}",
-            type=llir.DataType.INT,
-        )
+            while_loop_body: List[llir.Stmt] = []
 
-        index_var_candidate_llir_list = []
-
-        if len(filtered_tensor_level_type_list) > 1:
-            # TODO: Need to break ties. Take the minimum
-
-            for i, (tensor_var, level, level_type) in enumerate(
-                filtered_tensor_level_type_list
-            ):
-                index_var_candidate_llir = llir.Var(
-                    name=f"{index_var.name}_{tensor_var.name}{level}",
-                    type=llir.DataType.INT,
-                )
-                index_var_candidate_llir_list.append(index_var_candidate_llir)
-                sparse_level_index_var = sparse_level_index_var_bound_pairs[i][0]
-                while_loop_body.append(
-                    llir.VarAssign(
-                        var=index_var_candidate_llir,
-                        value=llir.Var(
-                            name=f"{tensor_var.name}{level}_idx[{sparse_level_index_var.name}]",
-                            type=llir.DataType.INT,
-                        ),
-                    )
-                )
-            # index var = std::min({candidate index vars})
-            while_loop_body.append(
-                llir.VarAssign(
-                    var=index_var_llir,
-                    value=llir.FunctionCall(
-                        name="std::min",
-                        args=[
-                            llir.Array(
-                                values=index_var_candidate_llir_list,
-                                data_type=llir.DataType.INT,
-                            )
-                        ],
-                    ),
-                )
+            while_loop = llir.WhileLoop(
+                cond=while_loop_condition,
+                body=while_loop_body,
             )
 
-        elif len(filtered_tensor_level_type_list) == 1:
-            sparse_level_index_var = sparse_level_index_var_bound_pairs[0][0]
-            tensor_var, level, level_type = filtered_tensor_level_type_list[0]
-            while_loop_body.append(
-                llir.VarAssign(
-                    var=index_var_llir,
-                    value=llir.Var(
-                        name=f"{tensor_var.name}{level}_crd[{sparse_level_index_var.name}]",
-                        type=llir.DataType.INT,
-                    ),
-                )
-            )
+            return while_loop
 
-        # Else (if == 0), we can use the current index var name directly
+        while_loops = [
+            [
+                generate_while_loop_from_lattice_point(p),
+                llir.BlankLine(),
+            ]
+            for p in iter_lattice.lattice_points
+        ]
 
-        # For each lattice point:
-        # TODO: handle union later, only intersection right now
-        # condition is index_var_llir == candidate index vars for each tensor
-
-        if_condition = None
-        for ivar_cand in index_var_candidate_llir_list:
-            sub_condition = llir.BinOp(
-                op="==",
-                left=index_var_llir,
-                right=ivar_cand,
-            )
-            if if_condition is None:
-                if_condition = sub_condition
-            else:
-                if_condition = llir.BinOp(
-                    op="&&",
-                    left=if_condition,
-                    right=sub_condition,
-                )
-
-        self.defined_index_vars.append(index_var)
-
-        if_statement = llir.IfThenElse(
-            cond=if_condition,
-            then_body=self.lower_IndexStmt(stmt.stmt),
-        )
-
-        while_loop_body.append(if_statement)
-
-        while_loop = llir.WhileLoop(
-            cond=while_loop_condition,
-            body=while_loop_body,
-        )
+        # while_loop_condition = None
+        #
+        # for (
+        #     sparse_level_index_var,
+        #     sparse_level_index_var_upper_bound,
+        # ) in iterator_var_to_upper_bound.items():
+        #     bound_cond = llir.BinOp(
+        #         op="<",
+        #         left=sparse_level_index_var,
+        #         right=sparse_level_index_var_upper_bound,
+        #     )
+        #     if while_loop_condition is None:
+        #         while_loop_condition = bound_cond
+        #     else:
+        #         while_loop_condition = llir.BinOp(
+        #             op="&&",
+        #             left=while_loop_condition,
+        #             right=bound_cond,
+        #         )
+        #
+        # while_loop_body: List[llir.Stmt] = []
+        #
+        # # Get actual coordinate for this index var
+        # index_var_llir = llir.Var(
+        #     name=f"{index_var.name}",
+        #     type=llir.DataType.INT,
+        # )
+        #
+        # index_var_candidate_llir_list = []
+        #
+        # if len(filtered_tensor_level_type_list) > 1:
+        #     # TODO: Need to break ties. Take the minimum
+        #
+        #     for i, (tensor_var, level, level_type) in enumerate(filtered_tensor_level_type_list):
+        #         index_var_candidate_llir = llir.Var(
+        #             name=f"{index_var.name}_{tensor_var.name}{level}",
+        #             type=llir.DataType.INT,
+        #         )
+        #         index_var_candidate_llir_list.append(index_var_candidate_llir)
+        #         sparse_level_index_var = list(iterator_var_to_upper_bound.items())[i][0]
+        #         while_loop_body.append(
+        #             llir.VarAssign(
+        #                 var=index_var_candidate_llir,
+        #                 value=llir.Var(
+        #                     name=f"{tensor_var.name}{level}_idx[{sparse_level_index_var.name}]",
+        #                     type=llir.DataType.INT,
+        #                 ),
+        #             )
+        #         )
+        #     # index var = std::min({candidate index vars})
+        #     while_loop_body.append(
+        #         llir.VarAssign(
+        #             var=index_var_llir,
+        #             value=llir.FunctionCall(
+        #                 name="std::min",
+        #                 args=[
+        #                     llir.Array(
+        #                         values=index_var_candidate_llir_list,
+        #                         data_type=llir.DataType.INT,
+        #                     )
+        #                 ],
+        #             ),
+        #         )
+        #     )
+        #
+        # elif len(filtered_tensor_level_type_list) == 1:
+        #     sparse_level_index_var = list(iterator_var_to_upper_bound.items())[0][0]
+        #     tensor_var, level, level_type = filtered_tensor_level_type_list[0]
+        #     while_loop_body.append(
+        #         llir.VarAssign(
+        #             var=index_var_llir,
+        #             value=llir.Var(
+        #                 name=f"{tensor_var.name}{level}_crd[{sparse_level_index_var.name}]",
+        #                 type=llir.DataType.INT,
+        #             ),
+        #         )
+        #     )
+        #
+        # # Else (if == 0), we can use the current index var name directly
+        #
+        # # For each lattice point:
+        # # TODO: handle union later, only intersection right now
+        # # condition is index_var_llir == candidate index vars for each tensor
+        #
+        # if_condition = None
+        # for ivar_cand in index_var_candidate_llir_list:
+        #     sub_condition = llir.BinOp(
+        #         op="==",
+        #         left=index_var_llir,
+        #         right=ivar_cand,
+        #     )
+        #     if if_condition is None:
+        #         if_condition = sub_condition
+        #     else:
+        #         if_condition = llir.BinOp(
+        #             op="&&",
+        #             left=if_condition,
+        #             right=sub_condition,
+        #         )
+        #
+        # self.defined_index_vars.append(index_var)
+        #
+        # if_statement = llir.IfThenElse(
+        #     cond=if_condition,
+        #     then_body=self.lower_IndexStmt(stmt.stmt),
+        # )
+        #
+        # while_loop_body.append(if_statement)
+        #
+        # while_loop = llir.WhileLoop(
+        #     cond=while_loop_condition,
+        #     body=while_loop_body,
+        # )
 
         return [
             *sparse_level_index_init_stmts,
-            while_loop,
+            llir.BlankLine(),
+            *while_loops,
         ]
 
     @staticmethod
