@@ -50,13 +50,18 @@ class LLIRLowerer:
         elif isinstance(ir, llir.VarAssign):
             if ir.var.type:
                 return self.lower_llir(
-                    f"{ir.var.type.value} {ir.var.name} = {self.lower_llir(ir.value)};",
+                    f"{ir.var.type.value} {ir.var.name} {ir.op} {self.lower_llir(ir.value)};",
                     indent_level,
                 )
             else:
                 return self.lower_llir(
-                    f"{ir.var.name} = {self.lower_llir(ir.value)};", indent_level
+                    f"{ir.var.name} {ir.op} {self.lower_llir(ir.value)};", indent_level
                 )
+        elif isinstance(ir, llir.Cast):
+            return self.lower_llir(
+                f"({ir.data_type.value}) {self.lower_llir(ir.expr)}", indent_level
+            )
+
         elif isinstance(ir, llir.BinOp):
             return self.lower_llir(
                 f"{self.lower_llir(ir.left)} {ir.op} {self.lower_llir(ir.right)}",
@@ -394,6 +399,7 @@ class CINLowerer:
 
         # Get index variable at this forall
         index_var = stmt.get_index_var()
+        self.defined_index_vars.append(index_var)
         iter_lattice = IterationLattice(for_all_stmt=stmt)
         for p in iter_lattice.lattice_points:
             p.gen_iterators(index_var)
@@ -435,7 +441,9 @@ class CINLowerer:
             while_loop = llir.WhileLoop(
                 cond=lattice_point.get_while_condition(),
                 body=[
-                    *lattice_point.get_candidate_coordinate_stmts(index_var),
+                    *lattice_point.get_candidate_coordinate_stmts(),
+                    # TODO: iterate over children lattice points
+                    *lattice_point.get_iterators_advance_stmts(),
                 ],
             )
 

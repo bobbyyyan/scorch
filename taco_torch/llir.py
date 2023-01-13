@@ -1,6 +1,7 @@
 from typing import List, Optional, Any, Tuple, Union
 
 from enum import Enum
+from dataclasses import dataclass
 
 """
 TODO: maybe need this, maybe not
@@ -196,14 +197,20 @@ class VarDecl(Stmt):
         self.value = value
 
 
+@dataclass(frozen=False)
 class VarAssign(Stmt):
     """A variable assignment statement.
     Assigns an expression to a variable.
     """
 
-    def __init__(self, var: Var, value: Expr):
-        self.var = var
-        self.value = value
+    var: Var
+    value: Expr
+    op: str = "="
+    cast: Optional[bool] = False
+
+    def __post_init__(self):
+        if self.cast:
+            self.value = Cast(self.value, self.var.type)
 
 
 class Allocate(Stmt):
@@ -352,6 +359,14 @@ class Switch(Stmt):
         self.cond = cond
         self.cases = cases
         self.default = default
+
+
+@dataclass(frozen=True)
+class Cast(Expr):
+    """A cast expression."""
+
+    expr: Expr
+    data_type: DataType
 
 
 # Node visitor

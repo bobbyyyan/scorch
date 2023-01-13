@@ -29,6 +29,8 @@ class LatticePoint:
     dense_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)
     iterators: Optional[List[ModeIterator]] = field(default_factory=list)
     child_lattice_points: Optional[List["LatticePoint"]] = field(default_factory=list)
+    index_var: Optional[IndexVar] = None
+    index_var_llir: Optional[llir.Var] = None
 
     def __add__(self, other):
         if isinstance(other, LatticePoint):
@@ -49,7 +51,15 @@ class LatticePoint:
             tuple(self.dense_tensor_accesses)
         )
 
+    def set_index_var(self, index_var: IndexVar):
+        self.index_var = index_var
+        self.index_var_llir = llir.Var(
+            name=f"{index_var.name}",
+            type=llir.DataType.INT,
+        )
+
     def gen_iterators(self, index_var: IndexVar) -> List[ModeIterator]:
+        self.set_index_var(index_var)
         self.iterators = [
             ModeIterator(
                 tensor_access=ta,
@@ -81,14 +91,37 @@ class LatticePoint:
                 condition = llir.BinOp(op="&&", left=condition, right=this_condition)
         return condition
 
-    def get_candidate_coordinate_stmts(self, index_var: IndexVar) -> List[llir.Stmt]:
-
+    def get_iterators_advance_stmts(self) -> List[llir.Stmt]:
         stmts = []
 
-        index_var_llir = llir.Var(
-            name=f"{index_var.name}",
-            type=llir.DataType.INT,
-        )
+        if len(self.iterators) > 1:
+            stmts.append(llir.Comment("Advance iterators"))
+            for it in self.iterators:
+                stmts.append(
+                    llir.VarAssign(
+                        var=it.iterator_var_llir,
+                        value=llir.BinOp(
+                            op="==",
+                            left=it.iterator_var_llir,
+                            right=self.index_var_llir,
+                        ),
+                        op="+=",
+                        cast=True,
+                    )
+                )
+        elif len(self.iterators) == 1:
+            stmts.append(llir.Comment("Advance iterator"))
+            stmts.append(
+                llir.Increment(
+                    var=self.iterators[0].iterator_var_llir,
+                )
+            )
+
+        return stmts
+
+    def get_candidate_coordinate_stmts(self) -> List[llir.Stmt]:
+
+        stmts = []
 
         if len(self.iterators) > 1:
             stmts.append(llir.Comment("Get candidate coordinates"))
@@ -102,7 +135,7 @@ class LatticePoint:
             stmts.append(llir.Comment("Resolve coordinate"))
             stmts.append(
                 llir.VarAssign(
-                    var=index_var_llir,
+                    var=self.index_var_llir,
                     value=llir.FunctionCall(
                         name="std::min",
                         args=[
@@ -118,7 +151,7 @@ class LatticePoint:
             stmts.append(llir.Comment("Resolve coordinate"))
             stmts.append(
                 llir.VarAssign(
-                    var=index_var_llir,
+                    var=self.index_var_llir,
                     value=self.iterators[0].coord_var_value_llir,
                 )
             )
