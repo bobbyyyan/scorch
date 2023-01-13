@@ -1,3 +1,7 @@
+.idea
+.vscode
+playground.ipynb
+
 # Created by https://www.toptal.com/developers/gitignore/api/macos,visualstudiocode,pycharm,python,c++,cuda
 # Edit at https://www.toptal.com/developers/gitignore?templates=macos,visualstudiocode,pycharm,python,c++,cuda
 
@@ -227,7 +231,7 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Unit test / coverage reports
+# Unit tests / coverage reports
 htmlcov/
 .tox/
 .nox/
