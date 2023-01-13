@@ -1,4 +1,4 @@
-from typing import List, Optional, Any, Iterable
+from typing import List, Optional, Any, Iterable, Dict
 from itertools import chain, product
 
 from taco_torch import llir
@@ -28,6 +28,7 @@ class LatticePoint:
     sparse_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)
     dense_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)
     iterators: Optional[List[ModeIterator]] = field(default_factory=list)
+    child_lattice_points: Optional[List["LatticePoint"]] = field(default_factory=list)
 
     def __add__(self, other):
         if isinstance(other, LatticePoint):
@@ -43,6 +44,11 @@ class LatticePoint:
     def __radd__(self, other):
         return self.__add__(other)
 
+    def __hash__(self):
+        return hash(tuple(self.sparse_tensor_accesses)) + hash(
+            tuple(self.dense_tensor_accesses)
+        )
+
     def gen_iterators(self, index_var: IndexVar) -> List[ModeIterator]:
         self.iterators = [
             ModeIterator(
@@ -52,6 +58,14 @@ class LatticePoint:
             for ta in self.sparse_tensor_accesses
         ]
         return self.iterators
+
+    def filter_and_set_children(
+        self, lattice_points: List["LatticePoint"]
+    ) -> List["LatticePoint"]:
+        self.child_lattice_points = [
+            lp for lp in lattice_points if lp.is_child_of(self)
+        ]
+        return self.child_lattice_points
 
     def get_while_condition(self):
         condition = None
@@ -67,6 +81,59 @@ class LatticePoint:
                 condition = llir.BinOp(op="&&", left=condition, right=this_condition)
         return condition
 
+    def get_candidate_coordinate_stmts(self, index_var: IndexVar) -> List[llir.Stmt]:
+
+        stmts = []
+
+        index_var_llir = llir.Var(
+            name=f"{index_var.name}",
+            type=llir.DataType.INT,
+        )
+
+        if len(self.iterators) > 1:
+            stmts.append(llir.Comment("Get candidate coordinates"))
+            for it in self.iterators:
+                stmts.append(
+                    llir.VarAssign(
+                        var=it.coord_var_llir,
+                        value=it.coord_var_value_llir,
+                    )
+                )
+            stmts.append(llir.Comment("Resolve coordinate"))
+            stmts.append(
+                llir.VarAssign(
+                    var=index_var_llir,
+                    value=llir.FunctionCall(
+                        name="std::min",
+                        args=[
+                            llir.Array(
+                                values=[it.coord_var_llir for it in self.iterators],
+                                data_type=llir.DataType.INT,
+                            )
+                        ],
+                    ),
+                )
+            )
+        elif len(self.iterators) == 1:
+            stmts.append(llir.Comment("Resolve coordinate"))
+            stmts.append(
+                llir.VarAssign(
+                    var=index_var_llir,
+                    value=self.iterators[0].coord_var_value_llir,
+                )
+            )
+
+        return stmts
+
+    def is_child_of(self, other: "LatticePoint") -> bool:
+        """
+        A lattice_point is a child of another lattice point if its sparse tensor accesses is a
+        strict subset of the parent's
+        """
+        return set(self.sparse_tensor_accesses).issubset(
+            set(other.sparse_tensor_accesses)
+        )
+
 
 @dataclass(frozen=False)
 class IterationLattice:
@@ -79,6 +146,9 @@ class IterationLattice:
 
     for_all_stmt: ForAll
     lattice_points: Optional[List[LatticePoint]] = None
+    parent_to_children_lattice_points: Optional[
+        Dict[LatticePoint, List[LatticePoint]]
+    ] = None
 
     def gen_lattice_points(self) -> List[LatticePoint]:
         """
@@ -189,6 +259,26 @@ class IterationLattice:
 
         return lattice_points
 
+    def gen_parent_to_children_lattice_points(
+        self,
+    ) -> Dict[LatticePoint, List[LatticePoint]]:
+        """
+        Generate the parent to children lattice points mapping for the iteration lattice of the given
+        iteration domain.
+
+        """
+        lattice_points = self.lattice_points
+        parent_to_children_lattice_points = {}
+        for i, lattice_point in enumerate(lattice_points):
+            children = lattice_point.filter_and_set_children(lattice_points[i + 1 :])
+            parent_to_children_lattice_points[lattice_point] = children
+            # parent_to_children_lattice_points[lattice_point] = [
+            #     lp for lp in lattice_points[i + 1 :] if lp.is_child_of(lattice_point)
+            # ]
+        self.parent_to_children_lattice_points = parent_to_children_lattice_points
+        return parent_to_children_lattice_points
+
     def __post_init__(self):
         if self.lattice_points is None:
             self.lattice_points = self.gen_lattice_points()
+            self.gen_parent_to_children_lattice_points()

@@ -424,16 +424,19 @@ class CINLowerer:
         all_mode_iterators = iter_lattice.lattice_points[0].iterators
 
         sparse_level_index_init_stmts = [
+            llir.Comment("Initialize iterators"),
+        ]
+        sparse_level_index_init_stmts += [
             mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators
         ]
 
         def generate_while_loop_from_lattice_point(lattice_point: LatticePoint):
 
-            while_loop_body: List[llir.Stmt] = []
-
             while_loop = llir.WhileLoop(
                 cond=lattice_point.get_while_condition(),
-                body=while_loop_body,
+                body=[
+                    *lattice_point.get_candidate_coordinate_stmts(index_var),
+                ],
             )
 
             return while_loop
@@ -449,10 +452,7 @@ class CINLowerer:
         # while_loop_body: List[llir.Stmt] = []
         #
         # # Get actual coordinate for this index var
-        # index_var_llir = llir.Var(
-        #     name=f"{index_var.name}",
-        #     type=llir.DataType.INT,
-        # )
+
         #
         # index_var_candidate_llir_list = []
         #
