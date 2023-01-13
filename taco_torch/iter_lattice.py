@@ -1,6 +1,7 @@
 from typing import List, Optional, Any, Iterable
 from itertools import chain, product
 
+from taco_torch import llir
 from taco_torch.cin import (
     IndexVar,
     ForAll,
@@ -13,7 +14,7 @@ from taco_torch.cin import (
     Operation,
 )
 from taco_torch.format import LevelType
-from taco_torch.iterator import TensorIterators
+from taco_torch.iterator import TensorIterators, ModeIterator
 from dataclasses import dataclass, field
 
 
@@ -24,20 +25,47 @@ class LatticePoint:
     locators: List of tensor accesses to locate only
     """
 
-    iterators: Optional[List[TensorAccess]] = field(default_factory=list)
-    locators: Optional[List[TensorAccess]] = field(default_factory=list)
+    sparse_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)
+    dense_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)
+    iterators: Optional[List[ModeIterator]] = field(default_factory=list)
 
     def __add__(self, other):
         if isinstance(other, LatticePoint):
             return LatticePoint(
-                iterators=self.iterators + other.iterators,
-                locators=self.locators + other.locators,
+                sparse_tensor_accesses=self.sparse_tensor_accesses
+                + other.sparse_tensor_accesses,
+                dense_tensor_accesses=self.dense_tensor_accesses
+                + other.dense_tensor_accesses,
             )
         else:
             return self
 
     def __radd__(self, other):
         return self.__add__(other)
+
+    def gen_iterators(self, index_var: IndexVar) -> List[ModeIterator]:
+        self.iterators = [
+            ModeIterator(
+                tensor_access=ta,
+                index_var=index_var,
+            )
+            for ta in self.sparse_tensor_accesses
+        ]
+        return self.iterators
+
+    def get_while_condition(self):
+        condition = None
+        for it in self.iterators:
+            this_condition = llir.BinOp(
+                op="<",
+                left=it.iterator_var_llir,
+                right=it.iterator_var_end_var_llir,
+            )
+            if condition is None:
+                condition = this_condition
+            else:
+                condition = llir.BinOp(op="&&", left=condition, right=this_condition)
+        return condition
 
 
 @dataclass(frozen=False)
@@ -80,7 +108,11 @@ class IterationLattice:
             left_accesses: List[List[TensorAccess]],
             right_accesses: List[List[TensorAccess]],
         ) -> List[List[TensorAccess]]:
-            return [*left_accesses, *right_accesses, left_accesses + right_accesses]
+            return [
+                *left_accesses,
+                *right_accesses,
+                left_accesses + right_accesses,
+            ]
 
         def union_lattice_points(
             left_lattice_points: List[LatticePoint],
@@ -132,14 +164,18 @@ class IterationLattice:
                     ]
                     == LevelType.DENSE
                 ):
-                    return [LatticePoint(locators=[cin])]
-                return [LatticePoint(iterators=[cin])]
+                    return [LatticePoint(dense_tensor_accesses=[cin])]
+                return [LatticePoint(sparse_tensor_accesses=[cin])]
 
         lattice_points = get_lattice_points_from_cin(self.for_all_stmt)
 
         # Sort lattice_points in descending number of iterators, then descending number of locators
         lattice_points.sort(
-            key=lambda lp: (len(lp.iterators), len(lp.locators)), reverse=True
+            key=lambda lp: (
+                len(lp.sparse_tensor_accesses),
+                len(lp.dense_tensor_accesses),
+            ),
+            reverse=True,
         )
 
         # Remove lattice points that have the same iterators, only keep the one with the most locators
@@ -147,8 +183,8 @@ class IterationLattice:
         lattice_points = [
             lattice_point
             for i, lattice_point in enumerate(lattice_points)
-            if lattice_point.iterators
-            not in [lp.iterators for lp in lattice_points[:i]]
+            if lattice_point.sparse_tensor_accesses
+            not in [lp.sparse_tensor_accesses for lp in lattice_points[:i]]
         ]
 
         return lattice_points

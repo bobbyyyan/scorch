@@ -168,7 +168,8 @@ class CINLowerer:
                 statements.append(
                     llir.VarAssign(
                         var=llir.Var(
-                            name=f"{tensor.name}{level}_size", type=llir.DataType.INT
+                            name=f"{tensor.name}{level}_size",
+                            type=llir.DataType.INT,
                         ),
                         value=llir.Var(
                             name=f"{tensor.name}._shape[{level}]",
@@ -211,7 +212,8 @@ class CINLowerer:
         return llir.VarAssign(
             var=llir.Var(name=f"{tensor.name}_values", type=llir.DataType.TORCH_TENSOR),
             value=llir.Var(
-                name=f"{tensor.name}._storage._value", type=llir.DataType.TORCH_TENSOR
+                name=f"{tensor.name}._storage._value",
+                type=llir.DataType.TORCH_TENSOR,
             ),
         )
 
@@ -385,13 +387,16 @@ class CINLowerer:
         parent_index_var: Optional[IndexVar] = None,
     ) -> List[llir.Stmt]:
 
-        iter_lattice = IterationLattice(for_all_stmt=stmt)
         """
         Lower a ForAll to LLIR
         parent_index_var is the index var of the parent ForAll, if any
         """
+
         # Get index variable at this forall
         index_var = stmt.get_index_var()
+        iter_lattice = IterationLattice(for_all_stmt=stmt)
+        for p in iter_lattice.lattice_points:
+            p.gen_iterators(index_var)
 
         assert (
             index_var in self.index_var_to_rhs_tensor_level_type
@@ -415,51 +420,25 @@ class CINLowerer:
 
         # We can just use the first lattice point to determine what to initialize
         # since the list is sorted by number of iterators
-        iterator_tensor_accesses = iter_lattice.lattice_points[0].iterators
 
-        sparse_level_index_init_stmts = []
+        all_mode_iterators = iter_lattice.lattice_points[0].iterators
 
-        iterators = []
-
-        for tensor_access in iterator_tensor_accesses:
-            mode_iterator = ModeIterator(
-                tensor_access=tensor_access,
-                index_var=index_var,
-            )
-            iterators.append(mode_iterator)
-            sparse_level_index_init_stmts.extend(mode_iterator.get_init_stmts())
+        sparse_level_index_init_stmts = [
+            mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators
+        ]
 
         def generate_while_loop_from_lattice_point(lattice_point: LatticePoint):
-            # TODO: implement this
-            while_loop_condition = None
-
-            while_loop_condition = []
-
-            # for (iterator_var, iterator_upper_bound) in iterator_var_to_upper_bound.items():
-            #     bound_cond = llir.BinOp(
-            #         op="<",
-            #         left=iterator_var,
-            #         right=iterator_upper_bound,
-            #     )
-            #     if while_loop_condition is None:
-            #         while_loop_condition = bound_cond
-            #     else:
-            #         while_loop_condition = llir.BinOp(
-            #             op="&&",
-            #             left=while_loop_condition,
-            #             right=bound_cond,
-            #         )
 
             while_loop_body: List[llir.Stmt] = []
 
             while_loop = llir.WhileLoop(
-                cond=while_loop_condition,
+                cond=lattice_point.get_while_condition(),
                 body=while_loop_body,
             )
 
             return while_loop
 
-        while_loops = [
+        lattice_while_loops = [
             [
                 generate_while_loop_from_lattice_point(p),
                 llir.BlankLine(),
@@ -467,26 +446,6 @@ class CINLowerer:
             for p in iter_lattice.lattice_points
         ]
 
-        # while_loop_condition = None
-        #
-        # for (
-        #     sparse_level_index_var,
-        #     sparse_level_index_var_upper_bound,
-        # ) in iterator_var_to_upper_bound.items():
-        #     bound_cond = llir.BinOp(
-        #         op="<",
-        #         left=sparse_level_index_var,
-        #         right=sparse_level_index_var_upper_bound,
-        #     )
-        #     if while_loop_condition is None:
-        #         while_loop_condition = bound_cond
-        #     else:
-        #         while_loop_condition = llir.BinOp(
-        #             op="&&",
-        #             left=while_loop_condition,
-        #             right=bound_cond,
-        #         )
-        #
         # while_loop_body: List[llir.Stmt] = []
         #
         # # Get actual coordinate for this index var
@@ -584,7 +543,7 @@ class CINLowerer:
         return [
             *sparse_level_index_init_stmts,
             llir.BlankLine(),
-            *while_loops,
+            *lattice_while_loops,
         ]
 
     @staticmethod
