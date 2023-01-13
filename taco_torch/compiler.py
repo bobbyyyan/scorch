@@ -458,64 +458,6 @@ class CINLowerer:
         ]
 
         def generate_while_loop_from_lattice_point(lattice_point: LatticePoint):
-            def rewrite_cin(cin: CIN) -> Optional[CIN]:
-                # Rewrite the CIN to eliminate tensors that have run out of values
-                # Based on the lattice_point we are currently at
-                if isinstance(cin, TensorAccess):
-                    if (
-                        cin in lattice_point.sparse_tensor_accesses
-                        or cin in lattice_point.dense_tensor_accesses
-                    ):
-                        return cin
-                    else:
-                        return None
-
-                elif isinstance(cin, BinaryOp):
-
-                    left_new = rewrite_cin(cin.left)
-                    right_new = rewrite_cin(cin.right)
-
-                    if left_new is None and right_new is None:
-                        return None
-
-                    if left_new and right_new:
-                        assert isinstance(left_new, IndexExpr) and isinstance(
-                            right_new, IndexExpr
-                        ), "Expected IndexExpr for left and right"
-                        return BinaryOp(
-                            op=cin.op,
-                            left=left_new,
-                            right=right_new,
-                        )
-
-                    # At this point, one of left_new or right_new is None
-
-                    if cin.op == Operation.ADD:
-                        return left_new or right_new
-                    elif cin.op == Operation.MUL:
-                        return None
-
-                elif isinstance(cin, ForAll):
-                    rewritten_inner_stmt = rewrite_cin(cin.stmt)
-                    assert isinstance(
-                        rewritten_inner_stmt, IndexStmt
-                    ), "Rewritten inner stmt is not an index stmt"
-                    return ForAll(
-                        index_var=cin.index_var,
-                        stmt=rewritten_inner_stmt,
-                    )
-
-                elif isinstance(cin, TensorAssign):
-                    rewritten_rhs = rewrite_cin(cin.rhs)
-                    assert isinstance(
-                        rewritten_rhs, IndexExpr
-                    ), "Rewritten rhs is not an index expr"
-                    return TensorAssign(
-                        lhs=cin.lhs,
-                        rhs=rewritten_rhs,
-                    )
-
-            rewritten_cin = rewrite_cin(stmt.stmt)
 
             while_loop = llir.WhileLoop(
                 cond=lattice_point.get_while_condition(),
