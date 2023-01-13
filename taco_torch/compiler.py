@@ -12,6 +12,7 @@ from taco_torch.cin import (
     ForAll,
     IndexExpr,
     BinaryOp,
+    CIN,
 )
 from taco_torch.format import LevelType
 from taco_torch.iter_lattice import IterationLattice, LatticePoint
@@ -236,6 +237,12 @@ class CINLowerer:
                 name=f"{index_expr.tensor.name}_values[{last_index_var.name}_{index_expr.tensor.name}]",
             )
 
+    def lower_CIN(self, cin: CIN) -> Union[llir.Stmt, List[llir.Stmt], llir.Expr]:
+        if isinstance(cin, IndexStmt):
+            return self.lower_IndexStmt(cin)
+        elif isinstance(cin, IndexExpr):
+            return self.lower_IndexExpr(cin)
+
     def lower_IndexStmt(self, stmt: IndexStmt) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
         Lower an IndexStmt to LLIR
@@ -437,12 +444,65 @@ class CINLowerer:
         ]
 
         def generate_while_loop_from_lattice_point(lattice_point: LatticePoint):
+            def rewrite_cin(cin: CIN) -> Optional[CIN]:
+                # Rewrite the CIN to eliminate tensors that have run out of values
+                # Based on the lattice_point we are currently at
+                if isinstance(cin, TensorAccess):
+                    if (
+                        cin in lattice_point.sparse_tensor_accesses
+                        or cin in lattice_point.dense_tensor_accesses
+                    ):
+                        return cin
+                    else:
+                        return None
+                elif isinstance(cin, BinaryOp):
+                    # TODO: this is the case for addition, need to handle the multiplication case
+                    left_new = rewrite_cin(cin.left)
+                    right_new = rewrite_cin(cin.right)
+
+                    if left_new is None and right_new is None:
+                        return None
+
+                    if left_new and right_new:
+                        assert isinstance(left_new, IndexExpr) and isinstance(
+                            right_new, IndexExpr
+                        ), "Expected IndexExpr for left and right"
+                        return BinaryOp(
+                            op=cin.op,
+                            left=left_new,
+                            right=right_new,
+                        )
+
+                    return left_new or right_new
+
+                elif isinstance(cin, ForAll):
+                    rewritten_inner_stmt = rewrite_cin(cin.stmt)
+                    assert isinstance(
+                        rewritten_inner_stmt, IndexStmt
+                    ), "Rewritten inner stmt is not an index stmt"
+                    return ForAll(
+                        index_var=cin.index_var,
+                        stmt=rewritten_inner_stmt,
+                    )
+
+                elif isinstance(cin, TensorAssign):
+                    rewritten_rhs = rewrite_cin(cin.rhs)
+                    assert isinstance(
+                        rewritten_rhs, IndexExpr
+                    ), "Rewritten rhs is not an index expr"
+                    return TensorAssign(
+                        lhs=cin.lhs,
+                        rhs=rewritten_rhs,
+                    )
+
+            rewritten_cin = rewrite_cin(stmt.stmt)
 
             while_loop = llir.WhileLoop(
                 cond=lattice_point.get_while_condition(),
                 body=[
                     *lattice_point.get_candidate_coordinate_stmts(),
-                    # TODO: iterate over children lattice points
+                    # TODO: iterate over children lattice points, and rewrite/simplify inner statement for each case
+                    self.lower_CIN(rewritten_cin),
                     *lattice_point.get_iterators_advance_stmts(),
                 ],
             )
