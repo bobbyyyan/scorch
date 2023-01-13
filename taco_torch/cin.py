@@ -1,6 +1,6 @@
-from enum import Enum
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, Optional, Any, Tuple, Callable, Union
 
 import torch

@@ -1,18 +1,11 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
-
-from copy import deepcopy
-
-import numpy as numpy
-import scipy.sparse
-import torch
-
-from .tensor import TacoTensor
-from .storage import TensorStorage, TensorIndex, TensorFormat
-
-from torch.utils.cpp_extension import load, load_inline
-
 from pathlib import Path
+from typing import Any, Union
 
+import torch
+from torch.utils.cpp_extension import load
+
+from .storage import TensorStorage, TensorIndex
+from .tensor import TacoTensor
 
 PROJECT_ROOT_DIR = Path(__file__).parent.parent
 

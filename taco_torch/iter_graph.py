@@ -1,17 +1,12 @@
-from copy import deepcopy
-from dataclasses import dataclass
-from typing import List, Optional, Any, Tuple, Callable, Union, TypeVar
+from typing import List, Optional, TypeVar
 
 from taco_torch.cin import (
     TensorAssign,
     IndexVar,
     TensorAccess,
-    TensorVar,
     IndexExpr,
     BinaryOp,
 )
-from taco_torch.format import TensorFormat
-from taco_torch.utils import get_format_from_list
 
 # Type aliases for type hints
 

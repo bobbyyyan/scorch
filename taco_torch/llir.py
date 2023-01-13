@@ -1,7 +1,6 @@
-from typing import List, Optional, Any, Tuple, Union
-
-from enum import Enum
 from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional, Any, Union
 
 """
 TODO: maybe need this, maybe not

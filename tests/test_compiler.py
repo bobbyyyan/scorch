@@ -1,20 +1,46 @@
-from taco_torch.cin import TensorAssign, TensorAccess, IndexVar, TensorVar, ForAll
+from taco_torch.cin import IndexVar, TensorVar, ForAll
 from taco_torch.compiler import CINLowerer, LLIRLowerer
 
 
 def test_elementwise_vector_mul_codegen():
     # elementwise vector multiplication code generation
     # a[i] = b[i] * c[i]
+    # Reference: http://tensor-compiler.org/codegen.html?expr=a(i)=b(i)*c(i)&format=a:s:0;b:d:0;c:s:0
 
     i = IndexVar("i")
 
     a = TensorVar("a", fmt="sparse")
-    # a = TensorVar("a", fmt="dense")
-    # n = TensorVar("b", fmt="sparse")
     b = TensorVar("b", fmt="dense")
     c = TensorVar("c", fmt="sparse")
 
     a[i] = b[i] * c[i]
+
+    cin_stmt = ForAll(i, a._assignment)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elementwise_vector_add_codegen():
+    # elementwise vector addition code generation
+    # a[i] = b[i] + c[i]
+    # Reference: http://tensor-compiler.org/codegen.html?expr=a(i)=b(i)+c(i)&format=a:s:0;b:d:0;c:s:0
+    i = IndexVar("i")
+
+    a = TensorVar("a", fmt="sparse")
+    # a = TensorVar("a", fmt="dense")
+    # b = TensorVar("b", fmt="sparse")
+    b = TensorVar("b", fmt="dense")
+    c = TensorVar("c", fmt="sparse")
+    # c = TensorVar("c", fmt="dense")
+
+    a[i] = b[i] + c[i]
 
     cin_stmt = ForAll(i, a._assignment)
 
@@ -101,7 +127,8 @@ def test_elementwise_matrix_mul_codegen():
 
 def test_elementwise_matrix_add_mul_codegen():
     # elementwise matrix multiplication code generation
-    # A(i,j)=(B(i,j)+C(i,j))*(D(i,j)+E(i,j))
+    # A[i, j] = (B[i, j] + C[i, j]) * (D[i, j] + E[i, j])
+    # TACO reference: http://tensor-compiler.org/codegen.html?expr=A(i,j)=(B(i,j)+C(i,j))*(D(i,j)+E(i,j))&format=A:ss:0,1;B:ds:0,1;C:ds:0,1;D:ss:0,1;E:ss:0,1
 
     i = IndexVar("i")
     j = IndexVar("j")

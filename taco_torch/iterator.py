@@ -1,10 +1,9 @@
+from dataclasses import dataclass
 from typing import Dict, Optional, List
 
 from taco_torch import llir
 from taco_torch.cin import TensorVar, IndexStmt, TensorAccess, IndexVar
 from taco_torch.format import TensorFormat, LevelType
-
-from dataclasses import dataclass
 
 
 @dataclass(frozen=False)

@@ -1,12 +1,8 @@
-import warnings
-
 from typing import Optional, List, Tuple
 
 import torch
 
 from .format import TensorFormat, LevelType
-
-import taco_torch
 
 
 class TensorLevelIndex(object):

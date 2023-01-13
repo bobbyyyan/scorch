@@ -174,7 +174,6 @@ class LatticePoint:
             )
 
     def get_child_subregion_loops(self, cin_lowerer, cin: CIN) -> List[llir.Stmt]:
-        # TODO: implement this
         stmts = []
         if self.child_lattice_points:
             if_conditions = []

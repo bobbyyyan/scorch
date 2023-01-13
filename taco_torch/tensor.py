@@ -1,6 +1,5 @@
-from typing import Optional, Tuple, Union
-
 from copy import deepcopy
+from typing import Optional, Tuple, Union
 
 import torch
 

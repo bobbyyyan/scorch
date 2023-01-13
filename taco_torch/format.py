@@ -1,8 +1,6 @@
-import warnings
-from typing import Optional, Union, List, Tuple
-from enum import Enum, auto
+from enum import Enum
+from typing import Optional, Union, List
 
-import taco_torch
 from taco_torch import llir
 
 

@@ -18,7 +18,6 @@ from taco_torch.cin import (
 from taco_torch.format import LevelType
 from taco_torch.iter_lattice import IterationLattice, LatticePoint
 from taco_torch.iterator import ModeIterator, ModeAccess
-from taco_torch.utils import dtype_to_datatype
 
 
 class LLIRLowerer:
@@ -428,11 +427,7 @@ class CINLowerer:
                 ],
             )
 
-    def lower_ForAll(
-        self,
-        stmt: ForAll,
-        parent_index_var: Optional[IndexVar] = None,
-    ) -> List[llir.Stmt]:
+    def lower_ForAll(self, stmt: ForAll) -> List[llir.Stmt]:
 
         """
         Lower a ForAll to LLIR
@@ -449,22 +444,6 @@ class CINLowerer:
         assert (
             index_var in self.index_var_to_rhs_tensor_level_type
         ), f"Index var {{{index_var.name}}} not found in rhs tensor level types"
-        tensor_level_type_list = self.index_var_to_rhs_tensor_level_type[index_var]
-
-        all_dense: bool = all(
-            [
-                tensor_level_type[2] == LevelType.DENSE
-                for tensor_level_type in tensor_level_type_list
-            ]
-        )
-
-        # Filter to only the compressed ones
-        filtered_tensor_level_type_list = list(
-            filter(
-                lambda tensor_level_type: tensor_level_type[2] == LevelType.COMPRESSED,
-                tensor_level_type_list,
-            )
-        )
 
         # We can just use the first lattice point to determine what to initialize
         # since the list is sorted by number of iterators
