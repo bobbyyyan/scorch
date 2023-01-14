@@ -1,7 +1,7 @@
 from typing import List, Optional, Dict, Union
 
-import taco_torch.llir as llir
-from taco_torch.cin import (
+from src.taco_torch import llir
+from src.taco_torch.cin import (
     IndexStmt,
     IndexVar,
     all_free_var_loops_before_reduction_loops,
@@ -14,9 +14,9 @@ from taco_torch.cin import (
     BinaryOp,
     CIN,
 )
-from taco_torch.format import LevelType
-from taco_torch.iter_lattice import IterationLattice, LatticePoint
-from taco_torch.iterator import ModeIterator, ModeAccess
+from src.taco_torch.format import LevelType
+from src.taco_torch.iter_lattice import IterationLattice
+from src.taco_torch.iterator import ModeIterator, ModeAccess
 
 
 class LLIRLowerer:

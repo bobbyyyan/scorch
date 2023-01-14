@@ -3,8 +3,8 @@ from typing import List, Dict, Any, Iterable
 
 import torch
 
-from taco_torch.format import TensorFormat, LevelFormat, LevelType
-from taco_torch.llir import DataType
+from src.taco_torch.format import TensorFormat, LevelFormat, LevelType
+from src.taco_torch.llir import DataType
 
 
 def get_format_from_list(format_str_list: List[str]) -> TensorFormat:

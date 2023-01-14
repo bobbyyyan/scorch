@@ -1,13 +1,15 @@
-from pathlib import Path
-from typing import Any, Union
-
 import torch
 from torch.utils.cpp_extension import load
+
+from pathlib import Path
+from typing import Any, Union
 
 from .storage import TensorStorage, TensorIndex
 from .tensor import TacoTensor
 
-PROJECT_ROOT_DIR = Path(__file__).parent.parent
+PROJECT_ROOT_DIR = Path(__file__)
+while not (PROJECT_ROOT_DIR / "setup.py").exists():
+    PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 ops_cpp = load(
     name="ops_cpp",

@@ -1,6 +1,6 @@
 from typing import List, Optional, TypeVar
 
-from taco_torch.cin import (
+from src.taco_torch.cin import (
     TensorAssign,
     IndexVar,
     TensorAccess,

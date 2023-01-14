@@ -1,4 +1,4 @@
-from taco_torch import TacoTensor
+from src.taco_torch import TacoTensor
 from torch.utils import cpp_extension
 
 for path in cpp_extension.include_paths():

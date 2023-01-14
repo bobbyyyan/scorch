@@ -3,13 +3,13 @@ from dataclasses import dataclass, field
 from itertools import product
 from typing import List, Optional, Dict, TYPE_CHECKING
 
-from taco_torch.utils import flatten_2d_list
+from src.taco_torch.utils import flatten_2d_list
 
 if TYPE_CHECKING:
-    from taco_torch.compiler import CINLowerer
+    from src.taco_torch.compiler import CINLowerer
 
-from taco_torch import llir
-from taco_torch.cin import (
+from src.taco_torch import llir
+from src.taco_torch.cin import (
     IndexVar,
     ForAll,
     TensorAccess,
@@ -20,8 +20,8 @@ from taco_torch.cin import (
     Operation,
     IndexExpr,
 )
-from taco_torch.format import LevelType
-from taco_torch.iterator import ModeIterator
+from src.taco_torch.format import LevelType
+from src.taco_torch.iterator import ModeIterator
 
 
 @dataclass(frozen=False)

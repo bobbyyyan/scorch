@@ -1,6 +1,5 @@
 import torch
-from taco_torch import TacoTensor, taco_einsum
-from taco_torch.cin import TensorAssign, MulOp, TensorAccess, IndexVar
+from src.taco_torch import TacoTensor
 
 A = TacoTensor(name="A", value=torch.randn(3, 4))
 B = TacoTensor(name="B", value=torch.randn(3, 4))

@@ -1,8 +1,7 @@
 import torch
-from taco_torch import TacoTensor, taco_einsum
-from taco_torch.cin import TensorAssign, TensorAccess, MulOp, IndexVar
-from taco_torch.format import TensorFormat, LevelFormat, LevelType
-from taco_torch.storage import TensorStorage, TensorIndex
+from src.taco_torch import TacoTensor
+from src.taco_torch.format import TensorFormat, LevelFormat, LevelType
+from src.taco_torch.storage import TensorStorage, TensorIndex
 
 A = TacoTensor(name="A", value=torch.randn(3, 4))
 B = TacoTensor(name="B", value=torch.randn(3, 4))
