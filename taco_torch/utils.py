@@ -1,4 +1,5 @@
-from typing import List, Dict
+from itertools import chain
+from typing import List, Dict, Any, Iterable
 
 import torch
 
@@ -67,3 +68,7 @@ def get_pytorch_c_dtype_str(dtype: torch.dtype) -> str:
         str: C++ pytorch dtype string.
     """
     return PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE[dtype]
+
+
+def flatten_2d_list(lst: Iterable[List[Any]]) -> List[Any]:
+    return list(chain(*lst))

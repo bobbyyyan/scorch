@@ -27,6 +27,31 @@ def test_elementwise_vector_mul_codegen():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_elementwise_vector_mul_add_codegen():
+    # elementwise vector multiplication and addition code generation
+    # Reference: http://tensor-compiler.org/codegen.html?expr=a(i)=b(i)*c(i)+d(i)&format=a:s:0;b:s:0;c:s:0;d:d:0
+    # a[i] = b[i] * c[i] + d[i]
+    i = IndexVar("i")
+
+    a = TensorVar("a", fmt="sparse")
+    b = TensorVar("b", fmt="sparse")
+    c = TensorVar("c", fmt="sparse")
+    d = TensorVar("d", fmt="dense")
+
+    a[i] = b[i] * c[i] + d[i]
+
+    cin_stmt = ForAll(i, a._assignment)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elementwise_vector_add_codegen():
     # elementwise vector addition code generation
     # a[i] = b[i] + c[i]
@@ -43,6 +68,32 @@ def test_elementwise_vector_add_codegen():
     a[i] = b[i] + c[i]
 
     cin_stmt = ForAll(i, a._assignment)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_matrix_vector_mul_codegen():
+    # matrix vector multiplication code generation
+    # A[i, j] = B[i, j] * C[j]
+    # Reference: http://tensor-compiler.org/codegen.html?expr=A(i,j)=B(i,j)*c(j)&format=A:ss:0,1;B:ss:0,1;c:s:0
+
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["sparse", "sparse"])
+    B = TensorVar("B", fmt=["sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse"])
+
+    A[i, j] = B[i, j] * C[j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
     lowerer = CINLowerer()
 

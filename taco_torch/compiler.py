@@ -13,7 +13,6 @@ from taco_torch.cin import (
     IndexExpr,
     BinaryOp,
     CIN,
-    Operation,
 )
 from taco_torch.format import LevelType
 from taco_torch.iter_lattice import IterationLattice, LatticePoint
@@ -260,7 +259,7 @@ class CINLowerer:
     def lower_IndexExpr(self, index_expr: IndexExpr) -> llir.Expr:
         if isinstance(index_expr, BinaryOp):
             return llir.BinOp(
-                op=index_expr.op,
+                op=index_expr.op.value,
                 left=self.lower_IndexExpr(index_expr.left),
                 right=self.lower_IndexExpr(index_expr.right),
             )
@@ -436,63 +435,24 @@ class CINLowerer:
 
         # Get index variable at this forall
         index_var = stmt.get_index_var()
+
         self.defined_index_vars.append(index_var)
-        iter_lattice = IterationLattice(for_all_stmt=stmt)
-        for p in iter_lattice.lattice_points:
-            p.gen_iterators(index_var)
 
-        assert (
-            index_var in self.index_var_to_rhs_tensor_level_type
-        ), f"Index var {{{index_var.name}}} not found in rhs tensor level types"
-
-        # We can just use the first lattice point to determine what to initialize
-        # since the list is sorted by number of iterators
-
-        all_mode_iterators = iter_lattice.lattice_points[0].iterators
-
-        sparse_level_index_init_stmts = [
-            llir.Comment("Initialize iterators"),
-        ]
-        sparse_level_index_init_stmts += [
-            mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators
-        ]
-
-        def generate_while_loop_from_lattice_point(lattice_point: LatticePoint):
-
-            while_loop = llir.WhileLoop(
-                cond=lattice_point.get_while_condition(),
-                body=[
-                    *lattice_point.get_candidate_coordinate_stmts(),
-                    # TODO: iterate over children lattice points, and rewrite/simplify inner statement for each case
-                    # self.lower_CIN(rewritten_cin),
-                    *lattice_point.get_child_subregion_loops(self, stmt.stmt),
-                    *lattice_point.get_iterators_advance_stmts(),
-                ],
-            )
-
-            return while_loop
-
-        lattice_while_loops = [
-            [
-                generate_while_loop_from_lattice_point(p),
-                llir.BlankLine(),
-            ]
-            for p in iter_lattice.lattice_points
-        ]
+        iter_lattice = IterationLattice(for_all_stmt=stmt, cin_lowerer=self)
 
         return [
-            *sparse_level_index_init_stmts,
+            *iter_lattice.get_iterator_init_stmts(),
             llir.BlankLine(),
-            *lattice_while_loops,
+            *iter_lattice.get_lattice_loops(),
         ]
 
     @staticmethod
-    def lower_TensorVar(tvar: TensorVar) -> llir.Expr:
+    def lower_TensorVar(tensor_var: TensorVar) -> llir.Expr:
         """
         Lower a TensorVar to LLIR
         """
         return llir.Var(
-            name=tvar.name,
+            name=tensor_var.name,
             # type=dtype_to_datatype(tvar.dtype),
             type=llir.DataType.TACO_TENSOR,
         )

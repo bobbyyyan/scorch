@@ -1,6 +1,12 @@
+from __future__ import annotations
 from dataclasses import dataclass, field
-from itertools import chain, product
-from typing import List, Optional, Any, Iterable, Dict
+from itertools import product
+from typing import List, Optional, Dict, TYPE_CHECKING
+
+from taco_torch.utils import flatten_2d_list
+
+if TYPE_CHECKING:
+    from taco_torch.compiler import CINLowerer
 
 from taco_torch import llir
 from taco_torch.cin import (
@@ -58,7 +64,9 @@ class LatticePoint:
             type=llir.DataType.INT,
         )
 
-    def gen_iterators(self, index_var: IndexVar) -> List[ModeIterator]:
+    def set_index_var_and_gen_iterators(
+        self, index_var: IndexVar
+    ) -> List[ModeIterator]:
         self.set_index_var(index_var)
         self.iterators = [
             ModeIterator(
@@ -173,7 +181,14 @@ class LatticePoint:
                 rhs=rewritten_rhs,
             )
 
-    def get_child_subregion_loops(self, cin_lowerer, cin: CIN) -> List[llir.Stmt]:
+    def get_child_subregion_loops(
+        self, cin_lowerer: CINLowerer, cin: CIN
+    ) -> List[llir.Stmt]:
+        """
+        Iterates over the child lattice points and generate an inner loop over each
+        case. The inner loop uses a simplified/rewritten expression of the original
+        CIN to ignore the tensors that have run out of values.
+        """
         stmts = []
         if self.child_lattice_points:
             if_conditions = []
@@ -256,7 +271,7 @@ class LatticePoint:
 
         return stmts
 
-    def is_child_of(self, other: "LatticePoint") -> bool:
+    def is_child_of(self, other: LatticePoint) -> bool:
         """
         A lattice_point is a child of another lattice point if its sparse tensor accesses is a
         strict subset of the parent's
@@ -280,6 +295,8 @@ class IterationLattice:
     parent_to_children_lattice_points: Optional[
         Dict[LatticePoint, List[LatticePoint]]
     ] = None
+    index_var: Optional[IndexVar] = None
+    cin_lowerer: Optional[CINLowerer] = None
 
     def gen_lattice_points(self) -> List[LatticePoint]:
         """
@@ -287,9 +304,6 @@ class IterationLattice:
         iteration domain.
         """
         current_index_var = self.for_all_stmt.get_index_var()
-
-        def flatten_2d_list(lst: Iterable[List[Any]]) -> List[Any]:
-            return list(chain(*lst))
 
         def intersect_accesses(
             left_accesses: List[List[TensorAccess]],
@@ -413,3 +427,57 @@ class IterationLattice:
         if self.lattice_points is None:
             self.lattice_points = self.gen_lattice_points()
             self.gen_parent_to_children_lattice_points()
+
+        if self.index_var is None:
+            # Get the index variable from the ForAll statement
+            self.index_var = self.for_all_stmt.get_index_var()
+
+        # Generate the iterators for each lattice point now that we know the index variable
+        for lp in self.lattice_points:
+            lp.set_index_var_and_gen_iterators(self.index_var)
+
+    def get_iterator_init_stmts(self) -> List[llir.Stmt]:
+        """
+        Generate the iterator initialization statements for the given iteration domain.
+
+        """
+        # We can just use the first lattice point to determine what to initialize
+        # since the list is sorted by number of iterators
+        # TODO: need to handle dense iterators
+        all_mode_iterators = self.lattice_points[0].iterators
+
+        return [
+            llir.Comment("Initialize iterators"),
+            *[mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators],
+        ]
+
+    def get_lattice_loops(self) -> List[llir.Stmt]:
+        """
+        Generate the outermost loops, one for each lattice point.
+
+        """
+
+        def gen_single_lattice_loop(lattice_point: LatticePoint) -> llir.Stmt:
+
+            while_loop = llir.WhileLoop(
+                cond=lattice_point.get_while_condition(),
+                body=[
+                    *lattice_point.get_candidate_coordinate_stmts(),
+                    *lattice_point.get_child_subregion_loops(
+                        self.cin_lowerer, self.for_all_stmt.stmt
+                    ),
+                    *lattice_point.get_iterators_advance_stmts(),
+                ],
+            )
+
+            return while_loop
+
+        return flatten_2d_list(
+            [
+                [
+                    gen_single_lattice_loop(p),
+                    llir.BlankLine(),
+                ]
+                for p in self.lattice_points
+            ]
+        )

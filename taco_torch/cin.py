@@ -1,3 +1,4 @@
+from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
@@ -14,7 +15,7 @@ _BinaryOp = Callable[[Any, Any], Any]
 
 
 class CIN:
-    def accept(self, visitor: "CINVisitor") -> None:
+    def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self)
 
 
