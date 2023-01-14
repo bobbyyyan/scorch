@@ -1,3 +1,9 @@
 numpy
 scipy
 torch
+
+# Development
+black
+flake8
+mypy
+pytest
