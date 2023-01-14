@@ -30,11 +30,12 @@ class LevelFormat(object):
         if isinstance(mode, str):
             # convert string to LevelType
             if mode == "dense":
-                self._mode = LevelType.DENSE
+                mode = LevelType.DENSE
             elif mode == "compressed":
-                self._mode = LevelType.COMPRESSED
+                mode = LevelType.COMPRESSED
             elif mode == "singleton":
-                self._mode = LevelType.SINGLETON
+                mode = LevelType.SINGLETON
+        assert isinstance(mode, LevelType)
         self._mode = mode
         self._bit_width = bit_width
 
@@ -68,7 +69,7 @@ class LevelPack:
 class TensorFormat(object):
     """A tensor format"""
 
-    _level_formats: Optional[List[LevelFormat]]
+    _level_formats: List[LevelFormat]
 
     # Fill value default to 0.0
     # TODO: extend to support other fill values
@@ -90,10 +91,14 @@ class TensorFormat(object):
             raise ValueError("Invalid level_formats: {}".format(level_formats))
 
     def get_level_formats(self) -> List[LevelFormat]:
+        assert self._level_formats is not None, "level_formats is None"
         return self._level_formats
 
     def get_level_types(self) -> List[LevelType]:
         return [level_format.get_level_type() for level_format in self._level_formats]
+
+    def get_order(self) -> int:
+        return len(self.get_level_formats())
 
     def __str__(self):
         # return "TensorFormat({})".format(self._level_formats)

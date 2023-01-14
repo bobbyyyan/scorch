@@ -13,5 +13,5 @@ pip freeze -r requirements.txt > requirements.lock
 
 # Code style and linting
 black --check --diff src
-mypy --install-types --non-interactive --show-error-codes --show-column-numbers --pretty src
+mypy --install-types --non-interactive --show-error-codes --check-untyped-defs --pretty src
 flake8 src

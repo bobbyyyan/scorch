@@ -163,8 +163,16 @@ class TensorVar(IndexExpr):
 
         self.dtype = dtype
 
+    def get_name(self) -> str:
+        assert self.name is not None, "TensorVar name is None"
+        return self.name
+
+    def get_format(self) -> TensorFormat:
+        assert self.format is not None, "TensorVar format is None"
+        return self.format
+
     def get_level_types(self) -> List[LevelType]:
-        return self.format.get_level_types()
+        return self.get_format().get_level_types()
 
     def get_level_size_cpp(self, level: int) -> str:
         return f"(int) ({self.name}._shape[{level}])"

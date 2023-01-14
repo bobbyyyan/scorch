@@ -53,7 +53,7 @@ class TacoTensor(torch.nn.Module):
         index: Optional[TensorIndex] = None,
         value: Optional[torch.Tensor] = None,
         requires_grad: Optional[bool] = False,
-    ) -> object:
+    ) -> None:
         super().__init__()
         if storage is not None:
             self._storage = storage
@@ -69,9 +69,15 @@ class TacoTensor(torch.nn.Module):
         pass
 
     @property
-    def value(self):
+    def value(self) -> torch.Tensor:
         """Get the tensor value."""
-        return self._storage.value
+        return self.storage.value
+
+    @property
+    def storage(self) -> TensorStorage:
+        """Get the tensor storage."""
+        assert self._storage is not None, "Tensor storage is not set."
+        return self._storage
 
     # dtype property
     @property

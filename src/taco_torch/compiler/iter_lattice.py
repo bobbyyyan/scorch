@@ -107,7 +107,7 @@ class LatticePoint:
             stmts.append(llir.Comment("Advance iterators"))
             for it in self.iterators:
                 stmts.append(
-                    llir.VarAssign(
+                    llir.VarInit(
                         var=it.iterator_var_llir,
                         value=llir.BinOp(
                             op="==",
@@ -224,8 +224,8 @@ class LatticePoint:
 
             stmts.append(
                 llir.IfThenElse(
-                    cond=if_conditions,
-                    then_body=then_body_list,
+                    cond_list=if_conditions,
+                    then_body_list=then_body_list,
                     else_body=[],
                 )
             )
@@ -241,14 +241,14 @@ class LatticePoint:
             stmts.append(llir.Comment("Get candidate coordinates"))
             for it in self.iterators:
                 stmts.append(
-                    llir.VarAssign(
+                    llir.VarInit(
                         var=it.coord_var_llir,
                         value=it.coord_var_value_llir,
                     )
                 )
             stmts.append(llir.Comment("Resolve coordinate"))
             stmts.append(
-                llir.VarAssign(
+                llir.VarInit(
                     var=self.index_var_llir,
                     value=llir.FunctionCall(
                         name="std::min",
@@ -264,7 +264,7 @@ class LatticePoint:
         elif len(self.iterators) == 1:
             stmts.append(llir.Comment("Resolve coordinate"))
             stmts.append(
-                llir.VarAssign(
+                llir.VarInit(
                     var=self.index_var_llir,
                     value=self.iterators[0].coord_var_value_llir,
                 )

@@ -55,7 +55,7 @@ class CINLowerer:
         for level, level_type in enumerate(level_types):
             if level_type == LevelType.DENSE:
                 statements.append(
-                    llir.VarAssign(
+                    llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_size",
                             type=llir.DataType.INT,
@@ -68,7 +68,7 @@ class CINLowerer:
                 )
             elif level_type == LevelType.COMPRESSED:
                 statements.append(
-                    llir.VarAssign(
+                    llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_pos",
                             type=llir.DataType.TORCH_TENSOR,
@@ -80,7 +80,7 @@ class CINLowerer:
                     )
                 )
                 statements.append(
-                    llir.VarAssign(
+                    llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_crd",
                             type=llir.DataType.TORCH_TENSOR,
@@ -98,7 +98,7 @@ class CINLowerer:
         """
         Get the value array for a tensor
         """
-        return llir.VarAssign(
+        return llir.VarInit(
             var=llir.Var(name=f"{tensor.name}_values", type=llir.DataType.TORCH_TENSOR),
             value=llir.Var(
                 name=f"{tensor.name}._storage._value",
@@ -118,13 +118,56 @@ class CINLowerer:
 
             return llir.Var(
                 name=f"{index_expr.tensor.name}_values[{last_index_var.name}_{index_expr.tensor.name}]",
+                type=llir.DataType.NO_TYPE,
             )
+        raise NotImplementedError
 
     def lower_CIN(self, cin: CIN) -> Union[llir.Stmt, List[llir.Stmt], llir.Expr]:
         if isinstance(cin, IndexStmt):
             return self.lower_IndexStmt(cin)
         elif isinstance(cin, IndexExpr):
             return self.lower_IndexExpr(cin)
+        return []
+
+    def lower_TensorAssign(self, stmt: TensorAssign) -> List[llir.Stmt]:
+        """
+        Lower a TensorAssign to LLIR
+        """
+        llir_stmts: List[llir.Stmt] = []
+        # if we are at the bottommost level, we can emit the compute code
+        assert self.result_tensor_access, "result tensor access is None"
+        if (
+            self.result_tensor_access.get_index_vars()[-1]
+            == self.defined_index_vars[-1]
+        ):
+            assert self.result_tensor_var, "result tensor var is None"
+            if self.result_value_array_sparse_index_llir:
+                tensor_access_llir = llir.Var(
+                    name=f"{self.result_tensor_var.get_name()}_values"
+                    + f"[{self.defined_index_vars[-1].name}_{self.result_tensor_var.get_name()}]",
+                    type=llir.DataType.NO_TYPE,
+                )
+            else:
+                tensor_access_llir = llir.Var(
+                    name=f"{self.result_tensor_var.get_name()}_values"
+                    + f"[{self.defined_index_vars[-1].name}]",
+                    type=llir.DataType.NO_TYPE,
+                )
+            llir_stmts.append(
+                llir.Assign(
+                    var=tensor_access_llir,
+                    value=self.lower_IndexExpr(stmt.rhs),
+                )
+            )
+            # if has sparse index for result value array, need to increment
+            if self.result_value_array_sparse_index_llir is not None:
+                llir_stmts.append(
+                    llir.Increment(
+                        var=self.result_value_array_sparse_index_llir,
+                    )
+                )
+
+        return llir_stmts
 
     def lower_IndexStmt(self, stmt: IndexStmt) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
@@ -132,37 +175,7 @@ class CINLowerer:
         """
 
         if isinstance(stmt, TensorAssign):
-            llir_stmts = []
-            # if we are at the bottommost level, we can emit the compute code
-            if (
-                self.result_tensor_access.get_index_vars()[-1]
-                == self.defined_index_vars[-1]
-            ):
-                if self.result_value_array_sparse_index_llir:
-                    tensor_access_llir = llir.Var(
-                        name=f"{self.result_tensor_var.name}_values"
-                        + f"[{self.defined_index_vars[-1].name}_{self.result_tensor_var.name}]"
-                    )
-                else:
-                    tensor_access_llir = llir.Var(
-                        name=f"{self.result_tensor_var.name}_values"
-                        + f"[{self.defined_index_vars[-1].name}]"
-                    )
-                llir_stmts.append(
-                    llir.VarAssign(
-                        var=tensor_access_llir,
-                        value=self.lower_IndexExpr(stmt.rhs),
-                    )
-                )
-                # if has sparse index for result value array, need to increment
-                if self.result_value_array_sparse_index_llir is not None:
-                    llir_stmts.append(
-                        llir.Increment(
-                            var=self.result_value_array_sparse_index_llir,
-                        )
-                    )
-
-            return llir_stmts
+            return self.lower_TensorAssign(stmt)
 
         # loop_order_allow_short_circuit = all_free_var_loops_before_reduction_loops(stmt)
 
@@ -243,7 +256,7 @@ class CINLowerer:
                 result_last_compressed_index_var
             ] = self.result_value_array_sparse_index_llir
             result_index_init_stmts.append(
-                llir.VarAssign(
+                llir.VarInit(
                     var=llir.Var(
                         name=f"{result_last_compressed_index_var.name}_{self.result_tensor_var.name}",
                         type=llir.DataType.INT,
@@ -276,6 +289,8 @@ class CINLowerer:
                 ],
             )
 
+        return []
+
     def lower_ForAll(self, stmt: ForAll) -> List[llir.Stmt]:
 
         """
@@ -302,7 +317,7 @@ class CINLowerer:
         Lower a TensorVar to LLIR
         """
         return llir.Var(
-            name=tensor_var.name,
+            name=tensor_var.get_name(),
             # type=dtype_to_datatype(tvar.dtype),
             type=llir.DataType.TACO_TENSOR,
         )

@@ -28,11 +28,11 @@ class ModeIterator:
     def get_init_stmts(self) -> List[llir.Stmt]:
         if self.level_type == LevelType.COMPRESSED:
             return [
-                llir.VarAssign(
+                llir.VarInit(
                     var=self.iterator_var_llir,
                     value=self.iterator_var_begin_value_llir,
                 ),
-                llir.VarAssign(
+                llir.VarInit(
                     var=self.iterator_var_end_var_llir,
                     value=self.iterator_var_end_value_llir,
                 ),

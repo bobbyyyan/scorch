@@ -1,6 +1,8 @@
-from typing import Union, List
+from typing import Union, List, TypeVar, cast
 
 from src.taco_torch.compiler import llir
+
+LLIR_NODE = TypeVar("LLIR_NODE", bound=llir.Node)
 
 
 class LLIRLowerer:
@@ -13,7 +15,7 @@ class LLIRLowerer:
 
     def lower_llir(
         self,
-        ir: Union[llir.Node, List[llir.Node], str, List[str]],
+        ir: Union[LLIR_NODE, List[LLIR_NODE], str, List[str]],
         indent_level: int = 0,
     ) -> str:
         if isinstance(ir, str):
@@ -31,16 +33,18 @@ class LLIRLowerer:
         elif isinstance(ir, llir.Literal):
             return self.lower_llir(str(ir.value), indent_level)
 
-        elif isinstance(ir, llir.VarAssign):
-            if ir.var.type:
-                return self.lower_llir(
-                    f"{ir.var.type.value} {ir.var.name} {ir.op} {self.lower_llir(ir.value)};",
-                    indent_level,
-                )
-            else:
-                return self.lower_llir(
-                    f"{ir.var.name} {ir.op} {self.lower_llir(ir.value)};", indent_level
-                )
+        elif isinstance(ir, llir.VarInit):
+            return self.lower_llir(
+                f"{ir.var.type.value} {ir.var.name} {ir.op} {self.lower_llir(ir.value)};",
+                indent_level,
+            )
+
+        elif isinstance(ir, llir.Assign):
+            return self.lower_llir(
+                f"{ir.var.name} {ir.op.value} {self.lower_llir(ir.value)};",
+                indent_level,
+            )
+
         elif isinstance(ir, llir.Cast):
             return self.lower_llir(
                 f"({ir.data_type.value}) {self.lower_llir(ir.expr)}", indent_level
@@ -73,29 +77,29 @@ class LLIRLowerer:
             # Handle the case where cond is a list of conditions and then_body is a list of list
             # of statements
             result = ""
-            if isinstance(ir.cond, list):
-                assert isinstance(ir.then_body, list)
-                assert len(ir.cond) == len(
-                    ir.then_body
+            if ir.cond_list:
+                assert ir.then_body_list, "then_body_list must be provided"
+                assert len(ir.cond_list) == len(
+                    ir.then_body_list
                 ), "Number of conditions and then_body's must be the same"
 
-                total_num_conds = len(ir.cond) + (1 if ir.else_body else 0)
+                total_num_conds = len(ir.cond_list) + (1 if ir.else_body else 0)
 
-                for i, cond in enumerate(ir.cond):
+                for i, cond in enumerate(ir.cond_list):
                     if i == 0:
                         result += (
                             self.lower_llir(
                                 f"if ({self.lower_llir(cond)}) {{", indent_level
                             )
                             + "\n"
-                            + self.lower_llir(ir.then_body[i], indent_level + 1)
+                            + self.lower_llir(ir.then_body_list[i], indent_level + 1)
                             + "\n"
                         )
                     elif ir.make_last_case_else and i == total_num_conds - 1:
                         result += (
                             self.lower_llir("} else {", indent_level)
                             + "\n"
-                            + self.lower_llir(ir.then_body[i], indent_level + 1)
+                            + self.lower_llir(ir.then_body_list[i], indent_level + 1)
                             + "\n"
                         )
                     else:
@@ -104,10 +108,12 @@ class LLIRLowerer:
                                 f"}} else if ({self.lower_llir(cond)}) {{", indent_level
                             )
                             + "\n"
-                            + self.lower_llir(ir.then_body[i], indent_level + 1)
+                            + self.lower_llir(ir.then_body_list[i], indent_level + 1)
                             + "\n"
                         )
             else:
+                assert ir.cond, "If condition must be provided"
+                assert ir.then_body, "If then body must be provided"
                 result += (
                     self.lower_llir(f"if ({self.lower_llir(ir.cond)}) {{", indent_level)
                     + "\n"
@@ -134,11 +140,16 @@ class LLIRLowerer:
 
         elif isinstance(ir, llir.Function):
             # args must be llir.Var's
-            assert [isinstance(arg, llir.Var) for arg in ir.args]
+            assert [
+                isinstance(arg, llir.Var) for arg in ir.args
+            ], "Args must be llir.Var's"
+            args = cast(List[llir.Var], ir.args)
+            # Assert all the args have types so that type checker is happy
+            assert all([arg.type for arg in args]), "All args must have types"
             return (
                 self.lower_llir(
                     f"{ir.return_type.value} {ir.name}"
-                    + f"({', '.join([f'{arg.type.value} {arg.name}' for arg in ir.args])}) {{",
+                    + f"({', '.join([f'{arg.type.value} {arg.name}' for arg in args])}) {{",
                     indent_level,
                 )
                 + "\n"

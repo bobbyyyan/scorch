@@ -58,43 +58,37 @@ class TensorIndex(object):
 
     def get_mode_index(self, mode: int) -> torch.Tensor:
         """Get the mode index of a mode."""
-        return self.mode_indices[mode]
+        return self.get_mode_indices()[mode]
 
     def get_mode_indices(self) -> List[torch.Tensor]:
         """Get the mode indices of all modes."""
+        assert self.mode_indices, "mode_indices is None"
         return self.mode_indices
 
     def get_order(self) -> int:
         """Get the order of the tensor."""
-        return self.format.get_order()
+        return self.get_format().get_order()
 
     def get_format(self) -> TensorFormat:
         """Get the format of the tensor."""
+        assert self.format, "format is None"
         return self.format
 
-    def get_mode_format(self, mode: int) -> LevelType:
+    def get_level_type(self, mode: int) -> LevelType:
         """Get the format of a mode."""
-        return self.format.get_mode_format(mode)
+        return self.get_level_types()[mode]
 
-    def get_mode_formats(self) -> List[LevelType]:
+    def get_level_types(self) -> List[LevelType]:
         """Get the format of all modes."""
-        return self.format.get_mode_formats()
+        return self.get_format().get_level_types()
 
-    def get_dimension(self, mode: int) -> int:
-        """Get the dimension of a mode."""
-        return self.mode_indices[mode].shape(0)
-
-    def get_dimensions(self) -> List[int]:
-        """Get the dimensions of all modes."""
-        return [self.mode_indices[mode].shape(0) for mode in range(self.get_order())]
-
-    def get_size(self) -> int:
-        """Get the number of non-zero elements in the tensor."""
-        return self.mode_indices[0].shape(0)
+    def get_size(self, mode: int) -> int:
+        """Get the size of a mode."""
+        return self.get_mode_index(mode).shape[0]
 
     def get_sizes(self) -> List[int]:
         """Get the number of non-zero elements in each mode."""
-        return [self.mode_indices[mode].shape(0) for mode in range(self.get_order())]
+        return [self.get_size(mode) for mode in range(self.get_order())]
 
 
 class TensorStorage(object):
@@ -126,6 +120,7 @@ class TensorStorage(object):
     @property
     def value(self) -> torch.Tensor:
         """Get the value of the tensor."""
+        assert self._value is not None, "value is None"
         return self._value
 
 

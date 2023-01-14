@@ -66,6 +66,23 @@ class GetTensorProperty(Expr):
         self.name = name
 
 
+class AssignOp(Enum):
+    """Assignment operators."""
+
+    ASSIGN = "="
+    ADD_ASSIGN = "+="
+    SUB_ASSIGN = "-="
+    MUL_ASSIGN = "*="
+    DIV_ASSIGN = "/="
+    MOD_ASSIGN = "%="
+    REM_ASSIGN = "%="
+    AND_ASSIGN = "&="
+    OR_ASSIGN = "|="
+    XOR_ASSIGN = "^="
+    SHL_ASSIGN = "<<="
+    SHR_ASSIGN = ">>="
+
+
 class DataType(Enum):
     """
     All possible data type of a variable in C++.
@@ -93,6 +110,7 @@ class DataType(Enum):
     TORCH_INT8 = "torch::kInt8"
     TORCH_UINT8 = "torch::kUInt8"
     TACO_TENSOR = "TacoTensor"
+    NO_TYPE = "NO_TYPE"
 
     @classmethod
     def from_python_type(cls, py_type):
@@ -118,7 +136,7 @@ class Var(Expr):
     """A variable reference."""
 
     name: str
-    type: Optional[DataType] = None
+    type: DataType
     is_ptr: bool = False
 
 
@@ -139,21 +157,16 @@ class BinOp(Expr):
         self.right = right
 
 
+@dataclass(frozen=False)
 class Literal(Expr):
     """A literal value."""
 
-    def __init__(self, value: Any, data_type: Optional[DataType] = None):
-        self.value = value
-        if data_type is None:
-            self.type = DataType.from_python_type(type(value))
-        else:
-            self.type: DataType = data_type
+    value: Any
+    data_type: Optional[DataType] = None
 
-    def __str__(self):
-        return f"Literal(value={self.value}, type={self.type})"
-
-    def __repr__(self):
-        return str(self)
+    def __post_init__(self):
+        if self.data_type is None:
+            self.data_type = DataType.from_python_type(type(self.value))
 
 
 """
@@ -184,14 +197,28 @@ class VarDecl(Stmt):
 
 
 @dataclass(frozen=False)
-class VarAssign(Stmt):
-    """A variable assignment statement.
-    Assigns an expression to a variable.
+class VarInit(Stmt):
+    """A variable initialization statement.
+    Declares a variable and assigns a value to it.
     """
 
     var: Var
     value: Expr
     op: str = "="
+    cast: Optional[bool] = False
+
+    def __post_init__(self):
+        if self.cast:
+            self.value = Cast(self.value, self.var.type)
+
+
+@dataclass(frozen=False)
+class Assign(Stmt):
+    """A variable assignment statement."""
+
+    var: Var
+    value: Expr
+    op: AssignOp = AssignOp.ASSIGN
     cast: Optional[bool] = False
 
     def __post_init__(self):
@@ -297,9 +324,9 @@ class ForLoop(Stmt):
 
     def __init__(
         self,
-        init: Union[VarAssign, VarDecl],
+        init: Union[VarInit, VarDecl],
         cond: Expr,
-        update: Union[VarAssign, FunctionCall],
+        update: Union[VarInit, FunctionCall],
         body: List[Stmt],
     ):
         self.init = init
@@ -320,9 +347,13 @@ class WhileLoop(Stmt):
 class IfThenElse(Stmt):
     """An if-then-else statement in C/C++."""
 
-    cond: Optional[Union[Expr, List[Expr]]] = None
-    then_body: Optional[Union[List[Stmt], List[List[Stmt]]]] = None
+    cond: Optional[Expr] = None
+    then_body: Optional[List[Stmt]] = None
     else_body: Optional[List[Stmt]] = None
+
+    cond_list: Optional[List[Expr]] = None
+    then_body_list: Optional[List[List[Stmt]]] = None
+
     make_last_case_else: bool = False
 
 
