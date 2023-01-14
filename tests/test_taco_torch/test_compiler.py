@@ -1,5 +1,6 @@
-from src.taco_torch.cin import IndexVar, TensorVar, ForAll
-from src.taco_torch.compiler import CINLowerer, LLIRLowerer
+from src.taco_torch.compiler.cin import IndexVar, TensorVar, ForAll
+from src.taco_torch.compiler.cin_lowerer import CINLowerer
+from src.taco_torch.compiler.codegen import LLIRLowerer
 
 
 def test_elementwise_vector_mul_codegen():

@@ -1,6 +1,6 @@
 from typing import List, Optional, TypeVar
 
-from src.taco_torch.cin import (
+from src.taco_torch.compiler.cin import (
     TensorAssign,
     IndexVar,
     TensorAccess,
@@ -56,7 +56,7 @@ class IterationGraph:
 
     def __init__(
         self,
-        tensor_accesses: List[TenersorAccess],
+        tensor_accesses: List[TensorAccess],
         result_tensor_access: TensorAccess,
     ):
         self.index_vars = []

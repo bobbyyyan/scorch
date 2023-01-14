@@ -12,6 +12,6 @@ python -m pip install --upgrade pip
 pip freeze -r requirements.txt > requirements.lock
 
 # Code style and linting
-black --check --diff .
-mypy --install-types --non-interactive --show-error-codes --show-column-numbers --pretty .
-flake8 .
+black --check --diff src
+mypy --install-types --non-interactive --show-error-codes --show-column-numbers --pretty src
+flake8 src

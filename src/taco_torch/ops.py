@@ -37,7 +37,7 @@ def mul(src: TacoTensor, other: TacoTensor):
     # TODO: (Inline) load C++ code using PyTorch's C++ extension
     # TODO: Call C++ code
     # TODO: Return result
-    ttensor = ops_cpp.TacoTensor
+    # ttensor = ops_cpp.TacoTensor
 
     result = ops_cpp.elemwise_mul(
         src._storage._index.mode_indices,

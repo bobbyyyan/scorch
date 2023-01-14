@@ -5,18 +5,18 @@ from typing import List, Optional, Any, Union
 """
 TODO: maybe need this, maybe not
 Enum class for different IRNode types.
-Literal, Var, Neg, Sqrt, 
-Add, Sub, Mul, Div, Mod, Rem, 
+Literal, Var, Neg, Sqrt,
+Add, Sub, Mul, Div, Mod, Rem,
 Min, Max,
-And, Or, Not, 
-BitAnd, BitOr, 
-Eq, Ne, Lt, Le, Gt, Ge, 
-IfThenElse, For, While, Block, 
+And, Or, Not,
+BitAnd, BitOr,
+Eq, Ne, Lt, Le, Gt, Ge,
+IfThenElse, For, While, Block,
 Function, Call,
-VarAssign, VarDecl, 
+VarAssign, VarDecl,
 Yield, Allocate, Free, Comment, BlankLine, Print, GetTensorProperty,
-Continue, Sort, 
-Cast, Case, Switch, Load, Malloc, Sizeof, Store, Scope 
+Continue, Sort,
+Cast, Case, Switch, Load, Malloc, Sizeof, Store, Scope
 """
 
 
@@ -113,26 +113,13 @@ Expression nodes
 """
 
 
+@dataclass(frozen=False)
 class Var(Expr):
     """A variable reference."""
 
     name: str
-    type: DataType
+    type: Optional[DataType] = None
     is_ptr: bool = False
-
-    def __init__(
-        self, name: str, type: Optional[DataType] = None, is_ptr: bool = False
-    ):
-        super().__init__()
-        self.name = name
-        self.type = type
-        self.is_ptr = is_ptr
-
-    def __str__(self):
-        return f"Var(name={self.name}, type={self.type}, is_ptr={self.is_ptr})"
-
-    def __repr__(self):
-        return str(self)
 
 
 class UnaryOp(Expr):

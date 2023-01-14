@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from typing import Dict, Optional, List
 
-from src.taco_torch import llir
-from src.taco_torch.cin import TensorVar, IndexStmt, TensorAccess, IndexVar
+from src.taco_torch.compiler import llir
+from src.taco_torch.compiler.cin import TensorVar, IndexStmt, TensorAccess, IndexVar
 from src.taco_torch.format import TensorFormat, LevelType
 
 

@@ -1,4 +1,4 @@
-from src.taco_torch.cin import (
+from src.taco_torch.compiler.cin import (
     IndexVar,
     TensorVar,
     ForAll,
