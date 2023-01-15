@@ -13,9 +13,8 @@ from src.taco_torch.compiler.cin import (
     BinaryOp,
     CIN,
 )
-from src.taco_torch.format import LevelType
 from src.taco_torch.compiler.iter_lattice import IterationLattice
-from src.taco_torch.compiler.iterator import ModeIterator, ModeAccess
+from src.taco_torch.format import LevelType
 
 
 class CINLowerer:
@@ -40,7 +39,6 @@ class CINLowerer:
         self.defined_index_vars: List[IndexVar] = []
         self.need_compute: List[TensorVar] = []
         self.tensor_var_to_llir: Dict[TensorVar, llir.Expr] = {}
-        self.level_iterators: Dict[ModeAccess, ModeIterator] = {}
 
     @staticmethod
     def get_level_arrays(tensor: TensorVar) -> List[llir.Stmt]:
@@ -50,7 +48,7 @@ class CINLowerer:
         # Iterate over the levels in tensor, then depending on whether it is sparse or dense, generate the bound
         # variables
         # TODO: handle COO
-        statements = []
+        statements: List[llir.Stmt] = []
         level_types = tensor.get_level_types()
         for level, level_type in enumerate(level_types):
             if level_type == LevelType.DENSE:

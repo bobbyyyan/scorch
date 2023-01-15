@@ -390,8 +390,8 @@ class ForAll(IndexStmt):
 class CINVisitor:
     def visit(self, node: CIN) -> None:
         method_name = "visit_" + node.__class__.__name__
-        visitor = getattr(self, method_name, self.generic_visit)
-        return visitor(node)
+        visitor: Callable[[CIN], None] = getattr(self, method_name, self.generic_visit)
+        visitor(node)
 
     def generic_visit(self, node: CIN) -> None:
         raise Exception(f"No visit_{node.__class__.__name__} method")

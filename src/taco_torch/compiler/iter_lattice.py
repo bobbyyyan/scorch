@@ -1,7 +1,8 @@
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from itertools import product
-from typing import List, Optional, Dict, TYPE_CHECKING
+from typing import List, Optional, Dict, TYPE_CHECKING, Iterable, Sequence
 
 from src.taco_torch.compiler import llir
 from src.taco_torch.utils import flatten_2d_list
@@ -32,20 +33,20 @@ class LatticePoint:
     locators: List of tensor accesses to locate only
     """
 
-    sparse_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)
-    dense_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)
-    iterators: Optional[List[ModeIterator]] = field(default_factory=list)
-    child_lattice_points: Optional[List["LatticePoint"]] = field(default_factory=list)
+    sparse_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)  # type: ignore
+    dense_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)  # type: ignore
+    iterators: Optional[List[ModeIterator]] = field(default_factory=list)  # type: ignore
+    child_lattice_points: Optional[List["LatticePoint"]] = field(default_factory=list)  # type: ignore
     index_var: Optional[IndexVar] = None
     index_var_llir: Optional[llir.Var] = None
 
     def __add__(self, other):
         if isinstance(other, LatticePoint):
             return LatticePoint(
-                sparse_tensor_accesses=self.sparse_tensor_accesses
-                + other.sparse_tensor_accesses,
-                dense_tensor_accesses=self.dense_tensor_accesses
-                + other.dense_tensor_accesses,
+                sparse_tensor_accesses=self.get_sparse_tensor_accesses()
+                + other.get_sparse_tensor_accesses(),
+                dense_tensor_accesses=self.get_dense_tensor_accesses()
+                + other.get_dense_tensor_accesses(),
             )
         else:
             return self
@@ -54,8 +55,8 @@ class LatticePoint:
         return self.__add__(other)
 
     def __hash__(self):
-        return hash(tuple(self.sparse_tensor_accesses)) + hash(
-            tuple(self.dense_tensor_accesses)
+        return hash(tuple(self.get_sparse_tensor_accesses())) + hash(
+            tuple(self.get_dense_tensor_accesses())
         )
 
     def set_index_var(self, index_var: IndexVar):
@@ -64,6 +65,10 @@ class LatticePoint:
             name=f"{index_var.name}",
             type=llir.DataType.INT,
         )
+
+    def get_index_var_llir(self):
+        assert self.index_var_llir is not None, "Index var LLIR not set"
+        return self.index_var_llir
 
     def set_index_var_and_gen_iterators(
         self, index_var: IndexVar
@@ -74,13 +79,13 @@ class LatticePoint:
                 tensor_access=ta,
                 index_var=index_var,
             )
-            for ta in self.sparse_tensor_accesses
+            for ta in self.get_sparse_tensor_accesses()
         ]
         return self.iterators
 
     def filter_and_set_children(
-        self, lattice_points: List["LatticePoint"]
-    ) -> List["LatticePoint"]:
+        self, lattice_points: Iterable[LatticePoint]
+    ) -> List[LatticePoint]:
         self.child_lattice_points = [
             lp for lp in lattice_points if lp.is_child_of(self)
         ]
@@ -88,11 +93,11 @@ class LatticePoint:
 
     def get_while_condition(self):
         condition = None
-        for it in self.iterators:
+        for it in self.get_iterators():
             this_condition = llir.BinOp(
                 op="<",
-                left=it.iterator_var_llir,
-                right=it.iterator_var_end_var_llir,
+                left=it.get_iterator_var_llir(),
+                right=it.get_iterator_var_end_value_llir(),
             )
             if condition is None:
                 condition = this_condition
@@ -100,39 +105,56 @@ class LatticePoint:
                 condition = llir.BinOp(op="&&", left=condition, right=this_condition)
         return condition
 
-    def get_iterators_advance_stmts(self) -> List[llir.Stmt]:
-        stmts = []
+    def get_iterators_advance_stmts(self) -> Sequence[llir.Stmt]:
+        stmts: List[llir.Stmt] = []
 
-        if len(self.iterators) > 1:
+        iterators = self.get_iterators()
+
+        if len(iterators) > 1:
             stmts.append(llir.Comment("Advance iterators"))
-            for it in self.iterators:
+            for it in iterators:
                 stmts.append(
                     llir.VarInit(
-                        var=it.iterator_var_llir,
+                        var=it.get_iterator_var_llir(),
                         value=llir.BinOp(
                             op="==",
-                            left=it.iterator_var_llir,
-                            right=self.index_var_llir,
+                            left=it.get_iterator_var_llir(),
+                            right=self.get_index_var_llir(),
                         ),
                         op="+=",
                         cast=True,
                     )
                 )
-        elif len(self.iterators) == 1:
+        elif len(iterators) == 1:
             stmts.append(llir.Comment("Advance iterator"))
             stmts.append(
                 llir.Increment(
-                    var=self.iterators[0].iterator_var_llir,
+                    var=iterators[0].get_iterator_var_llir(),
                 )
             )
 
         return stmts
 
+    def get_iterators(self) -> Sequence[ModeIterator]:
+        assert self.iterators is not None, "Iterators not set"
+        return self.iterators
+
+    def get_sparse_tensor_accesses(self) -> List[TensorAccess]:
+        assert self.sparse_tensor_accesses is not None, "Sparse tensor accesses not set"
+        return self.sparse_tensor_accesses
+
+    def get_dense_tensor_accesses(self) -> List[TensorAccess]:
+        assert self.dense_tensor_accesses is not None, "Dense tensor accesses not set"
+        return self.dense_tensor_accesses
+
     def get_simplified_cin(self, cin: CIN) -> Optional[CIN]:
         # Rewrite the CIN to eliminate tensors that have run out of values
         # Based on the lattice_point we are currently at
         if isinstance(cin, TensorAccess):
-            if cin in self.sparse_tensor_accesses or cin in self.dense_tensor_accesses:
+            if (
+                cin in self.get_sparse_tensor_accesses()
+                or cin in self.get_dense_tensor_accesses()
+            ):
                 return cin
             else:
                 return None
@@ -182,31 +204,48 @@ class LatticePoint:
                 rhs=rewritten_rhs,
             )
 
+        raise NotImplementedError(f"Unhandled CIN type {type(cin)}")
+
     def get_child_subregion_loops(
-        self, cin_lowerer: CINLowerer, cin: CIN
-    ) -> List[llir.Stmt]:
+        self, cin_lowerer: CINLowerer, cin: IndexStmt
+    ) -> Sequence[llir.Stmt]:
         """
         Iterates over the child lattice points and generate an inner loop over each
         case. The inner loop uses a simplified/rewritten expression of the original
         CIN to ignore the tensors that have run out of values.
         """
-        stmts = []
+        stmts: List[llir.Stmt] = []
+
+        def lower_cin_and_add_to_list(
+            lattice_point: LatticePoint, cin: IndexStmt, lst: List[llir.Stmt]
+        ):
+            simplified_cin = lattice_point.get_simplified_cin(cin)
+            assert simplified_cin is not None, "Simplified CIN is None"
+            assert isinstance(
+                simplified_cin, IndexStmt
+            ), "Simplified CIN is not an index stmt"
+            cin_lowered = cin_lowerer.lower_IndexStmt(simplified_cin)
+            if isinstance(cin_lowered, llir.Stmt):
+                lst.append(cin_lowered)
+            elif isinstance(cin_lowered, list):
+                lst.extend(cin_lowered)
+
         if self.child_lattice_points:
-            if_conditions = []
+            if_conditions: List[llir.Expr] = []
             then_body_list = []
 
             for child_lp in [self] + self.child_lattice_points:
                 candidate_coord_var_llirs = map(
-                    lambda it: it.coord_var_llir, child_lp.iterators
+                    lambda it: it.get_coord_var_llir(), child_lp.get_iterators()
                 )
                 if_condition = None
-                then_body = []
+                then_body: List[llir.Stmt] = []
 
                 for coord_var_llir in candidate_coord_var_llirs:
                     this_condition = llir.BinOp(
                         op="==",
                         left=coord_var_llir,
-                        right=self.index_var_llir,
+                        right=self.get_index_var_llir(),
                     )
                     if if_condition is None:
                         if_condition = this_condition
@@ -215,9 +254,7 @@ class LatticePoint:
                             op="&&", left=if_condition, right=this_condition
                         )
 
-                then_body.append(
-                    cin_lowerer.lower_CIN(child_lp.get_simplified_cin(cin))
-                )
+                lower_cin_and_add_to_list(child_lp, cin, then_body)
 
                 if_conditions.append(if_condition)
                 then_body_list.append(then_body)
@@ -230,43 +267,45 @@ class LatticePoint:
                 )
             )
         else:
-            stmts.append(cin_lowerer.lower_CIN(self.get_simplified_cin(cin)))
+            lower_cin_and_add_to_list(self, cin, stmts)
+
         return stmts
 
-    def get_candidate_coordinate_stmts(self) -> List[llir.Stmt]:
+    def get_candidate_coordinate_stmts(self) -> Sequence[llir.Stmt]:
 
-        stmts = []
+        stmts: List[llir.Stmt] = []
+        iterators = self.get_iterators()
 
-        if len(self.iterators) > 1:
+        if len(iterators) > 1:
             stmts.append(llir.Comment("Get candidate coordinates"))
-            for it in self.iterators:
+            for it in iterators:
                 stmts.append(
                     llir.VarInit(
-                        var=it.coord_var_llir,
-                        value=it.coord_var_value_llir,
+                        var=it.get_coord_var_llir(),
+                        value=it.get_coord_var_value_llir(),
                     )
                 )
             stmts.append(llir.Comment("Resolve coordinate"))
             stmts.append(
                 llir.VarInit(
-                    var=self.index_var_llir,
+                    var=self.get_index_var_llir(),
                     value=llir.FunctionCall(
                         name="std::min",
                         args=[
                             llir.Array(
-                                values=[it.coord_var_llir for it in self.iterators],
+                                values=[it.get_coord_var_llir() for it in iterators],
                                 data_type=llir.DataType.INT,
                             )
                         ],
                     ),
                 )
             )
-        elif len(self.iterators) == 1:
+        elif len(iterators) == 1:
             stmts.append(llir.Comment("Resolve coordinate"))
             stmts.append(
                 llir.VarInit(
-                    var=self.index_var_llir,
-                    value=self.iterators[0].coord_var_value_llir,
+                    var=self.get_index_var_llir(),
+                    value=iterators[0].get_coord_var_value_llir(),
                 )
             )
 
@@ -277,8 +316,8 @@ class LatticePoint:
         A lattice_point is a child of another lattice point if its sparse tensor accesses is a
         strict subset of the parent's
         """
-        return set(self.sparse_tensor_accesses).issubset(
-            set(other.sparse_tensor_accesses)
+        return set(self.get_sparse_tensor_accesses()).issubset(
+            set(other.get_sparse_tensor_accesses())
         )
 
 
@@ -306,30 +345,6 @@ class IterationLattice:
         """
         current_index_var = self.for_all_stmt.get_index_var()
 
-        def intersect_accesses(
-            left_accesses: List[List[TensorAccess]],
-            right_accesses: List[List[TensorAccess]],
-        ) -> List[List[TensorAccess]]:
-
-            unflattened_intersected_accesses = list(
-                product(left_accesses, right_accesses)
-            )
-            flattened_intersected_accesses = [
-                flatten_2d_list(accesses)
-                for accesses in unflattened_intersected_accesses
-            ]
-            return flattened_intersected_accesses
-
-        def union_accesses(
-            left_accesses: List[List[TensorAccess]],
-            right_accesses: List[List[TensorAccess]],
-        ) -> List[List[TensorAccess]]:
-            return [
-                *left_accesses,
-                *right_accesses,
-                left_accesses + right_accesses,
-            ]
-
         def union_lattice_points(
             left_lattice_points: List[LatticePoint],
             right_lattice_points: List[LatticePoint],
@@ -345,7 +360,7 @@ class IterationLattice:
             right_lattice_points: List[LatticePoint],
         ) -> List[LatticePoint]:
             return [
-                *map(sum, product(left_lattice_points, right_lattice_points)),
+                *map(sum, product(left_lattice_points, right_lattice_points)),  # type: ignore
             ]
 
         def get_lattice_points_from_cin(cin: CIN) -> List[LatticePoint]:
@@ -382,14 +397,15 @@ class IterationLattice:
                 ):
                     return [LatticePoint(dense_tensor_accesses=[cin])]
                 return [LatticePoint(sparse_tensor_accesses=[cin])]
+            raise NotImplementedError(f"Unsupported CIN: {cin}")
 
         lattice_points = get_lattice_points_from_cin(self.for_all_stmt)
 
         # Sort lattice_points in descending number of iterators, then descending number of locators
         lattice_points.sort(
             key=lambda lp: (
-                len(lp.sparse_tensor_accesses),
-                len(lp.dense_tensor_accesses),
+                len(lp.get_sparse_tensor_accesses()),
+                len(lp.get_dense_tensor_accesses()),
             ),
             reverse=True,
         )
@@ -405,6 +421,10 @@ class IterationLattice:
 
         return lattice_points
 
+    def get_lattice_points(self) -> Sequence[LatticePoint]:
+        assert self.lattice_points is not None, "Lattice points not generated"
+        return self.lattice_points
+
     def gen_parent_to_children_lattice_points(
         self,
     ) -> Dict[LatticePoint, List[LatticePoint]]:
@@ -413,7 +433,7 @@ class IterationLattice:
         iteration domain.
 
         """
-        lattice_points = self.lattice_points
+        lattice_points = self.get_lattice_points()
         parent_to_children_lattice_points = {}
         for i, lattice_point in enumerate(lattice_points):
             children = lattice_point.filter_and_set_children(lattice_points[i + 1 :])
@@ -445,11 +465,12 @@ class IterationLattice:
         # We can just use the first lattice point to determine what to initialize
         # since the list is sorted by number of iterators
         # TODO: need to handle dense iterators
-        all_mode_iterators = self.lattice_points[0].iterators
-
+        lattice_points = self.get_lattice_points()
+        assert len(lattice_points) > 0, "No lattice points generated"
+        all_mode_iterators = lattice_points[0].get_iterators()
         return [
             llir.Comment("Initialize iterators"),
-            *[mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators],
+            *[mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators],  # type: ignore
         ]
 
     def get_lattice_loops(self) -> List[llir.Stmt]:
@@ -459,6 +480,8 @@ class IterationLattice:
         """
 
         def gen_single_lattice_loop(lattice_point: LatticePoint) -> llir.Stmt:
+
+            assert self.cin_lowerer, "CINLowerer not set"
 
             while_loop = llir.WhileLoop(
                 cond=lattice_point.get_while_condition(),
@@ -479,6 +502,6 @@ class IterationLattice:
                     gen_single_lattice_loop(p),
                     llir.BlankLine(),
                 ]
-                for p in self.lattice_points
+                for p in self.get_lattice_points()
             ]
         )

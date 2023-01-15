@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Any, Union
+from typing import List, Optional, Any, Union, TypeVar
 
 """
 TODO: maybe need this, maybe not
@@ -18,6 +18,8 @@ Yield, Allocate, Free, Comment, BlankLine, Print, GetTensorProperty,
 Continue, Sort,
 Cast, Case, Switch, Load, Malloc, Sizeof, Store, Scope
 """
+
+LLIR_STMT = TypeVar("LLIR_STMT", bound="Stmt")
 
 
 class Node:

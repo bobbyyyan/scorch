@@ -1,9 +1,9 @@
 from dataclasses import dataclass
-from typing import Dict, Optional, List
+from typing import Optional, List
 
 from src.taco_torch.compiler import llir
-from src.taco_torch.compiler.cin import TensorVar, IndexStmt, TensorAccess, IndexVar
-from src.taco_torch.format import TensorFormat, LevelType
+from src.taco_torch.compiler.cin import TensorVar, TensorAccess, IndexVar
+from src.taco_torch.format import LevelType
 
 
 @dataclass(frozen=False)
@@ -25,16 +25,46 @@ class ModeIterator:
     coord_var_llir: Optional[llir.Var] = None
     coord_var_value_llir: Optional[llir.Expr] = None
 
+    def get_coord_var_llir(self) -> llir.Var:
+        assert self.coord_var_llir is not None, "coord_var_llir is None"
+        return self.coord_var_llir
+
+    def get_coord_var_value_llir(self) -> llir.Expr:
+        assert self.coord_var_value_llir is not None, "coord_var_value_llir is None"
+        return self.coord_var_value_llir
+
+    def get_iterator_var_llir(self) -> llir.Var:
+        assert self.iterator_var_llir is not None, "iterator_var_llir is None"
+        return self.iterator_var_llir
+
+    def get_iterator_var_begin_value_llir(self) -> llir.Expr:
+        assert (
+            self.iterator_var_begin_value_llir is not None
+        ), "iterator_var_begin_value_llir is None"
+        return self.iterator_var_begin_value_llir
+
+    def get_iterator_var_end_var_llir(self) -> llir.Var:
+        assert (
+            self.iterator_var_end_var_llir is not None
+        ), "iterator_var_end_var_llir is None"
+        return self.iterator_var_end_var_llir
+
+    def get_iterator_var_end_value_llir(self) -> llir.Expr:
+        assert (
+            self.iterator_var_end_value_llir is not None
+        ), "iterator_var_end_value_llir is None"
+        return self.iterator_var_end_value_llir
+
     def get_init_stmts(self) -> List[llir.Stmt]:
         if self.level_type == LevelType.COMPRESSED:
             return [
                 llir.VarInit(
-                    var=self.iterator_var_llir,
-                    value=self.iterator_var_begin_value_llir,
+                    var=self.get_iterator_var_llir(),
+                    value=self.get_iterator_var_begin_value_llir(),
                 ),
                 llir.VarInit(
-                    var=self.iterator_var_end_var_llir,
-                    value=self.iterator_var_end_value_llir,
+                    var=self.get_iterator_var_end_var_llir(),
+                    value=self.get_iterator_var_end_value_llir(),
                 ),
             ]
 
@@ -61,12 +91,21 @@ class ModeIterator:
 
         # If TensorVar is none, get it from TensorAccess
         if self.tensor_var is None:
+            assert (
+                self.tensor_access is not None
+            ), "If tensor_var is not provided, tensor_access must be provided"
             self.tensor_var = self.tensor_access.get_tensor()
 
         if self.level is None:
+            assert (
+                self.tensor_access is not None
+            ), "If level is not provided, tensor_access must be provided"
             self.level = self.tensor_access.level_of_index_var(self.index_var)
 
         if self.level_type is None:
+            assert (
+                self.tensor_access is not None
+            ), "If level_type is not provided, tensor_access must be provided"
             self.level_type = self.tensor_var.get_level_types()[
                 self.tensor_access.level_of_index_var(self.index_var)
             ]
@@ -112,57 +151,3 @@ class ModeIterator:
                 name=f"{self.tensor_var.name}{self.level}_crd[{self.iterator_var_llir.name}]",
                 type=llir.DataType.INT,
             )
-
-
-class ModeIteratorOld:
-    def __init__(self):
-        self.tensor: Optional[llir.Expr] = None
-        self.index_var: Optional[IndexVar] = None
-        self.pos_var: Optional[llir.Expr] = None
-        self.coord_var: Optional[llir.Expr] = None
-        self.begin_var: Optional[llir.Expr] = None
-        self.end_var: Optional[llir.Expr] = None
-        self.seg_end_var: Optional[llir.Expr] = None
-        self.valid_var: Optional[llir.Expr] = None
-        self.parent: Optional[ModeIterator] = None
-
-    def from_cin(
-        self,
-        stmt: IndexStmt,
-        tensor_vars_to_llir: Dict[TensorVar, llir.Expr],
-    ):
-        self.stmt = stmt
-        self.tensor_vars_to_llir = tensor_vars_to_llir
-
-    def from_tensor_expr(self, tensor_expr: llir.Expr) -> None:
-        self.tensor = tensor_expr
-        self.pos_var = llir.Literal(0)
-        self.coord_var = llir.Literal(0)
-        self.end_var = llir.Literal(1)
-
-
-class TensorIterators:
-    def __init__(self):
-        self.level_iterators: Dict[ModeAccess, ModeIterator] = {}
-        self.mode_accesses: Dict[ModeIterator, ModeAccess] = {}
-        self.mode_iterators: Dict[IndexVar, ModeIterator] = {}
-
-    def create_access_iterators(
-        self,
-        access: TensorAccess,
-        fmt: TensorFormat,
-        tensor_var_llir: llir.Expr,
-    ) -> None:
-        parent_iterator = ModeIterator.from_tensor_expr(tensor_var_llir)
-        self.level_iterators[ModeAccess(access, 0)] = parent_iterator
-
-
-class ModeAccess:
-    """
-    A ModeAccess is the access of a single mode in a tensor access.
-    e.g. A[i, j] consists of two mode accesses, A[1] and A[2].
-    """
-
-    def __init__(self, tensor_access: TensorAccess, mode: int):
-        self.tensor_access: Optional[TensorAccess] = tensor_access
-        self.mode: Optional[int] = mode
