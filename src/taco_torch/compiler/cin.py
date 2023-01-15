@@ -107,6 +107,9 @@ class IndexVar(IndexExpr):
         super().__init__()
         self.name = name
 
+    def get_name(self) -> str:
+        return self.name
+
     def __str__(self):
         return f"ivar_{self.name}"
 

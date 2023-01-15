@@ -177,6 +177,31 @@ def test_elementwise_matrix_mul_codegen():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_elementwise_matrix_mul_codegen_2():
+    # elementwise matrix multiplication code generation
+    # A[i, j] = B[i, j] * C[i, j]
+
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["sparse", "sparse"])
+    B = TensorVar("B", fmt=["sparse", "dense"])
+    C = TensorVar("C", fmt=["sparse", "dense"])
+
+    A[i, j] = B[i, j] * C[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elementwise_matrix_add_mul_codegen():
     # elementwise matrix multiplication code generation
     # A[i, j] = (B[i, j] + C[i, j]) * (D[i, j] + E[i, j])

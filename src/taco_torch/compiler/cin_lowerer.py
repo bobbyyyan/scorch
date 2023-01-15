@@ -104,20 +104,44 @@ class CINLowerer:
             ),
         )
 
-    def lower_IndexExpr(self, index_expr: IndexExpr) -> llir.Expr:
-        if isinstance(index_expr, BinaryOp):
-            return llir.BinOp(
-                op=index_expr.op.value,
-                left=self.lower_IndexExpr(index_expr.left),
-                right=self.lower_IndexExpr(index_expr.right),
-            )
-        elif isinstance(index_expr, TensorAccess):
-            last_index_var = index_expr.indices[-1]
+    def lower_TensorAccess(self, tensor_access: TensorAccess) -> llir.Expr:
+        """
+        Lower a TensorAccess to LLIR
+        """
+        last_index_var = tensor_access.indices[-1]
 
+        # If the level_type corresponding to the last index var is dense, then we can just use
+        # the index var as the index into the value array
+        tensor_var = tensor_access.get_tensor()
+        level = tensor_access.level_of_index_var(last_index_var)
+        level_type = tensor_var.get_level_types()[level]
+        if level_type == LevelType.DENSE:
             return llir.Var(
-                name=f"{index_expr.tensor.name}_values[{last_index_var.name}_{index_expr.tensor.name}]",
+                name=f"{tensor_access.tensor.name}_values[{last_index_var.name}]",
                 type=llir.DataType.NO_TYPE,
             )
+        elif level_type == LevelType.COMPRESSED:
+            return llir.Var(
+                name=f"{tensor_access.tensor.name}_values[{last_index_var.name}_{tensor_access.tensor.name}]",
+                type=llir.DataType.NO_TYPE,
+            )
+        raise NotImplementedError(f"Level type {level_type} not implemented")
+
+    def lower_BinaryOp(self, bin_op: BinaryOp) -> llir.Expr:
+        """
+        Lower a BinaryOp to LLIR
+        """
+        return llir.BinOp(
+            op=bin_op.op.value,
+            left=self.lower_IndexExpr(bin_op.left),
+            right=self.lower_IndexExpr(bin_op.right),
+        )
+
+    def lower_IndexExpr(self, index_expr: IndexExpr) -> llir.Expr:
+        if isinstance(index_expr, BinaryOp):
+            return self.lower_BinaryOp(index_expr)
+        elif isinstance(index_expr, TensorAccess):
+            return self.lower_TensorAccess(index_expr)
         raise NotImplementedError
 
     def lower_CIN(self, cin: CIN) -> Union[llir.Stmt, List[llir.Stmt], llir.Expr]:
@@ -346,8 +370,12 @@ class CINLowerer:
         tensor_collector.visit(stmt)
         return dependent_tensor_vars
 
-    def lower_IndexVar(self, ivar: IndexVar) -> llir.Expr:
+    @staticmethod
+    def lower_IndexVar(ivar: IndexVar) -> llir.Var:
         """
         Lower an IndexVar to LLIR
         """
-        raise NotImplementedError
+        return llir.Var(
+            name=ivar.get_name(),
+            type=llir.DataType.INT,
+        )

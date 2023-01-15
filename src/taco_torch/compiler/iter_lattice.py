@@ -91,27 +91,42 @@ class LatticePoint:
         ]
         return self.child_lattice_points
 
-    def get_while_condition(self):
+    def get_while_condition(self, lattice: IterationLattice) -> llir.Expr:
         condition = None
         for it in self.get_iterators():
             this_condition = llir.BinOp(
                 op="<",
                 left=it.get_iterator_var_llir(),
-                right=it.get_iterator_var_end_value_llir(),
+                right=it.get_iterator_var_end_var_llir(),
             )
             if condition is None:
                 condition = this_condition
             else:
                 condition = llir.BinOp(op="&&", left=condition, right=this_condition)
+        # if domain is dense
+        if lattice.dense_index_var_llir:
+            assert (
+                lattice.dense_index_var_end_var_llir is not None
+            ), "Dense index var upper bound not set"
+            condition = llir.BinOp(
+                op="<",
+                left=lattice.dense_index_var_llir,
+                right=lattice.dense_index_var_end_var_llir,
+            )
+        assert condition is not None, "Failed to generate while condition"
         return condition
 
-    def get_iterators_advance_stmts(self) -> Sequence[llir.Stmt]:
+    def get_iterators_advance_stmts(
+        self, lattice: IterationLattice
+    ) -> Sequence[llir.Stmt]:
         stmts: List[llir.Stmt] = []
 
         iterators = self.get_iterators()
 
-        if len(iterators) > 1:
-            stmts.append(llir.Comment("Advance iterators"))
+        # Control flows are symmetrical to the initialization of iterators
+        if len(iterators) > 1 or lattice.dense_index_var_llir:
+            if iterators or lattice.dense_index_var_llir:
+                stmts.append(llir.Comment("Advance iterators"))
             for it in iterators:
                 stmts.append(
                     llir.VarInit(
@@ -123,6 +138,12 @@ class LatticePoint:
                         ),
                         op="+=",
                         cast=True,
+                    )
+                )
+            if lattice.dense_index_var_llir:
+                stmts.append(
+                    llir.Increment(
+                        var=lattice.dense_index_var_llir,
                     )
                 )
         elif len(iterators) == 1:
@@ -233,11 +254,15 @@ class LatticePoint:
         if self.child_lattice_points:
             if_conditions: List[llir.Expr] = []
             then_body_list = []
+            else_body: List[llir.Stmt] = []
 
-            for child_lp in [self] + self.child_lattice_points:
+            all_inner_lattice_points = [self] + self.child_lattice_points
+
+            for child_lp in all_inner_lattice_points:
                 candidate_coord_var_llirs = map(
                     lambda it: it.get_coord_var_llir(), child_lp.get_iterators()
                 )
+
                 if_condition = None
                 then_body: List[llir.Stmt] = []
 
@@ -254,52 +279,74 @@ class LatticePoint:
                             op="&&", left=if_condition, right=this_condition
                         )
 
-                lower_cin_and_add_to_list(child_lp, cin, then_body)
-
-                if_conditions.append(if_condition)
-                then_body_list.append(then_body)
+                # If this lattice point has no (sparse) iterators, then we
+                # are at the dense domain, set the would-be then_body as the else_body
+                if not child_lp.iterators:
+                    print("here the candidate_coord_var_llirs are:")
+                    lower_cin_and_add_to_list(child_lp, cin, else_body)
+                else:
+                    lower_cin_and_add_to_list(child_lp, cin, then_body)
+                    assert if_condition is not None, "if_condition cannot be None"
+                    if_conditions.append(if_condition)
+                    then_body_list.append(then_body)
 
             stmts.append(
                 llir.IfThenElse(
                     cond_list=if_conditions,
                     then_body_list=then_body_list,
-                    else_body=[],
+                    else_body=else_body,
                 )
             )
         else:
             lower_cin_and_add_to_list(self, cin, stmts)
 
-        return stmts
+        return (
+            [llir.Comment("Inner loops over child regions")]
+            + stmts
+            + [llir.BlankLine()]
+            if stmts
+            else []
+        )
 
-    def get_candidate_coordinate_stmts(self) -> Sequence[llir.Stmt]:
+    def get_candidate_coordinate_stmts(
+        self, lattice: IterationLattice
+    ) -> Sequence[llir.Stmt]:
 
         stmts: List[llir.Stmt] = []
         iterators = self.get_iterators()
 
-        if len(iterators) > 1:
-            stmts.append(llir.Comment("Get candidate coordinates"))
-            for it in iterators:
+        if len(iterators) > 1 or lattice.dense_index_var_llir:
+            # If we have a dense universe, then we still need to resolve
+            # the sparse coordinate even if we have a single iterator
+            if iterators:
+                stmts.append(llir.Comment("Resolve coordinates"))
+                for it in iterators:
+                    stmts.append(
+                        llir.VarInit(
+                            var=it.get_coord_var_llir(),
+                            value=it.get_coord_var_value_llir(),
+                        )
+                    )
+            # Only need to break ties among the resolved sparse coordinates
+            # if we don't have a dense domain
+            if not lattice.dense_index_var_llir:
+                stmts.append(llir.Comment("Break ties"))
                 stmts.append(
                     llir.VarInit(
-                        var=it.get_coord_var_llir(),
-                        value=it.get_coord_var_value_llir(),
+                        var=self.get_index_var_llir(),
+                        value=llir.FunctionCall(
+                            name="std::min",
+                            args=[
+                                llir.Array(
+                                    values=[
+                                        it.get_coord_var_llir() for it in iterators
+                                    ],
+                                    data_type=llir.DataType.INT,
+                                )
+                            ],
+                        ),
                     )
                 )
-            stmts.append(llir.Comment("Resolve coordinate"))
-            stmts.append(
-                llir.VarInit(
-                    var=self.get_index_var_llir(),
-                    value=llir.FunctionCall(
-                        name="std::min",
-                        args=[
-                            llir.Array(
-                                values=[it.get_coord_var_llir() for it in iterators],
-                                data_type=llir.DataType.INT,
-                            )
-                        ],
-                    ),
-                )
-            )
         elif len(iterators) == 1:
             stmts.append(llir.Comment("Resolve coordinate"))
             stmts.append(
@@ -309,7 +356,7 @@ class LatticePoint:
                 )
             )
 
-        return stmts
+        return stmts + [llir.BlankLine()] if stmts else []
 
     def is_child_of(self, other: LatticePoint) -> bool:
         """
@@ -337,6 +384,11 @@ class IterationLattice:
     ] = None
     index_var: Optional[IndexVar] = None
     cin_lowerer: Optional[CINLowerer] = None
+
+    # these are only set if the iteration domain is the universe
+    dense_index_var: Optional[IndexVar] = None
+    dense_index_var_llir: Optional[llir.Var] = None
+    dense_index_var_end_var_llir: Optional[llir.Var] = None
 
     def gen_lattice_points(self) -> List[LatticePoint]:
         """
@@ -419,6 +471,32 @@ class IterationLattice:
             not in [lp.sparse_tensor_accesses for lp in lattice_points[:i]]
         ]
 
+        # If any of the lattice points have no iterators, then the iteration domain is the universe
+        if any([not lp.sparse_tensor_accesses for lp in lattice_points]):
+            self.dense_index_var = current_index_var
+            assert self.cin_lowerer, "cin_lowerer must be set"
+            self.dense_index_var_llir = self.cin_lowerer.lower_IndexVar(
+                current_index_var
+            )
+            # first get the lattice point with no iterators
+            dense_lattice_point = next(
+                lp for lp in lattice_points if not lp.sparse_tensor_accesses
+            )
+            # then pick any of the dense tensor accesses in the lattice point
+            # to get the end variable
+            first_dense_tensor_access = dense_lattice_point.get_dense_tensor_accesses()[
+                0
+            ]
+            first_dense_tensor_var = first_dense_tensor_access.get_tensor()
+            level_of_current_index_var = first_dense_tensor_access.level_of_index_var(
+                current_index_var
+            )
+            # end var is the <tensor_var_name><level>_size, type is int
+            self.dense_index_var_end_var_llir = llir.Var(
+                name=f"{first_dense_tensor_var.name}{level_of_current_index_var}_size",
+                type=llir.DataType.INT,
+            )
+
         return lattice_points
 
     def get_lattice_points(self) -> Sequence[LatticePoint]:
@@ -465,13 +543,21 @@ class IterationLattice:
         # We can just use the first lattice point to determine what to initialize
         # since the list is sorted by number of iterators
         # TODO: need to handle dense iterators
+        stmts: List[llir.Stmt] = [llir.Comment("Initialize iterators")]
         lattice_points = self.get_lattice_points()
         assert len(lattice_points) > 0, "No lattice points generated"
         all_mode_iterators = lattice_points[0].get_iterators()
-        return [
-            llir.Comment("Initialize iterators"),
-            *[mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators],  # type: ignore
-        ]
+        if self.dense_index_var_llir:
+            stmts.append(
+                llir.VarInit(
+                    var=self.dense_index_var_llir,
+                    value=llir.Literal(value=0, data_type=llir.DataType.INT),
+                )
+            )
+        stmts.append(
+            *[mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators]  # type: ignore
+        )
+        return stmts
 
     def get_lattice_loops(self) -> List[llir.Stmt]:
         """
@@ -484,13 +570,13 @@ class IterationLattice:
             assert self.cin_lowerer, "CINLowerer not set"
 
             while_loop = llir.WhileLoop(
-                cond=lattice_point.get_while_condition(),
+                cond=lattice_point.get_while_condition(lattice=self),
                 body=[
-                    *lattice_point.get_candidate_coordinate_stmts(),
+                    *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                     *lattice_point.get_child_subregion_loops(
                         self.cin_lowerer, self.for_all_stmt.stmt
                     ),
-                    *lattice_point.get_iterators_advance_stmts(),
+                    *lattice_point.get_iterators_advance_stmts(lattice=self),
                 ],
             )
 
