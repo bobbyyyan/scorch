@@ -115,16 +115,20 @@ class CINLowerer:
         tensor_var = tensor_access.get_tensor()
         level = tensor_access.level_of_index_var(last_index_var)
         level_type = tensor_var.get_level_types()[level]
-        if level_type == LevelType.DENSE:
-            return llir.Var(
-                name=f"{tensor_access.tensor.name}_values[{last_index_var.name}]",
-                type=llir.DataType.NO_TYPE,
-            )
-        elif level_type == LevelType.COMPRESSED:
-            return llir.Var(
-                name=f"{tensor_access.tensor.name}_values[{last_index_var.name}_{tensor_access.tensor.name}]",
-                type=llir.DataType.NO_TYPE,
-            )
+        return llir.Var(
+            name=f"{tensor_access.tensor.name}_values[{last_index_var.name}_{tensor_access.tensor.name}]",
+            type=llir.DataType.NO_TYPE,
+        )
+        # if level_type == LevelType.DENSE:
+        #     return llir.Var(
+        #         name=f"{tensor_access.tensor.name}_values[{last_index_var.name}]",
+        #         type=llir.DataType.NO_TYPE,
+        #     )
+        # elif level_type == LevelType.COMPRESSED:
+        #     return llir.Var(
+        #         name=f"{tensor_access.tensor.name}_values[{last_index_var.name}_{tensor_access.tensor.name}]",
+        #         type=llir.DataType.NO_TYPE,
+        #     )
         raise NotImplementedError(f"Level type {level_type} not implemented")
 
     def lower_BinaryOp(self, bin_op: BinaryOp) -> llir.Expr:

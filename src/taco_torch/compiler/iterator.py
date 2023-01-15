@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -13,7 +15,7 @@ class ModeIterator:
     tensor_access: Optional[TensorAccess] = None
     index_var: Optional[IndexVar] = None
     parent_index_var: Optional[IndexVar] = None
-    parent_iterator: Optional["ModeIterator"] = None
+    parent_iterator: Optional[ModeIterator] = None
     level: Optional[int] = None
     level_type: Optional[LevelType] = None
 
@@ -151,3 +153,26 @@ class ModeIterator:
                 name=f"{self.tensor_var.name}{self.level}_crd[{self.iterator_var_llir.name}]",
                 type=llir.DataType.INT,
             )
+
+        elif self.level_type == LevelType.DENSE:
+            # if self.level == 0:
+            #     self.coord_var_llir = llir.Var(
+            #         name=f"{self.index_var.name}",
+            #         type=llir.DataType.INT,
+            #     )
+            # else:
+            if not self.parent_iterator and self.parent_index_var:
+                self.parent_iterator = ModeIterator(
+                    tensor_access=self.tensor_access,
+                    index_var=self.parent_index_var,
+                )
+
+            self.coord_var_llir = llir.Var(
+                name=f"{self.index_var.name}_{self.tensor_var.name}",
+                type=llir.DataType.INT,
+            )
+            if self.parent_iterator:
+                self.coord_var_value_llir = llir.Var(
+                    name=f"{self.parent_iterator.get_iterator_var_llir().name} * {self.tensor_var.get_name()}{self.level}_size + {self.index_var.name}",
+                    type=llir.DataType.INT,
+                )

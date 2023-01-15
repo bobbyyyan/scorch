@@ -80,6 +80,33 @@ def test_elementwise_vector_add_codegen():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_elementwise_matrix_mul_dense_sparse_mix_codegen():
+    # Reference: http://tensor-compiler.org/codegen.html?expr=A(i,j)=B(i,j)*C(i,j)&format=A:ss:0,1;B:dd:0,1;C:sd:0,1
+    # A[i, j] = B[i, j] * C[i, j]
+    # A: sparse, sparse
+    # B: dense, dense
+    # C: sparse, dense
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["sparse", "sparse"])
+    B = TensorVar("B", fmt=["dense", "dense"])
+    C = TensorVar("C", fmt=["sparse", "dense"])
+
+    A[i, j] = B[i, j] * C[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_matrix_vector_mul_codegen():
     # matrix vector multiplication code generation
     # A[i, j] = B[i, j] * C[j]
@@ -189,6 +216,35 @@ def test_elementwise_matrix_mul_codegen_2():
     C = TensorVar("C", fmt=["sparse", "dense"])
 
     A[i, j] = B[i, j] * C[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elementwise_matrix_mul_diff_order_codegen():
+    # http://tensor-compiler.org/codegen.html?expr=A(i,j)=B(i,j)*C(j,i)&format=A:ss:0,1;B:dd:0,1;C:dd:0,1
+    # elementwise matrix multiplication code generation
+    # A[i, j] = B[i, j] * C[j, i]
+    # A: sparse, sparse
+    # B: dense, dense
+    # C: dense, dense
+
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["sparse", "sparse"])
+    B = TensorVar("B", fmt=["dense", "dense"])
+    C = TensorVar("C", fmt=["dense", "dense"])
+
+    A[i, j] = B[i, j] * C[j, i]
 
     cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
