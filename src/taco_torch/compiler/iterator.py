@@ -123,10 +123,16 @@ class ModeIterator:
                 raise Exception("Cannot infer parent_index_var")
 
         if self.iterator_var_llir is None:
-            self.iterator_var_llir = llir.Var(
-                name=f"{self.index_var.name}_{self.tensor_var.name}",
-                type=llir.DataType.INT,
-            )
+            if self.level_type == LevelType.COMPRESSED:
+                self.iterator_var_llir = llir.Var(
+                    name=f"{self.index_var.name}_{self.tensor_var.name}",
+                    type=llir.DataType.INT,
+                )
+            else:
+                self.iterator_var_llir = llir.Var(
+                    name=f"{self.index_var.name}",
+                    type=llir.DataType.INT,
+                )
 
         if self.level_type == LevelType.COMPRESSED:
             self.iterator_var_begin_value_llir = llir.Var(

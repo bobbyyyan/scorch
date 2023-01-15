@@ -360,6 +360,7 @@ class LatticePoint:
             )
 
         if self.dense_iterators:
+            stmts.append(llir.Comment("Resolve dense coordinates"))
             for it in self.dense_iterators:
                 if it.coord_var_value_llir:
                     stmts.append(
