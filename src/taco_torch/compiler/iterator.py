@@ -27,6 +27,10 @@ class ModeIterator:
     coord_var_llir: Optional[llir.Var] = None
     coord_var_value_llir: Optional[llir.Expr] = None
 
+    def get_index_var(self) -> IndexVar:
+        assert self.index_var is not None, "index_var is None"
+        return self.index_var
+
     def get_coord_var_llir(self) -> llir.Var:
         assert self.coord_var_llir is not None, "coord_var_llir is None"
         return self.coord_var_llir

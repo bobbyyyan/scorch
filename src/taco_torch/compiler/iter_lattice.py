@@ -67,6 +67,10 @@ class LatticePoint:
             type=llir.DataType.INT,
         )
 
+    def get_index_var(self) -> IndexVar:
+        assert self.index_var is not None, "Index var not set"
+        return self.index_var
+
     def get_index_var_llir(self):
         assert self.index_var_llir is not None, "Index var LLIR not set"
         return self.index_var_llir
@@ -359,18 +363,50 @@ class LatticePoint:
                 )
             )
 
-        if self.dense_iterators:
-            stmts.append(llir.Comment("Resolve dense coordinates"))
-            for it in self.dense_iterators:
-                if it.coord_var_value_llir:
-                    stmts.append(
-                        llir.VarInit(
-                            var=it.get_coord_var_llir(),
-                            value=it.get_coord_var_value_llir(),
-                        )
-                    )
+        cin_lowerer = lattice.cin_lowerer
+        assert cin_lowerer is not None, "CIN lowerer is None"
 
-        return stmts + [llir.BlankLine()] if stmts else []
+        if self.dense_iterators:
+            for it in self.dense_iterators:
+                # TODO: if parent iterator is not yet resolved (get this info from the lowerer)
+                # then we need to push this resolution later
+
+                if it.coord_var_value_llir:
+                    dense_coord_resolve_stmt = llir.VarInit(
+                        var=it.get_coord_var_llir(),
+                        value=it.get_coord_var_value_llir(),
+                    )
+                    if (
+                        it.parent_iterator
+                        and it.parent_iterator.index_var
+                        not in cin_lowerer.defined_index_vars
+                    ):
+                        dependent_index_var = it.parent_iterator.get_index_var()
+                        existing_list = (
+                            cin_lowerer.dep_index_var_to_dense_coord_resolution.get(
+                                dependent_index_var, []
+                            )
+                        )
+                        existing_list.append(dense_coord_resolve_stmt)
+                        cin_lowerer.dep_index_var_to_dense_coord_resolution[
+                            dependent_index_var
+                        ] = existing_list
+                    else:
+                        stmts.append(dense_coord_resolve_stmt)
+
+        current_index_var = self.get_index_var()
+        if current_index_var in cin_lowerer.dep_index_var_to_dense_coord_resolution:
+            stmts.extend(
+                cin_lowerer.dep_index_var_to_dense_coord_resolution[current_index_var]
+            )
+
+        stmts = (
+            [llir.Comment("Resolve dense coordinates"), *stmts, llir.BlankLine()]
+            if stmts
+            else []
+        )
+
+        return stmts
 
     def is_child_of(self, other: LatticePoint) -> bool:
         """

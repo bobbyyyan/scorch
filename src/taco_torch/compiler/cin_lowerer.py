@@ -24,8 +24,16 @@ class CINLowerer:
 
     def __init__(self):
 
+        self.defined_index_vars: List[IndexVar] = []
+        # dict from IndexVar to a List of llir.Stmt of dense coordinate resolution
+        # the index var is the index var that needs to be defined before the coord
+        # can be resolved
+        self.dep_index_var_to_dense_coord_resolution: Dict[
+            IndexVar, List[llir.Stmt]
+        ] = {}
+
         self.seen_outermost_forall = False
-        self.processed_index_vars: List[IndexVar] = []
+
         self.result_value_array_sparse_index_llir = None
         self.index_var_to_rhs_tensor_level_type = None
         self.index_var_to_result_tensor_level_type = None
@@ -35,8 +43,7 @@ class CINLowerer:
         self.result_tensor_value_index_var_dict: Dict[IndexVar, llir.Expr] = {}
 
         self.llir_stmt: Optional[llir.Stmt] = None
-        self.defined_index_vars_ordered: List[IndexVar] = []
-        self.defined_index_vars: List[IndexVar] = []
+
         self.need_compute: List[TensorVar] = []
         self.tensor_var_to_llir: Dict[TensorVar, llir.Expr] = {}
 
