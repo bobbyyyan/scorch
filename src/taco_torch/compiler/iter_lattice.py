@@ -400,11 +400,11 @@ class LatticePoint:
                 cin_lowerer.dep_index_var_to_dense_coord_resolution[current_index_var]
             )
 
-        stmts = (
-            [llir.Comment("Resolve dense coordinates"), *stmts, llir.BlankLine()]
-            if stmts
-            else []
-        )
+        # stmts = (
+        #     [llir.Comment("Resolve dense coordinates"), *stmts, llir.BlankLine()]
+        #     if stmts
+        #     else []
+        # )
 
         return stmts
 
