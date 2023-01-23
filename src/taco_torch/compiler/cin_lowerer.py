@@ -130,7 +130,7 @@ class CINLowerer:
             )
 
         return llir.Var(
-            name=f"{tensor_access.tensor.name}_values[{last_index_var.name}_{tensor_access.tensor.name}]",
+            name=f"{tensor_access.tensor.name}_values[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]",
             type=llir.DataType.NO_TYPE,
         )
 
@@ -244,7 +244,7 @@ class CINLowerer:
         # Generate iterator bounds
         tensor_level_array_assign_stmts = []
         tensor_value_array_assign_stmts = []
-        for tensor in rhs_tensor_vars + result_tensor_vars:
+        for tensor in rhs_tensor_vars:
             tensor_level_array_assign_stmts.extend(self.get_level_arrays(tensor))
             tensor_value_array_assign_stmts.append(
                 self.get_value_array_statement(tensor)

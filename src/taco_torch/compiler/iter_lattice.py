@@ -142,14 +142,14 @@ class LatticePoint:
                 stmts.append(llir.Comment("Advance iterators"))
             for it in iterators:
                 stmts.append(
-                    llir.VarInit(
+                    llir.Assign(
                         var=it.get_iterator_var_llir(),
                         value=llir.BinOp(
                             op="==",
                             left=it.get_coord_var_llir(),
                             right=self.get_index_var_llir(),
                         ),
-                        op="+=",
+                        op=llir.AssignOp.ADD_ASSIGN,
                         cast=True,
                     )
                 )
@@ -264,13 +264,13 @@ class LatticePoint:
             elif isinstance(cin_lowered, list):
                 lst.extend(cin_lowered)
 
-        if self.child_lattice_points:
+        all_inner_lattice_points = [self] + self.child_lattice_points
+
+        if self.child_lattice_points or len(self.iterators) > 1:
             stmts.append(llir.Comment("Inner loops over child regions"))
             if_conditions: List[llir.Expr] = []
             then_body_list = []
             else_body: List[llir.Stmt] = []
-
-            all_inner_lattice_points = [self] + self.child_lattice_points
 
             for child_lp in all_inner_lattice_points:
                 candidate_coord_var_llirs = map(
@@ -326,7 +326,7 @@ class LatticePoint:
             # If we have a dense universe, then we still need to resolve
             # the sparse coordinate even if we have a single iterator
             if iterators:
-                stmts.append(llir.Comment("Resolve coordinates"))
+                stmts.append(llir.Comment("Load coordinates"))
                 for it in iterators:
                     stmts.append(
                         llir.VarInit(
@@ -337,7 +337,7 @@ class LatticePoint:
             # Only need to break ties among the resolved sparse coordinates
             # if we don't have a dense domain
             if not lattice.dense_index_var_llir:
-                stmts.append(llir.Comment("Break ties"))
+                stmts.append(llir.Comment("Resolve coordinates"))
                 stmts.append(
                     llir.VarInit(
                         var=self.get_index_var_llir(),
@@ -355,7 +355,7 @@ class LatticePoint:
                     )
                 )
         elif len(iterators) == 1:
-            stmts.append(llir.Comment("Resolve coordinate"))
+            stmts.append(llir.Comment("Resolve coordinates"))
             stmts.append(
                 llir.VarInit(
                     var=self.get_index_var_llir(),
