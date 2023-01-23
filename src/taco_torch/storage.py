@@ -39,7 +39,7 @@ class TensorIndex(object):
     def __init__(
         self,
         tensor_format: Optional[TensorFormat] = None,
-        mode_indices: Optional[List[torch.Tensor]] = None,
+        mode_indices: Optional[List[List[torch.Tensor]]] = None,
     ):
         self.format = tensor_format
         self.mode_indices = mode_indices
@@ -56,11 +56,11 @@ class TensorIndex(object):
     def __ne__(self, other):
         return not self.__eq__(other)
 
-    def get_mode_index(self, mode: int) -> torch.Tensor:
+    def get_mode_index(self, mode: int) -> List[torch.Tensor]:
         """Get the mode index of a mode."""
         return self.get_mode_indices()[mode]
 
-    def get_mode_indices(self) -> List[torch.Tensor]:
+    def get_mode_indices(self) -> List[List[torch.Tensor]]:
         """Get the mode indices of all modes."""
         assert self.mode_indices, "mode_indices is None"
         return self.mode_indices
@@ -122,6 +122,12 @@ class TensorStorage(object):
         """Get the value of the tensor."""
         assert self._value is not None, "value is None"
         return self._value
+
+    @property
+    def index(self) -> TensorIndex:
+        """Get the index of the tensor."""
+        assert self._index is not None, "index is None"
+        return self._index
 
 
 class TensorStorageView(TensorStorage):
