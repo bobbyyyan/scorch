@@ -1,9 +1,11 @@
+from __future__ import annotations
 from copy import deepcopy
 from typing import Optional, Tuple, Union
 
 import torch
 
-from .storage import TensorStorage, TensorIndex, TensorStorageView
+from src.taco_torch.format import TensorFormat, LevelFormat, LevelType
+from src.taco_torch.storage import TensorStorage, TensorIndex, TensorStorageView
 
 
 class Window(object):
@@ -60,6 +62,7 @@ class TacoTensor(torch.nn.Module):
         else:
             self._storage = TensorStorage(index=index, value=value, shape=shape)
         self._name = name
+        self._shape = shape
 
         self.requires_grad = requires_grad
 
@@ -69,7 +72,13 @@ class TacoTensor(torch.nn.Module):
         pass
 
     @property
-    def value(self) -> torch.Tensor:
+    def name(self) -> str:
+        """Get the tensor name."""
+        assert self._name is not None, "Tensor name is not set."
+        return self._name
+
+    @property
+    def values(self) -> torch.Tensor:
         """Get the tensor value."""
         return self.storage.value
 
@@ -84,6 +93,11 @@ class TacoTensor(torch.nn.Module):
     def dtype(self):
         """Get the tensor logical dtype."""
         return self._dtype
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """Get the tensor shape."""
+        return self._shape if self._shape is not None else tuple()
 
     def __str__(self):
         """Get a string representation of the tensor."""
@@ -112,3 +126,44 @@ class TacoTensor(torch.nn.Module):
         """Clone the tensor."""
         # TODO: Implement this.
         raise NotImplementedError()
+
+    # function to create a TacoTensor from a torch.Tensor
+    @staticmethod
+    def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> TacoTensor:
+        """Create a TacoTensor from a torch.Tensor."""
+        # torch.Tensor is dense, so shape is the same as torch tensor,
+        # and format is dense at every level
+        tt_tensor = TacoTensor(
+            name=name,
+            shape=tuple(tensor.shape),
+            storage=TensorStorage(
+                value=tensor,
+            ),
+        )
+
+        return tt_tensor
+
+    # function to sparseify a TacoTensor
+    def to_sparse(self, fmt: Optional[TensorFormat] = None) -> TacoTensor:
+        """Convert the tensor to a sparse tensor."""
+        if len(self.shape) == 1:
+            # Find indexes of non-zero elements in self.values, flatten them
+            nonzero_indices = torch.nonzero(self.values).flatten()
+            size = len(nonzero_indices)
+            # Create a filtered value tensor that only contains non-zero elements
+            filtered_values = self.values[nonzero_indices]
+            self._storage = TensorStorage(
+                index=TensorIndex(
+                    tensor_format=TensorFormat(
+                        level_formats=[LevelFormat(mode=LevelType.COMPRESSED)]
+                    ),
+                    mode_indices=[
+                        [
+                            torch.Tensor([0, size]),
+                            nonzero_indices,
+                        ]
+                    ],
+                ),
+                value=filtered_values,
+            )
+        return self

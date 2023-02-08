@@ -1,3 +1,4 @@
+from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Any, Union, TypeVar
@@ -113,6 +114,18 @@ class DataType(Enum):
     TORCH_UINT8 = "torch::kUInt8"
     TACO_TENSOR = "TacoTensor"
     NO_TYPE = "NO_TYPE"
+    CVECTOR_INT = "cvector<int>"
+    CVECTOR_FLOAT32 = "cvector<float>"
+    CVECTOR_TORCH_FLOAT32 = "cvector<torch::kFloat32>"
+    STD_VECTOR_INT = "std::vector<int>"
+    STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
+
+    @classmethod
+    def cvector_type(cls, dtype: DataType) -> DataType:
+        """
+        A custom vector type for C++.
+        """
+        return DataType(f"cvector<{dtype.value}>")
 
     @classmethod
     def from_python_type(cls, py_type):
@@ -190,12 +203,11 @@ class Return(Stmt):
         self.value = value
 
 
+@dataclass(frozen=False)
 class VarDecl(Stmt):
     """A variable declaration statement."""
 
-    def __init__(self, name: str, value: Expr):
-        self.name = name
-        self.value = value
+    var: Var
 
 
 @dataclass(frozen=False)
@@ -308,6 +320,12 @@ class Function(Stmt):
 class FunctionCall(Expr):
     """A function call expression."""
 
+    def __init__(self, name: str, args: List[Expr]):
+        self.name = name
+        self.args = args
+
+
+class FunctionCallStmt(Stmt):
     def __init__(self, name: str, args: List[Expr]):
         self.name = name
         self.args = args

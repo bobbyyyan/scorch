@@ -10,7 +10,6 @@ from src.taco_torch.utils import flatten_2d_list
 if TYPE_CHECKING:
     from src.taco_torch.compiler.cin_lowerer import CINLowerer
 
-
 from src.taco_torch.compiler.cin import (
     IndexVar,
     ForAll,
@@ -139,6 +138,7 @@ class LatticePoint:
         # Control flows are symmetrical to the initialization of iterators
         if len(iterators) > 1 or lattice.dense_index_var_llir:
             if iterators or lattice.dense_index_var_llir:
+                stmts.append(llir.BlankLine())
                 stmts.append(llir.Comment("Advance iterators"))
             for it in iterators:
                 stmts.append(
@@ -267,6 +267,7 @@ class LatticePoint:
         all_inner_lattice_points = [self] + self.child_lattice_points
 
         if self.child_lattice_points or len(self.iterators) > 1:
+            stmts.append(llir.BlankLine())
             stmts.append(llir.Comment("Inner loops over child regions"))
             if_conditions: List[llir.Expr] = []
             then_body_list = []
@@ -354,6 +355,7 @@ class LatticePoint:
                         ),
                     )
                 )
+                stmts.append(llir.BlankLine())
         elif len(iterators) == 1:
             stmts.append(llir.Comment("Resolve coordinates"))
             stmts.append(
@@ -362,6 +364,7 @@ class LatticePoint:
                     value=iterators[0].get_coord_var_value_llir(),
                 )
             )
+            stmts.append(llir.BlankLine())
 
         cin_lowerer = lattice.cin_lowerer
         assert cin_lowerer is not None, "CIN lowerer is None"
@@ -616,9 +619,10 @@ class IterationLattice:
 
         """
 
-        def gen_single_lattice_loop(lattice_point: LatticePoint) -> llir.Stmt:
-
+        def gen_single_lattice_loop(lattice_point: LatticePoint) -> List[llir.Stmt]:
             assert self.cin_lowerer, "CINLowerer not set"
+
+            stmts: List[llir.Node] = []
 
             while_loop = llir.WhileLoop(
                 cond=lattice_point.get_while_condition(lattice=self),
@@ -631,12 +635,86 @@ class IterationLattice:
                 ],
             )
 
-            return while_loop
+            stmts.append(while_loop)
+
+            # If we have a sparse level here, we need to set
+            # {result_tensor_var}{level}_pos[p{result_tensor_var}{parent_level} + 1] to
+            # p{result_tensor_var}{level}
+            result_tensor_var = self.cin_lowerer.result_tensor_var
+            result_tensor_access = self.cin_lowerer.result_tensor_access
+            level = result_tensor_access.level_of_index_var(lattice_point.index_var)
+            if (
+                result_tensor_access.level_type_of_index_var(lattice_point.index_var)
+                == LevelType.COMPRESSED
+            ):
+                stmts.extend(
+                    [
+                        llir.BlankLine(),
+                        llir.Comment("Set position index"),
+                    ]
+                )
+
+                # if level is > 0 and parent level is also sparse, we need to set
+                # the parent level's crd
+                if level > 0:
+                    parent_index_var = result_tensor_access.get_parent_index_var(
+                        lattice_point.index_var
+                    )
+                    if (
+                        result_tensor_access.level_type_of_index_var(parent_index_var)
+                        == LevelType.COMPRESSED
+                    ):
+                        stmts.append(
+                            # e.g.
+                            # if (A1_pos.back() < pA1) {
+                            #     A0_crd.push_back(i);
+                            # }
+                            llir.IfThenElse(
+                                cond=llir.BinOp(
+                                    op="<",
+                                    left=llir.FunctionCall(
+                                        name=f"{result_tensor_var.name}{level}_pos.back",
+                                        args=[],
+                                    ),
+                                    right=llir.Var(
+                                        name=f"p{result_tensor_var.name}{level}",
+                                        type=llir.DataType.INT,
+                                    ),
+                                ),
+                                then_body=[
+                                    llir.FunctionCallStmt(
+                                        name=f"{result_tensor_var.name}{level - 1}_crd.push_back",
+                                        args=[
+                                            llir.Var(
+                                                name="i",
+                                                type=llir.DataType.INT,
+                                            )
+                                        ],
+                                    ),
+                                ],
+                            )
+                        )
+
+                stmts.append(
+                    # e.g. A1_pos.push_back(pA1)
+                    llir.FunctionCallStmt(
+                        name=f"{result_tensor_var.name}{level}_pos.push_back",
+                        args=[
+                            llir.Var(
+                                name=f"{result_tensor_var.name}{level}_crd.size()",
+                                # name=f"p{result_tensor_var.name}{level}",
+                                type=llir.DataType.INT,
+                            )
+                        ],
+                    )
+                )
+
+            return stmts
 
         return flatten_2d_list(
             [
                 [
-                    gen_single_lattice_loop(p),
+                    *gen_single_lattice_loop(p),
                     llir.BlankLine(),
                 ]
                 for p in self.get_lattice_points()

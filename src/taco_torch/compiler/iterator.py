@@ -142,7 +142,7 @@ class ModeIterator:
             self.iterator_var_begin_value_llir = llir.Var(
                 name=f"{self.tensor_var.name}{self.level}_pos[{self.parent_index_var.name}]"
                 if self.parent_index_var
-                else f"{self.tensor_var.name}{self.level}_pos[0]",
+                else f"{self.tensor_var.name}{self.level}_pos[0].item<int>()",
                 type=llir.DataType.INT,
             )
             self.iterator_var_end_var_llir = llir.Var(
@@ -152,7 +152,7 @@ class ModeIterator:
             self.iterator_var_end_value_llir = llir.Var(
                 name=f"{self.tensor_var.name}{self.level}_pos[{self.parent_index_var.name}+1]"
                 if self.parent_index_var
-                else f"{self.tensor_var.name}{self.level}_pos[1]",
+                else f"{self.tensor_var.name}{self.level}_pos[1].item<int>()",
                 type=llir.DataType.INT,
             )
             self.coord_var_llir = llir.Var(
@@ -160,7 +160,7 @@ class ModeIterator:
                 type=llir.DataType.INT,
             )
             self.coord_var_value_llir = llir.Var(
-                name=f"{self.tensor_var.name}{self.level}_crd[{self.iterator_var_llir.name}]",
+                name=f"{self.tensor_var.name}{self.level}_crd[{self.iterator_var_llir.name}].item<int>()",
                 type=llir.DataType.INT,
             )
 

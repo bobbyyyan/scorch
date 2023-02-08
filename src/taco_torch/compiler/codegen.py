@@ -60,6 +60,11 @@ class LLIRLowerer:
                 f"{ir.name}({', '.join([self.lower_llir(arg) for arg in ir.args])})",
                 indent_level,
             )
+        elif isinstance(ir, llir.FunctionCallStmt):
+            return self.lower_llir(
+                f"{ir.name}({', '.join([self.lower_llir(arg) for arg in ir.args])});",
+                indent_level,
+            )
         elif isinstance(ir, llir.Array):
             return self.lower_llir(
                 f"{{{', '.join([self.lower_llir(v) for v in ir.values])}}}",
@@ -135,14 +140,18 @@ class LLIRLowerer:
         elif isinstance(ir, llir.Var):
             return ir.name
 
+        elif isinstance(ir, llir.VarDecl):
+            return self.lower_llir(f"{ir.var.type.value} {ir.var.name};", indent_level)
+
         elif isinstance(ir, llir.Increment):
             return self.lower_llir(f"{ir.var.name}++;", indent_level)
 
         elif isinstance(ir, llir.Function):
             # args must be llir.Var's
-            assert [
-                isinstance(arg, llir.Var) for arg in ir.args
-            ], "Args must be llir.Var's"
+            if ir.args:
+                assert [
+                    isinstance(arg, llir.Var) for arg in ir.args
+                ], "Args must be llir.Var's"
             args = cast(List[llir.Var], ir.args)
             # Assert all the args have types so that type checker is happy
             assert all([arg.type for arg in args]), "All args must have types"
@@ -157,6 +166,10 @@ class LLIRLowerer:
                 + "\n"
                 + self.lower_llir("}", indent_level)
             )
+
+        elif isinstance(ir, llir.Return):
+            return self.lower_llir(f"return {self.lower_llir(ir.value)};", indent_level)
+
         return self.lower_llir(
             f"No code gen implemented for node type: {ir.__class__.__name__}",
             indent_level,

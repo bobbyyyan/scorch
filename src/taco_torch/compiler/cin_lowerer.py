@@ -15,6 +15,11 @@ from src.taco_torch.compiler.cin import (
 )
 from src.taco_torch.compiler.iter_lattice import IterationLattice
 from src.taco_torch.format import LevelType
+from src.taco_torch.utils import (
+    dtype_to_datatype,
+    dtype_to_c_datatype,
+    get_pytorch_c_dtype_str,
+)
 
 
 class CINLowerer:
@@ -72,6 +77,7 @@ class CINLowerer:
                     )
                 )
             elif level_type == LevelType.COMPRESSED:
+
                 statements.append(
                     llir.VarInit(
                         var=llir.Var(
@@ -79,11 +85,13 @@ class CINLowerer:
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                         value=llir.Var(
-                            name=f"{tensor.name}._storage._index.mode_indices[{level}][0]",
+                            # name=f"{tensor.name}._storage._index.mode_indices[{level}][0]",
+                            name=f"{tensor.name}_mode_indices[{level}][0]",
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                     )
                 )
+                #
                 statements.append(
                     llir.VarInit(
                         var=llir.Var(
@@ -91,7 +99,8 @@ class CINLowerer:
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                         value=llir.Var(
-                            name=f"{tensor.name}._storage._index.mode_indices[{level}][1]",
+                            # name=f"{tensor.name}._storage._index.mode_indices[{level}][1]",
+                            name=f"{tensor.name}_mode_indices[{level}][1]",
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                     )
@@ -130,7 +139,9 @@ class CINLowerer:
             )
 
         return llir.Var(
-            name=f"{tensor_access.tensor.name}_values[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]",
+            name=f"{tensor_access.tensor.name}_values"
+            + f"[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]"
+            + f".item<{dtype_to_c_datatype(tensor_var.dtype).value}>()",
             type=llir.DataType.NO_TYPE,
         )
 
@@ -185,7 +196,7 @@ class CINLowerer:
             if self.result_value_array_sparse_index_llir:
                 tensor_access_llir = llir.Var(
                     name=f"{self.result_tensor_var.get_name()}_values"
-                    + f"[{self.defined_index_vars[-1].name}_{self.result_tensor_var.get_name()}]",
+                    + f"[{self.result_value_array_sparse_index_llir.name}]",
                     type=llir.DataType.NO_TYPE,
                 )
             else:
@@ -200,6 +211,23 @@ class CINLowerer:
                     value=self.lower_IndexExpr(stmt.rhs),
                 )
             )
+            # If the last level of the result tensor var is sparse, then we need to set
+            # the coordinates
+            llir_stmts.append(llir.Comment("Set coordinates"))
+            llir_stmts.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}_crd"
+                        + f"[p{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}]",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    value=llir.Var(
+                        name=self.defined_index_vars[-1].name,
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                )
+            )
+
             # if has sparse index for result value array, need to increment
             if self.result_value_array_sparse_index_llir is not None:
                 llir_stmts.append(
@@ -234,15 +262,78 @@ class CINLowerer:
 
         self.need_compute.extend(result_tensor_vars)
 
+        tensor_value_array_init_stmts = []
+        result_level_indices_init_stmts: List[llir.Stmt] = []
+
         for result_tensor_var in result_tensor_vars:
             self.tensor_var_to_llir[result_tensor_var] = self.lower_TensorVar(
                 result_tensor_var
             )
+            tensor_value_array_init_stmts.append(
+                llir.VarDecl(
+                    llir.Var(
+                        name=f"{result_tensor_var.get_name()}_values",
+                        type=llir.DataType.cvector_type(
+                            dtype_to_c_datatype(result_tensor_var.dtype)
+                        ),
+                    )
+                )
+            )
 
-        print()
+            for i, level_type in enumerate(result_tensor_var.get_level_types()):
+                if level_type == LevelType.COMPRESSED:
+                    # e.g. cvector<int> a0_pos;
+                    result_level_indices_init_stmts.append(
+                        llir.VarDecl(
+                            llir.Var(
+                                name=f"{result_tensor_var.get_name()}{i}_pos",
+                                type=llir.DataType.CVECTOR_INT,
+                            )
+                        )
+                    )
+
+                    # e.g. cvector<int> a0_crd;
+                    result_level_indices_init_stmts.append(
+                        llir.VarDecl(
+                            llir.Var(
+                                name=f"{result_tensor_var.get_name()}{i}_crd",
+                                type=llir.DataType.CVECTOR_INT,
+                            )
+                        )
+                    )
+
+                    # e.g. a0_pos[0] = 0;
+                    result_level_indices_init_stmts.append(
+                        llir.Assign(
+                            var=llir.Var(
+                                name=f"{result_tensor_var.get_name()}{i}_pos[0]",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Literal(0),
+                        )
+                    )
+
+                    # e.g. int pa0 = 0;
+                    result_level_indices_init_stmts.append(
+                        llir.VarInit(
+                            llir.Var(
+                                name=f"p{result_tensor_var.get_name()}{i}",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Literal(0),
+                        )
+                    )
+
+        if result_level_indices_init_stmts:
+            result_level_indices_init_stmts = [
+                llir.Comment("Init result level indices"),
+                *result_level_indices_init_stmts,
+                llir.BlankLine(),
+            ]
 
         # Generate iterator bounds
         tensor_level_array_assign_stmts = []
+
         tensor_value_array_assign_stmts = []
         for tensor in rhs_tensor_vars:
             tensor_level_array_assign_stmts.extend(self.get_level_arrays(tensor))
@@ -290,7 +381,8 @@ class CINLowerer:
 
         if result_last_compressed_index_var is not None:
             self.result_value_array_sparse_index_llir = llir.Var(
-                name=f"{result_last_compressed_index_var.name}_{self.result_tensor_var.name}",
+                # name=f"p{self.result_tensor_var.name}{self.result_tensor_access.level_of_index_var(result_last_compressed_index_var)}",
+                name=f"p{self.result_tensor_var.name}{self.result_tensor_var.levels - 1}",
                 type=llir.DataType.INT,
             )
             self.result_tensor_value_index_var_dict[
@@ -298,10 +390,7 @@ class CINLowerer:
             ] = self.result_value_array_sparse_index_llir
             result_index_init_stmts.append(
                 llir.VarInit(
-                    var=llir.Var(
-                        name=f"{result_last_compressed_index_var.name}_{self.result_tensor_var.name}",
-                        type=llir.DataType.INT,
-                    ),
+                    var=self.result_value_array_sparse_index_llir,
                     value=llir.Literal(value=0, data_type=llir.DataType.INT),
                 )
             )
@@ -312,22 +401,207 @@ class CINLowerer:
                 return self.lower_ForAll(stmt)
             else:
                 self.seen_outermost_forall = True
-            return llir.Function(
-                return_type=llir.DataType.TACO_TENSOR,
-                name="compute",
-                args=rhs_tensor_vars_llir,
-                body=[
+
+            kernel_args: List[llir.Var] = []
+
+            kernel_args.append(
+                llir.Var(
+                    name="result_shape",
+                    type=llir.DataType.STD_VECTOR_INT,
+                )
+            )
+
+            for tensor in rhs_tensor_vars:
+                kernel_args.append(
+                    llir.Var(
+                        name=f"{tensor.get_name()}_mode_indices",
+                        type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
+                    )
+                )
+                kernel_args.append(
+                    llir.Var(
+                        name=f"{tensor.get_name()}_values",
+                        type=llir.DataType.TORCH_TENSOR,
+                    )
+                )
+
+            body_stmts: List[llir.Stmt] = []
+
+            body_stmts.extend(
+                [
                     llir.Comment("Get tensor level arrays"),
                     *tensor_level_array_assign_stmts,
                     llir.BlankLine(),
-                    llir.Comment("Get tensor value arrays"),
-                    *tensor_value_array_assign_stmts,
-                    llir.BlankLine(),
-                    llir.Comment("Initialize result value array index"),
-                    *result_index_init_stmts,
+                    *result_level_indices_init_stmts,
+                    # llir.Comment("Get tensor value arrays"),
+                    # *tensor_value_array_assign_stmts,
+                    # llir.BlankLine(),
+                    llir.Comment("Initialize result value array"),
+                    *tensor_value_array_init_stmts,
+                    # *result_index_init_stmts,
                     llir.BlankLine(),
                     *self.lower_ForAll(stmt),
-                ],
+                    llir.Comment("Assemble result"),
+                    llir.VarDecl(
+                        var=llir.Var(
+                            name=f"{self.result_tensor_var.get_name()}",
+                            type=llir.DataType.TACO_TENSOR,
+                        )
+                    ),
+                ]
+            )
+
+            # torch::Tensor a0_pos_torch = torch::from_blob(a0_pos.data(), {a0_pos.size()}, a0_pos.get_deleter(), torch::kInt);
+            for i, level_type in enumerate(self.result_tensor_var.get_level_types()):
+                if level_type == LevelType.COMPRESSED:
+                    tensor_level_name = f"{self.result_tensor_var.get_name()}{i}"
+                    # Emit {tensor_level_name}_pos_torch array
+                    body_stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor_level_name}_pos_torch",
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            value=llir.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_pos.data()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{{{tensor_level_name}_pos.size()}}",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_pos.get_deleter()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"torch::kInt",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                ],
+                            ),
+                        )
+                    )
+                    # Emit {tensor_level_name}_crd_torch array
+                    body_stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor_level_name}_crd_torch",
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            value=llir.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_crd.data()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{{{tensor_level_name}_crd.size()}}",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_crd.get_deleter()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"torch::kInt",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                ],
+                            ),
+                        )
+                    )
+
+            # Emit result value array
+            body_stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}_values_torch",
+                        type=llir.DataType.TORCH_TENSOR,
+                    ),
+                    value=llir.FunctionCall(
+                        name="torch::from_blob",
+                        args=[
+                            llir.Var(
+                                name=f"{self.result_tensor_var.get_name()}_values.data()",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"{{{self.result_tensor_var.get_name()}_values.size()}}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"{self.result_tensor_var.get_name()}_values.get_deleter()",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=get_pytorch_c_dtype_str(
+                                    self.result_tensor_var.dtype
+                                ),
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                        ],
+                    ),
+                )
+            )
+
+            # Emit result tensor index assignment
+            # e.g. A._storage._index.mode_indices = {{A0_pos_torch, A0_crd_torch}, {A1_pos_torch, A1_crd_torch}};
+
+            def get_result_mode_index_set(i, level_type: LevelType):
+                tensor_level_name = f"{self.result_tensor_var.get_name()}{i}"
+                if level_type == LevelType.DENSE:
+                    return "{}"
+                elif level_type == LevelType.COMPRESSED:
+                    return f"{{{tensor_level_name}_pos_torch, {tensor_level_name}_crd_torch}}"
+
+            body_stmts.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}._storage._index.mode_indices",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    value=llir.Var(
+                        name=f"{{{', '.join([get_result_mode_index_set(i, level_type) for i, level_type in enumerate(self.result_tensor_var.get_level_types())])}}}",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                )
+            )
+
+            # Emit result tensor value assignment
+            # e.g. A._storage._value = A_values_torch;
+            body_stmts.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}._storage._value",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    value=llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}_values_torch",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                )
+            )
+
+            # Emit return statement
+            body_stmts.append(
+                llir.Return(
+                    value=llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}",
+                        type=llir.DataType.NO_TYPE,
+                    )
+                )
+            )
+
+            return llir.Function(
+                return_type=llir.DataType.TACO_TENSOR,
+                name="evaluate",
+                args=kernel_args,
+                body=body_stmts,
             )
 
         return []
@@ -346,11 +620,17 @@ class CINLowerer:
 
         iter_lattice = IterationLattice(for_all_stmt=stmt, cin_lowerer=self)
 
-        return [
-            *iter_lattice.get_iterator_init_stmts(),
-            llir.BlankLine(),
-            *iter_lattice.get_lattice_loops(),
-        ]
+        stmts: List[llir.Stmt] = []
+
+        stmts.extend(
+            [
+                *iter_lattice.get_iterator_init_stmts(),
+                llir.BlankLine(),
+                *iter_lattice.get_lattice_loops(),
+            ]
+        )
+
+        return stmts
 
     @staticmethod
     def lower_TensorVar(tensor_var: TensorVar) -> llir.Expr:

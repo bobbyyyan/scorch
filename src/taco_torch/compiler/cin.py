@@ -177,6 +177,10 @@ class TensorVar(IndexExpr):
     def get_level_types(self) -> List[LevelType]:
         return self.get_format().get_level_types()
 
+    @property
+    def levels(self) -> int:
+        return len(self.get_level_types())
+
     def get_level_size_cpp(self, level: int) -> str:
         return f"(int) ({self.name}._shape[{level}])"
 
@@ -234,6 +238,9 @@ class TensorAccess(IndexExpr):
 
     def level_of_index_var(self, index: IndexVar) -> int:
         return self.indices.index(index)
+
+    def level_type_of_index_var(self, index: IndexVar) -> LevelType:
+        return self.tensor.get_level_types()[self.level_of_index_var(index)]
 
     def __getitem__(self, index) -> "TensorAccess":
         return TensorAccess(self.tensor, self.indices + [index])

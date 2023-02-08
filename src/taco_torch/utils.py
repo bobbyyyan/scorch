@@ -45,6 +45,27 @@ PYTORCH_DTYPE_TO_DATATYPE: Dict[torch.dtype, DataType] = {
     torch.uint8: DataType.TORCH_UINT8,
 }
 
+PYTORCH_DTYPE_TO_C_DATATYPE: Dict[torch.dtype, DataType] = {
+    torch.float32: DataType.FLOAT32,
+    torch.float64: DataType.FLOAT64,
+    torch.int32: DataType.INT32,
+    torch.int64: DataType.INT64,
+    torch.int8: DataType.INT8,
+    torch.uint8: DataType.UINT8,
+}
+
+
+def dtype_to_c_datatype(dtype: torch.dtype) -> DataType:
+    """Convert a pytorch dtype to a C++ DataType.
+
+    Args:
+        dtype (torch.dtype): Pytorch dtype.
+
+    Returns:
+        DataType: C++ DataType object.
+    """
+    return PYTORCH_DTYPE_TO_C_DATATYPE[dtype]
+
 
 def dtype_to_datatype(dtype: torch.dtype) -> DataType:
     """Convert a pytorch dtype to a DataType.
