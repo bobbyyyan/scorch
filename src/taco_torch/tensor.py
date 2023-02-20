@@ -83,6 +83,16 @@ class TacoTensor(torch.nn.Module):
         return self.storage.value
 
     @property
+    def index(self) -> TensorIndex:
+        """Get the tensor index."""
+        return self.storage.index
+
+    @property
+    def format(self) -> TensorFormat:
+        """Get the tensor format."""
+        return self.index.format
+
+    @property
     def storage(self) -> TensorStorage:
         """Get the tensor storage."""
         assert self._storage is not None, "Tensor storage is not set."
@@ -143,7 +153,7 @@ class TacoTensor(torch.nn.Module):
 
         return tt_tensor
 
-    # function to sparseify a TacoTensor
+    # function to sparsify a TacoTensor
     def to_sparse(self, fmt: Optional[TensorFormat] = None) -> TacoTensor:
         """Convert the tensor to a sparse tensor."""
         if len(self.shape) == 1:
