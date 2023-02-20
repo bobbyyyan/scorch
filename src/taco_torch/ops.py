@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Union, Sequence
 
 import torch
 from torch.utils.cpp_extension import load
@@ -29,7 +29,7 @@ def test_cpp_ext_rand_matrix():
 def test_cpp_ext_rand_matrix_tt():
     print("random tt tensor:")
     rand_tt_tensor: TacoTensor = ops_cpp.get_rand_matrix_tt(7, 8)
-    print(rand_tt_tensor._storage._value)
+    print(rand_tt_tensor._storage._value)  # type: ignore
 
 
 def test_cpp_ext_sparse_vector_mul():
@@ -95,6 +95,7 @@ def einsum(
     result_tensor_var = TensorVar(name="result", fmt=output_format)
 
     # Generate the python code for constructing the TensorAccess's, and TensorAssign and execute it
+    assert index_var_dict, "index_var_dict is empty"
     rhs = ""
     for i, tensor_var in enumerate(tensor_vars):
         inside = ", ".join(
@@ -165,10 +166,10 @@ def einsum(
     )
 
     # Call module.evaluate with the output shape,and the mode indices and values of each tensor
-    args = [result_shape]
+    args: Sequence[Any] = [result_shape]
     for tensor in tensors:
-        args.append(tensor._storage._index.mode_indices)
-        args.append(tensor._storage.value)
+        args.append(tensor._storage._index.mode_indices)  # type: ignore
+        args.append(tensor._storage.value)  # type: ignore
 
     result_cpp = module.evaluate(*args)
     result = TacoTensor(
@@ -181,56 +182,3 @@ def einsum(
     )
 
     return result
-
-
-def mul(src: TacoTensor, other: TacoTensor):
-    """Multiply two tensors.
-    e.g. `mul(a, b)` is equivalent to `a * b`.
-    """
-    # TODO: Lower to TACO IR
-    # TODO: Compile to C++ code
-    # TODO: (Inline) load C++ code using PyTorch's C++ extension
-    # TODO: Call C++ code
-    # TODO: Return result
-    # ttensor = ops_cpp.TacoTensor
-
-    result = ops_cpp.elemwise_mul(
-        src._storage._index.mode_indices,
-        src._storage.value,
-        other._storage._index.mode_indices,
-        other._storage.value,
-    )
-
-    print("ops_cpp.TacoTensor", ops_cpp.TacoTensor)
-
-    return TacoTensor(
-        index=TensorIndex(
-            mode_indices=result._storage._index.mode_indices,
-        ),
-        value=result._storage._value,
-    )
-
-    raise NotImplementedError("TACO mul is not implemented yet.")
-
-
-def add(src, other):
-    # print(ops_cpp.add)
-    # TODO: implement this
-    # return TacoTensor(
-    #     value=ops_cpp.add(src.value, other.value),
-    # )
-    # return ops_cpp.add(src, other)
-
-    # Lower to TACO IR
-    # Compile to C++ code
-    # (Inline) load C++ code using PyTorch's C++ extension
-    # Call C++ code
-    # Return result
-
-    if isinstance(other, TacoTensor):
-        raise NotImplementedError("TACO add is not implemented yet.")
-
-
-TacoTensor.add = add
-TacoTensor.__add__ = add
-TacoTensor.__mul__ = mul

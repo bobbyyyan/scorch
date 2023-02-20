@@ -16,7 +16,6 @@ from src.taco_torch.compiler.cin import (
 from src.taco_torch.compiler.iter_lattice import IterationLattice
 from src.taco_torch.format import LevelType
 from src.taco_torch.utils import (
-    dtype_to_datatype,
     dtype_to_c_datatype,
     get_pytorch_c_dtype_str,
 )
@@ -478,7 +477,7 @@ class CINLowerer:
                                         type=llir.DataType.NO_TYPE,
                                     ),
                                     llir.Var(
-                                        name=f"torch::kInt",
+                                        name="torch::kInt",
                                         type=llir.DataType.NO_TYPE,
                                     ),
                                 ],
@@ -508,7 +507,7 @@ class CINLowerer:
                                         type=llir.DataType.NO_TYPE,
                                     ),
                                     llir.Var(
-                                        name=f"torch::kInt",
+                                        name="torch::kInt",
                                         type=llir.DataType.NO_TYPE,
                                     ),
                                 ],
@@ -553,6 +552,7 @@ class CINLowerer:
             # e.g. A._storage._index.mode_indices = {{A0_pos_torch, A0_crd_torch}, {A1_pos_torch, A1_crd_torch}};
 
             def get_result_mode_index_set(i, level_type: LevelType):
+                assert self.result_tensor_var, "Result tensor variable not set"
                 tensor_level_name = f"{self.result_tensor_var.get_name()}{i}"
                 if level_type == LevelType.DENSE:
                     return "{}"
@@ -639,7 +639,6 @@ class CINLowerer:
         """
         return llir.Var(
             name=tensor_var.get_name(),
-            # type=dtype_to_datatype(tvar.dtype),
             type=llir.DataType.TACO_TENSOR,
         )
 

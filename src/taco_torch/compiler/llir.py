@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Any, Union, TypeVar
+from typing import List, Optional, Any, Union, TypeVar, Sequence
 
 """
 TODO: maybe need this, maybe not
@@ -308,7 +308,7 @@ class Function(Stmt):
         self,
         return_type: DataType,
         name: str,
-        args: List[Expr],
+        args: Sequence[Expr],
         body: List[Stmt],
     ):
         self.return_type: DataType = return_type
@@ -444,6 +444,3 @@ class CppCodeGenerator(NodeVisitor):
 
     def generate_Return(self, node: Return):
         self.add_line(f"return {self.visit(node.value)};")
-
-    def generate_VarDecl(self, node: VarDecl):
-        self.add_line(f"{node.name} = {self.visit(node.value)};")

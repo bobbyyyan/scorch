@@ -90,7 +90,9 @@ class TacoTensor(torch.nn.Module):
     @property
     def format(self) -> TensorFormat:
         """Get the tensor format."""
-        return self.index.format
+        tensor_format = self.index.format
+        assert tensor_format is not None, "Tensor format is not set."
+        return tensor_format
 
     @property
     def storage(self) -> TensorStorage:
@@ -135,6 +137,14 @@ class TacoTensor(torch.nn.Module):
     def clone(self):
         """Clone the tensor."""
         # TODO: Implement this.
+        raise NotImplementedError()
+
+    def __add__(self, other) -> TacoTensor:
+        """Add two tensors together."""
+        raise NotImplementedError()
+
+    def __mul__(self, other) -> TacoTensor:
+        """Multiply two tensors together."""
         raise NotImplementedError()
 
     # function to create a TacoTensor from a torch.Tensor

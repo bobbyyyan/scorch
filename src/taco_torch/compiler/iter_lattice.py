@@ -622,7 +622,7 @@ class IterationLattice:
         def gen_single_lattice_loop(lattice_point: LatticePoint) -> List[llir.Stmt]:
             assert self.cin_lowerer, "CINLowerer not set"
 
-            stmts: List[llir.Node] = []
+            stmts: List[llir.Stmt] = []
 
             while_loop = llir.WhileLoop(
                 cond=lattice_point.get_while_condition(lattice=self),
@@ -641,12 +641,13 @@ class IterationLattice:
             # {result_tensor_var}{level}_pos[p{result_tensor_var}{parent_level} + 1] to
             # p{result_tensor_var}{level}
             result_tensor_var = self.cin_lowerer.result_tensor_var
+            assert result_tensor_var, "Result tensor var not set"
             result_tensor_access = self.cin_lowerer.result_tensor_access
-            level = result_tensor_access.level_of_index_var(lattice_point.index_var)
-            if (
-                result_tensor_access.level_type_of_index_var(lattice_point.index_var)
-                == LevelType.COMPRESSED
-            ):
+            assert result_tensor_access, "Result tensor access not set"
+            level = result_tensor_access.level_of_index_var(
+                lattice_point.get_index_var()
+            )
+            if level == LevelType.COMPRESSED:
                 stmts.extend(
                     [
                         llir.BlankLine(),
@@ -658,8 +659,9 @@ class IterationLattice:
                 # the parent level's crd
                 if level > 0:
                     parent_index_var = result_tensor_access.get_parent_index_var(
-                        lattice_point.index_var
+                        lattice_point.get_index_var()
                     )
+                    assert parent_index_var is not None, "Parent index var is None"
                     if (
                         result_tensor_access.level_type_of_index_var(parent_index_var)
                         == LevelType.COMPRESSED
@@ -701,7 +703,7 @@ class IterationLattice:
                         name=f"{result_tensor_var.name}{level}_pos.push_back",
                         args=[
                             llir.Var(
-                                name=f"{result_tensor_var.name}{level}_crd.size()",
+                                name=f"{result_tensor_var.get_name()}{level}_crd.size()",
                                 # name=f"p{result_tensor_var.name}{level}",
                                 type=llir.DataType.INT,
                             )
