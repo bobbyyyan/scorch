@@ -10,7 +10,6 @@ from src.taco_torch.format import LevelType
 
 @dataclass(frozen=False)
 class ModeIterator:
-
     tensor_var: Optional[TensorVar] = None
     tensor_access: Optional[TensorAccess] = None
     index_var: Optional[IndexVar] = None

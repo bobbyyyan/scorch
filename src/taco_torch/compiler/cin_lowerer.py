@@ -27,7 +27,6 @@ class CINLowerer:
     """
 
     def __init__(self):
-
         self.defined_index_vars: List[IndexVar] = []
         # dict from IndexVar to a List of llir.Stmt of dense coordinate resolution
         # the index var is the index var that needs to be defined before the coord
@@ -76,7 +75,6 @@ class CINLowerer:
                     )
                 )
             elif level_type == LevelType.COMPRESSED:
-
                 statements.append(
                     llir.VarInit(
                         var=llir.Var(
@@ -607,7 +605,6 @@ class CINLowerer:
         return []
 
     def lower_ForAll(self, stmt: ForAll) -> List[llir.Stmt]:
-
         """
         Lower a ForAll to LLIR
         parent_index_var is the index var of the parent ForAll, if any

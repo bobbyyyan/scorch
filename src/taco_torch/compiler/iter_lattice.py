@@ -194,7 +194,6 @@ class LatticePoint:
                 return None
 
         elif isinstance(cin, BinaryOp):
-
             left_new = self.get_simplified_cin(cin.left)
             right_new = self.get_simplified_cin(cin.right)
 
@@ -319,7 +318,6 @@ class LatticePoint:
     def get_candidate_coordinate_stmts(
         self, lattice: IterationLattice
     ) -> Sequence[llir.Stmt]:
-
         stmts: List[llir.Stmt] = []
         iterators = self.get_iterators()
 

@@ -107,6 +107,7 @@ def einsum(
     lhs_inside = ", ".join(
         [f'index_var_dict["{index_str}"]' for index_str in result_index_strs]
     )
+    assert result_tensor_var is not None, "result_tensor_var is not defined"
     code = f"result_tensor_var[{lhs_inside}] = {rhs}"
 
     exec(code)

@@ -100,7 +100,6 @@ class TacoTensor(torch.nn.Module):
         assert self._storage is not None, "Tensor storage is not set."
         return self._storage
 
-    # dtype property
     @property
     def dtype(self):
         """Get the tensor logical dtype."""

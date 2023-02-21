@@ -408,7 +408,6 @@ class CINVisitor:
 
 
 class CINVisitorAccept(CINVisitor):
-
     # A CIN visitor that make non-implemented nodes call their accept method
     # with the visitor as an argument.
     def generic_visit(self, node: CIN) -> None:
