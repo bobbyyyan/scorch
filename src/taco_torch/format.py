@@ -79,14 +79,33 @@ class TensorFormat(object):
     # or None (for a 0-order tensor/scalar)
     def __init__(
         self,
-        level_formats: Optional[Union[LevelFormat, List[LevelFormat]]] = None,
+        level_formats: Optional[
+            Union[LevelFormat, List[LevelFormat], List[str], str]
+        ] = None,
     ):
         if level_formats is None:
             self._level_formats = []
         elif isinstance(level_formats, LevelFormat):
             self._level_formats = [level_formats]
-        elif isinstance(level_formats, list):
-            self._level_formats = level_formats
+        elif isinstance(level_formats, str):
+            level_formats = list(level_formats)
+
+        if isinstance(level_formats, list):
+            if all(
+                isinstance(level_format, LevelFormat) for level_format in level_formats
+            ):
+                self._level_formats = level_formats
+            elif all(isinstance(level_format, str) for level_format in level_formats):
+                self._level_formats = []
+                for format_str in level_formats:
+                    if format_str in ["dense", "d"]:
+                        self._level_formats.append(LevelFormat(mode=LevelType.DENSE))
+                    elif format_str in ["compressed", "sparse", "c", "s"]:
+                        self._level_formats.append(
+                            LevelFormat(mode=LevelType.COMPRESSED)
+                        )
+                    else:
+                        raise ValueError(f"Invalid format string: {format_str}")
         else:
             raise ValueError("Invalid level_formats: {}".format(level_formats))
 

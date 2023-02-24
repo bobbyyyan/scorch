@@ -32,21 +32,6 @@ def test_cpp_ext_rand_matrix_tt():
     print(rand_tt_tensor._storage._value)  # type: ignore
 
 
-def test_cpp_ext_sparse_vector_mul():
-    tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
-    tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
-
-    sp_vector_a = TacoTensor.from_torch(tensor_a_torch, "a").to_sparse()
-    sp_vector_b = TacoTensor.from_torch(tensor_b_torch, "b").to_sparse()
-
-    result = einsum("i,i->i", sp_vector_a, sp_vector_b)
-
-    print("\nResult shape:", result.shape)
-    print("Result format:", result.format)
-    print("Result index:", result.index.mode_indices)
-    print("Result values:", result.values)
-
-
 def einsum(
     expression: str,
     *tensors: Union[torch.Tensor, TacoTensor],
