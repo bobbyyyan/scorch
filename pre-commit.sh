@@ -6,10 +6,10 @@ if [ "$PYTHON_VERSION_MIN_MET" == "False" ]; then
 fi
 
 # Upgrade pip
-python -m pip install --upgrade pip
+# python -m pip install --upgrade pip
 
 # Pin dependencies
-pip freeze -r requirements.txt > requirements.lock
+# pip freeze -r requirements.txt > requirements.lock
 
 # Code style and linting
 black --check --diff src

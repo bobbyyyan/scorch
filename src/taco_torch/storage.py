@@ -84,7 +84,7 @@ class TensorIndex(object):
 
     def get_size(self, mode: int) -> int:
         """Get the size of a mode."""
-        return self.get_mode_index(mode).shape[0]
+        return self.get_mode_index(mode)[0].shape[0]
 
     def get_sizes(self) -> List[int]:
         """Get the number of non-zero elements in each mode."""

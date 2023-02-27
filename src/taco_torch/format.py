@@ -91,23 +91,19 @@ class TensorFormat(object):
             level_formats = list(level_formats)
 
         if isinstance(level_formats, list):
-            if all(
-                isinstance(level_format, LevelFormat) for level_format in level_formats
-            ):
-                self._level_formats = level_formats
-            elif all(isinstance(level_format, str) for level_format in level_formats):
-                self._level_formats = []
-                for format_str in level_formats:
-                    if format_str in ["dense", "d"]:
+            self._level_formats = []
+            for level_format in level_formats:
+                if isinstance(level_format, str):
+                    if level_format in ["dense", "d"]:
                         self._level_formats.append(LevelFormat(mode=LevelType.DENSE))
-                    elif format_str in ["compressed", "sparse", "c", "s"]:
+                    elif level_format in ["compressed", "sparse", "c", "s"]:
                         self._level_formats.append(
                             LevelFormat(mode=LevelType.COMPRESSED)
                         )
                     else:
-                        raise ValueError(f"Invalid format string: {format_str}")
-        else:
-            raise ValueError("Invalid level_formats: {}".format(level_formats))
+                        raise ValueError(f"Invalid format string: {level_format}")
+                elif isinstance(level_format, LevelFormat):
+                    self._level_formats.append(level_format)
 
     def get_level_formats(self) -> List[LevelFormat]:
         assert self._level_formats is not None, "level_formats is None"

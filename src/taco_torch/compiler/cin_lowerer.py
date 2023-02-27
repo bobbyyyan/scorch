@@ -210,20 +210,26 @@ class CINLowerer:
             )
             # If the last level of the result tensor var is sparse, then we need to set
             # the coordinates
-            llir_stmts.append(llir.Comment("Set coordinates"))
-            llir_stmts.append(
-                llir.Assign(
-                    var=llir.Var(
-                        name=f"{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}_crd"
-                        + f"[p{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}]",
-                        type=llir.DataType.NO_TYPE,
-                    ),
-                    value=llir.Var(
-                        name=self.defined_index_vars[-1].name,
-                        type=llir.DataType.NO_TYPE,
-                    ),
+            if (
+                self.result_tensor_access.level_type_of_index_var(
+                    self.defined_index_vars[-1]
                 )
-            )
+                == LevelType.COMPRESSED
+            ):
+                llir_stmts.append(llir.Comment("Set coordinates"))
+                llir_stmts.append(
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}_crd"
+                            + f"[p{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        value=llir.Var(
+                            name=self.defined_index_vars[-1].name,
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    )
+                )
 
             # if has sparse index for result value array, need to increment
             if self.result_value_array_sparse_index_llir is not None:

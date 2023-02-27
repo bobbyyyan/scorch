@@ -265,7 +265,7 @@ class LatticePoint:
 
         all_inner_lattice_points = [self] + self.child_lattice_points
 
-        if self.child_lattice_points or len(self.iterators) > 1:
+        if self.child_lattice_points or (self.iterators and len(self.iterators) > 1):
             stmts.append(llir.BlankLine())
             stmts.append(llir.Comment("Inner loops over child regions"))
             if_conditions: List[llir.Expr] = []
