@@ -112,7 +112,7 @@ class DataType(Enum):
     TORCH_INT64 = "torch::kInt64"
     TORCH_INT8 = "torch::kInt8"
     TORCH_UINT8 = "torch::kUInt8"
-    TACO_TENSOR = "TacoTensor"
+    TACO_TENSOR = "Tensor"
     NO_TYPE = "NO_TYPE"
     CVECTOR_INT = "cvector<int>"
     CVECTOR_FLOAT32 = "cvector<float>"

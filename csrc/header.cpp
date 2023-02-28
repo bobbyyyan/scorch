@@ -13,7 +13,7 @@ typedef struct {
   TensorStorage _storage;
   // a tuple of ints as shape
   std::vector<int> _shape;
-} TacoTensor;
+} Tensor;
 
 // ####################################
 // ===== BEGIN === VECTOR IMPL ========

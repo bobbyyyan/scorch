@@ -10,7 +10,7 @@ from src.scorch.storage import TensorStorage, TensorIndex, TensorStorageView
 
 class Window(object):
     """A tensor window object that describes the slice into a physical storage (TensorStorage)
-    or another logical tensor (TacoTensor)
+    or another logical tensor (Tensor)
     Contains:
         - an offset for the starting coordinate of the window
         - a shape tuple for the shape of the window
@@ -32,7 +32,7 @@ class Window(object):
         return Window(deepcopy(self.offset), deepcopy(self.shape), deepcopy(self.step))
 
 
-class TacoTensor(torch.nn.Module):
+class Tensor(torch.nn.Module):
     """A tensor stored in custom format."""
 
     _name: Optional[str]
@@ -113,7 +113,7 @@ class TacoTensor(torch.nn.Module):
     def __str__(self):
         """Get a string representation of the tensor."""
         # return f"TacoTensor_{self._name}({self._storage})"
-        return "TacoTensor"
+        return "Tensor"
 
     def __repr__(self):
         """Get a string representation of the tensor."""
@@ -138,21 +138,21 @@ class TacoTensor(torch.nn.Module):
         # TODO: Implement this.
         raise NotImplementedError()
 
-    def __add__(self, other) -> TacoTensor:
+    def __add__(self, other) -> Tensor:
         """Add two tensors together."""
         raise NotImplementedError()
 
-    def __mul__(self, other) -> TacoTensor:
+    def __mul__(self, other) -> Tensor:
         """Multiply two tensors together."""
         raise NotImplementedError()
 
-    # function to create a TacoTensor from a torch.Tensor
+    # function to create a Tensor from a torch.Tensor
     @staticmethod
-    def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> TacoTensor:
-        """Create a TacoTensor from a torch.Tensor."""
+    def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
+        """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
         # and format is dense at every level
-        tt_tensor = TacoTensor(
+        tt_tensor = Tensor(
             name=name,
             shape=tuple(tensor.shape),
             storage=TensorStorage(
@@ -162,8 +162,8 @@ class TacoTensor(torch.nn.Module):
 
         return tt_tensor
 
-    # function to sparsify a TacoTensor
-    def to_sparse(self, fmt: Optional[TensorFormat] = None) -> TacoTensor:
+    # function to sparsify a Tensor
+    def to_sparse(self, fmt: Optional[TensorFormat] = None) -> Tensor:
         """Convert the tensor to a sparse tensor."""
         if len(self.shape) == 1:
             # Find indexes of non-zero elements in self.values, flatten them

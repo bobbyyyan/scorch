@@ -1,11 +1,11 @@
 from .ops import einsum
-from .tensor import TacoTensor
+from .tensor import Tensor
 from .format import TensorFormat
 
 __version__ = "0.0.1"
 
 __all__ = [
-    "TacoTensor",
+    "Tensor",
     "TensorFormat",
     "einsum",
     "__version__",

@@ -9,34 +9,40 @@ from src.scorch.compiler.cin_lowerer import CINLowerer
 from src.scorch.compiler.codegen import LLIRLowerer
 from src.scorch.format import TensorFormat, LevelFormat, LevelType
 from src.scorch.storage import TensorIndex
-from src.scorch.tensor import TacoTensor
+from src.scorch.tensor import Tensor
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
-ops_cpp = load(
-    name="ops_cpp",
-    sources=[str(PROJECT_ROOT_DIR / "csrc/ops.cpp")],
+# Register custom classes
+load(
+    name="pybind",
+    sources=[str(PROJECT_ROOT_DIR / "csrc/pybind.cpp")],
 )
 
-
-def test_cpp_ext_rand_matrix():
-    print("random tensor:")
-    print(ops_cpp.get_rand_matrix(7, 8))
-
-
-def test_cpp_ext_rand_matrix_tt():
-    print("random tt tensor:")
-    rand_tt_tensor: TacoTensor = ops_cpp.get_rand_matrix_tt(7, 8)
-    print(rand_tt_tensor._storage._value)  # type: ignore
+# ops_cpp = load(
+#     name="ops_cpp",
+#     sources=[str(PROJECT_ROOT_DIR / "csrc/ops.cpp")],
+# )
+#
+#
+# def test_cpp_ext_rand_matrix():
+#     print("random tensor:")
+#     print(ops_cpp.get_rand_matrix(7, 8))
+#
+#
+# def test_cpp_ext_rand_matrix_tt():
+#     print("random tt tensor:")
+#     rand_tt_tensor: Tensor = ops_cpp.get_rand_matrix_tt(7, 8)
+#     print(rand_tt_tensor._storage._value)  # type: ignore
 
 
 def einsum(
     expression: str,
-    *tensors: Union[torch.Tensor, TacoTensor],
+    *tensors: Union[torch.Tensor, Tensor],
     **kwargs: Any,
-) -> TacoTensor:
+) -> Tensor:
     """Perform a tensor contraction using the TACO compiler."""
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
     # elementwise multiplication or "ik,kj->ij" for matrix multiplication
@@ -62,7 +68,7 @@ def einsum(
     # Create TensorVar's for each tensor
     tensor_vars = []
     for tensor in tensors:
-        if isinstance(tensor, TacoTensor):
+        if isinstance(tensor, Tensor):
             tensor_vars.append(TensorVar(name=tensor.name, fmt=tensor.format))
 
     # Get output format from kwargs
@@ -116,6 +122,8 @@ def einsum(
 
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
+    # print("\n\n", cpp_code)
+
     # Read header_cpp_code from csrc/header.cpp
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
         header_cpp_code = f.read()
@@ -129,7 +137,17 @@ def einsum(
     #     f.write(
     #         f"""
     #         PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-    #             m.def("evaluate", &evaluate);
+    #           m.def("evaluate", &evaluate);
+    #             pybind11::class_<Tensor>(m, "Tensor")
+    #               .def(pybind11::init<>())
+    #               .def_readwrite("_storage", &Tensor::_storage);
+    #             pybind11::class_<TensorStorage>(m, "TensorStorage")
+    #               .def(pybind11::init<>())
+    #               .def_readwrite("_value", &TensorStorage::_value)
+    #               .def_readwrite("_index", &TensorStorage::_index);
+    #             pybind11::class_<TensorIndex>(m, "TensorIndex")
+    #               .def(pybind11::init<>())
+    #               .def_readwrite("mode_indices", &TensorIndex::mode_indices);
     #         }}
     #         """
     #     )
@@ -158,7 +176,7 @@ def einsum(
         args.append(tensor._storage.value)  # type: ignore
 
     result_cpp = module.evaluate(*args)
-    result = TacoTensor(
+    result = Tensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp._storage._index.mode_indices,

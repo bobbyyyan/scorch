@@ -207,7 +207,7 @@ class TensorAccess(IndexExpr):
     A tensor access in the taco IR.
     e.g. A[i, j]
     Access expressions are returned when calling the overloaded
-    __getitem__ method on a TacoTensor.
+    __getitem__ method on a Tensor.
     Access expressions can be assigned an expression using the overloaded
     __setitem__ method, which happens when they are on the left hand side
     of an assignment.

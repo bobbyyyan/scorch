@@ -1,14 +1,14 @@
 import torch
-from src.scorch import TacoTensor
+from src.scorch import Tensor
 from src.scorch.format import TensorFormat, LevelFormat, LevelType
 from src.scorch.storage import TensorStorage, TensorIndex
 
-A = TacoTensor(name="A", value=torch.randn(3, 4))
-B = TacoTensor(name="B", value=torch.randn(3, 4))
+A = Tensor(name="A", value=torch.randn(3, 4))
+B = Tensor(name="B", value=torch.randn(3, 4))
 
 # Create a Compressed sparse vector A that has name "vector_a" and shape (4,),
 # and the index and value for [1, 0, 2, 4]
-vector_a = TacoTensor(
+vector_a = Tensor(
     name="vector_a",
     storage=TensorStorage(
         index=TensorIndex(
@@ -24,7 +24,7 @@ vector_a = TacoTensor(
 
 # Create a Compressed sparse vector B that has name "vector_b" and shape (4,),
 # and the index and value for [8, 1, 6, 0]
-vector_b = TacoTensor(
+vector_b = Tensor(
     name="vector_b",
     storage=TensorStorage(
         index=TensorIndex(
@@ -40,7 +40,7 @@ vector_b = TacoTensor(
 
 # Create a Compressed sparse vector C that has name "vector_c" and shape (4,),
 # and the index and value that will be computed
-vector_c = TacoTensor(
+vector_c = Tensor(
     name="vector_c",
     storage=TensorStorage(
         index=TensorIndex(
