@@ -1,7 +1,7 @@
 import torch
-from src.taco_torch import TacoTensor
-from src.taco_torch.format import TensorFormat, LevelFormat, LevelType
-from src.taco_torch.storage import TensorStorage, TensorIndex
+from src.scorch import TacoTensor
+from src.scorch.format import TensorFormat, LevelFormat, LevelType
+from src.scorch.storage import TensorStorage, TensorIndex
 
 A = TacoTensor(name="A", value=torch.randn(3, 4))
 B = TacoTensor(name="B", value=torch.randn(3, 4))

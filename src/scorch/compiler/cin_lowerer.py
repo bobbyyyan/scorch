@@ -1,7 +1,7 @@
 from typing import List, Optional, Dict, Union
 
-from src.taco_torch.compiler import llir
-from src.taco_torch.compiler.cin import (
+from src.scorch.compiler import llir
+from src.scorch.compiler.cin import (
     IndexStmt,
     IndexVar,
     TensorVar,
@@ -13,9 +13,9 @@ from src.taco_torch.compiler.cin import (
     BinaryOp,
     CIN,
 )
-from src.taco_torch.compiler.iter_lattice import IterationLattice
-from src.taco_torch.format import LevelType
-from src.taco_torch.utils import (
+from src.scorch.compiler.iter_lattice import IterationLattice
+from src.scorch.format import LevelType
+from src.scorch.utils import (
     dtype_to_c_datatype,
     get_pytorch_c_dtype_str,
 )

@@ -4,12 +4,12 @@ from typing import Any, Union, Sequence
 import torch
 from torch.utils.cpp_extension import load
 
-from src.taco_torch.compiler.cin import IndexVar, TensorVar, ForAll
-from src.taco_torch.compiler.cin_lowerer import CINLowerer
-from src.taco_torch.compiler.codegen import LLIRLowerer
-from src.taco_torch.format import TensorFormat, LevelFormat, LevelType
-from src.taco_torch.storage import TensorIndex
-from src.taco_torch.tensor import TacoTensor
+from src.scorch.compiler.cin import IndexVar, TensorVar, ForAll
+from src.scorch.compiler.cin_lowerer import CINLowerer
+from src.scorch.compiler.codegen import LLIRLowerer
+from src.scorch.format import TensorFormat, LevelFormat, LevelType
+from src.scorch.storage import TensorIndex
+from src.scorch.tensor import TacoTensor
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():

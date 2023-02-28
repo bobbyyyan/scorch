@@ -1,6 +1,6 @@
 from typing import Union, List, TypeVar, cast
 
-from src.taco_torch.compiler import llir
+from src.scorch.compiler import llir
 
 LLIR_NODE = TypeVar("LLIR_NODE", bound=llir.Node)
 

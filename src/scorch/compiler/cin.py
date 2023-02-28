@@ -6,8 +6,8 @@ from typing import List, Optional, Any, Tuple, Callable, Union
 
 import torch
 
-from src.taco_torch.format import TensorFormat, LevelType
-from src.taco_torch.utils import get_format_from_list
+from src.scorch.format import TensorFormat, LevelType
+from src.scorch.utils import get_format_from_list
 
 # Type aliases for type hints
 _UnaryOp = Callable[[Any], Any]

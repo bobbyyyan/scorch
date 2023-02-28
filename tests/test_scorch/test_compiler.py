@@ -1,6 +1,6 @@
-from src.taco_torch.compiler.cin import IndexVar, TensorVar, ForAll
-from src.taco_torch.compiler.cin_lowerer import CINLowerer
-from src.taco_torch.compiler.codegen import LLIRLowerer
+from src.scorch.compiler.cin import IndexVar, TensorVar, ForAll
+from src.scorch.compiler.cin_lowerer import CINLowerer
+from src.scorch.compiler.codegen import LLIRLowerer
 
 
 def test_elemwise_vector_mul_sss():

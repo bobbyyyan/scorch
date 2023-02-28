@@ -1,5 +1,5 @@
 import torch
-from src.taco_torch import TacoTensor
+from src.scorch import TacoTensor
 
 A = TacoTensor(name="A", value=torch.randn(3, 4))
 B = TacoTensor(name="B", value=torch.randn(3, 4))

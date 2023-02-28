@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Union, List
 
-from src.taco_torch.compiler import llir
+from src.scorch.compiler import llir
 
 
 class LevelType(Enum):

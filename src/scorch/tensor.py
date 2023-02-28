@@ -4,8 +4,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from src.taco_torch.format import TensorFormat, LevelFormat, LevelType
-from src.taco_torch.storage import TensorStorage, TensorIndex, TensorStorageView
+from src.scorch.format import TensorFormat, LevelFormat, LevelType
+from src.scorch.storage import TensorStorage, TensorIndex, TensorStorageView
 
 
 class Window(object):

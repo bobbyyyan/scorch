@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, List
 
-from src.taco_torch.compiler import llir
-from src.taco_torch.compiler.cin import TensorVar, TensorAccess, IndexVar
-from src.taco_torch.format import LevelType
+from src.scorch.compiler import llir
+from src.scorch.compiler.cin import TensorVar, TensorAccess, IndexVar
+from src.scorch.format import LevelType
 
 
 @dataclass(frozen=False)
