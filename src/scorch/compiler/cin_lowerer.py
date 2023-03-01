@@ -344,6 +344,25 @@ class CINLowerer:
                 self.get_value_array_statement(tensor)
             )
 
+        # Generate per-level size variables for each dense level in result tensor
+        result_tensor_level_sizes: List[llir.Stmt] = [
+            llir.Comment("Init result tensor level sizes")
+        ]
+        for i, level_type in enumerate(self.result_tensor_var.get_level_types()):
+            if level_type == LevelType.DENSE:
+                result_tensor_level_sizes.append(
+                    llir.VarInit(
+                        llir.Var(
+                            name=f"{self.result_tensor_var.get_name()}{i}_size",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Var(
+                            name=f"result_shape[{i}]",
+                            type=llir.DataType.INT,
+                        ),
+                    )
+                )
+
         # A mapping from IndexVar to a list of (TensorVar, level: int, LevelType) tuples
         self.index_var_to_rhs_tensor_level_type = {}
         for tensor_access in rhs_tensor_accesses:
@@ -432,6 +451,8 @@ class CINLowerer:
 
             body_stmts.extend(
                 [
+                    *result_tensor_level_sizes,
+                    llir.BlankLine(),
                     llir.Comment("Get tensor level arrays"),
                     *tensor_level_array_assign_stmts,
                     llir.BlankLine(),
@@ -627,6 +648,8 @@ class CINLowerer:
 
         stmts.extend(
             [
+                llir.Comment("Assemble dense result level as needed"),
+                llir.BlankLine(),
                 *iter_lattice.get_iterator_init_stmts(),
                 llir.BlankLine(),
                 *iter_lattice.get_lattice_loops(),
