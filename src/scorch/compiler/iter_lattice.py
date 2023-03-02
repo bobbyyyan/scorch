@@ -266,7 +266,6 @@ class LatticePoint:
         all_inner_lattice_points = [self] + self.child_lattice_points
 
         if self.child_lattice_points or (self.iterators and len(self.iterators) > 1):
-            stmts.append(llir.BlankLine())
             stmts.append(llir.Comment("Inner loops over child regions"))
             if_conditions: List[llir.Expr] = []
             then_body_list = []
@@ -622,6 +621,17 @@ class IterationLattice:
 
             stmts: List[llir.Stmt] = []
 
+            # If we have a sparse level here, we need to set
+            # {result_tensor_var}{level}_pos[p{result_tensor_var}{parent_level} + 1] to
+            # p{result_tensor_var}{level}
+            result_tensor_var = self.cin_lowerer.result_tensor_var
+            assert result_tensor_var, "Result tensor var not set"
+            result_tensor_access = self.cin_lowerer.result_tensor_access
+            assert result_tensor_access, "Result tensor access not set"
+            index_var = lattice_point.get_index_var()
+            level = result_tensor_access.level_of_index_var(index_var)
+            level_type = result_tensor_access.level_type_of_index_var(index_var)
+
             while_loop = llir.WhileLoop(
                 cond=lattice_point.get_while_condition(lattice=self),
                 body=[
@@ -635,21 +645,11 @@ class IterationLattice:
 
             stmts.append(while_loop)
 
-            # If we have a sparse level here, we need to set
-            # {result_tensor_var}{level}_pos[p{result_tensor_var}{parent_level} + 1] to
-            # p{result_tensor_var}{level}
-            result_tensor_var = self.cin_lowerer.result_tensor_var
-            assert result_tensor_var, "Result tensor var not set"
-            result_tensor_access = self.cin_lowerer.result_tensor_access
-            assert result_tensor_access, "Result tensor access not set"
-            level = result_tensor_access.level_of_index_var(
-                lattice_point.get_index_var()
-            )
-            if level == LevelType.COMPRESSED:
+            if level_type == LevelType.COMPRESSED:
                 stmts.extend(
                     [
                         llir.BlankLine(),
-                        llir.Comment("Set position index"),
+                        llir.Comment("Assembly compressed level indices"),
                     ]
                 )
 

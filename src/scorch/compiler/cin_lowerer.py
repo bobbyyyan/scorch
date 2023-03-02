@@ -646,10 +646,22 @@ class CINLowerer:
 
         stmts: List[llir.Stmt] = []
 
+        # If the result level for this index_var is dense, need to assemble the result by
+        # setting the corresponding values in the result values array to 0
+        if (
+            self.result_tensor_access
+            and self.result_tensor_access.level_type_of_index_var(index_var)
+            == LevelType.DENSE
+        ):
+            stmts.extend(
+                [
+                    llir.Comment("Assemble dense result level as needed"),
+                    llir.BlankLine(),
+                ]
+            )
+
         stmts.extend(
             [
-                llir.Comment("Assemble dense result level as needed"),
-                llir.BlankLine(),
                 *iter_lattice.get_iterator_init_stmts(),
                 llir.BlankLine(),
                 *iter_lattice.get_lattice_loops(),

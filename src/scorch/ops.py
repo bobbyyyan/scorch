@@ -83,7 +83,7 @@ def einsum(
         output_format = TensorFormat(level_formats)
 
     # Create the result TensorVar
-    result_tensor_var = TensorVar(name="result", fmt=output_format)
+    result_tensor_var = TensorVar(name="RESULT", fmt=output_format)
 
     # Generate the python code for constructing the TensorAccess's, and TensorAssign and execute it
     assert index_var_dict, "index_var_dict is empty"
