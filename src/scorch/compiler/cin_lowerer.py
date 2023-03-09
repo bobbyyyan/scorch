@@ -653,12 +653,91 @@ class CINLowerer:
             and self.result_tensor_access.level_type_of_index_var(index_var)
             == LevelType.DENSE
         ):
-            stmts.extend(
+            # If the parent level is not dense or has no parent level,
+            # and the next levels are all dense
+            # then we need to initialize result value array elements to 0
+            level_of_index_var = self.result_tensor_access.level_of_index_var(index_var)
+            if (
+                (level_of_index_var == 0)
+                or (
+                    self.result_tensor_access.level_types()[level_of_index_var - 1]
+                    != LevelType.DENSE
+                )
+            ) and all(
                 [
-                    llir.Comment("Assemble dense result level as needed"),
-                    llir.BlankLine(),
+                    self.result_tensor_access.level_types()[i] == LevelType.DENSE
+                    for i in range(
+                        level_of_index_var + 1, self.result_tensor_access.num_levels
+                    )
                 ]
-            )
+            ):
+                stmts.extend(
+                    [
+                        llir.Comment("Assemble dense result level as needed"),
+                        # initialize a result stride variable = current_level_size * next_level_size * ...
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{self.result_tensor_var.get_name()}_stride",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Var(
+                                name=" * ".join(
+                                    [
+                                        f"{self.result_tensor_var.get_name()}{i}_size"
+                                        for i in range(
+                                            level_of_index_var,
+                                            self.result_tensor_access.num_levels,
+                                        )
+                                    ]
+                                ),
+                                type=llir.DataType.INT,
+                            ),
+                        ),
+                        # for (int i = 0; i < <result_tensor_name>_stride; i++) {
+                        #   <result_tensor_name>_values[i] = 0;
+                        # }
+                        llir.ForLoop(
+                            init=llir.VarInit(
+                                var=llir.Var(
+                                    name="i",
+                                    type=llir.DataType.INT,
+                                ),
+                                value=llir.Literal(
+                                    value="0",
+                                ),
+                            ),
+                            cond=llir.BinOp(
+                                op="<",
+                                left=llir.Var(
+                                    name="i",
+                                    type=llir.DataType.INT,
+                                ),
+                                right=llir.Var(
+                                    name=f"{self.result_tensor_var.get_name()}_stride",
+                                    type=llir.DataType.INT,
+                                ),
+                            ),
+                            update=llir.Increment(
+                                var=llir.Var(
+                                    name="i",
+                                    type=llir.DataType.INT,
+                                ),
+                            ),
+                            body=[
+                                llir.Assign(
+                                    var=llir.Var(
+                                        name=f"{self.result_tensor_var.get_name()}_values[i]",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    value=llir.Literal(
+                                        value="0",
+                                    ),
+                                )
+                            ],
+                        ),
+                        llir.BlankLine(),
+                    ]
+                )
 
         stmts.extend(
             [

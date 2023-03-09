@@ -346,7 +346,7 @@ class ForLoop(Stmt):
         self,
         init: Union[VarInit, VarDecl],
         cond: Expr,
-        update: Union[VarInit, FunctionCall],
+        update: Union[Increment, VarInit, FunctionCall],
         body: List[Stmt],
     ):
         self.init = init

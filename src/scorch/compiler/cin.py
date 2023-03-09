@@ -242,6 +242,13 @@ class TensorAccess(IndexExpr):
     def level_type_of_index_var(self, index: IndexVar) -> LevelType:
         return self.tensor.get_level_types()[self.level_of_index_var(index)]
 
+    def level_types(self) -> List[LevelType]:
+        return self.tensor.get_level_types()
+
+    @property
+    def num_levels(self) -> int:
+        return len(self.indices)
+
     def __getitem__(self, index) -> "TensorAccess":
         return TensorAccess(self.tensor, self.indices + [index])
 

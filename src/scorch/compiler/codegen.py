@@ -17,6 +17,7 @@ class LLIRLowerer:
         self,
         ir: Union[LLIR_NODE, List[LLIR_NODE], str, List[str]],
         indent_level: int = 0,
+        no_semicolon: bool = False,
     ) -> str:
         if isinstance(ir, str):
             return indent_level * self.indent_str + ir
@@ -55,6 +56,10 @@ class LLIRLowerer:
                 f"{self.lower_llir(ir.left)} {ir.op} {self.lower_llir(ir.right)}",
                 indent_level,
             )
+        elif isinstance(ir, llir.UnaryOp):
+            return self.lower_llir(
+                f"{ir.op} {self.lower_llir(ir.operand)}", indent_level
+            )
         elif isinstance(ir, llir.FunctionCall):
             return self.lower_llir(
                 f"{ir.name}({', '.join([self.lower_llir(arg) for arg in ir.args])})",
@@ -73,6 +78,18 @@ class LLIRLowerer:
         elif isinstance(ir, llir.WhileLoop):
             return (
                 self.lower_llir(f"while ({self.lower_llir(ir.cond)}) {{", indent_level)
+                + "\n"
+                + self.lower_llir(ir.body, indent_level + 1)
+                + "\n"
+                + self.lower_llir("}", indent_level)
+            )
+
+        elif isinstance(ir, llir.ForLoop):
+            return (
+                self.lower_llir(
+                    f"for ({self.lower_llir(ir.init)} {self.lower_llir(ir.cond)}; {self.lower_llir(ir.update, no_semicolon=True)}) {{",
+                    indent_level,
+                )
                 + "\n"
                 + self.lower_llir(ir.body, indent_level + 1)
                 + "\n"
@@ -144,6 +161,8 @@ class LLIRLowerer:
             return self.lower_llir(f"{ir.var.type.value} {ir.var.name};", indent_level)
 
         elif isinstance(ir, llir.Increment):
+            if no_semicolon:
+                return self.lower_llir(f"{ir.var.name}++", indent_level)
             return self.lower_llir(f"{ir.var.name}++;", indent_level)
 
         elif isinstance(ir, llir.Function):
