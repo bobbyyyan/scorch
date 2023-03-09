@@ -8,6 +8,7 @@ class LevelType(Enum):
     DENSE = "d"
     COMPRESSED = "s"
     SINGLETON = "singleton"
+    COORDINATE = "o"
 
 
 class LevelFormat(object):
@@ -99,6 +100,14 @@ class TensorFormat(object):
                     elif level_format in ["compressed", "sparse", "c", "s"]:
                         self._level_formats.append(
                             LevelFormat(mode=LevelType.COMPRESSED)
+                        )
+                    elif level_format in ["singleton", "single", "s"]:
+                        self._level_formats.append(
+                            LevelFormat(mode=LevelType.SINGLETON)
+                        )
+                    elif level_format in ["coordinate", "coord", "o"]:
+                        self._level_formats.append(
+                            LevelFormat(mode=LevelType.COORDINATE)
                         )
                     else:
                         raise ValueError(f"Invalid format string: {level_format}")
