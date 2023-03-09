@@ -128,6 +128,31 @@ def test_elemwise_vector_add_sss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_elemwise_vector_add_dss():
+    # elementwise vector addition code generation
+    # a[i] = b[i] + c[i]
+    # taco "a(i) = b(i)+c(i)" -f=a:d -f=b:s -f=c:s -print-evaluate
+    i = IndexVar("i")
+
+    a = TensorVar("a", fmt="dense")
+    b = TensorVar("b", fmt="sparse")
+    c = TensorVar("c", fmt="sparse")
+    # c = TensorVar("c", fmt="dense")
+
+    a[i] = b[i] + c[i]
+
+    cin_stmt = ForAll(i, a._assignment)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elemwise_vector_add_sds():
     # elementwise vector addition code generation
     # a[i] = b[i] + c[i]
@@ -144,6 +169,160 @@ def test_elemwise_vector_add_sds():
     a[i] = b[i] + c[i]
 
     cin_stmt = ForAll(i, a._assignment)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_mul_3d_tensor_dss_sss_sss():
+    # A[i, j, k] = B[i, j, k] * C[i, j, k]
+    # taco "A(i,j,k) = B(i,j,k) * C(i,j,k)" -f=A:dss -f=B:sss -f=C:sss -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt=["dense", "sparse", "sparse"])
+    B = TensorVar("B", fmt=["sparse", "sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse", "sparse", "sparse"])
+
+    A[i, j, k] = B[i, j, k] * C[i, j, k]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, A._assignment)))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_mul_4d_tensor_oooo_ssss_ssss():
+    # taco "A(i,j,k,l)=B(i,j,k,l)*C(i,j,k,l)" -f=A:uccq:0,1,2,3 -f=B:ssss:0,1,2,3 -f=C:ssss:0,1,2,3 -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    l = IndexVar("l")
+
+    A = TensorVar("A", fmt=["coord", "coord", "coord", "coord"])
+    B = TensorVar("B", fmt=["sparse", "sparse", "sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse", "sparse", "sparse", "sparse"])
+
+    A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_mul_4d_tensor_ssss_ssss_ssss():
+    # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+    # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ssss -f=B:ssss -f=C:ssss -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    l = IndexVar("l")
+
+    A = TensorVar("A", fmt=["sparse", "sparse", "sparse", "sparse"])
+    B = TensorVar("B", fmt=["sparse", "sparse", "sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse", "sparse", "sparse", "sparse"])
+
+    A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_mul_4d_tensor_ssdd_ssss_ssss():
+    # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+    # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ssdd -f=B:ssss -f=C:ssss -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    l = IndexVar("l")
+
+    A = TensorVar("A", fmt=["sparse", "sparse", "dense", "dense"])
+    B = TensorVar("B", fmt=["sparse", "sparse", "sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse", "sparse", "sparse", "sparse"])
+
+    A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_mul_4d_tensor_dddd_ssss_ssss():
+    # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+    # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:dddd -f=B:ssss -f=C:ssss -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    l = IndexVar("l")
+
+    A = TensorVar("A", fmt=["dense", "dense", "dense", "dense"])
+    B = TensorVar("B", fmt=["sparse", "sparse", "sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse", "sparse", "sparse", "sparse"])
+
+    A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_mul_4d_tensor_ddss_ssss_ssss():
+    # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+    # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ddss -f=B:ssss -f=C:ssss -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    l = IndexVar("l")
+
+    A = TensorVar("A", fmt=["dense", "dense", "sparse", "sparse"])
+    B = TensorVar("B", fmt=["sparse", "sparse", "sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse", "sparse", "sparse", "sparse"])
+
+    A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
 
     lowerer = CINLowerer()
 
@@ -233,6 +412,29 @@ def test_elemwise_matrix_mul_ss_ss_ss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_elemwise_matrix_mul_oo_oo_oo():
+    # taco "A(i,j)=B(i,j)*C(i,j)" -f=A:uq:0,1 -f=B:uq:0,1 -f=C:uq:0,1 -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["coordinate", "coordinate"])
+    B = TensorVar("B", fmt=["coordinate", "coordinate"])
+    C = TensorVar("C", fmt=["coordinate", "coordinate"])
+
+    A[i, j] = B[i, j] * C[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elemwise_matrix_mul_ds_ss_ss():
     # elementwise matrix multiplication code generation
     # A[i, j] = B[i, j] * C[i, j]
@@ -268,6 +470,32 @@ def test_elemwise_matrix_add_ss_ss_ss():
     j = IndexVar("j")
 
     A = TensorVar("A", fmt=["sparse", "sparse"])
+    B = TensorVar("B", fmt=["sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse", "sparse"])
+
+    A[i, j] = B[i, j] + C[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_matrix_add_ds_ss_ss():
+    # elementwise matrix multiplication code generation
+    # A[i, j] = B[i, j] * C[i, j]
+    # taco "A(i,j) = B(i,j) + C(i,j)" -f=A:ds -f=B:ss -f=C:ss -print-evaluate
+
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["dense", "sparse"])
     B = TensorVar("B", fmt=["sparse", "sparse"])
     C = TensorVar("C", fmt=["sparse", "sparse"])
 
