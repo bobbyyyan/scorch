@@ -327,6 +327,8 @@ class CINLowerer:
                         )
                     )
 
+                    result_level_indices_init_stmts.append(llir.BlankLine())
+
         if result_level_indices_init_stmts:
             result_level_indices_init_stmts = [
                 llir.Comment("Init result level indices"),
@@ -345,9 +347,7 @@ class CINLowerer:
             )
 
         # Generate per-level size variables for each dense level in result tensor
-        result_tensor_level_sizes: List[llir.Stmt] = [
-            llir.Comment("Init result tensor level sizes")
-        ]
+        result_tensor_level_sizes: List[llir.Stmt] = []
         for i, level_type in enumerate(self.result_tensor_var.get_level_types()):
             if level_type == LevelType.DENSE:
                 result_tensor_level_sizes.append(
@@ -362,6 +362,11 @@ class CINLowerer:
                         ),
                     )
                 )
+
+        if result_tensor_level_sizes:
+            result_tensor_level_sizes = [
+                llir.Comment("Init result tensor level sizes")
+            ] + result_tensor_level_sizes
 
         # A mapping from IndexVar to a list of (TensorVar, level: int, LevelType) tuples
         self.index_var_to_rhs_tensor_level_type = {}

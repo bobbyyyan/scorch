@@ -22,6 +22,8 @@ def get_format_from_list(format_str_list: List[str]) -> TensorFormat:
             level_formats.append(LevelFormat(mode=LevelType.DENSE))
         elif format_str in ["compressed", "sparse", "c", "s"]:
             level_formats.append(LevelFormat(mode=LevelType.COMPRESSED))
+        elif format_str in ["coordinate", "coord", "o"]:
+            level_formats.append(LevelFormat(mode=LevelType.COORDINATE))
         else:
             raise ValueError(f"Invalid format string: {format_str}")
     return TensorFormat(level_formats=level_formats)

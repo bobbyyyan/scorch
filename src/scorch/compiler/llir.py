@@ -119,6 +119,7 @@ class DataType(Enum):
     CVECTOR_TORCH_FLOAT32 = "cvector<torch::kFloat32>"
     STD_VECTOR_INT = "std::vector<int>"
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
+    ARRAY_INT = "int[]"
 
     @classmethod
     def cvector_type(cls, dtype: DataType) -> DataType:
@@ -337,6 +338,14 @@ class Array(Expr):
     def __init__(self, values: List[Expr], data_type: DataType):
         self.values = values
         self.data_type = data_type
+
+
+@dataclass(frozen=False)
+class ArrayAccess(Expr):
+    """An array access expression."""
+
+    array: Expr
+    index: Expr
 
 
 class ForLoop(Stmt):

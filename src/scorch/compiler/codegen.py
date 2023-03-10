@@ -75,6 +75,13 @@ class LLIRLowerer:
                 f"{{{', '.join([self.lower_llir(v) for v in ir.values])}}}",
                 indent_level,
             )
+
+        elif isinstance(ir, llir.ArrayAccess):
+            return self.lower_llir(
+                f"{self.lower_llir(ir.array)}[{self.lower_llir(ir.index)}]",
+                indent_level,
+            )
+
         elif isinstance(ir, llir.WhileLoop):
             return (
                 self.lower_llir(f"while ({self.lower_llir(ir.cond)}) {{", indent_level)

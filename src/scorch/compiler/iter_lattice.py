@@ -335,6 +335,7 @@ class LatticePoint:
             # Only need to break ties among the resolved sparse coordinates
             # if we don't have a dense domain
             if not lattice.dense_index_var_llir:
+                stmts.append(llir.BlankLine())
                 stmts.append(llir.Comment("Resolve coordinates"))
                 stmts.append(
                     llir.VarInit(
@@ -353,6 +354,70 @@ class LatticePoint:
                     )
                 )
                 stmts.append(llir.BlankLine())
+
+                coordinate_level_iterator_end_resolution_stmts: List[llir.Stmt] = []
+                # e.g. once i is known, we can compute the end of the iterators for the second level
+                #    int pB1_end = pB0;
+                #    while (pB1_end < pB0_end && B0_crd[pB1_end] == i) {
+                #      pB1_end++;
+                #    }
+                for it in iterators:
+                    # Only do this for coordinate levels
+                    if it.level_type == LevelType.COORDINATE:
+                        # If the next level is still a valid level
+                        if (it.level + 1) < it.tensor_var.levels:
+                            next_level_iterator_end_llir = llir.Var(
+                                name=f"p{it.tensor_var.name}{it.level + 1}_end",
+                                type=llir.DataType.INT,
+                            )
+
+                            # int pB1_end = pB0;
+                            coordinate_level_iterator_end_resolution_stmts.append(
+                                llir.VarInit(
+                                    var=next_level_iterator_end_llir,
+                                    value=it.iterator_var_llir,
+                                )
+                            )
+
+                            # while (pB1_end < pB0_end && B0_crd[pB1_end] == i) {
+                            #   pB1_end++;
+                            # }
+                            coordinate_level_iterator_end_resolution_stmts.append(
+                                llir.WhileLoop(
+                                    cond=llir.BinOp(
+                                        op="&&",
+                                        left=llir.BinOp(
+                                            op="<",
+                                            left=next_level_iterator_end_llir,
+                                            right=it.iterator_var_end_var_llir,
+                                        ),
+                                        right=llir.BinOp(
+                                            op="==",
+                                            left=llir.ArrayAccess(
+                                                array=llir.Var(
+                                                    name=f"{it.tensor_var.name}{it.level}_crd",
+                                                    type=llir.DataType.ARRAY_INT,
+                                                ),
+                                                index=next_level_iterator_end_llir,
+                                            ),
+                                            right=self.get_index_var_llir(),
+                                        ),
+                                    ),
+                                    body=[
+                                        llir.Increment(
+                                            var=next_level_iterator_end_llir,
+                                        )
+                                    ],
+                                )
+                            )
+                            coordinate_level_iterator_end_resolution_stmts.append(
+                                llir.BlankLine()
+                            )
+
+                if coordinate_level_iterator_end_resolution_stmts:
+                    stmts.append(llir.Comment("Find iterator end for coordinate level"))
+                    stmts.extend(coordinate_level_iterator_end_resolution_stmts)
+
         elif len(iterators) == 1:
             stmts.append(llir.Comment("Resolve coordinates"))
             stmts.append(
@@ -715,7 +780,7 @@ class IterationLattice:
             [
                 [
                     *gen_single_lattice_loop(p),
-                    llir.BlankLine(),
+                    # llir.BlankLine(),
                 ]
                 for p in self.get_lattice_points()
             ]

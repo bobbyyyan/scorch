@@ -61,19 +61,26 @@ class ModeIterator:
         return self.iterator_var_end_value_llir
 
     def get_init_stmts(self) -> List[llir.Stmt]:
-        if self.level_type == LevelType.COMPRESSED:
-            return [
+        stmts: List[llir.Stmt] = []
+        if (
+            self.level_type == LevelType.COMPRESSED
+            or self.level_type == LevelType.COORDINATE
+        ):
+            stmts.append(
                 llir.VarInit(
                     var=self.get_iterator_var_llir(),
                     value=self.get_iterator_var_begin_value_llir(),
-                ),
-                llir.VarInit(
-                    var=self.get_iterator_var_end_var_llir(),
-                    value=self.get_iterator_var_end_value_llir(),
-                ),
-            ]
+                )
+            )
+            if self.iterator_var_end_value_llir:
+                stmts.append(
+                    llir.VarInit(
+                        var=self.get_iterator_var_end_var_llir(),
+                        value=self.get_iterator_var_end_value_llir(),
+                    )
+                )
 
-        return []
+        return stmts
 
     def __post_init__(self):
         # IndexVar must be provided
@@ -126,7 +133,10 @@ class ModeIterator:
                 raise Exception("Cannot infer parent_index_var")
 
         if self.iterator_var_llir is None:
-            if self.level_type == LevelType.COMPRESSED:
+            if (
+                self.level_type == LevelType.COMPRESSED
+                or self.level_type == LevelType.COORDINATE
+            ):
                 self.iterator_var_llir = llir.Var(
                     name=f"p{self.tensor_var.get_name()}{self.level}",
                     type=llir.DataType.INT,
@@ -137,7 +147,32 @@ class ModeIterator:
                     type=llir.DataType.INT,
                 )
 
-        if self.level_type == LevelType.COMPRESSED:
+        if self.level_type == LevelType.COORDINATE:
+            self.iterator_var_begin_value_llir = llir.Var(
+                name=f"p{self.tensor_var.name}{self.level - 1}"
+                if self.parent_index_var
+                else f"{self.tensor_var.name}{self.level}_pos[0].item<int>()",
+                type=llir.DataType.INT,
+            )
+            self.iterator_var_end_var_llir = llir.Var(
+                name=f"p{self.tensor_var.name}{self.level}_end",
+                type=llir.DataType.INT,
+            )
+            if not self.parent_index_var:
+                self.iterator_var_end_value_llir = llir.Var(
+                    f"{self.tensor_var.name}{self.level}_pos[1].item<int>()",
+                    type=llir.DataType.INT,
+                )
+            self.coord_var_llir = llir.Var(
+                name=f"{self.index_var.name}_{self.tensor_var.name}",
+                type=llir.DataType.INT,
+            )
+            self.coord_var_value_llir = llir.Var(
+                name=f"{self.tensor_var.name}{self.level}_crd[{self.iterator_var_llir.name}].item<int>()",
+                type=llir.DataType.INT,
+            )
+
+        elif self.level_type == LevelType.COMPRESSED:
             self.iterator_var_begin_value_llir = llir.Var(
                 name=f"{self.tensor_var.name}{self.level}_pos[{self.parent_index_var.name}]"
                 if self.parent_index_var
