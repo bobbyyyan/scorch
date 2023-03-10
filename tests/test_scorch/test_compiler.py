@@ -256,6 +256,32 @@ def test_elemwise_mul_4d_tensor_ssss_ssss_ssss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_elemwise_mul_4d_tensor_ssss_oooo_oooo():
+    # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+    # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ssss -f=B:oooo -f=C:oooo -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    l = IndexVar("l")
+
+    A = TensorVar("A", fmt=["sparse", "sparse", "sparse", "sparse"])
+    B = TensorVar("B", fmt=["coord", "coord", "coord", "coord"])
+    C = TensorVar("C", fmt=["coord", "coord", "coord", "coord"])
+
+    A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elemwise_mul_4d_tensor_ssdd_ssss_ssss():
     # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
     # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ssdd -f=B:ssss -f=C:ssss -print-evaluate
