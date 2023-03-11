@@ -62,23 +62,47 @@ class ModeIterator:
 
     def get_init_stmts(self) -> List[llir.Stmt]:
         stmts: List[llir.Stmt] = []
+
         if (
             self.level_type == LevelType.COMPRESSED
             or self.level_type == LevelType.COORDINATE
         ):
-            stmts.append(
-                llir.VarInit(
-                    var=self.get_iterator_var_llir(),
-                    value=self.get_iterator_var_begin_value_llir(),
-                )
-            )
-            if self.iterator_var_end_value_llir:
+            # if this is the parent-most coordinate level,
+            # initialize the bounds using the size of the crd array
+            if self.level == 0:
+                # int pB0 = 0;
                 stmts.append(
                     llir.VarInit(
-                        var=self.get_iterator_var_end_var_llir(),
-                        value=self.get_iterator_var_end_value_llir(),
+                        var=self.get_iterator_var_llir(),
+                        value=llir.Literal(0),
                     )
                 )
+                # int pB0_end = B0_crd.size(0);
+                if self.iterator_var_end_value_llir:
+                    stmts.append(
+                        llir.VarInit(
+                            var=self.get_iterator_var_end_var_llir(),
+                            value=llir.FunctionCall(
+                                name=f"{self.tensor_var.get_name()}{self.level}_crd.size",
+                                args=[llir.Literal(0)],
+                            ),
+                        )
+                    )
+                return stmts
+            else:
+                stmts.append(
+                    llir.VarInit(
+                        var=self.get_iterator_var_llir(),
+                        value=self.get_iterator_var_begin_value_llir(),
+                    )
+                )
+                if self.iterator_var_end_value_llir:
+                    stmts.append(
+                        llir.VarInit(
+                            var=self.get_iterator_var_end_var_llir(),
+                            value=self.get_iterator_var_end_value_llir(),
+                        )
+                    )
 
         return stmts
 

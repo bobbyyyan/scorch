@@ -58,11 +58,11 @@ class CINLowerer:
         # Iterate over the levels in tensor, then depending on whether it is sparse or dense, generate the bound
         # variables
         # TODO: handle COO
-        statements: List[llir.Stmt] = []
+        stmts: List[llir.Stmt] = []
         level_types = tensor.get_level_types()
         for level, level_type in enumerate(level_types):
             if level_type == LevelType.DENSE:
-                statements.append(
+                stmts.append(
                     llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_size",
@@ -75,7 +75,7 @@ class CINLowerer:
                     )
                 )
             elif level_type == LevelType.COMPRESSED:
-                statements.append(
+                stmts.append(
                     llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_pos",
@@ -89,7 +89,7 @@ class CINLowerer:
                     )
                 )
                 #
-                statements.append(
+                stmts.append(
                     llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_crd",
@@ -102,7 +102,21 @@ class CINLowerer:
                         ),
                     )
                 )
-        return statements
+            elif level_type == LevelType.COORDINATE:
+                stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{tensor.name}{level}_crd",
+                            type=llir.DataType.TORCH_TENSOR,
+                        ),
+                        value=llir.Var(
+                            # name=f"{tensor.name}._storage._index.mode_indices[{level}][0]",
+                            name=f"{tensor.name}_mode_indices[{level}][0]",
+                            type=llir.DataType.TORCH_TENSOR,
+                        ),
+                    )
+                )
+        return stmts
 
     @staticmethod
     def get_value_array_statement(tensor: TensorVar) -> llir.Stmt:
