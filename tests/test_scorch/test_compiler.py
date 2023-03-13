@@ -205,6 +205,30 @@ def test_elemwise_mul_3d_tensor_dss_sss_sss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_convert_4d_tensor_ssss_oooo():
+    # taco "A(i,j,k,l)=B(i,j,k,l)" -f=A:ssss:0,1,2,3 -f=B:uccq:0,1,2,3 -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    l = IndexVar("l")
+
+    A = TensorVar("A", fmt=["sparse", "sparse", "sparse", "sparse"])
+    B = TensorVar("B", fmt=["coord", "coord", "coord", "coord"])
+
+    A[i, j, k, l] = B[i, j, k, l]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
+
+    lowerer = CINLowerer(filter_zeros=True)
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elemwise_mul_4d_tensor_oooo_ssss_ssss():
     # taco "A(i,j,k,l)=B(i,j,k,l)*C(i,j,k,l)" -f=A:uccq:0,1,2,3 -f=B:ssss:0,1,2,3 -f=C:ssss:0,1,2,3 -print-evaluate
     i = IndexVar("i")
