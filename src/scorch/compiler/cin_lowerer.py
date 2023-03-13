@@ -26,7 +26,8 @@ class CINLowerer:
     This is a class to lower a CIN to LLIR
     """
 
-    def __init__(self):
+    def __init__(self, filter_zeros=False):
+        self.filter_zeros: bool = filter_zeros
         self.defined_index_vars: List[IndexVar] = []
         # dict from IndexVar to a List of llir.Stmt of dense coordinate resolution
         # the index var is the index var that needs to be defined before the coord
@@ -197,6 +198,7 @@ class CINLowerer:
         Lower a TensorAssign to LLIR
         """
         llir_stmts: List[llir.Stmt] = []
+
         # if we are at the bottommost level, we can emit the compute code
         assert self.result_tensor_access, "result tensor access is None"
         if (
@@ -216,10 +218,13 @@ class CINLowerer:
                     + f"[{self.defined_index_vars[-1].name}]",
                     type=llir.DataType.NO_TYPE,
                 )
+
+            rhs_llir = self.lower_IndexExpr(stmt.rhs)
+
             llir_stmts.append(
                 llir.Assign(
                     var=tensor_access_llir,
-                    value=self.lower_IndexExpr(stmt.rhs),
+                    value=rhs_llir,
                 )
             )
             # If the last level of the result tensor var is sparse, then we need to set
@@ -252,6 +257,21 @@ class CINLowerer:
                         var=self.result_value_array_sparse_index_llir,
                     )
                 )
+
+            # If CINLowerer has filter_zeros attribute set to True,
+            # we need to wrap llir_stmts in an if block,
+            # the condition is whether the input value is non-zero
+            if self.filter_zeros:
+                llir_stmts = [
+                    llir.IfThenElse(
+                        cond=llir.BinOp(
+                            op="!=",
+                            left=rhs_llir,
+                            right=llir.Literal(value="0"),
+                        ),
+                        then_body=llir_stmts,
+                    )
+                ]
 
         return llir_stmts
 
