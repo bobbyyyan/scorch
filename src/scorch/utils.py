@@ -1,10 +1,15 @@
 from itertools import chain
+from pathlib import Path
 from typing import List, Dict, Any, Iterable
 
 import torch
 
 from src.scorch.format import TensorFormat, LevelFormat, LevelType
 from src.scorch.compiler.llir import DataType
+
+PROJECT_ROOT_DIR = Path(__file__)
+while not (PROJECT_ROOT_DIR / "setup.py").exists():
+    PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 
 def get_format_from_list(format_str_list: List[str]) -> TensorFormat:

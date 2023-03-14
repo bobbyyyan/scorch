@@ -4,8 +4,12 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from src.scorch.compiler.cin import TensorVar, ForAll, IndexVar
+from src.scorch.compiler.cin_lowerer import CINLowerer
+from src.scorch.compiler.codegen import LLIRLowerer
 from src.scorch.format import TensorFormat, LevelFormat, LevelType
 from src.scorch.storage import TensorStorage, TensorIndex, TensorStorageView
+from src.scorch.utils import PROJECT_ROOT_DIR
 
 
 class Window(object):
@@ -185,4 +189,66 @@ class Tensor(torch.nn.Module):
                 ),
                 value=filtered_values,
             )
+        else:
+            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+
+            B = TensorVar(
+                name="B",
+                fmt=self.format,
+            )
+
+            output_format = fmt
+            A = TensorVar(
+                name="A",
+                fmt=output_format,
+            )
+
+            # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
+            lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+            rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+            code = f"{lhs} = {rhs}"
+            exec(code)
+
+            # Generate the python code for constructing the ForAll's and execute it
+            # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
+            rhs = "A._assignment"
+            assert ForAll is not None, "ForAll is not imported"
+            for i in range(len(self.shape))[::-1]:
+                rhs = f"ForAll(index_vars[{i}], {rhs})"
+            cin_stmt = eval(rhs)
+
+            print("\n\ncin_stmt: ", cin_stmt)
+
+            lowerer = CINLowerer(filter_zeros=True)
+            lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+            llir_lowerer = LLIRLowerer()
+            cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+            print("\n\ncpp_code:\n\n", cpp_code)
+
+            # Read header_cpp_code from csrc/header.cpp
+            with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+                header_cpp_code = f.read()
+
+            module = torch.utils.cpp_extension.load_inline(
+                name="kernel",
+                cpp_sources=[header_cpp_code, cpp_code],
+                functions=["evaluate"],
+            )
+
+            result_cpp = module.evaluate(
+                self._storage._index.mode_indices, self._storage.value
+            )
+            self._storage.index = TensorIndex(
+                mode_indices=result_cpp._storage._index.mode_indices,
+                tensor_format=output_format,
+            )
+            self._storage.value = result_cpp._storage._value
+            # self._storage = TensorStorage(
+            #     index=TensorIndex(
+            #         tensor_format=fmt,
+            #         mode_indices=result.index.mode_indices,
+            #     ),
+            #     value=result.values,
+            # )
         return self
