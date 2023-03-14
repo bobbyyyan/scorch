@@ -751,7 +751,7 @@ class IterationLattice:
                                         name=f"{result_tensor_var.name}{level - 1}_crd.push_back",
                                         args=[
                                             llir.Var(
-                                                name="i",
+                                                name=parent_index_var.get_name(),
                                                 type=llir.DataType.INT,
                                             )
                                         ],
