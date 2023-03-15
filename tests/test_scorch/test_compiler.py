@@ -205,7 +205,7 @@ def test_elemwise_mul_3d_tensor_dss_sss_sss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_convert_4d_tensor_ssss_oooo():
+def test_compile_4d_tensor_ssss_oooo():
     # taco "A(i,j,k,l)=B(i,j,k,l)" -f=A:ssss:0,1,2,3 -f=B:uccq:0,1,2,3 -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
