@@ -236,19 +236,33 @@ class Tensor(torch.nn.Module):
                 functions=["evaluate"],
             )
 
+            print(
+                "self._storage._index.mode_indices: ", self._storage._index.mode_indices
+            )
+
+            print("self._storage.value: ", self._storage.value)
+
             result_cpp = module.evaluate(
-                self._storage._index.mode_indices, self._storage.value
+                self.shape, self._storage._index.mode_indices, self._storage.value
             )
-            self._storage.index = TensorIndex(
-                mode_indices=result_cpp._storage._index.mode_indices,
-                tensor_format=output_format,
-            )
-            self._storage.value = result_cpp._storage._value
-            # self._storage = TensorStorage(
-            #     index=TensorIndex(
-            #         tensor_format=fmt,
-            #         mode_indices=result.index.mode_indices,
-            #     ),
-            #     value=result.values,
+
+            # self._storage.index = TensorIndex(
+            #     mode_indices=result_cpp._storage._index.mode_indices,
+            #     tensor_format=output_format,
             # )
+            # self._storage.value = result_cpp._storage._value
+
+            self._storage = TensorStorage(
+                index=TensorIndex(
+                    tensor_format=fmt,
+                    mode_indices=result_cpp._storage._index.mode_indices,
+                ),
+                value=result_cpp._storage._value,
+            )
+
+            print(
+                "self._storage._index.mode_indices: ", self._storage._index.mode_indices
+            )
+
+            print("self._storage.value: ", self._storage.value)
         return self
