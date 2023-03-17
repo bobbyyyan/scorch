@@ -161,11 +161,37 @@ class LatticePoint:
                 )
         elif len(iterators) == 1:
             stmts.append(llir.Comment("Advance iterator"))
-            stmts.append(
-                llir.Increment(
-                    var=iterators[0].get_iterator_var_llir(),
+
+            # If this level is coordinate and next level is coordinate
+            # then advance by setting
+            # p{tensor_name}{current_level}
+            # to p{tensor_name}{next_level}_end
+            iterator = iterators[0]
+            next_level = iterator.level + 1
+            tensor_var = iterator.tensor_var
+
+            if (
+                next_level < tensor_var.levels
+                and iterator.level_type == LevelType.COORDINATE
+                and tensor_var.get_level_types()[next_level] == LevelType.COORDINATE
+            ):
+                next_level_end_var = llir.Var(
+                    name=f"p{tensor_var.name}{next_level}_end",
+                    type=llir.DataType.INT,
                 )
-            )
+
+                stmts.append(
+                    llir.Assign(
+                        var=iterator.get_iterator_var_llir(),
+                        value=next_level_end_var,
+                    )
+                )
+            else:
+                stmts.append(
+                    llir.Increment(
+                        var=iterators[0].get_iterator_var_llir(),
+                    )
+                )
 
         return stmts
 
@@ -385,7 +411,11 @@ class LatticePoint:
                     coordinate_level_iterator_end_resolution_stmts.append(
                         llir.VarInit(
                             var=next_level_iterator_end_llir,
-                            value=it.iterator_var_llir,
+                            value=llir.BinOp(
+                                op="+",
+                                left=it.iterator_var_llir,
+                                right=llir.Literal(value=1),
+                            ),
                         )
                     )
 
@@ -763,9 +793,10 @@ class IterationLattice:
                                 ],
                             )
                         )
-
+                # if previous level is dense: A1_pos.push_back(A1_crd.size())
+                # TODO: if previous level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
                 stmts.append(
-                    # e.g. A1_pos.push_back(pA1)
+                    # e.g. A1_pos.push_back(pA1))
                     llir.FunctionCallStmt(
                         name=f"{result_tensor_var.name}{level}_pos.push_back",
                         args=[
