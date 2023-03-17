@@ -15,11 +15,11 @@ def test_2d_ss_oo():
         index=TensorIndex(
             tensor_format=get_format_from_list(["o", "o"]),
             mode_indices=[
-                [torch.tensor([0, 1, 2, 3, 4])],
-                [torch.tensor([0, 1, 2, 3, 4])],
+                [torch.tensor([0, 1, 2, 2, 3, 4])],
+                [torch.tensor([0, 1, 2, 3, 3, 4])],
             ],
         ),
-        value=torch.tensor([1, 2, 3, 0, 5]),
+        value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
     matrix.to_sparse(get_format_from_list(["s", "s"]))
 
@@ -31,10 +31,10 @@ def test_2d_ds_oo():
         index=TensorIndex(
             tensor_format=get_format_from_list(["o", "o"]),
             mode_indices=[
-                [torch.tensor([0, 1, 2, 3, 4])],
-                [torch.tensor([0, 1, 2, 3, 4])],
+                [torch.tensor([0, 1, 2, 2, 3, 4])],
+                [torch.tensor([0, 1, 2, 3, 3, 4])],
             ],
         ),
-        value=torch.tensor([1, 2, 3, 0, 5]),
+        value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
     matrix.to_sparse(get_format_from_list(["d", "s"]))
