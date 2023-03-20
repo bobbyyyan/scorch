@@ -672,3 +672,29 @@ def test_elemwise_matrix_add_mul_codegen():
 
     print("\nC++ torch extension code:")
     print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_spmv_codegen():
+    # taco "y(i) = A(i, j) * x(j)" -f=y:d -f=A:ds -f=x:d -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    y = TensorVar("y", fmt=["dense"])
+    A = TensorVar("A", fmt=["dense", "sparse"])
+    x = TensorVar("x", fmt=["dense"])
+
+    y[i] = A[i, j] * x[j]
+
+    cin_stmt = ForAll(i, ForAll(j, y._assignment))
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
