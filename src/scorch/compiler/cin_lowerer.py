@@ -689,7 +689,6 @@ class CINLowerer:
             index_var
         ):
             stmts.append(llir.Comment(f"{index_var} not in result tensor access"))
-            return stmts
 
         # If the result level for this index_var is dense, need to assemble the result by
         # setting the corresponding values in the result values array to 0
