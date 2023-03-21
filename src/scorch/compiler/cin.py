@@ -232,6 +232,9 @@ class TensorAccess(IndexExpr):
     def get_index_vars(self) -> List[IndexVar]:
         return self.indices
 
+    def has_index_var(self, index_var: IndexVar) -> bool:
+        return index_var in self.indices
+
     def get_parent_index_var(self, index_var: IndexVar) -> Optional[IndexVar]:
         index_var_index = self.indices.index(index_var)
         return self.indices[index_var_index - 1] if index_var_index > 0 else None

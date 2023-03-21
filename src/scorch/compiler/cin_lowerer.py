@@ -685,10 +685,17 @@ class CINLowerer:
 
         stmts: List[llir.Stmt] = []
 
+        if self.result_tensor_access and not self.result_tensor_access.has_index_var(
+            index_var
+        ):
+            stmts.append(llir.Comment(f"{index_var} not in result tensor access"))
+            return stmts
+
         # If the result level for this index_var is dense, need to assemble the result by
         # setting the corresponding values in the result values array to 0
         if (
             self.result_tensor_access
+            and self.result_tensor_access.has_index_var(index_var)
             and self.result_tensor_access.level_type_of_index_var(index_var)
             == LevelType.DENSE
         ):

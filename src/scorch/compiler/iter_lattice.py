@@ -255,6 +255,10 @@ class LatticePoint:
 
         elif isinstance(cin, TensorAssign):
             rewritten_rhs = self.get_simplified_cin(cin.rhs)
+            if not rewritten_rhs:
+                rewritten_rhs = cin.rhs
+            print("\n\nrhs:\n\n", cin.rhs)
+            print("\n\nrewritten_rhs:\n\n", rewritten_rhs)
             assert isinstance(
                 rewritten_rhs, IndexExpr
             ), "Rewritten rhs is not an index expr"
@@ -560,6 +564,11 @@ class IterationLattice:
             left_lattice_points: List[LatticePoint],
             right_lattice_points: List[LatticePoint],
         ) -> List[LatticePoint]:
+            # TODO: double check this
+            if not right_lattice_points:
+                return left_lattice_points
+            if not left_lattice_points:
+                return right_lattice_points
             return [
                 *map(sum, product(left_lattice_points, right_lattice_points)),  # type: ignore
             ]
