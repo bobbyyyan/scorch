@@ -698,3 +698,30 @@ def test_spmv_codegen():
 
     print("\nC++ torch extension code:")
     print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_spmm_codegen():
+    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt=["dense", "sparse"])
+    B = TensorVar("B", fmt=["dense", "sparse"])
+    C = TensorVar("C", fmt=["dense", "sparse"])
+
+    A[i, j] = B[i, k] * C[k, j]
+
+    cin_stmt = ForAll(i, ForAll(k, ForAll(j, A._assignment)))
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
