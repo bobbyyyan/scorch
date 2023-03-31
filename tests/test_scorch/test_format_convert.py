@@ -25,7 +25,7 @@ def test_2d_ss_oo():
 
 
 def test_2d_ds_oo():
-    # Test converting a COO matrix to a sparse-sparse matrix
+    # Test converting a COO matrix to a CSR (dense, sparse) matrix
     matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
