@@ -1,15 +1,12 @@
 import torch
 
-from src.scorch.compiler.cin import IndexVar, TensorVar, ForAll
-from src.scorch.compiler.cin_lowerer import CINLowerer
-from src.scorch.compiler.codegen import LLIRLowerer
-from src.scorch import Tensor, einsum, TensorFormat
+from src.scorch import Tensor
 from src.scorch.storage import TensorIndex
 from src.scorch.utils import get_format_from_list
 
 
 def test_2d_ss_oo():
-    # Test converting a COO matrix to a sparse-sparse matrix
+    # Test converting a COO matrix to a DCSR (sparse, sparse) matrix
     matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
