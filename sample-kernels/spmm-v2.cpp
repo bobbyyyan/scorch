@@ -1,10 +1,10 @@
 // taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
 
-int cmp(const void *a, const void *b) {
+int cmp(const void* a, const void* b) {
   return *((const int*)a) - *((const int*)b);
 }
 
-int evaluate(taco_tensor_t *A, taco_tensor_t *B, taco_tensor_t *C) {
+int evaluate(taco_tensor_t* A, taco_tensor_t* B, taco_tensor_t* C) {
   int A0_size = (int)(A->dimensions[0]);
   int* A1_pos = (int*)(A->indices[1][0]);
   int* A1_crd = (int*)(A->indices[1][1]);
@@ -30,16 +30,9 @@ int evaluate(taco_tensor_t *A, taco_tensor_t *B, taco_tensor_t *C) {
 
   cvector<double> A_vals;
 
-  double* w = 0;
-  int32_t* w_index_list = 0;
-  cvector<int> w_index_list = cvector<int>(C1_size);
-  bool* w_already_set = calloc(C1_size, sizeof(bool));
-  cvector<double> w = cvector<double>(C1_size);
   coo_workspace<double> wksp = coo_workspace<double>(1);
 
   for (int32_t i = 0; i < B0_size; i++) {
-    int32_t w_index_list_size = 0;
-
     for (int32_t pB1 = B1_pos[i]; pB1 < B1_pos[i + 1]; pB1++) {
       int32_t k = B1_crd[pB1];
       for (int32_t pC1 = C1_pos[k]; pC1 < C1_pos[k + 1]; pC1++) {
@@ -52,7 +45,7 @@ int evaluate(taco_tensor_t *A, taco_tensor_t *B, taco_tensor_t *C) {
     int32_t pA1_begin = pA1;
 
     auto wksp_map = wksp.get_map();
-    for (auto it=wksp_map.begin(); it != wksp_map.end(); ++it) {
+    for (auto it = wksp_map.begin(); it != wksp_map.end(); ++it) {
       int32_t j = it->first[0];
       double w_val = it->second;
 
