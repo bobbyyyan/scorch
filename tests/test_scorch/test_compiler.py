@@ -3,7 +3,7 @@ from src.scorch.compiler.cin_lowerer import CINLowerer
 from src.scorch.compiler.codegen import LLIRLowerer
 
 
-def test_elemwise_vector_mul_sss():
+def test_elemwise_mul_1d_sss():
     # elementwise vector multiplication code generation
     # a[i] = b[i] * c[i]
     # taco "a(i) = b(i)*c(i)" -f=a:s -f=b:s -f=c:s -print-evaluate
@@ -29,7 +29,7 @@ def test_elemwise_vector_mul_sss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_vector_mul_dss():
+def test_elemwise_mul_1d_dss():
     # elementwise vector multiplication code generation
     # a[i] = b[i] * c[i]
     # taco "a(i) = b(i)*c(i)" -f=a:d -f=b:s -f=c:s -print-evaluate
@@ -54,7 +54,7 @@ def test_elemwise_vector_mul_dss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_vector_mul_sds():
+def test_elemwise_mul_1d_sds():
     # elementwise vector multiplication code generation
     # a[i] = b[i] * c[i]
     # Reference: http://tensor-compiler.org/codegen.html?expr=a(i)=b(i)*c(i)&format=a:s:0;b:d:0;c:s:0
@@ -79,7 +79,7 @@ def test_elemwise_vector_mul_sds():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_vector_mul_add_sssd():
+def test_elemwise_mul_add_1d_sssd():
     # elementwise vector multiplication and addition code generation
     # Reference: http://tensor-compiler.org/codegen.html?expr=a(i)=b(i)*c(i)+d(i)&format=a:s:0;b:s:0;c:s:0;d:d:0
     # a[i] = b[i] * c[i] + d[i]
@@ -104,7 +104,7 @@ def test_elemwise_vector_mul_add_sssd():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_vector_add_sss():
+def test_elemwise_add_1d_sss():
     # elementwise vector addition code generation
     # a[i] = b[i] + c[i]
     i = IndexVar("i")
@@ -128,7 +128,7 @@ def test_elemwise_vector_add_sss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_vector_add_dss():
+def test_elemwise_add_1d_dss():
     # elementwise vector addition code generation
     # a[i] = b[i] + c[i]
     # taco "a(i) = b(i)+c(i)" -f=a:d -f=b:s -f=c:s -print-evaluate
@@ -153,7 +153,7 @@ def test_elemwise_vector_add_dss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_vector_add_sds():
+def test_elemwise_add_1d_sds():
     # elementwise vector addition code generation
     # a[i] = b[i] + c[i]
     # Reference: http://tensor-compiler.org/codegen.html?expr=a(i)=b(i)+c(i)&format=a:s:0;b:d:0;c:s:0
@@ -205,8 +205,8 @@ def test_elemwise_mul_3d_tensor_dss_sss_sss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_compile_4d_tensor_ssss_oooo():
-    # taco "A(i,j,k,l)=B(i,j,k,l)" -f=A:ssss:0,1,2,3 -f=B:uccq:0,1,2,3 -print-evaluate
+def test_convert_4d_ssss_oooo():
+    # taco "A(i,j,k,l) = B(i,j,k,l)" -f=A:ssss:0,1,2,3 -f=B:uccq:0,1,2,3 -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
@@ -229,7 +229,7 @@ def test_compile_4d_tensor_ssss_oooo():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_mul_4d_tensor_oooo_ssss_ssss():
+def test_elemwise_mul_4d_oooo_ssss_ssss():
     # taco "A(i,j,k,l)=B(i,j,k,l)*C(i,j,k,l)" -f=A:uccq:0,1,2,3 -f=B:ssss:0,1,2,3 -f=C:ssss:0,1,2,3 -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
@@ -254,7 +254,7 @@ def test_elemwise_mul_4d_tensor_oooo_ssss_ssss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_mul_4d_tensor_ssss_ssss_ssss():
+def test_elemwise_mul_4d_ssss_ssss_ssss():
     # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
     # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ssss -f=B:ssss -f=C:ssss -print-evaluate
     i = IndexVar("i")
@@ -280,7 +280,7 @@ def test_elemwise_mul_4d_tensor_ssss_ssss_ssss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_mul_4d_tensor_ssss_oooo_oooo():
+def test_elemwise_mul_4d_ssss_oooo_oooo():
     # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
     # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ssss -f=B:oooo -f=C:oooo -print-evaluate
     i = IndexVar("i")
@@ -306,7 +306,7 @@ def test_elemwise_mul_4d_tensor_ssss_oooo_oooo():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_mul_4d_tensor_ssdd_ssss_ssss():
+def test_elemwise_mul_4d_ssdd_ssss_ssss():
     # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
     # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ssdd -f=B:ssss -f=C:ssss -print-evaluate
     i = IndexVar("i")
@@ -332,7 +332,7 @@ def test_elemwise_mul_4d_tensor_ssdd_ssss_ssss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_mul_4d_tensor_dddd_ssss_ssss():
+def test_elemwise_mul_4d_dddd_ssss_ssss():
     # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
     # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:dddd -f=B:ssss -f=C:ssss -print-evaluate
     i = IndexVar("i")
@@ -358,7 +358,7 @@ def test_elemwise_mul_4d_tensor_dddd_ssss_ssss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_mul_4d_tensor_ddss_ssss_ssss():
+def test_elemwise_mul_4d_ddss_ssss_ssss():
     # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
     # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ddss -f=B:ssss -f=C:ssss -print-evaluate
     i = IndexVar("i")
@@ -384,7 +384,7 @@ def test_elemwise_mul_4d_tensor_ddss_ssss_ssss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_matrix_mul_ss_dd_ds():
+def test_elemwise_mul_2d_ss_dd_ds():
     # A[i, j] = B[i, j] * C[i, j]
     # A: sparse, sparse
     # B: dense, dense
@@ -436,7 +436,7 @@ def test_matrix_vector_mul_codegen():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_matrix_mul_ss_ss_ss():
+def test_elemwise_mul_2d_ss_ss_ss():
     # elementwise matrix multiplication code generation
     # A[i, j] = B[i, j] * C[i, j]
     # taco "A(i,j) = B(i,j) * C(i,j)" -f=A:ss -f=B:ss -f=C:ss -print-evaluate
@@ -462,7 +462,7 @@ def test_elemwise_matrix_mul_ss_ss_ss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_matrix_mul_oo_oo_oo():
+def test_elemwise_mul_2d_oo_oo_oo():
     # taco "A(i,j)=B(i,j)*C(i,j)" -f=A:uq:0,1 -f=B:uq:0,1 -f=C:uq:0,1 -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
@@ -485,7 +485,30 @@ def test_elemwise_matrix_mul_oo_oo_oo():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_matrix_mul_ds_ss_ss():
+def test_elemwise_mul_2d_dd_dd_ds():
+    # taco "A(i,j) = B(i,j) * C(i,j)" -f=A:dd -f=B:dd -f=C:ds -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["dense", "dense"])
+    B = TensorVar("B", fmt=["dense", "dense"])
+    C = TensorVar("C", fmt=["dense", "sparse"])
+
+    A[i, j] = B[i, j] * C[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_mul_2d_ds_ss_ss():
     # elementwise matrix multiplication code generation
     # A[i, j] = B[i, j] * C[i, j]
     # taco "A(i,j) = B(i,j) * C(i,j)" -f=A:ds -f=B:ss -f=C:ss -print-evaluate
@@ -589,7 +612,7 @@ def test_elemwise_matrix_add_sd_ss_ss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_matrix_mul_codegen_2():
+def test_elemwise_mul_2d_codegen_2():
     # elementwise matrix multiplication code generation
     # A[i, j] = B[i, j] * C[i, j]
 
@@ -614,7 +637,7 @@ def test_elemwise_matrix_mul_codegen_2():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_elemwise_matrix_mul_diff_order_codegen():
+def test_elemwise_mul_2d_diff_order_codegen():
     # http://tensor-compiler.org/codegen.html?expr=A(i,j)=B(i,j)*C(j,i)&format=A:ss:0,1;B:dd:0,1;C:dd:0,1
     # elementwise matrix multiplication code generation
     # A[i, j] = B[i, j] * C[j, i]
