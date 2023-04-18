@@ -1,3 +1,5 @@
+# Scorch
+
 ### Setting up development environment
 
 #### Install libtorch
