@@ -144,7 +144,77 @@ class Tensor(torch.nn.Module):
 
     def __add__(self, other) -> Tensor:
         """Add two tensors together."""
-        raise NotImplementedError()
+        # Perform element-wise addition
+        # TODO: support broadcasting
+        index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+        # TODO: output format inferred from input formats
+        output_format = self.format
+        result_shape = self.shape
+
+        A = TensorVar(
+            name="A",
+            fmt=output_format,
+        )
+        B = TensorVar(
+            name="B",
+            fmt=self.format,
+        )
+        C = TensorVar(
+            name="C",
+            fmt=other.format,
+        )
+
+        # Generate the python code for the element-wise addition
+        # e.g. A[i0, i1, ...] = B[i0, i1, ...] + C[i0, i1, ...]
+        lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        rhs += f' + C[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        code = f"{lhs} = {rhs}"
+        exec(code)
+
+        # Generate the python code for constructing the ForAll's and execute it
+        # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
+        rhs = "A._assignment"
+        assert ForAll is not None, "ForAll is not imported"
+        for i in range(len(self.shape))[::-1]:
+            rhs = f"ForAll(index_vars[{i}], {rhs})"
+        cin_stmt = eval(rhs)
+
+        lowerer = CINLowerer()
+        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer()
+        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+        print("\n\ncpp_code:\n\n", cpp_code)
+
+        # Read header_cpp_code from csrc/header.cpp
+        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+            header_cpp_code = f.read()
+
+        module = torch.utils.cpp_extension.load_inline(
+            name="kernel",
+            cpp_sources=[header_cpp_code, cpp_code],
+            functions=["evaluate"],
+        )
+
+        result_cpp = module.evaluate(
+            result_shape,
+            self._storage._index.mode_indices,
+            self._storage.value,
+            other._storage._index.mode_indices,
+            other._storage.value,
+        )
+
+        result = Tensor(
+            shape=result_shape,
+            index=TensorIndex(
+                mode_indices=result_cpp._storage._index.mode_indices,
+                tensor_format=output_format,
+            ),
+            value=result_cpp._storage._value,
+        )
+
+        return result
 
     def __mul__(self, other) -> Tensor:
         """Multiply two tensors together."""
