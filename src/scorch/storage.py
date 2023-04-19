@@ -118,6 +118,11 @@ class TensorStorage(object):
         return "TensorStorage({})"
 
     @property
+    def has_index(self) -> bool:
+        """Check if the tensor storage has an index."""
+        return self._index is not None
+
+    @property
     def value(self) -> torch.Tensor:
         """Get the value of the tensor."""
         assert self._value is not None, "value is None"

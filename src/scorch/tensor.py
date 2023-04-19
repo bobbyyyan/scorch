@@ -76,6 +76,11 @@ class Tensor(torch.nn.Module):
         pass
 
     @property
+    def has_index(self) -> bool:
+        """Return whether the tensor has an index."""
+        return self.storage.has_index
+
+    @property
     def name(self) -> str:
         """Get the tensor name."""
         assert self._name is not None, "Tensor name is not set."
@@ -262,12 +267,32 @@ class Tensor(torch.nn.Module):
         else:
             index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
 
-            B = TensorVar(
-                name="B",
-                fmt=self.format,
-            )
+            if self.has_index:
+                B = TensorVar(
+                    name="B",
+                    fmt=self.format,
+                )
+            else:
+                B = TensorVar(
+                    name="B",
+                    fmt=TensorFormat(
+                        level_formats=[
+                            LevelFormat(mode=LevelType.DENSE)
+                            for _ in range(len(self.shape))
+                        ]
+                    ),
+                )
 
             output_format = fmt
+            if output_format is None:
+                # TODO: infer output format from input format
+                # For now, make every level COMPRESSED
+                output_format = TensorFormat(
+                    level_formats=[
+                        LevelFormat(mode=LevelType.COMPRESSED)
+                        for _ in range(len(self.shape))
+                    ]
+                )
             A = TensorVar(
                 name="A",
                 fmt=output_format,

@@ -70,7 +70,9 @@ class CINLowerer:
                             type=llir.DataType.INT,
                         ),
                         value=llir.Var(
-                            name=f"{tensor.name}._shape[{level}]",
+                            # name=f"{tensor.name}._shape[{level}]",
+                            # name=f"{tensor.name}_mode_indices[{level}][0][0].item<int>()",
+                            name=f"{tensor.name}_shape[{level}]",
                             type=llir.DataType.INT,
                         ),
                     )
@@ -438,6 +440,7 @@ class CINLowerer:
             tensor_var, level, level_type = tensor_level_type_list[0]
             if level_type == LevelType.COMPRESSED:
                 result_last_compressed_index_var = index_var
+
         result_index_init_stmts = []
 
         if result_last_compressed_index_var is not None:
@@ -449,6 +452,7 @@ class CINLowerer:
             self.result_tensor_value_index_var_dict[
                 result_last_compressed_index_var
             ] = self.result_value_array_sparse_index_llir
+
             result_index_init_stmts.append(
                 llir.VarInit(
                     var=self.result_value_array_sparse_index_llir,
