@@ -279,6 +279,12 @@ class LatticePoint:
         """
         stmts: List[llir.Stmt] = []
 
+        print("\n========== get_child_subregion_loops =========")
+        print("cin\n:", cin)
+        print("self.child_lattice_points:", self.child_lattice_points)
+
+        # print("self.iterators:", self.iterators)
+
         def lower_cin_and_add_to_list(
             lattice_point: LatticePoint, cin: IndexStmt, lst: List[llir.Stmt]
         ):
@@ -724,6 +730,112 @@ class IterationLattice:
 
         """
 
+        stmts: List[llir.Stmt] = []
+
+        lattice_points = self.get_lattice_points()
+        lattice_point = lattice_points[0]
+
+        result_tensor_var = self.cin_lowerer.result_tensor_var
+        assert result_tensor_var, "Result tensor var not set"
+        result_tensor_access = self.cin_lowerer.result_tensor_access
+        assert result_tensor_access, "Result tensor access not set"
+
+        index_var = lattice_point.get_index_var()
+
+        if result_tensor_access.has_index_var(index_var):
+            level = result_tensor_access.level_of_index_var(index_var)
+            level_type = result_tensor_access.level_type_of_index_var(index_var)
+            if level_type == LevelType.COMPRESSED:
+                stmts.extend(
+                    [
+                        llir.BlankLine(),
+                        llir.Comment("Assembly compressed level indices"),
+                    ]
+                )
+
+                # if level is > 0 and parent level is also sparse, we need to set
+                # the parent level's crd
+                if level > 0:
+                    parent_index_var = result_tensor_access.get_parent_index_var(
+                        lattice_point.get_index_var()
+                    )
+                    assert parent_index_var is not None, "Parent index var is None"
+                    if (
+                        result_tensor_access.level_type_of_index_var(parent_index_var)
+                        == LevelType.COMPRESSED
+                    ):
+                        stmts.append(
+                            # e.g.
+                            # if (A1_pos.back() < pA1) {
+                            #     A0_crd.push_back(i);
+                            # }
+                            llir.IfThenElse(
+                                cond=llir.BinOp(
+                                    op="<",
+                                    left=llir.FunctionCall(
+                                        name=f"{result_tensor_var.name}{level}_pos.back",
+                                        args=[],
+                                    ),
+                                    right=llir.Var(
+                                        name=f"p{result_tensor_var.name}{level}",
+                                        type=llir.DataType.INT,
+                                    ),
+                                ),
+                                then_body=[
+                                    llir.FunctionCallStmt(
+                                        name=f"{result_tensor_var.name}{level - 1}_crd.push_back",
+                                        args=[
+                                            llir.Var(
+                                                name=parent_index_var.get_name(),
+                                                type=llir.DataType.INT,
+                                            )
+                                        ],
+                                    ),
+                                ],
+                            )
+                        )
+                # if previous level is dense: A1_pos.push_back(A1_crd.size())
+                # TODO: if previous level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
+                assembled_pos_array = False
+                if level > 0:
+                    parent_index_var = result_tensor_access.get_parent_index_var(
+                        lattice_point.get_index_var()
+                    )
+                    assert parent_index_var is not None, "Parent index var is None"
+                    if (
+                        result_tensor_access.level_type_of_index_var(parent_index_var)
+                        == LevelType.COMPRESSED
+                    ):
+                        # A1_pos[A0_crd.size()] = A1_crd.size()
+                        stmts.append(
+                            llir.Assign(
+                                var=llir.Var(
+                                    name=f"{result_tensor_var.name}{level}_pos[{result_tensor_var.name}{level - 1}_crd.size()]",
+                                    type=llir.DataType.INT,
+                                ),
+                                value=llir.FunctionCall(
+                                    name=f"{result_tensor_var.name}{level}_crd.size",
+                                    args=[],
+                                ),
+                            )
+                        )
+                        assembled_pos_array = True
+
+                if not assembled_pos_array:
+                    stmts.append(
+                        # e.g. A1_pos.push_back(pA1))
+                        llir.FunctionCallStmt(
+                            name=f"{result_tensor_var.name}{level}_pos.push_back",
+                            args=[
+                                llir.Var(
+                                    name=f"{result_tensor_var.get_name()}{level}_crd.size()",
+                                    # name=f"p{result_tensor_var.name}{level}",
+                                    type=llir.DataType.INT,
+                                )
+                            ],
+                        )
+                    )
+
         def gen_single_lattice_loop(lattice_point: LatticePoint) -> List[llir.Stmt]:
             assert self.cin_lowerer, "CINLowerer not set"
 
@@ -732,11 +844,9 @@ class IterationLattice:
             # If we have a sparse level here, we need to set
             # {result_tensor_var}{level}_pos[p{result_tensor_var}{parent_level} + 1] to
             # p{result_tensor_var}{level}
-            result_tensor_var = self.cin_lowerer.result_tensor_var
-            assert result_tensor_var, "Result tensor var not set"
-            result_tensor_access = self.cin_lowerer.result_tensor_access
-            assert result_tensor_access, "Result tensor access not set"
+
             index_var = lattice_point.get_index_var()
+
             if result_tensor_access.has_index_var(index_var):
                 level = result_tensor_access.level_of_index_var(index_var)
                 level_type = result_tensor_access.level_type_of_index_var(index_var)
@@ -754,104 +864,16 @@ class IterationLattice:
 
                 stmts.append(while_loop)
 
-                if level_type == LevelType.COMPRESSED:
-                    stmts.extend(
-                        [
-                            llir.BlankLine(),
-                            llir.Comment("Assembly compressed level indices"),
-                        ]
-                    )
-
-                    # if level is > 0 and parent level is also sparse, we need to set
-                    # the parent level's crd
-                    if level > 0:
-                        parent_index_var = result_tensor_access.get_parent_index_var(
-                            lattice_point.get_index_var()
-                        )
-                        assert parent_index_var is not None, "Parent index var is None"
-                        if (
-                            result_tensor_access.level_type_of_index_var(
-                                parent_index_var
-                            )
-                            == LevelType.COMPRESSED
-                        ):
-                            stmts.append(
-                                # e.g.
-                                # if (A1_pos.back() < pA1) {
-                                #     A0_crd.push_back(i);
-                                # }
-                                llir.IfThenElse(
-                                    cond=llir.BinOp(
-                                        op="<",
-                                        left=llir.FunctionCall(
-                                            name=f"{result_tensor_var.name}{level}_pos.back",
-                                            args=[],
-                                        ),
-                                        right=llir.Var(
-                                            name=f"p{result_tensor_var.name}{level}",
-                                            type=llir.DataType.INT,
-                                        ),
-                                    ),
-                                    then_body=[
-                                        llir.FunctionCallStmt(
-                                            name=f"{result_tensor_var.name}{level - 1}_crd.push_back",
-                                            args=[
-                                                llir.Var(
-                                                    name=parent_index_var.get_name(),
-                                                    type=llir.DataType.INT,
-                                                )
-                                            ],
-                                        ),
-                                    ],
-                                )
-                            )
-                    # if previous level is dense: A1_pos.push_back(A1_crd.size())
-                    # TODO: if previous level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
-                    assembled_pos_array = False
-                    if level > 0:
-                        parent_index_var = result_tensor_access.get_parent_index_var(
-                            lattice_point.get_index_var()
-                        )
-                        assert parent_index_var is not None, "Parent index var is None"
-                        if (
-                            result_tensor_access.level_type_of_index_var(
-                                parent_index_var
-                            )
-                            == LevelType.COMPRESSED
-                        ):
-                            # A1_pos[A0_crd.size()] = A1_crd.size()
-                            stmts.append(
-                                llir.Assign(
-                                    var=llir.Var(
-                                        name=f"{result_tensor_var.name}{level}_pos[{result_tensor_var.name}{level - 1}_crd.size()]",
-                                        type=llir.DataType.INT,
-                                    ),
-                                    value=llir.FunctionCall(
-                                        name=f"{result_tensor_var.name}{level}_crd.size",
-                                        args=[],
-                                    ),
-                                )
-                            )
-                            assembled_pos_array = True
-
-                    if not assembled_pos_array:
-                        stmts.append(
-                            # e.g. A1_pos.push_back(pA1))
-                            llir.FunctionCallStmt(
-                                name=f"{result_tensor_var.name}{level}_pos.push_back",
-                                args=[
-                                    llir.Var(
-                                        name=f"{result_tensor_var.get_name()}{level}_crd.size()",
-                                        # name=f"p{result_tensor_var.name}{level}",
-                                        type=llir.DataType.INT,
-                                    )
-                                ],
-                            )
-                        )
             else:
+                # TODO: index var not in result tensor access
+                # TODO: generate workspace for the index vars below
+
                 while_loop = llir.WhileLoop(
                     cond=lattice_point.get_while_condition(lattice=self),
                     body=[
+                        llir.Comment(
+                            f"Index var {index_var} not in result tensor access"
+                        ),
                         *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                         *lattice_point.get_child_subregion_loops(
                             self.cin_lowerer, self.for_all_stmt.stmt
@@ -864,12 +886,16 @@ class IterationLattice:
 
             return stmts
 
-        return flatten_2d_list(
-            [
+        return (
+            flatten_2d_list(
                 [
-                    *gen_single_lattice_loop(p),
-                    # llir.BlankLine(),
+                    [
+                        llir.Comment(f"Lattice point {p}"),
+                        *gen_single_lattice_loop(p),
+                        # llir.BlankLine(),
+                    ]
+                    for p in lattice_points
                 ]
-                for p in self.get_lattice_points()
-            ]
+            )
+            + stmts
         )
