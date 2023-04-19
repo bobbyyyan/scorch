@@ -358,6 +358,32 @@ def test_elemwise_mul_4d_dddd_ssss_ssss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_elemwise_mul_4d_ddss_dddd_ssss():
+    # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+    # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ddss -f=B:dddd -f=C:ssss -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    l = IndexVar("l")
+
+    A = TensorVar("A", fmt=["dense", "dense", "sparse", "sparse"])
+    B = TensorVar("B", fmt=["dense", "dense", "dense", "dense"])
+    C = TensorVar("C", fmt=["sparse", "sparse", "sparse", "sparse"])
+
+    A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elemwise_mul_4d_ddss_ssss_ssss():
     # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
     # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ddss -f=B:ssss -f=C:ssss -print-evaluate
@@ -470,6 +496,29 @@ def test_elemwise_mul_2d_oo_oo_oo():
     A = TensorVar("A", fmt=["coordinate", "coordinate"])
     B = TensorVar("B", fmt=["coordinate", "coordinate"])
     C = TensorVar("C", fmt=["coordinate", "coordinate"])
+
+    A[i, j] = B[i, j] * C[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_elemwise_mul_2d_ds_dd_ds():
+    # taco "A(i,j) = B(i,j) * C(i,j)" -f=A:ds -f=B:dd -f=C:ds -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["dense", "sparse"])
+    B = TensorVar("B", fmt=["dense", "dense"])
+    C = TensorVar("C", fmt=["dense", "sparse"])
 
     A[i, j] = B[i, j] * C[i, j]
 
