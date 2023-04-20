@@ -49,13 +49,16 @@ def test_elemwise_vector_mul_dss():
 
 
 def test_elemwise_matrix_mul_ss_ss_ss():
-    tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
-    tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
+    # Generate a random sparse 10x10 torch tensor
+    tensor_a_torch = torch.rand(10, 10)
+    tensor_a_torch[torch.rand(10, 10) > 0.5] = 0
+    tensor_b_torch = torch.rand(10, 10)
+    tensor_b_torch[torch.rand(10, 10) > 0.5] = 0
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch, "a").to_sparse()
-    sp_vector_b = Tensor.from_torch(tensor_b_torch, "b").to_sparse()
+    a_sparse = Tensor.from_torch(tensor_a_torch, "a").to_sparse()
+    b_sparse = Tensor.from_torch(tensor_b_torch, "b").to_sparse()
 
-    result = einsum("i,i->i", sp_vector_a, sp_vector_b)
+    result = einsum("ij,ij->ij", a_sparse, b_sparse)
 
     print("\nResult shape:", result.shape)
     print("Result format:", result.format)
