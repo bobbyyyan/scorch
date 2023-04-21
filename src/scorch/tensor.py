@@ -204,8 +204,10 @@ class Tensor(torch.nn.Module):
 
         result_cpp = module.evaluate(
             result_shape,
+            self.shape,
             self._storage._index.mode_indices,
             self._storage.value,
+            other.shape,
             other._storage._index.mode_indices,
             other._storage.value,
         )
@@ -231,6 +233,11 @@ class Tensor(torch.nn.Module):
         """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
         # and format is dense at every level
+
+        # If name is not provided, use the default name
+        if name is None:
+            name = "tensor"
+
         tt_tensor = Tensor(
             name=name,
             shape=tuple(tensor.shape),
@@ -332,7 +339,10 @@ class Tensor(torch.nn.Module):
             )
 
             result_cpp = module.evaluate(
-                self.shape, self._storage._index.mode_indices, self._storage.value
+                self.shape,
+                self.shape,
+                self._storage._index.mode_indices,
+                self._storage.value,
             )
 
             self._storage = TensorStorage(

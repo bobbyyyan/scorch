@@ -479,6 +479,12 @@ class CINLowerer:
             for tensor in rhs_tensor_vars:
                 kernel_args.append(
                     llir.Var(
+                        name=f"{tensor.get_name()}_shape",
+                        type=llir.DataType.STD_VECTOR_INT,
+                    )
+                )
+                kernel_args.append(
+                    llir.Var(
                         name=f"{tensor.get_name()}_mode_indices",
                         type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
                     )

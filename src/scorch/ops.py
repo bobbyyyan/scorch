@@ -172,6 +172,7 @@ def einsum(
     # Call module.evaluate with the output shape,and the mode indices and values of each tensor
     args: Sequence[Any] = [result_shape]
     for tensor in tensors:
+        args.append(tensor.shape)  # type: ignore
         args.append(tensor._storage._index.mode_indices)  # type: ignore
         args.append(tensor._storage.value)  # type: ignore
 
