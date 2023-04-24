@@ -55,5 +55,8 @@ def test_2d_dd_oo():
 
 def test_2d_ss_dd():
     # Test converting a dense matrix to a sparse matrix
-    matrix = Tensor.from_torch(torch.randn(5, 5))
+    matrix = torch.rand(5, 5)
+    # Sparsify the matrix
+    matrix[torch.rand(5, 5) > 0.5] = 0
+    matrix = Tensor.from_torch(matrix)
     matrix.to_sparse(get_format_from_list(["s", "s"]))

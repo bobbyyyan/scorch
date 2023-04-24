@@ -242,7 +242,16 @@ class Tensor(torch.nn.Module):
             name=name,
             shape=tuple(tensor.shape),
             storage=TensorStorage(
-                value=tensor,
+                index=TensorIndex(
+                    tensor_format=TensorFormat(
+                        level_formats=[
+                            LevelFormat(mode=LevelType.DENSE)
+                            for _ in range(len(tensor.shape))
+                        ]
+                    ),
+                    mode_indices=[[] for _ in range(len(tensor.shape))],
+                ),
+                value=tensor.flatten(),
             ),
         )
 
