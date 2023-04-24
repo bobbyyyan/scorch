@@ -33,6 +33,23 @@ def test_elemwise_vector_add_sss():
     print("Result values:", result.values)
 
 
+def test_elemwise_vector_add_sss_2():
+    tensor_a_torch = torch.Tensor([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    tensor_b_torch = torch.Tensor([0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    tensor_c_torch = torch.Tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12])
+
+    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse()
+    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse()
+    sp_vector_c = Tensor.from_torch(tensor_c_torch).to_sparse()
+
+    result = sp_vector_a + sp_vector_b + sp_vector_c
+
+    print("\nResult shape:", result.shape)
+    print("Result format:", result.format)
+    print("Result index:", result.index.mode_indices)
+    print("Result values:", result.values)
+
+
 def test_elemwise_vector_mul_dss():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4, 5, 0])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5, 0, 14])
