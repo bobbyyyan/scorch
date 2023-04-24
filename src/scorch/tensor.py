@@ -86,6 +86,10 @@ class Tensor(torch.nn.Module):
         assert self._name is not None, "Tensor name is not set."
         return self._name
 
+    @name.setter
+    def name(self, name: str) -> None:
+        self._name = name
+
     @property
     def values(self) -> torch.Tensor:
         """Get the tensor value."""
@@ -356,7 +360,7 @@ class Tensor(torch.nn.Module):
 
             self._storage = TensorStorage(
                 index=TensorIndex(
-                    tensor_format=fmt,
+                    tensor_format=output_format,
                     mode_indices=result_cpp._storage._index.mode_indices,
                 ),
                 value=result_cpp._storage._value,

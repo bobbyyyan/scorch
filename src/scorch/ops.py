@@ -21,6 +21,7 @@ load(
     sources=[str(PROJECT_ROOT_DIR / "csrc/pybind.cpp")],
 )
 
+
 # ops_cpp = load(
 #     name="ops_cpp",
 #     sources=[str(PROJECT_ROOT_DIR / "csrc/ops.cpp")],
@@ -46,6 +47,13 @@ def einsum(
     """Perform a tensor contraction using the TACO compiler."""
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
     # elementwise multiplication or "ik,kj->ij" for matrix multiplication
+
+    # If any of the tensors have the same name, rename them
+    tensor_names = [tensor.name for tensor in tensors]
+    tensor_name_counts = {name: tensor_names.count(name) for name in tensor_names}
+    for i, tensor in enumerate(tensors):
+        if tensor_name_counts[tensor.name] > 1:
+            tensor.name = tensor.name + str(i)
 
     # unique_index_strs should be a list of unique index strings
     # e.g. ["i", "j", "k"]
