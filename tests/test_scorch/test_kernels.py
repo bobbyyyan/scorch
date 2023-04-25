@@ -12,10 +12,14 @@ def test_elemwise_vector_mul_sss():
 
     result = einsum("i,i->i", sp_vector_a, sp_vector_b)
 
-    print("\nResult shape:", result.shape)
-    print("Result format:", result.format)
-    print("Result index:", result.index.mode_indices)
-    print("Result values:", result.values)
+    assert result.shape == (12,)
+    assert len(result.index.mode_indices) == 1
+
+    mode_index = result.index.mode_indices[0]
+    assert mode_index[0].tolist() == [0, 5]
+    assert mode_index[1].tolist() == [0, 2, 4, 10, 11]
+
+    assert result.values.tolist() == [2.0, 4.0, 6.0, 8.0, 10.0]
 
 
 def test_elemwise_vector_add_sss():
@@ -27,10 +31,14 @@ def test_elemwise_vector_add_sss():
 
     result = sp_vector_a + sp_vector_b
 
-    print("\nResult shape:", result.shape)
-    print("Result format:", result.format)
-    print("Result index:", result.index.mode_indices)
-    print("Result values:", result.values)
+    assert result.shape == (12,)
+    assert len(result.index.mode_indices) == 1
+
+    mode_index = result.index.mode_indices[0]
+    assert mode_index[0].tolist() == [0, 9]
+    assert mode_index[1].tolist() == [0, 1, 2, 3, 4, 6, 8, 10, 11]
+
+    assert result.values.tolist() == [3.0, 2.0, 4.0, 2.0, 5.0, 4.0, 5.0, 9.0, 6.5]
 
 
 def test_elemwise_vector_add_sss_2():
@@ -44,10 +52,14 @@ def test_elemwise_vector_add_sss_2():
 
     result = sp_vector_a + sp_vector_b + sp_vector_c
 
-    print("\nResult shape:", result.shape)
-    print("Result format:", result.format)
-    print("Result index:", result.index.mode_indices)
-    print("Result values:", result.values)
+    assert result.shape == (12,)
+    assert len(result.index.mode_indices) == 1
+
+    mode_index = result.index.mode_indices[0]
+    assert mode_index[0].tolist() == [0, 3]
+    assert mode_index[1].tolist() == [0, 1, 11]
+
+    assert result.values.tolist() == [1.0, 2.0, 12.0]
 
 
 def test_elemwise_vector_mul_dss():
@@ -66,11 +78,29 @@ def test_elemwise_vector_mul_dss():
 
 
 def test_elemwise_matrix_mul_ss_ss_ss():
-    # Generate a random sparse 10x10 torch tensor
-    tensor_a_torch = torch.rand(10, 10)
-    tensor_a_torch[torch.rand(10, 10) > 0.5] = 0
-    tensor_b_torch = torch.rand(10, 10)
-    tensor_b_torch[torch.rand(10, 10) > 0.5] = 0
+    # # Generate a random sparse 10x10 torch tensor
+    # tensor_a_torch = torch.rand(10, 10)
+    # tensor_a_torch[torch.rand(10, 10) > 0.5] = 0
+    # tensor_b_torch = torch.rand(10, 10)
+    # tensor_b_torch[torch.rand(10, 10) > 0.5] = 0
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
 
     a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse()
     b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse()
