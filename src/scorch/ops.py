@@ -57,7 +57,9 @@ def einsum(
 
     # unique_index_strs should be a list of unique index strings
     # e.g. ["i", "j", "k"]
-    unique_index_strs = list(set(expression.replace(",", "").replace("->", "")))
+    unique_index_strs = list(expression.replace(",", "").replace("->", ""))
+    # Make sure the index strings are unique, keeping the order
+    unique_index_strs = list(dict.fromkeys(unique_index_strs))
     result_index_strs = list(expression.split("->")[1])
     input_index_strs = [list(x) for x in expression.split("->")[0].split(",")]
     # Create a list of IndexVar objects, and a dict mapping index strings
