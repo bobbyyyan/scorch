@@ -107,7 +107,13 @@ def test_elemwise_matrix_mul_ss_ss_ss():
 
     result = einsum("ij,ij->ij", a_sparse, b_sparse)
 
-    print("\nResult shape:", result.shape)
-    print("Result format:", result.format)
-    print("Result index:", result.index.mode_indices)
-    print("Result values:", result.values)
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    assert result.index.mode_indices[0][0].tolist() == [0, 5]
+    assert result.index.mode_indices[0][1].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.index.mode_indices[1][0].tolist() == [0, 1, 2, 3, 4, 5]
+    assert result.index.mode_indices[1][1].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.values.tolist() == [1.0, 4.0, 9.0, 16.0, 25.0]
