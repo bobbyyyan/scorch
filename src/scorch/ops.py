@@ -48,12 +48,12 @@ def einsum(
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
     # elementwise multiplication or "ik,kj->ij" for matrix multiplication
 
-    # If any of the tensors have the same name, rename them
-    tensor_names = [tensor.name for tensor in tensors]
-    tensor_name_counts = {name: tensor_names.count(name) for name in tensor_names}
-    for i, tensor in enumerate(tensors):
-        if tensor_name_counts[tensor.name] > 1:
-            tensor.name = tensor.name + str(i)
+    # # If any of the tensors have the same name, rename them
+    # tensor_names = [tensor.name for tensor in tensors]
+    # tensor_name_counts = {name: tensor_names.count(name) for name in tensor_names}
+    # for i, tensor in enumerate(tensors):
+    #     if tensor_name_counts[tensor.name] > 1:
+    #         tensor.name = tensor.name + str(i)
 
     # unique_index_strs should be a list of unique index strings
     # e.g. ["i", "j", "k"]
@@ -77,9 +77,10 @@ def einsum(
 
     # Create TensorVar's for each tensor
     tensor_vars = []
-    for tensor in tensors:
+    tensor_names = list("BCDEFGHIJKLMNOPQRSTUVWXYZ")
+    for i, tensor in enumerate(tensors):
         if isinstance(tensor, Tensor):
-            tensor_vars.append(TensorVar(name=tensor.name, fmt=tensor.format))
+            tensor_vars.append(TensorVar(name=tensor_names[i], fmt=tensor.format))
 
     # Get output format from kwargs
     output_format = kwargs.get("format", None)

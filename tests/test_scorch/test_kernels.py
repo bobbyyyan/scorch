@@ -71,10 +71,25 @@ def test_elemwise_vector_mul_dss():
 
     result = einsum("i,i->i", sp_vector_a, sp_vector_b, format=TensorFormat("d"))
 
-    print("\nResult shape:", result.shape)
-    print("Result format:", result.format)
-    print("Result index:", result.index.mode_indices)
-    print("Result values:", result.values)
+    assert result.shape == (14,)
+    assert len(result.index.mode_indices) == 1
+
+    assert result.values.tolist() == [
+        2.0,
+        0.0,
+        4.0,
+        0.0,
+        6.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        8.0,
+        10.0,
+        0.0,
+        0.0,
+    ]
 
 
 def test_elemwise_matrix_mul_ss_ss_ss():

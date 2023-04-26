@@ -215,11 +215,19 @@ class CINLowerer:
                     type=llir.DataType.NO_TYPE,
                 )
             else:
+                level = self.result_tensor_access.level_of_index_var(
+                    self.defined_index_vars[-1]
+                )
                 tensor_access_llir = llir.Var(
                     name=f"{self.result_tensor_var.get_name()}_values"
-                    + f"[{self.defined_index_vars[-1].name}]",
+                    + f"[p{self.result_tensor_var.get_name()}{level}]",
                     type=llir.DataType.NO_TYPE,
                 )
+                # tensor_access_llir = llir.Var(
+                #     name=f"{self.result_tensor_var.get_name()}_values"
+                #     + f"[{self.defined_index_vars[-1].name}]",
+                #     type=llir.DataType.NO_TYPE,
+                # )
 
             rhs_llir = self.lower_IndexExpr(stmt.rhs)
 

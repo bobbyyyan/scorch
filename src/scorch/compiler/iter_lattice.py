@@ -851,10 +851,37 @@ class IterationLattice:
                 level = result_tensor_access.level_of_index_var(index_var)
                 level_type = result_tensor_access.level_type_of_index_var(index_var)
 
+                result_value_index_stmts: List[llir.Stmt] = [
+                    llir.Comment("Resolve index into dense level of values array"),
+                ]
+                # Index into result value array: p<result tensor var name><level>
+                result_index_var = llir.Var(
+                    name=f"p{result_tensor_var.name}{level}",
+                    type=llir.DataType.INT,
+                )
+
+                # Initialize the result index var, if this level is dense
+                # If is level 0, then p<result tensor var name><level> = index var
+                # If level > 0, then p<result tensor var name><level> =
+                # p<result tensor var name><parent level> * <size of this level> + index var
+                if level_type == LevelType.DENSE:
+                    if level == 0:
+                        result_value_index_stmts.append(
+                            llir.VarInit(
+                                var=result_index_var,
+                                value=llir.Var(
+                                    name=index_var.get_name(),
+                                    type=llir.DataType.INT,
+                                ),
+                            )
+                        )
+                        result_value_index_stmts.append(llir.BlankLine())
+
                 while_loop = llir.WhileLoop(
                     cond=lattice_point.get_while_condition(lattice=self),
                     body=[
                         *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                        *result_value_index_stmts,
                         *lattice_point.get_child_subregion_loops(
                             self.cin_lowerer, self.for_all_stmt.stmt
                         ),
