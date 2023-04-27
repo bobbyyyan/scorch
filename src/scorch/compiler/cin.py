@@ -111,10 +111,10 @@ class IndexVar(IndexExpr):
         return self.name
 
     def __str__(self):
-        return f"ivar_{self.name}"
+        return str(self.name)
 
     def __repr__(self):
-        return str(self)
+        return f"ivar_{self.name}"
 
     def __eq__(self, other):
         if isinstance(other, IndexVar):
@@ -194,12 +194,12 @@ class TensorVar(IndexExpr):
         self._assignment = TensorAssign(TensorAccess(self, key), value)
 
     def __str__(self):
-        return f"tensor_{self.name}:{self.format}"
+        return f"{self.name}:{self.format}"
         # return f'TensorVar("{self.name}", fmt={self.format})'
         # return f"TensorVar(name={self.name}, shape={self.shape}, format={self.format})"
 
     def __repr__(self):
-        return str(self)
+        return f"tensor_{self.name}:{self.format}"
 
 
 class TensorAccess(IndexExpr):
@@ -365,7 +365,7 @@ class TensorAssign(IndexStmt):
         # return f"TensorAssign(lhs={self.lhs}, rhs={self.rhs})"
 
     def __repr__(self):
-        return str(self)
+        return f"{self.lhs} <- {self.rhs}"
 
     def accept(self, visitor: "CINVisitor") -> None:
         visitor.visit(self.lhs)
@@ -397,10 +397,10 @@ class ForAll(IndexStmt):
         return self.index_var
 
     def __str__(self):
-        return f"ForAll_{{{self.index_var}}} ({self.stmt})"
+        return f"∀{{{self.index_var}}} ({self.stmt})"
 
     def __repr__(self):
-        return str(self)
+        return f"ForAll_{{{self.index_var}}} ({self.stmt})"
 
     def accept(self, visitor: "CINVisitor") -> None:
         visitor.visit(self.index_var)

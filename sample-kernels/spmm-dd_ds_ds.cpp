@@ -24,12 +24,12 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> B_shape,
   int A_capacity = A0_size * A1_size;
   cvector<double> A_values = cvector<double>(A_capacity);
 
-#pragma omp parallel for schedule(static)
+  #pragma omp parallel for schedule(static)
   for (int pA = 0; pA < A_capacity; pA++) {
     A_values[pA] = 0.0;
   }
 
-#pragma omp parallel for schedule(runtime)
+  #pragma omp parallel for schedule(runtime)
   for (int i = 0; i < B0_size; i++) {
     int pA0 = i;
 

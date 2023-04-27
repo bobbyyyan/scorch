@@ -851,3 +851,29 @@ def test_spmm_sd_ds_ds():
 
     print("\nC++ torch extension code:")
     print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_ij_i_j_ss_s_s():
+    # taco "A(i, j) = B(i) * C(j)" -f=A:ss -f=B:s -f=C:s -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt=["sparse", "sparse"])
+    B = TensorVar("B", fmt=["sparse"])
+    C = TensorVar("C", fmt=["sparse"])
+
+    A[i, j] = B[i] * C[j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
