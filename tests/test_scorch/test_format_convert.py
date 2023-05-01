@@ -45,6 +45,13 @@ def test_2d_ds_oo():
     )
     matrix.to_sparse(get_format_from_list(["d", "s"]))
 
+    assert len(matrix.index.mode_indices) == 2
+
+    assert matrix.index.mode_indices[1][0].tolist() == [0, 1, 2, 4, 4, 5]
+    assert matrix.index.mode_indices[1][1].tolist() == [0, 1, 2, 3, 4]
+
+    assert matrix.values.tolist() == [1, 2, 3, 4, 5]
+
 
 def test_2d_dd_oo():
     # Test converting a COO matrix to a dense matrix
@@ -78,3 +85,12 @@ def test_2d_ss_dd():
     )
     matrix = Tensor.from_torch(matrix)
     matrix.to_sparse(get_format_from_list(["s", "s"]))
+
+    assert len(matrix.index.mode_indices) == 2
+
+    assert matrix.index.mode_indices[0][0].tolist() == [0, 5]
+    assert matrix.index.mode_indices[0][1].tolist() == [0, 1, 2, 3, 4]
+    assert matrix.index.mode_indices[1][0].tolist() == [0, 1, 2, 5, 7, 8]
+    assert matrix.index.mode_indices[1][1].tolist() == [0, 1, 2, 3, 4, 3, 4, 4]
+
+    assert matrix.values.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
