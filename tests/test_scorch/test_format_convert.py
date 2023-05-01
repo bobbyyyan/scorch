@@ -20,6 +20,15 @@ def test_2d_ss_oo():
     )
     matrix.to_sparse(get_format_from_list(["s", "s"]))
 
+    assert len(matrix.index.mode_indices) == 2
+
+    assert matrix.index.mode_indices[0][0].tolist() == [0, 4]
+    assert matrix.index.mode_indices[0][1].tolist() == [0, 1, 2, 4]
+    assert matrix.index.mode_indices[1][0].tolist() == [0, 1, 2, 4, 5]
+    assert matrix.index.mode_indices[1][1].tolist() == [0, 1, 2, 3, 4]
+
+    assert matrix.values.tolist() == [1, 2, 3, 4, 5]
+
 
 def test_2d_ds_oo():
     # Test converting a COO matrix to a CSR (dense, sparse) matrix
@@ -55,8 +64,17 @@ def test_2d_dd_oo():
 
 def test_2d_ss_dd():
     # Test converting a dense matrix to a sparse matrix
-    matrix = torch.rand(5, 5)
+    # matrix = torch.rand(5, 5)
     # Sparsify the matrix
-    matrix[torch.rand(5, 5) > 0.5] = 0
+    # matrix[torch.rand(5, 5) > 0.5] = 0
+    matrix = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 4, 5],
+            [0, 0, 0, 6, 7],
+            [0, 0, 0, 0, 8],
+        ]
+    )
     matrix = Tensor.from_torch(matrix)
     matrix.to_sparse(get_format_from_list(["s", "s"]))
