@@ -132,3 +132,24 @@ def test_elemwise_matrix_mul_ss_ss_ss():
     assert result.index.mode_indices[1][1].tolist() == [0, 1, 2, 3, 4]
 
     assert result.values.tolist() == [1.0, 4.0, 9.0, 16.0, 25.0]
+
+
+def test_ij_i_j_ss_s_s():
+    tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3])
+    tensor_b_torch = torch.Tensor([7, 8, 0, 9])
+
+    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse()
+    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse()
+
+    result = einsum("i,j->ij", sp_vector_a, sp_vector_b, format=["s", "s"])
+
+    assert result.shape == (5, 4)
+    assert len(result.index.mode_indices) == 2
+
+    assert result.index.mode_indices[0][0].tolist() == [0, 3]
+    assert result.index.mode_indices[0][1].tolist() == [0, 2, 4]
+
+    assert result.index.mode_indices[1][0].tolist() == [0, 3, 6, 9]
+    assert result.index.mode_indices[1][1].tolist() == [0, 1, 3, 0, 1, 3, 0, 1, 3]
+
+    assert result.values.tolist() == [7.0, 8.0, 9.0, 14.0, 16.0, 18.0, 21.0, 24.0, 27.0]
