@@ -1,6 +1,6 @@
 from __future__ import annotations
 from copy import deepcopy
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 import torch
 
@@ -9,7 +9,7 @@ from src.scorch.compiler.cin_lowerer import CINLowerer
 from src.scorch.compiler.codegen import LLIRLowerer
 from src.scorch.format import TensorFormat, LevelFormat, LevelType
 from src.scorch.storage import TensorStorage, TensorIndex, TensorStorageView
-from src.scorch.utils import PROJECT_ROOT_DIR
+from src.scorch.utils import PROJECT_ROOT_DIR, parse_format
 
 
 class Window(object):
@@ -262,7 +262,9 @@ class Tensor(torch.nn.Module):
         return tt_tensor
 
     # function to sparsify a Tensor
-    def to_sparse(self, fmt: Optional[TensorFormat] = None) -> Tensor:
+    def to_sparse(
+        self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None
+    ) -> Tensor:
         """Convert the tensor to a sparse tensor."""
         if len(self.shape) == 1:
             # Find indexes of non-zero elements in self.values, flatten them
@@ -303,8 +305,7 @@ class Tensor(torch.nn.Module):
                     ),
                 )
 
-            output_format = fmt
-            if output_format is None:
+            if fmt is None:
                 # TODO: infer output format from input format
                 # For now, make every level COMPRESSED
                 output_format = TensorFormat(
@@ -313,6 +314,9 @@ class Tensor(torch.nn.Module):
                         for _ in range(len(self.shape))
                     ]
                 )
+            else:
+                output_format = parse_format(fmt)
+
             A = TensorVar(
                 name="A",
                 fmt=output_format,

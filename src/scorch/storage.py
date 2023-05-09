@@ -1,8 +1,9 @@
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 
 import torch
 
 from .format import TensorFormat, LevelType
+from .utils import parse_format
 
 
 class TensorLevelIndex(object):
@@ -38,10 +39,10 @@ class TensorIndex(object):
 
     def __init__(
         self,
-        tensor_format: Optional[TensorFormat] = None,
+        tensor_format: Optional[Union[TensorFormat, str, List[str]]] = None,
         mode_indices: Optional[List[List[torch.Tensor]]] = None,
     ):
-        self.format = tensor_format
+        self.format = parse_format(tensor_format) if tensor_format else None
         self.mode_indices = mode_indices
 
     def __str__(self):

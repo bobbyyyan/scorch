@@ -2,7 +2,6 @@ import torch
 
 from src.scorch import Tensor
 from src.scorch.storage import TensorIndex
-from src.scorch.utils import parse_format
 
 
 def test_2d_ss_oo():
@@ -10,7 +9,7 @@ def test_2d_ss_oo():
     matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
-            tensor_format=parse_format("oo"),
+            tensor_format="oo",
             mode_indices=[
                 [torch.tensor([0, 1, 2, 2, 3, 4])],
                 [torch.tensor([0, 1, 2, 3, 3, 4])],
@@ -18,7 +17,7 @@ def test_2d_ss_oo():
         ),
         value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
-    matrix.to_sparse(parse_format("ss"))
+    matrix.to_sparse("ss")
 
     assert len(matrix.index.mode_indices) == 2
 
@@ -35,7 +34,7 @@ def test_2d_ds_oo():
     matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
-            tensor_format=parse_format("oo"),
+            tensor_format="oo",
             mode_indices=[
                 [torch.tensor([0, 1, 2, 2, 3, 4])],
                 [torch.tensor([0, 1, 2, 3, 3, 4])],
@@ -43,7 +42,7 @@ def test_2d_ds_oo():
         ),
         value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
-    matrix.to_sparse(parse_format("ds"))
+    matrix.to_sparse("ds")
 
     assert len(matrix.index.mode_indices) == 2
 
@@ -58,7 +57,7 @@ def test_2d_dd_oo():
     matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
-            tensor_format=parse_format("oo"),
+            tensor_format="oo",
             mode_indices=[
                 [torch.tensor([0, 1, 2, 2, 3, 4])],
                 [torch.tensor([0, 1, 2, 3, 3, 4])],
@@ -66,7 +65,7 @@ def test_2d_dd_oo():
         ),
         value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
-    matrix.to_sparse(parse_format("dd"))
+    matrix.to_sparse("dd")
 
 
 def test_2d_ss_dd():
@@ -84,7 +83,7 @@ def test_2d_ss_dd():
         ]
     )
     matrix = Tensor.from_torch(matrix)
-    matrix.to_sparse(parse_format("ss"))
+    matrix.to_sparse("ss")
 
     assert len(matrix.index.mode_indices) == 2
 
