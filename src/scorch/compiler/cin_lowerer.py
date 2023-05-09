@@ -640,6 +640,8 @@ class CINLowerer:
                     return "{}"
                 elif level_type == LevelType.COMPRESSED:
                     return f"{{{tensor_level_name}_pos_torch, {tensor_level_name}_crd_torch}}"
+                elif level_type == LevelType.COORDINATE:
+                    return f"{{{tensor_level_name}_crd_torch}}"
 
             body_stmts.append(
                 llir.Assign(

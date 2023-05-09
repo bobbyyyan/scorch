@@ -69,7 +69,7 @@ class ModeIterator:
         ):
             # if this is the parent-most coordinate level,
             # initialize the bounds using the size of the crd array
-            if self.level == 0:
+            if self.level == 0 and self.level_type == LevelType.COORDINATE:
                 # int pB0 = 0;
                 stmts.append(
                     llir.VarInit(

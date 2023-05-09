@@ -493,9 +493,9 @@ def test_elemwise_mul_2d_oo_oo_oo():
     i = IndexVar("i")
     j = IndexVar("j")
 
-    A = TensorVar("A", fmt=["coordinate", "coordinate"])
-    B = TensorVar("B", fmt=["coordinate", "coordinate"])
-    C = TensorVar("C", fmt=["coordinate", "coordinate"])
+    A = TensorVar("A", fmt=["coord", "coord"])
+    B = TensorVar("B", fmt=["coord", "coord"])
+    C = TensorVar("C", fmt=["coord", "coord"])
 
     A[i, j] = B[i, j] * C[i, j]
 
