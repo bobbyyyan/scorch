@@ -2,7 +2,7 @@ import torch
 
 from src.scorch import Tensor
 from src.scorch.storage import TensorIndex
-from src.scorch.utils import get_format_from_list
+from src.scorch.utils import parse_format
 
 
 def test_2d_ss_oo():
@@ -10,7 +10,7 @@ def test_2d_ss_oo():
     matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
-            tensor_format=get_format_from_list(["o", "o"]),
+            tensor_format=parse_format("oo"),
             mode_indices=[
                 [torch.tensor([0, 1, 2, 2, 3, 4])],
                 [torch.tensor([0, 1, 2, 3, 3, 4])],
@@ -18,7 +18,7 @@ def test_2d_ss_oo():
         ),
         value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
-    matrix.to_sparse(get_format_from_list(["s", "s"]))
+    matrix.to_sparse(parse_format("ss"))
 
     assert len(matrix.index.mode_indices) == 2
 
@@ -35,7 +35,7 @@ def test_2d_ds_oo():
     matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
-            tensor_format=get_format_from_list(["o", "o"]),
+            tensor_format=parse_format("oo"),
             mode_indices=[
                 [torch.tensor([0, 1, 2, 2, 3, 4])],
                 [torch.tensor([0, 1, 2, 3, 3, 4])],
@@ -43,7 +43,7 @@ def test_2d_ds_oo():
         ),
         value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
-    matrix.to_sparse(get_format_from_list(["d", "s"]))
+    matrix.to_sparse(parse_format("ds"))
 
     assert len(matrix.index.mode_indices) == 2
 
@@ -58,7 +58,7 @@ def test_2d_dd_oo():
     matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
-            tensor_format=get_format_from_list(["o", "o"]),
+            tensor_format=parse_format("oo"),
             mode_indices=[
                 [torch.tensor([0, 1, 2, 2, 3, 4])],
                 [torch.tensor([0, 1, 2, 3, 3, 4])],
@@ -66,7 +66,7 @@ def test_2d_dd_oo():
         ),
         value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
-    matrix.to_sparse(get_format_from_list(["d", "d"]))
+    matrix.to_sparse(parse_format("dd"))
 
 
 def test_2d_ss_dd():
@@ -84,7 +84,7 @@ def test_2d_ss_dd():
         ]
     )
     matrix = Tensor.from_torch(matrix)
-    matrix.to_sparse(get_format_from_list(["s", "s"]))
+    matrix.to_sparse(parse_format("ss"))
 
     assert len(matrix.index.mode_indices) == 2
 

@@ -7,7 +7,7 @@ from typing import List, Optional, Any, Tuple, Callable, Union
 import torch
 
 from src.scorch.format import TensorFormat, LevelType
-from src.scorch.utils import get_format_from_list
+from src.scorch.utils import parse_format
 
 # Type aliases for type hints
 _UnaryOp = Callable[[Any], Any]
@@ -162,7 +162,7 @@ class TensorVar(IndexExpr):
         if isinstance(fmt, TensorFormat):
             self.format = fmt
         elif isinstance(fmt, list):
-            self.format = get_format_from_list(fmt)
+            self.format = parse_format(fmt)
 
         self.dtype = dtype
 

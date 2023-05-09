@@ -1,6 +1,6 @@
 from itertools import chain
 from pathlib import Path
-from typing import List, Dict, Any, Iterable
+from typing import List, Dict, Any, Iterable, Union
 
 import torch
 
@@ -12,17 +12,21 @@ while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 
-def get_format_from_list(format_str_list: List[str]) -> TensorFormat:
+def parse_format(fmt: Union[List[str], str, TensorFormat]) -> TensorFormat:
     """Convert a list of format strings to a TensorFormat.
 
     Args:
-        format_str_list (List[str]): List of format strings.
+        fmt (List[str]): List of format strings.
 
     Returns:
         TensorFormat: TensorFormat object.
     """
+    if isinstance(fmt, TensorFormat):
+        return fmt
+    if isinstance(fmt, str):
+        fmt = list(fmt)
     level_formats = []
-    for format_str in format_str_list:
+    for format_str in fmt:
         if format_str in ["dense", "d"]:
             level_formats.append(LevelFormat(mode=LevelType.DENSE))
         elif format_str in ["compressed", "sparse", "c", "s"]:
