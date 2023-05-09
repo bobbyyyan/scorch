@@ -67,6 +67,36 @@ def test_2d_dd_oo():
     )
     matrix.to_sparse("dd")
 
+    assert matrix.values.tolist() == [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        3.0,
+        4.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        5.0,
+    ]
+
+    print(matrix.values.tolist())
+
 
 def test_2d_ss_dd():
     # Test converting a dense matrix to a sparse matrix

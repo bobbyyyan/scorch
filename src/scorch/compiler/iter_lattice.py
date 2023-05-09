@@ -876,6 +876,32 @@ class IterationLattice:
                             )
                         )
                         result_value_index_stmts.append(llir.BlankLine())
+                    else:
+                        result_value_index_stmts.append(
+                            llir.VarInit(
+                                var=result_index_var,
+                                value=llir.BinOp(
+                                    op="+",
+                                    left=llir.BinOp(
+                                        op="*",
+                                        left=llir.Var(
+                                            name=f"p{result_tensor_var.name}{level - 1}",
+                                            type=llir.DataType.INT,
+                                        ),
+                                        # <result tensor name><level>_size
+                                        right=llir.Var(
+                                            name=f"{result_tensor_var.name}{level}_size",
+                                            type=llir.DataType.INT,
+                                        ),
+                                    ),
+                                    right=llir.Var(
+                                        name=index_var.get_name(),
+                                        type=llir.DataType.INT,
+                                    ),
+                                ),
+                            )
+                        )
+                        result_value_index_stmts.append(llir.BlankLine())
 
                 while_loop = llir.WhileLoop(
                     cond=lattice_point.get_while_condition(lattice=self),
