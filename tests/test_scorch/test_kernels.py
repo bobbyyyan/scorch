@@ -7,10 +7,10 @@ def test_elemwise_vector_mul_sss():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse()
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse()
+    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
 
-    result = einsum("i,i->i", sp_vector_a, sp_vector_b)
+    result = einsum("i,i->i", sp_vector_a, sp_vector_b, format="s")
 
     assert result.shape == (12,)
     assert len(result.index.mode_indices) == 1
@@ -26,8 +26,8 @@ def test_elemwise_vector_add_sss():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse()
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse()
+    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
 
     result = sp_vector_a + sp_vector_b
 
@@ -46,9 +46,9 @@ def test_elemwise_vector_add_sss_2():
     tensor_b_torch = torch.Tensor([0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     tensor_c_torch = torch.Tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse()
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse()
-    sp_vector_c = Tensor.from_torch(tensor_c_torch).to_sparse()
+    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
+    sp_vector_c = Tensor.from_torch(tensor_c_torch).to_sparse("s")
 
     result = sp_vector_a + sp_vector_b + sp_vector_c
 
@@ -66,10 +66,10 @@ def test_elemwise_vector_mul_dss():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4, 5, 0])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5, 0, 14])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse()
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse()
+    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
 
-    result = einsum("i,i->i", sp_vector_a, sp_vector_b, format=TensorFormat("d"))
+    result = einsum("i,i->i", sp_vector_a, sp_vector_b, format="d")
 
     assert result.shape == (14,)
     assert len(result.index.mode_indices) == 1
@@ -90,6 +90,76 @@ def test_elemwise_vector_mul_dss():
         0.0,
         0.0,
     ]
+
+
+def test_elemwise_matrix_mul_oo_oo_oo():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
+
+    result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
+
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    assert result.index.mode_indices[0][0].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.index.mode_indices[1][0].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.values.tolist() == [1.0, 4.0, 9.0, 16.0, 25.0]
+
+
+def test_elemwise_matrix_mul_oo_ss_ss():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ss")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
+
+    result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
+
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    assert result.index.mode_indices[0][0].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.index.mode_indices[1][0].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.values.tolist() == [1.0, 4.0, 9.0, 16.0, 25.0]
 
 
 def test_elemwise_matrix_mul_ss_ss_ss():
@@ -117,10 +187,10 @@ def test_elemwise_matrix_mul_ss_ss_ss():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse()
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse()
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ss")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
 
-    result = einsum("ij,ij->ij", a_sparse, b_sparse)
+    result = einsum("ij,ij->ij", a_sparse, b_sparse, format="ss")
 
     assert result.shape == (5, 5)
     assert len(result.index.mode_indices) == 2
@@ -141,7 +211,7 @@ def test_ij_i_j_ss_s_s():
     sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse()
     sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse()
 
-    result = einsum("i,j->ij", sp_vector_a, sp_vector_b, format=["s", "s"])
+    result = einsum("i,j->ij", sp_vector_a, sp_vector_b, format="ss")
 
     assert result.shape == (5, 4)
     assert len(result.index.mode_indices) == 2

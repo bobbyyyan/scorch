@@ -10,6 +10,7 @@ from src.scorch.compiler.codegen import LLIRLowerer
 from src.scorch.format import TensorFormat, LevelFormat, LevelType
 from src.scorch.storage import TensorIndex
 from src.scorch.tensor import Tensor
+from src.scorch.utils import parse_format
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
@@ -92,6 +93,8 @@ def einsum(
         for index_str in result_index_strs:
             level_formats.append(LevelFormat(LevelType.COMPRESSED))
         output_format = TensorFormat(level_formats)
+    else:
+        output_format = parse_format(output_format)
 
     # Create the result TensorVar
     available_names = [
