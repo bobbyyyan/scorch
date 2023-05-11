@@ -361,11 +361,11 @@ class TensorAssign(IndexStmt):
         return self.rhs
 
     def __str__(self):
-        return f"{self.lhs} <- {self.rhs}"
+        return f"{self.lhs} {self.op or ''}= {self.rhs}"
         # return f"TensorAssign(lhs={self.lhs}, rhs={self.rhs})"
 
     def __repr__(self):
-        return f"{self.lhs} <- {self.rhs}"
+        return f"{self.lhs} {self.op or ''}= {self.rhs}"
 
     def accept(self, visitor: "CINVisitor") -> None:
         visitor.visit(self.lhs)
@@ -422,6 +422,42 @@ class CINVisitorAccept(CINVisitor):
     # with the visitor as an argument.
     def generic_visit(self, node: CIN) -> None:
         node.accept(self)
+
+
+class CINIndexVariablesGetter(CINVisitor):
+    # free variables are index variables of the result tensor
+    free_vars: List[IndexVar] = []
+    # input variables are index variables of the input tensors
+    input_vars: List[IndexVar] = []
+
+    def __init__(self, stmt: Optional[IndexStmt] = None):
+        self.free_vars = []
+        self.input_vars = []
+        if stmt is not None:
+            self.visit(stmt)
+
+    def visit_TensorAssign(self, node: TensorAssign) -> None:
+        for var in node.get_lhs().get_index_vars():
+            self.free_vars.append(var)
+        self.visit(node.get_rhs())
+
+    def visit_ForAll(self, node: ForAll) -> None:
+        ivar = node.get_index_var()
+        if ivar not in self.input_vars:
+            self.input_vars.append(ivar)
+        self.visit(node.stmt)
+
+    def visit_BinaryOp(self, node: BinaryOp) -> None:
+        self.visit(node.left)
+        self.visit(node.right)
+
+    def visit_TensorAccess(self, node: TensorAccess) -> None:
+        for var in node.get_index_vars():
+            if var not in self.input_vars:
+                self.input_vars.append(var)
+
+    def get_reduction_vars(self) -> List[IndexVar]:
+        return [var for var in self.input_vars if var not in self.free_vars]
 
 
 class LoopOrderGetter(CINVisitor):

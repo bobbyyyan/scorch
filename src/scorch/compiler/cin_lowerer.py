@@ -12,6 +12,7 @@ from src.scorch.compiler.cin import (
     IndexExpr,
     BinaryOp,
     CIN,
+    Operation,
 )
 from src.scorch.compiler.iter_lattice import IterationLattice
 from src.scorch.format import LevelType
@@ -231,12 +232,24 @@ class CINLowerer:
 
             rhs_llir = self.lower_IndexExpr(stmt.rhs)
 
-            llir_stmts.append(
-                llir.Assign(
-                    var=tensor_access_llir,
-                    value=rhs_llir,
+            if stmt.op == Operation.ADD:
+                llir_stmts.append(
+                    llir.Assign(
+                        var=tensor_access_llir,
+                        value=llir.BinOp(
+                            op="+",
+                            left=tensor_access_llir,
+                            right=rhs_llir,
+                        ),
+                    )
                 )
-            )
+            else:
+                llir_stmts.append(
+                    llir.Assign(
+                        var=tensor_access_llir,
+                        value=rhs_llir,
+                    )
+                )
             # If the last level of the result tensor var is sparse, then we need to set
             # the coordinates
             last_ivar = self.defined_index_vars[-1]

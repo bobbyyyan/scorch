@@ -20,6 +20,7 @@ from src.scorch.compiler.cin import (
     BinaryOp,
     Operation,
     IndexExpr,
+    CINIndexVariablesGetter,
 )
 from src.scorch.format import LevelType
 from src.scorch.compiler.iterator import ModeIterator
@@ -254,6 +255,17 @@ class LatticePoint:
             )
 
         elif isinstance(cin, TensorAssign):
+            cin_ivar_getter = CINIndexVariablesGetter()
+            cin_ivar_getter.visit(cin)
+
+            reduction_vars = cin_ivar_getter.get_reduction_vars()
+
+            print("free vars: ", cin_ivar_getter.free_vars)
+            print("input vars: ", cin_ivar_getter.input_vars)
+            print("reduction vars: ", reduction_vars)
+
+            has_reduction = len(reduction_vars) > 0
+
             rewritten_rhs = self.get_simplified_cin(cin.rhs)
             if not rewritten_rhs:
                 rewritten_rhs = cin.rhs
@@ -262,9 +274,11 @@ class LatticePoint:
             assert isinstance(
                 rewritten_rhs, IndexExpr
             ), "Rewritten rhs is not an index expr"
+
             return TensorAssign(
                 lhs=cin.lhs,
                 rhs=rewritten_rhs,
+                op=Operation.ADD if has_reduction else None,
             )
 
         raise NotImplementedError(f"Unhandled CIN type {type(cin)}")

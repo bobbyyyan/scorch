@@ -1,3 +1,5 @@
+from itertools import product
+
 import torch
 
 from src.scorch import Tensor, einsum, TensorFormat
@@ -232,6 +234,41 @@ def test_elemwise_matrix_mul_oo_ss_ss():
     assert result.values.tolist() == [1.0, 4.0, 9.0, 16.0, 25.0]
 
 
+def test_elemwise_matrix_mul_oo_ds_ds():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+
+    result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
+
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    assert result.index.mode_indices[0][0].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.index.mode_indices[1][0].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.values.tolist() == [1.0, 4.0, 9.0, 16.0, 25.0]
+
+
 def test_elemwise_matrix_mul_ss_ss_ss():
     # # Generate a random sparse 10x10 torch tensor
     # tensor_a_torch = torch.rand(10, 10)
@@ -275,11 +312,6 @@ def test_elemwise_matrix_mul_ss_ss_ss():
 
 
 def test_elemwise_matrix_mul_ss_oo_ss():
-    # # Generate a random sparse 10x10 torch tensor
-    # tensor_a_torch = torch.rand(10, 10)
-    # tensor_a_torch[torch.rand(10, 10) > 0.5] = 0
-    # tensor_b_torch = torch.rand(10, 10)
-    # tensor_b_torch[torch.rand(10, 10) > 0.5] = 0
     tensor_a_torch = torch.Tensor(
         [
             [1, 0, 0, 0, 0],
@@ -335,3 +367,126 @@ def test_ij_i_j_ss_s_s():
     assert result.index.mode_indices[1][1].tolist() == [0, 1, 3, 0, 1, 3, 0, 1, 3]
 
     assert result.values.tolist() == [7.0, 8.0, 9.0, 14.0, 16.0, 18.0, 21.0, 24.0, 27.0]
+
+
+def test_spmm_dd_ds_ds():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+
+    result = einsum("ik,kj->ij", a_sparse, b_sparse, format="dd")
+
+    assert result.shape == (5, 5)
+
+    assert result.values.tolist() == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        4.0,
+        4.0,
+        0.0,
+        0.0,
+        0.0,
+        9.0,
+        0.0,
+        9.0,
+        0.0,
+        0.0,
+        16.0,
+        0.0,
+        0.0,
+        16.0,
+        0.0,
+        25.0,
+        0.0,
+        0.0,
+        0.0,
+        25.0,
+    ]
+
+
+def test_spmm_dd_multi_multi():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    tensor_a = Tensor.from_torch(tensor_a_torch, "A")
+    tensor_b = Tensor.from_torch(tensor_b_torch, "B")
+
+    input_formats = ["ds", "ss", "oo"]
+
+    input_format_pairs = list(product(input_formats, input_formats))
+
+    for format_a, format_b in input_format_pairs:
+        a_sparse = tensor_a.to_sparse(format_a)
+        b_sparse = tensor_b.to_sparse(format_b)
+
+        result = einsum("ik,kj->ij", a_sparse, b_sparse, format="dd")
+
+        print("Input formats: ", format_a, format_b)
+        print("Output format: ", result.format)
+
+        assert result.shape == (5, 5)
+
+        assert result.values.tolist() == [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            4.0,
+            4.0,
+            0.0,
+            0.0,
+            0.0,
+            9.0,
+            0.0,
+            9.0,
+            0.0,
+            0.0,
+            16.0,
+            0.0,
+            0.0,
+            16.0,
+            0.0,
+            25.0,
+            0.0,
+            0.0,
+            0.0,
+            25.0,
+        ]
