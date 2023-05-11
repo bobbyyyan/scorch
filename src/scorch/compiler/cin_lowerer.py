@@ -239,25 +239,58 @@ class CINLowerer:
             )
             # If the last level of the result tensor var is sparse, then we need to set
             # the coordinates
+            last_ivar = self.defined_index_vars[-1]
             last_level_type = self.result_tensor_access.level_type_of_index_var(
-                self.defined_index_vars[-1]
+                last_ivar
             )
             if last_level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
                 llir_stmts.append(llir.Comment("Set coordinates"))
-                result_index_name = f"[p{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}]"
+                result_tensor_name = self.result_tensor_var.get_name()
+                result_index_name = (
+                    f"p{result_tensor_name}{self.result_tensor_var.levels - 1}"
+                )
+                level = self.result_tensor_access.level_of_index_var(last_ivar)
+
                 llir_stmts.append(
                     llir.Assign(
                         var=llir.Var(
-                            name=f"{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}_crd"
-                            + f"[p{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}]",
+                            name=f"{result_tensor_name}{level}_crd"
+                            + f"[{result_index_name}]",
                             type=llir.DataType.NO_TYPE,
                         ),
                         value=llir.Var(
-                            name=self.defined_index_vars[-1].name,
+                            name=last_ivar.name,
                             type=llir.DataType.NO_TYPE,
                         ),
                     )
                 )
+
+                # if the last level is COORDINATE, we might need to set the coordinates
+                # or previous levels as well
+                if last_level_type == LevelType.COORDINATE:
+                    for defined_ivar in self.defined_index_vars[-2::-1]:
+                        level_type = self.result_tensor_access.level_type_of_index_var(
+                            defined_ivar
+                        )
+                        level = self.result_tensor_access.level_of_index_var(
+                            defined_ivar
+                        )
+                        if level_type == LevelType.COORDINATE:
+                            llir_stmts.append(
+                                llir.Assign(
+                                    var=llir.Var(
+                                        name=f"{result_tensor_name}{level}_crd"
+                                        + f"[{result_index_name}]",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    value=llir.Var(
+                                        name=defined_ivar.name,
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                )
+                            )
+                        else:
+                            break
 
             # if has sparse index for result value array, need to increment
             if self.result_value_array_sparse_index_llir is not None:
