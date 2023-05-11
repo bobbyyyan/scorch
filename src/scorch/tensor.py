@@ -287,7 +287,13 @@ class Tensor(torch.nn.Module):
                 value=filtered_values,
             )
         else:
-            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+            default_index_vars = [
+                IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+            ]
+            if len(self.shape) > len(default_index_vars):
+                index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+            else:
+                index_vars = default_index_vars[: len(self.shape)]
 
             if self.has_index:
                 B = TensorVar(

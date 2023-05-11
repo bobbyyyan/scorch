@@ -231,7 +231,7 @@ class VarInit(Stmt):
 class Assign(Stmt):
     """A variable assignment statement."""
 
-    var: Var
+    var: Union[Var, Expr]
     value: Expr
     op: AssignOp = AssignOp.ASSIGN
     cast: Optional[bool] = False

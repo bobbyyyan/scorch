@@ -239,13 +239,12 @@ class CINLowerer:
             )
             # If the last level of the result tensor var is sparse, then we need to set
             # the coordinates
-            if (
-                self.result_tensor_access.level_type_of_index_var(
-                    self.defined_index_vars[-1]
-                )
-                == LevelType.COMPRESSED
-            ):
+            last_level_type = self.result_tensor_access.level_type_of_index_var(
+                self.defined_index_vars[-1]
+            )
+            if last_level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
                 llir_stmts.append(llir.Comment("Set coordinates"))
+                result_index_name = f"[p{self.result_tensor_var.get_name()}{self.result_tensor_var.levels - 1}]"
                 llir_stmts.append(
                     llir.Assign(
                         var=llir.Var(
@@ -373,6 +372,30 @@ class CINLowerer:
 
                     result_level_indices_init_stmts.append(llir.BlankLine())
 
+                elif level_type == LevelType.COORDINATE:
+                    # e.g. cvector<int> a0_crd;
+                    result_level_indices_init_stmts.append(
+                        llir.VarDecl(
+                            llir.Var(
+                                name=f"{result_tensor_var.get_name()}{i}_crd",
+                                type=llir.DataType.CVECTOR_INT,
+                            )
+                        )
+                    )
+
+                    # e.g. int pa0 = 0;
+                    result_level_indices_init_stmts.append(
+                        llir.VarInit(
+                            llir.Var(
+                                name=f"p{result_tensor_var.get_name()}{i}",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Literal(0),
+                        )
+                    )
+
+                    result_level_indices_init_stmts.append(llir.BlankLine())
+
         if result_level_indices_init_stmts:
             result_level_indices_init_stmts = [
                 llir.Comment("Init result level indices"),
@@ -446,7 +469,7 @@ class CINLowerer:
         ) in self.index_var_to_result_tensor_level_type.items():
             # TODO: deal with multiple outputs
             tensor_var, level, level_type = tensor_level_type_list[0]
-            if level_type == LevelType.COMPRESSED:
+            if level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
                 result_last_compressed_index_var = index_var
 
         result_index_init_stmts = []
@@ -534,38 +557,41 @@ class CINLowerer:
 
             # torch::Tensor a0_pos_torch = torch::from_blob(a0_pos.data(), {a0_pos.size()}, a0_pos.get_deleter(), torch::kInt);
             for i, level_type in enumerate(self.result_tensor_var.get_level_types()):
-                if level_type == LevelType.COMPRESSED:
-                    tensor_level_name = f"{self.result_tensor_var.get_name()}{i}"
-                    # Emit {tensor_level_name}_pos_torch array
-                    body_stmts.append(
-                        llir.VarInit(
-                            var=llir.Var(
-                                name=f"{tensor_level_name}_pos_torch",
-                                type=llir.DataType.TORCH_TENSOR,
-                            ),
-                            value=llir.FunctionCall(
-                                name="torch::from_blob",
-                                args=[
-                                    llir.Var(
-                                        name=f"{tensor_level_name}_pos.data()",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{{{tensor_level_name}_pos.size()}}",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{tensor_level_name}_pos.get_deleter()",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name="torch::kInt",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                ],
-                            ),
+                tensor_level_name = f"{self.result_tensor_var.get_name()}{i}"
+
+                if level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
+                    if level_type == LevelType.COMPRESSED:
+                        # Emit {tensor_level_name}_pos_torch array
+                        body_stmts.append(
+                            llir.VarInit(
+                                var=llir.Var(
+                                    name=f"{tensor_level_name}_pos_torch",
+                                    type=llir.DataType.TORCH_TENSOR,
+                                ),
+                                value=llir.FunctionCall(
+                                    name="torch::from_blob",
+                                    args=[
+                                        llir.Var(
+                                            name=f"{tensor_level_name}_pos.data()",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
+                                        llir.Var(
+                                            name=f"{{{tensor_level_name}_pos.size()}}",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
+                                        llir.Var(
+                                            name=f"{tensor_level_name}_pos.get_deleter()",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
+                                        llir.Var(
+                                            name="torch::kInt",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
+                                    ],
+                                ),
+                            )
                         )
-                    )
+
                     # Emit {tensor_level_name}_crd_torch array
                     body_stmts.append(
                         llir.VarInit(
