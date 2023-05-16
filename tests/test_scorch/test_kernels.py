@@ -369,6 +369,132 @@ def test_ij_i_j_ss_s_s():
     assert result.values.tolist() == [7.0, 8.0, 9.0, 14.0, 16.0, 18.0, 21.0, 24.0, 27.0]
 
 
+def test_spmm_ds_ds_ds():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+
+    result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ds")
+
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    assert result.index.mode_indices[1][0].tolist() == [0, 5, 7, 9, 11, 13]
+    assert result.index.mode_indices[1][1].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        0,
+        1,
+        0,
+        2,
+        0,
+        3,
+        0,
+        4,
+    ]
+
+    assert result.values.tolist() == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        4.0,
+        4.0,
+        9.0,
+        9.0,
+        16.0,
+        16.0,
+        25.0,
+        25.0,
+    ]
+
+
+def test_spmm_ss_ds_ds():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+
+    result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
+
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    assert result.index.mode_indices[0][0].tolist() == [0, 5]
+    assert result.index.mode_indices[0][1].tolist() == [0, 1, 2, 3, 4]
+
+    assert result.index.mode_indices[1][0].tolist() == [0, 5, 7, 9, 11, 13]
+    assert result.index.mode_indices[1][1].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        0,
+        1,
+        0,
+        2,
+        0,
+        3,
+        0,
+        4,
+    ]
+    assert result.values.tolist() == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        4.0,
+        4.0,
+        9.0,
+        9.0,
+        16.0,
+        16.0,
+        25.0,
+        25.0,
+    ]
+
+
 def test_spmm_dd_ds_ds():
     tensor_a_torch = torch.Tensor(
         [
@@ -488,5 +614,153 @@ def test_spmm_dd_multi_multi():
             0.0,
             0.0,
             0.0,
+            25.0,
+        ]
+
+
+def test_spmm_ds_multi_multi():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    tensor_a = Tensor.from_torch(tensor_a_torch, "A")
+    tensor_b = Tensor.from_torch(tensor_b_torch, "B")
+
+    input_formats = ["ds", "ss", "oo"]
+
+    input_format_pairs = list(product(input_formats, input_formats))
+
+    for format_a, format_b in input_format_pairs:
+        a_sparse = tensor_a.to_sparse(format_a)
+        b_sparse = tensor_b.to_sparse(format_b)
+
+        result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ds")
+
+        print("Input formats: ", format_a, format_b)
+        print("Output format: ", result.format)
+
+        assert result.shape == (5, 5)
+        assert len(result.index.mode_indices) == 2
+
+        assert result.index.mode_indices[1][0].tolist() == [0, 5, 7, 9, 11, 13]
+        assert result.index.mode_indices[1][1].tolist() == [
+            0,
+            1,
+            2,
+            3,
+            4,
+            0,
+            1,
+            0,
+            2,
+            0,
+            3,
+            0,
+            4,
+        ]
+
+        assert result.values.tolist() == [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            4.0,
+            4.0,
+            9.0,
+            9.0,
+            16.0,
+            16.0,
+            25.0,
+            25.0,
+        ]
+
+
+def test_spmm_ss_multi_multi():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    tensor_a = Tensor.from_torch(tensor_a_torch, "A")
+    tensor_b = Tensor.from_torch(tensor_b_torch, "B")
+
+    input_formats = ["ds", "ss", "oo"]
+
+    input_format_pairs = list(product(input_formats, input_formats))
+
+    for format_a, format_b in input_format_pairs:
+        a_sparse = tensor_a.to_sparse(format_a)
+        b_sparse = tensor_b.to_sparse(format_b)
+
+        result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
+
+        print("Input formats: ", format_a, format_b)
+        print("Output format: ", result.format)
+
+        assert result.shape == (5, 5)
+        assert len(result.index.mode_indices) == 2
+
+        assert result.index.mode_indices[0][0].tolist() == [0, 5]
+        assert result.index.mode_indices[0][1].tolist() == [0, 1, 2, 3, 4]
+
+        assert result.index.mode_indices[1][0].tolist() == [0, 5, 7, 9, 11, 13]
+        assert result.index.mode_indices[1][1].tolist() == [
+            0,
+            1,
+            2,
+            3,
+            4,
+            0,
+            1,
+            0,
+            2,
+            0,
+            3,
+            0,
+            4,
+        ]
+        assert result.values.tolist() == [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            4.0,
+            4.0,
+            9.0,
+            9.0,
+            16.0,
+            16.0,
+            25.0,
             25.0,
         ]
