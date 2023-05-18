@@ -57,21 +57,22 @@ class IndexStmt(CIN):
             def get_result_tensor_accesses(self):
                 return self.result_tensor_accesses
 
-            def visit_TensorAssign(self, node: "TensorAssign"):
+            def visit_TensorAssign(self, node: TensorAssign):
                 self.result_tensor_accesses.append(node.lhs)
 
         collector = ResultTensorAccessCollector()
         self.accept(collector)
         return collector.get_result_tensor_accesses()
 
-    def get_result_tensor_vars(self) -> List["TensorVar"]:
+    def get_result_tensor_vars(self) -> List[TensorVar]:
         result_tensor_vars = []
         result_tensor_accesses: List[TensorAccess] = self.get_result_tensor_accesses()
         for tensor_access in result_tensor_accesses:
-            result_tensor_vars.append(tensor_access.get_tensor())
+            if isinstance(tensor_access, TensorAccess):
+                result_tensor_vars.append(tensor_access.get_tensor())
         return result_tensor_vars
 
-    def get_rhs_tensor_accesses(self) -> List["TensorAccess"]:
+    def get_rhs_tensor_accesses(self) -> List[TensorAccess]:
         class RHSAccessCollector(CINVisitorAccept):
             def __init__(self):
                 self.rhs_tensor_accesses: List[TensorAccess] = []
@@ -79,11 +80,17 @@ class IndexStmt(CIN):
             def get_rhs_tensor_accesses(self):
                 return self.rhs_tensor_accesses
 
-            def visit_TensorAccess(self, node: "TensorAccess"):
+            def visit_TensorAccess(self, node: TensorAccess):
                 self.rhs_tensor_accesses.append(node)
 
-            def visit_TensorAssign(self, node: "TensorAssign"):
+            def visit_TensorAssign(self, node: TensorAssign):
                 self.visit(node.rhs)
+
+            def visit_Where(self, node: Where):
+                # Only want to visit the producer, because visiting the consumer
+                # would add the workspace to the list of RHS accesses, which we
+                # don't want.
+                self.visit(node.producer)
 
         collector = RHSAccessCollector()
         self.accept(collector)
@@ -201,6 +208,34 @@ class TensorVar(IndexExpr):
     def __repr__(self):
         return f"tensor_{self.name}:{self.format}"
 
+    def accept(self, visitor: CINVisitor) -> None:
+        return
+
+
+class Workspace(TensorVar):
+    name: Optional[str] = None
+    dim: int
+
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        dim: int = 1,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.name = name
+        self.dim = dim
+        self.dtype = dtype
+
+    def get_format(self) -> TensorFormat:
+        return parse_format(["o"] * self.dim)
+
+    def __str__(self):
+        return f"{self.name}({self.dim})"
+
+    def __repr__(self):
+        return str(self)
+
 
 class TensorAccess(IndexExpr):
     """
@@ -261,6 +296,9 @@ class TensorAccess(IndexExpr):
 
     def __repr__(self):
         return str(self)
+
+    def accept(self, visitor: CINVisitor) -> None:
+        visitor.visit(self.tensor)
 
 
 class Operation(Enum):
@@ -405,6 +443,45 @@ class ForAll(IndexStmt):
     def accept(self, visitor: "CINVisitor") -> None:
         visitor.visit(self.index_var)
         visitor.visit(self.stmt)
+
+
+@dataclass(frozen=True)
+class Where(IndexStmt):
+    """
+    A where statement involves a producer statement and a consumer statement.
+    The producer statement binds a tensor variable in the environment of the
+    consumer statement.
+    """
+
+    consumer: IndexStmt
+    producer: IndexStmt
+
+    def __str__(self):
+        return f"where ({self.consumer}) ({self.producer})"
+
+    def __repr__(self):
+        return str(self)
+
+    def accept(self, visitor: CINVisitor) -> None:
+        visitor.visit(self.consumer)
+        visitor.visit(self.producer)
+
+    def get_workspaces(self) -> List[Workspace]:
+        class WorkspaceGetter(CINVisitorAccept):
+            workspaces: List[Workspace] = []
+
+            def visit_Workspace(self, node: Workspace) -> None:
+                self.workspaces.append(node)
+
+            def visit_Where(self, node: Where) -> None:
+                self.visit(node.producer)
+
+            def visit_ForAll(self, node: ForAll) -> None:
+                self.visit(node.stmt)
+
+        visitor = WorkspaceGetter()
+        visitor.visit(self)
+        return visitor.workspaces
 
 
 class CINVisitor:

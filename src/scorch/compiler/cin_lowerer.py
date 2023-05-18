@@ -13,6 +13,7 @@ from src.scorch.compiler.cin import (
     BinaryOp,
     CIN,
     Operation,
+    Where,
 )
 from src.scorch.compiler.iter_lattice import IterationLattice
 from src.scorch.format import LevelType
@@ -330,6 +331,37 @@ class CINLowerer:
 
         return llir_stmts
 
+    def lower_Where(self, stmt: Where) -> Union[llir.Stmt, List[llir.Stmt]]:
+        """
+        Lower a Where to LLIR
+        """
+        print("Workspaces:", stmt.get_workspaces())
+        return [
+            llir.Comment("TODO: lower_Where"),
+            *self.lower_ProducerIndexStmt(stmt.producer),
+            *self.lower_ConsumerIndexStmt(stmt.consumer),
+        ]
+
+    def lower_ProducerIndexStmt(
+        self, stmt: IndexStmt
+    ) -> Union[llir.Stmt, List[llir.Stmt]]:
+        """
+        Lower a ProducerIndexStmt to LLIR
+        """
+        return [
+            llir.Comment("TODO: lower_ProducerIndexStmt"),
+        ]
+
+    def lower_ConsumerIndexStmt(
+        self, stmt: IndexStmt
+    ) -> Union[llir.Stmt, List[llir.Stmt]]:
+        """
+        Lower a ConsumerIndexStmt to LLIR
+        """
+        return [
+            llir.Comment("TODO: lower_ConsumerIndexStmt"),
+        ]
+
     def lower_IndexStmt(self, stmt: IndexStmt) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
         Lower an IndexStmt to LLIR
@@ -337,6 +369,9 @@ class CINLowerer:
 
         if isinstance(stmt, TensorAssign):
             return self.lower_TensorAssign(stmt)
+
+        if isinstance(stmt, Where):
+            return self.lower_Where(stmt)
 
         # loop_order_allow_short_circuit = all_free_var_loops_before_reduction_loops(stmt)
 

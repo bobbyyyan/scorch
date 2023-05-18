@@ -21,6 +21,7 @@ from src.scorch.compiler.cin import (
     Operation,
     IndexExpr,
     CINIndexVariablesGetter,
+    Where,
 )
 from src.scorch.format import LevelType
 from src.scorch.compiler.iterator import ModeIterator
@@ -254,26 +255,37 @@ class LatticePoint:
                 stmt=rewritten_inner_stmt,
             )
 
+        elif isinstance(cin, Where):
+            producer_rewritten = self.get_simplified_cin(cin.producer)
+            consumer_rewritten = self.get_simplified_cin(cin.consumer)
+            assert isinstance(producer_rewritten, IndexStmt) and isinstance(
+                consumer_rewritten, IndexStmt
+            ), "Rewritten producer and consumer are not index stmts"
+            return Where(
+                producer=producer_rewritten,
+                consumer=consumer_rewritten,
+            )
+
         elif isinstance(cin, TensorAssign):
             cin_ivar_getter = CINIndexVariablesGetter()
             cin_ivar_getter.visit(cin)
 
             reduction_vars = cin_ivar_getter.get_reduction_vars()
 
-            print("free vars: ", cin_ivar_getter.free_vars)
-            print("input vars: ", cin_ivar_getter.input_vars)
-            print("reduction vars: ", reduction_vars)
+            print("Free vars: ", cin_ivar_getter.free_vars)
+            print("Input vars: ", cin_ivar_getter.input_vars)
+            print("Reduction vars: ", reduction_vars)
 
             has_reduction = len(reduction_vars) > 0
 
             rewritten_rhs = self.get_simplified_cin(cin.rhs)
             if not rewritten_rhs:
                 rewritten_rhs = cin.rhs
-            print("\n\nrhs:\n\n", cin.rhs)
-            print("\n\nrewritten_rhs:\n\n", rewritten_rhs)
+            print("RHS: ", cin.rhs)
+            print("Rewritten RHS: ", rewritten_rhs)
             assert isinstance(
                 rewritten_rhs, IndexExpr
-            ), "Rewritten rhs is not an index expr"
+            ), "Rewritten RHS is not an IndexExpr"
 
             return TensorAssign(
                 lhs=cin.lhs,
@@ -294,7 +306,7 @@ class LatticePoint:
         stmts: List[llir.Stmt] = []
 
         print("\n========== get_child_subregion_loops =========")
-        print("cin\n:", cin)
+        print("cin: ", cin)
         print("self.child_lattice_points:", self.child_lattice_points)
 
         # print("self.iterators:", self.iterators)
@@ -594,6 +606,8 @@ class IterationLattice:
             ]
 
         def get_lattice_points_from_cin(cin: CIN) -> List[LatticePoint]:
+            if isinstance(cin, Where):
+                return get_lattice_points_from_cin(cin.producer)
             if isinstance(cin, ForAll):
                 return get_lattice_points_from_cin(cin.stmt)
             if isinstance(cin, TensorAssign):

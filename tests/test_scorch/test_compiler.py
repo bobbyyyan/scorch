@@ -1,4 +1,13 @@
-from src.scorch.compiler.cin import IndexVar, TensorVar, ForAll
+from src.scorch.compiler.cin import (
+    IndexVar,
+    TensorVar,
+    ForAll,
+    TensorAssign,
+    TensorAccess,
+    Operation,
+    Workspace,
+    Where,
+)
 from src.scorch.compiler.cin_lowerer import CINLowerer
 from src.scorch.compiler.codegen import LLIRLowerer
 
@@ -799,6 +808,103 @@ def test_spmm_codegen():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_spmm_ds_ds_ds():
+    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt=["dense", "sparse"])
+    B = TensorVar("B", fmt=["dense", "sparse"])
+    C = TensorVar("C", fmt=["dense", "sparse"])
+
+    cin_stmt = ForAll(
+        i,
+        ForAll(
+            k,
+            ForAll(
+                j,
+                TensorAssign(
+                    A[i, j],
+                    B[i, k] * C[k, j],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_spmm_ds_ds_ds_workspace():
+    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt=["dense", "sparse"])
+    B = TensorVar("B", fmt=["dense", "sparse"])
+    C = TensorVar("C", fmt=["dense", "sparse"])
+
+    workspace = Workspace(
+        name="wksp",
+        dim=1,
+    )
+
+    # A[i, j] = ForAll(i,
+    #   Where(
+    #     producer=ForAll(k, ForAll(j, workspace[j] += B[i, k] * C[k, j])),
+    #     consumer=ForAll(j, A[i, j] = workspace[j])
+    #   )
+    # )
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        B[i, k] * C[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    A[i, j],
+                    workspace[j],
+                ),
+            ),
+        ),
+    )
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_spmm_dd_ds_ds():
     # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:dd -f=B:ds -f=C:ds -print-evaluate
     i = IndexVar("i")
@@ -809,9 +915,20 @@ def test_spmm_dd_ds_ds():
     B = TensorVar("B", fmt=["dense", "sparse"])
     C = TensorVar("C", fmt=["dense", "sparse"])
 
-    A[i, j] = B[i, k] * C[k, j]
-
-    cin_stmt = ForAll(i, ForAll(k, ForAll(j, A._assignment)))
+    cin_stmt = ForAll(
+        i,
+        ForAll(
+            k,
+            ForAll(
+                j,
+                TensorAssign(
+                    A[i, j],
+                    B[i, k] * C[k, j],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
 
     print("\nCIN statement:")
     print(cin_stmt)
