@@ -173,6 +173,12 @@ class Tensor(torch.nn.Module):
             fmt=other.format,
         )
 
+        # Assert A, B, C, and index_vars are defined
+        assert A is not None, "Tensor A is not defined."
+        assert B is not None, "Tensor B is not defined."
+        assert C is not None, "Tensor C is not defined."
+        assert index_vars is not None, "Index variables are not defined."
+
         # Generate the python code for the element-wise addition
         # e.g. A[i0, i1, ...] = B[i0, i1, ...] + C[i0, i1, ...]
         lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
@@ -209,8 +215,8 @@ class Tensor(torch.nn.Module):
         result_cpp = module.evaluate(
             result_shape,
             self.shape,
-            self._storage._index.mode_indices,
-            self._storage.value,
+            self.index.mode_indices,
+            self.storage.value,
             other.shape,
             other._storage._index.mode_indices,
             other._storage.value,
@@ -236,7 +242,7 @@ class Tensor(torch.nn.Module):
     def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
         """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
-        # and format is dense at every level
+        # and format is dense at every _level
 
         # If name is not provided, use the default name
         if name is None:
@@ -313,7 +319,7 @@ class Tensor(torch.nn.Module):
 
             if fmt is None:
                 # TODO: infer output format from input format
-                # For now, make every level COMPRESSED
+                # For now, make every _level COMPRESSED
                 output_format = TensorFormat(
                     level_formats=[
                         LevelFormat(mode=LevelType.COMPRESSED)
@@ -327,6 +333,11 @@ class Tensor(torch.nn.Module):
                 name="A",
                 fmt=output_format,
             )
+
+            # Assert A, B, and index_vars are defined
+            assert A is not None, "A is not defined"
+            assert B is not None, "B is not defined"
+            assert index_vars is not None, "index_vars is not defined"
 
             # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
             lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
@@ -364,8 +375,8 @@ class Tensor(torch.nn.Module):
             result_cpp = module.evaluate(
                 self.shape,
                 self.shape,
-                self._storage._index.mode_indices,
-                self._storage.value,
+                self.index.mode_indices,
+                self.storage.value,
             )
 
             self._storage = TensorStorage(
@@ -376,9 +387,4 @@ class Tensor(torch.nn.Module):
                 value=result_cpp._storage._value,
             )
 
-            print(
-                "self._storage._index.mode_indices: ", self._storage._index.mode_indices
-            )
-
-            print("self._storage.value: ", self._storage.value)
         return self

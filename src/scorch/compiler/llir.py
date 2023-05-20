@@ -238,6 +238,7 @@ class Assign(Stmt):
 
     def __post_init__(self):
         if self.cast:
+            assert isinstance(self.var, Var)
             self.value = Cast(self.value, self.var.type)
 
 

@@ -41,6 +41,7 @@ class LLIRLowerer:
             )
 
         elif isinstance(ir, llir.Assign):
+            assert isinstance(ir.var, llir.Var), f"Invalid var: {ir.var}"
             return self.lower_llir(
                 f"{ir.var.name} {ir.op.value} {self.lower_llir(ir.value)};",
                 indent_level,

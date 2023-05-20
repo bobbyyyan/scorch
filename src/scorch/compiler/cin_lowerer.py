@@ -72,8 +72,8 @@ class CINLowerer:
                             type=llir.DataType.INT,
                         ),
                         value=llir.Var(
-                            # name=f"{tensor.name}._shape[{level}]",
-                            # name=f"{tensor.name}_mode_indices[{level}][0][0].item<int>()",
+                            # name=f"{tensor.name}._shape[{_level}]",
+                            # name=f"{tensor.name}_mode_indices[{_level}][0][0].item<int>()",
                             name=f"{tensor.name}_shape[{level}]",
                             type=llir.DataType.INT,
                         ),
@@ -87,7 +87,7 @@ class CINLowerer:
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                         value=llir.Var(
-                            # name=f"{tensor.name}._storage._index.mode_indices[{level}][0]",
+                            # name=f"{tensor.name}._storage._index.mode_indices[{_level}][0]",
                             name=f"{tensor.name}_mode_indices[{level}][0]",
                             type=llir.DataType.TORCH_TENSOR,
                         ),
@@ -101,7 +101,7 @@ class CINLowerer:
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                         value=llir.Var(
-                            # name=f"{tensor.name}._storage._index.mode_indices[{level}][1]",
+                            # name=f"{tensor.name}._storage._index.mode_indices[{_level}][1]",
                             name=f"{tensor.name}_mode_indices[{level}][1]",
                             type=llir.DataType.TORCH_TENSOR,
                         ),
@@ -115,7 +115,7 @@ class CINLowerer:
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                         value=llir.Var(
-                            # name=f"{tensor.name}._storage._index.mode_indices[{level}][0]",
+                            # name=f"{tensor.name}._storage._index.mode_indices[{_level}][0]",
                             name=f"{tensor.name}_mode_indices[{level}][0]",
                             type=llir.DataType.TORCH_TENSOR,
                         ),
@@ -203,7 +203,7 @@ class CINLowerer:
         """
         llir_stmts: List[llir.Stmt] = []
 
-        # if we are at the bottommost level, we can emit the compute code
+        # if we are at the bottommost _level, we can emit the compute code
         assert self.result_tensor_access, "result tensor access is None"
         if (
             self.result_tensor_access.get_index_vars()[-1]
@@ -251,7 +251,7 @@ class CINLowerer:
                         value=rhs_llir,
                     )
                 )
-            # If the last level of the result tensor var is sparse, then we need to set
+            # If the last _level of the result tensor var is sparse, then we need to set
             # the coordinates
             last_ivar = self.defined_index_vars[-1]
             last_level_type = self.result_tensor_access.level_type_of_index_var(
@@ -279,7 +279,7 @@ class CINLowerer:
                     )
                 )
 
-                # if the last level is COORDINATE, we might need to set the coordinates
+                # if the last _level is COORDINATE, we might need to set the coordinates
                 # or previous levels as well
                 if last_level_type == LevelType.COORDINATE:
                     for defined_ivar in self.defined_index_vars[-2::-1]:
@@ -342,9 +342,7 @@ class CINLowerer:
             *self.lower_ConsumerIndexStmt(stmt.consumer),
         ]
 
-    def lower_ProducerIndexStmt(
-        self, stmt: IndexStmt
-    ) -> Union[llir.Stmt, List[llir.Stmt]]:
+    def lower_ProducerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
         """
         Lower a ProducerIndexStmt to LLIR
         """
@@ -352,9 +350,7 @@ class CINLowerer:
             llir.Comment("TODO: lower_ProducerIndexStmt"),
         ]
 
-    def lower_ConsumerIndexStmt(
-        self, stmt: IndexStmt
-    ) -> Union[llir.Stmt, List[llir.Stmt]]:
+    def lower_ConsumerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
         """
         Lower a ConsumerIndexStmt to LLIR
         """
@@ -383,9 +379,9 @@ class CINLowerer:
         self.result_tensor_access = result_tensor_accesses[0]
         rhs_tensor_vars: List[TensorVar] = stmt.get_rhs_tensor_vars()
         rhs_tensor_accesses: List[TensorAccess] = stmt.get_rhs_tensor_accesses()
-        rhs_tensor_vars_llir: List[llir.Expr] = [
-            self.lower_TensorVar(tv) for tv in rhs_tensor_vars
-        ]
+        # rhs_tensor_vars_llir: List[llir.Expr] = [
+        #     self.lower_TensorVar(tv) for tv in rhs_tensor_vars
+        # ]
 
         self.need_compute.extend(result_tensor_vars)
 
@@ -479,7 +475,7 @@ class CINLowerer:
 
         if result_level_indices_init_stmts:
             result_level_indices_init_stmts = [
-                llir.Comment("Init result level indices"),
+                llir.Comment("Init result _level indices"),
                 *result_level_indices_init_stmts,
                 llir.BlankLine(),
             ]
@@ -494,7 +490,7 @@ class CINLowerer:
                 self.get_value_array_statement(tensor)
             )
 
-        # Generate per-level size variables for each dense level in result tensor
+        # Generate per-_level size variables for each dense _level in result tensor
         result_tensor_level_sizes: List[llir.Stmt] = []
         for i, level_type in enumerate(self.result_tensor_var.get_level_types()):
             if level_type == LevelType.DENSE:
@@ -513,10 +509,10 @@ class CINLowerer:
 
         if result_tensor_level_sizes:
             result_tensor_level_sizes = [
-                llir.Comment("Init result tensor level sizes")
+                llir.Comment("Init result tensor _level sizes")
             ] + result_tensor_level_sizes
 
-        # A mapping from IndexVar to a list of (TensorVar, level: int, LevelType) tuples
+        # A mapping from IndexVar to a list of (TensorVar, _level: int, LevelType) tuples
         self.index_var_to_rhs_tensor_level_type = {}
         for tensor_access in rhs_tensor_accesses:
             index_vars = tensor_access.get_index_vars()
@@ -541,8 +537,8 @@ class CINLowerer:
                     [tensor_var, level, tensor_level_types[level]]
                 )
 
-        # Initialize index into result if any level if compressed
-        # Find last compressed level of the result tensor, if any
+        # Initialize index into result if any _level if compressed
+        # Find last compressed _level of the result tensor, if any
         result_last_compressed_index_var = None
         for (
             index_var,
@@ -614,7 +610,7 @@ class CINLowerer:
                 [
                     *result_tensor_level_sizes,
                     llir.BlankLine(),
-                    llir.Comment("Get tensor level arrays"),
+                    llir.Comment("Get tensor _level arrays"),
                     *tensor_level_array_assign_stmts,
                     llir.BlankLine(),
                     *result_level_indices_init_stmts,
@@ -817,7 +813,7 @@ class CINLowerer:
         ):
             stmts.append(llir.Comment(f"{index_var} not in result tensor access"))
 
-        # If the result level for this index_var is dense, need to assemble the result by
+        # If the result _level for this index_var is dense, need to assemble the result by
         # setting the corresponding values in the result values array to 0
         if (
             self.result_tensor_access
@@ -825,7 +821,7 @@ class CINLowerer:
             and self.result_tensor_access.level_type_of_index_var(index_var)
             == LevelType.DENSE
         ):
-            # If the parent level is not dense or has no parent level,
+            # If the parent _level is not dense or has no parent _level,
             # and the next levels are all dense
             # then we need to initialize result value array elements to 0
             level_of_index_var = self.result_tensor_access.level_of_index_var(index_var)
@@ -843,9 +839,11 @@ class CINLowerer:
                     )
                 ]
             ):
+                assert self.result_tensor_var, "Result tensor variable not set"
+
                 stmts.extend(
                     [
-                        llir.Comment("Assemble dense result level as needed"),
+                        llir.Comment("Assemble dense result _level as needed"),
                         # initialize a result stride variable = current_level_size * next_level_size * ...
                         llir.VarInit(
                             var=llir.Var(

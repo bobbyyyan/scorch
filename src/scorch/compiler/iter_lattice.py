@@ -164,13 +164,14 @@ class LatticePoint:
         elif len(iterators) == 1:
             stmts.append(llir.Comment("Advance iterator"))
 
-            # If this level is coordinate and next level is coordinate
+            # If this _level is coordinate and next _level is coordinate
             # then advance by setting
             # p{tensor_name}{current_level}
             # to p{tensor_name}{next_level}_end
             iterator = iterators[0]
             next_level = iterator.level + 1
-            tensor_var = iterator.tensor_var
+            tensor_var = iterator._tensor_var
+            assert tensor_var is not None, "Tensor var not set"
 
             if (
                 next_level < tensor_var.levels
@@ -325,7 +326,9 @@ class LatticePoint:
             elif isinstance(cin_lowered, list):
                 lst.extend(cin_lowered)
 
-        all_inner_lattice_points = [self] + self.child_lattice_points
+        all_inner_lattice_points = [self]
+        if self.child_lattice_points:
+            all_inner_lattice_points.extend(self.child_lattice_points)
 
         if self.child_lattice_points or (self.iterators and len(self.iterators) > 1):
             stmts.append(llir.Comment("Inner loops over child regions"))
@@ -428,22 +431,31 @@ class LatticePoint:
             stmts.append(llir.BlankLine())
 
         coordinate_level_iterator_end_resolution_stmts: List[llir.Stmt] = []
-        # e.g. once i is known, we can compute the end of the iterators for the second level
+        # e.g. once i is known, we can compute the end of the iterators for the second _level
         #    int pB1_end = pB0;
         #    while (pB1_end < pB0_end && B0_crd[pB1_end].item<int>() == i) {
         #      pB1_end++;
         #    }
         for it in iterators:
+            assert it._tensor_var is not None, "Iterator tensor var is None"
             # Only do this for coordinate levels
             if it.level_type == LevelType.COORDINATE:
-                # If the next level is still a valid level
-                if (it.level + 1) < it.tensor_var.levels:
+                # If the next _level is still a valid _level
+                # Assert it._level is an int
+                assert isinstance(it._level, int), "it._level is not an int"
+                if (it._level + 1) < it._tensor_var.levels:
                     next_level_iterator_end_llir = llir.Var(
-                        name=f"p{it.tensor_var.name}{it.level + 1}_end",
+                        name=f"p{it._tensor_var.name}{it._level + 1}_end",
                         type=llir.DataType.INT,
                     )
 
                     # int pB1_end = pB0;
+                    assert (
+                        next_level_iterator_end_llir is not None
+                    ), "next_level_iterator_end_llir cannot be None"
+                    assert (
+                        it.iterator_var_llir is not None
+                    ), "it.iterator_var_llir cannot be None"
                     coordinate_level_iterator_end_resolution_stmts.append(
                         llir.VarInit(
                             var=next_level_iterator_end_llir,
@@ -458,6 +470,10 @@ class LatticePoint:
                     # while (pB1_end < pB0_end && B0_crd[pB1_end].item<int>() == i) {
                     #   pB1_end++;
                     # }
+                    assert (
+                        it.iterator_var_end_var_llir is not None
+                    ), "it.iterator_var_end_var_llir cannot be None"
+
                     coordinate_level_iterator_end_resolution_stmts.append(
                         llir.WhileLoop(
                             cond=llir.BinOp(
@@ -471,13 +487,13 @@ class LatticePoint:
                                     op="==",
                                     # left=llir.ArrayAccess(
                                     #     array=llir.Var(
-                                    #         name=f"{it.tensor_var.name}{it.level}_crd",
+                                    #         name=f"{it._tensor_var.name}{it._level}_crd",
                                     #         type=llir.DataType.ARRAY_INT,
                                     #     ),
                                     #     index=next_level_iterator_end_llir,
                                     # ),
                                     left=llir.Var(
-                                        name=f"{it.tensor_var.name}{it.level}_crd[{next_level_iterator_end_llir.name}].item<int>()",
+                                        name=f"{it._tensor_var.name}{it._level}_crd[{next_level_iterator_end_llir.name}].item<int>()",
                                         type=llir.DataType.INT,
                                     ),
                                     right=self.get_index_var_llir(),
@@ -495,7 +511,7 @@ class LatticePoint:
                     )
 
         if coordinate_level_iterator_end_resolution_stmts:
-            stmts.append(llir.Comment("Find iterator end for coordinate level"))
+            stmts.append(llir.Comment("Find iterator end for coordinate _level"))
             stmts.extend(coordinate_level_iterator_end_resolution_stmts)
 
         cin_lowerer = lattice.cin_lowerer
@@ -632,7 +648,7 @@ class IterationLattice:
                 # TODO: check Empty list if current_index_var is not in the tensor access
                 if current_index_var not in cin.indices:
                     return []
-                # if index variable correspond to a dense level, put in locators
+                # if index variable correspond to a dense _level, put in locators
                 if (
                     cin.get_tensor().get_level_types()[
                         cin.get_index_vars().index(current_index_var)
@@ -683,7 +699,7 @@ class IterationLattice:
             level_of_current_index_var = first_dense_tensor_access.level_of_index_var(
                 current_index_var
             )
-            # end var is the <tensor_var_name><level>_size, type is int
+            # end var is the <tensor_var_name><_level>_size, type is int
             self.dense_index_var_end_var_llir = llir.Var(
                 name=f"{first_dense_tensor_var.name}{level_of_current_index_var}_size",
                 type=llir.DataType.INT,
@@ -757,6 +773,7 @@ class IterationLattice:
         Generate the outermost loops, one for each lattice point.
 
         """
+        assert self.cin_lowerer is not None, "cin_lowerer must be set"
 
         stmts: List[llir.Stmt] = []
 
@@ -764,9 +781,9 @@ class IterationLattice:
         lattice_point = lattice_points[0]
 
         result_tensor_var = self.cin_lowerer.result_tensor_var
-        assert result_tensor_var, "Result tensor var not set"
+        assert result_tensor_var is not None, "Result tensor var not set"
         result_tensor_access = self.cin_lowerer.result_tensor_access
-        assert result_tensor_access, "Result tensor access not set"
+        assert result_tensor_access is not None, "Result tensor access not set"
 
         index_var = lattice_point.get_index_var()
 
@@ -777,12 +794,12 @@ class IterationLattice:
                 stmts.extend(
                     [
                         llir.BlankLine(),
-                        llir.Comment("Assembly compressed level indices"),
+                        llir.Comment("Assembly compressed _level indices"),
                     ]
                 )
 
-                # if level is > 0 and parent level is also sparse, we need to set
-                # the parent level's crd
+                # if _level is > 0 and parent _level is also sparse, we need to set
+                # the parent _level's crd
                 if level > 0:
                     parent_index_var = result_tensor_access.get_parent_index_var(
                         lattice_point.get_index_var()
@@ -822,8 +839,8 @@ class IterationLattice:
                                 ],
                             )
                         )
-                # if previous level is dense: A1_pos.push_back(A1_crd.size())
-                # TODO: if previous level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
+                # if previous _level is dense: A1_pos.push_back(A1_crd.size())
+                # TODO: if previous _level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
                 assembled_pos_array = False
                 if level > 0:
                     parent_index_var = result_tensor_access.get_parent_index_var(
@@ -857,7 +874,7 @@ class IterationLattice:
                             args=[
                                 llir.Var(
                                     name=f"{result_tensor_var.get_name()}{level}_crd.size()",
-                                    # name=f"p{result_tensor_var.name}{level}",
+                                    # name=f"p{result_tensor_var.name}{_level}",
                                     type=llir.DataType.INT,
                                 )
                             ],
@@ -866,12 +883,16 @@ class IterationLattice:
 
         def gen_single_lattice_loop(lattice_point: LatticePoint) -> List[llir.Stmt]:
             assert self.cin_lowerer, "CINLowerer not set"
+            assert result_tensor_var is not None, "Result tensor var is None"
+            assert isinstance(
+                result_tensor_access, TensorAccess
+            ), "Result tensor access is None"
 
             stmts: List[llir.Stmt] = []
 
-            # If we have a sparse level here, we need to set
-            # {result_tensor_var}{level}_pos[p{result_tensor_var}{parent_level} + 1] to
-            # p{result_tensor_var}{level}
+            # If we have a sparse _level here, we need to set
+            # {result_tensor_var}{_level}_pos[p{result_tensor_var}{parent_level} + 1] to
+            # p{result_tensor_var}{_level}
 
             index_var = lattice_point.get_index_var()
 
@@ -880,18 +901,18 @@ class IterationLattice:
                 level_type = result_tensor_access.level_type_of_index_var(index_var)
 
                 result_value_index_stmts: List[llir.Stmt] = [
-                    llir.Comment("Resolve index into dense level of values array"),
+                    llir.Comment("Resolve index into dense _level of values array"),
                 ]
-                # Index into result value array: p<result tensor var name><level>
+                # Index into result value array: p<result tensor var name><_level>
                 result_index_var = llir.Var(
                     name=f"p{result_tensor_var.name}{level}",
                     type=llir.DataType.INT,
                 )
 
-                # Initialize the result index var, if this level is dense
-                # If is level 0, then p<result tensor var name><level> = index var
-                # If level > 0, then p<result tensor var name><level> =
-                # p<result tensor var name><parent level> * <size of this level> + index var
+                # Initialize the result index var, if this _level is dense
+                # If is _level 0, then p<result tensor var name><_level> = index var
+                # If _level > 0, then p<result tensor var name><_level> =
+                # p<result tensor var name><parent _level> * <size of this _level> + index var
                 if level_type == LevelType.DENSE:
                     if level == 0:
                         result_value_index_stmts.append(
@@ -916,7 +937,7 @@ class IterationLattice:
                                             name=f"p{result_tensor_var.name}{level - 1}",
                                             type=llir.DataType.INT,
                                         ),
-                                        # <result tensor name><level>_size
+                                        # <result tensor name><_level>_size
                                         right=llir.Var(
                                             name=f"{result_tensor_var.name}{level}_size",
                                             type=llir.DataType.INT,

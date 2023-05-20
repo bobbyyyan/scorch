@@ -10,12 +10,12 @@ from src.scorch.format import LevelType
 
 @dataclass(frozen=False)
 class ModeIterator:
-    tensor_var: Optional[TensorVar] = None
+    _tensor_var: Optional[TensorVar] = None
     tensor_access: Optional[TensorAccess] = None
     index_var: Optional[IndexVar] = None
     parent_index_var: Optional[IndexVar] = None
     parent_iterator: Optional[ModeIterator] = None
-    level: Optional[int] = None
+    _level: Optional[int] = None
     level_type: Optional[LevelType] = None
 
     iterator_var_llir: Optional[llir.Var] = None
@@ -25,6 +25,16 @@ class ModeIterator:
 
     coord_var_llir: Optional[llir.Var] = None
     coord_var_value_llir: Optional[llir.Expr] = None
+
+    @property
+    def level(self) -> int:
+        assert self._level is not None, "_level is None"
+        return self._level
+
+    @property
+    def tensor_var(self) -> TensorVar:
+        assert self._tensor_var is not None, "_tensor_var is None"
+        return self._tensor_var
 
     def get_index_var(self) -> IndexVar:
         assert self.index_var is not None, "index_var is None"
@@ -67,9 +77,9 @@ class ModeIterator:
             self.level_type == LevelType.COMPRESSED
             or self.level_type == LevelType.COORDINATE
         ):
-            # if this is the parent-most coordinate level,
+            # if this is the parent-most coordinate _level,
             # initialize the bounds using the size of the crd array
-            if self.level == 0 and self.level_type == LevelType.COORDINATE:
+            if self._level == 0 and self.level_type == LevelType.COORDINATE:
                 # int pB0 = 0;
                 stmts.append(
                     llir.VarInit(
@@ -83,7 +93,7 @@ class ModeIterator:
                         llir.VarInit(
                             var=self.get_iterator_var_end_var_llir(),
                             value=llir.FunctionCall(
-                                name=f"{self.tensor_var.get_name()}{self.level}_crd.size",
+                                name=f"{self.tensor_var.get_name()}{self._level}_crd.size",
                                 args=[llir.Literal(0)],
                             ),
                         )
@@ -112,7 +122,7 @@ class ModeIterator:
             self.index_var is not None
         ), "An IndexVar must be provided to construct a ModeIterator"
         # Either TensorVar or TensorAccess must be provided
-        assert (self.tensor_var is not None) or (
+        assert (self._tensor_var is not None) or (
             self.tensor_access is not None
         ), "Either a TensorVar or a TensorAccess must be provided to construct a ModeIterator"
         # Either parent_iterator or parent_index_var must be provided, or tensor_access must be provided
@@ -126,23 +136,23 @@ class ModeIterator:
         )
 
         # If TensorVar is none, get it from TensorAccess
-        if self.tensor_var is None:
+        if self._tensor_var is None:
             assert (
                 self.tensor_access is not None
-            ), "If tensor_var is not provided, tensor_access must be provided"
-            self.tensor_var = self.tensor_access.get_tensor()
+            ), "If _tensor_var is not provided, tensor_access must be provided"
+            self._tensor_var = self.tensor_access.get_tensor()
 
-        if self.level is None:
+        if self._level is None:
             assert (
                 self.tensor_access is not None
-            ), "If level is not provided, tensor_access must be provided"
-            self.level = self.tensor_access.level_of_index_var(self.index_var)
+            ), "If _level is not provided, tensor_access must be provided"
+            self._level = self.tensor_access.level_of_index_var(self.index_var)
 
         if self.level_type is None:
             assert (
                 self.tensor_access is not None
             ), "If level_type is not provided, tensor_access must be provided"
-            self.level_type = self.tensor_var.get_level_types()[
+            self.level_type = self._tensor_var.get_level_types()[
                 self.tensor_access.level_of_index_var(self.index_var)
             ]
 
@@ -162,7 +172,7 @@ class ModeIterator:
                 or self.level_type == LevelType.COORDINATE
             ):
                 self.iterator_var_llir = llir.Var(
-                    name=f"p{self.tensor_var.get_name()}{self.level}",
+                    name=f"p{self._tensor_var.get_name()}{self._level}",
                     type=llir.DataType.INT,
                 )
             else:
@@ -173,57 +183,57 @@ class ModeIterator:
 
         if self.level_type == LevelType.COORDINATE:
             self.iterator_var_begin_value_llir = llir.Var(
-                name=f"p{self.tensor_var.name}{self.level - 1}"
+                name=f"p{self._tensor_var.name}{self._level - 1}"
                 if self.parent_index_var
-                else f"{self.tensor_var.name}{self.level}_pos[0].item<int>()",
+                else f"{self._tensor_var.name}{self._level}_pos[0].item<int>()",
                 type=llir.DataType.INT,
             )
             self.iterator_var_end_var_llir = llir.Var(
-                name=f"p{self.tensor_var.name}{self.level}_end",
+                name=f"p{self._tensor_var.name}{self._level}_end",
                 type=llir.DataType.INT,
             )
             if not self.parent_index_var:
                 self.iterator_var_end_value_llir = llir.Var(
-                    f"{self.tensor_var.name}{self.level}_pos[1].item<int>()",
+                    f"{self._tensor_var.name}{self._level}_pos[1].item<int>()",
                     type=llir.DataType.INT,
                 )
             self.coord_var_llir = llir.Var(
-                name=f"{self.index_var.name}_{self.tensor_var.name}",
+                name=f"{self.index_var.name}_{self._tensor_var.name}",
                 type=llir.DataType.INT,
             )
             self.coord_var_value_llir = llir.Var(
-                name=f"{self.tensor_var.name}{self.level}_crd[{self.iterator_var_llir.name}].item<int>()",
+                name=f"{self._tensor_var.name}{self._level}_crd[{self.iterator_var_llir.name}].item<int>()",
                 type=llir.DataType.INT,
             )
 
         elif self.level_type == LevelType.COMPRESSED:
             self.iterator_var_begin_value_llir = llir.Var(
-                name=f"{self.tensor_var.name}{self.level}_pos[{self.parent_index_var.name}].item<int>()"
+                name=f"{self._tensor_var.name}{self._level}_pos[{self.parent_index_var.name}].item<int>()"
                 if self.parent_index_var
-                else f"{self.tensor_var.name}{self.level}_pos[0].item<int>()",
+                else f"{self._tensor_var.name}{self._level}_pos[0].item<int>()",
                 type=llir.DataType.INT,
             )
             self.iterator_var_end_var_llir = llir.Var(
-                name=f"p{self.tensor_var.name}{self.level}_end",
+                name=f"p{self._tensor_var.name}{self._level}_end",
                 type=llir.DataType.INT,
             )
             self.iterator_var_end_value_llir = llir.Var(
-                name=f"{self.tensor_var.name}{self.level}_pos[{self.parent_index_var.name} + 1].item<int>()"
+                name=f"{self._tensor_var.name}{self._level}_pos[{self.parent_index_var.name} + 1].item<int>()"
                 if self.parent_index_var
-                else f"{self.tensor_var.name}{self.level}_pos[1].item<int>()",
+                else f"{self._tensor_var.name}{self._level}_pos[1].item<int>()",
                 type=llir.DataType.INT,
             )
             self.coord_var_llir = llir.Var(
-                name=f"{self.index_var.name}_{self.tensor_var.name}",
+                name=f"{self.index_var.name}_{self._tensor_var.name}",
                 type=llir.DataType.INT,
             )
             self.coord_var_value_llir = llir.Var(
-                name=f"{self.tensor_var.name}{self.level}_crd[{self.iterator_var_llir.name}].item<int>()",
+                name=f"{self._tensor_var.name}{self._level}_crd[{self.iterator_var_llir.name}].item<int>()",
                 type=llir.DataType.INT,
             )
 
         elif self.level_type == LevelType.DENSE:
-            # if self.level == 0:
+            # if self._level == 0:
             #     self.coord_var_llir = llir.Var(
             #         name=f"{self.index_var.name}",
             #         type=llir.DataType.INT,
@@ -236,16 +246,16 @@ class ModeIterator:
                 )
 
             # self.coord_var_llir = llir.Var(
-            #     name=f"{self.index_var.name}_{self.tensor_var.name}",
+            #     name=f"{self.index_var.name}_{self._tensor_var.name}",
             #     type=llir.DataType.INT,
             # )
             self.coord_var_llir = llir.Var(
-                name=f"p{self.tensor_var.name}{self.level}",
+                name=f"p{self._tensor_var.name}{self._level}",
                 type=llir.DataType.INT,
             )
 
             if self.parent_iterator:
                 self.coord_var_value_llir = llir.Var(
-                    name=f"{self.parent_iterator.get_iterator_var_llir().name} * {self.tensor_var.get_name()}{self.level}_size + {self.index_var.name}",
+                    name=f"{self.parent_iterator.get_iterator_var_llir().name} * {self._tensor_var.get_name()}{self._level}_size + {self.index_var.name}",
                     type=llir.DataType.INT,
                 )
