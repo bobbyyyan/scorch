@@ -103,6 +103,51 @@ class IndexStmt(CIN):
             rhs_tensor_vars.append(tensor_access.get_tensor())
         return rhs_tensor_vars
 
+    def get_rhs_workspaces(self) -> List[Workspace]:
+        class WorkspaceGetter(CINVisitorAccept):
+            workspaces: List[Workspace] = []
+
+            def visit_Workspace(self, node: Workspace) -> None:
+                self.workspaces.append(node)
+
+            def visit_TensorAssign(self, node: TensorAssign) -> None:
+                self.visit(node.rhs)
+
+            def visit_Where(self, node: Where) -> None:
+                self.visit(node.producer)
+
+            def visit_ForAll(self, node: ForAll) -> None:
+                self.visit(node.stmt)
+
+        visitor = WorkspaceGetter()
+        visitor.visit(self)
+        return visitor.workspaces
+
+    def get_lhs_workspaces(self) -> List[Workspace]:
+        class WorkspaceGetter(CINVisitorAccept):
+            workspaces: List[Workspace] = []
+
+            def visit_Workspace(self, node: Workspace) -> None:
+                self.workspaces.append(node)
+
+            def visit_TensorAssign(self, node: TensorAssign) -> None:
+                self.visit(node.lhs)
+
+            def visit_Where(self, node: Where) -> None:
+                self.visit(node.consumer)
+
+            def visit_ForAll(self, node: ForAll) -> None:
+                self.visit(node.stmt)
+
+        visitor = WorkspaceGetter()
+        visitor.visit(self)
+        return visitor.workspaces
+
+    def get_workspaces(self) -> List[Workspace]:
+        workspaces = self.get_lhs_workspaces() + self.get_rhs_workspaces()
+        # Remove duplicates
+        return list(set(workspaces))
+
 
 class IndexVar(IndexExpr):
     """A tensor index variable.
@@ -191,7 +236,7 @@ class TensorVar(IndexExpr):
     def get_level_size_cpp(self, level: int) -> str:
         return f"(int) ({self.name}._shape[{level}])"
 
-    def __getitem__(self, item) -> "TensorAccess":
+    def __getitem__(self, item) -> TensorAccess:
         return TensorAccess(self, item)
 
     def __setitem__(self, key, value) -> None:
@@ -235,6 +280,9 @@ class Workspace(TensorVar):
 
     def __repr__(self):
         return str(self)
+
+    def __getitem__(self, item) -> WorkspaceAccess:
+        return WorkspaceAccess(self, item)
 
 
 class TensorAccess(IndexExpr):
@@ -287,7 +335,7 @@ class TensorAccess(IndexExpr):
     def num_levels(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, index) -> "TensorAccess":
+    def __getitem__(self, index) -> TensorAccess:
         return TensorAccess(self.tensor, self.indices + [index])
 
     def __str__(self):
@@ -296,6 +344,18 @@ class TensorAccess(IndexExpr):
 
     def __repr__(self):
         return str(self)
+
+    def accept(self, visitor: CINVisitor) -> None:
+        visitor.visit(self.tensor)
+
+
+class WorkspaceAccess(TensorAccess):
+    def __init__(
+        self,
+        tensor: Workspace,
+        indices: Union[IndexVar, List[IndexVar]],
+    ):
+        super().__init__(tensor, indices)
 
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self.tensor)
@@ -501,7 +561,7 @@ class CINVisitorAccept(CINVisitor):
         node.accept(self)
 
 
-class CINIndexVariablesGetter(CINVisitor):
+class CINIndexVariablesGetter(CINVisitorAccept):
     # free variables are index variables of the result tensor
     free_vars: List[IndexVar] = []
     # input variables are index variables of the input tensors

@@ -335,9 +335,31 @@ class CINLowerer:
         """
         Lower a Where to LLIR
         """
-        print("Workspaces:", stmt.get_workspaces())
+        workspaces = stmt.get_workspaces()
+        workspace_init_stmts: List[llir.Stmt] = [
+            llir.Comment("Initialize workspaces"),
+        ]
+        for wksp in workspaces:
+            # coo_workspace<wksp's ctype> <wksp's name> = coo_workspace<wksp's ctype>(<wksp's dim>);
+            wksp_ctype = dtype_to_c_datatype(wksp.dtype)
+            workspace_init_stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=wksp.get_name(),
+                        type=llir.DataType.coo_workspace_type(wksp_ctype),
+                    ),
+                    value=llir.FunctionCall(
+                        name=f"coo_workspace<{wksp_ctype.value}>",
+                        args=[
+                            llir.Literal(value=f"{wksp.dim}"),
+                        ],
+                    ),
+                )
+            )
+
         return [
             llir.Comment("TODO: lower_Where"),
+            *workspace_init_stmts,
             *self.lower_ProducerIndexStmt(stmt.producer),
             *self.lower_ConsumerIndexStmt(stmt.consumer),
         ]
@@ -354,8 +376,64 @@ class CINLowerer:
         """
         Lower a ConsumerIndexStmt to LLIR
         """
+        workspaces = stmt.get_workspaces()
+        wksp = workspaces[0]
+
+        # Get wksp map statement
+        # auto <wksp's name>_map = <wksp's name>.get_map();
+        wksp_map_stmt = llir.VarInit(
+            var=llir.Var(
+                name=f"{wksp.get_name()}_map",
+                type=llir.DataType.AUTO,
+            ),
+            value=llir.FunctionCall(
+                name=f"{wksp.get_name()}.get_map",
+            ),
+        )
+
+        # For loop
+        # for (auto it = <wksp's name>_map.begin(); it != <wksp's name>_map.end(); ++it) {
+        #    TODO: <body statement>
+        # }
+        loop_var = llir.Var(
+            name="it",
+            type=llir.DataType.AUTO,
+        )
+
+        loop_init_stmt = llir.VarInit(
+            var=loop_var,
+            value=llir.FunctionCall(
+                name=f"{wksp.get_name()}_map.begin",
+            ),
+        )
+
+        loop_cond = llir.BinOp(
+            op="!=",
+            left=loop_var,
+            right=llir.FunctionCall(
+                name=f"{wksp.get_name()}_map.end",
+            ),
+        )
+
+        loop_incr = llir.Increment(
+            var=loop_var,
+        )
+
+        loop_body: List[llir.Stmt] = [
+            llir.Comment("TODO: Loop body"),
+        ]
+
+        loop_stmt = llir.ForLoop(
+            init=loop_init_stmt,
+            cond=loop_cond,
+            update=loop_incr,
+            body=loop_body,
+        )
+
         return [
             llir.Comment("TODO: lower_ConsumerIndexStmt"),
+            wksp_map_stmt,
+            loop_stmt,
         ]
 
     def lower_IndexStmt(self, stmt: IndexStmt) -> Union[llir.Stmt, List[llir.Stmt]]:

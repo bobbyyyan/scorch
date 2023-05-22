@@ -91,6 +91,7 @@ class DataType(Enum):
     All possible data type of a variable in C++.
     """
 
+    AUTO = "auto"
     INT = "int"
     BOOL = "bool"
     UINT8 = "uint8_t"
@@ -117,6 +118,11 @@ class DataType(Enum):
     CVECTOR_INT = "cvector<int>"
     CVECTOR_FLOAT32 = "cvector<float>"
     CVECTOR_TORCH_FLOAT32 = "cvector<torch::kFloat32>"
+
+    COO_WORKSPACE_INT = "coo_workspace<int>"
+    COO_WORKSPACE_FLOAT32 = "coo_workspace<float>"
+    COO_WORKSPACE_TORCH_FLOAT32 = "coo_workspace<torch::kFloat32>"
+
     STD_VECTOR_INT = "std::vector<int>"
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
     ARRAY_INT = "int[]"
@@ -127,6 +133,13 @@ class DataType(Enum):
         A custom vector type for C++.
         """
         return DataType(f"cvector<{dtype.value}>")
+
+    @classmethod
+    def coo_workspace_type(cls, dtype: DataType) -> DataType:
+        """
+        A custom vector type for C++.
+        """
+        return DataType(f"coo_workspace<{dtype.value}>")
 
     @classmethod
     def from_python_type(cls, py_type):
@@ -322,7 +335,7 @@ class Function(Stmt):
 class FunctionCall(Expr):
     """A function call expression."""
 
-    def __init__(self, name: str, args: List[Expr]):
+    def __init__(self, name: str, args: List[Expr] = []):
         self.name = name
         self.args = args
 
