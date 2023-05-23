@@ -782,14 +782,16 @@ class IterationLattice:
 
         result_tensor_var = self.cin_lowerer.result_tensor_var
         assert result_tensor_var is not None, "Result tensor var not set"
+        result_tensor_name = result_tensor_var.name
         result_tensor_access = self.cin_lowerer.result_tensor_access
         assert result_tensor_access is not None, "Result tensor access not set"
 
-        index_var = lattice_point.get_index_var()
+        current_index_var = lattice_point.get_index_var()
 
-        if result_tensor_access.has_index_var(index_var):
-            level = result_tensor_access.level_of_index_var(index_var)
-            level_type = result_tensor_access.level_type_of_index_var(index_var)
+        if result_tensor_access.has_index_var(current_index_var):
+            level = result_tensor_access.level_of_index_var(current_index_var)
+            level_type = result_tensor_access.level_type_of_index_var(current_index_var)
+
             if level_type == LevelType.COMPRESSED:
                 stmts.extend(
                     [
@@ -802,13 +804,14 @@ class IterationLattice:
                 # the parent _level's crd
                 if level > 0:
                     parent_index_var = result_tensor_access.get_parent_index_var(
-                        lattice_point.get_index_var()
+                        current_index_var
                     )
                     assert parent_index_var is not None, "Parent index var is None"
-                    if (
-                        result_tensor_access.level_type_of_index_var(parent_index_var)
-                        == LevelType.COMPRESSED
-                    ):
+                    parent_level_type = result_tensor_access.level_type_of_index_var(
+                        parent_index_var
+                    )
+
+                    if parent_level_type == LevelType.COMPRESSED:
                         stmts.append(
                             # e.g.
                             # if (A1_pos.back() < pA1) {
@@ -818,17 +821,17 @@ class IterationLattice:
                                 cond=llir.BinOp(
                                     op="<",
                                     left=llir.FunctionCall(
-                                        name=f"{result_tensor_var.name}{level}_pos.back",
+                                        name=f"{result_tensor_name}{level}_pos.back",
                                         args=[],
                                     ),
                                     right=llir.Var(
-                                        name=f"p{result_tensor_var.name}{level}",
+                                        name=f"p{result_tensor_name}{level}",
                                         type=llir.DataType.INT,
                                     ),
                                 ),
                                 then_body=[
                                     llir.FunctionCallStmt(
-                                        name=f"{result_tensor_var.name}{level - 1}_crd.push_back",
+                                        name=f"{result_tensor_name}{level - 1}_crd.push_back",
                                         args=[
                                             llir.Var(
                                                 name=parent_index_var.get_name(),
@@ -870,10 +873,10 @@ class IterationLattice:
                     stmts.append(
                         # e.g. A1_pos.push_back(pA1))
                         llir.FunctionCallStmt(
-                            name=f"{result_tensor_var.name}{level}_pos.push_back",
+                            name=f"{result_tensor_name}{level}_pos.push_back",
                             args=[
                                 llir.Var(
-                                    name=f"{result_tensor_var.get_name()}{level}_crd.size()",
+                                    name=f"{result_tensor_name}{level}_crd.size()",
                                     # name=f"p{result_tensor_var.name}{_level}",
                                     type=llir.DataType.INT,
                                 )
@@ -896,7 +899,10 @@ class IterationLattice:
 
             index_var = lattice_point.get_index_var()
 
-            if result_tensor_access.has_index_var(index_var):
+            if (
+                not result_tensor_access.is_workspace()
+                and result_tensor_access.has_index_var(index_var)
+            ):
                 level = result_tensor_access.level_of_index_var(index_var)
                 level_type = result_tensor_access.level_type_of_index_var(index_var)
 

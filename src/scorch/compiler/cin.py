@@ -148,6 +148,28 @@ class IndexStmt(CIN):
         # Remove duplicates
         return list(set(workspaces))
 
+    def get_workspace_accesses(self) -> List[WorkspaceAccess]:
+        class WorkspaceAccessGetter(CINVisitorAccept):
+            workspace_accesses: List[WorkspaceAccess] = []
+
+            def visit_WorkspaceAccess(self, node: WorkspaceAccess) -> None:
+                self.workspace_accesses.append(node)
+
+            def visit_TensorAssign(self, node: TensorAssign) -> None:
+                self.visit(node.lhs)
+                self.visit(node.rhs)
+
+            def visit_Where(self, node: Where) -> None:
+                self.visit(node.producer)
+                self.visit(node.consumer)
+
+            def visit_ForAll(self, node: ForAll) -> None:
+                self.visit(node.stmt)
+
+        visitor = WorkspaceAccessGetter()
+        visitor.visit(self)
+        return visitor.workspace_accesses
+
 
 class IndexVar(IndexExpr):
     """A tensor index variable.
@@ -308,6 +330,9 @@ class TensorAccess(IndexExpr):
         if isinstance(indices, IndexVar):
             indices = [indices]
         self.indices = indices
+
+    def is_workspace(self) -> bool:
+        return isinstance(self.tensor, Workspace)
 
     def get_tensor(self) -> TensorVar:
         return self.tensor
