@@ -41,6 +41,7 @@ class CINLowerer:
         ] = {}
 
         self.seen_outermost_forall = False
+        self.outermost_stmt: Optional[IndexStmt] = None
 
         self.result_value_array_sparse_index_llir = None
         self.index_var_to_rhs_tensor_level_type = None
@@ -645,16 +646,18 @@ class CINLowerer:
             *assembly_stmts,
         ]
 
-    def lower_IndexStmt(self, stmt: IndexStmt) -> Union[llir.Stmt, List[llir.Stmt]]:
+    def lower_IndexStmt(
+        self, stmt: IndexStmt, recurse=False
+    ) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
         Lower an IndexStmt to LLIR
         """
 
+        if not self.outermost_stmt:
+            self.outermost_stmt = stmt
+
         if isinstance(stmt, TensorAssign):
             return self.lower_TensorAssign(stmt)
-
-        if isinstance(stmt, Where):
-            return self.lower_Where(stmt)
 
         # loop_order_allow_short_circuit = all_free_var_loops_before_reduction_loops(stmt)
 
@@ -690,6 +693,12 @@ class CINLowerer:
         # ]
 
         self.need_compute.extend(result_tensor_vars)
+
+        if recurse or stmt != self.outermost_stmt:
+            if isinstance(stmt, ForAll):
+                return self.lower_ForAll(stmt)
+            if isinstance(stmt, Where):
+                return self.lower_Where(stmt)
 
         tensor_value_array_init_stmts = []
         result_level_indices_init_stmts: List[llir.Stmt] = []
@@ -875,12 +884,7 @@ class CINLowerer:
             )
 
         # Finally, return function that computes the result
-        if isinstance(stmt, ForAll):
-            if self.seen_outermost_forall:
-                return self.lower_ForAll(stmt)
-            else:
-                self.seen_outermost_forall = True
-
+        if stmt == self.outermost_stmt:
             kernel_args: List[llir.Var] = []
 
             kernel_args.append(
@@ -912,6 +916,10 @@ class CINLowerer:
 
             body_stmts: List[llir.Stmt] = []
 
+            recurse_stmts = self.lower_IndexStmt(stmt, recurse=True)
+            if not isinstance(recurse_stmts, list):
+                recurse_stmts = [recurse_stmts]
+
             body_stmts.extend(
                 [
                     *result_tensor_level_sizes,
@@ -927,7 +935,7 @@ class CINLowerer:
                     *tensor_value_array_init_stmts,
                     # *result_index_init_stmts,
                     llir.BlankLine(),
-                    *self.lower_ForAll(stmt),
+                    *recurse_stmts,
                 ]
             )
 
