@@ -19,7 +19,6 @@ typedef struct {
 // ===== BEGIN === VECTOR IMPL ========
 // ####################################
 
-
 template<typename T>
 class cvector {
     int _size;
@@ -194,4 +193,80 @@ public:
 
 // ####################################
 // ====== END ==== VECTOR IMPL ========
+// ####################################
+
+
+
+// ####################################
+// ===== BEGIN === COO WKSP IMPL ======
+// ####################################
+
+#include <map>
+#include <vector>
+
+/**
+ * This class implements a workspace to store the intermediate results of tensor
+ * operations. It keeps track of the intermediate tensor in the coordinate list
+ * format.
+ * For a N-dimensional tensor, the workspace stores N lists of indices.
+ * The class has a sort function that sorts the indices in the lists.
+ *
+ * @tparam T type of the values stored
+ */
+template <typename T>
+class coo_workspace {
+  // dimension of the tensor
+  int _dim;
+  // number of non-zero elements in the tensor
+  int size = 0;
+  // flat array to store the values of the tensor
+  std::vector<T> _values;
+  // A vector of _dim lists of indices
+  std::vector<std::vector<int>> _indices;
+
+  // custom comparator for the map's keys
+  // sort the keys, by the array's first element, then the second element, and
+  // so on
+  struct compare {
+    bool operator()(const std::vector<int> &a,
+                    const std::vector<int> &b) const {
+      for (int i = 0; i < a.size(); i++) {
+        if (a[i] < b[i]) {
+          return true;
+        } else if (a[i] > b[i]) {
+          return false;
+        }
+      }
+      return false;
+    }
+  };
+
+  // map from coordinates to values, should be exposed to the user
+  std::map<std::vector<int>, T, compare> _map;
+
+ public:
+  // Constructor
+  explicit coo_workspace(int dim) : _dim(dim) {
+    _dim = dim;
+    // Create _dim lists of indices
+    for (int i = 0; i < _dim; i++) {
+      _indices.emplace_back();
+    }
+  }
+  // Function to insert a coordinate-value pair into the workspace
+  void insert(std::vector<int> coord, T value) {
+    // if the coordinate is already in the map, add the value to the existing
+    // value
+    if (_map.count(coord)) {
+      _map[coord] += value;
+    } else {
+      _map[coord] = value;
+    }
+  }
+  // Expose the map to the user
+  std::map<std::vector<int>, T, compare> &get_map() { return _map; }
+};
+
+// ####################################
+// ====== END ==== COO WKSP IMPL ======
 // ####################################

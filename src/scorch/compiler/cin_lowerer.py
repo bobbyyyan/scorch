@@ -15,6 +15,7 @@ from src.scorch.compiler.cin import (
     Operation,
     Where,
     WorkspaceAccess,
+    Workspace,
 )
 from src.scorch.compiler.iter_lattice import IterationLattice
 from src.scorch.format import LevelType
@@ -48,6 +49,8 @@ class CINLowerer:
         self.result_tensor_var: Optional[TensorVar] = None
         self.result_tensor_access: Optional[TensorAccess] = None
         self.result_tensor_value_index_var_dict: Dict[IndexVar, llir.Expr] = {}
+        self.final_result_tensor_var: Optional[TensorVar] = None
+        self.final_result_tensor_access: Optional[TensorAccess] = None
 
         self.llir_stmt: Optional[llir.Stmt] = None
 
@@ -510,11 +513,11 @@ class CINLowerer:
         # Add blank line
         loop_body.append(llir.BlankLine())
 
-        # <result tensor name>_vals[<result level iterator>] = <wksp's name>_value;
+        # <result tensor name>_values[<result level iterator>] = <wksp's name>_value;
         loop_body.append(
             llir.Assign(
                 var=llir.Var(
-                    name=f"{result_tensor_name}_vals[{result_level_iterator_name}]",
+                    name=f"{result_tensor_name}_values[{result_level_iterator_name}]",
                     type=llir.DataType.NO_TYPE,
                 ),
                 value=llir.Var(
@@ -659,8 +662,27 @@ class CINLowerer:
         result_tensor_vars: List[TensorVar] = stmt.get_result_tensor_vars()
         # TODO: need to handle multiple result tensors
         self.result_tensor_var = result_tensor_vars[0]
+        non_workspace_result_tensor_vars = [
+            x for x in result_tensor_vars if not isinstance(x, Workspace)
+        ]
+        if not self.final_result_tensor_var:
+            self.final_result_tensor_var = (
+                non_workspace_result_tensor_vars[0]
+                if non_workspace_result_tensor_vars
+                else None
+            )
         result_tensor_accesses = stmt.get_result_tensor_accesses()
         self.result_tensor_access = result_tensor_accesses[0]
+        non_workspace_result_tensor_accesses = [
+            x for x in result_tensor_accesses if not isinstance(x.tensor, Workspace)
+        ]
+        if not self.final_result_tensor_access:
+            self.final_result_tensor_access = (
+                non_workspace_result_tensor_accesses[0]
+                if non_workspace_result_tensor_accesses
+                else None
+            )
+
         rhs_tensor_vars: List[TensorVar] = stmt.get_rhs_tensor_vars()
         rhs_tensor_accesses: List[TensorAccess] = stmt.get_rhs_tensor_accesses()
         # rhs_tensor_vars_llir: List[llir.Expr] = [
@@ -906,19 +928,28 @@ class CINLowerer:
                     # *result_index_init_stmts,
                     llir.BlankLine(),
                     *self.lower_ForAll(stmt),
-                    llir.Comment("Assemble result"),
-                    llir.VarDecl(
-                        var=llir.Var(
-                            name=f"{self.result_tensor_var.get_name()}",
-                            type=llir.DataType.TACO_TENSOR,
-                        )
-                    ),
                 ]
             )
 
+            if self.final_result_tensor_var:
+                body_stmts.extend(
+                    [
+                        llir.Comment("Assemble final result"),
+                        llir.VarDecl(
+                            var=llir.Var(
+                                name=f"{self.final_result_tensor_var.get_name()}",
+                                type=llir.DataType.TACO_TENSOR,
+                            )
+                        ),
+                    ]
+                )
+
             # torch::Tensor a0_pos_torch = torch::from_blob(a0_pos.data(), {a0_pos.size()}, a0_pos.get_deleter(), torch::kInt);
-            for i, level_type in enumerate(self.result_tensor_var.get_level_types()):
-                tensor_level_name = f"{self.result_tensor_var.get_name()}{i}"
+            assert self.final_result_tensor_var is not None, "No final result tensor"
+            for i, level_type in enumerate(
+                self.final_result_tensor_var.get_level_types()
+            ):
+                tensor_level_name = f"{self.final_result_tensor_var.get_name()}{i}"
 
                 if level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
                     if level_type == LevelType.COMPRESSED:
@@ -988,27 +1019,27 @@ class CINLowerer:
             body_stmts.append(
                 llir.VarInit(
                     var=llir.Var(
-                        name=f"{self.result_tensor_var.get_name()}_values_torch",
+                        name=f"{self.final_result_tensor_var.get_name()}_values_torch",
                         type=llir.DataType.TORCH_TENSOR,
                     ),
                     value=llir.FunctionCall(
                         name="torch::from_blob",
                         args=[
                             llir.Var(
-                                name=f"{self.result_tensor_var.get_name()}_values.data()",
+                                name=f"{self.final_result_tensor_var.get_name()}_values.data()",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
-                                name=f"{{{self.result_tensor_var.get_name()}_values.size()}}",
+                                name=f"{{{self.final_result_tensor_var.get_name()}_values.size()}}",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
-                                name=f"{self.result_tensor_var.get_name()}_values.get_deleter()",
+                                name=f"{self.final_result_tensor_var.get_name()}_values.get_deleter()",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
                                 name=get_pytorch_c_dtype_str(
-                                    self.result_tensor_var.dtype
+                                    self.final_result_tensor_var.dtype
                                 ),
                                 type=llir.DataType.NO_TYPE,
                             ),
@@ -1021,8 +1052,8 @@ class CINLowerer:
             # e.g. A._storage._index.mode_indices = {{A0_pos_torch, A0_crd_torch}, {A1_pos_torch, A1_crd_torch}};
 
             def get_result_mode_index_set(i, level_type: LevelType):
-                assert self.result_tensor_var, "Result tensor variable not set"
-                tensor_level_name = f"{self.result_tensor_var.get_name()}{i}"
+                assert self.final_result_tensor_var, "Result tensor variable not set"
+                tensor_level_name = f"{self.final_result_tensor_var.get_name()}{i}"
                 if level_type == LevelType.DENSE:
                     return "{}"
                 elif level_type == LevelType.COMPRESSED:
@@ -1033,11 +1064,11 @@ class CINLowerer:
             body_stmts.append(
                 llir.Assign(
                     var=llir.Var(
-                        name=f"{self.result_tensor_var.get_name()}._storage._index.mode_indices",
+                        name=f"{self.final_result_tensor_var.get_name()}._storage._index.mode_indices",
                         type=llir.DataType.NO_TYPE,
                     ),
                     value=llir.Var(
-                        name=f"{{{', '.join([get_result_mode_index_set(i, level_type) for i, level_type in enumerate(self.result_tensor_var.get_level_types())])}}}",
+                        name=f"{{{', '.join([get_result_mode_index_set(i, level_type) for i, level_type in enumerate(self.final_result_tensor_var.get_level_types())])}}}",
                         type=llir.DataType.NO_TYPE,
                     ),
                 )
@@ -1048,11 +1079,11 @@ class CINLowerer:
             body_stmts.append(
                 llir.Assign(
                     var=llir.Var(
-                        name=f"{self.result_tensor_var.get_name()}._storage._value",
+                        name=f"{self.final_result_tensor_var.get_name()}._storage._value",
                         type=llir.DataType.NO_TYPE,
                     ),
                     value=llir.Var(
-                        name=f"{self.result_tensor_var.get_name()}_values_torch",
+                        name=f"{self.final_result_tensor_var.get_name()}_values_torch",
                         type=llir.DataType.NO_TYPE,
                     ),
                 )
@@ -1062,7 +1093,7 @@ class CINLowerer:
             body_stmts.append(
                 llir.Return(
                     value=llir.Var(
-                        name=f"{self.result_tensor_var.get_name()}",
+                        name=f"{self.final_result_tensor_var.get_name()}",
                         type=llir.DataType.NO_TYPE,
                     )
                 )

@@ -808,7 +808,7 @@ def test_spmm_codegen():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_spmm_ds_ds_ds():
+def test_spmm_ds_ds_ds_ikj_gustavson():
     # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
