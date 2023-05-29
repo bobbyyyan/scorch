@@ -38,10 +38,10 @@ for epoch in range(200):
     optimizer.step()
 
 # Save weights
-torch.save(model.state_dict(), 'gcn_cora_weights.pth')
+torch.save(model.state_dict(), 'weights/gcn_cora_weights.pth')
 
 # Load weights and prepare for inference
-model.load_state_dict(torch.load('gcn_cora_weights.pth'))
+model.load_state_dict(torch.load('weights/gcn_cora_weights.pth'))
 model.eval()
 
 # Perform inference and measure time

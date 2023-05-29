@@ -34,7 +34,7 @@ g = g.to(torch.device('cpu'))
 model_dgl = DGLGCN(dataset.num_features, dataset.num_classes).to(torch.device('cpu'))
 
 # Load weights from PyG model
-model_dgl.load_state_dict(torch.load('gcn_cora_weights.pth'))
+model_dgl.load_state_dict(torch.load('weights/gcn_cora_weights.pth'))
 
 # Prepare for inference
 model_dgl.eval()
