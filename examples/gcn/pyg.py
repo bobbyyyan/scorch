@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch_geometric.datasets import Planetoid
 from torch_geometric.nn import GCNConv
 
+
 # Define GCN model
 class GCN(torch.nn.Module):
     def __init__(self, num_features, num_classes):
@@ -19,12 +20,13 @@ class GCN(torch.nn.Module):
         x = self.conv2(x, edge_index)
         return F.log_softmax(x, dim=1)
 
+
 # Load dataset
-dataset = Planetoid(root=os.path.join(os.getcwd(), 'data'), name='Cora')
+dataset = Planetoid(root=os.path.join(os.getcwd(), "data"), name="Cora")
 data = dataset[0]
 
 # Initialize model and optimizer
-device = torch.device('cpu')
+device = torch.device("cpu")
 model = GCN(dataset.num_features, dataset.num_classes).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
 
@@ -38,10 +40,10 @@ for epoch in range(200):
     optimizer.step()
 
 # Save weights
-torch.save(model.state_dict(), 'weights/gcn_cora_weights.pth')
+torch.save(model.state_dict(), "weights/gcn_cora_weights.pth")
 
 # Load weights and prepare for inference
-model.load_state_dict(torch.load('weights/gcn_cora_weights.pth'))
+model.load_state_dict(torch.load("weights/gcn_cora_weights.pth"))
 model.eval()
 
 # Perform inference and measure time

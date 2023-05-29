@@ -3,16 +3,24 @@ import time
 import torch
 import torch.nn.functional as F
 import dgl
-from dgl.nn import GraphConv
+from dgl import nn as dglnn
+from scipy.sparse import coo_matrix
+import numpy as np
 from torch_geometric.datasets import Planetoid
-from torch_geometric.utils import to_networkx
+
+
+import warnings
+
+# warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*TypedStorage is deprecated.*")
+
 
 # Define GCN model using DGL
 class DGLGCN(torch.nn.Module):
     def __init__(self, num_features, num_classes):
         super(DGLGCN, self).__init__()
-        self.conv1 = GraphConv(num_features, 16)
-        self.conv2 = GraphConv(16, num_classes)
+        self.conv1 = dglnn.GraphConv(num_features, 16)
+        self.conv2 = dglnn.GraphConv(16, num_classes)
 
     def forward(self, g, x):
         x = self.conv1(g, x)
@@ -21,20 +29,54 @@ class DGLGCN(torch.nn.Module):
         x = self.conv2(g, x)
         return F.log_softmax(x, dim=1)
 
+
 # Load dataset
-dataset = Planetoid(root=os.path.join(os.getcwd(), 'data'), name='Cora')
+dataset = Planetoid(root=os.path.join(os.getcwd(), "data"), name="Cora")
 data = dataset[0]
 
-# Convert PyG graph to DGL graph
-g = dgl.graph(data.edge_index)
-g.ndata['feat'] = data.x
-g = g.to(torch.device('cpu'))
+
+# # Convert PyG graph to DGL graph
+# g = dgl.from_scipy(data.edge_index.t().numpy())
+
+# Assuming 'data.edge_index' is a PyTorch tensor of shape (2, num_edges)
+edge_index = data.edge_index.t().numpy()
+
+# Get the number of nodes by finding the maximum node index
+num_nodes = edge_index.max() + 1
+
+# Create a SciPy sparse matrix (COO format) from the edge list
+sparse_matrix = coo_matrix(
+    (np.ones(edge_index.shape[0]), (edge_index[:, 0], edge_index[:, 1])),
+    shape=(num_nodes, num_nodes),
+)
+
+# Convert the sparse matrix to a DGL graph
+g = dgl.from_scipy(sparse_matrix)
+g.ndata["feat"] = data.x
+g = g.to(torch.device("cpu"))
 
 # Initialize DGL model
-model_dgl = DGLGCN(dataset.num_features, dataset.num_classes).to(torch.device('cpu'))
+model_dgl = DGLGCN(dataset.num_features, dataset.num_classes).to(torch.device("cpu"))
 
 # Load weights from PyG model
-model_dgl.load_state_dict(torch.load('weights/gcn_cora_weights.pth'))
+# model_dgl.load_state_dict(torch.load("weights/gcn_cora_weights.pth"))
+
+# Convert weights named "conv1.weight" and "conv2.weight" to DGL format
+# Load the pre-trained weights
+state_dict = torch.load("weights/gcn_cora_weights.pth")
+
+# Modify the keys and transpose the weights if necessary
+new_state_dict = {}
+for key, value in state_dict.items():
+    new_key = key.replace(".lin.", ".")
+    new_value = value
+    if ".weight" in new_key:
+        new_value = value.t()  # Transpose the weight dimensions
+    new_state_dict[new_key] = new_value
+
+# Load the modified state_dict into the model
+model_dgl.load_state_dict(new_state_dict)
+
 
 # Prepare for inference
 model_dgl.eval()
@@ -43,7 +85,7 @@ model_dgl.eval()
 start_time = time.time()
 
 with torch.no_grad():
-    logits_dgl = model_dgl(g, g.ndata['feat'])
+    logits_dgl = model_dgl(g, g.ndata["feat"])
     pred_dgl = logits_dgl.argmax(dim=1)
 
 inference_time_dgl = time.time() - start_time
