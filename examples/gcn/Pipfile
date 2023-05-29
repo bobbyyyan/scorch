@@ -13,6 +13,8 @@ mypy = "*"
 pytest = "*"
 torch-geometric = "*"
 dgl = "*"
+torch-sparse = "*"
+torch-scatter = "*"
 
 [dev-packages]
 
