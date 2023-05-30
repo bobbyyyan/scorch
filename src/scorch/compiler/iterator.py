@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, List
 
-from src.scorch.compiler import llir
-from src.scorch.compiler.cin import TensorVar, TensorAccess, IndexVar
-from src.scorch.format import LevelType
+from . import llir
+from .cin import TensorVar, TensorAccess, IndexVar
+from ..format import LevelType
 
 
 @dataclass(frozen=False)

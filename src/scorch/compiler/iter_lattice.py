@@ -4,13 +4,13 @@ from dataclasses import dataclass, field
 from itertools import product
 from typing import List, Optional, Dict, TYPE_CHECKING, Iterable, Sequence
 
-from src.scorch.compiler import llir
-from src.scorch.utils import flatten_2d_list
+from . import llir
+from ..utils import flatten_2d_list
 
 if TYPE_CHECKING:
     from src.scorch.compiler.cin_lowerer import CINLowerer
 
-from src.scorch.compiler.cin import (
+from .cin import (
     IndexVar,
     ForAll,
     TensorAccess,
@@ -23,8 +23,8 @@ from src.scorch.compiler.cin import (
     CINIndexVariablesGetter,
     Where,
 )
-from src.scorch.format import LevelType
-from src.scorch.compiler.iterator import ModeIterator
+from ..format import LevelType
+from .iterator import ModeIterator
 
 
 @dataclass(frozen=False)

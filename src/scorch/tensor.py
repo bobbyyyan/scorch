@@ -4,12 +4,12 @@ from typing import Optional, Tuple, Union, List
 
 import torch
 
-from src.scorch.compiler.cin import TensorVar, ForAll, IndexVar
-from src.scorch.compiler.cin_lowerer import CINLowerer
-from src.scorch.compiler.codegen import LLIRLowerer
-from src.scorch.format import TensorFormat, LevelFormat, LevelType
-from src.scorch.storage import TensorStorage, TensorIndex, TensorStorageView
-from src.scorch.utils import PROJECT_ROOT_DIR, parse_format
+from .compiler.cin import TensorVar, ForAll, IndexVar
+from .compiler.cin_lowerer import CINLowerer
+from .compiler.codegen import LLIRLowerer
+from .format import TensorFormat, LevelFormat, LevelType
+from .storage import TensorStorage, TensorIndex, TensorStorageView
+from .utils import PROJECT_ROOT_DIR, parse_format
 
 
 class Window(object):

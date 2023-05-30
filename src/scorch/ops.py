@@ -4,13 +4,13 @@ from typing import Any, Union, Sequence
 import torch
 from torch.utils.cpp_extension import load
 
-from src.scorch.compiler.cin import IndexVar, TensorVar, ForAll
-from src.scorch.compiler.cin_lowerer import CINLowerer
-from src.scorch.compiler.codegen import LLIRLowerer
-from src.scorch.format import TensorFormat, LevelFormat, LevelType
-from src.scorch.storage import TensorIndex
-from src.scorch.tensor import Tensor
-from src.scorch.utils import parse_format
+from .compiler.cin import IndexVar, TensorVar, ForAll
+from .compiler.cin_lowerer import CINLowerer
+from .compiler.codegen import LLIRLowerer
+from .format import TensorFormat, LevelFormat, LevelType
+from .storage import TensorIndex
+from .tensor import Tensor
+from .utils import parse_format
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():

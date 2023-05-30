@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Union, List
 
-from src.scorch.compiler import llir
+from .compiler import llir
 
 
 class LevelType(Enum):
