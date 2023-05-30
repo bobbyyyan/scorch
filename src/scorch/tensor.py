@@ -267,14 +267,130 @@ class Tensor(torch.nn.Module):
         return tt_tensor
 
     def to_torch(self) -> torch.Tensor:
-        """Convert a dense Scorch Tensor to a torch.Tensor."""
-        # TODO: Implement this.
-        raise NotImplementedError()
+        """Convert a Scorch Tensor to a torch.Tensor."""
+        # Get a dense Scorch tensor
+        dense_tensor = self.to_dense()
+        # Convert the dense Scorch tensor to a torch.Tensor
+        torch_tensor = torch.tensor(
+            dense_tensor.storage.value,
+            dtype=self.dtype,
+        )
+        # Reshape the torch.Tensor to the original shape
+        torch_tensor = torch_tensor.reshape(dense_tensor.shape)
+        return torch_tensor
 
-    def to_dense(self) -> Tensor:
+    def to_dense(
+        self,
+        fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
+        in_place: bool = False,
+    ) -> Tensor:
         """Convert the Scorch tensor to a dense Scorch tensor."""
-        # TODO: Implement this.
-        raise NotImplementedError()
+
+        # If self is already dense at every level, return self
+        if self.format.is_dense():
+            return self
+
+        default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
+
+        if len(self.shape) > len(default_index_vars):
+            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+        else:
+            index_vars = default_index_vars[: len(self.shape)]
+
+        if self.has_index:
+            B = TensorVar(
+                name="B",
+                fmt=self.format,
+            )
+        else:
+            B = TensorVar(
+                name="B",
+                fmt=TensorFormat(
+                    level_formats=[
+                        LevelFormat(mode=LevelType.DENSE)
+                        for _ in range(len(self.shape))
+                    ]
+                ),
+            )
+
+        if fmt is None:
+            # TODO: infer output format from input format
+            # For now, make every _level COMPRESSED
+            output_format = TensorFormat(
+                level_formats=[
+                    LevelFormat(mode=LevelType.DENSE) for _ in range(len(self.shape))
+                ]
+            )
+        else:
+            output_format = parse_format(fmt)
+
+        A = TensorVar(
+            name="A",
+            fmt=output_format,
+        )
+
+        # Assert A, B, and index_vars are defined
+        assert A is not None, "A is not defined"
+        assert B is not None, "B is not defined"
+        assert index_vars is not None, "index_vars is not defined"
+
+        # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
+        lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        code = f"{lhs} = {rhs}"
+        exec(code)
+
+        # Generate the python code for constructing the ForAll's and execute it
+        # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
+        rhs = "A._assignment"
+        assert ForAll is not None, "ForAll is not imported"
+        for i in range(len(self.shape))[::-1]:
+            rhs = f"ForAll(index_vars[{i}], {rhs})"
+        cin_stmt = eval(rhs)
+
+        lowerer = CINLowerer(filter_zeros=True)
+        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer()
+        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+        # print("\n\ncpp_code:\n\n", cpp_code)
+
+        # Read header_cpp_code from csrc/header.cpp
+        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+            header_cpp_code = f.read()
+
+        module = torch.utils.cpp_extension.load_inline(
+            name="kernel",
+            cpp_sources=[header_cpp_code, cpp_code],
+            functions=["evaluate"],
+        )
+
+        result_cpp = module.evaluate(
+            self.shape,
+            self.shape,
+            self.index.mode_indices,
+            self.storage.value,
+        )
+
+        new_storage = TensorStorage(
+            index=TensorIndex(
+                tensor_format=output_format,
+                mode_indices=result_cpp._storage._index.mode_indices,
+            ),
+            value=result_cpp._storage._value,
+        )
+
+        if in_place:
+            self._storage = new_storage
+            return self
+
+        new_tensor = Tensor(
+            name=self.name,
+            shape=self.shape,
+            storage=new_storage,
+        )
+
+        return new_tensor
 
     def to_sparse(
         self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None

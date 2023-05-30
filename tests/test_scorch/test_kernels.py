@@ -18,6 +18,50 @@ from src.scorch.storage import TensorIndex
 from src.scorch.utils import PROJECT_ROOT_DIR, parse_format
 
 
+def test_to_dense():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
+
+    a_sparse_to_torch = a_sparse.to_torch()
+    b_sparse_to_torch = b_sparse.to_torch()
+
+    assert a_sparse_to_torch.tolist() == tensor_a_torch.tolist()
+    assert b_sparse_to_torch.tolist() == tensor_b_torch.tolist()
+
+
+def test_to_torch():
+    tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
+    tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
+
+    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
+
+    sp_vector_a_to_torch = sp_vector_a.to_torch()
+    sp_vector_b_to_torch = sp_vector_b.to_torch()
+
+    assert sp_vector_a_to_torch.tolist() == [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4]
+    assert sp_vector_b_to_torch.tolist() == [2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5]
+
+
 def test_elemwise_vector_mul_sss():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])

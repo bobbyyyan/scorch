@@ -124,6 +124,14 @@ class TensorFormat(object):
     def get_order(self) -> int:
         return len(self.get_level_formats())
 
+    def is_dense(self) -> bool:
+        return all(
+            [
+                level_format.get_level_type() == LevelType.DENSE
+                for level_format in self._level_formats
+            ]
+        )
+
     def __str__(self):
         # return "TensorFormat({})".format(self._level_formats)
         # return str(self._level_formats)
