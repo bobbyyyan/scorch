@@ -237,7 +237,6 @@ class Tensor(torch.nn.Module):
         """Multiply two tensors together."""
         raise NotImplementedError()
 
-    # function to create a Tensor from a torch.Tensor
     @staticmethod
     def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
         """Create a Tensor from a torch.Tensor."""
@@ -267,11 +266,20 @@ class Tensor(torch.nn.Module):
 
         return tt_tensor
 
-    # function to sparsify a Tensor
+    def to_torch(self) -> torch.Tensor:
+        """Convert a dense Scorch Tensor to a torch.Tensor."""
+        # TODO: Implement this.
+        raise NotImplementedError()
+
+    def to_dense(self) -> Tensor:
+        """Convert the Scorch tensor to a dense Scorch tensor."""
+        # TODO: Implement this.
+        raise NotImplementedError()
+
     def to_sparse(
         self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None
     ) -> Tensor:
-        """Convert the tensor to a sparse tensor."""
+        """Convert the Scorch tensor to a sparse Scorch tensor."""
         if len(self.shape) == 1:
             # Find indexes of non-zero elements in self.values, flatten them
             nonzero_indices = torch.nonzero(self.values).flatten()

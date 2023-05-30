@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)
-project(taco_torch)
+project(scorch)
 
 set(CMAKE_CXX_STANDARD 14)
 
@@ -21,4 +21,4 @@ include_directories(venv/lib/python3.9/site-packages/torch/include/torch/csrc/ap
 include_directories(venv/lib/python3.9/site-packages/torch/include/torch/csrc/api/include)
 
 
-add_executable(taco_torch csrc/ops.cpp csrc/elem_wise_vector_mul.cpp csrc/elem_wise_vector_mul.h)
+add_executable(scorch csrc/ops.cpp csrc/elem_wise_vector_mul.cpp csrc/elem_wise_vector_mul.h)

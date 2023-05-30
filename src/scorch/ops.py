@@ -23,21 +23,13 @@ load(
 )
 
 
-# ops_cpp = load(
-#     name="ops_cpp",
-#     sources=[str(PROJECT_ROOT_DIR / "csrc/ops.cpp")],
-# )
-#
-#
-# def test_cpp_ext_rand_matrix():
-#     print("random tensor:")
-#     print(ops_cpp.get_rand_matrix(7, 8))
-#
-#
-# def test_cpp_ext_rand_matrix_tt():
-#     print("random tt tensor:")
-#     rand_tt_tensor: Tensor = ops_cpp.get_rand_matrix_tt(7, 8)
-#     print(rand_tt_tensor._storage._value)  # type: ignore
+def matmul(
+    a: Union[torch.Tensor, Tensor],
+    b: Union[torch.Tensor, Tensor],
+    **kwargs: Any,
+) -> Tensor:
+    """Perform a matrix multiplication."""
+    raise NotImplementedError
 
 
 def einsum(
@@ -45,7 +37,6 @@ def einsum(
     *tensors: Union[torch.Tensor, Tensor],
     **kwargs: Any,
 ) -> Tensor:
-    """Perform a tensor contraction using the TACO compiler."""
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
     # elementwise multiplication or "ik,kj->ij" for matrix multiplication
 
