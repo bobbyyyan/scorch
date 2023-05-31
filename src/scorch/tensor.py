@@ -240,7 +240,7 @@ class Tensor(torch.nn.Module):
     def copy(self) -> Tensor:
         """Copy the tensor."""
         return Tensor(
-            name=self.name,
+            name=self._name,
             shape=self.shape,
             storage=self.storage.copy(),
         )
@@ -395,7 +395,7 @@ class Tensor(torch.nn.Module):
             return self
 
         new_tensor = Tensor(
-            name=self.name,
+            name=self._name,
             shape=self.shape,
             storage=new_storage,
         )

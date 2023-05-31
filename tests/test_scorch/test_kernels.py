@@ -14,6 +14,7 @@ from src.scorch.compiler.cin import (
 )
 from src.scorch.compiler.cin_lowerer import CINLowerer
 from src.scorch.compiler.codegen import LLIRLowerer
+from src.scorch.ops import matmul
 from src.scorch.storage import TensorIndex
 from src.scorch.utils import PROJECT_ROOT_DIR, parse_format
 
@@ -737,6 +738,97 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
 #         25.0,
 #         25.0,
 #     ]
+
+
+def test_matmul():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
+    scorch_result = matmul(tensor_a_torch, tensor_b_torch, format="dd")
+
+    # print(torch_result)
+    # print(scorch_result.shape)
+    # print(scorch_result.format)
+    # print(scorch_result.index.mode_indices)
+    # print(scorch_result.values)
+    # print(scorch_result.to_torch())
+    assert torch_result.tolist() == scorch_result.to_torch().tolist()
+
+
+def test_spmm_ds_dd_dd():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+
+    result = einsum("ik,kj->ij", a_scorch, b_scorch, format="ds")
+
+    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    assert result_torch.tolist() == result.to_torch().tolist()
+
+
+def test_spmm_dd_dd_dd():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+
+    result = einsum("ik,kj->ij", a_scorch, b_scorch, format="dd")
+
+    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    assert result_torch.tolist() == result.to_torch().tolist()
 
 
 def test_spmm_ds_ds_ds():

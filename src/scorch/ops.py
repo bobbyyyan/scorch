@@ -29,7 +29,15 @@ def matmul(
     **kwargs: Any,
 ) -> Tensor:
     """Perform a matrix multiplication."""
-    raise NotImplementedError
+
+    if isinstance(a, torch.Tensor):
+        a = Tensor.from_torch(a)
+    if isinstance(b, torch.Tensor):
+        b = Tensor.from_torch(b)
+
+    result = einsum("ik,kj->ij", a, b, **kwargs)
+
+    return result
 
 
 def einsum(
