@@ -271,10 +271,9 @@ class Tensor(torch.nn.Module):
         # Get a dense Scorch tensor
         dense_tensor = self.to_dense()
         # Convert the dense Scorch tensor to a torch.Tensor
-        torch_tensor = torch.tensor(
-            dense_tensor.storage.value,
-            dtype=self.dtype,
-        )
+        torch_tensor = dense_tensor.storage.value.clone().detach()
+        if torch_tensor.dtype != self.dtype:
+            torch_tensor = torch_tensor.type(self.dtype)
         # Reshape the torch.Tensor to the original shape
         torch_tensor = torch_tensor.reshape(dense_tensor.shape)
         return torch_tensor
