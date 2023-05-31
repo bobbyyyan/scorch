@@ -18,7 +18,25 @@ from src.scorch.storage import TensorIndex
 from src.scorch.utils import PROJECT_ROOT_DIR, parse_format
 
 
-def test_to_dense():
+def test_dense_copy():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+
+    tensor_a = Tensor.from_torch(tensor_a_torch, "A")
+
+    tensor_a_dense = tensor_a.to_dense()
+
+    print(tensor_a_dense)
+
+
+def test_sparse_to_dense():
     tensor_a_torch = torch.Tensor(
         [
             [1, 0, 0, 0, 0],

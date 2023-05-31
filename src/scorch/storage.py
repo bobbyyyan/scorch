@@ -57,6 +57,16 @@ class TensorIndex(object):
     def __ne__(self, other):
         return not self.__eq__(other)
 
+    def copy(self):
+        mode_indices = None
+        if self.mode_indices:
+            # append .clone().detach() to avoid memory leak
+            mode_indices = [
+                [index.clone().detach() for index in mode_index]
+                for mode_index in self.mode_indices
+            ]
+        return TensorIndex(self.format, mode_indices)
+
     def get_mode_index(self, mode: int) -> List[torch.Tensor]:
         """Get the mode index of a mode."""
         return self.get_mode_indices()[mode]
@@ -117,6 +127,16 @@ class TensorStorage(object):
 
     def __repr__(self):
         return "TensorStorage({})"
+
+    def copy(self):
+        """Return a copy of the tensor storage."""
+        index = self._index.copy() if self._index is not None else None
+        value = self._value.clone() if self._value is not None else None
+        return TensorStorage(
+            index=index,
+            value=value,
+            shape=self._shape,
+        )
 
     @property
     def has_index(self) -> bool:

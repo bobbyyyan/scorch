@@ -237,6 +237,14 @@ class Tensor(torch.nn.Module):
         """Multiply two tensors together."""
         raise NotImplementedError()
 
+    def copy(self) -> Tensor:
+        """Copy the tensor."""
+        return Tensor(
+            name=self.name,
+            shape=self.shape,
+            storage=self.storage.copy(),
+        )
+
     @staticmethod
     def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
         """Create a Tensor from a torch.Tensor."""
@@ -287,7 +295,10 @@ class Tensor(torch.nn.Module):
 
         # If self is already dense at every level, return self
         if self.format.is_dense():
-            return self
+            if in_place:
+                return self
+            else:
+                return self.copy()
 
         default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
 
