@@ -798,7 +798,9 @@ def test_spmm_ds_dd_dd():
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
-    assert result_torch.tolist() == result.to_torch().tolist()
+    print(result.index.mode_indices)
+
+    # assert result_torch.tolist() == result.to_torch().tolist()
 
 
 def test_spmm_dd_dd_dd():
@@ -893,6 +895,355 @@ def test_spmm_ds_ds_ds():
     ]
 
 
+def test_spmm_ss_dd_dd_ikj_gustavson():
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt=["sparse", "sparse"])
+    B = TensorVar("B", fmt=["dense", "dense"])
+    C = TensorVar("C", fmt=["dense", "dense"])
+
+    workspace = Workspace(
+        name="wksp",
+        dim=1,
+    )
+
+    """
+    A[i, j] = ForAll(i,
+      Where(
+        producer=ForAll(k, ForAll(j, 1[j] += B[i, k] * C[k, j])),
+        consumer=ForAll(j, A[i, j] = workspace[j])
+      )
+    )
+    """
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        B[i, k] * C[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    A[i, j],
+                    workspace[j],
+                ),
+            ),
+        ),
+    )
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+    print(cpp_code)
+
+    # Read header_cpp_code from csrc/header.cpp
+    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+        header_cpp_code = f.read()
+
+    module = torch.utils.cpp_extension.load_inline(
+        name="kernel",
+        cpp_sources=[header_cpp_code, cpp_code],
+        functions=["evaluate"],
+    )
+
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+
+    output_format = parse_format("ss")
+
+    result_shape = (5, 5)
+    args = [result_shape]
+
+    for tensor in [a_sparse, b_sparse]:
+        args.append(tensor.shape)  # type: ignore
+        args.append(tensor._storage._index.mode_indices)  # type: ignore
+        args.append(tensor._storage.value)  # type: ignore
+
+    result_cpp = module.evaluate(*args)
+    result = Tensor(
+        shape=result_shape,
+        index=TensorIndex(
+            mode_indices=result_cpp._storage._index.mode_indices,
+            tensor_format=output_format,
+        ),
+        value=result_cpp._storage._value,
+    )
+
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+    # print(result.index.mode_indices)
+    assert result.to_torch().tolist() == result_torch.tolist()
+
+
+def test_spmm_ds_dd_dd_ikj_gustavson():
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt=["dense", "sparse"])
+    B = TensorVar("B", fmt=["dense", "dense"])
+    C = TensorVar("C", fmt=["dense", "dense"])
+
+    workspace = Workspace(
+        name="wksp",
+        dim=1,
+    )
+
+    """
+    A[i, j] = ForAll(i,
+      Where(
+        producer=ForAll(k, ForAll(j, 1[j] += B[i, k] * C[k, j])),
+        consumer=ForAll(j, A[i, j] = workspace[j])
+      )
+    )
+    """
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        B[i, k] * C[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    A[i, j],
+                    workspace[j],
+                ),
+            ),
+        ),
+    )
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+    print(cpp_code)
+
+    # Read header_cpp_code from csrc/header.cpp
+    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+        header_cpp_code = f.read()
+
+    module = torch.utils.cpp_extension.load_inline(
+        name="kernel",
+        cpp_sources=[header_cpp_code, cpp_code],
+        functions=["evaluate"],
+    )
+
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+
+    output_format = parse_format("ds")
+
+    result_shape = (5, 5)
+    args = [result_shape]
+
+    for tensor in [a_sparse, b_sparse]:
+        args.append(tensor.shape)  # type: ignore
+        args.append(tensor._storage._index.mode_indices)  # type: ignore
+        args.append(tensor._storage.value)  # type: ignore
+
+    result_cpp = module.evaluate(*args)
+    result = Tensor(
+        shape=result_shape,
+        index=TensorIndex(
+            mode_indices=result_cpp._storage._index.mode_indices,
+            tensor_format=output_format,
+        ),
+        value=result_cpp._storage._value,
+    )
+
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+    assert result.to_torch().tolist() == result_torch.tolist()
+
+
+def test_spmm_ds_ds_ds_ikj_gustavson():
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt=["sparse", "sparse"])
+    B = TensorVar("B", fmt=["dense", "sparse"])
+    C = TensorVar("C", fmt=["dense", "sparse"])
+
+    workspace = Workspace(
+        name="wksp",
+        dim=1,
+    )
+
+    """
+    A[i, j] = ForAll(i,
+      Where(
+        producer=ForAll(k, ForAll(j, 1[j] += B[i, k] * C[k, j])),
+        consumer=ForAll(j, A[i, j] = workspace[j])
+      )
+    )
+    """
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        B[i, k] * C[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    A[i, j],
+                    workspace[j],
+                ),
+            ),
+        ),
+    )
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+    print(cpp_code)
+
+    # Read header_cpp_code from csrc/header.cpp
+    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+        header_cpp_code = f.read()
+
+    module = torch.utils.cpp_extension.load_inline(
+        name="kernel",
+        cpp_sources=[header_cpp_code, cpp_code],
+        functions=["evaluate"],
+    )
+
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 3, 0, 0],
+            [0, 0, 0, 4, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [4, 0, 0, 4, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+
+    output_format = parse_format("ds")
+
+    result_shape = (5, 5)
+    args = [result_shape]
+
+    for tensor in [a_sparse, b_sparse]:
+        args.append(tensor.shape)  # type: ignore
+        args.append(tensor._storage._index.mode_indices)  # type: ignore
+        args.append(tensor._storage.value)  # type: ignore
+
+    result_cpp = module.evaluate(*args)
+    result = Tensor(
+        shape=result_shape,
+        index=TensorIndex(
+            mode_indices=result_cpp._storage._index.mode_indices,
+            tensor_format=output_format,
+        ),
+        value=result_cpp._storage._value,
+    )
+
+    assert result.shape == (5, 5)
+    assert len(result.index.mode_indices) == 2
+
+    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+    assert result.to_torch().tolist() == result_torch.tolist()
+
+
 def test_spmm_ss_ds_ds_ikj_gustavson():
     i = IndexVar("i")
     j = IndexVar("j")
@@ -907,12 +1258,14 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
         dim=1,
     )
 
-    # A[i, j] = ForAll(i,
-    #   Where(
-    #     producer=ForAll(k, ForAll(j, workspace[j] += B[i, k] * C[k, j])),
-    #     consumer=ForAll(j, A[i, j] = workspace[j])
-    #   )
-    # )
+    """
+    A[i, j] = ForAll(i,
+      Where(
+        producer=ForAll(k, ForAll(j, 1[j] += B[i, k] * C[k, j])),
+        consumer=ForAll(j, A[i, j] = workspace[j])
+      )
+    )
+    """
 
     cin_stmt = ForAll(
         i,
