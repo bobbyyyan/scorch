@@ -1,4 +1,4 @@
-from .ops import einsum
+from .ops import einsum, matmul
 from .tensor import Tensor
 from .format import TensorFormat
 
@@ -8,5 +8,6 @@ __all__ = [
     "Tensor",
     "TensorFormat",
     "einsum",
+    "matmul",
     "__version__",
 ]

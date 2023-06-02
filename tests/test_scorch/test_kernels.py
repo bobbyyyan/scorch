@@ -1,3 +1,4 @@
+import time
 from itertools import product
 
 import torch
@@ -801,6 +802,36 @@ def test_spmm_ds_dd_dd():
     print(result.index.mode_indices)
 
     # assert result_torch.tolist() == result.to_torch().tolist()
+
+
+def test_matmul_time():
+    """
+    Compare speed of torch and scorch matmul
+    Use random tensors
+    """
+    n = 300
+    sparsity = 0.9
+    random_tensor_a = torch.rand(n, n)
+    random_tensor_b = torch.rand(n, n)
+
+    # Randomly sparsify each tensor
+    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity).float()
+    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity).float()
+
+    start_time = time.time()
+    torch_result = torch.matmul(random_tensor_a, random_tensor_b)
+    torch_time = time.time() - start_time
+
+    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse()
+    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse()
+
+    start_time = time.time()
+    scorch_result = matmul(tensor_a_scorch, tensor_b_scorch, format="ds")
+    scorch_time = time.time() - start_time
+
+    print(f"torch time: {torch_time}")
+    print(f"scorch time: {scorch_time}")
+    print(f"scorch time / torch time: {scorch_time / torch_time}")
 
 
 def test_spmm_dd_dd_dd():

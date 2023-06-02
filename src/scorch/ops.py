@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from typing import Any, Union, Sequence
 
@@ -31,9 +32,9 @@ def matmul(
     """Perform a matrix multiplication."""
 
     if isinstance(a, torch.Tensor):
-        a = Tensor.from_torch(a)
+        a = Tensor.from_torch(a).to_sparse()
     if isinstance(b, torch.Tensor):
-        b = Tensor.from_torch(b)
+        b = Tensor.from_torch(b).to_sparse()
 
     result = einsum("ik,kj->ij", a, b, **kwargs)
 
@@ -192,7 +193,11 @@ def einsum(
         args.append(tensor._storage._index.mode_indices)  # type: ignore
         args.append(tensor._storage.value)  # type: ignore
 
+    start_time = time.time()
     result_cpp = module.evaluate(*args)
+    end_time = time.time()
+    print("Time taken for evaluate:", end_time - start_time)
+
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
