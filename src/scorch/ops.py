@@ -1,11 +1,19 @@
 import time
 from pathlib import Path
-from typing import Any, Union, Sequence
+from typing import Any, Union, Sequence, Optional, List
 
 import torch
 from torch.utils.cpp_extension import load
 
-from .compiler.cin import IndexVar, TensorVar, ForAll
+from .compiler.cin import (
+    IndexVar,
+    TensorVar,
+    ForAll,
+    Workspace,
+    Where,
+    TensorAssign,
+    Operation,
+)
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
 from .format import TensorFormat, LevelFormat, LevelType
@@ -22,6 +30,101 @@ load(
     name="pybind",
     sources=[str(PROJECT_ROOT_DIR / "csrc/pybind.cpp")],
 )
+
+
+def matmul_wksp(
+    a: Union[torch.Tensor, Tensor],
+    b: Union[torch.Tensor, Tensor],
+    output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
+) -> Tensor:
+    if isinstance(a, torch.Tensor):
+        a = Tensor.from_torch(a).to_sparse()
+    if isinstance(b, torch.Tensor):
+        b = Tensor.from_torch(b).to_sparse()
+
+    if output_format is None:
+        output_format = parse_format("ds")
+    elif not isinstance(output_format, TensorFormat):
+        output_format = parse_format(output_format)
+
+    C = TensorVar("C", fmt=output_format)
+    A = TensorVar("A", fmt=a.format)
+    B = TensorVar("B", fmt=b.format)
+
+    workspace = Workspace(
+        name="wksp",
+        dim=1,
+    )
+
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        A[i, k] * B[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    C[i, j],
+                    workspace[j],
+                ),
+            ),
+        ),
+    )
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+    # Read header_cpp_code from csrc/header.cpp
+    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+        header_cpp_code = f.read()
+
+    module = torch.utils.cpp_extension.load_inline(
+        name="kernel",
+        cpp_sources=[header_cpp_code, cpp_code],
+        functions=["evaluate"],
+    )
+
+    result_shape = (a.shape[0], b.shape[1])
+    args = [result_shape]
+
+    for tensor in [a, b]:
+        args.append(tensor.shape)  # type: ignore
+        args.append(tensor.index.mode_indices)  # type: ignore
+        args.append(tensor.values)  # type: ignore
+
+    start_time = time.time()
+    result_cpp = module.evaluate(*args)
+    end_time = time.time()
+    print(f"Kernel evaluate time: {end_time - start_time}")
+
+    result = Tensor(
+        shape=result_shape,
+        index=TensorIndex(
+            mode_indices=result_cpp._storage._index.mode_indices,
+            tensor_format=output_format,
+        ),
+        value=result_cpp._storage._value,
+    )
+
+    return result
 
 
 def matmul(

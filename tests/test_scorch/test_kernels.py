@@ -15,7 +15,7 @@ from src.scorch.compiler.cin import (
 )
 from src.scorch.compiler.cin_lowerer import CINLowerer
 from src.scorch.compiler.codegen import LLIRLowerer
-from src.scorch.ops import matmul
+from src.scorch.ops import matmul, matmul_wksp
 from src.scorch.storage import TensorIndex
 from src.scorch.utils import PROJECT_ROOT_DIR, parse_format
 
@@ -741,6 +741,15 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
 #     ]
 
 
+def test_matmul_wksp():
+    # Random 5x5 matrix
+    tensor_a_torch = torch.rand(5, 5)
+    tensor_b_torch = torch.rand(5, 5)
+    torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
+    scorch_result = matmul_wksp(tensor_a_torch, tensor_b_torch)
+    assert torch.allclose(torch_result, scorch_result.to_torch())
+
+
 def test_matmul():
     tensor_a_torch = torch.Tensor(
         [
@@ -802,6 +811,32 @@ def test_spmm_ds_dd_dd():
     print(result.index.mode_indices)
 
     # assert result_torch.tolist() == result.to_torch().tolist()
+
+
+def test_matmul_wksp_time():
+    n = 300
+    sparsity = 0.9
+    random_tensor_a = torch.rand(n, n)
+    random_tensor_b = torch.rand(n, n)
+
+    # Randomly sparsify each tensor
+    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity).float()
+    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity).float()
+
+    start_time = time.time()
+    torch_result = torch.matmul(random_tensor_a, random_tensor_b)
+    torch_time = time.time() - start_time
+
+    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse()
+    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse()
+
+    start_time = time.time()
+    scorch_result = matmul_wksp(tensor_a_scorch, tensor_b_scorch, output_format="ss")
+    scorch_time = time.time() - start_time
+
+    print(f"torch time: {torch_time}")
+    print(f"[matmul_wksp] scorch time: {scorch_time}")
+    print(f"[matmul_wksp] scorch time / torch time: {scorch_time / torch_time}")
 
 
 def test_matmul_time():
