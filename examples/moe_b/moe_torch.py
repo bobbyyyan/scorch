@@ -31,7 +31,9 @@ class SparseMoE(nn.Module):
         super(SparseMoE, self).__init__()
         self.num_experts = num_experts
         self.gates = nn.Linear(in_features, num_experts)
-        self.experts = nn.ModuleList([nn.Linear(in_features, out_features) for _ in range(num_experts)])
+        self.experts = nn.ModuleList(
+            [nn.Linear(in_features, out_features) for _ in range(num_experts)]
+        )
 
     def forward(self, x):
         gate_values = F.softmax(self.gates(x), dim=1)
@@ -39,7 +41,9 @@ class SparseMoE(nn.Module):
         outputs = torch.zeros(x.shape[0], self.num_experts).to(x.device)
         for i, expert in enumerate(self.experts):
             outputs[:, i] = expert(x).squeeze()
-        expanded_selection = F.one_hot(selected_expert, num_classes=self.num_experts).float()
+        expanded_selection = F.one_hot(
+            selected_expert, num_classes=self.num_experts
+        ).float()
         return torch.sum(outputs * expanded_selection, dim=1)
 
 
@@ -47,7 +51,9 @@ class SparseMoE(nn.Module):
 newsgroups_train = fetch_20newsgroups(subset="train")
 
 # Convert text data to vectors
-vectorizer = TfidfVectorizer(max_features=5000)  # Limit to 5000 most frequent words for simplicity
+vectorizer = TfidfVectorizer(
+    max_features=5000
+)  # Limit to 5000 most frequent words for simplicity
 vectors = vectorizer.fit_transform(newsgroups_train.data)
 vectors = vectors.toarray()
 

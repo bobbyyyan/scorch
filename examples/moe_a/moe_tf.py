@@ -28,7 +28,8 @@ model.build((None, X.shape[1]))
 # Assign the weights
 for layer, (weight_name, bias_name) in zip(
     [model.gates] + model.experts,
-    [("gates.weight", "gates.bias")] + [(f"experts.{i}.weight", f"experts.{i}.bias") for i in range(10)],
+    [("gates.weight", "gates.bias")]
+    + [(f"experts.{i}.weight", f"experts.{i}.bias") for i in range(10)],
 ):
     layer.kernel.assign(weights[weight_name].T)
     layer.bias.assign(weights[bias_name])

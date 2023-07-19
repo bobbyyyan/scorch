@@ -30,7 +30,9 @@ class SparseMoE(nn.Module):
     def __init__(self, in_features, num_experts, out_features):
         super(SparseMoE, self).__init__()
         self.gates = nn.Linear(in_features, num_experts)
-        self.experts = nn.ModuleList([nn.Linear(in_features, out_features) for _ in range(num_experts)])
+        self.experts = nn.ModuleList(
+            [nn.Linear(in_features, out_features) for _ in range(num_experts)]
+        )
 
     def forward(self, x):
         gate_outputs = F.softmax(self.gates(x), dim=1)
@@ -43,7 +45,9 @@ class SparseMoE(nn.Module):
 newsgroups_train = fetch_20newsgroups(subset="train")
 
 # Convert text data to vectors
-vectorizer = TfidfVectorizer(max_features=5000)  # Limit to 5000 most frequent words for simplicity
+vectorizer = TfidfVectorizer(
+    max_features=5000
+)  # Limit to 5000 most frequent words for simplicity
 vectors = vectorizer.fit_transform(newsgroups_train.data)
 vectors = vectors.toarray()
 
