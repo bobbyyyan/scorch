@@ -98,7 +98,7 @@ public:
     inline T &operator[](int index) {
         // if index is out of range, resize the vector
         if (index >= _capacity) {
-            resize(index + 1);
+            resize(2 * index);  // Double the requested size
         }
         if (index >= _size) {
             _size = index + 1;
@@ -106,21 +106,20 @@ public:
         return _data[index];
     }
 
-    // function to resize the vector
-    inline void resize(int new_size) {
-        // if new_size is smaller than the current size, do nothing
-        if (new_size <= _size) {
+    // function to change the capacity of the vector
+    inline void resize(int new_capacity) {
+        // if new_capacity is smaller than the current size, do nothing
+        if (new_capacity <= _capacity) {
             return;
         }
-        // if new_size is larger than the current size, resize the vector
-        T *temp = new T[new_size];
+        // if new_capacity is larger than the current size, resize the vector
+        T *temp = new T[new_capacity];
         for (int i = 0; i < _size; i++) {
             temp[i] = _data[i];
         }
         delete[] _data;
         _data = temp;
-        _size = new_size;
-        _capacity = new_size;
+        _capacity = new_capacity;
     }
 
 
