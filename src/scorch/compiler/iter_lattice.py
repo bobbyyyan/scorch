@@ -998,7 +998,7 @@ class IterationLattice:
             flatten_2d_list(
                 [
                     [
-                        llir.Comment(f"Lattice point {p}"),
+                        # llir.Comment(f"Lattice point {p}"),
                         *gen_single_lattice_loop(p),
                         # llir.BlankLine(),
                     ]
