@@ -92,8 +92,8 @@ def matmul_wksp(
 
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    print("\n C++ CODE:\n")
-    print(cpp_code)
+    # print("\n C++ CODE:\n")
+    # print(cpp_code)
 
     # Read header_cpp_code from csrc/header.cpp
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:

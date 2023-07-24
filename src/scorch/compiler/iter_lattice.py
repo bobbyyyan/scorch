@@ -273,17 +273,17 @@ class LatticePoint:
 
             reduction_vars = cin_ivar_getter.get_reduction_vars()
 
-            print("Free vars: ", cin_ivar_getter.free_vars)
-            print("Input vars: ", cin_ivar_getter.input_vars)
-            print("Reduction vars: ", reduction_vars)
+            # print("Free vars: ", cin_ivar_getter.free_vars)
+            # print("Input vars: ", cin_ivar_getter.input_vars)
+            # print("Reduction vars: ", reduction_vars)
 
             has_reduction = len(reduction_vars) > 0
 
             rewritten_rhs = self.get_simplified_cin(cin.rhs)
             if not rewritten_rhs:
                 rewritten_rhs = cin.rhs
-            print("RHS: ", cin.rhs)
-            print("Rewritten RHS: ", rewritten_rhs)
+            # print("RHS: ", cin.rhs)
+            # print("Rewritten RHS: ", rewritten_rhs)
             assert isinstance(
                 rewritten_rhs, IndexExpr
             ), "Rewritten RHS is not an IndexExpr"
@@ -306,9 +306,9 @@ class LatticePoint:
         """
         stmts: List[llir.Stmt] = []
 
-        print("\n========== get_child_subregion_loops =========")
-        print("cin: ", cin)
-        print("self.child_lattice_points:", self.child_lattice_points)
+        # print("\n========== get_child_subregion_loops =========")
+        # print("cin: ", cin)
+        # print("self.child_lattice_points:", self.child_lattice_points)
 
         # print("self.iterators:", self.iterators)
 

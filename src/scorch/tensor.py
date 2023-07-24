@@ -487,7 +487,7 @@ class Tensor(torch.nn.Module):
                 rhs = f"ForAll(index_vars[{i}], {rhs})"
             cin_stmt = eval(rhs)
 
-            print("\n\ncin_stmt: ", cin_stmt)
+            # print("\n\ncin_stmt: ", cin_stmt)
 
             lowerer = CINLowerer(filter_zeros=True)
             lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
