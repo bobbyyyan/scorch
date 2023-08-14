@@ -310,7 +310,8 @@ def einsum(
     start_time = time.time()
     result_cpp = module.evaluate(*args)
     end_time = time.time()
-    print("Time taken for evaluate:", end_time - start_time)
+    eval_time = end_time - start_time
+    print("Time taken for evaluate:", eval_time)
 
     result = Tensor(
         shape=result_shape,
@@ -320,5 +321,9 @@ def einsum(
         ),
         value=result_cpp._storage._value,
     )
+
+    if "time_dict" in kwargs:
+        time_dict = kwargs["time_dict"]
+        time_dict["eval_time"] = eval_time
 
     return result
