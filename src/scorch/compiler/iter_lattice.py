@@ -493,7 +493,7 @@ class LatticePoint:
                                     #     index=next_level_iterator_end_llir,
                                     # ),
                                     left=llir.Var(
-                                        name=f"{it._tensor_var.name}{it._level}_crd[{next_level_iterator_end_llir.name}].item<int>()",
+                                        name=f"{it._tensor_var.name}{it._level}_crd[{next_level_iterator_end_llir.name}]",
                                         type=llir.DataType.INT,
                                     ),
                                     right=self.get_index_var_llir(),

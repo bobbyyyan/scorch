@@ -49,8 +49,6 @@ class Tensor(torch.nn.Module):
     # TODO: storage can also be a secondary index (TensorStorageView)
     _storage: Optional[Union[TensorStorage, TensorStorageView]]
 
-    _value: Optional[torch.Tensor]
-
     def __init__(
         self,
         name: Optional[str] = None,
@@ -67,6 +65,9 @@ class Tensor(torch.nn.Module):
             self._storage = TensorStorage(index=index, value=value, shape=shape)
         self._name = name
         self._shape = shape
+
+        if value is not None:
+            self._dtype = value.dtype
 
         self.requires_grad = requires_grad
 
@@ -439,6 +440,7 @@ class Tensor(torch.nn.Module):
                 B = TensorVar(
                     name="B",
                     fmt=self.format,
+                    dtype=self.dtype,
                 )
             else:
                 B = TensorVar(

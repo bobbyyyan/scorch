@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Any, Union, TypeVar, Sequence
 
+import torch
+
 """
 TODO: maybe need this, maybe not
 Enum class for different IRNode types.
@@ -127,6 +129,21 @@ class DataType(Enum):
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
     ARRAY_INT = "int[]"
 
+    # Pointer types
+    PTR_INT = "int*"
+    PTR_INT_32 = "int32_t*"
+    PTR_INT_64 = "int64_t*"
+    PTR_FLOAT32 = "float*"
+    PTR_TORCH_FLOAT32 = "torch::kFloat32*"
+    PTR_TORCH_FLOAT64 = "torch::kFloat64*"
+    PTR_TORCH_INT32 = "torch::kInt32*"
+    PTR_TORCH_INT64 = "torch::kInt64*"
+    PTR_TORCH_INT8 = "torch::kInt8*"
+    PTR_TORCH_UINT8 = "torch::kUInt8*"
+    PTR_TORCH_TENSOR = "torch::Tensor*"
+    PTR_TENSOR = "Tensor*"
+    PTR_VOID = "void*"
+
     @classmethod
     def cvector_type(cls, dtype: DataType) -> DataType:
         """
@@ -140,6 +157,34 @@ class DataType(Enum):
         A custom vector type for C++.
         """
         return DataType(f"coo_workspace<{dtype.value}>")
+
+    @classmethod
+    # pointer type, e.g. int*, float*, etc.
+    def ptr_type(cls, dtype: Union[DataType, torch.dtype]) -> DataType:
+        if isinstance(dtype, DataType):
+            return DataType(f"{dtype.value}*")
+        elif isinstance(dtype, torch.dtype):
+            data_type = DataType.from_dtype(dtype)
+            return DataType(f"{data_type.value}*")
+
+    @classmethod
+    def from_dtype(cls, dtype: torch.dtype):
+        if dtype == torch.int:
+            return cls.INT
+        elif dtype == torch.float32:
+            return cls.FLOAT32
+        elif dtype == torch.float64:
+            return cls.FLOAT64
+        elif dtype == torch.int32:
+            return cls.INT32
+        elif dtype == torch.int64:
+            return cls.INT64
+        elif dtype == torch.int8:
+            return cls.INT8
+        elif dtype == torch.uint8:
+            return cls.UINT8
+        else:
+            raise NotImplementedError(f"Unsupported dtype: {dtype}")
 
     @classmethod
     def from_python_type(cls, py_type):

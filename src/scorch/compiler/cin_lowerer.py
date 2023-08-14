@@ -74,8 +74,6 @@ class CINLowerer:
                             type=llir.DataType.INT,
                         ),
                         value=llir.Var(
-                            # name=f"{tensor.name}._shape[{_level}]",
-                            # name=f"{tensor.name}_mode_indices[{_level}][0][0].item<int>()",
                             name=f"{tensor.name}_shape[{level}]",
                             type=llir.DataType.INT,
                         ),
@@ -86,12 +84,11 @@ class CINLowerer:
                     llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_pos",
-                            type=llir.DataType.TORCH_TENSOR,
+                            type=llir.DataType.PTR_INT,
                         ),
                         value=llir.Var(
-                            # name=f"{tensor.name}._storage._index.mode_indices[{_level}][0]",
-                            name=f"{tensor.name}_mode_indices[{level}][0]",
-                            type=llir.DataType.TORCH_TENSOR,
+                            name=f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()",
+                            type=llir.DataType.PTR_INT,
                         ),
                     )
                 )
@@ -100,12 +97,11 @@ class CINLowerer:
                     llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_crd",
-                            type=llir.DataType.TORCH_TENSOR,
+                            type=llir.DataType.PTR_INT,
                         ),
                         value=llir.Var(
-                            # name=f"{tensor.name}._storage._index.mode_indices[{_level}][1]",
-                            name=f"{tensor.name}_mode_indices[{level}][1]",
-                            type=llir.DataType.TORCH_TENSOR,
+                            name=f"{tensor.name}_mode_indices[{level}][1].data_ptr<int>()",
+                            type=llir.DataType.PTR_INT,
                         ),
                     )
                 )
@@ -113,17 +109,43 @@ class CINLowerer:
                 stmts.append(
                     llir.VarInit(
                         var=llir.Var(
-                            name=f"{tensor.name}{level}_crd",
+                            name=f"{tensor.name}{level}_crd_tensor",
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                         value=llir.Var(
-                            # name=f"{tensor.name}._storage._index.mode_indices[{_level}][0]",
                             name=f"{tensor.name}_mode_indices[{level}][0]",
                             type=llir.DataType.TORCH_TENSOR,
                         ),
                     )
                 )
+                stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{tensor.name}{level}_crd",
+                            type=llir.DataType.PTR_INT,
+                        ),
+                        value=llir.Var(
+                            name=f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()",
+                            type=llir.DataType.PTR_INT,
+                        ),
+                    )
+                )
         return stmts
+
+    @staticmethod
+    def get_val_ptr_stmt(tensor: TensorVar) -> llir.Stmt:
+        """
+        Get the value pointer for a tensor
+        """
+        data_type = dtype_to_c_datatype(tensor.dtype)
+        ptr_type = llir.DataType.ptr_type(tensor.dtype)
+        return llir.VarInit(
+            var=llir.Var(name=f"{tensor.name}_val", type=ptr_type),
+            value=llir.Var(
+                name=f"{tensor.name}_values.data_ptr<{data_type.value}>()",
+                type=ptr_type,
+            ),
+        )
 
     @staticmethod
     def get_value_array_statement(tensor: TensorVar) -> llir.Stmt:
@@ -152,14 +174,13 @@ class CINLowerer:
 
         if len(tensor_access.indices) == 1 and level_type == LevelType.DENSE:
             return llir.Var(
-                name=f"{tensor_access.tensor.name}_values[{last_index_var.name}]",
+                name=f"{tensor_access.tensor.name}_val[{last_index_var.name}]",
                 type=llir.DataType.NO_TYPE,
             )
 
         return llir.Var(
-            name=f"{tensor_access.tensor.name}_values"
-            + f"[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]"
-            + f".item<{dtype_to_c_datatype(tensor_var.dtype).value}>()",
+            name=f"{tensor_access.tensor.name}_val"
+            + f"[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]",
             type=llir.DataType.NO_TYPE,
         )
 
@@ -795,12 +816,12 @@ class CINLowerer:
         # Generate iterator bounds
         tensor_level_array_assign_stmts = []
 
-        tensor_value_array_assign_stmts = []
         for tensor in rhs_tensor_vars:
-            tensor_level_array_assign_stmts.extend(self.get_level_arrays(tensor))
-            tensor_value_array_assign_stmts.append(
-                self.get_value_array_statement(tensor)
+            tensor_level_array_assign_stmts.append(
+                llir.Comment(f"Get {tensor.get_name()}'s level & value arrays")
             )
+            tensor_level_array_assign_stmts.extend(self.get_level_arrays(tensor))
+            tensor_level_array_assign_stmts.append(self.get_val_ptr_stmt(tensor))
 
         # Generate per-_level size variables for each dense _level in result tensor
         result_tensor_level_sizes: List[llir.Stmt] = []
@@ -921,12 +942,9 @@ class CINLowerer:
                 [
                     *result_tensor_level_sizes,
                     llir.BlankLine(),
-                    llir.Comment("Get tensor _level arrays"),
                     *tensor_level_array_assign_stmts,
                     llir.BlankLine(),
                     *result_level_indices_init_stmts,
-                    # llir.Comment("Get tensor value arrays"),
-                    # *tensor_value_array_assign_stmts,
                     # llir.BlankLine(),
                     llir.Comment("Initialize result value array"),
                     *tensor_value_array_init_stmts,

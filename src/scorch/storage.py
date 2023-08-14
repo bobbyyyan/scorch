@@ -44,6 +44,12 @@ class TensorIndex(object):
     ):
         self.format = parse_format(tensor_format) if tensor_format else None
         self.mode_indices = mode_indices
+        # Convert all mode indices to int dtype if they are not already
+        if self.mode_indices:
+            for i, mode_index in enumerate(self.mode_indices):
+                for j, index in enumerate(mode_index):
+                    if index.dtype != torch.int:
+                        self.mode_indices[i][j] = index.int()
 
     def __str__(self):
         return "TensorIndex({})".format(self.format)

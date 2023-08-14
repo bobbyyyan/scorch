@@ -92,18 +92,24 @@ def matmul_wksp(
 
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    # print("\n C++ CODE:\n")
-    # print(cpp_code)
+    print("\n C++ CODE:\n")
+    print(cpp_code)
 
     # Read header_cpp_code from csrc/header.cpp
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
         header_cpp_code = f.read()
 
+    start_time = time.time()
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
     )
+    end_time = time.time()
+
+    compile_time = end_time - start_time
+    #  Print kernel compile time to 5 decimal places
+    print(f"Kernel compile time: {compile_time:.5f} seconds")
 
     result_shape = (a.shape[0], b.shape[1])
     args = [result_shape]
@@ -116,7 +122,9 @@ def matmul_wksp(
     start_time = time.time()
     result_cpp = module.evaluate(*args)
     end_time = time.time()
-    print(f"Kernel evaluate time: {end_time - start_time}")
+    evaluate_time = end_time - start_time
+    #  Print kernel runtime to 5 significant figures
+    print(f"Kernel runtime: {evaluate_time:.5g} seconds")
 
     result = Tensor(
         shape=result_shape,
