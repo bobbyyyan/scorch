@@ -31,31 +31,29 @@ public:
     cvector() {
         _size = 0;
         _capacity = 1;
-        _data = new T[_capacity];
+        _data = (T*) malloc(sizeof(T));
     }
 
     // constructor with capacity
     cvector(int capacity) {
         _size = 0;
         _capacity = capacity;
-        _data = new T[_capacity];
+        _data = (T*) malloc(sizeof(T) * capacity);
     }
 
-    // destructor
+    // destructor is not used
     /**
     ~cvector() {
-        delete[] _data;
+        free(_data);
     }
     */
 
     // function to append an element to the vector
     inline void push_back(T element) {
         if (_size == _capacity) {
-            T *temp = new T[2 * _capacity];
-            for (int i = 0; i < _capacity; i++) {
-                temp[i] = _data[i];
-            }
-            delete[] _data;
+            T *temp = (T*) malloc(sizeof(T) * 2 * _capacity);
+            memcpy(temp, _data, sizeof(T) * _size);
+            free(_data);
             _capacity *= 2;
             _data = temp;
         }
@@ -89,6 +87,14 @@ public:
         }
     }
 
+    // function to read the element
+  // without checking the index
+  inline T get_unsafe(int index) { return _data[index]; }
+
+  // function to set the element
+  // without checking the index
+  inline void set_unsafe(int index, T element) { _data[index] = element; }
+
     // overload operator [] to get elements
     inline T operator[](int index) const {
         return get(index);
@@ -112,12 +118,12 @@ public:
         if (new_capacity <= _capacity) {
             return;
         }
-        // if new_capacity is larger than the current size, resize the vector
-        T *temp = new T[new_capacity];
-        for (int i = 0; i < _size; i++) {
-            temp[i] = _data[i];
-        }
-        delete[] _data;
+        // if new_capacity is larger than the current size
+        // resize the vector
+        T *temp = (T*) malloc(sizeof(T) * new_capacity);
+        memcpy(temp, _data, sizeof(T) * _size);
+        // free the old data
+        free(_data);
         _data = temp;
         _capacity = new_capacity;
     }
@@ -133,9 +139,11 @@ public:
     // function to remove the element at a particular index
     inline void remove(int index) {
         if (index < _size) {
-            for (int i = index; i < _size - 1; i++) {
-                _data[i] = _data[i + 1];
-            }
+            // for (int i = index; i < _size - 1; i++) {
+            //     _data[i] = _data[i + 1];
+            // }
+            // use memcpy for better performance
+             memcpy(_data + index, _data + index + 1, sizeof(T) * (_size - index - 1));
             _size--;
         }
     }
@@ -144,17 +152,17 @@ public:
     inline void insert(int index, T element) {
         if (index < _size) {
             if (_size == _capacity) {
-                T *temp = new T[2 * _capacity];
-                for (int i = 0; i < _capacity; i++) {
-                    temp[i] = _data[i];
-                }
-                delete[] _data;
+                T* temp = (T*) malloc(sizeof(T) * 2 * _capacity);
+                memcpy(temp, _data, sizeof(T) * _size);
+                free(_data);
                 _capacity *= 2;
                 _data = temp;
             }
-            for (int i = _size; i > index; i--) {
-                _data[i] = _data[i - 1];
-            }
+            // for (int i = _size; i > index; i--) {
+            //     _data[i] = _data[i - 1];
+            // }
+            // use memcpy for better performance
+            memcpy(_data + index + 1, _data + index, sizeof(T) * (_size - index));
             _data[index] = element;
             _size++;
         }
@@ -171,14 +179,16 @@ public:
     }
 
     // function to get the pointer to the data
-    inline T *data() {
+    inline T* data() {
         return _data;
     }
 
-    // function to return a lambda function / std::function<void(void*)> that would deallocate the data
+    // function to return a lambda function
+    // std::function<void(void*)>
+    // that would deallocate the data
     inline std::function<void(void *)> get_deleter() {
         return [](void *data) {
-            delete[] (T *) data;
+            free(data);
         };
     }
 
