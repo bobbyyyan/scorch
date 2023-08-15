@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch_geometric.datasets import Planetoid
 from torch_geometric.nn import MessagePassing
 
+
 # Define GINConv layer
 class GINConv(MessagePassing):
     def __init__(self, in_channels, out_channels):

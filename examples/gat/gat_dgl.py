@@ -12,6 +12,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*TypedStorage is deprecated.*")
 
+
 # Define GAT model using DGL
 class DGLGAT(torch.nn.Module):
     def __init__(self, num_features, num_classes):

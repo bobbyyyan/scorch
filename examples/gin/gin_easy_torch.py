@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.datasets import Planetoid
 
+
 # Define GINConv layer
 class GINConv(nn.Module):
     def __init__(self, in_features, out_features):
