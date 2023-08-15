@@ -36,6 +36,7 @@ def matmul_wksp(
     a: Union[torch.Tensor, Tensor],
     b: Union[torch.Tensor, Tensor],
     output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
+    **kwargs,
 ) -> Tensor:
     if isinstance(a, torch.Tensor):
         a = Tensor.from_torch(a).to_sparse()
@@ -122,9 +123,10 @@ def matmul_wksp(
     start_time = time.time()
     result_cpp = module.evaluate(*args)
     end_time = time.time()
-    evaluate_time = end_time - start_time
-    #  Print kernel runtime to 5 significant figures
-    print(f"Kernel runtime: {evaluate_time:.5g} seconds")
+    eval_time = end_time - start_time
+    if "time_dict" in kwargs:
+        time_dict = kwargs["time_dict"]
+        time_dict["eval_time"] = eval_time
 
     result = Tensor(
         shape=result_shape,

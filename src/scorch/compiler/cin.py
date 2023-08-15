@@ -230,12 +230,7 @@ class TensorVar(IndexExpr):
         self.name = name
         self.shape = shape
 
-        if isinstance(fmt, str):
-            fmt = [fmt]
-
-        if isinstance(fmt, TensorFormat):
-            self.format = fmt
-        elif isinstance(fmt, list):
+        if fmt:
             self.format = parse_format(fmt)
 
         self.dtype = dtype
@@ -254,6 +249,9 @@ class TensorVar(IndexExpr):
     @property
     def levels(self) -> int:
         return len(self.get_level_types())
+
+    def is_dense(self) -> bool:
+        return self.get_format().is_dense()
 
     def get_level_size_cpp(self, level: int) -> str:
         return f"(int) ({self.name}._shape[{level}])"

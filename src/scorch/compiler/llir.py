@@ -470,6 +470,13 @@ class Cast(Expr):
     data_type: DataType
 
 
+@dataclass(frozen=True)
+class Sizeof(Expr):
+    """A sizeof expression."""
+
+    data_type: DataType
+
+
 # Node visitor
 class NodeVisitor:
     def visit(self, node: Node):

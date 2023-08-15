@@ -52,6 +52,9 @@ class LLIRLowerer:
                 f"({ir.data_type.value}) {self.lower_llir(ir.expr)}", indent_level
             )
 
+        elif isinstance(ir, llir.Sizeof):
+            return self.lower_llir(f"sizeof({ir.data_type.value})", indent_level)
+
         elif isinstance(ir, llir.BinOp):
             return self.lower_llir(
                 f"{self.lower_llir(ir.left)} {ir.op} {self.lower_llir(ir.right)}",
