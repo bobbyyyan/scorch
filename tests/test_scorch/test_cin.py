@@ -47,9 +47,9 @@ def get_spmm_cin(loop_order=None):
 def test_elementwise_sparse_vector_mul_cin():
     """c[i] = a[i] * b[i]"""
     i = IndexVar("i")
-    a = TensorVar("a", fmt="sparse")
-    b = TensorVar("b", fmt="sparse")
-    c = TensorVar("c", fmt="sparse")
+    a = TensorVar("a", fmt="s")
+    b = TensorVar("b", fmt="s")
+    c = TensorVar("c", fmt="s")
 
     c[i] = a[i] * b[i]
 

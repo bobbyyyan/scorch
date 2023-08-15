@@ -20,9 +20,9 @@ def test_elemwise_mul_1d_sss():
 
     i = IndexVar("i")
 
-    a = TensorVar("a", fmt="sparse")
-    b = TensorVar("b", fmt="sparse")
-    c = TensorVar("c", fmt="sparse")
+    a = TensorVar("a", fmt="s")
+    b = TensorVar("b", fmt="s")
+    c = TensorVar("c", fmt="s")
 
     a[i] = b[i] * c[i]
 
@@ -45,9 +45,9 @@ def test_elemwise_mul_1d_dss():
 
     i = IndexVar("i")
 
-    a = TensorVar("a", fmt="dense")
-    b = TensorVar("b", fmt="sparse")
-    c = TensorVar("c", fmt="sparse")
+    a = TensorVar("a", fmt="d")
+    b = TensorVar("b", fmt="s")
+    c = TensorVar("c", fmt="s")
 
     a[i] = b[i] * c[i]
 
@@ -70,9 +70,9 @@ def test_elemwise_mul_1d_sds():
 
     i = IndexVar("i")
 
-    a = TensorVar("a", fmt="sparse")
-    b = TensorVar("b", fmt="dense")
-    c = TensorVar("c", fmt="sparse")
+    a = TensorVar("a", fmt="s")
+    b = TensorVar("b", fmt="d")
+    c = TensorVar("c", fmt="s")
 
     a[i] = b[i] * c[i]
 
@@ -94,10 +94,10 @@ def test_elemwise_mul_add_1d_sssd():
     # a[i] = b[i] * c[i] + d[i]
     i = IndexVar("i")
 
-    a = TensorVar("a", fmt="sparse")
-    b = TensorVar("b", fmt="sparse")
-    c = TensorVar("c", fmt="sparse")
-    d = TensorVar("d", fmt="dense")
+    a = TensorVar("a", fmt="s")
+    b = TensorVar("b", fmt="s")
+    c = TensorVar("c", fmt="s")
+    d = TensorVar("d", fmt="d")
 
     a[i] = b[i] * c[i] + d[i]
 
@@ -118,10 +118,9 @@ def test_elemwise_add_1d_sss():
     # a[i] = b[i] + c[i]
     i = IndexVar("i")
 
-    a = TensorVar("a", fmt="sparse")
-    b = TensorVar("b", fmt="sparse")
-    c = TensorVar("c", fmt="sparse")
-    # c = TensorVar("c", fmt="dense")
+    a = TensorVar("a", fmt="s")
+    b = TensorVar("b", fmt="s")
+    c = TensorVar("c", fmt="s")
 
     a[i] = b[i] + c[i]
 
@@ -143,10 +142,9 @@ def test_elemwise_add_1d_dss():
     # taco "a(i) = b(i)+c(i)" -f=a:d -f=b:s -f=c:s -print-evaluate
     i = IndexVar("i")
 
-    a = TensorVar("a", fmt="dense")
-    b = TensorVar("b", fmt="sparse")
-    c = TensorVar("c", fmt="sparse")
-    # c = TensorVar("c", fmt="dense")
+    a = TensorVar("a", fmt="d")
+    b = TensorVar("b", fmt="s")
+    c = TensorVar("c", fmt="s")
 
     a[i] = b[i] + c[i]
 
@@ -168,12 +166,9 @@ def test_elemwise_add_1d_sds():
     # Reference: http://tensor-compiler.org/codegen.html?expr=a(i)=b(i)+c(i)&format=a:s:0;b:d:0;c:s:0
     i = IndexVar("i")
 
-    a = TensorVar("a", fmt="sparse")
-    # a = TensorVar("a", fmt="dense")
-    # b = TensorVar("b", fmt="sparse")
-    b = TensorVar("b", fmt="dense")
-    c = TensorVar("c", fmt="sparse")
-    # c = TensorVar("c", fmt="dense")
+    a = TensorVar("a", fmt="s")
+    b = TensorVar("b", fmt="d")
+    c = TensorVar("c", fmt="s")
 
     a[i] = b[i] + c[i]
 
@@ -930,6 +925,57 @@ def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
     #     consumer=ForAll(j, A[i, j] = workspace[j])
     #   )
     # )
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        B[i, k] * C[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    A[i, j],
+                    workspace[j],
+                ),
+            ),
+        ),
+    )
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt="dd")
+    B = TensorVar("B", fmt="oo")
+    C = TensorVar("C", fmt="dd")
+
+    workspace = Workspace(
+        name="wksp",
+        dim=1,
+    )
 
     cin_stmt = ForAll(
         i,

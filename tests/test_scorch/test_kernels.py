@@ -743,22 +743,32 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
 
 def test_matmul_wksp():
     print("Testing matmul_wksp")
-    # Random 5x5 matrix
-    tensor_a_torch = torch.rand(5, 5)
-    tensor_b_torch = torch.rand(5, 5)
+    # Random matrix
+    dim_n = 50
+    tensor_a_torch = torch.rand(dim_n, dim_n)
+    tensor_b_torch = torch.rand(dim_n, dim_n)
 
     start_time = time.time()
     torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
     end_time = time.time()
-    torch_total_time = round(end_time - start_time, 3)
+    torch_total_time = end_time - start_time
+
+    time_dict = {}
 
     start_time = time.time()
-    scorch_result = matmul_wksp(tensor_a_torch, tensor_b_torch)
+    scorch_result = matmul_wksp(tensor_a_torch, tensor_b_torch, time_dict=time_dict)
     end_time = time.time()
-    scorch_total_time = round(end_time - start_time, 3)
 
-    print(f"Toch total time taken: {torch_total_time}s")
+    scorch_eval_time = time_dict["eval_time"]
+    scorch_total_time = end_time - start_time
+
+    # Assert that the results are the same
+    assert torch.allclose(torch_result, scorch_result.to_torch())
+
+    print(f"Torch total time taken: {torch_total_time}s")
+    print(f"Scorch eval time taken: {scorch_eval_time}s")
     print(f"Scorch total time taken: {scorch_total_time}s")
+    print(f"Scorch eval time / Torch total time: {scorch_eval_time / torch_total_time}")
 
     assert torch.allclose(torch_result, scorch_result.to_torch())
 
@@ -938,8 +948,82 @@ def test_spmv_d_ds_d_time():
     print(scorch_result.to_torch())
 
 
+def todo_test_spmm_dd_oo_dd_wksp_time():
+    n = 100
+    sparsity = 0.99
+    random_tensor_a = torch.rand(n, n).float()
+    random_tensor_b = torch.rand(n, n).float()
+
+    # Randomly sparsify each tensor
+    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity)
+    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity)
+
+    random_tensor_a_csr = random_tensor_a.to_sparse_coo()
+    # Convert random_tensor_a to a sparse COO pytorch tensor
+    start_time = time.time()
+    # torch_result = torch.matmul(random_tensor_a, random_tensor_b).to_sparse_coo()
+    torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
+    torch_time = time.time() - start_time
+
+    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("oo")
+    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+
+    time_dict = {}
+    start_time = time.time()
+    scorch_result = matmul_wksp(
+        tensor_a_scorch, tensor_b_scorch, format="dd", time_dict=time_dict
+    )
+    scorch_total_time = time.time() - start_time
+    scorch_eval_time = time_dict["eval_time"]
+
+    # Assert that the results are the same
+    assert torch.allclose(torch_result, scorch_result.to_torch())
+
+    print(f"torch time: {torch_time}")
+    print(f"scorch total time: {scorch_total_time}")
+    print(f"scorch eval time: {scorch_eval_time}")
+    print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
+
+
+def test_spmm_dd_ds_dd_wksp_time():
+    n = 200
+    sparsity = 0.99
+    random_tensor_a = torch.rand(n, n).float()
+    random_tensor_b = torch.rand(n, n).float()
+
+    # Randomly sparsify each tensor
+    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity)
+    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity)
+
+    random_tensor_a_csr = random_tensor_a.to_sparse_csr()
+    # Convert random_tensor_a to a sparse CSR pytorch tensor
+    start_time = time.time()
+    # torch_result = torch.matmul(random_tensor_a, random_tensor_b).to_sparse_coo()
+    torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
+    torch_time = time.time() - start_time
+
+    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("ds")
+    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+
+    time_dict = {}
+    start_time = time.time()
+    scorch_result = matmul_wksp(
+        tensor_a_scorch, tensor_b_scorch, format="dd", time_dict=time_dict
+    )
+    scorch_total_time = time.time() - start_time
+    scorch_eval_time = time_dict["eval_time"]
+
+    # Assert that the results are the same
+    assert torch.allclose(torch_result, scorch_result.to_torch())
+
+    print(f"torch time: {torch_time}")
+    print(f"scorch total time: {scorch_total_time}")
+    print(f"scorch eval time: {scorch_eval_time}")
+    print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
+
+
 def test_spmm_dd_ds_dd_time():
-    n = 2000
+    n = 100
     sparsity = 0.99
     random_tensor_a = torch.rand(n, n).float()
     random_tensor_b = torch.rand(n, n).float()
