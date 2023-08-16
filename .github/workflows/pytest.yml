@@ -1,0 +1,35 @@
+name: Run Pytest Tests
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.8  # Change this to match your project's Python version
+
+    - name: Install pipenv
+      run: |
+        pip install pipenv
+
+    - name: Install dependencies
+      run: |
+        pipenv install --dev --ignore-pipfile
+
+    - name: Run pytest
+      run: pipenv run pytest
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v2
+      with:
+        name: test-results
+        path: |
+          pytest-report.xml
