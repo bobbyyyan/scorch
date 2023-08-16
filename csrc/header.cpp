@@ -229,11 +229,8 @@ public:
  * @tparam T type of the values stored, e.g. float, double, int, etc.
  */
 
-#include <algorithm>
-#include <iostream>
-#include <map>
+#include <unordered_map>
 #include <vector>
-
 
 template <typename T>
 class coo_workspace {
@@ -241,50 +238,35 @@ class coo_workspace {
   int _capacity;
   int _size;
   T* _values;
-  int** _indices;
-
-  struct compare {
-    bool operator()(const std::vector<int>& a,
-                    const std::vector<int>& b) const {
-      for (int i = 0; i < a.size(); i++) {
-        if (a[i] < b[i]) {
-          return true;
-        } else if (a[i] > b[i]) {
-          return false;
-        }
-      }
-      return false;
-    }
-  };
-
-  std::map<std::vector<int>, T, compare> _map;
+  int* _indices;
+  std::unordered_map<int, int> _existingCoords;  // Map of existing coordinates
 
  public:
   coo_workspace(int dim, int capacity)
       : _dim(dim), _capacity(capacity), _size(0) {
     _values = new T[capacity];
-    _indices = new int*[_dim];
-    for (int i = 0; i < _dim; i++) {
-      _indices[i] = new int[capacity];
-    }
+    _indices = new int[capacity * _dim];
   }
 
-  // capacity is optional, if not provided, default to 1024
   explicit coo_workspace(int dim) : coo_workspace(dim, 1024) {}
 
   ~coo_workspace() {
     delete[] _values;
-    for (int i = 0; i < _dim; i++) {
-      delete[] _indices[i];
-    }
     delete[] _indices;
   }
 
   void insert(const std::vector<int>& coord, T value) {
-    // Convert coordinate to a linear index
+    // Convert coordinates to a linear index
     int index = coord[_dim - 1];
     for (int i = _dim - 2; i >= 0; i--) {
       index = index * _dim + coord[i];
+    }
+
+    auto existingCoordIt = _existingCoords.find(index);
+    if (existingCoordIt != _existingCoords.end()) {
+      // Coordinate already exists, accumulate the value
+      _values[existingCoordIt->second] += value;
+      return;  // Exit the function
     }
 
     // Check if we need to reallocate memory
@@ -292,24 +274,18 @@ class coo_workspace {
       // Double the capacity
       int newCapacity = 2 * _capacity;
       T* newValues = new T[newCapacity];
-      int** newIndices = new int*[_dim];
-      for (int i = 0; i < _dim; i++) {
-        newIndices[i] = new int[newCapacity];
-      }
+      int* newIndices = new int[newCapacity * _dim];
 
       // Copy values and indices
       for (int i = 0; i < _size; i++) {
         newValues[i] = _values[i];
         for (int j = 0; j < _dim; j++) {
-          newIndices[j][i] = _indices[j][i];
+          newIndices[j * newCapacity + i] = _indices[j * _capacity + i];
         }
       }
 
       // Delete old memory
       delete[] _values;
-      for (int i = 0; i < _dim; i++) {
-        delete[] _indices[i];
-      }
       delete[] _indices;
 
       // Update pointers and capacity
@@ -321,44 +297,51 @@ class coo_workspace {
     // Insert value and indices
     _values[_size] = value;
     for (int i = 0; i < _dim; i++) {
-      _indices[i][_size] = coord[i];
+      _indices[i * _capacity + _size] = coord[i];
     }
 
-    // Check if the coordinate is already in the map
-    auto map_it = _map.find(coord);
-    if (map_it != _map.end()) {
-        // Coordinate already exists, accumulate the value
-        map_it->second += value;
-    } else {
-        // Coordinate is not in the map, insert it with the given value
-        _map[coord] = value;
-    }
+    // Update the existing coordinates map
+    _existingCoords[index] = _size;
 
     _size++;
   }
 
   class iterator {
-    using iter_type = typename std::map<std::vector<int>, T, compare>::iterator;
-
-    iter_type iter;
-    iter_type end;
+    int _index;
+    T* _values;
+    int* _indices;
+    int _dim;
+    int _capacity;  // Added capacity as a member
 
    public:
-    iterator(iter_type begin, iter_type end) : iter(begin), end(end) {}
+    iterator(int index, T* values, int* indices, int dim, int capacity)
+        : _index(index),
+          _values(values),
+          _indices(indices),
+          _dim(dim),
+          _capacity(capacity) {}
 
     iterator& operator++() {
-      ++iter;
+      _index++;
       return *this;
     }
 
-    bool operator!=(const iterator& other) const { return iter != other.iter; }
+    bool operator!=(const iterator& other) const {
+      return _index != other._index;
+    }
 
-    std::pair<const std::vector<int>&, T&> operator*() const { return *iter; }
+    std::pair<std::vector<int>, T> operator*() const {
+      std::vector<int> coord(_dim);
+      for (int i = 0; i < _dim; i++) {
+        coord[i] = _indices[i * _capacity + _index];
+      }
+      return {coord, _values[_index]};
+    }
   };
 
-  iterator begin() { return iterator(_map.begin(), _map.end()); }
+  iterator begin() { return iterator(0, _values, _indices, _dim, _capacity); }
 
-  iterator end() { return iterator(_map.end(), _map.end()); }
+  iterator end() { return iterator(_size, _values, _indices, _dim, _capacity); }
 };
 
 // ####################################
