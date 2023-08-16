@@ -235,6 +235,8 @@ public:
 
 template <typename T>
 class coo_workspace {
+  static constexpr int BLOCK_SIZE = 1024;  // Adjust block size as needed
+
   int _dim;
   int _capacity;
   int _size;
@@ -245,17 +247,17 @@ class coo_workspace {
  public:
   coo_workspace(int dim, int capacity)
       : _dim(dim), _capacity(capacity), _size(0) {
-    // Allocate memory using custom allocator
-    _values = allocateMemory<T>(_capacity);
-    _indices = allocateMemory<int>(_capacity * _dim);
+    // Allocate memory using block-based allocator
+    _values = allocateBlockMemory<T>(_capacity);
+    _indices = allocateBlockMemory<int>(_capacity * _dim);
   }
 
   explicit coo_workspace(int dim) : coo_workspace(dim, 1024) {}
 
   ~coo_workspace() {
-    // Deallocate memory using custom deallocator
-    deallocateMemory(_values);
-    deallocateMemory(_indices);
+    // Deallocate memory using block-based deallocator
+    deallocateBlockMemory(_values);
+    deallocateBlockMemory(_indices);
   }
 
   void insert(const std::vector<int>& coord, T value) {
@@ -357,12 +359,13 @@ class coo_workspace {
 
  private:
   template <typename U>
-  U* allocateMemory(int count) {
-    return static_cast<U*>(std::malloc(count * sizeof(U)));
+  U* allocateBlockMemory(int count) {
+    int numBlocks = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    return static_cast<U*>(std::malloc(numBlocks * BLOCK_SIZE * sizeof(U)));
   }
 
   template <typename U>
-  void deallocateMemory(U* memory) {
+  void deallocateBlockMemory(U* memory) {
     std::free(memory);
   }
 };
