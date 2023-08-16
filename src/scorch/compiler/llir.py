@@ -144,6 +144,8 @@ class DataType(Enum):
     PTR_TENSOR = "Tensor*"
     PTR_VOID = "void*"
 
+    CONST_AUTO_REF = "const auto&"
+
     @classmethod
     def cvector_type(cls, dtype: DataType) -> DataType:
         """
@@ -421,6 +423,16 @@ class ForLoop(Stmt):
         self.cond = cond
         self.update = update
         self.body = body
+
+
+# A for loop styled for (auto XXX : YYY) { ... }
+@dataclass(frozen=False)
+class ForLoopAuto(Stmt):
+    """A for loop statement in C/C++."""
+
+    var: Var
+    array: Expr
+    body: List[Stmt]
 
 
 class WhileLoop(Stmt):

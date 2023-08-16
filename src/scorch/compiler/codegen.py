@@ -106,6 +106,22 @@ class LLIRLowerer:
                 + "\n"
                 + self.lower_llir("}", indent_level)
             )
+
+        elif isinstance(ir, llir.ForLoopAuto):
+            # for (auto i : arr) {
+            #   ...
+            # }
+            return (
+                self.lower_llir(
+                    f"for ({ir.var.type.value} {self.lower_llir(ir.var)} : {self.lower_llir(ir.array)}) {{",
+                    indent_level,
+                )
+                + "\n"
+                + self.lower_llir(ir.body, indent_level + 1)
+                + "\n"
+                + self.lower_llir("}", indent_level)
+            )
+
         elif isinstance(ir, llir.IfThenElse):
             # Handle the case where cond is a list of conditions and then_body is a list of list
             # of statements

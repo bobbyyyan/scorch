@@ -457,44 +457,19 @@ class CINLowerer:
             type=llir.DataType.NO_TYPE,
         )
 
-        # Get wksp map statement
-        # auto <wksp's name>_map = <wksp's name>.get_map();
-        wksp_map_stmt = llir.VarInit(
-            var=llir.Var(
-                name=f"{wksp.get_name()}_map",
-                type=llir.DataType.AUTO,
-            ),
-            value=llir.FunctionCall(
-                name=f"{wksp.get_name()}.get_map",
-            ),
-        )
-
         # For loop
-        # for (auto it = <wksp's name>_map.begin(); it != <wksp's name>_map.end(); ++it) {
+        # for (const auto& pair : <wksp's name>) {
         #    <body statement>
         # }
+
         loop_var = llir.Var(
             name="it",
+            type=llir.DataType.CONST_AUTO_REF,
+        )
+
+        loop_array = llir.Var(
+            name=f"{wksp.get_name()}",
             type=llir.DataType.AUTO,
-        )
-
-        loop_init_stmt = llir.VarInit(
-            var=loop_var,
-            value=llir.FunctionCall(
-                name=f"{wksp.get_name()}_map.begin",
-            ),
-        )
-
-        loop_cond = llir.BinOp(
-            op="!=",
-            left=loop_var,
-            right=llir.FunctionCall(
-                name=f"{wksp.get_name()}_map.end",
-            ),
-        )
-
-        loop_incr = llir.Increment(
-            var=loop_var,
         )
 
         loop_body: List[llir.Stmt] = []
@@ -510,7 +485,7 @@ class CINLowerer:
                         type=llir.DataType.INT,
                     ),
                     value=llir.Var(
-                        name=f"{loop_var.name}->first[{i}]",
+                        name=f"{loop_var.name}.first[{i}]",
                         type=llir.DataType.NO_TYPE,
                     ),
                 )
@@ -523,7 +498,7 @@ class CINLowerer:
                     type=dtype_to_c_datatype(wksp.dtype),
                 ),
                 value=llir.Var(
-                    name=f"{loop_var.name}->second",
+                    name=f"{loop_var.name}.second",
                     type=llir.DataType.NO_TYPE,
                 ),
             )
@@ -568,10 +543,9 @@ class CINLowerer:
             )
         )
 
-        loop_stmt = llir.ForLoop(
-            init=loop_init_stmt,
-            cond=loop_cond,
-            update=loop_incr,
+        loop_stmt = llir.ForLoopAuto(
+            var=loop_var,
+            array=loop_array,
             body=loop_body,
         )
 
@@ -658,7 +632,6 @@ class CINLowerer:
 
         return [
             llir.Comment("Lower consumer CIN"),
-            wksp_map_stmt,
             loop_stmt,
             llir.BlankLine(),
             *assembly_stmts,
