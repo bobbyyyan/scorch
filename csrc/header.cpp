@@ -229,6 +229,7 @@ public:
  * @tparam T type of the values stored, e.g. float, double, int, etc.
  */
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -244,15 +245,17 @@ class coo_workspace {
  public:
   coo_workspace(int dim, int capacity)
       : _dim(dim), _capacity(capacity), _size(0) {
-    _values = new T[capacity];
-    _indices = new int[capacity * _dim];
+    // Allocate memory using custom allocator
+    _values = allocateMemory<T>(_capacity);
+    _indices = allocateMemory<int>(_capacity * _dim);
   }
 
   explicit coo_workspace(int dim) : coo_workspace(dim, 1024) {}
 
   ~coo_workspace() {
-    delete[] _values;
-    delete[] _indices;
+    // Deallocate memory using custom deallocator
+    deallocateMemory(_values);
+    deallocateMemory(_indices);
   }
 
   void insert(const std::vector<int>& coord, T value) {
@@ -271,8 +274,8 @@ class coo_workspace {
 
     // Check if we need to reallocate memory
     if (_size >= _capacity) {
-      // Double the capacity
-      int newCapacity = 2 * _capacity;
+      // Calculate new capacity based on some growth factor
+      int newCapacity = static_cast<int>(_capacity * 1.5);
       T* newValues = new T[newCapacity];
       int* newIndices = new int[newCapacity * _dim];
 
@@ -288,10 +291,19 @@ class coo_workspace {
       delete[] _values;
       delete[] _indices;
 
-      // Update pointers and capacity
+      // Update pointers, capacity, and reassign existing coords
       _values = newValues;
       _indices = newIndices;
       _capacity = newCapacity;
+
+      // Update existing coordinates map with new indices
+      for (int i = 0; i < _size; i++) {
+        int coordIndex = 0;
+        for (int j = 0; j < _dim; j++) {
+          coordIndex = coordIndex * _dim + _indices[j * _capacity + i];
+        }
+        _existingCoords[coordIndex] = i;
+      }
     }
 
     // Insert value and indices
@@ -342,6 +354,17 @@ class coo_workspace {
   iterator begin() { return iterator(0, _values, _indices, _dim, _capacity); }
 
   iterator end() { return iterator(_size, _values, _indices, _dim, _capacity); }
+
+ private:
+  template <typename U>
+  U* allocateMemory(int count) {
+    return static_cast<U*>(std::malloc(count * sizeof(U)));
+  }
+
+  template <typename U>
+  void deallocateMemory(U* memory) {
+    std::free(memory);
+  }
 };
 
 // ####################################
