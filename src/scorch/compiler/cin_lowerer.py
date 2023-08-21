@@ -457,6 +457,13 @@ class CINLowerer:
             type=llir.DataType.NO_TYPE,
         )
 
+        # call .sort() on the workspace
+        # <wksp's name>.sort();
+        wksp_sort_stmt = llir.FunctionCallStmt(
+            name=f"{wksp.get_name()}.sort",
+            args=[],
+        )
+
         # For loop
         # for (const auto& pair : <wksp's name>) {
         #    <body statement>
@@ -632,6 +639,7 @@ class CINLowerer:
 
         return [
             llir.Comment("Lower consumer CIN"),
+            wksp_sort_stmt,
             loop_stmt,
             llir.BlankLine(),
             *assembly_stmts,
