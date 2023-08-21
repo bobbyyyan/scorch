@@ -192,6 +192,19 @@ def einsum(
             if index_str not in index_str_to_size:
                 index_str_to_size[index_str] = tensor.shape[i]
 
+    # Create a mapping from each index string to the list of LevelFormats
+    # of the levels it indexes into each input tensor
+    index_str_to_level_formats = {}
+    for index_strs, tensor in zip(input_index_strs, tensors):
+        assert isinstance(tensor, Tensor), "Input tensor is not a Scorch Tensor"
+
+        for i, index_str in enumerate(index_strs):
+            if index_str not in index_str_to_level_formats:
+                index_str_to_level_formats[index_str] = []
+            index_str_to_level_formats[index_str].append(
+                tensor.format.get_level_formats()[i]
+            )
+
     # Create TensorVar's for each tensor
     tensor_vars = []
     tensor_names = list("BCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -204,11 +217,47 @@ def einsum(
 
     # If output format is not specified, do sparse for all levels first
     if output_format is None:
+        # Use format inference rules to infer the optimal format of the output
+        # tensor
+        # The format inference rules are decided on a per-level basis:
+        # 1. Let the index variable indexing into the level be called i
+        # 2. If the index variable is used to index into any input tensor's sparse
+        #    dimension and multiplied with any other tensor, then the level is
+        #    sparse
+        # 3. If the index variable is used to index into any input tensor's dense
+        #    dimension and added with any other tensor, then the level is dense
+        # 4. Otherwise, the level is compressed
+        # i.e sparse * anything = sparse
+        #     dense + anything = dense
+        # Note that LevelType.COMPRESSED and LevelType.COORDINATE are both "sparse"
+        # levels
+        # To break ties, we use the following priority: we always prefer coordinate
+        # over compressed
+
         # Create a list of LevelFormat objects
-        level_formats = []
+        output_level_formats = []
         for index_str in result_index_strs:
-            level_formats.append(LevelFormat(LevelType.COMPRESSED))
-        output_format = TensorFormat(level_formats)
+            level_format = LevelFormat(LevelType.DENSE)
+            # Use the index_str_to_level_formats to get the list of LevelFormats
+            # of the levels it indexes into each input tensor
+            level_formats: List[LevelFormat] = index_str_to_level_formats[index_str]
+            # If any of them is sparse, then the output level is sparse
+            if any(
+                level_format.get_level_type() == LevelType.COMPRESSED
+                for level_format in level_formats
+            ):
+                level_format = LevelFormat(LevelType.COMPRESSED)
+            # If any of them is coordinate, then the output level is coordinate format
+            elif any(
+                level_format.get_level_type() == LevelType.COORDINATE
+                for level_format in level_formats
+            ):
+                level_format = LevelFormat(LevelType.COORDINATE)
+
+            output_level_formats.append(level_format)
+
+        output_format = TensorFormat(output_level_formats)
+        print(f"Unspecified output format, using inferred {output_format}")
     else:
         output_format = parse_format(output_format)
 
