@@ -748,6 +748,14 @@ def test_matmul_wksp():
     tensor_a_torch = torch.rand(dim_n, dim_n)
     tensor_b_torch = torch.rand(dim_n, dim_n)
 
+    # Sparsify to 80% sparsity
+    sparsity_level = 0.8
+    tensor_a_torch = torch.where(
+        torch.rand_like(tensor_a_torch) > sparsity_level,
+        tensor_a_torch,
+        torch.zeros_like(tensor_a_torch),
+    )
+
     start_time = time.time()
     torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
     end_time = time.time()
