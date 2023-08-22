@@ -229,62 +229,63 @@ public:
  * @tparam T type of the values stored, e.g. float, double, int, etc.
  */
 
+#ifndef SPARSE_ML_COO_WORKSPACE_H
+#define SPARSE_ML_COO_WORKSPACE_H
+
 #include <algorithm>
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <numeric>
 
-template <typename T>
+template <typename T, int N>
 class coo_workspace {
   static constexpr int BLOCK_SIZE = 1024;
 
-  int _dim;
-  std::vector<T> _values;
-  std::vector<int> _indices;
+  struct Entry {
+    int coords[N];
+    T value;
+  };
+
+  std::vector<Entry> _entries;
   std::unordered_map<int, int> _existingCoords;
   std::vector<int> _sortedIndices;
 
  public:
-  coo_workspace(int dim, int capacity)
-      : _dim(dim) {
-    _values.reserve(capacity);
-    _indices.reserve(capacity * _dim);
+  explicit coo_workspace(int capacity) {
+    _entries.reserve(capacity);
   }
 
-  explicit coo_workspace(int dim) : coo_workspace(dim, BLOCK_SIZE) {}
+  explicit coo_workspace() : coo_workspace(BLOCK_SIZE) {}
 
   void insert(const std::vector<int>& coord, T value) {
-    int index = coord[_dim - 1];
-    for (int i = _dim - 2; i >= 0; i--) {
-      index = index * _dim + coord[i];
+    int index = coord[N - 1];
+    for (int i = N - 2; i >= 0; i--) {
+      index = index * N + coord[i];
     }
 
     auto existingCoordIt = _existingCoords.find(index);
     if (existingCoordIt != _existingCoords.end()) {
-      _values[existingCoordIt->second] += value;
+      _entries[existingCoordIt->second].value += value;
       return;
     }
 
-    _values.push_back(value);
-    for (int i = 0; i < _dim; i++) {
-      _indices.push_back(coord[i]);
-    }
+    Entry entry;
+    std::copy(coord.begin(), coord.end(), entry.coords);
+    entry.value = value;
+    _entries.push_back(entry);
 
-    _existingCoords[index] = _values.size() - 1;
+    _existingCoords[index] = _entries.size() - 1;
   }
 
   void sort() {
-    _sortedIndices.resize(_values.size());
-    for (int i = 0; i < _values.size(); i++) {
-      _sortedIndices[i] = i;
-    }
+    _sortedIndices.resize(_entries.size());
+    std::iota(_sortedIndices.begin(), _sortedIndices.end(), 0);
 
     auto radixComparator = [this](int a, int b) {
-      for (int i = 0; i < _dim; i++) {
-        int coordA = _indices[i * _values.size() + a];
-        int coordB = _indices[i * _values.size() + b];
-        if (coordA != coordB) {
-          return coordA < coordB;
+      for (int i = 0; i < N; i++) {
+        if (_entries[a].coords[i] != _entries[b].coords[i]) {
+          return _entries[a].coords[i] < _entries[b].coords[i];
         }
       }
       return false;
@@ -294,16 +295,12 @@ class coo_workspace {
 
   class iterator {
     int _index;
-    std::vector<T>& _values;
-    std::vector<int>& _indices;
-    int _dim;
+    std::vector<Entry>& _entries;
     std::vector<int>* _sortedIndices;
 
    public:
-    iterator(int index, std::vector<T>& values, std::vector<int>& indices, int dim,
-             std::vector<int>* sortedIndices)
-        : _index(index), _values(values), _indices(indices), _dim(dim),
-          _sortedIndices(sortedIndices) {}
+    iterator(int index, std::vector<Entry>& entries, std::vector<int>* sortedIndices)
+        : _index(index), _entries(entries), _sortedIndices(sortedIndices) {}
 
     iterator& operator++() {
       _index++;
@@ -316,26 +313,26 @@ class coo_workspace {
 
     std::pair<std::vector<int>, T> operator*() const {
       int sortedIndex = (*_sortedIndices)[_index];
-      std::vector<int> coord(_dim);
-      for (int i = 0; i < _dim; i++) {
-        coord[i] = _indices[i * _values.size() + sortedIndex];
-      }
-      return {coord, _values[sortedIndex]};
+      std::vector<int> coord(_entries[sortedIndex].coords, _entries[sortedIndex].coords + N);
+      return {coord, _entries[sortedIndex].value};
     }
   };
 
   iterator begin() {
-    return iterator(0, _values, _indices, _dim, &_sortedIndices);
+    return iterator(0, _entries, &_sortedIndices);
   }
 
   iterator end() {
-    return iterator(_values.size(), _values, _indices, _dim, &_sortedIndices);
+    return iterator(_entries.size(), _entries, &_sortedIndices);
   }
 
-  int size() const { return _values.size(); }
+  int size() const { return _entries.size(); }
 
-  int capacity() const { return _values.capacity(); }
+  int capacity() const { return _entries.capacity(); }
 };
+
+#endif  // SPARSE_ML_COO_WORKSPACE_H
+
 
 // ####################################
 // ====== END ==== COO WKSP IMPL ======

@@ -394,10 +394,12 @@ class CINLowerer:
                 llir.VarInit(
                     var=llir.Var(
                         name=wksp.get_name(),
-                        type=llir.DataType.coo_workspace_type(wksp_ctype),
+                        type=llir.DataType.coo_workspace_type_with_dim(
+                            wksp_ctype, wksp.dim
+                        ),
                     ),
                     value=llir.FunctionCall(
-                        name=f"coo_workspace<{wksp_ctype.value}>",
+                        name=f"coo_workspace<{wksp_ctype.value}, {wksp.dim}>",
                         args=[
                             llir.Literal(value=f"{wksp.dim}"),
                         ],

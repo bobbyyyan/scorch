@@ -124,6 +124,17 @@ class DataType(Enum):
     COO_WORKSPACE_INT = "coo_workspace<int>"
     COO_WORKSPACE_FLOAT32 = "coo_workspace<float>"
     COO_WORKSPACE_TORCH_FLOAT32 = "coo_workspace<torch::kFloat32>"
+    # "coo_workspace<type, dim_size>"
+    COO_WORKSPACE_INT_1 = "coo_workspace<int, 1>"
+    COO_WORKSPACE_INT_2 = "coo_workspace<int, 2>"
+    COO_WORKSPACE_INT_3 = "coo_workspace<int, 3>"
+    COO_WORKSPACE_INT_4 = "coo_workspace<int, 4>"
+    COO_WORKSPACE_INT_5 = "coo_workspace<int, 5>"
+    COO_WORKSPACE_FLOAT32_1 = "coo_workspace<float, 1>"
+    COO_WORKSPACE_FLOAT32_2 = "coo_workspace<float, 2>"
+    COO_WORKSPACE_FLOAT32_3 = "coo_workspace<float, 3>"
+    COO_WORKSPACE_FLOAT32_4 = "coo_workspace<float, 4>"
+    COO_WORKSPACE_FLOAT32_5 = "coo_workspace<float, 5>"
 
     STD_VECTOR_INT = "std::vector<int>"
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
@@ -159,6 +170,13 @@ class DataType(Enum):
         A custom vector type for C++.
         """
         return DataType(f"coo_workspace<{dtype.value}>")
+
+    @classmethod
+    def coo_workspace_type_with_dim(cls, dtype: DataType, dim: int) -> DataType:
+        """
+        A custom vector type for C++.
+        """
+        return DataType(f"coo_workspace<{dtype.value}, {dim}>")
 
     @classmethod
     # pointer type, e.g. int*, float*, etc.
