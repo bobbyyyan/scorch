@@ -401,7 +401,7 @@ class CINLowerer:
                     value=llir.FunctionCall(
                         name=f"coo_workspace<{wksp_ctype.value}, {wksp.dim}>",
                         args=[
-                            llir.Literal(value=f"{wksp.dim}"),
+                            llir.Literal(value=f"{1024}"),
                         ],
                     ),
                 )

@@ -232,11 +232,8 @@ public:
 #ifndef SPARSE_ML_COO_WORKSPACE_H
 #define SPARSE_ML_COO_WORKSPACE_H
 
-#include <algorithm>
-#include <memory>
 #include <unordered_map>
 #include <vector>
-#include <numeric>
 
 template <typename T, int N>
 class coo_workspace {
