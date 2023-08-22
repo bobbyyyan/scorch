@@ -239,31 +239,21 @@ class coo_workspace {
   static constexpr int BLOCK_SIZE = 1024;
 
   int _dim;
-  int _capacity;
-  int _size;
-  T* _values;
-  int* _indices;
+  std::vector<T> _values;
+  std::vector<int> _indices;
   std::unordered_map<int, int> _existingCoords;
   std::vector<int> _sortedIndices;
 
  public:
   coo_workspace(int dim, int capacity)
-      : _dim(dim), _capacity(capacity), _size(0) {
-    _values = allocateBlockMemory<T>(_capacity);
-    _indices = allocateBlockMemory<int>(_capacity * _dim);
+      : _dim(dim) {
+    _values.reserve(capacity);
+    _indices.reserve(capacity * _dim);
   }
 
-  explicit coo_workspace(int dim) : coo_workspace(dim, 1024) {}
-
-  ~coo_workspace() {
-    deallocateBlockMemory(_values);
-    deallocateBlockMemory(_indices);
-  }
+  explicit coo_workspace(int dim) : coo_workspace(dim, BLOCK_SIZE) {}
 
   void insert(const std::vector<int>& coord, T value) {
-    // Compute linear index
-    // e.g for a 3D coordinate like (x, y, z), the linear index
-    // is index = x * (_dim^2) + y * _dim + z
     int index = coord[_dim - 1];
     for (int i = _dim - 2; i >= 0; i--) {
       index = index * _dim + coord[i];
@@ -275,54 +265,24 @@ class coo_workspace {
       return;
     }
 
-    if (_size >= _capacity) {
-      int newCapacity = static_cast<int>(_capacity * 1.5);
-      T* newValues = new T[newCapacity];
-      int* newIndices = new int[newCapacity * _dim];
-
-      for (int i = 0; i < _size; i++) {
-        newValues[i] = _values[i];
-        for (int j = 0; j < _dim; j++) {
-          newIndices[j * newCapacity + i] = _indices[j * _capacity + i];
-        }
-      }
-
-      delete[] _values;
-      delete[] _indices;
-
-      _values = newValues;
-      _indices = newIndices;
-      _capacity = newCapacity;
-
-      for (int i = 0; i < _size; i++) {
-        int coordIndex = 0;
-        for (int j = 0; j < _dim; j++) {
-          coordIndex = coordIndex * _dim + _indices[j * _capacity + i];
-        }
-        _existingCoords[coordIndex] = i;
-      }
-    }
-
-    _values[_size] = value;
+    _values.push_back(value);
     for (int i = 0; i < _dim; i++) {
-      _indices[i * _capacity + _size] = coord[i];
+      _indices.push_back(coord[i]);
     }
 
-    _existingCoords[index] = _size;
-
-    _size++;
+    _existingCoords[index] = _values.size() - 1;
   }
 
   void sort() {
-    _sortedIndices.resize(_size);
-    for (int i = 0; i < _size; i++) {
+    _sortedIndices.resize(_values.size());
+    for (int i = 0; i < _values.size(); i++) {
       _sortedIndices[i] = i;
     }
 
     auto radixComparator = [this](int a, int b) {
       for (int i = 0; i < _dim; i++) {
-        int coordA = _indices[i * _capacity + a];
-        int coordB = _indices[i * _capacity + b];
+        int coordA = _indices[i * _values.size() + a];
+        int coordB = _indices[i * _values.size() + b];
         if (coordA != coordB) {
           return coordA < coordB;
         }
@@ -334,20 +294,15 @@ class coo_workspace {
 
   class iterator {
     int _index;
-    T* _values;
-    int* _indices;
+    std::vector<T>& _values;
+    std::vector<int>& _indices;
     int _dim;
-    int _capacity;
     std::vector<int>* _sortedIndices;
 
    public:
-    iterator(int index, T* values, int* indices, int dim, int capacity,
+    iterator(int index, std::vector<T>& values, std::vector<int>& indices, int dim,
              std::vector<int>* sortedIndices)
-        : _index(index),
-          _values(values),
-          _indices(indices),
-          _dim(dim),
-          _capacity(capacity),
+        : _index(index), _values(values), _indices(indices), _dim(dim),
           _sortedIndices(sortedIndices) {}
 
     iterator& operator++() {
@@ -363,34 +318,23 @@ class coo_workspace {
       int sortedIndex = (*_sortedIndices)[_index];
       std::vector<int> coord(_dim);
       for (int i = 0; i < _dim; i++) {
-        coord[i] = _indices[i * _capacity + sortedIndex];
+        coord[i] = _indices[i * _values.size() + sortedIndex];
       }
       return {coord, _values[sortedIndex]};
     }
   };
 
   iterator begin() {
-    return iterator(0, _values, _indices, _dim, _capacity, &_sortedIndices);
+    return iterator(0, _values, _indices, _dim, &_sortedIndices);
   }
 
   iterator end() {
-    return iterator(_size, _values, _indices, _dim, _capacity, &_sortedIndices);
+    return iterator(_values.size(), _values, _indices, _dim, &_sortedIndices);
   }
 
-  int size() const { return _size; }
+  int size() const { return _values.size(); }
 
-  int capacity() const { return _capacity; }
-
- private:
-  template <typename U>
-  U* allocateBlockMemory(int size) {
-    return (U*)new char[sizeof(U) * size];
-  }
-
-  template <typename U>
-  void deallocateBlockMemory(U* ptr) {
-    delete[] ((char*)ptr);
-  }
+  int capacity() const { return _values.capacity(); }
 };
 
 // ####################################
