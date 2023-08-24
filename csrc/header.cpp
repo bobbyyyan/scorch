@@ -214,17 +214,19 @@ public:
  * This class implements a workspace to store the intermediate results of tensor
  * operations. It keeps track of the intermediate tensor in the coordinate list
  * format.
- * For a N-dimensional tensor, the workspace stores N lists of indices.
- * The class also provides an interface to iterate through the coordinates-value
- * pairs in the order sorted by the indices (coordinates)
- * e.g. for a 3-dimensional workspace, the coordinates-value pairs could be:
- * (0, 0, 0) - 11
- * (1, 1, 1) - 22
- * (1, 1, 0) - 33
- * Then the iterator would return the pairs in the order:
- * (0, 0, 0) - 11
- * (1, 1, 0) - 33
- * (1, 1, 1) - 22
+ * - It provides an interface to insert a coordinate-value pair into the workspace.
+ *   - If the coordinate already exists in the workspace, the new value would be
+ *     accumulated to the existing value by addition.
+ * - It also provides an interface to iterate through the coordinate-value
+ *   pairs in the order sorted by the coordinates.
+ *   - For example, for a 3-dimensional workspace, the coordinate-value pairs could be:
+ *     (0, 0, 0) - 11
+ *     (1, 1, 1) - 22
+ *     (1, 1, 0) - 33
+ *     Then the iterator would return the pairs in the order:
+ *     (0, 0, 0) - 11
+ *     (1, 1, 0) - 33
+ *     (1, 1, 1) - 22
  *
  * @tparam T type of the values stored, e.g. float, double, int, etc.
  */
