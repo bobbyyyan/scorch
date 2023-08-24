@@ -256,6 +256,19 @@ def einsum(
 
             output_level_formats.append(level_format)
 
+        # Make sure that the output format doesn't have a sparse level preceding
+        # a dense level
+        # If it does, then we need to make the preceding level dense as well
+        # e.g. if the output level formats are [sparse, dense, dense], then we
+        # need to make it [dense, dense, dense]
+        # TODO: unless we are dealing with block tensors
+        for i in range(len(output_level_formats) - 1, 0, -1):
+            if (
+                output_level_formats[i].get_level_type() == LevelType.DENSE
+                and output_level_formats[i - 1].get_level_type() != LevelType.DENSE
+            ):
+                output_level_formats[i - 1] = LevelFormat(LevelType.DENSE)
+
         output_format = TensorFormat(output_level_formats)
         print(f"Unspecified output format, using inferred {output_format}")
     else:
