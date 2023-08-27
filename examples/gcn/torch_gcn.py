@@ -10,7 +10,20 @@ class GraphConvolution(nn.Module):
         self.linear = nn.Linear(in_features, out_features)
 
     def forward(self, x, adjacency):
+        # Print sparsity level
+        x_nnz = torch.count_nonzero(x)
+        adj_nnz = torch.count_nonzero(adjacency)
+
+        x_sparsity = 1 - x_nnz.item() / (x.shape[0] * x.shape[1])
+        adj_sparsity = 1 - adj_nnz.item() / (adjacency.shape[0] * adjacency.shape[1])
+
+        print(f"x Sparsity: {x_sparsity * 100:.2f}%")
+        print(f"Adjacency Sparsity: {adj_sparsity * 100:.2f}%")
+
+        start_time = time.perf_counter()
         out = torch.matmul(adjacency, x)
+        end_time = time.perf_counter()
+        print(f"torch.matmul(adjacency, x) took {end_time - start_time} s")
         out = self.linear(out)
         return out
 
@@ -35,7 +48,6 @@ out_channels = 7
 
 # Initialize the custom PyTorch GCN model
 model_custom = CustomGCN(in_channels, hidden_channels, out_channels)
-
 
 # Load the pre-trained weights
 state_dict = torch.load("weights/gcn_cora_weights.pth")
@@ -74,6 +86,15 @@ adjacency_matrix = graph.adj_t.to_dense()  # Convert the sparse tensor to a dens
 x = node_features.clone().detach().to(torch.float)
 adjacency = adjacency_matrix.clone().detach().to(torch.float)
 
+# # Print sparsity level
+# x_nnz = torch.count_nonzero(x)
+# adj_nnz = torch.count_nonzero(adjacency)
+#
+# x_sparsity = 1 - x_nnz.item() / (x.shape[0] * x.shape[1])
+# adj_sparsity = 1 - adj_nnz.item() / (adjacency.shape[0] * adjacency.shape[1])
+#
+# print(f"x Sparsity: {x_sparsity * 100:.2f}%")
+# print(f"Adjacency Sparsity: {adj_sparsity * 100:.2f}%")
 
 # Measure the inference time
 start_time = time.perf_counter()

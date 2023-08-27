@@ -12,7 +12,11 @@ class GraphConvolution(nn.Module):
 
     def forward(self, x, adjacency):
         # out = torch.matmul(adjacency, x)
-        out = scorch.matmul(adjacency, x).to_torch()
+        start_time = time.perf_counter()
+        out = scorch.matmul(adjacency, x)
+        end_time = time.perf_counter()
+        print(f"scorch.matmul(adjacency, x) took {end_time - start_time} s")
+        out = out.to_torch()
         out = self.linear(out)
         return out
 
@@ -37,7 +41,6 @@ out_channels = 7
 
 # Initialize the custom PyTorch GCN model
 model_custom = CustomGCN(in_channels, hidden_channels, out_channels)
-
 
 # Load the pre-trained weights
 state_dict = torch.load("weights/gcn_cora_weights.pth")
@@ -74,8 +77,9 @@ adjacency_matrix = graph.adj_t.to_dense()  # Convert the sparse tensor to a dens
 # x = torch.tensor(node_features, dtype=torch.float)
 # adjacency = torch.tensor(adjacency_matrix, dtype=torch.float)
 x = node_features.clone().detach().to(torch.float)
+x = scorch.Tensor.from_torch(x, "x").to_sparse("ds")
 adjacency = adjacency_matrix.clone().detach().to(torch.float)
-
+adjacency = scorch.Tensor.from_torch(adjacency, "A").to_sparse("ds")
 
 # Measure the inference time
 start_time = time.perf_counter()
