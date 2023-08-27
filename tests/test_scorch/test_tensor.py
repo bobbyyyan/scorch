@@ -1,6 +1,6 @@
 import torch
 
-from src.scorch import Tensor
+from scorch import Tensor
 from torch.utils import cpp_extension
 
 for path in cpp_extension.include_paths():

@@ -1,7 +1,7 @@
 import torch
 
-from src.scorch import Tensor
-from src.scorch.storage import TensorIndex
+from scorch import Tensor
+from scorch.storage import TensorIndex
 
 
 def test_2d_ss_oo():

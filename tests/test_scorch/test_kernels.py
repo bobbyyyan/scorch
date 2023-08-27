@@ -3,8 +3,8 @@ from itertools import product
 
 import torch
 
-from src.scorch import Tensor, einsum, TensorFormat
-from src.scorch.compiler.cin import (
+from scorch import Tensor, einsum, TensorFormat
+from scorch.compiler.cin import (
     ForAll,
     Where,
     TensorAssign,
@@ -13,11 +13,11 @@ from src.scorch.compiler.cin import (
     TensorVar,
     Workspace,
 )
-from src.scorch.compiler.cin_lowerer import CINLowerer
-from src.scorch.compiler.codegen import LLIRLowerer
-from src.scorch.ops import matmul, matmul_wksp
-from src.scorch.storage import TensorIndex
-from src.scorch.utils import PROJECT_ROOT_DIR, parse_format
+from scorch.compiler.cin_lowerer import CINLowerer
+from scorch.compiler.codegen import LLIRLowerer
+from scorch.ops import matmul, matmul_wksp
+from scorch.storage import TensorIndex
+from scorch.utils import PROJECT_ROOT_DIR, parse_format
 
 
 def test_dense_copy():

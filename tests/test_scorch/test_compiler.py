@@ -1,4 +1,4 @@
-from src.scorch.compiler.cin import (
+from scorch.compiler.cin import (
     IndexVar,
     TensorVar,
     ForAll,
@@ -8,8 +8,8 @@ from src.scorch.compiler.cin import (
     Workspace,
     Where,
 )
-from src.scorch.compiler.cin_lowerer import CINLowerer
-from src.scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.cin_lowerer import CINLowerer
+from scorch.compiler.codegen import LLIRLowerer
 
 
 def test_elemwise_mul_1d_sss():

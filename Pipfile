@@ -4,6 +4,7 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+scorch = {editable = true, path = "."}
 numpy = "*"
 scipy = "*"
 torch = "*"
@@ -18,3 +19,9 @@ ipdb = "*"
 [requires]
 python_version = "3.10"
 python_full_version = "3.10.4"
+
+[scripts]
+format = "black src tests examples"
+lint = "flake8 ."
+typecheck = "mypy ."
+test = "pytest tests"

@@ -1,4 +1,4 @@
-from src.scorch.compiler.cin import (
+from scorch.compiler.cin import (
     IndexVar,
     TensorVar,
     ForAll,
