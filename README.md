@@ -1,5 +1,7 @@
 # Scorch
 
+[![pytest](https://github.com/bobbyyyan/scorch/actions/workflows/pytest.yml/badge.svg)](https://github.com/bobbyyyan/scorch/actions/workflows/pytest.yml)
+
 ### Setting up development environment
 
 #### Install Ninja
