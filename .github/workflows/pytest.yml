@@ -12,6 +12,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    container:
+      image: nvcr.io/nvidia/pytorch:21.06-py3
+      options: --gpus all
+
     steps:
       - name: Check out code
         uses: actions/checkout@v2
