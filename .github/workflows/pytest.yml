@@ -12,10 +12,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    container:
-      image: nvcr.io/nvidia/pytorch:21.06-py3
-      options: --gpus all
-
     steps:
       - name: Check out code
         uses: actions/checkout@v2
@@ -32,6 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           pipenv install --dev --ignore-pipfile
+          pipenv run pip install torch==2.0.1 -f https://download.pytorch.org/whl/cpu/torch_stable.html
 
       - name: Run tests
         working-directory: /home/runner/work/scorch/scorch
