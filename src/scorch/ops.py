@@ -93,8 +93,8 @@ def matmul_wksp(
 
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    print("\n C++ CODE:\n")
-    print(cpp_code)
+    # print("\n C++ CODE:\n")
+    # print(cpp_code)
 
     # Read header_cpp_code from csrc/header.cpp
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
@@ -146,6 +146,9 @@ def matmul(
     **kwargs: Any,
 ) -> Tensor:
     """Perform a matrix multiplication."""
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        result = torch.matmul(a, b)
+        return result
 
     if isinstance(a, torch.Tensor):
         a = Tensor.from_torch(a).to_sparse()
@@ -270,7 +273,7 @@ def einsum(
                 output_level_formats[i - 1] = LevelFormat(LevelType.DENSE)
 
         output_format = TensorFormat(output_level_formats)
-        print(f"Unspecified output format, using inferred {output_format}")
+        print(f"\nUnspecified output format, using inferred {output_format}")
     else:
         output_format = parse_format(output_format)
 
@@ -317,7 +320,7 @@ def einsum(
 
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    print("\n\n", cpp_code)
+    # print("\n\n", cpp_code)
 
     # Read header_cpp_code from csrc/header.cpp
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
