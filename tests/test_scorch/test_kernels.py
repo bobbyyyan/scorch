@@ -1779,7 +1779,8 @@ def test_spmm_ss_ds_ds():
     a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
-    result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
+    # result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
+    result = matmul_wksp(a_sparse, b_sparse, output_format="ss")
 
     assert result.shape == (5, 5)
     assert len(result.index.mode_indices) == 2
@@ -2048,7 +2049,8 @@ def test_spmm_ss_multi_multi():
         a_sparse = tensor_a.to_sparse(format_a)
         b_sparse = tensor_b.to_sparse(format_b)
 
-        result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
+        # result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
+        result = matmul_wksp(a_sparse, b_sparse, output_format="ss")
 
         print("Input formats: ", format_a, format_b)
         print("Output format: ", result.format)
