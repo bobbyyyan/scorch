@@ -2,6 +2,9 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_geometric.datasets as datasets
+from torch_geometric.transforms import ToSparseTensor
+
 import scorch
 
 
@@ -11,12 +14,17 @@ class GraphConvolution(nn.Module):
         self.linear = nn.Linear(in_features, out_features)
 
     def forward(self, x, adjacency):
-        # out = torch.matmul(adjacency, x)
         start_time = time.perf_counter()
+        # out = torch.matmul(adjacency, x)
         out = scorch.matmul(adjacency, x)
         end_time = time.perf_counter()
         print(f"scorch.matmul(adjacency, x) took {end_time - start_time} s")
+
+        start_time = time.perf_counter()
         out = out.to_torch()
+        end_time = time.perf_counter()
+        print(f"out.to_torch() took {end_time - start_time} s")
+
         out = self.linear(out)
         return out
 
@@ -34,12 +42,23 @@ class CustomGCN(nn.Module):
         return x
 
 
-# Define the dimensions
-in_channels = 1433
-hidden_channels = 16
-out_channels = 7
+# Prepare the input data (e.g., node features and adjacency matrix)
+# Load the Cora dataset
+dataset = datasets.Planetoid(root="data/Cora", name="Cora", transform=ToSparseTensor())
 
-# Initialize the custom PyTorch GCN model
+# Get the first graph in the dataset
+graph = dataset[0]
+
+# Get the node features and adjacency matrix
+node_features = graph.x
+adjacency_matrix = graph.adj_t.to_dense()  # Convert the sparse tensor to a dense tensor
+
+# Define the dimensions
+in_channels = node_features.shape[1]  # 1433
+hidden_channels = 16
+out_channels = dataset.num_classes  # 7
+
+# Initialize the GCN model
 model_custom = CustomGCN(in_channels, hidden_channels, out_channels)
 
 # Load the pre-trained weights
@@ -60,26 +79,24 @@ model_custom.load_state_dict(new_state_dict)
 # Set the model to evaluation mode
 model_custom.eval()
 
-# Prepare the input data (e.g., node features and adjacency matrix)
-import torch_geometric.datasets as datasets
-from torch_geometric.transforms import ToSparseTensor
-
-# Load the Cora dataset
-dataset = datasets.Planetoid(root="data/Cora", name="Cora", transform=ToSparseTensor())
-
-# Get the first graph in the dataset
-graph = dataset[0]
-
-# Get the node features and adjacency matrix
-node_features = graph.x
-adjacency_matrix = graph.adj_t.to_dense()  # Convert the sparse tensor to a dense tensor
-
 # x = torch.tensor(node_features, dtype=torch.float)
 # adjacency = torch.tensor(adjacency_matrix, dtype=torch.float)
 x = node_features.clone().detach().to(torch.float)
+
+start_time = time.perf_counter()
 x = scorch.Tensor.from_torch(x, "x").to_sparse("ds")
+end_time = time.perf_counter()
+print(
+    f"scorch.Tensor.from_torch(x, 'x').to_sparse('ds') took {end_time - start_time} s"
+)
+
 adjacency = adjacency_matrix.clone().detach().to(torch.float)
+start_time = time.perf_counter()
 adjacency = scorch.Tensor.from_torch(adjacency, "A").to_sparse("ds")
+end_time = time.perf_counter()
+print(
+    f"scorch.Tensor.from_torch(adjacency, 'A').to_sparse('ds') took {end_time - start_time} s"
+)
 
 # Measure the inference time
 start_time = time.perf_counter()
