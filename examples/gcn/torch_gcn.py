@@ -17,7 +17,7 @@ class GraphConvolution(nn.Module):
         x_sparsity = 1 - x_nnz.item() / (x.shape[0] * x.shape[1])
         adj_sparsity = 1 - adj_nnz.item() / (adjacency.shape[0] * adjacency.shape[1])
 
-        print(f"x Sparsity: {x_sparsity * 100:.2f}%")
+        print(f"\nx Sparsity: {x_sparsity * 100:.2f}%")
         print(f"Adjacency Sparsity: {adj_sparsity * 100:.2f}%")
 
         start_time = time.perf_counter()
@@ -35,15 +35,23 @@ class CustomGCN(nn.Module):
         self.conv2 = GraphConvolution(hidden_channels, out_channels)
 
     def forward(self, x, adjacency):
+        start_time = time.perf_counter()
         x = self.conv1(x, adjacency)
+        end_time = time.perf_counter()
+        print(f"\nself.conv1(x, adjacency) took {end_time - start_time} s")
+
         x = F.relu(x)
+        x = F.dropout(x, p=0.5, training=self.training)
+        start_time = time.perf_counter()
         x = self.conv2(x, adjacency)
+        end_time = time.perf_counter()
+        print(f"\nself.conv2(x, adjacency) took {end_time - start_time} s")
         return x
 
 
 # Define the dimensions
 in_channels = 1433
-hidden_channels = 16
+hidden_channels = 128
 out_channels = 7
 
 # Initialize the custom PyTorch GCN model
@@ -72,14 +80,14 @@ import torch_geometric.datasets as datasets
 from torch_geometric.transforms import ToSparseTensor
 
 # Load the Cora dataset
-dataset = datasets.Planetoid(root="data/Cora", name="Cora", transform=ToSparseTensor())
+dataset = datasets.Planetoid(root="data", name="Cora", transform=ToSparseTensor())
 
-# Get the first graph in the dataset
-graph = dataset[0]
+# Get the first data in the dataset
+data = dataset[0]
 
 # Get the node features and adjacency matrix
-node_features = graph.x
-adjacency_matrix = graph.adj_t.to_dense()  # Convert the sparse tensor to a dense tensor
+node_features = data.x
+adjacency_matrix = data.adj_t.to_dense()  # Convert the sparse tensor to a dense tensor
 
 # x = torch.tensor(node_features, dtype=torch.float)
 # adjacency = torch.tensor(adjacency_matrix, dtype=torch.float)
@@ -101,10 +109,23 @@ start_time = time.perf_counter()
 
 # Perform inference
 with torch.no_grad():
-    output = model_custom(x, adjacency)
+    logits = model_custom(x, adjacency)
+    pred = logits.argmax(dim=1)
+
+inference_time = time.perf_counter() - start_time
+
+# Calculate accuracy
+correct = float((pred[data.test_mask] == data.y[data.test_mask]).sum().item())
+accuracy = correct / data.test_mask.sum().item()
 
 end_time = time.perf_counter()
 
 # Calculate the inference time
 inference_time = end_time - start_time
-print(f"Inference time: {inference_time:.6f} seconds")
+
+# Calculate accuracy
+correct = float((pred[data.test_mask] == data.y[data.test_mask]).sum().item())
+accuracy = correct / data.test_mask.sum().item()
+
+print(f"\nInference time: {inference_time:.6f} seconds")
+print(f"Accuracy: {accuracy:.4f}")

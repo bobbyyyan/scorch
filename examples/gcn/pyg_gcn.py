@@ -16,10 +16,18 @@ class GCN(torch.nn.Module):
         self.conv2 = GCNConv(128, num_classes)
 
     def forward(self, x, edge_index):
+        start_time = time.perf_counter()
         x = self.conv1(x, edge_index)
+        end_time = time.perf_counter()
+        print(f"\nself.conv1(x, edge_index) took {end_time - start_time} s")
+
         x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
+        start_time = time.perf_counter()
         x = self.conv2(x, edge_index)
+        end_time = time.perf_counter()
+        print(f"self.conv2(x, edge_index) took {end_time - start_time} s")
+
         return F.log_softmax(x, dim=1)
 
 
@@ -58,7 +66,7 @@ def inference(model, data, device, dataset_name):
     correct = float((pred[data.test_mask] == data.y[data.test_mask]).sum().item())
     accuracy = correct / data.test_mask.sum().item()
 
-    print(f"Inference time: {inference_time:.6f} seconds")
+    print(f"\nInference time: {inference_time:.6f} seconds")
     print(f"Accuracy: {accuracy:.4f}")
 
 
