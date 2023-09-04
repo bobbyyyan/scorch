@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.datasets import Planetoid
 from torch_geometric.nn import GCNConv
+import argparse
 
 
 # Define GCN model
@@ -21,43 +22,69 @@ class GCN(torch.nn.Module):
         return F.log_softmax(x, dim=1)
 
 
-# Load dataset
-dataset = Planetoid(root=os.path.join(os.getcwd(), "data"), name="Cora")
-data = dataset[0]
+def train(model, data, device):
+    # Initialize optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
 
-# Initialize model and optimizer
-device = torch.device("cpu")
-model = GCN(dataset.num_features, dataset.num_classes).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+    # Train the model
+    model.train()
+    for epoch in range(200):
+        optimizer.zero_grad()
+        out = model(data.x.to(device), data.edge_index.to(device))
+        loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask].to(device))
+        loss.backward()
+        optimizer.step()
 
-# Train the model
-model.train()
-for epoch in range(200):
-    optimizer.zero_grad()
-    out = model(data.x.to(device), data.edge_index.to(device))
-    loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask].to(device))
-    loss.backward()
-    optimizer.step()
+    # Save weights
+    torch.save(model.state_dict(), "weights/gcn_cora_weights.pth")
 
-# Save weights
-torch.save(model.state_dict(), "weights/gcn_cora_weights.pth")
 
-# Load weights and prepare for inference
-model.load_state_dict(torch.load("weights/gcn_cora_weights.pth"))
-model.eval()
+def inference(model, data, device):
+    # Load weights and prepare for inference
+    model.load_state_dict(torch.load("weights/gcn_cora_weights.pth"))
+    model.eval()
 
-# Perform inference and measure time
-start_time = time.time()
+    # Perform inference and measure time
+    start_time = time.time()
 
-with torch.no_grad():
-    logits = model(data.x.to(device), data.edge_index.to(device))
-    pred = logits.argmax(dim=1)
+    with torch.no_grad():
+        logits = model(data.x.to(device), data.edge_index.to(device))
+        pred = logits.argmax(dim=1)
 
-inference_time = time.time() - start_time
+    inference_time = time.time() - start_time
 
-# Calculate accuracy
-correct = float((pred[data.test_mask] == data.y[data.test_mask]).sum().item())
-accuracy = correct / data.test_mask.sum().item()
+    # Calculate accuracy
+    correct = float((pred[data.test_mask] == data.y[data.test_mask]).sum().item())
+    accuracy = correct / data.test_mask.sum().item()
 
-print(f"Inference time: {inference_time:.6f} seconds")
-print(f"Accuracy: {accuracy:.4f}")
+    print(f"Inference time: {inference_time:.6f} seconds")
+    print(f"Accuracy: {accuracy:.4f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train and test a GCN.")
+    parser.add_argument(
+        "--mode", type=str, default="train", help='Mode to run: "train" or "test".'
+    )
+    args = parser.parse_args()
+
+    # Load dataset
+    dataset = Planetoid(root=os.path.join(os.getcwd(), "data"), name="Cora")
+    data = dataset[0]
+
+    # Initialize model
+    device = torch.device("cpu")
+    model = GCN(dataset.num_features, dataset.num_classes).to(device)
+
+    if args.mode == "train":
+        train(model, data, device)
+    elif args.mode == "test":
+        inference(model, data, device)
+    else:
+        raise ValueError(
+            f"Mode {args.mode} not recognized. Choose from 'train' or 'test'."
+        )
+
+
+if __name__ == "__main__":
+    main()
