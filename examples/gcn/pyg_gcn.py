@@ -73,7 +73,7 @@ def inference(model, data, device, dataset_name):
 def main():
     parser = argparse.ArgumentParser(description="Train and test a GCN.")
     parser.add_argument(
-        "--mode", type=str, default="train", help='Mode to run: "train" or "test".'
+        "--mode", type=str, default="test", help='Mode to run: "train" or "test".'
     )
     parser.add_argument(
         "--dataset",
