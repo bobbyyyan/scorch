@@ -148,12 +148,12 @@ def matmul(
     """Perform a matrix multiplication."""
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         result = torch.matmul(a, b)
-        return result
+        return Tensor.from_torch(result)
 
     if isinstance(a, torch.Tensor):
-        a = Tensor.from_torch(a).to_sparse()
+        a = Tensor.from_torch(a)
     if isinstance(b, torch.Tensor):
-        b = Tensor.from_torch(b).to_sparse()
+        b = Tensor.from_torch(b)
 
     result = einsum("ik,kj->ij", a, b, **kwargs)
 

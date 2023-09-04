@@ -290,7 +290,7 @@ class Tensor(torch.nn.Module):
     def to_dense(
         self,
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
-        in_place: bool = False,
+        in_place: bool = True,
     ) -> Tensor:
         """Convert the Scorch tensor to a dense Scorch tensor."""
 
