@@ -8,7 +8,6 @@ import argparse
 from tqdm import tqdm
 
 
-
 # Define GCN model
 class GCN(torch.nn.Module):
     def __init__(self, num_features, num_classes):
@@ -30,7 +29,7 @@ def train(model, data, device, dataset_name):
 
     # Train the model
     model.train()
-    for epoch in range(200):
+    for epoch in tqdm(range(200), desc="Training", unit="epoch"):
         optimizer.zero_grad()
         out = model(data.x.to(device), data.edge_index.to(device))
         loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask].to(device))
