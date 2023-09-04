@@ -141,7 +141,7 @@ def main():
     args = parser.parse_args()
 
     # Load the Reddit dataset
-    dataset = datasets.Reddit(root="data/Reddit", transform=ToSparseTensor())
+    dataset = datasets.Reddit(root="data/reddit", transform=ToSparseTensor())
 
     # Initialize the GCN model
     in_channels = dataset.num_features
