@@ -19,6 +19,12 @@ from scorch.ops import matmul, matmul_wksp
 from scorch.storage import TensorIndex
 from scorch.utils import PROJECT_ROOT_DIR, parse_format
 
+# pretty print
+import pprint
+
+# indent 2 pretty print
+pp = pprint.PrettyPrinter(indent=2)
+
 
 def test_dense_copy():
     tensor_a_torch = torch.Tensor(
@@ -1192,7 +1198,11 @@ def test_spmm_ds_ds_ds():
     a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
-    result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ds")
+    # result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ds")
+    result = matmul_wksp(a_sparse, b_sparse, output_format="ds")
+    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    assert torch.allclose(result.to_torch(), result_torch)
 
     assert result.shape == (5, 5)
     assert len(result.index.mode_indices) == 2
@@ -1229,6 +1239,39 @@ def test_spmm_ds_ds_ds():
         25.0,
         25.0,
     ]
+
+
+def test_spmm_ds_ds_ds_random():
+    dim_n = 10
+    sparsity = 0.9
+    tensor_a_torch = torch.rand(dim_n, dim_n)
+    tensor_b_torch = torch.rand(dim_n, dim_n)
+
+    # Randomly sparsify each tensor
+    tensor_a_torch = tensor_a_torch * (torch.rand(dim_n, dim_n) > sparsity).float()
+    tensor_b_torch = tensor_b_torch * (torch.rand(dim_n, dim_n) > sparsity).float()
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+
+    result = matmul_wksp(a_sparse, b_sparse, output_format="ds")
+    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    result_to_torch = result.to_torch()
+
+    assert torch.allclose(result_to_torch, result_torch)
+
+    if not torch.allclose(result_to_torch, result_torch):
+        print("\n\nresult_torch:")
+        print(result_torch.tolist())
+        print("\n\nresult:")
+        print(result.index.mode_indices[1][0].tolist())
+        print(result.index.mode_indices[1][1].tolist())
+        print(result.values.tolist())
+        print("\n\nresult_to_torch:")
+        print(result_to_torch.tolist())
+        print("\n\nresult_to_torch - result_torch:")
+        print((result_to_torch - result_torch).tolist())
 
 
 def test_spmm_ss_dd_dd_ikj_gustavson():
