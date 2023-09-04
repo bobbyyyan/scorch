@@ -127,6 +127,7 @@ def matmul_wksp(
     if "time_dict" in kwargs:
         time_dict = kwargs["time_dict"]
         time_dict["eval_time"] = eval_time
+    # print("Time taken for evaluate:", eval_time)
 
     result = Tensor(
         shape=result_shape,
@@ -378,7 +379,7 @@ def einsum(
     result_cpp = module.evaluate(*args)
     end_time = time.time()
     eval_time = end_time - start_time
-    print("Time taken for evaluate:", eval_time)
+    # print("Time taken for evaluate:", eval_time)
 
     result = Tensor(
         shape=result_shape,
