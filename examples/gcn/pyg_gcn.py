@@ -81,11 +81,12 @@ def main():
     # Load dataset
     if args.dataset in ["cora", "pubmed", "citeseer"]:
         dataset = Planetoid(
-            root=os.path.join(os.getcwd(), "data"), name=args.dataset.capitalize()
+            root=os.path.join(os.getcwd(), "data"),
+            name=args.dataset,
         )
         data = dataset[0]
     elif args.dataset == "reddit":
-        dataset = Reddit(root=os.path.join(os.getcwd(), "data"))
+        dataset = Reddit(root=os.path.join(os.getcwd(), "data/reddit"))
         data = dataset[0]
     else:
         raise ValueError(
