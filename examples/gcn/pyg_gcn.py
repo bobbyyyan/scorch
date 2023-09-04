@@ -2,17 +2,19 @@ import os
 import time
 import torch
 import torch.nn.functional as F
-from torch_geometric.datasets import Planetoid
+from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.nn import GCNConv
 import argparse
+from tqdm import tqdm
+
 
 
 # Define GCN model
 class GCN(torch.nn.Module):
     def __init__(self, num_features, num_classes):
         super(GCN, self).__init__()
-        self.conv1 = GCNConv(num_features, 16)
-        self.conv2 = GCNConv(16, num_classes)
+        self.conv1 = GCNConv(num_features, 128)
+        self.conv2 = GCNConv(128, num_classes)
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
@@ -64,31 +66,40 @@ def inference(model, data, device, dataset_name):
 def main():
     parser = argparse.ArgumentParser(description="Train and test a GCN.")
     parser.add_argument(
-        "--mode", type=str, default="test", help='Mode to run: "train" or "test".'
+        "--mode", type=str, default="train", help='Mode to run: "train" or "test".'
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default="cora",
-        help='Dataset to use. Options are "Cora", "Pubmed", or "CiteSeer".',
+        help='Dataset to use. Options are "cora", "pubmed", "citeseer", or "reddit".',
     )
     args = parser.parse_args()
 
-    # Set dataset name to lowercase
+    # Convert dataset to lowercase
     args.dataset = args.dataset.lower()
 
     # Load dataset
-    dataset = Planetoid(root=os.path.join(os.getcwd(), "data"), name=args.dataset)
-    data = dataset[0]
+    if args.dataset in ["cora", "pubmed", "citeseer"]:
+        dataset = Planetoid(
+            root=os.path.join(os.getcwd(), "data"), name=args.dataset.capitalize()
+        )
+        data = dataset[0]
+    elif args.dataset == "reddit":
+        dataset = Reddit(root=os.path.join(os.getcwd(), "data"))
+        data = dataset[0]
+    else:
+        raise ValueError(
+            f"Dataset {args.dataset} not recognized. Choose from 'cora', 'pubmed', 'citeseer', or 'reddit'."
+        )
 
     # Initialize model
     device = torch.device("cpu")
     model = GCN(dataset.num_features, dataset.num_classes).to(device)
 
-    if args.mode == "train":
+    if args.mode.lower() == "train":
         train(model, data, device, args.dataset)
-        inference(model, data, device, args.dataset)
-    elif args.mode == "test":
+    elif args.mode.lower() == "test":
         inference(model, data, device, args.dataset)
     else:
         raise ValueError(
