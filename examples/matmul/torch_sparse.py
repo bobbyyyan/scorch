@@ -9,7 +9,7 @@ def sparse_mm(A, B):
     return torch.sparse.mm(A, B)
 
 
-def gen_rand_sparse_coo(dim_m, dim_n, sparsity):
+def gen_rand_sparse_coo_v1(dim_m, dim_n, sparsity):
     """Generate sparse matrix with PyTorch
     sparsity is the percentage of zero elements
     """
@@ -20,27 +20,45 @@ def gen_rand_sparse_coo(dim_m, dim_n, sparsity):
     return A
 
 
+def gen_rand_sparse_coo(dim_m, dim_n, sparsity):
+    """Generate sparse matrix with PyTorch
+    sparsity is the percentage of zero elements
+    """
+    nnz = int((1 - sparsity) * dim_m * dim_n)
+    indices = torch.randint(0, dim_m, size=(2, nnz))
+    values = torch.rand(nnz)
+
+    _, inverse_indices = torch.unique(indices, dim=1, return_inverse=True)
+    while len(inverse_indices) != len(indices.transpose(0, 1)):
+        indices = torch.randint(0, dim_m, size=(2, nnz))
+        _, inverse_indices = torch.unique(indices, dim=1, return_inverse=True)
+
+    A = torch.sparse_coo_tensor(indices, values, (dim_m, dim_n))
+    return A
+
+
 # Create sparse matrix
-dim_m = 10000
+dim_m = 15000
 dim_n = dim_m
 dim_k = dim_m
 
 if __name__ == "__main__":
-    # Create random sparse COO matrix A with 99% sparsity, COO format
     A = gen_rand_sparse_coo(dim_m, dim_n, 0.99)
-
     print("A's nnz count: ", A._nnz())
-    # to 2 decimal places
     print(f"A's sparsity level: {100 - A._nnz() / (dim_m * dim_n) * 100:.2f}%")
 
-    # Create random dense matrix B
     B = torch.rand(dim_n, dim_k)
 
-    # Time matmul
-    start = time.time()
+    runtimes = []
 
-    C = torch.sparse.mm(A, B)
-    # C = torch.matmul(A, B)
+    # Warm up
+    for _ in range(5):
+        torch.sparse.mm(A, B)
 
-    end = time.time()
-    print("Time: ", end - start)
+    for _ in range(5):
+        start = time.time()
+        C = torch.sparse.mm(A, B)
+        end = time.time()
+        runtimes.append(end - start)
+
+    print("Times: \n", runtimes)
