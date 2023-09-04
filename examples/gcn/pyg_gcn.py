@@ -22,7 +22,7 @@ class GCN(torch.nn.Module):
         return F.log_softmax(x, dim=1)
 
 
-def train(model, data, device):
+def train(model, data, device, dataset_name):
     # Initialize optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
 
@@ -36,12 +36,12 @@ def train(model, data, device):
         optimizer.step()
 
     # Save weights
-    torch.save(model.state_dict(), "weights/gcn_cora_weights.pth")
+    torch.save(model.state_dict(), f"weights/gcn_{dataset_name.lower()}_weights.pth")
 
 
-def inference(model, data, device):
+def inference(model, data, device, dataset_name):
     # Load weights and prepare for inference
-    model.load_state_dict(torch.load("weights/gcn_cora_weights.pth"))
+    model.load_state_dict(torch.load(f"weights/gcn_{dataset_name.lower()}_weights.pth"))
     model.eval()
 
     # Perform inference and measure time
@@ -64,12 +64,21 @@ def inference(model, data, device):
 def main():
     parser = argparse.ArgumentParser(description="Train and test a GCN.")
     parser.add_argument(
-        "--mode", type=str, default="train", help='Mode to run: "train" or "test".'
+        "--mode", type=str, default="test", help='Mode to run: "train" or "test".'
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cora",
+        help='Dataset to use. Options are "Cora", "Pubmed", or "CiteSeer".',
     )
     args = parser.parse_args()
 
+    # Set dataset name to lowercase
+    args.dataset = args.dataset.lower()
+
     # Load dataset
-    dataset = Planetoid(root=os.path.join(os.getcwd(), "data"), name="Cora")
+    dataset = Planetoid(root=os.path.join(os.getcwd(), "data"), name=args.dataset)
     data = dataset[0]
 
     # Initialize model
@@ -77,9 +86,10 @@ def main():
     model = GCN(dataset.num_features, dataset.num_classes).to(device)
 
     if args.mode == "train":
-        train(model, data, device)
+        train(model, data, device, args.dataset)
+        inference(model, data, device, args.dataset)
     elif args.mode == "test":
-        inference(model, data, device)
+        inference(model, data, device, args.dataset)
     else:
         raise ValueError(
             f"Mode {args.mode} not recognized. Choose from 'train' or 'test'."
