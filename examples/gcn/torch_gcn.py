@@ -1,10 +1,11 @@
+import argparse
 import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric.datasets as datasets
 from torch_geometric.transforms import ToSparseTensor
-import argparse
 
 
 class GraphConvolution(nn.Module):
