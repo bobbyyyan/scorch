@@ -15,6 +15,7 @@ torch-geometric = "*"
 dgl = "*"
 torch-sparse = "*"
 torch-scatter = "*"
+ogb = "*"
 
 [dev-packages]
 tqdm = "*"

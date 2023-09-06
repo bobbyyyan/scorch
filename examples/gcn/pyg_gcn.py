@@ -1,10 +1,12 @@
+import argparse
 import os
 import time
+
 import torch
 import torch.nn.functional as F
+from ogb.nodeproppred import PygNodePropPredDataset
 from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.nn import GCNConv
-import argparse
 from tqdm import tqdm
 
 
@@ -31,16 +33,23 @@ class GCN(torch.nn.Module):
         return F.log_softmax(x, dim=1)
 
 
-def train(model, data, device, dataset_name):
+def train(model, data, device, dataset_name, split_idx=None):
     # Initialize optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+
+    # Create mask for train data
+    if dataset_name == "ogbn-arxiv":
+        train_mask = torch.zeros(data.num_nodes, dtype=bool)
+        train_mask[split_idx["train"]] = True
+    else:
+        train_mask = data.train_mask
 
     # Train the model
     model.train()
     for epoch in tqdm(range(200), desc="Training", unit="epoch"):
         optimizer.zero_grad()
         out = model(data.x.to(device), data.edge_index.to(device))
-        loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask].to(device))
+        loss = F.nll_loss(out[train_mask], data.y.view(-1)[train_mask].to(device))
         loss.backward()
         optimizer.step()
 
@@ -48,10 +57,17 @@ def train(model, data, device, dataset_name):
     torch.save(model.state_dict(), f"weights/gcn_{dataset_name.lower()}_weights.pth")
 
 
-def inference(model, data, device, dataset_name):
+def inference(model, data, device, dataset_name, split_idx=None):
     # Load weights and prepare for inference
     model.load_state_dict(torch.load(f"weights/gcn_{dataset_name.lower()}_weights.pth"))
     model.eval()
+
+    # Create mask for test data
+    if dataset_name == "ogbn-arxiv":
+        test_mask = torch.zeros(data.num_nodes, dtype=bool)
+        test_mask[split_idx["test"]] = True
+    else:
+        test_mask = data.test_mask
 
     # Perform inference and measure time
     start_time = time.time()
@@ -63,10 +79,10 @@ def inference(model, data, device, dataset_name):
     inference_time = time.time() - start_time
 
     # Calculate accuracy
-    correct = float((pred[data.test_mask] == data.y[data.test_mask]).sum().item())
-    accuracy = correct / data.test_mask.sum().item()
+    correct = float((pred[test_mask] == data.y.view(-1)[test_mask]).sum().item())
+    accuracy = correct / test_mask.sum().item()
 
-    print(f"\nInference time: {inference_time:.6f} seconds")
+    print(f"Inference time: {inference_time:.6f} seconds")
     print(f"Accuracy: {accuracy:.4f}")
 
 
@@ -79,7 +95,7 @@ def main():
         "--dataset",
         type=str,
         default="cora",
-        help='Dataset to use. Options are "cora", "pubmed", "citeseer", or "reddit".',
+        help='Dataset to use. Options are "cora", "pubmed", "citeseer", "reddit", or "ogbn-arxiv".',
     )
     args = parser.parse_args()
 
@@ -87,6 +103,8 @@ def main():
     args.dataset = args.dataset.lower()
 
     # Load dataset
+    split_idx = None
+
     if args.dataset in ["cora", "pubmed", "citeseer"]:
         dataset = Planetoid(
             root=os.path.join(os.getcwd(), "data"),
@@ -96,9 +114,15 @@ def main():
     elif args.dataset == "reddit":
         dataset = Reddit(root=os.path.join(os.getcwd(), "data/reddit"))
         data = dataset[0]
+    elif args.dataset == "ogbn-arxiv":
+        dataset = PygNodePropPredDataset(
+            name="ogbn-arxiv", root=os.path.join(os.getcwd(), "data")
+        )
+        split_idx = dataset.get_idx_split()
+        data = dataset[0]
     else:
         raise ValueError(
-            f"Dataset {args.dataset} not recognized. Choose from 'cora', 'pubmed', 'citeseer', or 'reddit'."
+            f"Dataset {args.dataset} not recognized. Choose from 'cora', 'pubmed', 'citeseer', 'reddit', or 'ogbn-arxiv'."
         )
 
     # Initialize model
@@ -106,9 +130,9 @@ def main():
     model = GCN(dataset.num_features, dataset.num_classes).to(device)
 
     if args.mode.lower() == "train":
-        train(model, data, device, args.dataset)
+        train(model, data, device, args.dataset, split_idx)
     elif args.mode.lower() == "test":
-        inference(model, data, device, args.dataset)
+        inference(model, data, device, args.dataset, split_idx)
     else:
         raise ValueError(
             f"Mode {args.mode} not recognized. Choose from 'train' or 'test'."
