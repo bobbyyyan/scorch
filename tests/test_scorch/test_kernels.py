@@ -1187,8 +1187,6 @@ def test_spmm_ds_ds_ds():
     result = matmul_wksp(a_sparse, b_sparse, output_format="ds")
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch.allclose(result.to_torch(), result_torch)
-
     assert result.shape == (5, 5)
     assert len(result.index.mode_indices) == 2
 
@@ -1224,6 +1222,8 @@ def test_spmm_ds_ds_ds():
         25.0,
         25.0,
     ]
+
+    assert torch.allclose(result.to_torch(), result_torch)
 
 
 def test_spmm_ds_ds_ds_random():
