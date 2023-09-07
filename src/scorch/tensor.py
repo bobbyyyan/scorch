@@ -267,7 +267,7 @@ class Tensor(torch.nn.Module):
 
         mode_indices = []
         for i in range(len(shape)):
-            mode_indices.append(indices[:, i])
+            mode_indices.append([indices[:, i]])
 
         tt_tensor = Tensor(
             name=name,
@@ -285,6 +285,8 @@ class Tensor(torch.nn.Module):
                 value=values,
             ),
         )
+
+        return tt_tensor
 
     @staticmethod
     def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
