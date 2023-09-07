@@ -247,6 +247,46 @@ class Tensor(torch.nn.Module):
         )
 
     @staticmethod
+    def from_coo(
+        indices: torch.Tensor,
+        values: torch.Tensor,
+        shape: Tuple[int, ...],
+        name: Optional[str] = None,
+    ) -> Tensor:
+        """
+        Create a Tensor from a COO tensor.
+        :param indices:
+        :param values:
+        :param shape:
+        :param name:
+        :return:
+        """
+        # If name is not provided, use the default name
+        if name is None:
+            name = "tensor"
+
+        mode_indices = []
+        for i in range(len(shape)):
+            mode_indices.append(indices[:, i])
+
+        tt_tensor = Tensor(
+            name=name,
+            shape=tuple(shape),
+            storage=TensorStorage(
+                index=TensorIndex(
+                    tensor_format=TensorFormat(
+                        level_formats=[
+                            LevelFormat(mode=LevelType.COORDINATE)
+                            for _ in range(len(shape))
+                        ]
+                    ),
+                    mode_indices=mode_indices,
+                ),
+                value=values,
+            ),
+        )
+
+    @staticmethod
     def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
         """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
@@ -278,9 +318,10 @@ class Tensor(torch.nn.Module):
     def to_torch(self) -> torch.Tensor:
         """Convert a Scorch Tensor to a torch.Tensor."""
         # Get a dense Scorch tensor
-        dense_tensor = self.to_dense()
+        dense_tensor = self.to_dense(in_place=True)
         # Convert the dense Scorch tensor to a torch.Tensor
-        torch_tensor = dense_tensor.storage.value.clone().detach()
+        # torch_tensor = dense_tensor.storage.value.clone().detach()
+        torch_tensor = dense_tensor.storage.value
         if torch_tensor.dtype != self.dtype:
             torch_tensor = torch_tensor.type(self.dtype)
         # Reshape the torch.Tensor to the original shape

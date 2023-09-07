@@ -25,6 +25,8 @@ PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
+_kernel_cache = {}
+
 # Register custom classes
 load(
     name="pybind",
@@ -163,7 +165,8 @@ def matmul(
 
 def einsum(
     expression: str,
-    *tensors: Union[torch.Tensor, Tensor],
+    *tensors: Optional[Union[torch.Tensor, Tensor]],
+    compile_only: Optional[bool] = False,
     **kwargs: Any,
 ) -> Tensor:
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
@@ -187,14 +190,6 @@ def einsum(
     # to IndexVar objects
     index_vars = [IndexVar(index_str) for index_str in unique_index_strs]
     index_var_dict = {index_var.name: index_var for index_var in index_vars}
-
-    # Create a mapping from each index string to the size of the dimension
-    # it indexes
-    index_str_to_size = {}
-    for index_strs, tensor in zip(input_index_strs, tensors):
-        for i, index_str in enumerate(index_strs):
-            if index_str not in index_str_to_size:
-                index_str_to_size[index_str] = tensor.shape[i]
 
     # Create a mapping from each index string to the list of LevelFormats
     # of the levels it indexes into each input tensor
@@ -313,55 +308,74 @@ def einsum(
 
     # print("cin_stmt:", cin_stmt)
 
-    lowerer = CINLowerer()
+    if str(cin_stmt) in _kernel_cache:
+        print(f"Using cached kernel for {cin_stmt}")
+        module = _kernel_cache[str(cin_stmt)]
+    else:
+        lowerer = CINLowerer()
 
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
 
-    llir_lowerer = LLIRLowerer()
+        llir_lowerer = LLIRLowerer()
 
-    cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    # print("\n\n", cpp_code)
+        # print("\n\n", cpp_code)
 
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+        # Read header_cpp_code from csrc/header.cpp
+        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+            header_cpp_code = f.read()
 
-    # # Write "#include <torch/extension.h>" + "\n" + '#include "header.cpp"' + "\n" + cpp_code to a file
-    # # and PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("evaluate", &evaluate); }
-    # with open(PROJECT_ROOT_DIR / "csrc/kernel.cpp", "w") as f:
-    #     f.write("#include <torch/extension.h>\n")
-    #     f.write('#include "header.cpp"\n')
-    #     f.write(cpp_code)
-    #     f.write(
-    #         f"""
-    #         PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-    #           m.def("evaluate", &evaluate);
-    #             pybind11::class_<Tensor>(m, "Tensor")
-    #               .def(pybind11::init<>())
-    #               .def_readwrite("_storage", &Tensor::_storage);
-    #             pybind11::class_<TensorStorage>(m, "TensorStorage")
-    #               .def(pybind11::init<>())
-    #               .def_readwrite("_value", &TensorStorage::_value)
-    #               .def_readwrite("_index", &TensorStorage::_index);
-    #             pybind11::class_<TensorIndex>(m, "TensorIndex")
-    #               .def(pybind11::init<>())
-    #               .def_readwrite("mode_indices", &TensorIndex::mode_indices);
-    #         }}
-    #         """
-    #     )
-    #
-    # # Load the C++ code using PyTorch's C++ extension
-    # module = torch.utils.cpp_extension.load(
-    #     name="kernel",
-    #     sources=[str(PROJECT_ROOT_DIR / "csrc/kernel.cpp")],
-    # )
+        # # Write "#include <torch/extension.h>" + "\n" + '#include "header.cpp"' + "\n" + cpp_code to a file
+        # # and PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("evaluate", &evaluate); }
+        # with open(PROJECT_ROOT_DIR / "csrc/kernel.cpp", "w") as f:
+        #     f.write("#include <torch/extension.h>\n")
+        #     f.write('#include "header.cpp"\n')
+        #     f.write(cpp_code)
+        #     f.write(
+        #         f"""
+        #         PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+        #           m.def("evaluate", &evaluate);
+        #             pybind11::class_<Tensor>(m, "Tensor")
+        #               .def(pybind11::init<>())
+        #               .def_readwrite("_storage", &Tensor::_storage);
+        #             pybind11::class_<TensorStorage>(m, "TensorStorage")
+        #               .def(pybind11::init<>())
+        #               .def_readwrite("_value", &TensorStorage::_value)
+        #               .def_readwrite("_index", &TensorStorage::_index);
+        #             pybind11::class_<TensorIndex>(m, "TensorIndex")
+        #               .def(pybind11::init<>())
+        #               .def_readwrite("mode_indices", &TensorIndex::mode_indices);
+        #         }}
+        #         """
+        #     )
+        #
+        # # Load the C++ code using PyTorch's C++ extension
+        # module = torch.utils.cpp_extension.load(
+        #     name="kernel",
+        #     sources=[str(PROJECT_ROOT_DIR / "csrc/kernel.cpp")],
+        # )
 
-    module = torch.utils.cpp_extension.load_inline(
-        name="kernel",
-        cpp_sources=[header_cpp_code, cpp_code],
-        functions=["evaluate"],
-    )
+        module = torch.utils.cpp_extension.load_inline(
+            name="kernel",
+            cpp_sources=[header_cpp_code, cpp_code],
+            functions=["evaluate"],
+        )
+
+        _kernel_cache[str(cin_stmt)] = module
+
+        print(f"Cached kernel for {cin_stmt}")
+
+    if compile_only:
+        return None
+
+    # Create a mapping from each index string to the size of the dimension
+    # it indexes
+    index_str_to_size = {}
+    for index_strs, tensor in zip(input_index_strs, tensors):
+        for i, index_str in enumerate(index_strs):
+            if index_str not in index_str_to_size:
+                index_str_to_size[index_str] = tensor.shape[i]
 
     # Get the result shape from the expression, using index_str_to_size
     result_shape = tuple(
@@ -395,3 +409,14 @@ def einsum(
         time_dict["eval_time"] = eval_time
 
     return result
+
+
+def precompile_kernels():
+    DS = Tensor(index=TensorIndex(tensor_format="ds"))
+    DD = Tensor(index=TensorIndex(tensor_format="dd"))
+
+    einsum("ik,kj->ij", DS, DD, compile_only=True, format="dd")
+    einsum("ik,kj->ij", DS, DS, compile_only=True, format="ds")
+    einsum("ik,kj->ij", DS, DS, compile_only=True, format="dd")
+
+    print("Precompiled kernels.")
