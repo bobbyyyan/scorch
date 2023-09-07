@@ -1,13 +1,12 @@
 import argparse
-import os
 import time
 
 import torch
 import torch.nn.functional as F
-from ogb.nodeproppred import PygNodePropPredDataset
-from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.nn import GCNConv
 from tqdm import tqdm
+
+from utils import load_dataset
 
 
 # Define GCN model
@@ -64,7 +63,7 @@ def inference(model, data, device, dataset_name, split_idx=None):
 
     # Create mask for test data
     if dataset_name == "ogbn-arxiv":
-        test_mask = torch.zeros(data.num_nodes, dtype=bool)
+        test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
         test_mask[split_idx["test"]] = True
     else:
         test_mask = data.test_mask
@@ -84,31 +83,6 @@ def inference(model, data, device, dataset_name, split_idx=None):
 
     print(f"Inference time: {inference_time:.6f} seconds")
     print(f"Accuracy: {accuracy:.4f}")
-
-
-def load_dataset(dataset_name):
-    dataset_name = dataset_name.lower()
-
-    split_idx = None
-
-    if dataset_name in ["cora", "pubmed", "citeseer"]:
-        dataset = Planetoid(
-            root=os.path.join(os.getcwd(), "data"),
-            name=dataset_name,
-        )
-    elif dataset_name == "reddit":
-        dataset = Reddit(root=os.path.join(os.getcwd(), "data/reddit"))
-    elif dataset_name == "ogbn-arxiv":
-        dataset = PygNodePropPredDataset(
-            name="ogbn-arxiv", root=os.path.join(os.getcwd(), "data")
-        )
-        split_idx = dataset.get_idx_split()
-    else:
-        raise ValueError(
-            f"Dataset {dataset_name} not recognized. Choose from 'cora', 'pubmed', 'citeseer', 'reddit', or 'ogbn-arxiv'."
-        )
-
-    return dataset, split_idx
 
 
 def main():

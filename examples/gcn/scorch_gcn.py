@@ -5,8 +5,8 @@ import scorch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_geometric.datasets as datasets
-from torch_geometric.transforms import ToSparseTensor
+
+from utils import load_dataset, modify_state_dict_pyg_to_torch
 
 
 class GraphConvolution(nn.Module):
@@ -44,34 +44,6 @@ class CustomGCN(nn.Module):
         x = F.dropout(x, p=0.5, training=self.training)
         x = self.conv2(x, adjacency)
         return F.log_softmax(x, dim=1)
-
-
-def load_dataset(dataset_name):
-    if dataset_name in ["cora", "pubmed", "citeseer"]:
-        dataset = datasets.Planetoid(
-            root="data",
-            name=dataset_name,
-            transform=ToSparseTensor(),
-        )
-    elif dataset_name == "reddit":
-        dataset = datasets.Reddit(root="data/reddit", transform=ToSparseTensor())
-    else:
-        raise ValueError(
-            f"Dataset {dataset_name} not recognized. Choose from 'cora', 'pubmed', 'citeseer', or 'reddit'."
-        )
-    return dataset
-
-
-def modify_state_dict_pyg_to_torch(state_dict):
-    # replace .lin. with .linear.
-    # and replace .bias. with .linear.bias.
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        new_key = key.replace(".lin.", ".linear.")
-        if ".bias" in new_key:
-            new_key = new_key.replace(".bias", ".linear.bias")
-        new_state_dict[new_key] = value
-    return new_state_dict
 
 
 def inference(model, data, device, dataset_name):
@@ -134,7 +106,7 @@ def main():
     args.dataset = args.dataset.lower()
 
     # Load dataset
-    dataset = load_dataset(args.dataset)
+    dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
     data = dataset[0]
 
     # Define the dimensions
