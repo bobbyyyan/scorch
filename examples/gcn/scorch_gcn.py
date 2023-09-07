@@ -10,9 +10,9 @@ from torch_geometric.transforms import ToSparseTensor
 
 
 class GraphConvolution(nn.Module):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_channels, out_channels):
         super(GraphConvolution, self).__init__()
-        self.linear = nn.Linear(in_features, out_features)
+        self.linear = nn.Linear(in_channels, out_channels)
 
     def forward(self, x, adjacency):
         start_time = time.perf_counter()
@@ -83,19 +83,25 @@ def inference(model, data, device, dataset_name):
 
     x = data.x.clone().detach().to(torch.float)
     start_time = time.perf_counter()
-    x = scorch.Tensor.from_torch(x, "x").to_sparse("ds")
+    x = scorch.from_torch(x)
+    x = x.to_sparse("ds")
     end_time = time.perf_counter()
     print(
         f"scorch.Tensor.from_torch(x, 'x').to_sparse('ds') took {end_time - start_time} s"
     )
 
-    adjacency = data.adj_t.to_dense().clone().detach().to(torch.float)
     start_time = time.perf_counter()
-    adjacency = scorch.Tensor.from_torch(adjacency, "adjacency").to_sparse("ds")
+    adjacency = data.adj_t.to_dense().clone().detach().to(torch.float)
+    adjacency = scorch.from_torch(adjacency)
+    adjacency = adjacency.to_sparse("ds")
+
+    # adjacency = scorch.from_coo(
+    #     indices=data.edge_index.T,
+    #     values=torch.ones(data.edge_index.shape[1]),
+    #     shape=(data.num_nodes, data.num_nodes),
+    # )
     end_time = time.perf_counter()
-    print(
-        f"scorch.Tensor.from_torch(adjacency, 'adjacency').to_sparse('ds') took {end_time - start_time} s"
-    )
+    print(f"Adj matrix construction took {end_time - start_time} s")
 
     # Perform inference and measure time
     start_time = time.perf_counter()
@@ -136,10 +142,9 @@ def main():
     hidden_channels = 128  # This should match the hidden dimension used in pyg_gcn.py
     out_channels = dataset.num_classes
 
-    # Initialize the CustomGCN model
-    model = CustomGCN(in_channels, hidden_channels, out_channels)
-
+    # Initialize model
     device = torch.device("cpu")
+    model = CustomGCN(in_channels, hidden_channels, out_channels).to(device)
 
     # Inference
     inference(model, data, device, args.dataset)

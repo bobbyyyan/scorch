@@ -12,10 +12,10 @@ from tqdm import tqdm
 
 # Define GCN model
 class GCN(torch.nn.Module):
-    def __init__(self, num_features, num_classes):
+    def __init__(self, in_channels, hidden_channels, out_channels):
         super(GCN, self).__init__()
-        self.conv1 = GCNConv(num_features, 128)
-        self.conv2 = GCNConv(128, num_classes)
+        self.conv1 = GCNConv(in_channels, hidden_channels, normalize=False)
+        self.conv2 = GCNConv(hidden_channels, out_channels, normalize=False)
 
     def forward(self, x, edge_index):
         start_time = time.perf_counter()
@@ -86,6 +86,31 @@ def inference(model, data, device, dataset_name, split_idx=None):
     print(f"Accuracy: {accuracy:.4f}")
 
 
+def load_dataset(dataset_name):
+    dataset_name = dataset_name.lower()
+
+    split_idx = None
+
+    if dataset_name in ["cora", "pubmed", "citeseer"]:
+        dataset = Planetoid(
+            root=os.path.join(os.getcwd(), "data"),
+            name=dataset_name,
+        )
+    elif dataset_name == "reddit":
+        dataset = Reddit(root=os.path.join(os.getcwd(), "data/reddit"))
+    elif dataset_name == "ogbn-arxiv":
+        dataset = PygNodePropPredDataset(
+            name="ogbn-arxiv", root=os.path.join(os.getcwd(), "data")
+        )
+        split_idx = dataset.get_idx_split()
+    else:
+        raise ValueError(
+            f"Dataset {dataset_name} not recognized. Choose from 'cora', 'pubmed', 'citeseer', 'reddit', or 'ogbn-arxiv'."
+        )
+
+    return dataset, split_idx
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train and test a GCN.")
     parser.add_argument(
@@ -103,31 +128,17 @@ def main():
     args.dataset = args.dataset.lower()
 
     # Load dataset
-    split_idx = None
+    dataset, split_idx = load_dataset(args.dataset)
+    data = dataset[0]
 
-    if args.dataset in ["cora", "pubmed", "citeseer"]:
-        dataset = Planetoid(
-            root=os.path.join(os.getcwd(), "data"),
-            name=args.dataset,
-        )
-        data = dataset[0]
-    elif args.dataset == "reddit":
-        dataset = Reddit(root=os.path.join(os.getcwd(), "data/reddit"))
-        data = dataset[0]
-    elif args.dataset == "ogbn-arxiv":
-        dataset = PygNodePropPredDataset(
-            name="ogbn-arxiv", root=os.path.join(os.getcwd(), "data")
-        )
-        split_idx = dataset.get_idx_split()
-        data = dataset[0]
-    else:
-        raise ValueError(
-            f"Dataset {args.dataset} not recognized. Choose from 'cora', 'pubmed', 'citeseer', 'reddit', or 'ogbn-arxiv'."
-        )
+    # Define dimensions
+    in_channels = dataset.num_features
+    hidden_channels = 128
+    out_channels = dataset.num_classes
 
     # Initialize model
     device = torch.device("cpu")
-    model = GCN(dataset.num_features, dataset.num_classes).to(device)
+    model = GCN(in_channels, hidden_channels, out_channels).to(device)
 
     if args.mode.lower() == "train":
         train(model, data, device, args.dataset, split_idx)

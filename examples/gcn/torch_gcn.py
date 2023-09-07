@@ -7,13 +7,27 @@ import torch.nn.functional as F
 import torch_geometric.datasets as datasets
 from torch_geometric.transforms import ToSparseTensor
 
+args_dict = {}
+
 
 class GraphConvolution(nn.Module):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_channels, out_channels):
         super(GraphConvolution, self).__init__()
-        self.linear = nn.Linear(in_features, out_features)
+        self.linear = nn.Linear(in_channels, out_channels)
 
     def forward(self, x, adjacency):
+        if not args_dict["sparse"]:
+            # Print sparsity level
+            x_nnz = torch.count_nonzero(x)
+            x_sparsity = 1 - x_nnz.item() / (x.shape[0] * x.shape[1])
+            print(f"\nx Sparsity: {x_sparsity * 100:.2f}%")
+
+            adj_nnz = torch.count_nonzero(adjacency)
+            adj_sparsity = 1 - adj_nnz.item() / (
+                adjacency.shape[0] * adjacency.shape[1]
+            )
+            print(f"Adjacency Sparsity: {adj_sparsity * 100:.2f}%")
+
         start_time = time.perf_counter()
         out = torch.matmul(adjacency, x)
         end_time = time.perf_counter()
@@ -30,16 +44,6 @@ class CustomGCN(nn.Module):
         self.conv2 = GraphConvolution(hidden_channels, out_channels)
 
     def forward(self, x, adjacency):
-        # Print sparsity level
-        x_nnz = torch.count_nonzero(x)
-        adj_nnz = torch.count_nonzero(adjacency)
-
-        x_sparsity = 1 - x_nnz.item() / (x.shape[0] * x.shape[1])
-        adj_sparsity = 1 - adj_nnz.item() / (adjacency.shape[0] * adjacency.shape[1])
-
-        print(f"\nx Sparsity: {x_sparsity * 100:.2f}%")
-        print(f"Adjacency Sparsity: {adj_sparsity * 100:.2f}%")
-
         start_time = time.perf_counter()
         x = self.conv1(x, adjacency)
         end_time = time.perf_counter()
@@ -91,8 +95,13 @@ def inference(model, data, device, dataset_name):
     model.load_state_dict(new_state_dict)
     model.eval()
 
-    x = data.x.clone().detach().to(torch.float)
-    adjacency = data.adj_t.to_dense().clone().detach().to(torch.float)
+    x = data.x.clone().detach().to(torch.float).to(device)
+    adjacency = data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
+
+    # Convert adjacency matrix to a PyTorch sparse tensor
+    if args_dict["sparse"]:
+        # x = x.to_sparse_csr()
+        adjacency = adjacency.to_sparse_csr()
 
     # Perform inference and measure time
     start_time = time.perf_counter()
@@ -119,21 +128,31 @@ def main():
         default="cora",
         help='Dataset to use. Options are "cora", "pubmed", "citeseer", or "reddit".',
     )
+    parser.add_argument(
+        "--sparse",
+        action="store_true",
+        default=False,
+        help="Use sparse adjacency matrix.",
+    )
+
     args = parser.parse_args()
 
     # Convert dataset to lowercase
     args.dataset = args.dataset.lower()
 
+    global args_dict
+    args_dict = vars(args)
+
     # Load dataset
     dataset = load_dataset(args.dataset)
     data = dataset[0]
 
-    # Define the dimensions
+    # Define dimensions
     in_channels = dataset.num_features
-    hidden_channels = 128  # This should match the hidden dimension used in pyg_gcn.py
+    hidden_channels = 128
     out_channels = dataset.num_classes
 
-    # Initialize the CustomGCN model
+    # Initialize model
     model = CustomGCN(in_channels, hidden_channels, out_channels)
 
     device = torch.device("cpu")
