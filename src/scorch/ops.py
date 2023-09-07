@@ -414,9 +414,12 @@ def einsum(
 def precompile_kernels():
     DS = Tensor(index=TensorIndex(tensor_format="ds"))
     DD = Tensor(index=TensorIndex(tensor_format="dd"))
+    OO = Tensor(index=TensorIndex(tensor_format="oo"))
 
     einsum("ik,kj->ij", DS, DD, compile_only=True, format="dd")
-    einsum("ik,kj->ij", DS, DS, compile_only=True, format="ds")
+    einsum("ik,kj->ij", OO, DD, compile_only=True, format="dd")
+    einsum("ik,kj->ij", OO, DS, compile_only=True, format="dd")
     einsum("ik,kj->ij", DS, DS, compile_only=True, format="dd")
+    einsum("ik,kj->ij", DS, DS, compile_only=True, format="ds")
 
     print("Precompiled kernels.")
