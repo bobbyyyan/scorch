@@ -7,7 +7,43 @@ import torch.nn.functional as F
 
 from utils import load_dataset, modify_state_dict_pyg_to_torch
 
+from torch_scatter import scatter_add
+
 args_dict = {}
+
+
+class GCNConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(GCNConv, self).__init__()
+        self.linear = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        x = self.linear(x)
+
+        node_dim = 0
+
+        src_nodes = edge_index[0]  # source nodes
+        source_node_feats = x.index_select(node_dim, src_nodes)  # source node features
+
+        # Scatter source node features to destination nodes
+        dest_nodes = edge_index[1]
+        out = scatter_add(source_node_feats, dest_nodes, dim=0, dim_size=x.size(0))
+
+        return out
+
+
+class GCN(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+
+        return x
 
 
 class GraphConvolution(nn.Module):
@@ -24,7 +60,7 @@ class GraphConvolution(nn.Module):
 
             adj_nnz = torch.count_nonzero(adjacency)
             adj_sparsity = 1 - adj_nnz.item() / (
-                adjacency.shape[0] * adjacency.shape[1]
+                    adjacency.shape[0] * adjacency.shape[1]
             )
             print(f"Adjacency Sparsity: {adj_sparsity * 100:.2f}%")
 
@@ -60,7 +96,7 @@ class CustomGCN(nn.Module):
         return F.log_softmax(x, dim=1)
 
 
-def inference(model, data, device, dataset_name):
+def inference(model, data, device, dataset_name, split_idx=None):
     # Load weights and prepare for inference
     state_dict = torch.load(f"weights/gcn_{dataset_name.lower()}_weights.pth")
     new_state_dict = modify_state_dict_pyg_to_torch(state_dict)
@@ -68,12 +104,34 @@ def inference(model, data, device, dataset_name):
     model.eval()
 
     x = data.x.clone().detach().to(torch.float).to(device)
-    adjacency = data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
 
-    # Convert adjacency matrix to a PyTorch sparse tensor
-    if args_dict["sparse"]:
-        # x = x.to_sparse_csr()
-        adjacency = adjacency.to_sparse_csr()
+    # Create mask for test data
+    if split_idx and dataset_name in ["ogbn-arxiv"]:
+        test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        test_mask[split_idx["test"]] = True
+    else:
+        test_mask = data.test_mask
+
+    adjacency = None
+    if args_dict["gather"]:
+        adjacency = data.edge_index
+    else:
+        if hasattr(data, "adj_t"):
+            adjacency = (
+                data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
+            )
+
+            # Convert adjacency matrix to a PyTorch sparse tensor
+            if args_dict["sparse"]:
+                # x = x.to_sparse_csr()
+                adjacency = adjacency.to_sparse_csr()
+        else:
+
+            adjacency = torch.sparse_coo_tensor(
+                indices=data.edge_index,
+                values=torch.ones(data.edge_index.shape[1]),
+                size=(data.num_nodes, data.num_nodes),
+            )
 
     # Perform inference and measure time
     start_time = time.perf_counter()
@@ -85,8 +143,8 @@ def inference(model, data, device, dataset_name):
     inference_time = time.perf_counter() - start_time
 
     # Calculate accuracy
-    correct = float((pred[data.test_mask] == data.y[data.test_mask]).sum().item())
-    accuracy = correct / data.test_mask.sum().item()
+    correct = float((pred[test_mask] == data.y[test_mask]).sum().item())
+    accuracy = correct / test_mask.sum().item()
 
     print(f"\nInference time: {inference_time:.6f} seconds")
     print(f"Accuracy: {accuracy:.4f}")
@@ -106,6 +164,14 @@ def main():
         default=False,
         help="Use sparse adjacency matrix.",
     )
+    # Add argument to use gather-scatter implementation
+    parser.add_argument(
+        "--gather",
+        dest="gather",
+        action="store_true",
+        default=False,
+        help="Use gather-scatter implementation.",
+    )
 
     args = parser.parse_args()
 
@@ -116,7 +182,16 @@ def main():
     args_dict = vars(args)
 
     # Load dataset
-    dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
+    if args.gather:
+        dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=False)
+    else:
+        if args.dataset in ["ogbn-arxiv"]:
+            if args_dict["sparse"]:
+                dataset, split_idx = load_dataset(args.dataset)
+            else:
+                dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
+        else:
+            dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
     data = dataset[0]
 
     # Define dimensions
@@ -125,12 +200,15 @@ def main():
     out_channels = dataset.num_classes
 
     # Initialize model
-    model = CustomGCN(in_channels, hidden_channels, out_channels)
+    if args.gather:
+        model = GCN(in_channels, hidden_channels, out_channels)
+    else:
+        model = CustomGCN(in_channels, hidden_channels, out_channels)
 
     device = torch.device("cpu")
 
     # Inference
-    inference(model, data, device, args.dataset)
+    inference(model, data, device, args.dataset, split_idx)
 
 
 if __name__ == "__main__":
