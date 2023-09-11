@@ -39,41 +39,59 @@ class CustomGCN(nn.Module):
         self.conv2 = GraphConvolution(hidden_channels, out_channels)
 
     def forward(self, x, adjacency):
+        start_time = time.perf_counter()
         x = self.conv1(x, adjacency)
+        end_time = time.perf_counter()
+        print(f"self.conv1(x, adjacency) took {end_time - start_time} s")
+
         x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
+
+        start_time = time.perf_counter()
         x = self.conv2(x, adjacency)
+        end_time = time.perf_counter()
+        print(f"self.conv2(x, adjacency) took {end_time - start_time} s")
+
         return F.log_softmax(x, dim=1)
 
 
-def inference(model, data, device, dataset_name):
+def inference(model, data, device, dataset_name, split_idx=None):
     # Load weights and prepare for inference
     state_dict = torch.load(f"weights/gcn_{dataset_name.lower()}_weights.pth")
     new_state_dict = modify_state_dict_pyg_to_torch(state_dict)
     model.load_state_dict(new_state_dict)
     model.eval()
 
-    x = data.x.clone().detach().to(torch.float)
+    x = data.x.clone().detach().to(torch.float).to(device)
     start_time = time.perf_counter()
     x = scorch.from_torch(x)
-    x = x.to_sparse("ds")
+    # x = x.to_sparse("ds")
     end_time = time.perf_counter()
     print(
-        f"scorch.Tensor.from_torch(x, 'x').to_sparse('ds') took {end_time - start_time} s"
+        f"scorch.from_torch(x) took {end_time - start_time} s"
     )
 
     start_time = time.perf_counter()
-    adjacency = data.adj_t.to_dense().clone().detach().to(torch.float)
-    adjacency = scorch.from_torch(adjacency)
-    adjacency = adjacency.to_sparse("ds")
 
-    # adjacency = scorch.from_coo(
-    #     indices=data.edge_index.T,
-    #     values=torch.ones(data.edge_index.shape[1]),
-    #     shape=(data.num_nodes, data.num_nodes),
-    # )
+    if hasattr(data, "adj_t"):
+        adjacency = data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
+        adjacency = scorch.from_torch(adjacency)
+        adjacency = adjacency.to_sparse("ds")
+    else:
+        adjacency = scorch.from_coo(
+            indices=data.edge_index.T,
+            values=torch.ones(data.edge_index.shape[1]),
+            shape=(data.num_nodes, data.num_nodes),
+        )
     end_time = time.perf_counter()
     print(f"Adj matrix construction took {end_time - start_time} s")
+
+    # Create mask for test data
+    if split_idx and dataset_name in ["ogbn-arxiv"]:
+        test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        test_mask[split_idx["test"]] = True
+    else:
+        test_mask = data.test_mask
 
     # Perform inference and measure time
     start_time = time.perf_counter()
@@ -85,8 +103,8 @@ def inference(model, data, device, dataset_name):
     inference_time = time.perf_counter() - start_time
 
     # Calculate accuracy
-    correct = float((pred[data.test_mask] == data.y[data.test_mask]).sum().item())
-    accuracy = correct / data.test_mask.sum().item()
+    correct = float((pred[test_mask] == data.y[test_mask]).sum().item())
+    accuracy = correct / test_mask.sum().item()
 
     print(f"\nInference time: {inference_time:.6f} seconds")
     print(f"Accuracy: {accuracy:.4f}")
@@ -106,7 +124,10 @@ def main():
     args.dataset = args.dataset.lower()
 
     # Load dataset
-    dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
+    if args.dataset in ["ogbn-arxiv"]:
+        dataset, split_idx = load_dataset(args.dataset)
+    else:
+        dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
     data = dataset[0]
 
     # Define the dimensions
@@ -119,7 +140,7 @@ def main():
     model = CustomGCN(in_channels, hidden_channels, out_channels).to(device)
 
     # Inference
-    inference(model, data, device, args.dataset)
+    inference(model, data, device, args.dataset, split_idx)
 
 
 if __name__ == "__main__":

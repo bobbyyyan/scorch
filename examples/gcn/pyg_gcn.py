@@ -3,13 +3,72 @@ import time
 
 import torch
 import torch.nn.functional as F
+from torch.nn import Linear, Parameter
+from torch_geometric.nn import MessagePassing
+
 from torch_geometric.nn import GCNConv
+from torch_geometric.utils import add_self_loops, degree
 from tqdm import tqdm
 
 from utils import load_dataset
 
 
-# Define GCN model
+class GCNConv(MessagePassing):
+    def __init__(
+        self, in_channels, out_channels, normalize=False, add_self_loops=False
+    ):
+        super().__init__(aggr="add")  # "Add" aggregation (Step 5).
+        self.lin = Linear(in_channels, out_channels, bias=False)
+        self.bias = Parameter(torch.empty(out_channels))
+        self.normalize = normalize
+        self.add_self_loops = add_self_loops
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin.reset_parameters()
+        self.bias.data.zero_()
+
+    def forward(self, x, edge_index):
+        # x has shape [N, in_channels]
+        # edge_index has shape [2, E]
+
+        # Step 1: Add self-loops to the adjacency matrix.
+        if self.add_self_loops:
+            edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+
+        # Step 2: Linearly transform node feature matrix.
+        x = self.lin(x)
+
+        # Step 3: Compute normalization.
+        norm = None
+        if self.normalize:
+            row, col = edge_index
+            deg = degree(col, x.size(0), dtype=x.dtype)
+            deg_inv_sqrt = deg.pow(-0.5)
+            deg_inv_sqrt[deg_inv_sqrt == float("inf")] = 0
+            norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+
+        # Step 4-5: Start propagating messages.
+        out = self.propagate(edge_index, x=x, norm=norm)
+
+        # Step 6: Apply a final bias vector.
+        out += self.bias
+
+        return out
+
+    def message(self, x_j, norm=None):
+        # x_j has shape [E, out_channels]
+
+        # Step 4: Normalize node features.
+        if norm is not None:
+            return norm.view(-1, 1) * x_j
+        else:
+            return x_j
+
+        # Define GCN model
+
+
 class GCN(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super(GCN, self).__init__()
@@ -62,7 +121,7 @@ def inference(model, data, device, dataset_name, split_idx=None):
     model.eval()
 
     # Create mask for test data
-    if dataset_name == "ogbn-arxiv":
+    if split_idx and dataset_name in ["ogbn-arxiv"]:
         test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
         test_mask[split_idx["test"]] = True
     else:
