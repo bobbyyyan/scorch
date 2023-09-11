@@ -25,7 +25,9 @@ def load_dataset(dataset_name, to_sparse_tensor=False):
         )
     elif dataset_name == "ogbn-arxiv":
         dataset = PygNodePropPredDataset(
-            name="ogbn-arxiv", root=os.path.join(os.getcwd(), "data")
+            name="ogbn-arxiv",
+            root=os.path.join(os.getcwd(), "data"),
+            transform=transform,
         )
         split_idx = dataset.get_idx_split()
     else:
