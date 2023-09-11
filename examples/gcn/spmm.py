@@ -45,7 +45,6 @@ dim_n = dim_m
 dim_k = dim_m
 
 if __name__ == "__main__":
-
     scorch_times = []
     torch_times = []
 
@@ -82,4 +81,7 @@ if __name__ == "__main__":
 
     print("Scorch times: \n", scorch_times)
     print("PyTorch times: \n", torch_times)
-    print("PyTorch/Scorch: \n", [torch_times[i] / scorch_times[i] for i in range(len(scorch_times))])
+    print(
+        "PyTorch/Scorch: \n",
+        [torch_times[i] / scorch_times[i] for i in range(len(scorch_times))],
+    )

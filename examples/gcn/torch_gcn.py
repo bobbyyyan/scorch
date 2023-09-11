@@ -68,7 +68,7 @@ class GraphConvolution(nn.Module):
 
             adj_nnz = torch.count_nonzero(adjacency)
             adj_sparsity = 1 - adj_nnz.item() / (
-                    adjacency.shape[0] * adjacency.shape[1]
+                adjacency.shape[0] * adjacency.shape[1]
             )
             print(f"Adjacency Sparsity: {adj_sparsity * 100:.2f}%")
 
@@ -134,7 +134,6 @@ def inference(model, data, device, dataset_name, split_idx=None):
                 # x = x.to_sparse_csr()
                 adjacency = adjacency.to_sparse_csr()
         else:
-
             adjacency = torch.sparse_coo_tensor(
                 indices=data.edge_index,
                 values=torch.ones(data.edge_index.shape[1]),

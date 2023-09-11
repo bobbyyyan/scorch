@@ -67,9 +67,7 @@ def inference(model, data, device, dataset_name, split_idx=None):
     x = scorch.from_torch(x)
     # x = x.to_sparse("ds")
     end_time = time.perf_counter()
-    print(
-        f"scorch.from_torch(x) took {end_time - start_time} s"
-    )
+    print(f"scorch.from_torch(x) took {end_time - start_time} s")
 
     start_time = time.perf_counter()
 
