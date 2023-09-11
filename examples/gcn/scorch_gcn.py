@@ -77,7 +77,7 @@ def inference(model, data, device, dataset_name, split_idx=None):
         adjacency = adjacency.to_sparse("ds")
     else:
         adjacency = scorch.from_coo(
-            indices=data.edge_index.T,
+            indices=data.edge_index,
             values=torch.ones(data.edge_index.shape[1]),
             shape=(data.num_nodes, data.num_nodes),
         )

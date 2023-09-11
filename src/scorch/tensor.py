@@ -76,6 +76,10 @@ class Tensor(torch.nn.Module):
         # TODO: Implement this.
         pass
 
+    def _nnz(self):
+        """Get the number of non-zero elements in the tensor."""
+        return self.values.numel()
+
     @property
     def has_index(self) -> bool:
         """Return whether the tensor has an index."""
@@ -267,7 +271,7 @@ class Tensor(torch.nn.Module):
 
         mode_indices = []
         for i in range(len(shape)):
-            mode_indices.append([indices[:, i]])
+            mode_indices.append([indices[i]])
 
         tt_tensor = Tensor(
             name=name,
@@ -317,10 +321,10 @@ class Tensor(torch.nn.Module):
 
         return tt_tensor
 
-    def to_torch(self) -> torch.Tensor:
+    def to_torch(self, in_place=True) -> torch.Tensor:
         """Convert a Scorch Tensor to a torch.Tensor."""
         # Get a dense Scorch tensor
-        dense_tensor = self.to_dense(in_place=True)
+        dense_tensor = self.to_dense(in_place=in_place)
         # Convert the dense Scorch tensor to a torch.Tensor
         # torch_tensor = dense_tensor.storage.value.clone().detach()
         torch_tensor = dense_tensor.storage.value
@@ -511,6 +515,8 @@ class Tensor(torch.nn.Module):
             A = TensorVar(
                 name="A",
                 fmt=output_format,
+                shape=self.shape,
+                dtype=self.dtype,
             )
 
             # Assert A, B, and index_vars are defined

@@ -269,7 +269,7 @@ def einsum(
                 output_level_formats[i - 1] = LevelFormat(LevelType.DENSE)
 
         output_format = TensorFormat(output_level_formats)
-        print(f"\nUnspecified output format, using inferred {output_format}")
+        # print(f"\nUnspecified output format, using inferred {output_format}")
     else:
         output_format = parse_format(output_format)
 
@@ -309,7 +309,7 @@ def einsum(
     # print("cin_stmt:", cin_stmt)
 
     if str(cin_stmt) in _kernel_cache:
-        print(f"Using cached kernel for {cin_stmt}")
+        # print(f"Using cached kernel for {cin_stmt}")
         module = _kernel_cache[str(cin_stmt)]
     else:
         lowerer = CINLowerer()
@@ -364,7 +364,7 @@ def einsum(
 
         _kernel_cache[str(cin_stmt)] = module
 
-        print(f"Cached kernel for {cin_stmt}")
+        # print(f"Cached kernel for {cin_stmt}")
 
     if compile_only:
         return None
@@ -422,4 +422,4 @@ def precompile_kernels():
     einsum("ik,kj->ij", DS, DS, compile_only=True, format="dd")
     einsum("ik,kj->ij", DS, DS, compile_only=True, format="ds")
 
-    print("Precompiled kernels.")
+    print("Precompiled kernels.\n")
