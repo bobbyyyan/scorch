@@ -135,7 +135,6 @@ def test_2d_oo_dd():
     assert len(matrix.index.mode_indices) == 2
 
     assert matrix.index.mode_indices[0][0].tolist() == [0, 1, 2, 3, 4]
-
     assert matrix.index.mode_indices[1][0].tolist() == [0, 1, 2, 3, 4]
 
     assert matrix.values.tolist() == [1, 2, 3, 4, 5]
@@ -143,7 +142,7 @@ def test_2d_oo_dd():
 
 def test_2d_dd_ds():
     # Test converting a CSR matrix to a dense matrix
-    matrix = Tensor(
+    coo_matrix = Tensor(
         shape=(5, 5),
         index=TensorIndex(
             tensor_format="oo",
@@ -154,9 +153,14 @@ def test_2d_dd_ds():
         ),
         value=torch.tensor([1, 2, 3, 4, 0, 5]),
     )
-    csr_matrix = matrix.to_sparse("ds")
 
-    dense_matrix = csr_matrix.to_torch(in_place=False)
+    dense_from_coo = coo_matrix.to_torch(in_place=False)
+
+    csr_matrix = coo_matrix.to_sparse("ds")
+
+    dense_from_csr = csr_matrix.to_torch(in_place=False)
+
+    assert torch.allclose(dense_from_coo, dense_from_csr)
 
 
 def test_2d_dd_oo():
