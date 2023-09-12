@@ -359,6 +359,7 @@ class Tensor(torch.nn.Module):
             B = TensorVar(
                 name="B",
                 fmt=self.format,
+                dtype=self.dtype,
             )
         else:
             B = TensorVar(
@@ -369,6 +370,7 @@ class Tensor(torch.nn.Module):
                         for _ in range(len(self.shape))
                     ]
                 ),
+                dtype=self.dtype,
             )
 
         if fmt is None:
@@ -385,6 +387,7 @@ class Tensor(torch.nn.Module):
         A = TensorVar(
             name="A",
             fmt=output_format,
+            dtype=self.dtype,
         )
 
         # Assert A, B, and index_vars are defined

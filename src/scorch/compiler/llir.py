@@ -118,6 +118,7 @@ class DataType(Enum):
     TACO_TENSOR = "Tensor"
     NO_TYPE = "NO_TYPE"
     CVECTOR_INT = "cvector<int>"
+    CVECTOR_INT64 = "cvector<int64_t>"
     CVECTOR_FLOAT32 = "cvector<float>"
     CVECTOR_TORCH_FLOAT32 = "cvector<torch::kFloat32>"
 
