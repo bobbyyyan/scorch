@@ -117,7 +117,7 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn')  # Set start method to 'spawn'
+    multiprocessing.set_start_method("spawn")  # Set start method to 'spawn'
     p = multiprocessing.Process(target=main)  # Create a Process object
     p.start()  # Start the process
     p.join()  # Wait for the process to complete
