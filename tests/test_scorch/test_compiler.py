@@ -963,6 +963,65 @@ def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_spmm_ds_ds_dd_ikj_gustavson_workspace():
+    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:dd -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt="ds")
+    B = TensorVar("B", fmt="ds")
+    C = TensorVar("C", fmt="dd")
+
+    workspace = Workspace(
+        name="wksp",
+        dim=1,
+    )
+
+    # A[i, j] = ForAll(i,
+    #   Where(
+    #     producer=ForAll(k, ForAll(j, workspace[j] += B[i, k] * C[k, j])),
+    #     consumer=ForAll(j, A[i, j] = workspace[j])
+    #   )
+    # )
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        B[i, k] * C[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    A[i, j],
+                    workspace[j],
+                ),
+            ),
+        ),
+    )
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
     i = IndexVar("i")
     j = IndexVar("j")

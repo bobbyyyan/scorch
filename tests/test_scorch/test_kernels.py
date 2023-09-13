@@ -882,7 +882,7 @@ def test_matmul_wksp_ds_time():
     assert torch.allclose(torch_result, scorch_result.to_torch())
 
 
-def todo_test_spmm_ds_ds_dd_time():
+def test_spmm_ds_ds_dd_time():
     """
     Compare speed of torch and scorch matmul
     Use random tensors
@@ -903,14 +903,21 @@ def todo_test_spmm_ds_ds_dd_time():
     tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("ds")
     tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
 
+    time_dict = {}
     start_time = time.time()
-    scorch_result = matmul(tensor_a_scorch, tensor_b_scorch, format="ds")
-    scorch_time = time.time() - start_time
+    scorch_result = matmul_wksp(
+        tensor_a_scorch, tensor_b_scorch, format="ds", time_dict=time_dict
+    )
+    scorch_total_time = time.time() - start_time
+    scorch_eval_time = time_dict["eval_time"]
+
+    # Assert that the results are the same
+    assert torch.allclose(torch_result, scorch_result.to_torch())
 
     print(f"torch time: {torch_time}")
-    print(f"scorch time: {scorch_time}")
-    print(f"scorch time / torch time: {scorch_time / torch_time}")
-    assert torch.allclose(torch_result, scorch_result.to_torch())
+    print(f"scorch total time: {scorch_total_time}")
+    print(f"scorch eval time: {scorch_eval_time}")
+    print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
 
 
 def test_spmv_d_ds_d_time():
