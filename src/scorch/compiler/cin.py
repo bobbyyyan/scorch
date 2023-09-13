@@ -351,6 +351,18 @@ class TensorAccess(IndexExpr):
     def level_type_of_index_var(self, index: IndexVar) -> LevelType:
         return self.tensor.get_level_types()[self.level_of_index_var(index)]
 
+    def parent_level_type_of_index_var(self, index: IndexVar) -> Optional[LevelType]:
+        parent_index = self.get_parent_index_var(index)
+        if parent_index is None:
+            return None
+        return self.level_type_of_index_var(parent_index)
+
+    def child_level_type_of_index_var(self, index: IndexVar) -> Optional[LevelType]:
+        index_level = self.level_of_index_var(index)
+        if index_level == self.tensor.levels - 1:
+            return None
+        return self.tensor.get_level_types()[index_level + 1]
+
     def level_types(self) -> List[LevelType]:
         return self.tensor.get_level_types()
 

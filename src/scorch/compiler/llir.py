@@ -433,7 +433,7 @@ class ForLoop(Stmt):
 
     def __init__(
         self,
-        init: Union[VarInit, VarDecl],
+        init: Optional[Union[VarInit, VarDecl]],
         cond: Expr,
         update: Union[Increment, VarInit, FunctionCall],
         body: List[Stmt],

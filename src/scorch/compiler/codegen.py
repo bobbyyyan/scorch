@@ -96,9 +96,11 @@ class LLIRLowerer:
             )
 
         elif isinstance(ir, llir.ForLoop):
+            init_lowered = self.lower_llir(ir.init) if ir.init is not None else ";"
+
             return (
                 self.lower_llir(
-                    f"for ({self.lower_llir(ir.init)} {self.lower_llir(ir.cond)}; {self.lower_llir(ir.update, no_semicolon=True)}) {{",
+                    f"for ({init_lowered} {self.lower_llir(ir.cond)}; {self.lower_llir(ir.update, no_semicolon=True)}) {{",
                     indent_level,
                 )
                 + "\n"

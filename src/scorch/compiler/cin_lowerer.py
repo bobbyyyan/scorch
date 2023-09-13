@@ -625,19 +625,45 @@ class CINLowerer:
                     assembled_pos_array = True
 
             if not assembled_pos_array:
+                # e.g. A1_pos[pA1] = A1_crd.size()
+                # assembly_stmts.append(
+                #     llir.Assign(
+                #         var=llir.Var(
+                #             name=f"{result_tensor_name}{level}_pos[p{result_tensor_name}{level}]",
+                #             type=llir.DataType.INT,
+                #         ),
+                #         value=llir.FunctionCall(
+                #             name=f"{result_tensor_name}{level}_crd.size",
+                #             args=[],
+                #         ),
+                #     )
+                # )
+                # e.g. A1_pos[A1_pos_index + 1] = A1_crd.size()
                 assembly_stmts.append(
-                    # e.g. A1_pos.push_back(pA1))
-                    llir.FunctionCallStmt(
-                        name=f"{result_tensor_name}{level}_pos.push_back",
-                        args=[
-                            llir.Var(
-                                name=f"{result_tensor_name}{level}_crd.size()",
-                                # name=f"p{result_tensor_var.name}{_level}",
-                                type=llir.DataType.INT,
-                            )
-                        ],
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level}_pos_index + 1]",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.FunctionCall(
+                            name=f"{result_tensor_name}{level}_crd.size",
+                            args=[],
+                        ),
                     )
                 )
+                # assembly_stmts.append(
+                #     # e.g. A1_pos.push_back(pA1))
+                #     llir.FunctionCallStmt(
+                #         name=f"{result_tensor_name}{level}_pos.push_back",
+                #         args=[
+                #             llir.Var(
+                #                 name=f"{result_tensor_name}{level}_crd.size()",
+                #                 # name=f"p{result_tensor_var.name}{_level}",
+                #                 type=llir.DataType.INT,
+                #             )
+                #         ],
+                #     )
+                # )
 
         return [
             llir.Comment("Lower consumer CIN"),
@@ -783,13 +809,14 @@ class CINLowerer:
                     )
                 )
 
-            for i, level_type in enumerate(result_tensor_var.get_level_types()):
+            result_level_types = result_tensor_var.get_level_types()
+            for i, level_type in enumerate(result_level_types):
                 if level_type == LevelType.COMPRESSED:
                     # e.g. cvector<int> a0_pos;
                     result_level_indices_init_stmts.append(
                         llir.VarDecl(
                             llir.Var(
-                                name=f"{result_tensor_var.get_name()}{i}_pos",
+                                name=f"{result_name}{i}_pos",
                                 type=llir.DataType.CVECTOR_INT,
                             )
                         )
@@ -799,7 +826,7 @@ class CINLowerer:
                     result_level_indices_init_stmts.append(
                         llir.VarDecl(
                             llir.Var(
-                                name=f"{result_tensor_var.get_name()}{i}_crd",
+                                name=f"{result_name}{i}_crd",
                                 type=llir.DataType.CVECTOR_INT,
                             )
                         )
@@ -809,7 +836,7 @@ class CINLowerer:
                     result_level_indices_init_stmts.append(
                         llir.Assign(
                             var=llir.Var(
-                                name=f"{result_tensor_var.get_name()}{i}_pos[0]",
+                                name=f"{result_name}{i}_pos[0]",
                                 type=llir.DataType.INT,
                             ),
                             value=llir.Literal(0),
@@ -820,7 +847,18 @@ class CINLowerer:
                     result_level_indices_init_stmts.append(
                         llir.VarInit(
                             llir.Var(
-                                name=f"p{result_tensor_var.get_name()}{i}",
+                                name=f"p{result_name}{i}",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Literal(0),
+                        )
+                    )
+
+                    # e.g. int a0_pos_index = 0;
+                    result_level_indices_init_stmts.append(
+                        llir.VarInit(
+                            llir.Var(
+                                name=f"{result_name}{i}_pos_index",
                                 type=llir.DataType.INT,
                             ),
                             value=llir.Literal(0),
@@ -829,12 +867,53 @@ class CINLowerer:
 
                     result_level_indices_init_stmts.append(llir.BlankLine())
 
+                    # TODO: If parent level of this level is dense, then we also add
+                    # a for loop to initialize the pos array to all zeros from the 2nd
+                    # element to the last element
+                    # e.g. for (int p<tensor_name><i> = 1; p<tensor_name><i> < <tensor_name><i-1>_size + 1; p<tensor_name><i>++) {
+                    # e.g.     <tensor_name><i>_pos[p<tensor_name><i>] = 0;
+                    # e.g. }
+                    if i > 0 and result_level_types[i - 1] == LevelType.DENSE:
+                        loop_var_name = f"p{result_name}{i}"
+                        loop_var = llir.Var(
+                            name=loop_var_name,
+                            type=llir.DataType.INT,
+                        )
+                        loop = llir.ForLoop(
+                            init=llir.VarInit(
+                                var=loop_var,
+                                value=llir.Literal(1),
+                            ),
+                            cond=llir.BinOp(
+                                left=loop_var,
+                                op="<=",
+                                right=llir.Var(
+                                    name=f"{result_name}{i - 1}_size",
+                                    type=llir.DataType.INT,
+                                ),
+                            ),
+                            update=llir.Increment(
+                                var=loop_var,
+                            ),
+                            body=[
+                                llir.Assign(
+                                    var=llir.Var(
+                                        name=f"{result_name}{i}_pos[{loop_var_name}]",
+                                        type=llir.DataType.INT,
+                                    ),
+                                    value=llir.Literal(0),
+                                )
+                            ],
+                        )
+
+                        result_level_indices_init_stmts.append(loop)
+
                 elif level_type == LevelType.COORDINATE:
                     # e.g. cvector<int> a0_crd;
                     result_level_indices_init_stmts.append(
                         llir.VarDecl(
                             llir.Var(
-                                name=f"{result_tensor_var.get_name()}{i}_crd",
+                                name=f"{result_name}{i}_crd",
                                 type=llir.DataType.CVECTOR_INT,
                             )
                         )
@@ -844,7 +923,7 @@ class CINLowerer:
                     result_level_indices_init_stmts.append(
                         llir.VarInit(
                             llir.Var(
-                                name=f"p{result_tensor_var.get_name()}{i}",
+                                name=f"p{result_name}{i}",
                                 type=llir.DataType.INT,
                             ),
                             value=llir.Literal(0),

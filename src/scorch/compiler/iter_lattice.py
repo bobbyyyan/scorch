@@ -430,6 +430,58 @@ class LatticePoint:
             )
             stmts.append(llir.BlankLine())
 
+        result_tensor_access = lattice.cin_lowerer.result_tensor_access
+        result_tensor_var = lattice.cin_lowerer.result_tensor_var
+        result_tensor_name = result_tensor_var.name
+        # If the current level is a COMPRESSED level, and the previous level
+        # is a DENSE level for the result tensor access, then we need to
+        # add assembly loop:
+        #   for (; A1_pos_index < i; A1_pos_index++) {
+        #       A1_pos[A1_pos_index + 1] = A1_crd.size();
+        #   }
+        index_var = self.get_index_var()
+        index_var_llir = self.get_index_var_llir()
+
+        if result_tensor_access.has_index_var(index_var):
+            child_level = result_tensor_access.level_of_index_var(index_var) + 1
+            curr_level_type = result_tensor_access.level_type_of_index_var(index_var)
+            child_level_type = result_tensor_access.child_level_type_of_index_var(
+                index_var
+            )
+            if (
+                curr_level_type == LevelType.DENSE
+                and child_level_type == LevelType.COMPRESSED
+            ):
+                stmts.append(llir.Comment("Assemble COMPRESSED level"))
+                pos_index_var_llir = llir.Var(
+                    name=f"{result_tensor_name}{child_level}_pos_index",
+                    type=llir.DataType.INT,
+                )
+                stmts.append(
+                    llir.ForLoop(
+                        init=None,
+                        cond=llir.BinOp(
+                            op="<",
+                            left=pos_index_var_llir,
+                            right=index_var_llir,
+                        ),
+                        update=llir.Increment(var=pos_index_var_llir),
+                        body=[
+                            # A1_pos[A1_pos_index + 1] = A1_crd.size();
+                            llir.Assign(
+                                var=llir.Var(
+                                    name=f"{result_tensor_name}{child_level}_pos[{pos_index_var_llir.name} + 1]",
+                                    type=llir.DataType.INT,
+                                ),
+                                value=llir.FunctionCall(
+                                    name=f"{result_tensor_name}{child_level}_crd.size",
+                                    args=[],
+                                ),
+                            )
+                        ],
+                    )
+                )
+
         coordinate_level_iterator_end_resolution_stmts: List[llir.Stmt] = []
         # e.g. once i is known, we can compute the end of the iterators for the second _level
         #    int pB1_end = pB0;
@@ -437,15 +489,12 @@ class LatticePoint:
         #      pB1_end++;
         #    }
         for it in iterators:
-            assert it._tensor_var is not None, "Iterator tensor var is None"
             # Only do this for coordinate levels
             if it.level_type == LevelType.COORDINATE:
                 # If the next _level is still a valid _level
-                # Assert it._level is an int
-                assert isinstance(it._level, int), "it._level is not an int"
-                if (it._level + 1) < it._tensor_var.levels:
+                if (it.level + 1) < it.tensor_var.levels:
                     next_level_iterator_end_llir = llir.Var(
-                        name=f"p{it._tensor_var.name}{it._level + 1}_end",
+                        name=f"p{it.tensor_var.name}{it.level + 1}_end",
                         type=llir.DataType.INT,
                     )
 
@@ -493,7 +542,7 @@ class LatticePoint:
                                     #     index=next_level_iterator_end_llir,
                                     # ),
                                     left=llir.Var(
-                                        name=f"{it._tensor_var.name}{it._level}_crd[{next_level_iterator_end_llir.name}]",
+                                        name=f"{it.tensor_var.name}{it.level}_crd[{next_level_iterator_end_llir.name}]",
                                         type=llir.DataType.INT,
                                     ),
                                     right=self.get_index_var_llir(),
@@ -842,7 +891,7 @@ class IterationLattice:
                                 ],
                             )
                         )
-                # if previous _level is dense: A1_pos.push_back(A1_crd.size())
+                # If previous _level is dense: A1_pos[A1_pos_index + 1] = A1_crd.size()
                 # TODO: if previous _level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
                 assembled_pos_array = False
                 if level > 0:
@@ -858,11 +907,11 @@ class IterationLattice:
                         stmts.append(
                             llir.Assign(
                                 var=llir.Var(
-                                    name=f"{result_tensor_var.name}{level}_pos[{result_tensor_var.name}{level - 1}_crd.size()]",
+                                    name=f"{result_tensor_name}{level}_pos[{result_tensor_var.name}{level - 1}_crd.size()]",
                                     type=llir.DataType.INT,
                                 ),
                                 value=llir.FunctionCall(
-                                    name=f"{result_tensor_var.name}{level}_crd.size",
+                                    name=f"{result_tensor_name}{level}_crd.size",
                                     args=[],
                                 ),
                             )
@@ -871,16 +920,16 @@ class IterationLattice:
 
                 if not assembled_pos_array:
                     stmts.append(
-                        # e.g. A1_pos.push_back(pA1))
-                        llir.FunctionCallStmt(
-                            name=f"{result_tensor_name}{level}_pos.push_back",
-                            args=[
-                                llir.Var(
-                                    name=f"{result_tensor_name}{level}_crd.size()",
-                                    # name=f"p{result_tensor_var.name}{_level}",
-                                    type=llir.DataType.INT,
-                                )
-                            ],
+                        # e.g. A1_pos[A1_pos_index + 1] = A1_crd.size()
+                        llir.Assign(
+                            var=llir.Var(
+                                name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level}_pos_index + 1]",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.FunctionCall(
+                                name=f"{result_tensor_name}{level}_crd.size",
+                                args=[],
+                            ),
                         )
                     )
 

@@ -68,6 +68,8 @@ class Tensor(torch.nn.Module):
 
         if value is not None:
             self._dtype = value.dtype
+        elif storage and storage.value is not None:
+            self._dtype = storage.value.dtype
 
         self.requires_grad = requires_grad
 
