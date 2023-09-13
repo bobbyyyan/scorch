@@ -40,25 +40,26 @@ def test_2d_ds_oo_random():
 
 
 def test_2d_ds_oo_2():
+    values = torch.tensor(
+        [
+            0.5713,
+            0.4238,
+            0.6953,
+            0.9270,
+            0.1595,
+            0.9325,
+            0.2542,
+            0.6638,
+            0.8833,
+            0.2976,
+            0.8072,
+        ]
+    )
     matrix = Tensor.from_coo(
         indices=torch.tensor(
             [[0, 1, 1, 2, 2, 3, 3, 5, 5, 6, 9], [6, 0, 9, 2, 9, 0, 6, 0, 7, 1, 5]]
         ),
-        values=torch.tensor(
-            [
-                0.5713,
-                0.4238,
-                0.6953,
-                0.9270,
-                0.1595,
-                0.9325,
-                0.2542,
-                0.6638,
-                0.8833,
-                0.2976,
-                0.8072,
-            ]
-        ),
+        values=values,
         shape=(10, 10),
     )
     matrix.to_sparse("ds")
@@ -80,19 +81,7 @@ def test_2d_ds_oo_2():
     ]
     assert matrix.index.mode_indices[1][1].tolist() == [6, 0, 9, 2, 9, 0, 6, 0, 7, 1, 5]
 
-    assert matrix.values.tolist() == [
-        0.5713,
-        0.4238,
-        0.6953,
-        0.9270,
-        0.1595,
-        0.9325,
-        0.2542,
-        0.6638,
-        0.8833,
-        0.2976,
-        0.8072,
-    ]
+    assert torch.allclose(matrix.values, values)
 
 
 def test_2d_ds_oo():

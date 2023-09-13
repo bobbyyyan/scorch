@@ -1103,3 +1103,28 @@ def test_ij_i_j_ss_s_s():
 
     print("\nC++ torch extension code:")
     print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_coo_to_csr():
+    # A[i, j] = B[i, j]
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt="ds")
+    B = TensorVar("B", fmt="oo")
+
+    A[i, j] = B[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
