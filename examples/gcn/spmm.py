@@ -46,9 +46,10 @@ def gen_rand_sparse_coo(dim_m, dim_n, sparsity):
 
 
 def gen_rand_sparse_csr(dim_m, dim_n, sparsity):
-    A = gen_rand_sparse_coo(dim_m, dim_n, sparsity)
+    A, A_torch = gen_rand_sparse_coo(dim_m, dim_n, sparsity)
+    A_torch = A_torch.to_sparse_csr()
     A = A.to_sparse("ds")
-    return A
+    return A, A_torch
 
 
 # Create sparse matrix
@@ -62,13 +63,10 @@ def main():
     torch_times = []
 
     for _ in range(3):
-        A, A_torch = gen_rand_sparse_coo(dim_m, dim_n, 0.99)
+        # A, A_torch = gen_rand_sparse_coo(dim_m, dim_n, 0.99)
+        A, A_torch = gen_rand_sparse_csr(dim_m, dim_n, 0.99)
 
         assert torch.allclose(A.values, A_torch.values().flatten())
-
-        # A = gen_rand_sparse_csr(dim_m, dim_n, 0.99)
-        # A_torch = A.to_torch(in_place=False)
-        # A_torch = A_torch.to_sparse_csr()
 
         B_torch = torch.rand(dim_n, dim_k)
         B = scorch.from_torch(B_torch)
@@ -117,7 +115,8 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn")  # Set start method to 'spawn'
-    p = multiprocessing.Process(target=main)  # Create a Process object
-    p.start()  # Start the process
-    p.join()  # Wait for the process to complete
+    # multiprocessing.set_start_method("spawn")  # Set start method to 'spawn'
+    # p = multiprocessing.Process(target=main)  # Create a Process object
+    # p.start()  # Start the process
+    # p.join()  # Wait for the process to complete
+    main()
