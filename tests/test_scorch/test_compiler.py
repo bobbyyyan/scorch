@@ -750,6 +750,34 @@ def test_elemwise_matrix_add_mul_codegen():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_sddmm_codegen():
+    # taco "A(i, j) = B(i, j) * C(i, k) * D(k, j)" -f=A:ds -f=B:ds -f=C:dd -f=D:dd -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt="ds")
+    B = TensorVar("B", fmt="ds")
+    C = TensorVar("C", fmt="dd")
+    D = TensorVar("D", fmt="dd")
+
+    A[i, j] = B[i, j] * C[i, k] * D[k, j]
+
+    cin_stmt = ForAll(i, ForAll(k, ForAll(j, A._assignment)))
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_spmv_codegen():
     # taco "y(i) = A(i, j) * x(j)" -f=y:d -f=A:ds -f=x:d -print-evaluate
     i = IndexVar("i")
@@ -949,6 +977,33 @@ def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
             ),
         ),
     )
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_spmm_dd_ds_dd_ikj():
+    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:dd -f=B:ds -f=C:dd -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    A = TensorVar("A", fmt="ds")
+    B = TensorVar("B", fmt="ds")
+    C = TensorVar("C", fmt="dd")
+
+    A[i, j] = B[i, k] * C[k, j]
+
+    cin_stmt = ForAll(i, ForAll(k, ForAll(j, A._assignment)))
 
     print("\nCIN statement:")
     print(cin_stmt)
