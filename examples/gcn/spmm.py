@@ -33,8 +33,8 @@ def gen_rand_sparse_coo(dim_m, dim_n, sparsity):
 
     # Indices are already unique, so no need to check for uniqueness again.
 
-    # Create a wksp that concatenates the indices along the second dimension.
-    # Then, sort this wksp along the second dimension.
+    # Create a tensor that concatenates the indices along the second dimension.
+    # Then, sort this tensor along the second dimension.
     # This will effectively sort the indices by row first and then by column.
     indices_flattened = indices[0] * dim_n + indices[1]
     sorted_indices = torch.argsort(indices_flattened)
