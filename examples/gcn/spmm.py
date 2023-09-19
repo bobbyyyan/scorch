@@ -1,8 +1,6 @@
-import gc
 import torch
 import time
 import scorch
-import multiprocessing
 from statistics import mean, stdev
 
 
@@ -16,6 +14,14 @@ def torch_spmm(A, B):
     return torch.sparse.mm(A, B)
 
 
+def scorch_spmv(A, B):
+    return scorch.einsum("ik,k->i", A, B)
+
+
+def torch_spmv(A, B):
+    return torch.matmul(A, B)
+
+
 def gen_rand_sparse_coo(dim_m, dim_n, sparsity):
     """Generate sparse matrix with PyTorch
     sparsity is the percentage of zero elements
@@ -27,8 +33,8 @@ def gen_rand_sparse_coo(dim_m, dim_n, sparsity):
 
     # Indices are already unique, so no need to check for uniqueness again.
 
-    # Create a tensor that concatenates the indices along the second dimension.
-    # Then, sort this tensor along the second dimension.
+    # Create a wksp that concatenates the indices along the second dimension.
+    # Then, sort this wksp along the second dimension.
     # This will effectively sort the indices by row first and then by column.
     indices_flattened = indices[0] * dim_n + indices[1]
     sorted_indices = torch.argsort(indices_flattened)
@@ -52,13 +58,53 @@ def gen_rand_sparse_csr(dim_m, dim_n, sparsity):
     return A, A_torch
 
 
-# Create sparse matrix
-dim_m = 10000
-dim_n = dim_m
-dim_k = dim_m
+def spmv(dim_m=10000, dim_n=10000):
+    scorch_times = []
+    torch_times = []
+
+    for _ in range(3):
+        A, A_torch = gen_rand_sparse_coo(dim_m, dim_n, 0.99)
+        # A, A_torch = gen_rand_sparse_csr(dim_m, dim_n, 0.99)
+
+        assert torch.allclose(A.values, A_torch.values().flatten())
+
+        B_torch = torch.rand(dim_n)
+        B = scorch.from_torch(B_torch)
+
+        # Warm up
+        for _ in range(1):
+            scorch_spmv(A, B)
+
+        # gc.collect()
+
+        start = time.perf_counter()
+        C = scorch_spmv(A, B)
+        end = time.perf_counter()
+        scorch_times.append(end - start)
+
+        # Warm up
+        for _ in range(1):
+            torch_spmv(A_torch, B_torch)
+
+        start = time.perf_counter()
+        C_torch = torch_spmv(A_torch, B_torch)
+        end = time.perf_counter()
+        torch_times.append(end - start)
+
+        assert torch.allclose(C.values, C_torch.values().flatten())
+
+    print(f"Scorch: {mean(scorch_times)} ± {stdev(scorch_times)}")
+    print(f"PyTorch: {mean(torch_times)} ± {stdev(torch_times)}")
+    print("std/mean Scorch: ", stdev(scorch_times) / mean(scorch_times))
+    print("std/mean PyTorch: ", stdev(torch_times) / mean(torch_times))
+    print(
+        "PyTorch/Scorch: \n",
+        [torch_times[i] / scorch_times[i] for i in range(len(scorch_times))],
+    )
+    print("Average PyTorch/Scorch: ", sum(torch_times) / sum(scorch_times))
 
 
-def main():
+def spmm(dim_m=10000, dim_n=10000, dim_k=10000):
     scorch_times = []
     torch_times = []
 
@@ -75,8 +121,6 @@ def main():
         for _ in range(1):
             scorch_spmm(A, B)
 
-        # gc.collect()
-
         start = time.perf_counter()
         C = scorch_spmm(A, B)
         end = time.perf_counter()
@@ -85,8 +129,6 @@ def main():
         # Warm up
         for _ in range(1):
             torch_spmm(A_torch, B_torch)
-
-        # gc.collect()
 
         start = time.perf_counter()
         C_torch = torch_spmm(A_torch, B_torch)
@@ -99,12 +141,8 @@ def main():
     print("A's nnz count: ", A._nnz())
     print(f"A's sparsity level: {100 - A._nnz() / (dim_m * dim_n) * 100:.2f}%")
 
-    print("Scorch times: \n", scorch_times)
-    print("PyTorch times: \n", torch_times)
-    print("Average Scorch time: ", mean(scorch_times))
-    print("Average PyTorch time: ", mean(torch_times))
-    print("std Scorch time: ", stdev(scorch_times))
-    print("std PyTorch time: ", stdev(torch_times))
+    print(f"Scorch: {mean(scorch_times)} ± {stdev(scorch_times)}")
+    print(f"PyTorch: {mean(torch_times)} ± {stdev(torch_times)}")
     print("std/mean Scorch: ", stdev(scorch_times) / mean(scorch_times))
     print("std/mean PyTorch: ", stdev(torch_times) / mean(torch_times))
     print(
@@ -119,4 +157,5 @@ if __name__ == "__main__":
     # p = multiprocessing.Process(target=main)  # Create a Process object
     # p.start()  # Start the process
     # p.join()  # Wait for the process to complete
-    main()
+    spmm()
+    # spmv()
