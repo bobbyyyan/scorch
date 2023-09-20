@@ -1,6 +1,9 @@
 .idea
 .vscode
 playground.ipynb
+plot.ipynb
+demos
+sample-taco-kernels
 
 # Created by https://www.toptal.com/developers/gitignore/api/macos,visualstudiocode,pycharm,python,c++,cuda
 # Edit at https://www.toptal.com/developers/gitignore?templates=macos,visualstudiocode,pycharm,python,c++,cuda
