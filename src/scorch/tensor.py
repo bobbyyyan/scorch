@@ -158,6 +158,10 @@ class Tensor(torch.nn.Module):
         # TODO: Implement this.
         raise NotImplementedError()
 
+    def dim(self):
+        """Get the number of dimensions."""
+        return len(self.shape)
+
     def __add__(self, other) -> Tensor:
         """Add two tensors together."""
         # Perform element-wise addition

@@ -71,7 +71,7 @@ def test_spmv_d_oo_d_time():
     # scorch_result = einsum(
     #     "ij,j->i", tensor_a_scorch, tensor_x_scorch, time_dict=time_dict
     # )
-    scorch_result = spmv(tensor_a_scorch, tensor_x_scorch, time_dict=time_dict)
+    scorch_result = matmul(tensor_a_scorch, tensor_x_scorch, time_dict=time_dict)
     scorch_total_time = time.time() - start_time
     scorch_eval_time = time_dict["eval_time"]
 

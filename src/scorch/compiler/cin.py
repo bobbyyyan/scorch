@@ -60,7 +60,6 @@ class IndexStmt(CIN):
             def visit_TensorAssign(self, node: TensorAssign):
                 self.result_tensor_accesses.append(node.lhs)
 
-
         collector = ResultTensorAccessCollector()
         collector.visit(self)
         # self.accept(collector)

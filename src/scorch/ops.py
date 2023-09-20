@@ -34,9 +34,12 @@ load(
 )
 
 
-def spmv(a: Tensor, b: Tensor,
-         output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
-         **kwargs) -> Tensor:
+def spmv(
+    a: Tensor,
+    b: Tensor,
+    output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
+    **kwargs,
+) -> Tensor:
     if output_format is None:
         output_format = parse_format("d")
     elif not isinstance(output_format, TensorFormat):
@@ -69,7 +72,6 @@ def spmv(a: Tensor, b: Tensor,
             ),
         ),
     )
-
 
     lowerer = CINLowerer()
     lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -122,10 +124,10 @@ def spmv(a: Tensor, b: Tensor,
 
 
 def matmul_wksp(
-        a: Union[torch.Tensor, Tensor],
-        b: Union[torch.Tensor, Tensor],
-        output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
-        **kwargs,
+    a: Union[torch.Tensor, Tensor],
+    b: Union[torch.Tensor, Tensor],
+    output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
+    **kwargs,
 ) -> Tensor:
     if isinstance(a, torch.Tensor):
         a = Tensor.from_torch(a).to_sparse()
@@ -231,9 +233,9 @@ def matmul_wksp(
 
 
 def matmul(
-        a: Union[torch.Tensor, Tensor],
-        b: Union[torch.Tensor, Tensor],
-        **kwargs: Any,
+    a: Union[torch.Tensor, Tensor],
+    b: Union[torch.Tensor, Tensor],
+    **kwargs: Any,
 ) -> Tensor:
     """Perform a matrix multiplication."""
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
@@ -245,16 +247,17 @@ def matmul(
     if isinstance(b, torch.Tensor):
         b = Tensor.from_torch(b)
 
-    result = einsum("ik,kj->ij", a, b, **kwargs)
+    if a.dim() == 2 and b.dim() == 1:
+        return spmv(a, b, **kwargs)
 
-    return result
+    return einsum("ik,kj->ij", a, b, **kwargs)
 
 
 def einsum(
-        expression: str,
-        *tensors: Optional[Union[torch.Tensor, Tensor]],
-        compile_only: Optional[bool] = False,
-        **kwargs: Any,
+    expression: str,
+    *tensors: Optional[Union[torch.Tensor, Tensor]],
+    compile_only: Optional[bool] = False,
+    **kwargs: Any,
 ) -> Tensor:
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
     # elementwise multiplication or "ik,kj->ij" for matrix multiplication
@@ -329,14 +332,14 @@ def einsum(
             level_formats: List[LevelFormat] = index_str_to_level_formats[index_str]
             # If any of them is sparse, then the output level is sparse
             if any(
-                    level_format.get_level_type() == LevelType.COMPRESSED
-                    for level_format in level_formats
+                level_format.get_level_type() == LevelType.COMPRESSED
+                for level_format in level_formats
             ):
                 level_format = LevelFormat(LevelType.COMPRESSED)
             # If any of them is coordinate, then the output level is coordinate format
             elif any(
-                    level_format.get_level_type() == LevelType.COORDINATE
-                    for level_format in level_formats
+                level_format.get_level_type() == LevelType.COORDINATE
+                for level_format in level_formats
             ):
                 level_format = LevelFormat(LevelType.COORDINATE)
 
@@ -350,8 +353,8 @@ def einsum(
         # TODO: unless we are dealing with block tensors
         for i in range(len(output_level_formats) - 1, 0, -1):
             if (
-                    output_level_formats[i].get_level_type() == LevelType.DENSE
-                    and output_level_formats[i - 1].get_level_type() != LevelType.DENSE
+                output_level_formats[i].get_level_type() == LevelType.DENSE
+                and output_level_formats[i - 1].get_level_type() != LevelType.DENSE
             ):
                 output_level_formats[i - 1] = LevelFormat(LevelType.DENSE)
 
