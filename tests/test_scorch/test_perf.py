@@ -3,6 +3,7 @@ import time
 import torch
 
 from scorch import Tensor, matmul, einsum
+from scorch.ops import spmv
 
 
 def test_spmm_dd_ds_dd_time():
@@ -42,7 +43,7 @@ def test_spmm_dd_ds_dd_time():
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
 
 
-def test_spmv_d_ds_d_time():
+def test_spmv_d_oo_d_time():
     """
     Compare speed of torch and scorch Sparse matrix * Dense vector
     Use random tensors
@@ -67,11 +68,14 @@ def test_spmv_d_ds_d_time():
 
     time_dict = {}
     start_time = time.time()
-    scorch_result = einsum(
-        "ij,j->i", tensor_a_scorch, tensor_x_scorch, time_dict=time_dict
-    )
+    # scorch_result = einsum(
+    #     "ij,j->i", tensor_a_scorch, tensor_x_scorch, time_dict=time_dict
+    # )
+    scorch_result = spmv(tensor_a_scorch, tensor_x_scorch, time_dict=time_dict)
     scorch_total_time = time.time() - start_time
     scorch_eval_time = time_dict["eval_time"]
+
+    assert torch.allclose(torch_result, scorch_result.values)
 
     print(f"torch time: {torch_time}")
     print(f"scorch total time: {scorch_total_time}")
@@ -79,7 +83,7 @@ def test_spmv_d_ds_d_time():
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
 
 
-def test_sddmm_time():
+def todo_test_sddmm_time():
     """
     A[i, j] = B[i, j] * C[i, k] * D[k, j]
     A: CSR

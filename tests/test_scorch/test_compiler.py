@@ -787,9 +787,35 @@ def test_spmv_codegen():
     A = TensorVar("A", fmt=["dense", "sparse"])
     x = TensorVar("x", fmt=["dense"])
 
-    y[i] = A[i, j] * x[j]
+    """
+    y[i] = ForAll(i,
+        Where(
+            producer=ForAll(j, workspace[0] = A[i, j] * x[j]),
+            consumer=(y[i] = workspace[0])
+        )
+    )
+    """
 
-    cin_stmt = ForAll(i, ForAll(j, y._assignment))
+    workspace = Workspace(
+        name="wksp",
+        dim=0,
+    )
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                j,
+                TensorAssign(
+                    workspace.get_default_access(), A[i, j] * x[j], op=Operation.ADD
+                ),
+            ),
+            consumer=TensorAssign(
+                y[i],
+                workspace.get_default_access(),
+            ),
+        ),
+    )
 
     print("\nCIN statement:")
     print(cin_stmt)

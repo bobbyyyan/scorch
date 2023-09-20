@@ -177,6 +177,9 @@ class DataType(Enum):
         """
         A custom vector type for C++.
         """
+        # if dimension is 0, then simply return the scalar type
+        if dim == 0:
+            return dtype
         return DataType(f"coo_workspace<{dtype.value}, {dim}>")
 
     @classmethod

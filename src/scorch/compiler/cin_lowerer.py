@@ -18,6 +18,7 @@ from .cin import (
     Workspace,
 )
 from .iter_lattice import IterationLattice
+from .llir import Assign, AssignOp
 from ..format import LevelType
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -180,7 +181,7 @@ class CINLowerer:
 
         return llir.Var(
             name=f"{tensor_access.tensor.name}_val"
-            + f"[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]",
+                 + f"[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]",
             type=llir.DataType.NO_TYPE,
         )
 
@@ -226,76 +227,85 @@ class CINLowerer:
         """
         llir_stmts: List[llir.Stmt] = []
 
+        rhs_llir = self.lower_IndexExpr(stmt.rhs)
+
         # if we are at the bottommost _level, we can emit the compute code
         assert self.result_tensor_access, "result tensor access is None"
-        if (
-            self.result_tensor_access.get_index_vars()[-1]
-            == self.defined_index_vars[-1]
-        ):
-            assert self.result_tensor_var, "result tensor var is None"
-            if self.result_value_array_sparse_index_llir:
-                tensor_access_llir = llir.Var(
-                    name=f"{self.result_tensor_var.get_name()}_values"
-                    + f"[{self.result_value_array_sparse_index_llir.name}]",
-                    type=llir.DataType.NO_TYPE,
-                )
-            else:
-                level = self.result_tensor_access.level_of_index_var(
-                    self.defined_index_vars[-1]
-                )
-                tensor_access_llir = llir.Var(
-                    name=f"{self.result_tensor_var.get_name()}_values"
-                    + f"[p{self.result_tensor_var.get_name()}{level}]",
-                    type=llir.DataType.NO_TYPE,
-                )
-                # tensor_access_llir = llir.Var(
-                #     name=f"{self.result_tensor_var.get_name()}_values"
-                #     + f"[{self.defined_index_vars[-1].name}]",
-                #     type=llir.DataType.NO_TYPE,
-                # )
-
-            rhs_llir = self.lower_IndexExpr(stmt.rhs)
-
-            if self.result_tensor_access.is_workspace():
-                # <wksp name>.insert(<C++ array of indices>, <rhs_llir>);
-                result_index_vars = self.result_tensor_access.get_index_vars()
-                llir_stmts.append(
-                    llir.FunctionCallStmt(
-                        name=f"{self.result_tensor_access.get_tensor().get_name()}.insert",
-                        args=[
-                            llir.Array(
-                                values=[
-                                    llir.Var(
-                                        name=ivar.name,
-                                        type=llir.DataType.INT,
-                                    )
-                                    for ivar in result_index_vars
-                                ],
-                                data_type=llir.DataType.INT,
-                            ),
-                            rhs_llir,
-                        ],
+        index_vars = self.result_tensor_access.get_index_vars()
+        # If index_vars is None (empty), that means we have a scalar workspace
+        # Then just do <tensor> += <rhs_llir>
+        if not index_vars:
+            wksp_name = self.result_tensor_var.get_name()
+            assign_stmt = llir.Assign(
+                var=llir.Var(name=f"{wksp_name}", type=llir.DataType.NO_TYPE),
+                value=rhs_llir,
+                op=AssignOp.ADD_ASSIGN,
+            )
+            llir_stmts.append(assign_stmt)
+        else:
+            if index_vars[-1] == self.defined_index_vars[-1]:
+                assert self.result_tensor_var, "result tensor var is None"
+                if self.result_value_array_sparse_index_llir:
+                    tensor_access_llir = llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}_values"
+                             + f"[{self.result_value_array_sparse_index_llir.name}]",
+                        type=llir.DataType.NO_TYPE,
                     )
-                )
-            else:
-                if stmt.op == Operation.ADD:
+                else:
+                    level = self.result_tensor_access.level_of_index_var(
+                        self.defined_index_vars[-1]
+                    )
+                    tensor_access_llir = llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}_values"
+                             + f"[p{self.result_tensor_var.get_name()}{level}]",
+                        type=llir.DataType.NO_TYPE,
+                    )
+                    # tensor_access_llir = llir.Var(
+                    #     name=f"{self.result_tensor_var.get_name()}_values"
+                    #     + f"[{self.defined_index_vars[-1].name}]",
+                    #     type=llir.DataType.NO_TYPE,
+                    # )
+
+                if self.result_tensor_access.is_workspace():
+                    # <tensor name>.insert(<C++ array of indices>, <rhs_llir>);
+                    result_index_vars = self.result_tensor_access.get_index_vars()
                     llir_stmts.append(
-                        llir.Assign(
-                            var=tensor_access_llir,
-                            value=llir.BinOp(
-                                op="+",
-                                left=tensor_access_llir,
-                                right=rhs_llir,
-                            ),
+                        llir.FunctionCallStmt(
+                            name=f"{self.result_tensor_access.get_tensor().get_name()}.insert",
+                            args=[
+                                llir.Array(
+                                    values=[
+                                        llir.Var(
+                                            name=ivar.name,
+                                            type=llir.DataType.INT,
+                                        )
+                                        for ivar in result_index_vars
+                                    ],
+                                    data_type=llir.DataType.INT,
+                                ),
+                                rhs_llir,
+                            ],
                         )
                     )
                 else:
-                    llir_stmts.append(
-                        llir.Assign(
-                            var=tensor_access_llir,
-                            value=rhs_llir,
+                    if stmt.op == Operation.ADD:
+                        llir_stmts.append(
+                            llir.Assign(
+                                var=tensor_access_llir,
+                                value=llir.BinOp(
+                                    op="+",
+                                    left=tensor_access_llir,
+                                    right=rhs_llir,
+                                ),
+                            )
                         )
-                    )
+                    else:
+                        llir_stmts.append(
+                            llir.Assign(
+                                var=tensor_access_llir,
+                                value=rhs_llir,
+                            )
+                        )
             # If the last _level of the result tensor var is sparse, then we need to set
             # the coordinates
             if not self.result_tensor_access.is_workspace():
@@ -315,7 +325,7 @@ class CINLowerer:
                         llir.Assign(
                             var=llir.Var(
                                 name=f"{result_tensor_name}{level}_crd"
-                                + f"[{result_index_name}]",
+                                     + f"[{result_index_name}]",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             value=llir.Var(
@@ -342,7 +352,7 @@ class CINLowerer:
                                     llir.Assign(
                                         var=llir.Var(
                                             name=f"{result_tensor_name}{level}_crd"
-                                            + f"[{result_index_name}]",
+                                                 + f"[{result_index_name}]",
                                             type=llir.DataType.NO_TYPE,
                                         ),
                                         value=llir.Var(
@@ -388,8 +398,22 @@ class CINLowerer:
             llir.Comment("Initialize workspaces"),
         ]
         for wksp in workspaces:
-            # coo_workspace<wksp's ctype> <wksp's name> = coo_workspace<wksp's ctype>(<wksp's dim>);
+            # coo_workspace<tensor's ctype> <tensor's name> = coo_workspace<tensor's ctype>(<tensor's dim>);
             wksp_ctype = dtype_to_c_datatype(wksp.dtype)
+
+            # If the workspace is 0-dimensional, just initialize it with a literal
+            if wksp.dim == 0:
+                workspace_init_stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=wksp.get_name(),
+                            type=wksp_ctype,
+                        ),
+                        value=llir.Literal(0),
+                    )
+                )
+                continue
+
             workspace_init_stmts.append(
                 llir.VarInit(
                     var=llir.Var(
@@ -432,20 +456,53 @@ class CINLowerer:
         wksp = workspaces[0]
         workspace_accesses = stmt.get_workspace_accesses()
         wksp_access: WorkspaceAccess = workspace_accesses[0]
-        current_index_var = wksp_access.get_index_vars()[-1]
+        wksp_index_vars = wksp_access.get_index_vars()
 
         result_tensor_accesses = stmt.get_result_tensor_accesses()
         result_tensor_access: TensorAccess = result_tensor_accesses[0]
-
         result_tensor_name = result_tensor_access.get_tensor().get_name()
-        level = result_tensor_access.level_of_index_var(current_index_var)
-        level_type = result_tensor_access.level_type_of_index_var(current_index_var)
+
+        # If the wksp_index_var is None, that means we just have a scalar
+        # workspace
+        if not wksp_index_vars:
+            stmts: List[llir.Stmt] = []
+
+            index_var = result_tensor_access.get_index_vars()[0]
+            level = result_tensor_access.level_of_index_var(index_var)
+            level_type = result_tensor_access.level_type_of_index_var(index_var)
+
+            if level_type == LevelType.DENSE:
+                # <result tensor name>_values[<result level iterator>] = <wksp's name>;
+                stmts.append(
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"{result_tensor_name}_values[{index_var.get_name()}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        value=llir.Var(
+                            name=f"{wksp.get_name()}",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    )
+                )
+            else:
+                raise NotImplementedError("TODO: need to handle assembly of workspace with sparse level")
+            return [
+                llir.Comment("Lower consumer CIN"),
+                *stmts,
+                llir.BlankLine(),
+            ]
+
+        wksp_last_index_var = wksp_index_vars[-1]
+
+        level = result_tensor_access.level_of_index_var(wksp_last_index_var)
+        level_type = result_tensor_access.level_type_of_index_var(wksp_last_index_var)
 
         parent_index_var = None
         parent_level_type = None
         if level > 0:
             parent_index_var = result_tensor_access.get_parent_index_var(
-                current_index_var
+                wksp_last_index_var
             )
             assert parent_index_var is not None, "parent_index_var should not be None"
             parent_level_type = result_tensor_access.level_type_of_index_var(
@@ -674,7 +731,7 @@ class CINLowerer:
         ]
 
     def lower_IndexStmt(
-        self, stmt: IndexStmt, recurse=False
+            self, stmt: IndexStmt, recurse=False
     ) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
         Lower an IndexStmt to LLIR
@@ -730,7 +787,7 @@ class CINLowerer:
         tensor_value_array_init_stmts = []
         result_level_indices_init_stmts: List[llir.Stmt] = []
 
-        for result_tensor_var in result_tensor_vars:
+        for result_tensor_var in non_workspace_result_tensor_vars:
             self.tensor_var_to_llir[result_tensor_var] = self.lower_TensorVar(
                 result_tensor_var
             )
@@ -968,8 +1025,8 @@ class CINLowerer:
 
         if result_tensor_level_sizes:
             result_tensor_level_sizes = [
-                llir.Comment("Init result tensor _level sizes")
-            ] + result_tensor_level_sizes
+                                            llir.Comment("Init result tensor _level sizes")
+                                        ] + result_tensor_level_sizes
 
         # A mapping from IndexVar to a list of (TensorVar, _level: int, LevelType) tuples
         self.index_var_to_rhs_tensor_level_type = {}
@@ -987,6 +1044,8 @@ class CINLowerer:
         self.index_var_to_result_tensor_level_type = {}
         for tensor_access in result_tensor_accesses:
             index_vars = tensor_access.get_index_vars()
+            if not index_vars:
+                continue
             tensor_var = tensor_access.get_tensor()
             tensor_level_types = tensor_var.get_level_types()
             for level, index_var in enumerate(index_vars):
@@ -1000,8 +1059,8 @@ class CINLowerer:
         # Find last compressed _level of the result tensor, if any
         result_last_compressed_index_var = None
         for (
-            index_var,
-            tensor_level_type_list,
+                index_var,
+                tensor_level_type_list,
         ) in self.index_var_to_result_tensor_level_type.items():
             # TODO: deal with multiple outputs
             tensor_var, level, level_type = tensor_level_type_list[0]
@@ -1096,7 +1155,7 @@ class CINLowerer:
             # torch::Tensor a0_pos_torch = torch::from_blob(a0_pos.data(), {a0_pos.size()}, a0_pos.get_deleter(), torch::kInt);
             assert self.final_result_tensor_var is not None, "No final result tensor"
             for i, level_type in enumerate(
-                self.final_result_tensor_var.get_level_types()
+                    self.final_result_tensor_var.get_level_types()
             ):
                 tensor_level_name = f"{self.final_result_tensor_var.get_name()}{i}"
 
@@ -1321,34 +1380,34 @@ class CINLowerer:
         stmts: List[llir.Stmt] = []
 
         if self.result_tensor_access and not self.result_tensor_access.has_index_var(
-            index_var
+                index_var
         ):
             stmts.append(llir.Comment(f"{index_var} not in result tensor access"))
 
         # If the result _level for this index_var is dense, need to assemble the result by
         # setting the corresponding values in the result values array to 0
         if (
-            self.result_tensor_access
-            and self.result_tensor_access.has_index_var(index_var)
-            and self.result_tensor_access.level_type_of_index_var(index_var)
-            == LevelType.DENSE
+                self.result_tensor_access
+                and self.result_tensor_access.has_index_var(index_var)
+                and self.result_tensor_access.level_type_of_index_var(index_var)
+                == LevelType.DENSE
         ):
             # If the parent _level is not dense or has no parent _level,
             # and the next levels are all dense
             # then we need to initialize result value array elements to 0
             level_of_index_var = self.result_tensor_access.level_of_index_var(index_var)
             if (
-                (level_of_index_var == 0)
-                or (
-                    self.result_tensor_access.level_types()[level_of_index_var - 1]
-                    != LevelType.DENSE
-                )
+                    (level_of_index_var == 0)
+                    or (
+                            self.result_tensor_access.level_types()[level_of_index_var - 1]
+                            != LevelType.DENSE
+                    )
             ) and all(
                 [
                     self.result_tensor_access.level_types()[i] == LevelType.DENSE
                     for i in range(
-                        level_of_index_var + 1, self.result_tensor_access.num_levels
-                    )
+                    level_of_index_var + 1, self.result_tensor_access.num_levels
+                )
                 ]
             ):
                 assert self.result_tensor_var, "Result tensor variable not set"
@@ -1367,9 +1426,9 @@ class CINLowerer:
                                     [
                                         f"{self.result_tensor_var.get_name()}{i}_size"
                                         for i in range(
-                                            level_of_index_var,
-                                            self.result_tensor_access.num_levels,
-                                        )
+                                        level_of_index_var,
+                                        self.result_tensor_access.num_levels,
+                                    )
                                     ]
                                 ),
                                 type=llir.DataType.INT,
@@ -1443,7 +1502,7 @@ class CINLowerer:
 
     @staticmethod
     def add_dependent_tensors(
-        stmt: IndexStmt, tensor_vars: List[TensorVar]
+            stmt: IndexStmt, tensor_vars: List[TensorVar]
     ) -> List[TensorVar]:
         """
         Add dependent tensor variables to the list of tensor variables

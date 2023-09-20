@@ -34,11 +34,98 @@ load(
 )
 
 
+def spmv(a: Tensor, b: Tensor,
+         output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
+         **kwargs) -> Tensor:
+    if output_format is None:
+        output_format = parse_format("d")
+    elif not isinstance(output_format, TensorFormat):
+        output_format = parse_format(output_format)
+
+    y = TensorVar("y", fmt=output_format)
+    A = TensorVar("A", fmt=a.format)
+    x = TensorVar("x", fmt=b.format)
+
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    workspace = Workspace(
+        name="wksp",
+        dim=0,
+    )
+
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                j,
+                TensorAssign(
+                    workspace.get_default_access(), A[i, j] * x[j], op=Operation.ADD
+                ),
+            ),
+            consumer=TensorAssign(
+                y[i],
+                workspace.get_default_access(),
+            ),
+        ),
+    )
+
+
+    lowerer = CINLowerer()
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+    llir_lowerer = LLIRLowerer()
+    cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+    # Read header_cpp_code from csrc/header.cpp
+    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+        header_cpp_code = f.read()
+
+    start_time = time.time()
+    module = torch.utils.cpp_extension.load_inline(
+        name="kernel",
+        cpp_sources=[header_cpp_code, cpp_code],
+        functions=["evaluate"],
+    )
+    end_time = time.time()
+
+    compile_time = end_time - start_time
+    #  Print kernel compile time to 5 decimal places
+    print(f"Kernel compile time: {compile_time:.5f} seconds")
+
+    result_shape = (a.shape[0],)
+    args = [result_shape]
+
+    for tensor in [a, b]:
+        args.append(tensor.shape)  # type: ignore
+        args.append(tensor.index.mode_indices)  # type: ignore
+        args.append(tensor.values)  # type: ignore
+
+    start_time = time.time()
+    result_cpp = module.evaluate(*args)
+    end_time = time.time()
+    eval_time = end_time - start_time
+    if "time_dict" in kwargs:
+        time_dict = kwargs["time_dict"]
+        time_dict["eval_time"] = eval_time
+    # print("Time taken for evaluate:", eval_time)
+
+    result = Tensor(
+        shape=result_shape,
+        index=TensorIndex(
+            mode_indices=result_cpp._storage._index.mode_indices,
+            tensor_format=output_format,
+        ),
+        value=result_cpp._storage._value,
+    )
+
+    return result
+
+
 def matmul_wksp(
-    a: Union[torch.Tensor, Tensor],
-    b: Union[torch.Tensor, Tensor],
-    output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
-    **kwargs,
+        a: Union[torch.Tensor, Tensor],
+        b: Union[torch.Tensor, Tensor],
+        output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
+        **kwargs,
 ) -> Tensor:
     if isinstance(a, torch.Tensor):
         a = Tensor.from_torch(a).to_sparse()
@@ -144,9 +231,9 @@ def matmul_wksp(
 
 
 def matmul(
-    a: Union[torch.Tensor, Tensor],
-    b: Union[torch.Tensor, Tensor],
-    **kwargs: Any,
+        a: Union[torch.Tensor, Tensor],
+        b: Union[torch.Tensor, Tensor],
+        **kwargs: Any,
 ) -> Tensor:
     """Perform a matrix multiplication."""
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
@@ -164,10 +251,10 @@ def matmul(
 
 
 def einsum(
-    expression: str,
-    *tensors: Optional[Union[torch.Tensor, Tensor]],
-    compile_only: Optional[bool] = False,
-    **kwargs: Any,
+        expression: str,
+        *tensors: Optional[Union[torch.Tensor, Tensor]],
+        compile_only: Optional[bool] = False,
+        **kwargs: Any,
 ) -> Tensor:
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
     # elementwise multiplication or "ik,kj->ij" for matrix multiplication
@@ -242,14 +329,14 @@ def einsum(
             level_formats: List[LevelFormat] = index_str_to_level_formats[index_str]
             # If any of them is sparse, then the output level is sparse
             if any(
-                level_format.get_level_type() == LevelType.COMPRESSED
-                for level_format in level_formats
+                    level_format.get_level_type() == LevelType.COMPRESSED
+                    for level_format in level_formats
             ):
                 level_format = LevelFormat(LevelType.COMPRESSED)
             # If any of them is coordinate, then the output level is coordinate format
             elif any(
-                level_format.get_level_type() == LevelType.COORDINATE
-                for level_format in level_formats
+                    level_format.get_level_type() == LevelType.COORDINATE
+                    for level_format in level_formats
             ):
                 level_format = LevelFormat(LevelType.COORDINATE)
 
@@ -263,8 +350,8 @@ def einsum(
         # TODO: unless we are dealing with block tensors
         for i in range(len(output_level_formats) - 1, 0, -1):
             if (
-                output_level_formats[i].get_level_type() == LevelType.DENSE
-                and output_level_formats[i - 1].get_level_type() != LevelType.DENSE
+                    output_level_formats[i].get_level_type() == LevelType.DENSE
+                    and output_level_formats[i - 1].get_level_type() != LevelType.DENSE
             ):
                 output_level_formats[i - 1] = LevelFormat(LevelType.DENSE)
 

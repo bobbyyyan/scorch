@@ -60,8 +60,10 @@ class IndexStmt(CIN):
             def visit_TensorAssign(self, node: TensorAssign):
                 self.result_tensor_accesses.append(node.lhs)
 
+
         collector = ResultTensorAccessCollector()
-        self.accept(collector)
+        collector.visit(self)
+        # self.accept(collector)
         return collector.get_result_tensor_accesses()
 
     def get_result_tensor_vars(self) -> List[TensorVar]:
@@ -304,6 +306,10 @@ class Workspace(TensorVar):
     def __getitem__(self, item) -> WorkspaceAccess:
         return WorkspaceAccess(self, item)
 
+    # Default workspace access for a 0-dimensional/scalar workspace
+    def get_default_access(self) -> WorkspaceAccess:
+        return WorkspaceAccess(self)
+
 
 class TensorAccess(IndexExpr):
     """
@@ -339,7 +345,7 @@ class TensorAccess(IndexExpr):
         return self.indices
 
     def has_index_var(self, index_var: IndexVar) -> bool:
-        return index_var in self.indices
+        return self.indices and index_var in self.indices
 
     def get_parent_index_var(self, index_var: IndexVar) -> Optional[IndexVar]:
         index_var_index = self.indices.index(index_var)
@@ -387,13 +393,17 @@ class TensorAccess(IndexExpr):
 class WorkspaceAccess(TensorAccess):
     def __init__(
         self,
-        tensor: Workspace,
-        indices: Union[IndexVar, List[IndexVar]],
+        wksp: Workspace,
+        indices: Optional[Union[IndexVar, List[IndexVar]]] = None,
     ):
-        super().__init__(tensor, indices)
+        super().__init__(wksp, indices)
 
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self.tensor)
+
+    def __str__(self):
+        return f"{self.tensor}[{self.indices}]"
+        # return f"TensorAccess(tensor={self.tensor}, indices={self.indices})"
 
 
 class Operation(Enum):
@@ -609,8 +619,10 @@ class CINIndexVariablesGetter(CINVisitorAccept):
             self.visit(stmt)
 
     def visit_TensorAssign(self, node: TensorAssign) -> None:
-        for var in node.get_lhs().get_index_vars():
-            self.free_vars.append(var)
+        lhs_index_vars = node.get_lhs().get_index_vars()
+        if lhs_index_vars:
+            for var in node.get_lhs().get_index_vars():
+                self.free_vars.append(var)
         self.visit(node.get_rhs())
 
     def visit_ForAll(self, node: ForAll) -> None:
