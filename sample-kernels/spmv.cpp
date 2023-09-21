@@ -14,11 +14,11 @@ int evaluate(taco_tensor_t *y, taco_tensor_t *A, taco_tensor_t *x) {
   cvector<double> y_vals = cvector<double>(y_capacity);
 
   #pragma omp parallel for schedule(runtime)
-  for (int32_t i = 0; i < A0_size; i++) {
+  for (int i = 0; i < A0_size; i++) {
     double tjy_val = 0.0;
-    for (int32_t jA = A1_pos[i]; jA < A1_pos[(i + 1)]; jA++) {
-      int32_t j = A1_crd[jA];
-      tjy_val += A_vals[jA] * x_vals[j];
+    for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
+      int j = A1_crd[pA1];
+      tjy_val += A_vals[pA1] * x_vals[j];
     }
     y_vals[i] = tjy_val;
   }
