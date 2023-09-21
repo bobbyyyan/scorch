@@ -243,7 +243,8 @@ class CINLowerer:
             )
             llir_stmts.append(assign_stmt)
         else:
-            if index_vars[-1] == self.defined_index_vars[-1]:
+            # if index_vars are all in defined_index_vars, then we can emit the compute code
+            if all(index_var in self.defined_index_vars for index_var in index_vars):
                 assert self.result_tensor_var, "result tensor var is None"
                 if self.result_value_array_sparse_index_llir:
                     tensor_access_llir = llir.Var(
@@ -252,9 +253,7 @@ class CINLowerer:
                         type=llir.DataType.NO_TYPE,
                     )
                 else:
-                    level = self.result_tensor_access.level_of_index_var(
-                        self.defined_index_vars[-1]
-                    )
+                    level = self.result_tensor_access.level_of_index_var(index_vars[-1])
                     tensor_access_llir = llir.Var(
                         name=f"{self.result_tensor_var.get_name()}_values"
                         + f"[p{self.result_tensor_var.get_name()}{level}]",
@@ -289,14 +288,21 @@ class CINLowerer:
                     )
                 else:
                     if stmt.op == Operation.ADD:
+                        # llir_stmts.append(
+                        #     llir.Assign(
+                        #         var=tensor_access_llir,
+                        #         value=llir.BinOp(
+                        #             op="+",
+                        #             left=tensor_access_llir,
+                        #             right=rhs_llir,
+                        #         ),
+                        #     )
+                        # )
                         llir_stmts.append(
                             llir.Assign(
                                 var=tensor_access_llir,
-                                value=llir.BinOp(
-                                    op="+",
-                                    left=tensor_access_llir,
-                                    right=rhs_llir,
-                                ),
+                                value=rhs_llir,
+                                op=AssignOp.ADD_ASSIGN,
                             )
                         )
                     else:
@@ -310,9 +316,7 @@ class CINLowerer:
             # the coordinates
             if not self.result_tensor_access.is_workspace():
                 last_ivar = self.defined_index_vars[-1]
-                last_level_type = self.result_tensor_access.level_type_of_index_var(
-                    last_ivar
-                )
+                last_level_type = self.result_tensor_access.level_types()[-1]
                 if last_level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
                     llir_stmts.append(llir.Comment("Set coordinates"))
                     result_tensor_name = self.result_tensor_var.get_name()
