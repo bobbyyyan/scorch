@@ -19,7 +19,7 @@ from .compiler.codegen import LLIRLowerer
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorIndex
 from .tensor import Tensor
-from .utils import parse_format
+from .utils import parse_format, topo_sort_characters
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
@@ -275,6 +275,8 @@ def einsum(
     # Make sure the index strings are unique, keeping the order
     unique_index_strs = list(dict.fromkeys(unique_index_strs))
     result_index_strs = list(expression.split("->")[1])
+    input_index_strs_concat = expression.split("->")[0]
+    index_strs_by_schedule = topo_sort_characters(input_index_strs_concat)
     input_index_strs = [list(x) for x in expression.split("->")[0].split(",")]
     # Create a list of IndexVar objects, and a dict mapping index strings
     # to IndexVar objects
@@ -392,11 +394,11 @@ def einsum(
     # Generate the python code for constructing the ForAll's and execute it
     rhs = "result_tensor_var._assignment"
     assert ForAll is not None, "ForAll is not imported"
-    for i, index_str in enumerate(unique_index_strs[::-1]):
+    for i, index_str in enumerate(index_strs_by_schedule[::-1]):
         rhs = f'ForAll(index_var_dict["{index_str}"], {rhs})'
     cin_stmt = eval(rhs)
 
-    # print("cin_stmt:", cin_stmt)
+    print("cin_stmt:\n", cin_stmt)
 
     if str(cin_stmt) in _kernel_cache:
         print(f"Using cached kernel for {cin_stmt}")
@@ -410,7 +412,7 @@ def einsum(
 
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        # print("\n\n", cpp_code)
+        print("\n\n", cpp_code)
 
         # Read header_cpp_code from csrc/header.cpp
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:

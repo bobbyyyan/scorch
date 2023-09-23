@@ -5,7 +5,7 @@ from .format import TensorFormat
 from_torch = Tensor.from_torch
 from_coo = Tensor.from_coo
 
-precompile_kernels()
+# precompile_kernels()
 
 __version__ = "0.0.1"
 

@@ -1,3 +1,4 @@
+from collections import defaultdict, deque
 from itertools import chain
 from pathlib import Path
 from typing import List, Dict, Any, Iterable, Union
@@ -10,6 +11,43 @@ from .compiler.llir import DataType
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
+
+
+def topo_sort_characters(s):
+    # Split the string into substrings
+    substrings = s.split(",")
+
+    # Create a directed graph
+    graph = defaultdict(list)
+    in_degree = defaultdict(int)
+    nodes = set()
+
+    # Add edges to the graph
+    for substring in substrings:
+        for i in range(len(substring) - 1):
+            if substring[i + 1] not in graph[substring[i]]:
+                graph[substring[i]].append(substring[i + 1])
+                in_degree[substring[i + 1]] += 1
+            nodes.add(substring[i])
+            nodes.add(substring[i + 1])
+
+    # Run topological sort
+    zero_in_degree_nodes = deque([node for node in nodes if in_degree[node] == 0])
+    result = []
+
+    while zero_in_degree_nodes:
+        node = zero_in_degree_nodes.popleft()
+        result.append(node)
+        for neighbor in graph[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                zero_in_degree_nodes.append(neighbor)
+
+    if len(result) < len(nodes):
+        # The graph contains a cycle, so it's not possible to sort the nodes
+        raise ValueError("The input string contains a contradiction.")
+
+    return result
 
 
 def parse_format(fmt: Union[List[str], str, TensorFormat]) -> TensorFormat:
