@@ -87,14 +87,15 @@ class LatticePoint:
             )
             for ta in self.get_sparse_tensor_accesses()
         ]
-        if not self.iterators:
-            self.dense_iterators = [
-                ModeIterator(
-                    tensor_access=ta,
-                    index_var=index_var,
-                )
-                for ta in self.get_dense_tensor_accesses()
-            ]
+
+        self.dense_iterators = [
+            ModeIterator(
+                tensor_access=ta,
+                index_var=index_var,
+            )
+            for ta in self.get_dense_tensor_accesses()
+        ]
+
         return self.iterators
 
     def filter_and_set_children(
