@@ -83,15 +83,15 @@ def test_spmv_d_oo_d_time():
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
 
 
-def todo_test_sddmm_time():
+def test_sddmm_dd_ds_dd_dd_time():
     """
     A[i, j] = B[i, j] * C[i, k] * D[k, j]
-    A: CSR
+    A: Dense
     B: CSR
     C: Dense
     D: Dense
     """
-    N = 100
+    N = 1000
     sparsity = 0.9
     random_tensor_b = torch.rand(N, N)
     random_tensor_c = torch.rand(N, N)
@@ -101,10 +101,12 @@ def todo_test_sddmm_time():
     random_tensor_b_sparse = random_tensor_b.to_sparse_csr()
 
     start_time = time.time()
-    # torch_result = torch.einsum("ij,ik,kj->ij", random_tensor_b_sparse, random_tensor_c, random_tensor_d)
-    torch_result = torch.sparse.sampled_addmm(
-        random_tensor_b_sparse, random_tensor_c, random_tensor_d, beta=0
+    torch_result = torch.einsum(
+        "ij,ik,kj->ij", random_tensor_b, random_tensor_c, random_tensor_d
     )
+    # torch_result = torch.sparse.sampled_addmm(
+    #     random_tensor_b_sparse, random_tensor_c, random_tensor_d, beta=0
+    # )
     torch_time = time.time() - start_time
 
     tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse("ds")
@@ -119,9 +121,63 @@ def todo_test_sddmm_time():
         tensor_c_scorch,
         tensor_d_scorch,
         time_dict=time_dict,
+        format="dd",
     )
     scorch_total_time = time.time() - start_time
     scorch_eval_time = time_dict["eval_time"]
+
+    assert torch.allclose(torch_result, scorch_result.to_torch())
+
+    print(f"torch time: {torch_time}")
+    print(f"scorch total time: {scorch_total_time}")
+    print(f"scorch eval time: {scorch_eval_time}")
+    print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
+
+
+def todo_test_sddmm_ds_ds_dd_dd_time():
+    """
+    A[i, j] = B[i, j] * C[i, k] * D[k, j]
+    A: CSR
+    B: CSR
+    C: Dense
+    D: Dense
+    """
+    N = 1000
+    sparsity = 0.9
+    random_tensor_b = torch.rand(N, N)
+    random_tensor_c = torch.rand(N, N)
+    random_tensor_d = torch.rand(N, N)
+    # Sparsify B
+    random_tensor_b = random_tensor_b * (torch.rand(N, N) > sparsity).float()
+    random_tensor_b_sparse = random_tensor_b.to_sparse_csr()
+
+    start_time = time.time()
+    torch_result = torch.einsum(
+        "ij,ik,kj->ij", random_tensor_b, random_tensor_c, random_tensor_d
+    )
+    # torch_result = torch.sparse.sampled_addmm(
+    #     random_tensor_b_sparse, random_tensor_c, random_tensor_d, beta=0
+    # )
+    torch_time = time.time() - start_time
+
+    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse("ds")
+    tensor_c_scorch = Tensor.from_torch(random_tensor_c, "C")
+    tensor_d_scorch = Tensor.from_torch(random_tensor_d, "D")
+
+    time_dict = {}
+    start_time = time.time()
+    scorch_result = einsum(
+        "ij,ik,kj->ij",
+        tensor_b_scorch,
+        tensor_c_scorch,
+        tensor_d_scorch,
+        time_dict=time_dict,
+        format="ds",
+    )
+    scorch_total_time = time.time() - start_time
+    scorch_eval_time = time_dict["eval_time"]
+
+    assert torch.allclose(torch_result, scorch_result.to_torch())
 
     print(f"torch time: {torch_time}")
     print(f"scorch total time: {scorch_total_time}")
