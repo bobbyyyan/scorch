@@ -22,14 +22,19 @@ def topo_sort_characters(s):
     in_degree = defaultdict(int)
     nodes = set()
 
+    # Initialize in_degree for all characters
+    for substring in substrings:
+        for char in substring:
+            nodes.add(char)
+            if char not in in_degree:
+                in_degree[char] = 0
+
     # Add edges to the graph
     for substring in substrings:
         for i in range(len(substring) - 1):
             if substring[i + 1] not in graph[substring[i]]:
                 graph[substring[i]].append(substring[i + 1])
                 in_degree[substring[i + 1]] += 1
-            nodes.add(substring[i])
-            nodes.add(substring[i + 1])
 
     # Run topological sort
     zero_in_degree_nodes = deque([node for node in nodes if in_degree[node] == 0])
