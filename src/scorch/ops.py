@@ -16,6 +16,7 @@ from .compiler.cin import (
 )
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
+from .compiler.scheduler import Scheduler
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorIndex
 from .tensor import Tensor
@@ -398,6 +399,10 @@ def einsum(
         rhs = f'ForAll(index_var_dict["{index_str}"], {rhs})'
     cin_stmt = eval(rhs)
 
+    scheduler = Scheduler()
+
+    cin_stmt = scheduler.auto_schedule(cin_stmt)
+
     print("cin_stmt:\n", cin_stmt)
 
     if str(cin_stmt) in _kernel_cache:
@@ -412,7 +417,7 @@ def einsum(
 
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        print("\n\n", cpp_code)
+        # print("\n\n", cpp_code)
 
         # Read header_cpp_code from csrc/header.cpp
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:

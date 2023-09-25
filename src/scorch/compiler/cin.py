@@ -642,12 +642,15 @@ class CINIndexVariablesGetter(CINVisitorAccept):
     def get_reduction_vars(self) -> List[IndexVar]:
         return [var for var in self.input_vars if var not in self.free_vars]
 
+    def get_free_vars(self) -> List[IndexVar]:
+        return self.free_vars
+
 
 class LoopOrderGetter(CINVisitor):
     index_vars_ordered: List[IndexVar] = []
     free_vars: List[IndexVar] = []
 
-    def __init__(self, stmt: Optional[IndexStmt] = None):
+    def __init__(self, stmt: Optional[CIN] = None):
         self.index_vars_ordered = []
         self.free_vars = []
         if stmt is not None:
