@@ -13,7 +13,7 @@ while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 
-def topo_sort_characters(s):
+def topo_sort_characters(s, priority=""):
     # Split the string into substrings
     substrings = s.split(",")
 
@@ -37,7 +37,12 @@ def topo_sort_characters(s):
                 in_degree[substring[i + 1]] += 1
 
     # Run topological sort
-    zero_in_degree_nodes = deque([node for node in nodes if in_degree[node] == 0])
+    zero_in_degree_nodes = [node for node in nodes if in_degree[node] == 0]
+    zero_in_degree_nodes.sort(
+        key=lambda x: priority.index(x) if x in priority else float("inf")
+    )
+    zero_in_degree_nodes = deque(zero_in_degree_nodes)
+
     result = []
 
     while zero_in_degree_nodes:
@@ -47,6 +52,13 @@ def topo_sort_characters(s):
             in_degree[neighbor] -= 1
             if in_degree[neighbor] == 0:
                 zero_in_degree_nodes.append(neighbor)
+
+        # Sort newly zero in-degree nodes according to priority
+        zero_in_degree_nodes = list(zero_in_degree_nodes)
+        zero_in_degree_nodes.sort(
+            key=lambda x: priority.index(x) if x in priority else float("inf")
+        )
+        zero_in_degree_nodes = deque(zero_in_degree_nodes)
 
     if len(result) < len(nodes):
         # The graph contains a cycle, so it's not possible to sort the nodes

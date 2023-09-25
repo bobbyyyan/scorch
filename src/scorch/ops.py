@@ -277,7 +277,9 @@ def einsum(
     unique_index_strs = list(dict.fromkeys(unique_index_strs))
     result_index_strs = list(expression.split("->")[1])
     input_index_strs_concat = expression.split("->")[0]
-    index_strs_by_schedule = topo_sort_characters(input_index_strs_concat)
+    index_strs_by_schedule = topo_sort_characters(
+        input_index_strs_concat, priority=result_index_strs
+    )
     input_index_strs = [list(x) for x in expression.split("->")[0].split(",")]
     # Create a list of IndexVar objects, and a dict mapping index strings
     # to IndexVar objects
