@@ -20,6 +20,7 @@ ogb = "*"
 [dev-packages]
 tqdm = "*"
 ipdb = "*"
+matplotlib = "*"
 
 [requires]
 python_version = "3.11"
