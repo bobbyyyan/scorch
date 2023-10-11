@@ -1041,18 +1041,18 @@ def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
 
 
 def test_spmm_dd_ds_dd_ikj():
-    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:dd -f=B:ds -f=C:dd -print-evaluate
+    # taco "C(i, j) = A(i, k) * B(k, j)" -f=C:dd -f=A:ds -f=B:dd -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
 
-    A = TensorVar("A", fmt="ds")
-    B = TensorVar("B", fmt="ds")
     C = TensorVar("C", fmt="dd")
+    A = TensorVar("A", fmt="ds")
+    B = TensorVar("B", fmt="dd")
 
-    A[i, j] = B[i, k] * C[k, j]
+    C[i, j] = A[i, k] * B[k, j]
 
-    cin_stmt = ForAll(i, ForAll(k, ForAll(j, A._assignment)))
+    cin_stmt = ForAll(i, ForAll(k, ForAll(j, C._assignment)))
 
     print("\nCIN statement:")
     print(cin_stmt)

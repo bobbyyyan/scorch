@@ -408,7 +408,7 @@ if __name__ == "__main__":
             2000,
             3000,
             5000,
-            # 10000,
+            10000,
             # 15000,
             # 20000,
             # 25000,
@@ -429,7 +429,19 @@ if __name__ == "__main__":
         sparse_format="csr",
         custom_func=scorch_spmm_custom,
     )
-    plot_benchmark(dimensions, speedups_means, speedups_stds, benchmark="SpMM (CSR)")
+    plot_benchmark(
+        dimensions, speedups_means, speedups_stds, benchmark="SpMM (CSR) (After)"
+    )
+
+    # torch_times, scorch_times, speedups_means, speedups_stds = bench_spmm(
+    #     dimensions,
+    #     num_runs=10,
+    #     sparsity=0.99,
+    #     sparse_format="csr",
+    # )
+    # plot_benchmark(
+    #     dimensions, speedups_means, speedups_stds, benchmark="SpMM (CSR) (Before)",
+    # )
 
     # torch_times, scorch_times, speedups_means, speedups_stds = bench_spmspm(
     #     dimensions, sparsity=0.99, sparse_format="coo"

@@ -1757,6 +1757,20 @@ def test_spmm_ss_ds_ds():
     ]
 
 
+def test_spmm_dd_ds_dd():
+    tensor_a_torch = torch.rand(5, 5)
+    tensor_b_torch = torch.rand(5, 5)
+
+    a_scorch = Tensor.from_torch(tensor_a_torch, "A")
+    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+
+    result = matmul(a_scorch, b_scorch, format="dd")
+
+    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    assert torch.allclose(result.to_torch(), result_torch)
+
+
 def test_spmm_dd_ds_ds():
     tensor_a_torch = torch.Tensor(
         [
