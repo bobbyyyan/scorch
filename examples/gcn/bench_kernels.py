@@ -24,10 +24,11 @@ spmm = load_inline(
     name="kernel",
     cpp_sources=[header_cpp_code, cpp_code],
     functions=["evaluate"],
+    extra_cflags=["-O3"],
 )
 
 
-def scorch_spmm_custom(A: Tensor, B: Tensor):
+def scorch_spmm_custom(A: Tensor, B: Tensor, **kwargs):
     # a = TensorVar("A", fmt=A.format)
     # b = TensorVar("B", fmt=B.format)
 
@@ -43,7 +44,8 @@ def scorch_spmm_custom(A: Tensor, B: Tensor):
     result_cpp = spmm.evaluate(*args)
     end_time = time.time()
     eval_time = end_time - start_time
-    print("Time taken for evaluate:", eval_time)
+    if "time_dict" in kwargs:
+        kwargs["time_dict"]["eval_time"] = eval_time
 
     result = Tensor(
         shape=result_shape,
@@ -57,9 +59,9 @@ def scorch_spmm_custom(A: Tensor, B: Tensor):
     return result
 
 
-def scorch_spmm(A, B):
+def scorch_spmm(A, B, **kwargs):
     """Sparse matrix multiplication with Scorch"""
-    return scorch.matmul(A, B)
+    return scorch.matmul(A, B, **kwargs)
 
 
 def torch_spmm(A, B):
@@ -68,9 +70,9 @@ def torch_spmm(A, B):
     return torch.matmul(A, B)
 
 
-def scorch_spmv(A, B):
+def scorch_spmv(A, B, **kwargs):
     # return scorch.einsum("ij,j->i", A, B)
-    return scorch.matmul(A, B)
+    return scorch.matmul(A, B, **kwargs)
 
 
 def torch_spmv(A, B):
@@ -134,6 +136,7 @@ def gen_rand_sparse_coo(dim_m, dim_n, sparsity):
 def gen_rand_sparse_csr(dim_m, dim_n, sparsity):
     A, A_torch = gen_rand_sparse_coo(dim_m, dim_n, sparsity)
     A_torch = A_torch.to_sparse_csr()
+    A_torch = A_torch.to("cpu")
     A = A.to_sparse("ds")
     return A, A_torch
 
@@ -270,31 +273,31 @@ def bench_spmm(
     if custom_func is not None:
         scorch_spmm_func = custom_func
 
+    gen_rand_sparse_func = gen_rand_sparse_coo if sparse_format == "coo" else gen_rand_sparse_csr
+
     for dim in dimensions:
         torch_time_run = []
         scorch_time_run = []
         speedup_run = []
 
         for _ in range(num_runs):
-            if sparse_format == "coo":
-                A, A_torch = gen_rand_sparse_coo(dim, dim, sparsity)
-            else:
-                A, A_torch = gen_rand_sparse_csr(dim, dim, sparsity)
-
-            B_torch = torch.rand(dim, dim)
+            A, A_torch = gen_rand_sparse_func(dim, dim, sparsity)
+            B_torch = torch.rand(dim, dim).to("cpu")
             B = scorch.from_torch(B_torch)
 
-            # Warm up
+            # Warm up for scorch benchmark.
             for _ in range(num_warmup_runs):
                 scorch_spmm_func(A, B)
 
+            time_dict = {}
             start = time.perf_counter()
-            scorch_result = scorch_spmm_func(A, B)
+            scorch_result = scorch_spmm_func(A, B, time_dict=time_dict)
             end = time.perf_counter()
-            scorch_time = end - start
+            # scorch_time = end - start
+            scorch_time = time_dict["eval_time"]
             scorch_time_run.append(scorch_time)
 
-            # Warm up
+            # Warm up for torch benchmark.
             for _ in range(num_warmup_runs):
                 torch_spmm(A_torch, B_torch)
 
@@ -339,10 +342,12 @@ def bench_spmv(dimensions, num_runs=5):
             for _ in range(1):
                 scorch_spmv(A, B)
 
+            time_dict = {}
             start = time.perf_counter()
-            scorch_spmv(A, B)
+            scorch_spmv(A, B, time_dict=time_dict)
             end = time.perf_counter()
-            scorch_time = end - start
+            # scorch_time = end - start
+            scorch_time = time_dict["eval_time"]
             scorch_time_run.append(scorch_time)
 
             # Warm up
@@ -388,7 +393,30 @@ def plot_benchmark(dimensions, speedup_means, speedup_stds, benchmark="SpMV"):
     file_name_with_timestamp = f"{benchmark.lower()}-{timestamp}.png"
 
     plt.savefig(file_name_with_timestamp, dpi=300)
-    # plt.show()
+
+    # Also plot Mean speedup (PyTorch/Scorch)
+    plt.figure(figsize=(10, 6))
+
+    speedup_means = 1 / np.array(speedup_means)
+    speedup_upper = 1 / speedup_upper
+    speedup_lower = 1 / speedup_lower
+
+    # Plot mean speedup
+    plt.plot(dimensions, speedup_means, "-o", label="Mean speedup (PyTorch/Scorch)")
+
+    # Add shaded area for standard deviation
+    plt.fill_between(dimensions, speedup_lower, speedup_upper, color="blue", alpha=0.2)
+
+    plt.title(f"{benchmark} Speedup of PyTorch over Scorch")
+    plt.xlabel("Matrix dimensions")
+    plt.ylabel("Speedup factor")
+    plt.legend()
+    plt.grid(True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name_with_timestamp = f"{benchmark.lower()}-inverse-{timestamp}.png"
+
+    plt.savefig(file_name_with_timestamp, dpi=300)
 
 
 if __name__ == "__main__":
@@ -408,7 +436,7 @@ if __name__ == "__main__":
             2000,
             3000,
             5000,
-            10000,
+            # 10000,
             # 15000,
             # 20000,
             # 25000,
@@ -430,7 +458,7 @@ if __name__ == "__main__":
         custom_func=scorch_spmm_custom,
     )
     plot_benchmark(
-        dimensions, speedups_means, speedups_stds, benchmark="SpMM (CSR) (After)"
+        dimensions, speedups_means, speedups_stds, benchmark="SpMM 99 (CSR) (After)"
     )
 
     # torch_times, scorch_times, speedups_means, speedups_stds = bench_spmm(
@@ -440,7 +468,7 @@ if __name__ == "__main__":
     #     sparse_format="csr",
     # )
     # plot_benchmark(
-    #     dimensions, speedups_means, speedups_stds, benchmark="SpMM (CSR) (Before)",
+    #     dimensions, speedups_means, speedups_stds, benchmark="SpMM 99 (CSR) (Before)",
     # )
 
     # torch_times, scorch_times, speedups_means, speedups_stds = bench_spmspm(
