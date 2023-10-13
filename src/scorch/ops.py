@@ -83,17 +83,18 @@ def spmv(
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
         header_cpp_code = f.read()
 
-    start_time = time.time()
+    # start_time = time.time()
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
+        extra_cflags=["-O3"],
     )
-    end_time = time.time()
+    # end_time = time.time()
 
-    compile_time = end_time - start_time
+    # compile_time = end_time - start_time
     #  Print kernel compile time to 5 decimal places
-    print(f"Kernel compile time: {compile_time:.5f} seconds")
+    # print(f"Kernel compile time: {compile_time:.5f} seconds")
 
     result_shape = (a.shape[0],)
     args = [result_shape]
@@ -192,17 +193,18 @@ def matmul_wksp(
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
         header_cpp_code = f.read()
 
-    start_time = time.time()
+    # start_time = time.time()
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
+        extra_cflags=["-O3"],
     )
-    end_time = time.time()
+    # end_time = time.time()
 
-    compile_time = end_time - start_time
+    # compile_time = end_time - start_time
     #  Print kernel compile time to 5 decimal places
-    print(f"Kernel compile time: {compile_time:.5f} seconds")
+    # print(f"Kernel compile time: {compile_time:.5f} seconds")
 
     result_shape = (a.shape[0], b.shape[1])
     args = [result_shape]
@@ -459,6 +461,7 @@ def einsum(
             name="kernel",
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
+            extra_cflags=["-O3"],
         )
 
         _kernel_cache[str(cin_stmt)] = module

@@ -221,6 +221,7 @@ class Tensor(torch.nn.Module):
             name="kernel",
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
+            extra_cflags=["-O3"],
         )
 
         result_cpp = module.evaluate(
@@ -430,6 +431,7 @@ class Tensor(torch.nn.Module):
             name="kernel",
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
+            extra_cflags=["-O3"],
         )
 
         result_cpp = module.evaluate(
@@ -564,6 +566,7 @@ class Tensor(torch.nn.Module):
                 name="kernel",
                 cpp_sources=[header_cpp_code, cpp_code],
                 functions=["evaluate"],
+                extra_cflags=["-O3"],
             )
 
             result_cpp = module.evaluate(

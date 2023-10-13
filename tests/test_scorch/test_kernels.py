@@ -515,6 +515,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
+        extra_cflags=["-O3"],
     )
 
     tensor_a_torch = torch.Tensor(
@@ -1260,6 +1261,7 @@ def test_spmm_ss_dd_dd_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
+        extra_cflags=["-O3"],
     )
 
     tensor_a_torch = torch.Tensor(
@@ -1377,6 +1379,7 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
+        extra_cflags=["-O3"],
     )
 
     tensor_a_torch = torch.Tensor(
@@ -1493,6 +1496,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
+        extra_cflags=["-O3"],
     )
 
     tensor_a_torch = torch.Tensor(
@@ -1609,6 +1613,7 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
+        extra_cflags=["-O3"],
     )
 
     tensor_a_torch = torch.Tensor(
