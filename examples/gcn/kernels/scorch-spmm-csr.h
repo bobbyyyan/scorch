@@ -1,3 +1,8 @@
+#define SCORCH_PRAGMA_UNROLL _Pragma("unroll")
+#define SCORCH_LIKELY(x) __builtin_expect(!!(x), 1)
+#define SCORCH_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define SCORCH_RESTRICT __restrict__
+
 Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
                 torch::Tensor A_values, std::vector<int> B_shape,
@@ -9,13 +14,13 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
 
   // Get A's level & value arrays
   int A0_size = A_shape[0];
-  int* A1_pos = A_mode_indices[1][0].data_ptr<int>();
-  int* A1_crd = A_mode_indices[1][1].data_ptr<int>();
-  float* A_val = A_values.data_ptr<float>();
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
   // Get B's level & value arrays
   int B0_size = B_shape[0];
   int B1_size = B_shape[1];
-  float* B_val = B_values.data_ptr<float>();
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
@@ -24,13 +29,16 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
                      .dtype(A_values.scalar_type())
                      .device(A_values.device());
   auto C_values = torch::empty({C0_size, C1_size}, options);
-  float* C_val = C_values.data_ptr<float>();
+  float* SCORCH_RESTRICT C_val = C_values.data_ptr<float>();
 
-  constexpr int kTileN = 4;
-  // TODO: Relax this constraint
-  TORCH_CHECK((B1_size % kTileN) == 0);
+  // Tile size should be minimum of 1024 and B1_size
+  int kTileN = (B1_size < 1024) ? B1_size : 1024;
 
-  for (int i = 0; i < A0_size; i++) {
+  // Relax this constraint
+  // TORCH_CHECK((B1_size % kTileN) == 0);
+
+  #pragma omp parallel for simd
+  for (int i = 0; SCORCH_LIKELY(i < A0_size); i++) {
     int pC0 = i;
 
     // Initialize iterators
@@ -43,7 +51,11 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
         // Resolve coordinates
         int k = A1_crd[pA1];
 
-        for (int inner_j = 0; inner_j < kTileN; inner_j++) {
+        int inner_j_end = std::min(kTileN, B1_size - outer_j);
+
+        // Unroll the inner loop
+        SCORCH_PRAGMA_UNROLL
+        for (int inner_j = 0; SCORCH_LIKELY(inner_j < inner_j_end); inner_j++) {
           int j = outer_j + inner_j;
           int pB1 = k * B1_size + j;
           accumulator[inner_j] += A_val[pA1] * B_val[pB1];
@@ -51,7 +63,8 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
       }
 
       // Flush the accumulator
-      for (int inner_j = 0; inner_j < kTileN; inner_j++) {
+      #pragma omp simd
+      for (int inner_j = 0; SCORCH_LIKELY(inner_j < kTileN); inner_j++) {
         int j = outer_j + inner_j;
         int pC1 = pC0 * C1_size + j;
         C_val[pC1] = accumulator[inner_j];
