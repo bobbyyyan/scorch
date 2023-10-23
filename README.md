@@ -14,7 +14,7 @@ pipenv shell
 
 #### Install Ninja
 
-Ninja is required to load C++ extension. For Mac, use `brew install ninja`.
+Ninja is required to load C++ extension. To install, use `pip install ninja`.
 
 #### Install libtorch
 
