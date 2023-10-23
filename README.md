@@ -2,6 +2,14 @@
 
 [![pytest](https://github.com/bobbyyyan/scorch/actions/workflows/pytest.yml/badge.svg)](https://github.com/bobbyyyan/scorch/actions/workflows/pytest.yml)
 
+## Getting started
+
+```
+cd scorch
+pipenv install --dev
+pipenv shell
+```
+
 ### Setting up development environment
 
 #### Install Ninja
