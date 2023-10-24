@@ -1,12 +1,12 @@
 import argparse
+import os
 import time
 
 import torch
 import torch.nn.functional as F
 from torch.nn import Linear, Parameter
-from torch_geometric.nn import MessagePassing
-
 from torch_geometric.nn import GCNConv
+from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 from tqdm import tqdm
 
@@ -112,6 +112,8 @@ def train(model, data, device, dataset_name, split_idx=None):
         optimizer.step()
 
     # Save weights
+    # Make weights/ directory if it doesn't exist
+    os.makedirs("weights", exist_ok=True)
     torch.save(model.state_dict(), f"weights/gcn_{dataset_name.lower()}_weights.pth")
 
 
