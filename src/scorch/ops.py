@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any, Union, Sequence, Optional, List
 
 import torch
-from torch.utils.cpp_extension import load
+from torch.utils.cpp_extension import load, load_inline
 
 from .compiler.cin import (
     IndexVar,
@@ -33,6 +33,23 @@ load(
     name="pybind",
     sources=[str(PROJECT_ROOT_DIR / "csrc/pybind.cpp")],
 )
+
+# Read header_cpp_code from csrc/header.cpp
+with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+    header_cpp_code = f.read()
+
+with open(PROJECT_ROOT_DIR / "csrc/spmm-csr.cpp", "r") as f:
+    cpp_code = f.read()
+
+# Load special kernels
+spmm_csr = load_inline(
+    name="kernel",
+    cpp_sources=[header_cpp_code, cpp_code],
+    functions=["evaluate"],
+    extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+)
+
+_kernel_cache["spmm_csr"] = spmm_csr
 
 
 def spmv(
@@ -111,7 +128,7 @@ def spmv(
     if "time_dict" in kwargs:
         time_dict = kwargs["time_dict"]
         time_dict["eval_time"] = eval_time
-    # print("Time taken for evaluate:", eval_time)
+    # m
 
     result = Tensor(
         shape=result_shape,
@@ -252,6 +269,35 @@ def matmul(
 
     if a.dim() == 2 and b.dim() == 1:
         return spmv(a, b, **kwargs)
+
+    if str(a.format) == "d,s" and str(b.format) == "d,d":
+        result_shape = (a.shape[0], b.shape[1])
+        args = [result_shape]
+
+        for tensor in [a, b]:
+            args.append(tensor.shape)  # type: ignore
+            args.append(tensor.index.mode_indices)  # type: ignore
+            args.append(tensor.values)  # type: ignore
+
+        spmm_csr = _kernel_cache["spmm_csr"]
+
+        start_time = time.time()
+        result_cpp = spmm_csr.evaluate(*args)
+        end_time = time.time()
+        eval_time = end_time - start_time
+        if "time_dict" in kwargs:
+            kwargs["time_dict"]["eval_time"] = eval_time
+
+        result = Tensor(
+            shape=result_shape,
+            index=TensorIndex(
+                mode_indices=result_cpp._storage._index.mode_indices,
+                tensor_format="dd",
+            ),
+            value=result_cpp._storage._value,
+        )
+
+        return result
 
     return einsum("ik,kj->ij", a, b, **kwargs)
 
