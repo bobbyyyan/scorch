@@ -453,10 +453,10 @@ def einsum(
 
     cin_stmt = scheduler.auto_schedule(cin_stmt)
 
-    print("cin_stmt:\n", cin_stmt)
+    # print("cin_stmt:\n", cin_stmt)
 
     if str(cin_stmt) in _kernel_cache:
-        print(f"Using cached kernel for {cin_stmt}")
+        # print(f"Using cached kernel for {cin_stmt}")
         module = _kernel_cache[str(cin_stmt)]
     else:
         lowerer = CINLowerer()
