@@ -18,7 +18,7 @@ with open("kernels/header.h", "r", encoding="utf-8") as f:
 with open("kernels/scorch-spmm-csr.h", "r", encoding="utf-8") as f:
     spmm_cpp_code = f.read()
 
-with open("kernels/scorch-spmspm-csr.h", "r", encoding="utf-8") as f:
+with open("kernels/scorch-spmspm-csr-original.h", "r", encoding="utf-8") as f:
     spmspm_cpp_code = f.read()
 
 
@@ -567,7 +567,8 @@ if __name__ == "__main__":
         dimensions,
         speedups_means,
         speedups_stds,
-        benchmark="SpMSpM 50% (CSR) TACO",
+        # benchmark="SpMSpM 50% (CSR) TACO (c1_pos_cvector, c1_crd_cvector, c_val_cvector)",
+        benchmark="SpMSpM 50% (CSR) Scorch custom (w scorch v2 workspace)",
     )
 
     # torch_times, scorch_times, speedups_means, speedups_stds = bench_sddmm(

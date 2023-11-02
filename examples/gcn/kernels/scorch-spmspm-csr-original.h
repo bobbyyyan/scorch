@@ -1,15 +1,16 @@
 // taco "C(i, k) = A(i, j) * B(j, k)" -f=A:ds -f=B:ds -f=C:ds
 #define SCORCH_PRAGMA_UNROLL _Pragma("unroll")
 #define SCORCH_LIKELY(x) __builtin_expect(!!(x), 1)
-#define SCORCH_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define SCORCH_UNLIKELY(x) (x)
 #define SCORCH_RESTRICT __restrict__
 
 #include <torch/torch.h>
 
 #include <vector>
 
-#include "header.h"
 #include "cvector.h"
+#include "header.h"
+#include "workspace.h"
 
 int cmp(const void* a, const void* b) {
   return *((const int*)a) - *((const int*)b);
@@ -29,67 +30,63 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
   int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
   float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
 
+  // Get B's level & value arrays
   int B0_size = B_shape[0];
   int B1_size = B_shape[1];
   int* SCORCH_RESTRICT B1_pos = B_mode_indices[1][0].data_ptr<int>();
   int* SCORCH_RESTRICT B1_crd = B_mode_indices[1][1].data_ptr<int>();
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
+  // Init result _level indices
   cvector<int> C1_pos;
   cvector<int> C1_crd;
   C1_pos[0] = 0;
   int pC1 = 0;
+  int C1_pos_index = 0;
 
-  for (int pC1 = 1; pC1 < (C0_size + 1); pC1++) {
+  for (int pC1 = 1; pC1 <= C0_size; pC1++) {
     C1_pos[pC1] = 0;
   }
 
   // Initialize result value array
   cvector<float> C_values;
 
-  float* SCORCH_RESTRICT w = (float*)malloc(sizeof(float) * B1_size);
-  int* SCORCH_RESTRICT w_index_list = (int*)malloc(sizeof(int) * B1_size);
-  bool* SCORCH_RESTRICT w_already_set = (bool*)calloc(B1_size, sizeof(bool));
-
   for (int i = 0; i < A0_size; i++) {
-    int w_index_list_size = 0;
+    // Assemble COMPRESSED level
+    for (; C1_pos_index < i; C1_pos_index++) {
+      C1_pos[C1_pos_index + 1] = C1_crd.size();
+    }
+    // Resolve index into dense _level of values array
+    int pC0 = i;
+
+    // Lower Where statement
+    // Initialize workspaces
+    coo_workspace<float, 1> wksp = coo_workspace<float, 1>(B1_size);
+
     for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
       int j = A1_crd[pA1];
+
       for (int pB1 = B1_pos[j]; pB1 < B1_pos[j + 1]; pB1++) {
         int k = B1_crd[pB1];
-        if (!w_already_set[k]) {
-          w[k] = A_val[pA1] * B_val[pB1];
-          w_index_list[w_index_list_size] = k;
-          w_already_set[k] = 1;
-          w_index_list_size++;
-        } else {
-          w[k] = w[k] + A_val[pA1] * B_val[pB1];
-        }
+
+        wksp.insert({k}, A_val[pA1] * B_val[pB1]);
       }
     }
-    qsort(w_index_list, w_index_list_size, sizeof(int), cmp);
-    int pC1_begin = pC1;
 
-    for (int w_idx = 0; w_idx < w_index_list_size; w_idx++) {
-      int k = w_index_list[w_idx];
+    // Lower consumer CIN
+    wksp.sort();
 
-      C_values[pC1] = w[k];
+    for (const auto& it : wksp) {
+      int k = it.first;
+      float wksp_value = it.second;
+
+      C_values[pC1] = wksp_value;
       C1_crd[pC1] = k;
       pC1++;
-      w_already_set[k] = 0;
     }
 
-    C1_pos[i + 1] = pC1 - pC1_begin;
-  }
-
-  free(w_index_list);
-  free(w_already_set);
-  free(w);
-
-  int csC1 = 0;
-  for (int pC10 = 1; pC10 < (C0_size + 1); pC10++) {
-    csC1 += C1_pos[pC10];
-    C1_pos[pC10] = csC1;
+    // Assembly compressed _level indices
+    C1_pos[C1_pos_index + 1] = C1_crd.size();
   }
 
   // Assemble final result

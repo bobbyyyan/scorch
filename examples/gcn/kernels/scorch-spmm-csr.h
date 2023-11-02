@@ -3,11 +3,16 @@
 #define SCORCH_UNLIKELY(x) (x)
 #define SCORCH_RESTRICT __restrict__
 
-Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
+#include <vector>
+
+Tensor evaluate(std::vector<int> result_shape,
+                std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
-                torch::Tensor A_values, std::vector<int> B_shape,
+                torch::Tensor A_values,
+                std::vector<int> B_shape,
                 std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values) {
+                torch::Tensor B_values)
+                {
   // Init result tensor _level sizesÏ
   int C0_size = result_shape[0];
   int C1_size = result_shape[1];
@@ -26,15 +31,13 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
   int C_capacity = C0_size * C1_size;
 
   // Use Torch API to create output
-  // auto options = torch::TensorOptions()
-  //                    .dtype(A_values.scalar_type())
-  //                    .device(A_values.device());
-  // auto C_values = torch::empty({C0_size, C1_size}, options);
-  // float* SCORCH_RESTRICT C_val = C_values.data_ptr<float>();
+  auto options = torch::TensorOptions().dtype(A_values.scalar_type()).device(A_values.device());
+  auto C_values = torch::empty({C0_size, C1_size}, options);
+  float* SCORCH_RESTRICT C_val = C_values.data_ptr<float>();
 
-  float* SCORCH_RESTRICT C_val = (float*)malloc(sizeof(float) * C_capacity);
+  // float* SCORCH_RESTRICT C_val = (float*)malloc(sizeof(float) * C_capacity);
 
-  constexpr int kTileN = 1024;
+  constexpr int kTileN = 512;
 
   for (int i = 0; SCORCH_LIKELY(i < A0_size); i++) {
     int pC0 = i;
@@ -74,9 +77,9 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
 
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void* ptr) { free(ptr); };
-  torch::Tensor C_values =
-      torch::from_blob(C_val, {C_capacity}, C_values_deleter, torch::kFloat32);
+  // auto C_values_deleter = [](void* ptr) { free(ptr); };
+  // torch::Tensor C_values =
+  //     torch::from_blob(C_val, {C_capacity}, C_values_deleter, torch::kFloat32);
   C._storage._index.mode_indices = {{}, {}};
   C._storage._value = C_values;
   return C;
