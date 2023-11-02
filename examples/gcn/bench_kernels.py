@@ -16,15 +16,54 @@ with open("kernels/header.h", "r", encoding="utf-8") as f:
     header_cpp_code = f.read()
 
 with open("kernels/scorch-spmm-csr.h", "r", encoding="utf-8") as f:
-    cpp_code = f.read()
+    spmm_cpp_code = f.read()
 
-# Dump the compiled kernel to a file for disassembly using extra flags
+with open("kernels/scorch-spmspm-csr.h", "r", encoding="utf-8") as f:
+    spmspm_cpp_code = f.read()
+
+
 spmm = load_inline(
     name="kernel",
-    cpp_sources=[header_cpp_code, cpp_code],
+    cpp_sources=[header_cpp_code, spmm_cpp_code],
     functions=["evaluate"],
-    extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+    extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros", "-Werror"],
 )
+
+spmspm = load_inline(
+    name="kernel",
+    cpp_sources=[spmspm_cpp_code],
+    extra_include_paths=["kernels/"],
+    functions=["evaluate"],
+    extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros", "-Werror"],
+)
+
+
+def scorch_spmspm_custom(a: Tensor, b: Tensor, **kwargs):
+    result_shape = (a.shape[0], b.shape[1])
+    args = [result_shape]
+
+    for tensor in [a, b]:
+        args.append(tensor.shape)  # type: ignore
+        args.append(tensor.index.mode_indices)  # type: ignore
+        args.append(tensor.values)  # type: ignore
+
+    start_time = time.time()
+    result_cpp = spmspm.evaluate(*args)
+    end_time = time.time()
+    eval_time = end_time - start_time
+    if "time_dict" in kwargs:
+        kwargs["time_dict"]["eval_time"] = eval_time
+
+    result = Tensor(
+        shape=result_shape,
+        index=TensorIndex(
+            mode_indices=result_cpp._storage._index.mode_indices,
+            tensor_format="ds",
+        ),
+        value=result_cpp._storage._value,
+    )
+
+    return result
 
 
 def scorch_spmm_custom(a: Tensor, b: Tensor, **kwargs):
@@ -213,11 +252,21 @@ def bench_sddmm(
     return torch_times, scorch_times, speedups_means, speedups_stds
 
 
-def bench_spmspm(dimensions, num_runs=5, sparsity=0.99, sparse_format="csr"):
+def bench_spmspm(
+    dimensions,
+    num_runs=5,
+    sparsity=0.99,
+    sparse_format="csr",
+    custom_func=None,
+):
     torch_times = []
     scorch_times = []
     speedups_means = []
     speedups_stds = []
+
+    scorch_spmspm_func = scorch_spmm
+    if custom_func is not None:
+        scorch_spmspm_func = custom_func
 
     gen_rand_sparse_func = gen_rand_sparse_coo if sparse_format == "coo" else gen_rand_sparse_csr
 
@@ -232,10 +281,10 @@ def bench_spmspm(dimensions, num_runs=5, sparsity=0.99, sparse_format="csr"):
 
             # Warm up
             for _ in range(1):
-                scorch_spmm(A, B)
+                scorch_spmspm_func(A, B)
 
             start = time.perf_counter()
-            scorch_spmm(A, B)
+            scorch_result = scorch_spmspm_func(A, B)
             end = time.perf_counter()
             scorch_time = end - start
             scorch_time_run.append(scorch_time)
@@ -245,10 +294,24 @@ def bench_spmspm(dimensions, num_runs=5, sparsity=0.99, sparse_format="csr"):
                 torch_spmm(A_torch, B_torch)
 
             start = time.perf_counter()
-            torch_spmm(A_torch, B_torch)
+            torch_result = torch_spmm(A_torch, B_torch)
             end = time.perf_counter()
             torch_time = end - start
             torch_time_run.append(torch_time)
+
+            # if not torch.allclose(torch_result.values().flatten(), scorch_result.values.flatten()):
+            #     print("\n\n\n")
+            #     print("torch_result.to_dense():")
+            #     print(torch_result.to_dense())
+            #     print("scorch_result.values.flatten():")
+            #     print(scorch_result.values.flatten())
+            #     print("A_torch.to_dense():")
+            #     print(A_torch.to_dense())
+            #     print("B_torch.to_dense():")
+            #     print(B_torch.to_dense())
+            #     import pdb
+
+            #     pdb.set_trace()
 
             speedup_run.append(torch_time / scorch_time)
 
@@ -467,17 +530,17 @@ if __name__ == "__main__":
     # )
     # plot_benchmark(dimensions, speedups_means, speedups_stds, benchmark="SpMV 80% (COO)")
 
-    torch_times, scorch_times, speedups_means, speedups_stds = bench_spmm(
-        dimensions,
-        num_runs=10,
-        sparsity=0.50,
-        sparse_format="csr",
-        custom_func=scorch_spmm_custom,
-    )
-    plot_benchmark(
-        dimensions, speedups_means, speedups_stds, benchmark="SpMM 50 (CSR) (tilesize=1024, restrict, unroll, likely, torchtensor)"
-        # dimensions, speedups_means, speedups_stds, benchmark="SpMM 65% (CSR)"
-    )
+    # torch_times, scorch_times, speedups_means, speedups_stds = bench_spmm(
+    #     dimensions,
+    #     num_runs=10,
+    #     sparsity=0.50,
+    #     sparse_format="csr",
+    #     custom_func=scorch_spmm_custom,
+    # )
+    # plot_benchmark(
+    #     dimensions, speedups_means, speedups_stds, benchmark="SpMM 50% (CSR) (tilesize=512, restrict, unroll, likely, torchtensor)"
+    #     # dimensions, speedups_means, speedups_stds, benchmark="SpMM 65% (CSR)"
+    # )
 
     # torch_times, scorch_times, speedups_means, speedups_stds = bench_spmm(
     #     dimensions,
@@ -494,10 +557,18 @@ if __name__ == "__main__":
     # )
     # plot_benchmark(dimensions, speedups_means, speedups_stds, benchmark="SpMSpM (COO)")
 
-    # torch_times, scorch_times, speedups_means, speedups_stds = bench_spmspm(
-    #     dimensions, sparsity=0.99, sparse_format="csr"
-    # )
-    # plot_benchmark(dimensions, speedups_means, speedups_stds, benchmark="SpMSpM (CSR)")
+    torch_times, scorch_times, speedups_means, speedups_stds = bench_spmspm(
+        dimensions,
+        sparsity=0.5,
+        sparse_format="csr",
+        custom_func=scorch_spmspm_custom,
+    )
+    plot_benchmark(
+        dimensions,
+        speedups_means,
+        speedups_stds,
+        benchmark="SpMSpM 50% (CSR) TACO",
+    )
 
     # torch_times, scorch_times, speedups_means, speedups_stds = bench_sddmm(
     #     dimensions,
