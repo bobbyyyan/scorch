@@ -1,3 +1,4 @@
+// taco "C(i, k) = A(i, j) * B(j, k)" -f=A:ds -f=B:ds -f=C:ds
 #define SCORCH_PRAGMA_UNROLL _Pragma("unroll")
 #define SCORCH_LIKELY(x) __builtin_expect(!!(x), 1)
 #define SCORCH_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -31,14 +32,13 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
   int* SCORCH_RESTRICT B1_crd = B_mode_indices[1][1].data_ptr<int>();
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
-  int* C1_pos = (int*)malloc(sizeof(int) * (C0_size + 1));
+  cvector<int> C1_pos;
   C1_pos[0] = 0;
   for (int pC1 = 1; pC1 < (C0_size + 1); pC1++) {
     C1_pos[pC1] = 0;
   }
-  int C1_crd_capacity = 1048576;
-  int* C1_crd = (int*)malloc(sizeof(int) * C1_crd_capacity);
-  int kC = 0;
+  cvector<int> C1_crd;
+  int pC1 = 0;
   int C_capacity = 1048576;
   float* C_vals = (float*)malloc(sizeof(float) * C_capacity);
 
@@ -50,41 +50,37 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
 
   for (int i = 0; i < A0_size; i++) {
     int w_index_list_size = 0;
-    for (int jA = A1_pos[i]; jA < A1_pos[(i + 1)]; jA++) {
-      int j = A1_crd[jA];
-      for (int kB = B1_pos[j]; kB < B1_pos[(j + 1)]; kB++) {
+    for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
+      int j = A1_crd[pA1];
+      for (int kB = B1_pos[j]; kB < B1_pos[j + 1]; kB++) {
         int k = B1_crd[kB];
         if (!w_already_set[k]) {
-          w[k] = A_val[jA] * B_val[kB];
+          w[k] = A_val[pA1] * B_val[kB];
           w_index_list[w_index_list_size] = k;
           w_already_set[k] = 1;
           w_index_list_size++;
         } else {
-          w[k] = w[k] + A_val[jA] * B_val[kB];
+          w[k] = w[k] + A_val[pA1] * B_val[kB];
         }
       }
     }
     qsort(w_index_list, w_index_list_size, sizeof(int), cmp);
-    int pC1_begin = kC;
+    int pC1_begin = pC1;
 
     for (int w_index_locator = 0; w_index_locator < w_index_list_size;
          w_index_locator++) {
       int k = w_index_list[w_index_locator];
-      if (C_capacity <= kC) {
+      if (C_capacity <= pC1) {
         C_vals = (float*)realloc(C_vals, sizeof(float) * (C_capacity * 2));
         C_capacity *= 2;
       }
-      C_vals[kC] = w[k];
-      if (C1_crd_capacity <= kC) {
-        C1_crd = (int*)realloc(C1_crd, sizeof(int) * (C1_crd_capacity * 2));
-        C1_crd_capacity *= 2;
-      }
-      C1_crd[kC] = k;
-      kC++;
+      C_vals[pC1] = w[k];
+      C1_crd[pC1] = k;
+      pC1++;
       w_already_set[k] = 0;
     }
 
-    C1_pos[i + 1] = kC - pC1_begin;
+    C1_pos[i + 1] = pC1 - pC1_begin;
   }
 
   free(w_index_list);
@@ -99,14 +95,14 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
 
   Tensor C;
   int C1_pos_size = C0_size + 1;
-  int C1_crd_size = kC;
-  int C_val_size = kC;
+  int C1_crd_size = pC1;
+  int C_val_size = pC1;
   auto free_deleter = [](void* ptr) { free(ptr); };
 
-  torch::Tensor C1_pos_torch =
-      torch::from_blob(C1_pos, {C1_pos_size}, free_deleter, torch::kInt);
-  torch::Tensor C1_crd_torch =
-      torch::from_blob(C1_crd, {C1_crd_size}, free_deleter, torch::kInt);
+  torch::Tensor C1_pos_torch = torch::from_blob(
+      C1_pos.data(), {C1_pos.size()}, C1_pos.get_deleter(), torch::kInt);
+  torch::Tensor C1_crd_torch = torch::from_blob(
+      C1_crd.data(), {C1_crd.size()}, C1_crd.get_deleter(), torch::kInt);
   torch::Tensor C_values_torch =
       torch::from_blob(C_vals, {C_val_size}, free_deleter, torch::kFloat32);
   C._storage._index.mode_indices = {{}, {C1_pos_torch, C1_crd_torch}};
