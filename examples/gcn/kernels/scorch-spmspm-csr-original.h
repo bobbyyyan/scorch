@@ -10,7 +10,7 @@
 
 #include "cvector.h"
 #include "header.h"
-#include "workspace.h"
+#include "workspace-v2.h"
 
 int cmp(const void* a, const void* b) {
   return *((const int*)a) - *((const int*)b);

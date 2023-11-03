@@ -34,12 +34,13 @@
 
 template <typename T, int N>
 class coo_workspace {
-  static constexpr int BLOCK_SIZE = 1024;
+  static constexpr int DEFAULT_CAPACITY = 1024;
 
   T* _values;
   int* _indices;
   bool* _setFlags;
   int _size;
+  int _capacity;
 
  public:
   explicit coo_workspace(int capacity) {
@@ -47,9 +48,10 @@ class coo_workspace {
     _indices = (int*)malloc(sizeof(int) * capacity);
     _setFlags = (bool*)calloc(capacity, sizeof(bool));
     _size = 0;
+    _capacity = capacity;
   }
 
-  explicit coo_workspace() : coo_workspace(BLOCK_SIZE) {}
+  explicit coo_workspace() : coo_workspace(DEFAULT_CAPACITY) {}
 
   ~coo_workspace() {
     free(_values);
@@ -57,23 +59,11 @@ class coo_workspace {
     free(_setFlags);
   }
 
-  void insert(const std::vector<int>& coord, T value) {
-    int index = coord[N - 1];
-    for (int i = N - 2; i >= 0; i--) {
-      index = index * N + coord[i];
-    }
-
-    if (!_setFlags[index]) {
-      _values[index] = value;
-      _indices[_size] = index;
-      _setFlags[index] = true;
-      _size++;
-    } else {
-      _values[index] += value;
-    }
-  }
-
   void insert(const int coord, T value) {
+    if (_size == _capacity) {
+      resize(_capacity * 2);
+    }
+
     if (!_setFlags[coord]) {
       _values[coord] = value;
       _indices[_size] = coord;
@@ -84,6 +74,18 @@ class coo_workspace {
     }
   }
 
+  void resize(int new_capacity) {
+    _values = (T*)realloc(_values, sizeof(T) * new_capacity);
+    _indices = (int*)realloc(_indices, sizeof(int) * new_capacity);
+    _setFlags = (bool*)realloc(_setFlags, sizeof(bool) * new_capacity);
+
+    // Initialize new elements to false for _setFlags
+    for (int i = _capacity; i < new_capacity; i++) {
+      _setFlags[i] = false;
+    }
+    _capacity = new_capacity;
+  }
+
   void sort() {
     std::qsort(_indices, _size, sizeof(int), [](const void* a, const void* b) {
       return *(const int*)a - *(const int*)b;
@@ -92,7 +94,7 @@ class coo_workspace {
 
   void clear() {
     _size = 0;
-    std::fill_n(_setFlags, BLOCK_SIZE, false);
+    std::fill_n(_setFlags, _capacity, false);
   }
 
   class iterator {
