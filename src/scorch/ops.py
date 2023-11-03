@@ -299,7 +299,7 @@ def matmul(
 
         return result
 
-    return einsum("ik,kj->ij", a, b, **kwargs)
+    return einsum("ij,jk->ik", a, b, **kwargs)
 
 
 def einsum(
@@ -349,10 +349,11 @@ def einsum(
 
     # Create TensorVar's for each tensor
     tensor_vars = []
-    tensor_names = list("BCDEFGHIJKLMNOPQRSTUVWXYZ")
+    tensor_names_available = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     for i, tensor in enumerate(tensors):
         if isinstance(tensor, Tensor):
-            tensor_vars.append(TensorVar(name=tensor_names[i], fmt=tensor.format))
+            tensor_name = tensor_names_available.pop(0)
+            tensor_vars.append(TensorVar(name=tensor_name, fmt=tensor.format))
 
     # Get output format from kwargs
     output_format = kwargs.get("format", None)
@@ -417,10 +418,7 @@ def einsum(
         output_format = parse_format(output_format)
 
     # Create the result TensorVar
-    available_names = [
-        x for x in list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") if x not in tensor_names
-    ]
-    result_tensor_var = TensorVar(name=available_names[0], fmt=output_format)
+    result_tensor_var = TensorVar(name=tensor_names_available.pop(0), fmt=output_format)
 
     # Generate the python code for constructing the TensorAccess's, and TensorAssign and execute it
     assert index_var_dict, "index_var_dict is empty"
