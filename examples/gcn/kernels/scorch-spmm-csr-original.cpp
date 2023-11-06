@@ -1,18 +1,13 @@
 #define SCORCH_PRAGMA_UNROLL _Pragma("unroll")
 #define SCORCH_LIKELY(x) __builtin_expect(!!(x), 1)
-#define SCORCH_UNLIKELY(x) (x)
+#define SCORCH_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define SCORCH_RESTRICT __restrict__
 
-#include <vector>
-
-Tensor evaluate(std::vector<int> result_shape,
-                std::vector<int> A_shape,
+Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
-                torch::Tensor A_values,
-                std::vector<int> B_shape,
+                torch::Tensor A_values, std::vector<int> B_shape,
                 std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values)
-                {
+                torch::Tensor B_values) {
   // Init result tensor _level sizesÏ
   int C0_size = result_shape[0];
   int C1_size = result_shape[1];
@@ -29,15 +24,19 @@ Tensor evaluate(std::vector<int> result_shape,
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
-
   // Use Torch API to create output
-  auto options = torch::TensorOptions().dtype(A_values.scalar_type()).device(A_values.device());
+  auto options = torch::TensorOptions()
+                     .dtype(A_values.scalar_type())
+                     .device(A_values.device());
   auto C_values = torch::empty({C0_size, C1_size}, options);
   float* SCORCH_RESTRICT C_val = C_values.data_ptr<float>();
 
-  // float* SCORCH_RESTRICT C_val = (float*)malloc(sizeof(float) * C_capacity);
+  // Tile size should be minimum of kTileNMax and B1_size
+  constexpr int kTileNMax = 32;
+  int kTileN = (B1_size < kTileNMax) ? B1_size : kTileNMax;
 
-  constexpr int kTileN = 1024;
+  // Relax this constraint
+  // TORCH_CHECK((B1_size % kTileN) == 0);
 
   for (int i = 0; SCORCH_LIKELY(i < A0_size); i++) {
     int pC0 = i;
@@ -48,15 +47,15 @@ Tensor evaluate(std::vector<int> result_shape,
 
     for (int outer_j = 0; outer_j < B1_size; outer_j += kTileN) {
       float accumulator[kTileN] = {};
-      // float* SCORCH_RESTRICT accumulator = new float[kTileN]();
-
       for (int pA1 = pA1_start; pA1 < pA1_end; pA1++) {
         // Resolve coordinates
         int k = A1_crd[pA1];
 
+        int inner_j_end = std::min(kTileN, B1_size - outer_j);
+
         // Unroll the inner loop
         SCORCH_PRAGMA_UNROLL
-        for (int inner_j = 0; inner_j < kTileN; inner_j++) {
+        for (int inner_j = 0; SCORCH_LIKELY(inner_j < inner_j_end); inner_j++) {
           int j = outer_j + inner_j;
           int pB1 = k * B1_size + j;
           accumulator[inner_j] += A_val[pA1] * B_val[pB1];
@@ -64,23 +63,16 @@ Tensor evaluate(std::vector<int> result_shape,
       }
 
       // Flush the accumulator
-      SCORCH_PRAGMA_UNROLL
-      for (int inner_j = 0; inner_j < kTileN; inner_j++) {
+      for (int inner_j = 0; SCORCH_LIKELY(inner_j < kTileN); inner_j++) {
         int j = outer_j + inner_j;
         int pC1 = pC0 * C1_size + j;
         C_val[pC1] = accumulator[inner_j];
       }
-
-      // Deallocate memory to prevent memory leak
-      // delete[] accumulator;
     }
   }
 
   // Assemble final result
   Tensor C;
-  // auto C_values_deleter = [](void* ptr) { free(ptr); };
-  // torch::Tensor C_values =
-  //     torch::from_blob(C_val, {C_capacity}, C_values_deleter, torch::kFloat32);
   C._storage._index.mode_indices = {{}, {}};
   C._storage._value = C_values;
   return C;
