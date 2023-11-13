@@ -880,25 +880,56 @@ def test_spmm_codegen():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_spmm_ds_ds_ds_ikj_gustavson():
-    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
+def test_ttm_ddd_dds_dd_ijkm():
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    m = IndexVar("m")
+
+    C = TensorVar("C", fmt="ddd")
+    A = TensorVar("A", fmt="dds")
+    B = TensorVar("B", fmt="dd")
+
+    C[i, j, m] = A[i, j, k] * B[k, m]
+
+    C._assignment.op = Operation.ADD
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(m, C._assignment))))
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_spmm_dd_dd_ds_ijk_gustavson():
+    # taco "C(i, k) = A(i, j) * B(j, k)" -f=A:dd -f=B:dd -f=C:ds -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
 
-    A = TensorVar("A", fmt=["dense", "sparse"])
-    B = TensorVar("B", fmt=["dense", "sparse"])
-    C = TensorVar("C", fmt=["dense", "sparse"])
+    C = TensorVar("C", fmt="dd")
+
+    A = TensorVar("A", fmt="dd")
+    B = TensorVar("B", fmt="ds")
 
     cin_stmt = ForAll(
         i,
         ForAll(
-            k,
+            j,
             ForAll(
-                j,
+                k,
                 TensorAssign(
-                    A[i, j],
-                    B[i, k] * C[k, j],
+                    C[i, k],
+                    A[i, j] * B[j, k],
                     op=Operation.ADD,
                 ),
             ),

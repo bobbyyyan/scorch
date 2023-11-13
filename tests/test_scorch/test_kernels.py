@@ -1431,48 +1431,25 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
     assert result.to_torch().tolist() == result_torch.tolist()
 
 
-def test_spmm_ds_ds_ds_ikj_gustavson():
+def test_spmm_ds_ds_ds_ikj_gustavson_random():
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
 
-    A = TensorVar("A", fmt=["sparse", "sparse"])
+    A = TensorVar("A", fmt=["dense", "sparse"])
     B = TensorVar("B", fmt=["dense", "sparse"])
     C = TensorVar("C", fmt=["dense", "sparse"])
 
-    workspace = Workspace(
-        name="wksp",
-        dim=1,
-    )
-
-    """
-    A[i, j] = ForAll(i,
-      Where(
-        producer=ForAll(k, ForAll(j, 1[j] += B[i, k] * C[k, j])),
-        consumer=ForAll(j, A[i, j] = workspace[j])
-      )
-    )
-    """
-
     cin_stmt = ForAll(
         i,
-        Where(
-            producer=ForAll(
-                k,
-                ForAll(
-                    j,
-                    TensorAssign(
-                        workspace[j],
-                        B[i, k] * C[k, j],
-                        op=Operation.ADD,
-                    ),
-                ),
-            ),
-            consumer=ForAll(
+        ForAll(
+            k,
+            ForAll(
                 j,
                 TensorAssign(
                     A[i, j],
-                    workspace[j],
+                    B[i, k] * C[k, j],
+                    op=Operation.ADD,
                 ),
             ),
         ),
@@ -1499,24 +1476,8 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
         extra_cflags=["-O3"],
     )
 
-    tensor_a_torch = torch.Tensor(
-        [
-            [1, 0, 0, 0, 0],
-            [0, 2, 0, 0, 0],
-            [0, 0, 3, 0, 0],
-            [0, 0, 0, 4, 0],
-            [0, 0, 0, 0, 5],
-        ]
-    )
-    tensor_b_torch = torch.Tensor(
-        [
-            [1, 2, 3, 4, 5],
-            [2, 2, 0, 0, 0],
-            [3, 0, 3, 0, 0],
-            [4, 0, 0, 4, 0],
-            [5, 0, 0, 0, 5],
-        ]
-    )
+    tensor_a_torch = torch.rand(50, 50)
+    tensor_b_torch = torch.rand(50, 50)
 
     a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
@@ -1763,11 +1724,11 @@ def test_spmm_ss_ds_ds():
 
 
 def test_spmm_dd_ds_dd():
-    tensor_a_torch = torch.rand(5, 5)
-    tensor_b_torch = torch.rand(5, 5)
+    tensor_a_torch = torch.rand(100, 100)
+    tensor_b_torch = torch.rand(100, 100)
 
-    a_scorch = Tensor.from_torch(tensor_a_torch, "A")
-    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_scorch = Tensor.from_torch(tensor_b_torch, "B")
 
     result = matmul(a_scorch, b_scorch, format="dd")
 
