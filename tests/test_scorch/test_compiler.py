@@ -881,6 +881,7 @@ def test_spmm_codegen():
 
 
 def test_ttm_ddd_dds_dd_ijkm():
+    # C[i, j, m] = A[i, j, k] * B[k, m]
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
@@ -895,6 +896,38 @@ def test_ttm_ddd_dds_dd_ijkm():
     C._assignment.op = Operation.ADD
 
     cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(m, C._assignment))))
+
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_mttkrp_dd_sss_dd_dd_ijkm():
+    # D[i, m] = A[i, j, k] * B[j, m] * C[k, m]
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    m = IndexVar("m")
+
+    D = TensorVar("D", fmt="dd")
+    A = TensorVar("A", fmt="sss")
+    B = TensorVar("B", fmt="dd")
+    C = TensorVar("C", fmt="dd")
+
+    D[i, m] = A[i, j, k] * B[j, m] * C[k, m]
+
+    D._assignment.op = Operation.ADD
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(m, D._assignment))))
 
     print("\nCIN statement:")
     print(cin_stmt)

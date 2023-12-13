@@ -1432,6 +1432,8 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
 
 
 def test_spmm_ds_ds_ds_ikj_gustavson_random():
+    dim_n = 50
+
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
@@ -1440,16 +1442,39 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
     B = TensorVar("B", fmt=["dense", "sparse"])
     C = TensorVar("C", fmt=["dense", "sparse"])
 
+    workspace = Workspace(
+        name="wksp",
+        dim=1,
+    )
+
+    """
+    A[i, j] = ForAll(i,
+      Where(
+        producer=ForAll(k, ForAll(j, 1[j] += B[i, k] * C[k, j])),
+        consumer=ForAll(j, A[i, j] = workspace[j])
+      )
+    )
+    """
+
     cin_stmt = ForAll(
         i,
-        ForAll(
-            k,
-            ForAll(
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        B[i, k] * C[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
                 j,
                 TensorAssign(
                     A[i, j],
-                    B[i, k] * C[k, j],
-                    op=Operation.ADD,
+                    workspace[j],
                 ),
             ),
         ),
@@ -1476,15 +1501,15 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
         extra_cflags=["-O3"],
     )
 
-    tensor_a_torch = torch.rand(50, 50)
-    tensor_b_torch = torch.rand(50, 50)
+    tensor_a_torch = torch.rand(dim_n, dim_n)
+    tensor_b_torch = torch.rand(dim_n, dim_n)
 
     a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     output_format = parse_format("ds")
 
-    result_shape = (5, 5)
+    result_shape = (dim_n, dim_n)
     args = [result_shape]
 
     for tensor in [a_sparse, b_sparse]:
@@ -1502,11 +1527,11 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
         value=result_cpp._storage._value,
     )
 
-    assert result.shape == (5, 5)
+    assert result.shape == (dim_n, dim_n)
     assert len(result.index.mode_indices) == 2
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
-    assert result.to_torch().tolist() == result_torch.tolist()
+    assert result_torch.flatten().allclose(result.to_torch().flatten())
 
 
 def test_spmm_ss_ds_ds_ikj_gustavson():
