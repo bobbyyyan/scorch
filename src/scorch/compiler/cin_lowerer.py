@@ -418,6 +418,26 @@ class CINLowerer:
                 )
                 continue
 
+            # DONE: If the workspace is 1-dimensional, use optimized 1D workspace implementation
+            # class name: coo_workspace_1d<tensor's ctype, tensor's dim>
+
+            if wksp.dim == 1:
+                workspace_init_stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=wksp.get_name(),
+                            type=llir.DataType.AUTO,
+                        ),
+                        value=llir.FunctionCall(
+                            name=f"coo_workspace_1d<{wksp_ctype.value}, {wksp.dim}>",
+                            args=[
+                                llir.Literal(value=f"{1024}"),
+                            ],
+                        ),
+                    )
+                )
+                continue
+
             workspace_init_stmts.append(
                 llir.VarInit(
                     var=llir.Var(
@@ -549,19 +569,35 @@ class CINLowerer:
         # int <wksp_access's first index var's name> = it->first[0];
         # int <wksp_access's second index var's name> = it->first[1];
         # ...
-        for i, index_var in enumerate(wksp_access.get_index_vars()):
+        # DONE: if the workspace is one dimensional, then just do .first without the index
+        # vars
+        if len(wksp_access.get_index_vars()) == 1:
             loop_body.append(
                 llir.VarInit(
                     var=llir.Var(
-                        name=index_var.name,
+                        name=wksp_access.get_index_vars()[0].name,
                         type=llir.DataType.INT,
                     ),
                     value=llir.Var(
-                        name=f"{loop_var.name}.first[{i}]",
+                        name=f"{loop_var.name}.first",
                         type=llir.DataType.NO_TYPE,
                     ),
                 )
             )
+        else:
+            for i, index_var in enumerate(wksp_access.get_index_vars()):
+                loop_body.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=index_var.name,
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Var(
+                            name=f"{loop_var.name}.first[{i}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    )
+                )
         # <wksp's ctype> <wksp's name>_value = it->second;
         loop_body.append(
             llir.VarInit(
