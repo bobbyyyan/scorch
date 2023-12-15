@@ -1131,6 +1131,78 @@ def test_spmm_dd_ds_dd_ikj():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_spmm_dd_ds_dd_tiled():
+    # TODO: implement this
+    """
+    C[i, k] = A[i, j] * B[j, k]
+    k gets tiled
+    loop order: i, k_out, j, k_in
+    accumualtor: accum_c[k_in]
+    ForAll i
+      ForAll k_out
+        Where(
+            producer=ForAll j, ForAll k_in
+                k = k_out + k_in
+                (accum_c[k_in] += A[i, j] * B[j, k]),
+            consumer=ForAll k_in
+                k = k_out + k_in
+                C[i, k] = accum_c[k_in]
+        )
+    """
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k_out = IndexVar("k_out")
+    k_in = IndexVar("k_in")
+    k = IndexVar("k", k_out + k_in)
+
+    C = TensorVar("C", fmt="dd")
+    A = TensorVar("A", fmt="ds")
+    B = TensorVar("B", fmt="dd")
+
+    accum_c = TensorVar("accum_c", fmt="d")
+
+    cin_stmt = ForAll(
+        i,
+        ForAll(
+            k_out,
+            Where(
+                producer=ForAll(
+                    j,
+                    ForAll(
+                        k_in,
+                        TensorAssign(
+                            accum_c[k_in],
+                            A[i, j] * B[j, k],
+                            op=Operation.ADD,
+                        ),
+                    ),
+                ),
+                consumer=ForAll(
+                    k_in,
+                    TensorAssign(
+                        C[i, k],
+                        accum_c[k_in],
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    print("\nCIN statement:")
+
+    print(cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_spmm_ds_ds_dd_ikj_gustavson_workspace():
     # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:dd -print-evaluate
     i = IndexVar("i")
