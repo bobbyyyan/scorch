@@ -500,7 +500,7 @@ class CINLowerer:
                 stmts.append(
                     llir.Assign(
                         var=llir.Var(
-                            name=f"{result_tensor_name}_values[{index_var.get_name()}]",
+                            name=f"{result_tensor_name}_values[{index_var.name}]",
                             type=llir.DataType.NO_TYPE,
                         ),
                         value=llir.Var(
@@ -521,15 +521,18 @@ class CINLowerer:
 
         wksp_last_index_var = wksp_index_vars[-1]
 
-        level = result_tensor_access.level_of_index_var(wksp_last_index_var)
-        level_type = result_tensor_access.level_type_of_index_var(wksp_last_index_var)
+        if wksp_last_index_var.has_parent:
+            curr_index_var = wksp_last_index_var.parent
+        else:
+            curr_index_var = wksp_last_index_var
+
+        level = result_tensor_access.level_of_index_var(curr_index_var)
+        level_type = result_tensor_access.level_type_of_index_var(curr_index_var)
 
         parent_index_var = None
         parent_level_type = None
         if level > 0:
-            parent_index_var = result_tensor_access.get_parent_index_var(
-                wksp_last_index_var
-            )
+            parent_index_var = result_tensor_access.get_parent_index_var(curr_index_var)
             assert parent_index_var is not None, "parent_index_var should not be None"
             parent_level_type = result_tensor_access.level_type_of_index_var(
                 parent_index_var
@@ -694,7 +697,7 @@ class CINLowerer:
                                     name=f"{result_tensor_name}{level - 1}_crd.push_back",
                                     args=[
                                         llir.Var(
-                                            name=parent_index_var.get_name(),
+                                            name=parent_index_var.name,
                                             type=llir.DataType.INT,
                                         )
                                     ],
@@ -1574,6 +1577,6 @@ class CINLowerer:
         Lower an IndexVar to LLIR
         """
         return llir.Var(
-            name=ivar.get_name(),
+            name=ivar.name,
             type=llir.DataType.INT,
         )

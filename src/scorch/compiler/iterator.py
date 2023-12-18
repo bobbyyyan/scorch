@@ -146,7 +146,22 @@ class ModeIterator:
             assert (
                 self.tensor_access is not None
             ), "If _level is not provided, tensor_access must be provided"
-            self._level = self.tensor_access.level_of_index_var(self.index_var)
+            # TODO: if self.index_var is not in self.tensor_access,
+            #  check if the parent index var is in self.tensor_access
+            tensor_access_index_vars = self.tensor_access.get_index_vars()
+            if self.index_var in tensor_access_index_vars:
+                self._level = self.tensor_access.level_of_index_var(self.index_var)
+            elif (
+                self.index_var.has_parent
+                and self.index_var.parent in tensor_access_index_vars
+            ):
+                self._level = self.tensor_access.level_of_index_var(
+                    self.index_var.parent
+                )
+            else:
+                raise Exception(
+                    f"IndexVar {self.index_var} not in TensorAccess {self.tensor_access}"
+                )
 
         if self.level_type is None:
             assert (

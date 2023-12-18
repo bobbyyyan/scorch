@@ -80,6 +80,10 @@ class LatticePoint:
         self, index_var: IndexVar
     ) -> List[ModeIterator]:
         self.set_index_var(index_var)
+
+        if index_var.has_parent:
+            index_var = index_var.parent
+
         self.iterators = [
             ModeIterator(
                 tensor_access=ta,
@@ -647,6 +651,8 @@ class IterationLattice:
         iteration domain.
         """
         current_index_var = self.for_all_stmt.get_index_var()
+        if current_index_var.has_parent:
+            current_index_var = current_index_var.parent
 
         def union_lattice_points(
             left_lattice_points: List[LatticePoint],
@@ -884,7 +890,7 @@ class IterationLattice:
                                         name=f"{result_tensor_name}{level - 1}_crd.push_back",
                                         args=[
                                             llir.Var(
-                                                name=parent_index_var.get_name(),
+                                                name=parent_index_var.name,
                                                 type=llir.DataType.INT,
                                             )
                                         ],
@@ -975,7 +981,7 @@ class IterationLattice:
                             llir.VarInit(
                                 var=result_index_var,
                                 value=llir.Var(
-                                    name=index_var.get_name(),
+                                    name=index_var.name,
                                     type=llir.DataType.INT,
                                 ),
                             )
@@ -1000,7 +1006,7 @@ class IterationLattice:
                                         ),
                                     ),
                                     right=llir.Var(
-                                        name=index_var.get_name(),
+                                        name=index_var.name,
                                         type=llir.DataType.INT,
                                     ),
                                 ),

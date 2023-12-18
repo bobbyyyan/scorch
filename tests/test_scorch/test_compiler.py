@@ -1159,7 +1159,8 @@ def test_spmm_dd_ds_dd_tiled():
     A = TensorVar("A", fmt="ds")
     B = TensorVar("B", fmt="dd")
 
-    accum_c = TensorVar("accum_c", fmt="d")
+    # accum_c = TensorVar("accum_c", fmt="d")
+    accum_c = Workspace("accum_c", dim=1)
 
     cin_stmt = ForAll(
         i,

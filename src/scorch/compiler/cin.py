@@ -178,12 +178,42 @@ class IndexVar(IndexExpr):
     An index variable is bound to a set of coordinates by a forall statement.
     """
 
-    def __init__(self, name: str):
+    def __init__(
+        self,
+        name: str,
+        expr: Optional[IndexVarExpr] = None,
+        parent: Optional[IndexVar] = None,
+    ):
         super().__init__()
-        self.name = name
+        self._name = name
+        self._expr = expr
+        self._parent = parent
+        # if expr, then set parent of expr to self
+        if expr:
+            expr.set_parent(self)
 
-    def get_name(self) -> str:
-        return self.name
+    @property
+    def name(self) -> str:
+        assert self._name is not None, "IndexVar name is None"
+        return self._name
+
+    @property
+    def expr(self) -> IndexVarExpr:
+        assert self._expr is not None, "IndexVar expr is None"
+        return self._expr
+
+    @property
+    def parent(self) -> IndexVar:
+        assert self._parent is not None, "IndexVar parent is None"
+        return self._parent
+
+    @property
+    def has_parent(self) -> bool:
+        return self._parent is not None
+
+    @parent.setter
+    def parent(self, parent: IndexVar) -> None:
+        self._parent = parent
 
     def __str__(self):
         return str(self.name)
@@ -204,6 +234,56 @@ class IndexVar(IndexExpr):
 
     def __hash__(self):
         return hash(self.name)
+
+    def __add__(self, other) -> IndexVarExpr:
+        return IndexVarAdd(self, other)
+
+
+class IndexVarExpr(IndexExpr):
+    """An expression involving index variables.
+    e.g. 2 * i + j
+    """
+
+    def set_parent(self, parent: IndexVar) -> None:
+        raise NotImplementedError
+
+
+class IndexVarAdd(IndexVarExpr):
+    """A sum of two index variables.
+    e.g. i + j
+    """
+
+    def __init__(self, lhs: IndexVar, rhs: IndexVar):
+        super().__init__()
+        self.lhs = lhs
+        self.rhs = rhs
+
+    def get_lhs(self) -> IndexVar:
+        return self.lhs
+
+    def get_rhs(self) -> IndexVar:
+        return self.rhs
+
+    def set_parent(self, parent: IndexVar) -> None:
+        self.lhs.parent = parent
+        self.rhs.parent = parent
+
+    def __str__(self):
+        return f"{self.lhs} + {self.rhs}"
+
+    def __repr__(self):
+        return f"ivar_add_{self.lhs}_{self.rhs}"
+
+    def __eq__(self, other):
+        if isinstance(other, IndexVarAdd):
+            return self.lhs == other.lhs and self.rhs == other.rhs
+        return False
+
+    def __copy__(self):
+        return IndexVarAdd(deepcopy(self.lhs), deepcopy(self.rhs))
+
+    def __hash__(self):
+        return hash((self.lhs, self.rhs))
 
 
 class TensorVar(IndexExpr):
