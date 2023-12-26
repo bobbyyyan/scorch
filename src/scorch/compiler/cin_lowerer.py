@@ -229,8 +229,9 @@ class CINLowerer:
 
         rhs_llir = self.lower_IndexExpr(stmt.rhs)
 
-        # if we are at the bottommost _level, we can emit the compute code
+        # if we are at the bottommost _level, we can emit compute code
         assert self.result_tensor_access, "result tensor access is None"
+        is_workspace = self.result_tensor_access.is_workspace()
         index_vars = self.result_tensor_access.get_index_vars()
         # If index_vars is None (empty), that means we have a scalar workspace
         # Then just do <tensor> += <rhs_llir>
@@ -246,17 +247,20 @@ class CINLowerer:
             # if index_vars are all in defined_index_vars, then we can emit the compute code
             if all(index_var in self.defined_index_vars for index_var in index_vars):
                 assert self.result_tensor_var, "result tensor var is None"
+
+                values_llir_name = self.result_tensor_var.name
+                if not is_workspace:
+                    values_llir_name = f"{values_llir_name}_values"
+
                 if self.result_value_array_sparse_index_llir:
                     tensor_access_llir = llir.Var(
-                        name=f"{self.result_tensor_var.get_name()}_values"
-                        + f"[{self.result_value_array_sparse_index_llir.name}]",
+                        name=f"{values_llir_name}[{self.result_value_array_sparse_index_llir.name}]",
                         type=llir.DataType.NO_TYPE,
                     )
                 else:
                     level = self.result_tensor_access.level_of_index_var(index_vars[-1])
                     tensor_access_llir = llir.Var(
-                        name=f"{self.result_tensor_var.get_name()}_values"
-                        + f"[p{self.result_tensor_var.get_name()}{level}]",
+                        name=f"{values_llir_name}[p{self.result_tensor_var.name}{level}]",
                         type=llir.DataType.NO_TYPE,
                     )
                     # tensor_access_llir = llir.Var(
@@ -265,27 +269,49 @@ class CINLowerer:
                     #     type=llir.DataType.NO_TYPE,
                     # )
 
-                if self.result_tensor_access.is_workspace():
-                    # <tensor name>.insert(<C++ array of indices>, <rhs_llir>);
-                    result_index_vars = self.result_tensor_access.get_index_vars()
-                    llir_stmts.append(
-                        llir.FunctionCallStmt(
-                            name=f"{self.result_tensor_access.get_tensor().get_name()}.insert",
-                            args=[
-                                llir.Array(
-                                    values=[
-                                        llir.Var(
-                                            name=ivar.name,
-                                            type=llir.DataType.INT,
-                                        )
-                                        for ivar in result_index_vars
-                                    ],
-                                    data_type=llir.DataType.INT,
+                if is_workspace:
+                    assert isinstance(self.result_tensor_access, WorkspaceAccess)
+                    wksp_access: WorkspaceAccess = self.result_tensor_access
+                    wksp_index_vars = wksp_access.get_index_vars()
+
+                    if wksp_access.is_dense():
+                        # <workspace name>[<C++ array of indices>] += <rhs_llir>;
+                        assert (
+                            len(wksp_index_vars) == 1
+                        ), "dense workspace has more than 1 index var"
+                        wksp_index_var = wksp_index_vars[0]
+                        llir_stmts.append(
+                            llir.Assign(
+                                var=llir.Var(
+                                    name=f"{self.result_tensor_var.name}[{wksp_index_var.name}]",
+                                    type=llir.DataType.NO_TYPE,
                                 ),
-                                rhs_llir,
-                            ],
+                                value=rhs_llir,
+                                op=AssignOp.ADD_ASSIGN,
+                            )
                         )
-                    )
+
+                    else:
+                        # <workspace name>.insert(<C++ array of indices>, <rhs_llir>);
+
+                        llir_stmts.append(
+                            llir.FunctionCallStmt(
+                                name=f"{self.result_tensor_access.get_tensor().get_name()}.insert",
+                                args=[
+                                    llir.Array(
+                                        values=[
+                                            llir.Var(
+                                                name=ivar.name,
+                                                type=llir.DataType.INT,
+                                            )
+                                            for ivar in wksp_index_vars
+                                        ],
+                                        data_type=llir.DataType.INT,
+                                    ),
+                                    rhs_llir,
+                                ],
+                            )
+                        )
                 else:
                     if stmt.op == Operation.ADD:
                         # llir_stmts.append(
@@ -514,6 +540,7 @@ class CINLowerer:
                     "TODO: need to handle assembly of workspace with sparse level"
                 )
             return [
+                llir.BlankLine(),
                 llir.Comment("Lower consumer CIN"),
                 *stmts,
                 llir.BlankLine(),
@@ -551,6 +578,64 @@ class CINLowerer:
             name=f"{wksp.get_name()}.sort",
             args=[],
         )
+
+        # TODO: handle dense accumulator workspace
+        if wksp_access.is_dense():
+            assert (
+                len(wksp_index_vars) == 1
+            ), "dense workspace has more than 1 index var"
+            wksp_index_var = wksp_index_vars[0]
+            assert wksp_index_var.tile_size_var and wksp_index_var.is_inner
+            # For loop
+            # for (int <wksp index var> = 0; <wksp index var> < <wksp index var bound>; <wksp index var>++) {
+            #    <body statement>
+            # }
+            loop_var = llir.Var(
+                name=f"{wksp_index_var.name}",
+                type=llir.DataType.INT,
+            )
+
+            loop_body: List[llir.Stmt] = []
+
+            # <result tensor name>_values[<result level iterator>] = <wksp's name>[<wksp index var>];
+
+            loop_body.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=f"{result_tensor_name}_values[{result_level_iterator_name}]",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    value=llir.Var(
+                        name=f"{wksp.get_name()}[{loop_var.name}]",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                )
+            )
+
+            for_loop = llir.ForLoop(
+                init=llir.VarInit(
+                    var=loop_var,
+                    value=llir.Literal(0),
+                ),
+                cond=llir.BinOp(
+                    op="<",
+                    left=loop_var,
+                    right=llir.Var(
+                        name=wksp_index_var.tile_size_var.name,
+                        type=llir.DataType.INT,
+                    ),
+                ),
+                update=llir.Increment(
+                    var=loop_var,
+                ),
+                body=loop_body,
+            )
+
+            return [
+                llir.BlankLine(),
+                llir.Comment("Lower consumer CIN"),
+                for_loop,
+            ]
 
         # For loop
         # for (const auto& pair : <wksp's name>) {
@@ -768,6 +853,7 @@ class CINLowerer:
                 # )
 
         return [
+            llir.BlankLine(),
             llir.Comment("Lower consumer CIN"),
             wksp_sort_stmt,
             loop_stmt,

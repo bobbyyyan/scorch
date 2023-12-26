@@ -178,6 +178,11 @@ class IndexVar(IndexExpr):
     An index variable is bound to a set of coordinates by a forall statement.
     """
 
+    is_tiled: bool = False
+    is_outer: bool = False
+    is_inner: bool = False
+    tile_size_var: Optional[TileSizeVar] = None
+
     def __init__(
         self,
         name: str,
@@ -215,6 +220,18 @@ class IndexVar(IndexExpr):
     def parent(self, parent: IndexVar) -> None:
         self._parent = parent
 
+    def set_tile_size_var(
+        self,
+        tile_size_var: TileSizeVar,
+        is_outer: Optional[bool] = None,
+        is_inner: Optional[bool] = None,
+    ) -> None:
+        self.tile_size_var = tile_size_var
+        if is_outer is not None:
+            self.is_outer = is_outer
+        if is_inner is not None:
+            self.is_inner = is_inner
+
     def __str__(self):
         return str(self.name)
 
@@ -237,6 +254,43 @@ class IndexVar(IndexExpr):
 
     def __add__(self, other) -> IndexVarExpr:
         return IndexVarAdd(self, other)
+
+
+@dataclass(frozen=False)
+class TileSizeVar(IndexExpr):
+    outer_index_var: IndexVar
+    inner_index_var: IndexVar
+    size: int
+    _name: Optional[str] = None
+    _index_var: Optional[IndexVar] = None
+
+    @property
+    def name(self) -> str:
+        assert self._name is not None, "TileSizeVar name is None"
+        return self._name
+
+    @name.setter
+    def name(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def index_var(self) -> IndexVar:
+        return (
+            self._index_var
+            or self.inner_index_var.parent
+            or self.outer_index_var.parent
+        )
+
+    @index_var.setter
+    def index_var(self, index_var: IndexVar) -> None:
+        self._index_var = index_var
+
+    def __post_init__(self):
+        # if _name is not given, set it to f"kTile_{index_var.name}"
+        if self._name is None:
+            self._name = f"kTile_{self.index_var.name}"
+        self.outer_index_var.set_tile_size_var(self, is_outer=True)
+        self.inner_index_var.set_tile_size_var(self, is_inner=True)
 
 
 class IndexVarExpr(IndexExpr):
@@ -295,7 +349,7 @@ class TensorVar(IndexExpr):
     e.g. A, B, C, ...
     """
 
-    name: Optional[str] = None
+    _name: Optional[str] = None
     shape: Optional[Tuple[int, ...]] = None
     format: Optional[TensorFormat] = None
     dtype: torch.dtype = torch.float32
@@ -308,13 +362,22 @@ class TensorVar(IndexExpr):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        self.name = name
+        self._name = name
         self.shape = shape
 
         if fmt:
             self.format = parse_format(fmt)
 
         self.dtype = dtype
+
+    @property
+    def name(self) -> str:
+        assert self._name is not None, "TensorVar name is None"
+        return self._name
+
+    @name.setter
+    def name(self, name: str) -> None:
+        self._name = name
 
     def get_name(self) -> str:
         assert self.name is not None, "TensorVar name is None"
@@ -367,14 +430,19 @@ class Workspace(TensorVar):
         name: Optional[str] = None,
         dim: int = 1,
         dtype: torch.dtype = torch.float32,
+        dense: bool = False,
     ):
         super().__init__()
         self.name = name
         self.dim = dim
         self.dtype = dtype
+        self.dense = dense
 
     def get_format(self) -> TensorFormat:
         return parse_format(["o"] * self.dim)
+
+    def is_dense(self) -> bool:
+        return self.dense
 
     def __str__(self):
         return f"{self.name}({self.dim})"
@@ -476,6 +544,10 @@ class WorkspaceAccess(TensorAccess):
         indices: Optional[Union[IndexVar, List[IndexVar]]] = None,
     ):
         super().__init__(wksp, indices)
+        self.wksp: Workspace = wksp
+
+    def is_dense(self) -> bool:
+        return self.wksp.is_dense()
 
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self.tensor)

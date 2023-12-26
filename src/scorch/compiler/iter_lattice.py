@@ -112,6 +112,7 @@ class LatticePoint:
 
     def get_while_condition(self, lattice: IterationLattice) -> llir.Expr:
         condition = None
+
         for it in self.get_iterators():
             this_condition = llir.BinOp(
                 op="<",
@@ -122,6 +123,7 @@ class LatticePoint:
                 condition = this_condition
             else:
                 condition = llir.BinOp(op="&&", left=condition, right=this_condition)
+
         # if domain is dense
         if lattice.dense_index_var_llir:
             assert (
@@ -161,11 +163,39 @@ class LatticePoint:
                     )
                 )
             if lattice.dense_index_var_llir:
-                stmts.append(
-                    llir.Increment(
-                        var=lattice.dense_index_var_llir,
+                lattice_ivar = lattice.index_var
+                if lattice_ivar.tile_size_var and lattice_ivar.is_outer:
+                    # k_out += k_tile_size;
+                    stmts.append(
+                        llir.Assign(
+                            var=lattice.dense_index_var_llir,
+                            value=llir.Var(
+                                name=lattice_ivar.tile_size_var.name,
+                                type=llir.DataType.INT,
+                            ),
+                            op=llir.AssignOp.ADD_ASSIGN,
+                        )
                     )
-                )
+                    # stmts.append(
+                    #     llir.Assign(
+                    #         var=lattice.dense_index_var_llir,
+                    #         value=llir.BinOp(
+                    #             op="+",
+                    #             left=lattice.dense_index_var_llir,
+                    #             right=llir.Var(
+                    #                 name=lattice_ivar.tile_size_var.name,
+                    #                 type=llir.DataType.INT,
+                    #             ),
+                    #         ),
+                    #     )
+                    # )
+                else:
+                    stmts.append(
+                        llir.Increment(
+                            var=lattice.dense_index_var_llir,
+                        )
+                    )
+
         elif len(iterators) == 1:
             stmts.append(llir.Comment("Advance iterator"))
 
@@ -650,9 +680,10 @@ class IterationLattice:
         Generate the lattice points for the iteration lattice of the given
         iteration domain.
         """
-        current_index_var = self.for_all_stmt.get_index_var()
-        if current_index_var.has_parent:
-            current_index_var = current_index_var.parent
+        curr_index_var = self.for_all_stmt.get_index_var()
+        parsed_index_var = curr_index_var
+        if parsed_index_var.has_parent:
+            parsed_index_var = parsed_index_var.parent
 
         def union_lattice_points(
             left_lattice_points: List[LatticePoint],
@@ -702,12 +733,12 @@ class IterationLattice:
                     )
             if isinstance(cin, TensorAccess):
                 # TODO: check Empty list if current_index_var is not in the tensor access
-                if current_index_var not in cin.indices:
+                if parsed_index_var not in cin.indices:
                     return []
                 # if index variable correspond to a dense _level, put in locators
                 if (
                     cin.get_tensor().get_level_types()[
-                        cin.get_index_vars().index(current_index_var)
+                        cin.get_index_vars().index(parsed_index_var)
                     ]
                     == LevelType.DENSE
                 ):
@@ -737,11 +768,9 @@ class IterationLattice:
 
         # If any of the lattice points have no iterators, then the iteration domain is the universe
         if any([not lp.sparse_tensor_accesses for lp in lattice_points]):
-            self.dense_index_var = current_index_var
+            self.dense_index_var = curr_index_var
             assert self.cin_lowerer, "cin_lowerer must be set"
-            self.dense_index_var_llir = self.cin_lowerer.lower_IndexVar(
-                current_index_var
-            )
+            self.dense_index_var_llir = self.cin_lowerer.lower_IndexVar(curr_index_var)
             # first get the lattice point with no iterators
             dense_lattice_point = next(
                 lp for lp in lattice_points if not lp.sparse_tensor_accesses
@@ -753,13 +782,19 @@ class IterationLattice:
             ]
             first_dense_tensor_var = first_dense_tensor_access.get_tensor()
             level_of_current_index_var = first_dense_tensor_access.level_of_index_var(
-                current_index_var
+                parsed_index_var
             )
             # end var is the <tensor_var_name><_level>_size, type is int
-            self.dense_index_var_end_var_llir = llir.Var(
-                name=f"{first_dense_tensor_var.name}{level_of_current_index_var}_size",
-                type=llir.DataType.INT,
-            )
+            if curr_index_var.tile_size_var and curr_index_var.is_inner:
+                self.dense_index_var_end_var_llir = llir.Var(
+                    name=curr_index_var.tile_size_var.name,
+                    type=llir.DataType.INT,
+                )
+            else:
+                self.dense_index_var_end_var_llir = llir.Var(
+                    name=f"{first_dense_tensor_var.name}{level_of_current_index_var}_size",
+                    type=llir.DataType.INT,
+                )
 
         return lattice_points
 

@@ -7,6 +7,7 @@ from scorch.compiler.cin import (
     Operation,
     Workspace,
     Where,
+    TileSizeVar,
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
@@ -1155,12 +1156,17 @@ def test_spmm_dd_ds_dd_tiled():
     k_in = IndexVar("k_in")
     k = IndexVar("k", k_out + k_in)
 
+    k_tilesize = 1024
+    k_tile_var = TileSizeVar(
+        outer_index_var=k_out, inner_index_var=k_in, size=k_tilesize
+    )
+
     C = TensorVar("C", fmt="dd")
     A = TensorVar("A", fmt="ds")
     B = TensorVar("B", fmt="dd")
 
     # accum_c = TensorVar("accum_c", fmt="d")
-    accum_c = Workspace("accum_c", dim=1)
+    accum_c = Workspace("accum_c", dim=1, dense=True)
 
     cin_stmt = ForAll(
         i,
