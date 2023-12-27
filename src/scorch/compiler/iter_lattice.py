@@ -602,9 +602,10 @@ class LatticePoint:
         assert cin_lowerer is not None, "CIN lowerer is None"
 
         if self.dense_iterators:
+            stmts.append(llir.Comment("Resolve dense iterators"))
             for it in self.dense_iterators:
                 # TODO: if parent iterator is not yet resolved (get this info from the lowerer)
-                # then we need to push this resolution later
+                #  then we need to push this resolution later
 
                 if it.coord_var_value_llir:
                     dense_coord_resolve_stmt = llir.VarInit(
@@ -990,6 +991,16 @@ class IterationLattice:
 
             index_var = lattice_point.get_index_var()
 
+            tiled_index_var_resolve_stmts: List[llir.Stmt] = []
+
+            if index_var.tile_size_var and index_var.is_inner:
+                tiled_index_var_resolve_stmts.append(
+                    llir.Comment("Resolve tiled index var")
+                )
+                tiled_index_var_resolve_stmts.extend(
+                    index_var.parent.get_resolve_llir_stmts()
+                )
+
             if (
                 not result_tensor_access.is_workspace()
                 and result_tensor_access.has_index_var(index_var)
@@ -1052,6 +1063,7 @@ class IterationLattice:
                 while_loop = llir.WhileLoop(
                     cond=lattice_point.get_while_condition(lattice=self),
                     body=[
+                        *tiled_index_var_resolve_stmts,
                         *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                         *result_value_index_stmts,
                         *lattice_point.get_child_subregion_loops(
@@ -1073,6 +1085,7 @@ class IterationLattice:
                         llir.Comment(
                             f"Index var {index_var} not in result tensor access"
                         ),
+                        *tiled_index_var_resolve_stmts,
                         *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                         *lattice_point.get_child_subregion_loops(
                             self.cin_lowerer, self.for_all_stmt.stmt

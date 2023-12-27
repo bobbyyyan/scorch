@@ -255,6 +255,20 @@ class BinOp(Expr):
         self.right = right
 
 
+class Add(BinOp):
+    """Addition."""
+
+    def __init__(self, left: Expr, right: Expr):
+        super().__init__("+", left, right)
+
+
+class Mul(BinOp):
+    """Multiplication."""
+
+    def __init__(self, left: Expr, right: Expr):
+        super().__init__("*", left, right)
+
+
 @dataclass(frozen=False)
 class Literal(Expr):
     """A literal value."""

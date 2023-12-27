@@ -6,6 +6,7 @@ from typing import List, Optional, Any, Tuple, Callable, Union
 
 import torch
 
+from . import llir
 from ..format import TensorFormat, LevelType
 from ..utils import parse_format
 
@@ -207,6 +208,19 @@ class IndexVar(IndexExpr):
         assert self._expr is not None, "IndexVar expr is None"
         return self._expr
 
+    def get_resolve_llir_stmts(self) -> List[llir.Stmt]:
+        if isinstance(self.expr, IndexVarAdd):
+            # int self.name = lhs.name + rhs.name
+            return [
+                llir.VarInit(
+                    var=llir.Var(self.name, llir.DataType.INT),
+                    value=llir.Add(
+                        left=llir.Var(self.expr.lhs.name, llir.DataType.INT),
+                        right=llir.Var(self.expr.rhs.name, llir.DataType.INT),
+                    ),
+                )
+            ]
+
     @property
     def parent(self) -> IndexVar:
         assert self._parent is not None, "IndexVar parent is None"
@@ -227,6 +241,7 @@ class IndexVar(IndexExpr):
         is_inner: Optional[bool] = None,
     ) -> None:
         self.tile_size_var = tile_size_var
+        self.parent.is_tiled = True
         if is_outer is not None:
             self.is_outer = is_outer
         if is_inner is not None:
@@ -522,6 +537,50 @@ class TensorAccess(IndexExpr):
     @property
     def num_levels(self) -> int:
         return len(self.indices)
+
+    def get_level_iterator_resolve_stmts(
+        self,
+        level: Optional[int] = None,
+        index_var: Optional[IndexVar] = None,
+    ) -> List[llir.Stmt]:
+        assert (
+            level is not None or index_var is not None
+        ), "Either level or index_var must be specified"
+        if index_var:
+            level = self.level_of_index_var(index_var)
+        elif level is not None:
+            index_var = self.indices[level]
+
+        level_type = self.level_type_of_index_var(index_var)
+        tensor_name = self.tensor.name
+
+        if level_type == LevelType.DENSE:
+            if level > 0:
+                parent_level = level - 1
+                parent_index_var = self.get_parent_index_var(index_var)
+                coord_var_llir = llir.Var(
+                    name=f"p{tensor_name}{level}",
+                    type=llir.DataType.INT,
+                )
+                # int p{name}{level} = p{name}{level-1} * {name}{level}_size + <index var>
+                return [
+                    llir.VarInit(
+                        var=coord_var_llir,
+                        value=llir.Add(
+                            left=llir.Mul(
+                                left=llir.Var(
+                                    name=f"p{tensor_name}{parent_level}",
+                                    type=llir.DataType.INT,
+                                ),
+                                right=llir.Var(
+                                    name=f"{tensor_name}{level}_size",
+                                    type=llir.DataType.INT,
+                                ),
+                            ),
+                            right=llir.Var(name=index_var.name, type=llir.DataType.INT),
+                        ),
+                    )
+                ]
 
     def __getitem__(self, index) -> TensorAccess:
         return TensorAccess(self.tensor, self.indices + [index])

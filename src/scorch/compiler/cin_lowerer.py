@@ -585,7 +585,9 @@ class CINLowerer:
                 len(wksp_index_vars) == 1
             ), "dense workspace has more than 1 index var"
             wksp_index_var = wksp_index_vars[0]
-            assert wksp_index_var.tile_size_var and wksp_index_var.is_inner
+            assert (
+                wksp_index_var.tile_size_var and wksp_index_var.is_inner
+            ), "Dense accumulator used not for tiling"
             # For loop
             # for (int <wksp index var> = 0; <wksp index var> < <wksp index var bound>; <wksp index var>++) {
             #    <body statement>
@@ -598,6 +600,12 @@ class CINLowerer:
             loop_body: List[llir.Stmt] = []
 
             # <result tensor name>_values[<result level iterator>] = <wksp's name>[<wksp index var>];
+
+            loop_body.extend(wksp_index_var.parent.get_resolve_llir_stmts())
+
+            loop_body.extend(
+                result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+            )
 
             loop_body.append(
                 llir.Assign(

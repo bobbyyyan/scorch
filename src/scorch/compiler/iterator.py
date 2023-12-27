@@ -270,7 +270,20 @@ class ModeIterator:
             )
 
             if self.parent_iterator:
-                self.coord_var_value_llir = llir.Var(
-                    name=f"{self.parent_iterator.get_iterator_var_llir().name} * {self._tensor_var.get_name()}{self._level}_size + {self.index_var.name}",
-                    type=llir.DataType.INT,
+                # e.g. int pB1 = j * B1_size + k;
+                self.coord_var_value_llir = llir.Add(
+                    left=llir.Mul(
+                        left=llir.Var(
+                            name=self.parent_iterator.get_iterator_var_llir().name,
+                            type=llir.DataType.INT,
+                        ),
+                        right=llir.Var(
+                            name=f"{self.tensor_var.name}{self.level}_size",
+                            type=llir.DataType.INT,
+                        ),
+                    ),
+                    right=llir.Var(
+                        name=self.index_var.name,
+                        type=llir.DataType.INT,
+                    ),
                 )
