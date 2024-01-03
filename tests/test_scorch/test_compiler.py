@@ -13,6 +13,30 @@ from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 
 
+def test_convert_dd_ds():
+    # Test converting a CSR matrix to a dense matrix
+    # A[i, j] = B[i, j]
+
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt="dd")
+    B = TensorVar("B", fmt="ds")
+
+    A[i, j] = B[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elemwise_mul_1d_sss():
     # elementwise vector multiplication code generation
     # a[i] = b[i] * c[i]
