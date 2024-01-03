@@ -1130,7 +1130,7 @@ class CINLowerer:
 
         if result_level_indices_init_stmts:
             result_level_indices_init_stmts = [
-                llir.Comment("Init result _level indices"),
+                llir.Comment("Init result level indices"),
                 *result_level_indices_init_stmts,
                 llir.BlankLine(),
             ]
@@ -1164,10 +1164,11 @@ class CINLowerer:
 
         if result_tensor_level_sizes:
             result_tensor_level_sizes = [
-                llir.Comment("Init result tensor _level sizes")
-            ] + result_tensor_level_sizes
+                llir.Comment("Init result tensor level sizes"),
+                *result_tensor_level_sizes,
+            ]
 
-        # A mapping from IndexVar to a list of (TensorVar, _level: int, LevelType) tuples
+            # A mapping from IndexVar to a list of (TensorVar, _level: int, LevelType) tuples
         self.index_var_to_rhs_tensor_level_type = {}
         for tensor_access in rhs_tensor_accesses:
             index_vars = tensor_access.get_index_vars()
@@ -1518,10 +1519,10 @@ class CINLowerer:
 
         stmts: List[llir.Stmt] = []
 
-        if self.result_tensor_access and not self.result_tensor_access.has_index_var(
-            index_var
-        ):
-            stmts.append(llir.Comment(f"{index_var} not in result tensor access"))
+        # if self.result_tensor_access and not self.result_tensor_access.has_index_var(
+        #     index_var
+        # ):
+        #     stmts.append(llir.Comment(f"{index_var} not in result tensor access"))
 
         # If the result _level for this index_var is dense, need to assemble the result by
         # setting the corresponding values in the result values array to 0
