@@ -172,6 +172,30 @@ class IndexStmt(CIN):
         visitor.visit(self)
         return visitor.workspace_accesses
 
+    def get_index_vars(self) -> List[IndexVar]:
+        class IndexVarCollector(CINVisitorAccept):
+            index_vars: List[IndexVar] = []
+
+            def visit_IndexVar(self, node: IndexVar) -> None:
+                if node not in self.index_vars:
+                    self.index_vars.append(node)
+
+        visitor = IndexVarCollector()
+        visitor.visit(self)
+        return visitor.index_vars
+
+    def get_tile_size_vars(self) -> List[TileSizeVar]:
+        index_vars = self.get_index_vars()
+        tile_size_vars = []
+        for index_var in index_vars:
+            if (
+                index_var.tile_size_var
+                and index_var.tile_size_var not in tile_size_vars
+            ):
+                tile_size_vars.append(index_var.tile_size_var)
+
+        return tile_size_vars
+
 
 class IndexVar(IndexExpr):
     """A tensor index variable.
@@ -299,6 +323,14 @@ class TileSizeVar(IndexExpr):
     @index_var.setter
     def index_var(self, index_var: IndexVar) -> None:
         self._index_var = index_var
+
+    @property
+    def llir_var(self) -> llir.Var:
+        return llir.Var(self.name, llir.DataType.CONSTEXPR_INT)
+
+    @property
+    def llir_var_init(self) -> llir.VarInit:
+        return llir.VarInit(var=self.llir_var, value=llir.Literal(self.size))
 
     def __post_init__(self):
         # if _name is not given, set it to f"kTile_{index_var.name}"
@@ -446,12 +478,23 @@ class Workspace(TensorVar):
         dim: int = 1,
         dtype: torch.dtype = torch.float32,
         dense: bool = False,
+        tile_size_var: Optional[TileSizeVar] = None,
     ):
         super().__init__()
         self.name = name
         self.dim = dim
         self.dtype = dtype
         self.dense = dense
+        self._tile_size_var = tile_size_var
+
+    @property
+    def is_tiled(self) -> bool:
+        return self._tile_size_var is not None
+
+    @property
+    def tile_size_var(self) -> TileSizeVar:
+        assert self._tile_size_var is not None, "Workspace is not tiled"
+        return self._tile_size_var
 
     def get_format(self) -> TensorFormat:
         return parse_format(["o"] * self.dim)
@@ -594,6 +637,8 @@ class TensorAccess(IndexExpr):
 
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self.tensor)
+        for index in self.indices:
+            visitor.visit(index)
 
 
 class WorkspaceAccess(TensorAccess):

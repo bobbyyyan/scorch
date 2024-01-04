@@ -156,6 +156,9 @@ class DataType(Enum):
     PTR_TENSOR = "Tensor*"
     PTR_VOID = "void*"
 
+    # CONSTEXPR types
+    CONSTEXPR_INT = "constexpr int"
+
     CONST_AUTO_REF = "const auto&"
 
     @classmethod

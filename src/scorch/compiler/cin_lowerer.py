@@ -18,7 +18,7 @@ from .cin import (
     Workspace,
 )
 from .iter_lattice import IterationLattice
-from .llir import Assign, AssignOp
+from .llir import Assign, AssignOp, DataType
 from ..format import LevelType
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -430,6 +430,7 @@ class CINLowerer:
         for wksp in workspaces:
             # coo_workspace<tensor's ctype> <tensor's name> = coo_workspace<tensor's ctype>(<tensor's dim>);
             wksp_ctype = dtype_to_c_datatype(wksp.dtype)
+            wksp_ctype_ptr = DataType.ptr_type(wksp_ctype)
 
             # If the workspace is 0-dimensional, just initialize it with a literal
             if wksp.dim == 0:
@@ -444,24 +445,41 @@ class CINLowerer:
                 )
                 continue
 
-            # DONE: If the workspace is 1-dimensional, use optimized 1D workspace implementation
-            # class name: coo_workspace_1d<tensor's ctype, tensor's dim>
-
             if wksp.dim == 1:
-                workspace_init_stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=wksp.get_name(),
-                            type=llir.DataType.AUTO,
-                        ),
-                        value=llir.FunctionCall(
-                            name=f"coo_workspace_1d<{wksp_ctype.value}, {wksp.dim}>",
-                            args=[
-                                llir.Literal(value=f"{1024}"),
-                            ],
-                        ),
+                # TODO: if the workspace is dense, then
+                # float* <workspace name> = new float[<workspace size>]();
+                # change float to the corresponding ctype
+                if wksp.is_dense():
+                    assert wksp.is_tiled, "Dense workspace not tiled"
+                    workspace_init_stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=wksp.get_name(),
+                                type=wksp_ctype_ptr,
+                            ),
+                            value=llir.FunctionCall(
+                                name=f"new {wksp_ctype.value}[{wksp.tile_size_var.name}]",
+                                args=[],
+                            ),
+                        )
                     )
-                )
+                else:
+                    # If the workspace is 1-dimensional, use optimized 1D workspace implementation
+                    # coo_workspace_1d<tensor's ctype, tensor's dim>
+                    workspace_init_stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=wksp.get_name(),
+                                type=llir.DataType.AUTO,
+                            ),
+                            value=llir.FunctionCall(
+                                name=f"coo_workspace_1d<{wksp_ctype.value}, {wksp.dim}>",
+                                args=[
+                                    llir.Literal(value=f"{1024}"),
+                                ],
+                            ),
+                        )
+                    )
                 continue
 
             workspace_init_stmts.append(
@@ -915,6 +933,15 @@ class CINLowerer:
         #     self.lower_TensorVar(tv) for tv in rhs_tensor_vars
         # ]
 
+        tile_size_vars = stmt.get_tile_size_vars()
+        tile_size_vars_init_stmts: List[llir.Stmt] = (
+            [llir.BlankLine(), llir.Comment("Initialize tile sizes")]
+            if tile_size_vars
+            else []
+        )
+        for tile_size_var in tile_size_vars:
+            tile_size_vars_init_stmts.append(tile_size_var.llir_var_init)
+
         self.need_compute.extend(result_tensor_vars)
 
         if recurse or stmt != self.outermost_stmt:
@@ -1273,6 +1300,7 @@ class CINLowerer:
                     # llir.BlankLine(),
                     llir.Comment("Initialize result value array"),
                     *tensor_value_array_init_stmts,
+                    *tile_size_vars_init_stmts,
                     # *result_index_init_stmts,
                     llir.BlankLine(),
                     *recurse_stmts,

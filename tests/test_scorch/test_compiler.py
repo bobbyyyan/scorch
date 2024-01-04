@@ -1189,7 +1189,12 @@ def test_spmm_dd_ds_dd_tiled():
     B = TensorVar("B", fmt="dd")
 
     # accum_c = TensorVar("accum_c", fmt="d")
-    accum_c = Workspace("accum_c", dim=1, dense=True)
+    accum_c = Workspace(
+        "accum_c",
+        dim=1,
+        dense=True,
+        tile_size_var=k_tile_var,
+    )
 
     cin_stmt = ForAll(
         i,
