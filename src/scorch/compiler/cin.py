@@ -496,6 +496,10 @@ class Workspace(TensorVar):
         assert self._tile_size_var is not None, "Workspace is not tiled"
         return self._tile_size_var
 
+    @tile_size_var.setter
+    def tile_size_var(self, tile_size_var: TileSizeVar) -> None:
+        self._tile_size_var = tile_size_var
+
     def get_format(self) -> TensorFormat:
         return parse_format(["o"] * self.dim)
 
@@ -649,6 +653,15 @@ class WorkspaceAccess(TensorAccess):
     ):
         super().__init__(wksp, indices)
         self.wksp: Workspace = wksp
+
+        # If the indices contain an inner index, then we need to set
+        # the tile_size_var of the workspace
+        if not isinstance(indices, list):
+            indices = [indices]
+
+        for index_var in indices:
+            if index_var.is_inner and index_var.tile_size_var:
+                wksp.tile_size_var = index_var.tile_size_var
 
     def is_dense(self) -> bool:
         return self.wksp.is_dense()
