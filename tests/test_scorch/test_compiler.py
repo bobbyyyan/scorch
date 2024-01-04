@@ -1129,8 +1129,8 @@ def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
-def test_spmm_dd_ds_dd_ikj():
-    # taco "C(i, j) = A(i, k) * B(k, j)" -f=C:dd -f=A:ds -f=B:dd -print-evaluate
+def test_spmm_dd_ds_dd_ijk():
+    # taco "C(i, k) = A(i, j) * B(j, k)" -f=C:dd -f=A:ds -f=B:dd -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
@@ -1139,9 +1139,9 @@ def test_spmm_dd_ds_dd_ikj():
     A = TensorVar("A", fmt="ds")
     B = TensorVar("B", fmt="dd")
 
-    C[i, j] = A[i, k] * B[k, j]
+    C[i, k] = A[i, j] * B[j, k]
 
-    cin_stmt = ForAll(i, ForAll(k, ForAll(j, C._assignment)))
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, C._assignment)))
 
     print("\nCIN statement:")
     print(cin_stmt)
@@ -1157,12 +1157,11 @@ def test_spmm_dd_ds_dd_ikj():
 
 
 def test_spmm_dd_ds_dd_tiled():
-    # TODO: implement this
     """
     C[i, k] = A[i, j] * B[j, k]
     k gets tiled
     loop order: i, k_out, j, k_in
-    accumualtor: accum_c[k_in]
+    accumulator: accum_c[k_in]
     ForAll i
       ForAll k_out
         Where(
@@ -1180,9 +1179,9 @@ def test_spmm_dd_ds_dd_tiled():
     k_in = IndexVar("k_in")
     k = IndexVar("k", k_out + k_in)
 
-    k_tilesize = 1024
+    k_tile_size = 1024
     k_tile_var = TileSizeVar(
-        outer_index_var=k_out, inner_index_var=k_in, size=k_tilesize
+        outer_index_var=k_out, inner_index_var=k_in, size=k_tile_size
     )
 
     C = TensorVar("C", fmt="dd")
