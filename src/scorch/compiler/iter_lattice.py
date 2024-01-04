@@ -651,17 +651,17 @@ class LatticePoint:
                                 ),
                                 right=llir.BinOp(
                                     op="==",
-                                    # left=llir.ArrayAccess(
-                                    #     array=llir.Var(
-                                    #         name=f"{it._tensor_var.name}{it._level}_crd",
-                                    #         type=llir.DataType.ARRAY_INT,
-                                    #     ),
-                                    #     index=next_level_iterator_end_llir,
-                                    # ),
-                                    left=llir.Var(
-                                        name=f"{it.tensor_var.name}{it.level}_crd[{next_level_iterator_end_llir.name}]",
-                                        type=llir.DataType.INT,
+                                    left=llir.ArrayAccess(
+                                        array=llir.Var(
+                                            name=f"{it.tensor_var.name}{it.level}_crd",
+                                            type=llir.DataType.ARRAY_INT,
+                                        ),
+                                        index=next_level_iterator_end_llir,
                                     ),
+                                    # left=llir.Var(
+                                    #     name=f"{it.tensor_var.name}{it.level}_crd[{next_level_iterator_end_llir.name}]",
+                                    #     type=llir.DataType.INT,
+                                    # ),
                                     right=self.get_index_var_llir(),
                                 ),
                             ),
@@ -929,14 +929,14 @@ class IterationLattice:
         assert len(lattice_points) > 0, "No lattice points generated"
         all_mode_iterators = lattice_points[0].get_iterators()
 
-        if self.dense_index_var_llir:
-            iterator_init_stmts.append(llir.Comment("Initialize dense index variable"))
-            iterator_init_stmts.append(
-                llir.VarInit(
-                    var=self.dense_index_var_llir,
-                    value=llir.Literal(value=0, data_type=llir.DataType.INT),
-                )
-            )
+        # if self.dense_index_var_llir:
+        #     iterator_init_stmts.append(llir.Comment("Initialize dense index variable"))
+        #     iterator_init_stmts.append(
+        #         llir.VarInit(
+        #             var=self.dense_index_var_llir,
+        #             value=llir.Literal(value=0, data_type=llir.DataType.INT),
+        #         )
+        #     )
 
         if len(all_mode_iterators) > 1:
             iterator_init_stmts.extend(
@@ -944,14 +944,8 @@ class IterationLattice:
             )
 
         if len(all_mode_iterators) == 1:
-            iterator_init_stmts.append(
-                llir.Comment("Only a single iterator here, TODO need to init end")
-            )
             iterator = all_mode_iterators[0]
             iterator_init_stmts.extend(iterator.get_iterator_end_init_stmts())
-            # iterator_init_stmts.extend(
-            #     all_mode_iterators[0].get_iterator_end_init_stmts()
-            # )
 
         if iterator_init_stmts:
             iterator_init_stmts = [
@@ -1042,8 +1036,8 @@ class IterationLattice:
                                 ],
                             )
                         )
-                # If previous _level is dense: A1_pos[A1_pos_index + 1] = A1_crd.size()
-                # TODO: if previous _level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
+                # If previous level is dense: A1_pos[A1_pos_index + 1] = A1_crd.size()
+                # TODO: if previous level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
                 assembled_pos_array = False
                 if level > 0:
                     parent_index_var = result_tensor_access.get_parent_index_var(
@@ -1095,9 +1089,9 @@ class IterationLattice:
 
             iterators = lattice_point.get_iterators()
 
-            # If we have a sparse _level here, we need to set
-            # {result_tensor_var}{_level}_pos[p{result_tensor_var}{parent_level} + 1] to
-            # p{result_tensor_var}{_level}
+            # If we have a sparse level here, we need to set
+            # {result_tensor_var}{level}_pos[p{result_tensor_var}{parent_level} + 1] to
+            # p{result_tensor_var}{level}
 
             index_var = lattice_point.get_index_var()
 
@@ -1142,7 +1136,6 @@ class IterationLattice:
                                 ),
                             )
                         )
-                        result_value_index_stmts.append(llir.BlankLine())
                     else:
                         result_value_index_stmts.append(
                             llir.VarInit(
@@ -1155,7 +1148,7 @@ class IterationLattice:
                                             name=f"p{result_tensor_var.name}{level - 1}",
                                             type=llir.DataType.INT,
                                         ),
-                                        # <result tensor name><_level>_size
+                                        # <result tensor name><level>_size
                                         right=llir.Var(
                                             name=f"{result_tensor_var.name}{level}_size",
                                             type=llir.DataType.INT,
@@ -1168,9 +1161,26 @@ class IterationLattice:
                                 ),
                             )
                         )
-                        result_value_index_stmts.append(llir.BlankLine())
 
-                if len(iterators) == 1 and not lattice_point.parent_lattice_point:
+                if len(iterators) == 0:
+                    for_loop = llir.ForLoop(
+                        init=self.get_dense_iterator_init_stmt(),
+                        cond=lattice_point.get_for_loop_condition(lattice=self),
+                        update=lattice_point.get_single_iterator_advance_stmt(
+                            lattice=self
+                        ),
+                        body=[
+                            *tiled_index_var_resolve_stmts,
+                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                            *result_value_index_stmts,
+                            *lattice_point.get_child_subregion_loops(
+                                self.cin_lowerer, self.for_all_stmt.stmt
+                            ),
+                        ],
+                    )
+                    stmts.append(for_loop)
+
+                elif len(iterators) == 1 and not lattice_point.parent_lattice_point:
                     # Note: we don't want to do this for a child lattice point
                     # because we don't want to re-initialize the iterator(s)
                     it = iterators[0]

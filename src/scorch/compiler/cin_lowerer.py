@@ -1616,7 +1616,6 @@ class CINLowerer:
                                 )
                             ],
                         ),
-                        llir.BlankLine(),
                     ]
                 )
 
