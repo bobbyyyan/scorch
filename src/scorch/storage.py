@@ -7,7 +7,7 @@ from .utils import parse_format
 
 
 class TensorLevelIndex(object):
-    """A TensorLevelIndex contains a list of indices for a single _level of a tensor."""
+    """A TensorLevelIndex contains a list of indices for a single level of a tensor."""
 
     _indices: Optional[List[torch.Tensor]]
     _level_type: Optional[LevelType]
@@ -26,9 +26,7 @@ class TensorLevelIndex(object):
         )
 
     def __repr__(self):
-        return (
-            f"TensorLevelIndex(level_type={self._level_type}, indices={self._indices})"
-        )
+        return str(self)
 
 
 class TensorIndex(object):

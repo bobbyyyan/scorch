@@ -13,7 +13,7 @@ class LevelType(Enum):
 
 class LevelFormat(object):
     """
-    A _level format has a type: compressed, dense, or singleton
+    A level format has a type: compressed, dense, or singleton
     Also has bit width (for optimization)
     """
 

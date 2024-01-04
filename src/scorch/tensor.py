@@ -303,7 +303,7 @@ class Tensor(torch.nn.Module):
     def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
         """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
-        # and format is dense at every _level
+        # and format is dense at every level
 
         # If name is not provided, use the default name
         if name is None:
@@ -382,7 +382,7 @@ class Tensor(torch.nn.Module):
 
         if fmt is None:
             # TODO: infer output format from input format
-            # For now, make every _level COMPRESSED
+            # For now, make every level COMPRESSED
             output_format = TensorFormat(
                 level_formats=[
                     LevelFormat(mode=LevelType.DENSE) for _ in range(len(self.shape))
@@ -513,7 +513,7 @@ class Tensor(torch.nn.Module):
 
             if fmt is None:
                 # TODO: infer output format from input format
-                # For now, make every _level COMPRESSED
+                # For now, make every level COMPRESSED
                 output_format = TensorFormat(
                     level_formats=[
                         LevelFormat(mode=LevelType.COMPRESSED)

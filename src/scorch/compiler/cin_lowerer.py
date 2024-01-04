@@ -229,7 +229,7 @@ class CINLowerer:
 
         rhs_llir = self.lower_IndexExpr(stmt.rhs)
 
-        # if we are at the bottommost _level, we can emit compute code
+        # if we are at the bottommost level, we can emit compute code
         assert self.result_tensor_access, "result tensor access is None"
         is_workspace = self.result_tensor_access.is_workspace()
         index_vars = self.result_tensor_access.get_index_vars()
@@ -500,7 +500,6 @@ class CINLowerer:
             )
 
         return [
-            llir.Comment("Lower Where statement"),
             *workspace_init_stmts,
             *self.lower_ProducerIndexStmt(stmt.producer),
             *self.lower_ConsumerIndexStmt(stmt.consumer),
@@ -1159,20 +1158,20 @@ class CINLowerer:
             result_level_indices_init_stmts = [
                 llir.Comment("Init result level indices"),
                 *result_level_indices_init_stmts,
-                llir.BlankLine(),
             ]
 
         # Generate iterator bounds
         tensor_level_array_assign_stmts = []
 
         for tensor in rhs_tensor_vars:
+            tensor_level_array_assign_stmts.append(llir.BlankLine())
             tensor_level_array_assign_stmts.append(
                 llir.Comment(f"Get {tensor.get_name()}'s level & value arrays")
             )
             tensor_level_array_assign_stmts.extend(self.get_level_arrays(tensor))
             tensor_level_array_assign_stmts.append(self.get_val_ptr_stmt(tensor))
 
-        # Generate per-_level size variables for each dense _level in result tensor
+        # Generate per-level size variables for each dense level in result tensor
         result_tensor_level_sizes: List[llir.Stmt] = []
         for i, level_type in enumerate(self.result_tensor_var.get_level_types()):
             if level_type == LevelType.DENSE:
@@ -1293,11 +1292,9 @@ class CINLowerer:
             body_stmts.extend(
                 [
                     *result_tensor_level_sizes,
-                    llir.BlankLine(),
                     *tensor_level_array_assign_stmts,
                     llir.BlankLine(),
                     *result_level_indices_init_stmts,
-                    # llir.BlankLine(),
                     llir.Comment("Initialize result value array"),
                     *tensor_value_array_init_stmts,
                     *tile_size_vars_init_stmts,

@@ -28,12 +28,12 @@ class ModeIterator:
 
     @property
     def level(self) -> int:
-        assert self._level is not None, "_level is None"
+        assert self._level is not None, "level is None"
         return self._level
 
     @property
     def tensor_var(self) -> TensorVar:
-        assert self._tensor_var is not None, "_tensor_var is None"
+        assert self._tensor_var is not None, "tensor_var is None"
         return self._tensor_var
 
     def get_index_var(self) -> IndexVar:
@@ -75,7 +75,7 @@ class ModeIterator:
             self.level_type == LevelType.COMPRESSED
             or self.level_type == LevelType.COORDINATE
         ):
-            # if this is the parent-most coordinate _level,
+            # if this is the parent-most coordinate level,
             # initialize the bounds using the size of the crd array
             if self.level == 0 and self.level_type == LevelType.COORDINATE:
                 # int pB0 = 0;
@@ -97,7 +97,7 @@ class ModeIterator:
             self.level_type == LevelType.COMPRESSED
             or self.level_type == LevelType.COORDINATE
         ):
-            # if this is the parent-most coordinate _level,
+            # if this is the parent-most coordinate level,
             # initialize the bounds using the size of the crd array
             if self.level == 0 and self.level_type == LevelType.COORDINATE:
                 # int pB0_end = B0_crd.size(0);

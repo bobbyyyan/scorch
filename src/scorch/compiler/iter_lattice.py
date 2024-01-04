@@ -1242,7 +1242,6 @@ class IterationLattice:
                     stmts.append(for_loop)
 
                 elif len(iterators) == 1:
-                    stmts.append(llir.Comment("DONE: Single iterator"))
                     it = iterators[0]
                     for_loop = llir.ForLoop(
                         init=it.get_init_stmt(),
