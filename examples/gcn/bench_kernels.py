@@ -26,7 +26,13 @@ spmm = load_inline(
     name="kernel",
     cpp_sources=[header_cpp_code, spmm_cpp_code],
     functions=["evaluate"],
-    extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros", "-Werror"],
+    extra_cflags=[
+        "-O3",
+        "-march=native",
+        "-ffast-math",
+        "-fno-signed-zeros",
+        "-Werror",
+    ],
 )
 
 spmspm = load_inline(
@@ -34,7 +40,13 @@ spmspm = load_inline(
     cpp_sources=[spmspm_cpp_code],
     extra_include_paths=["kernels/"],
     functions=["evaluate"],
-    extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros", "-Werror"],
+    extra_cflags=[
+        "-O3",
+        "-march=native",
+        "-ffast-math",
+        "-fno-signed-zeros",
+        "-Werror",
+    ],
 )
 
 
@@ -202,7 +214,9 @@ def bench_sddmm(
 
     torch_sddmm_func = torch_sddmm
     scorch_sddmm_func = scorch_sddmm
-    gen_rand_sparse_func = gen_rand_sparse_coo if sparse_format == "coo" else gen_rand_sparse_csr
+    gen_rand_sparse_func = (
+        gen_rand_sparse_coo if sparse_format == "coo" else gen_rand_sparse_csr
+    )
 
     if output_format == "dense":
         torch_sddmm_func = torch_sddmm_dense
@@ -268,7 +282,9 @@ def bench_spmspm(
     if custom_func is not None:
         scorch_spmspm_func = custom_func
 
-    gen_rand_sparse_func = gen_rand_sparse_coo if sparse_format == "coo" else gen_rand_sparse_csr
+    gen_rand_sparse_func = (
+        gen_rand_sparse_coo if sparse_format == "coo" else gen_rand_sparse_csr
+    )
 
     for dim in dimensions:
         torch_time_run = []
@@ -340,7 +356,9 @@ def bench_spmm(
     if custom_func is not None:
         scorch_spmm_func = custom_func
 
-    gen_rand_sparse_func = gen_rand_sparse_coo if sparse_format == "coo" else gen_rand_sparse_csr
+    gen_rand_sparse_func = (
+        gen_rand_sparse_coo if sparse_format == "coo" else gen_rand_sparse_csr
+    )
 
     for dim in dimensions:
         torch_time_run = []
@@ -374,7 +392,9 @@ def bench_spmm(
             torch_time = end - start
             torch_time_run.append(torch_time)
 
-            assert torch.allclose(torch_result.flatten(), scorch_result.values.flatten())
+            assert torch.allclose(
+                torch_result.flatten(), scorch_result.values.flatten()
+            )
 
             speedup_run.append(torch_time / scorch_time)
 
@@ -445,7 +465,12 @@ def plot_benchmark(dimensions, speedup_means, speedup_stds, benchmark="SpMV"):
     speedup_lower = np.array(speedup_means) - np.array(speedup_stds)
 
     # Plot mean speedup of Scorch over PyTorch
-    plt.plot(dimensions, speedup_means, "-o", label="Mean speedup (pytorch time / scorch time)")
+    plt.plot(
+        dimensions,
+        speedup_means,
+        "-o",
+        label="Mean speedup (pytorch time / scorch time)",
+    )
 
     # Add shaded area for standard deviation
     plt.fill_between(dimensions, speedup_lower, speedup_upper, color="blue", alpha=0.2)
@@ -472,7 +497,12 @@ def plot_benchmark(dimensions, speedup_means, speedup_stds, benchmark="SpMV"):
     speedup_lower = 1 / speedup_lower
 
     # Plot mean speedup
-    plt.plot(dimensions, speedup_means, "-o", label="Mean speedup (scorch time / pytorch time)")
+    plt.plot(
+        dimensions,
+        speedup_means,
+        "-o",
+        label="Mean speedup (scorch time / pytorch time)",
+    )
 
     # Add shaded area for standard deviation
     plt.fill_between(dimensions, speedup_lower, speedup_upper, color="blue", alpha=0.2)
