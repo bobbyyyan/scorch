@@ -1230,7 +1230,7 @@ def test_spmm_dd_ds_dd_tiled():
 
     print("\nC++ torch extension code:")
 
-    print(llir_lowerer.lower_llir(lowered_llir))
+    print(llir_lowerer.lower_llir(lowered_llir, no_comments=True))
 
 
 def test_spmm_ds_ds_dd_ikj_gustavson_workspace():

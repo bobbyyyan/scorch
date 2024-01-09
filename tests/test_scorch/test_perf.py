@@ -7,7 +7,7 @@ from scorch.ops import spmv
 
 
 def test_spmm_dd_ds_dd_time():
-    n = 10000
+    n = 1024
     sparsity = 0.95
     random_tensor_a = torch.rand(n, n).float()
     random_tensor_b = torch.rand(n, n).float()
