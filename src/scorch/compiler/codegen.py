@@ -12,24 +12,33 @@ class LLIRLowerer:
 
     indent_str = "  "
     indent_level = 0
+    no_comments = False
 
     def lower_llir(
         self,
         ir: Union[LLIR_NODE, List[LLIR_NODE], str, List[str]],
         indent_level: int = 0,
         no_semicolon: bool = False,
+        no_comments: bool = False,
     ) -> str:
+        if no_comments:
+            self.no_comments = True
+
         if isinstance(ir, str):
             return indent_level * self.indent_str + ir
 
         elif isinstance(ir, list):
-            return "\n".join([self.lower_llir(node, indent_level) for node in ir])
+            lines = [self.lower_llir(node, indent_level) for node in ir]
+            lines = [line for line in lines if line != ""]
+            return "\n".join(lines)
 
         elif isinstance(ir, llir.Comment):
+            if self.no_comments:
+                return ""
             return self.lower_llir(f"// {ir.value}", indent_level)
 
         elif isinstance(ir, llir.BlankLine):
-            return self.lower_llir("", indent_level)
+            return self.lower_llir(" ", indent_level)
 
         elif isinstance(ir, llir.Literal):
             return self.lower_llir(str(ir.value), indent_level)

@@ -13,6 +13,7 @@ from .compiler.cin import (
     Where,
     TensorAssign,
     Operation,
+    IndexStmt,
 )
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
@@ -553,6 +554,61 @@ def einsum(
     if "time_dict" in kwargs:
         time_dict = kwargs["time_dict"]
         time_dict["eval_time"] = eval_time
+
+    return result
+
+
+def lower_and_exec_cin(
+    cin_stmt: IndexStmt, result_shape: Sequence[int], *args: Tensor, **kwargs
+) -> Tensor:
+    """Lower a CIN statement to LLIR then codegen and call on the input tensors.
+
+    Args:
+        cin_stmt (IndexStmt): CIN statement to lower.
+        result_shape (Sequence[int]): Shape of the result tensor.
+        *args (Tensor): Input tensors.
+
+    Returns:
+        Tensor: Output tensor.
+    """
+    # Lower to LLIR
+    lowerer = CINLowerer()
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+    llir_lowerer = LLIRLowerer()
+    cpp_code = llir_lowerer.lower_llir(lowered_llir)
+    print(cpp_code)
+    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+        header_cpp_code = f.read()
+
+    module = torch.utils.cpp_extension.load_inline(
+        name="kernel",
+        cpp_sources=[header_cpp_code, cpp_code],
+        functions=["evaluate"],
+        extra_cflags=["-O3"],
+    )
+
+    module_args = [result_shape]
+
+    for arg in args:
+        module_args.append(arg.shape)
+        module_args.append(arg.index.mode_indices)
+        module_args.append(arg.values)
+
+    start_time = time.time()
+    result_cpp = module.evaluate(*module_args)
+    end_time = time.time()
+    eval_time = end_time - start_time
+    if "time_dict" in kwargs:
+        kwargs["time_dict"]["eval_time"] = eval_time
+
+    result = Tensor(
+        shape=tuple(result_shape),
+        index=TensorIndex(
+            mode_indices=result_cpp._storage._index.mode_indices,
+            tensor_format="dd",
+        ),
+        value=result_cpp._storage._value,
+    )
 
     return result
 

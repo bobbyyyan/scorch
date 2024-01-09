@@ -687,20 +687,29 @@ class LatticePoint:
 
         if self.dense_iterators:
             for it in self.dense_iterators:
-                # TODO: if parent iterator is not yet resolved (get this info from the lowerer)
-                #  then we need to push this resolution later
 
                 if it.coord_var_value_llir:
                     dense_coord_resolve_stmt = llir.VarInit(
                         var=it.get_coord_var_llir(),
                         value=it.get_coord_var_value_llir(),
                     )
+
+                    # If parent iterator is not yet resolved (get this info from the lowerer)
+                    #  then we need to push this resolution later
                     if (
                         it.parent_iterator
                         and it.parent_iterator.index_var
                         not in cin_lowerer.defined_index_vars
                     ):
+                        # TODO: check if this condition is correct
+                        if it.index_var.is_tiled:
+                            continue
+
                         dependent_index_var = it.parent_iterator.get_index_var()
+                        # if dependent_index_var.tile_size_var:
+                        #     dependent_index_var = (
+                        #         dependent_index_var.tile_size_var.inner_index_var
+                        #     )
                         existing_list = (
                             cin_lowerer.dep_index_var_to_dense_coord_resolution.get(
                                 dependent_index_var, []
@@ -714,7 +723,13 @@ class LatticePoint:
                         dense_iterators_resolve_stmts.append(dense_coord_resolve_stmt)
 
         current_index_var = self.get_index_var()
+
         if current_index_var in cin_lowerer.dep_index_var_to_dense_coord_resolution:
+            dense_iterators_resolve_stmts.append(
+                llir.Comment(
+                    f"current index var {current_index_var} in dep_index_var_to_dense_coord_resolution"
+                )
+            )
             dense_iterators_resolve_stmts.extend(
                 cin_lowerer.dep_index_var_to_dense_coord_resolution[current_index_var]
             )

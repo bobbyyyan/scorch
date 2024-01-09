@@ -5,8 +5,8 @@ from typing import List, Dict, Any, Iterable, Union
 
 import torch
 
-from .format import TensorFormat, LevelFormat, LevelType
 from .compiler.llir import DataType
+from .format import TensorFormat, LevelFormat, LevelType
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():

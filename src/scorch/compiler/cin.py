@@ -2,7 +2,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Any, Tuple, Callable, Union
+from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 import torch
 
@@ -649,19 +649,20 @@ class WorkspaceAccess(TensorAccess):
     def __init__(
         self,
         wksp: Workspace,
-        indices: Optional[Union[IndexVar, List[IndexVar]]] = None,
+        indices: Optional[Union[IndexVar, Sequence[IndexVar]]] = None,
     ):
         super().__init__(wksp, indices)
         self.wksp: Workspace = wksp
 
-        # If the indices contain an inner index, then we need to set
-        # the tile_size_var of the workspace
-        if not isinstance(indices, list):
-            indices = [indices]
+        if indices:
+            # If the indices contain an inner index, then we need to set
+            # the tile_size_var of the workspace
+            if isinstance(indices, IndexVar):
+                indices = [indices]
 
-        for index_var in indices:
-            if index_var.is_inner and index_var.tile_size_var:
-                wksp.tile_size_var = index_var.tile_size_var
+            for index_var in indices:
+                if index_var.is_inner and index_var.tile_size_var:
+                    wksp.tile_size_var = index_var.tile_size_var
 
     def is_dense(self) -> bool:
         return self.wksp.is_dense()
