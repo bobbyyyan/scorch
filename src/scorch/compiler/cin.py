@@ -664,6 +664,17 @@ class WorkspaceAccess(TensorAccess):
                 if index_var.is_inner and index_var.tile_size_var:
                     wksp.tile_size_var = index_var.tile_size_var
 
+    def update_indices(self, indices: Union[IndexVar, Sequence[IndexVar]]) -> None:
+        if indices:
+            # If the indices contain an inner index, then we need to set
+            # the tile_size_var of the workspace
+            if isinstance(indices, IndexVar):
+                self.indices = [indices]
+
+            for index_var in indices:
+                if index_var.is_inner and index_var.tile_size_var:
+                    self.wksp.tile_size_var = index_var.tile_size_var
+
     def is_dense(self) -> bool:
         return self.wksp.is_dense()
 
@@ -827,11 +838,11 @@ class Where(IndexStmt):
     consumer statement.
     """
 
-    consumer: IndexStmt
     producer: IndexStmt
+    consumer: IndexStmt
 
     def __str__(self):
-        return f"where ({self.consumer}) ({self.producer})"
+        return f"Where(\nproducer={self.producer}, \nconsumer={self.consumer})"
 
     def __repr__(self):
         return str(self)

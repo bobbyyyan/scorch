@@ -11,6 +11,7 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.scheduler import Scheduler
 
 
 def test_convert_dd_ds():
@@ -1149,6 +1150,34 @@ def test_spmm_dd_ds_dd_ijk():
     lowerer = CINLowerer()
 
     lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
+def test_spmm_dd_ds_dd_ijk_auto_tile():
+    # taco "C(i, k) = A(i, j) * B(j, k)" -f=C:dd -f=A:ds -f=B:dd -print-evaluate
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    C = TensorVar("C", fmt="dd")
+    A = TensorVar("A", fmt="ds")
+    B = TensorVar("B", fmt="dd")
+
+    C[i, k] = A[i, j] * B[j, k]
+
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, C._assignment)))
+    tiled_cin_stmt = Scheduler.add_tile(cin_stmt, k, 1024)
+
+    print("\nTiled CIN statement:")
+    print(tiled_cin_stmt)
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(tiled_cin_stmt)
 
     llir_lowerer = LLIRLowerer()
 
