@@ -8,9 +8,9 @@ from scorch.compiler.cin import (
     Workspace,
     Where,
     TileSizeVar,
-    Intersection,
+    IntersectionSeq,
     IndexSeq,
-    Union,
+    UnionSeq,
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
@@ -26,7 +26,7 @@ def test_mul_seq():
     A[i] = B[i] * C[i]
     assert IterationLattice(
         for_all_stmt=ForAll(
-            i, A._assignment, seq=Intersection(IndexSeq(B, i), IndexSeq(C, i))
+            i, A._assignment, seq=IntersectionSeq(IndexSeq(B, i), IndexSeq(C, i))
         ),
         cin_lowerer=CINLowerer(),
     ).gen_lattice_points() == [
@@ -43,7 +43,7 @@ def test_add_seq():
     A[i, j] = B[i, j] + C[i, j]
 
     cin = ForAll(
-        i, ForAll(j, A._assignment, Union(IndexSeq(B, [i, j]), IndexSeq(C, [i, j])))
+        i, ForAll(j, A._assignment, UnionSeq(IndexSeq(B, [i, j]), IndexSeq(C, [i, j])))
     )
     assert IterationLattice(
         cin,

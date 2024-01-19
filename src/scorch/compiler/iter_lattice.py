@@ -22,9 +22,10 @@ from .cin import (
     IndexExpr,
     CINIndexVariablesGetter,
     Where,
-    Intersection,
+    IntersectionSeq,
     IndexSeq,
-    Union,
+    UnionSeq,
+    SliceSeq,
 )
 from ..format import LevelType
 from .iterator import ModeIterator
@@ -810,19 +811,21 @@ class IterationLattice:
         def get_lattice_points_from_seq(seq: Seq) -> List[LatticePoint]:
             """Returns the lattice points from `seq`."""
             match seq:
-                case Intersection(s1, s2):
+                case IntersectionSeq(s1, s2):
                     return intersect_lattice_points(
                         get_lattice_points_from_seq(s1), get_lattice_points_from_seq(s2)
                     )
-                case Union(s1, s2):
+                case UnionSeq(s1, s2):
                     return union_lattice_points(
                         get_lattice_points_from_seq(s1), get_lattice_points_from_seq(s2)
                     )
                 case IndexSeq(access):
                     # (For simplicity, we use the original data structure and algorithm.)
                     return get_lattice_points_from_cin(access)
-                case _:
+                case SliceSeq(s, start, end, stride):
                     raise NotimplementedError
+                case _:
+                    raise ValueError
 
         def get_lattice_points_from_cin(cin: CIN) -> List[LatticePoint]:
             if isinstance(cin, Where):

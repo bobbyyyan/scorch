@@ -21,7 +21,28 @@ class Seq:
 
 
 @dataclass
-class Union(Seq):
+class SliceSeq(Seq):
+    """The slice of `seq`, e.g., `seq[s:e:r]`"""
+    seq: Seq
+    start: int
+    end: int
+    stride: int
+
+    def __init__(self, seq: Seq, start: int, end: int, stride: int):
+        self.seq = seq
+        self.start = start
+        self.end = end
+        self.stride = stride
+
+    def __str__(self):
+        return f"{self.seq}[{self.start}:{self.end}:{self.stride}]"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+@dataclass
+class UnionSeq(Seq):
     """The union of two sequences, e.g., `+`"""
 
     s1: Seq
@@ -39,7 +60,7 @@ class Union(Seq):
 
 
 @dataclass
-class Intersection(Seq):
+class IntersectionSeq(Seq):
     """The intersection of two sequences, e.g., `*`"""
 
     s1: Seq
