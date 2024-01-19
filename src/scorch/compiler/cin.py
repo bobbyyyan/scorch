@@ -15,6 +15,64 @@ _UnaryOp = Callable[[Any], Any]
 _BinaryOp = Callable[[Any, Any], Any]
 
 
+@dataclass
+class Seq:
+    pass
+
+
+@dataclass
+class Union(Seq):
+    """The union of two sequences, e.g., `+`"""
+
+    s1: Seq
+    s2: Seq
+
+    def __init__(self, s1: Seq, s2: Seq):
+        self.s1 = s1
+        self.s2 = s2
+
+    def __str__(self):
+        return f"{self.s1} ∪ {self.s2}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+@dataclass
+class Intersection(Seq):
+    """The intersection of two sequences, e.g., `*`"""
+
+    s1: Seq
+    s2: Seq
+
+    def __init__(self, s1: Seq, s2: Seq):
+        self.s1 = s1
+        self.s2 = s2
+
+    def __str__(self):
+        return f"{self.s1} ∩ {self.s2}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+@dataclass
+class IndexSeq(Seq):
+    """A sequence index, e.g., `iₐ`"""
+
+    # For simplicity, reuse same data structure as CIN.
+    access: TensorAccess
+
+    def __init__(self, tv: TensorVar, iv: Union[IndexVar, List[IndexVar]]):
+        self.access = TensorAccess(tv, iv)
+
+    def __str__(self):
+        return f"{self.access}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
 class CIN:
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self)
@@ -634,10 +692,15 @@ class TensorAccess(IndexExpr):
 
     def __str__(self):
         return f"{self.tensor}[{', '.join([str(i) for i in self.indices])}]"
-        # return f"TensorAccess(tensor={self.tensor}, indices={self.indices})"
 
     def __repr__(self):
         return str(self)
+
+    def __eq__(self, other: TensorAccess) -> bool:
+        return (self.tensor, self.indices) == (other.tensor, other.indices)
+
+    def __hash__(self):
+        return hash(self.tensor) + sum(hash(i) for i in self.indices)
 
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self.tensor)
@@ -740,6 +803,23 @@ class BinaryOp(OpExpr):
         visitor.visit(self.right)
 
 
+@dataclass(frozen=True)
+class SplitOp(IndexExpr):
+    """
+    A split expression in the taco IR.
+    """
+
+    expr: IndexExpr
+    input: IndexVar
+    output: Tuple[IndexVar]
+
+    def __str__(self):
+        return f"split({self.expr}, {self.input} -> ({', '.join(str(i) for i in self.output)}))"
+
+    def __repr__(self):
+        return str(self)
+
+
 class TensorAssign(IndexStmt):
     """
     TensorAssign :=
@@ -799,20 +879,22 @@ class ForAll(IndexStmt):
     e.g. forall_(i) A[i] = B[i] * C[i]
     """
 
-    def __init__(self, index_var: IndexVar, stmt: IndexStmt):
+    def __init__(self, index_var: IndexVar, stmt: IndexStmt, seq: Optional[Seq] = None):
         # TODO
         super(ForAll, self).__init__(None, None)
         self.index_var = index_var
         self.stmt = stmt
+        self.seq = seq
 
     def get_index_var(self) -> IndexVar:
         return self.index_var
 
     def __str__(self):
-        return f"∀{{{self.index_var}}} ({self.stmt})"
+        seq = f"∈({self.seq})" if self.seq is not None else ""
+        return f"∀{{{self.index_var}}} {seq} ({self.stmt})"
 
     def __repr__(self):
-        return f"ForAll_{{{self.index_var}}} ({self.stmt})"
+        return f"ForAll_{{{self.index_var}}} in {self.seq} ({self.stmt})"
 
     def accept(self, visitor: "CINVisitor") -> None:
         visitor.visit(self.index_var)

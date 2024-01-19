@@ -8,9 +8,30 @@ from scorch.compiler.cin import (
     Workspace,
     Where,
     TileSizeVar,
+    IndexSeq
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+
+
+def test_seq():
+    # Verify explicit `seq` is equivalent to the implicit version.
+    # For historical context, the compiler began with the latter.
+    A = TensorVar("A", fmt="dd")
+    B = TensorVar("B", fmt="ds")
+    i = IndexVar("i")
+    j = IndexVar("j")
+    A[i, j] = B[i, j]
+
+    expected = ForAll(i, ForAll(j, A._assignment))
+    expected = CINLowerer().lower_IndexStmt(expected)
+    expected = LLIRLowerer().lower_llir(expected)
+
+    # Explicitly provide the sequence.
+    actual = ForAll(i, ForAll(j, A._assignment, IndexSeq(B, [i, j])))
+    actual = CINLowerer().lower_IndexStmt(actual)
+    actual = LLIRLowerer().lower_llir(actual)
+    assert expected == actual
 
 
 def test_convert_dd_ds():

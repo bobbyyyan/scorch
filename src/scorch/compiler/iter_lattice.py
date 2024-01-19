@@ -22,6 +22,9 @@ from .cin import (
     IndexExpr,
     CINIndexVariablesGetter,
     Where,
+    Intersection,
+    IndexSeq,
+    Union,
 )
 from ..format import LevelType
 from .iterator import ModeIterator
@@ -687,7 +690,6 @@ class LatticePoint:
 
         if self.dense_iterators:
             for it in self.dense_iterators:
-
                 if it.coord_var_value_llir:
                     dense_coord_resolve_stmt = llir.VarInit(
                         var=it.get_coord_var_llir(),
@@ -805,10 +807,29 @@ class IterationLattice:
                 *map(sum, product(left_lattice_points, right_lattice_points)),  # type: ignore
             ]
 
+        def get_lattice_points_from_seq(seq: Seq) -> List[LatticePoint]:
+            """Returns the lattice points from `seq`."""
+            match seq:
+                case Intersection(s1, s2):
+                    return intersect_lattice_points(
+                        get_lattice_points_from_seq(s1), get_lattice_points_from_seq(s2)
+                    )
+                case Union(s1, s2):
+                    return union_lattice_points(
+                        get_lattice_points_from_seq(s1), get_lattice_points_from_seq(s2)
+                    )
+                case IndexSeq(access):
+                    # (For simplicity, we use the original data structure and algorithm.)
+                    return get_lattice_points_from_cin(access)
+                case _:
+                    raise NotimplementedError
+
         def get_lattice_points_from_cin(cin: CIN) -> List[LatticePoint]:
             if isinstance(cin, Where):
                 return get_lattice_points_from_cin(cin.producer)
             if isinstance(cin, ForAll):
+                if cin.seq is not None:
+                    return get_lattice_points_from_seq(cin.seq)
                 return get_lattice_points_from_cin(cin.stmt)
             if isinstance(cin, TensorAssign):
                 return get_lattice_points_from_cin(cin.rhs)
