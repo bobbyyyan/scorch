@@ -803,23 +803,6 @@ class BinaryOp(OpExpr):
         visitor.visit(self.right)
 
 
-@dataclass(frozen=True)
-class SplitOp(IndexExpr):
-    """
-    A split expression in the taco IR.
-    """
-
-    expr: IndexExpr
-    input: IndexVar
-    output: Tuple[IndexVar]
-
-    def __str__(self):
-        return f"split({self.expr}, {self.input} -> ({', '.join(str(i) for i in self.output)}))"
-
-    def __repr__(self):
-        return str(self)
-
-
 class TensorAssign(IndexStmt):
     """
     TensorAssign :=
