@@ -23,6 +23,7 @@ class Seq:
 @dataclass
 class SliceSeq(Seq):
     """The slice of `seq`, e.g., `seq[s:e:r]`"""
+
     seq: Seq
     start: int
     end: int
