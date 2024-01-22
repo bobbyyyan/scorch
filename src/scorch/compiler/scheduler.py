@@ -427,4 +427,4 @@ class Scheduler:
 
     @staticmethod
     def auto_schedule(cin: CIN) -> CIN:
-        return Scheduler.insert_workspace(cin)
+        return Scheduler.insert_workspace(cin, allow_dense=False)
