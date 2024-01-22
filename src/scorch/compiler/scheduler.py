@@ -282,6 +282,7 @@ class Scheduler:
 
     @staticmethod
     def insert_workspace(cin: CIN, allow_dense=False) -> CIN:
+        # TODO: this method should be idempotent
         # Collect all the reduction variables
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(cin)
@@ -295,6 +296,7 @@ class Scheduler:
         free_vars = cin_ivar_getter.get_free_vars()
 
         loop_order_getter = LoopOrderGetter(cin)
+
         index_vars_ordered = loop_order_getter.index_vars_ordered
 
         if len(reduction_vars) == 0:
@@ -427,4 +429,5 @@ class Scheduler:
 
     @staticmethod
     def auto_schedule(cin: CIN) -> CIN:
-        return Scheduler.insert_workspace(cin, allow_dense=False)
+        new_cin = Scheduler.insert_workspace(cin, allow_dense=True)
+        return new_cin

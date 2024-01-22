@@ -219,6 +219,7 @@ class IndexVar(IndexExpr):
         self._name = name
         self._expr = expr
         self._parent = parent
+        self.tensor_accesses = []
         # if expr, then set parent of expr to self
         if expr:
             expr.set_parent(self)
@@ -273,13 +274,16 @@ class IndexVar(IndexExpr):
             self.is_inner = is_inner
 
     def add_tensor_access(self, tensor_access: TensorAccess) -> None:
+        assert self in tensor_access.indices, f"{self} not in {tensor_access}"
         if tensor_access not in self.tensor_accesses:
             self.tensor_accesses.append(tensor_access)
 
     @property
     def size_llir_var(self) -> llir.Var:
         # Get the size of the index variable from the dense tensor accesses
-        dense_tensor_accesses = [ta for ta in self.tensor_accesses if ta.is_dense()]
+        dense_tensor_accesses = [
+            ta for ta in self.tensor_accesses if ta.is_dense() and self in ta.indices
+        ]
         assert len(dense_tensor_accesses) > 0, "No dense tensor accesses"
         # Pick one
         tensor_access = dense_tensor_accesses[0]
@@ -506,6 +510,7 @@ class Workspace(TensorVar):
         self.dtype = dtype
         self.dense = dense
         self._tile_size_var = tile_size_var
+        self.workspace_accesses = []
 
     @property
     def is_tiled(self) -> bool:
@@ -523,7 +528,10 @@ class Workspace(TensorVar):
     @property
     def size_llir_var(self) -> llir.Var:
         assert len(self.workspace_accesses) > 0, "No workspace accesses"
-        wksp_access = self.workspace_accesses[0]
+        wksp_accesses = [
+            wa for wa in self.workspace_accesses if wa.indices and len(wa.indices) == 1
+        ]
+        wksp_access = wksp_accesses[0]
         index_var = wksp_access.indices[0]
         return index_var.size_llir_var
 

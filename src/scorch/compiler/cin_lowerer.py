@@ -618,11 +618,51 @@ class CINLowerer:
             wksp_index_var = wksp_index_vars[0]
 
             if not wksp_index_var.tile_size_var:
+                loop_var = llir.Var(
+                    name=f"{wksp_index_var.name}",
+                    type=llir.DataType.INT,
+                )
+
+                loop_body: List[llir.Stmt] = []
+
+                loop_body.extend(
+                    result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+                )
+
+                loop_body.append(
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"{result_tensor_name}_values[{result_level_iterator_name}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        value=llir.Var(
+                            name=f"{wksp.get_name()}[{loop_var.name}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    )
+                )
+
+                for_loop = llir.ForLoop(
+                    init=llir.VarInit(
+                        var=loop_var,
+                        value=llir.Literal(0),
+                    ),
+                    cond=llir.BinOp(
+                        op="<",
+                        left=loop_var,
+                        right=wksp_index_var.size_llir_var,
+                    ),
+                    update=llir.Increment(
+                        var=loop_var,
+                    ),
+                    body=loop_body,
+                )
                 return [
                     llir.BlankLine(),
                     llir.Comment(
                         "TODO: Lower consumer CIN for dense accumulator workspace"
                     ),
+                    for_loop,
                 ]
 
             assert (
