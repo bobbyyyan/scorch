@@ -1,4 +1,5 @@
 import copy
+from typing import List, Set
 
 from scorch.compiler.cin import (
     CIN,
@@ -130,7 +131,9 @@ class Scheduler:
 
 
         """
-        new_cin = Scheduler.insert_workspace(cin, allow_dense=True)
+
+        if not cin.inserted_workspace:
+            cin = Scheduler.insert_workspace(cin, allow_dense=True)
 
         """
         2) Stripmine the index_var
@@ -229,10 +232,8 @@ class Scheduler:
         """
 
         # Find the Where statement
-        assert isinstance(
-            new_cin, ForAll
-        ), "Expected input CIN to be a ForAll statement."
-        parent_forall = new_cin
+        assert isinstance(cin, ForAll), "Expected input CIN to be a ForAll statement."
+        parent_forall = cin
         while hasattr(parent_forall, "stmt") and not isinstance(
             parent_forall.stmt, Where
         ):
@@ -273,16 +274,29 @@ class Scheduler:
         """
         Wrap the new_cin in a new ForAll loop, with the outer index var        
         """
-        new_cin = ForAll(
+        cin = ForAll(
             index_var=outer_index_var,
-            stmt=new_cin,
+            stmt=cin,
         )
 
-        return new_cin
+        return cin
 
     @staticmethod
     def insert_workspace(cin: CIN, allow_dense=False) -> CIN:
-        # TODO: this method should be idempotent
+        """
+        Args:
+            cin: CIN statement to insert a workspace into
+            allow_dense: If True, then allow dense workspaces to be inserted.
+
+        Returns:
+            A new CIN statement with a workspace inserted.
+
+        Insert a workspace into a CIN statement, if necessary.
+        Only works on the last reduction variable in the loop order.
+
+        This function should be idempotent.
+        """
+
         # Collect all the reduction variables
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(cin)
@@ -295,14 +309,23 @@ class Scheduler:
         reduction_vars = cin_ivar_getter.get_reduction_vars()
         free_vars = cin_ivar_getter.get_free_vars()
 
-        loop_order_getter = LoopOrderGetter(cin)
-
-        index_vars_ordered = loop_order_getter.index_vars_ordered
+        # loop_order_getter = LoopOrderGetter(cin)
+        # index_vars_ordered = loop_order_getter.index_vars_ordered
+        index_vars_ordered = cin.loop_order
 
         if len(reduction_vars) == 0:
             return cin
-        last_reduction_var = reduction_vars[-1]
-        last_reduction_var_index = index_vars_ordered.index(last_reduction_var)
+
+        reduction_vars_todo = [
+            var for var in reduction_vars if var in index_vars_ordered
+        ]
+
+        if len(reduction_vars_todo) == 0:
+            return cin
+
+        next_reduction_var = reduction_vars_todo[-1]
+
+        last_reduction_var_index = index_vars_ordered.index(next_reduction_var)
 
         # List of variables that come after the last reduction variable
         # in the loop order
@@ -346,7 +369,7 @@ class Scheduler:
         parent_forall: ForAll = new_cin
         while (
             isinstance(parent_forall.stmt, ForAll)
-            and parent_forall.stmt.index_var != last_reduction_var
+            and parent_forall.stmt.index_var != next_reduction_var
         ):
             parent_forall = parent_forall.stmt
 
@@ -425,9 +448,48 @@ class Scheduler:
         # Replace the reduction forall with the Where statement
         parent_forall.stmt = where_stmt
 
+        new_cin.inserted_workspace = True
+
         return new_cin
 
     @staticmethod
     def auto_schedule(cin: CIN) -> CIN:
-        new_cin = Scheduler.insert_workspace(cin, allow_dense=True)
-        return new_cin
+        cin = Scheduler.insert_workspace(cin, allow_dense=True)
+        all_index_vars = cin.index_vars
+        tensor_accesses = cin.tensor_accesses
+
+        index_vars_to_tile: List[IndexVar] = []
+        index_vars_sparse: Set[IndexVar] = set()
+
+        # First, populate the list of index variables to tile by iterating
+        # through each of the tensor access; if the tensor access does not
+        # use all the index variables, then we add the index variables in
+        # that tensor access corresponding to dense levels to the to tile
+        # list.
+        for tensor_access in tensor_accesses:
+            tensor_access_index_vars = tensor_access.index_vars
+            for index_var in tensor_access_index_vars:
+                if tensor_access.level_type_of_index_var(index_var) != LevelType.DENSE:
+                    index_vars_sparse.add(index_var)
+
+            if set(tensor_access_index_vars) != set(all_index_vars):
+                for index_var in tensor_access.index_vars:
+                    if (
+                        index_var not in index_vars_sparse
+                        and index_var not in index_vars_to_tile
+                    ):
+                        index_vars_to_tile.append(index_var)
+
+        first_loop_index_var = cin.loop_order[0]
+
+        # We should remove the first loop index var from the list of index vars to tile
+        # because tiling that doesn't help.
+        if first_loop_index_var in index_vars_to_tile:
+            index_vars_to_tile.remove(first_loop_index_var)
+
+        print(f"Index vars to tile: {index_vars_to_tile}")
+
+        # for index_var in index_vars_to_tile:
+        #     cin = Scheduler.add_tile(cin, index_var, 4096)
+
+        return cin

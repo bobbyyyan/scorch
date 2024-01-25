@@ -16,8 +16,115 @@ _BinaryOp = Callable[[Any, Any], Any]
 
 
 class CIN:
+    inserted_workspace: bool = False
+
+    def __init__(self):
+        self.inserted_workspace = False
+
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self)
+
+    @property
+    def index_vars(self) -> List[IndexVar]:
+        """
+        Returns a list of all index variables in the CIN.
+        """
+        cin_ivar_getter = CINIndexVariablesGetter()
+        cin_ivar_getter.visit(self)
+        all_vars = cin_ivar_getter.free_vars + cin_ivar_getter.input_vars
+        return list(set(all_vars))
+
+    @property
+    def tensor_accesses(self, omit_workspace=True) -> List[TensorAccess]:
+        """
+        Returns a list of all tensor accesses in the CIN.
+
+        For example, if the CIN is:
+            ForAll(
+                i,
+                Where(
+                    producer=ForAll(
+                        j,
+                        ForAll(
+                            k,
+                            TensorAssign(
+                                accum_c[k],
+                                A[i, j] * B[j, k],
+                                op=Operation.ADD
+                            )
+                        )
+                    ),
+                    consumer=ForAll(
+                        k,
+                        TensorAssign(
+                            C[i, k],
+                            accum_c[k],
+                        )
+                    )
+                )
+            )
+
+        Then, the tensor accesses are:
+            [A[i, j], B[j, k], accum_c[k], C[i, k]]
+
+        If omit_workspace is True, then workspace accesses are omitted:
+            [A[i, j], B[j, k], C[i, k]]
+        """
+
+        class TensorAccessGetter(CINVisitorAccept):
+            tensor_accesses: List[TensorAccess] = []
+
+            def visit_TensorAccess(self, node: TensorAccess) -> None:
+                self.tensor_accesses.append(node)
+
+            def visit_TensorAssign(self, node: TensorAssign) -> None:
+                self.visit(node.lhs)
+                self.visit(node.rhs)
+
+            def visit_Where(self, node: Where) -> None:
+                self.visit(node.producer)
+                self.visit(node.consumer)
+
+            def visit_ForAll(self, node: ForAll) -> None:
+                self.visit(node.stmt)
+
+        visitor = TensorAccessGetter()
+        visitor.visit(self)
+        if omit_workspace:
+            return [ta for ta in visitor.tensor_accesses if not ta.is_workspace()]
+        return visitor.tensor_accesses
+
+    @property
+    def loop_order(self) -> List[IndexVar, List[IndexVar]]:
+        """
+        Returns a list of index variables in the order that they are looped over.
+        """
+
+        class LoopOrderGetter(CINVisitor):
+            index_vars_ordered: List[IndexVar, List[IndexVar]] = []
+            free_vars: List[IndexVar] = []
+
+            def __init__(self, stmt: Optional[CIN] = None):
+                self.index_vars_ordered = []
+                self.free_vars = []
+                if stmt is not None:
+                    self.visit(stmt)
+
+            def visit_TensorAssign(self, node: TensorAssign) -> None:
+                for var in node.get_lhs().get_index_vars():
+                    self.free_vars.append(var)
+
+            def visit_ForAll(self, node: ForAll) -> None:
+                self.index_vars_ordered.append(node.index_var)
+                self.visit(node.stmt)
+
+            def visit_Where(self, node: Where) -> None:
+                self.index_vars_ordered.append(
+                    [node.producer.loop_order, node.consumer.loop_order]
+                )
+
+        loop_order_getter = LoopOrderGetter(self)
+        return loop_order_getter.index_vars_ordered
 
 
 class IndexExpr(CIN):
