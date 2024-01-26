@@ -642,7 +642,8 @@ class Workspace(TensorVar):
         index_var = wksp_access.indices[0]
         return index_var.size_llir_var
 
-    def get_format(self) -> TensorFormat:
+    @property
+    def format(self) -> TensorFormat:
         if self.dense:
             return parse_format(["d"] * self.dim)
         return parse_format(["o"] * self.dim)

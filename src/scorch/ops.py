@@ -271,7 +271,9 @@ def matmul(
     if a.dim() == 2 and b.dim() == 1:
         return spmv(a, b, **kwargs)
 
-    if str(a.format) == "d,s" and str(b.format) == "d,d":
+    use_cache = kwargs.get("use_cache", False)
+
+    if str(a.format) == "d,s" and str(b.format) == "d,d" and use_cache:
         result_shape = (a.shape[0], b.shape[1])
         args = [result_shape]
 

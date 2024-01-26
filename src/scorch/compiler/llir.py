@@ -240,6 +240,9 @@ class Var(Expr):
     type: DataType
     is_ptr: bool = False
 
+    def __hash__(self):
+        return hash(self.name)
+
 
 class UnaryOp(Expr):
     """Base class for all unary operations."""
@@ -324,6 +327,9 @@ class VarInit(Stmt):
     def __post_init__(self):
         if self.cast:
             self.value = Cast(self.value, self.var.type)
+
+    def __hash__(self):
+        return hash(self.var)
 
 
 @dataclass(frozen=False)

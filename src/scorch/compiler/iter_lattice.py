@@ -34,14 +34,15 @@ class LatticePoint:
     locators: List of tensor accesses to locate only
     """
 
-    sparse_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)  # type: ignore
-    dense_tensor_accesses: Optional[List[TensorAccess]] = field(default_factory=list)  # type: ignore
-    iterators: Optional[List[ModeIterator]] = field(default_factory=list)  # type: ignore
-    dense_iterators: Optional[List[ModeIterator]] = field(default_factory=list)  # type: ignore
-    child_lattice_points: Optional[List["LatticePoint"]] = field(default_factory=list)  # type: ignore
+    sparse_tensor_accesses: List[TensorAccess] = field(default_factory=list)
+    dense_tensor_accesses: List[TensorAccess] = field(default_factory=list)
+    iterators: Optional[List[ModeIterator]] = field(default_factory=list)
+    dense_iterators: List[ModeIterator] = field(default_factory=list)
+    child_lattice_points: List["LatticePoint"] = field(default_factory=list)
     parent_lattice_point: Optional["LatticePoint"] = None  # type: ignore
     index_var: Optional[IndexVar] = None
     index_var_llir: Optional[llir.Var] = None
+    _lattice: Optional[IterationLattice] = None
 
     def __add__(self, other):
         if isinstance(other, LatticePoint):
@@ -76,6 +77,19 @@ class LatticePoint:
     def get_index_var_llir(self):
         assert self.index_var_llir is not None, "Index var LLIR not set"
         return self.index_var_llir
+
+    @property
+    def lattice(self) -> IterationLattice:
+        assert self._lattice is not None, "Lattice not set"
+        return self._lattice
+
+    @lattice.setter
+    def lattice(self, lattice: IterationLattice):
+        self._lattice = lattice
+
+    @property
+    def cin_lowerer(self) -> CINLowerer:
+        return self.lattice.cin_lowerer
 
     def set_index_var_and_gen_iterators(
         self, index_var: IndexVar
@@ -684,6 +698,7 @@ class LatticePoint:
         assert cin_lowerer is not None, "CIN lowerer is None"
 
         dense_iterators_resolve_stmts: List[llir.Stmt] = []
+        d = cin_lowerer.dense_coord_resolve_stmt_to_dep_index_vars
 
         if self.dense_iterators:
             for it in self.dense_iterators:
@@ -693,45 +708,24 @@ class LatticePoint:
                         value=it.get_coord_var_value_llir(),
                     )
 
-                    # If parent iterator is not yet resolved (get this info from the lowerer)
-                    #  then we need to push this resolution later
+                    d_stmts: List[llir.VarInit] = list(d.keys())
+                    to_resolve_index_var_names = [stmt.var.name for stmt in d_stmts]
+
                     if (
-                        it.parent_iterator
-                        and it.parent_iterator.index_var
-                        not in cin_lowerer.defined_index_vars
+                        dense_coord_resolve_stmt.var.name
+                        not in to_resolve_index_var_names
                     ):
-                        # TODO: check if this condition is correct
-                        if it.index_var.is_tiled:
-                            continue
+                        d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
 
-                        dependent_index_var = it.parent_iterator.get_index_var()
-                        # if dependent_index_var.tile_size_var:
-                        #     dependent_index_var = (
-                        #         dependent_index_var.tile_size_var.inner_index_var
-                        #     )
-                        existing_list = (
-                            cin_lowerer.dep_index_var_to_dense_coord_resolution.get(
-                                dependent_index_var, []
-                            )
-                        )
-                        existing_list.append(dense_coord_resolve_stmt)
-                        cin_lowerer.dep_index_var_to_dense_coord_resolution[
-                            dependent_index_var
-                        ] = existing_list
-                    else:
-                        dense_iterators_resolve_stmts.append(dense_coord_resolve_stmt)
+        defined_index_vars = set(cin_lowerer.defined_index_vars)
 
-        current_index_var = self.get_index_var()
-
-        if current_index_var in cin_lowerer.dep_index_var_to_dense_coord_resolution:
-            dense_iterators_resolve_stmts.append(
-                llir.Comment(
-                    f"current index var {current_index_var} in dep_index_var_to_dense_coord_resolution"
-                )
-            )
-            dense_iterators_resolve_stmts.extend(
-                cin_lowerer.dep_index_var_to_dense_coord_resolution[current_index_var]
-            )
+        d_copy = d.copy()
+        for stmt, dep_index_vars in d_copy.items():
+            # if dep_index_vars is a subset of defined_index_vars, then we can resolve the dense coordinate
+            if set(dep_index_vars).issubset(defined_index_vars):
+                dense_iterators_resolve_stmts.append(stmt)
+                # remove this statement from the dictionary
+                del d[stmt]
 
         if dense_iterators_resolve_stmts:
             stmts.append(llir.Comment("Resolve dense coordinates"))
@@ -842,7 +836,13 @@ class IterationLattice:
                 return [LatticePoint(sparse_tensor_accesses=[cin])]
             raise NotImplementedError(f"Unsupported CIN: {cin}")
 
-        lattice_points = get_lattice_points_from_cin(self.for_all_stmt)
+        lattice_points: List[LatticePoint] = get_lattice_points_from_cin(
+            self.for_all_stmt
+        )
+
+        # Set the lattice pointer for each lattice point
+        for lattice_point in lattice_points:
+            lattice_point.lattice = self
 
         # Sort lattice_points in descending number of iterators, then descending number of locators
         lattice_points.sort(
@@ -1118,6 +1118,7 @@ class IterationLattice:
                 tiled_index_var_resolve_stmts.extend(
                     index_var.parent.get_resolve_llir_stmts()
                 )
+                self.cin_lowerer.defined_index_vars.append(index_var.parent)
 
             if (
                 not result_tensor_access.is_workspace()

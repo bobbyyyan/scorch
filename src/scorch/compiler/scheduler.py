@@ -373,6 +373,10 @@ class Scheduler:
         ):
             parent_forall = parent_forall.stmt
 
+        assert isinstance(
+            parent_forall, ForAll
+        ), "Expected parent_forall to be a ForAll statement."
+
         """
         For example, if parent_forall's stmt is:
 
@@ -413,10 +417,15 @@ class Scheduler:
 
         reduction_forall = parent_forall.stmt
 
+        # If we have already inserted a workspace, then we should not insert another one.
+        if isinstance(reduction_forall, Where):
+            return cin
+
         # Create the producer forall
         producer_forall = copy.deepcopy(reduction_forall)
 
         producer_forall_tensor_access_parent = producer_forall
+
         # Iterate until the TensorAssign statement
         while not isinstance(producer_forall_tensor_access_parent.stmt, TensorAssign):
             producer_forall_tensor_access_parent = (

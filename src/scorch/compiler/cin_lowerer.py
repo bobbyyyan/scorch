@@ -31,11 +31,9 @@ class CINLowerer:
     def __init__(self, filter_zeros=False):
         self.filter_zeros: bool = filter_zeros
         self.defined_index_vars: List[IndexVar] = []
-        # dict from IndexVar to a List of llir.Stmt of dense coordinate resolution
-        # the index var is the index var that needs to be defined before the coord
-        # can be resolved
-        self.dep_index_var_to_dense_coord_resolution: Dict[
-            IndexVar, List[llir.Stmt]
+
+        self.dense_coord_resolve_stmt_to_dep_index_vars: Dict[
+            llir.VarInit, List[IndexVar]
         ] = {}
 
         self.seen_outermost_forall = False
