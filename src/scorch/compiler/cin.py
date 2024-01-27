@@ -16,8 +16,115 @@ _BinaryOp = Callable[[Any, Any], Any]
 
 
 class CIN:
+    inserted_workspace: bool = False
+
+    def __init__(self):
+        self.inserted_workspace = False
+
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self)
+
+    @property
+    def index_vars(self) -> List[IndexVar]:
+        """
+        Returns a list of all index variables in the CIN.
+        """
+        cin_ivar_getter = CINIndexVariablesGetter()
+        cin_ivar_getter.visit(self)
+        all_vars = cin_ivar_getter.free_vars + cin_ivar_getter.input_vars
+        return list(set(all_vars))
+
+    @property
+    def tensor_accesses(self, omit_workspace=True) -> List[TensorAccess]:
+        """
+        Returns a list of all tensor accesses in the CIN.
+
+        For example, if the CIN is:
+            ForAll(
+                i,
+                Where(
+                    producer=ForAll(
+                        j,
+                        ForAll(
+                            k,
+                            TensorAssign(
+                                accum_c[k],
+                                A[i, j] * B[j, k],
+                                op=Operation.ADD
+                            )
+                        )
+                    ),
+                    consumer=ForAll(
+                        k,
+                        TensorAssign(
+                            C[i, k],
+                            accum_c[k],
+                        )
+                    )
+                )
+            )
+
+        Then, the tensor accesses are:
+            [A[i, j], B[j, k], accum_c[k], C[i, k]]
+
+        If omit_workspace is True, then workspace accesses are omitted:
+            [A[i, j], B[j, k], C[i, k]]
+        """
+
+        class TensorAccessGetter(CINVisitorAccept):
+            tensor_accesses: List[TensorAccess] = []
+
+            def visit_TensorAccess(self, node: TensorAccess) -> None:
+                self.tensor_accesses.append(node)
+
+            def visit_TensorAssign(self, node: TensorAssign) -> None:
+                self.visit(node.lhs)
+                self.visit(node.rhs)
+
+            def visit_Where(self, node: Where) -> None:
+                self.visit(node.producer)
+                self.visit(node.consumer)
+
+            def visit_ForAll(self, node: ForAll) -> None:
+                self.visit(node.stmt)
+
+        visitor = TensorAccessGetter()
+        visitor.visit(self)
+        if omit_workspace:
+            return [ta for ta in visitor.tensor_accesses if not ta.is_workspace()]
+        return visitor.tensor_accesses
+
+    @property
+    def loop_order(self) -> List[IndexVar, List[IndexVar]]:
+        """
+        Returns a list of index variables in the order that they are looped over.
+        """
+
+        class LoopOrderGetter(CINVisitor):
+            index_vars_ordered: List[IndexVar, List[IndexVar]] = []
+            free_vars: List[IndexVar] = []
+
+            def __init__(self, stmt: Optional[CIN] = None):
+                self.index_vars_ordered = []
+                self.free_vars = []
+                if stmt is not None:
+                    self.visit(stmt)
+
+            def visit_TensorAssign(self, node: TensorAssign) -> None:
+                for var in node.get_lhs().get_index_vars():
+                    self.free_vars.append(var)
+
+            def visit_ForAll(self, node: ForAll) -> None:
+                self.index_vars_ordered.append(node.index_var)
+                self.visit(node.stmt)
+
+            def visit_Where(self, node: Where) -> None:
+                self.index_vars_ordered.append(
+                    [node.producer.loop_order, node.consumer.loop_order]
+                )
+
+        loop_order_getter = LoopOrderGetter(self)
+        return loop_order_getter.index_vars_ordered
 
 
 class IndexExpr(CIN):
@@ -207,6 +314,7 @@ class IndexVar(IndexExpr):
     is_outer: bool = False
     is_inner: bool = False
     tile_size_var: Optional[TileSizeVar] = None
+    tensor_accesses: List[TensorAccess] = []
 
     def __init__(
         self,
@@ -218,6 +326,7 @@ class IndexVar(IndexExpr):
         self._name = name
         self._expr = expr
         self._parent = parent
+        self.tensor_accesses = []
         # if expr, then set parent of expr to self
         if expr:
             expr.set_parent(self)
@@ -270,6 +379,27 @@ class IndexVar(IndexExpr):
             self.is_outer = is_outer
         if is_inner is not None:
             self.is_inner = is_inner
+
+    def add_tensor_access(self, tensor_access: TensorAccess) -> None:
+        assert self in tensor_access.indices, f"{self} not in {tensor_access}"
+        if tensor_access not in self.tensor_accesses:
+            self.tensor_accesses.append(tensor_access)
+
+    @property
+    def size_llir_var(self) -> llir.Var:
+        # Get the size of the index variable from the dense tensor accesses
+        dense_tensor_accesses = [
+            ta for ta in self.tensor_accesses if ta.is_dense() and self in ta.indices
+        ]
+        assert len(dense_tensor_accesses) > 0, "No dense tensor accesses"
+        # Pick one
+        tensor_access = dense_tensor_accesses[0]
+        level = tensor_access.level_of_index_var(self)
+        # <tensor name>{level}_size
+        return llir.Var(
+            name=f"{tensor_access.tensor.name}{level}_size",
+            type=llir.DataType.INT,
+        )
 
     def __str__(self):
         return str(self.name)
@@ -471,6 +601,7 @@ class TensorVar(IndexExpr):
 class Workspace(TensorVar):
     name: Optional[str] = None
     dim: int
+    workspace_accesses: List[WorkspaceAccess] = []
 
     def __init__(
         self,
@@ -486,6 +617,7 @@ class Workspace(TensorVar):
         self.dtype = dtype
         self.dense = dense
         self._tile_size_var = tile_size_var
+        self.workspace_accesses = []
 
     @property
     def is_tiled(self) -> bool:
@@ -500,14 +632,31 @@ class Workspace(TensorVar):
     def tile_size_var(self, tile_size_var: TileSizeVar) -> None:
         self._tile_size_var = tile_size_var
 
-    def get_format(self) -> TensorFormat:
+    @property
+    def size_llir_var(self) -> llir.Var:
+        assert len(self.workspace_accesses) > 0, "No workspace accesses"
+        wksp_accesses = [
+            wa for wa in self.workspace_accesses if wa.indices and len(wa.indices) == 1
+        ]
+        wksp_access = wksp_accesses[0]
+        index_var = wksp_access.indices[0]
+        return index_var.size_llir_var
+
+    @property
+    def format(self) -> TensorFormat:
+        if self.dense:
+            return parse_format(["d"] * self.dim)
         return parse_format(["o"] * self.dim)
+
+    def add_workspace_access(self, workspace_access: WorkspaceAccess) -> None:
+        if workspace_access not in self.workspace_accesses:
+            self.workspace_accesses.append(workspace_access)
 
     def is_dense(self) -> bool:
         return self.dense
 
     def __str__(self):
-        return f"{self.name}({self.dim})"
+        return f"{self.name}:{self.format}(dim={self.dim})"
 
     def __repr__(self):
         return str(self)
@@ -543,6 +692,14 @@ class TensorAccess(IndexExpr):
         if isinstance(indices, IndexVar):
             indices = [indices]
         self.indices = indices
+
+        if self.indices:
+            # Add tensor access to index vars
+            for ivar in self.indices:
+                ivar.add_tensor_access(self)
+
+    def is_dense(self) -> bool:
+        return self.tensor.is_dense()
 
     def is_workspace(self) -> bool:
         return isinstance(self.tensor, Workspace)
@@ -659,6 +816,7 @@ class WorkspaceAccess(TensorAccess):
     ):
         super().__init__(wksp, indices)
         self.wksp: Workspace = wksp
+        wksp.add_workspace_access(self)
 
         if indices:
             # If the indices contain an inner index, then we need to set
@@ -669,6 +827,17 @@ class WorkspaceAccess(TensorAccess):
             for index_var in indices:
                 if index_var.is_inner and index_var.tile_size_var:
                     wksp.tile_size_var = index_var.tile_size_var
+
+    def update_indices(self, indices: Union[IndexVar, Sequence[IndexVar]]) -> None:
+        if indices:
+            # If the indices contain an inner index, then we need to set
+            # the tile_size_var of the workspace
+            if isinstance(indices, IndexVar):
+                self.indices = [indices]
+
+            for index_var in indices:
+                if index_var.is_inner and index_var.tile_size_var:
+                    self.wksp.tile_size_var = index_var.tile_size_var
 
     def is_dense(self) -> bool:
         return self.wksp.is_dense()
@@ -835,11 +1004,11 @@ class Where(IndexStmt):
     consumer statement.
     """
 
-    consumer: IndexStmt
     producer: IndexStmt
+    consumer: IndexStmt
 
     def __str__(self):
-        return f"where ({self.consumer}) ({self.producer})"
+        return f"Where(\n\tproducer={self.producer}, \n\tconsumer={self.consumer}\n)"
 
     def __repr__(self):
         return str(self)

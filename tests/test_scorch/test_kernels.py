@@ -827,7 +827,7 @@ def test_spmm_ds_dd_dd():
 
     print(result.index.mode_indices)
 
-    # assert result_torch.tolist() == result.to_torch().tolist()
+    assert result_torch.tolist() == result.to_torch().tolist()
 
 
 def todo_test_matmul_wksp_dd_oo_dd_time():
@@ -1000,7 +1000,7 @@ def test_spmm_dd_oo_dd_time():
     Compare speed of torch and scorch matmul
     Use random tensors
     """
-    n = 2000
+    n = 4096
     sparsity = 0.99
     random_tensor_a = torch.rand(n, n).float()
     random_tensor_b = torch.rand(n, n).float()

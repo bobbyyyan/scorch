@@ -31,11 +31,9 @@ class CINLowerer:
     def __init__(self, filter_zeros=False):
         self.filter_zeros: bool = filter_zeros
         self.defined_index_vars: List[IndexVar] = []
-        # dict from IndexVar to a List of llir.Stmt of dense coordinate resolution
-        # the index var is the index var that needs to be defined before the coord
-        # can be resolved
-        self.dep_index_var_to_dense_coord_resolution: Dict[
-            IndexVar, List[llir.Stmt]
+
+        self.dense_coord_resolve_stmt_to_dep_index_vars: Dict[
+            llir.VarInit, List[IndexVar]
         ] = {}
 
         self.seen_outermost_forall = False
@@ -428,6 +426,7 @@ class CINLowerer:
             llir.Comment("Initialize workspaces"),
         ]
         for wksp in workspaces:
+            assert isinstance(wksp, Workspace), "workspace is not a Workspace"
             # coo_workspace<tensor's ctype> <tensor's name> = coo_workspace<tensor's ctype>(<tensor's dim>);
             wksp_ctype = dtype_to_c_datatype(wksp.dtype)
             wksp_ctype_ptr = DataType.ptr_type(wksp_ctype)
@@ -450,19 +449,32 @@ class CINLowerer:
                 # float* <workspace name> = new float[<workspace size>]();
                 # change float to the corresponding ctype
                 if wksp.is_dense():
-                    assert wksp.is_tiled, "Dense workspace not tiled"
-                    workspace_init_stmts.append(
-                        llir.VarInit(
-                            var=llir.Var(
-                                name=wksp.get_name(),
-                                type=wksp_ctype_ptr,
-                            ),
-                            value=llir.FunctionCall(
-                                name=f"new {wksp_ctype.value}[{wksp.tile_size_var.name}]",
-                                args=[],
-                            ),
+                    if wksp.is_tiled:
+                        workspace_init_stmts.append(
+                            llir.VarInit(
+                                var=llir.Var(
+                                    name=wksp.get_name(),
+                                    type=wksp_ctype_ptr,
+                                ),
+                                value=llir.FunctionCall(
+                                    name=f"new {wksp_ctype.value}[{wksp.tile_size_var.name}]",
+                                    args=[],
+                                ),
+                            )
                         )
-                    )
+                    else:
+                        workspace_init_stmts.append(
+                            llir.VarInit(
+                                var=llir.Var(
+                                    name=wksp.get_name(),
+                                    type=wksp_ctype_ptr,
+                                ),
+                                value=llir.FunctionCall(
+                                    name=f"new {wksp_ctype.value}[{wksp.size_llir_var.name}]",
+                                    args=[],
+                                ),
+                            )
+                        )
                 else:
                     # If the workspace is 1-dimensional, use optimized 1D workspace implementation
                     # coo_workspace_1d<tensor's ctype, tensor's dim>
@@ -602,9 +614,59 @@ class CINLowerer:
                 len(wksp_index_vars) == 1
             ), "dense workspace has more than 1 index var"
             wksp_index_var = wksp_index_vars[0]
+
+            if not wksp_index_var.tile_size_var:
+                loop_var = llir.Var(
+                    name=f"{wksp_index_var.name}",
+                    type=llir.DataType.INT,
+                )
+
+                loop_body: List[llir.Stmt] = []
+
+                loop_body.extend(
+                    result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+                )
+
+                loop_body.append(
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"{result_tensor_name}_values[{result_level_iterator_name}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        value=llir.Var(
+                            name=f"{wksp.get_name()}[{loop_var.name}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    )
+                )
+
+                for_loop = llir.ForLoop(
+                    init=llir.VarInit(
+                        var=loop_var,
+                        value=llir.Literal(0),
+                    ),
+                    cond=llir.BinOp(
+                        op="<",
+                        left=loop_var,
+                        right=wksp_index_var.size_llir_var,
+                    ),
+                    update=llir.Increment(
+                        var=loop_var,
+                    ),
+                    body=loop_body,
+                )
+                return [
+                    llir.BlankLine(),
+                    llir.Comment(
+                        "TODO: Lower consumer CIN for dense accumulator workspace"
+                    ),
+                    for_loop,
+                ]
+
             assert (
                 wksp_index_var.tile_size_var and wksp_index_var.is_inner
             ), "Dense accumulator used not for tiling"
+
             # For loop
             # for (int <wksp index var> = 0; <wksp index var> < <wksp index var bound>; <wksp index var>++) {
             #    <body statement>
@@ -1549,7 +1611,7 @@ class CINLowerer:
         # ):
         #     stmts.append(llir.Comment(f"{index_var} not in result tensor access"))
 
-        # If the result _level for this index_var is dense, need to assemble the result by
+        # If the result level for this index_var is dense, need to assemble the result by
         # setting the corresponding values in the result values array to 0
         if (
             self.result_tensor_access
@@ -1557,7 +1619,7 @@ class CINLowerer:
             and self.result_tensor_access.level_type_of_index_var(index_var)
             == LevelType.DENSE
         ):
-            # If the parent _level is not dense or has no parent _level,
+            # If the parent level is not dense or has no parent level,
             # and the next levels are all dense
             # then we need to initialize result value array elements to 0
             level_of_index_var = self.result_tensor_access.level_of_index_var(index_var)
@@ -1577,72 +1639,93 @@ class CINLowerer:
             ):
                 assert self.result_tensor_var, "Result tensor variable not set"
 
-                stmts.extend(
-                    [
-                        llir.Comment("Assemble dense result level as needed"),
-                        # initialize a result stride variable = current_level_size * next_level_size * ...
-                        llir.VarInit(
-                            var=llir.Var(
-                                name=f"{self.result_tensor_var.get_name()}_stride",
-                                type=llir.DataType.INT,
-                            ),
-                            value=llir.Var(
-                                name=" * ".join(
-                                    [
-                                        f"{self.result_tensor_var.get_name()}{i}_size"
-                                        for i in range(
-                                            level_of_index_var,
-                                            self.result_tensor_access.num_levels,
-                                        )
-                                    ]
-                                ),
-                                type=llir.DataType.INT,
-                            ),
-                        ),
-                        # for (int i = 0; i < <result_tensor_name>_stride; i++) {
-                        #   <result_tensor_name>_values[i] = 0;
-                        # }
-                        llir.ForLoop(
-                            init=llir.VarInit(
+                iter_var = llir.Var(name="i", type=llir.DataType.INT)
+
+                if self.result_tensor_access.is_workspace():
+                    wksp = self.result_tensor_var
+                    assert isinstance(wksp, Workspace), "Expected a Workspace"
+                    # TODO: determine if we need to initialize the result value array
+                    # if not wksp.is_tiled:
+                    #     stmts.append(
+                    #         llir.Comment(
+                    #             "Initialize result value array elements to 0 for workspace"
+                    #         )
+                    #     )
+                    #     stmts.append(
+                    #         llir.ForLoop(
+                    #             init=llir.VarInit(
+                    #                 var=iter_var,
+                    #                 value=llir.Literal(0),
+                    #             ),
+                    #             cond=llir.BinOp(
+                    #                 op="<",
+                    #                 left=iter_var,
+                    #                 right=wksp.size_llir_var,
+                    #             ),
+                    #             update=llir.Increment(iter_var),
+                    #             body=[
+                    #                 llir.Assign(
+                    #                     var=llir.Var(
+                    #                         name=f"{self.result_tensor_var.name}[{iter_var.name}]",
+                    #                         type=llir.DataType.NO_TYPE,
+                    #                     ),
+                    #                     value=llir.Literal(0),
+                    #                 )
+                    #             ],
+                    #         )
+                    #     )
+                else:
+                    stmts.extend(
+                        [
+                            llir.Comment("Assemble dense result level as needed"),
+                            # initialize a result stride variable = current_level_size * next_level_size * ...
+                            llir.VarInit(
                                 var=llir.Var(
-                                    name="i",
-                                    type=llir.DataType.INT,
-                                ),
-                                value=llir.Literal(
-                                    value="0",
-                                ),
-                            ),
-                            cond=llir.BinOp(
-                                op="<",
-                                left=llir.Var(
-                                    name="i",
-                                    type=llir.DataType.INT,
-                                ),
-                                right=llir.Var(
                                     name=f"{self.result_tensor_var.get_name()}_stride",
                                     type=llir.DataType.INT,
                                 ),
-                            ),
-                            update=llir.Increment(
-                                var=llir.Var(
-                                    name="i",
+                                value=llir.Var(
+                                    name=" * ".join(
+                                        [
+                                            f"{self.result_tensor_var.get_name()}{i}_size"
+                                            for i in range(
+                                                level_of_index_var,
+                                                self.result_tensor_access.num_levels,
+                                            )
+                                        ]
+                                    ),
                                     type=llir.DataType.INT,
                                 ),
                             ),
-                            body=[
-                                llir.Assign(
-                                    var=llir.Var(
-                                        name=f"{self.result_tensor_var.get_name()}_values[i]",
-                                        type=llir.DataType.NO_TYPE,
+                            # for (int i = 0; i < <result_tensor_name>_stride; i++) {
+                            #   <result_tensor_name>_values[i] = 0;
+                            # }
+                            llir.ForLoop(
+                                init=llir.VarInit(
+                                    var=iter_var,
+                                    value=llir.Literal(0),
+                                ),
+                                cond=llir.BinOp(
+                                    op="<",
+                                    left=iter_var,
+                                    right=llir.Var(
+                                        name=f"{self.result_tensor_var.get_name()}_stride",
+                                        type=llir.DataType.INT,
                                     ),
-                                    value=llir.Literal(
-                                        value="0",
-                                    ),
-                                )
-                            ],
-                        ),
-                    ]
-                )
+                                ),
+                                update=llir.Increment(iter_var),
+                                body=[
+                                    llir.Assign(
+                                        var=llir.Var(
+                                            name=f"{self.result_tensor_var.get_name()}_values[{iter_var.name}]",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
+                                        value=llir.Literal(0),
+                                    )
+                                ],
+                            ),
+                        ]
+                    )
 
         stmts.extend(
             [

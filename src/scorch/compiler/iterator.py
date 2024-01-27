@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List
 
 from . import llir
@@ -25,6 +25,8 @@ class ModeIterator:
 
     coord_var_llir: Optional[llir.Var] = None
     coord_var_value_llir: Optional[llir.Expr] = None
+    # coord_var_value_depends_on use default factory
+    coord_var_value_depends_on: List[IndexVar] = field(default_factory=list)
 
     @property
     def level(self) -> int:
@@ -371,6 +373,10 @@ class ModeIterator:
                         name=self.index_var.name,
                         type=llir.DataType.INT,
                     ),
+                )
+
+                self.coord_var_value_depends_on.extend(
+                    [self.index_var, self.parent_iterator.index_var]
                 )
 
     def __str__(self) -> str:

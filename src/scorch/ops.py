@@ -271,7 +271,9 @@ def matmul(
     if a.dim() == 2 and b.dim() == 1:
         return spmv(a, b, **kwargs)
 
-    if str(a.format) == "d,s" and str(b.format) == "d,d":
+    use_cache = kwargs.get("use_cache", False)
+
+    if str(a.format) == "d,s" and str(b.format) == "d,d" and use_cache:
         result_shape = (a.shape[0], b.shape[1])
         args = [result_shape]
 
@@ -446,13 +448,14 @@ def einsum(
     assert ForAll is not None, "ForAll is not imported"
     for i, index_str in enumerate(index_strs_by_schedule[::-1]):
         rhs = f'ForAll(index_var_dict["{index_str}"], {rhs})'
+
     cin_stmt = eval(rhs)
 
-    scheduler = Scheduler()
+    print("CIN:\n", cin_stmt)
 
-    cin_stmt = scheduler.auto_schedule(cin_stmt)
+    cin_stmt = Scheduler.auto_schedule(cin_stmt)
 
-    # print("cin_stmt:\n", cin_stmt)
+    print("Auto-scheduled CIN:\n", cin_stmt)
 
     if str(cin_stmt) in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
@@ -466,7 +469,7 @@ def einsum(
 
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        # print("\n\n", cpp_code)
+        print("\n\n", cpp_code)
 
         # Read header_cpp_code from csrc/header.cpp
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
