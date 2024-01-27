@@ -14,201 +14,6 @@ from ..utils import parse_format
 _UnaryOp = Callable[[Any], Any]
 _BinaryOp = Callable[[Any, Any], Any]
 
-####################################
-####### Sequence Combinators #######
-####################################
-
-
-@dataclass
-class Seq:
-    pass
-
-
-@dataclass
-class SliceSeq(Seq):
-    """The slice of `seq`, e.g., `seq[s:e:r]`"""
-
-    seq: Seq
-    start: int
-    end: int
-    stride: int
-    format: Optional[LevelType] = None
-
-    def __init__(self, seq: Seq, start: int, end: int, stride: int):
-        self.seq = seq
-        self.start = start
-        self.end = end
-        self.stride = stride
-
-    def __str__(self):
-        return f"{self.seq}[{self.start}:{self.end}:{self.stride}]"
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __hash__(self):
-        return hash((self.format, self.seq, self.start, self.end, self.stride))
-
-    def __eq__(self, other):
-        if not isinstance(other, SliceSeq):
-            return False
-        return (self.format, self.seq, self.start, self.end, self.stride) == (
-            other.format,
-            other.seq,
-            other.start,
-            other.end,
-            other.stride,
-        )
-
-
-@dataclass
-class UnionSeq(Seq):
-    """The union of two sequences, e.g., `+`"""
-
-    s1: Seq
-    s2: Seq
-    format: Optional[LevelType] = None
-
-    def __init__(self, s1: Seq, s2: Seq):
-        self.s1 = s1
-        self.s2 = s2
-
-    def __str__(self):
-        return f"{self.s1} ∪ {self.s2}"
-
-    def __repr__(self):
-        return self.__str__()
-
-
-@dataclass
-class IntersectionSeq(Seq):
-    """The intersection of two sequences, e.g., `*`"""
-
-    s1: Seq
-    s2: Seq
-    format: Optional[LevelType] = None
-
-    def __init__(self, s1: Seq, s2: Seq):
-        self.s1 = s1
-        self.s2 = s2
-
-    def __str__(self):
-        return f"{self.s1} ∩ {self.s2}"
-
-    def __repr__(self):
-        return self.__str__()
-
-
-# While this shares much of the same functionality as a TensorAccess,
-# it has the additional restriction of only allowing a single index.
-@dataclass
-class IndexSeq(Seq):
-    """A sequence index, e.g., `iₐ`"""
-
-    # The index used to access `tensor`. (For simplicity, reuse same data structure as CIN.)
-    idx: IndexVar
-    # The tensor to be accessed.
-    tensor: TensorVar
-    # The size of the dimension of the accessed index.
-    size: int
-    # The access index, e.g., for `A[i, j]` i = 0 and j = 1.
-    index: int
-    # The format of this sequence.
-    format: LevelType
-    # The parent of this sequence, e.g., the parent of `j` in `A[i, j]` is `i`.
-    # If this is None, then it has no parent.
-    parent: Optional[IndexVar] = None
-
-    def __init__(
-        self,
-        iv: IndexVar,
-        tv: TensorVar,
-        size: int,
-        index: int,
-        format: Optional[LevelType],
-        parent: Optional[IndexVar] = None,
-    ):
-        self.idx = iv
-        self.tensor = tv
-        self.size = size
-        self.index = index
-        self.parent = parent
-        self.format = format
-
-    def __str__(self):
-        return f"{self.tensor}[{self.idx}]"
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __eq__(self, other):
-        if not isinstance(other, IndexSeq):
-            return False
-        return (
-            self.idx,
-            self.tensor,
-            self.size,
-            self.index,
-            self.parent,
-            self.format,
-        ) == (
-            other.idx,
-            other.tensor,
-            other.size,
-            other.index,
-            other.parent,
-            other.format,
-        )
-
-    def __hash__(self):
-        return hash(
-            (self.format, self.idx, self.size, self.tensor, self.index, self.parent)
-        )
-
-
-@dataclass
-class FullSeq(Seq):
-    size: int
-
-    def __init__(self, size: int):
-        self.size = size
-
-    def __str__(self):
-        return f"full({self.size})"
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __eq__(self, other):
-        if not isinstance(other, FullSeq):
-            return False
-        return (self.size) == (other.size)
-
-    def __hash__(self):
-        return hash((self.size))
-
-
-@dataclass
-class EmptySeq(Seq):
-    size: int
-
-    def __init__(self, size: int):
-        self.size = size
-
-    def __str__(self):
-        return f"empty({self.size})"
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __eq__(self, other):
-        if not isinstance(other, EmptySeq):
-            return False
-        return (self.size) == (other.size)
-
-    def __hash__(self):
-        return hash((self.size))
-
 
 class CIN:
     def accept(self, visitor: CINVisitor) -> None:
@@ -1150,3 +955,198 @@ def all_free_var_loops_before_reduction_loops(stmt: IndexStmt) -> bool:
     free_vars = loop_order_getter.free_vars
     free_var_loops = [var for var in index_vars_ordered if var in free_vars]
     return free_var_loops == index_vars_ordered[: len(free_var_loops)]
+
+####################################
+####### Sequence Combinators #######
+####################################
+
+
+@dataclass
+class Seq:
+    pass
+
+
+@dataclass
+class SliceSeq(Seq):
+    """The slice of `seq`, e.g., `seq[s:e:r]`"""
+
+    seq: Seq
+    start: int
+    end: int
+    stride: int
+    format: Optional[LevelType] = None
+
+    def __init__(self, seq: Seq, start: int, end: int, stride: int):
+        self.seq = seq
+        self.start = start
+        self.end = end
+        self.stride = stride
+
+    def __str__(self):
+        return f"{self.seq}[{self.start}:{self.end}:{self.stride}]"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __hash__(self):
+        return hash((self.format, self.seq, self.start, self.end, self.stride))
+
+    def __eq__(self, other):
+        if not isinstance(other, SliceSeq):
+            return False
+        return (self.format, self.seq, self.start, self.end, self.stride) == (
+            other.format,
+            other.seq,
+            other.start,
+            other.end,
+            other.stride,
+        )
+
+
+@dataclass
+class UnionSeq(Seq):
+    """The union of two sequences, e.g., `+`"""
+
+    s1: Seq
+    s2: Seq
+    format: Optional[LevelType] = None
+
+    def __init__(self, s1: Seq, s2: Seq):
+        self.s1 = s1
+        self.s2 = s2
+
+    def __str__(self):
+        return f"{self.s1} ∪ {self.s2}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+@dataclass
+class IntersectionSeq(Seq):
+    """The intersection of two sequences, e.g., `*`"""
+
+    s1: Seq
+    s2: Seq
+    format: Optional[LevelType] = None
+
+    def __init__(self, s1: Seq, s2: Seq):
+        self.s1 = s1
+        self.s2 = s2
+
+    def __str__(self):
+        return f"{self.s1} ∩ {self.s2}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+# While this shares much of the same functionality as a TensorAccess,
+# it has the additional restriction of only allowing a single index.
+@dataclass
+class IndexSeq(Seq):
+    """A sequence index, e.g., `iₐ`"""
+
+    # The index used to access `tensor`. (For simplicity, reuse same data structure as CIN.)
+    idx: IndexVar
+    # The tensor to be accessed.
+    tensor: TensorVar
+    # The size of the dimension of the accessed index.
+    size: int
+    # The access index, e.g., for `A[i, j]` i = 0 and j = 1.
+    index: int
+    # The format of this sequence.
+    format: LevelType
+    # The parent of this sequence, e.g., the parent of `j` in `A[i, j]` is `i`.
+    # If this is None, then it has no parent.
+    parent: Optional[IndexVar] = None
+
+    def __init__(
+        self,
+        iv: IndexVar,
+        tv: TensorVar,
+        size: int,
+        index: int,
+        format: Optional[LevelType],
+        parent: Optional[IndexVar] = None,
+    ):
+        self.idx = iv
+        self.tensor = tv
+        self.size = size
+        self.index = index
+        self.parent = parent
+        self.format = format
+
+    def __str__(self):
+        return f"{self.tensor}[{self.idx}]"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __eq__(self, other):
+        if not isinstance(other, IndexSeq):
+            return False
+        return (
+            self.idx,
+            self.tensor,
+            self.size,
+            self.index,
+            self.parent,
+            self.format,
+        ) == (
+            other.idx,
+            other.tensor,
+            other.size,
+            other.index,
+            other.parent,
+            other.format,
+        )
+
+    def __hash__(self):
+        return hash(
+            (self.format, self.idx, self.size, self.tensor, self.index, self.parent)
+        )
+
+
+@dataclass
+class FullSeq(Seq):
+    size: int
+
+    def __init__(self, size: int):
+        self.size = size
+
+    def __str__(self):
+        return f"full({self.size})"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __eq__(self, other):
+        if not isinstance(other, FullSeq):
+            return False
+        return (self.size) == (other.size)
+
+    def __hash__(self):
+        return hash((self.size))
+
+
+@dataclass
+class EmptySeq(Seq):
+    size: int
+
+    def __init__(self, size: int):
+        self.size = size
+
+    def __str__(self):
+        return f"empty({self.size})"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __eq__(self, other):
+        if not isinstance(other, EmptySeq):
+            return False
+        return (self.size) == (other.size)
+
+    def __hash__(self):
+        return hash((self.size))
