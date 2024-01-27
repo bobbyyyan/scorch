@@ -113,11 +113,11 @@ class IndexSeq(Seq):
     size: int
     # The access index, e.g., for `A[i, j]` i = 0 and j = 1.
     index: int
+    # The format of this sequence.
+    format: LevelType
     # The parent of this sequence, e.g., the parent of `j` in `A[i, j]` is `i`.
     # If this is None, then it has no parent.
     parent: Optional[IndexVar] = None
-    # The format of this sequence.
-    format: Optional[LevelType] = None
 
     def __init__(
         self,
@@ -125,8 +125,8 @@ class IndexSeq(Seq):
         tv: TensorVar,
         size: int,
         index: int,
+        format: Optional[LevelType],
         parent: Optional[IndexVar] = None,
-        format: Optional[LevelType] = None,
     ):
         self.idx = iv
         self.tensor = tv
