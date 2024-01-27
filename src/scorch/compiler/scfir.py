@@ -17,7 +17,7 @@ class CFIR:
 @dataclass
 class Switch(CFIR):
     idx: cin.IndexVar
-    cases: List[Pair[cin.Seq, cin.CIN]]
+    cases: List[Tuple[cin.Seq, cin.CIN]]
 
     def __str__(self):
         newline = "\n"
@@ -60,13 +60,13 @@ class Lattice:
     children: dict[cin.Seq, Lattice] = field(default_factory=dict)
 
 
-def 𝜒(sexpr: cin.Seq):
+def 𝜒(sexpr: cin.Seq) -> set[cin.Seq]:
     match sexpr:
-        case cin.FullSeq(_) | cin.EmptySeq(_):
+        case cin.FullSeq() | cin.EmptySeq():
             return {}
-        case cin.IndexSeq(_, _, _):
+        case cin.IndexSeq():
             return {sexpr}
-        case cin.SliceSeq(a, _, _, _):
+        case cin.SliceSeq(a):
             return 𝜒(a) | {sexpr}
         case _:
             raise NotImplementedError(type(sexpr))
@@ -93,27 +93,32 @@ def TopoSort(lattice: Lattice):
     return t
 
 
-def Size(sexpr: cin.Seq):
+def Size(sexpr: cin.Seq) -> int:
     match sexpr:
-        case cin.IndexSeq(idx, tensor, size):
+        case cin.IndexSeq(_, _, size):
             return size
         case cin.FullSeq(sz) | cin.EmptySeq(sz):
             return sz
-        case cin.SliceSeq(a, s, e, r):
+        case cin.SliceSeq(_, s, e, r):
             return (e - s) + (r - 1) // r
         case _:
             return NotImplementedError(type(sexpr))
 
 
-def Remove(sexpr: cin.Seq, sub: cin.Seq):
+def IsDense(sexpr: cin.Seq) -> bool:
+    match sexpr:
+        case cin.IndexSeq(_, _, _, _, fmt):
+            return fmt == format.LevelType.DENSE
+        case cin.SliceSeq(a):
+            return IsDense(a)
+        case _:
+            raise NotImplementedError(type(sexpr))
+
+
+def Remove(sexpr: cin.Seq, sub: cin.Seq) -> cin.Seq:
     if sexpr == sub:
-        assert hasattr(sexpr, "format"), sexpr
-        size = Size(sexpr)
-        return (
-            cin.FullSeq(size)
-            if sexpr.format == format.LevelType.DENSE
-            else cin.EmptySeq(size)
-        )
+        sz: int = Size(sexpr)
+        return cin.FullSeq(sz) if IsDense(sexpr) else cin.EmptySeq(sz)
     match sexpr:
         case cin.IndexSeq(_, _, _):
             return sexpr
@@ -123,14 +128,14 @@ def Remove(sexpr: cin.Seq, sub: cin.Seq):
             raise NotImplementedError(type(sexpr))
 
 
-def Simplify(sexpr: cin.Seq, defs: set[T]):
+def Simplify(sexpr: cin.Seq, defs: set[Any]) -> cin.Seq:
     match sexpr:
-        case cin.IndexSeq(_, _, size, _, _, format):
+        case cin.IndexSeq(_, _, sz, _, _, format):
             # TODO(cgyurgyik): Verify the index is defined already.
             return (
-                cin.FullSeq(size)
+                cin.FullSeq(sz)
                 if format == format.LevelType.DENSE
-                else cin.EmptySeq(size)
+                else cin.EmptySeq(sz)
             )
         case cin.FullSeq(_) | cin.EmptySeq(_):
             return sexpr
@@ -146,29 +151,30 @@ def Simplify(sexpr: cin.Seq, defs: set[T]):
             raise NotImplementedError(type(sexpr))
 
 
-def ConstructGraph(sexpr: cin.Seq, defs: set[T], visited: set[cin.Seq] = set()):
+def ConstructGraph(sexpr: cin.Seq, defs: set[Any], visited: set[cin.Seq] = set()):
     if sexpr in visited:
         return {}
     set.update({sexpr})
     graph = {}
-    edges = 𝜒(sexpr)
+    edges: set[cin.Seq] = 𝜒(sexpr)
+    # TODO(cgyurgyik): This is nondeterministic.
     for sub in edges:
-        r = Remove(sexpr, sub)
-        s = Simplify(r, defs)
+        r: cin.Seq = Remove(sexpr, sub)
+        s: cin.Seq = Simplify(r, defs)
         l = ConstructGraph(s, defs, visited)
         graph[sub] = l
     return graph
 
 
-def ConstructLattice(top: cin.Seq, defs: set[T]):
+def ConstructLattice(top: cin.Seq, defs: set[Any]):
     return Lattice(top, ConstructGraph(top, defs))
 
 
 def Iters(sexpr: cin.Seq):
     match sexpr:
-        case cin.SliceSeq(a, _, _, _):
+        case cin.SliceSeq(a):
             return Iters(a)
-        case cin.IndexSeq(_, _, _):
+        case cin.IndexSeq():
             return {sexpr}
         case _:
             raise NotImplementedError(type(sexpr))
@@ -199,18 +205,19 @@ def BuildLoop(point: cin.Seq, lattice: Lattice, fa: cin.ForAll):
     return Loop(idx, point, body)
 
 
-def CompileForAll(fa: cin.ForAll, defs: set[T]):
-    lattice = ConstructLattice(fa.seq, defs)
-    return [BuildLoop(p, lattice, fa) for p in TopoSort(lattice)]
+def CompileForAll(fa: cin.ForAll, defs: set[Any]):
+    lattice: Lattice = ConstructLattice(fa.seq, defs)
+    loops: list[Loop] = [BuildLoop(p, lattice, fa) for p in TopoSort(lattice)]
+    return loops.pop() if len(loops) == 1 else loops
 
 
-def CompileTensorAssign(c: cin.TensorAssign, defs: set[T]):
+def CompileTensorAssign(c: cin.TensorAssign, defs: set[Any]):
     if c.op is None:
         return Assign(c.lhs, c.rhs)
     raise NotImplementedError(c.op)
 
 
-def Lower(c: cin.CIN, defs: set[T] = set()):
+def Lower(c: cin.CIN, defs: set[Any] = set()):
     """Lowers Concrete Index Notation (CIN) to CFIR."""
     match c:
         case cin.ForAll():

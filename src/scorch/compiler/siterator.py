@@ -2,8 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
-from scorch.compiler import cin as cin, scpp as cpp
-import scorch.format as format
+from scorch.compiler import cin as cin, scpp as cpp, scpputils as cpputil
 
 # An iterator model that follows the work presented in "Compilation of
 # Shape Operators on Sparse Arrays" by Root, et. al. The `s` in `siterator`
@@ -12,13 +11,13 @@ import scorch.format as format
 
 def Init(sexpr: cin.Seq):
     match (sexpr):
-        case cin.IndexSeq(idx, _):
+        case cin.IndexSeq():
             return cpp.Define(
                 type=cpp.IndexType(),
-                lhs=cpp.ArrayIndexVariable(sexpr),
-                rhs=cpp.ArrayLowerBound(sexpr),
+                lhs=cpputil.ArrayIndexVariable(sexpr),
+                rhs=cpputil.ArrayLowerBound(sexpr),
             )
-        case cin.SliceSeq(a, s, e, r):
+        case cin.SliceSeq(a, s, _, r):
             return cpp.Block(
                 [
                     Init(a),
@@ -60,8 +59,8 @@ def Reset(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq(idx, array):
             return cpp.Assign(
-                lhs=cpp.ArrayIndexVariable(sexpr),
-                rhs=cpp.ArrayLowerBound(array, idx),
+                lhs=cpputil.ArrayIndexVariable(sexpr),
+                rhs=cpputil.ArrayLowerBound(array, idx),
             )
         case cin.SliceSeq(a, s, e, r):
             raise NotImplementedError(type(sexpr))
@@ -73,9 +72,10 @@ def Valid(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq(_, _):
             return cpp.Lt(
-                lhs=cpp.ArrayIndexVariable(sexpr), rhs=cpp.ArrayUpperBound(sexpr)
+                lhs=cpputil.ArrayIndexVariable(sexpr),
+                rhs=cpputil.ArrayUpperBound(sexpr),
             )
-        case cin.SliceSeq(a, s, e, r):
+        case cin.SliceSeq(a, _, e, r):
             return cpp.And(Valid(a), cpp.Lt(Eval(a), cpp.Constant(e)))
         case _:
             raise NotImplementedError(type(sexpr))
@@ -83,9 +83,9 @@ def Valid(sexpr: cin.Seq):
 
 def Eval(sexpr: cin.Seq):
     match (sexpr):
-        case cin.IndexSeq(_, _):
-            return cpp.ArrayAccessCrd(sexpr)
-        case cin.SliceSeq(a, s, e, r):
+        case cin.IndexSeq():
+            return cpputil.ArrayAccessCrd(sexpr)
+        case cin.SliceSeq(a, s, _, r):
             return cpp.Div(cpp.Sub(Eval(a), cpp.Constant(s)), cpp.Constant(r))
         case _:
             raise NotImplementedError(type(sexpr))
@@ -95,7 +95,7 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq(_, _):
             return cpp.IncAssign(
-                cpp.ArrayIndexVariable(sexpr), cpp.Eq(value, Eval(sexpr))
+                cpputil.ArrayIndexVariable(sexpr), cpp.Eq(value, Eval(sexpr))
             )
         case cin.SliceSeq(a, s, e, r):
             raise NotImplementedError(type(sexpr))
@@ -106,8 +106,8 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
 def UnconditionalNext(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq(_, _):
-            return cpp.IncAssign(cpp.ArrayIndexVariable(sexpr), cpp.Constant(1))
-        case cin.SliceSeq(a, s, e, r):
+            return cpp.IncAssign(cpputil.ArrayIndexVariable(sexpr), cpp.Constant(1))
+        case cin.SliceSeq(a, s, _, r):
             return cpp.Block(
                 [
                     UnconditionalNext(a),

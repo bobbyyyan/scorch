@@ -1,8 +1,11 @@
-from dataclasses import dataclass
-from enum import Enum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
-from scorch.compiler import scfir as cfir, scpp as cpp, cin
-import scorch.compiler.siterator as it
+from scorch.compiler import (
+    scfir as cfir,
+    scpp as cpp,
+    siterator as it,
+    scpputils as cpputil,
+    cin,
+)
 import scorch.format as format
 
 
@@ -27,7 +30,7 @@ def LowerLoop(idx: cin.IndexVar, sexpr: cin.Seq, body: cfir.CFIR, first: bool):
 def LowerIndexExpr(expr: cin.IndexExpr):
     match expr:
         case cin.TensorAccess():
-            tensor = expr.tensor
+            tensor: cin.TensorVar = expr.tensor
             return cpp.Access(
                 cpp.Variable(f"{tensor.name}.data"), LowerIndexExprRec(expr)
             )
@@ -42,8 +45,8 @@ def LowerIndexExprRec(expr: cin.IndexExpr, i: int = 0):
                 return cpp.Constant(0)
             if expr.num_levels == 0:
                 return cpp.Variable(expr.tensor.name)
-            idx = expr.get_index_vars()[i]
-            fmt = expr.level_types()[i]
+            idx: cin.IndexVar = expr.get_index_vars()[i]
+            fmt: format.LevelType = expr.level_types()[i]
             match fmt:
                 case format.LevelType.COMPRESSED:
                     return cpp.Variable(f"{idx.name}p_{expr.tensor.name}")
@@ -61,7 +64,7 @@ def LowerIndexExprRec(expr: cin.IndexExpr, i: int = 0):
 
 
 def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr):
-    iterators = cpp.UpdateCompressedIterators(lhs)
+    iterators = cpputil.UpdateCompressedIterators(lhs)
     return cpp.Block(
         stmts=[
             # Write to compressed dimensions.
@@ -89,7 +92,7 @@ def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar):
     index: int = ta.level_of_index_var(idx)
     format: format.LevelType = ta.level_types()[index]
     return cpp.Assign(
-        cpp.ArrayAccessCrd2(ta.tensor, idx, format), cpp.Variable(idx.name)
+        cpputil.ArrayAccessCrd(ta.tensor, idx, index, format), cpp.Variable(idx.name)
     )
 
 

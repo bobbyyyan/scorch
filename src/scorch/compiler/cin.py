@@ -1144,7 +1144,6 @@ class SliceSeq(Seq):
     start: int
     end: int
     stride: int
-    format: Optional[LevelType] = None
 
     def __init__(self, seq: Seq, start: int, end: int, stride: int):
         self.seq = seq
@@ -1159,13 +1158,12 @@ class SliceSeq(Seq):
         return self.__str__()
 
     def __hash__(self):
-        return hash((self.format, self.seq, self.start, self.end, self.stride))
+        return hash((self.seq, self.start, self.end, self.stride))
 
     def __eq__(self, other):
         if not isinstance(other, SliceSeq):
             return False
-        return (self.format, self.seq, self.start, self.end, self.stride) == (
-            other.format,
+        return (self.seq, self.start, self.end, self.stride) == (
             other.seq,
             other.start,
             other.end,
@@ -1179,7 +1177,6 @@ class UnionSeq(Seq):
 
     s1: Seq
     s2: Seq
-    format: Optional[LevelType] = None
 
     def __init__(self, s1: Seq, s2: Seq):
         self.s1 = s1
@@ -1198,7 +1195,6 @@ class IntersectionSeq(Seq):
 
     s1: Seq
     s2: Seq
-    format: Optional[LevelType] = None
 
     def __init__(self, s1: Seq, s2: Seq):
         self.s1 = s1
@@ -1215,37 +1211,40 @@ class IntersectionSeq(Seq):
 # it has the additional restriction of only allowing a single index.
 @dataclass
 class IndexSeq(Seq):
-    """A sequence index, e.g., `iₐ`"""
+    """A sequence index, e.g., `iₐ`
 
-    # The index used to access `tensor`. (For simplicity, reuse same data structure as CIN.)
+    idx: The index used to access `tensor`.
+    tensor: The tensor to be accessed.
+    size: The size of the dimension of the accessed index.
+    index: The access index, e.g., for `A[i, j]` i = 0 and j = 1.
+    format: The format of this sequence.
+    parent: The (optional) parent of this sequence, e.g., the parent of `j`
+            in `A[i, j]` is `i`. If this is None, then it has no parent.
+    """
+
     idx: IndexVar
-    # The tensor to be accessed.
     tensor: TensorVar
-    # The size of the dimension of the accessed index.
     size: int
-    # The access index, e.g., for `A[i, j]` i = 0 and j = 1.
     index: int
-    # The format of this sequence.
     format: LevelType
-    # The parent of this sequence, e.g., the parent of `j` in `A[i, j]` is `i`.
-    # If this is None, then it has no parent.
+
     parent: Optional[IndexVar] = None
 
     def __init__(
         self,
-        iv: IndexVar,
-        tv: TensorVar,
+        idx: IndexVar,
+        tensor: TensorVar,
         size: int,
         index: int,
         format: Optional[LevelType],
         parent: Optional[IndexVar] = None,
     ):
-        self.idx = iv
-        self.tensor = tv
+        self.idx = idx
+        self.tensor = tensor
         self.size = size
         self.index = index
-        self.parent = parent
         self.format = format
+        self.parent = parent
 
     def __str__(self):
         return f"{self.tensor}[{self.idx}]"

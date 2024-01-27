@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from scorch.compiler import cin
-from scorch import format
 
 
 @dataclass
@@ -240,91 +239,3 @@ class Mod(BinaryOp):
 class Div(BinaryOp):
     def __init__(self, lhs: Cpp, rhs: Cpp):
         super().__init__(lhs=lhs, rhs=rhs, op=Op.DIVIDE)
-
-
-# ----------------------------------------
-
-
-# TODO(cgyurgyik): ... I don't want to include a dependency for multiple dispatch for now,
-# but that will likely change soon.
-def ArrayIndexVariable2(
-    idx: cin.IndexVar, tensor: cin.TensorVar, fmt: format.LevelType
-):
-    match fmt:
-        case format.LevelType.DENSE:
-            return Variable(f"{idx}_{tensor.name}")
-        case format.LevelType.COMPRESSED:
-            return Variable(f"{idx}p_{tensor.name}")
-        case _:
-            raise NotImplementedError(fmt)
-
-
-def ArrayIndexVariable(seq: cin.IndexSeq):
-    return ArrayIndexVariable2(seq.idx, seq.tensor, seq.format)
-
-
-def ArrayLowerBound(seq: cin.IndexSeq):
-    match fmt := seq.format:
-        case format.LevelType.DENSE:
-            return Constant(0)
-        case format.LevelType.COMPRESSED:
-            i = seq.index
-            return Access(
-                Access(Variable(f"{seq.tensor.name}.pos"), i),
-                Constant(0)
-                if i == 0
-                else ArrayIndexVariable2(seq.parent, seq.tensor, seq.format),
-            )
-        case _:
-            raise NotImplementedError(fmt)
-
-
-def ArrayUpperBound(seq: cin.IndexSeq):
-    match fmt := seq.format:
-        case format.LevelType.DENSE:
-            return Constant(seq.size)
-        case format.LevelType.COMPRESSED:
-            i = seq.index
-            return Access(
-                Access(Variable(f"{seq.tensor.name}.pos"), Constant(i)),
-                Constant(1)
-                if i == 0
-                else Add(
-                    ArrayIndexVariable2(seq.parent, seq.tensor, seq.format), Constant(1)
-                ),
-            )
-        case _:
-            raise NotImplementedError(fmt)
-
-
-def ArrayAccessCrd(seq: cin.IndexSeq):
-    match fmt := seq.format:
-        case format.LevelType.DENSE:
-            return ArrayIndexVariable(seq)
-        case format.LevelType.COMPRESSED:
-            return Access(
-                Access(Variable(f"{seq.tensor.name}.crd"), Constant(seq.index)),
-                ArrayIndexVariable(seq),
-            )
-
-
-def ArrayAccessCrd2(tensor: cin.TensorVar, index: cin.IndexVar, fmt: format.LevelType):
-    match fmt:
-        case format.LevelType.DENSE:
-            return ArrayIndexVariable2(index, tensor, fmt)
-        case format.LevelType.COMPRESSED:
-            return Access(
-                Access(Variable(f"{tensor.name}.crd"), Constant(index)),
-                ArrayIndexVariable2(index, tensor, fmt),
-            )
-
-
-def UpdateCompressedIterators(ta: cin.TensorAccess) -> Optional[Cpp]:
-    assert isinstance(ta, cin.TensorAccess), type(ta)
-    types = ta.level_types()
-    if types[-1] == format.LevelType.DENSE:
-        return None
-    indices = ta.get_index_vars()
-    return IncAssign(
-        ArrayIndexVariable2(indices[-1], ta.tensor, types[-1]), Constant(1)
-    )
