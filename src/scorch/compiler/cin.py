@@ -156,7 +156,7 @@ class IndexSeq(Seq):
             other.tensor,
             other.size,
             other.index,
-            self.parent,
+            other.parent,
             other.format,
         )
 
