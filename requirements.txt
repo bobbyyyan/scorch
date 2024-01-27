@@ -1,6 +1,7 @@
 numpy
 scipy
 torch
+multipledispatch
 
 # Development
 black
