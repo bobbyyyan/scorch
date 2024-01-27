@@ -45,7 +45,7 @@ def test_slice():
             A.data[ip_A] = B.data[jp_B];
             ip_A += 1;
             jp_B += 1;
-            while (((jp_B < B.pos[0][1]) && (! (((B.crd[0][jp_B] - 0) % 2) == 0)))) {
+            while (((jp_B < B.pos[0][1]) && (!(((B.crd[0][jp_B] - 0) % 2) == 0)))) {
               jp_B += 1;
             }
           }""",

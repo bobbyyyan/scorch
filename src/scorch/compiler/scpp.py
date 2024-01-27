@@ -158,7 +158,7 @@ class UnaryOp(Cpp):
         self.op = op
 
     def __str__(self):
-        return f"({self.op} {self.input})"
+        return f"({self.op}{self.input})"
 
     def __repr__(self):
         return str(self)
