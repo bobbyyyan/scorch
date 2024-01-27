@@ -6,8 +6,7 @@ from scorch.compiler import cin as cin
 from scorch.compiler.shapes import cpp, cpputil
 
 # An iterator model that follows the work presented in "Compilation of
-# Shape Operators on Sparse Arrays" by Root, et. al. The `s` in `siterator`
-# is ambiguous; it can stand for simple, shape, or even supercilious.
+# Shape Operators on Sparse Arrays" by Root, et. al.
 
 
 def Init(sexpr: cin.Seq):
