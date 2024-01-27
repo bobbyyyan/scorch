@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
-import scorch.compiler.cin as cin
+from scorch.compiler import cin
 import scorch.format as format
 
 # The control flow intermediate representation (CFIR) as presented in

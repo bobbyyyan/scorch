@@ -1,4 +1,5 @@
-from scorch.compiler import cin, scfir as cfir, scpp as cpp, scodegen as codegen
+from scorch.compiler import cin
+from scorch.compiler.shapes import cfir, cpp, codegen
 from scorch.format import LevelType
 
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence

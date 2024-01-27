@@ -11,6 +11,7 @@ torch = "*"
 black = "*"
 flake8 = "*"
 mypy = "*"
+multipledispatch = "*"
 pytest = "*"
 
 [dev-packages]

@@ -1,11 +1,6 @@
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
-from scorch.compiler import (
-    scfir as cfir,
-    scpp as cpp,
-    siterator as it,
-    scpputils as cpputil,
-    cin,
-)
+from scorch.compiler import cin
+from scorch.compiler.shapes import cfir, cpp, cpputil, iterator as it
 import scorch.format as format
 
 

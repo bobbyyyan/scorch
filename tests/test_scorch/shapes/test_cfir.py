@@ -1,5 +1,5 @@
-import scorch.compiler.cin as cin
-import scorch.compiler.scfir as cfir
+from scorch.compiler import cin
+from scorch.compiler.shapes import cfir
 from scorch.format import LevelType
 
 # Tests CIN -> CFIR lowering phase.

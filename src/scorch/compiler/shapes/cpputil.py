@@ -1,6 +1,7 @@
 from scorch import format
 from multipledispatch import dispatch
-from scorch.compiler import cin, scpp as cpp
+from scorch.compiler import cin
+from scorch.compiler.shapes import cpp
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 # Utility functions to used in the CFIR -> CIN lowering phase.
