@@ -2,8 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
-from . import cin
-from . import cpp
+from scorch.compiler import cin as cin, scpp as cpp
 import scorch.format as format
 
 # An iterator model that follows the work presented in "Compilation of

@@ -1,9 +1,8 @@
 from dataclasses import dataclass
-from enum import Enum
-from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
-from . import cin
-from scorch import format
 from enum import StrEnum
+from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
+from scorch.compiler import cin
+from scorch import format
 
 
 @dataclass

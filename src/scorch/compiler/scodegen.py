@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
-from scorch.compiler import cfir, cin, cpp
+from scorch.compiler import scfir as cfir, scpp as cpp, cin
 import scorch.compiler.siterator as it
 import scorch.format as format
 

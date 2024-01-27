@@ -1,9 +1,8 @@
-import scorch.compiler.cin as cin
-import scorch.compiler.cfir as cfir
+from scorch.compiler import cin, scfir as cfir, scpp as cpp, scodegen as codegen
 from scorch.format import LevelType
-import scorch.compiler.cppcodegen as cppcodegen
+
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
-import scorch.compiler.cpp as cpp
+
 
 # Tests CFIR -> CPP lowering phase.
 
@@ -27,7 +26,7 @@ def test_slice():
     A[i] = B[j]
 
     assert_equal(
-        cppcodegen.Lower(
+        codegen.Lower(
             cfir.Loop(
                 idx=i,
                 sexpr=cin.SliceSeq(

@@ -1,3 +1,4 @@
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
@@ -54,18 +55,9 @@ class Assign(CFIR):
 
 
 @dataclass
-class Lattice(CFIR):
+class Lattice:
     sexpr: cin.Seq
     children: dict[cin.Seq, Lattice] = field(default_factory=dict)
-
-    def add_child(self, sub: cin.Seq, point: Lattice):
-        self.children[sub] = point
-
-    def seq(self):
-        return sexpr
-
-    def subpoints(self):
-        return children.values()
 
 
 def 𝜒(sexpr: cin.Seq):
@@ -80,7 +72,7 @@ def 𝜒(sexpr: cin.Seq):
             raise NotImplementedError(type(sexpr))
 
 
-def TopoSortHelper(
+def TopoSortRec(
     node: cin.Seq, graph: dict[cin.Seq, Lattice], visited: set[cin.Seq] = set()
 ):
     if node in visited or isinstance(node, cin.FullSeq | cin.EmptySeq):
@@ -90,12 +82,12 @@ def TopoSortHelper(
     for c, cs in graph.items():
         if len(cs) == 0:
             continue
-        nodes.extend(TopoSortHelper(c, cs, visited))
+        nodes.extend(TopoSortRec(c, cs, visited))
     return nodes + [node]
 
 
-def TopoSort(il: IterationLattice):
-    t = TopoSortHelper(il.sexpr, il.children)
+def TopoSort(lattice: Lattice):
+    t = TopoSortRec(lattice.sexpr, lattice.children)
     t = list(dict.fromkeys(t))  # De-duplicate
     t = t[::-1]  # Reverse
     return t
@@ -182,15 +174,16 @@ def Iters(sexpr: cin.Seq):
             raise NotImplementedError(type(sexpr))
 
 
-def Subpoints(il: IterationLattice):
-    subs = TopoSortHelper(il.sexpr, il.children)
-    iters = Iters(il.sexpr)
+# TODO(cgyurgyik): This needs to be fixed.
+def Subpoints(lattice: Lattice):
+    subs = TopoSort(lattice)
+    iters = Iters(lattice.sexpr)
     # def f(x): return Iters(x) <= iters
     # return list(filter(f, subs))
     return iters
 
 
-def BuildLoop(point: cin.Seq, lattice: IterationLattice, fa: cin.ForAll):
+def BuildLoop(point: cin.Seq, lattice: Lattice, fa: cin.ForAll):
     # TODO(cgyurgyik): Add simplify function for `CIN`.
     # TODO(cgyurgyik): `locs` and `defs` manipulation here.
     idx: cin.IndexVar = fa.index_var
@@ -199,8 +192,7 @@ def BuildLoop(point: cin.Seq, lattice: IterationLattice, fa: cin.ForAll):
     def build(c: cin.CIN):
         return [c, Lower(body)]
 
-    subpoints = Subpoints(lattice)
-    bodies = [build(sub) for sub in subpoints]
+    bodies = [build(sub) for sub in Subpoints(lattice)]
 
     # TODO(cgyurgyik): Check if this contains an intersection sequence.
     body = bodies[0][1] if len(bodies) == 1 else Switch(idx, bodies)
