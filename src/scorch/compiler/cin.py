@@ -956,6 +956,7 @@ def all_free_var_loops_before_reduction_loops(stmt: IndexStmt) -> bool:
     free_var_loops = [var for var in index_vars_ordered if var in free_vars]
     return free_var_loops == index_vars_ordered[: len(free_var_loops)]
 
+
 ####################################
 ####### Sequence Combinators #######
 ####################################
