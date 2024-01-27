@@ -22,10 +22,6 @@ from .cin import (
     IndexExpr,
     CINIndexVariablesGetter,
     Where,
-    IntersectionSeq,
-    IndexSeq,
-    UnionSeq,
-    SliceSeq,
 )
 from ..format import LevelType
 from .iterator import ModeIterator
@@ -808,31 +804,10 @@ class IterationLattice:
                 *map(sum, product(left_lattice_points, right_lattice_points)),  # type: ignore
             ]
 
-        def get_lattice_points_from_seq(seq: Seq) -> List[LatticePoint]:
-            """Returns the lattice points from `seq`."""
-            match seq:
-                case IntersectionSeq(s1, s2):
-                    return intersect_lattice_points(
-                        get_lattice_points_from_seq(s1), get_lattice_points_from_seq(s2)
-                    )
-                case UnionSeq(s1, s2):
-                    return union_lattice_points(
-                        get_lattice_points_from_seq(s1), get_lattice_points_from_seq(s2)
-                    )
-                case IndexSeq(access):
-                    # (For simplicity, we use the original data structure and algorithm.)
-                    return get_lattice_points_from_cin(access)
-                case SliceSeq(s, start, end, stride):
-                    raise NotimplementedError
-                case _:
-                    raise ValueError
-
         def get_lattice_points_from_cin(cin: CIN) -> List[LatticePoint]:
             if isinstance(cin, Where):
                 return get_lattice_points_from_cin(cin.producer)
             if isinstance(cin, ForAll):
-                if cin.seq is not None:
-                    return get_lattice_points_from_seq(cin.seq)
                 return get_lattice_points_from_cin(cin.stmt)
             if isinstance(cin, TensorAssign):
                 return get_lattice_points_from_cin(cin.rhs)
@@ -865,7 +840,7 @@ class IterationLattice:
                 ):
                     return [LatticePoint(dense_tensor_accesses=[cin])]
                 return [LatticePoint(sparse_tensor_accesses=[cin])]
-            raise NotImplementedError(f"Unsupported CIN: {cin}")
+            raise NotImplementedError(f"Unsupported CIN: {cin} of type: {type(cin)}")
 
         lattice_points = get_lattice_points_from_cin(self.for_all_stmt)
 
@@ -952,8 +927,8 @@ class IterationLattice:
             self.index_var = self.for_all_stmt.get_index_var()
 
         # Generate the iterators for each lattice point now that we know the index variable
-        for lp in self.lattice_points:
-            lp.set_index_var_and_gen_iterators(self.index_var)
+        # for lp in self.lattice_points:
+        #     lp.set_index_var_and_gen_iterators(self.index_var)
 
     def get_iterator_init_stmts(self) -> List[llir.Stmt]:
         """
