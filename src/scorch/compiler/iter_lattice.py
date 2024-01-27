@@ -840,7 +840,7 @@ class IterationLattice:
                 ):
                     return [LatticePoint(dense_tensor_accesses=[cin])]
                 return [LatticePoint(sparse_tensor_accesses=[cin])]
-            raise NotImplementedError(f"Unsupported CIN: {cin} of type: {type(cin)}")
+            raise NotImplementedError(f"Unsupported CIN: {cin}")
 
         lattice_points = get_lattice_points_from_cin(self.for_all_stmt)
 
@@ -927,8 +927,8 @@ class IterationLattice:
             self.index_var = self.for_all_stmt.get_index_var()
 
         # Generate the iterators for each lattice point now that we know the index variable
-        # for lp in self.lattice_points:
-        #     lp.set_index_var_and_gen_iterators(self.index_var)
+        for lp in self.lattice_points:
+            lp.set_index_var_and_gen_iterators(self.index_var)
 
     def get_iterator_init_stmts(self) -> List[llir.Stmt]:
         """

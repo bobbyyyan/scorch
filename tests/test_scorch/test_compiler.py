@@ -8,7 +8,6 @@ from scorch.compiler.cin import (
     Workspace,
     Where,
     TileSizeVar,
-    IndexSeq,
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
