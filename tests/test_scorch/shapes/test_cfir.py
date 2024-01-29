@@ -14,20 +14,34 @@ def test_union():
     i = cin.IndexVar("i")
     A[i] = B[i] + C[i]
 
-    util.assert_equal(cfir.PrettyPrint(cfir.Lower(
-        cin.ForAll(
-            i,
-            A._assignment,
-            cin.UnionSeq(
-                cin.IndexSeq(
-                    i, B, size=8, index=0, parent=None, format=LevelType.COMPRESSED
-                ),
-                cin.IndexSeq(
-                    i, C, size=8, index=0, parent=None, format=LevelType.COMPRESSED
-                ),
-            ),
-        )
-    )), """while i <-- B:s[i] ∪ C:s[i]
+    util.assert_equal(
+        cfir.PrettyPrint(
+            cfir.Lower(
+                cin.ForAll(
+                    i,
+                    A._assignment,
+                    cin.UnionSeq(
+                        cin.IndexSeq(
+                            i,
+                            B,
+                            size=8,
+                            index=0,
+                            parent=None,
+                            format=LevelType.COMPRESSED,
+                        ),
+                        cin.IndexSeq(
+                            i,
+                            C,
+                            size=8,
+                            index=0,
+                            parent=None,
+                            format=LevelType.COMPRESSED,
+                        ),
+                    ),
+                )
+            )
+        ),
+        """while i <-- B:s[i] ∪ C:s[i]
              switch i
                case: B:s[i] ∪ C:s[i]
                  A:s[i] = (B:s[i] + C:s[i])
@@ -38,7 +52,8 @@ def test_union():
            while i <-- B:s[i] 
              A:s[i] = B:s[i]
            while i <-- C:s[i] 
-             A:s[i] = C:s[i]""")
+             A:s[i] = C:s[i]""",
+    )
 
 
 def test_slice():

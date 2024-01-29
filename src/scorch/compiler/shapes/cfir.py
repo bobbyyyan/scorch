@@ -58,7 +58,7 @@ class Block(CFIR):
     stmts: list[CFIR]
 
     def __str__(self):
-        return '\n'.join(str(stmt) for stmt in self.stmts)
+        return "\n".join(str(stmt) for stmt in self.stmts)
 
 
 @dataclass
@@ -87,10 +87,7 @@ def BuildLoop(
 
     def Build(child: cin.Seq):
         newdefs: set[cin.Seq] = defs | il.Iters(child) | locdefs
-        return SwitchCase(
-            sexpr=child,
-            stmt=Lower(il.Simplify(body, newdefs), newdefs)
-        )
+        return SwitchCase(sexpr=child, stmt=Lower(il.Simplify(body, newdefs), newdefs))
 
     bodies = list(map(Build, il.Subpoints(lattice, point)))
 
@@ -152,6 +149,7 @@ def Lower(c: cin.CIN, defs: set[cin.Seq] = set()) -> CFIR:
         case _:
             raise NotImplementedError(type(c))
 
+
 #######################################
 ############# Pretty Print #############
 ########################################
@@ -162,6 +160,7 @@ def PrettyPrint(stmt: CFIR, indent_level: int = 0) -> str:
     Pretty print for the CF intermediate representation.
     This will handle indentation.
     """
+
     def indent(i: int = indent_level) -> str:
         return i * " "
 

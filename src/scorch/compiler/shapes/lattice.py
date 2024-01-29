@@ -134,7 +134,7 @@ def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
                 size=tensor.shape[index],
                 index=index,
                 format=level,
-                parent=sequences[index - 1] if index != 0 else None
+                parent=sequences[index - 1] if index != 0 else None,
             )
         )
     return sequences
@@ -166,8 +166,13 @@ def Simplify(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
                         return x
                     return cin.BinaryOp(cin.Operation.ADD, x, y)
                 case cin.Operation.MUL:
-                    return None if x is None or y is None else cin.BinaryOp(cin.Operation.MUL, x, y)
-                case _ : raise NotImplementedError(op)
+                    return (
+                        None
+                        if x is None or y is None
+                        else cin.BinaryOp(cin.Operation.MUL, x, y)
+                    )
+                case _:
+                    raise NotImplementedError(op)
 
         case _:
             raise NotImplementedError(type(e))
@@ -185,10 +190,7 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
                 seq=sexpr,
             )
         case cin.TensorAssign():
-            return cin.TensorAssign(
-                lhs=c.lhs,
-                rhs=Simplify(c.rhs, defs)
-            )
+            return cin.TensorAssign(lhs=c.lhs, rhs=Simplify(c.rhs, defs))
         case _:
             raise NotImplementedError(type(c))
 

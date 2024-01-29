@@ -22,15 +22,17 @@ def test_assign_1d_s():
     i = cin.IndexVar("i")
     A[i] = B[i]
 
-    util.assert_equal(Compile(
-        cin.ForAll(
-            i,
-            A._assignment,
-            cin.IndexSeq(
-                i, B, size=8, index=0, parent=None, format=LevelType.COMPRESSED
-            ),
-        )
-    ), """
+    util.assert_equal(
+        Compile(
+            cin.ForAll(
+                i,
+                A._assignment,
+                cin.IndexSeq(
+                    i, B, size=8, index=0, parent=None, format=LevelType.COMPRESSED
+                ),
+            )
+        ),
+        """
       size_t ip_B = B.pos[0][0];
       while ((ip_B < B.pos[0][1])) {
         size_t i = B.crd[0][ip_B];
@@ -38,7 +40,8 @@ def test_assign_1d_s():
         A.data[ip_A] = B.data[ip_B];
         ip_A += 1;
         ip_B += 1;
-      }""")
+      }""",
+    )
 
 
 def test_union():
@@ -50,17 +53,20 @@ def test_union():
 
     return  # TODO(cgyurgyik): Provide `union` support in codegen.
 
-    util.assert_equal(Compile(
-        cin.ForAll(
-            i,
-            A._assignment,
-            cin.UnionSeq(
-                cin.IndexSeq(
-                    i, B, size=8, index=0, parent=None, format=LevelType.COMPRESSED
+    util.assert_equal(
+        Compile(
+            cin.ForAll(
+                i,
+                A._assignment,
+                cin.UnionSeq(
+                    cin.IndexSeq(
+                        i, B, size=8, index=0, parent=None, format=LevelType.COMPRESSED
+                    ),
+                    cin.IndexSeq(
+                        i, C, size=8, index=0, parent=None, format=LevelType.COMPRESSED
+                    ),
                 ),
-                cin.IndexSeq(
-                    i, C, size=8, index=0, parent=None, format=LevelType.COMPRESSED
-                ),
-            ),
-        )
-    ), """""")
+            )
+        ),
+        """""",
+    )
