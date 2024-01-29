@@ -168,7 +168,7 @@ def Simplify(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
                 case cin.Operation.MUL:
                     return (
                         None
-                        if x is None or y is None
+                        if None in (x, y)
                         else cin.BinaryOp(cin.Operation.MUL, x, y)
                     )
                 case _:
