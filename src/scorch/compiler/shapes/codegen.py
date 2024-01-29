@@ -22,13 +22,23 @@ def LowerLoop(idx: cin.IndexVar, sexpr: cin.Seq, body: cfir.CFIR, first: bool):
     return cpp.Block(stmts=[it.Init(sexpr), loop]) if first else loop
 
 
-def LowerIndexExpr(expr: cin.IndexExpr):
+def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
     match expr:
         case cin.TensorAccess():
             tensor: cin.TensorVar = expr.tensor
             return cpp.Access(
                 cpp.Variable(f"{tensor.name}.data"), LowerIndexExprRec(expr)
             )
+        case cin.BinaryOp():
+            lhs: cpp.Cpp = LowerIndexExpr(expr.left)
+            rhs: cpp.Cpp = LowerIndexExpr(expr.right)
+            match op := expr.op:
+                case cin.Operation.ADD:
+                    return cpp.Add(lhs, rhs)
+                case cin.Operation.MUL:
+                    return cpp.Mul(lhs, rhs)
+                case _:
+                    raise NotImplementedError(op)
         case _:
             raise NotImplementedError(type(expr))
 
@@ -98,6 +108,17 @@ def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
                 return LowerLoop(idx, sexpr, body, first)
             case cfir.Assign(lhs, rhs):
                 return LowerAssign(lhs, rhs)
+            case cfir.Block(stmts):
+                return cpp.Block(
+                    stmts=[_Lower(s, first=(i == 0)) for (i, s) in enumerate(stmts)]
+                )
+            case cfir.Switch(idx, cases):
+                return cpp.IfBlock(pairs=list(
+                    map(lambda c: (
+                        it.Equals(cpp.Variable(idx.name), c.sexpr),
+                        Lower(c.stmt)
+                    ), cases)
+                ))
             case _:
                 raise NotImplementedError(type(stmt))
 
@@ -115,16 +136,31 @@ def PrettyPrint(stmt: cpp.Cpp, indent_level: int = 0) -> str:
     This will handle indentation.
     """
 
-    def PpExpr(e: cpp.Cpp):
+    def PpExpr(e: cpp.Cpp) -> str:
         return str(e)
 
-    def indent():
+    def indent() -> str:
         return indent_level * " "
+
+    def PpIf(cond: Optional[cpp.Cpp], body: cpp.Cpp) -> str:
+        pp: str = ""
+        if cond is not None:
+            pp += f"if ({PpExpr(cond)})"
+        pp += " {"
+        pp += "\n"
+        pp += PrettyPrint(body, indent_level + 2)
+        pp += "\n"
+        pp += indent()
+        pp += "}"
+        return pp
 
     pp: str = ""
     match stmt:
         case cpp.Block(stmts):
-            return "\n".join(PrettyPrint(stmt, indent_level) for stmt in stmts)
+            pp += "\n".join(PrettyPrint(stmt, indent_level) for stmt in stmts)
+        case cpp.IfBlock(pairs):
+            pp += indent()
+            pp += " else ".join(PpIf(p[0], p[1]) for p in pairs)
         case cpp.While(cond, block):
             # while (cond) {
             #   stmt0

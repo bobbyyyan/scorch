@@ -26,7 +26,7 @@ class IterationLattice:
             visited: set = set(),
         ):
             s = ""
-            if isinstance(node, cin.EmptySeq) or node in visited:
+            if isinstance(node, cin.EmptySeq | cin.FullSeq) or node in visited:
                 return s
             visited.add(node)
             children: Tuple[cin.Seq, cin.Seq] = graph[node]
@@ -67,7 +67,7 @@ def TopologicalSortRec(
     graph: dict[cin.Seq, Tuple[cin.Seq, cin.Seq]],
     visited: set[cin.Seq] = set(),
 ):
-    if node in visited or isinstance(node, cin.EmptySeq):
+    if node in visited or isinstance(node, cin.EmptySeq | cin.FullSeq):
         return []
     visited.add(node)
     return [
@@ -183,7 +183,7 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
     match c:
         case cin.ForAll():
             sexpr: cin.Seq = Simplify(c.seq, defs)
-            assert not isinstance(sexpr, cin.EmptySeq)
+            assert not isinstance(sexpr, cin.EmptySeq | cin.FullSeq)
             return cin.ForAll(
                 index_var=c.index_var,
                 stmt=Simplify(c.stmt, defs | Iters(sexpr)),
@@ -248,7 +248,7 @@ def Contains(sexpr: cin.Seq, subpoint: cin.Seq):
 
 
 def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = set()):
-    if sexpr in visited or isinstance(sexpr, cin.EmptySeq):
+    if sexpr in visited or isinstance(sexpr, cin.EmptySeq | cin.FullSeq):
         return {}
     visited.update({sexpr})
     edges: set[cin.Seq] = 𝜒(sexpr)

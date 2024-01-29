@@ -10,11 +10,10 @@ def assert_equal(actual: Any, expected: str):
 
     def strip(s: Any) -> str:
         s = str(s)
-        s = s.strip()
         s = s.replace("\n", "")
         s = s.replace("\t", "")
         s = s.replace(" ", "")
-        return
+        return s
 
     actual = strip(actual)
     expected = strip(expected)

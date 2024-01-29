@@ -107,6 +107,14 @@ class Block(Cpp):
 
 
 @dataclass
+class IfBlock(Cpp):
+    pairs: List[Cpp | Tuple[Cpp, Cpp]]
+
+    def __str__(self):
+        return " else ".join([f"if ({p[0]}) {{ {p[1]} }}" if isinstance(p, Tuple) else f"{p}" for p in self.pairs])
+
+
+@dataclass
 class While(Cpp):
     cond: Cpp
     body: Block
@@ -145,6 +153,8 @@ class Op(StrEnum):
     NOT = "!"
     LOGICAL_AND = "&&"
     LOGICAL_OR = "||"
+    MINIMUM = "min"
+    MAXIMUM = "max"
 
 
 @dataclass
@@ -181,6 +191,8 @@ class BinaryOp(Cpp):
         self.op = op
 
     def __str__(self):
+        if self.op in (Op.MINIMUM, Op.MAXIMUM):
+            return f"{self.op}({self.lhs}, {self.rhs})"
         return f"({self.lhs} {self.op} {self.rhs})"
 
     def __repr__(self):
@@ -239,3 +251,15 @@ class Mod(BinaryOp):
 class Div(BinaryOp):
     def __init__(self, lhs: Cpp, rhs: Cpp):
         super().__init__(lhs=lhs, rhs=rhs, op=Op.DIVIDE)
+
+
+@dataclass
+class Min(BinaryOp):
+    def __init__(self, lhs: Cpp, rhs: Cpp):
+        super().__init__(lhs=lhs, rhs=rhs, op=Op.MINIMUM)
+
+
+@dataclass
+class Max(BinaryOp):
+    def __init__(self, lhs: Cpp, rhs: Cpp):
+        super().__init__(lhs=lhs, rhs=rhs, op=Op.MAXIMUM)
