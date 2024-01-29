@@ -113,12 +113,17 @@ def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
                     stmts=[_Lower(s, first=(i == 0)) for (i, s) in enumerate(stmts)]
                 )
             case cfir.Switch(idx, cases):
-                return cpp.IfBlock(pairs=list(
-                    map(lambda c: (
-                        it.Equals(cpp.Variable(idx.name), c.sexpr),
-                        Lower(c.stmt)
-                    ), cases)
-                ))
+                return cpp.IfBlock(
+                    pairs=list(
+                        map(
+                            lambda c: (
+                                it.Equals(cpp.Variable(idx.name), c.sexpr),
+                                Lower(c.stmt),
+                            ),
+                            cases,
+                        )
+                    )
+                )
             case _:
                 raise NotImplementedError(type(stmt))
 

@@ -59,7 +59,7 @@ class Variable(Cpp):
 
 @dataclass
 class Access(Cpp):
-    # TODO(cgyurgyik): This is a hack.
+    # TODO(cgyurgyik): This is a hack, we really shouldn't have dependencies across translation phases
     array: cin.TensorVar | Cpp
     idx: cin.IndexExpr | Cpp
 
@@ -111,7 +111,12 @@ class IfBlock(Cpp):
     pairs: List[Cpp | Tuple[Cpp, Cpp]]
 
     def __str__(self):
-        return " else ".join([f"if ({p[0]}) {{ {p[1]} }}" if isinstance(p, Tuple) else f"{p}" for p in self.pairs])
+        return " else ".join(
+            [
+                f"if ({p[0]}) {{ {p[1]} }}" if isinstance(p, Tuple) else f"{p}"
+                for p in self.pairs
+            ]
+        )
 
 
 @dataclass

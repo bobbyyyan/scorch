@@ -126,4 +126,5 @@ def test_union():
           A.data[ip_A] = B.data[ip_B];
           ip_A += 1;
           ip_B += 1;
-        }""")
+        }""",
+    )
