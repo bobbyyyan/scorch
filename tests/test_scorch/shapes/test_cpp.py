@@ -2,26 +2,7 @@ from scorch.compiler import cin
 from scorch.compiler.shapes import cfir, cpp, codegen
 from scorch.format import LevelType
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
-
-
-def assert_equal(actual: Any, expected: str):
-    """Asserts `actual` is equal to `expected` while ignoring white space,
-    e.g.,
-       assert_equal("  a", "\n  a  \t ") # true
-       assert_equal("ab", "a")           # false
-    """
-
-    def strip(s: Any) -> str:
-        s = str(s)
-        s = s.strip()
-        s = s.replace("\n", "")
-        s = s.replace("\t", "")
-        s = s.replace(" ", "")
-        return
-
-    actual = strip(actual)
-    expected = strip(expected)
-    assert actual == expected, f"\nactual:{actual}\nexpected:{expected}\n"
+import tests.utility as util
 
 # Tests CFIR -> CPP lowering phase.
 
@@ -60,7 +41,7 @@ def test_slice():
     j = cin.IndexVar("j")
     A[i] = B[j]
 
-    assert_equal(
+    util.assert_equal(
         codegen.Lower(
             cfir.Loop(
                 idx=i,
@@ -100,7 +81,7 @@ def test_assign_2D_sd():
     j = cin.IndexVar("j")
     A[i, j] = B[i, j]
 
-    assert_equal(
+    util.assert_equal(
         codegen.Lower(
             cfir.Loop(
                 idx=i,
