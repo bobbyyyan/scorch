@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from multipledispatch import dispatch
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from scorch.compiler import cin
 import scorch.format as format
@@ -9,42 +10,74 @@ import scorch.format as format
 
 
 @dataclass
-class Lattice:
-    sexpr: cin.Seq
-    children: dict[cin.Seq, Lattice] = field(default_factory=dict)
+class IterationLattice:
+    """A data structure to represent an iteration lattice.
+    sexpr: The entry node.
+    graph: mapping from sequence expression to (edge, simplified).
+    """
+
+    top: cin.Seq
+    graph: dict[cin.Seq, Tuple[cin.Seq, cin.Seq]] = field(default_factory=dict)
+
+    def __str__(self):
+        def pp(
+            node: cin.Seq,
+            graph: dict[cin.Seq, Tuple[cin.Seq, cin.Seq]],
+            visited: set = set(),
+        ):
+            s = ""
+            if isinstance(node, cin.EmptySeq) or node in visited:
+                return s
+            visited.add(node)
+            children: Tuple[cin.Seq, cin.Seq] = graph[node]
+            s += f"{node}"
+            s += "{"
+            for k, v in children:
+                s += "\n"
+                s += f"  {k} -- {v}"
+            s += "\n"
+            s += "}"
+            s += "\n"
+            for _, v in children:
+                s += pp(v, graph)
+            return s
+
+        return pp(self.top, self.graph)
+
+    def __repr__(self):
+        return self.__str__()
 
 
 def 𝜒(sexpr: cin.Seq) -> set[cin.Seq]:
     match sexpr:
-        case cin.FullSeq() | cin.EmptySeq():
-            return {}
         case cin.IndexSeq():
             return {sexpr}
+        case cin.FullSeq() | cin.EmptySeq():
+            return {}
         case cin.SliceSeq(a):
             return 𝜒(a) | {sexpr}
+        case cin.UnionSeq(s1, s2):
+            return 𝜒(s1) | 𝜒(s2)
         case _:
             raise NotImplementedError(type(sexpr))
 
 
-def TopoSortRec(
-    node: cin.Seq, graph: dict[cin.Seq, Lattice], visited: set[cin.Seq] = set()
+def TopologicalSortRec(
+    node: cin.Seq,
+    graph: dict[cin.Seq, Tuple[cin.Seq, cin.Seq]],
+    visited: set[cin.Seq] = set(),
 ):
-    if node in visited or isinstance(node, cin.FullSeq | cin.EmptySeq):
+    if node in visited or isinstance(node, cin.EmptySeq):
         return []
-    nodes = []
     visited.add(node)
-    for c, cs in graph.items():
-        if len(cs) == 0:
-            continue
-        nodes.extend(TopoSortRec(c, cs, visited))
-    return nodes + [node]
+    return [
+        *sum(map(lambda p: TopologicalSortRec(p[1], graph, visited), graph[node]), []),
+        node,
+    ]
 
 
-def TopoSort(lattice: Lattice):
-    t = TopoSortRec(lattice.sexpr, lattice.children)
-    t = list(dict.fromkeys(t))  # De-duplicate
-    t = t[::-1]  # Reverse
-    return t
+def TopologicalSort(lattice: IterationLattice):
+    return TopologicalSortRec(lattice.top, lattice.graph)[::-1]
 
 
 def Size(sexpr: cin.Seq) -> int:
@@ -63,6 +96,8 @@ def IsDense(sexpr: cin.Seq) -> bool:
     match sexpr:
         case cin.IndexSeq(_, _, _, _, fmt):
             return fmt == format.LevelType.DENSE
+        case cin.UnionSeq(s1, s2):
+            return IsDense(s1) and IsDense(s2)
         case cin.SliceSeq(a):
             return IsDense(a)
         case _:
@@ -78,18 +113,95 @@ def Remove(sexpr: cin.Seq, sub: cin.Seq) -> cin.Seq:
             return sexpr
         case cin.SliceSeq(a, s, e, r):
             return cin.SliceSeq(Remove(a, sub), s, e, r)
+        case cin.UnionSeq(s1, s2):
+            return cin.UnionSeq(Remove(s1, sub), Remove(s2, sub))
         case _:
             raise NotImplementedError(type(sexpr))
 
 
-def Simplify(sexpr: cin.Seq, defs: set[Any]) -> cin.Seq:
+def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
+    assert isinstance(e, cin.TensorAccess)
+    indices: List[cin.IndexVar] = e.get_index_vars()
+    levels: List[format.LevelType] = e.level_types()
+    tensor: cin.TensorVar = e.get_tensor()
+
+    sequences = []
+    for index, (idx, level) in enumerate(zip(indices, levels)):
+        sequences.append(
+            cin.IndexSeq(
+                idx=idx,
+                tensor=tensor,
+                size=tensor.shape[index],
+                index=index,
+                format=level,
+                parent=sequences[index - 1] if index != 0 else None
+            )
+        )
+    return sequences
+
+
+def IndexDefined(sexpr: cin.Seq, defs: set[cin.Seq]):
+    assert isinstance(sexpr, cin.Seq), sexpr
+    return sexpr in defs
+
+
+def IndicesDefined(expr: cin.TensorAccess, defs: set[cin.Seq]):
+    assert isinstance(expr, cin.TensorAccess)
+    return all(map(lambda x: IndexDefined(x, defs), ConvertToIndexSequences(expr)))
+
+
+@dispatch(cin.IndexExpr, set)
+def Simplify(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
+    match e:
+        case cin.TensorAccess():
+            return e if IndicesDefined(e, defs) else None
+        case cin.BinaryOp():
+            x: Optional[cin.IndexExpr] = Simplify(e.left, defs)
+            y: Optional[cin.IndexExpr] = Simplify(e.right, defs)
+            match op := e.op:
+                case cin.Operation.ADD:
+                    if x is None:
+                        return y
+                    if y is None:
+                        return x
+                    return cin.BinaryOp(cin.Operation.ADD, x, y)
+                case cin.Operation.MUL:
+                    return None if x is None or y is None else cin.BinaryOp(cin.Operation.MUL, x, y)
+                case _ : raise NotImplementedError(op)
+
+        case _:
+            raise NotImplementedError(type(e))
+
+
+@dispatch(cin.IndexStmt, set)
+def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
+    match c:
+        case cin.ForAll():
+            sexpr: cin.Seq = Simplify(c.seq, defs)
+            assert not isinstance(sexpr, cin.EmptySeq)
+            return cin.ForAll(
+                index_var=c.index_var,
+                stmt=Simplify(c.stmt, defs | Iters(sexpr)),
+                seq=sexpr,
+            )
+        case cin.TensorAssign():
+            return cin.TensorAssign(
+                lhs=c.lhs,
+                rhs=Simplify(c.rhs, defs)
+            )
+        case _:
+            raise NotImplementedError(type(c))
+
+
+@dispatch(cin.Seq, set)
+def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
     match sexpr:
-        case cin.IndexSeq(_, _, sz, _, _, format):
-            # TODO(cgyurgyik): Verify the index is defined already.
+        case cin.IndexSeq(_, _, sz, _, _, fmt):
+            # TODO(cgyurgyik): Fix.
+            # if IndexDefined(sexpr, defs):
+            return sexpr
             return (
-                cin.FullSeq(sz)
-                if format == format.LevelType.DENSE
-                else cin.EmptySeq(sz)
+                cin.FullSeq(sz) if fmt == format.LevelType.DENSE else cin.EmptySeq(sz)
             )
         case cin.FullSeq(_) | cin.EmptySeq(_):
             return sexpr
@@ -101,43 +213,73 @@ def Simplify(sexpr: cin.Seq, defs: set[Any]) -> cin.Seq:
                     return cin.EmptySeq(Size(sexpr))
                 case _:
                     return cin.SliceSeq(x, s, e, r)
+        case cin.UnionSeq(s1, s2):
+            x: cin.Seq = Simplify(s1, defs)
+            y: cin.Seq = Simplify(s2, defs)
+            match (x, y):
+                case (cin.FullSeq(), _):
+                    return x
+                case (_, cin.FullSeq()):
+                    return y
+                case (cin.EmptySeq(), cin.EmptySeq()):
+                    return x
+                case (cin.EmptySeq(), _):
+                    return y
+                case (_, cin.EmptySeq()):
+                    return x
+                case _:
+                    return cin.UnionSeq(x, y)
         case _:
             raise NotImplementedError(type(sexpr))
 
 
-def ConstructGraph(sexpr: cin.Seq, defs: set[Any], visited: set[cin.Seq] = set()):
-    if sexpr in visited:
+def Contains(sexpr: cin.Seq, subpoint: cin.Seq):
+    if sexpr == subpoint:
+        return True
+    match sexpr:
+        case cin.IndexSeq():
+            return False
+        case cin.UnionSeq(s1, s2):
+            return Contains(s1, subpoint) or Contains(s2, subpoint)
+        case cin.SliceSeq(a, _, _, _):
+            return Contains(a, subpoint)
+
+
+def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = set()):
+    if sexpr in visited or isinstance(sexpr, cin.EmptySeq):
         return {}
-    set.update({sexpr})
-    graph = {}
+    visited.update({sexpr})
     edges: set[cin.Seq] = 𝜒(sexpr)
-    # TODO(cgyurgyik): This is nondeterministic.
-    for sub in edges:
-        r: cin.Seq = Remove(sexpr, sub)
+    graph = {}
+    pairs: list[Tuple[cin.Seq, cin.Seq]] = []
+    for e in edges:
+        r: cin.Seq = Remove(sexpr, e)
         s: cin.Seq = Simplify(r, defs)
-        l = ConstructGraph(s, defs, visited)
-        graph[sub] = l
+        graph |= ConstructGraph(s, defs, visited)
+        pairs.append((e, s))
+    graph[sexpr] = {(e, s) for e, s in pairs}
     return graph
 
 
-def ConstructLattice(top: cin.Seq, defs: set[Any]):
-    return Lattice(top, ConstructGraph(top, defs))
+def ConstructIterationLattice(top: cin.Seq, defs: set[cin.Seq]):
+    return IterationLattice(top, ConstructGraph(top, defs))
 
 
 def Iters(sexpr: cin.Seq):
     match sexpr:
-        case cin.SliceSeq(a):
-            return Iters(a)
         case cin.IndexSeq():
             return {sexpr}
+        case cin.SliceSeq(a):
+            return Iters(a)
+        case cin.UnionSeq(s1, s2):
+            return Iters(s1) | Iters(s2)
         case _:
             raise NotImplementedError(type(sexpr))
 
 
-# TODO(cgyurgyik): This needs to be fixed.
-def Subpoints(lattice: Lattice):
-    subs = TopoSort(lattice)
-    iters = Iters(lattice.sexpr)
-    # def f(x): return Iters(x) <= iters
-    # return list(filter(f, subs))
-    return iters
+def Subpoints(lattice: IterationLattice, point: cin.Seq):
+    """Returns sub-points for `point` in the lattice."""
+    subs = TopologicalSortRec(point, lattice.graph, visited=set())
+    iters = Iters(point)
+    n = list(filter(lambda x: Iters(x) <= iters, subs))
+    return n[::-1]

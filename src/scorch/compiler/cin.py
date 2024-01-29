@@ -1188,6 +1188,14 @@ class UnionSeq(Seq):
     def __repr__(self):
         return self.__str__()
 
+    def __hash__(self):
+        return hash((self.s1, self.s2))
+
+    def __eq__(self, other):
+        if not isinstance(other, UnionSeq):
+            return False
+        return (self.s1, self.s2) == (other.s1, other.s2)
+
 
 @dataclass
 class IntersectionSeq(Seq):
@@ -1205,6 +1213,14 @@ class IntersectionSeq(Seq):
 
     def __repr__(self):
         return self.__str__()
+
+    def __hash__(self):
+        return hash((self.s1, self.s2))
+
+    def __eq__(self, other):
+        if not isinstance(other, IntersectionSeq):
+            return False
+        return (self.s1, self.s2) == (other.s1, other.s2)
 
 
 # While this shares much of the same functionality as a TensorAccess,

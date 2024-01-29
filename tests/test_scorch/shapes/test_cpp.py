@@ -1,26 +1,56 @@
 from scorch.compiler import cin
 from scorch.compiler.shapes import cfir, cpp, codegen
 from scorch.format import LevelType
-
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 
-# Tests CFIR -> CPP lowering phase.
-
-
-def assert_equal(actual: cpp.Cpp, expected: str):
+def assert_equal(actual: Any, expected: str):
     """Asserts `actual` is equal to `expected` while ignoring white space,
     e.g.,
-       assert_equal("a", "\n  a  \t ") # true
-       assert_equal("ab", "a")         # false
+       assert_equal("  a", "\n  a  \t ") # true
+       assert_equal("ab", "a")           # false
     """
 
     def strip(s: Any) -> str:
-        return str(s).replace(" ", "").strip()
+        s = str(s)
+        s = s.strip()
+        s = s.replace("\n", "")
+        s = s.replace("\t", "")
+        s = s.replace(" ", "")
+        return
 
     actual = strip(actual)
     expected = strip(expected)
     assert actual == expected, f"\nactual:{actual}\nexpected:{expected}\n"
+
+# Tests CFIR -> CPP lowering phase.
+
+
+def test_pretty_print():
+    assert (
+        codegen.PrettyPrint(cpp.Assign(cpp.Variable("a"), cpp.Constant(1))) == "a = 1;"
+    )
+
+    assert (
+        codegen.PrettyPrint(
+            cpp.While(
+                cond=cpp.Lt(cpp.Variable("pb_A"), cpp.Constant(42)),
+                body=cpp.Block(
+                    stmts=[
+                        cpp.Define(cpp.Int32(), cpp.Variable("i"), cpp.Constant(0)),
+                        cpp.IncAssign(
+                            cpp.Access(
+                                array=cin.TensorVar(name="A"),
+                                idx=cin.IndexVar(name="i"),
+                            ),
+                            cpp.Constant(1),
+                        ),
+                    ]
+                ),
+            )
+        ).replace("\n", "")
+        == "while ((pb_A < 42)) {  int32_t i = 0;  A[i] += 1;}"
+    )
 
 
 def test_slice():
@@ -45,20 +75,25 @@ def test_slice():
                 body=cfir.Assign(A[i], B[j]),
             )
         ),
-        """while (((jp_B < B.pos[0][1]) && (B.crd[0][jp_B] < 8))) {
-             size_t i = ((B.crd[0][jp_B] - 0) / 2);
-             A.crd[0][ip_A] = i;
-             A.data[ip_A] = B.data[jp_B];
-             ip_A += 1;
-             jp_B += 1;
-             while (((jp_B < B.pos[0][1]) && (!(((B.crd[0][jp_B] - 0) % 2) == 0)))) {
-               jp_B += 1;
-             }
-           }""",
+        """
+        size_t jp_B = B.pos[0][0];
+        while (((jp_B < B.pos[0][1]) && (!(((B.crd[0][jp_B] - 0) % 2) == 0)))) {
+            jp_B += 1;
+        }
+        while (((jp_B < B.pos[0][1]) && (B.crd[0][jp_B] < 8))) {
+            size_t i = ((B.crd[0][jp_B] - 0) / 2);
+            A.crd[0][ip_A] = i;
+            A.data[ip_A] = B.data[jp_B];
+            ip_A += 1;
+            jp_B += 1;
+            while (((jp_B < B.pos[0][1]) && (!(((B.crd[0][jp_B] - 0) % 2) == 0)))) {
+                jp_B += 1;
+            }
+        }""",
     )
 
 
-def test_2d_assign():
+def test_assign_2D_sd():
     A = cin.TensorVar("A", fmt=["s", "d"], shape=[8, 10])
     B = cin.TensorVar("B", fmt=["s", "d"], shape=[8, 10])
     i = cin.IndexVar("i")
@@ -79,14 +114,17 @@ def test_2d_assign():
                 ),
             )
         ),
-        """while ((ip_B < B.pos[0][1])) {
-             size_t i = B.crd[0][ip_B];
-             while ((j_B < 10)) {
-               size_t j = j_B;
-               A.crd[0][ip_A] = i;
-               A.data[ip_A] = B.data[ip_B];
-               j_B += 1;
-             }
-             ip_B += 1;
-           }""",
+        """
+        size_t ip_B = B.pos[0][0];
+        while ((ip_B < B.pos[0][1])) {
+            size_t i = B.crd[0][ip_B];
+            size_t j_B = 0;
+            while ((j_B < 10)) {
+                size_t j = j_B;
+                A.crd[0][ip_A] = i;
+                A.data[ip_A] = B.data[ip_B];
+                j_B += 1;
+            }
+            ip_B += 1;
+        }""",
     )

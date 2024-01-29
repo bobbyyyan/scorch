@@ -19,7 +19,7 @@ def LowerLoop(idx: cin.IndexVar, sexpr: cin.Seq, body: cfir.CFIR, first: bool):
             ]
         ),
     )
-    return [it.Init(sexpr), loop] if first else loop
+    return cpp.Block(stmts=[it.Init(sexpr), loop]) if first else loop
 
 
 def LowerIndexExpr(expr: cin.IndexExpr):
@@ -72,7 +72,7 @@ def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr):
     )
 
 
-def IndexWriteList(ta: cin.TensorAccess):
+def IndexWriteList(ta: cin.TensorAccess) -> list[cpp.Cpp]:
     types: List[format.LevelType] = ta.level_types()
     indices: List[cin.IndexVar] = ta.get_index_vars()
 
@@ -83,7 +83,7 @@ def IndexWriteList(ta: cin.TensorAccess):
     return [IndexWrite(ta, idx) for (_, idx) in compressed_levels]
 
 
-def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar):
+def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar) -> cpp.Cpp:
     index: int = ta.level_of_index_var(idx)
     format: format.LevelType = ta.level_types()[index]
     return cpp.Assign(
@@ -91,13 +91,55 @@ def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar):
     )
 
 
-def Lower(stmt: cfir.CFIR, first=False):
+def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
+    def _Lower(stmt: cfir.CFIR, first=False):
+        match stmt:
+            case cfir.Loop(idx, sexpr, body):
+                return LowerLoop(idx, sexpr, body, first)
+            case cfir.Assign(lhs, rhs):
+                return LowerAssign(lhs, rhs)
+            case _:
+                raise NotImplementedError(type(stmt))
+
+    return _Lower(stmt, first=True)
+
+
+########################################
+############# Pretty Print #############
+########################################
+
+
+def PrettyPrint(stmt: cpp.Cpp, indent_level: int = 0) -> str:
+    """
+    Pretty print for the CPP intermediate representation.
+    This will handle indentation.
+    """
+
+    def PpExpr(e: cpp.Cpp):
+        return str(e)
+
+    def indent():
+        return indent_level * " "
+
+    pp: str = ""
     match stmt:
-        case cfir.Loop(idx, sexpr, body):
-            return LowerLoop(idx, sexpr, body, first)
-        case cfir.Assign(lhs, rhs):
-            return LowerAssign(lhs, rhs)
-        case list(l):
-            return [Lower(c) for c in l]
+        case cpp.Block(stmts):
+            return "\n".join(PrettyPrint(stmt, indent_level) for stmt in stmts)
+        case cpp.While(cond, block):
+            # while (cond) {
+            #   stmt0
+            #   stmt1
+            #   ...
+            # }
+            pp += indent()
+            pp += f"while ({PpExpr(cond)}) "
+            pp += "{"
+            pp += "\n"
+            pp += PrettyPrint(block, indent_level + 2)
+            pp += "\n"
+            pp += indent()
+            pp += "}"
         case _:
-            raise NotImplementedError(type(stmt))
+            pp += indent()
+            pp += PpExpr(stmt)
+    return pp
