@@ -6,8 +6,6 @@ import tests.utility as util
 
 # Tests CIN -> CFIR -> CPP lowering phase(s).
 
-# TODO(cgyurgyik): Nondeterminism when iterating over sets.
-
 
 def Compile(cin: cin.CIN) -> str:
     """Compiles CIN -> CFIR -> CIN, and then pretty prints it."""
@@ -70,6 +68,34 @@ def test_assign_1d_s():
     )
 
 
+def test_assign_2d_ss():
+    A = cin.TensorVar("A", fmt=["s", "s"], shape=[8, 10])
+    B = cin.TensorVar("B", fmt=["s", "s"], shape=[8, 10])
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+    A[i, j] = B[i, j]
+
+    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED, parent=None)
+    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.COMPRESSED, parent=Bi)
+
+    util.assert_equal(
+        Compile(cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)),
+        """ size_t ip_B = B.pos[0][0];
+            while ((ip_B < B.pos[0][1])) {
+              size_t i = B.crd[0][ip_B];
+              size_t jp_B = B.pos[1][ip_B];
+              while ((jp_B < B.pos[1][(ip_B + 1)])) {
+                size_t j = B.crd[1][jp_B];
+                A.crd[0][ip_A] = i;
+                A.crd[1][jp_A] = j;
+                A.data[ip_A] = B.data[ip_B];
+                jp_A += 1;
+                jp_B += 1;
+              }
+              ip_B += 1;
+            }""")
+
+
 def test_union():
     A = cin.TensorVar("A", fmt=["s"], shape=[8])
     B = cin.TensorVar("B", fmt=["s"], shape=[8])
@@ -84,10 +110,10 @@ def test_union():
                 A._assignment,
                 cin.UnionSeq(
                     cin.IndexSeq(
-                        i, B, size=8, index=0, parent=None, format=LevelType.COMPRESSED
+                        i, B, size=8, index=0, format=LevelType.COMPRESSED, parent=None,
                     ),
                     cin.IndexSeq(
-                        i, C, size=8, index=0, parent=None, format=LevelType.COMPRESSED
+                        i, C, size=8, index=0, format=LevelType.COMPRESSED, parent=None
                     ),
                 ),
             )
@@ -101,24 +127,17 @@ def test_union():
             A.crd[0][ip_A] = i;
             A.data[ip_A] = (B.data[ip_B] + C.data[ip_C]);
             ip_A += 1;
-          } else if ((i == ip_C)) {
-            A.crd[0][ip_A] = i;
-            A.data[ip_A] = C.data[ip_C];
-            ip_A += 1;
           } else if ((i == ip_B)) {
             A.crd[0][ip_A] = i;
             A.data[ip_A] = B.data[ip_B];
             ip_A += 1;
+          } else if ((i == ip_C)) {
+            A.crd[0][ip_A] = i;
+            A.data[ip_A] = C.data[ip_C];
+            ip_A += 1;
           }
           ip_B += (i == B.crd[0][ip_B]);
           ip_C += (i == C.crd[0][ip_C]);
-        }
-        while ((ip_C < C.pos[0][1])) {
-          size_t i = C.crd[0][ip_C];
-          A.crd[0][ip_A] = i;
-          A.data[ip_A] = C.data[ip_C];
-          ip_A += 1;
-          ip_C += 1;
         }
         while ((ip_B < B.pos[0][1])) {
           size_t i = B.crd[0][ip_B];
@@ -126,5 +145,12 @@ def test_union():
           A.data[ip_A] = B.data[ip_B];
           ip_A += 1;
           ip_B += 1;
+        }
+        while ((ip_C < C.pos[0][1])) {
+          size_t i = C.crd[0][ip_C];
+          A.crd[0][ip_A] = i;
+          A.data[ip_A] = C.data[ip_C];
+          ip_A += 1;
+          ip_C += 1;
         }""",
     )

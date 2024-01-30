@@ -33,7 +33,7 @@ def ArrayLowerBound(seq: cin.IndexSeq):
                 cpp.Access(cpp.Variable(f"{seq.tensor.name}.pos"), i),
                 cpp.Constant(0)
                 if i == 0
-                else ArrayIndexVariable(seq.parent, seq.tensor, seq.format),
+                else ArrayIndexVariable(seq.parent.idx, seq.tensor, seq.format),
             )
         case _:
             raise NotImplementedError(fmt)
@@ -50,7 +50,7 @@ def ArrayUpperBound(seq: cin.IndexSeq):
                 cpp.Constant(1)
                 if i == 0
                 else cpp.Add(
-                    ArrayIndexVariable(seq.parent, seq.tensor, seq.format),
+                    ArrayIndexVariable(seq.parent.idx, seq.tensor, seq.format),
                     cpp.Constant(1),
                 ),
             )

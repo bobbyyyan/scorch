@@ -29,8 +29,8 @@ def test_pretty_print():
                     ]
                 ),
             )
-        ).replace("\n", "")
-        == "while ((pb_A < 42)) {  int32_t i = 0;  A[i] += 1;}"
+        )
+        == "while ((pb_A < 42)) {\n  int32_t i = 0;\n  A[i] += 1;\n}"
     )
 
 
@@ -74,7 +74,7 @@ def test_slice():
     )
 
 
-def test_assign_2D_sd():
+def test_assign_2d_sd():
     A = cin.TensorVar("A", fmt=["s", "d"], shape=[8, 10])
     B = cin.TensorVar("B", fmt=["s", "d"], shape=[8, 10])
     i = cin.IndexVar("i")

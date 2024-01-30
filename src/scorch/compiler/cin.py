@@ -1170,6 +1170,9 @@ class SliceSeq(Seq):
             other.stride,
         )
 
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
 
 @dataclass
 class UnionSeq(Seq):
@@ -1196,6 +1199,9 @@ class UnionSeq(Seq):
             return False
         return (self.s1, self.s2) == (other.s1, other.s2)
 
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
 
 @dataclass
 class IntersectionSeq(Seq):
@@ -1213,6 +1219,9 @@ class IntersectionSeq(Seq):
 
     def __repr__(self):
         return self.__str__()
+
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
 
     def __hash__(self):
         return hash((self.s1, self.s2))
@@ -1268,6 +1277,9 @@ class IndexSeq(Seq):
     def __repr__(self):
         return self.__str__()
 
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
     def __eq__(self, other):
         if not isinstance(other, IndexSeq):
             return False
@@ -1306,6 +1318,9 @@ class FullSeq(Seq):
     def __repr__(self):
         return self.__str__()
 
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
     def __eq__(self, other):
         if not isinstance(other, FullSeq):
             return False
@@ -1328,6 +1343,9 @@ class EmptySeq(Seq):
     def __repr__(self):
         return self.__str__()
 
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
     def __eq__(self, other):
         if not isinstance(other, EmptySeq):
             return False
@@ -1335,3 +1353,21 @@ class EmptySeq(Seq):
 
     def __hash__(self):
         return hash((self.size))
+
+
+def LessThanSeq(a: Seq, b: Seq):
+    """Less than operation defines on sequences to avoid nondeterminism."""
+
+    def GetIndexSequence(x: Seq):
+        match x:
+            case IndexSeq():
+                return x
+            case UnionSeq(s1, s2) | IntersectionSeq(s1, s2):
+                # Just look at the first, for simplicity.
+                return GetIndexSequence(s1)
+            case SliceSeq(a):
+                return GetIndexSequence(a)
+            case _: raise NotImplementedError(type(x))
+    if isinstance(a, FullSeq | EmptySeq) and isinstance(b, FullSeq | EmptySeq):
+        return a.sz < b.sz
+    return str(GetIndexSequence(a)) < str(GetIndexSequence(b))

@@ -45,6 +45,9 @@ class Loop(CFIR):
     sexpr: cin.Seq
     body: cin.IndexStmt
 
+    def __lt__(self, other):
+        return self.sexpr < other.sexpr
+
     def __str__(self):
         newline = "\n"
         return f"while {self.idx} <-- {self.sexpr}{newline}{self.body}"
@@ -89,7 +92,7 @@ def BuildLoop(
         newdefs: set[cin.Seq] = defs | il.Iters(child) | locdefs
         return SwitchCase(sexpr=child, stmt=Lower(il.Simplify(body, newdefs), newdefs))
 
-    bodies = list(map(Build, il.Subpoints(lattice, point)))
+    bodies = list(map(Build, sorted(il.Subpoints(lattice, point))))
 
     # TODO(cgyurgyik): Check if this contains an intersection sequence.
     # Skip creating a switch if there is only a single case.
@@ -130,7 +133,7 @@ def CompileForAll(fa: cin.ForAll, defs: set[cin.Seq]) -> CFIR | list[CFIR]:
     loops: list[Loop] = [
         BuildLoop(p, lattice, fa, defs, locs) for p in il.TopologicalSort(lattice)
     ]
-    return loops.pop() if len(loops) == 1 else Block(stmts=loops)
+    return loops.pop() if len(loops) == 1 else Block(stmts=sorted(loops))
 
 
 def CompileTensorAssign(c: cin.TensorAssign, defs: set[cin.Seq]) -> CFIR:

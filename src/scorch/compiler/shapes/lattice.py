@@ -142,12 +142,12 @@ def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
 
 def IndexDefined(sexpr: cin.Seq, defs: set[cin.Seq]):
     assert isinstance(sexpr, cin.Seq), sexpr
-    return sexpr in defs
+    return sexpr.index == 0 or sexpr.parent in defs
 
 
 def IndicesDefined(expr: cin.TensorAccess, defs: set[cin.Seq]):
     assert isinstance(expr, cin.TensorAccess)
-    return all(map(lambda x: IndexDefined(x, defs), ConvertToIndexSequences(expr)))
+    return all(map(lambda x: x in defs, ConvertToIndexSequences(expr)))
 
 
 @dispatch(cin.IndexExpr, set)
@@ -199,10 +199,7 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
 def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
     match sexpr:
         case cin.IndexSeq(_, _, sz, _, _, fmt):
-            # TODO(cgyurgyik): Fix.
-            # if IndexDefined(sexpr, defs):
-            return sexpr
-            return (
+            return sexpr if IndexDefined(sexpr, defs) else (
                 cin.FullSeq(sz) if fmt == format.LevelType.DENSE else cin.EmptySeq(sz)
             )
         case cin.FullSeq(_) | cin.EmptySeq(_):

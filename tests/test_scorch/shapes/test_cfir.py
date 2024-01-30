@@ -90,34 +90,22 @@ def test_slice():
     )
 
 
-def test_2d_assign():
-    return  # TODO(cgyurgyik): This is causing an EmptySeq upon simplification.
+def test_assign_2d_ss():
     A = cin.TensorVar("A", fmt=["s", "s"], shape=[8, 10])
     B = cin.TensorVar("B", fmt=["s", "s"], shape=[8, 10])
     i = cin.IndexVar("i")
     j = cin.IndexVar("j")
     A[i, j] = B[i, j]
 
-    assert cfir.Lower(
-        cin.ForAll(
-            i,
-            cin.ForAll(
-                j,
-                A._assignment,
-                cin.IndexSeq(
-                    j, B, size=10, index=1, format=LevelType.COMPRESSED, parent=i
-                ),
-            ),
-            cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED),
-        )
-    ) == cfir.Loop(
+    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED, parent=None)
+    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.COMPRESSED, parent=Bi)
+
+    assert cfir.Lower(cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)) == cfir.Loop(
         idx=i,
-        sexpr=cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED),
+        sexpr=Bi,
         body=cfir.Loop(
             idx=j,
-            sexpr=cin.IndexSeq(
-                j, B, size=10, index=1, format=LevelType.COMPRESSED, parent=i
-            ),
+            sexpr=Bj,
             body=cfir.Assign(A[i, j], B[i, j]),
         ),
     )
