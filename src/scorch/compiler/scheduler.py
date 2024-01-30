@@ -499,6 +499,6 @@ class Scheduler:
         print(f"Index vars to tile: {index_vars_to_tile}")
 
         # for index_var in index_vars_to_tile:
-        #     cin = Scheduler.add_tile(cin, index_var, 4096)
+        #     cin = Scheduler.add_tile(cin, index_var, 1024)
 
         return cin

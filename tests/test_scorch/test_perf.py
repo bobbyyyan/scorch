@@ -101,7 +101,7 @@ def test_spmm_dd_ds_dd_tiled_time():
 
 
 def test_spmm_dd_ds_dd_time():
-    n = 5000
+    n = 4096
     sparsity = 0.95
     random_tensor_a = torch.rand(n, n).float()
     random_tensor_b = torch.rand(n, n).float()
