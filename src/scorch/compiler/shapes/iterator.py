@@ -17,7 +17,7 @@ def Init(sexpr: cin.Seq):
                 lhs=cpputil.ArrayIndexVariable(sexpr),
                 rhs=cpputil.ArrayLowerBound(sexpr),
             )
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[Init(s1), Init(s2)])
         case cin.SliceSeq(a, s, _, r):
             return cpp.Block(
@@ -34,6 +34,7 @@ def Init(sexpr: cin.Seq):
                                     ),
                                     cpp.Constant(0),
                                 )
+                                # if s is 0, a < 0 is always false.
                                 if s == 0
                                 else cpp.Or(
                                     cpp.Lt(Eval(a), cpp.Constant(s)),
@@ -64,7 +65,7 @@ def Reset(sexpr: cin.Seq):
                 lhs=cpputil.ArrayIndexVariable(sexpr),
                 rhs=cpputil.ArrayLowerBound(array, idx),
             )
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[Reset(s1), Reset(s2)])
         case cin.SliceSeq(a, s, e, r):
             raise NotImplementedError(type(sexpr))
@@ -79,7 +80,7 @@ def Valid(sexpr: cin.Seq):
                 lhs=cpputil.ArrayIndexVariable(sexpr),
                 rhs=cpputil.ArrayUpperBound(sexpr),
             )
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.And(Valid(s1), Valid(s2))
         case cin.SliceSeq(a, _, e, r):
             return cpp.And(Valid(a), cpp.Lt(Eval(a), cpp.Constant(e)))
@@ -91,7 +92,7 @@ def Eval(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq():
             return cpputil.ArrayAccessCrd(sexpr)
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Min(Eval(s1), Eval(s2))
         case cin.SliceSeq(a, s, _, r):
             return cpp.Div(cpp.Sub(Eval(a), cpp.Constant(s)), cpp.Constant(r))
@@ -105,7 +106,7 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
             return cpp.IncAssign(
                 cpputil.ArrayIndexVariable(sexpr), cpp.Eq(value, Eval(sexpr))
             )
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[Next(value, s1), Next(value, s2)])
         case cin.SliceSeq(a, s, e, r):
             raise NotImplementedError(type(sexpr))
@@ -117,7 +118,7 @@ def UnconditionalNext(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq(_, _):
             return cpp.IncAssign(cpputil.ArrayIndexVariable(sexpr), cpp.Constant(1))
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[UnconditionalNext(s1), UnconditionalNext(s2)])
         case cin.SliceSeq(a, s, _, r):
             return cpp.Block(
@@ -148,7 +149,7 @@ def Equals(value: cpp.Cpp, sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq():
             return cpp.Eq(value, cpputil.ArrayIndexVariable(sexpr))
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.And(Equals(value, s1), Equals(value, s2))
         case cin.SliceSeq(a, s, e, r):
             raise NotImplementedError(type(sexpr))

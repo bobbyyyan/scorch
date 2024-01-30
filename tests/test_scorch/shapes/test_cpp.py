@@ -98,14 +98,14 @@ def test_assign_2d_sd():
         """
         size_t ip_B = B.pos[0][0];
         while ((ip_B < B.pos[0][1])) {
-            size_t i = B.crd[0][ip_B];
-            size_t j_B = 0;
-            while ((j_B < 10)) {
-                size_t j = j_B;
-                A.crd[0][ip_A] = i;
-                A.data[ip_A] = B.data[ip_B];
-                j_B += 1;
-            }
-            ip_B += 1;
+        size_t i = B.crd[0][ip_B];
+        size_t j_B = 0;
+        while ((j_B < 10)) {
+        size_t j = j_B;
+        A.crd[0][ip_A] = i;
+        A.data[((ip_A * 10) + j)] = B.data[((ip_B * 10) + j)];
+        j_B += 1;
+        }
+        ip_B += 1;
         }""",
     )

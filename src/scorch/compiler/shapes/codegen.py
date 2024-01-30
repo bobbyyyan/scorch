@@ -27,7 +27,8 @@ def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
         case cin.TensorAccess():
             tensor: cin.TensorVar = expr.tensor
             return cpp.Access(
-                cpp.Variable(f"{tensor.name}.data"), LowerIndexExprRec(expr)
+                cpp.Variable(f"{tensor.name}.data"),
+                LowerIndexExprRec(expr, i=expr.num_levels),
             )
         case cin.BinaryOp():
             lhs: cpp.Cpp = LowerIndexExpr(expr.left)
@@ -43,10 +44,11 @@ def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
             raise NotImplementedError(type(expr))
 
 
-def LowerIndexExprRec(expr: cin.IndexExpr, i: int = 0):
+def LowerIndexExprRec(expr: cin.IndexExpr, i: int):
+    i = i - 1  # Off by one, since we'll pass in the total number of indices.
     match expr:
         case cin.TensorAccess():
-            if i >= expr.num_levels:
+            if not (0 <= i < expr.num_levels):
                 return cpp.Constant(0)
             if expr.num_levels == 0:
                 return cpp.Variable(expr.tensor.name)
@@ -57,9 +59,7 @@ def LowerIndexExprRec(expr: cin.IndexExpr, i: int = 0):
                     return cpp.Variable(f"{idx.name}p_{expr.tensor.name}")
                 case format.LevelType.DENSE:
                     return cpp.Add(
-                        cpp.Mul(
-                            LowerIndexExprRec(expr, i + 1), expr.get_tensor().shape[i]
-                        ),
+                        cpp.Mul(LowerIndexExprRec(expr, i), expr.get_tensor().shape[i]),
                         cpp.Variable(idx.name),
                     )
                 case _:

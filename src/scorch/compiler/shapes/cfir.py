@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
+from functools import reduce
 
 from scorch.compiler import cin
 from scorch.compiler.shapes import lattice as il
@@ -84,7 +85,8 @@ def BuildLoop(
     locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]],
 ) -> Loop:
     locs = FilterLocators(locs, point)
-    locdefs = set(map(lambda p: il.Iters(p[1]), locs))
+    locdefs = map(lambda p: il.Iters(p[1]), locs)
+    locdefs = reduce(set.union, locdefs, set())
     idx: cin.IndexVar = fa.index_var
     body: cin.IndexStmt = fa.stmt
 
@@ -94,17 +96,49 @@ def BuildLoop(
 
     bodies = list(map(Build, sorted(il.Subpoints(lattice, point))))
 
-    # TODO(cgyurgyik): Check if this contains an intersection sequence.
     # Skip creating a switch if there is only a single case.
-    body = bodies.pop().stmt if len(bodies) == 1 else Switch(idx, bodies)
+    body = (
+        Switch(idx, bodies)
+        if len(bodies) > 1 or il.ContainsIntersection(point)
+        else bodies.pop().stmt
+    )
     return Loop(idx, point, body)
+
+
+# TODO(cgyurgyik): Verify this type hint...
+
+
+def RemoveDense(
+    sexpr: cin.Seq,
+) -> Tuple[Optional[cin.Seq], list[Tuple[cin.Seq, cin.Seq]]]:
+    if il.IsDense(sexpr):
+        return [None, [sexpr]]
+    match sexpr:
+        case cin.UnionSeq(s1, s2):
+            x, xlocs = RemoveDense(s1)
+            y, ylocs = RemoveDense(s2)
+            if x is None:
+                return [y, xlocs + ylocs]
+            if y is None:
+                return [x, xlocs + ylocs]
+            return [cin.UnionSeq(x, y), xlocs + ylocs]
+        case cin.IntersectionSeq(s1, s2):
+            x, xlocs = RemoveDense(s1)
+            y, ylocs = RemoveDense(s2)
+            if x is None:
+                return [y, xlocs + ylocs]
+            if y is None:
+                return [x, xlocs + ylocs]
+            return [cin.IntersectionSeq(x, y), xlocs + ylocs]
+        case _:
+            return [sexpr, []]
 
 
 def FilterLocators(locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]], point: cin.Seq):
     return list(filter(lambda p: il.Contains(point, p[0]), locs))
 
 
-def FindLocators(sexpr: cin.Seq) -> Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]]:
+def FindLocators(sexpr: cin.Seq) -> Tuple[cin.Seq, list[Tuple[cin.Seq, ...]]]:
     match sexpr:
         case cin.IndexSeq():
             return [sexpr, []]
@@ -112,13 +146,30 @@ def FindLocators(sexpr: cin.Seq) -> Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]
             aexpr, alocs = FindLocators(s1)
             bexpr, blocs = FindLocators(s2)
             return (
-                [aexpr, [(a, b) for a, b in zip(alocs, blocs) + [(aexpr, bexpr)]]]
+                [aexpr, [(a, b) for a, b in zip(alocs, blocs)] + [(aexpr, bexpr)]]
                 if il.IsDense(aexpr) and il.IsDense(bexpr)
                 else [
                     cin.UnionSeq(aexpr, bexpr),
                     [(a, b) for a, b in zip(alocs, blocs)],
                 ]
             )
+        case cin.IntersectionSeq(s1, s2):
+            aexpr, alocs = FindLocators(s1)
+            bexpr, blocs = FindLocators(s2)
+            if not il.IsDense(s1):
+                # Use s1 to locate into s2.
+                y, ydense = RemoveDense(bexpr)
+                r = aexpr if y is None else cin.IntersectionSeq(aexpr, y)
+                ylocs = [(r, y) for y in ydense]
+                return [r, alocs + blocs + ylocs]
+            if not il.IsDense(s2):
+                # Use s2 to locate into s1.
+                x, xdense = RemoveDense(aexpr)
+                r = bexpr if x is None else cin.IntersectionSeq(x, bexpr)
+                xlocs = [(r, x) for x in xdense]
+                return [r, alocs + blocs + xlocs]
+            # Both are dense.
+            return [aexpr, [(a, b) for a, b in zip(alocs, blocs)] + [(aexpr, bexpr)]]
         case cin.SliceSeq(a, s, e, r):
             aexpr, alocs = FindLocators(a)
             return [cin.SliceSeq(aexpr, s, e, r), alocs]
@@ -139,7 +190,7 @@ def CompileForAll(fa: cin.ForAll, defs: set[cin.Seq]) -> CFIR | list[CFIR]:
 def CompileTensorAssign(c: cin.TensorAssign, defs: set[cin.Seq]) -> CFIR:
     if c.op is None:
         return Assign(c.lhs, c.rhs)
-    raise NotImplementedError(c.op)
+    raise NotImplementedError(c)
 
 
 def Lower(c: cin.CIN, defs: set[cin.Seq] = set()) -> CFIR:

@@ -56,7 +56,7 @@ def 𝜒(sexpr: cin.Seq) -> set[cin.Seq]:
             return {}
         case cin.SliceSeq(a):
             return 𝜒(a) | {sexpr}
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return 𝜒(s1) | 𝜒(s2)
         case _:
             raise NotImplementedError(type(sexpr))
@@ -96,7 +96,7 @@ def IsDense(sexpr: cin.Seq) -> bool:
     match sexpr:
         case cin.IndexSeq(_, _, _, _, fmt):
             return fmt == format.LevelType.DENSE
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return IsDense(s1) and IsDense(s2)
         case cin.SliceSeq(a):
             return IsDense(a)
@@ -115,6 +115,8 @@ def Remove(sexpr: cin.Seq, sub: cin.Seq) -> cin.Seq:
             return cin.SliceSeq(Remove(a, sub), s, e, r)
         case cin.UnionSeq(s1, s2):
             return cin.UnionSeq(Remove(s1, sub), Remove(s2, sub))
+        case cin.IntersectionSeq(s1, s2):
+            return cin.IntersectionSeq(Remove(s1, sub), Remove(s2, sub))
         case _:
             raise NotImplementedError(type(sexpr))
 
@@ -234,6 +236,22 @@ def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
                     return x
                 case _:
                     return cin.UnionSeq(x, y)
+        case cin.IntersectionSeq(s1, s2):
+            x: cin.Seq = Simplify(s1, defs)
+            y: cin.Seq = Simplify(s2, defs)
+            match (x, y):
+                case (cin.FullSeq(), _):
+                    return x
+                case (_, cin.FullSeq()):
+                    return y
+                case (cin.EmptySeq(), cin.EmptySeq()):
+                    return x
+                case (cin.EmptySeq(), _):
+                    return cin.FullSeq(0) if IsDense(y) else x
+                case (_, cin.EmptySeq()):
+                    return cin.FullSeq(0) if IsDense(x) else y
+                case _:
+                    return cin.IntersectionSeq(x, y)
         case _:
             raise NotImplementedError(type(sexpr))
 
@@ -244,10 +262,26 @@ def Contains(sexpr: cin.Seq, subpoint: cin.Seq):
     match sexpr:
         case cin.IndexSeq():
             return False
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return Contains(s1, subpoint) or Contains(s2, subpoint)
         case cin.SliceSeq(a, _, _, _):
             return Contains(a, subpoint)
+        case _:
+            raise NotImplementedError(type(sexpr))
+
+
+def ContainsIntersection(sexpr: cin.Seq):
+    match sexpr:
+        case cin.IndexSeq():
+            return False
+        case cin.UnionSeq(s1, s2):
+            return ContainsIntersection(s1) or ContainsIntersection(s2)
+        case cin.IntersectionSeq(s1, s2):
+            return True
+        case cin.SliceSeq(a, _, _, _):
+            return ContainsIntersection(a)
+        case _:
+            raise NotImplementedError(type(sexpr))
 
 
 def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = set()):
@@ -267,7 +301,9 @@ def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = s
 
 
 def ConstructIterationLattice(top: cin.Seq, defs: set[cin.Seq]):
-    return IterationLattice(top, ConstructGraph(top, defs))
+    lattice = IterationLattice(top, ConstructGraph(top, defs))
+    print(f"Lattice: {lattice}\n")
+    return lattice
 
 
 def Iters(sexpr: cin.Seq):
@@ -276,7 +312,7 @@ def Iters(sexpr: cin.Seq):
             return {sexpr}
         case cin.SliceSeq(a):
             return Iters(a)
-        case cin.UnionSeq(s1, s2):
+        case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return Iters(s1) | Iters(s2)
         case _:
             raise NotImplementedError(type(sexpr))

@@ -797,6 +797,8 @@ class TensorAccess(IndexExpr):
         return str(self)
 
     def __eq__(self, other: TensorAccess) -> bool:
+        if not isinstance(other, TensorAccess):
+            return False
         return (self.tensor, self.indices) == (other.tensor, other.indices)
 
     def __hash__(self):
@@ -1137,6 +1139,77 @@ class Seq:
 
 
 @dataclass
+class IndexSeq(Seq):
+    """A sequence index, e.g., `iₐ`
+
+    idx: The index used to access `tensor`.
+    tensor: The tensor to be accessed.
+    size: The size of the dimension of the accessed index.
+    index: The access index, e.g., for `A[i, j]` i = 0 and j = 1.
+    format: The format of this sequence.
+    parent: The (optional) parent of this sequence, e.g., the parent of `j`
+            in `A[i, j]` is `i`. If this is None, then it has no parent.
+    """
+
+    idx: IndexVar
+    tensor: TensorVar
+    size: int
+    index: int
+    format: LevelType
+
+    parent: Optional[IndexSeq] = None
+
+    def __init__(
+        self,
+        idx: IndexVar,
+        tensor: TensorVar,
+        size: int,
+        index: int,
+        format: Optional[LevelType],
+        parent: Optional[IndexSeq] = None,
+    ):
+        self.idx = idx
+        self.tensor = tensor
+        self.size = size
+        self.index = index
+        self.format = format
+        self.parent = parent
+
+    def __str__(self):
+        return f"{self.tensor}[{self.idx}]"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
+    def __eq__(self, other):
+        if not isinstance(other, IndexSeq):
+            return False
+        return (
+            self.idx,
+            self.tensor,
+            self.size,
+            self.index,
+            self.parent,
+            self.format,
+        ) == (
+            other.idx,
+            other.tensor,
+            other.size,
+            other.index,
+            other.parent,
+            other.format,
+        )
+
+    def __hash__(self):
+        return hash(
+            (self.format, self.idx, self.size, self.tensor, self.index, self.parent)
+        )
+
+
+@dataclass
 class SliceSeq(Seq):
     """The slice of `seq`, e.g., `seq[s:e:r]`"""
 
@@ -1232,79 +1305,6 @@ class IntersectionSeq(Seq):
         return (self.s1, self.s2) == (other.s1, other.s2)
 
 
-# While this shares much of the same functionality as a TensorAccess,
-# it has the additional restriction of only allowing a single index.
-@dataclass
-class IndexSeq(Seq):
-    """A sequence index, e.g., `iₐ`
-
-    idx: The index used to access `tensor`.
-    tensor: The tensor to be accessed.
-    size: The size of the dimension of the accessed index.
-    index: The access index, e.g., for `A[i, j]` i = 0 and j = 1.
-    format: The format of this sequence.
-    parent: The (optional) parent of this sequence, e.g., the parent of `j`
-            in `A[i, j]` is `i`. If this is None, then it has no parent.
-    """
-
-    idx: IndexVar
-    tensor: TensorVar
-    size: int
-    index: int
-    format: LevelType
-
-    parent: Optional[IndexVar] = None
-
-    def __init__(
-        self,
-        idx: IndexVar,
-        tensor: TensorVar,
-        size: int,
-        index: int,
-        format: Optional[LevelType],
-        parent: Optional[IndexVar] = None,
-    ):
-        self.idx = idx
-        self.tensor = tensor
-        self.size = size
-        self.index = index
-        self.format = format
-        self.parent = parent
-
-    def __str__(self):
-        return f"{self.tensor}[{self.idx}]"
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __lt__(self, other):
-        return LessThanSeq(self, other)
-
-    def __eq__(self, other):
-        if not isinstance(other, IndexSeq):
-            return False
-        return (
-            self.idx,
-            self.tensor,
-            self.size,
-            self.index,
-            self.parent,
-            self.format,
-        ) == (
-            other.idx,
-            other.tensor,
-            other.size,
-            other.index,
-            other.parent,
-            other.format,
-        )
-
-    def __hash__(self):
-        return hash(
-            (self.format, self.idx, self.size, self.tensor, self.index, self.parent)
-        )
-
-
 @dataclass
 class FullSeq(Seq):
     size: int
@@ -1324,7 +1324,7 @@ class FullSeq(Seq):
     def __eq__(self, other):
         if not isinstance(other, FullSeq):
             return False
-        return (self.size) == (other.size)
+        return self.size == other.size
 
     def __hash__(self):
         return hash((self.size))
@@ -1349,7 +1349,7 @@ class EmptySeq(Seq):
     def __eq__(self, other):
         if not isinstance(other, EmptySeq):
             return False
-        return (self.size) == (other.size)
+        return self.size == other.size
 
     def __hash__(self):
         return hash((self.size))
