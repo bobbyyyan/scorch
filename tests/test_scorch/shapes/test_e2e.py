@@ -93,7 +93,8 @@ def test_assign_2d_ss():
                 jp_B += 1;
               }
               ip_B += 1;
-            }""")
+            }""",
+    )
 
 
 def test_union():
@@ -110,7 +111,12 @@ def test_union():
                 A._assignment,
                 cin.UnionSeq(
                     cin.IndexSeq(
-                        i, B, size=8, index=0, format=LevelType.COMPRESSED, parent=None,
+                        i,
+                        B,
+                        size=8,
+                        index=0,
+                        format=LevelType.COMPRESSED,
+                        parent=None,
                     ),
                     cin.IndexSeq(
                         i, C, size=8, index=0, format=LevelType.COMPRESSED, parent=None

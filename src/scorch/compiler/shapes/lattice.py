@@ -199,8 +199,14 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
 def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
     match sexpr:
         case cin.IndexSeq(_, _, sz, _, _, fmt):
-            return sexpr if IndexDefined(sexpr, defs) else (
-                cin.FullSeq(sz) if fmt == format.LevelType.DENSE else cin.EmptySeq(sz)
+            return (
+                sexpr
+                if IndexDefined(sexpr, defs)
+                else (
+                    cin.FullSeq(sz)
+                    if fmt == format.LevelType.DENSE
+                    else cin.EmptySeq(sz)
+                )
             )
         case cin.FullSeq(_) | cin.EmptySeq(_):
             return sexpr

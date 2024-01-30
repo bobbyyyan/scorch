@@ -1362,12 +1362,14 @@ def LessThanSeq(a: Seq, b: Seq):
         match x:
             case IndexSeq():
                 return x
-            case UnionSeq(s1, s2) | IntersectionSeq(s1, s2):
+            case UnionSeq(s1, _) | IntersectionSeq(s1, _):
                 # Just look at the first, for simplicity.
                 return GetIndexSequence(s1)
             case SliceSeq(a):
                 return GetIndexSequence(a)
-            case _: raise NotImplementedError(type(x))
+            case _:
+                raise NotImplementedError(type(x))
+
     if isinstance(a, FullSeq | EmptySeq) and isinstance(b, FullSeq | EmptySeq):
         return a.sz < b.sz
     return str(GetIndexSequence(a)) < str(GetIndexSequence(b))
