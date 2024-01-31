@@ -105,12 +105,7 @@ def BuildLoop(
     return Loop(idx, point, body)
 
 
-# TODO(cgyurgyik): Verify this type hint...
-
-
-def RemoveDense(
-    sexpr: cin.Seq,
-) -> Tuple[Optional[cin.Seq], list[Tuple[cin.Seq, cin.Seq]]]:
+def RemoveDense(sexpr: cin.Seq) -> Tuple[cin.Seq, list[cin.Seq]]:
     if il.IsDense(sexpr):
         return [None, [sexpr]]
     match sexpr:
@@ -173,6 +168,14 @@ def FindLocators(sexpr: cin.Seq) -> Tuple[cin.Seq, list[Tuple[cin.Seq, ...]]]:
         case cin.SliceSeq(a, s, e, r):
             aexpr, alocs = FindLocators(a)
             return [cin.SliceSeq(aexpr, s, e, r), alocs]
+        case cin.Concatenate(s1, s2):
+            aexpr, alocs = FindLocators(s1)
+            bexpr, blocs = FindLocators(s2)
+            return [cin.Concatenate(aexpr, bexpr), alocs + blocs]
+        case cin.Product(s1, s2):
+            aexpr, alocs = FindLocators(s1)
+            bexpr, blocs = FindLocators(s2)
+            return [cin.Product(aexpr, bexpr), alocs + blocs]
         case _:
             raise NotImplementedError(str(sexpr))
 

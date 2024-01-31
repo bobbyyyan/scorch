@@ -41,9 +41,9 @@ def test_intersection():
                 )
             )
         ),
-        """while i <-- B:s[i] ∩ C:s[i]
+        """while i <-- (B:s[i] ∩ C:s[i])
              switch i
-               case: B:s[i] ∩ C:s[i]
+               case: (B:s[i] ∩ C:s[i])
                  A:s[i] = (B:s[i] * C:s[i])""",
     )
 
@@ -82,9 +82,9 @@ def test_union():
                 )
             )
         ),
-        """while i <-- B:s[i] ∪ C:s[i]
+        """while i <-- (B:s[i] ∪ C:s[i])
              switch i
-               case: B:s[i] ∪ C:s[i]
+               case: (B:s[i] ∪ C:s[i])
                  A:s[i] = (B:s[i] + C:s[i])
                case: B:s[i]
                  A:s[i] = B:s[i]
@@ -128,6 +128,44 @@ def test_slice():
             stride=2,
         ),
         body=cfir.Assign(A[i], B[j]),
+    )
+
+
+def test_collapse():
+    A = cin.TensorVar("A", fmt=["d", "s"], shape=[8, 8])
+    b = cin.TensorVar("b", fmt=["s"], shape=[8])
+    c = cin.TensorVar("c", fmt=["d"], shape=[8])
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+    k = cin.IndexVar("k")
+    c[k] = A[i, j] + b[k]
+
+    Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE, parent=None)
+    Aj = cin.IndexSeq(j, A, size=8, index=1, format=LevelType.COMPRESSED, parent=Ai)
+    bk = cin.IndexSeq(k, b, size=8, index=0, format=LevelType.COMPRESSED, parent=None)
+
+    util.assert_equal(
+        cfir.PrettyPrint(
+            cfir.Lower(
+                cin.ForAll(k, c._assignment, cin.UnionSeq(cin.Product(Ai, Aj), bk))
+            )
+        ),
+        """
+    while k <-- ((A:d,s[i] × A:d,s[j]) ∪ b:s[k]) 
+      switch k
+        case: ((A:d,s[i] × A:d,s[j]) ∪ b:s[k])
+          c:d[k] = (A:d,s[i, j] + b:s[k])
+        case: (A:d,s[i] × A:d,s[j])
+          c:d[k] = A:d,s[i, j]
+        case: b:s[k]
+          c:d[k] = b:s[k]
+
+    while k <-- (A:d,s[i] × A:d,s[j]) 
+      c:d[k] = A:d,s[i, j]
+
+    while k <-- b:s[k] 
+      c:d[k] = b:s[k]
+    """,
     )
 
 

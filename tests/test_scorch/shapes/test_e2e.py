@@ -375,15 +375,83 @@ def test_intersection_1d_d():
     )
 
 
+def test_collapse():
+    A = cin.TensorVar("A", fmt=["d", "s"], shape=[8, 8])
+    b = cin.TensorVar("b", fmt=["s"], shape=[8])
+    c = cin.TensorVar("c", fmt=["d"], shape=[8])
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+    k = cin.IndexVar("k")
+    c[k] = A[i, j] + b[k]
+
+    Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE, parent=None)
+    Aj = cin.IndexSeq(j, A, size=8, index=1, format=LevelType.COMPRESSED, parent=Ai)
+    bk = cin.IndexSeq(k, b, size=8, index=0, format=LevelType.COMPRESSED, parent=None)
+
+    util.assert_equal(
+        Compile(cin.ForAll(k, c._assignment, cin.UnionSeq(cin.Product(Ai, Aj), bk))),
+        """
+    size_t i_A = 0;
+    size_t jp_A = A.pos[1][ip_A];
+    while (((i_A < 8) && (!(jp_A < A.pos[1][(ip_A + 1)])))) {
+      i_A += 1;
+      jp_A = A.pos[1][ip_A];
+    }
+    size_t kp_b = b.pos[0][0];
+    while ((((i_A < 8) && (jp_A < A.pos[1][(ip_A + 1)])) && (kp_b < b.pos[0][1]))) {
+      size_t k = min(((i_A * 8) + A.crd[1][jp_A]), b.crd[0][kp_b]);
+      if (((((k / 8) == i_A) && ((k % 8) == jp_A)) && (k == kp_b))) {
+        c.data[k] = (A.data[jp_A] + b.data[kp_b]);
+      } else if ((((k / 8) == i_A) && ((k % 8) == jp_A))) {
+        c.data[k] = A.data[jp_A];
+      } else if ((k == kp_b)) {
+        c.data[k] = b.data[kp_b];
+      }
+      if ((k == ((i_A * 8) + A.crd[1][jp_A]))) {
+        jp_A += 1;
+        while (((i_A < 8) && (!(jp_A < A.pos[1][(ip_A + 1)])))) {
+          i_A += 1;
+          jp_A = A.pos[1][ip_A];
+        }
+      }
+      kp_b += (k == b.crd[0][kp_b]);
+    }
+    while (((i_A < 8) && (jp_A < A.pos[1][(ip_A + 1)]))) {
+      size_t k = ((i_A * 8) + A.crd[1][jp_A]);
+      c.data[k] = A.data[jp_A];
+      jp_A += 1;
+      while (((i_A < 8) && (!(jp_A < A.pos[1][(ip_A + 1)])))) {
+        i_A += 1;
+        jp_A = A.pos[1][ip_A];
+      }
+    }
+    while ((kp_b < b.pos[0][1])) {
+      size_t k = b.crd[0][kp_b];
+      c.data[k] = b.data[kp_b];
+      kp_b += 1;
+    }""",
+    )
+
+
 def test_spmm():
     # SpMM: C[i, j] = A[i, k] * B[k, j]
     i = cin.IndexVar("i")
     j = cin.IndexVar("j")
     k = cin.IndexVar("k")
 
-    A = cin.TensorVar("A", fmt=["dense", "sparse"], shape=[10, 10])
-    B = cin.TensorVar("B", fmt=["dense", "sparse"], shape=[10, 10])
-    C = cin.TensorVar("C", fmt=["dense", "sparse"], shape=[10, 10])
-
+    A = cin.TensorVar("A", fmt=["dense", "dense"], shape=[10, 10])
+    B = cin.TensorVar("B", fmt=["dense", "dense"], shape=[10, 10])
+    C = cin.TensorVar("C", fmt=["dense", "dense"], shape=[10, 10])
     C[i, j] = A[i, k] * B[k, j]
-    # TODO(cgyurgyik): Implement.
+
+    Bi = cin.IndexSeq(i, B, size=10, index=0, format=LevelType.DENSE, parent=None)
+    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.DENSE, parent=Bi)
+    Bk = cin.IndexSeq(k, B, size=10, index=2, format=LevelType.DENSE, parent=Bj)
+
+    Ai = cin.IndexSeq(i, A, size=10, index=0, format=LevelType.DENSE, parent=None)
+    Aj = cin.IndexSeq(j, A, size=10, index=1, format=LevelType.DENSE, parent=Ai)
+    Ak = cin.IndexSeq(k, A, size=10, index=2, format=LevelType.DENSE, parent=Aj)
+    # TODO(cgyurgyik): Get reductions to work.
+    cin.ForAll(
+        i, cin.ForAll(j, cin.ForAll(k, C._assignment, cin.UnionSeq(Bk, Ak)), Bj), Ai
+    )

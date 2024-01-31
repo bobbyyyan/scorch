@@ -1248,6 +1248,64 @@ class SliceSeq(Seq):
 
 
 @dataclass
+class Product(Seq):
+    """The product of `s1` and `s2`, e.g., a[i] × b[i]"""
+
+    s1: Seq
+    s2: Seq
+
+    def __init__(self, s1: Seq, s2: Seq):
+        self.s1 = s1
+        self.s2 = s2
+
+    def __str__(self):
+        return f"({self.s1} × {self.s2})"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __hash__(self):
+        return hash((self.s1, self.s2))
+
+    def __eq__(self, other):
+        if not isinstance(other, SliceSeq):
+            return False
+        return (self.s1, self.s2) == (other.s1, other.s2)
+
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
+
+@dataclass
+class Concatenate(Seq):
+    """The concatenation of `s1` and `s2`, e.g., a[i] ⊔ b[i]"""
+
+    s1: Seq
+    s2: Seq
+
+    def __init__(self, s1: Seq, s2: Seq):
+        self.s1 = s1
+        self.s2 = s2
+
+    def __str__(self):
+        return f"({self.s1} ⊔ {self.s2})"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __hash__(self):
+        return hash((self.s1, self.s2))
+
+    def __eq__(self, other):
+        if not isinstance(other, SliceSeq):
+            return False
+        return (self.s1, self.s2) == (other.s1, other.s2)
+
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
+
+@dataclass
 class UnionSeq(Seq):
     """The union of two sequences, e.g., `+`"""
 
@@ -1259,7 +1317,7 @@ class UnionSeq(Seq):
         self.s2 = s2
 
     def __str__(self):
-        return f"{self.s1} ∪ {self.s2}"
+        return f"({self.s1} ∪ {self.s2})"
 
     def __repr__(self):
         return self.__str__()
@@ -1288,7 +1346,7 @@ class IntersectionSeq(Seq):
         self.s2 = s2
 
     def __str__(self):
-        return f"{self.s1} ∩ {self.s2}"
+        return f"({self.s1} ∩ {self.s2})"
 
     def __repr__(self):
         return self.__str__()
@@ -1363,7 +1421,8 @@ def LessThanSeq(a: Seq, b: Seq):
             case IndexSeq():
                 return x
             case UnionSeq(s1, _) | IntersectionSeq(s1, _):
-                # Just look at the first, for simplicity.
+                return GetIndexSequence(s1)
+            case Concatenate(s1, _) | Product(s1, _):
                 return GetIndexSequence(s1)
             case SliceSeq(a):
                 return GetIndexSequence(a)
