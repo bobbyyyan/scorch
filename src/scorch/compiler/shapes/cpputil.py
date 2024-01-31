@@ -95,3 +95,36 @@ def UpdateCompressedIterators(ta: cin.TensorAccess) -> Optional[cpp.Cpp]:
     return cpp.IncAssign(
         ArrayIndexVariable(indices[-1], ta.tensor, types[-1]), cpp.Constant(1)
     )
+
+
+def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
+    """Simple algebraic reductions on Cpp constructs."""
+    match expr:
+        case cpp.Add(a, b):
+            a, b = Simplify(a), Simplify(b)
+            if a == cpp.Constant(0):
+                return b
+            if b == cpp.Constant(0):
+                return a
+            return cpp.Add(a, b)
+        case cpp.Sub(a, b):
+            a, b = Simplify(a), Simplify(b)
+            if b == 0:
+                return a
+            return cpp.Sub(a, b)
+        case cpp.Mul(a, b):
+            a, b = Simplify(a), Simplify(b)
+            if cpp.Constant(0) in (a, b):
+                return cpp.Constant(0)
+            return cpp.Mul(a, b)
+        case cpp.Div(a, b):
+            a, b = Simplify(a), Simplify(b)
+            if b == cpp.Constant(0):
+                raise ZeroDivisionError(expr)
+            if b == cpp.Constant(1):
+                return a
+            if a == cpp.Constant(0):
+                return a
+            return cpp.Div(a, b)
+        case _:
+            return expr

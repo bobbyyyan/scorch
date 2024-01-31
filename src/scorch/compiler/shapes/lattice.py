@@ -301,9 +301,7 @@ def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = s
 
 
 def ConstructIterationLattice(top: cin.Seq, defs: set[cin.Seq]):
-    lattice = IterationLattice(top, ConstructGraph(top, defs))
-    print(f"Lattice: {lattice}\n")
-    return lattice
+    return IterationLattice(top, ConstructGraph(top, defs))
 
 
 def Iters(sexpr: cin.Seq):

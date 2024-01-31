@@ -34,7 +34,7 @@ def test_assign_1d_d():
         size_t i_B = 0;
         while ((i_B < 8)) {
           size_t i = i_B;
-          A.data[((0 * 8) + i)] = B.data[((0 * 8) + i)];
+          A.data[i] = B.data[i];
           i_B += 1;
         }""",
     )
@@ -117,7 +117,7 @@ def test_assign_2d_dd():
           size_t j_B = 0;
           while ((j_B < 10)) {
             size_t j = j_B;
-            A.data[((((0 * 8) + i) * 10) + j)] = B.data[((((0 * 8) + i) * 10) + j)];
+            A.data[((i * 10) + j)] = B.data[((i * 10) + j)];
             j_B += 1;
           }
           i_B += 1;
@@ -278,7 +278,7 @@ def test_union_1d_d():
         size_t i_B = 0;
         while ((i_B < 8)) {
           size_t i = i_B;
-          A.data[((0 * 8) + i)] = (B.data[((0 * 8) + i)] + C.data[((0 * 8) + i)]);
+          A.data[i] = (B.data[i] + C.data[i]);
           i_B += 1;
         }
         """,
@@ -369,7 +369,7 @@ def test_intersection_1d_d():
       size_t i_B = 0;
       while ((i_B < 8)) {
         size_t i = i_B;
-        A.data[((0 * 8) + i)] = (B.data[((0 * 8) + i)] * C.data[((0 * 8) + i)]);
+        A.data[i] = (B.data[i] * C.data[i]);
         i_B += 1;
       }""",
     )

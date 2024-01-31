@@ -28,7 +28,7 @@ def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
             tensor: cin.TensorVar = expr.tensor
             return cpp.Access(
                 cpp.Variable(f"{tensor.name}.data"),
-                LowerIndexExprRec(expr, i=expr.num_levels),
+                LowerIndexExprRec(expr),
             )
         case cin.BinaryOp():
             lhs: cpp.Cpp = LowerIndexExpr(expr.left)
@@ -44,28 +44,31 @@ def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
             raise NotImplementedError(type(expr))
 
 
-def LowerIndexExprRec(expr: cin.IndexExpr, i: int):
-    i = i - 1  # Off by one, since we'll pass in the total number of indices.
-    match expr:
-        case cin.TensorAccess():
-            if not (0 <= i < expr.num_levels):
-                return cpp.Constant(0)
-            if expr.num_levels == 0:
-                return cpp.Variable(expr.tensor.name)
-            idx: cin.IndexVar = expr.get_index_vars()[i]
-            fmt: format.LevelType = expr.level_types()[i]
-            match fmt:
-                case format.LevelType.COMPRESSED:
-                    return cpp.Variable(f"{idx.name}p_{expr.tensor.name}")
-                case format.LevelType.DENSE:
-                    return cpp.Add(
-                        cpp.Mul(LowerIndexExprRec(expr, i), expr.get_tensor().shape[i]),
-                        cpp.Variable(idx.name),
-                    )
-                case _:
-                    raise NotImplementedError(fmt)
-        case _:
-            raise NotImplementedError(expr)
+def LowerIndexExprRec(expr: cin.IndexExpr) -> cpp.Cpp:
+    def _Lower(expr: cin.IndexExpr, i: int):
+        i = i - 1  # Off by one, since we'll pass in the total number of indices.
+        match expr:
+            case cin.TensorAccess():
+                if not (0 <= i < expr.num_levels):
+                    return cpp.Constant(0)
+                if expr.num_levels == 0:
+                    return cpp.Variable(expr.tensor.name)
+                idx: cin.IndexVar = expr.get_index_vars()[i]
+                fmt: format.LevelType = expr.level_types()[i]
+                match fmt:
+                    case format.LevelType.COMPRESSED:
+                        return cpp.Variable(f"{idx.name}p_{expr.tensor.name}")
+                    case format.LevelType.DENSE:
+                        return cpp.Add(
+                            cpp.Mul(_Lower(expr, i), expr.get_tensor().shape[i]),
+                            cpp.Variable(idx.name),
+                        )
+                    case _:
+                        raise NotImplementedError(fmt)
+            case _:
+                raise NotImplementedError(expr)
+
+    return cpputil.Simplify(_Lower(expr, i=expr.num_levels))
 
 
 def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr):
