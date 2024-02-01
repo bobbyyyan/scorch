@@ -10,7 +10,6 @@ import tests.utility as util
 def Compile(cin: cin.CIN) -> str:
     """Compiles CIN -> CFIR -> CIN, and then pretty prints it."""
     s0: cfir.CFIR = cfir.Lower(cin)
-    print(cfir.PrettyPrint(s0))
     s1: cpp.Cpp = codegen.Lower(s0)
     return codegen.PrettyPrint(s1)
 
@@ -476,3 +475,37 @@ def test_scalar_workspace_dd():
       }
       i_A += 1;
     }""")
+
+
+def test_scalar_workspace_mixed():
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+    k = cin.IndexVar("k")
+
+    A = cin.TensorVar("A", fmt="ds", shape=[8, 8])
+    B = cin.TensorVar("B", fmt="sd", shape=[8, 8])
+    C = cin.TensorVar("C", fmt="dd", shape=[8, 8])
+    w = cin.Workspace(name="wksp", dim=0)
+
+    Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE)
+    Ak = cin.IndexSeq(k, A, size=8, index=1, format=LevelType.COMPRESSED)
+    Bj = cin.IndexSeq(j, B, size=8, index=1, format=LevelType.COMPRESSED)
+    Bk = cin.IndexSeq(k, B, size=8, index=0, format=LevelType.DENSE)
+
+    # TODO(cgyurgyik): I think this should work.
+    # "C(i,j)=A(i,k)*B(k,j)" -f=C:dd:0,1 -f=A:ds:0,1 -f=B:ds:1,0
+    return
+    print(Compile(cin.ForAll(
+        i,
+        cin.ForAll(j, cin.Where(
+            workspace=w,
+            producer=cin.ForAll(
+                k,
+                cin.TensorAssign(w.get_default_access(), A[i, k] * B[k, j], op=cin.Operation.ADD),
+                cin.IntersectionSeq(Ak, Bk),
+            ),
+            consumer=cin.TensorAssign(C[i, j], w.get_default_access()),
+        ), cin.IntersectionSeq(Bj, cin.Universe(j, 8))
+        ),
+        cin.IntersectionSeq(Ai, cin.Universe(i, 8)),
+    )))

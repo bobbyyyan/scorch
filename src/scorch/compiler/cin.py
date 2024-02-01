@@ -1018,7 +1018,7 @@ class Where(IndexStmt):
 
     producer: IndexStmt
     consumer: IndexStmt
-    workspace: Workspace
+    workspace: Optional[Workspace] = None
 
     def __str__(self):
         return f"Where(\n\tproducer={self.producer}, \n\tconsumer={self.consumer}\n)"
