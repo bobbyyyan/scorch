@@ -16,6 +16,19 @@ class CFIR:
 
 
 @dataclass
+class Allocate:
+    t: cin.Workspace
+    producer: CFIR
+    consumer: CFIR
+
+    def __str__(self):
+        return f"{self.t} {{ {self.producer} in {self.consumer} }}"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
 class SwitchCase:
     sexpr: cin.Seq
     stmt: CFIR
@@ -56,6 +69,7 @@ class Loop(CFIR):
         if len(self.locs) > 0:
             ll = " ".join([f"{p[0]}={p[1]}" for p in self.locs])
             s += f"with {ll}"
+        return s
 
     def __repr__(self):
         return str(self)
@@ -73,9 +87,10 @@ class Block(CFIR):
 class Assign(CFIR):
     lhs: cin.TensorAccess
     rhs: cin.IndexExpr
+    op: Optional[cin.Operation] = None
 
     def __str__(self):
-        return f"{self.lhs} = {self.rhs}"
+        return f"{self.lhs} {self.op or ''}= {self.rhs}"
 
     def __repr__(self):
         return str(self)
@@ -195,20 +210,23 @@ def CompileForAll(fa: cin.ForAll, defs: set[cin.Seq]) -> CFIR | list[CFIR]:
 
 
 def CompileTensorAssign(c: cin.TensorAssign, defs: set[cin.Seq]) -> CFIR:
-    if c.op is None:
-        return Assign(c.lhs, c.rhs)
-    raise NotImplementedError(c)
+    return Assign(c.lhs, c.rhs, c.op)
 
 
 def CompileWhere(c: cin.Where, defs: set[cin.Seq]) -> CFIR:
-    return Block(stmts=[Lower(c.producer, defs), Lower(c.consumer, defs)])
+    return Allocate(
+        t=c.workspace,
+        producer=Lower(c.producer, defs),
+        consumer=Lower(c.consumer, defs),
+    )
 
 
 def Lower(c: cin.CIN, defs: set[cin.Seq] = set()) -> CFIR:
     """Lowers Concrete Index Notation (CIN) to CFIR."""
     match c:
         case cin.ForAll():
-            return CompileForAll(c, defs)
+            x = CompileForAll(c, defs)
+            return x
         case cin.TensorAssign():
             return CompileTensorAssign(c, defs)
         case cin.Where():
@@ -247,6 +265,16 @@ def PrettyPrint(stmt: CFIR, indent_level: int = 0) -> str:
     match stmt:
         case Block(stmts):
             return "\n".join(PrettyPrint(stmt, indent_level) for stmt in stmts)
+        case Allocate(t, producer, consumer):
+            pp += indent()
+            pp += "let"
+            pp += "\n"
+            pp += PrettyPrint(producer, indent_level + 2)
+            pp += "\n"
+            pp += indent()
+            pp += "in"
+            pp += "\n"
+            pp += PrettyPrint(consumer, indent_level + 4)
         case Switch(idx, cases):
             # switch `idx`:
             #   `s0` = `c0`

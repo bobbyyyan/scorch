@@ -1,7 +1,7 @@
 from scorch import format
 from multipledispatch import dispatch
 from scorch.compiler import cin
-from scorch.compiler.shapes import cpp
+from scorch.compiler.shapes import cpp, lattice as il
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 # Utility functions used in the CFIR -> CIN lowering phase.
@@ -37,7 +37,7 @@ def ArrayLowerBound(seq: cin.IndexSeq):
                 cpp.Access(cpp.Variable(f"{seq.tensor.name}.pos"), i),
                 cpp.Constant(0)
                 if i == 0
-                else ArrayIndexVariable(seq.parent.idx, seq.tensor, seq.format),
+                else ArrayIndexVariable(il.GetParent(seq).idx, seq.tensor, seq.format),
             )
         case _:
             raise NotImplementedError(fmt)
@@ -54,7 +54,7 @@ def ArrayUpperBound(seq: cin.IndexSeq):
                 cpp.Constant(1)
                 if i == 0
                 else cpp.Add(
-                    ArrayIndexVariable(seq.parent.idx, seq.tensor, seq.format),
+                    ArrayIndexVariable(il.GetParent(seq).idx, seq.tensor, seq.format),
                     cpp.Constant(1),
                 ),
             )
@@ -90,14 +90,14 @@ def ArrayAccessCrd(
             )
 
 
-def UpdateCompressedIterators(ta: cin.TensorAccess) -> Optional[cpp.Cpp]:
-    assert isinstance(ta, cin.TensorAccess), type(ta)
-    types: List[format.LevelType] = ta.level_types()
-    if types[-1] == format.LevelType.DENSE:
+def UpdateCompressedIterators(access: cin.TensorAccess) -> Optional[cpp.Cpp]:
+    assert isinstance(access, cin.TensorAccess), type(access)
+    types: List[format.LevelType] = access.level_types()
+    if len(types) == 0 or types[-1] == format.LevelType.DENSE:
         return None
-    indices: List[cin.IndexVar] = ta.get_index_vars()
+    indices: List[cin.IndexVar] = access.get_index_vars()
     return cpp.IncAssign(
-        ArrayIndexVariable(indices[-1], ta.tensor, types[-1]), cpp.Constant(1)
+        ArrayIndexVariable(indices[-1], access.tensor, types[-1]), cpp.Constant(1)
     )
 
 

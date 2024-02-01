@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from scorch.compiler import cin
+import torch  # For conversion from (torch.dtype) -> (c++ type).
 
 
 @dataclass
@@ -19,6 +20,15 @@ class Int32(CppType):
 
 
 @dataclass
+class Float32(CppType):
+    def __str__(self):
+        return "float"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
 class IndexType(CppType):
     def __str__(self):
         return "size_t"
@@ -26,6 +36,13 @@ class IndexType(CppType):
     def __repr__(self):
         return str(self)
 
+
+def TypeFrom(type: torch.dtype) -> CppType:
+    match type:
+        case torch.int32:
+            return Int32()
+        case torch.float32:
+            return Float32()
 
 # ----------------------------------------
 
@@ -75,9 +92,10 @@ class Access(Cpp):
 class Assign(Cpp):
     lhs: Cpp
     rhs: Cpp
+    op: Optional[cin.Operation] = None
 
     def __str__(self):
-        return f"{self.lhs} = {self.rhs};"
+        return f"{self.lhs} {self.op or ''}= {self.rhs};"
 
     def __repr__(self):
         return str(self)

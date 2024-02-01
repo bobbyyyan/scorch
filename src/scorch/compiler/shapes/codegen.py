@@ -26,6 +26,8 @@ def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
     match expr:
         case cin.TensorAccess():
             tensor: cin.TensorVar = expr.tensor
+            if tensor.shape is None or len(tensor.shape) == 0:
+                return cpp.Variable(tensor.name)
             return cpp.Access(
                 cpp.Variable(f"{tensor.name}.data"),
                 LowerIndexExprRec(expr),
@@ -71,29 +73,31 @@ def LowerIndexExprRec(expr: cin.IndexExpr) -> cpp.Cpp:
     return cpputil.Simplify(_Lower(expr, i=expr.num_levels))
 
 
-def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr):
+def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr, op: cin.Operation):
     iterators = cpputil.UpdateCompressedIterators(lhs)
     return cpp.Block(
         stmts=[
             # Write to compressed dimensions.
             *IndexWriteList(lhs),
             # Perform assignment/compute.
-            cpp.Assign(LowerIndexExpr(lhs), LowerIndexExpr(rhs)),
+            cpp.Assign(LowerIndexExpr(lhs), LowerIndexExpr(rhs), op),
             # Update compressed iterators.
             *([] if iterators is None else [iterators]),
         ]
     )
 
 
-def IndexWriteList(ta: cin.TensorAccess) -> list[cpp.Cpp]:
-    types: List[format.LevelType] = ta.level_types()
-    indices: List[cin.IndexVar] = ta.get_index_vars()
+def IndexWriteList(access: cin.TensorAccess) -> list[cpp.Cpp]:
+    types: List[format.LevelType] = access.level_types()
+    if len(types) == 0:
+        return []
+    indices: List[cin.IndexVar] = access.get_index_vars()
 
     def is_compressed(pair: Tuple[format.LevelType, cin.IndexVar]):
         return pair[0] == format.LevelType.COMPRESSED
 
     compressed_levels = list(filter(is_compressed, zip(types, indices)))
-    return [IndexWrite(ta, idx) for (_, idx) in compressed_levels]
+    return [IndexWrite(access, idx) for (_, idx) in compressed_levels]
 
 
 def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar) -> cpp.Cpp:
@@ -109,12 +113,20 @@ def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
         match stmt:
             case cfir.Loop(idx, sexpr, body):
                 return LowerLoop(idx, sexpr, body, first)
-            case cfir.Assign(lhs, rhs):
-                return LowerAssign(lhs, rhs)
+            case cfir.Assign(lhs, rhs, op):
+                return LowerAssign(lhs, rhs, op)
             case cfir.Block(stmts):
                 return cpp.Block(
                     stmts=[_Lower(s, first=(i == 0)) for (i, s) in enumerate(stmts)]
                 )
+            case cfir.Allocate(workspace, producer, consumer):
+                if workspace.dim > 0:
+                    raise NotImplementedError("non-scalar workspaces")
+                return cpp.Block(stmts=[
+                    cpp.Define(cpp.TypeFrom(workspace.dtype), cpp.Variable(workspace.name), cpp.Constant(0)),
+                    Lower(producer),
+                    Lower(consumer)
+                ])
             case cfir.Switch(idx, cases):
                 return cpp.IfBlock(
                     pairs=list(

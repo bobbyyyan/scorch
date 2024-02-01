@@ -10,6 +10,7 @@ import tests.utility as util
 def Compile(cin: cin.CIN) -> str:
     """Compiles CIN -> CFIR -> CIN, and then pretty prints it."""
     s0: cfir.CFIR = cfir.Lower(cin)
+    print(cfir.PrettyPrint(s0))
     s1: cpp.Cpp = codegen.Lower(s0)
     return codegen.PrettyPrint(s1)
 
@@ -26,7 +27,7 @@ def test_assign_1d_d():
                 i,
                 A._assignment,
                 cin.IndexSeq(
-                    i, B, size=8, index=0, parent=None, format=LevelType.DENSE
+                    i, B, size=8, index=0, format=LevelType.DENSE
                 ),
             )
         ),
@@ -52,7 +53,7 @@ def test_assign_1d_s():
                 i,
                 A._assignment,
                 cin.IndexSeq(
-                    i, B, size=8, index=0, parent=None, format=LevelType.COMPRESSED
+                    i, B, size=8, index=0, format=LevelType.COMPRESSED
                 ),
             )
         ),
@@ -75,8 +76,8 @@ def test_assign_2d_ss():
     j = cin.IndexVar("j")
     A[i, j] = B[i, j]
 
-    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED, parent=None)
-    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.COMPRESSED, parent=Bi)
+    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED)
+    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.COMPRESSED)
 
     util.assert_equal(
         Compile(cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)),
@@ -105,8 +106,8 @@ def test_assign_2d_dd():
     j = cin.IndexVar("j")
     A[i, j] = B[i, j]
 
-    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.DENSE, parent=None)
-    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.DENSE, parent=Bi)
+    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.DENSE)
+    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.DENSE)
 
     util.assert_equal(
         Compile(cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)),
@@ -132,8 +133,8 @@ def test_assign_2d_sd():
     j = cin.IndexVar("j")
     A[i, j] = B[i, j]
 
-    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED, parent=None)
-    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.DENSE, parent=Bi)
+    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED)
+    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.DENSE)
 
     util.assert_equal(
         Compile(cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)),
@@ -160,8 +161,8 @@ def test_assign_2d_ds():
     j = cin.IndexVar("j")
     A[i, j] = B[i, j]
 
-    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.DENSE, parent=None)
-    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.COMPRESSED, parent=Bi)
+    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.DENSE)
+    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.COMPRESSED)
 
     util.assert_equal(
         Compile(cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)),
@@ -201,10 +202,9 @@ def test_union_1d_s():
                         size=8,
                         index=0,
                         format=LevelType.COMPRESSED,
-                        parent=None,
                     ),
                     cin.IndexSeq(
-                        i, C, size=8, index=0, format=LevelType.COMPRESSED, parent=None
+                        i, C, size=8, index=0, format=LevelType.COMPRESSED
                     ),
                 ),
             )
@@ -266,10 +266,9 @@ def test_union_1d_d():
                         size=8,
                         index=0,
                         format=LevelType.DENSE,
-                        parent=None,
                     ),
                     cin.IndexSeq(
-                        i, C, size=8, index=0, format=LevelType.DENSE, parent=None
+                        i, C, size=8, index=0, format=LevelType.DENSE
                     ),
                 ),
             )
@@ -303,7 +302,6 @@ def test_intersection_1d_s():
                         B,
                         size=8,
                         index=0,
-                        parent=None,
                         format=LevelType.COMPRESSED,
                     ),
                     cin.IndexSeq(
@@ -311,7 +309,6 @@ def test_intersection_1d_s():
                         C,
                         size=8,
                         index=0,
-                        parent=None,
                         format=LevelType.COMPRESSED,
                     ),
                 ),
@@ -351,7 +348,6 @@ def test_intersection_1d_d():
                         B,
                         size=8,
                         index=0,
-                        parent=None,
                         format=LevelType.DENSE,
                     ),
                     cin.IndexSeq(
@@ -359,7 +355,6 @@ def test_intersection_1d_d():
                         C,
                         size=8,
                         index=0,
-                        parent=None,
                         format=LevelType.DENSE,
                     ),
                 ),
@@ -384,9 +379,9 @@ def test_collapse():
     k = cin.IndexVar("k")
     c[k] = A[i, j] + b[k]
 
-    Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE, parent=None)
-    Aj = cin.IndexSeq(j, A, size=8, index=1, format=LevelType.COMPRESSED, parent=Ai)
-    bk = cin.IndexSeq(k, b, size=8, index=0, format=LevelType.COMPRESSED, parent=None)
+    Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE)
+    Aj = cin.IndexSeq(j, A, size=8, index=1, format=LevelType.COMPRESSED)
+    bk = cin.IndexSeq(k, b, size=8, index=0, format=LevelType.COMPRESSED)
 
     util.assert_equal(
         Compile(cin.ForAll(k, c._assignment, cin.UnionSeq(cin.Product(Ai, Aj), bk))),
@@ -431,3 +426,53 @@ def test_collapse():
       kp_b += 1;
     }""",
     )
+
+
+def test_scalar_workspace_dd():
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+    k = cin.IndexVar("k")
+
+    A = cin.TensorVar("A", fmt="dd", shape=[8, 8])
+    B = cin.TensorVar("B", fmt="dd", shape=[8, 8])
+    C = cin.TensorVar("C", fmt="dd", shape=[8, 8])
+    w = cin.Workspace(name="wksp", dim=0)
+
+    Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE)
+    Ak = cin.IndexSeq(k, A, size=8, index=1, format=LevelType.DENSE)
+    Bj = cin.IndexSeq(j, B, size=8, index=1, format=LevelType.DENSE)
+    Bk = cin.IndexSeq(k, B, size=8, index=0, format=LevelType.DENSE)
+
+    util.assert_equal(Compile(cin.ForAll(
+        i,
+        cin.ForAll(j, cin.Where(
+            workspace=w,
+            producer=cin.ForAll(
+                k,
+                cin.TensorAssign(w.get_default_access(), A[i, k] * B[k, j], op=cin.Operation.ADD),
+                cin.IntersectionSeq(Ak, Bk),
+            ),
+            consumer=cin.TensorAssign(C[i, j], w.get_default_access()),
+        ), cin.IntersectionSeq(Bj, cin.Universe(j, 8))
+        ),
+        cin.IntersectionSeq(Ai, cin.Universe(i, 8)),
+    )),
+        """
+    size_t i_A = 0;
+    while ((i_A < 8)) {
+      size_t i = i_A;
+      size_t j_B = 0;
+      while ((j_B < 8)) {
+        size_t j = j_B;
+        float wksp = 0;
+        size_t k_A = 0;
+        while ((k_A < 8)) {
+          size_t k = k_A;
+          wksp += (A.data[((i * 8) + k)] * B.data[((k * 8) + j)]);
+          k_A += 1;
+        }
+        C.data[((i * 8) + j)] = wksp;
+        j_B += 1;
+      }
+      i_A += 1;
+    }""")

@@ -85,6 +85,9 @@ def TopologicalSort(lattice: IterationLattice):
 def Size(sexpr: cin.Seq) -> int:
     match sexpr:
         case cin.IndexSeq(_, _, size):
+            # accesses: List[cin.TensorAccess] = var.tensor_accesses()
+            # These should all share the same size.
+            # (type, ) = set(var.shape[a.level_of_index_var(idx)] for a in accesses)
             return size
         case cin.FullSeq(sz) | cin.EmptySeq(sz):
             return sz
@@ -102,6 +105,10 @@ def IsDense(sexpr: cin.Seq) -> bool:
     match sexpr:
         case cin.IndexSeq(_, _, _, _, fmt):
             return fmt == format.LevelType.DENSE
+            # accesses: List[cin.TensorAccess] = var.tensor_accesses()
+            # # These should all share the same format.
+            # (type,) = set(a.level_type_of_index_var(idx) for a in accesses)
+            # return type == format.LevelType.DENSE
         case cin.Universe():
             return True
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
@@ -119,7 +126,7 @@ def Remove(sexpr: cin.Seq, sub: cin.Seq) -> cin.Seq:
         sz: int = Size(sexpr)
         return cin.FullSeq(sz) if IsDense(sexpr) else cin.EmptySeq(sz)
     match sexpr:
-        case cin.IndexSeq(_, _, _):
+        case cin.IndexSeq() | cin.Universe():
             return sexpr
         case cin.SliceSeq(a, s, e, r):
             return cin.SliceSeq(Remove(a, sub), s, e, r)
@@ -136,6 +143,8 @@ def Remove(sexpr: cin.Seq, sub: cin.Seq) -> cin.Seq:
 
 
 def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
+    if isinstance(e, cin.WorkspaceAccess):
+        return []
     assert isinstance(e, cin.TensorAccess)
     indices: List[cin.IndexVar] = e.get_index_vars()
     levels: List[format.LevelType] = e.level_types()
@@ -150,18 +159,37 @@ def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
                 size=tensor.shape[index],
                 index=index,
                 format=level,
-                parent=sequences[index - 1] if index != 0 else None,
             )
         )
     return sequences
 
 
+def GetParent(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
+    idx: cin.IndexVar = sexpr.idx
+    var: cin.TensorVar = sexpr.tensor
+
+    accesses: List[cin.TensorAccess] = var.tensor_accesses()
+    parent: Optional[cin.IndexVar] = None
+    for access in accesses:
+        p: Optional[cin.IndexVar] = access.get_parent_index_var(idx)
+        if p is None:
+            continue
+        parent = p
+        break
+
+    if parent is None:
+        return None
+    sexpr: List[cin.IndexSeq] = ConvertToIndexSequences(var[parent])
+    return sexpr.pop()
+
+
 def IndexDefined(sexpr: cin.IndexSeq, defs: set[cin.Seq]):
     assert isinstance(sexpr, cin.IndexSeq), sexpr
+    parent: Optional[cin.IndexSeq] = GetParent(sexpr)
     return any(
         [
             sexpr.index == 0,
-            sexpr.parent in defs,
+            parent is not None and parent in defs,
             all(
                 [
                     type == format.LevelType.DENSE
@@ -172,14 +200,17 @@ def IndexDefined(sexpr: cin.IndexSeq, defs: set[cin.Seq]):
     )
 
 
-def IndicesDefined(expr: cin.TensorAccess, defs: set[cin.Seq]):
+def IndicesDefined(expr: cin.TensorAccess, defs: set[cin.Seq]) -> bool:
     assert isinstance(expr, cin.TensorAccess)
-    return all(map(lambda x: x in defs, ConvertToIndexSequences(expr)))
+    result = all(map(lambda x: x in defs, ConvertToIndexSequences(expr)))
+    return result
 
 
 @dispatch(cin.IndexExpr, set)
 def Simplify(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
     match e:
+        case cin.Workspace():
+            return e
         case cin.TensorAccess():
             return e if IndicesDefined(e, defs) else None
         case cin.BinaryOp():
@@ -210,7 +241,7 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
     match c:
         case cin.ForAll():
             sexpr: cin.Seq = Simplify(c.seq, defs)
-            assert not isinstance(sexpr, cin.EmptySeq | cin.FullSeq), f"{c}, {defs}"
+            assert not isinstance(sexpr, cin.EmptySeq | cin.FullSeq), f"{c}\n{defs}"
             return cin.ForAll(
                 index_var=c.index_var,
                 stmt=Simplify(c.stmt, defs | Iters(sexpr)),
@@ -219,9 +250,13 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
         case cin.TensorAssign():
             rhs = Simplify(c.rhs, defs)
             assert rhs is not None, f"{c}, {defs}"
-            return cin.TensorAssign(lhs=c.lhs, rhs=rhs)
+            return cin.TensorAssign(lhs=c.lhs, rhs=rhs, op=c.op)
         case cin.Where():
-            return cin.Where(Simplify(c.producer, defs), Simplify(c.consumer, defs))
+            return cin.Where(
+                producer=Simplify(c.producer, defs),
+                consumer=Simplify(c.consumer, defs),
+                workspace=c.workspace
+            )
         case _:
             raise NotImplementedError(type(c))
 
@@ -229,7 +264,7 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
 @dispatch(cin.Seq, set)
 def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
     match sexpr:
-        case cin.IndexSeq(_, _, sz, _, _, fmt):
+        case cin.IndexSeq(_, _, sz, _, fmt):
             return (
                 sexpr
                 if IndexDefined(sexpr, defs)

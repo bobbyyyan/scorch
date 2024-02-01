@@ -530,6 +530,7 @@ class TensorVar(IndexExpr):
     shape: Optional[Tuple[int, ...]] = None
     format: Optional[TensorFormat] = None
     dtype: torch.dtype = torch.float32
+    accesses: List[TensorAccess] = []
 
     def __init__(
         self,
@@ -567,6 +568,9 @@ class TensorVar(IndexExpr):
     def get_level_types(self) -> List[LevelType]:
         return self.get_format().get_level_types()
 
+    def tensor_accesses(self) -> List[TensorAccess]:
+        return self.accesses
+
     @property
     def levels(self) -> int:
         return len(self.get_level_types())
@@ -578,7 +582,9 @@ class TensorVar(IndexExpr):
         return f"(int) ({self.name}._shape[{level}])"
 
     def __getitem__(self, item) -> TensorAccess:
-        return TensorAccess(self, item)
+        access = TensorAccess(self, item)
+        self.accesses.append(access)
+        return access
 
     def __setitem__(self, key, value) -> None:
         """
@@ -714,6 +720,8 @@ class TensorAccess(IndexExpr):
         return self.indices and index_var in self.indices
 
     def get_parent_index_var(self, index_var: IndexVar) -> Optional[IndexVar]:
+        if index_var not in self.indices:
+            return None
         index_var_index = self.indices.index(index_var)
         return self.indices[index_var_index - 1] if index_var_index > 0 else None
 
@@ -740,6 +748,8 @@ class TensorAccess(IndexExpr):
 
     @property
     def num_levels(self) -> int:
+        if self.indices is None:
+            return 0
         return len(self.indices)
 
     def get_level_iterator_resolve_stmts(
@@ -1008,6 +1018,7 @@ class Where(IndexStmt):
 
     producer: IndexStmt
     consumer: IndexStmt
+    workspace: Workspace
 
     def __str__(self):
         return f"Where(\n\tproducer={self.producer}, \n\tconsumer={self.consumer}\n)"
@@ -1156,7 +1167,7 @@ class IndexSeq(Seq):
     size: int
     index: int
     format: LevelType
-    parent: Optional[IndexSeq] = None
+    # parent: Optional[IndexSeq] = None
 
     def __init__(
         self,
@@ -1165,14 +1176,14 @@ class IndexSeq(Seq):
         size: int,
         index: int,
         format: Optional[LevelType],
-        parent: Optional[IndexSeq] = None,
+        # parent: Optional[IndexSeq] = None,
     ):
         self.idx = idx
         self.tensor = tensor
         self.size = size
         self.index = index
         self.format = format
-        self.parent = parent
+        # self.parent = parent
 
     def __str__(self):
         return f"{self.tensor}[{self.idx}]"
@@ -1191,20 +1202,20 @@ class IndexSeq(Seq):
             self.tensor,
             self.size,
             self.index,
-            self.parent,
+            # self.parent,
             self.format,
         ) == (
             other.idx,
             other.tensor,
             other.size,
             other.index,
-            other.parent,
+            # other.parent,
             other.format,
         )
 
     def __hash__(self):
         return hash(
-            (self.format, self.idx, self.size, self.tensor, self.index, self.parent)
+            (self.format, self.idx, self.size, self.tensor, self.index)  # self.parent)
         )
 
 

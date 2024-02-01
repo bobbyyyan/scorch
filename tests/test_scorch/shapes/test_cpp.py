@@ -47,7 +47,7 @@ def test_slice():
                 idx=i,
                 sexpr=cin.SliceSeq(
                     cin.IndexSeq(
-                        j, B, size=8, index=0, parent=None, format=LevelType.COMPRESSED
+                        j, B, size=8, index=0, format=LevelType.COMPRESSED
                     ),
                     start=0,
                     end=8,
@@ -90,7 +90,7 @@ def test_assign_2d_sd():
                 body=cfir.Loop(
                     idx=j,
                     sexpr=cin.IndexSeq(
-                        j, B, size=10, index=1, format=LevelType.DENSE, parent=i
+                        j, B, size=10, index=1, format=LevelType.DENSE
                     ),
                     body=cfir.Assign(A[i, j], B[i, j]),
                     locs=[],
