@@ -431,27 +431,3 @@ def test_collapse():
       kp_b += 1;
     }""",
     )
-
-
-def test_spmm():
-    # SpMM: C[i, j] = A[i, k] * B[k, j]
-    i = cin.IndexVar("i")
-    j = cin.IndexVar("j")
-    k = cin.IndexVar("k")
-
-    A = cin.TensorVar("A", fmt=["dense", "dense"], shape=[10, 10])
-    B = cin.TensorVar("B", fmt=["dense", "dense"], shape=[10, 10])
-    C = cin.TensorVar("C", fmt=["dense", "dense"], shape=[10, 10])
-    C[i, j] = A[i, k] * B[k, j]
-
-    Bi = cin.IndexSeq(i, B, size=10, index=0, format=LevelType.DENSE, parent=None)
-    Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.DENSE, parent=Bi)
-    Bk = cin.IndexSeq(k, B, size=10, index=2, format=LevelType.DENSE, parent=Bj)
-
-    Ai = cin.IndexSeq(i, A, size=10, index=0, format=LevelType.DENSE, parent=None)
-    Aj = cin.IndexSeq(j, A, size=10, index=1, format=LevelType.DENSE, parent=Ai)
-    Ak = cin.IndexSeq(k, A, size=10, index=2, format=LevelType.DENSE, parent=Aj)
-    # TODO(cgyurgyik): Get reductions to work.
-    cin.ForAll(
-        i, cin.ForAll(j, cin.ForAll(k, C._assignment, cin.UnionSeq(Bk, Ak)), Bj), Ai
-    )

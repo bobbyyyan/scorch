@@ -54,6 +54,7 @@ def test_slice():
                     stride=2,
                 ),
                 body=cfir.Assign(A[i], B[j]),
+                locs=[],
             )
         ),
         """
@@ -92,7 +93,9 @@ def test_assign_2d_sd():
                         j, B, size=10, index=1, format=LevelType.DENSE, parent=i
                     ),
                     body=cfir.Assign(A[i, j], B[i, j]),
+                    locs=[],
                 ),
+                locs=[],
             )
         ),
         """

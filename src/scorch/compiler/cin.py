@@ -1210,6 +1210,35 @@ class IndexSeq(Seq):
 
 
 @dataclass
+class Universe(Seq):
+    """Represents all coordinates for a given index, e.g., U_i"""
+
+    idx: IndexVar
+    size: int
+
+    def __init__(self, idx: IndexVar, size: int):
+        self.idx = idx
+        self.size = size
+
+    def __str__(self):
+        return f"U_{self.idx}"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
+    def __eq__(self, other):
+        if not isinstance(other, Universe):
+            return False
+        return (self.idx, self.size) == (other.idx, other.size)
+
+    def __hash__(self):
+        return hash((self.idx, self.size))
+
+
+@dataclass
 class SliceSeq(Seq):
     """The slice of `seq`, e.g., `seq[s:e:r]`"""
 
@@ -1418,8 +1447,10 @@ def LessThanSeq(a: Seq, b: Seq):
 
     def GetIndexSequence(x: Seq):
         match x:
-            case IndexSeq():
+            case IndexSeq(idx):
                 return x
+            case Universe(idx, size):
+                return (idx, size)
             case UnionSeq(s1, _) | IntersectionSeq(s1, _):
                 return GetIndexSequence(s1)
             case Concatenate(s1, _) | Product(s1, _):

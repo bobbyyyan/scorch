@@ -45,13 +45,17 @@ class Loop(CFIR):
     idx: cin.IndexVar
     sexpr: cin.Seq
     body: cin.IndexStmt
+    locs: list[Tuple[cin.Seq, cin.Seq]]
 
     def __lt__(self, other):
         return self.sexpr < other.sexpr
 
     def __str__(self):
         newline = "\n"
-        return f"while {self.idx} <-- {self.sexpr}{newline}{self.body}"
+        s = f"while {self.idx} <-- {self.sexpr}{newline}{self.body}"
+        if len(self.locs) > 0:
+            ll = " ".join([f"{p[0]}={p[1]}" for p in self.locs])
+            s += f"with {ll}"
 
     def __repr__(self):
         return str(self)
@@ -102,7 +106,7 @@ def BuildLoop(
         if len(bodies) > 1 or il.ContainsIntersection(point)
         else bodies.pop().stmt
     )
-    return Loop(idx, point, body)
+    return Loop(idx, point, body, locs)
 
 
 def RemoveDense(sexpr: cin.Seq) -> Tuple[cin.Seq, list[cin.Seq]]:
@@ -135,7 +139,7 @@ def FilterLocators(locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]], point: c
 
 def FindLocators(sexpr: cin.Seq) -> Tuple[cin.Seq, list[Tuple[cin.Seq, ...]]]:
     match sexpr:
-        case cin.IndexSeq():
+        case cin.IndexSeq() | cin.Universe():
             return [sexpr, []]
         case cin.UnionSeq(s1, s2):
             aexpr, alocs = FindLocators(s1)
@@ -196,6 +200,10 @@ def CompileTensorAssign(c: cin.TensorAssign, defs: set[cin.Seq]) -> CFIR:
     raise NotImplementedError(c)
 
 
+def CompileWhere(c: cin.Where, defs: set[cin.Seq]) -> CFIR:
+    return Block(stmts=[Lower(c.producer, defs), Lower(c.consumer, defs)])
+
+
 def Lower(c: cin.CIN, defs: set[cin.Seq] = set()) -> CFIR:
     """Lowers Concrete Index Notation (CIN) to CFIR."""
     match c:
@@ -203,6 +211,8 @@ def Lower(c: cin.CIN, defs: set[cin.Seq] = set()) -> CFIR:
             return CompileForAll(c, defs)
         case cin.TensorAssign():
             return CompileTensorAssign(c, defs)
+        case cin.Where():
+            return CompileWhere(c, defs)
         case _:
             raise NotImplementedError(type(c))
 
@@ -246,13 +256,16 @@ def PrettyPrint(stmt: CFIR, indent_level: int = 0) -> str:
             pp += f"switch {PpExpr(idx)}"
             for case in cases:
                 pp += PpExpr(case)
-        case Loop(idx, sexpr, body):
+        case Loop(idx, sexpr, body, locs):
             # while `idx` <-- `sexpr`
             #   stmt0
             #   stmt1
             #   ...
             pp += indent()
             pp += f"while {PpExpr(idx)} <-- {PpExpr(sexpr)} "
+            if len(locs) > 0:
+                ll = " ".join([f"{p[0]}={p[1]}" for p in locs])
+                pp += f"with {ll}"
             pp += "\n"
             pp += PrettyPrint(body, indent_level + 2)
             pp += "\n"

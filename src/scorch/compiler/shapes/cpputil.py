@@ -23,6 +23,10 @@ def ArrayIndexVariable(seq: cin.IndexSeq):
     return ArrayIndexVariable(seq.idx, seq.tensor, seq.format)
 
 
+def UniverseIndexVariable(idx: cin.IndexExpr):
+    return cpp.Variable(f"U_{idx}")
+
+
 def ArrayLowerBound(seq: cin.IndexSeq):
     match fmt := seq.format:
         case format.LevelType.DENSE:

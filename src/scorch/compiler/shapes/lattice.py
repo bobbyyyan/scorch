@@ -41,7 +41,6 @@ class IterationLattice:
             for _, v in children:
                 s += pp(v, graph)
             return s
-
         return pp(self.top, self.graph)
 
     def __repr__(self):
@@ -50,7 +49,7 @@ class IterationLattice:
 
 def 𝜒(sexpr: cin.Seq) -> set[cin.Seq]:
     match sexpr:
-        case cin.IndexSeq():
+        case cin.IndexSeq() | cin.Universe():
             return {sexpr}
         case cin.FullSeq() | cin.EmptySeq():
             return {}
@@ -102,6 +101,8 @@ def IsDense(sexpr: cin.Seq) -> bool:
     match sexpr:
         case cin.IndexSeq(_, _, _, _, fmt):
             return fmt == format.LevelType.DENSE
+        case cin.Universe():
+            return True
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return IsDense(s1) and IsDense(s2)
         case cin.Product(s1, s2) | cin.Concatenate(s1, s2):
@@ -154,9 +155,20 @@ def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
     return sequences
 
 
-def IndexDefined(sexpr: cin.Seq, defs: set[cin.Seq]):
-    assert isinstance(sexpr, cin.Seq), sexpr
-    return sexpr.index == 0 or sexpr.parent in defs
+def IndexDefined(sexpr: cin.IndexSeq, defs: set[cin.Seq]):
+    assert isinstance(sexpr, cin.IndexSeq), sexpr
+    return any(
+        [
+            sexpr.index == 0,
+            sexpr.parent in defs,
+            all(
+                [
+                    type == format.LevelType.DENSE
+                    for type in sexpr.tensor.get_level_types()
+                ]
+            ),
+        ]
+    )
 
 
 def IndicesDefined(expr: cin.TensorAccess, defs: set[cin.Seq]):
@@ -197,14 +209,18 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
     match c:
         case cin.ForAll():
             sexpr: cin.Seq = Simplify(c.seq, defs)
-            assert not isinstance(sexpr, cin.EmptySeq | cin.FullSeq)
+            assert not isinstance(sexpr, cin.EmptySeq | cin.FullSeq), f"{c}, {defs}"
             return cin.ForAll(
                 index_var=c.index_var,
                 stmt=Simplify(c.stmt, defs | Iters(sexpr)),
                 seq=sexpr,
             )
         case cin.TensorAssign():
-            return cin.TensorAssign(lhs=c.lhs, rhs=Simplify(c.rhs, defs))
+            rhs = Simplify(c.rhs, defs)
+            assert rhs is not None, f"{c}, {defs}"
+            return cin.TensorAssign(lhs=c.lhs, rhs=rhs)
+        case cin.Where():
+            return cin.Where(Simplify(c.producer, defs), Simplify(c.consumer, defs))
         case _:
             raise NotImplementedError(type(c))
 
@@ -222,6 +238,8 @@ def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
                     else cin.EmptySeq(sz)
                 )
             )
+        case cin.Universe(_):
+            return sexpr
         case cin.FullSeq(_) | cin.EmptySeq(_):
             return sexpr
         case cin.SliceSeq(a, s, e, r):
@@ -290,7 +308,7 @@ def Contains(sexpr: cin.Seq, subpoint: cin.Seq):
     if sexpr == subpoint:
         return True
     match sexpr:
-        case cin.IndexSeq():
+        case cin.IndexSeq() | cin.Universe():
             return False
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return Contains(s1, subpoint) or Contains(s2, subpoint)
@@ -304,7 +322,7 @@ def Contains(sexpr: cin.Seq, subpoint: cin.Seq):
 
 def ContainsIntersection(sexpr: cin.Seq):
     match sexpr:
-        case cin.IndexSeq():
+        case cin.IndexSeq() | cin.Universe():
             return False
         case cin.UnionSeq(s1, s2) | cin.Concatenate(s1, s2) | cin.Product(s1, s2):
             return ContainsIntersection(s1) or ContainsIntersection(s2)
@@ -333,15 +351,15 @@ def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = s
 
 
 def ConstructIterationLattice(top: cin.Seq, defs: set[cin.Seq]):
-    l = IterationLattice(top, ConstructGraph(top, defs))
-    print(f"\nLattice:{l}\n")
-    return l
+    return IterationLattice(top, ConstructGraph(top, defs))
 
 
 def Iters(sexpr: cin.Seq):
     match sexpr:
         case cin.IndexSeq():
             return {sexpr}
+        case cin.Universe():
+            return set()
         case cin.SliceSeq(a):
             return Iters(a)
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):

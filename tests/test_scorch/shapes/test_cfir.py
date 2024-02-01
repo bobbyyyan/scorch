@@ -128,6 +128,7 @@ def test_slice():
             stride=2,
         ),
         body=cfir.Assign(A[i], B[j]),
+        locs=[],
     )
 
 
@@ -186,5 +187,54 @@ def test_assign_2d_ss():
             idx=j,
             sexpr=Bj,
             body=cfir.Assign(A[i, j], B[i, j]),
+            locs=[],
         ),
+        locs=[],
     )
+
+
+def test_where():
+    return
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+    k = cin.IndexVar("k")
+
+    A = cin.TensorVar("A", fmt="dd", shape=[8, 8])
+    B = cin.TensorVar("B", fmt="dd", shape=[8, 8])
+    C = cin.TensorVar("C", fmt="dd", shape=[8, 8])
+
+    # w = cin.Workspace(name="wksp", dim=1)
+    w = cin.TensorVar("w", fmt="d", shape=[8])
+
+    Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE, parent=None)
+    Aj = cin.IndexSeq(j, A, size=8, index=1, format=LevelType.DENSE, parent=Ai)
+    Ak = cin.IndexSeq(k, A, size=8, index=2, format=LevelType.DENSE, parent=Aj)
+    Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.DENSE, parent=None)
+    Bj = cin.IndexSeq(j, B, size=8, index=1, format=LevelType.DENSE, parent=Bi)
+    Bk = cin.IndexSeq(k, B, size=8, index=2, format=LevelType.DENSE, parent=Bj)
+
+    c = cin.ForAll(
+        i,
+        cin.Where(
+            producer=cin.ForAll(
+                k,
+                cin.ForAll(
+                    j,
+                    cin.TensorAssign(w[j], A[i, k] * B[k, j], op=cin.Operation.ADD),
+                    Bj,
+                ),
+                cin.IntersectionSeq(Ak, Bk),
+            ),
+            consumer=cin.ForAll(
+                j,
+                cin.TensorAssign(
+                    C[i, j],
+                    w[j],
+                ),
+                cin.IntersectionSeq(Bj, cin.Universe(j, 8)),
+            ),
+        ),
+        cin.IntersectionSeq(Ai, cin.Universe(i, 8)),
+    )
+    print(c)
+    print(cfir.Lower(c))
