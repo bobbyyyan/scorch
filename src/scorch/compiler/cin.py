@@ -1156,7 +1156,6 @@ class IndexSeq(Seq):
     size: int
     index: int
     format: LevelType
-
     parent: Optional[IndexSeq] = None
 
     def __init__(

@@ -41,6 +41,7 @@ class IterationLattice:
             for _, v in children:
                 s += pp(v, graph)
             return s
+
         return pp(self.top, self.graph)
 
     def __repr__(self):
