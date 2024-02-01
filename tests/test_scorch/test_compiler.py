@@ -1489,31 +1489,3 @@ def test_coo_to_csr():
 
     print("\nC++ torch extension code:")
     print(llir_lowerer.lower_llir(lowered_llir))
-
-
-def test_xxx():
-    i = IndexVar("i")
-    j = IndexVar("j")
-    k = IndexVar("k")
-
-    A = TensorVar("A", fmt=["dense", "dense"], shape=[10, 10])
-    B = TensorVar("B", fmt=["dense", "dense"], shape=[10, 10])
-    C = TensorVar("C", fmt=["dense", "dense"], shape=[10, 10])
-    w = Workspace(name="wksp", dim=0, dense=True)
-    C[i, j] = A[i, k] * B[k, j]
-    c = ForAll(
-        i,
-        ForAll(
-            j,
-            Where(
-                producer=ForAll(
-                    k,
-                    TensorAssign(w[j], A[i, k] * B[k, j], Operation.ADD),
-                ),
-                consumer=TensorAssign(C[i, j], w[j]),
-            ),
-        ),
-    )
-
-    lowerer = CINLowerer()
-    lowered_llir = lowerer.lower_IndexStmt(c)
