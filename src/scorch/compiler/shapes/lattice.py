@@ -166,11 +166,13 @@ def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
 
 def GetParent(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
     idx: cin.IndexVar = sexpr.idx
-    var: cin.TensorVar = sexpr.tensor
+    tensor: cin.TensorVar = sexpr.tensor
 
-    accesses: List[cin.TensorAccess] = var.tensor_accesses()
+    accesses: List[cin.TensorAccess] = tensor.tensor_accesses()
     parent: Optional[cin.IndexVar] = None
     for access in accesses:
+        if access.tensor != tensor:
+            continue
         p: Optional[cin.IndexVar] = access.get_parent_index_var(idx)
         if p is None:
             continue
@@ -179,7 +181,7 @@ def GetParent(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
 
     if parent is None:
         return None
-    sexpr: List[cin.IndexSeq] = ConvertToIndexSequences(var[parent])
+    sexpr: List[cin.IndexSeq] = ConvertToIndexSequences(tensor[parent])
     return sexpr.pop()
 
 

@@ -477,35 +477,54 @@ def test_scalar_workspace_dd():
     }""")
 
 
-def test_scalar_workspace_mixed():
+def test_scalar_workspace_csc():
     i = cin.IndexVar("i")
     j = cin.IndexVar("j")
     k = cin.IndexVar("k")
 
     A = cin.TensorVar("A", fmt="ds", shape=[8, 8])
-    B = cin.TensorVar("B", fmt="sd", shape=[8, 8])
+    B = cin.TensorVar("B", fmt="ds", shape=[8, 8])
     C = cin.TensorVar("C", fmt="dd", shape=[8, 8])
     w = cin.Workspace(name="wksp", dim=0)
 
     Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE)
     Ak = cin.IndexSeq(k, A, size=8, index=1, format=LevelType.COMPRESSED)
-    Bj = cin.IndexSeq(j, B, size=8, index=1, format=LevelType.COMPRESSED)
-    Bk = cin.IndexSeq(k, B, size=8, index=0, format=LevelType.DENSE)
+    Bj = cin.IndexSeq(j, B, size=8, index=0, format=LevelType.DENSE)
+    Bk = cin.IndexSeq(k, B, size=8, index=1, format=LevelType.COMPRESSED)
 
-    # TODO(cgyurgyik): I think this should work.
-    # "C(i,j)=A(i,k)*B(k,j)" -f=C:dd:0,1 -f=A:ds:0,1 -f=B:ds:1,0
-    return
-    print(Compile(cin.ForAll(
+    util.assert_equal(Compile(cin.ForAll(
         i,
         cin.ForAll(j, cin.Where(
             workspace=w,
             producer=cin.ForAll(
                 k,
-                cin.TensorAssign(w.get_default_access(), A[i, k] * B[k, j], op=cin.Operation.ADD),
+                cin.TensorAssign(w.get_default_access(), A[i, k] * B[j, k], op=cin.Operation.ADD),
                 cin.IntersectionSeq(Ak, Bk),
             ),
             consumer=cin.TensorAssign(C[i, j], w.get_default_access()),
         ), cin.IntersectionSeq(Bj, cin.Universe(j, 8))
         ),
         cin.IntersectionSeq(Ai, cin.Universe(i, 8)),
-    )))
+    )), """
+        size_t i_A = 0;
+        while ((i_A < 8)) {
+          size_t i = i_A;
+          size_t j_B = 0;
+          while ((j_B < 8)) {
+            size_t j = j_B;
+            float wksp = 0;
+            size_t kp_A = A.pos[1][ip_A];
+            size_t kp_B = B.pos[1][jp_B];
+            while (((kp_A < A.pos[1][(ip_A + 1)]) && (kp_B < B.pos[1][(jp_B + 1)]))) {
+              size_t k = min(A.crd[1][kp_A], B.crd[1][kp_B]);
+              if (((k == kp_A) && (k == kp_B))) {
+                wksp += (A.data[kp_A] * B.data[kp_B]);
+              }
+              kp_A += (k == A.crd[1][kp_A]);
+              kp_B += (k == B.crd[1][kp_B]);
+            }
+            C.data[((i * 8) + j)] = wksp;
+            j_B += 1;
+          }
+          i_A += 1;
+        }""")
