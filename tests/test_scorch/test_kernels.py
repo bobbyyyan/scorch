@@ -799,8 +799,23 @@ def test_dense_matmul():
 
 
 def test_matmul_ds_dd_dd():
-    # TODO: figure out why we error with larger n (e.g. n = 2048)
-    n = 64
+    n = 1024
+    tensor_b_torch = torch.randint(0, 1000, (n, n))
+    tensor_a_torch = torch.randint(0, 1000, (n, n))
+
+    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+
+    torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    scorch_result = einsum("ik,kj->ij", a_scorch, b_scorch, format="ds")
+    scorch_result_torch = scorch_result.to_torch()
+
+    assert torch_result.allclose(scorch_result_torch)
+
+
+def test_matmul_ds_dd_dd_large():
+    n = 2048
     tensor_b_torch = torch.randint(0, 1000, (n, n))
     tensor_a_torch = torch.randint(0, 1000, (n, n))
 
@@ -1059,11 +1074,12 @@ def test_matmul_dd_dd_dd():
     a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
     b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
 
-    result = einsum("ik,kj->ij", a_scorch, b_scorch, format="dd")
+    scorch_result = einsum("ik,kj->ij", a_scorch, b_scorch, format="dd")
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+    scorch_result_torch = scorch_result.to_torch()
 
-    assert result_torch.tolist() == result.to_torch().tolist()
+    assert result_torch.allclose(scorch_result_torch)
 
 
 def test_matmul_ds_ds_ds():

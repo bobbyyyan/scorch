@@ -637,6 +637,7 @@ class CINLowerer:
                             name=f"{wksp.get_name()}[{loop_var.name}]",
                             type=llir.DataType.NO_TYPE,
                         ),
+                        op=AssignOp.ADD_ASSIGN,
                     )
                 )
 
@@ -696,6 +697,7 @@ class CINLowerer:
                         name=f"{wksp.get_name()}[{loop_var.name}]",
                         type=llir.DataType.NO_TYPE,
                     ),
+                    op=AssignOp.ADD_ASSIGN,
                 )
             )
 

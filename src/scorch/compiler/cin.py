@@ -17,9 +17,11 @@ _BinaryOp = Callable[[Any, Any], Any]
 
 class CIN:
     inserted_workspace: bool = False
+    no_tile_list: List[IndexVar] = []
 
     def __init__(self):
         self.inserted_workspace = False
+        self.no_tile_list = []
 
     def accept(self, visitor: CINVisitor) -> None:
         visitor.visit(self)
