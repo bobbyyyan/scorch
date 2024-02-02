@@ -25,9 +25,7 @@ def test_assign_1d_d():
             cin.ForAll(
                 i,
                 A._assignment,
-                cin.IndexSeq(
-                    i, B, size=8, index=0, format=LevelType.DENSE
-                ),
+                cin.IndexSeq(i, B, size=8, index=0, format=LevelType.DENSE),
             )
         ),
         """
@@ -51,9 +49,7 @@ def test_assign_1d_s():
             cin.ForAll(
                 i,
                 A._assignment,
-                cin.IndexSeq(
-                    i, B, size=8, index=0, format=LevelType.COMPRESSED
-                ),
+                cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED),
             )
         ),
         """
@@ -202,9 +198,7 @@ def test_union_1d_s():
                         index=0,
                         format=LevelType.COMPRESSED,
                     ),
-                    cin.IndexSeq(
-                        i, C, size=8, index=0, format=LevelType.COMPRESSED
-                    ),
+                    cin.IndexSeq(i, C, size=8, index=0, format=LevelType.COMPRESSED),
                 ),
             )
         ),
@@ -266,9 +260,7 @@ def test_union_1d_d():
                         index=0,
                         format=LevelType.DENSE,
                     ),
-                    cin.IndexSeq(
-                        i, C, size=8, index=0, format=LevelType.DENSE
-                    ),
+                    cin.IndexSeq(i, C, size=8, index=0, format=LevelType.DENSE),
                 ),
             )
         ),
@@ -442,20 +434,30 @@ def test_scalar_workspace_dd():
     Bj = cin.IndexSeq(j, B, size=8, index=1, format=LevelType.DENSE)
     Bk = cin.IndexSeq(k, B, size=8, index=0, format=LevelType.DENSE)
 
-    util.assert_equal(Compile(cin.ForAll(
-        i,
-        cin.ForAll(j, cin.Where(
-            workspace=w,
-            producer=cin.ForAll(
-                k,
-                cin.TensorAssign(w.get_default_access(), A[i, k] * B[k, j], op=cin.Operation.ADD),
-                cin.IntersectionSeq(Ak, Bk),
-            ),
-            consumer=cin.TensorAssign(C[i, j], w.get_default_access()),
-        ), cin.IntersectionSeq(Bj, cin.Universe(j, 8))
+    util.assert_equal(
+        Compile(
+            cin.ForAll(
+                i,
+                cin.ForAll(
+                    j,
+                    cin.Where(
+                        workspace=w,
+                        producer=cin.ForAll(
+                            k,
+                            cin.TensorAssign(
+                                w.get_default_access(),
+                                A[i, k] * B[k, j],
+                                op=cin.Operation.ADD,
+                            ),
+                            cin.IntersectionSeq(Ak, Bk),
+                        ),
+                        consumer=cin.TensorAssign(C[i, j], w.get_default_access()),
+                    ),
+                    cin.IntersectionSeq(Bj, cin.Universe(j, 8)),
+                ),
+                cin.IntersectionSeq(Ai, cin.Universe(i, 8)),
+            )
         ),
-        cin.IntersectionSeq(Ai, cin.Universe(i, 8)),
-    )),
         """
     size_t i_A = 0;
     while ((i_A < 8)) {
@@ -474,7 +476,8 @@ def test_scalar_workspace_dd():
         j_B += 1;
       }
       i_A += 1;
-    }""")
+    }""",
+    )
 
 
 def test_scalar_workspace_csc():
@@ -492,20 +495,31 @@ def test_scalar_workspace_csc():
     Bj = cin.IndexSeq(j, B, size=8, index=0, format=LevelType.DENSE)
     Bk = cin.IndexSeq(k, B, size=8, index=1, format=LevelType.COMPRESSED)
 
-    util.assert_equal(Compile(cin.ForAll(
-        i,
-        cin.ForAll(j, cin.Where(
-            workspace=w,
-            producer=cin.ForAll(
-                k,
-                cin.TensorAssign(w.get_default_access(), A[i, k] * B[j, k], op=cin.Operation.ADD),
-                cin.IntersectionSeq(Ak, Bk),
-            ),
-            consumer=cin.TensorAssign(C[i, j], w.get_default_access()),
-        ), cin.IntersectionSeq(Bj, cin.Universe(j, 8))
+    util.assert_equal(
+        Compile(
+            cin.ForAll(
+                i,
+                cin.ForAll(
+                    j,
+                    cin.Where(
+                        workspace=w,
+                        producer=cin.ForAll(
+                            k,
+                            cin.TensorAssign(
+                                w.get_default_access(),
+                                A[i, k] * B[j, k],
+                                op=cin.Operation.ADD,
+                            ),
+                            cin.IntersectionSeq(Ak, Bk),
+                        ),
+                        consumer=cin.TensorAssign(C[i, j], w.get_default_access()),
+                    ),
+                    cin.IntersectionSeq(Bj, cin.Universe(j, 8)),
+                ),
+                cin.IntersectionSeq(Ai, cin.Universe(i, 8)),
+            )
         ),
-        cin.IntersectionSeq(Ai, cin.Universe(i, 8)),
-    )), """
+        """
         size_t i_A = 0;
         while ((i_A < 8)) {
           size_t i = i_A;
@@ -527,4 +541,5 @@ def test_scalar_workspace_csc():
             j_B += 1;
           }
           i_A += 1;
-        }""")
+        }""",
+    )

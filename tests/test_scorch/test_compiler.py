@@ -5,13 +5,10 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorAccess,
     Operation,
-    IndexSeq,
-    UnionSeq,
     Workspace,
     Where,
     TileSizeVar,
 )
-import scorch.format as fmt
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.scheduler import Scheduler

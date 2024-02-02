@@ -44,6 +44,7 @@ def TypeFrom(type: torch.dtype) -> CppType:
         case torch.float32:
             return Float32()
 
+
 # ----------------------------------------
 
 

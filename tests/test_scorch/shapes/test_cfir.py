@@ -105,9 +105,7 @@ def test_slice():
             i,
             A._assignment,
             cin.SliceSeq(
-                cin.IndexSeq(
-                    j, B, size=8, index=0, format=LevelType.COMPRESSED
-                ),
+                cin.IndexSeq(j, B, size=8, index=0, format=LevelType.COMPRESSED),
                 start=0,
                 end=8,
                 stride=2,
@@ -116,9 +114,7 @@ def test_slice():
     ) == cfir.Loop(
         idx=i,
         sexpr=cin.SliceSeq(
-            cin.IndexSeq(
-                j, B, size=8, index=0, format=LevelType.COMPRESSED
-            ),
+            cin.IndexSeq(j, B, size=8, index=0, format=LevelType.COMPRESSED),
             start=0,
             end=8,
             stride=2,

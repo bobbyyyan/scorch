@@ -122,11 +122,17 @@ def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
             case cfir.Allocate(workspace, producer, consumer):
                 if workspace.dim > 0:
                     raise NotImplementedError("non-scalar workspaces")
-                return cpp.Block(stmts=[
-                    cpp.Define(cpp.TypeFrom(workspace.dtype), cpp.Variable(workspace.name), cpp.Constant(0)),
-                    Lower(producer),
-                    Lower(consumer)
-                ])
+                return cpp.Block(
+                    stmts=[
+                        cpp.Define(
+                            cpp.TypeFrom(workspace.dtype),
+                            cpp.Variable(workspace.name),
+                            cpp.Constant(0),
+                        ),
+                        Lower(producer),
+                        Lower(consumer),
+                    ]
+                )
             case cfir.Switch(idx, cases):
                 return cpp.IfBlock(
                     pairs=list(

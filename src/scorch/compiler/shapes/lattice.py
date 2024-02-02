@@ -257,7 +257,7 @@ def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
             return cin.Where(
                 producer=Simplify(c.producer, defs),
                 consumer=Simplify(c.consumer, defs),
-                workspace=c.workspace
+                workspace=c.workspace,
             )
         case _:
             raise NotImplementedError(type(c))
