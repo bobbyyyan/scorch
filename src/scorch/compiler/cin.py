@@ -616,8 +616,9 @@ class Workspace(TensorVar):
         dtype: torch.dtype = torch.float32,
         dense: bool = False,
         tile_size_var: Optional[TileSizeVar] = None,
+        shape: Optional[Tuple[int, ...]] = None,
     ):
-        super().__init__()
+        super().__init__(shape=shape)
         self.name = name
         self.dim = dim
         self.dtype = dtype

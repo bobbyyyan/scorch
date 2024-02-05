@@ -1,3 +1,5 @@
+import torch
+
 from scorch.compiler import cin
 from scorch.compiler.shapes import cfir, codegen, cpp
 from scorch.format import LevelType
@@ -427,7 +429,7 @@ def test_scalar_workspace_dd():
     A = cin.TensorVar("A", fmt="dd", shape=[8, 8])
     B = cin.TensorVar("B", fmt="dd", shape=[8, 8])
     C = cin.TensorVar("C", fmt="dd", shape=[8, 8])
-    w = cin.Workspace(name="wksp", dim=0)
+    w = cin.Workspace(name="w", dim=0, shape=[])
 
     Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE)
     Ak = cin.IndexSeq(k, A, size=8, index=1, format=LevelType.DENSE)
@@ -465,14 +467,14 @@ def test_scalar_workspace_dd():
       size_t j_B = 0;
       while ((j_B < 8)) {
         size_t j = j_B;
-        float wksp = 0;
+        float w = 0;
         size_t k_A = 0;
         while ((k_A < 8)) {
           size_t k = k_A;
-          wksp += (A.data[((i * 8) + k)] * B.data[((k * 8) + j)]);
+          w += (A.data[((i * 8) + k)] * B.data[((k * 8) + j)]);
           k_A += 1;
         }
-        C.data[((i * 8) + j)] = wksp;
+        C.data[((i * 8) + j)] = w;
         j_B += 1;
       }
       i_A += 1;
@@ -488,7 +490,7 @@ def test_scalar_workspace_csc():
     A = cin.TensorVar("A", fmt="ds", shape=[8, 8])
     B = cin.TensorVar("B", fmt="ds", shape=[8, 8])
     C = cin.TensorVar("C", fmt="dd", shape=[8, 8])
-    w = cin.Workspace(name="wksp", dim=0)
+    w = cin.Workspace(name="w", dim=0, shape=[])
 
     Ai = cin.IndexSeq(i, A, size=8, index=0, format=LevelType.DENSE)
     Ak = cin.IndexSeq(k, A, size=8, index=1, format=LevelType.COMPRESSED)
@@ -526,20 +528,60 @@ def test_scalar_workspace_csc():
           size_t j_B = 0;
           while ((j_B < 8)) {
             size_t j = j_B;
-            float wksp = 0;
+            float w = 0;
             size_t kp_A = A.pos[1][ip_A];
             size_t kp_B = B.pos[1][jp_B];
             while (((kp_A < A.pos[1][(ip_A + 1)]) && (kp_B < B.pos[1][(jp_B + 1)]))) {
               size_t k = min(A.crd[1][kp_A], B.crd[1][kp_B]);
               if (((k == kp_A) && (k == kp_B))) {
-                wksp += (A.data[kp_A] * B.data[kp_B]);
+                w += (A.data[kp_A] * B.data[kp_B]);
               }
               kp_A += (k == A.crd[1][kp_A]);
               kp_B += (k == B.crd[1][kp_B]);
             }
-            C.data[((i * 8) + j)] = wksp;
+            C.data[((i * 8) + j)] = w;
             j_B += 1;
           }
           i_A += 1;
+        }""",
+    )
+
+
+def test_vector_workspace_dd():
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+
+    a = cin.TensorVar("A", fmt="d", shape=[8])
+    b = cin.TensorVar("B", fmt="d", shape=[8])
+    c = cin.TensorVar("C", fmt="d", shape=[8])
+    w = cin.Workspace(name="w", dim=1, dtype=torch.float32, dense=True, shape=[8])
+
+    ai = cin.IndexSeq(i, a, size=8, index=0, format=LevelType.DENSE)
+    bi = cin.IndexSeq(i, b, size=8, index=0, format=LevelType.DENSE)
+    wj = cin.IndexSeq(j, w, size=8, index=0, format=LevelType.DENSE)
+
+    util.assert_equal(
+        Compile(
+            cin.Where(
+                workspace=w,
+                producer=cin.ForAll(
+                    i, cin.TensorAssign(w[i], a[i] + b[i]), cin.IntersectionSeq(ai, bi)
+                ),
+                consumer=cin.ForAll(j, cin.TensorAssign(c[j], w[j]), wj),
+            )
+        ),
+        """
+        size_t i_A = 0;
+        while ((i_A < 8)) {
+          size_t i = i_A;
+          w.data[i] = (A.data[i] + B.data[i]);
+          i_A += 1;
+        }
+        size_t j_w = 0;
+        while ((j_w < 8)) {
+          size_t j = j_w;
+          C.data[j] = w.data[j];
+          w.data[j] = 0;
+          j_w += 1;
         }""",
     )

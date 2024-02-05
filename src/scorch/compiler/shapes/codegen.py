@@ -24,9 +24,12 @@ def LowerLoop(idx: cin.IndexVar, sexpr: cin.Seq, body: cfir.CFIR, first: bool):
 
 def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
     match expr:
-        case cin.TensorAccess():
+        case cin.TensorAccess() | cin.WorkspaceAccess():
             tensor: cin.TensorVar = expr.tensor
-            if tensor.shape is None or len(tensor.shape) == 0:
+            name: str = tensor.name
+            # CIN should always pass an explicit shape to avoid tricky bugs.
+            assert tensor.shape is not None
+            if len(tensor.shape) == 0:
                 return cpp.Variable(tensor.name)
             return cpp.Access(
                 cpp.Variable(f"{tensor.name}.data"),
@@ -50,16 +53,17 @@ def LowerIndexExprRec(expr: cin.IndexExpr) -> cpp.Cpp:
     def _Lower(expr: cin.IndexExpr, i: int):
         i = i - 1  # Off by one, since we'll pass in the total number of indices.
         match expr:
-            case cin.TensorAccess():
+            case cin.TensorAccess() | cin.WorkspaceAccess():
+                name: str = expr.tensor.name
                 if not (0 <= i < expr.num_levels):
                     return cpp.Constant(0)
                 if expr.num_levels == 0:
-                    return cpp.Variable(expr.tensor.name)
+                    return cpp.Variable(name)
                 idx: cin.IndexVar = expr.get_index_vars()[i]
                 fmt: format.LevelType = expr.level_types()[i]
                 match fmt:
                     case format.LevelType.COMPRESSED:
-                        return cpp.Variable(f"{idx.name}p_{expr.tensor.name}")
+                        return cpp.Variable(f"{idx.name}p_{name}")
                     case format.LevelType.DENSE:
                         return cpp.Add(
                             cpp.Mul(_Lower(expr, i), expr.get_tensor().shape[i]),
@@ -81,6 +85,13 @@ def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr, op: cin.Operation):
             *IndexWriteList(lhs),
             # Perform assignment/compute.
             cpp.Assign(LowerIndexExpr(lhs), LowerIndexExpr(rhs), op),
+            # If there is a workspace, reset its value for the next loop iteration.
+            # TODO(cgyurgyik): This is only necessary if we actually read from the workspace again.
+            *(
+                [cpp.Assign(LowerIndexExpr(rhs), cpp.Constant(0))]
+                if isinstance(rhs, cin.WorkspaceAccess) and not len(rhs.tensor.shape) == 0
+                else []
+            ),
             # Update compressed iterators.
             *([] if iterators is None else [iterators]),
         ]
@@ -109,7 +120,7 @@ def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar) -> cpp.Cpp:
 
 
 def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
-    def _Lower(stmt: cfir.CFIR, first=False):
+    def _Lower(stmt: cfir.CFIR, first: bool):
         match stmt:
             case cfir.Loop(idx, sexpr, body):
                 return LowerLoop(idx, sexpr, body, first)
@@ -120,17 +131,23 @@ def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
                     stmts=[_Lower(s, first=(i == 0)) for (i, s) in enumerate(stmts)]
                 )
             case cfir.Allocate(workspace, producer, consumer):
-                if workspace.dim > 0:
-                    raise NotImplementedError("non-scalar workspaces")
-                return cpp.Block(
-                    stmts=[
+                stmts = []
+                if workspace.dim == 0:  # Scalar
+                    stmts.append(
                         cpp.Define(
                             cpp.TypeFrom(workspace.dtype),
                             cpp.Variable(workspace.name),
                             cpp.Constant(0),
-                        ),
-                        Lower(producer),
-                        Lower(consumer),
+                        )
+                    )
+                else:
+                    # We assume the workspace has already been zero-initialized.
+                    pass
+                return cpp.Block(
+                    stmts=stmts
+                    + [
+                        _Lower(producer, first=True),
+                        _Lower(consumer, first=True),
                     ]
                 )
             case cfir.Switch(idx, cases):
