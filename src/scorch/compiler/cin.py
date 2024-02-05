@@ -360,22 +360,20 @@ class IndexVar(IndexExpr):
                     ),
                 )
             ]
-        raise NotImplementedError(
-            f"Resolve LLIR stmts for {self.expr} not implemented"
-        )
+        raise NotImplementedError(f"Resolve LLIR stmts for {self.expr} not implemented")
 
     @property
     def parent(self) -> IndexVar:
         assert self._parent is not None, "IndexVar parent is None"
         return self._parent
 
-    @property
-    def has_parent(self) -> bool:
-        return self._parent is not None
-
     @parent.setter
     def parent(self, parent: IndexVar) -> None:
         self._parent = parent
+
+    @property
+    def has_parent(self) -> bool:
+        return self._parent is not None
 
     def set_tile_size_var(
         self,

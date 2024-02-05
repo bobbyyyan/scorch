@@ -1013,7 +1013,7 @@ class CINLowerer:
             if isinstance(stmt, Where):
                 return self.lower_Where(stmt)
 
-        tensor_value_array_init_stmts = []
+        tensor_value_array_init_stmts: List[llir.Stmt] = []
         result_level_indices_init_stmts: List[llir.Stmt] = []
 
         for result_tensor_var in non_workspace_result_tensor_vars:
@@ -1242,7 +1242,7 @@ class CINLowerer:
             ]
 
         # Generate iterator bounds
-        tensor_level_array_assign_stmts = []
+        tensor_level_array_assign_stmts: List[llir.Stmt] = []
 
         for tensor in rhs_tensor_vars:
             tensor_level_array_assign_stmts.append(llir.BlankLine())
