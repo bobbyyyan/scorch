@@ -18,7 +18,7 @@ from .cin import (
     Workspace,
 )
 from .iter_lattice import IterationLattice
-from .llir import Assign, AssignOp, DataType
+from .llir import AssignOp, DataType
 from ..format import LevelType
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -1486,7 +1486,7 @@ class CINLowerer:
                             type=llir.DataType.AUTO,
                         ),
                         value=llir.Var(
-                            name=f"[](void* ptr) {{ free(ptr); }}",
+                            name="[](void* ptr) {{ free(ptr); }}",
                             type=llir.DataType.AUTO,
                         ),
                     )
@@ -1657,8 +1657,6 @@ class CINLowerer:
                 ]
             ):
                 assert self.result_tensor_var, "Result tensor variable not set"
-
-                iter_var = llir.Var(name="i", type=llir.DataType.INT)
 
         stmts.extend(
             [

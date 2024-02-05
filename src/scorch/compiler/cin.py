@@ -97,13 +97,13 @@ class CIN:
         return visitor.tensor_accesses
 
     @property
-    def loop_order(self) -> List[IndexVar, List[IndexVar]]:
+    def loop_order(self) -> List[IndexVar]:
         """
         Returns a list of index variables in the order that they are looped over.
         """
 
         class LoopOrderGetter(CINVisitor):
-            index_vars_ordered: List[IndexVar, List[IndexVar]] = []
+            index_vars_ordered: List[IndexVar] = []
             free_vars: List[IndexVar] = []
 
             def __init__(self, stmt: Optional[CIN] = None):
@@ -343,6 +343,11 @@ class IndexVar(IndexExpr):
         assert self._expr is not None, "IndexVar expr is None"
         return self._expr
 
+    @expr.setter
+    def expr(self, expr: IndexVarExpr) -> None:
+        self._expr = expr
+        expr.set_parent(self)
+
     def get_resolve_llir_stmts(self) -> List[llir.Stmt]:
         if isinstance(self.expr, IndexVarAdd):
             # int self.name = lhs.name + rhs.name
@@ -355,6 +360,9 @@ class IndexVar(IndexExpr):
                     ),
                 )
             ]
+        raise NotImplementedError(
+            f"Resolve LLIR stmts for {self.expr} not implemented"
+        )
 
     @property
     def parent(self) -> IndexVar:
@@ -763,12 +771,10 @@ class TensorAccess(IndexExpr):
         if level_type == LevelType.DENSE:
             if level > 0:
                 parent_level = level - 1
-                parent_index_var = self.get_parent_index_var(index_var)
                 coord_var_llir = llir.Var(
                     name=f"p{tensor_name}{level}",
                     type=llir.DataType.INT,
                 )
-                # int p{name}{level} = p{name}{level-1} * {name}{level}_size + <index var>
                 return [
                     llir.VarInit(
                         var=coord_var_llir,
@@ -793,7 +799,6 @@ class TensorAccess(IndexExpr):
 
     def __str__(self):
         return f"{self.tensor}[{', '.join([str(i) for i in self.indices])}]"
-        # return f"TensorAccess(tensor={self.tensor}, indices={self.indices})"
 
     def __repr__(self):
         return str(self)

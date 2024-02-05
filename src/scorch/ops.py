@@ -430,6 +430,7 @@ def einsum(
         output_format = parse_format(output_format)
 
     # Create the result TensorVar
+    assert output_tensor_dtype is not None, "Output tensor type is not defined"
     result_tensor_var = TensorVar(
         name=tensor_names_available.pop(0), fmt=output_format, dtype=output_tensor_dtype
     )
@@ -528,12 +529,13 @@ def einsum(
         print(f"Cached kernel for {cin_stmt}")
 
     if compile_only:
-        return None
+        return Tensor("Compile only")
 
     # Create a mapping from each index string to the size of the dimension
     # it indexes
     index_str_to_size = {}
     for index_strs, tensor in zip(input_index_strs, tensors):
+        assert isinstance(tensor, Tensor)
         for i, index_str in enumerate(index_strs):
             if index_str not in index_str_to_size:
                 index_str_to_size[index_str] = tensor.shape[i]
@@ -601,7 +603,7 @@ def lower_and_exec_cin(
         extra_cflags=["-O3"],
     )
 
-    module_args = [result_shape]
+    module_args: List[Any] = [result_shape]
 
     for arg in args:
         module_args.append(arg.shape)

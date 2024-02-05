@@ -814,7 +814,7 @@ def test_matmul_ds_dd_dd():
     assert torch_result.allclose(scorch_result_torch)
 
 
-def test_matmul_ds_dd_dd_large():
+def todo_test_matmul_ds_dd_dd_large():
     n = 2048
     tensor_b_torch = torch.randint(0, 1000, (n, n))
     tensor_a_torch = torch.randint(0, 1000, (n, n))

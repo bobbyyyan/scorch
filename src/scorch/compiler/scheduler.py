@@ -4,7 +4,6 @@ from typing import List, Set
 from scorch.compiler.cin import (
     CIN,
     CINIndexVariablesGetter,
-    LoopOrderGetter,
     Workspace,
     ForAll,
     TensorAssign,
@@ -135,101 +134,90 @@ class Scheduler:
         if not cin.inserted_workspace:
             cin = Scheduler.insert_workspace(cin, allow_dense=True)
 
-        """
-        2) Stripmine the index_var
-        Create inner and outer index variables, e.g. 
-            k_out = IndexVar("k_out")
-            k_in = IndexVar("k_in")        
-        """
+        # 2) Stripmine the index_var
+        # Create inner and outer index variables, e.g.
+        #   k_out = IndexVar("k_out")
+        #   k_in = IndexVar("k_in")
         inner_index_var = IndexVar(f"{index_var.name}_in")
         outer_index_var = IndexVar(f"{index_var.name}_out")
 
-        """
-        Create a new index variable that is the sum of the inner and outer index variables
-        e.g. k = IndexVar("k", k_out + k_in)
-        """
-        new_index_var = IndexVar(
-            name=index_var.name,
-            expr=outer_index_var + inner_index_var,
-        )
+        # Create a new index variable that is the sum of the inner and outer index variables
+        # e.g. k = IndexVar("k", k_out + k_in)
+        index_var.expr = outer_index_var + inner_index_var
 
-        """
-        Create a new tile size variable
-        
-        e.g. 
-        k_tile_size = 32
-        k_tile_var = TileSizeVar(
-            outer_index_var=k_out,
-            inner_index_var=k_in,
-            size=k_tile_size
-        )
-        """
-        tile_size_var = TileSizeVar(
+        # Create a new tile size variable
+        #
+        # e.g.
+        # k_tile_size = 32
+        # k_tile_var = TileSizeVar(
+        #     outer_index_var=k_out,
+        #     inner_index_var=k_in,
+        #     size=k_tile_size
+        # )
+        TileSizeVar(
             outer_index_var=outer_index_var,
             inner_index_var=inner_index_var,
             size=tile_size,
         )
 
-        """
-        Now, we want to go from, for example:
-        
-        new_cin = ForAll(
-            i,
-            Where(
-                producer=ForAll(
-                    j,
-                    ForAll(
-                        k,
-                        TensorAssign(
-                            accum_c[k],
-                            A[i, j] * B[j, k],
-                            op=Operation.ADD
-                        )
-                    )
-                ),
-                consumer=ForAll(
-                    k,
-                    TensorAssign(
-                        C[i, k],
-                        accum_c[k],
-                    )
-                )
-            )
-        )
-        
-        to a new_cin:
-        
-        new_cin = ForAll(
-            i,
-            ForAll(
-                k_out,
-                Where(
-                    producer=ForAll(
-                        j,
-                        ForAll(
-                            k_in,
-                            TensorAssign(
-                                accum_c[k_in],
-                                A[i, j] * B[j, k],
-                                op=Operation.ADD,
-                            ),
-                        ),
-                    ),
-                    consumer=ForAll(
-                        k_in,
-                        TensorAssign(
-                            C[i, k],
-                            accum_c[k_in],
-                        )
-                    )
-                )
-            )
-        )
-        
-        This involves several steps:
-        - Replace the index_var in the Where statement indexing into the workspace with the inner index var
-        - Add a new ForAll loop outside/before the Where statement
-        """
+        # Now, we want to go from, for example:
+        #
+        # new_cin = ForAll(
+        #     i,
+        #     Where(
+        #         producer=ForAll(
+        #             j,
+        #             ForAll(
+        #                 k,
+        #                 TensorAssign(
+        #                     accum_c[k],
+        #                     A[i, j] * B[j, k],
+        #                     op=Operation.ADD
+        #                 )
+        #             )
+        #         ),
+        #         consumer=ForAll(
+        #             k,
+        #             TensorAssign(
+        #                 C[i, k],
+        #                 accum_c[k],
+        #             )
+        #         )
+        #     )
+        # )
+        #
+        # to a new_cin:
+        #
+        # new_cin = ForAll(
+        #     i,
+        #     ForAll(
+        #         k_out,
+        #         Where(
+        #             producer=ForAll(
+        #                 j,
+        #                 ForAll(
+        #                     k_in,
+        #                     TensorAssign(
+        #                         accum_c[k_in],
+        #                         A[i, j] * B[j, k],
+        #                         op=Operation.ADD,
+        #                     ),
+        #                 ),
+        #             ),
+        #             consumer=ForAll(
+        #                 k_in,
+        #                 TensorAssign(
+        #                     C[i, k],
+        #                     accum_c[k_in],
+        #                 )
+        #             )
+        #         )
+        #     )
+        # )
+        #
+        # This involves several steps:
+        # - Replace the index_var in the Where statement indexing into the workspace with the inner index var
+        # - Add a new ForAll loop outside/before the Where statement
 
         # Find the Where statement
         assert isinstance(cin, ForAll), "Expected input CIN to be a ForAll statement."
@@ -240,6 +228,7 @@ class Scheduler:
             assert isinstance(parent_forall, ForAll)
             parent_forall = parent_forall.stmt
 
+        assert isinstance(parent_forall, ForAll)
         assert isinstance(parent_forall.stmt, Where)
         where_stmt = parent_forall.stmt
 
@@ -271,9 +260,7 @@ class Scheduler:
         )
         replace_index_var_visitor.visit(where_stmt)
 
-        """
-        Wrap the new_cin in a new ForAll loop, with the outer index var        
-        """
+        # Wrap the new_cin in a new ForAll loop, with the outer index var
         cin = ForAll(
             index_var=outer_index_var,
             stmt=cin,
@@ -455,6 +442,7 @@ class Scheduler:
         )
 
         if not are_all_dense_levels:
+            assert isinstance(producer_forall, ForAll)
             new_cin.no_tile_list.append(producer_forall.index_var)
 
         # Replace the reduction forall with the Where statement
