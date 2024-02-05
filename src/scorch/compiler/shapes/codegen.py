@@ -89,7 +89,8 @@ def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr, op: cin.Operation):
             # TODO(cgyurgyik): This is only necessary if we actually read from the workspace again.
             *(
                 [cpp.Assign(LowerIndexExpr(rhs), cpp.Constant(0))]
-                if isinstance(rhs, cin.WorkspaceAccess) and not len(rhs.tensor.shape) == 0
+                if isinstance(rhs, cin.WorkspaceAccess)
+                and not len(rhs.tensor.shape) == 0
                 else []
             ),
             # Update compressed iterators.
