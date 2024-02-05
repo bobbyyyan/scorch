@@ -353,10 +353,19 @@ def einsum(
     # Create TensorVar's for each tensor
     tensor_vars = []
     tensor_names_available = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    output_tensor_dtype = None
     for i, tensor in enumerate(tensors):
         if isinstance(tensor, Tensor):
             tensor_name = tensor_names_available.pop(0)
-            tensor_vars.append(TensorVar(name=tensor_name, fmt=tensor.format))
+            tensor_vars.append(
+                TensorVar(name=tensor_name, fmt=tensor.format, dtype=tensor.dtype)
+            )
+            if output_tensor_dtype is None:
+                output_tensor_dtype = tensor.dtype
+            else:
+                assert (
+                    output_tensor_dtype == tensor.dtype
+                ), "All tensors must have the same dtype"
 
     # Get output format from kwargs
     output_format = kwargs.get("format", None)
@@ -421,7 +430,9 @@ def einsum(
         output_format = parse_format(output_format)
 
     # Create the result TensorVar
-    result_tensor_var = TensorVar(name=tensor_names_available.pop(0), fmt=output_format)
+    result_tensor_var = TensorVar(
+        name=tensor_names_available.pop(0), fmt=output_format, dtype=output_tensor_dtype
+    )
 
     # Generate the python code for constructing the TensorAccess's, and TensorAssign and execute it
     assert index_var_dict, "index_var_dict is empty"
@@ -536,8 +547,8 @@ def einsum(
     args: Sequence[Any] = [result_shape]
     for tensor in tensors:
         args.append(tensor.shape)  # type: ignore
-        args.append(tensor._storage._index.mode_indices)  # type: ignore
-        args.append(tensor._storage.value)  # type: ignore
+        args.append(tensor.index.mode_indices)  # type: ignore
+        args.append(tensor.values)  # type: ignore
 
     start_time = time.time()
     result_cpp = module.evaluate(*args)

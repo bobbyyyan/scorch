@@ -637,6 +637,7 @@ class CINLowerer:
                             name=f"{wksp.get_name()}[{loop_var.name}]",
                             type=llir.DataType.NO_TYPE,
                         ),
+                        op=AssignOp.ADD_ASSIGN,
                     )
                 )
 
@@ -696,6 +697,7 @@ class CINLowerer:
                         name=f"{wksp.get_name()}[{loop_var.name}]",
                         type=llir.DataType.NO_TYPE,
                     ),
+                    op=AssignOp.ADD_ASSIGN,
                 )
             )
 
@@ -1078,6 +1080,23 @@ class CINLowerer:
                     llir.VarInit(
                         var=result_val_var,
                         value=malloc,
+                    )
+                )
+
+                # if we use malloc, we should also memset the result tensor to 0
+                # memset(<result_name>_values, 0, sizeof(<result c datatype>) * A_capacity);
+                tensor_value_array_init_stmts.append(
+                    llir.FunctionCallStmt(
+                        name="memset",
+                        args=[
+                            result_val_var,
+                            llir.Literal(0),
+                            llir.BinOp(
+                                left=sizeof_expr,
+                                op="*",
+                                right=res_capacity_var,
+                            ),
+                        ],
                     )
                 )
 
@@ -1640,92 +1659,6 @@ class CINLowerer:
                 assert self.result_tensor_var, "Result tensor variable not set"
 
                 iter_var = llir.Var(name="i", type=llir.DataType.INT)
-
-                if self.result_tensor_access.is_workspace():
-                    wksp = self.result_tensor_var
-                    assert isinstance(wksp, Workspace), "Expected a Workspace"
-                    # TODO: determine if we need to initialize the result value array
-                    # if not wksp.is_tiled:
-                    #     stmts.append(
-                    #         llir.Comment(
-                    #             "Initialize result value array elements to 0 for workspace"
-                    #         )
-                    #     )
-                    #     stmts.append(
-                    #         llir.ForLoop(
-                    #             init=llir.VarInit(
-                    #                 var=iter_var,
-                    #                 value=llir.Literal(0),
-                    #             ),
-                    #             cond=llir.BinOp(
-                    #                 op="<",
-                    #                 left=iter_var,
-                    #                 right=wksp.size_llir_var,
-                    #             ),
-                    #             update=llir.Increment(iter_var),
-                    #             body=[
-                    #                 llir.Assign(
-                    #                     var=llir.Var(
-                    #                         name=f"{self.result_tensor_var.name}[{iter_var.name}]",
-                    #                         type=llir.DataType.NO_TYPE,
-                    #                     ),
-                    #                     value=llir.Literal(0),
-                    #                 )
-                    #             ],
-                    #         )
-                    #     )
-                else:
-                    stmts.extend(
-                        [
-                            llir.Comment("Assemble dense result level as needed"),
-                            # initialize a result stride variable = current_level_size * next_level_size * ...
-                            llir.VarInit(
-                                var=llir.Var(
-                                    name=f"{self.result_tensor_var.get_name()}_stride",
-                                    type=llir.DataType.INT,
-                                ),
-                                value=llir.Var(
-                                    name=" * ".join(
-                                        [
-                                            f"{self.result_tensor_var.get_name()}{i}_size"
-                                            for i in range(
-                                                level_of_index_var,
-                                                self.result_tensor_access.num_levels,
-                                            )
-                                        ]
-                                    ),
-                                    type=llir.DataType.INT,
-                                ),
-                            ),
-                            # for (int i = 0; i < <result_tensor_name>_stride; i++) {
-                            #   <result_tensor_name>_values[i] = 0;
-                            # }
-                            llir.ForLoop(
-                                init=llir.VarInit(
-                                    var=iter_var,
-                                    value=llir.Literal(0),
-                                ),
-                                cond=llir.BinOp(
-                                    op="<",
-                                    left=iter_var,
-                                    right=llir.Var(
-                                        name=f"{self.result_tensor_var.get_name()}_stride",
-                                        type=llir.DataType.INT,
-                                    ),
-                                ),
-                                update=llir.Increment(iter_var),
-                                body=[
-                                    llir.Assign(
-                                        var=llir.Var(
-                                            name=f"{self.result_tensor_var.get_name()}_values[{iter_var.name}]",
-                                            type=llir.DataType.NO_TYPE,
-                                        ),
-                                        value=llir.Literal(0),
-                                    )
-                                ],
-                            ),
-                        ]
-                    )
 
         stmts.extend(
             [

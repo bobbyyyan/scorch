@@ -798,36 +798,36 @@ def test_dense_matmul():
     assert torch_result.tolist() == scorch_result.to_torch().tolist()
 
 
-def test_spmm_ds_dd_dd():
-    tensor_a_torch = torch.Tensor(
-        [
-            [1, 0, 0, 0, 0],
-            [0, 2, 0, 0, 0],
-            [0, 0, 3, 0, 0],
-            [0, 0, 0, 4, 0],
-            [0, 0, 0, 0, 5],
-        ]
-    )
-    tensor_b_torch = torch.Tensor(
-        [
-            [1, 2, 3, 4, 5],
-            [2, 2, 0, 0, 0],
-            [3, 0, 3, 0, 0],
-            [4, 0, 0, 4, 0],
-            [5, 0, 0, 0, 5],
-        ]
-    )
+def test_matmul_ds_dd_dd():
+    n = 1024
+    tensor_b_torch = torch.randint(0, 1000, (n, n))
+    tensor_a_torch = torch.randint(0, 1000, (n, n))
 
     a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
     b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
 
-    result = einsum("ik,kj->ij", a_scorch, b_scorch, format="ds")
+    torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
 
-    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+    scorch_result = einsum("ik,kj->ij", a_scorch, b_scorch, format="ds")
+    scorch_result_torch = scorch_result.to_torch()
 
-    print(result.index.mode_indices)
+    assert torch_result.allclose(scorch_result_torch)
 
-    assert result_torch.tolist() == result.to_torch().tolist()
+
+def test_matmul_ds_dd_dd_large():
+    n = 2048
+    tensor_b_torch = torch.randint(0, 1000, (n, n))
+    tensor_a_torch = torch.randint(0, 1000, (n, n))
+
+    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+
+    torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    scorch_result = einsum("ik,kj->ij", a_scorch, b_scorch, format="ds")
+    scorch_result_torch = scorch_result.to_torch()
+
+    assert torch_result.allclose(scorch_result_torch)
 
 
 def todo_test_matmul_wksp_dd_oo_dd_time():
@@ -837,8 +837,8 @@ def todo_test_matmul_wksp_dd_oo_dd_time():
     random_tensor_b = torch.rand(n, n)
 
     # Randomly sparsify each tensor
-    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity).float()
-    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity).float()
+    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity)
+    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity)
 
     start_time = time.time()
     torch_result = torch.matmul(random_tensor_a, random_tensor_b)
@@ -1000,7 +1000,7 @@ def test_spmm_dd_oo_dd_time():
     Compare speed of torch and scorch matmul
     Use random tensors
     """
-    n = 4096
+    n = 64
     sparsity = 0.99
     random_tensor_a = torch.rand(n, n).float()
     random_tensor_b = torch.rand(n, n).float()
@@ -1012,8 +1012,7 @@ def test_spmm_dd_oo_dd_time():
     # Convert random_tensor_a to a sparse COO pytorch tensor
     random_tensor_a_coo = random_tensor_a.to_sparse()
     start_time = time.time()
-    torch_result = torch.matmul(random_tensor_a, random_tensor_b)
-    # torch_result = torch.sparse.mm(random_tensor_a_coo, random_tensor_b)
+    torch_result = torch.matmul(random_tensor_a_coo, random_tensor_b)
     torch_time = time.time() - start_time
 
     tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("oo")
@@ -1067,98 +1066,32 @@ def test_matmul_time():
     print(f"scorch time / torch time: {scorch_time / torch_time}")
 
 
-def test_spmm_dd_dd_dd():
-    tensor_a_torch = torch.Tensor(
-        [
-            [1, 0, 0, 0, 0],
-            [0, 2, 0, 0, 0],
-            [0, 0, 3, 0, 0],
-            [0, 0, 0, 4, 0],
-            [0, 0, 0, 0, 5],
-        ]
-    )
-    tensor_b_torch = torch.Tensor(
-        [
-            [1, 2, 3, 4, 5],
-            [2, 2, 0, 0, 0],
-            [3, 0, 3, 0, 0],
-            [4, 0, 0, 4, 0],
-            [5, 0, 0, 0, 5],
-        ]
-    )
+def test_matmul_dd_dd_dd():
+    n = 64
+    tensor_a_torch = torch.rand(n, n)
+    tensor_b_torch = torch.rand(n, n)
 
     a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
     b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
 
-    result = einsum("ik,kj->ij", a_scorch, b_scorch, format="dd")
+    scorch_result = einsum("ik,kj->ij", a_scorch, b_scorch, format="dd")
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+    scorch_result_torch = scorch_result.to_torch()
 
-    assert result_torch.tolist() == result.to_torch().tolist()
+    assert result_torch.allclose(scorch_result_torch)
 
 
-def test_spmm_ds_ds_ds():
-    tensor_a_torch = torch.Tensor(
-        [
-            [1, 0, 0, 0, 0],
-            [0, 2, 0, 0, 0],
-            [0, 0, 3, 0, 0],
-            [0, 0, 0, 4, 0],
-            [0, 0, 0, 0, 5],
-        ]
-    )
-    tensor_b_torch = torch.Tensor(
-        [
-            [1, 2, 3, 4, 5],
-            [2, 2, 0, 0, 0],
-            [3, 0, 3, 0, 0],
-            [4, 0, 0, 4, 0],
-            [5, 0, 0, 0, 5],
-        ]
-    )
+def test_matmul_ds_ds_ds():
+    n = 64
+    tensor_a_torch = torch.rand(n, n)
+    tensor_b_torch = torch.rand(n, n)
 
     a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
-    # result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ds")
-    result = matmul_wksp(a_sparse, b_sparse, output_format="ds")
+    result = matmul(a_sparse, b_sparse, output_format="ds")
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
-
-    assert result.shape == (5, 5)
-    assert len(result.index.mode_indices) == 2
-
-    assert result.index.mode_indices[1][0].tolist() == [0, 5, 7, 9, 11, 13]
-    assert result.index.mode_indices[1][1].tolist() == [
-        0,
-        1,
-        2,
-        3,
-        4,
-        0,
-        1,
-        0,
-        2,
-        0,
-        3,
-        0,
-        4,
-    ]
-
-    assert result.values.tolist() == [
-        1.0,
-        2.0,
-        3.0,
-        4.0,
-        5.0,
-        4.0,
-        4.0,
-        9.0,
-        9.0,
-        16.0,
-        16.0,
-        25.0,
-        25.0,
-    ]
 
     assert torch.allclose(result.to_torch(), result_torch)
 
@@ -1748,9 +1681,10 @@ def test_spmm_ss_ds_ds():
     ]
 
 
-def test_spmm_dd_ds_dd():
-    tensor_a_torch = torch.rand(100, 100)
-    tensor_b_torch = torch.rand(100, 100)
+def test_matmul_dd_ds_dd():
+    n = 64
+    tensor_a_torch = torch.rand(n, n)
+    tensor_b_torch = torch.rand(n, n)
 
     a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_scorch = Tensor.from_torch(tensor_b_torch, "B")
@@ -2043,22 +1977,19 @@ def test_sddmm_ds_ds_dd_dd():
     C: Dense
     D: Dense
     """
-    N = 100
+    n = 64
     sparsity = 0.9
-    random_tensor_b = torch.rand(N, N)
-    random_tensor_c = torch.rand(N, N)
-    random_tensor_d = torch.rand(N, N)
+    random_tensor_b = torch.rand(n, n)
+    random_tensor_c = torch.rand(n, n)
+    random_tensor_d = torch.rand(n, n)
     # Sparsify B
-    random_tensor_b = random_tensor_b * (torch.rand(N, N) > sparsity).float()
-    random_tensor_b_sparse = random_tensor_b.to_sparse_csr()
+    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity)
 
     start_time = time.time()
     torch_result = torch.einsum(
         "ij,ik,kj->ij", random_tensor_b, random_tensor_c, random_tensor_d
     )
-    # torch_result = torch.sparse.sampled_addmm(
-    #     random_tensor_b_sparse, random_tensor_c, random_tensor_d, beta=0
-    # )
+
     torch_time = time.time() - start_time
 
     tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse("ds")

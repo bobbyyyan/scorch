@@ -454,6 +454,9 @@ class Scheduler:
             consumer=consumer_forall,
         )
 
+        if not are_all_dense_levels:
+            new_cin.no_tile_list.append(producer_forall.index_var)
+
         # Replace the reduction forall with the Where statement
         parent_forall.stmt = where_stmt
 
@@ -466,6 +469,11 @@ class Scheduler:
         cin = Scheduler.insert_workspace(cin, allow_dense=True)
         all_index_vars = cin.index_vars
         tensor_accesses = cin.tensor_accesses
+
+        print("Auto-scheduling CIN statement" f"\n{cin}")
+
+        print(f"Index vars: {all_index_vars}")
+        print(f"Tensor accesses: {tensor_accesses}")
 
         index_vars_to_tile: List[IndexVar] = []
         index_vars_sparse: Set[IndexVar] = set()
@@ -496,9 +504,24 @@ class Scheduler:
         if first_loop_index_var in index_vars_to_tile:
             index_vars_to_tile.remove(first_loop_index_var)
 
+        # Remove the index variables that are sparse
+        index_vars_to_tile = [
+            index_var
+            for index_var in index_vars_to_tile
+            if index_var not in index_vars_sparse
+        ]
+
+        # Remove the index variables that are already in the no_tile_list
+        # TODO: check that the condition for adding to no_tile_list is correct
+        index_vars_to_tile = [
+            index_var
+            for index_var in index_vars_to_tile
+            if index_var not in cin.no_tile_list
+        ]
+
         print(f"Index vars to tile: {index_vars_to_tile}")
 
-        # for index_var in index_vars_to_tile:
-        #     cin = Scheduler.add_tile(cin, index_var, 4096)
+        for index_var in index_vars_to_tile:
+            cin = Scheduler.add_tile(cin, index_var, 32)
 
         return cin

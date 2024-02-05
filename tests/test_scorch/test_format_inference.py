@@ -4,9 +4,9 @@ from scorch import Tensor, einsum
 
 
 def test_spmm_oo_dd_fmtinf():
-    # random 5x5 torch tensors
-    tensor_a_torch = torch.rand(5, 5)
-    tensor_b_torch = torch.rand(5, 5)
+    n = 64
+    tensor_a_torch = torch.rand(n, n)
+    tensor_b_torch = torch.rand(n, n)
 
     a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
     b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
@@ -19,9 +19,9 @@ def test_spmm_oo_dd_fmtinf():
 
 
 def test_spmm_ds_dd_fmtinf():
-    # random 5x5 torch tensors
-    tensor_a_torch = torch.rand(5, 5)
-    tensor_b_torch = torch.rand(5, 5)
+    n = 64
+    tensor_a_torch = torch.rand(n, n)
+    tensor_b_torch = torch.rand(n, n)
 
     a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
