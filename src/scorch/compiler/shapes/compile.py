@@ -226,18 +226,17 @@ def CompileAndPrint(cin: cin.CIN) -> str:
     return codegen.PrettyPrint(Compile(cin))
 
 
-def ConvertToTensorVar(t: tensor.Tensor) -> cin.TensorVar:
-    return cin.TensorVar(name=t.name, shape=t.shape, fmt=t.format, dtype=t.dtype)
-
-
 def CompileAndExecuteFunction(
     stmt: cpp.Cpp, result: tensor.Tensor, arguments: List[tensor.Tensor]
 ) -> tensor.Tensor:
+    def Convert(t: tensor.Tensor) -> cin.TensorVar:
+        return cin.TensorVar(name=t.name, shape=t.shape, fmt=t.format, dtype=t.dtype)
+
     fn: cpp.Function = DefineFunction(
         "evaluate",
         stmt,
-        ConvertToTensorVar(result),
-        [ConvertToTensorVar(a) for a in arguments],
+        Convert(result),
+        [Convert(a) for a in arguments],
     )
 
     from pathlib import Path
@@ -256,8 +255,8 @@ def CompileAndExecuteFunction(
     )
 
     args = [result.shape]
-    for t in arguments:
-        args.extend([t.shape, t.index.mode_indices, t.values])
+    for a in arguments:
+        args.extend([a.shape, a.index.mode_indices, a.values])
 
     output = module.evaluate(*args)
     return tensor.Tensor(
