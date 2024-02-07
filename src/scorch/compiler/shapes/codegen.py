@@ -32,7 +32,7 @@ def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
             if len(tensor.shape) == 0:
                 return cpp.Variable(tensor.name)
             return cpp.Access(
-                cpp.Variable(f"{tensor.name}.data"),
+                cpp.Variable(f"{tensor.name}_values"),
                 LowerIndexExprRec(expr),
             )
         case cin.BinaryOp():
@@ -218,6 +218,18 @@ def PrettyPrint(stmt: cpp.Cpp, indent_level: int = 0) -> str:
             pp += PrettyPrint(block, indent_level + 2)
             pp += "\n"
             pp += indent()
+            pp += "}"
+        case cpp.Function(returntype, name, args, body):
+
+            def x(t, v):
+                return f"{t} {v}"
+
+            pp += indent()
+            pp += f"{returntype} {name}({', '.join(x(t, v) for (t, v) in args)}) "
+            pp += "{"
+            pp += "\n"
+            pp += PrettyPrint(body, indent_level + 2)
+            pp += "\n"
             pp += "}"
         case _:
             pp += indent()

@@ -11,6 +11,26 @@ class CppType:
 
 
 @dataclass
+class Auto(CppType):
+    def __str__(self):
+        return "auto"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
+class Pointer(CppType):
+    parameter: CppType
+
+    def __str__(self):
+        return f"{self.parameter}*"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
 class Int32(CppType):
     def __str__(self):
         return "int32_t"
@@ -37,12 +57,57 @@ class IndexType(CppType):
         return str(self)
 
 
+@dataclass
+class StdVector(CppType):
+    parameter: CppType
+
+    def __str__(self):
+        return f"std::vector<{self.parameter}>"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
+class TorchTensor(CppType):
+    def __str__(self):
+        return "torch::Tensor"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
+class TacoTensor(CppType):
+    def __str__(self):
+        return "Tensor"
+
+    def __repr__(self):
+        return str(self)
+
+
 def TypeFrom(type: torch.dtype) -> CppType:
-    match type:
-        case torch.int32:
-            return Int32()
-        case torch.float32:
-            return Float32()
+    """Converts dtype to CppType."""
+    PYTORCH_DTYPE_TO_CPP_TYPE: dict[torch.dtype, CppType] = {
+        torch.int32: Int32(),
+        torch.float32: Float32(),
+    }
+    assert type in PYTORCH_DTYPE_TO_CPP_TYPE
+    return PYTORCH_DTYPE_TO_CPP_TYPE[type]
+
+
+def PyTorchTypeToString(type: torch.dtype):
+    """Converts dtype to stringified C dtype."""
+    PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE: dict[torch.dtype, str] = {
+        torch.float32: "torch::kFloat32",
+        torch.float64: "torch::kFloat64",
+        torch.int32: "torch::kInt32",
+        torch.int64: "torch::kInt64",
+        torch.int8: "torch::kInt8",
+        torch.uint8: "torch::kUInt8",
+    }
+    assert type in PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE
+    return PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE[type]
 
 
 # ----------------------------------------
@@ -51,6 +116,17 @@ def TypeFrom(type: torch.dtype) -> CppType:
 @dataclass
 class Cpp:
     pass
+
+
+@dataclass
+class Expression(Cpp):
+    value: Cpp
+
+    def __str__(self):
+        return f"{self.value};"
+
+    def __repr__(self):
+        return str(self)
 
 
 @dataclass
@@ -70,6 +146,17 @@ class Variable(Cpp):
 
     def __str__(self):
         return self.name
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
+class Return(Cpp):
+    variable: Variable
+
+    def __str__(self):
+        return f"return {self.variable};"
 
     def __repr__(self):
         return str(self)
@@ -151,6 +238,18 @@ class While(Cpp):
 
 
 @dataclass
+class Declare(Cpp):
+    type: CppType
+    input: Cpp
+
+    def __str__(self):
+        return f"{self.type} {self.input};"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
 class Define(Cpp):
     type: CppType
     lhs: Cpp
@@ -158,6 +257,58 @@ class Define(Cpp):
 
     def __str__(self):
         return f"{self.type} {self.lhs} = {self.rhs};"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
+class FunctionCall(Cpp):
+    name: str
+    args: Sequence[Variable]
+
+    def __str__(self):
+        return f"{self.name}({', '.join(str(a) for a in self.args)})"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
+class Function(Cpp):
+    returntype: CppType
+    name: str
+    args: Sequence[Tuple[CppType, Variable]]
+    body: Cpp
+
+    def __str__(self):
+        def pp(t, v):
+            return f"{t} {v}"
+
+        return f"{self.returntype} {self.name}({', '.join(pp(t, v) for t,v in self.args)}) {{\n{self.body}\n}}"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
+class Cast(Cpp):
+    newtype: CppType
+    argument: Cpp
+
+    def __str__(self):
+        return f"({self.newtype}) {self.argument}"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
+class SizeOf(Cpp):
+    argument: Cpp
+
+    def __str__(self):
+        return f"sizeof({self.argument})"
 
     def __repr__(self):
         return str(self)

@@ -63,7 +63,7 @@ def test_slice():
         while (((jp_B < B.pos[0][1]) && (B.crd[0][jp_B] < 8))) {
             size_t i = ((B.crd[0][jp_B] - 0) / 2);
             A.crd[0][ip_A] = i;
-            A.data[ip_A] = B.data[jp_B];
+            A_values[ip_A] = B_values[jp_B];
             ip_A += 1;
             jp_B += 1;
             while (((jp_B < B.pos[0][1]) && (!(((B.crd[0][jp_B] - 0) % 2) == 0)))) {
@@ -102,7 +102,7 @@ def test_assign_2d_sd():
         while ((j_B < 10)) {
         size_t j = j_B;
         A.crd[0][ip_A] = i;
-        A.data[((ip_A * 10) + j)] = B.data[((ip_B * 10) + j)];
+        A_values[((ip_A * 10) + j)] = B_values[((ip_B * 10) + j)];
         j_B += 1;
         }
         ip_B += 1;
