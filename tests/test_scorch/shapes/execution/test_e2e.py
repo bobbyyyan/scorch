@@ -91,7 +91,9 @@ def test_slice():
 
     stmt: cpp.Cpp = compile.Compile(c)
     a = tensor.Tensor.from_torch(torch.zeros(size=(8,)), name="A")
-    b = tensor.Tensor.from_torch(torch.Tensor([0, 1, 2, 3, 4, 5, 6, 7]), name="B").to_sparse("s")
+    b = tensor.Tensor.from_torch(
+        torch.Tensor([0, 1, 2, 3, 4, 5, 6, 7]), name="B"
+    ).to_sparse("s")
     assert torch.equal(
         compile.CompileAndExecuteFunction(
             stmt=stmt, arguments=[b], result=a
@@ -114,7 +116,9 @@ def test_collapse():
     c: cin.CIN = cin.ForAll(k, A._assignment, cin.Product(Bi, Bj))
     stmt: cpp.Cpp = compile.Compile(c)
     a = tensor.Tensor.from_torch(torch.zeros((6,)), name="A")
-    b = tensor.Tensor.from_torch(torch.Tensor([[1, 2, 3], [4, 5, 6]]), name="B").to_sparse("ds")
+    b = tensor.Tensor.from_torch(
+        torch.Tensor([[1, 2, 3], [4, 5, 6]]), name="B"
+    ).to_sparse("ds")
     assert torch.equal(
         compile.CompileAndExecuteFunction(
             stmt=stmt, arguments=[b], result=a

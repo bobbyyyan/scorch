@@ -7,4 +7,3 @@ from scorch.format import LevelType
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 # TODO(cgyurgyik): Add high-level shape operators.
-# TODO(cgyurgyik): Reuse high-level linear algebra operations from Scorch-original.
