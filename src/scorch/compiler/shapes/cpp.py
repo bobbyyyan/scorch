@@ -69,6 +69,17 @@ class StdVector(CppType):
 
 
 @dataclass
+class ScorchVector(CppType):
+    parameter: CppType
+
+    def __str__(self):
+        return f"cvector<{self.parameter}>"
+
+    def __repr__(self):
+        return str(self)
+
+
+@dataclass
 class TorchTensor(CppType):
     def __str__(self):
         return "torch::Tensor"
@@ -328,8 +339,8 @@ class Op(StrEnum):
     NOT = "!"
     LOGICAL_AND = "&&"
     LOGICAL_OR = "||"
-    MINIMUM = "min"
-    MAXIMUM = "max"
+    MINIMUM = "std::min"
+    MAXIMUM = "std::max"
 
 
 @dataclass
@@ -378,6 +389,12 @@ class BinaryOp(Cpp):
 class Lt(BinaryOp):
     def __init__(self, lhs: Cpp, rhs: Cpp):
         super().__init__(lhs=lhs, rhs=rhs, op=Op.LT)
+
+
+@dataclass
+class Le(BinaryOp):
+    def __init__(self, lhs: Cpp, rhs: Cpp):
+        super().__init__(lhs=lhs, rhs=rhs, op=Op.LE)
 
 
 @dataclass

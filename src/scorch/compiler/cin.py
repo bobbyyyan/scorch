@@ -728,6 +728,16 @@ class TensorAccess(IndexExpr):
         index_var_index = self.indices.index(index_var)
         return self.indices[index_var_index - 1] if index_var_index > 0 else None
 
+    def get_child_index_var(self, index_var: IndexVar) -> Optional[IndexVar]:
+        if index_var not in self.indices:
+            return None
+        index_var_index = self.indices.index(index_var)
+        return (
+            self.indices[index_var_index + 1]
+            if index_var_index + 1 < len(self.indices)
+            else None
+        )
+
     def level_of_index_var(self, index: IndexVar) -> int:
         return self.indices.index(index)
 

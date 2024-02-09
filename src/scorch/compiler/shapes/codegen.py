@@ -63,7 +63,7 @@ def LowerIndexExprRec(expr: cin.IndexExpr) -> cpp.Cpp:
                 fmt: format.LevelType = expr.level_types()[i]
                 match fmt:
                     case format.LevelType.COMPRESSED:
-                        return cpp.Variable(f"{idx.name}p_{name}")
+                        return cpp.Variable(f"p{name}{i}")
                     case format.LevelType.DENSE:
                         return cpp.Add(
                             cpp.Mul(_Lower(expr, i), expr.get_tensor().shape[i]),
@@ -206,11 +206,6 @@ def PrettyPrint(stmt: cpp.Cpp, indent_level: int = 0) -> str:
             pp += indent()
             pp += " else ".join(PpIf(p[0], p[1]) for p in pairs)
         case cpp.While(cond, block):
-            # while (cond) {
-            #   stmt0
-            #   stmt1
-            #   ...
-            # }
             pp += indent()
             pp += f"while ({PpExpr(cond)}) "
             pp += "{"

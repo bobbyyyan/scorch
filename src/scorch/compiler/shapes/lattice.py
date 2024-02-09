@@ -185,6 +185,35 @@ def GetParent(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
     return sexpr.pop()
 
 
+def GetChild(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
+    idx: cin.IndexVar = sexpr.idx
+    tensor: cin.TensorVar = sexpr.tensor
+
+    accesses: List[cin.TensorAccess] = tensor.tensor_accesses()
+    child: Optional[cin.IndexVar] = None
+    for access in accesses:
+        if access.tensor != tensor:
+            continue
+        c: Optional[cin.IndexVar] = access.get_child_index_var(idx)
+        if c is None:
+            continue
+
+        indices: List[cin.IndexVar] = access.get_index_vars()
+        levels: List[format.LevelType] = access.level_types()
+        for i, (idx, level) in enumerate(zip(indices, levels)):
+            if idx != c:
+                continue
+            return cin.IndexSeq(
+                idx=c,
+                tensor=access.tensor,
+                size=access.tensor.shape[i],
+                index=i,
+                format=level,
+            )
+
+    return None
+
+
 def IndexDefined(sexpr: cin.IndexSeq, defs: set[cin.Seq]):
     assert isinstance(sexpr, cin.IndexSeq), sexpr
     parent: Optional[cin.IndexSeq] = GetParent(sexpr)

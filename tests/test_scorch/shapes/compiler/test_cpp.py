@@ -42,33 +42,37 @@ def test_slice():
     A[i] = B[j]
 
     util.assert_equal(
-        codegen.Lower(
-            cfir.Loop(
-                idx=i,
-                sexpr=cin.SliceSeq(
-                    cin.IndexSeq(j, B, size=8, index=0, format=LevelType.COMPRESSED),
-                    start=0,
-                    end=8,
-                    stride=2,
-                ),
-                body=cfir.Assign(A[i], B[j]),
-                locs=[],
+        codegen.PrettyPrint(
+            codegen.Lower(
+                cfir.Loop(
+                    idx=i,
+                    sexpr=cin.SliceSeq(
+                        cin.IndexSeq(
+                            j, B, size=8, index=0, format=LevelType.COMPRESSED
+                        ),
+                        start=0,
+                        end=8,
+                        stride=2,
+                    ),
+                    body=cfir.Assign(A[i], B[j]),
+                    locs=[],
+                )
             )
         ),
         """
-        size_t jp_B = B.pos[0][0];
-        while (((jp_B < B.pos[0][1]) && (!(((B.crd[0][jp_B] - 0) % 2) == 0)))) {
-            jp_B += 1;
+        size_t pB0 = B0_pos[0];
+        while (((pB0 < B0_pos[1]) && (!(((B0_crd[pB0] - 0) % 2) == 0)))) {
+          pB0 += 1;
         }
-        while (((jp_B < B.pos[0][1]) && (B.crd[0][jp_B] < 8))) {
-            size_t i = ((B.crd[0][jp_B] - 0) / 2);
-            A.crd[0][ip_A] = i;
-            A_values[ip_A] = B_values[jp_B];
-            ip_A += 1;
-            jp_B += 1;
-            while (((jp_B < B.pos[0][1]) && (!(((B.crd[0][jp_B] - 0) % 2) == 0)))) {
-                jp_B += 1;
-            }
+        while (((pB0 < B0_pos[1]) && (B0_crd[pB0] < 8))) {
+          size_t i = ((B0_crd[pB0] - 0) / 2);
+          A0_crd[pA0] = i;
+          A_values[pA0] = B_values[pB0];
+          pA0 += 1;
+          pB0 += 1;
+          while (((pB0 < B0_pos[1]) && (!(((B0_crd[pB0] - 0) % 2) == 0)))) {
+            pB0 += 1;
+          }
         }""",
     )
 
@@ -81,30 +85,36 @@ def test_assign_2d_sd():
     A[i, j] = B[i, j]
 
     util.assert_equal(
-        codegen.Lower(
-            cfir.Loop(
-                idx=i,
-                sexpr=cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED),
-                body=cfir.Loop(
-                    idx=j,
-                    sexpr=cin.IndexSeq(j, B, size=10, index=1, format=LevelType.DENSE),
-                    body=cfir.Assign(A[i, j], B[i, j]),
+        codegen.PrettyPrint(
+            codegen.Lower(
+                cfir.Loop(
+                    idx=i,
+                    sexpr=cin.IndexSeq(
+                        i, B, size=8, index=0, format=LevelType.COMPRESSED
+                    ),
+                    body=cfir.Loop(
+                        idx=j,
+                        sexpr=cin.IndexSeq(
+                            j, B, size=10, index=1, format=LevelType.DENSE
+                        ),
+                        body=cfir.Assign(A[i, j], B[i, j]),
+                        locs=[],
+                    ),
                     locs=[],
-                ),
-                locs=[],
+                )
             )
         ),
         """
-        size_t ip_B = B.pos[0][0];
-        while ((ip_B < B.pos[0][1])) {
-          size_t i = B.crd[0][ip_B];
-          size_t j_B = 0;
-          while ((j_B < 10)) {
-            size_t j = j_B;
-            A.crd[0][ip_A] = i;
-            A_values[((ip_A * 10) + j)] = B_values[((ip_B * 10) + j)];
-            j_B += 1;
-          }
-        ip_B += 1;
+        size_t pB0 = B0_pos[0];
+        while ((pB0 < B0_pos[1])) {
+        size_t i = B0_crd[pB0];
+        size_t B1 = 0;
+        while ((B1 < 10)) {
+            size_t j = B1;
+            A0_crd[pA0] = i;
+            A_values[((pA0 * 10) + j)] = B_values[((pB0 * 10) + j)];
+            B1 += 1;
+        }
+        pB0 += 1;
         }""",
     )

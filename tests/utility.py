@@ -15,6 +15,14 @@ def assert_equal(actual: Any, expected: str):
         s = s.replace(" ", "")
         return s
 
-    actual = strip(actual)
-    expected = strip(expected)
-    assert actual == expected, f"\nactual:{actual}\nexpected:{expected}\n"
+    sactual = strip(actual)
+    sexpected = strip(expected)
+
+    # Prepend a newline for readability.
+    if len(actual) > 0 and actual[0] != "\n":
+        actual = f"\n{actual}"
+    if len(expected) > 0 and expected[0] != "\n":
+        expected = f"\n{expected}"
+    assert (
+        sactual == sexpected
+    ), f"(IGNORING WHITESPACE)\nactual:{actual}\nexpected:{expected}\n"

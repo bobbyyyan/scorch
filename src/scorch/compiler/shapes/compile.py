@@ -6,6 +6,18 @@ from scorch.compiler.shapes import cfir, codegen, cpp
 from scorch.format import LevelType
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
+# TODO(cgyurgyik): The `pos`` array needs to be updated using GetChild.
+# child: Optional[cin.Seq] = il.GetChild(sexpr)
+#         if child is not None and sexpr.format == format.LevelType.DENSE and child.format == format.LevelType.COMPRESSED:
+#         name: str = f"{child.tensor.name}{child.index}"
+#         cpp.While(
+#             cond=cpp.Lt(cpp.Variable(f"{name}_pos_index"), cpputil.ArrayIndexVariable(sexpr)),
+#             body=cpp.Assign(
+#                 cpp.Access(cpp.Variable(f"{name}_pos"),
+#                            cpp.Add(cpp.Variable(f"{name}_pos_index"), cpp.Constant(1))),
+#                 cpp.Variable(f"{name}_crd.size()"))
+#         )
+
 
 def GetLevelAndValueArrays(argument: cin.TensorVar) -> Sequence[cpp.Cpp]:
     name: str = argument.get_name()
@@ -21,7 +33,24 @@ def GetLevelAndValueArrays(argument: cin.TensorVar) -> Sequence[cpp.Cpp]:
                     )
                 )
             case LevelType.COMPRESSED:
-                raise NotImplementedError(level_type)
+                stmts.extend(
+                    [
+                        cpp.Define(
+                            cpp.Pointer(cpp.Int32()),
+                            cpp.Variable(f"{name}{i}_pos"),
+                            cpp.Variable(
+                                f"{name}_mode_indices[{i}][0].data_ptr<int>()"
+                            ),
+                        ),
+                        cpp.Define(
+                            cpp.Pointer(cpp.Int32()),
+                            cpp.Variable(f"{name}{i}_crd"),
+                            cpp.Variable(
+                                f"{name}_mode_indices[{i}][1].data_ptr<int>()"
+                            ),
+                        ),
+                    ]
+                )
             case LevelType.COORDINATE | _:
                 raise NotImplementedError(level_type)
     return stmts
@@ -64,7 +93,7 @@ def InitializeResultTensor(result: cin.TensorVar) -> Sequence[cpp.Cpp]:
     else:
         stmts.append(
             cpp.Declare(
-                cpp.StdVector(cpp.TypeFrom(result.dtype)),
+                cpp.ScorchVector(cpp.TypeFrom(result.dtype)),
                 cpp.Variable(f"{name}_values"),
             )
         )
@@ -107,22 +136,37 @@ def DefineFunction(
             case LevelType.COMPRESSED:
                 prologue.append(
                     cpp.Declare(
-                        cpp.StdVector(cpp.Int32()), cpp.Variable(f"{resultname}{i}_pos")
+                        cpp.ScorchVector(cpp.Int32()),
+                        cpp.Variable(f"{resultname}{i}_pos"),
                     )
                 )
                 prologue.append(
                     cpp.Declare(
-                        cpp.StdVector(cpp.Int32()), cpp.Variable(f"{resultname}{i}_crd")
+                        cpp.ScorchVector(cpp.Int32()),
+                        cpp.Variable(f"{resultname}{i}_crd"),
                     )
                 )
                 prologue.append(
                     cpp.Assign(cpp.Variable(f"{resultname}{i}_pos[0]"), cpp.Constant(0))
                 )
-                prologue.append(
-                    cpp.Define(
-                        cpp.Int32(), cpp.Variable(f"p{resultname}{i}"), cpp.Constant(0)
+                # Initialize the pos array to all zeroes from the 2nd element to the last element.
+                if i > 0 and result.get_level_types()[i - 1] == LevelType.DENSE:
+                    it = cpp.Variable(f"z{resultname}{i}")
+                    prologue.append(cpp.Define(cpp.Int32(), it, cpp.Constant(1)))
+                    prologue.append(
+                        cpp.While(
+                            cond=cpp.Le(it, cpp.Variable(f"{resultname}{i - 1}_size")),
+                            body=cpp.Block(
+                                stmts=[
+                                    cpp.Assign(
+                                        cpp.Variable(f"{resultname}{i}_pos[{it}]"),
+                                        cpp.Constant(0),
+                                    ),
+                                    cpp.IncAssign(it, cpp.Constant(1)),
+                                ]
+                            ),
+                        )
                     )
-                )
                 prologue.append(
                     cpp.Define(
                         cpp.Int32(),
@@ -130,8 +174,11 @@ def DefineFunction(
                         cpp.Constant(0),
                     )
                 )
-                raise NotImplementedError(f"prologue for {level_type} format")
-                # See: https://github.com/bobbyyyan/scorch/blob/56c27071644acb5cc4cd0c0f5486c713d6cbf06e/src/scorch/compiler/cin_lowerer.py#L1173
+                prologue.append(
+                    cpp.Define(
+                        cpp.Int32(), cpp.Variable(f"p{resultname}{i}"), cpp.Constant(0)
+                    )
+                )
             case LevelType.COORDINATE | _:
                 raise NotImplementedError(level_type)
     for argument in arguments:
@@ -178,7 +225,58 @@ def DefineFunction(
             )
         )
     else:
-        raise NotImplementedError("sparse result initialization")
+        epilogue.append(
+            cpp.Define(
+                cpp.TorchTensor(),
+                cpp.Variable(f"{resultname}_tensor_torch"),
+                cpp.FunctionCall(
+                    name="torch::from_blob",
+                    args=[
+                        cpp.Variable(f"{resultname}_values.data()"),
+                        cpp.Variable(f"{{{resultname}_values.size()}}"),
+                        cpp.Variable(f"{resultname}_values.get_deleter()"),
+                        cpp.Variable(cpp.PyTorchTypeToString(result.dtype)),
+                    ],
+                ),
+            )
+        )
+        for i, level_type in enumerate(result.get_level_types()):
+            match level_type:
+                case LevelType.COMPRESSED:
+                    epilogue.append(
+                        cpp.Define(
+                            cpp.TorchTensor(),
+                            cpp.Variable(f"{resultname}{i}_pos_torch"),
+                            cpp.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    cpp.Variable(f"{resultname}{i}_pos.data()"),
+                                    cpp.Variable(f"{{{resultname}{i}_pos.size()}}"),
+                                    cpp.Variable(f"{resultname}{i}_pos.get_deleter()"),
+                                    cpp.Variable(cpp.PyTorchTypeToString(torch.int32)),
+                                ],
+                            ),
+                        )
+                    )
+                    epilogue.append(
+                        cpp.Define(
+                            cpp.TorchTensor(),
+                            cpp.Variable(f"{resultname}{i}_crd_torch"),
+                            cpp.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    cpp.Variable(f"{resultname}{i}_crd.data()"),
+                                    cpp.Variable(f"{{{resultname}{i}_crd.size()}}"),
+                                    cpp.Variable(f"{resultname}{i}_crd.get_deleter()"),
+                                    cpp.Variable(cpp.PyTorchTypeToString(torch.int32)),
+                                ],
+                            ),
+                        )
+                    )
+                case LevelType.DENSE:
+                    pass
+                case _:
+                    raise NotImplementedError(level_type)
 
     def mode_index_set(level: int, level_type: LevelType) -> str:
         name = f"{resultname}{level}"
@@ -238,6 +336,8 @@ def CompileAndExecuteFunction(
         Convert(result),
         [Convert(a) for a in arguments],
     )
+    # TODO(cgyurgyik): Remove.
+    print(codegen.PrettyPrint(fn))
 
     from pathlib import Path
 

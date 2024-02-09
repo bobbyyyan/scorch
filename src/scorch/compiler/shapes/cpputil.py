@@ -7,20 +7,20 @@ from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 # Utility functions used in the CFIR -> CIN lowering phase.
 
 
-@dispatch(cin.IndexVar, cin.TensorVar, format.LevelType)
-def ArrayIndexVariable(idx: cin.IndexVar, tensor: cin.TensorVar, fmt: format.LevelType):
+@dispatch(int, cin.TensorVar, format.LevelType)
+def ArrayIndexVariable(index: int, tensor: cin.TensorVar, fmt: format.LevelType):
     match fmt:
         case format.LevelType.DENSE:
-            return cpp.Variable(f"{idx}_{tensor.name}")
+            return cpp.Variable(f"{tensor.name}{index}")
         case format.LevelType.COMPRESSED:
-            return cpp.Variable(f"{idx}p_{tensor.name}")
+            return cpp.Variable(f"p{tensor.name}{index}")
         case _:
             raise NotImplementedError(fmt)
 
 
 @dispatch(cin.IndexSeq)
 def ArrayIndexVariable(seq: cin.IndexSeq):
-    return ArrayIndexVariable(seq.idx, seq.tensor, seq.format)
+    return ArrayIndexVariable(seq.index, seq.tensor, seq.format)
 
 
 def UniverseIndexVariable(idx: cin.IndexExpr):
@@ -34,10 +34,8 @@ def ArrayLowerBound(seq: cin.IndexSeq):
         case format.LevelType.COMPRESSED:
             i: int = seq.index
             return cpp.Access(
-                cpp.Access(cpp.Variable(f"{seq.tensor.name}.pos"), i),
-                cpp.Constant(0)
-                if i == 0
-                else ArrayIndexVariable(il.GetParent(seq).idx, seq.tensor, seq.format),
+                cpp.Variable(f"{seq.tensor.name}{i}_pos"),
+                cpp.Constant(0) if i == 0 else ArrayIndexVariable(il.GetParent(seq)),
             )
         case _:
             raise NotImplementedError(fmt)
@@ -50,11 +48,11 @@ def ArrayUpperBound(seq: cin.IndexSeq):
         case format.LevelType.COMPRESSED:
             i = seq.index
             return cpp.Access(
-                cpp.Access(cpp.Variable(f"{seq.tensor.name}.pos"), cpp.Constant(i)),
+                cpp.Variable(f"{seq.tensor.name}{seq.index}_pos"),
                 cpp.Constant(1)
                 if i == 0
                 else cpp.Add(
-                    ArrayIndexVariable(il.GetParent(seq).idx, seq.tensor, seq.format),
+                    ArrayIndexVariable(il.GetParent(seq)),
                     cpp.Constant(1),
                 ),
             )
@@ -69,11 +67,11 @@ def ArrayAccessCrd(seq: cin.IndexSeq):
             return ArrayIndexVariable(seq)
         case format.LevelType.COMPRESSED:
             return cpp.Access(
-                cpp.Access(
-                    cpp.Variable(f"{seq.tensor.name}.crd"), cpp.Constant(seq.index)
-                ),
+                cpp.Variable(f"{seq.tensor.name}{seq.index}_crd"),
                 ArrayIndexVariable(seq),
             )
+        case _:
+            raise NotImplementedError(fmt)
 
 
 @dispatch(cin.TensorVar, cin.IndexVar, int, format.LevelType)
@@ -82,11 +80,11 @@ def ArrayAccessCrd(
 ):
     match fmt:
         case format.LevelType.DENSE:
-            return ArrayIndexVariable(idx, tensor, fmt)
+            return ArrayIndexVariable(index, tensor, fmt)
         case format.LevelType.COMPRESSED:
             return cpp.Access(
-                cpp.Access(cpp.Variable(f"{tensor.name}.crd"), cpp.Constant(index)),
-                ArrayIndexVariable(idx, tensor, fmt),
+                cpp.Variable(f"{tensor.name}{index}_crd"),
+                ArrayIndexVariable(index, tensor, fmt),
             )
 
 
@@ -97,7 +95,7 @@ def UpdateCompressedIterators(access: cin.TensorAccess) -> Optional[cpp.Cpp]:
         return None
     indices: List[cin.IndexVar] = access.get_index_vars()
     return cpp.IncAssign(
-        ArrayIndexVariable(indices[-1], access.tensor, types[-1]), cpp.Constant(1)
+        ArrayIndexVariable(len(indices) - 1, access.tensor, types[-1]), cpp.Constant(1)
     )
 
 
