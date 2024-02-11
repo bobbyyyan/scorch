@@ -43,6 +43,16 @@ def Init(sexpr: cin.Seq):
                     ),
                 ]
             )
+        case cin.ProjectSeq(a, k, I, J):
+            return (
+                Init(a)
+                if k == 0
+                else cpp.Define(
+                    cpp.IndexType(),
+                    cpputil.ProjectionVariable(k),
+                    Eval(cin.ProjectSeq(a, 0, I, J)),
+                )
+            )
         case cin.SliceSeq(a, s, _, r):
             return cpp.Block(
                 [
@@ -113,6 +123,14 @@ def Reset(sexpr: cin.Seq):
                     ),
                 ]
             )
+        case cin.ProjectSeq(a, k, I, J):
+            return (
+                Reset(a)
+                if k == 0
+                else cpp.Assign(
+                    cpputil.ProjectionVariable(k), cin.ProjectSeq(a, 0, I, J)
+                )
+            )
         case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case cin.SliceSeq(a, s, e, r):
@@ -136,6 +154,14 @@ def Valid(sexpr: cin.Seq):
             return cpp.And(Valid(s1), Valid(s2))
         case cin.SliceSeq(a, _, e, r):
             return cpp.And(Valid(a), cpp.Lt(Eval(a), cpp.Constant(e)))
+        case cin.ProjectSeq(a, k, I, J):
+            return (
+                Valid(a)
+                if k == 0
+                else cpp.Eq(
+                    cpputil.ProjectionVariable(k), Eval(cin.ProjectSeq(a, 0, I, J))
+                )
+            )
         case _:
             raise NotImplementedError(type(sexpr))
 
@@ -153,6 +179,9 @@ def Eval(sexpr: cin.Seq):
         case cin.ProductSeq(s1, s2):
             # a * |b| + b
             return cpp.Add(cpp.Mul(Eval(s1), il.Size(s2)), Eval(s2))
+        case cin.ProjectSeq(a, k, I, J):
+            a = Eval(a)
+            return cpp.Div(a, J) if k == 0 else cpp.Mod(a, J)
         case cin.SliceSeq(a, s, _, r):
             return cpp.Div(cpp.Sub(Eval(a), cpp.Constant(s)), cpp.Constant(r))
         case _:
@@ -193,6 +222,8 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
                     )
                 ]
             )
+        case cin.ProjectSeq(a, k, I, J):
+            raise NotImplementedError(type(sexpr))
         case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case cin.SliceSeq(a, s, e, r):
@@ -245,6 +276,17 @@ def UnconditionalNext(sexpr: cin.Seq):
                     ),
                 ]
             )
+        case cin.ProjectSeq(a, k, I, J):
+            return (
+                cpp.While(
+                    cond=cpp.And(
+                        Valid(a), cpp.Eq(cpputil.ProjectionVariable(1), Eval(sexpr))
+                    ),
+                    body=UnconditionalNext(a),
+                )
+                if k == 0
+                else UnconditionalNext(a)
+            )
         case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case _:
@@ -264,6 +306,8 @@ def Equals(value: cpp.Cpp, sexpr: cin.Seq):
                 Equals(cpp.Div(value, il.Size(s2)), s1),
                 Equals(cpp.Mod(value, il.Size(s2)), s2),
             )
+        case cin.ProjectSeq(a, k, I, J):
+            raise NotImplementedError(type(sexpr))
         case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case cin.SliceSeq(a, s, e, r):

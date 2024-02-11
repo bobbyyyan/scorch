@@ -1189,14 +1189,12 @@ class IndexSeq(Seq):
         size: int,
         index: int,
         format: Optional[LevelType],
-        # parent: Optional[IndexSeq] = None,
     ):
         self.idx = idx
         self.tensor = tensor
         self.size = size
         self.index = index
         self.format = format
-        # self.parent = parent
 
     def __str__(self):
         return f"{self.tensor}[{self.idx}]"
@@ -1215,21 +1213,17 @@ class IndexSeq(Seq):
             self.tensor,
             self.size,
             self.index,
-            # self.parent,
             self.format,
         ) == (
             other.idx,
             other.tensor,
             other.size,
             other.index,
-            # other.parent,
             other.format,
         )
 
     def __hash__(self):
-        return hash(
-            (self.format, self.idx, self.size, self.tensor, self.index)  # self.parent)
-        )
+        return hash((self.format, self.idx, self.size, self.tensor, self.index))
 
 
 @dataclass
@@ -1499,7 +1493,7 @@ class EmptySeq(Seq):
 
 
 def LessThanSeq(a: Seq, b: Seq):
-    """Less than operation defined on sequences to avoid 
+    """Less than operation defined on sequences to avoid
     nondeterminism for iteration over unordered data structures."""
 
     def GetIndexSequence(x: Seq):

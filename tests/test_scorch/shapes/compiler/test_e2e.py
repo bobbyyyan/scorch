@@ -496,6 +496,42 @@ def test_collapse():
     )
 
 
+def test_project():
+    A = cin.TensorVar("A", fmt=["s", "s"], shape=[8, 8])
+    b = cin.TensorVar("b", fmt=["s"], shape=[64])
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+    k = cin.IndexVar("k")
+
+    kb = cin.IndexSeq(k, b, size=64, index=0, format=LevelType.COMPRESSED)
+    proj0 = cin.ProjectSeq(kb, k=0, I=i, J=j)
+    proj1 = cin.ProjectSeq(kb, k=1, I=i, J=j)
+    A[i, j] = b[k]
+
+    util.assert_equal(
+        compile.CompileAndPrint(
+            cin.ForAll(i, cin.ForAll(j, A._assignment, proj1), proj0)
+        ),
+        """
+        size_t pb0 = b0_pos[0];        
+        while ((pb0 < b0_pos[1])) {
+          size_t i = (b0_crd[pb0] / j);
+          size_t proj_1 = (b0_crd[pb0] / j);
+          while ((proj_1 == (b0_crd[pb0] / j))) {
+            size_t j = (b0_crd[pb0] % j);
+            A0_crd[pA0] = i;
+            A1_crd[pA1] = j;
+            A_values[pA1] = b_values[pb0];
+            pA1 += 1;
+            pb0 += 1;
+          }
+          while (((pb0 < b0_pos[1]) && (proj_1 == (b0_crd[pb0] / j)))) {
+            pb0 += 1;
+          }
+        }""",
+    )
+
+
 def test_scalar_workspace_dd():
     i = cin.IndexVar("i")
     j = cin.IndexVar("j")

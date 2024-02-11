@@ -27,6 +27,10 @@ def UniverseIndexVariable(idx: cin.IndexExpr):
     return cpp.Variable(f"U_{idx}")
 
 
+def ProjectionVariable(k: int):
+    return cpp.Variable(f"proj_{k}")
+
+
 def ArrayLowerBound(seq: cin.IndexSeq):
     match fmt := seq.format:
         case format.LevelType.DENSE:

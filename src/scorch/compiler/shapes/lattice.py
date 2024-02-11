@@ -54,7 +54,7 @@ def 𝜒(sexpr: cin.Seq) -> set[cin.Seq]:
             return {sexpr}
         case cin.FullSeq() | cin.EmptySeq():
             return {}
-        case cin.SliceSeq(a):
+        case cin.SliceSeq(a) | cin.ProjectSeq(a):
             return 𝜒(a) | {sexpr}
         case cin.ConcatenateSeq(s1, _) | cin.ProductSeq(s1, _):
             return 𝜒(s1)
@@ -97,6 +97,9 @@ def Size(sexpr: cin.Seq) -> int:
             return Size(s1) * Size(s2)
         case cin.ConcatenateSeq(s1, s2):
             return Size(s1) + Size(s2)
+        case cin.ProjectSeq(_, k, I, J):
+            assert k in (0, 1)
+            return I if k == 0 else J
         case _:
             return NotImplementedError(type(sexpr))
 
@@ -105,17 +108,13 @@ def IsDense(sexpr: cin.Seq) -> bool:
     match sexpr:
         case cin.IndexSeq(_, _, _, _, fmt):
             return fmt == format.LevelType.DENSE
-            # accesses: List[cin.TensorAccess] = var.tensor_accesses()
-            # # These should all share the same format.
-            # (type,) = set(a.level_type_of_index_var(idx) for a in accesses)
-            # return type == format.LevelType.DENSE
         case cin.Universe():
             return True
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return IsDense(s1) and IsDense(s2)
         case cin.ProductSeq(s1, s2) | cin.ConcatenateSeq(s1, s2):
             return IsDense(s1) and IsDense(s2)
-        case cin.SliceSeq(a):
+        case cin.SliceSeq(a) | cin.ProjectSeq(a):
             return IsDense(a)
         case _:
             raise NotImplementedError(type(sexpr))
@@ -138,6 +137,8 @@ def Remove(sexpr: cin.Seq, sub: cin.Seq) -> cin.Seq:
             return cin.UnionSeq(Remove(s1, sub), Remove(s2, sub))
         case cin.IntersectionSeq(s1, s2):
             return cin.IntersectionSeq(Remove(s1, sub), Remove(s2, sub))
+        case cin.ProjectSeq(a, k, I, J):
+            return cin.ProjectSeq(Remove(a, sub), k, I, J)
         case _:
             raise NotImplementedError(type(sexpr))
 
@@ -237,16 +238,15 @@ def IndicesDefined(expr: cin.TensorAccess, defs: set[cin.Seq]) -> bool:
     return result
 
 
-@dispatch(cin.IndexExpr, set)
-def Simplify(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
+def SimplifyExpr(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
     match e:
         case cin.Workspace():
             return e
         case cin.TensorAccess():
             return e if IndicesDefined(e, defs) else None
         case cin.BinaryOp():
-            x: Optional[cin.IndexExpr] = Simplify(e.left, defs)
-            y: Optional[cin.IndexExpr] = Simplify(e.right, defs)
+            x: Optional[cin.IndexExpr] = SimplifyExpr(e.left, defs)
+            y: Optional[cin.IndexExpr] = SimplifyExpr(e.right, defs)
             match op := e.op:
                 case cin.Operation.ADD:
                     if x is None:
@@ -267,33 +267,31 @@ def Simplify(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
             raise NotImplementedError(type(e))
 
 
-@dispatch(cin.IndexStmt, set)
-def Simplify(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
+def SimplifyStmt(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
     match c:
         case cin.ForAll():
-            sexpr: cin.Seq = Simplify(c.seq, defs)
+            sexpr: cin.Seq = c.seq  # SimplifySeq(c.seq, defs)``
             assert not isinstance(sexpr, cin.EmptySeq | cin.FullSeq), f"{c}\n{defs}"
             return cin.ForAll(
                 index_var=c.index_var,
-                stmt=Simplify(c.stmt, defs | Iters(sexpr)),
+                stmt=SimplifyStmt(c.stmt, defs | Iters(sexpr)),
                 seq=sexpr,
             )
         case cin.TensorAssign():
-            rhs = Simplify(c.rhs, defs)
+            rhs = SimplifyExpr(c.rhs, defs)
             assert rhs is not None, f"{c}, {defs}"
             return cin.TensorAssign(lhs=c.lhs, rhs=rhs, op=c.op)
         case cin.Where():
             return cin.Where(
-                producer=Simplify(c.producer, defs),
-                consumer=Simplify(c.consumer, defs),
+                producer=SimplifyStmt(c.producer, defs),
+                consumer=SimplifyStmt(c.consumer, defs),
                 workspace=c.workspace,
             )
         case _:
             raise NotImplementedError(type(c))
 
 
-@dispatch(cin.Seq, set)
-def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
+def SimplifySeq(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
     match sexpr:
         case cin.IndexSeq(_, _, sz, _, fmt):
             return (
@@ -310,7 +308,7 @@ def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
         case cin.FullSeq(_) | cin.EmptySeq(_):
             return sexpr
         case cin.SliceSeq(a, s, e, r):
-            match x := Simplify(a, defs):
+            match x := SimplifySeq(a, defs):
                 case cin.FullSeq(_):
                     return cin.FullSeq(Size(sexpr))
                 case cin.EmptySeq(_):
@@ -318,26 +316,41 @@ def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
                 case _:
                     return cin.SliceSeq(x, s, e, r)
         case cin.ConcatenateSeq(s1, s2):
-            x, y = Simplify(s1, defs), Simplify(s2, defs)
+            x, y = SimplifySeq(s1, defs), SimplifySeq(s2, defs)
             if isinstance(x, cin.FullSeq | cin.EmptySeq):
                 raise NotImplementedError(sexpr)  # Offset
             if isinstance(y, cin.FullSeq | cin.EmptySeq):
                 raise NotImplementedError(sexpr)  # Pad
             return cin.ConcatenateSeq(x, y)
         case cin.ProductSeq(s1, s2):
-            x = Simplify(s1, defs)
+            x = SimplifySeq(s1, defs)
             if isinstance(x, cin.FullSeq) and IsDense(s2):
                 return cin.FullSeq(Size(s1) * Size(s2))
             if isinstance(x, cin.FullSeq | cin.EmptySeq):
                 return cin.EmptySeq(Size(s1) * Size(s2))
             newdefs = defs | Iters(x)
-            y = Simplify(s2, newdefs)
+            y = SimplifySeq(s2, newdefs)
             if isinstance(y, cin.FullSeq | cin.EmptySeq):
                 raise ValueError(f"unexpected simplification: {sexpr} -> {x} × {y}")
             return cin.ProductSeq(x, y)
+        case cin.ProjectSeq(a, k, I, J):
+            x = SimplifySeq(a, defs)
+            match x:
+                case cin.FullSeq(_):
+                    return cin.FullSeq(Size(sexpr))
+                case cin.EmptySeq(_):
+                    return cin.EmptySeq(Size(sexpr))
+                case _:
+                    if k == 0 or (k - 1, x) in defs:
+                        return cin.ProjectSeq(x, k, I, J)
+                    return (
+                        cin.FullSeq(Size(sexpr))
+                        if IsDense(sexpr)
+                        else cin.EmptySeq(Size(sexpr))
+                    )
         case cin.UnionSeq(s1, s2):
-            x: cin.Seq = Simplify(s1, defs)
-            y: cin.Seq = Simplify(s2, defs)
+            x: cin.Seq = SimplifySeq(s1, defs)
+            y: cin.Seq = SimplifySeq(s2, defs)
             match (x, y):
                 case (cin.FullSeq(), _):
                     return x
@@ -352,8 +365,8 @@ def Simplify(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
                 case _:
                     return cin.UnionSeq(x, y)
         case cin.IntersectionSeq(s1, s2):
-            x: cin.Seq = Simplify(s1, defs)
-            y: cin.Seq = Simplify(s2, defs)
+            x: cin.Seq = SimplifySeq(s1, defs)
+            y: cin.Seq = SimplifySeq(s2, defs)
             match (x, y):
                 case (cin.FullSeq(), _):
                     return x
@@ -381,7 +394,7 @@ def Contains(sexpr: cin.Seq, subpoint: cin.Seq):
             return Contains(s1, subpoint) or Contains(s2, subpoint)
         case cin.ConcatenateSeq(s1, s2) | cin.ProductSeq(s1, s2):
             return Contains(s1, subpoint) or Contains(s2, subpoint)
-        case cin.SliceSeq(a, _, _, _):
+        case cin.SliceSeq(a) | cin.ProjectSeq(a):
             return Contains(a, subpoint)
         case _:
             raise NotImplementedError(type(sexpr))
@@ -395,7 +408,7 @@ def ContainsIntersection(sexpr: cin.Seq):
             return ContainsIntersection(s1) or ContainsIntersection(s2)
         case cin.IntersectionSeq(s1, s2):
             return True
-        case cin.SliceSeq(a, _, _, _):
+        case cin.SliceSeq(a) | cin.ProjectSeq(a):
             return ContainsIntersection(a)
         case _:
             raise NotImplementedError(type(sexpr))
@@ -410,7 +423,7 @@ def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = s
     pairs: list[Tuple[cin.Seq, cin.Seq]] = []
     for e in edges:
         r: cin.Seq = Remove(sexpr, e)
-        s: cin.Seq = Simplify(r, defs)
+        s: cin.Seq = SimplifySeq(r, defs)
         graph |= ConstructGraph(s, defs, visited)
         pairs.append((e, s))
     graph[sexpr] = {(e, s) for e, s in pairs}
@@ -433,6 +446,10 @@ def Iters(sexpr: cin.Seq):
             return Iters(s1) | Iters(s2)
         case cin.ConcatenateSeq(s1, s2) | cin.ProductSeq(s1, s2):
             return Iters(s1) | Iters(s2)
+        case cin.ProjectSeq(a, k):
+            s = set()
+            s.add((k, a))
+            return s if k == 0 else Iters(a) | s
         case _:
             raise NotImplementedError(type(sexpr))
 

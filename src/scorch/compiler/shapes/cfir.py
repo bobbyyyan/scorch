@@ -111,7 +111,9 @@ def BuildLoop(
 
     def Build(child: cin.Seq):
         newdefs: set[cin.Seq] = defs | il.Iters(child) | locdefs
-        return SwitchCase(sexpr=child, stmt=Lower(il.Simplify(body, newdefs), newdefs))
+        return SwitchCase(
+            sexpr=child, stmt=Lower(il.SimplifyStmt(body, newdefs), newdefs)
+        )
 
     bodies = list(map(Build, sorted(il.Subpoints(lattice, point))))
 
@@ -195,6 +197,9 @@ def FindLocators(sexpr: cin.Seq) -> Tuple[cin.Seq, list[Tuple[cin.Seq, ...]]]:
             aexpr, alocs = FindLocators(s1)
             bexpr, blocs = FindLocators(s2)
             return [cin.ProductSeq(aexpr, bexpr), alocs + blocs]
+        case cin.ProjectSeq(a, k, I, J):
+            aexpr, alocs = FindLocators(a)
+            return [cin.ProjectSeq(aexpr, k, I, J), alocs]
         case _:
             raise NotImplementedError(str(sexpr))
 

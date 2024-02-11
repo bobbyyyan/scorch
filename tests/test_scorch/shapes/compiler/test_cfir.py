@@ -124,6 +124,28 @@ def test_slice():
     )
 
 
+def test_project():
+    A = cin.TensorVar("A", fmt=["s", "s"], shape=[8, 8])
+    b = cin.TensorVar("b", fmt=["s"], shape=[64])
+    i = cin.IndexVar("i")
+    j = cin.IndexVar("j")
+    k = cin.IndexVar("k")
+
+    kb = cin.IndexSeq(k, b, size=64, index=0, format=LevelType.COMPRESSED)
+    proj0 = cin.ProjectSeq(kb, k=0, I=i, J=j)
+    proj1 = cin.ProjectSeq(kb, k=1, I=i, J=j)
+    A[i, j] = b[k]
+
+    util.assert_equal(
+        cfir.PrettyPrint(
+            cfir.Lower(cin.ForAll(i, cin.ForAll(j, A._assignment, proj1), proj0))
+        ),
+        """while i <-- 𝜋0(b:s[k],[i, j]) 
+             while j <-- 𝜋1(b:s[k],[i, j]) 
+               A:s,s[i, j] = b:s[k]""",
+    )
+
+
 def test_collapse():
     A = cin.TensorVar("A", fmt=["d", "s"], shape=[8, 8])
     b = cin.TensorVar("b", fmt=["s"], shape=[8])
