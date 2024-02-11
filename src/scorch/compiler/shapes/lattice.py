@@ -447,9 +447,7 @@ def Iters(sexpr: cin.Seq):
         case cin.ConcatenateSeq(s1, s2) | cin.ProductSeq(s1, s2):
             return Iters(s1) | Iters(s2)
         case cin.ProjectSeq(a, k):
-            s = set()
-            s.add((k, a))
-            return s if k == 0 else Iters(a) | s
+            return {(k, a)} if k == 0 else Iters(a) | {(k, a)}
         case _:
             raise NotImplementedError(type(sexpr))
 
