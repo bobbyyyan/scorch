@@ -451,7 +451,7 @@ def test_collapse():
 
     util.assert_equal(
         compile.CompileAndPrint(
-            cin.ForAll(k, c._assignment, cin.UnionSeq(cin.Product(Ai, Aj), bk))
+            cin.ForAll(k, c._assignment, cin.UnionSeq(cin.ProductSeq(Ai, Aj), bk))
         ),
         """
     size_t A0 = 0;

@@ -1300,7 +1300,7 @@ class SliceSeq(Seq):
 
 
 @dataclass
-class Product(Seq):
+class ProductSeq(Seq):
     """The product of `s1` and `s2`, e.g., a[i] × b[i]"""
 
     s1: Seq
@@ -1320,7 +1320,7 @@ class Product(Seq):
         return hash((self.s1, self.s2))
 
     def __eq__(self, other):
-        if not isinstance(other, SliceSeq):
+        if not isinstance(other, ProductSeq):
             return False
         return (self.s1, self.s2) == (other.s1, other.s2)
 
@@ -1329,7 +1329,40 @@ class Product(Seq):
 
 
 @dataclass
-class Concatenate(Seq):
+class ProjectSeq(Seq):
+    """The projection of A onto I, J, e.g., 𝜋𝑘(A, (I, J))"""
+
+    s: Seq
+    k: int
+    I: IndexVar
+    J: IndexVar
+
+    def __init__(self, s: Seq, k: int, I: IndexVar, J: IndexVar):
+        self.s = s
+        self.k = k
+        self.I = I
+        self.J = J
+
+    def __str__(self):
+        return f"𝜋{self.k}({self.s},[{self.I}, {self.J}])"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __hash__(self):
+        return hash((self.s, self.k, self.I, self.J))
+
+    def __eq__(self, other):
+        if not isinstance(other, ProjectSeq):
+            return False
+        return (self.s, self.k, self.I, self.J) == (other.s, other.k, other.I, other.J)
+
+    def __lt__(self, other):
+        return LessThanSeq(self, other)
+
+
+@dataclass
+class ConcatenateSeq(Seq):
     """The concatenation of `s1` and `s2`, e.g., a[i] ⊔ b[i]"""
 
     s1: Seq
@@ -1349,7 +1382,7 @@ class Concatenate(Seq):
         return hash((self.s1, self.s2))
 
     def __eq__(self, other):
-        if not isinstance(other, SliceSeq):
+        if not isinstance(other, ConcatenateSeq):
             return False
         return (self.s1, self.s2) == (other.s1, other.s2)
 
@@ -1466,7 +1499,8 @@ class EmptySeq(Seq):
 
 
 def LessThanSeq(a: Seq, b: Seq):
-    """Less than operation defines on sequences to avoid nondeterminism."""
+    """Less than operation defined on sequences to avoid 
+    nondeterminism for iteration over unordered data structures."""
 
     def GetIndexSequence(x: Seq):
         match x:
@@ -1476,8 +1510,10 @@ def LessThanSeq(a: Seq, b: Seq):
                 return (idx, size)
             case UnionSeq(s1, _) | IntersectionSeq(s1, _):
                 return GetIndexSequence(s1)
-            case Concatenate(s1, _) | Product(s1, _):
+            case ConcatenateSeq(s1, _) | ProductSeq(s1, _):
                 return GetIndexSequence(s1)
+            case ProjectSeq(s):
+                return GetIndexSequence(s)
             case SliceSeq(a):
                 return GetIndexSequence(a)
             case _:

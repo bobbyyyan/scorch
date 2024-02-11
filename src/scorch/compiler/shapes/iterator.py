@@ -25,9 +25,9 @@ def Init(sexpr: cin.Seq):
             )
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[Init(s1), Init(s2)])
-        case cin.Concatenate(s1, s2):
+        case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(sexpr)
-        case cin.Product(s1, s2):
+        case cin.ProductSeq(s1, s2):
             return cpp.Block(
                 stmts=[
                     Init(s1),
@@ -97,7 +97,7 @@ def Reset(sexpr: cin.Seq):
             )
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[Reset(s1), Reset(s2)])
-        case cin.Product(s1, s2):
+        case cin.ProductSeq(s1, s2):
             return cpp.Block(
                 stmts=[
                     Reset(s1),
@@ -113,7 +113,7 @@ def Reset(sexpr: cin.Seq):
                     ),
                 ]
             )
-        case cin.Concatenate(s1, s2):
+        case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case cin.SliceSeq(a, s, e, r):
             raise NotImplementedError(type(sexpr))
@@ -132,7 +132,7 @@ def Valid(sexpr: cin.Seq):
             return cpp.Lt(cpputil.UniverseIndexVariable(idx), cpp.Constant(size))
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.And(Valid(s1), Valid(s2))
-        case cin.Concatenate(s1, s2) | cin.Product(s1, s2):
+        case cin.ConcatenateSeq(s1, s2) | cin.ProductSeq(s1, s2):
             return cpp.And(Valid(s1), Valid(s2))
         case cin.SliceSeq(a, _, e, r):
             return cpp.And(Valid(a), cpp.Lt(Eval(a), cpp.Constant(e)))
@@ -148,9 +148,9 @@ def Eval(sexpr: cin.Seq):
             return cpputil.UniverseIndexVariable(idx)
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Min(Eval(s1), Eval(s2))
-        case cin.Concatenate(s1, s2):
+        case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
-        case cin.Product(s1, s2):
+        case cin.ProductSeq(s1, s2):
             # a * |b| + b
             return cpp.Add(cpp.Mul(Eval(s1), il.Size(s2)), Eval(s2))
         case cin.SliceSeq(a, s, _, r):
@@ -171,7 +171,7 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
             )
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[Next(value, s1), Next(value, s2)])
-        case cin.Product(s1, s2):
+        case cin.ProductSeq(s1, s2):
             return cpp.IfBlock(
                 pairs=[
                     (
@@ -193,7 +193,7 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
                     )
                 ]
             )
-        case cin.Concatenate(s1, s2):
+        case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case cin.SliceSeq(a, s, e, r):
             raise NotImplementedError(type(sexpr))
@@ -230,7 +230,7 @@ def UnconditionalNext(sexpr: cin.Seq):
                     ),
                 ]
             )
-        case cin.Product(s1, s2):
+        case cin.ProductSeq(s1, s2):
             return cpp.Block(
                 stmts=[
                     UnconditionalNext(s2),
@@ -245,7 +245,7 @@ def UnconditionalNext(sexpr: cin.Seq):
                     ),
                 ]
             )
-        case cin.Concatenate(s1, s2):
+        case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case _:
             raise NotImplementedError(type(sexpr))
@@ -259,12 +259,12 @@ def Equals(value: cpp.Cpp, sexpr: cin.Seq):
             return cpp.Eq(value, cpputil.UniverseIndexVariable(idx))
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.And(Equals(value, s1), Equals(value, s2))
-        case cin.Product(s1, s2):
+        case cin.ProductSeq(s1, s2):
             return cpp.And(
                 Equals(cpp.Div(value, il.Size(s2)), s1),
                 Equals(cpp.Mod(value, il.Size(s2)), s2),
             )
-        case cin.Concatenate(s1, s2):
+        case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case cin.SliceSeq(a, s, e, r):
             raise NotImplementedError(type(sexpr))

@@ -113,7 +113,7 @@ def test_collapse():
     Bi = cin.IndexSeq(i, B, size=2, index=0, format=LevelType.DENSE)
     Bj = cin.IndexSeq(j, B, size=3, index=1, format=LevelType.COMPRESSED)
 
-    c: cin.CIN = cin.ForAll(k, A._assignment, cin.Product(Bi, Bj))
+    c: cin.CIN = cin.ForAll(k, A._assignment, cin.ProductSeq(Bi, Bj))
     stmt: cpp.Cpp = compile.Compile(c)
     a = tensor.Tensor.from_torch(torch.zeros((6,)), name="A")
     b = tensor.Tensor.from_torch(

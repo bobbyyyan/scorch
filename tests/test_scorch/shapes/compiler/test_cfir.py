@@ -140,7 +140,7 @@ def test_collapse():
     util.assert_equal(
         cfir.PrettyPrint(
             cfir.Lower(
-                cin.ForAll(k, c._assignment, cin.UnionSeq(cin.Product(Ai, Aj), bk))
+                cin.ForAll(k, c._assignment, cin.UnionSeq(cin.ProductSeq(Ai, Aj), bk))
             )
         ),
         """
