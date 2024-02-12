@@ -61,3 +61,12 @@ def test_flatten_2d():
     t: torch.Tensor = torch.Tensor([[1, 2, 3], [4, 5, 6]])
     input = tensor.Tensor.from_torch(t, "IN").to_sparse("ds")
     assert torch.equal(ops.flatten(input, dim=0, format="d").to_torch(), t.flatten())
+
+
+def test_unflatten_1d():
+    t: torch.Tensor = torch.Tensor([1, 2, 3, 4, 5, 6])
+    input = tensor.Tensor.from_torch(t, "IN").to_sparse("d")
+    assert torch.equal(
+        ops.unflatten(input, dim=0, sizes=(2, 3), format="dd").to_torch(),
+        t.unflatten(dim=0, sizes=(2, 3)),
+    )
