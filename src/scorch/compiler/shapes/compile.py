@@ -6,18 +6,6 @@ from scorch.compiler.shapes import cfir, codegen, cpp
 from scorch.format import LevelType
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
-# TODO(cgyurgyik): The `pos`` array needs to be updated using GetChild.
-# child: Optional[cin.Seq] = il.GetChild(sexpr)
-#         if child is not None and sexpr.format == format.LevelType.DENSE and child.format == format.LevelType.COMPRESSED:
-#         name: str = f"{child.tensor.name}{child.index}"
-#         cpp.While(
-#             cond=cpp.Lt(cpp.Variable(f"{name}_pos_index"), cpputil.ArrayIndexVariable(sexpr)),
-#             body=cpp.Assign(
-#                 cpp.Access(cpp.Variable(f"{name}_pos"),
-#                            cpp.Add(cpp.Variable(f"{name}_pos_index"), cpp.Constant(1))),
-#                 cpp.Variable(f"{name}_crd.size()"))
-#         )
-
 
 def GetLevelAndValueArrays(argument: cin.TensorVar) -> Sequence[cpp.Cpp]:
     name: str = argument.get_name()
