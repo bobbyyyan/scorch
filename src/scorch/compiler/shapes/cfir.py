@@ -230,8 +230,7 @@ def Lower(c: cin.CIN, defs: set[cin.Seq] = set()) -> CFIR:
     """Lowers Concrete Index Notation (CIN) to CFIR."""
     match c:
         case cin.ForAll():
-            x = CompileForAll(c, defs)
-            return x
+            return CompileForAll(c, defs)
         case cin.TensorAssign():
             return CompileTensorAssign(c, defs)
         case cin.Where():
