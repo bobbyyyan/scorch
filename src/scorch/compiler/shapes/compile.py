@@ -311,7 +311,7 @@ def Compile(cin: cin.CIN) -> cpp.Cpp:
 
 
 def CompileAndPrint(cin: cin.CIN) -> str:
-    """Compiles CIN -> CFIR -> CPP, and then pretty prints it."""
+    """Compiles CIN -> CFIR -> CPP, and then returns the pretty prints."""
     return codegen.PrettyPrint(Compile(cin))
 
 
