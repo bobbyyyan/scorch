@@ -30,8 +30,10 @@ def slice(
     format: The format of the output tensor.
 
     For example,
-      slice(input, dim=0, start=0, end=8, stride=2) == input[0:8:2]
+      input = torch.Tensor([0,1,2,3,4,5,6,7,8,9,10])
+      slice(input, dim=0, start=2, end=8, stride=2) # [2, 4, 6]
     """
+    assert dim < input.dim()
     inname: str = input.name if isinstance(input, tensor.Tensor) else "IN"
     if isinstance(input, torch.Tensor):
         input: tensor.Tensor = tensor.Tensor.from_torch(input)
@@ -96,13 +98,15 @@ def flatten(
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ) -> tensor.Tensor:
     """Flattens the tensor.
-    input: The input tensor to be flattene.d
+    input: The input tensor to be flattened
     dim: The dimension in `input` to be flattened with `dim + 1`.
     format: The format of the result tensor.
 
     For example,
-      flatten(input, dim=0) should be equivalent to torch.flatten(input, XXX).
+      input = torch.Tensor([[1,2,3], [4,5,6]])
+      flatten(input, dim=0) # [1,2,3,4,5,6]
     """
+    assert dim + 1 < input.dim()
     inname: str = input.name if isinstance(input, tensor.Tensor) else "IN"
     if isinstance(input, torch.Tensor):
         input: tensor.Tensor = tensor.Tensor.from_torch(input)
@@ -122,11 +126,45 @@ def flatten(
             A_shape[-1] *= size
         else:
             A_shape.append(size)
-
     A = cin.TensorVar(outname, shape=tuple(A_shape), fmt=format)
-    raise NotImplementedError("TODO(cgyurgyik)")
-    # A = cin.TensorVar("A", fmt=["d"], shape=[6])
-    # B = cin.TensorVar("B", fmt=["d", "s"], shape=[2, 3])
-    # Bi = cin.IndexSeq(i, B, size=2, index=0, format=LevelType.DENSE)
-    # Bj = cin.IndexSeq(j, B, size=3, index=1, format=LevelType.COMPRESSED)
-    # c: cin.CIN = cin.ForAll(k, A._assignment, cin.ProductSeq(Bi, Bj))
+
+    def ConstructFlatten(A: cin.TensorVar, B: cin.TensorVar) -> cin.CIN:
+        cins: List[Tuple[cin.IndexVar, cin.Seq]] = []
+        input_indices: List[cin.IndexVar] = []
+
+        level_types: list[LevelType] = B.format.get_level_types()
+        shape: list[int] = list(B.shape)
+        for i, (format, size) in enumerate(zip(level_types, shape)):
+            if i == dim:
+                # Fuse these dimensions on the `dim + 1` case.
+                continue
+            output_index = cin.IndexVar(TENSOR_INDEX_NAME[i])
+            input_index = output_index
+
+            if i == dim + 1:
+                ai: cin.IndexVar = cin.IndexVar(f"p{i - 1}")
+                bi: cin.IndexVar = cin.IndexVar(f"p{i}")
+                a: cin.IndexSeq = cin.IndexSeq(
+                    ai, B, shape[i - 1], i - 1, level_types[i - 1]
+                )
+                b: cin.IndexSeq = cin.IndexSeq(bi, B, size, i, format)
+                input_indices.extend([ai, bi])
+                cins.append((output_index, cin.ProductSeq(a, b)))
+                continue
+            input_indices.append(input_index)
+            cins.append((output_index, cin.IndexSeq(input_index, B, size, i, format)))
+
+        output_indices: list[cin.IndexVar] = [idx for (idx, _) in cins]
+        A[*output_indices] = B[*input_indices]
+
+        (idx, seq) = cins.pop()
+        stmt: cin.CIN = cin.ForAll(idx, A._assignment, seq)
+        for idx, seq in reversed(cins):
+            stmt = cin.ForAll(idx, stmt, seq)
+        return stmt
+
+    return compile.CompileAndExecuteFunction(
+        stmt=compile.Compile(ConstructFlatten(A, B)),
+        arguments=[input],
+        result=tensor.Tensor.from_torch(torch.zeros(A_shape), outname),
+    )

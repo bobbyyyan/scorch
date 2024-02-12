@@ -5,6 +5,7 @@ from scorch import tensor
 from scorch.compiler.shapes import cfir, codegen, cpp
 from scorch.format import LevelType
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
+from pathlib import Path
 
 
 def GetLevelAndValueArrays(argument: cin.TensorVar) -> Sequence[cpp.Cpp]:
@@ -324,10 +325,6 @@ def CompileAndExecuteFunction(
         Convert(result),
         [Convert(a) for a in arguments],
     )
-    # TODO(cgyurgyik): Remove.
-    print(codegen.PrettyPrint(fn))
-
-    from pathlib import Path
 
     path = Path(__file__)
     while not (path / "setup.py").exists():

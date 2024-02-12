@@ -55,3 +55,9 @@ def test_slice_2d_dimension1():
         ops.slice(input, dim=1, start=0, end=2, stride=1, format="dd").to_torch(),
         t[:, 0:2:1],
     )
+
+
+def test_flatten_2d():
+    t: torch.Tensor = torch.Tensor([[1, 2, 3], [4, 5, 6]])
+    input = tensor.Tensor.from_torch(t, "IN").to_sparse("ds")
+    assert torch.equal(ops.flatten(input, dim=0, format="d").to_torch(), t.flatten())
