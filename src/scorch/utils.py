@@ -1,9 +1,10 @@
 from collections import defaultdict, deque
 from itertools import chain
 from pathlib import Path
-from typing import List, Dict, Any, Iterable, Union
+from typing import List, Dict, Any, Iterable, Union, Optional
 
 import torch
+from torch.utils.cpp_extension import load_inline
 
 from .compiler.llir import DataType
 from .format import TensorFormat, LevelFormat, LevelType
@@ -11,6 +12,38 @@ from .format import TensorFormat, LevelFormat, LevelType
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
+
+
+def load_to_kernel_cache(
+    kernel_name: str, kernel_cache: Dict, kernel_code_filename: Optional[str]
+) -> None:
+    """Load a kernel to the kernel cache.
+
+    Args:
+        kernel_name (str): Name of the kernel.
+        kernel_cache (Dict): Kernel cache.
+        kernel_code_filename (str): Filename of the kernel code.
+    """
+
+    if kernel_code_filename is None:
+        kernel_code_filename = f"{kernel_name}.cpp"
+
+    # Read header_cpp_code from csrc/header.cpp
+    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+        header_cpp_code = f.read()
+
+    with open(PROJECT_ROOT_DIR / f"csrc/{kernel_code_filename}", "r") as f:
+        cpp_code = f.read()
+
+    # Load special kernels
+    module = load_inline(
+        name="kernel",
+        cpp_sources=[header_cpp_code, cpp_code],
+        functions=["evaluate"],
+        extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+    )
+
+    kernel_cache[kernel_name] = module
 
 
 def topo_sort_characters(s, priority=""):

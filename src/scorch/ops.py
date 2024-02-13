@@ -21,7 +21,7 @@ from .compiler.scheduler import Scheduler
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorIndex
 from .tensor import Tensor
-from .utils import parse_format, topo_sort_characters
+from .utils import parse_format, topo_sort_characters, load_to_kernel_cache
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
@@ -35,22 +35,8 @@ load(
     sources=[str(PROJECT_ROOT_DIR / "csrc/pybind.cpp")],
 )
 
-# Read header_cpp_code from csrc/header.cpp
-with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-    header_cpp_code = f.read()
-
-with open(PROJECT_ROOT_DIR / "csrc/spmm-csr.cpp", "r") as f:
-    cpp_code = f.read()
-
-# Load special kernels
-spmm_csr = load_inline(
-    name="kernel",
-    cpp_sources=[header_cpp_code, cpp_code],
-    functions=["evaluate"],
-    extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
-)
-
-_kernel_cache["spmm_csr"] = spmm_csr
+load_to_kernel_cache("spmm_csr", _kernel_cache, "spmm-csr.cpp")
+load_to_kernel_cache("spmm_csr-ones", _kernel_cache, "spmm-csr-ones.cpp")
 
 
 def spmv(
@@ -271,7 +257,7 @@ def matmul(
     if a.dim() == 2 and b.dim() == 1:
         return spmv(a, b, **kwargs)
 
-    use_cache = kwargs.get("use_cache", False)
+    use_cache = kwargs.get("use_cache", True)
 
     if str(a.format) == "d,s" and str(b.format) == "d,d" and use_cache:
         result_shape = (a.shape[0], b.shape[1])
@@ -288,8 +274,17 @@ def matmul(
         result_cpp = spmm_csr.evaluate(*args)
         end_time = time.time()
         eval_time = end_time - start_time
+        print("[spmm_csr] eval_time:", eval_time)
         if "time_dict" in kwargs:
             kwargs["time_dict"]["eval_time"] = eval_time
+
+        # if torch.all(a.values.eq(1)):
+        #     spmm_csr_ones = _kernel_cache["spmm_csr-ones"]
+        #     start_time = time.time()
+        #     result_cpp = spmm_csr_ones.evaluate(*args)
+        #     end_time = time.time()
+        #     eval_time = end_time - start_time
+        #     print("[spmm_csr-ones] eval_time:", eval_time)
 
         result = Tensor(
             shape=result_shape,
@@ -592,7 +587,7 @@ def lower_and_exec_cin(
     lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
     llir_lowerer = LLIRLowerer()
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
-    print(cpp_code)
+    # print(cpp_code)
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
         header_cpp_code = f.read()
 

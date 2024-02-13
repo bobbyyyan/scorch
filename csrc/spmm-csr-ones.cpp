@@ -52,7 +52,7 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
           int k = k_out + k_in;
           // Resolve dense coordinates
           int pB1 = j * B1_size + k;
-          accum_c[k_in] += A_val[pA1] * B_val[pB1];
+          accum_c[k_in] += B_val[pB1];
         }
       }
 
