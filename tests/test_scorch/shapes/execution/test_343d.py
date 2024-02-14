@@ -33,7 +33,7 @@ def test0():
         )
 
 
-def test1():  # Test 1
+def test1():
     for sparsity in SPARSITY:
         b: torch.Tensor = spvector(sparsity)
         c: torch.Tensor = spvector(sparsity)
@@ -47,31 +47,29 @@ def test1():  # Test 1
         )
 
 
-def test2():  # Test 2
-    for sparsity in SPARSITY:
-        a: torch.Tensor = dvector()
-        b: torch.Tensor = dvector()
-        lhs = tensor.Tensor.from_torch(a, "A")
-        rhs = tensor.Tensor.from_torch(b, "B")
-        assert torch.allclose(
-            ops.mul(lhs, rhs, format="d").to_torch(),
-            a * b,
-        )
+def test2():
+    a: torch.Tensor = dvector()
+    b: torch.Tensor = dvector()
+    lhs = tensor.Tensor.from_torch(a, "A")
+    rhs = tensor.Tensor.from_torch(b, "B")
+    assert torch.allclose(
+        ops.mul(lhs, rhs, format="d").to_torch(),
+        a * b,
+    )
 
 
-def test3():  # Test 3
-    for sparsity in SPARSITY:
-        a: torch.Tensor = dvector()
-        b: torch.Tensor = dvector()
-        lhs = tensor.Tensor.from_torch(a, "A")
-        rhs = tensor.Tensor.from_torch(b, "B")
-        assert torch.allclose(
-            ops.add(lhs, rhs, format="d").to_torch(),
-            a + b,
-        )
+def test3():
+    a: torch.Tensor = dvector()
+    b: torch.Tensor = dvector()
+    lhs = tensor.Tensor.from_torch(a, "A")
+    rhs = tensor.Tensor.from_torch(b, "B")
+    assert torch.allclose(
+        ops.add(lhs, rhs, format="d").to_torch(),
+        a + b,
+    )
 
 
-def test4():  # Test 4
+def test4():
     for sparsity in SPARSITY:
         a: torch.Tensor = spvector(sparsity)
         b: torch.Tensor = dvector()
@@ -83,7 +81,7 @@ def test4():  # Test 4
         )
 
 
-def test5():  # Test 5
+def test5():
     for sparsity in SPARSITY:
         b: torch.Tensor = spvector(sparsity)
         c: torch.Tensor = dvector()
