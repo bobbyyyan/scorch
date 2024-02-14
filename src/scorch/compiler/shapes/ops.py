@@ -383,8 +383,7 @@ def generic_vector(
         return __GenSeq(instructions[::-1])
 
     def __GenAssign1D(instructions: list[Op | cin.TensorVar], i: cin.IndexVar):
-        """Generate CIN RHS assignment.
-        Assumes polish notation, e.g., [x - 1, 2, 3] == (1 - 2) * 3"""
+        """Generate CIN RHS assignment."""
 
         def __GenAssign(instructions: list[Op | cin.TensorVar]):
             assert len(instructions) > 0
