@@ -1,8 +1,7 @@
 import torch
-import sys
 
 from scorch import tensor
-from scorch.compiler.shapes import compile, ops
+from scorch.compiler.shapes import ops
 
 # Test Reshape Operations against their PyTorch equivalent.
 
@@ -80,7 +79,7 @@ def test_add_2d():
     )
 
 
-def test_mul_1d_ss():  # Test 0
+def test_mul_1d_ss():
     a: torch.Tensor = torch.Tensor([1, 0, 3, 4, 5, 0])
     b: torch.Tensor = torch.Tensor([3, 4, 5, 0, 7, 8])
     lhs = tensor.Tensor.from_torch(a, "A").to_sparse("s")
@@ -91,7 +90,7 @@ def test_mul_1d_ss():  # Test 0
     )
 
 
-def test_muladd_1d():  # Test 1
+def test_muladd_1d():
     b: torch.Tensor = torch.Tensor([0, 2, 3, 4, 0, 6])
     c: torch.Tensor = torch.Tensor([3, 0, 5, 6, 0, 8])
     d: torch.Tensor = torch.Tensor([10, 11, 0, 0, 14, 0])
@@ -104,7 +103,7 @@ def test_muladd_1d():  # Test 1
     )
 
 
-def test_mul_1d_dd():  # Test 2
+def test_mul_1d_dd():
     a: torch.Tensor = torch.Tensor([0, 2, 3, 0, 5, 6])
     b: torch.Tensor = torch.Tensor([3, 4, 0, 6, 7, 0])
     lhs = tensor.Tensor.from_torch(a, "A")
@@ -115,7 +114,7 @@ def test_mul_1d_dd():  # Test 2
     )
 
 
-def test_add_1d_dd():  # Test 3
+def test_add_1d_dd():
     a: torch.Tensor = torch.Tensor([1, 0, 0, 4, 5, 6])
     b: torch.Tensor = torch.Tensor([3, 4, 0, 6, 7, 8])
     lhs = tensor.Tensor.from_torch(a, "A")
@@ -126,7 +125,7 @@ def test_add_1d_dd():  # Test 3
     )
 
 
-def test_mul_1d_sd():  # Test 4
+def test_mul_1d_sd():
     a: torch.Tensor = torch.Tensor([0, 2, 3, 4, 5, 0])
     b: torch.Tensor = torch.Tensor([0, 0, 2, 3, 0, 8])
     lhs = tensor.Tensor.from_torch(a, "A").to_sparse("s")
@@ -137,7 +136,7 @@ def test_mul_1d_sd():  # Test 4
     )
 
 
-def test_addmul_1d():  # Test 5
+def test_addmul_1d():
     b: torch.Tensor = torch.Tensor([1, 0, 3, 4, 0, 6])
     c: torch.Tensor = torch.Tensor([3, 4, 0, 6, 0, 8])
     d: torch.Tensor = torch.Tensor([10, 11, 0, 0, 14, 15])
