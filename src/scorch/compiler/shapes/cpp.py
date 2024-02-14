@@ -339,8 +339,8 @@ class Op(StrEnum):
     NOT = "!"
     LOGICAL_AND = "&&"
     LOGICAL_OR = "||"
-    MINIMUM = "std::min"
-    MAXIMUM = "std::max"
+    MINIMUM = "std::min<size_t>"
+    MAXIMUM = "std::max<size_t>"
 
 
 @dataclass

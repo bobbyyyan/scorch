@@ -296,7 +296,7 @@ def UnconditionalNext(sexpr: cin.Seq):
 def Equals(value: cpp.Cpp, sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq():
-            return cpp.Eq(value, cpputil.ArrayIndexVariable(sexpr))
+            return cpp.Eq(value, cpputil.ArrayAccessCrd(sexpr))
         case cin.Universe(idx):
             return cpp.Eq(value, cpputil.UniverseIndexVariable(idx))
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):

@@ -281,16 +281,16 @@ def test_union_1d_s():
         size_t pB0 = B0_pos[0];
         size_t pC0 = C0_pos[0];
         while (((pB0 < B0_pos[1]) && (pC0 < C0_pos[1]))) {
-          size_t i = std::min(B0_crd[pB0], C0_crd[pC0]);
-          if (((i == pB0) && (i == pC0))) {
+          size_t i = std::min<size_t>(B0_crd[pB0], C0_crd[pC0]);
+          if (((i == B0_crd[pB0]) && (i == C0_crd[pC0]))) {
             A0_crd[pA0] = i;
             A_values[pA0] = (B_values[pB0] + C_values[pC0]);
             pA0 += 1;
-          } else if ((i == pB0)) {
+          } else if ((i == B0_crd[pB0])) {
             A0_crd[pA0] = i;
             A_values[pA0] = B_values[pB0];
             pA0 += 1;
-          } else if ((i == pC0)) {
+          } else if ((i == C0_crd[pC0])) {
             A0_crd[pA0] = i;
             A_values[pA0] = C_values[pC0];
             pA0 += 1;
@@ -384,8 +384,8 @@ def test_intersection_1d_s():
         size_t pB0 = B0_pos[0];
         size_t pC0 = C0_pos[0];
         while (((pB0 < B0_pos[1]) && (pC0 < C0_pos[1]))) {
-          size_t i = std::min(B0_crd[pB0], C0_crd[pC0]);
-          if (((i == pB0) && (i == pC0))) {
+          size_t i = std::min<size_t>(B0_crd[pB0], C0_crd[pC0]);
+          if (((i == B0_crd[pB0]) && (i == C0_crd[pC0]))) {
             A0_crd[pA0] = i;
             A_values[pA0] = (B_values[pB0] * C_values[pC0]);
             pA0 += 1;
@@ -454,45 +454,45 @@ def test_collapse():
             cin.ForAll(k, c._assignment, cin.UnionSeq(cin.ProductSeq(Ai, Aj), bk))
         ),
         """
-    size_t A0 = 0;
-    size_t pA1 = A1_pos[A0];
-    while (((A0 < 8) && (!(pA1 < A1_pos[(A0 + 1)])))) {
-      A0 += 1;
-      pA1 = A1_pos[A0];
-    }
-    size_t pb0 = b0_pos[0];
-    while ((((A0 < 8) && (pA1 < A1_pos[(A0 + 1)])) && (pb0 < b0_pos[1]))) {
-      size_t k = std::min(((A0 * 8) + A1_crd[pA1]), b0_crd[pb0]);
-      if (((((k / 8) == A0) && ((k % 8) == pA1)) && (k == pb0))) {
-        c_values[k] = (A_values[pA1] + b_values[pb0]);
-      } else if ((((k / 8) == A0) && ((k % 8) == pA1))) {
-        c_values[k] = A_values[pA1];
-      } else if ((k == pb0)) {
-        c_values[k] = b_values[pb0];
-      }
-      if ((k == ((A0 * 8) + A1_crd[pA1]))) {
-        pA1 += 1;
+        size_t A0 = 0;
+        size_t pA1 = A1_pos[A0];
         while (((A0 < 8) && (!(pA1 < A1_pos[(A0 + 1)])))) {
           A0 += 1;
           pA1 = A1_pos[A0];
         }
-      }
-      pb0 += (k == b0_crd[pb0]);
-    }
-    while (((A0 < 8) && (pA1 < A1_pos[(A0 + 1)]))) {
-      size_t k = ((A0 * 8) + A1_crd[pA1]);
-      c_values[k] = A_values[pA1];
-      pA1 += 1;
-      while (((A0 < 8) && (!(pA1 < A1_pos[(A0 + 1)])))) {
-        A0 += 1;
-        pA1 = A1_pos[A0];
-      }
-    }
-    while ((pb0 < b0_pos[1])) {
-      size_t k = b0_crd[pb0];
-      c_values[k] = b_values[pb0];
-      pb0 += 1;
-    }""",
+        size_t pb0 = b0_pos[0];
+        while ((((A0 < 8) && (pA1 < A1_pos[(A0 + 1)])) && (pb0 < b0_pos[1]))) {
+          size_t k = std::min<size_t>(((A0 * 8) + A1_crd[pA1]), b0_crd[pb0]);
+          if (((((k / 8) == A0) && ((k % 8) == A1_crd[pA1])) && (k == b0_crd[pb0]))) {
+            c_values[k] = (A_values[pA1] + b_values[pb0]);
+          } else if ((((k / 8) == A0) && ((k % 8) == A1_crd[pA1]))) {
+            c_values[k] = A_values[pA1];
+          } else if ((k == b0_crd[pb0])) {
+            c_values[k] = b_values[pb0];
+          }
+          if ((k == ((A0 * 8) + A1_crd[pA1]))) {
+            pA1 += 1;
+            while (((A0 < 8) && (!(pA1 < A1_pos[(A0 + 1)])))) {
+              A0 += 1;
+              pA1 = A1_pos[A0];
+            }
+          }
+          pb0 += (k == b0_crd[pb0]);
+        }
+        while (((A0 < 8) && (pA1 < A1_pos[(A0 + 1)]))) {
+          size_t k = ((A0 * 8) + A1_crd[pA1]);
+          c_values[k] = A_values[pA1];
+          pA1 += 1;
+          while (((A0 < 8) && (!(pA1 < A1_pos[(A0 + 1)])))) {
+            A0 += 1;
+            pA1 = A1_pos[A0];
+          }
+        }
+        while ((pb0 < b0_pos[1])) {
+          size_t k = b0_crd[pb0];
+          c_values[k] = b_values[pb0];
+          pb0 += 1;
+        }""",
     )
 
 
@@ -643,8 +643,8 @@ def test_scalar_workspace_csc():
             size_t pA1 = A1_pos[A0];
             size_t pB1 = B1_pos[B0];
             while (((pA1 < A1_pos[(A0 + 1)]) && (pB1 < B1_pos[(B0 + 1)]))) {
-              size_t k = std::min(A1_crd[pA1], B1_crd[pB1]);
-              if (((k == pA1) && (k == pB1))) {
+              size_t k = std::min<size_t>(A1_crd[pA1], B1_crd[pB1]);
+              if (((k == A1_crd[pA1]) && (k == B1_crd[pB1]))) {
                 w += (A_values[pA1] * B_values[pB1]);
               }
               pA1 += (k == A1_crd[pA1]);

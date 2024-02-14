@@ -1,16 +1,15 @@
+from enum import StrEnum
 import torch
 
 from scorch.compiler import cin
 from scorch import tensor
 from scorch.utils import parse_format
-from scorch.compiler.shapes import cfir, codegen, cpp, compile
+from scorch.compiler.shapes import compile
 from scorch.format import LevelType, TensorFormat
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
-# Reshape operations on Scorch tensors. If the input tensor is PyTorch, then
-# it is converted to the Scorch equivalent. Note: this will perform assignment
-# into subsequent tensors, i.e., no fusion is performed here. Eventually, we'd
-# like to return CIN structures to perform scheduling optimizations.
+# Operations on Scorch tensors. If the input tensor is PyTorch, then it is converted
+# to the Scorch equivalent.
 
 # Used to hygienically name code generated index variables.
 TENSOR_INDEX_NAME = "ijklmnopqrstuvwxyz"
@@ -33,7 +32,7 @@ def slice(
     stride: The (optional) stride of the slice.
     format: The format of the result tensor. This is defaulted to dense.
 
-    This is similar to pytorch's `__getitem__` operation. For example,
+    This is similar to pytorch's `__getitem__` Op. For example,
         input = torch.Tensor([0,1,2,3,4,5,6,7,8,9,10])
         slice(input, dim=0, start=2, end=8, stride=2) # (Scorch)  [2, 4, 6]
         input[2:8:2]                                  # (PyTorch) [2, 4, 6]
@@ -41,7 +40,7 @@ def slice(
     assert dim < input.dim()
     inname: str = input.name if isinstance(input, tensor.Tensor) else "IN"
     if isinstance(input, torch.Tensor):
-        input: tensor.Tensor = tensor.Tensor.from_torch(input)
+        input: tensor.Tensor = tensor.Tensor.from_torch(input, inname)
     outname: str = "OUT"
     assert inname != outname
 
@@ -108,7 +107,7 @@ def flatten(
     dim: The dimension in `input` to be flattened with `dim + 1`.
     format: The format of the result tensor. This is defaulted to dense.
 
-    This is similar to pytorch's `flatten` operation. For example,
+    This is similar to pytorch's `flatten` Op. For example,
       input = torch.Tensor([[1,2], [3,4]])
       flatten(input, dim=0)                        # (Scorch)  [1,2,3,4]
       torch.flatten(input, start_dim=0, end_dim=1) # (PyTorch) [1,2,3,4]
@@ -116,7 +115,7 @@ def flatten(
     assert dim + 1 < input.dim()
     inname: str = input.name if isinstance(input, tensor.Tensor) else "IN"
     if isinstance(input, torch.Tensor):
-        input: tensor.Tensor = tensor.Tensor.from_torch(input)
+        input: tensor.Tensor = tensor.Tensor.from_torch(input, inname)
     outname: str = "OUT"
     assert inname != outname
 
@@ -182,7 +181,7 @@ def unflatten(
     dim: int,
     sizes: Tuple[int],
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
-) -> Tuple[tensor.Tensor]:
+) -> tensor.Tensor:
     """Splits the tensor into chunks.
 
     input:  The tensor input to be split.
@@ -190,7 +189,7 @@ def unflatten(
     sizes:  The new dimensions for the split dimension.
     format: The format of the result tensor. This is defaulted to dense.
 
-    This is similar to pytorch's `unflatten` operation. For example,
+    This is similar to pytorch's `unflatten` Op. For example,
       input = torch.Tensor([1,2,3,4])
       unflatten(input, dim=0, sizes=(2,2))        # (Scorch)  [[1,2],[3,4]]
       torch.unflatten(input, dim=0, sizes=(2, 2)) # (PyTorch) [[1,2],[3,4]]
@@ -200,7 +199,7 @@ def unflatten(
 
     inname: str = input.name if isinstance(input, tensor.Tensor) else "IN"
     if isinstance(input, torch.Tensor):
-        input: tensor.Tensor = tensor.Tensor.from_torch(input)
+        input: tensor.Tensor = tensor.Tensor.from_torch(input, inname)
     outname: str = "OUT"
     assert inname != outname
 
@@ -251,4 +250,195 @@ def unflatten(
         stmt=compile.Compile(ConstructUnflatten(A, B)),
         arguments=[input],
         result=tensor.Tensor.from_torch(torch.zeros(A_shape), outname),
+    )
+
+
+class Op(StrEnum):
+    ADD = "+"
+    MUL = "*"
+
+
+def __elementwise(
+    lhs: torch.Tensor | tensor.Tensor,
+    rhs: torch.Tensor | tensor.Tensor,
+    op: Op,
+    format: Optional[Union[TensorFormat, str, List[str]]] = None,
+) -> tensor.Tensor:
+    """Computes an elementwise operation `op` across the dimensions of `lhs` and `rhs`."""
+    assert lhs.dim() == rhs.dim()
+
+    lhsname: str = lhs.name if isinstance(lhs, tensor.Tensor) else "LHS"
+    if isinstance(lhs, torch.Tensor):
+        lhs: tensor.Tensor = tensor.Tensor.from_torch(lhs, lhsname)
+    rhsname: str = rhs.name if isinstance(rhs, tensor.Tensor) else "RHS"
+    if isinstance(rhs, torch.Tensor):
+        rhs: tensor.Tensor = tensor.Tensor.from_torch(rhs, rhsname)
+    outname: str = "OUT"
+    assert len({lhsname, rhsname, outname}) == 3
+
+    A = cin.TensorVar(lhsname, shape=lhs.shape, fmt=lhs.format)
+    if format is None:
+        format = parse_format("d" * lhs.levels)
+    elif not isinstance(format, TensorFormat):
+        format = parse_format(format)
+
+    B = cin.TensorVar(rhsname, shape=rhs.shape, fmt=rhs.format)
+
+    def ConstructElementwise(
+        R: cin.TensorVar, A: cin.TensorVar, B: cin.TensorVar
+    ) -> cin.CIN:
+        cins: List[Tuple[cin.IndexVar, cin.Seq]] = []
+        input_indices: List[cin.IndexVar] = []
+
+        B_levels: list[LevelType] = B.format.get_level_types()
+        B_shape: list[int] = list(B.shape)
+        A_levels: list[LevelType] = A.format.get_level_types()
+        A_shape: list[int] = list(A.shape)
+        for i, (fA, sA, fB, sB) in enumerate(zip(A_levels, A_shape, B_levels, B_shape)):
+            output_index = cin.IndexVar(TENSOR_INDEX_NAME[i])
+            input_index = output_index
+            input_indices.append(input_index)
+            seqA = cin.IndexSeq(input_index, A, sA, i, fA)
+            seqB = cin.IndexSeq(input_index, B, sB, i, fB)
+            match op:
+                case Op.ADD:
+                    cins.append((output_index, cin.UnionSeq(seqA, seqB)))
+                case Op.MUL:
+                    cins.append((output_index, cin.IntersectionSeq(seqA, seqB)))
+
+        output_indices: list[cin.IndexVar] = [idx for (idx, _) in cins]
+        match op:
+            case Op.ADD:
+                R[*output_indices] = A[*input_indices] + B[*input_indices]
+            case Op.MUL:
+                R[*output_indices] = A[*input_indices] * B[*input_indices]
+            case _:
+                raise NotImplementedError(op)
+
+        (idx, seq) = cins.pop()
+        stmt: cin.CIN = cin.ForAll(idx, R._assignment, seq)
+        for idx, seq in reversed(cins):
+            stmt = cin.ForAll(idx, stmt, seq)
+        return stmt
+
+    assert A.shape == B.shape
+    R = cin.TensorVar(outname, shape=A.shape, fmt=format)
+    return compile.CompileAndExecuteFunction(
+        stmt=compile.Compile(ConstructElementwise(R, A, B)),
+        arguments=[lhs, rhs],
+        result=tensor.Tensor.from_torch(torch.zeros(R.shape), outname),
+    )
+
+
+def add(
+    lhs: torch.Tensor | tensor.Tensor,
+    rhs: torch.Tensor | tensor.Tensor,
+    format: Optional[Union[TensorFormat, str, List[str]]] = None,
+):
+    return __elementwise(lhs, rhs, Op.ADD, format)
+
+
+def mul(
+    lhs: torch.Tensor | tensor.Tensor,
+    rhs: torch.Tensor | tensor.Tensor,
+    format: Optional[Union[TensorFormat, str, List[str]]] = None,
+):
+    return __elementwise(lhs, rhs, Op.MUL, format)
+
+
+def generic_vector(
+    instructions: list[Op | tensor.Tensor | torch.Tensor],
+    format: Optional[Union[TensorFormat, str, List[str]]] = None,
+):
+    """Computes the vector instructions provided in polish notation, e.g.,
+    generic_vector([Op.MUL, Op.ADD, B, C, D] == (B + C) * D
+    """
+
+    def __GenSeq1D(instructions: list[Op | cin.TensorVar], i: cin.IndexVar) -> cin.Seq:
+        """Generate CIN sequences for vector operations."""
+
+        def __GenSeq(instructions: list[Op | cin.TensorVar]) -> cin.Seq:
+            assert len(instructions) > 0
+            next: Op | cin.TensorVar = instructions.pop()
+            if isinstance(next, cin.TensorVar):
+                (level,) = next.format.get_level_types()
+                (size,) = next.shape
+                return cin.IndexSeq(
+                    idx=i, tensor=next, size=size, index=0, format=level
+                )
+
+            assert isinstance(next, Op)
+            match next:
+                case Op.ADD:
+                    lhs: cin.Seq = __GenSeq(instructions)
+                    rhs: cin.Seq = __GenSeq(instructions)
+                    return cin.UnionSeq(lhs, rhs)
+                case Op.MUL:
+                    lhs: cin.Seq = __GenSeq(instructions)
+                    rhs: cin.Seq = __GenSeq(instructions)
+                    return cin.IntersectionSeq(lhs, rhs)
+                case _:
+                    raise NotImplementedError(next)
+
+        return __GenSeq(instructions[::-1])
+
+    def __GenAssign1D(instructions: list[Op | cin.TensorVar], i: cin.IndexVar):
+        """Generate CIN RHS assignment.
+        Assumes polish notation, e.g., [x - 1, 2, 3] == (1 - 2) * 3"""
+
+        def __GenAssign(instructions: list[Op | cin.TensorVar]):
+            assert len(instructions) > 0
+            next: Op | cin.TensorVar = instructions.pop()
+            if isinstance(next, cin.TensorVar):
+                return next[i]
+
+            assert isinstance(next, Op)
+            match next:
+                case Op.ADD:
+                    lhs: cin.Seq = __GenAssign(instructions)
+                    rhs: cin.Seq = __GenAssign(instructions)
+                    return lhs + rhs
+                case Op.MUL:
+                    lhs: cin.Seq = __GenAssign(instructions)
+                    rhs: cin.Seq = __GenAssign(instructions)
+                    return lhs * rhs
+                case _:
+                    raise NotImplementedError(next)
+
+        return __GenAssign(instructions[::-1])
+
+    tensors: list[tensor.Tensor] = []
+    cins: list[Op | cin.TensorVar] = []
+    for i, instruction in enumerate(instructions):
+        if isinstance(instruction, Op):
+            cins.append(instruction)
+            continue
+        name: str = (
+            instruction.name if isinstance(instruction, tensor.Tensor) else f"T{i}"
+        )
+        if isinstance(instruction, torch.Tensor):
+            instruction: tensor.Tensor = tensor.Tensor.from_torch(instruction, name)
+        tensors.append(instruction)
+        cins.append(
+            cin.TensorVar(name, shape=instruction.shape, fmt=instruction.format)
+        )
+
+    outname: str = "OUT"
+    # Verify unique naming.
+    assert len(set(x.name for x in tensors) | {outname}) == len(tensors) + 1
+    if format is None:
+        format = parse_format("d")
+    elif not isinstance(format, TensorFormat):
+        format = parse_format(format)
+
+    assert len(set(t.shape for t in tensors)) == 1
+    shape = tensors[0].shape
+    i = cin.IndexVar("i")
+    R = cin.TensorVar(outname, shape=shape, fmt=format)
+    R[i]: cin.TensorAccess = __GenAssign1D(cins, i)
+    stmt: cin.CIN = cin.ForAll(i, R._assignment, __GenSeq1D(cins, i))
+    return compile.CompileAndExecuteFunction(
+        stmt=compile.Compile(stmt),
+        arguments=tensors,
+        result=tensor.Tensor.from_torch(torch.zeros(R.shape), outname),
     )
