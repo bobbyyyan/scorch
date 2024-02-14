@@ -12,7 +12,7 @@ N: int = 10
 
 
 def dvector() -> torch.Tensor:
-    """Returns a dense vector with random values and the provided sparsity."""
+    """Returns a dense vector with random values."""
     return torch.rand((N,)).float()
 
 
