@@ -303,9 +303,7 @@ def DefineFunction(
 
 def Compile(cin: cin.CIN) -> cpp.Cpp:
     """Compiles CIN -> CFIR -> CPP"""
-    print(f"\n{cin}")
     s0: cfir.CFIR = cfir.Lower(cin)
-    print(f"\n{cfir.PrettyPrint(s0)}")
     s1: cpp.Cpp = codegen.Lower(s0)
     return s1
 
@@ -327,7 +325,6 @@ def CompileAndExecuteFunction(
         Convert(result),
         [Convert(a) for a in arguments],
     )
-    print(f"\n{codegen.PrettyPrint(fn)}")
 
     path = Path(__file__)
     while not (path / "setup.py").exists():
