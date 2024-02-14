@@ -2,10 +2,7 @@ import torch
 import sys
 
 from scorch import tensor
-from scorch.compiler import cin
-from scorch.compiler.shapes import cfir, codegen, cpp, compile, ops
-from scorch.format import LevelType
-from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
+from scorch.compiler.shapes import compile, ops
 
 # Test Reshape Operations against their PyTorch equivalent.
 

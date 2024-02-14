@@ -1,7 +1,6 @@
 from scorch.compiler import cin
 from scorch.compiler.shapes import cfir
 from scorch.format import LevelType
-from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 import tests.utility as util
 
 # Tests CIN -> CFIR lowering phase.

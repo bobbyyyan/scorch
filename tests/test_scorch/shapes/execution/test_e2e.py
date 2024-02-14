@@ -2,9 +2,8 @@ import torch
 
 from scorch import tensor
 from scorch.compiler import cin
-from scorch.compiler.shapes import cfir, codegen, cpp, compile, ops
+from scorch.compiler.shapes import cpp, compile
 from scorch.format import LevelType
-from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 # Compiles CIN -> CFIR -> CPP and then executes the function, verifying
 # the resulting tensor has the correct values.

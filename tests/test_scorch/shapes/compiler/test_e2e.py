@@ -1,9 +1,8 @@
 import torch
 
 from scorch.compiler import cin
-from scorch.compiler.shapes import cfir, codegen, cpp, compile
+from scorch.compiler.shapes import codegen, cpp, compile
 from scorch.format import LevelType
-from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 import tests.utility as util
 
 # Tests CIN -> CFIR -> CPP lowering phase(s).
