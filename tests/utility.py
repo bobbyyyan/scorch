@@ -7,6 +7,8 @@ def assert_equal(actual: Any, expected: str):
        assert_equal("  a", "\n  a  \t ") # true
        assert_equal("ab", "a")           # false
     """
+    if not isinstance(actual, str):
+        actual = str(actual)
 
     def strip(s: Any) -> str:
         s = str(s)

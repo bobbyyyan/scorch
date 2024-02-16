@@ -268,7 +268,7 @@ def DefineFunction(
                     raise NotImplementedError(level_type)
 
     def mode_index_set(level: int, level_type: LevelType) -> str:
-        name = f"{resultname}{level}"
+        name: str = f"{resultname}{level}"
         match level_type:
             case LevelType.DENSE:
                 return "{}"
@@ -345,6 +345,7 @@ def CompileAndExecuteFunction(
 
     output = module.evaluate(*args)
     return tensor.Tensor(
+        name=result.name,
         shape=result.shape,
         index=tensor.TensorIndex(
             mode_indices=output._storage._index.mode_indices,
