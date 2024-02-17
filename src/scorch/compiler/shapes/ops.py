@@ -8,6 +8,8 @@ from scorch.compiler.shapes import compile
 from scorch.format import LevelType, TensorFormat
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
+import scorch.ops as experimental
+
 # Concrete operations on Scorch tensors. If the input tensor is PyTorch,
 # then it is converted to the Scorch equivalent.
 
@@ -25,10 +27,13 @@ def ResultName():
         s: int = RSUFFIX
         RSUFFIX += 1
         return s
+
     return f"_R{Suffix()}"
 
 
-def __format(format: Optional[Union[TensorFormat, str, List[str]]], rank: int) -> TensorFormat:
+def __format(
+    format: Optional[Union[TensorFormat, str, List[str]]], rank: int
+) -> TensorFormat:
     if format is None:
         return parse_format("d" * rank)
     if isinstance(format, TensorFormat):
@@ -67,7 +72,9 @@ def slice(
     # The result has the same shape as input save for the sliced dimension.
     A_shape = list(B.shape)
     A_shape[dim] = (end - start) // stride
-    A = cin.TensorVar(outname, shape=tuple(A_shape), fmt=__format(format, rank=len(A_shape)))
+    A = cin.TensorVar(
+        outname, shape=tuple(A_shape), fmt=__format(format, rank=len(A_shape))
+    )
 
     def ConstructSlice(A: cin.TensorVar, B: cin.TensorVar) -> cin.CIN:
         cins: List[Tuple[cin.IndexVar, cin.Seq]] = []
@@ -130,7 +137,9 @@ def flatten(
     assert dim + 1 < input.dim()
     outname: str = ResultName()
     if isinstance(input, torch.Tensor):
-        return tensor.Tensor.from_torch(input.flatten(start_dim=dim, end_dim=dim + 1), name=outname)
+        return tensor.Tensor.from_torch(
+            input.flatten(start_dim=dim, end_dim=dim + 1), name=outname
+        )
 
     B = cin.TensorVar(input.name, shape=input.shape, fmt=input.format)
 
@@ -141,7 +150,9 @@ def flatten(
             A_shape[-1] *= size
         else:
             A_shape.append(size)
-    A = cin.TensorVar(outname, shape=tuple(A_shape), fmt=__format(format, rank=len(A_shape)))
+    A = cin.TensorVar(
+        outname, shape=tuple(A_shape), fmt=__format(format, rank=len(A_shape))
+    )
 
     def ConstructFlatten(A: cin.TensorVar, B: cin.TensorVar) -> cin.CIN:
         cins: List[Tuple[cin.IndexVar, cin.Seq]] = []
@@ -415,7 +426,9 @@ def generic_vector(
             continue
         tensors.append(instruction)
         cins.append(
-            cin.TensorVar(instruction.name, shape=instruction.shape, fmt=instruction.format)
+            cin.TensorVar(
+                instruction.name, shape=instruction.shape, fmt=instruction.format
+            )
         )
 
     assert len(set(t.shape for t in tensors)) == 1
@@ -430,3 +443,28 @@ def generic_vector(
         arguments=tensors,
         result=tensor.Tensor.from_torch(torch.zeros(R.shape), outname),
     )
+
+
+def matmul(
+    lhs: torch.Tensor | tensor.Tensor,
+    rhs: torch.Tensor | tensor.Tensor,
+    format: Optional[Union[TensorFormat, str, List[str]]] = None,
+):
+    # TODO(cgyurgyik): Implement.
+    return experimental.matmul(lhs, rhs)
+
+
+def concat(
+    lhs: torch.Tensor | tensor.Tensor,
+    rhs: torch.Tensor | tensor.Tensor,
+    dim: int,
+    format: Optional[Union[TensorFormat, str, List[str]]] = None,
+):
+    # TODO(cgyurgyik): Implement.
+    assert type(lhs) == type(rhs)
+    if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
+        return torch.concat([lhs, rhs], dim)
+
+    return tensor.Tensor.from_torch(
+        torch.concat([lhs.to_torch(), rhs.to_torch()], dim)
+    ).to_sparse(format)

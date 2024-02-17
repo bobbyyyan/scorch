@@ -13,6 +13,7 @@ def _compile(func: Callable, region: ScorchRegion, args, kwargs):
         nonlocal i
         identifier: int = i
         i += 1
+        # Generous assumption: no other tensors have this name.
         return f"_T{identifier}"
 
     def _trace(t: tensor.Tensor | torch.Tensor):
@@ -24,19 +25,23 @@ def _compile(func: Callable, region: ScorchRegion, args, kwargs):
     def trace(args: Tuple) -> Tuple:
         return tuple(_trace(t) for t in args)
 
-    result: tensor.Tensor = func(*trace(args), **kwargs)
-    simplify(region)
+    result: IR = func(*trace(args), **kwargs)
+    # The result may be updated during simplification.
+    result: IR = simplify(region, result)
+    dce(region, result)
     return result
 
 
 def compile(func):
     """JIT compilation of Scorch functions; this is similar to JAX,
-       i.e., we trace and compile over "abstract" values, and then
-       use this to evaluate the real input values.
+    i.e., we trace and compile over "abstract" values, and then
+    use this to evaluate the real input values.
     """
+
     def wrapper(*args, **kwargs) -> torch.Tensor:
         name: str = func.__name__
-        region: ScorchRegion = ScorchRegion(name)
+        module: ScorchModule = ScorchModule("module")
+        region: ScorchRegion = ScorchRegion(name, module)
         result: tensor.Tensor = _compile(func, region, args, kwargs)
         return region.torch_evaluate(result)
 
