@@ -455,7 +455,7 @@ def test_collapse():
         """
         size_t A0 = 0;
         size_t pA1 = A1_pos[A0];
-        while (((A0 < 8) && (!(pA1 < A1_pos[(A0 + 1)])))) {
+        while (((A0 < 8) && (pA1 >= A1_pos[(A0 + 1)]))) {
           A0 += 1;
           pA1 = A1_pos[A0];
         }
@@ -471,7 +471,7 @@ def test_collapse():
           }
           if ((k == ((A0 * 8) + A1_crd[pA1]))) {
             pA1 += 1;
-            while (((A0 < 8) && (!(pA1 < A1_pos[(A0 + 1)])))) {
+            while (((A0 < 8) && (pA1 >= A1_pos[(A0 + 1)]))) {
               A0 += 1;
               pA1 = A1_pos[A0];
             }
@@ -482,7 +482,7 @@ def test_collapse():
           size_t k = ((A0 * 8) + A1_crd[pA1]);
           c_values[k] = A_values[pA1];
           pA1 += 1;
-          while (((A0 < 8) && (!(pA1 < A1_pos[(A0 + 1)])))) {
+          while (((A0 < 8) && (pA1 >= A1_pos[(A0 + 1)]))) {
             A0 += 1;
             pA1 = A1_pos[A0];
           }
@@ -571,24 +571,24 @@ def test_scalar_workspace_dd():
             )
         ),
         """
-    size_t A0 = 0;
-    while ((A0 < 8)) {
-      size_t i = A0;
-      size_t B1 = 0;
-      while ((B1 < 8)) {
-        size_t j = B1;
-        float w = 0;
-        size_t A1 = 0;
-        while ((A1 < 8)) {
-          size_t k = A1;
-          w += (A_values[((i * 8) + k)] * B_values[((k * 8) + j)]);
-          A1 += 1;
-        }
-        C_values[((i * 8) + j)] = w;
-        B1 += 1;
-      }
-      A0 += 1;
-    }""",
+        size_t A0 = 0;
+        while ((A0 < 8)) {
+          size_t i = A0;
+          size_t B1 = 0;
+          while ((B1 < 8)) {
+            size_t j = B1;
+            float w = 0;
+            size_t A1 = 0;
+            while ((A1 < 8)) {
+              size_t k = A1;
+              w += (A_values[((i * 8) + k)] * B_values[((k * 8) + j)]);
+              A1 += 1;
+            }
+            C_values[((i * 8) + j)] = w;
+            B1 += 1;
+          }
+          A0 += 1;
+        }""",
     )
 
 

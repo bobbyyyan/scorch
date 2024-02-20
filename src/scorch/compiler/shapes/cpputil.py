@@ -106,6 +106,74 @@ def UpdateCompressedIterators(access: cin.TensorAccess) -> Optional[cpp.Cpp]:
 def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
     """Simple algebraic reductions on Cpp constructs."""
     match expr:
+        case cpp.While(cond, body):
+            cond = Simplify(cond)
+            if cond == cpp.Constant(0):
+                return cpp.Nop()
+            return cpp.While(cond, Simplify(body))
+        case cpp.Block(stmts):
+            return cpp.Block([Simplify(stmt) for stmt in stmts])
+        case cpp.IfBlock(pairs):
+            return cpp.IfBlock([(Simplify(a), Simplify(b)) for (a, b) in pairs])
+        case cpp.Assign(lhs, rhs, op):
+            return cpp.Assign(Simplify(lhs), Simplify(rhs), op)
+        case cpp.IncAssign(lhs, rhs):
+            return cpp.IncAssign(Simplify(lhs), Simplify(rhs))
+        case cpp.Define(type, lhs, rhs):
+            return cpp.Define(type, Simplify(lhs), Simplify(rhs))
+        case cpp.Access(array, idx):
+            if isinstance(array, cpp.Cpp):
+                array = Simplify(array)
+            if isinstance(idx, cpp.Cpp):
+                idx = Simplify(idx)
+            return cpp.Access(array, idx)
+        case cpp.Eq(a, b):
+            a, b = Simplify(a), Simplify(b)
+            if a == b and not isinstance(a, cpp.FunctionCall):
+                return cpp.Constant(1)  # a == a, assuming a is pure.
+            return cpp.Eq(a, b)
+        case cpp.Expression(e):
+            return cpp.Expression(Simplify(e))
+        case cpp.Not(x):
+            x = Simplify(x)
+            if x == cpp.Constant(0):
+                return cpp.Constant(1)
+            if x == cpp.Constant(1):
+                return cpp.Constant(0)
+            match (x):
+                case cpp.Or(a, b):  # !(a || b) -> !a && !b
+                    return Simplify(cpp.And(cpp.Not(a), cpp.Not(b)))
+                case cpp.And(a, b):  # !(a && b) -> !a || !b
+                    return Simplify(cpp.Or(cpp.Not(a), cpp.Not(b)))
+                case cpp.Lt(a, b):  # !(a < b) == (a >= b)
+                    return Simplify(cpp.Ge(a, b))
+                case cpp.Le(a, b):  # !(a <= b) == (a > b)
+                    return Simplify(cpp.Gt(a, b))
+                case cpp.Ge(a, b):  # !(a >= b) == (a < b)
+                    return Simplify(cpp.Lt(a, b))
+                case cpp.Gt(a, b):  # !(a > b) == (a <= b)
+                    return Simplify(cpp.Le(a, b))
+            return cpp.Not(x)
+        case cpp.And(a, b):
+            a, b = Simplify(a), Simplify(b)
+            if cpp.Constant(0) in (a, b):
+                return cpp.Constant(0)
+            if a == b and not isinstance(a, cpp.FunctionCall):
+                return a  # a && a == a, assuming a is pure.
+            if isinstance(a, cpp.Constant):
+                return b  # n && b == b, when n != 0
+            if isinstance(b, cpp.Constant):
+                return a  # a && n == a, when n != 0
+            return cpp.And(a, b)
+        case cpp.Or(a, b):
+            a, b = Simplify(a), Simplify(b)
+            if a == cpp.Constant(0) and b == cpp.Constant(0):
+                return cpp.Constant(0)
+            if a == cpp.Constant(0):
+                return b  # 0 || b == b
+            if b == cpp.Constant(0):
+                return a  # a || 0 == a
+            return cpp.Or(a, b)
         case cpp.Add(a, b):
             a, b = Simplify(a), Simplify(b)
             if a == cpp.Constant(0):
@@ -115,7 +183,7 @@ def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
             return cpp.Add(a, b)
         case cpp.Sub(a, b):
             a, b = Simplify(a), Simplify(b)
-            if b == 0:
+            if b == cpp.Constant(0):
                 return a
             return cpp.Sub(a, b)
         case cpp.Mul(a, b):
@@ -132,5 +200,12 @@ def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
             if a == cpp.Constant(0):
                 return a
             return cpp.Div(a, b)
+        case cpp.Mod(a, b):
+            a, b = Simplify(a), Simplify(b)
+            if b == cpp.Constant(0):
+                raise ZeroDivisionError(expr)
+            if b == cpp.Constant(1):
+                return cpp.Constant(0)
+            return cpp.Mod(a, b)
         case _:
             return expr

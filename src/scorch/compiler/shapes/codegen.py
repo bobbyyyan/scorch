@@ -30,9 +30,9 @@ def LowerIndexExpr(expr: cin.IndexExpr) -> cpp.Cpp:
             # CIN should always pass an explicit shape to avoid tricky bugs.
             assert tensor.shape is not None
             if len(tensor.shape) == 0:
-                return cpp.Variable(tensor.name)
+                return cpp.Variable(name)
             return cpp.Access(
-                cpp.Variable(f"{tensor.name}_values"),
+                cpp.Variable(f"{name}_values"),
                 LowerIndexExprRec(expr),
             )
         case cin.BinaryOp():
@@ -74,7 +74,7 @@ def LowerIndexExprRec(expr: cin.IndexExpr) -> cpp.Cpp:
             case _:
                 raise NotImplementedError(expr)
 
-    return cpputil.Simplify(_Lower(expr, i=expr.num_levels))
+    return _Lower(expr, i=expr.num_levels)
 
 
 def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr, op: cin.Operation):
@@ -114,9 +114,9 @@ def IndexWriteList(access: cin.TensorAccess) -> list[cpp.Cpp]:
 
 def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar) -> cpp.Cpp:
     index: int = ta.level_of_index_var(idx)
-    format: format.LevelType = ta.level_types()[index]
+    fmt: format.LevelType = ta.level_types()[index]
     return cpp.Assign(
-        cpputil.ArrayAccessCrd(ta.tensor, idx, index, format), cpp.Variable(idx.name)
+        cpputil.ArrayAccessCrd(ta.tensor, idx, index, fmt), cpp.Variable(idx.name)
     )
 
 
@@ -166,7 +166,7 @@ def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
             case _:
                 raise NotImplementedError(type(stmt))
 
-    return _Lower(stmt, first=True)
+    return cpputil.Simplify(_Lower(stmt, first=True))
 
 
 ########################################
@@ -200,6 +200,8 @@ def PrettyPrint(stmt: cpp.Cpp, indent_level: int = 0) -> str:
 
     pp: str = ""
     match stmt:
+        case cpp.Nop():
+            pass
         case cpp.Block(stmts):
             pp += "\n".join(PrettyPrint(stmt, indent_level) for stmt in stmts)
         case cpp.IfBlock(pairs):

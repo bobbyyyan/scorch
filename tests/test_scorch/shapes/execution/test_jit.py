@@ -32,8 +32,8 @@ def test_zero_simplifications():
 
 
 def test_simplify_concat_spmv():
-    # TODO(cgyurgyik): Incorrect results produced. Hypothesis: related to CSC.
-
+    # TODO(cgyurgyik): This fails because CSC is not supported yet.
+    # It will return `[[0, 0], [0, 0]]` for _A2.
     @compile
     def Foo(A1, A2, b):
         return matmul(concat(A1, A2, dim=1), b)

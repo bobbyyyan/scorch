@@ -60,16 +60,16 @@ def test_slice():
         ),
         """
         size_t pB0 = B0_pos[0];
-        while (((pB0 < B0_pos[1]) && (!(((B0_crd[pB0] - 0) % 2) == 0)))) {
+        while (((pB0 < B0_pos[1]) && (!((B0_crd[pB0] % 2) == 0)))) {
           pB0 += 1;
         }
         while (((pB0 < B0_pos[1]) && (B0_crd[pB0] < 8))) {
-          size_t i = ((B0_crd[pB0] - 0) / 2);
+          size_t i = (B0_crd[pB0] / 2);
           A0_crd[pA0] = i;
           A_values[pA0] = B_values[pB0];
           pA0 += 1;
           pB0 += 1;
-          while (((pB0 < B0_pos[1]) && (!(((B0_crd[pB0] - 0) % 2) == 0)))) {
+          while (((pB0 < B0_pos[1]) && (!((B0_crd[pB0] % 2) == 0)))) {
             pB0 += 1;
           }
         }""",

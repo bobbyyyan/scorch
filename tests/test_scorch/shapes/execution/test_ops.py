@@ -6,12 +6,21 @@ from scorch.compiler.shapes import ops
 # Test Reshape Operations against their PyTorch equivalent.
 
 
-def test_slice_1d():
+def test_slice_1d_s():
     t: torch.Tensor = torch.Tensor([0, 1, 2, 3, 4, 5, 6, 7])
     input = tensor.Tensor.from_torch(t, "A").to_sparse("s")
     assert torch.equal(
-        ops.slice(input, dim=0, start=0, end=8, stride=2, format="d").to_torch(),
-        t[0:8:2],
+        ops.slice(input, dim=0, start=2, end=8, stride=2, format="d").to_torch(),
+        t[2:8:2],
+    )
+
+
+def test_slice_1d_d():
+    t: torch.Tensor = torch.Tensor([0, 1, 2, 3])
+    input = tensor.Tensor.from_torch(t, "A")
+    assert torch.equal(
+        ops.slice(input, dim=0, start=2, end=4, stride=1, format="d").to_torch(),
+        t[2:4:1],
     )
 
 

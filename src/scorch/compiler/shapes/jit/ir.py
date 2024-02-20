@@ -558,7 +558,7 @@ def simplify(region: ScorchRegion, result: IR) -> None:
 
     while 1:
         converged: bool = True
-        for old in (graph := region.graph):
+        for old in (_ := region.graph):
             new: Optional[IR | ScorchRegion] = _simplify(old)
             if new is not None:
                 converged = False

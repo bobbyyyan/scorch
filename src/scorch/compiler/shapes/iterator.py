@@ -68,20 +68,20 @@ def Init(sexpr: cin.Seq):
                                     ),
                                     cpp.Constant(0),
                                 )
-                                # if s is 0, a < 0 is always false.
-                                if s == 0
-                                else cpp.Or(
-                                    cpp.Lt(Eval(a), cpp.Constant(s)),
-                                    cpp.Not(
-                                        cpp.Eq(
-                                            cpp.Mod(
-                                                cpp.Sub(Eval(a), cpp.Constant(s)),
-                                                cpp.Constant(r),
-                                            ),
-                                            cpp.Constant(0),
-                                        )
-                                    ),
-                                )
+                            )
+                            # TODO(cgyurgyik): we want these fields to be cpp.Constant/cpp.Variable as well.
+                            if s == 0  # if s is 0, a < 0 is always false.
+                            else cpp.Or(
+                                cpp.Lt(Eval(a), cpp.Constant(s)),
+                                cpp.Not(
+                                    cpp.Eq(
+                                        cpp.Mod(
+                                            cpp.Sub(Eval(a), cpp.Constant(s)),
+                                            cpp.Constant(r),
+                                        ),
+                                        cpp.Constant(0),
+                                    )
+                                ),
                             ),
                         ),
                         body=UnconditionalNext(a),

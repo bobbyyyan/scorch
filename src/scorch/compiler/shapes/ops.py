@@ -82,7 +82,7 @@ def slice(
         for i, (format, size) in enumerate(zip(B.format.get_level_types(), B.shape)):
             s: str = TENSOR_INDEX_NAME[i]
             output_index = cin.IndexVar(s)
-            input_index = cin.IndexVar(f"s{s}") if i == dim else output_index
+            input_index = cin.IndexVar(f"{B.name}{i}") if i == dim else output_index
 
             sequence = (
                 cin.SliceSeq(
@@ -451,7 +451,9 @@ def matmul(
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ):
     # TODO(cgyurgyik): Implement.
-    return experimental.matmul(lhs, rhs)
+    output = experimental.matmul(lhs, rhs)
+    output.name = ResultName()
+    return output
 
 
 def concat(

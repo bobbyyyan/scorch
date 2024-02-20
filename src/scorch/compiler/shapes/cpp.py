@@ -130,6 +130,11 @@ class Cpp:
 
 
 @dataclass
+class Nop(Cpp):
+    pass
+
+
+@dataclass
 class Expression(Cpp):
     value: Cpp
 
@@ -395,6 +400,18 @@ class Lt(BinaryOp):
 class Le(BinaryOp):
     def __init__(self, lhs: Cpp, rhs: Cpp):
         super().__init__(lhs=lhs, rhs=rhs, op=Op.LE)
+
+
+@dataclass
+class Gt(BinaryOp):
+    def __init__(self, lhs: Cpp, rhs: Cpp):
+        super().__init__(lhs=lhs, rhs=rhs, op=Op.GT)
+
+
+@dataclass
+class Ge(BinaryOp):
+    def __init__(self, lhs: Cpp, rhs: Cpp):
+        super().__init__(lhs=lhs, rhs=rhs, op=Op.GE)
 
 
 @dataclass
