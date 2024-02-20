@@ -63,7 +63,7 @@ def test_zero_simplifications():
     )
 
 
-def test_simplify_concat():
+def test_simplify_concat_spmv():
     @graph
     def Foo(A1, A2, b):
         return matmul(concat(A1, A2, dim=1), b)

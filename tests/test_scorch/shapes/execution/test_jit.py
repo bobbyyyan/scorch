@@ -31,7 +31,7 @@ def test_zero_simplifications():
     assert torch.allclose(Foo(a, b), torch.Tensor([1, 2, 3]))
 
 
-def test_simplify_concat():
+def test_simplify_concat_spmv():
     # TODO(cgyurgyik): Incorrect results produced. Hypothesis: related to CSC.
     return
 
