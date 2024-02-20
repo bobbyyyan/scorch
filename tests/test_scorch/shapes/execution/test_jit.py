@@ -33,7 +33,6 @@ def test_zero_simplifications():
 
 def test_simplify_concat_spmv():
     # TODO(cgyurgyik): Incorrect results produced. Hypothesis: related to CSC.
-    return
 
     @compile
     def Foo(A1, A2, b):
