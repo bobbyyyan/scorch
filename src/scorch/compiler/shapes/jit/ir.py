@@ -456,7 +456,7 @@ class ScorchRegion:
             case matmul(A, B):
                 return ops.matmul(self.evaluate(A), self.evaluate(B))
             case slice(input, dim, start, end, step):
-                raise ops.slice(self.evaluate(input), dim, start, end, step)
+                return ops.slice(self.evaluate(input), dim, start, end, step)
             case copy(input):
                 return tensor.Tensor.copy(self.evaluate(input))
             case _:
