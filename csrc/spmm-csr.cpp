@@ -14,18 +14,18 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
 
   // Get A's level & value arrays
   int A0_size = A_shape[0];
-  int *A1_pos = A_mode_indices[1][0].data_ptr<int>();
-  int *A1_crd = A_mode_indices[1][1].data_ptr<int>();
-  float *A_val = A_values.data_ptr<float>();
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
 
   // Get B's level & value arrays
   int B0_size = B_shape[0];
   int B1_size = B_shape[1];
-  float *B_val = B_values.data_ptr<float>();
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
-  float *C_values = (float *)malloc(sizeof(float) * C_capacity);
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Initialize tile sizes
@@ -47,7 +47,8 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
         // Resolve coordinates
         int j = A1_crd[pA1];
 
-        for (int k_in = 0; k_in < kTile_k; k_in++) {
+        SCORCH_PRAGMA_UNROLL
+        for (int k_in = 0; SCORCH_LIKELY(k_in < kTile_k); k_in++) {
           // Resolve tiled index var
           int k = k_out + k_in;
           // Resolve dense coordinates
@@ -57,7 +58,7 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
       }
 
       // Lower consumer CIN
-      for (int k_in = 0; k_in < kTile_k; k_in++) {
+      for (int k_in = 0; SCORCH_LIKELY(k_in < kTile_k); k_in++) {
         int k = k_out + k_in;
         int pC1 = pC0 * C1_size + k;
         C_values[pC1] += accum_c[k_in];

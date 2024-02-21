@@ -78,7 +78,7 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
 
         for (int k = residual_k_start; k < B1_size; k++) {
           int pB1 = j * B1_size + k;
-          accum_c[k - residual_k_start] += A_val[pA1] * B_val[pB1];
+          accum_c[k - residual_k_start] += B_val[pB1];
         }
       }
 
