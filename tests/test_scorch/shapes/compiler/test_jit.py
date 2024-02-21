@@ -74,8 +74,7 @@ def test_simplify_concat_spmv():
     A1 = tensor.Tensor.from_torch(_A1, "A1").to_sparse("ds")
     A2 = tensor.Tensor.from_torch(_A2, "A2").to_sparse("sd")
     b = tensor.Tensor.from_torch(_b, "b")
-    # Verify the concatenation is simplified, since it
-    # would require asymptotic behavior for traversal.
+    # Verify the concatenation is simplified to avoid poor asymptotic complexity.
     util.assert_equal(
         Foo(A1, A2, b),
         """
