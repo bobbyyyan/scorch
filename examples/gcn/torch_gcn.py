@@ -12,9 +12,9 @@ from torch_scatter import scatter_add
 args_dict = {}
 
 
-class GCNConv(nn.Module):
+class GCNConvScatterGather(nn.Module):
     def __init__(self, in_channels, out_channels):
-        super(GCNConv, self).__init__()
+        super(GCNConvScatterGather, self).__init__()
         self.linear = nn.Linear(in_channels, out_channels)
 
     def forward(self, x, edge_index):
@@ -32,11 +32,11 @@ class GCNConv(nn.Module):
         return out
 
 
-class GCN(nn.Module):
+class GCNScatterGather(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
-        super(GCN, self).__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, out_channels)
+        super(GCNScatterGather, self).__init__()
+        self.conv1 = GCNConvScatterGather(in_channels, hidden_channels)
+        self.conv2 = GCNConvScatterGather(hidden_channels, out_channels)
 
     def forward(self, x, edge_index):
         start_time = time.perf_counter()
@@ -54,9 +54,9 @@ class GCN(nn.Module):
         return x
 
 
-class GraphConvolution(nn.Module):
+class GCNConv(nn.Module):
     def __init__(self, in_channels, out_channels):
-        super(GraphConvolution, self).__init__()
+        super(GCNConv, self).__init__()
         self.linear = nn.Linear(in_channels, out_channels)
 
     def forward(self, x, adjacency):
@@ -81,11 +81,11 @@ class GraphConvolution(nn.Module):
         return out
 
 
-class CustomGCN(nn.Module):
+class GCN(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
-        super(CustomGCN, self).__init__()
-        self.conv1 = GraphConvolution(in_channels, hidden_channels)
-        self.conv2 = GraphConvolution(hidden_channels, out_channels)
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
 
     def forward(self, x, adjacency):
         start_time = time.perf_counter()
@@ -158,12 +158,13 @@ def inference(model, data, device, dataset_name, split_idx=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test a CustomGCN with Scorch.")
+    parser = argparse.ArgumentParser(description="Test a GCN with PyTorch.")
     parser.add_argument(
         "--dataset",
         type=str,
         default="cora",
-        help='Dataset to use. Options are "cora", "pubmed", "citeseer", or "reddit".',
+        help='Dataset to use.',
+        choices=["cora", "pubmed", "citeseer", "reddit", "ogbn-arxiv"],
     )
     parser.add_argument(
         "--sparse",
@@ -208,9 +209,9 @@ def main():
 
     # Initialize model
     if args.gather:
-        model = GCN(in_channels, hidden_channels, out_channels)
+        model = GCNScatterGather(in_channels, hidden_channels, out_channels)
     else:
-        model = CustomGCN(in_channels, hidden_channels, out_channels)
+        model = GCN(in_channels, hidden_channels, out_channels)
 
     device = torch.device("cpu")
 
