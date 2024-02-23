@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import load_dataset, modify_state_dict_pyg_to_torch
+from utils import load_dataset
 
 from torch_scatter import scatter_add
 
@@ -15,10 +15,11 @@ args_dict = {}
 class GCNConvScatterGather(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(GCNConvScatterGather, self).__init__()
-        self.linear = nn.Linear(in_channels, out_channels)
+        self.lin = nn.Linear(in_channels, out_channels, bias=False)
+        self.bias = nn.Parameter(torch.empty(out_channels))
 
     def forward(self, x, edge_index):
-        x = self.linear(x)
+        x = self.lin(x)
 
         node_dim = 0
 
@@ -28,7 +29,7 @@ class GCNConvScatterGather(nn.Module):
         # Scatter source node features to destination nodes
         dest_nodes = edge_index[1]
         out = scatter_add(source_node_feats, dest_nodes, dim=0, dim_size=x.size(0))
-
+        out += self.bias
         return out
 
 
@@ -42,14 +43,14 @@ class GCNScatterGather(nn.Module):
         start_time = time.perf_counter()
         x = self.conv1(x, edge_index)
         end_time = time.perf_counter()
-        print(f"\nself.conv1(x, edge_index) took {end_time - start_time} s")
+        print(f"self.conv1(x, edge_index) took {end_time - start_time} s")
 
         x = F.relu(x)
 
         start_time = time.perf_counter()
         x = self.conv2(x, edge_index)
         end_time = time.perf_counter()
-        print(f"\nself.conv2(x, edge_index) took {end_time - start_time} s")
+        print(f"self.conv2(x, edge_index) took {end_time - start_time} s")
 
         return x
 
@@ -57,14 +58,15 @@ class GCNScatterGather(nn.Module):
 class GCNConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(GCNConv, self).__init__()
-        self.linear = nn.Linear(in_channels, out_channels)
+        self.lin = nn.Linear(in_channels, out_channels, bias=False)
+        self.bias = nn.Parameter(torch.empty(out_channels))
 
     def forward(self, x, adjacency):
         if not args_dict["sparse"]:
             # Print sparsity level
             x_nnz = torch.count_nonzero(x)
             x_sparsity = 1 - x_nnz.item() / (x.shape[0] * x.shape[1])
-            print(f"\nx Sparsity: {x_sparsity * 100:.2f}%")
+            print(f"x Sparsity: {x_sparsity * 100:.2f}%")
 
             adj_nnz = torch.count_nonzero(adjacency)
             adj_sparsity = 1 - adj_nnz.item() / (
@@ -75,9 +77,12 @@ class GCNConv(nn.Module):
         start_time = time.perf_counter()
         out = torch.matmul(adjacency, x)
         end_time = time.perf_counter()
-        print(f"\ntorch.matmul(adjacency, x) took {end_time - start_time} s")
+        print(f"torch.matmul(adjacency, x) took {end_time - start_time} s")
 
-        out = self.linear(out)
+        out = self.lin(out)
+
+        out += self.bias
+
         return out
 
 
@@ -89,7 +94,10 @@ class GCN(nn.Module):
 
     def forward(self, x, adjacency):
         start_time = time.perf_counter()
+        # print the first 10 elements of x
+        print(f"x before: {x[:10]}")
         x = self.conv1(x, adjacency)
+        print(f"x after: {x[:10]}")
         end_time = time.perf_counter()
         print(f"self.conv1(x, adjacency) took {end_time - start_time} s")
 
@@ -99,7 +107,7 @@ class GCN(nn.Module):
         start_time = time.perf_counter()
         x = self.conv2(x, adjacency)
         end_time = time.perf_counter()
-        print(f"\nself.conv2(x, adjacency) took {end_time - start_time} s")
+        print(f"self.conv2(x, adjacency) took {end_time - start_time} s")
 
         return F.log_softmax(x, dim=1)
 
@@ -107,8 +115,7 @@ class GCN(nn.Module):
 def inference(model, data, device, dataset_name, split_idx=None):
     # Load weights and prepare for inference
     state_dict = torch.load(f"weights/gcn_{dataset_name.lower()}_weights.pth")
-    new_state_dict = modify_state_dict_pyg_to_torch(state_dict)
-    model.load_state_dict(new_state_dict)
+    model.load_state_dict(state_dict)
     model.eval()
 
     x = data.x.clone().detach().to(torch.float).to(device)
@@ -150,7 +157,7 @@ def inference(model, data, device, dataset_name, split_idx=None):
     inference_time = time.perf_counter() - start_time
 
     # Calculate accuracy
-    correct = float((pred[test_mask] == data.y[test_mask]).sum().item())
+    correct = float((pred[test_mask] == data.y.view(-1)[test_mask]).sum().item())
     accuracy = correct / test_mask.sum().item()
 
     print(f"\nInference time: {inference_time:.6f} seconds")
@@ -162,9 +169,9 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="cora",
-        help='Dataset to use.',
         choices=["cora", "pubmed", "citeseer", "reddit", "ogbn-arxiv"],
+        default="cora",
+        help="Dataset to use.",
     )
     parser.add_argument(
         "--sparse",
