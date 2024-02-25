@@ -1,5 +1,6 @@
 import os
 
+import torch
 from ogb.nodeproppred import PygNodePropPredDataset
 from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.transforms import ToSparseTensor
@@ -10,7 +11,7 @@ def load_dataset(dataset_name, to_sparse_tensor=False):
 
     split_idx = None
 
-    transform = ToSparseTensor() if to_sparse_tensor else None
+    transform = ToSparseTensor(layout=torch.sparse_csr) if to_sparse_tensor else None
 
     if dataset_name in ["cora", "pubmed", "citeseer"]:
         dataset = Planetoid(

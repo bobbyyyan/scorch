@@ -95,9 +95,7 @@ class GCN(nn.Module):
     def forward(self, x, adjacency):
         start_time = time.perf_counter()
         # print the first 10 elements of x
-        print(f"x before: {x[:10]}")
         x = self.conv1(x, adjacency)
-        print(f"x after: {x[:10]}")
         end_time = time.perf_counter()
         print(f"self.conv1(x, adjacency) took {end_time - start_time} s")
 
@@ -128,22 +126,26 @@ def inference(model, data, device, dataset_name, split_idx=None):
         test_mask = data.test_mask
 
     adjacency = None
+
     if args_dict["gather"]:
         adjacency = data.edge_index
     else:
         if hasattr(data, "adj_t"):
-            adjacency = (
-                data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
-            )
-
-            # Convert adjacency matrix to a PyTorch sparse tensor
             if args_dict["sparse"]:
-                # x = x.to_sparse_csr()
-                adjacency = adjacency.to_sparse_csr()
+                adjacency = data.adj_t
+            else:
+                adjacency = (
+                    data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
+                )
         else:
+            if data.edge_index.dim() == 2 and data.edge_index.shape[0] != 2:
+                edge_index = data.edge_index.t()
+            else:
+                edge_index = data.edge_index
+
             adjacency = torch.sparse_coo_tensor(
-                indices=data.edge_index,
-                values=torch.ones(data.edge_index.shape[1]),
+                indices=edge_index,  # This should be a 2 x num_edges tensor
+                values=torch.ones(edge_index.shape[1]),
                 size=(data.num_nodes, data.num_nodes),
             )
 
@@ -200,13 +202,8 @@ def main():
     if args.gather:
         dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=False)
     else:
-        if args.dataset in ["ogbn-arxiv"]:
-            if args_dict["sparse"]:
-                dataset, split_idx = load_dataset(args.dataset)
-            else:
-                dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
-        else:
-            dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
+        dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
+
     data = dataset[0]
 
     # Define dimensions
