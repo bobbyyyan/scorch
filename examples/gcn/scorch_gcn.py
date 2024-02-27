@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import load_dataset, modify_state_dict_pyg_to_torch
+from utils import load_dataset
 
 import ipdb
 
@@ -14,7 +14,8 @@ import ipdb
 class GraphConvolution(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(GraphConvolution, self).__init__()
-        self.linear = nn.Linear(in_channels, out_channels)
+        self.lin = nn.Linear(in_channels, out_channels, bias=False)
+        self.bias = nn.Parameter(torch.empty(out_channels))
 
     def forward(self, x, adjacency):
         start_time = time.perf_counter()
@@ -30,7 +31,9 @@ class GraphConvolution(nn.Module):
         end_time = time.perf_counter()
         print(f"out.to_torch() took {end_time - start_time} s")
 
-        out = self.linear(out)
+        out = self.lin(out)
+        out += self.bias
+
         return out
 
 
@@ -60,8 +63,7 @@ class CustomGCN(nn.Module):
 def inference(model, data, device, dataset_name, split_idx=None):
     # Load weights and prepare for inference
     state_dict = torch.load(f"weights/gcn_{dataset_name.lower()}_weights.pth")
-    new_state_dict = modify_state_dict_pyg_to_torch(state_dict)
-    model.load_state_dict(new_state_dict)
+    model.load_state_dict(state_dict)
     model.eval()
 
     x = data.x.clone().detach().to(torch.float).to(device)
