@@ -66,9 +66,8 @@ class GCNConv(MessagePassing):
         else:
             return x_j
 
-        # Define GCN model
 
-
+# Define GCN model
 class GCN(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super(GCN, self).__init__()
@@ -79,7 +78,7 @@ class GCN(torch.nn.Module):
         start_time = time.perf_counter()
         x = self.conv1(x, edge_index)
         end_time = time.perf_counter()
-        print(f"\nself.conv1(x, edge_index) took {end_time - start_time} s")
+        print(f"self.conv1(x, edge_index) took {end_time - start_time} s")
 
         x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
@@ -149,13 +148,17 @@ def inference(model, data, device, dataset_name, split_idx=None):
 def main():
     parser = argparse.ArgumentParser(description="Train and test a GCN.")
     parser.add_argument(
-        "--mode", type=str, default="test", help='Mode to run: "train" or "test".'
+        "--mode",
+        type=str,
+        choices=["train", "test"],
+        default="test",
+        help='Mode to run: "train" or "test".',
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default="cora",
-        help='Dataset to use. Options are "cora", "pubmed", "citeseer", "reddit", or "ogbn-arxiv".',
+        choices=["cora", "pubmed", "citeseer", "reddit", "ogbn-arxiv", "dblp"],
     )
     args = parser.parse_args()
 

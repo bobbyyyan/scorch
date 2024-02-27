@@ -258,6 +258,53 @@ class Tensor(torch.nn.Module):
         )
 
     @staticmethod
+    def from_csr(
+        csr_matrix: torch.Tensor,
+        name: Optional[str] = None,
+    ) -> Tensor:
+        """
+        Create a Tensor from a PyTorch CSR tensor.
+
+        :param csr_matrix: A sparse tensor in CSR format
+        :param name: Optional name for the tensor
+        :return: A Tensor object
+        """
+        # If name is not provided, use the default name
+        if name is None:
+            name = "tensor"
+
+        # Check if input is a PyTorch CSR tensor
+        assert csr_matrix.is_sparse_csr, "Input tensor must be a sparse CSR tensor."
+
+        # Extract the crow_indices, col_indices, and values
+        crow_indices = csr_matrix.crow_indices()
+        col_indices = csr_matrix.col_indices()
+        values = csr_matrix.values()
+        shape = csr_matrix.size()
+
+        # We only handle 2D CSR tensors here
+        assert len(shape) == 2, "CSR format is only valid for 2D matrices."
+
+        tt_tensor = Tensor(
+            name=name,
+            shape=shape,
+            storage=TensorStorage(
+                index=TensorIndex(
+                    tensor_format=TensorFormat(
+                        level_formats=[
+                            LevelFormat(mode=LevelType.DENSE),
+                            LevelFormat(mode=LevelType.COMPRESSED),
+                        ]
+                    ),
+                    mode_indices=[[], [crow_indices, col_indices]],
+                ),
+                value=values,
+            ),
+        )
+
+        return tt_tensor
+
+    @staticmethod
     def from_coo(
         indices: torch.Tensor,
         values: torch.Tensor,

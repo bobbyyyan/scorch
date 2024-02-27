@@ -4,6 +4,7 @@ from .format import TensorFormat
 
 from_torch = Tensor.from_torch
 from_coo = Tensor.from_coo
+from_csr = Tensor.from_csr
 
 # precompile_kernels()
 

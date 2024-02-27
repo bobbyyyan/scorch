@@ -2,7 +2,7 @@ import os
 
 import torch
 from ogb.nodeproppred import PygNodePropPredDataset
-from torch_geometric.datasets import Planetoid, Reddit
+from torch_geometric.datasets import Planetoid, Reddit, DBLP
 from torch_geometric.transforms import ToSparseTensor
 
 
@@ -15,26 +15,32 @@ def load_dataset(dataset_name, to_sparse_tensor=False):
 
     if dataset_name in ["cora", "pubmed", "citeseer"]:
         dataset = Planetoid(
-            root=os.path.join(os.getcwd(), "data"),
+            root=os.path.join(os.getcwd(), "data", dataset_name),
             name=dataset_name,
             transform=transform,
         )
     elif dataset_name == "reddit":
         dataset = Reddit(
-            root=os.path.join(os.getcwd(), "data/reddit"),
+            root=os.path.join(os.getcwd(), "data", dataset_name),
             transform=transform,
         )
     elif dataset_name == "ogbn-arxiv":
         dataset = PygNodePropPredDataset(
             name="ogbn-arxiv",
-            root=os.path.join(os.getcwd(), "data"),
+            root=os.path.join(os.getcwd(), "data", dataset_name),
             transform=transform,
         )
         split_idx = dataset.get_idx_split()
+    elif dataset_name == "dblp":
+        dataset = DBLP(
+            root=os.path.join(os.getcwd(), "data", dataset_name),
+            transform=transform,
+        )
+        # You may need to define your own split here or leave as None if unavailable.
     else:
         raise ValueError(
             f"Dataset {dataset_name} not recognized. "
-            "Choose from 'cora', 'pubmed', 'citeseer', 'reddit', or 'ogbn-arxiv'."
+            "Choose from 'cora', 'pubmed', 'citeseer', 'reddit', 'ogbn-arxiv', or 'dblp'."
         )
 
     return dataset, split_idx

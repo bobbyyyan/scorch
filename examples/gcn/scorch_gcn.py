@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from utils import load_dataset, modify_state_dict_pyg_to_torch
 
+import ipdb
+
 
 class GraphConvolution(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -67,14 +69,20 @@ def inference(model, data, device, dataset_name, split_idx=None):
     x = scorch.from_torch(x)
     # x = x.to_sparse("ds")
     end_time = time.perf_counter()
-    print(f"scorch.from_torch(x) took {end_time - start_time} s")
+    # print(f"scorch.from_torch(x) took {end_time - start_time} s")
 
     start_time = time.perf_counter()
 
     if hasattr(data, "adj_t"):
-        adjacency = data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
-        adjacency = scorch.from_torch(adjacency)
-        adjacency = adjacency.to_sparse("ds")
+        # ipdb.set_trace()
+        if data.adj_t.is_sparse_csr:
+            adjacency = scorch.from_csr(data.adj_t)
+        else:
+            adjacency = (
+                data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
+            )
+            adjacency = scorch.from_torch(adjacency)
+            adjacency = adjacency.to_sparse("ds")
     else:
         adjacency = scorch.from_coo(
             indices=data.edge_index,
@@ -82,7 +90,7 @@ def inference(model, data, device, dataset_name, split_idx=None):
             shape=(data.num_nodes, data.num_nodes),
         )
     end_time = time.perf_counter()
-    print(f"Adj matrix construction took {end_time - start_time} s")
+    # print(f"Adj matrix construction took {end_time - start_time} s")
 
     # Create mask for test data
     if split_idx and dataset_name in ["ogbn-arxiv"]:
@@ -122,10 +130,7 @@ def main():
     args.dataset = args.dataset.lower()
 
     # Load dataset
-    if args.dataset in ["ogbn-arxiv"]:
-        dataset, split_idx = load_dataset(args.dataset)
-    else:
-        dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
+    dataset, split_idx = load_dataset(args.dataset, to_sparse_tensor=True)
     data = dataset[0]
 
     # Define the dimensions
