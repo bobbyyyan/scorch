@@ -140,7 +140,7 @@ def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
                 return cpp.Constant(1)
             if x == cpp.Constant(1):
                 return cpp.Constant(0)
-            match (x):
+            match x:
                 case cpp.Or(a, b):  # !(a || b) -> !a && !b
                     return Simplify(cpp.And(cpp.Not(a), cpp.Not(b)))
                 case cpp.And(a, b):  # !(a && b) -> !a || !b
@@ -153,6 +153,8 @@ def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
                     return Simplify(cpp.Lt(a, b))
                 case cpp.Gt(a, b):  # !(a > b) == (a <= b)
                     return Simplify(cpp.Le(a, b))
+                case cpp.Eq(a, b):
+                    return Simplify(cpp.Ne(a, b))
             return cpp.Not(x)
         case cpp.And(a, b):
             a, b = Simplify(a), Simplify(b)

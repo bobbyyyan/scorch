@@ -517,6 +517,7 @@ class ScorchRegion:
             case AbstractTensor(input):
                 return input
             case FusedOp(instructions):
+
                 def convert(instructions):
                     new = []
                     for instruction in instructions:

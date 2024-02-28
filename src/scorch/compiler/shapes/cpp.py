@@ -341,6 +341,7 @@ class Op(StrEnum):
     DIVIDE = "/"
     MODULO = "%"
     EQ = "=="
+    NE = "!="
     LT = "<"
     LE = "<="
     GT = ">"
@@ -422,6 +423,12 @@ class Ge(BinaryOp):
 class Eq(BinaryOp):
     def __init__(self, lhs: Cpp, rhs: Cpp):
         super().__init__(lhs=lhs, rhs=rhs, op=Op.EQ)
+
+
+@dataclass
+class Ne(BinaryOp):
+    def __init__(self, lhs: Cpp, rhs: Cpp):
+        super().__init__(lhs=lhs, rhs=rhs, op=Op.NE)
 
 
 @dataclass
