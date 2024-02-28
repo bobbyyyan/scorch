@@ -485,12 +485,15 @@ class ScorchRegion:
     # A sequential graph containing the SSA values.
     graph: list[IR]
     module: ScorchModule
-    # TODO(cgyurgyik): Just have the function `result` be part of the class.
+    result: Optional[IR] = None
 
     def __init__(self, name: str, module: ScorchModule):
         self.name = name
         self.graph = []
         self.module = module
+
+    def update_result(self, ir: IR) -> None:
+        self.result = ir
 
     def ordinal(self) -> int:
         """A tracker to guarantee a unique identifier for each SSA value."""
@@ -503,7 +506,7 @@ class ScorchRegion:
 
     def evaluate(self, V: IR) -> tensor.Tensor:
         """
-        Evaluates `V` and returns the resulting Scorch Tensor.
+        Evaluates the result and returns the resulting Scorch Tensor.
         This is similar to the lazy `eval` approach of MLX.
         """
         match V:
@@ -530,7 +533,7 @@ class ScorchRegion:
                 if len(V.shape()) == 1:
                     return ops.generic_vector(convert(instructions))
                 raise NotImplementedError(
-                    V
+                    type(V)
                 )  # TODO(cgyurgyik): Support different fusion.
             case add(lhs, rhs):
                 return ops.add(self.evaluate(lhs), self.evaluate(rhs))
@@ -550,8 +553,8 @@ class ScorchRegion:
             case _:
                 raise NotImplementedError(type(V))
 
-    def fuse_operations(self, result: IR) -> IR:
-        def fuse(A: IR, B: IR, result: IR) -> IR:
+    def fuse_operations(self) -> None:
+        def fuse(A: IR, B: IR) -> None:
             # A = B + C
             # B = D * E
             #  =>
@@ -573,25 +576,23 @@ class ScorchRegion:
                             raise NotImplementedError(type(operand))
             op = FusedOp(op, self)
             for old in (A, B):
-                result: IR = self.replace(old, op, result)
-            return result
+                self.replace(old, op)
 
-        def _fuse(result: IR) -> Tuple[IR, bool]:
+        def _fuse() -> bool:
             """Performs fusion and updates the underlying graph."""
             for instruction in self.graph:
                 for operand in instruction.operands():
                     if can_fuse(instruction, operand):
-                        result: IR = fuse(instruction, operand, result)
-                        return result, False
-            return result, True
+                        fuse(instruction, operand)
+                        return False
+            return True
 
-        while 1:
-            result, converged = _fuse(result)
-            if converged:
-                return result
+        while not _fuse():
+            pass
 
-    def replace(self, old: IR, new: IR | ScorchRegion, result: IR) -> IR:
+    def replace(self, old: IR, new: IR | ScorchRegion) -> IR:
         """Replaces all cases of `old` with `new`. This does *not* reorder the IR."""
+        assert self.result is not None
         for i, instruction in enumerate(graph := self.graph):
             if instruction == old:
                 if isinstance(new, ScorchRegion):
@@ -600,8 +601,8 @@ class ScorchRegion:
                 else:
                     assert isinstance(new, IR)
                     graph[i] = new
-                    if result == old:
-                        result = new
+                    if self.result == old:
+                        self.update_result(new)
             if old in instruction.operands():
                 match instruction:
                     case AbstractTensor(_):
@@ -622,9 +623,8 @@ class ScorchRegion:
                     case _:
                         raise NotImplementedError(type(instruction))
         self.graph = list(dict.fromkeys(graph))
-        return result
 
-    def simplify(self, result: IR) -> None:
+    def simplify(self) -> None:
         def _simplify(instruction: IR) -> Optional[IR | ScorchRegion]:
             match instruction:
                 case add(lhs, rhs):
@@ -673,21 +673,20 @@ class ScorchRegion:
                 new: Optional[IR | ScorchRegion] = _simplify(old)
                 if new is not None:
                     converged = False
-                    result: IR = self.replace(old, new, result)
+                    self.replace(old, new)
             if converged:
                 break
-        return result
 
     # TODO(cgyurgyik): This can probably be simplified by adding users/usees as fields.
-    def dce(self, result: IR) -> None:
+    def dce(self) -> None:
         def usees(ir: IR):
             return set(op.ordinal for op in ir.operands())
 
         found: bool = False
-        seen = set((result.ordinal,))
+        seen = set((self.result.ordinal,))
         dce_graph = []
         for instruction in reversed(self.graph):
-            if instruction == result:
+            if instruction == self.result:
                 found = True
             if not found:  # Result not reached yet.
                 continue
@@ -697,9 +696,8 @@ class ScorchRegion:
             dce_graph.append(instruction)
         self.graph = dce_graph[::-1]
 
-    def torch_evaluate(self, V: IR) -> torch.Tensor:
-        """Equivalent to `evaluate`, but converts the result to a torch.Tensor."""
-        return self.evaluate(V).to_torch()
+    def torch_evaluate(self) -> torch.Tensor:
+        return self.evaluate(self.result).to_torch()
 
     def __str__(self) -> str:
         s: str = f"${self.name}:\n"

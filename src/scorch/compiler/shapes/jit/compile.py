@@ -28,13 +28,10 @@ def _compile(func: Callable, region: ScorchRegion, args, kwargs):
         return tuple(_trace(t) for t in args)
 
     result: IR = func(*trace(args), **kwargs)
-    result: IR = region.simplify(
-        result
-    )  # The result may be updated during simplification.
-    result: IR = region.fuse_operations(
-        result
-    )  # The result may be updated during fusion.
-    region.dce(result)
+    region.update_result(result)
+    region.simplify()
+    region.fuse_operations()
+    region.dce()
     return result
 
 
@@ -48,7 +45,7 @@ def compile(func: Optional[Callable]):
         name: str = func.__name__
         module: ScorchModule = ScorchModule("module")
         region: ScorchRegion = ScorchRegion(name, module)
-        result: tensor.Tensor = _compile(func, region, args, kwargs)
-        return region.torch_evaluate(result)
+        _compile(func, region, args, kwargs)
+        return region.torch_evaluate()
 
     return wrapper
