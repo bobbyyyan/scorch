@@ -32,7 +32,6 @@ def _compile(func: Callable, region: ScorchRegion, args, kwargs) -> IR:
     region.simplify()
     region.fuse_operations()
     region.dce()
-    print(region)
     return result
 
 

@@ -367,6 +367,30 @@ def generic_vector(
     generic_vector([Opcode.MUL, Opcode.ADD, B, C, D] == (B + C) * D
     """
 
+    def hygienic(old: Sequence[tensor.Tensor | Opcode]) -> list[tensor.Tensor | Opcode]:
+        """
+        Each tensor must have a unique name during compilation. Therefore, if
+        the same tensor is used twice in the same equation, we must rename it.
+        """
+        new = []
+        names = set()
+        for instruction in old:
+            match instruction:
+                case Opcode():
+                    new.append(instruction)
+                case tensor.Tensor():
+                    if instruction.name in names:
+                        # Make a copy, since we need two *different* tensors.
+                        instruction = instruction.copy()
+                        i = 0
+                        while instruction.name in names:
+                            instruction.name = f"{instruction.name}_{i}"
+                            i += 1
+                    names.add(instruction.name)
+                    new.append(instruction)
+        return new
+    instructions = hygienic(instructions)
+
     def __GenSeq1D(
         instructions: list[Opcode | cin.TensorVar], i: cin.IndexVar
     ) -> cin.Seq:
