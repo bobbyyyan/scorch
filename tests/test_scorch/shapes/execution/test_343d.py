@@ -2,6 +2,7 @@ import torch
 
 from scorch import tensor
 from scorch.compiler.shapes import ops
+from scorch.compiler.shapes.opcode import Opcode
 
 # TODO(cgyurgyik): Remove this file after A2 is complete.
 
@@ -43,7 +44,7 @@ def test1():
         D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
         assert torch.allclose(
             ops.generic_vector(
-                [ops.Op.ADD, B, ops.Op.MUL, C, D], format="d"
+                [Opcode.ADD, B, Opcode.MUL, C, D], format="d"
             ).to_torch(),
             b + (c * d),
         )
@@ -93,7 +94,7 @@ def test5():
         D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
         assert torch.allclose(
             ops.generic_vector(
-                [ops.Op.MUL, ops.Op.ADD, B, C, D], format="d"
+                [Opcode.MUL, Opcode.ADD, B, C, D], format="d"
             ).to_torch(),
             (b + c) * d,
         )

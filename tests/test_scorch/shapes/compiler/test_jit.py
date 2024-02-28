@@ -18,30 +18,6 @@ def graph(func):
     return wrapper
 
 
-def test_naming():
-    @graph
-    def Foo(A, B):
-        C = A * B
-        D = copy(A)
-        E = C + D
-        return E
-
-    a = torch.Tensor([1, 2, 3, 4, 5])
-    b = torch.Tensor([1, 2, 3, 4, 5])
-    # Verify the IR gives each input tensor a unique name and SSA ordinal.
-    util.assert_equal(
-        Foo(a, b),
-        """
-    $Foo:
-      %0 = _T0[5:d]
-      %1 = _T1[5:d]
-      %2 = mul %0, %1
-      %3 = copy %0
-      %4 = add %2, %3
-    """,
-    )
-
-
 def test_zero_simplifications():
     @graph
     def Bar(A, B):

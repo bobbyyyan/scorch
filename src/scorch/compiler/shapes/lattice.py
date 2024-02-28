@@ -270,7 +270,7 @@ def SimplifyExpr(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr
 def SimplifyStmt(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
     match c:
         case cin.ForAll():
-            sexpr: cin.Seq = c.seq  # SimplifySeq(c.seq, defs)``
+            sexpr: cin.Seq = SimplifySeq(c.seq, defs)
             assert not isinstance(sexpr, cin.EmptySeq | cin.FullSeq), f"{c}\n{defs}"
             return cin.ForAll(
                 index_var=c.index_var,

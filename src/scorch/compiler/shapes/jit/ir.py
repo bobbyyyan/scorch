@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from enum import StrEnum
+from scorch.compiler.shapes.opcode import Opcode
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 import scorch.tensor as tensor
 from scorch.format import TensorFormat
@@ -10,16 +10,6 @@ import functools
 import operator
 
 
-class Opcode(StrEnum):
-    TENSOR = "tensor"
-    ADD = "add"
-    MUL = "mul"
-    COPY = "copy"
-    CONCAT = "concat"
-    MATMUL = "matmul"
-    SLICE = "slice"
-
-
 @dataclass
 class IR:
     """A scorch intermediate representation over abstract values."""
@@ -27,9 +17,12 @@ class IR:
     region: ScorchRegion
     opcode: Opcode
     ordinal: Optional[int] = None
+    _users: set[IR] = field(default_factory=set)
 
     def __post_init__(self):
         self.region.append(self)
+        for op in self.operands():
+            op.append_user(self)
 
     def __mul__(self, other):
         return mul(self, other)
@@ -48,6 +41,15 @@ class IR:
 
     def format(self) -> Tuple[TensorFormat] | TensorFormat:
         pass
+
+    def users(self) -> List[IR]:
+        return list(self._users)
+
+    def append_user(self, user: IR) -> None:
+        self._users.add(user)
+
+    def remove_user(self, user: IR) -> IR:
+        self._users.remove(user)
 
     def module(self) -> ScorchModule:
         return self.region.module
@@ -119,6 +121,51 @@ class Instruction(IR):
 
 
 @dataclass(kw_only=True)
+class FusedOp(IR):
+    __match_args__ = ("instructions",)
+    instructions: List[IR | Opcode]
+
+    def __init__(
+        self, instructions: Sequence[IR | Opcode], region: Optional[ScorchRegion] = None
+    ):
+        self.instructions = instructions
+        super().__init__(region=region, opcode=Opcode.FUSE)
+
+    def format(self) -> TensorFormat:
+        return self.instructions.format()
+
+    def __str__(self):
+        instructions = self.instructions.copy()[::-1]
+
+        def pp(input):
+            s = ""
+            match next := input.pop():
+                case IR():
+                    s += f"%{next.ordinal}"
+                case Opcode():
+                    x, y = pp(input), pp(input)
+                    s += f"({x} {next} {y})"
+            return s
+
+        return pp(instructions)
+
+    def operands(self) -> List[IR]:
+        return list(filter(lambda x: isinstance(x, IR), self.instructions))
+
+    def shape(self) -> Tuple[int]:
+        operands = self.operands()
+        s = set([op.shape() for op in operands])
+        assert len(s) == 1
+        return s.pop()
+
+    def __repr__(self):
+        return str(self)
+
+    def __hash__(self):
+        return super().__hash__()
+
+
+@dataclass(kw_only=True)
 class copy(Instruction):
     input: IR
     __match_args__ = ("input",)
@@ -126,17 +173,17 @@ class copy(Instruction):
     def __init__(self, input: IR, region: Optional[ScorchRegion] = None):
         if region is None:
             region = input.region
-        super().__init__(region=region, opcode=Opcode.COPY)
         self.input = input
+        super().__init__(region=region, opcode=Opcode.COPY)
 
     def operands(self) -> List[IR]:
         return [self.input]
 
     def shape(self) -> Tuple[int]:
-        return input.shape()
+        return self.input.shape()
 
     def format(self) -> TensorFormat:
-        return input.format()
+        return self.input.format()
 
     def __str__(self):
         return f"{self.opcode} %{self.input.ordinal}"
@@ -173,23 +220,23 @@ class slice(Instruction):
     ):
         if region is None:
             region = input.region
-        super().__init__(region=region, opcode=Opcode.SLICE)
         self.input = input
         self.dim = dim
         self.start = start
         self.end = end
         self.step = step
+        super().__init__(region=region, opcode=Opcode.SLICE)
 
     def operands(self) -> List[IR]:
         return [self.input]
 
     def shape(self) -> Tuple[int]:
-        s = input.shape()
+        s = list(self.input.shape())
         s[self.dim] = (self.end - self.start) // self.step
-        return s
+        return tuple(s)
 
     def format(self) -> TensorFormat:
-        return input.format()
+        return self.input.format()
 
     def __str__(self):
         return f"{self.opcode}.{self.dim} %{self.input.ordinal}[{self.start}:{self.end}:{self.step}]"
@@ -217,10 +264,10 @@ class concat(Instruction):
         (x, y) = A.region, B.region
         if region is None:
             region = x
-        super().__init__(region=region, opcode=Opcode.CONCAT)
         self.A = A
         self.B = B
         self.dim = dim
+        super().__init__(region=region, opcode=Opcode.CONCAT)
 
     def operands(self) -> List[IR]:
         return [self.A, self.B]
@@ -229,10 +276,10 @@ class concat(Instruction):
         return f"{self.opcode}.{self.dim} %{self.A.ordinal}, %{self.B.ordinal}"
 
     def shape(self) -> Tuple[int]:
-        (x, y) = self.A.shape(), self.B.shape()
+        (x, y) = list(self.A.shape()), list(self.B.shape())
         assert all(i == self.dim or a == b for i, (a, b) in enumerate(zip(x, y)))
         x[self.dim] += y[self.dim]
-        return x
+        return tuple(x)
 
     def format(self) -> Tuple[TensorFormat]:
         return (self.A.format(), self.B.format())
@@ -258,9 +305,9 @@ class matmul(Instruction):
         (x, y) = (A.region, B.region)
         if region is None:
             region = x
-        super().__init__(region=region, opcode=Opcode.MATMUL)
         self.A = A
         self.B = B
+        super().__init__(region=region, opcode=Opcode.MATMUL)
 
     def operands(self) -> List[IR]:
         return [self.A, self.B]
@@ -269,13 +316,13 @@ class matmul(Instruction):
         (x, y) = self.A.shape(), self.B.shape()
         # Treat matrix-vector as a special case of matrix-multiply.
         if len(x) == 1:
-            x = (x, 1)
+            x = (x[0], 1)
         if len(y) == 1:
-            y = (y, 1)
+            y = (y[0], 1)
         (x0, x1) = x
         (y0, y1) = y
-        assert x1 == y0
-        return tuple(x0, y1)
+        assert x1 == y0, f"mismatch in inner dimension: [{x0}, {x1}], [{y0}, {y1}]"
+        return (x0, y1)
 
     def format(self) -> Tuple[TensorFormat]:
         return (self.A.format(), self.B.format())
@@ -306,9 +353,9 @@ class BinaryOp(Instruction):
         (x, y) = lhs.region, rhs.region
         if region is None:
             region = x
-        super().__init__(region=region, opcode=opcode)
         self.lhs = lhs
         self.rhs = rhs
+        super().__init__(region=region, opcode=opcode)
 
     def operands(self) -> List[IR]:
         return [self.lhs, self.rhs]
@@ -413,6 +460,23 @@ class ScorchModule:
         return i
 
 
+def can_fuse(A: IR, B: IR):
+    if A.shape() != B.shape():
+        # Conservatively ignores broadcasting.
+        return False
+    if len(A.users()) > 1 or len(B.users()) > 1:
+        # Conversatively only fuse operations with 1 user.
+        return False
+    if B not in A.operands() or isinstance(B, AbstractTensor):
+        # A = B + C
+        # B = D + E
+        return False
+    # TODO(cgyurgyik): For prototype purposes, only supports 1-D.
+    if len(A.shape()) != 1:
+        return False
+    return True
+
+
 @dataclass()
 class ScorchRegion:
     """Intermediate representation graph to enable JIT optimizations."""
@@ -421,6 +485,7 @@ class ScorchRegion:
     # A sequential graph containing the SSA values.
     graph: list[IR]
     module: ScorchModule
+    # TODO(cgyurgyik): Just have the function `result` be part of the class.
 
     def __init__(self, name: str, module: ScorchModule):
         self.name = name
@@ -444,6 +509,29 @@ class ScorchRegion:
         match V:
             case AbstractTensor(input):
                 return input
+            case FusedOp(instructions):
+
+                def convert(instructions):
+                    new = []
+                    for instruction in instructions:
+                        if isinstance(instruction, Opcode):
+                            new.append(instruction)
+                            continue
+                        assert isinstance(instruction, IR)
+                        match instruction:
+                            case AbstractTensor(input):
+                                new.append(input)
+                            case add(a, b) | mul(a, b):
+                                new.extend(convert([a, b]))
+                            case _:
+                                raise NotImplementedError(type(instruction))
+                    return new
+
+                if len(V.shape()) == 1:
+                    return ops.generic_vector(convert(instructions))
+                raise NotImplementedError(
+                    V
+                )  # TODO(cgyurgyik): Support different fusion.
             case add(lhs, rhs):
                 return ops.add(self.evaluate(lhs), self.evaluate(rhs))
             case mul(lhs, rhs):
@@ -462,70 +550,49 @@ class ScorchRegion:
             case _:
                 raise NotImplementedError(type(V))
 
-    def torch_evaluate(self, V: IR) -> torch.Tensor:
-        """Equivalent to `evaluate`, but converts the result to a torch.Tensor."""
-        return self.evaluate(V).to_torch()
+    def fuse_operations(self, result: IR) -> IR:
+        def fuse(A: IR, B: IR, result: IR) -> IR:
+            # A = B + C
+            # B = D * E
+            #  =>
+            # A = (D * E) + C
+            assert B in A.operands()
+            op: list[Opcode | IR] = [A.opcode]
+            for operand in A.operands():
+                if operand == B:
+                    op.extend([B.opcode, *B.operands()])
+                else:
+                    match operand:
+                        case AbstractTensor():
+                            op.append(operand)
+                        case copy(input):
+                            op.append(input)
+                        case mul(a, b) | add(a, b):
+                            op.extend([operand.opcode, a, b])
+                        case _:
+                            raise NotImplementedError(type(operand))
+            op = FusedOp(op, self)
+            for old in (A, B):
+                result: IR = self.replace(old, op, result)
+            return result
 
-    def __str__(self) -> str:
-        s: str = f"${self.name}:\n"
-        indent: str = " " * 2
+        def _fuse(result: IR) -> Tuple[IR, bool]:
+            """Performs fusion and updates the underlying graph."""
+            for instruction in self.graph:
+                for operand in instruction.operands():
+                    if can_fuse(instruction, operand):
+                        result: IR = fuse(instruction, operand, result)
+                        return result, False
+            return result, True
 
-        def stringify(ir: IR):
-            return f"{indent} %{ir.ordinal} = {str(ir)}"
+        while 1:
+            result, converged = _fuse(result)
+            if converged:
+                return result
 
-        return s + "\n".join(stringify(ir) for ir in self.graph)
-
-    def __repr__(self) -> str:
-        return str(self)
-
-
-def simplify(region: ScorchRegion, result: IR) -> None:
-    def _simplify(instruction: IR) -> Optional[IR | ScorchRegion]:
-        match instruction:
-            case add(lhs, rhs):
-                if isinstance(lhs, AbstractTensor) and lhs.nnz() == 0:
-                    return rhs  # 0 + A = A
-                if isinstance(rhs, AbstractTensor) and rhs.nnz() == 0:
-                    return lhs  # A + 0 = A
-            case mul(lhs, rhs):
-                if isinstance(lhs, AbstractTensor) and lhs.nnz() == 0:
-                    return lhs  # 0 * A = 0
-                if isinstance(rhs, AbstractTensor) and rhs.nnz() == 0:
-                    return rhs  # A * 0 = 0
-            case concat(A, B, dim):
-                pass
-            case matmul(A, B):
-                if isinstance(A, concat) and A.dim == 1 and len(B.shape()) == 1:
-                    (a1f, a2f) = A.format()
-                    (a1f0, a1f1) = a1f.get_level_types()
-                    (a2f0, a2f1) = a2f.get_level_types()
-                    if (
-                        not a1f.is_dense()
-                        and not a2f.is_dense()
-                        and (a1f0, a1f1) != (a2f0, a2f1)
-                    ):
-                        # This results in conflicting iteration graphs. We
-                        # can avoid this by iterating over them separately.
-                        (b,) = B.shape()
-                        child = ScorchRegion("temporary", instruction.module())
-                        builder = IRBuilder(child)
-                        builder.add(
-                            builder.matmul(
-                                A.A, builder.slice(B, dim=0, start=0, end=b // 2)
-                            ),
-                            builder.matmul(
-                                A.B, builder.slice(B, dim=0, start=b // 2, end=b)
-                            ),
-                        )
-                        return child
-            case _:
-                pass
-        return None
-
-    def replace(old: IR, new: IR | ScorchRegion) -> None:
+    def replace(self, old: IR, new: IR | ScorchRegion, result: IR) -> IR:
         """Replaces all cases of `old` with `new`. This does *not* reorder the IR."""
-        nonlocal result
-        for i, instruction in enumerate(graph := region.graph):
+        for i, instruction in enumerate(graph := self.graph):
             if instruction == old:
                 if isinstance(new, ScorchRegion):
                     (*head, new) = new.graph
@@ -554,35 +621,94 @@ def simplify(region: ScorchRegion, result: IR) -> None:
                             instruction.B = new
                     case _:
                         raise NotImplementedError(type(instruction))
-        region.graph = list(dict.fromkeys(graph))
+        self.graph = list(dict.fromkeys(graph))
+        return result
 
-    while 1:
-        converged: bool = True
-        for old in (_ := region.graph):
-            new: Optional[IR | ScorchRegion] = _simplify(old)
-            if new is not None:
-                converged = False
-                replace(old, new)
-        if converged:
-            break
-    return result
+    def simplify(self, result: IR) -> None:
+        def _simplify(instruction: IR) -> Optional[IR | ScorchRegion]:
+            match instruction:
+                case add(lhs, rhs):
+                    if isinstance(lhs, AbstractTensor) and lhs.nnz() == 0:
+                        return rhs  # 0 + A = A
+                    if isinstance(rhs, AbstractTensor) and rhs.nnz() == 0:
+                        return lhs  # A + 0 = A
+                case mul(lhs, rhs):
+                    if isinstance(lhs, AbstractTensor) and lhs.nnz() == 0:
+                        return lhs  # 0 * A = 0
+                    if isinstance(rhs, AbstractTensor) and rhs.nnz() == 0:
+                        return rhs  # A * 0 = 0
+                case concat(A, B, dim):
+                    pass
+                case matmul(A, B):
+                    if isinstance(A, concat) and A.dim == 1 and len(B.shape()) == 1:
+                        (a1f, a2f) = A.format()
+                        (a1f0, a1f1) = a1f.get_level_types()
+                        (a2f0, a2f1) = a2f.get_level_types()
+                        if (
+                            not a1f.is_dense()
+                            and not a2f.is_dense()
+                            and (a1f0, a1f1) != (a2f0, a2f1)
+                        ):
+                            # This results in conflicting iteration graphs. We
+                            # can avoid this by iterating over them separately.
+                            (b,) = B.shape()
+                            child = ScorchRegion("temporary", instruction.module())
+                            builder = IRBuilder(child)
+                            builder.add(
+                                builder.matmul(
+                                    A.A, builder.slice(B, dim=0, start=0, end=b // 2)
+                                ),
+                                builder.matmul(
+                                    A.B, builder.slice(B, dim=0, start=b // 2, end=b)
+                                ),
+                            )
+                            return child
+                case _:
+                    pass
+            return None
 
+        while 1:
+            converged: bool = True
+            for old in (_ := self.graph):
+                new: Optional[IR | ScorchRegion] = _simplify(old)
+                if new is not None:
+                    converged = False
+                    result: IR = self.replace(old, new, result)
+            if converged:
+                break
+        return result
 
-# TODO(cgyurgyik): This can probably be simplified by adding users/usees as fields.
-def dce(region: ScorchRegion, result: IR):
-    def usees(ir: IR):
-        return set(op.ordinal for op in ir.operands())
+    # TODO(cgyurgyik): This can probably be simplified by adding users/usees as fields.
+    def dce(self, result: IR) -> None:
+        def usees(ir: IR):
+            return set(op.ordinal for op in ir.operands())
 
-    found: bool = False
-    seen = set((result.ordinal,))
-    dce_graph = []
-    for instruction in reversed(region.graph):
-        if instruction == result:
-            found = True
-        if not found:  # Result not reached yet.
-            continue
-        if instruction.ordinal not in seen:  # No users found.
-            continue
-        seen |= usees(instruction)
-        dce_graph.append(instruction)
-    region.graph = dce_graph[::-1]
+        found: bool = False
+        seen = set((result.ordinal,))
+        dce_graph = []
+        for instruction in reversed(self.graph):
+            if instruction == result:
+                found = True
+            if not found:  # Result not reached yet.
+                continue
+            if instruction.ordinal not in seen:  # No users found.
+                continue
+            seen |= usees(instruction)
+            dce_graph.append(instruction)
+        self.graph = dce_graph[::-1]
+
+    def torch_evaluate(self, V: IR) -> torch.Tensor:
+        """Equivalent to `evaluate`, but converts the result to a torch.Tensor."""
+        return self.evaluate(V).to_torch()
+
+    def __str__(self) -> str:
+        s: str = f"${self.name}:\n"
+        indent: str = " " * 2
+
+        def stringify(ir: IR):
+            return f"{indent} %{ir.ordinal} = {str(ir)}"
+
+        return s + "\n".join(stringify(ir) for ir in self.graph)
+
+    def __repr__(self) -> str:
+        return str(self)

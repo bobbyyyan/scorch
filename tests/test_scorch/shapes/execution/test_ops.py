@@ -2,6 +2,7 @@ import torch
 
 from scorch import tensor
 from scorch.compiler.shapes import ops
+from scorch.compiler.shapes.opcode import Opcode
 
 # Test Reshape Operations against their PyTorch equivalent.
 
@@ -107,7 +108,7 @@ def test_muladd_1d():
     C = tensor.Tensor.from_torch(c, "C").to_sparse("s")
     D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
     assert torch.equal(
-        ops.generic_vector([ops.Op.ADD, B, ops.Op.MUL, C, D], format="d").to_torch(),
+        ops.generic_vector([Opcode.ADD, B, Opcode.MUL, C, D], format="d").to_torch(),
         b + (c * d),
     )
 
@@ -145,7 +146,7 @@ def test_mul_1d_sd():
     )
 
 
-def test_addmul_1d():
+def test_muladd_1d():
     b: torch.Tensor = torch.Tensor([1, 0, 3, 4, 0, 6])
     c: torch.Tensor = torch.Tensor([3, 4, 0, 6, 0, 8])
     d: torch.Tensor = torch.Tensor([10, 11, 0, 0, 14, 15])
@@ -153,7 +154,7 @@ def test_addmul_1d():
     C = tensor.Tensor.from_torch(c, "C")
     D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
     assert torch.equal(
-        ops.generic_vector([ops.Op.MUL, ops.Op.ADD, B, C, D], format="d").to_torch(),
+        ops.generic_vector([Opcode.MUL, Opcode.ADD, B, C, D], format="d").to_torch(),
         (b + c) * d,
     )
 
@@ -166,7 +167,7 @@ def test_add2_1d():
     C = tensor.Tensor.from_torch(c, "C")
     D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
     assert torch.equal(
-        ops.generic_vector([ops.Op.ADD, ops.Op.ADD, B, C, D], format="d").to_torch(),
+        ops.generic_vector([Opcode.ADD, Opcode.ADD, B, C, D], format="d").to_torch(),
         (b + c) + d,
     )
 
@@ -179,6 +180,6 @@ def test_mul2_1d():
     C = tensor.Tensor.from_torch(c, "C")
     D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
     assert torch.equal(
-        ops.generic_vector([ops.Op.MUL, ops.Op.MUL, B, C, D], format="d").to_torch(),
+        ops.generic_vector([Opcode.MUL, Opcode.MUL, B, C, D], format="d").to_torch(),
         (b * c) * d,
     )

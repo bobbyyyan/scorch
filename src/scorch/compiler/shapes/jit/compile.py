@@ -6,6 +6,8 @@ import scorch.tensor as tensor
 import torch
 
 
+# TODO(cgyurgyik): This assumes that the function name used in `func` will align with the JIT IR.
+# A better approach might be to walk the Python AST, and map these two.
 def _compile(func: Callable, region: ScorchRegion, args, kwargs):
     i: int = 0
 
@@ -26,13 +28,17 @@ def _compile(func: Callable, region: ScorchRegion, args, kwargs):
         return tuple(_trace(t) for t in args)
 
     result: IR = func(*trace(args), **kwargs)
-    # The result may be updated during simplification.
-    result: IR = simplify(region, result)
-    dce(region, result)
+    result: IR = region.simplify(
+        result
+    )  # The result may be updated during simplification.
+    result: IR = region.fuse_operations(
+        result
+    )  # The result may be updated during fusion.
+    region.dce(result)
     return result
 
 
-def compile(func):
+def compile(func: Optional[Callable]):
     """JIT compilation of Scorch functions; this is similar to JAX,
     i.e., we trace and compile over "abstract" values, and then
     use this to evaluate the real input values.

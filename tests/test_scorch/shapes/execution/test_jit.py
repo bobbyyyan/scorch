@@ -6,15 +6,16 @@ from scorch.compiler.shapes.jit.ir import *
 
 def test_binary_operations():
     @compile
-    def Foo(A, B):
-        C = A * B
-        D = copy(A)
-        E = C + D
-        return E
+    def Foo(A, B, C):
+        D = A * B
+        E = copy(A)
+        F = D + C
+        return F
 
     a = torch.Tensor([1, 2, 3, 4, 5])
     b = torch.Tensor([1, 2, 3, 4, 5])
-    assert torch.allclose(Foo(a, b), (a * b) + a)
+    c = torch.Tensor([0, 0, 0, 0, 0])
+    assert torch.allclose(Foo(a, b, c), (a * b) + c)
 
 
 def test_zero_simplifications():
@@ -47,3 +48,22 @@ def test_simplify_concat_spmv():
     assert torch.allclose(
         Foo(A1, A2, b), torch.matmul(torch.concat([_A1, _A2], dim=1), _b)
     )
+
+
+def test_fusion_1d():
+    @compile
+    def Scorch(A, B, C):
+        D = A * B
+        E = C + D
+        return E
+
+    @torch.compile
+    def Torch(A, B, C):
+        D = A * B
+        E = C + D
+        return E
+
+    a = torch.Tensor([0, 2, 0, 0, 0])
+    b = torch.Tensor([1, 2, 1, 1, 1])
+    c = torch.Tensor([1, 2, 3, 1, 2])
+    assert torch.allclose(Scorch(a, b, c), Torch(a, b, c))

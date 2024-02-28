@@ -132,8 +132,9 @@ class Cpp:
 @dataclass
 class Nop(Cpp):
     """
-    Sometimes, simplifications result in the entire removal of a Cpp structure. 
+    Sometimes, simplifications result in the entire removal of a Cpp structure.
     We can represent this with a `nop`."""
+
     pass
 
 

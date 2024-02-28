@@ -1,6 +1,7 @@
 from enum import StrEnum
 import torch
 
+from scorch.compiler.shapes.opcode import Opcode
 from scorch.compiler import cin
 from scorch import tensor
 from scorch.utils import parse_format
@@ -8,6 +9,7 @@ from scorch.compiler.shapes import compile
 from scorch.format import LevelType, TensorFormat
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
+# Necessary for ops that aren't supported in Burrito variant of the compiler.
 import scorch.ops as experimental
 
 # Concrete operations on Scorch tensors. If the input tensor is PyTorch,
@@ -18,17 +20,21 @@ TENSOR_INDEX_NAME = "ijklmnopqrstuvwxyz"
 
 
 # Used to hygienically name results. I know, this is bad.
-RSUFFIX = 0
+SUFFIX = 0
+
+
+def Name():
+    def Suffix() -> int:
+        global SUFFIX
+        s: int = SUFFIX
+        SUFFIX += 1
+        return s
+
+    return f"{Suffix()}"
 
 
 def ResultName():
-    def Suffix() -> int:
-        global RSUFFIX
-        s: int = RSUFFIX
-        RSUFFIX += 1
-        return s
-
-    return f"_R{Suffix()}"
+    return f"_R{Name()}"
 
 
 def __format(
@@ -265,15 +271,10 @@ def unflatten(
     )
 
 
-class Op(StrEnum):
-    ADD = "+"
-    MUL = "*"
-
-
 def __elementwise(
     lhs: torch.Tensor | tensor.Tensor,
     rhs: torch.Tensor | tensor.Tensor,
-    op: Op,
+    op: Opcode,
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ) -> tensor.Tensor:
     """Computes an elementwise operation `op` across the dimensions of `lhs` and `rhs`."""
@@ -282,9 +283,9 @@ def __elementwise(
     outname: str = ResultName()
     if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
         match op:
-            case Op.ADD:
+            case Opcode.ADD:
                 return tensor.Tensor.from_torch(lhs + rhs, outname)
-            case Op.MUL:
+            case Opcode.MUL:
                 return tensor.Tensor.from_torch(lhs * rhs, outname)
             case _:
                 raise NotImplementedError(op)
@@ -313,16 +314,16 @@ def __elementwise(
             seqA = cin.IndexSeq(input_index, A, sA, i, fA)
             seqB = cin.IndexSeq(input_index, B, sB, i, fB)
             match op:
-                case Op.ADD:
+                case Opcode.ADD:
                     cins.append((output_index, cin.UnionSeq(seqA, seqB)))
-                case Op.MUL:
+                case Opcode.MUL:
                     cins.append((output_index, cin.IntersectionSeq(seqA, seqB)))
 
         output_indices: list[cin.IndexVar] = [idx for (idx, _) in cins]
         match op:
-            case Op.ADD:
+            case Opcode.ADD:
                 R[*output_indices] = A[*input_indices] + B[*input_indices]
-            case Op.MUL:
+            case Opcode.MUL:
                 R[*output_indices] = A[*input_indices] * B[*input_indices]
             case _:
                 raise NotImplementedError(op)
@@ -347,7 +348,7 @@ def add(
     rhs: torch.Tensor | tensor.Tensor,
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ):
-    return __elementwise(lhs, rhs, Op.ADD, format)
+    return __elementwise(lhs, rhs, Opcode.ADD, format)
 
 
 def mul(
@@ -355,23 +356,25 @@ def mul(
     rhs: torch.Tensor | tensor.Tensor,
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ):
-    return __elementwise(lhs, rhs, Op.MUL, format)
+    return __elementwise(lhs, rhs, Opcode.MUL, format)
 
 
 def generic_vector(
-    instructions: list[Op | tensor.Tensor],
+    instructions: list[Opcode | tensor.Tensor],
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ):
     """Computes the vector instructions provided in polish notation, e.g.,
-    generic_vector([Op.MUL, Op.ADD, B, C, D] == (B + C) * D
+    generic_vector([Opcode.MUL, Opcode.ADD, B, C, D] == (B + C) * D
     """
 
-    def __GenSeq1D(instructions: list[Op | cin.TensorVar], i: cin.IndexVar) -> cin.Seq:
+    def __GenSeq1D(
+        instructions: list[Opcode | cin.TensorVar], i: cin.IndexVar
+    ) -> cin.Seq:
         """Generate CIN sequences for vector operations."""
 
-        def __GenSeq(instructions: list[Op | cin.TensorVar]) -> cin.Seq:
+        def __GenSeq(instructions: list[Opcode | cin.TensorVar]) -> cin.Seq:
             assert len(instructions) > 0
-            next: Op | cin.TensorVar = instructions.pop()
+            next: Opcode | cin.TensorVar = instructions.pop()
             if isinstance(next, cin.TensorVar):
                 (level,) = next.format.get_level_types()
                 (size,) = next.shape
@@ -379,13 +382,13 @@ def generic_vector(
                     idx=i, tensor=next, size=size, index=0, format=level
                 )
 
-            assert isinstance(next, Op)
+            assert isinstance(next, Opcode)
             match next:
-                case Op.ADD:
+                case Opcode.ADD:
                     lhs: cin.Seq = __GenSeq(instructions)
                     rhs: cin.Seq = __GenSeq(instructions)
                     return cin.UnionSeq(lhs, rhs)
-                case Op.MUL:
+                case Opcode.MUL:
                     lhs: cin.Seq = __GenSeq(instructions)
                     rhs: cin.Seq = __GenSeq(instructions)
                     return cin.IntersectionSeq(lhs, rhs)
@@ -394,22 +397,22 @@ def generic_vector(
 
         return __GenSeq(instructions[::-1])
 
-    def __GenAssign1D(instructions: list[Op | cin.TensorVar], i: cin.IndexVar):
+    def __GenAssign1D(instructions: list[Opcode | cin.TensorVar], i: cin.IndexVar):
         """Generate CIN RHS assignment."""
 
-        def __GenAssign(instructions: list[Op | cin.TensorVar]):
+        def __GenAssign(instructions: list[Opcode | cin.TensorVar]):
             assert len(instructions) > 0
-            next: Op | cin.TensorVar = instructions.pop()
+            next: Opcode | cin.TensorVar = instructions.pop()
             if isinstance(next, cin.TensorVar):
                 return next[i]
 
-            assert isinstance(next, Op)
+            assert isinstance(next, Opcode)
             match next:
-                case Op.ADD:
+                case Opcode.ADD:
                     lhs: cin.Seq = __GenAssign(instructions)
                     rhs: cin.Seq = __GenAssign(instructions)
                     return lhs + rhs
-                case Op.MUL:
+                case Opcode.MUL:
                     lhs: cin.Seq = __GenAssign(instructions)
                     rhs: cin.Seq = __GenAssign(instructions)
                     return lhs * rhs
@@ -419,9 +422,9 @@ def generic_vector(
         return __GenAssign(instructions[::-1])
 
     tensors: list[tensor.Tensor] = []
-    cins: list[Op | cin.TensorVar] = []
+    cins: list[Opcode | cin.TensorVar] = []
     for i, instruction in enumerate(instructions):
-        if isinstance(instruction, Op):
+        if isinstance(instruction, Opcode):
             cins.append(instruction)
             continue
         tensors.append(instruction)

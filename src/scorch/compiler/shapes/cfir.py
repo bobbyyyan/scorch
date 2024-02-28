@@ -154,21 +154,22 @@ def FilterLocators(locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]], point: c
     return list(filter(lambda p: il.Contains(point, p[0]), locs))
 
 
-def FindLocators(sexpr: cin.Seq) -> Tuple[cin.Seq, list[Tuple[cin.Seq, ...]]]:
+def FindLocators(
+    sexpr: cin.Seq, dense_locate=False
+) -> Tuple[cin.Seq, list[Tuple[cin.Seq, ...]]]:
     match sexpr:
         case cin.IndexSeq() | cin.Universe():
             return [sexpr, []]
         case cin.UnionSeq(s1, s2):
             aexpr, alocs = FindLocators(s1)
             bexpr, blocs = FindLocators(s2)
-            return (
-                [aexpr, [(a, b) for a, b in zip(alocs, blocs)] + [(aexpr, bexpr)]]
-                if il.IsDense(aexpr) and il.IsDense(bexpr)
-                else [
-                    cin.UnionSeq(aexpr, bexpr),
-                    [(a, b) for a, b in zip(alocs, blocs)],
-                ]
-            )
+            if il.IsDense(aexpr) and il.IsDense(bexpr):
+                if isinstance(s2, cin.IntersectionSeq | cin.UnionSeq):
+                    bexpr, blocs = FindLocators(s2, dense_locate=True)
+                if dense_locate:
+                    return [cin.UnionSeq(aexpr, bexpr), alocs + blocs]
+                return [aexpr, alocs + blocs + [(aexpr, bexpr)]]
+            return [cin.UnionSeq(aexpr, bexpr), alocs + blocs]
         case cin.IntersectionSeq(s1, s2):
             aexpr, alocs = FindLocators(s1)
             bexpr, blocs = FindLocators(s2)
@@ -185,7 +186,12 @@ def FindLocators(sexpr: cin.Seq) -> Tuple[cin.Seq, list[Tuple[cin.Seq, ...]]]:
                 xlocs = [(r, x) for x in xdense]
                 return [r, alocs + blocs + xlocs]
             # Both are dense.
-            return [aexpr, [(a, b) for a, b in zip(alocs, blocs)] + [(aexpr, bexpr)]]
+            if dense_locate:
+                return [
+                    cin.IntersectionSeq(aexpr, bexpr),
+                    alocs + blocs + [(aexpr, bexpr)],
+                ]
+            return [aexpr, alocs + blocs + [(aexpr, bexpr)]]
         case cin.SliceSeq(a, s, e, r):
             aexpr, alocs = FindLocators(a)
             return [cin.SliceSeq(aexpr, s, e, r), alocs]

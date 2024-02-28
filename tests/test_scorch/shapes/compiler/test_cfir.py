@@ -6,6 +6,54 @@ import tests.utility as util
 # Tests CIN -> CFIR lowering phase.
 
 
+def test_intersection_union():
+    A = cin.TensorVar("A", fmt=["d"], shape=[8])
+    B = cin.TensorVar("B", fmt=["d"], shape=[8])
+    C = cin.TensorVar("C", fmt=["d"], shape=[8])
+    D = cin.TensorVar("D", fmt=["d"], shape=[8])
+    i = cin.IndexVar("i")
+    A[i] = B[i] + (C[i] * D[i])
+
+    util.assert_equal(
+        cfir.PrettyPrint(
+            cfir.Lower(
+                cin.ForAll(
+                    i,
+                    A._assignment,
+                    cin.UnionSeq(
+                        cin.IndexSeq(
+                            i,
+                            B,
+                            size=8,
+                            index=0,
+                            format=LevelType.DENSE,
+                        ),
+                        cin.IntersectionSeq(
+                            cin.IndexSeq(
+                                i,
+                                C,
+                                size=8,
+                                index=0,
+                                format=LevelType.DENSE,
+                            ),
+                            cin.IndexSeq(
+                                i,
+                                D,
+                                size=8,
+                                index=0,
+                                format=LevelType.DENSE,
+                            ),
+                        ),
+                    ),
+                )
+            )
+        ),
+        """
+        while i <-- B:d[i] with B:d[i]=(C:d[i] ∩ D:d[i])
+            A:d[i] = (B:d[i] + (C:d[i] * D:d[i]))""",
+    )
+
+
 def test_intersection():
     A = cin.TensorVar("A", fmt=["s"], shape=[8])
     B = cin.TensorVar("B", fmt=["s"], shape=[8])
