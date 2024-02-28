@@ -64,3 +64,25 @@ def test_simplify_concat_spmv():
           %8 = matmul %1, %7
           %9 = add %6, %8""",
     )
+
+
+def test_fusion_1d():
+    @graph
+    def Foo(A, B):
+        C = A * B
+        D = C + A
+        E = D + D
+        F = E + A
+        return F
+
+    a = torch.Tensor([0, 2, 0, 0, 0])
+    b = torch.Tensor([1, 2, 1, 1, 1])
+    util.assert_equal(
+        Foo(a, b),
+        """
+        $Foo:
+           %0 = _T0[5:d]
+           %1 = _T1[5:d]
+           %8 = add (add (add (mul %0, %1), %0), (add (mul %0, %1), %0)), %0
+        """,
+    )

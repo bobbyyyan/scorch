@@ -389,6 +389,7 @@ def generic_vector(
                     names.add(instruction.name)
                     new.append(instruction)
         return new
+
     instructions = hygienic(instructions)
 
     def __GenSeq1D(

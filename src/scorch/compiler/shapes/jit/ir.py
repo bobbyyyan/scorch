@@ -567,7 +567,11 @@ class ScorchRegion:
             op: list[Opcode | IR] = [A.opcode]
             for operand in A.operands():
                 if operand == B:
-                    op.extend([B.opcode, *B.operands()])
+                    match B:
+                        case FusedOp(instructions):
+                            op.extend(instructions)
+                        case _:
+                            op.extend([B.opcode, *B.operands()])
                 else:
                     match operand:
                         case AbstractTensor():
@@ -576,6 +580,8 @@ class ScorchRegion:
                             op.append(input)
                         case mul(a, b) | add(a, b):
                             op.extend([operand.opcode, a, b])
+                        case FusedOp(instructions):
+                            op.extend(instructions)
                         case _:
                             raise NotImplementedError(type(operand))
             op = FusedOp(op, self)
