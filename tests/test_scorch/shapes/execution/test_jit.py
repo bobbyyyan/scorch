@@ -67,3 +67,15 @@ def test_fusion_1d():
     b = torch.Tensor([1, 2, 1, 1, 1])
     c = torch.Tensor([1, 2, 3, 1, 2])
     assert torch.allclose(Scorch(a, b, c), Torch(a, b, c))
+
+
+def test_fusion_hygienic_naming():
+    @compile
+    def Foo(A, B):
+        C = A * B
+        D = C + A
+        return D
+
+    a = torch.Tensor([0, 2, 0, 0, 0])
+    b = torch.Tensor([1, 2, 1, 1, 1])
+    assert torch.allclose(Foo(a, b), a * b + a)

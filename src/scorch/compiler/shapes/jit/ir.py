@@ -137,17 +137,21 @@ class FusedOp(IR):
     def __str__(self):
         instructions = self.instructions.copy()[::-1]
 
-        def pp(input):
+        def pp(input, first: bool = False):
             s = ""
             match next := input.pop():
                 case IR():
                     s += f"%{next.ordinal}"
                 case Opcode():
                     x, y = pp(input), pp(input)
-                    s += f"({x} {next} {y})"
+                    if not first:
+                        s += "("
+                    s += f"{next} {x}, {y}"
+                    if not first:
+                        s += ")"
             return s
 
-        return pp(instructions)
+        return pp(instructions, first=True)
 
     def operands(self) -> List[IR]:
         return list(filter(lambda x: isinstance(x, IR), self.instructions))

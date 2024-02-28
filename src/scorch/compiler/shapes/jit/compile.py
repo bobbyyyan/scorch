@@ -8,7 +8,7 @@ import torch
 
 # TODO(cgyurgyik): This assumes that the function name used in `func` will align with the JIT IR.
 # A better approach might be to walk the Python AST, and map these two.
-def _compile(func: Callable, region: ScorchRegion, args, kwargs):
+def _compile(func: Callable, region: ScorchRegion, args, kwargs) -> IR:
     i: int = 0
 
     def id() -> str:
@@ -32,6 +32,7 @@ def _compile(func: Callable, region: ScorchRegion, args, kwargs):
     region.simplify()
     region.fuse_operations()
     region.dce()
+    print(region)
     return result
 
 
