@@ -517,7 +517,6 @@ class ScorchRegion:
             case AbstractTensor(input):
                 return input
             case FusedOp(instructions):
-
                 def convert(instructions):
                     new = []
                     for instruction in instructions:
@@ -679,7 +678,7 @@ class ScorchRegion:
 
         while 1:
             converged: bool = True
-            for old in (_ := self.graph):
+            for old in self.graph:
                 new: Optional[IR | ScorchRegion] = _simplify(old)
                 if new is not None:
                     converged = False
@@ -687,7 +686,6 @@ class ScorchRegion:
             if converged:
                 break
 
-    # TODO(cgyurgyik): This can probably be simplified by adding users/usees as fields.
     def dce(self) -> None:
         def usees(ir: IR):
             return set(op.ordinal for op in ir.operands())
