@@ -471,7 +471,14 @@ def can_fuse(A: IR, B: IR):
     if len(A.users()) > 1 or len(B.users()) > 1:
         # Conversatively only fuse operations with 1 user.
         return False
-    if B not in A.operands() or isinstance(B, AbstractTensor):
+
+    def supported(x: IR):
+        return isinstance(x, mul | add | FusedOp)
+
+    if not supported(A) or not supported(B):
+        # Conversatively only fuse multiply, add.
+        return False
+    if B not in A.operands():
         # A = B + C
         # B = D + E
         return False
