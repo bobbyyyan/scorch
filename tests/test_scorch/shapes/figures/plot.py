@@ -10,8 +10,6 @@ N: int = 100
 # The number of experiments. This will be averaged.
 E: int = 10
 
-# Density of rows / columns...?
-
 
 class Format(StrEnum):
     """Format of the input matrix"""
@@ -24,6 +22,23 @@ class Format(StrEnum):
     USC = "uni-col"  # CSC, but guarantees each column has same # of zeros.
 
 
+SPARSITIES: list[float] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+
+@dataclass
+class Data:
+    """C = f(A, B)"""
+    nnzA: list[int]
+    nnzB: list[int]
+    nnzC: list[int]
+    A0: list[int]
+    A1: list[int]
+    B0: list[int]
+    B1: list[int]
+    C0: list[int]
+    C1: list[int]
+
+
 def dmatrix() -> torch.Tensor:
     """Returns a dense matrix with random values."""
     return torch.rand((N, N)).float()
@@ -32,10 +47,6 @@ def dmatrix() -> torch.Tensor:
 def spmatrix(sparsity: int) -> torch.Tensor:
     """Returns a sparse matrix with random values and the provided sparsity."""
     return dmatrix() * (torch.rand((N, N)) > sparsity)
-
-
-# sparsities: list[float] = [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0]
-SPARSITIES: list[float] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
 
 def count_rows(t: torch.Tensor) -> int:
@@ -100,19 +111,6 @@ def average(l: list[int], E: int) -> None:
     a = sum(i) / len(i)
     assert a >= 0.0
     l.append(a)
-
-
-@dataclass
-class Data:
-    nnzA: list[int]
-    nnzB: list[int]
-    nnzC: list[int]
-    A0: list[int]
-    A1: list[int]
-    B0: list[int]
-    B1: list[int]
-    C0: list[int]
-    C1: list[int]
 
 
 def sparsity(f: Callable, input1: Format, input2: Format) -> Data:
