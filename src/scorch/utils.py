@@ -4,14 +4,16 @@ from pathlib import Path
 from typing import List, Dict, Any, Iterable, Union, Optional
 
 import torch
-from torch.utils.cpp_extension import load_inline
+from torch.utils.cpp_extension import load_inline, load
 
 from .compiler.llir import DataType
 from .format import TensorFormat, LevelFormat, LevelType
 
 PROJECT_ROOT_DIR = Path(__file__)
-while not (PROJECT_ROOT_DIR / "setup.py").exists():
-    PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
+# while not (PROJECT_ROOT_DIR / "setup.py").exists():
+#     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
+
+import time
 
 
 def load_to_kernel_cache(
@@ -36,12 +38,16 @@ def load_to_kernel_cache(
         cpp_code = f.read()
 
     # Load special kernels
+    start_time = time.time()
     module = load_inline(
-        name="kernel",
+        name=kernel_name,
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+        build_directory=PROJECT_ROOT_DIR / "build",
     )
+    end_time = time.time()
+    print(f"Loading {kernel_name} took {end_time - start_time} s")
 
     kernel_cache[kernel_name] = module
 
