@@ -4,6 +4,7 @@ from typing import Any, Union, Sequence, Optional, List
 
 import torch
 from torch.utils.cpp_extension import load, load_inline
+import scorch_ops as ops
 
 from .compiler.cin import (
     IndexVar,
@@ -24,19 +25,24 @@ from .tensor import Tensor
 from .utils import parse_format, topo_sort_characters, load_to_kernel_cache
 
 PROJECT_ROOT_DIR = Path(__file__)
-while not (PROJECT_ROOT_DIR / "setup.py").exists():
-    PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
+# while not (PROJECT_ROOT_DIR / "setup.py").exists():
+#     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 _kernel_cache = {}
 
-# Register custom classes
-load(
-    name="pybind",
-    sources=[str(PROJECT_ROOT_DIR / "csrc/pybind.cpp")],
-)
-
-load_to_kernel_cache("spmm_csr", _kernel_cache, "spmm-csr.cpp")
-load_to_kernel_cache("spmm_csr-ones", _kernel_cache, "spmm-csr-ones.cpp")
+# start_time = time.time()
+# # Register custom classes
+# load(
+#     name="pybind",
+#     sources=[str(PROJECT_ROOT_DIR / "csrc/pybind.cpp")],
+#     build_directory=PROJECT_ROOT_DIR / "build",
+# )
+# end_time = time.time()
+# compile_time = end_time - start_time
+# print(f"Pybind load time: {compile_time:.5f} seconds")
+#
+# load_to_kernel_cache("spmm_csr", _kernel_cache, "spmm-csr.cpp")
+# load_to_kernel_cache("spmm_csr_ones", _kernel_cache, "spmm-csr-ones.cpp")
 
 
 def spmv(
@@ -268,10 +274,10 @@ def matmul(
             args.append(tensor.index.mode_indices)  # type: ignore
             args.append(tensor.values)  # type: ignore
 
-        spmm_csr = _kernel_cache["spmm_csr"]
+        spmm_csr = ops.spmm_csr
 
         start_time = time.time()
-        result_cpp = spmm_csr.evaluate(*args)
+        result_cpp = spmm_csr(*args)
         end_time = time.time()
         eval_time = end_time - start_time
         print("[spmm_csr] eval_time:", eval_time)
@@ -279,20 +285,20 @@ def matmul(
             kwargs["time_dict"]["eval_time"] = eval_time
 
         # if torch.all(a.values.eq(1)):
-        #     spmm_csr_ones = _kernel_cache["spmm_csr-ones"]
+        #     spmm_csr_ones = _kernel_cache["spmm_csr_ones"]
         #     start_time = time.time()
         #     result_cpp = spmm_csr_ones.evaluate(*args)
         #     end_time = time.time()
         #     eval_time = end_time - start_time
-        #     print("[spmm_csr-ones] eval_time:", eval_time)
+        #     print("[spmm_csr_ones] eval_time:", eval_time)
 
         result = Tensor(
             shape=result_shape,
             index=TensorIndex(
-                mode_indices=result_cpp._storage._index.mode_indices,
+                mode_indices=result_cpp.storage.index.mode_indices,
                 tensor_format="dd",
             ),
-            value=result_cpp._storage._value,
+            value=result_cpp.storage.value,
         )
 
         return result
