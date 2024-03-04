@@ -42,7 +42,7 @@ def test_spmm_dd_ds_dd_tiled_time():
     k_in = IndexVar("k_in")
     k = IndexVar("k", k_out + k_in)
 
-    k_tile_size = 1024
+    k_tile_size = 4096
     k_tile_var = TileSizeVar(
         outer_index_var=k_out, inner_index_var=k_in, size=k_tile_size
     )
@@ -101,7 +101,7 @@ def test_spmm_dd_ds_dd_tiled_time():
 
 
 def test_spmm_dd_ds_dd_time():
-    n = 64
+    n = 4096
     sparsity = 0.8
     random_tensor_a = torch.rand(n, n).float()
     random_tensor_b = torch.rand(n, n).float()
