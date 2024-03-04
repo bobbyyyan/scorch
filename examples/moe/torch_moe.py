@@ -9,6 +9,7 @@ from sklearn.preprocessing import LabelEncoder
 import numpy as np
 import argparse
 import os
+import time
 
 
 class SparseDataset(Dataset):
@@ -83,14 +84,18 @@ def evaluate(model, test_loader):
     model.eval()
     correct = 0
     total = 0
+    start_time = time.perf_counter()
     with torch.no_grad():
         for inputs, labels in test_loader:
             outputs = model(inputs)
             _, predicted = torch.max(outputs, 1)
             correct += (predicted == labels).sum().item()
             total += labels.size(0)
+    end_time = time.perf_counter()
     accuracy = correct / total
+    inference_time = end_time - start_time
     print(f'Accuracy: {accuracy * 100:.2f}%')
+    print(f'Inference Time: {inference_time:.4f} seconds')
     return accuracy
 
 
@@ -126,9 +131,12 @@ def train(model, train_loader, criterion, optimizer, epochs=5):
 
 def test(model, test_loader):
     # Load the model
-    model.load_state_dict(torch.load('moe_model.pth'))
-    print('Model loaded for evaluation.')
-    evaluate(model, test_loader)
+    if os.path.exists('moe_model.pth'):
+        model.load_state_dict(torch.load('moe_model.pth'))
+        print('Model loaded for evaluation.')
+        evaluate(model, test_loader)
+    else:
+        print('Model weights file not found! Train the model with --mode train first.')
 
 
 def main():
