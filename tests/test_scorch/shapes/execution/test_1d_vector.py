@@ -4,12 +4,8 @@ from scorch import tensor
 from scorch.compiler.shapes import ops
 from scorch.compiler.shapes.opcode import Opcode
 
-# TODO(cgyurgyik): Remove this file after A2 is complete.
-
-# Sparsity of the vectors.
-SPARSITY: list[float] = [0.1, 0.3, 0.5, 0.7, 0.9]
-# Length of the vectors.
-N: int = 10
+SPARSITY: list[float] = [0.1, 0.3, 0.5, 0.7, 0.9]  # Sparsity of the vectors.
+N: int = 10  # Length of the vectors.
 
 
 def dvector() -> torch.Tensor:
