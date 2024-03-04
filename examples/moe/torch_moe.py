@@ -7,12 +7,11 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 import numpy as np
+import argparse
+import os
 
 
 class SparseDataset(Dataset):
-    """
-    A PyTorch Dataset that provides access to sparse matrix data.
-    """
     def __init__(self, x, y):
         self.x = x
         self.y = y
@@ -28,7 +27,7 @@ class SparseDataset(Dataset):
 
 class Expert(nn.Module):
     def __init__(self, input_size, output_size):
-        super(Expert, self).__init__()
+        super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_size, 256),
             nn.ReLU(),
@@ -42,7 +41,7 @@ class Expert(nn.Module):
 
 class GatingNetwork(nn.Module):
     def __init__(self, input_size, num_experts):
-        super(GatingNetwork, self).__init__()
+        super().__init__()
         self.fc = nn.Linear(input_size, num_experts)
 
     def forward(self, x):
@@ -51,7 +50,7 @@ class GatingNetwork(nn.Module):
 
 class MixtureOfExperts(nn.Module):
     def __init__(self, input_size, expert_output_size, num_experts, num_classes):
-        super(MixtureOfExperts, self).__init__()
+        super().__init__()
         self.num_experts = num_experts
         self.experts = nn.ModuleList([Expert(input_size, expert_output_size) for _ in range(num_experts)])
         self.gating_network = GatingNetwork(input_size, num_experts)
@@ -113,12 +112,31 @@ def preprocess_data():
     y_train = encoder.fit_transform(y_train)
     y_test = encoder.transform(y_test)
 
-    return SparseDataset(x_train, y_train), SparseDataset(x_test, y_test)
+    return SparseDataset(x_train, y_train), SparseDataset(x_test, y_test), vectorizer, encoder
+
+
+def train(model, train_loader, criterion, optimizer, epochs=5):
+    for epoch in range(epochs):
+        print(f'Epoch {epoch + 1}/{epochs}')
+        train_epoch(model, train_loader, criterion, optimizer)
+    # Save the model
+    torch.save(model.state_dict(), 'moe_model.pth')
+    print('Training complete. Model saved.')
+
+
+def test(model, test_loader):
+    # Load the model
+    model.load_state_dict(torch.load('moe_model.pth'))
+    print('Model loaded for evaluation.')
+    evaluate(model, test_loader)
 
 
 def main():
-    # Preprocessing step to load and prepare the dataset
-    train_dataset, test_dataset = preprocess_data()
+    parser = argparse.ArgumentParser(description="Train or Evaluate Mixture of Experts Model")
+    parser.add_argument('--mode', choices=['train', 'test'], required=True, help="Mode to run: train or test the model.")
+    args = parser.parse_args()
+
+    train_dataset, test_dataset, vectorizer, encoder = preprocess_data()
 
     # DataLoader
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
@@ -137,12 +155,10 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    # Training loop
-    epochs = 5
-    for epoch in range(epochs):
-        print(f'Epoch {epoch + 1}/{epochs}')
-        train_epoch(model, train_loader, criterion, optimizer)
-        evaluate(model, test_loader)
+    if args.mode == 'train':
+        train(model, train_loader, criterion, optimizer)
+    elif args.mode == 'test':
+        test(model, test_loader)
 
 
 if __name__ == "__main__":
