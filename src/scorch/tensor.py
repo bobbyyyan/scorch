@@ -510,7 +510,7 @@ class Tensor(torch.nn.Module):
                         ]
                     ),
                 )
-
+            # print("fmt: ", fmt)
             if fmt is None:
                 # TODO: infer output format from input format
                 # For now, make every level COMPRESSED

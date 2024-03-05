@@ -951,7 +951,6 @@ class IterationLattice:
         #             value=llir.Literal(value=0, data_type=llir.DataType.INT),
         #         )
         #     )
-
         if len(all_mode_iterators) > 1:
             iterator_init_stmts.extend(
                 [*[mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators]]  # type: ignore

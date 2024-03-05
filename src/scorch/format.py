@@ -19,6 +19,7 @@ class LevelFormat(object):
 
     _mode: LevelType
     _bit_width: Optional[int]
+    _tile_size: Optional[int]
 
     # For the constructor, mode may be a string or a LevelType
     # if mode is a string, then we need to convert it to a LevelType
@@ -27,6 +28,7 @@ class LevelFormat(object):
         self,
         mode: Union[str, LevelType],
         bit_width: Optional[int] = None,
+        tile_size: Optional[int] = None,
     ):
         if isinstance(mode, str):
             # convert string to LevelType
@@ -39,6 +41,7 @@ class LevelFormat(object):
         assert isinstance(mode, LevelType)
         self._mode = mode
         self._bit_width = bit_width
+        self._tile_size = tile_size
 
     def get_level_type(self) -> LevelType:
         return self._mode
@@ -120,6 +123,9 @@ class TensorFormat(object):
 
     def get_level_types(self) -> List[LevelType]:
         return [level_format.get_level_type() for level_format in self._level_formats]
+    
+    def get_level_tile_sizes(self) -> List[int]:
+        return [level_format._tile_size for level_format in self._level_formats]
 
     def get_order(self) -> int:
         return len(self.get_level_formats())

@@ -64,20 +64,35 @@ class CINLowerer:
         # TODO: handle COO
         stmts: List[llir.Stmt] = []
         level_types = tensor.get_level_types()
+        level_tile_sizes = tensor.get_level_tile_sizes()
         for level, level_type in enumerate(level_types):
             if level_type == LevelType.DENSE:
-                stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{tensor.name}{level}_size",
-                            type=llir.DataType.INT,
-                        ),
-                        value=llir.Var(
-                            name=f"{tensor.name}_shape[{level}]",
-                            type=llir.DataType.INT,
-                        ),
+                if level_tile_sizes[level] is not None:
+                    stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor.name}{level}_size",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Var(
+                                name=f"{tensor.name}_shape[{level}]/{level_tile_sizes[level]}",
+                                type=llir.DataType.INT,
+                            ),
+                        )
                     )
-                )
+                else:
+                    stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor.name}{level}_size",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Var(
+                                name=f"{tensor.name}_shape[{level}]",
+                                type=llir.DataType.INT,
+                            ),
+                        )
+                    )
             elif level_type == LevelType.COMPRESSED:
                 stmts.append(
                     llir.VarInit(
@@ -1004,7 +1019,7 @@ class CINLowerer:
         )
         for tile_size_var in tile_size_vars:
             tile_size_vars_init_stmts.append(tile_size_var.llir_var_init)
-
+        
         self.need_compute.extend(result_tensor_vars)
 
         if recurse or stmt != self.outermost_stmt:
@@ -1624,6 +1639,7 @@ class CINLowerer:
         iter_lattice = IterationLattice(for_all_stmt=stmt, cin_lowerer=self)
 
         stmts: List[llir.Stmt] = []
+        stmts.append(llir.Comment(f"Lower ForAll {index_var}"))
 
         # if self.result_tensor_access and not self.result_tensor_access.has_index_var(
         #     index_var

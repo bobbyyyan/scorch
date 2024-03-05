@@ -569,6 +569,9 @@ class TensorVar(IndexExpr):
     def get_level_types(self) -> List[LevelType]:
         return self.get_format().get_level_types()
 
+    def get_level_tile_sizes(self) -> List[int]:
+        return self.get_format().get_level_tile_sizes()
+
     @property
     def levels(self) -> int:
         return len(self.get_level_types())

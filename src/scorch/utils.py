@@ -66,7 +66,6 @@ def topo_sort_characters(s, priority=""):
 
     return result
 
-
 def parse_format(fmt: Union[List[str], str, TensorFormat]) -> TensorFormat:
     """Convert a list of format strings to a TensorFormat.
 
@@ -81,15 +80,28 @@ def parse_format(fmt: Union[List[str], str, TensorFormat]) -> TensorFormat:
     if isinstance(fmt, str):
         fmt = list(fmt)
     level_formats = []
-    for format_str in fmt:
-        if format_str in ["dense", "d"]:
-            level_formats.append(LevelFormat(mode=LevelType.DENSE))
-        elif format_str in ["compressed", "sparse", "c", "s"]:
-            level_formats.append(LevelFormat(mode=LevelType.COMPRESSED))
-        elif format_str in ["coordinate", "coord", "o"]:
-            level_formats.append(LevelFormat(mode=LevelType.COORDINATE))
-        else:
-            raise ValueError(f"Invalid format string: {format_str}")
+    for format_element in fmt:
+        if isinstance(format_element, str):
+            format_mode = format_element
+            if format_mode in ["dense", "d"]:
+                level_formats.append(LevelFormat(mode=LevelType.DENSE))
+            elif format_mode in ["compressed", "sparse", "c", "s"]:
+                level_formats.append(LevelFormat(mode=LevelType.COMPRESSED))
+            elif format_mode in ["coordinate", "coord", "o"]:
+                level_formats.append(LevelFormat(mode=LevelType.COORDINATE))
+            else:
+                raise ValueError(f"Invalid format element: {format_element}")
+        elif isinstance(format_element, list):
+            assert len(format_element) == 2, "Only two elements are allowed in a format list (mode and tile size)"
+            format_mode, tile_size = format_element
+            if format_mode in ["dense", "d"]:
+                level_formats.append(LevelFormat(mode=LevelType.DENSE, tile_size=tile_size))
+            elif format_mode in ["compressed", "sparse", "c", "s"]:
+                level_formats.append(LevelFormat(mode=LevelType.COMPRESSED, tile_size=tile_size))
+            elif format_mode in ["coordinate", "coord", "o"]:
+                level_formats.append(LevelFormat(mode=LevelType.COORDINATE, tile_size=tile_size))
+            else:
+                raise ValueError(f"Invalid format element: {format_element}")
     return TensorFormat(level_formats=level_formats)
 
 

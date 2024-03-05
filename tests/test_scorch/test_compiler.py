@@ -220,6 +220,11 @@ def test_elemwise_mul_3d_tensor_dss_sss_sss():
     A = TensorVar("A", fmt=["dense", "sparse", "sparse"])
     B = TensorVar("B", fmt=["sparse", "sparse", "sparse"])
     C = TensorVar("C", fmt=["sparse", "sparse", "sparse"])
+    
+    A = TensorVar("A", fmt=["dense", "sparse", "sparse"], tile=[2,2,2])
+    # specify the tile size for each dimension
+    B = TensorVar("B", fmt=["sparse", "sparse", "sparse"])
+    C = TensorVar("C", fmt=["sparse", "sparse", "sparse"])
 
     A[i, j, k] = B[i, j, k] * C[i, j, k]
 
