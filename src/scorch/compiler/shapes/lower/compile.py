@@ -2,10 +2,13 @@ import torch
 
 from scorch.compiler import cin
 from scorch import tensor
-from scorch.compiler.shapes import cfir, codegen, cpp
+from scorch.compiler.shapes.ast import cfir, cpp
+from scorch.compiler.shapes.lower import cfir_to_cpp, cin_to_cfir
 from scorch.format import LevelType
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from pathlib import Path
+
+# Necessary code generation to execute CPP generated code with PyTorch tensors.
 
 
 def GetLevelAndValueArrays(argument: cin.TensorVar) -> Sequence[cpp.Cpp]:
@@ -303,8 +306,8 @@ def DefineFunction(
 
 def Compile(cin: cin.CIN) -> cpp.Cpp:
     """Compiles CIN -> CFIR -> CPP"""
-    s0: cfir.CFIR = cfir.Lower(cin)
-    s1: cpp.Cpp = codegen.Lower(s0)
+    s0: cfir.CFIR = cin_to_cfir.Lower(cin)
+    s1: cpp.Cpp = cfir_to_cpp.Lower(s0)
     return s1
 
 

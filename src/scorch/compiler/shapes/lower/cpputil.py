@@ -1,7 +1,8 @@
 from scorch import format
 from multipledispatch import dispatch
 from scorch.compiler import cin
-from scorch.compiler.shapes import cpp, lattice as il
+from scorch.compiler.shapes.ast import cpp
+from scorch.compiler.shapes.lower import sequtil
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 # Utility functions used in the CFIR -> CIN lowering phase.
@@ -39,7 +40,9 @@ def ArrayLowerBound(seq: cin.IndexSeq):
             i: int = seq.index
             return cpp.Access(
                 cpp.Variable(f"{seq.tensor.name}{i}_pos"),
-                cpp.Constant(0) if i == 0 else ArrayIndexVariable(il.GetParent(seq)),
+                cpp.Constant(0)
+                if i == 0
+                else ArrayIndexVariable(sequtil.GetParent(seq)),
             )
         case _:
             raise NotImplementedError(fmt)
@@ -56,7 +59,7 @@ def ArrayUpperBound(seq: cin.IndexSeq):
                 cpp.Constant(1)
                 if i == 0
                 else cpp.Add(
-                    ArrayIndexVariable(il.GetParent(seq)),
+                    ArrayIndexVariable(sequtil.GetParent(seq)),
                     cpp.Constant(1),
                 ),
             )

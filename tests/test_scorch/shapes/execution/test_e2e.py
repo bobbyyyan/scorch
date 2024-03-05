@@ -2,7 +2,8 @@ import torch
 
 from scorch import tensor
 from scorch.compiler import cin
-from scorch.compiler.shapes import cpp, compile
+from scorch.compiler.shapes.ast import cpp
+from scorch.compiler.shapes.lower import compile
 from scorch.format import LevelType
 
 # Compiles CIN -> CFIR -> CPP and then executes the function, verifying

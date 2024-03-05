@@ -2,7 +2,6 @@ import torch
 
 from scorch import tensor
 from scorch.compiler.shapes import ops
-from scorch.compiler.shapes.opcode import Opcode
 
 # Test Reshape Operations against their PyTorch equivalent.
 

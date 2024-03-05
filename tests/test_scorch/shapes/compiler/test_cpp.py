@@ -1,5 +1,6 @@
 from scorch.compiler import cin
-from scorch.compiler.shapes import cfir, cpp, codegen
+from scorch.compiler.shapes.ast import cfir, cpp
+from scorch.compiler.shapes.lower import cfir_to_cpp
 from scorch.format import LevelType
 import tests.utility as util
 
@@ -40,7 +41,7 @@ def test_slice():
 
     util.assert_equal(
         cpp.PrettyPrint(
-            codegen.Lower(
+            cfir_to_cpp.Lower(
                 cfir.Loop(
                     idx=i,
                     sexpr=cin.SliceSeq(
@@ -83,7 +84,7 @@ def test_assign_2d_sd():
 
     util.assert_equal(
         cpp.PrettyPrint(
-            codegen.Lower(
+            cfir_to_cpp.Lower(
                 cfir.Loop(
                     idx=i,
                     sexpr=cin.IndexSeq(

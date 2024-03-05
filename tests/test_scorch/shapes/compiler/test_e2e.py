@@ -1,7 +1,8 @@
 import torch
 
 from scorch.compiler import cin
-from scorch.compiler.shapes import codegen, cpp, compile
+from scorch.compiler.shapes.ast import cpp
+from scorch.compiler.shapes.lower import compile
 from scorch.format import LevelType
 import tests.utility as util
 

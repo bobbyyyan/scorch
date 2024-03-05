@@ -1,9 +1,8 @@
-from dataclasses import dataclass
-from enum import Enum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 from scorch.compiler import cin as cin
-from scorch.compiler.shapes import cpp, cpputil, lattice as il
+from scorch.compiler.shapes.ast import cpp
+from scorch.compiler.shapes.lower import cpputil, sequtil
 
 # An iterator model that follows the work presented in "Compilation of
 # Shape Operators on Sparse Arrays" by Root, et. al.
@@ -178,7 +177,7 @@ def Eval(sexpr: cin.Seq):
             raise NotImplementedError(type(sexpr))
         case cin.ProductSeq(s1, s2):
             # a * |b| + b
-            return cpp.Add(cpp.Mul(Eval(s1), il.Size(s2)), Eval(s2))
+            return cpp.Add(cpp.Mul(Eval(s1), sequtil.Size(s2)), Eval(s2))
         case cin.ProjectSeq(a, k, I, J):
             a = Eval(a)
             return cpp.Div(a, J) if k == 0 else cpp.Mod(a, J)
@@ -303,8 +302,8 @@ def Equals(value: cpp.Cpp, sexpr: cin.Seq):
             return cpp.And(Equals(value, s1), Equals(value, s2))
         case cin.ProductSeq(s1, s2):
             return cpp.And(
-                Equals(cpp.Div(value, il.Size(s2)), s1),
-                Equals(cpp.Mod(value, il.Size(s2)), s2),
+                Equals(cpp.Div(value, sequtil.Size(s2)), s1),
+                Equals(cpp.Mod(value, sequtil.Size(s2)), s2),
             )
         case cin.ProjectSeq(a, k, I, J):
             raise NotImplementedError(type(sexpr))

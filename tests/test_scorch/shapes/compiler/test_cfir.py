@@ -1,5 +1,6 @@
 from scorch.compiler import cin
-from scorch.compiler.shapes import cfir
+from scorch.compiler.shapes.ast import cfir
+from scorch.compiler.shapes.lower import cin_to_cfir
 from scorch.format import LevelType
 import tests.utility as util
 
@@ -16,7 +17,7 @@ def test_intersection_union():
 
     util.assert_equal(
         cfir.PrettyPrint(
-            cfir.Lower(
+            cin_to_cfir.Lower(
                 cin.ForAll(
                     i,
                     A._assignment,
@@ -63,7 +64,7 @@ def test_intersection():
 
     util.assert_equal(
         cfir.PrettyPrint(
-            cfir.Lower(
+            cin_to_cfir.Lower(
                 cin.ForAll(
                     i,
                     A._assignment,
@@ -102,7 +103,7 @@ def test_union():
 
     util.assert_equal(
         cfir.PrettyPrint(
-            cfir.Lower(
+            cin_to_cfir.Lower(
                 cin.ForAll(
                     i,
                     A._assignment,
@@ -147,7 +148,7 @@ def test_slice():
     j = cin.IndexVar("j")
     A[i] = B[j]
 
-    assert cfir.Lower(
+    assert cin_to_cfir.Lower(
         cin.ForAll(
             i,
             A._assignment,
@@ -185,7 +186,7 @@ def test_project():
 
     util.assert_equal(
         cfir.PrettyPrint(
-            cfir.Lower(cin.ForAll(i, cin.ForAll(j, A._assignment, proj1), proj0))
+            cin_to_cfir.Lower(cin.ForAll(i, cin.ForAll(j, A._assignment, proj1), proj0))
         ),
         """while i <-- 𝜋0(b:s[k],[i, j]) 
              while j <-- 𝜋1(b:s[k],[i, j]) 
@@ -208,7 +209,7 @@ def test_collapse():
 
     util.assert_equal(
         cfir.PrettyPrint(
-            cfir.Lower(
+            cin_to_cfir.Lower(
                 cin.ForAll(k, c._assignment, cin.UnionSeq(cin.ProductSeq(Ai, Aj), bk))
             )
         ),
@@ -241,7 +242,9 @@ def test_assign_2d_ss():
     Bi = cin.IndexSeq(i, B, size=8, index=0, format=LevelType.COMPRESSED)
     Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.COMPRESSED)
 
-    assert cfir.Lower(cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)) == cfir.Loop(
+    assert cin_to_cfir.Lower(
+        cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)
+    ) == cfir.Loop(
         idx=i,
         sexpr=Bi,
         body=cfir.Loop(

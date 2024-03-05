@@ -1157,6 +1157,9 @@ def all_free_var_loops_before_reduction_loops(stmt: IndexStmt) -> bool:
 ####################################
 
 
+# TODO(cgyurgyik): This should contain its own definition of CIN constructs, e.g., TensorVar and IndexVar.
+# Right now, we have CIN constructs bleeding into the CFIR lowering as well. Then, we can also move these
+# into their own file.
 @dataclass
 class Seq:
     pass

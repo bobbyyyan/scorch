@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from scorch.compiler.shapes.opcode import Opcode
+from scorch.compiler.shapes.lower.opcode import Opcode
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 import scorch.tensor as tensor
 from scorch.format import TensorFormat

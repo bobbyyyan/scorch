@@ -1,14 +1,13 @@
 from enum import StrEnum
 import torch
 
-from scorch.compiler.shapes.opcode import Opcode
+from scorch.compiler.shapes.lower.opcode import Opcode
 from scorch.compiler import cin
 from scorch import tensor
 from scorch.utils import parse_format
-from scorch.compiler.shapes import compile
+from scorch.compiler.shapes.lower import compile
 from scorch.format import LevelType, TensorFormat
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
-from collections import Counter
 
 # Necessary for ops that aren't supported in Burrito variant of the compiler.
 import scorch.ops as experimental
@@ -363,6 +362,33 @@ def mul(
     return __elementwise(lhs, rhs, Opcode.MUL, format)
 
 
+def matmul(
+    lhs: torch.Tensor | tensor.Tensor,
+    rhs: torch.Tensor | tensor.Tensor,
+    format: Optional[Union[TensorFormat, str, List[str]]] = None,
+):
+    # TODO(cgyurgyik): Implement.
+    output = experimental.matmul(lhs, rhs)
+    output.name = ResultName()
+    return output
+
+
+def concat(
+    lhs: torch.Tensor | tensor.Tensor,
+    rhs: torch.Tensor | tensor.Tensor,
+    dim: int,
+    format: Optional[Union[TensorFormat, str, List[str]]] = None,
+):
+    # TODO(cgyurgyik): Implement.
+    assert type(lhs) == type(rhs)
+    if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
+        return torch.concat([lhs, rhs], dim)
+
+    return tensor.Tensor.from_torch(
+        torch.concat([lhs.to_torch(), rhs.to_torch()], dim)
+    ).to_sparse(format)
+
+
 def generic_vector(
     instructions: list[Opcode | tensor.Tensor],
     shape: Tuple[int] = None,
@@ -489,30 +515,3 @@ def generic_vector(
         arguments=tensors,
         result=tensor.Tensor.from_torch(torch.zeros(R.shape), outname),
     )
-
-
-def matmul(
-    lhs: torch.Tensor | tensor.Tensor,
-    rhs: torch.Tensor | tensor.Tensor,
-    format: Optional[Union[TensorFormat, str, List[str]]] = None,
-):
-    # TODO(cgyurgyik): Implement.
-    output = experimental.matmul(lhs, rhs)
-    output.name = ResultName()
-    return output
-
-
-def concat(
-    lhs: torch.Tensor | tensor.Tensor,
-    rhs: torch.Tensor | tensor.Tensor,
-    dim: int,
-    format: Optional[Union[TensorFormat, str, List[str]]] = None,
-):
-    # TODO(cgyurgyik): Implement.
-    assert type(lhs) == type(rhs)
-    if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
-        return torch.concat([lhs, rhs], dim)
-
-    return tensor.Tensor.from_torch(
-        torch.concat([lhs.to_torch(), rhs.to_torch()], dim)
-    ).to_sparse(format)

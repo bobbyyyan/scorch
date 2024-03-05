@@ -2,7 +2,7 @@ import torch
 
 from scorch import tensor
 from scorch.compiler.shapes import ops
-from scorch.compiler.shapes.opcode import Opcode
+from scorch.compiler.shapes.lower.opcode import Opcode
 
 SPARSITY: list[float] = [0.1, 0.3, 0.5, 0.7, 0.9]  # Sparsity of the vectors.
 N: int = 10  # Length of the vectors.
