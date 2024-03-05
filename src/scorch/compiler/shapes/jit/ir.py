@@ -101,10 +101,11 @@ class AbstractTensor(Value):
         return self._tensor._nnz()
 
     def __getitem__(self, key):
+        dimension = 0  # TODO(cgyurgyik): Support multi-dimensional slicing.
         (start, end, stride) = (key.start, key.stop, key.step)
         return slice(
             self,
-            dim=0,
+            dim=dimension,
             start=start,
             end=end,
             stride=stride if stride is not None else 1,
