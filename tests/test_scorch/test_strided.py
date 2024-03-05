@@ -110,13 +110,14 @@ def test_spmm_dd_ds_dd_time():
     random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity)
 
     random_tensor_a_csr = random_tensor_a.to_sparse_csr()
+    # random_tensor_a_bsr = random_tensor_a.to_sparse_bsr(block_size=(2, 2))
 
     start_time = time.time()
     torch_result = torch.matmul(random_tensor_a_csr, random_tensor_b)
     # torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse([["d", "3"], ["s", "2"]])
+    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("ds", stride_size=[4, 2])
     tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
 
     time_dict = {}
