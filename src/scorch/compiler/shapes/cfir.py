@@ -157,6 +157,9 @@ def FilterLocators(locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]], point: c
 def FindLocators(
     sexpr: cin.Seq, dense_locate=False
 ) -> Tuple[cin.Seq, list[Tuple[cin.Seq, ...]]]:
+    """
+    Note: The `dense_locate` flag is a quick-fix.
+    Reference: https://github.com/rootjalex/burrito/issues/1"""
     match sexpr:
         case cin.IndexSeq() | cin.Universe():
             return [sexpr, []]

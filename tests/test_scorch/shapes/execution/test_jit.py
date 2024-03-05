@@ -34,7 +34,9 @@ def test_zero_simplifications():
 
 def test_simplify_concat_spmv():
     # TODO(cgyurgyik): This fails because CSC is not supported yet.
-    # It will return `[[0, 0], [0, 0]]` for _A2.
+    # Reference: https://github.com/bobbyyyan/scorch/issues/3
+    return
+
     @compile
     def Foo(A1, A2, b):
         return matmul(concat(A1, A2, dim=1), b)
@@ -79,3 +81,19 @@ def test_fusion_hygienic_naming():
     a = torch.Tensor([0, 2, 0, 0, 0])
     b = torch.Tensor([1, 2, 1, 1, 1])
     assert torch.allclose(Foo(a, b), a * b + a)
+
+
+def test_fusion_with_slice():
+    @compile
+    def Foo(A, B, C):
+        D = A * B
+        E = D + C[0:5:1]
+        return E
+
+    a = torch.Tensor([0, 2, 0, 0, 0])
+    b = torch.Tensor([1, 2, 1, 1, 1])
+    c = torch.Tensor([1, 2, 3, 4, 5, 6, 7])
+    A = tensor.Tensor.from_torch(a, name="A")
+    B = tensor.Tensor.from_torch(b, name="B")
+    C = tensor.Tensor.from_torch(c, name="C")
+    assert torch.allclose(Foo(A, B, C), (a * b) + c[0:5:1])

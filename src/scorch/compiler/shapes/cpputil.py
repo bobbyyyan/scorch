@@ -209,5 +209,9 @@ def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
             if b == cpp.Constant(1):
                 return cpp.Constant(0)
             return cpp.Mod(a, b)
+        case cpp.Min(a, b):
+            return cpp.Min(Simplify(a), Simplify(b))
+        case cpp.Max(a, b):
+            return cpp.Max(Simplify(a), Simplify(b))
         case _:
             return expr

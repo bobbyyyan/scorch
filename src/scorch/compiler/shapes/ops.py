@@ -8,6 +8,7 @@ from scorch.utils import parse_format
 from scorch.compiler.shapes import compile
 from scorch.format import LevelType, TensorFormat
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
+from collections import Counter
 
 # Necessary for ops that aren't supported in Burrito variant of the compiler.
 import scorch.ops as experimental
@@ -24,6 +25,8 @@ SUFFIX = 0
 
 
 def Name():
+    """Hygienic name for operands."""
+
     def Suffix() -> int:
         global SUFFIX
         s: int = SUFFIX
@@ -34,6 +37,7 @@ def Name():
 
 
 def ResultName():
+    """Hygienic name for results."""
     return f"_R{Name()}"
 
 
@@ -361,6 +365,7 @@ def mul(
 
 def generic_vector(
     instructions: list[Opcode | tensor.Tensor],
+    shape: Tuple[int] = None,
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ):
     """Computes the vector instructions provided in polish notation, e.g.,
@@ -376,8 +381,6 @@ def generic_vector(
         names = set()
         for instruction in old:
             match instruction:
-                case Opcode():
-                    new.append(instruction)
                 case tensor.Tensor():
                     if instruction.name in names:
                         # Make a copy, since we need two *different* tensors.
@@ -388,26 +391,33 @@ def generic_vector(
                             i += 1
                     names.add(instruction.name)
                     new.append(instruction)
+                case Opcode() | _:
+                    new.append(instruction)
         return new
 
-    instructions = hygienic(instructions)
+    instructions: list[Opcode | tensor.Tensor] = hygienic(instructions)
 
     def __GenSeq1D(
         instructions: list[Opcode | cin.TensorVar], i: cin.IndexVar
     ) -> cin.Seq:
         """Generate CIN sequences for vector operations."""
 
-        def __GenSeq(instructions: list[Opcode | cin.TensorVar]) -> cin.Seq:
+        def __GenSeq(
+            instructions: list[Opcode | cin.TensorVar], v: Optional[cin.IndexVar] = None
+        ) -> cin.Seq:
             assert len(instructions) > 0
             next: Opcode | cin.TensorVar = instructions.pop()
             if isinstance(next, cin.TensorVar):
                 (level,) = next.format.get_level_types()
                 (size,) = next.shape
                 return cin.IndexSeq(
-                    idx=i, tensor=next, size=size, index=0, format=level
+                    idx=v if v is not None else i,
+                    tensor=next,
+                    size=size,
+                    index=0,
+                    format=level,
                 )
 
-            assert isinstance(next, Opcode)
             match next:
                 case Opcode.ADD:
                     lhs: cin.Seq = __GenSeq(instructions)
@@ -417,6 +427,9 @@ def generic_vector(
                     lhs: cin.Seq = __GenSeq(instructions)
                     rhs: cin.Seq = __GenSeq(instructions)
                     return cin.IntersectionSeq(lhs, rhs)
+                case (Opcode.SLICE, start, end, stride):
+                    input: cin.Seq = __GenSeq(instructions)
+                    return cin.SliceSeq(input, start=start, end=end, stride=stride)
                 case _:
                     raise NotImplementedError(next)
 
@@ -431,7 +444,6 @@ def generic_vector(
             if isinstance(next, cin.TensorVar):
                 return next[i]
 
-            assert isinstance(next, Opcode)
             match next:
                 case Opcode.ADD:
                     lhs: cin.Seq = __GenAssign(instructions)
@@ -441,6 +453,8 @@ def generic_vector(
                     lhs: cin.Seq = __GenAssign(instructions)
                     rhs: cin.Seq = __GenAssign(instructions)
                     return lhs * rhs
+                case (Opcode.SLICE, _, _, _):
+                    return __GenAssign(instructions)
                 case _:
                     raise NotImplementedError(next)
 
@@ -448,19 +462,23 @@ def generic_vector(
 
     tensors: list[tensor.Tensor] = []
     cins: list[Opcode | cin.TensorVar] = []
-    for i, instruction in enumerate(instructions):
-        if isinstance(instruction, Opcode):
-            cins.append(instruction)
-            continue
-        tensors.append(instruction)
-        cins.append(
-            cin.TensorVar(
-                instruction.name, shape=instruction.shape, fmt=instruction.format
+    for instruction in instructions:
+        if isinstance(instruction, tensor.Tensor):
+            cins.append(
+                cin.TensorVar(
+                    instruction.name,
+                    shape=instruction.shape,
+                    fmt=instruction.format,
+                )
             )
-        )
+            tensors.append(instruction)
+            continue
 
-    assert len(set(t.shape for t in tensors)) == 1
-    shape = tensors[0].shape
+        cins.append(instruction)
+
+    if shape is None:
+        assert len(set(t.shape for t in tensors)) == 1
+        shape = tensors[0].shape
     i = cin.IndexVar("i")
     outname: str = ResultName()
     R = cin.TensorVar(outname, shape=shape, fmt=__format(format, rank=1))

@@ -94,3 +94,29 @@ def test5():
             ).to_torch(),
             (b + c) * d,
         )
+
+
+def test6():
+    a: torch.Tensor = torch.Tensor([0, 1, 2, 3, 4, 5, 6, 7])
+    A = tensor.Tensor.from_torch(a, "A")
+    b: torch.Tensor = torch.Tensor([0, 1, 2, 3, 4])
+    B = tensor.Tensor.from_torch(b, "B")
+    assert torch.equal(
+        ops.generic_vector(
+            [Opcode.ADD, (Opcode.SLICE, 0, 5, 1), A, B], shape=(5,)
+        ).to_torch(),
+        a[0:5:1] + b,
+    )
+
+
+def test7():
+    b: torch.Tensor = torch.Tensor([0, 2, 3, 4, 0, 6])
+    c: torch.Tensor = torch.Tensor([3, 0, 5, 6, 0, 8])
+    d: torch.Tensor = torch.Tensor([10, 11, 0, 0, 14, 0])
+    B = tensor.Tensor.from_torch(b, "B").to_sparse("s")
+    C = tensor.Tensor.from_torch(c, "C").to_sparse("s")
+    D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
+    assert torch.equal(
+        ops.generic_vector([Opcode.ADD, B, Opcode.MUL, C, D], format="d").to_torch(),
+        b + (c * d),
+    )

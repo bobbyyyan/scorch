@@ -100,19 +100,6 @@ def test_mul_1d_ss():
     )
 
 
-def test_muladd_1d():
-    b: torch.Tensor = torch.Tensor([0, 2, 3, 4, 0, 6])
-    c: torch.Tensor = torch.Tensor([3, 0, 5, 6, 0, 8])
-    d: torch.Tensor = torch.Tensor([10, 11, 0, 0, 14, 0])
-    B = tensor.Tensor.from_torch(b, "B").to_sparse("s")
-    C = tensor.Tensor.from_torch(c, "C").to_sparse("s")
-    D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
-    assert torch.equal(
-        ops.generic_vector([Opcode.ADD, B, Opcode.MUL, C, D], format="d").to_torch(),
-        b + (c * d),
-    )
-
-
 def test_mul_1d_dd():
     a: torch.Tensor = torch.Tensor([0, 2, 3, 0, 5, 6])
     b: torch.Tensor = torch.Tensor([3, 4, 0, 6, 7, 0])
@@ -143,43 +130,4 @@ def test_mul_1d_sd():
     assert torch.equal(
         ops.mul(lhs, rhs, format="d").to_torch(),
         a * b,
-    )
-
-
-def test_muladd_1d():
-    b: torch.Tensor = torch.Tensor([1, 0, 3, 4, 0, 6])
-    c: torch.Tensor = torch.Tensor([3, 4, 0, 6, 0, 8])
-    d: torch.Tensor = torch.Tensor([10, 11, 0, 0, 14, 15])
-    B = tensor.Tensor.from_torch(b, "B").to_sparse("s")
-    C = tensor.Tensor.from_torch(c, "C")
-    D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
-    assert torch.equal(
-        ops.generic_vector([Opcode.MUL, Opcode.ADD, B, C, D], format="d").to_torch(),
-        (b + c) * d,
-    )
-
-
-def test_add2_1d():
-    b: torch.Tensor = torch.Tensor([1, 0, 3, 4, 0, 6])
-    c: torch.Tensor = torch.Tensor([3, 4, 0, 6, 0, 8])
-    d: torch.Tensor = torch.Tensor([10, 11, 0, 0, 14, 15])
-    B = tensor.Tensor.from_torch(b, "B").to_sparse("s")
-    C = tensor.Tensor.from_torch(c, "C")
-    D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
-    assert torch.equal(
-        ops.generic_vector([Opcode.ADD, Opcode.ADD, B, C, D], format="d").to_torch(),
-        (b + c) + d,
-    )
-
-
-def test_mul2_1d():
-    b: torch.Tensor = torch.Tensor([1, 0, 3, 4, 0, 6])
-    c: torch.Tensor = torch.Tensor([3, 4, 0, 6, 0, 8])
-    d: torch.Tensor = torch.Tensor([10, 11, 0, 0, 14, 15])
-    B = tensor.Tensor.from_torch(b, "B").to_sparse("s")
-    C = tensor.Tensor.from_torch(c, "C")
-    D = tensor.Tensor.from_torch(d, "D").to_sparse("s")
-    assert torch.equal(
-        ops.generic_vector([Opcode.MUL, Opcode.MUL, B, C, D], format="d").to_torch(),
-        (b * c) * d,
     )

@@ -100,6 +100,16 @@ class AbstractTensor(Value):
             return functools.reduce(operator.mul, self.shape(), 1)
         return self._tensor._nnz()
 
+    def __getitem__(self, key):
+        (start, end, stride) = (key.start, key.stop, key.step)
+        return slice(
+            self,
+            dim=0,
+            start=start,
+            end=end,
+            stride=stride if stride is not None else 1,
+        )
+
     def __str__(self):
         df: str = ",".join(
             f"{d}:{f}"
@@ -124,11 +134,16 @@ class Instruction(IR):
 class FusedOp(IR):
     __match_args__ = ("instructions",)
     instructions: List[IR | Opcode]
+    _shape: Tuple[int]
 
     def __init__(
-        self, instructions: Sequence[IR | Opcode], region: Optional[ScorchRegion] = None
+        self,
+        instructions: Sequence[IR | Opcode],
+        shape: Tuple[int],
+        region: Optional[ScorchRegion] = None,
     ):
         self.instructions = instructions
+        self._shape = shape
         super().__init__(region=region, opcode=Opcode.FUSE)
 
     def format(self) -> TensorFormat:
@@ -142,13 +157,20 @@ class FusedOp(IR):
             match next := input.pop():
                 case IR():
                     s += f"%{next.ordinal}"
+                case (Opcode.SLICE, start, end, stride):
+                    x = pp(input)
+                    s += f"{Opcode.SLICE} {x}[{start}:{end}:{stride}]"
                 case Opcode():
-                    x, y = pp(input), pp(input)
-                    if not first:
-                        s += "("
-                    s += f"{next} {x}, {y}"
-                    if not first:
-                        s += ")"
+                    if next in (Opcode.SLICE,):
+                        x = pp(input)
+                        s += f"{next} {x}"
+                    else:
+                        x, y = pp(input), pp(input)
+                        if not first:
+                            s += "("
+                        s += f"{next} {x}, {y}"
+                        if not first:
+                            s += ")"
             return s
 
         return pp(instructions, first=True)
@@ -157,10 +179,7 @@ class FusedOp(IR):
         return list(filter(lambda x: isinstance(x, IR), self.instructions))
 
     def shape(self) -> Tuple[int]:
-        operands = self.operands()
-        s = set([op.shape() for op in operands])
-        assert len(s) == 1
-        return s.pop()
+        return self._shape
 
     def __repr__(self):
         return str(self)
@@ -205,12 +224,13 @@ class slice(Instruction):
     dim: int
     start: int
     end: int
+    stride: int
     __match_args__ = (
         "input",
         "dim",
         "start",
         "end",
-        "step",
+        "stride",
     )
 
     def __init__(
@@ -219,7 +239,7 @@ class slice(Instruction):
         dim: int,
         start: int,
         end: int,
-        step: int = 1,
+        stride: int = 1,
         region: Optional[ScorchRegion] = None,
     ):
         if region is None:
@@ -228,7 +248,7 @@ class slice(Instruction):
         self.dim = dim
         self.start = start
         self.end = end
-        self.step = step
+        self.stride = stride
         super().__init__(region=region, opcode=Opcode.SLICE)
 
     def operands(self) -> List[IR]:
@@ -236,14 +256,14 @@ class slice(Instruction):
 
     def shape(self) -> Tuple[int]:
         s = list(self.input.shape())
-        s[self.dim] = (self.end - self.start) // self.step
+        s[self.dim] = (self.end - self.start) // self.stride
         return tuple(s)
 
     def format(self) -> TensorFormat:
         return self.input.format()
 
     def __str__(self):
-        return f"{self.opcode}.{self.dim} %{self.input.ordinal}[{self.start}:{self.end}:{self.step}]"
+        return f"{self.opcode}.{self.dim} %{self.input.ordinal}[{self.start}:{self.end}:{self.stride}]"
 
     def __repr__(self):
         return str(self)
@@ -366,7 +386,7 @@ class BinaryOp(Instruction):
 
     def shape(self) -> Tuple[int]:
         (x, y) = self.lhs.shape(), self.rhs.shape()
-        assert x == y
+        assert x == y, (x, y)
         return x
 
     def format(self) -> Tuple[TensorFormat]:
@@ -445,8 +465,8 @@ class IRBuilder:
     def concat(self, A: IR, B: IR, dim: int) -> IR:
         return concat(A, B, dim, self.region())
 
-    def slice(self, input: IR, dim: int, start: int, end: int, step: int = 1) -> IR:
-        return slice(input, dim, start, end, step, self.region())
+    def slice(self, input: IR, dim: int, start: int, end: int, stride: int = 1) -> IR:
+        return slice(input, dim, start, end, stride, self.region())
 
 
 @dataclass
@@ -473,7 +493,7 @@ def can_fuse(A: IR, B: IR):
         return False
 
     def supported(x: IR):
-        return isinstance(x, mul | add | FusedOp)
+        return isinstance(x, mul | add | slice | FusedOp)
 
     if not supported(A) or not supported(B):
         # Conversatively only fuse multiply, add.
@@ -531,18 +551,22 @@ class ScorchRegion:
                         if isinstance(instruction, Opcode):
                             new.append(instruction)
                             continue
-                        assert isinstance(instruction, IR)
                         match instruction:
                             case AbstractTensor(input):
                                 new.append(input)
                             case add(a, b) | mul(a, b):
                                 new.extend(convert([a, b]))
+                            case (Opcode.SLICE, start, end, stride):
+                                new.extend([(Opcode.SLICE, start, end, stride)])
+                            case slice(input, dim, start, end, stride):
+                                assert dim == 0
+                                new.append((input, start, end, stride))
                             case _:
                                 raise NotImplementedError(type(instruction))
                     return new
 
                 if len(V.shape()) == 1:
-                    return ops.generic_vector(convert(instructions))
+                    return ops.generic_vector(convert(instructions), V.shape())
                 raise NotImplementedError(
                     type(V)
                 )  # TODO(cgyurgyik): Support different fusion.
@@ -557,8 +581,8 @@ class ScorchRegion:
                 return ops.concat(self.evaluate(A), self.evaluate(B), dim)
             case matmul(A, B):
                 return ops.matmul(self.evaluate(A), self.evaluate(B))
-            case slice(input, dim, start, end, step):
-                return ops.slice(self.evaluate(input), dim, start, end, step)
+            case slice(input, dim, start, end, stride):
+                return ops.slice(self.evaluate(input), dim, start, end, stride)
             case copy(input):
                 return tensor.Tensor.copy(self.evaluate(input))
             case _:
@@ -571,14 +595,21 @@ class ScorchRegion:
             #  =>
             # A = (D * E) + C
             assert B in A.operands()
+            assert A.shape() == B.shape()
             op: list[Opcode | IR] = [A.opcode]
             for operand in A.operands():
                 if operand == B:
                     match B:
                         case FusedOp(instructions):
                             op.extend(instructions)
-                        case _:
+                        case slice(input, dim, start, end, stride):
+                            assert dim == 0
+                            op.append((B.opcode, start, end, stride))
+                            op.append(input)
+                        case IR():
                             op.extend([B.opcode, *B.operands()])
+                        case _:
+                            raise NotImplementedError(type(B))
                 else:
                     match operand:
                         case AbstractTensor():
@@ -587,11 +618,14 @@ class ScorchRegion:
                             op.append(input)
                         case mul(a, b) | add(a, b):
                             op.extend([operand.opcode, a, b])
+                        case slice(input, dim, start, end, stride):
+                            assert dim == 0
+                            op.extend([(operand.opcode, start, end, stride), input])
                         case FusedOp(instructions):
                             op.extend(instructions)
                         case _:
                             raise NotImplementedError(type(operand))
-            op = FusedOp(op, self)
+            op = FusedOp(op, A.shape(), self)
             for old in (A, B):
                 self.replace(old, op)
 

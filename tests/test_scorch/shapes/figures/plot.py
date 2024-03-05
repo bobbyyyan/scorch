@@ -13,6 +13,7 @@ E: int = 10
 
 class Format(StrEnum):
     """Format of the input matrix"""
+
     D = "d"  # dense (torch.rand)
     SP = "sp"  # "with probability p, A[i,j] is 0."
     CSR = "csr"  # S + "with probability p, A[:, j] is 0"
@@ -28,6 +29,7 @@ SPARSITIES: list[float] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
 @dataclass
 class Data:
     """C = f(A, B)"""
+
     nnzA: list[int]
     nnzB: list[int]
     nnzC: list[int]
@@ -172,22 +174,22 @@ def sparsity(f: Callable, input1: Format, input2: Format) -> Data:
 
 def _plot_nnz(f: Callable, axis, input1: Format, input2: Format):
     d: Data = sparsity(f, input1, input2)
-    axis.set_title(f'({input1}, {input2})')
-    axis.plot(SPARSITIES, d.nnzA, label='A.nnz')
-    axis.plot(SPARSITIES, d.nnzB, label='B.nnz')
-    axis.plot(SPARSITIES, d.nnzC, label='C.nnz')
+    axis.set_title(f"({input1}, {input2})")
+    axis.plot(SPARSITIES, d.nnzA, label="A.nnz")
+    axis.plot(SPARSITIES, d.nnzB, label="B.nnz")
+    axis.plot(SPARSITIES, d.nnzC, label="C.nnz")
 
 
 def _plot_density(f: Callable, axis, input1: Format, input2: Format):
     d: Data = sparsity(f, input1, input2)
-    axis.set_title(f'({input1}, {input2})')
-    axis.plot(SPARSITIES, d.C0, label='C.0')
-    axis.plot(SPARSITIES, d.C1, label='C.1')
+    axis.set_title(f"({input1}, {input2})")
+    axis.plot(SPARSITIES, d.C0, label="C.0")
+    axis.plot(SPARSITIES, d.C1, label="C.1")
 
 
 def plot_operations(input1: Format, input2: Format):
     figure, axes = plt.subplots(2, 2)
-    figure.suptitle(f'C = f(A,B) - (A={input1},B={input2})')
+    figure.suptitle(f"C = f(A,B) - (A={input1},B={input2})")
     _plot_nnz(torch.add, axes[0, 0], input1, input2)
     _plot_nnz(torch.matmul, axes[0, 1], input1, input2)
     _plot_nnz(torch.mul, axes[1, 0], input1, input2)
@@ -202,7 +204,9 @@ def plot_operations(input1: Format, input2: Format):
 
 def plot_nnz(f: Callable, formats: list[Format] = list(Format), block=False):
     n: int = len(formats)
-    formats: list[Tuple[Format, int]] = [(format, i) for (format, i) in zip(formats, range(0, n))]
+    formats: list[Tuple[Format, int]] = [
+        (format, i) for (format, i) in zip(formats, range(0, n))
+    ]
     figure, axes = plt.subplots(n, n)
     figure.suptitle(f"NNZ: C = {f.__name__}(A, B)")
     for i1, i in formats:
@@ -217,7 +221,9 @@ def plot_nnz(f: Callable, formats: list[Format] = list(Format), block=False):
 
 def plot_density(f: Callable, formats: list[Format] = list(Format), block=False):
     n: int = len(formats)
-    formats: list[Tuple[Format, int]] = [(format, i) for (format, i) in zip(formats, range(0, n))]
+    formats: list[Tuple[Format, int]] = [
+        (format, i) for (format, i) in zip(formats, range(0, n))
+    ]
     figure, axes = plt.subplots(n, n)
     figure.suptitle(f"Density: C = {f.__name__}(A, B)")
     for i1, i in formats:

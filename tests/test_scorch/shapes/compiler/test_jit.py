@@ -86,3 +86,25 @@ def test_fusion_1d():
            %8 = add (add (add (mul %0, %1), %0), (add (mul %0, %1), %0)), %0
         """,
     )
+
+
+def test_fusion_with_slice():
+    @graph
+    def Foo(A, B, C):
+        D = A * B
+        E = D + C[0:5:1]
+        return E
+
+    a = torch.Tensor([0, 2, 0, 0, 0])
+    b = torch.Tensor([1, 2, 1, 1, 1])
+    c = torch.Tensor([1, 2, 3, 4, 5, 6, 7])
+    util.assert_equal(
+        Foo(a, b, c),
+        """
+        $Foo:
+           %0 = _T0[5:d]
+           %1 = _T1[5:d]
+           %2 = _T2[7:d]
+           %6 = add (mul %0, %1), slice %2[0:5:1]
+        """,
+    )
