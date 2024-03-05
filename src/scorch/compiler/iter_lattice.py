@@ -699,7 +699,7 @@ class LatticePoint:
 
         dense_iterators_resolve_stmts: List[llir.Stmt] = []
         d = cin_lowerer.dense_coord_resolve_stmt_to_dep_index_vars
-
+        print("d: ", d)
         if self.dense_iterators:
             for it in self.dense_iterators:
                 if it.coord_var_value_llir:
@@ -718,7 +718,7 @@ class LatticePoint:
                         d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
 
         defined_index_vars = set(cin_lowerer.defined_index_vars)
-
+        print("after iteration d: ", d)
         d_copy = d.copy()
         for stmt, dep_index_vars in d_copy.items():
             # if dep_index_vars is a subset of defined_index_vars, then we can resolve the dense coordinate

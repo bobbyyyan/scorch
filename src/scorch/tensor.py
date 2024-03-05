@@ -462,7 +462,8 @@ class Tensor(torch.nn.Module):
         return new_tensor
 
     def to_sparse(
-        self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None
+        self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
+        stride_size: Optional[List[int]] = None,
     ) -> Tensor:
         """Convert the Scorch tensor to a sparse Scorch tensor."""
         if len(self.shape) == 1:
@@ -494,23 +495,32 @@ class Tensor(torch.nn.Module):
             else:
                 index_vars = default_index_vars[: len(self.shape)]
 
+            def stride_format(format, stride_size: Optional[List[int]] = None):
+                if stride_size is None:
+                    return format
+                else:
+                    for i, level_format in enumerate(format._level_formats):
+                        level_format._stride_size = stride_size[i]
+                    return format
+            
             if self.has_index:
                 B = TensorVar(
                     name="B",
-                    fmt=self.format,
+                    fmt=stride_format(self.format, stride_size),
                     dtype=self.dtype,
                 )
             else:
                 B = TensorVar(
                     name="B",
-                    fmt=TensorFormat(
+                    fmt=stride_format(TensorFormat(
                         level_formats=[
                             LevelFormat(mode=LevelType.DENSE)
                             for _ in range(len(self.shape))
                         ]
-                    ),
+                    ), stride_size),
                 )
-            # print("fmt: ", fmt)
+            print("self.format.get_level_stride_sizes()", self.format.get_level_stride_sizes())
+            # print("self.format", self.format) # d, d
             if fmt is None:
                 # TODO: infer output format from input format
                 # For now, make every level COMPRESSED
@@ -522,14 +532,14 @@ class Tensor(torch.nn.Module):
                 )
             else:
                 output_format = parse_format(fmt)
-
+            
             A = TensorVar(
                 name="A",
-                fmt=output_format,
+                fmt=stride_format(output_format, stride_size),
                 shape=self.shape,
                 dtype=self.dtype,
             )
-
+            
             # Assert A, B, and index_vars are defined
             assert A is not None, "A is not defined"
             assert B is not None, "B is not defined"
@@ -549,14 +559,14 @@ class Tensor(torch.nn.Module):
                 rhs = f"ForAll(index_vars[{i}], {rhs})"
             cin_stmt = eval(rhs)
 
-            # print("\n\ncin_stmt: ", cin_stmt)
+            print("\n\ntensor tensor tensor cin_stmt: ", cin_stmt)
 
             lowerer = CINLowerer(filter_zeros=True)
             lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
             llir_lowerer = LLIRLowerer()
             cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-            # print("\n\ncpp_code:\n\n", cpp_code)
+            print("\n\ntensor tensor tensor cpp_code:\n\n", cpp_code)
 
             # Read header_cpp_code from csrc/header.cpp
             with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
@@ -583,5 +593,6 @@ class Tensor(torch.nn.Module):
                 ),
                 value=result_cpp._storage._value,
             )
+            exit()
 
         return self

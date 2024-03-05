@@ -64,10 +64,21 @@ class CINLowerer:
         # TODO: handle COO
         stmts: List[llir.Stmt] = []
         level_types = tensor.get_level_types()
-        level_tile_sizes = tensor.get_level_tile_sizes()
+        level_stride_sizes = tensor.get_level_stride_sizes()
+        for level_idx, stride_size in enumerate(level_stride_sizes):
+            if stride_size is not None:
+                stmts.append(
+                    llir.VarInit(
+                        llir.Var(
+                            name=f"{tensor.name}{level_idx}_stride",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Literal(stride_size),
+                    )
+                )
         for level, level_type in enumerate(level_types):
             if level_type == LevelType.DENSE:
-                if level_tile_sizes[level] is not None:
+                if level_stride_sizes[level]:
                     stmts.append(
                         llir.VarInit(
                             var=llir.Var(
@@ -75,7 +86,7 @@ class CINLowerer:
                                 type=llir.DataType.INT,
                             ),
                             value=llir.Var(
-                                name=f"{tensor.name}_shape[{level}]/{level_tile_sizes[level]}",
+                                name=f"{tensor.name}_shape[{level}]/{tensor.name}{level}_stride",
                                 type=llir.DataType.INT,
                             ),
                         )
@@ -1258,7 +1269,6 @@ class CINLowerer:
 
         # Generate iterator bounds
         tensor_level_array_assign_stmts = []
-
         for tensor in rhs_tensor_vars:
             tensor_level_array_assign_stmts.append(llir.BlankLine())
             tensor_level_array_assign_stmts.append(
@@ -1269,28 +1279,61 @@ class CINLowerer:
 
         # Generate per-level size variables for each dense level in result tensor
         result_tensor_level_sizes: List[llir.Stmt] = []
+        result_tensor_stride_sizes = self.result_tensor_var.get_level_stride_sizes()
+        
         for i, level_type in enumerate(self.result_tensor_var.get_level_types()):
             if level_type == LevelType.DENSE:
-                result_tensor_level_sizes.append(
-                    llir.VarInit(
-                        llir.Var(
-                            name=f"{self.result_tensor_var.get_name()}{i}_size",
-                            type=llir.DataType.INT,
-                        ),
-                        value=llir.Var(
-                            name=f"result_shape[{i}]",
-                            type=llir.DataType.INT,
-                        ),
+                if result_tensor_stride_sizes[i] is not None:
+                    result_tensor_level_sizes.append(
+                        llir.VarInit(
+                            llir.Var(
+                                name=f"{self.result_tensor_var.get_name()}{i}_size",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Var(
+                                name=f"result_shape[{i}]/{self.result_tensor_var.get_name()}{i}_stride",
+                                type=llir.DataType.INT,
+                            ),
+                        )
                     )
-                )
+                else:
+                    result_tensor_level_sizes.append(
+                        llir.VarInit(
+                            llir.Var(
+                                name=f"{self.result_tensor_var.get_name()}{i}_size",
+                                type=llir.DataType.INT,
+                            ),
+                            value=llir.Var(
+                                name=f"result_shape[{i}]",
+                                type=llir.DataType.INT,
+                            ),
+                        )
+                    )
 
         if result_tensor_level_sizes:
             result_tensor_level_sizes = [
                 llir.Comment("Init result tensor level sizes"),
                 *result_tensor_level_sizes,
             ]
-
-            # A mapping from IndexVar to a list of (TensorVar, _level: int, LevelType) tuples
+        
+        init_stride_size_stmts = []
+        for level_id, stride_size in enumerate(result_tensor_stride_sizes):
+            init_stride_size_stmts.append(
+                llir.VarInit(
+                    llir.Var(
+                        name=f"{self.result_tensor_var.get_name()}{level_id}_stride",
+                        type=llir.DataType.INT,
+                    ),
+                    value=llir.Literal(stride_size),
+                )
+            )
+            
+        # put stride size init stmts before result tensor level sizes
+        # int A_stride0 = 4;
+        # int A_stride1 = 2;
+        result_tensor_level_sizes = init_stride_size_stmts + result_tensor_level_sizes
+        
+        # A mapping from IndexVar to a list of (TensorVar, _level: int, LevelType) tuples
         self.index_var_to_rhs_tensor_level_type = {}
         for tensor_access in rhs_tensor_accesses:
             index_vars = tensor_access.get_index_vars()

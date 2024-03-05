@@ -355,25 +355,61 @@ class ModeIterator:
                 name=f"p{self._tensor_var.name}{self._level}",
                 type=llir.DataType.INT,
             )
-
+            level_stride_vars = self._tensor_var.get_level_stride_sizes()
             if self.parent_iterator:
                 # e.g. int pB1 = j * B1_size + k;
-                self.coord_var_value_llir = llir.Add(
-                    left=llir.Mul(
-                        left=llir.Var(
-                            name=self.parent_iterator.get_iterator_var_llir().name,
-                            type=llir.DataType.INT,
+                if level_stride_vars[self._level]:
+                    self.coord_var_value_llir = llir.Add(
+                        left=llir.Mul(
+                            left=llir.Mul(
+                                left=llir.Var(
+                                    name=self.parent_iterator.get_iterator_var_llir().name,
+                                    type=llir.DataType.INT,
+                                ),
+                                right=llir.Var(
+                                    name=f"{self.tensor_var.name}{self.level}_size",
+                                    type=llir.DataType.INT,
+                                ),
+                            ),
+                            right=llir.Mul(
+                                left=llir.Var(
+                                    name=f"{self.tensor_var.name}{self.parent_iterator.level}_stride",
+                                    type=llir.DataType.INT,
+                                ),
+                                right=llir.Var(
+                                    name=f"{self.tensor_var.name}{self.level}_stride",
+                                    type=llir.DataType.INT,
+                                ),
+                            )
+                        ),
+                        right=llir.Mul(
+                            left=llir.Var(
+                                name=self.index_var.name,
+                                type=llir.DataType.INT,
+                            ),
+                            right=llir.Var(
+                                name=f"{self.tensor_var.name}{self.level}_stride",
+                                type=llir.DataType.INT,
+                            ),
+                        ),
+                    )
+                else:
+                    self.coord_var_value_llir = llir.Add(
+                        left=llir.Mul(
+                            left=llir.Var(
+                                name=self.parent_iterator.get_iterator_var_llir().name,
+                                type=llir.DataType.INT,
+                            ),
+                            right=llir.Var(
+                                name=f"{self.tensor_var.name}{self.level}_size",
+                                type=llir.DataType.INT,
+                            ),
                         ),
                         right=llir.Var(
-                            name=f"{self.tensor_var.name}{self.level}_size",
+                            name=self.index_var.name,
                             type=llir.DataType.INT,
                         ),
-                    ),
-                    right=llir.Var(
-                        name=self.index_var.name,
-                        type=llir.DataType.INT,
-                    ),
-                )
+                    )
 
                 self.coord_var_value_depends_on.extend(
                     [self.index_var, self.parent_iterator.index_var]

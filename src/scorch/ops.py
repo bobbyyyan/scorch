@@ -272,7 +272,6 @@ def matmul(
         return spmv(a, b, **kwargs)
 
     use_cache = kwargs.get("use_cache", False)
-
     if str(a.format) == "d,s" and str(b.format) == "d,d" and use_cache:
         result_shape = (a.shape[0], b.shape[1])
         args = [result_shape]
@@ -475,6 +474,8 @@ def einsum(
         lowerer = CINLowerer()
 
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        
+        print("lowered_llir", lowered_llir)
 
         llir_lowerer = LLIRLowerer()
 
