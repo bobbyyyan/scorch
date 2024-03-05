@@ -27,7 +27,7 @@ def test_assign_e2e_csr():
     stmt: cpp.Cpp = compile.Compile(c)
     return  # TODO(cgyurgyik): This needs to update the `pos` array.
     util.assert_equal(
-        codegen.PrettyPrint(
+        cpp.PrettyPrint(
             compile.DefineFunction(
                 functionname="evaluate", stmt=stmt, result=A, arguments=[B]
             )
@@ -54,7 +54,7 @@ def test_assign_e2e_dense():
     )
     stmt: cpp.Cpp = compile.Compile(c)
     util.assert_equal(
-        codegen.PrettyPrint(
+        cpp.PrettyPrint(
             compile.DefineFunction(
                 functionname="evaluate", stmt=stmt, result=A, arguments=[B]
             )

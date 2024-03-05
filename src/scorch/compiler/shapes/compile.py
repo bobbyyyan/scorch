@@ -310,7 +310,7 @@ def Compile(cin: cin.CIN) -> cpp.Cpp:
 
 def CompileAndPrint(cin: cin.CIN) -> str:
     """Compiles CIN -> CFIR -> CPP, and then returns the pretty prints."""
-    return codegen.PrettyPrint(Compile(cin))
+    return cpp.PrettyPrint(Compile(cin))
 
 
 def CompileAndExecuteFunction(
@@ -334,7 +334,7 @@ def CompileAndExecuteFunction(
 
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
-        cpp_sources=[header_cpp, codegen.PrettyPrint(fn)],
+        cpp_sources=[header_cpp, cpp.PrettyPrint(fn)],
         functions=["evaluate"],
         extra_cflags=["-O3"],
     )

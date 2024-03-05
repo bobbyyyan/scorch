@@ -483,3 +483,68 @@ class Min(BinaryOp):
 class Max(BinaryOp):
     def __init__(self, lhs: Cpp, rhs: Cpp):
         super().__init__(lhs=lhs, rhs=rhs, op=Op.MAXIMUM)
+
+
+########################################
+############# Pretty Print #############
+########################################
+
+
+def PrettyPrint(stmt: Cpp, indent_level: int = 0) -> str:
+    """
+    Pretty print for the CPP intermediate representation.
+    This will handle indentation.
+    """
+
+    def PpExpr(e: Cpp) -> str:
+        return str(e)
+
+    def indent() -> str:
+        return indent_level * " "
+
+    def PpIf(cond: Optional[Cpp], body: Cpp) -> str:
+        pp: str = ""
+        if cond is not None:
+            pp += f"if ({PpExpr(cond)})"
+        pp += " {"
+        pp += "\n"
+        pp += PrettyPrint(body, indent_level + 2)
+        pp += "\n"
+        pp += indent()
+        pp += "}"
+        return pp
+
+    pp: str = ""
+    match stmt:
+        case Nop():
+            pass
+        case Block(stmts):
+            pp += "\n".join(PrettyPrint(stmt, indent_level) for stmt in stmts)
+        case IfBlock(pairs):
+            pp += indent()
+            pp += " else ".join(PpIf(p[0], p[1]) for p in pairs)
+        case While(cond, block):
+            pp += indent()
+            pp += f"while ({PpExpr(cond)}) "
+            pp += "{"
+            pp += "\n"
+            pp += PrettyPrint(block, indent_level + 2)
+            pp += "\n"
+            pp += indent()
+            pp += "}"
+        case Function(returntype, name, args, body):
+
+            def x(t, v):
+                return f"{t} {v}"
+
+            pp += indent()
+            pp += f"{returntype} {name}({', '.join(x(t, v) for (t, v) in args)}) "
+            pp += "{"
+            pp += "\n"
+            pp += PrettyPrint(body, indent_level + 2)
+            pp += "\n"
+            pp += "}"
+        case _:
+            pp += indent()
+            pp += PpExpr(stmt)
+    return pp

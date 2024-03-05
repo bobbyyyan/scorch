@@ -7,12 +7,10 @@ import tests.utility as util
 
 
 def test_pretty_print():
-    assert (
-        codegen.PrettyPrint(cpp.Assign(cpp.Variable("a"), cpp.Constant(1))) == "a = 1;"
-    )
+    assert cpp.PrettyPrint(cpp.Assign(cpp.Variable("a"), cpp.Constant(1))) == "a = 1;"
 
     assert (
-        codegen.PrettyPrint(
+        cpp.PrettyPrint(
             cpp.While(
                 cond=cpp.Lt(cpp.Variable("pb_A"), cpp.Constant(42)),
                 body=cpp.Block(
@@ -41,7 +39,7 @@ def test_slice():
     A[i] = B[j]
 
     util.assert_equal(
-        codegen.PrettyPrint(
+        cpp.PrettyPrint(
             codegen.Lower(
                 cfir.Loop(
                     idx=i,
@@ -84,7 +82,7 @@ def test_assign_2d_sd():
     A[i, j] = B[i, j]
 
     util.assert_equal(
-        codegen.PrettyPrint(
+        cpp.PrettyPrint(
             codegen.Lower(
                 cfir.Loop(
                     idx=i,
