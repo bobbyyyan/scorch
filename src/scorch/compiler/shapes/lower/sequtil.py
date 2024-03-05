@@ -2,6 +2,8 @@ from scorch.compiler import cin
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 import scorch.format as format
 
+# Utility functions for sequence expressions (seq).
+
 
 def Size(sexpr: cin.Seq) -> int:
     match sexpr:

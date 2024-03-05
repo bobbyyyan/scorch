@@ -5,7 +5,9 @@ from scorch.compiler.shapes.lower import cpputil, iterator as it
 import scorch.format as format
 
 
-def LowerLoop(idx: cin.IndexVar, sexpr: cin.Seq, body: cfir.CFIR, first: bool):
+def LowerLoop(
+    idx: cin.IndexVar, sexpr: cin.Seq, body: cfir.CFIR, first: bool
+) -> cpp.Cpp:
     loop = cpp.While(
         it.Valid(sexpr),
         cpp.Block(
@@ -78,7 +80,9 @@ def LowerIndexExprRec(expr: cin.IndexExpr) -> cpp.Cpp:
     return _Lower(expr, i=expr.num_levels)
 
 
-def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr, op: cin.Operation):
+def LowerAssign(
+    lhs: cin.TensorAccess, rhs: cin.IndexExpr, op: cin.Operation
+) -> cpp.Cpp:
     iterators = cpputil.UpdateCompressedIterators(lhs)
     return cpp.Block(
         stmts=[
@@ -101,6 +105,13 @@ def LowerAssign(lhs: cin.TensorAccess, rhs: cin.IndexExpr, op: cin.Operation):
 
 
 def IndexWriteList(access: cin.TensorAccess) -> list[cpp.Cpp]:
+    def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar) -> cpp.Cpp:
+        index: int = ta.level_of_index_var(idx)
+        fmt: format.LevelType = ta.level_types()[index]
+        return cpp.Assign(
+            cpputil.ArrayAccessCrd(ta.tensor, idx, index, fmt), cpp.Variable(idx.name)
+        )
+
     types: List[format.LevelType] = access.level_types()
     if len(types) == 0:
         return []
@@ -111,14 +122,6 @@ def IndexWriteList(access: cin.TensorAccess) -> list[cpp.Cpp]:
 
     compressed_levels = list(filter(is_compressed, zip(types, indices)))
     return [IndexWrite(access, idx) for (_, idx) in compressed_levels]
-
-
-def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar) -> cpp.Cpp:
-    index: int = ta.level_of_index_var(idx)
-    fmt: format.LevelType = ta.level_types()[index]
-    return cpp.Assign(
-        cpputil.ArrayAccessCrd(ta.tensor, idx, index, fmt), cpp.Variable(idx.name)
-    )
 
 
 def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
