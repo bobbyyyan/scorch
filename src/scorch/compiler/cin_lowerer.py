@@ -483,7 +483,16 @@ class CINLowerer:
                         )
                     )
                     
-                    
+                    stride_loop_body = []
+                    # stride_loop_body.append(
+                    #     llir.Assign(
+                    #         var=llir.Var(
+                    #             name=f"p{self._tensor_var.name}{self._level}",
+                    #             type=llir.DataType.INT,
+                    #         ),
+                    #         value=llir.Literal(1),
+                    #     )
+                    # )
                     assign_true = llir.Assign(
                         var=llir.Var(
                             name="non_zero",

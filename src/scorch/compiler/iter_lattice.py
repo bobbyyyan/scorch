@@ -702,23 +702,23 @@ class LatticePoint:
         
         if self.dense_iterators:
             for it in self.dense_iterators:
-                if it.coord_var_array_value_llir:
-                    # if it is a vector, that means it is strided
-                    # only check coord_var_value_array_llir so we don't need to check if it is strided
-                    dense_coord_resolve_stmt = llir.VarInit(
-                        var=it.get_coord_var_array_llir(),
-                        value=it.get_coord_var_array_value_llir(),
-                    )
+                # if it.coord_var_array_value_llir:
+                #     # if it is a vector, that means it is strided
+                #     # only check coord_var_value_array_llir so we don't need to check if it is strided
+                #     dense_coord_resolve_stmt = llir.VarInit(
+                #         var=it.get_coord_var_array_llir(),
+                #         value=it.get_coord_var_array_value_llir(),
+                #     )
 
-                    d_stmts: List[llir.VarInit] = list(d.keys())
-                    to_resolve_index_var_names = [stmt.var.name for stmt in d_stmts]
+                #     d_stmts: List[llir.VarInit] = list(d.keys())
+                #     to_resolve_index_var_names = [stmt.var.name for stmt in d_stmts]
 
-                    if (
-                        dense_coord_resolve_stmt.var.name
-                        not in to_resolve_index_var_names
-                    ):
-                        d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
-                elif it.coord_var_value_llir:
+                #     if (
+                #         dense_coord_resolve_stmt.var.name
+                #         not in to_resolve_index_var_names
+                #     ):
+                #         d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
+                if it.coord_var_value_llir:
                     dense_coord_resolve_stmt = llir.VarInit(
                         var=it.get_coord_var_llir(),
                         value=it.get_coord_var_value_llir(),
