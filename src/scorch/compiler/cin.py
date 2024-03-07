@@ -601,8 +601,7 @@ class TensorVar(IndexExpr):
 
     def accept(self, visitor: CINVisitor) -> None:
         return
-
-
+    
 class Workspace(TensorVar):
     name: Optional[str] = None
     dim: int

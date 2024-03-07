@@ -436,40 +436,7 @@ class CINLowerer:
                 # generate a first for loop to iterate over the block, and see if the block is non-zero or not
                 stride_loop_stmts = []
                     
-                def generate_stride_for_loops(level_stride_sizes, cur_level, custom_body):
-                    if cur_level >= len(level_stride_sizes):
-                        return custom_body
-                    level_stride_size = level_stride_sizes[cur_level]
-                    if level_stride_size:
-                        return llir.ForLoop(
-                                init=llir.VarInit(
-                                    var=llir.Var(
-                                        name=f"i{cur_level}",
-                                        type=llir.DataType.INT,
-                                    ),
-                                    value=llir.Literal(0),
-                                ),
-                                cond=llir.BinOp(
-                                    op="<",
-                                    left=llir.Var(
-                                        name=f"i{cur_level}",
-                                        type=llir.DataType.INT,
-                                    ),
-                                    right=llir.Var(
-                                        name=f"{self.result_tensor_var.name}{cur_level}_stride",
-                                        type=llir.DataType.INT,
-                                    ),
-                                ),
-                                update=llir.Increment(
-                                    var=llir.Var(
-                                        name=f"i{cur_level}",
-                                        type=llir.DataType.INT,
-                                    ),
-                                ),
-                                body=generate_stride_for_loops(level_stride_sizes, cur_level + 1, custom_body),
-                            )
-                    else:
-                        return generate_stride_for_loops(level_stride_sizes, cur_level + 1, custom_body)
+                
                 
                 # assign a bool variable to check if the block is non-zero
                 if if_strided:
@@ -487,12 +454,33 @@ class CINLowerer:
                     # stride_loop_body.append(
                     #     llir.Assign(
                     #         var=llir.Var(
-                    #             name=f"p{self._tensor_var.name}{self._level}",
+                    #             name=f"p{self.result_tensor_var.name}{self.level}_stride",
                     #             type=llir.DataType.INT,
                     #         ),
-                    #         value=llir.Literal(1),
+                    #         value=llir.Add(
+                    #             left=llir.Var(
+                    #                 name=f"p{self.result_tensor_var.name}{self._level}",
+                    #                 type=llir.DataType.INT,
+                    #             ),
+                    #             right=llir.Mul(
+                    #                     left=llir.Var(
+                    #                         name=f"i{self._level}",
+                    #                         type=llir.DataType.INT,
+                    #                     ),
+                    #                     right=llir.Mul(
+                    #                         left=llir.Var(
+                    #                             name=f"{self._tensor_var.name}{self._level-1}_stride",
+                    #                             type=llir.DataType.INT,
+                    #                         ),
+                    #                         right=llir.Var(
+                    #                             name=f"{self._tensor_var.name}{self._level}_stride",
+                    #                             type=llir.DataType.INT,
+                    #                         ),
+                    #                     ),
+                    #                 ),
+                    #             ),
+                    #         )
                     #     )
-                    # )
                     assign_true = llir.Assign(
                         var=llir.Var(
                             name="non_zero",
@@ -509,9 +497,9 @@ class CINLowerer:
                         ),
                         then_body=assign_true
                     )
-                    
-                    nested_for_loops = generate_stride_for_loops(level_stride_sizes, 0, if_non_zero_assign_true)
-                    stride_loop_stmts.append(nested_for_loops)
+                    # stride_loop_body.append(if_non_zero_assign_true)
+                    # nested_for_loops = self.result_tensor_var.generate_stride_for_loops(level_stride_sizes, 0, stride_loop_body)
+                    # stride_loop_stmts.append(nested_for_loops)
                 
                 llir_stmts = [
                     stride_loop_stmts,
