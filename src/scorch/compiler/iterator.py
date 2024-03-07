@@ -27,6 +27,9 @@ class ModeIterator:
     coord_var_value_llir: Optional[llir.Expr] = None
     # coord_var_value_depends_on use default factory
     coord_var_value_depends_on: List[IndexVar] = field(default_factory=list)
+    
+    coord_var_array_llir: Optional[llir.Var] = None
+    coord_var_array_value_llir: Optional[llir.Expr] = None
 
     @property
     def level(self) -> int:
@@ -46,9 +49,17 @@ class ModeIterator:
         assert self.coord_var_llir is not None, "coord_var_llir is None"
         return self.coord_var_llir
 
+    def get_coord_var_array_llir(self) -> llir.Var:
+        assert self.coord_var_array_llir is not None, "coord_var_vector_llir is None"
+        return self.coord_var_array_llir
+
     def get_coord_var_value_llir(self) -> llir.Expr:
         assert self.coord_var_value_llir is not None, "coord_var_value_llir is None"
         return self.coord_var_value_llir
+    
+    def get_coord_var_array_value_llir(self) -> llir.Expr:
+        assert self.coord_var_array_value_llir is not None, "coord_var_array_value_llir is None"
+        return self.coord_var_array_value_llir
 
     def get_iterator_var_llir(self) -> llir.Var:
         assert self.iterator_var_llir is not None, "iterator_var_llir is None"
@@ -356,42 +367,60 @@ class ModeIterator:
                 type=llir.DataType.INT,
             )
             level_stride_vars = self._tensor_var.get_level_stride_sizes()
+            is_strided = any(level_stride_vars)
+            if is_strided:
+                self.coord_var_array_llir = llir.Var(
+                    name=f"p{self._tensor_var.name}{self._level}_stride_array",
+                    type=llir.DataType.CVECTOR_INT,
+                )
             if self.parent_iterator:
                 # e.g. int pB1 = j * B1_size + k;
                 if level_stride_vars[self._level]:
-                    self.coord_var_value_llir = llir.Add(
-                        left=llir.Mul(
-                            left=llir.Mul(
-                                left=llir.Var(
-                                    name=self.parent_iterator.get_iterator_var_llir().name,
-                                    type=llir.DataType.INT,
-                                ),
-                                right=llir.Var(
-                                    name=f"{self.tensor_var.name}{self.level}_size",
-                                    type=llir.DataType.INT,
-                                ),
-                            ),
-                            right=llir.Mul(
-                                left=llir.Var(
-                                    name=f"{self.tensor_var.name}{self.parent_iterator.level}_stride",
-                                    type=llir.DataType.INT,
-                                ),
-                                right=llir.Var(
-                                    name=f"{self.tensor_var.name}{self.level}_stride",
-                                    type=llir.DataType.INT,
-                                ),
+                    # generate a vector of indices
+                    array_values = []
+                    # currently only works in this case, not sure what to do for other cases
+                    for i_1 in range(level_stride_vars[self._level]):
+                        for i_0 in range(level_stride_vars[self._level - 1]):
+                            array_values.append(
+                                llir.Add(
+                                    left=llir.Mul(
+                                        left=llir.Mul(
+                                            left=llir.Var(
+                                                name=self.parent_iterator.get_iterator_var_llir().name,
+                                                type=llir.DataType.INT,
+                                            ),
+                                            right=llir.Var(
+                                                name=f"{self.tensor_var.name}{self.level}_size",
+                                                type=llir.DataType.INT,
+                                            ),
+                                        ),
+                                        right=llir.Mul(
+                                            left=llir.Var(
+                                                name=f"{self.tensor_var.name}{self.parent_iterator.level}_stride",
+                                                type=llir.DataType.INT,
+                                            ),
+                                            right=llir.Var(
+                                                name=f"{self.tensor_var.name}{self.level}_stride",
+                                                type=llir.DataType.INT,
+                                            ),
+                                        )
+                                    ),
+                                    right=llir.Mul(
+                                        left=llir.Var(
+                                            name=self.index_var.name,
+                                            type=llir.DataType.INT,
+                                        ),
+                                        right=llir.Var(
+                                            name=f"{self.tensor_var.name}{self.level}_stride",
+                                            type=llir.DataType.INT,
+                                        ),
+                                    ),
+                                )
                             )
-                        ),
-                        right=llir.Mul(
-                            left=llir.Var(
-                                name=self.index_var.name,
-                                type=llir.DataType.INT,
-                            ),
-                            right=llir.Var(
-                                name=f"{self.tensor_var.name}{self.level}_stride",
-                                type=llir.DataType.INT,
-                            ),
-                        ),
+                    # just use the array, don't check if the tensor is strided or not
+                    self.coord_var_array_value_llir = llir.Array(
+                        values=array_values,
+                        data_type=llir.DataType.INT,
                     )
                 else:
                     self.coord_var_value_llir = llir.Add(

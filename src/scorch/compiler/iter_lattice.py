@@ -699,10 +699,26 @@ class LatticePoint:
 
         dense_iterators_resolve_stmts: List[llir.Stmt] = []
         d = cin_lowerer.dense_coord_resolve_stmt_to_dep_index_vars
-        print("d: ", d)
+        
         if self.dense_iterators:
             for it in self.dense_iterators:
-                if it.coord_var_value_llir:
+                if it.coord_var_array_value_llir:
+                    # if it is a vector, that means it is strided
+                    # only check coord_var_value_array_llir so we don't need to check if it is strided
+                    dense_coord_resolve_stmt = llir.VarInit(
+                        var=it.get_coord_var_array_llir(),
+                        value=it.get_coord_var_array_value_llir(),
+                    )
+
+                    d_stmts: List[llir.VarInit] = list(d.keys())
+                    to_resolve_index_var_names = [stmt.var.name for stmt in d_stmts]
+
+                    if (
+                        dense_coord_resolve_stmt.var.name
+                        not in to_resolve_index_var_names
+                    ):
+                        d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
+                elif it.coord_var_value_llir:
                     dense_coord_resolve_stmt = llir.VarInit(
                         var=it.get_coord_var_llir(),
                         value=it.get_coord_var_value_llir(),
@@ -718,7 +734,6 @@ class LatticePoint:
                         d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
 
         defined_index_vars = set(cin_lowerer.defined_index_vars)
-        print("after iteration d: ", d)
         d_copy = d.copy()
         for stmt, dep_index_vars in d_copy.items():
             # if dep_index_vars is a subset of defined_index_vars, then we can resolve the dense coordinate
@@ -822,6 +837,7 @@ class IterationLattice:
                         left_lattice_points, right_lattice_points
                     )
             if isinstance(cin, TensorAccess):
+                print("get_lattice_points_from_cin cin: ", cin)
                 # TODO: check Empty list if current_index_var is not in the tensor access
                 if parsed_index_var not in cin.indices:
                     return []
@@ -1177,6 +1193,8 @@ class IterationLattice:
                         )
 
                 if len(iterators) == 0:
+                    
+                    print("here here here! len(iterators) == 0")
                     for_loop = llir.ForLoop(
                         init=self.get_dense_iterator_init_stmt(),
                         cond=lattice_point.get_for_loop_condition(lattice=self),
@@ -1184,17 +1202,23 @@ class IterationLattice:
                             lattice=self
                         ),
                         body=[
+                            llir.Comment("111"),
                             *tiled_index_var_resolve_stmts,
+                            llir.Comment("222"),
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                            llir.Comment("333"),
                             *result_value_index_stmts,
+                            llir.Comment("444"),
                             *lattice_point.get_child_subregion_loops(
                                 self.cin_lowerer, self.for_all_stmt.stmt
                             ),
+                            llir.Comment("555"),
                         ],
                     )
                     stmts.append(for_loop)
 
                 elif len(iterators) == 1 and not lattice_point.parent_lattice_point:
+                    print("here here here! len(iterators) == 1 and not lattice_point.parent_lattice_point")
                     # Note: we don't want to do this for a child lattice point
                     # because we don't want to re-initialize the iterator(s)
                     it = iterators[0]
@@ -1217,6 +1241,7 @@ class IterationLattice:
                     stmts.append(for_loop)
 
                 else:
+                    print("here here here! while loop")
                     while_loop = llir.WhileLoop(
                         cond=lattice_point.get_while_condition(lattice=self),
                         body=[
