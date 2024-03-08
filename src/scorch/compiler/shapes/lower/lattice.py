@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from scorch.compiler import cin
 from scorch.compiler.shapes.lower.seq_util import *
+import logging
 
 # The iteration lattice, as presented in "Compilation of Shape Operators on
 # Sparse Arrays" by Root, et. al.
@@ -98,7 +99,10 @@ def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = s
 
 
 def ConstructIterationLattice(top: cin.Seq, defs: set[cin.Seq]):
-    return IterationLattice(top, ConstructGraph(top, defs))
+    """Constructs an iteratin lattice, with `top` being the highest point."""
+    lattice = IterationLattice(top, ConstructGraph(top, defs))
+    logging.debug(f"Lattice Construction:\n{lattice}")
+    return lattice
 
 
 def Subpoints(lattice: IterationLattice, point: cin.Seq):

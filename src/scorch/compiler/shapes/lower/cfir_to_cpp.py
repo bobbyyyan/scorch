@@ -3,6 +3,7 @@ from scorch.compiler import cin
 from scorch.compiler.shapes.ast import cfir, cpp, ir
 from scorch.compiler.shapes.lower import cpp_util, iterator as it
 import scorch.format as format
+import logging
 
 
 def LowerLoop(

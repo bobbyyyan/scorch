@@ -7,6 +7,7 @@ from scorch.compiler.shapes.lower import cfir_to_cpp, cin_to_cfir
 from scorch.format import LevelType
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from pathlib import Path
+import logging
 
 # Necessary code generation to execute CPP generated code with PyTorch tensors.
 
@@ -298,6 +299,9 @@ def DefineFunction(
     )
     epilogue.append(cpp.Return(resultname))
 
+    logging.debug(f"prologue:\n{cpp.Block([*prologue])}")
+    logging.debug(f"epilogue:\n{cpp.Block([*epilogue])}")
+
     body = cpp.Block(stmts=[*prologue, stmt, *epilogue])
     return cpp.Function(
         returntype=cpp.TacoTensor(), name=functionname, body=body, args=args
@@ -306,8 +310,11 @@ def DefineFunction(
 
 def Compile(cin: cin.CIN) -> cpp.Cpp:
     """Compiles CIN -> CFIR -> CPP"""
+    logging.debug(f"CIN:\n{cin}")
     s0: cfir.CFIR = cin_to_cfir.Lower(cin)
+    logging.debug(f"CFIR:\n{cfir.PrettyPrint(s0)}")
     s1: cpp.Cpp = cfir_to_cpp.Lower(s0)
+    logging.debug(f"CPP:\n{cpp.PrettyPrint(s1)}")
     return s1
 
 

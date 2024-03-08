@@ -6,6 +6,7 @@ import scorch.format as format
 
 
 def Size(sexpr: cin.Seq) -> int:
+    """Returns the size of this sequence expression."""
     match sexpr:
         case cin.IndexSeq(_, _, size):
             return size
@@ -25,6 +26,7 @@ def Size(sexpr: cin.Seq) -> int:
 
 
 def IsDense(sexpr: cin.Seq) -> bool:
+    """Returns whether this sequence expression (or any of its children) is dense."""
     match sexpr:
         case cin.IndexSeq(_, _, _, _, fmt):
             return fmt == format.LevelType.DENSE
@@ -64,11 +66,13 @@ def Remove(sexpr: cin.Seq, sub: cin.Seq) -> cin.Seq:
 
 
 def IndicesDefined(expr: cin.TensorAccess, defs: set[cin.Seq]) -> bool:
+    """Returns whether all the indices in `expr` are defined in `defs`."""
     assert isinstance(expr, cin.TensorAccess)
     return all(map(lambda x: x in defs, ConvertToIndexSequences(expr)))
 
 
 def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
+    """Converts the indices of a `TensorAccess` to a sequence of `IndexSeq`."""
     if isinstance(e, cin.WorkspaceAccess):
         return []
     assert isinstance(e, cin.TensorAccess)
@@ -91,6 +95,7 @@ def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:
 
 
 def GetParent(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
+    """Returns the parent of `sexpr` if it exists, and None otherwise"""
     idx: cin.IndexVar = sexpr.idx
     tensor: cin.TensorVar = sexpr.tensor
 
@@ -112,6 +117,7 @@ def GetParent(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
 
 
 def GetChild(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
+    """Returns the child of `sexpr` if it exists, and None otherwise."""
     idx: cin.IndexVar = sexpr.idx
     tensor: cin.TensorVar = sexpr.tensor
 
@@ -141,6 +147,11 @@ def GetChild(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
 
 
 def IndexDefined(sexpr: cin.IndexSeq, defs: set[cin.Seq]):
+    """Returns whether one of the following conditions hold:
+    (1) this is the first index,
+    (2) the parent of this sequence expression is in `defs`, or
+    (3) all the levels are dense.
+    """
     assert isinstance(sexpr, cin.IndexSeq), sexpr
     parent: Optional[cin.IndexSeq] = GetParent(sexpr)
     return any(
@@ -158,6 +169,7 @@ def IndexDefined(sexpr: cin.IndexSeq, defs: set[cin.Seq]):
 
 
 def SimplifySeq(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
+    """Simplies `sexpr` and returns the simplified sequence expression."""
     match sexpr:
         case cin.IndexSeq(_, _, sz, _, fmt):
             return (
@@ -251,6 +263,7 @@ def SimplifySeq(sexpr: cin.Seq, defs: set[cin.Seq]) -> cin.Seq:
 
 
 def Contains(sexpr: cin.Seq, subpoint: cin.Seq) -> bool:
+    """Returns whether `sexpr` is or contains `subpoint`."""
     if sexpr == subpoint:
         return True
     match sexpr:
@@ -267,6 +280,7 @@ def Contains(sexpr: cin.Seq, subpoint: cin.Seq) -> bool:
 
 
 def ContainsIntersection(sexpr: cin.Seq) -> bool:
+    """Returns whether sexpr is or contains an intersection sequence expression."""
     match sexpr:
         case cin.IndexSeq() | cin.Universe():
             return False
@@ -281,6 +295,7 @@ def ContainsIntersection(sexpr: cin.Seq) -> bool:
 
 
 def Iters(sexpr: cin.Seq) -> set[cin.Seq]:
+    """Returns the iterators of `sexpr`."""
     match sexpr:
         case cin.IndexSeq():
             return {sexpr}

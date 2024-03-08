@@ -9,7 +9,7 @@ import tests.utility as util
 # Tests CIN -> CFIR -> CPP lowering phase(s).
 
 
-def test_assign_e2e_csr():
+def test_assign_e2e_ds():
     A = cin.TensorVar("A", fmt=["d", "s"], shape=[2, 2])
     B = cin.TensorVar("B", fmt=["d", "s"], shape=[2, 2])
     i = cin.IndexVar("i")
@@ -38,6 +38,9 @@ def test_assign_e2e_csr():
 
 
 def test_assign_e2e_dense():
+    import logging
+    logger = logging.getLogger("debug")
+    logger.setLevel(logging.DEBUG)
     A = cin.TensorVar("A", fmt=["d", "d"], shape=[2, 2])
     B = cin.TensorVar("B", fmt=["d", "d"], shape=[2, 2])
     i = cin.IndexVar("i")
@@ -593,7 +596,7 @@ def test_scalar_workspace_dd():
     )
 
 
-def test_scalar_workspace_csc():
+def test_scalar_workspace_sd():
     i = cin.IndexVar("i")
     j = cin.IndexVar("j")
     k = cin.IndexVar("k")
