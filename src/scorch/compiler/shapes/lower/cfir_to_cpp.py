@@ -1,12 +1,12 @@
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from scorch.compiler import cin
-from scorch.compiler.shapes.ast import cfir, cpp
-from scorch.compiler.shapes.lower import cpputil, iterator as it
+from scorch.compiler.shapes.ast import cfir, cpp, ir
+from scorch.compiler.shapes.lower import cpp_util, iterator as it
 import scorch.format as format
 
 
 def LowerLoop(
-    idx: cin.IndexVar, sexpr: cin.Seq, body: cfir.CFIR, first: bool
+    idx: ir.IndexVar, sexpr: cin.Seq, body: cfir.CFIR, first: bool
 ) -> cpp.Cpp:
     loop = cpp.While(
         it.Valid(sexpr),
@@ -83,7 +83,7 @@ def LowerIndexExprRec(expr: cin.IndexExpr) -> cpp.Cpp:
 def LowerAssign(
     lhs: cin.TensorAccess, rhs: cin.IndexExpr, op: cin.Operation
 ) -> cpp.Cpp:
-    iterators = cpputil.UpdateCompressedIterators(lhs)
+    iterators = cpp_util.UpdateCompressedIterators(lhs)
     return cpp.Block(
         stmts=[
             # Write to compressed dimensions.
@@ -105,19 +105,19 @@ def LowerAssign(
 
 
 def IndexWriteList(access: cin.TensorAccess) -> list[cpp.Cpp]:
-    def IndexWrite(ta: cin.TensorAccess, idx: cin.IndexVar) -> cpp.Cpp:
+    def IndexWrite(ta: cin.TensorAccess, idx: ir.IndexVar) -> cpp.Cpp:
         index: int = ta.level_of_index_var(idx)
         fmt: format.LevelType = ta.level_types()[index]
         return cpp.Assign(
-            cpputil.ArrayAccessCrd(ta.tensor, idx, index, fmt), cpp.Variable(idx.name)
+            cpp_util.ArrayAccessCrd(ta.tensor, index, fmt), cpp.Variable(idx.name)
         )
 
     types: List[format.LevelType] = access.level_types()
     if len(types) == 0:
         return []
-    indices: List[cin.IndexVar] = access.get_index_vars()
+    indices: List[ir.IndexVar] = access.get_index_vars()
 
-    def is_compressed(pair: Tuple[format.LevelType, cin.IndexVar]):
+    def is_compressed(pair: Tuple[format.LevelType, ir.IndexVar]):
         return pair[0] == format.LevelType.COMPRESSED
 
     compressed_levels = list(filter(is_compressed, zip(types, indices)))
@@ -170,4 +170,4 @@ def Lower(stmt: cfir.CFIR) -> cpp.Cpp:
             case _:
                 raise NotImplementedError(type(stmt))
 
-    return cpputil.Simplify(_Lower(stmt, first=True))
+    return cpp_util.Simplify(_Lower(stmt, first=True))

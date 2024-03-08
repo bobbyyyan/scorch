@@ -19,7 +19,7 @@ def test_pretty_print():
                         cpp.Define(cpp.Int32(), cpp.Variable("i"), cpp.Constant(0)),
                         cpp.IncAssign(
                             cpp.Access(
-                                array=cin.TensorVar(name="A"),
+                                tensor=cin.TensorVar(name="A"),
                                 idx=cin.IndexVar(name="i"),
                             ),
                             cpp.Constant(1),

@@ -1,11 +1,11 @@
 from scorch import format
 from multipledispatch import dispatch
 from scorch.compiler import cin
-from scorch.compiler.shapes.ast import cpp
-from scorch.compiler.shapes.lower import sequtil
+from scorch.compiler.shapes.ast import cpp, ir
+from scorch.compiler.shapes.lower import seq_util
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
-# Utility functions used in the CFIR -> CIN lowering phase.
+# Utility functions used in the CFIR -> CPP lowering phase.
 
 
 @dispatch(int, cin.TensorVar, format.LevelType)
@@ -42,7 +42,7 @@ def ArrayLowerBound(seq: cin.IndexSeq):
                 cpp.Variable(f"{seq.tensor.name}{i}_pos"),
                 cpp.Constant(0)
                 if i == 0
-                else ArrayIndexVariable(sequtil.GetParent(seq)),
+                else ArrayIndexVariable(seq_util.GetParent(seq)),
             )
         case _:
             raise NotImplementedError(fmt)
@@ -59,7 +59,7 @@ def ArrayUpperBound(seq: cin.IndexSeq):
                 cpp.Constant(1)
                 if i == 0
                 else cpp.Add(
-                    ArrayIndexVariable(sequtil.GetParent(seq)),
+                    ArrayIndexVariable(seq_util.GetParent(seq)),
                     cpp.Constant(1),
                 ),
             )
@@ -81,9 +81,9 @@ def ArrayAccessCrd(seq: cin.IndexSeq):
             raise NotImplementedError(fmt)
 
 
-@dispatch(cin.TensorVar, cin.IndexVar, int, format.LevelType)
+@dispatch(cin.TensorVar, int, format.LevelType)
 def ArrayAccessCrd(
-    tensor: cin.TensorVar, idx: cin.IndexVar, index: int, fmt: format.LevelType
+    tensor: cin.TensorVar, index: int, fmt: format.LevelType
 ):
     match fmt:
         case format.LevelType.DENSE:

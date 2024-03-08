@@ -7,7 +7,7 @@ name = "pypi"
 scorch = {editable = true, path = "."}
 numpy = "*"
 scipy = "*"
-torch = "*"
+torch = "2.2.1"
 black = "*"
 flake8 = "*"
 mypy = "*"

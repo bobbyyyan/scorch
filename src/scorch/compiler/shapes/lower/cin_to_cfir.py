@@ -3,8 +3,8 @@ from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from functools import reduce
 
 from scorch.compiler import cin
-from scorch.compiler.shapes.ast import cfir
-from scorch.compiler.shapes.lower import sequtil, lattice as il
+from scorch.compiler.shapes.ast import cfir, ir
+from scorch.compiler.shapes.lower import seq_util, lattice as il
 
 
 def SimplifyExpr(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
@@ -12,7 +12,7 @@ def SimplifyExpr(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr
         case cin.Workspace():
             return e
         case cin.TensorAccess():
-            return e if sequtil.IndicesDefined(e, defs) else None
+            return e if seq_util.IndicesDefined(e, defs) else None
         case cin.BinaryOp():
             x: Optional[cin.IndexExpr] = SimplifyExpr(e.left, defs)
             y: Optional[cin.IndexExpr] = SimplifyExpr(e.right, defs)
@@ -39,11 +39,11 @@ def SimplifyExpr(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr
 def SimplifyStmt(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
     match c:
         case cin.ForAll():
-            sexpr: cin.Seq = sequtil.SimplifySeq(c.seq, defs)
+            sexpr: cin.Seq = seq_util.SimplifySeq(c.seq, defs)
             assert not isinstance(sexpr, cin.EmptySeq | cin.FullSeq), f"{c}\n{defs}"
             return cin.ForAll(
                 index_var=c.index_var,
-                stmt=SimplifyStmt(c.stmt, defs | sequtil.Iters(sexpr)),
+                stmt=SimplifyStmt(c.stmt, defs | seq_util.Iters(sexpr)),
                 seq=sexpr,
             )
         case cin.TensorAssign():
@@ -68,13 +68,13 @@ def BuildLoop(
     locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]],
 ) -> cfir.Loop:
     locs = FilterLocators(locs, point)
-    locdefs = map(lambda p: sequtil.Iters(p[1]), locs)
+    locdefs = map(lambda p: seq_util.Iters(p[1]), locs)
     locdefs = reduce(set.union, locdefs, set())
-    idx: cin.IndexVar = fa.index_var
+    idx: ir.IndexVar = ir.IndexVar.from_cin(fa.index_var)
     body: cin.IndexStmt = fa.stmt
 
     def Build(child: cin.Seq):
-        newdefs: set[cin.Seq] = defs | sequtil.Iters(child) | locdefs
+        newdefs: set[cin.Seq] = defs | seq_util.Iters(child) | locdefs
         return cfir.SwitchCase(
             sexpr=child, stmt=Lower(SimplifyStmt(body, newdefs), newdefs)
         )
@@ -84,14 +84,14 @@ def BuildLoop(
     # Skip creating a switch if there is only a single case.
     body = (
         cfir.Switch(idx, bodies)
-        if len(bodies) > 1 or sequtil.ContainsIntersection(point)
+        if len(bodies) > 1 or seq_util.ContainsIntersection(point)
         else bodies.pop().stmt
     )
     return cfir.Loop(idx, point, body, locs)
 
 
 def RemoveDense(sexpr: cin.Seq) -> Tuple[cin.Seq, list[cin.Seq]]:
-    if sequtil.IsDense(sexpr):
+    if seq_util.IsDense(sexpr):
         return [None, [sexpr]]
     match sexpr:
         case cin.UnionSeq(s1, s2):
@@ -115,7 +115,7 @@ def RemoveDense(sexpr: cin.Seq) -> Tuple[cin.Seq, list[cin.Seq]]:
 
 
 def FilterLocators(locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]], point: cin.Seq):
-    return list(filter(lambda p: sequtil.Contains(point, p[0]), locs))
+    return list(filter(lambda p: seq_util.Contains(point, p[0]), locs))
 
 
 def FindLocators(
@@ -130,7 +130,7 @@ def FindLocators(
         case cin.UnionSeq(s1, s2):
             aexpr, alocs = FindLocators(s1)
             bexpr, blocs = FindLocators(s2)
-            if sequtil.IsDense(aexpr) and sequtil.IsDense(bexpr):
+            if seq_util.IsDense(aexpr) and seq_util.IsDense(bexpr):
                 if isinstance(s2, cin.IntersectionSeq | cin.UnionSeq):
                     bexpr, blocs = FindLocators(s2, dense_locate=True)
                 if dense_locate:
@@ -140,13 +140,13 @@ def FindLocators(
         case cin.IntersectionSeq(s1, s2):
             aexpr, alocs = FindLocators(s1)
             bexpr, blocs = FindLocators(s2)
-            if not sequtil.IsDense(s1):
+            if not seq_util.IsDense(s1):
                 # Use s1 to locate into s2.
                 y, ydense = RemoveDense(bexpr)
                 r = aexpr if y is None else cin.IntersectionSeq(aexpr, y)
                 ylocs = [(r, y) for y in ydense]
                 return [r, alocs + blocs + ylocs]
-            if not sequtil.IsDense(s2):
+            if not seq_util.IsDense(s2):
                 # Use s2 to locate into s1.
                 x, xdense = RemoveDense(aexpr)
                 r = bexpr if x is None else cin.IntersectionSeq(x, bexpr)

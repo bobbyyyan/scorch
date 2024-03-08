@@ -2,7 +2,7 @@ from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 from scorch.compiler import cin as cin
 from scorch.compiler.shapes.ast import cpp
-from scorch.compiler.shapes.lower import cpputil, sequtil
+from scorch.compiler.shapes.lower import cpp_util, seq_util
 
 # An iterator model that follows the work presented in "Compilation of
 # Shape Operators on Sparse Arrays" by Root, et. al.
@@ -13,13 +13,13 @@ def Init(sexpr: cin.Seq):
         case cin.IndexSeq():
             return cpp.Define(
                 type=cpp.IndexType(),
-                lhs=cpputil.ArrayIndexVariable(sexpr),
-                rhs=cpputil.ArrayLowerBound(sexpr),
+                lhs=cpp_util.ArrayIndexVariable(sexpr),
+                rhs=cpp_util.ArrayLowerBound(sexpr),
             )
         case cin.Universe(idx):
             return cpp.Define(
                 type=cpp.IndexType(),
-                lhs=cpputil.UniverseIndexVariable(idx),
+                lhs=cpp_util.UniverseIndexVariable(idx),
                 rhs=cpp.Constant(0),
             )
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
@@ -48,7 +48,7 @@ def Init(sexpr: cin.Seq):
                 if k == 0
                 else cpp.Define(
                     cpp.IndexType(),
-                    cpputil.ProjectionVariable(k),
+                    cpp_util.ProjectionVariable(k),
                     Eval(cin.ProjectSeq(a, 0, I, J)),
                 )
             )
@@ -95,13 +95,13 @@ def Reset(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq():
             return cpp.Assign(
-                lhs=cpputil.ArrayIndexVariable(sexpr),
-                rhs=cpputil.ArrayLowerBound(sexpr),
+                lhs=cpp_util.ArrayIndexVariable(sexpr),
+                rhs=cpp_util.ArrayLowerBound(sexpr),
             )
         case cin.Universe(idx):
             return cpp.Define(
                 type=cpp.IndexType(),
-                lhs=cpputil.UniverseIndexVariable(idx),
+                lhs=cpp_util.UniverseIndexVariable(idx),
                 rhs=cpp.Constant(0),
             )
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
@@ -127,7 +127,7 @@ def Reset(sexpr: cin.Seq):
                 Reset(a)
                 if k == 0
                 else cpp.Assign(
-                    cpputil.ProjectionVariable(k), cin.ProjectSeq(a, 0, I, J)
+                    cpp_util.ProjectionVariable(k), cin.ProjectSeq(a, 0, I, J)
                 )
             )
         case cin.ConcatenateSeq(s1, s2):
@@ -142,11 +142,11 @@ def Valid(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq(_, _):
             return cpp.Lt(
-                lhs=cpputil.ArrayIndexVariable(sexpr),
-                rhs=cpputil.ArrayUpperBound(sexpr),
+                lhs=cpp_util.ArrayIndexVariable(sexpr),
+                rhs=cpp_util.ArrayUpperBound(sexpr),
             )
         case cin.Universe(idx, size):
-            return cpp.Lt(cpputil.UniverseIndexVariable(idx), cpp.Constant(size))
+            return cpp.Lt(cpp_util.UniverseIndexVariable(idx), cpp.Constant(size))
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.And(Valid(s1), Valid(s2))
         case cin.ConcatenateSeq(s1, s2) | cin.ProductSeq(s1, s2):
@@ -158,7 +158,7 @@ def Valid(sexpr: cin.Seq):
                 Valid(a)
                 if k == 0
                 else cpp.Eq(
-                    cpputil.ProjectionVariable(k), Eval(cin.ProjectSeq(a, 0, I, J))
+                    cpp_util.ProjectionVariable(k), Eval(cin.ProjectSeq(a, 0, I, J))
                 )
             )
         case _:
@@ -168,16 +168,16 @@ def Valid(sexpr: cin.Seq):
 def Eval(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq():
-            return cpputil.ArrayAccessCrd(sexpr)
+            return cpp_util.ArrayAccessCrd(sexpr)
         case cin.Universe(idx):
-            return cpputil.UniverseIndexVariable(idx)
+            return cpp_util.UniverseIndexVariable(idx)
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Min(Eval(s1), Eval(s2))
         case cin.ConcatenateSeq(s1, s2):
             raise NotImplementedError(type(sexpr))
         case cin.ProductSeq(s1, s2):
             # a * |b| + b
-            return cpp.Add(cpp.Mul(Eval(s1), sequtil.Size(s2)), Eval(s2))
+            return cpp.Add(cpp.Mul(Eval(s1), seq_util.Size(s2)), Eval(s2))
         case cin.ProjectSeq(a, k, I, J):
             a = Eval(a)
             return cpp.Div(a, J) if k == 0 else cpp.Mod(a, J)
@@ -191,11 +191,11 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq(_, _):
             return cpp.IncAssign(
-                cpputil.ArrayIndexVariable(sexpr), cpp.Eq(value, Eval(sexpr))
+                cpp_util.ArrayIndexVariable(sexpr), cpp.Eq(value, Eval(sexpr))
             )
         case cin.Universe(idx):
             return cpp.IncAssign(
-                cpputil.UniverseIndexVariable(idx), cpp.Eq(value, Eval(sexpr))
+                cpp_util.UniverseIndexVariable(idx), cpp.Eq(value, Eval(sexpr))
             )
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[Next(value, s1), Next(value, s2)])
@@ -234,9 +234,9 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
 def UnconditionalNext(sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq(_, _):
-            return cpp.IncAssign(cpputil.ArrayIndexVariable(sexpr), cpp.Constant(1))
+            return cpp.IncAssign(cpp_util.ArrayIndexVariable(sexpr), cpp.Constant(1))
         case cin.Universe(idx):
-            return cpp.IncAssign(cpputil.UniverseIndexVariable(idx), cpp.Constant(1))
+            return cpp.IncAssign(cpp_util.UniverseIndexVariable(idx), cpp.Constant(1))
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.Block(stmts=[UnconditionalNext(s1), UnconditionalNext(s2)])
         case cin.SliceSeq(a, s, _, r):
@@ -279,7 +279,7 @@ def UnconditionalNext(sexpr: cin.Seq):
             return (
                 cpp.While(
                     cond=cpp.And(
-                        Valid(a), cpp.Eq(cpputil.ProjectionVariable(1), Eval(sexpr))
+                        Valid(a), cpp.Eq(cpp_util.ProjectionVariable(1), Eval(sexpr))
                     ),
                     body=UnconditionalNext(a),
                 )
@@ -295,15 +295,15 @@ def UnconditionalNext(sexpr: cin.Seq):
 def Equals(value: cpp.Cpp, sexpr: cin.Seq):
     match (sexpr):
         case cin.IndexSeq():
-            return cpp.Eq(value, cpputil.ArrayAccessCrd(sexpr))
+            return cpp.Eq(value, cpp_util.ArrayAccessCrd(sexpr))
         case cin.Universe(idx):
-            return cpp.Eq(value, cpputil.UniverseIndexVariable(idx))
+            return cpp.Eq(value, cpp_util.UniverseIndexVariable(idx))
         case cin.UnionSeq(s1, s2) | cin.IntersectionSeq(s1, s2):
             return cpp.And(Equals(value, s1), Equals(value, s2))
         case cin.ProductSeq(s1, s2):
             return cpp.And(
-                Equals(cpp.Div(value, sequtil.Size(s2)), s1),
-                Equals(cpp.Mod(value, sequtil.Size(s2)), s2),
+                Equals(cpp.Div(value, seq_util.Size(s2)), s1),
+                Equals(cpp.Mod(value, seq_util.Size(s2)), s2),
             )
         case cin.ProjectSeq(a, k, I, J):
             raise NotImplementedError(type(sexpr))

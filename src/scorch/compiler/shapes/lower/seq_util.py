@@ -8,9 +8,6 @@ import scorch.format as format
 def Size(sexpr: cin.Seq) -> int:
     match sexpr:
         case cin.IndexSeq(_, _, size):
-            # accesses: List[cin.TensorAccess] = var.tensor_accesses()
-            # These should all share the same size.
-            # (type, ) = set(var.shape[a.level_of_index_var(idx)] for a in accesses)
             return size
         case cin.FullSeq(sz) | cin.EmptySeq(sz):
             return sz
@@ -68,8 +65,7 @@ def Remove(sexpr: cin.Seq, sub: cin.Seq) -> cin.Seq:
 
 def IndicesDefined(expr: cin.TensorAccess, defs: set[cin.Seq]) -> bool:
     assert isinstance(expr, cin.TensorAccess)
-    result = all(map(lambda x: x in defs, ConvertToIndexSequences(expr)))
-    return result
+    return all(map(lambda x: x in defs, ConvertToIndexSequences(expr)))
 
 
 def ConvertToIndexSequences(e: cin.TensorAccess) -> list[cin.IndexSeq]:

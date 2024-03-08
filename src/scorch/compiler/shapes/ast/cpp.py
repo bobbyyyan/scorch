@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from scorch.compiler import cin
+from scorch.compiler.shapes.ast import ir
 import torch  # For conversion from (torch.dtype) -> (c++ type).
 
 
@@ -184,13 +185,12 @@ class Return(Cpp):
 
 @dataclass
 class Access(Cpp):
-    # TODO(cgyurgyik): This is a hack, we really shouldn't have dependencies across translation phases
-    array: cin.TensorVar | Cpp
-    idx: cin.IndexExpr | Cpp
+    tensor: cin.TensorVar
+    idx: ir.IndexVar
 
     def __str__(self):
-        array = self.array.name if isinstance(self.array, cin.TensorVar) else self.array
-        return f"{array}[{self.idx}]"
+        tensor = self.tensor.name if isinstance(self.tensor, cin.TensorVar) else self.tensor
+        return f"{tensor}[{self.idx}]"
 
     def __repr__(self):
         return str(self)

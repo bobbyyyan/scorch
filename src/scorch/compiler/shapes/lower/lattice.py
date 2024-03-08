@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from scorch.compiler import cin
-from scorch.compiler.shapes.lower.sequtil import *
+from scorch.compiler.shapes.lower.seq_util import *
 
 # The iteration lattice, as presented in "Compilation of Shape Operators on
 # Sparse Arrays" by Root, et. al.
@@ -11,7 +11,7 @@ from scorch.compiler.shapes.lower.sequtil import *
 @dataclass
 class IterationLattice:
     """A data structure to represent an iteration lattice.
-    sexpr: The entry node.
+    top: The entry node.
     graph: mapping from sequence expression to (edge, simplified).
     """
 
