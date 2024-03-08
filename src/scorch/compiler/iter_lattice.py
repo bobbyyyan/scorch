@@ -718,6 +718,8 @@ class LatticePoint:
                         not in to_resolve_index_var_names
                     ):
                         d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
+                    # not sure if this depends on is correct
+                    d[it.stride_non_zero_init] = it.coord_var_value_depends_on
                     d[it.stride_for_loops] = it.coord_var_value_depends_on
                 elif it.coord_var_value_llir:
                     dense_coord_resolve_stmt = llir.VarInit(

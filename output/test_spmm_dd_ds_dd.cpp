@@ -121,3 +121,10 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape, std::ve
   C._storage._value = C_values_torch;
   return C;
 }
+
+
+int pB1 = i * B0_stride * B1_size * B1_stride + j * B1_stride;
+for (int i0 = 0; i0 < B0_stride; i0++) {
+  for (int i1 = 0; i1 < B1_stride; i1++) {
+    int delta = i0 * B1_size * B1_stride + i1;
+  }

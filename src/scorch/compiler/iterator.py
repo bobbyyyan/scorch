@@ -417,75 +417,37 @@ class ModeIterator:
                             type=llir.DataType.CVECTOR_INT,
                         )
                     )
-                    
-                    stride_loop_body = []
-                    assign_true = llir.Assign(
+                    self.stride_non_zero = llir.Var(
+                        name="stride_non_zero",
+                        type=llir.DataType.BOOL,
+                    )
+                    self.stride_non_zero_init = llir.VarInit(
                         var=llir.Var(
-                            name="non_zero",
+                            name="stride_non_zero",
                             type=llir.DataType.BOOL,
                         ),
                         value=llir.Literal(1),
                     )
-                    
+                    stride_loop_body = []
                     if_non_zero_assign_true = llir.IfThenElse(
                         cond=llir.BinOp(
                             op="!=",
-                            left=self.tensor_var,
+                            left=llir.Var(
+                                name=f"{self.tensor_var.name}[p{self._tensor_var.name}{self._level} + p_stride]",
+                                type=llir.DataType.INT,
+                            ),
                             right=llir.Literal(value="0"),
                         ),
-                        then_body=assign_true
+                        then_body=llir.Assign(
+                            var=llir.Var(
+                                name="stride_non_zero",
+                                type=llir.DataType.BOOL,
+                            ),
+                            value=llir.Literal(1),
+                        ),
                     )
-                    stride_loop_body.append(if_non_zero_assign_true)
+                    stride_loop_body.extend([if_non_zero_assign_true])
                     self.stride_for_loops = self.generate_stride_for_loops(level_stride_sizes, 0, stride_loop_body)
-                    # stride_loop_body.append(llir.Assign(
-                    #     var=self.coord_var_array_value_llir,
-                    #     value=llir.Literal(0),
-                    # ))
-                    # level_stride_sizes = self.tensor_var.get_level_stride_sizes()
-                    # self.tensor_var.generate_stride_for_loops(level_stride_sizes, 0, stride_loop_body)
-                    # currently only works in this case, not sure what to do for other cases
-                    # for i_1 in range(level_stride_vars[self._level]):
-                    #     for i_0 in range(level_stride_vars[self._level - 1]):
-                    #         pstride = llir.Add(
-                    #                 left=llir.Mul(
-                    #                     left=llir.Mul(
-                    #                         left=llir.Var(
-                    #                             name=self.parent_iterator.get_iterator_var_llir().name,
-                    #                             type=llir.DataType.INT,
-                    #                         ),
-                    #                         right=llir.Var(
-                    #                             name=f"{self.tensor_var.name}{self.level}_size",
-                    #                             type=llir.DataType.INT,
-                    #                         ),
-                    #                     ),
-                    #                     right=llir.Mul(
-                    #                         left=llir.Var(
-                    #                             name=f"{self.tensor_var.name}{self.parent_iterator.level}_stride",
-                    #                             type=llir.DataType.INT,
-                    #                         ),
-                    #                         right=llir.Var(
-                    #                             name=f"{self.tensor_var.name}{self.level}_stride",
-                    #                             type=llir.DataType.INT,
-                    #                         ),
-                    #                     )
-                    #                 ),
-                    #                 right=llir.Mul(
-                    #                     left=llir.Var(
-                    #                         name=self.index_var.name,
-                    #                         type=llir.DataType.INT,
-                    #                     ),
-                    #                     right=llir.Var(
-                    #                         name=f"{self.tensor_var.name}{self.level}_stride",
-                    #                         type=llir.DataType.INT,
-                    #                     ),
-                    #                 ),
-                    #             )
-                            
-                    # # just use the array, don't check if the tensor is strided or not
-                    # self.coord_var_array_value_llir = llir.Array(
-                    #     values=array_values,
-                    #     data_type=llir.DataType.INT,
-                    # )
                 else:
                     self.coord_var_value_llir = llir.Add(
                         left=llir.Mul(
@@ -509,7 +471,7 @@ class ModeIterator:
                 )
                 
     
-    def generate_stride_for_loops(self, level_stride_sizes, cur_level, custom_body, p_stride=None):
+    def generate_stride_for_loops(self, level_stride_sizes, cur_level, custom_body, p_stride=None, save_to_array_idx=None):
         # for strided tensors
         # should work for all kinds of strides!
         if cur_level >= len(level_stride_sizes):
@@ -520,7 +482,27 @@ class ModeIterator:
                 ),
                 value=p_stride,
             )
-            return [assign_p_stride, custom_body]
+            assign_save_to_array_idx = llir.VarInit(
+                var=llir.Var(
+                    name=f"save_to_array_idx",
+                    type=llir.DataType.INT,
+                ),
+                value=save_to_array_idx,
+            )
+            # save the stride array
+            assign_coord_var_array = llir.Assign(
+                var=llir.Var(
+                    name=f"{self._tensor_var.name}{self._level}_stride_array[save_to_array_idx]",
+                    type=llir.DataType.INT,
+                ),
+                value=llir.Var(
+                    name=f"p{self._tensor_var.name}{self._level} + p_stride",
+                    type=llir.DataType.INT,
+                ),
+            )
+            custom_body.extend([assign_coord_var_array])
+            return [assign_p_stride, assign_save_to_array_idx, custom_body]
+        
         if p_stride is None:
             p_stride = llir.Var(
                 name=f"i{cur_level}",
@@ -529,13 +511,40 @@ class ModeIterator:
         else:
             p_stride = llir.Mul(
                 left=p_stride,
+                right=llir.Mul(
+                    left=llir.Var(
+                        name=f"{self.tensor_var.name}{cur_level}_stride",
+                        type=llir.DataType.INT,
+                    ),
+                    right=llir.Var(
+                        name=f"{self.tensor_var.name}{cur_level}_size",
+                        type=llir.DataType.INT,
+                    )
+                ),
+            )
+            p_stride = llir.Add(
+                left=p_stride,
+                right=llir.Var(
+                    name=f"i{cur_level}",
+                    type=llir.DataType.INT,
+                )
+            )
+        
+        if save_to_array_idx is None:
+            save_to_array_idx = llir.Var(
+                name=f"i{cur_level}",
+                type=llir.DataType.INT,
+            )
+        else:
+            save_to_array_idx = llir.Mul(
+                left=save_to_array_idx,
                 right=llir.Var(
                     name=f"{self.tensor_var.name}{cur_level}_stride",
                     type=llir.DataType.INT,
                 ),
             )
-            p_stride = llir.Add(
-                left=p_stride,
+            save_to_array_idx = llir.Add(
+                left=save_to_array_idx,
                 right=llir.Var(
                     name=f"i{cur_level}",
                     type=llir.DataType.INT,
@@ -568,10 +577,10 @@ class ModeIterator:
                             type=llir.DataType.INT,
                         ),
                     ),
-                    body=self.generate_stride_for_loops(level_stride_sizes, cur_level + 1, custom_body, p_stride),
+                    body=self.generate_stride_for_loops(level_stride_sizes, cur_level + 1, custom_body, p_stride, save_to_array_idx)
                 )
         else:
-            return self.generate_stride_for_loops(level_stride_sizes, cur_level + 1, custom_body, p_stride)
+            return self.generate_stride_for_loops(level_stride_sizes, cur_level + 1, custom_body, p_stride, save_to_array_idx)
 
 
 
