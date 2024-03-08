@@ -8,6 +8,7 @@ from scorch.compiler.shapes.lower import seq_util, lattice as il
 
 
 def SimplifyExpr(e: cin.IndexExpr, defs: set[cin.Seq]) -> Optional[cin.IndexExpr]:
+    """Simplifies the expression `e` to another (optional) expression."""
     match e:
         case cin.Workspace():
             return e
@@ -178,6 +179,7 @@ def FindLocators(
 
 
 def CompileForAll(fa: cin.ForAll, defs: set[cin.Seq]) -> cfir.CFIR | list[cfir.CFIR]:
+    """Lowers CIN `For All` construct to CFIR."""
     sexpr: cin.Seq = fa.seq
     sexpr, locs = FindLocators(sexpr)
     lattice: il.IterationLattice = il.ConstructIterationLattice(sexpr, defs)
@@ -188,10 +190,12 @@ def CompileForAll(fa: cin.ForAll, defs: set[cin.Seq]) -> cfir.CFIR | list[cfir.C
 
 
 def CompileTensorAssign(c: cin.TensorAssign, defs: set[cin.Seq]) -> cfir.CFIR:
+    """Lowers CIN `Tensor Assign` construct to CFIR."""
     return cfir.Assign(c.lhs, c.rhs, c.op)
 
 
 def CompileWhere(c: cin.Where, defs: set[cin.Seq]) -> cfir.CFIR:
+    """Lowers CIN `where` construct to CFIR."""
     return cfir.Allocate(
         t=c.workspace,
         producer=Lower(c.producer, defs),
