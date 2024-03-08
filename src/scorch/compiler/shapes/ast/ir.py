@@ -4,12 +4,13 @@ from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 from scorch.compiler import cin
 
-# Constructs used throughout the compiler, i.e., we choose to use the same
-# representation rather than having a per-pass variant.
+# Certain constructs can be used throughout the compiler, e.g., an index variable
+# is the same regardless of the compiler phase. This is where these representation-agnostic
+# constructs live.
 #
-# TODO(cgyurgyik): The other CIN constructs that appear in CFIR/CPP phases
-# should be translated to a "general" construct here too, e.g., TensorVar
-# and TensorAccess.
+# TODO(cgyurgyik): The other Scorch CIN constructs that appear in CFIR/CPP phases
+# should be translated to a "general" construct here too, e.g., TensorVar and
+# TensorAccess.
 
 
 @dataclass
