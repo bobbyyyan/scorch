@@ -63,16 +63,16 @@ def SimplifyStmt(c: cin.IndexStmt, defs: set[cin.Seq]) -> cin.CIN:
 
 def BuildLoop(
     point: cin.Seq,
-    lattice: il.Lattice,
-    fa: cin.ForAll,
+    lattice: il.IterationLattice,
+    construct: cin.ForAll,
     defs: set[cin.Seq],
     locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]],
 ) -> cfir.Loop:
     locs = FilterLocators(locs, point)
     locdefs = map(lambda p: seq_util.Iters(p[1]), locs)
     locdefs = reduce(set.union, locdefs, set())
-    idx: ir.IndexVar = ir.IndexVar.from_cin(fa.index_var)
-    body: cin.IndexStmt = fa.stmt
+    idx: ir.IndexVar = ir.IndexVar.from_cin(construct.index_var)
+    body: cin.IndexStmt = construct.stmt
 
     def Build(child: cin.Seq):
         newdefs: set[cin.Seq] = defs | seq_util.Iters(child) | locdefs

@@ -9,7 +9,7 @@ from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 
 @dispatch(int, cin.TensorVar, format.LevelType)
-def ArrayIndexVariable(index: int, tensor: cin.TensorVar, fmt: format.LevelType):
+def ArrayIndexVariable(index: int, tensor: cin.TensorVar, fmt: format.LevelType) -> cpp.Cpp:
     match fmt:
         case format.LevelType.DENSE:
             return cpp.Variable(f"{tensor.name}{index}")
@@ -20,19 +20,21 @@ def ArrayIndexVariable(index: int, tensor: cin.TensorVar, fmt: format.LevelType)
 
 
 @dispatch(cin.IndexSeq)
-def ArrayIndexVariable(seq: cin.IndexSeq):
+def ArrayIndexVariable(seq: cin.IndexSeq) -> cpp.Cpp:
     return ArrayIndexVariable(seq.index, seq.tensor, seq.format)
 
 
-def UniverseIndexVariable(idx: cin.IndexExpr):
+def UniverseIndexVariable(idx: cin.IndexExpr) -> cpp.Variable:
+    """Returns a Cpp universe variable for the given index expression."""
     return cpp.Variable(f"U_{idx}")
 
 
-def ProjectionVariable(k: int):
+def ProjectionVariable(k: int) -> cpp.Variable:
+    """Returns a Cpp projection variable for the given projection index."""
     return cpp.Variable(f"proj_{k}")
 
 
-def ArrayLowerBound(seq: cin.IndexSeq):
+def ArrayLowerBound(seq: cin.IndexSeq) -> cpp.Cpp:
     match fmt := seq.format:
         case format.LevelType.DENSE:
             return cpp.Constant(0)
@@ -48,7 +50,7 @@ def ArrayLowerBound(seq: cin.IndexSeq):
             raise NotImplementedError(fmt)
 
 
-def ArrayUpperBound(seq: cin.IndexSeq):
+def ArrayUpperBound(seq: cin.IndexSeq) -> cpp.Cpp:
     match fmt := seq.format:
         case format.LevelType.DENSE:
             return cpp.Constant(seq.size)
@@ -68,7 +70,7 @@ def ArrayUpperBound(seq: cin.IndexSeq):
 
 
 @dispatch(cin.IndexSeq)
-def ArrayAccessCrd(seq: cin.IndexSeq):
+def ArrayAccessCrd(seq: cin.IndexSeq) -> cpp.Cpp:
     match fmt := seq.format:
         case format.LevelType.DENSE:
             return ArrayIndexVariable(seq)
@@ -84,7 +86,7 @@ def ArrayAccessCrd(seq: cin.IndexSeq):
 @dispatch(cin.TensorVar, int, format.LevelType)
 def ArrayAccessCrd(
     tensor: cin.TensorVar, index: int, fmt: format.LevelType
-):
+) -> cpp.Cpp:
     match fmt:
         case format.LevelType.DENSE:
             return ArrayIndexVariable(index, tensor, fmt)
@@ -107,7 +109,7 @@ def UpdateCompressedIterators(access: cin.TensorAccess) -> Optional[cpp.Cpp]:
 
 
 def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
-    """Simple algebraic reductions on Cpp constructs."""
+    """Algebraic reductions on Cpp constructs."""
     match expr:
         case cpp.While(cond, body):
             cond = Simplify(cond)

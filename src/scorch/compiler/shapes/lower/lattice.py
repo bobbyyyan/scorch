@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 from scorch.compiler import cin
-from scorch.compiler.shapes.lower.seq_util import *
+from scorch.compiler.shapes.lower import seq_util
 import logging
 
 # The iteration lattice, as presented in "Compilation of Shape Operators on
@@ -78,7 +78,7 @@ def TopologicalSortRec(
     ]
 
 
-def TopologicalSort(lattice: IterationLattice):
+def TopologicalSort(lattice: IterationLattice) -> list[cin.Seq]:
     return TopologicalSortRec(lattice.top, lattice.graph)[::-1]
 
 
@@ -90,24 +90,24 @@ def ConstructGraph(sexpr: cin.Seq, defs: set[cin.Seq], visited: set[cin.Seq] = s
     graph = {}
     pairs: list[Tuple[cin.Seq, cin.Seq]] = []
     for e in edges:
-        r: cin.Seq = Remove(sexpr, e)
-        s: cin.Seq = SimplifySeq(r, defs)
+        r: cin.Seq = seq_util.Remove(sexpr, e)
+        s: cin.Seq = seq_util.SimplifySeq(r, defs)
         graph |= ConstructGraph(s, defs, visited)
         pairs.append((e, s))
     graph[sexpr] = {(e, s) for e, s in pairs}
     return graph
 
 
-def ConstructIterationLattice(top: cin.Seq, defs: set[cin.Seq]):
+def ConstructIterationLattice(top: cin.Seq, defs: set[cin.Seq]) -> IterationLattice:
     """Constructs an iteratin lattice, with `top` being the highest point."""
     lattice = IterationLattice(top, ConstructGraph(top, defs))
     logging.debug(f"Lattice Construction:\n{lattice}")
     return lattice
 
 
-def Subpoints(lattice: IterationLattice, point: cin.Seq):
+def Subpoints(lattice: IterationLattice, point: cin.Seq) -> list[cin.Seq]:
     """Returns sub-points for `point` in the lattice."""
-    subs = TopologicalSortRec(point, lattice.graph, visited=set())
-    iters = Iters(point)
-    n = list(filter(lambda x: Iters(x) <= iters, subs))
+    subs: list[cin.Seq] = TopologicalSortRec(point, lattice.graph, visited=set())
+    iters: set[cin.Seq] = seq_util.Iters(point)
+    n = list(filter(lambda x: seq_util.Iters(x) <= iters, subs))
     return n[::-1]

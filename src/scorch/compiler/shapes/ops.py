@@ -23,8 +23,8 @@ TENSOR_INDEX_NAME = "ijklmnopqrstuvwxyz"
 SUFFIX = 0
 
 
-def Name():
-    """Hygienic name for operands."""
+def ResultName():
+    """Hygienic name (or an attempt) for results."""
 
     def Suffix() -> int:
         global SUFFIX
@@ -32,17 +32,13 @@ def Name():
         SUFFIX += 1
         return s
 
-    return f"{Suffix()}"
-
-
-def ResultName():
-    """Hygienic name for results."""
-    return f"_R{Name()}"
+    return f"_R{Suffix()}"
 
 
 def __format(
     format: Optional[Union[TensorFormat, str, List[str]]], rank: int
 ) -> TensorFormat:
+    """Translates the provided format variant into a TensorFormat."""
     if format is None:
         return parse_format("d" * rank)
     if isinstance(format, TensorFormat):

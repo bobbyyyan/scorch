@@ -9,6 +9,10 @@ from scorch.compiler.shapes.lower import cpp_util, seq_util
 
 
 def Init(sexpr: cin.Seq):
+    """
+    Handles declaring any necessary iteration variables and 
+    locating the first non-zero element in the sequence.
+    """
     match (sexpr):
         case cin.IndexSeq():
             return cpp.Define(
@@ -92,6 +96,9 @@ def Init(sexpr: cin.Seq):
 
 
 def Reset(sexpr: cin.Seq):
+    """
+    Handles resetting the sequence expression.
+    """
     match (sexpr):
         case cin.IndexSeq():
             return cpp.Assign(
@@ -139,6 +146,12 @@ def Reset(sexpr: cin.Seq):
 
 
 def Valid(sexpr: cin.Seq):
+    """
+    Checks that the sequence has not run out of coordinates,
+    meaning no sub-sequenceh as run out. This means no iterators
+    have gone out of bounds, and slices/projections are still within
+    a valid range.
+    """
     match (sexpr):
         case cin.IndexSeq(_, _):
             return cpp.Lt(
@@ -188,6 +201,11 @@ def Eval(sexpr: cin.Seq):
 
 
 def Next(value: cpp.Cpp, sexpr: cin.Seq):
+    """
+    Steps forward any sequences that are currently behind. This follows the TACO
+    approach for unions and intersections, and defines new code generators for the
+    sequence combinators.
+    """
     match (sexpr):
         case cin.IndexSeq(_, _):
             return cpp.IncAssign(
@@ -232,6 +250,9 @@ def Next(value: cpp.Cpp, sexpr: cin.Seq):
 
 
 def UnconditionalNext(sexpr: cin.Seq):
+    """
+    Unconditonally steps the sequence combinator.
+    """
     match (sexpr):
         case cin.IndexSeq(_, _):
             return cpp.IncAssign(cpp_util.ArrayIndexVariable(sexpr), cpp.Constant(1))
@@ -293,6 +314,12 @@ def UnconditionalNext(sexpr: cin.Seq):
 
 
 def Equals(value: cpp.Cpp, sexpr: cin.Seq):
+    """
+    An equality test to determine whether a sequence is currently at a given coordinate.
+    For intersections and unions, this means both sequence operands are equal to the given
+    value. For sequence combinators, this re-maps the provided value into the spaces spanned
+    by the operand sequences.
+    """
     match (sexpr):
         case cin.IndexSeq():
             return cpp.Eq(value, cpp_util.ArrayAccessCrd(sexpr))
