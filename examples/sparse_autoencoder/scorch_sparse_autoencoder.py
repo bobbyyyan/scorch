@@ -39,10 +39,11 @@ class SparseLinear(nn.Module):
 
 
 class SparseAutoencoder(nn.Module):
-    def __init__(self):
+    def __init__(self, input_size, encoding_dim=256):
         super(SparseAutoencoder, self).__init__()
-        self.encoder = SparseLinear(28 * 28, 256)
-        self.decoder = nn.Linear(256, 28 * 28)
+        self.input_size = input_size
+        self.encoder = SparseLinear(input_size, encoding_dim)
+        self.decoder = nn.Linear(encoding_dim, input_size)
 
     def forward(self, x):
         x = torch.relu(self.encoder(x))
@@ -50,11 +51,40 @@ class SparseAutoencoder(nn.Module):
         return x
 
 
+def get_dataset(name):
+    if name == "mnist":
+        transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Lambda(lambda x: x.view(-1))]
+        )
+        train_dataset = datasets.MNIST(
+            "./data", train=True, download=True, transform=transform
+        )
+        test_dataset = datasets.MNIST("./data", train=False, transform=transform)
+        input_size = 28 * 28
+    elif name == "cifar10":
+        transform = transforms.Compose(
+            [
+                transforms.Grayscale(),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.view(-1)),
+            ]
+        )
+        train_dataset = datasets.CIFAR10(
+            "./data", train=True, download=True, transform=transform
+        )
+        test_dataset = datasets.CIFAR10("./data", train=False, transform=transform)
+        input_size = 32 * 32
+    else:
+        raise ValueError("Unsupported dataset")
+
+    return train_dataset, test_dataset, input_size
+
+
 def train(model, device, train_loader, optimizer, epoch):
     model.train()
     loss_fn = nn.MSELoss()
     for batch_idx, (data, _) in enumerate(train_loader):
-        data = data.view(-1, 28 * 28).to(device)
+        data = data.view(-1, model.input_size).to(device)
         optimizer.zero_grad()
         output = model(data)
         loss = loss_fn(output, data)
@@ -75,7 +105,7 @@ def test(model, device, test_loader):
 
     with torch.no_grad():
         for data, _ in test_loader:
-            data = data.view(-1, 28 * 28).to(device)
+            data = data.view(-1, model.input_size).to(device)
             sparse_data = data.to_sparse_csr()
             output = model(sparse_data)
             test_loss += loss_fn(output, data)
@@ -100,7 +130,7 @@ def main():
         "--dataset",
         type=str,
         default="mnist",
-        choices=["mnist"],
+        choices=["mnist", "cifar10"],
         help="dataset for training/testing the model (default: 'mnist')",
     )
 
@@ -127,6 +157,8 @@ def main():
     )
     args = parser.parse_args()
 
+    dataset_name = args.dataset
+
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
@@ -137,28 +169,24 @@ def main():
         train_kwargs.update(cuda_kwargs)
         test_kwargs.update(cuda_kwargs)
 
-    if args.dataset == "mnist":
-        transform = transforms.Compose([transforms.ToTensor()])
-        train_dataset = datasets.MNIST(
-            "./data", train=True, download=True, transform=transform
-        )
-        test_dataset = datasets.MNIST("./data", train=False, transform=transform)
-
+    train_dataset, test_dataset, input_size = get_dataset(args.dataset)
     train_loader = DataLoader(train_dataset, **train_kwargs)
     test_loader = DataLoader(test_dataset, **test_kwargs)
 
-    model = SparseAutoencoder().to(device)
+    model = SparseAutoencoder(input_size).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     if args.mode == "train":
         for epoch in range(1, args.epochs + 1):
             train(model, device, train_loader, optimizer, epoch)
-        torch.save(model.state_dict(), "mnist_sparse_autoencoder.pt")
+        torch.save(model.state_dict(), f"models/{dataset_name}_sparse_autoencoder.pt")
         print("Training complete, model saved.")
 
     elif args.mode == "test":
         model.load_state_dict(
-            torch.load("mnist_sparse_autoencoder.pt", map_location=device)
+            torch.load(
+                f"models/{dataset_name}_sparse_autoencoder.pt", map_location=device
+            )
         )
         test(model, device, test_loader)
 
