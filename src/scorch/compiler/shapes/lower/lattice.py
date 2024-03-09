@@ -49,6 +49,9 @@ class IterationLattice:
 
 
 def 𝜒(sexpr: cin.Seq) -> set[cin.Seq]:
+    """
+    Generates a set of subsequences that correspond to state transitions.
+    """
     match sexpr:
         case cin.IndexSeq() | cin.Universe():
             return {sexpr}
@@ -79,6 +82,10 @@ def TopologicalSortRec(
 
 
 def TopologicalSort(lattice: IterationLattice) -> list[cin.Seq]:
+    """
+    Performs a topological sort on the iteration lattice, 
+    returning the list of sequence combinators.
+    """
     return TopologicalSortRec(lattice.top, lattice.graph)[::-1]
 
 
