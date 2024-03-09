@@ -7,6 +7,15 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import scorch
 
+import warnings
+
+# Suppress specific PyTorch UserWarning about Sparse CSR tensor support
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="Sparse CSR tensor support is in beta state.*",
+)
+
 
 class SparseLinear(nn.Module):
     def __init__(self, in_features, out_features):
@@ -67,7 +76,7 @@ def test(model, device, test_loader):
     with torch.no_grad():
         for data, _ in test_loader:
             data = data.view(-1, 28 * 28).to(device)
-            sparse_data = data.to_sparse()
+            sparse_data = data.to_sparse_csr()
             output = model(sparse_data)
             test_loss += loss_fn(output, data)
 
@@ -83,9 +92,18 @@ def main():
         "--mode",
         type=str,
         choices=["train", "test"],
-        required=True,
+        default="test",
         help="train the model or test the model",
     )
+
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="mnist",
+        choices=["mnist"],
+        help="dataset for training/testing the model (default: 'mnist')",
+    )
+
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -119,11 +137,13 @@ def main():
         train_kwargs.update(cuda_kwargs)
         test_kwargs.update(cuda_kwargs)
 
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_dataset = datasets.MNIST(
-        "./data", train=True, download=True, transform=transform
-    )
-    test_dataset = datasets.MNIST("./data", train=False, transform=transform)
+    if args.dataset == "mnist":
+        transform = transforms.Compose([transforms.ToTensor()])
+        train_dataset = datasets.MNIST(
+            "./data", train=True, download=True, transform=transform
+        )
+        test_dataset = datasets.MNIST("./data", train=False, transform=transform)
+
     train_loader = DataLoader(train_dataset, **train_kwargs)
     test_loader = DataLoader(test_dataset, **test_kwargs)
 
