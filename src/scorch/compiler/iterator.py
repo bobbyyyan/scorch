@@ -428,12 +428,18 @@ class ModeIterator:
                         ),
                         value=llir.Literal(1),
                     )
+                    self.stride_array_init = llir.VarDecl(
+                        llir.Var(
+                            name=f"{self.tensor_var.name}{self.level}_stride_array",
+                            type=llir.DataType.CVECTOR_INT,
+                        )
+                    )
                     stride_loop_body = []
                     if_non_zero_assign_true = llir.IfThenElse(
                         cond=llir.BinOp(
                             op="!=",
                             left=llir.Var(
-                                name=f"{self.tensor_var.name}[p{self._tensor_var.name}{self._level} + p_stride]",
+                                name=f"{self.tensor_var.name}_val[p{self._tensor_var.name}{self._level} + p_stride]",
                                 type=llir.DataType.INT,
                             ),
                             right=llir.Literal(value="0"),
@@ -475,14 +481,14 @@ class ModeIterator:
         # for strided tensors
         # should work for all kinds of strides!
         if cur_level >= len(level_stride_sizes):
-            assign_p_stride = llir.VarInit(
+            init_p_stride = llir.VarInit(
                 var=llir.Var(
                     name=f"p_stride",
                     type=llir.DataType.INT,
                 ),
                 value=p_stride,
             )
-            assign_save_to_array_idx = llir.VarInit(
+            init_save_to_array_idx = llir.VarInit(
                 var=llir.Var(
                     name=f"save_to_array_idx",
                     type=llir.DataType.INT,
@@ -501,7 +507,7 @@ class ModeIterator:
                 ),
             )
             custom_body.extend([assign_coord_var_array])
-            return [assign_p_stride, assign_save_to_array_idx, custom_body]
+            return [init_p_stride, init_save_to_array_idx, custom_body]
         
         if p_stride is None:
             p_stride = llir.Var(

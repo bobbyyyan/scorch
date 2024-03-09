@@ -353,58 +353,72 @@ class CINLowerer:
                     else:
                         # This line assigns the value of the rhs to the tensor
                         if if_strided:
-                            stride_area= llir.Var(
-                                name=f"{self.result_tensor_var.get_name()}_stride_area",
-                                type=llir.DataType.INT,
-                            )
+                            stride_area=None
                             for stride_idx, stride_size in enumerate(level_stride_sizes):
                                 if stride_size is not None:
-                                    stride_area = llir.BinOp(
-                                        op="*",
-                                        left=stride_area,
-                                        right=llir.Var(
+                                    if stride_area is None:
+                                        stride_area = llir.Var(
                                             name=f"{self.result_tensor_var.get_name()}{stride_idx}_stride",
                                             type=llir.DataType.INT,
-                                        ),
-                                    )
+                                        )
+                                    else:
+                                        stride_area = llir.Mul(
+                                            left=stride_area,
+                                            right=llir.Var(
+                                                name=f"{self.result_tensor_var.get_name()}{stride_idx}_stride",
+                                                type=llir.DataType.INT,
+                                            ),
+                                        )
+                            init_stride_area = llir.VarInit(
+                                var=llir.Var(
+                                    name=f"{self.result_tensor_var.get_name()}_stride_area",
+                                    type=llir.DataType.INT,
+                                ),
+                                value=stride_area,
+                            )
+                            # not sure how to do this, wait for a while
+                            # rhs_tensor_var = stmt.rhs.get_tensor()
+                            level = self.result_tensor_access.level_of_index_var(index_vars[-1])
                             assign_through_stride_size = llir.ForLoop(
                                 init=llir.VarInit(
-                                    var=f"i{self.result_tensor_var.get_name()}_stride_area",
-                                    value=llir.Literal(1),
+                                    var=llir.Var(
+                                        name=f"i{self.result_tensor_var.get_name()}_stride_area",
+                                        type=llir.DataType.INT,
+                                    ),
+                                    value=llir.Literal(0),
                                 ),
                                 cond=llir.BinOp(
                                     op="<",
-                                    left=llir.VarInit(
-                                        var=f"i{self.result_tensor_var.get_name()}_stride_area",
-                                        value=llir.Literal(1),
+                                    left=llir.Var(
+                                        name=f"i{self.result_tensor_var.get_name()}_stride_area",
+                                        type=llir.DataType.INT,
                                     ),
-                                    right=stride_area
+                                    right=llir.Var(
+                                        name=f"{self.result_tensor_var.get_name()}_stride_area",
+                                        type=llir.DataType.INT,
+                                    ),
                                 ),
-                                update=llir.BinOp(
-                                    op="+",
-                                    left=llir.VarInit(
-                                        var=f"i{self.result_tensor_var.get_name()}_stride_area",
-                                        value=llir.Literal(1),
+                                update=llir.Increment(
+                                    var=llir.Var(
+                                        name=f"i{self.result_tensor_var.get_name()}_stride_area",
+                                        type=llir.DataType.INT,
                                     ),
-                                    right=llir.Literal(1),
                                 ),
                                 body=[
                                     llir.Assign(
                                         var=llir.Var(
-                                            name=f"{self.result_tensor_var.get_name()}[{tensor_access_llir.name} + i{self.result_tensor_var.get_name()}_stride_area]",
+                                            name=f"{self.result_tensor_var.get_name()}_values[p{self.result_tensor_var.get_name()}{level} * {self.result_tensor_var.get_name()}_stride_area + i{self.result_tensor_var.get_name()}_stride_area]",
                                             type=llir.DataType.NO_TYPE,
                                         ),
                                         value=rhs_llir,
                                     )
                                 ],
                             )
-                            llir_stmts.append(
-                                assign_through_stride_size
-                                # llir.Assign(
-                                #     var=tensor_access_llir,
-                                #     value=rhs_llir
-                                #     # op=AssignOp.ADD_ASSIGN,
-                                # )
+                            llir_stmts.extend(
+                                [
+                                    init_stride_area,
+                                    assign_through_stride_size
+                                ]
                             )
                         else:
                             llir_stmts.append(
@@ -490,7 +504,7 @@ class CINLowerer:
                         cond=llir.BinOp(
                             op="!=",
                             left=llir.Var(
-                                name=f"{self.result_tensor_var.get_name()}",
+                                name="stride_non_zero",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             right=llir.Literal(value="0"),

@@ -312,6 +312,9 @@ class VarDecl(Stmt):
     """A variable declaration statement."""
 
     var: Var
+    
+    def __hash__(self):
+        return hash(self.var)
 
 
 @dataclass(frozen=False)
