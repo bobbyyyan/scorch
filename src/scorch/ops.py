@@ -474,8 +474,6 @@ def einsum(
         lowerer = CINLowerer()
 
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-        
-        print("lowered_llir", lowered_llir)
 
         llir_lowerer = LLIRLowerer()
 

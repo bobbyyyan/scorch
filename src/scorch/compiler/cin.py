@@ -581,7 +581,13 @@ class TensorVar(IndexExpr):
 
     def get_level_size_cpp(self, level: int) -> str:
         return f"(int) ({self.name}._shape[{level}])"
-
+    
+    def get_level_stride_size(self, size: int) -> str:
+        level_stride_sizes = self.format.get_level_stride_sizes()
+        if size >= len(level_stride_sizes):
+            return None
+        return level_stride_sizes[size]
+        
     def __getitem__(self, item) -> TensorAccess:
         return TensorAccess(self, item)
 

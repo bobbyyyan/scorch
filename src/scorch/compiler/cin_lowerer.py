@@ -379,6 +379,8 @@ class CINLowerer:
                             # not sure how to do this, wait for a while
                             # rhs_tensor_var = stmt.rhs.get_tensor()
                             level = self.result_tensor_access.level_of_index_var(index_vars[-1])
+                            rhs_tensor_var = stmt.rhs.get_tensor() # only works when rhs is also tensor access
+                            # not sure what to do if rhs is not tensor access
                             assign_through_stride_size = llir.ForLoop(
                                 init=llir.VarInit(
                                     var=llir.Var(
@@ -410,7 +412,10 @@ class CINLowerer:
                                             name=f"{self.result_tensor_var.get_name()}_values[p{self.result_tensor_var.get_name()}{level} * {self.result_tensor_var.get_name()}_stride_area + i{self.result_tensor_var.get_name()}_stride_area]",
                                             type=llir.DataType.NO_TYPE,
                                         ),
-                                        value=rhs_llir,
+                                        value=llir.Var(
+                                            name=f"{rhs_tensor_var.get_name()}_val[{rhs_tensor_var.get_name()}{level}_stride_array[i{self.result_tensor_var.get_name()}_stride_area]]",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
                                     )
                                 ],
                             )

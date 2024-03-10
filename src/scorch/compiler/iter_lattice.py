@@ -1197,9 +1197,7 @@ class IterationLattice:
                             )
                         )
 
-                if len(iterators) == 0:
-                    
-                    print("here here here! len(iterators) == 0")
+                if len(iterators) == 0:                   
                     for_loop = llir.ForLoop(
                         init=self.get_dense_iterator_init_stmt(),
                         cond=lattice_point.get_for_loop_condition(lattice=self),
@@ -1207,7 +1205,7 @@ class IterationLattice:
                             lattice=self
                         ),
                         body=[
-                            llir.Comment("111"),
+                            llir.Comment("here here here! len(iterators) == 0"),
                             *tiled_index_var_resolve_stmts,
                             llir.Comment("222"),
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
@@ -1223,7 +1221,6 @@ class IterationLattice:
                     stmts.append(for_loop)
 
                 elif len(iterators) == 1 and not lattice_point.parent_lattice_point:
-                    print("here here here! len(iterators) == 1 and not lattice_point.parent_lattice_point")
                     # Note: we don't want to do this for a child lattice point
                     # because we don't want to re-initialize the iterator(s)
                     it = iterators[0]
@@ -1234,6 +1231,7 @@ class IterationLattice:
                             lattice=self
                         ),
                         body=[
+                            llir.Comment("here here here! len(iterators) == 1 and not lattice_point.parent_lattice_point"),
                             *tiled_index_var_resolve_stmts,
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                             *result_value_index_stmts,
@@ -1246,10 +1244,10 @@ class IterationLattice:
                     stmts.append(for_loop)
 
                 else:
-                    print("here here here! while loop")
                     while_loop = llir.WhileLoop(
                         cond=lattice_point.get_while_condition(lattice=self),
                         body=[
+                            llir.Comment("here here here! len(iterators) > 1, here here here! while loop"),
                             *tiled_index_var_resolve_stmts,
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                             *result_value_index_stmts,
