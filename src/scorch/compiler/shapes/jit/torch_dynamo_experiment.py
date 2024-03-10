@@ -4,9 +4,15 @@ import scorch.tensor as tensor
 import operator
 from dataclasses import dataclass
 
-# Experimenting with PyTorch2's TorchDynamo.
+# Experimenting with PyTorch2's TorchDynamo. It allows for customizable backends.
 # Once Sparse layouts are supported in FakeTensor, it will be possible
 # to perform more calculated optimizations.
+
+import scorch as torch
+
+before = torch.Tensor([[0, 1, 2], [3, 4, 5]]).to_sparse("ds")
+after = torch.flatten(before, start_dim=0)
+after = torch.unflatten(after, dim=0, sizes=(2, 3))
 
 
 def scorch_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
