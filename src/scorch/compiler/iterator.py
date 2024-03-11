@@ -49,17 +49,17 @@ class ModeIterator:
         assert self.coord_var_llir is not None, "coord_var_llir is None"
         return self.coord_var_llir
 
-    def get_coord_var_array_llir(self) -> llir.Var:
-        assert self.coord_var_array_llir is not None, "coord_var_vector_llir is None"
-        return self.coord_var_array_llir
+    # def get_coord_var_array_llir(self) -> llir.Var:
+    #     assert self.coord_var_array_llir is not None, "coord_var_vector_llir is None"
+    #     return self.coord_var_array_llir
 
     def get_coord_var_value_llir(self) -> llir.Expr:
         assert self.coord_var_value_llir is not None, "coord_var_value_llir is None"
         return self.coord_var_value_llir
     
-    def get_coord_var_array_value_llir(self) -> llir.Expr:
-        assert self.coord_var_array_value_llir is not None, "coord_var_array_value_llir is None"
-        return self.coord_var_array_value_llir
+    # def get_coord_var_array_value_llir(self) -> llir.Expr:
+    #     assert self.coord_var_array_value_llir is not None, "coord_var_array_value_llir is None"
+    #     return self.coord_var_array_value_llir
 
     def get_iterator_var_llir(self) -> llir.Var:
         assert self.iterator_var_llir is not None, "iterator_var_llir is None"
@@ -293,6 +293,9 @@ class ModeIterator:
                     name=f"{self.index_var.name}",
                     type=llir.DataType.INT,
                 )
+                
+        level_stride_sizes = self._tensor_var.get_level_stride_sizes()
+        is_strided = any(level_stride_sizes)
 
         if self.level_type == LevelType.COORDINATE:
             self.iterator_var_begin_value_llir = llir.Var(
@@ -366,118 +369,132 @@ class ModeIterator:
                 name=f"p{self._tensor_var.name}{self._level}",
                 type=llir.DataType.INT,
             )
-            level_stride_sizes = self._tensor_var.get_level_stride_sizes()
-            is_strided = any(level_stride_sizes)
-            if is_strided:
-                self.coord_var_array_llir = llir.Var(
-                    name=f"p{self._tensor_var.name}{self._level}_stride_array",
-                    type=llir.DataType.CVECTOR_INT,
-                )
+            # if is_strided:
+            #     self.coord_var_array_llir = llir.Var(
+            #         name=f"p{self._tensor_var.name}{self._level}_stride_array",
+            #         type=llir.DataType.CVECTOR_INT,
+            #     )
             if self.parent_iterator:
                 # e.g. int pB1 = j * B1_size + k;
-                if level_stride_sizes[self._level]:
-                    self.coord_var_value_llir = llir.Add(
-                        left=llir.Mul(
-                            left=llir.Mul(
-                                left=llir.Var(
-                                    name=self.parent_iterator.get_iterator_var_llir().name,
-                                    type=llir.DataType.INT,
-                                ),
-                                right=llir.Var(
-                                    name=f"{self.tensor_var.name}{self.level}_size",
-                                    type=llir.DataType.INT,
-                                ),
-                            ),
-                            right=llir.Mul(
-                                left=llir.Var(
-                                    name=f"{self.tensor_var.name}{self.parent_iterator.level}_stride",
-                                    type=llir.DataType.INT,
-                                ),
-                                right=llir.Var(
-                                    name=f"{self.tensor_var.name}{self.level}_stride",
-                                    type=llir.DataType.INT,
-                                ),
-                            )
-                        ),
-                        right=llir.Mul(
-                            left=llir.Var(
-                                name=self.index_var.name,
-                                type=llir.DataType.INT,
-                            ),
-                            right=llir.Var(
-                                name=f"{self.tensor_var.name}{self.level}_stride",
-                                type=llir.DataType.INT,
-                            ),
-                        ),
-                    )
+                # if level_stride_sizes[self._level]:
+                #     self.coord_var_value_llir = llir.Add(
+                #         left=llir.Mul(
+                #             left=llir.Mul(
+                #                 left=llir.Var(
+                #                     name=self.parent_iterator.get_iterator_var_llir().name,
+                #                     type=llir.DataType.INT,
+                #                 ),
+                #                 right=llir.Var(
+                #                     name=f"{self.tensor_var.name}{self.level}_size",
+                #                     type=llir.DataType.INT,
+                #                 ),
+                #             ),
+                #             right=llir.Mul(
+                #                 left=llir.Var(
+                #                     name=f"{self.tensor_var.name}{self.parent_iterator.level}_stride",
+                #                     type=llir.DataType.INT,
+                #                 ),
+                #                 right=llir.Var(
+                #                     name=f"{self.tensor_var.name}{self.level}_stride",
+                #                     type=llir.DataType.INT,
+                #                 ),
+                #             )
+                #         ),
+                #         right=llir.Mul(
+                #             left=llir.Var(
+                #                 name=self.index_var.name,
+                #                 type=llir.DataType.INT,
+                #             ),
+                #             right=llir.Var(
+                #                 name=f"{self.tensor_var.name}{self.level}_stride",
+                #                 type=llir.DataType.INT,
+                #             ),
+                #         ),
+                #     )
                     
-                    self.coord_var_array_value_llir = llir.VarDecl(
-                        llir.Var(
-                            name=f"{self.tensor_var.name}{self.level}_stride_array",
-                            type=llir.DataType.CVECTOR_INT,
-                        )
-                    )
-                    self.stride_non_zero = llir.Var(
-                        name="stride_non_zero",
-                        type=llir.DataType.BOOL,
-                    )
-                    self.stride_non_zero_init = llir.VarInit(
-                        var=llir.Var(
-                            name="stride_non_zero",
-                            type=llir.DataType.BOOL,
-                        ),
-                        value=llir.Literal(1),
-                    )
-                    self.stride_array_init = llir.VarDecl(
-                        llir.Var(
-                            name=f"{self.tensor_var.name}{self.level}_stride_array",
-                            type=llir.DataType.CVECTOR_INT,
-                        )
-                    )
-                    stride_loop_body = []
-                    if_non_zero_assign_true = llir.IfThenElse(
-                        cond=llir.BinOp(
-                            op="!=",
-                            left=llir.Var(
-                                name=f"{self.tensor_var.name}_val[p{self._tensor_var.name}{self._level} + p_stride]",
-                                type=llir.DataType.INT,
-                            ),
-                            right=llir.Literal(value="0"),
-                        ),
-                        then_body=llir.Assign(
-                            var=llir.Var(
-                                name="stride_non_zero",
-                                type=llir.DataType.BOOL,
-                            ),
-                            value=llir.Literal(1),
-                        ),
-                    )
-                    stride_loop_body.extend([if_non_zero_assign_true])
-                    self.stride_for_loops = self.generate_stride_for_loops(level_stride_sizes, 0, stride_loop_body)
-                else:
-                    self.coord_var_value_llir = llir.Add(
-                        left=llir.Mul(
-                            left=llir.Var(
-                                name=self.parent_iterator.get_iterator_var_llir().name,
-                                type=llir.DataType.INT,
-                            ),
-                            right=llir.Var(
-                                name=f"{self.tensor_var.name}{self.level}_size",
-                                type=llir.DataType.INT,
-                            ),
-                        ),
-                        right=llir.Var(
-                            name=self.index_var.name,
+                #     self.coord_var_array_value_llir = llir.VarDecl(
+                #         llir.Var(
+                #             name=f"{self.tensor_var.name}{self.level}_stride_array",
+                #             type=llir.DataType.CVECTOR_INT,
+                #         )
+                #     )
+                #     self.stride_non_zero = llir.Var(
+                #         name="stride_non_zero",
+                #         type=llir.DataType.BOOL,
+                #     )
+                #     self.stride_non_zero_init = llir.VarInit(
+                #         var=llir.Var(
+                #             name="stride_non_zero",
+                #             type=llir.DataType.BOOL,
+                #         ),
+                #         value=llir.Literal(1),
+                #     )
+                #     self.stride_array_init = llir.VarDecl(
+                #         llir.Var(
+                #             name=f"{self.tensor_var.name}{self.level}_stride_array",
+                #             type=llir.DataType.CVECTOR_INT,
+                #         )
+                #     )
+                #     stride_loop_body = []
+                #     if_non_zero_assign_true = llir.IfThenElse(
+                #         cond=llir.BinOp(
+                #             op="!=",
+                #             left=llir.Var(
+                #                 name=f"{self.tensor_var.name}_val[p{self._tensor_var.name}{self._level} + p_stride]",
+                #                 type=llir.DataType.INT,
+                #             ),
+                #             right=llir.Literal(value="0"),
+                #         ),
+                #         then_body=llir.Assign(
+                #             var=llir.Var(
+                #                 name="stride_non_zero",
+                #                 type=llir.DataType.BOOL,
+                #             ),
+                #             value=llir.Literal(1),
+                #         ),
+                #     )
+                #     stride_loop_body.extend([if_non_zero_assign_true])
+                #     self.stride_for_loops = self.generate_stride_for_loops(level_stride_sizes, 0, stride_loop_body)
+                # else:
+                #     self.coord_var_value_llir = llir.Add(
+                #         left=llir.Mul(
+                #             left=llir.Var(
+                #                 name=self.parent_iterator.get_iterator_var_llir().name,
+                #                 type=llir.DataType.INT,
+                #             ),
+                #             right=llir.Var(
+                #                 name=f"{self.tensor_var.name}{self.level}_size",
+                #                 type=llir.DataType.INT,
+                #             ),
+                #         ),
+                #         right=llir.Var(
+                #             name=self.index_var.name,
+                #             type=llir.DataType.INT,
+                #         ),
+                #     )
+
+                self.coord_var_value_llir = llir.Add(
+                    left=llir.Mul(
+                        left=llir.Var(
+                            name=self.parent_iterator.get_iterator_var_llir().name,
                             type=llir.DataType.INT,
                         ),
-                    )
-
+                        right=llir.Var(
+                            name=f"{self.tensor_var.name}{self.level}_size",
+                            type=llir.DataType.INT,
+                        ),
+                    ),
+                    right=llir.Var(
+                        name=self.index_var.name,
+                        type=llir.DataType.INT,
+                    ),
+                )
                 self.coord_var_value_depends_on.extend(
                     [self.index_var, self.parent_iterator.index_var]
                 )
                 
     
-    def generate_stride_for_loops(self, level_stride_sizes, cur_level, custom_body, p_stride=None, save_to_array_idx=None):
+    def stride_for_loops(self, level_stride_sizes, cur_level, custom_body, p_stride=None, save_to_array_idx=None):
         # for strided tensors
         # should work for all kinds of strides!
         if cur_level >= len(level_stride_sizes):

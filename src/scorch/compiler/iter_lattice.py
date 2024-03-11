@@ -62,6 +62,11 @@ class LatticePoint:
         return hash(tuple(self.get_sparse_tensor_accesses())) + hash(
             tuple(self.get_dense_tensor_accesses())
         )
+        
+    def is_strided(self) -> bool:
+        for it in self.get_iterators():
+            if it.is_strided():
+                return True
 
     def set_index_var(self, index_var: IndexVar):
         self.index_var = index_var
@@ -720,8 +725,8 @@ class LatticePoint:
                         d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
                     # not sure if this depends on is correct
                     # probably not
-                    d[it.stride_non_zero_init] = it.coord_var_value_depends_on
-                    d[it.stride_array_init] = it.coord_var_value_depends_on
+                    # d[it.stride_non_zero_init] = it.coord_var_value_depends_on
+                    # d[it.stride_array_init] = it.coord_var_value_depends_on
                     d[it.stride_for_loops] = it.coord_var_value_depends_on
                 elif it.coord_var_value_llir:
                     dense_coord_resolve_stmt = llir.VarInit(
@@ -783,7 +788,7 @@ class IterationLattice:
     # these are only set if the iteration domain is the universe
     dense_index_var: Optional[IndexVar] = None
     dense_index_var_llir: Optional[llir.Var] = None
-    dense_index_var_end_var_llir: Optional[llir.Var] = None
+    dense_index_var_end_var_llir: Optional[llir.Var] = None        
 
     def gen_lattice_points(self) -> List[LatticePoint]:
         """
@@ -1197,28 +1202,32 @@ class IterationLattice:
                             )
                         )
 
-                if len(iterators) == 0:                   
-                    for_loop = llir.ForLoop(
-                        init=self.get_dense_iterator_init_stmt(),
-                        cond=lattice_point.get_for_loop_condition(lattice=self),
-                        update=lattice_point.get_single_iterator_advance_stmt(
-                            lattice=self
-                        ),
-                        body=[
-                            llir.Comment("here here here! len(iterators) == 0"),
-                            *tiled_index_var_resolve_stmts,
-                            llir.Comment("222"),
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            llir.Comment("333"),
-                            *result_value_index_stmts,
-                            llir.Comment("444"),
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
+                if len(iterators) == 0:
+                    if lattice_point.is_strided():
+                        for_loop = lattice_point.generate_strided_for_loops()
+                        stmts.append(for_loop)
+                    else:
+                        for_loop = llir.ForLoop(
+                            init=self.get_dense_iterator_init_stmt(),
+                            cond=lattice_point.get_for_loop_condition(lattice=self),
+                            update=lattice_point.get_single_iterator_advance_stmt(
+                                lattice=self
                             ),
-                            llir.Comment("555"),
-                        ],
-                    )
-                    stmts.append(for_loop)
+                            body=[
+                                llir.Comment("here here here! len(iterators) == 0"),
+                                *tiled_index_var_resolve_stmts,
+                                llir.Comment("222"),
+                                *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                                llir.Comment("333"),
+                                *result_value_index_stmts,
+                                llir.Comment("444"),
+                                *lattice_point.get_child_subregion_loops(
+                                    self.cin_lowerer, self.for_all_stmt.stmt
+                                ),
+                                llir.Comment("555"),
+                            ],
+                        )
+                        stmts.append(for_loop)
 
                 elif len(iterators) == 1 and not lattice_point.parent_lattice_point:
                     # Note: we don't want to do this for a child lattice point
