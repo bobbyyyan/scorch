@@ -608,6 +608,13 @@ class TensorVar(IndexExpr):
     def accept(self, visitor: CINVisitor) -> None:
         return
     
+    def is_strided(self, level: int) -> bool:
+        level_format = self.format.get_level_formats()[level]
+        if level_format._stride_size is not None:
+            return level_format._stride_size
+        return None
+        
+    
 class Workspace(TensorVar):
     name: Optional[str] = None
     dim: int

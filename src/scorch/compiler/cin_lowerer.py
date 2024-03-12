@@ -76,6 +76,15 @@ class CINLowerer:
                         value=llir.Literal(stride_size),
                     )
                 )
+                stmts.append(
+                    llir.VarInit(
+                        llir.Var(
+                            name=f"{tensor.name}{level_idx}_size_stride",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Literal(stride_size),
+                    )
+                )
         for level, level_type in enumerate(level_types):
             if level_type == LevelType.DENSE:
                 if level_stride_sizes[level]:
@@ -351,93 +360,93 @@ class CINLowerer:
                             )
                         )
                     else:
-                        # # This line assigns the value of the rhs to the tensor
-                        # if if_strided:
-                        #     stride_area=None
-                        #     for stride_idx, stride_size in enumerate(level_stride_sizes):
-                        #         if stride_size is not None:
-                        #             if stride_area is None:
-                        #                 stride_area = llir.Var(
-                        #                     name=f"{self.result_tensor_var.get_name()}{stride_idx}_stride",
-                        #                     type=llir.DataType.INT,
-                        #                 )
-                        #             else:
-                        #                 stride_area = llir.Mul(
-                        #                     left=stride_area,
-                        #                     right=llir.Var(
-                        #                         name=f"{self.result_tensor_var.get_name()}{stride_idx}_stride",
-                        #                         type=llir.DataType.INT,
-                        #                     ),
-                        #                 )
-                        #     init_stride_area = llir.VarInit(
-                        #         var=llir.Var(
-                        #             name=f"{self.result_tensor_var.get_name()}_stride_area",
-                        #             type=llir.DataType.INT,
-                        #         ),
-                        #         value=stride_area,
-                        #     )
-                        #     # not sure how to do this, wait for a while
-                        #     # rhs_tensor_var = stmt.rhs.get_tensor()
-                        #     level = self.result_tensor_access.level_of_index_var(index_vars[-1])
-                        #     rhs_tensor_var = stmt.rhs.get_tensor() # only works when rhs is also tensor access
-                        #     # not sure what to do if rhs is not tensor access
-                        #     assign_through_stride_size = llir.ForLoop(
-                        #         init=llir.VarInit(
-                        #             var=llir.Var(
-                        #                 name=f"i{self.result_tensor_var.get_name()}_stride_area",
-                        #                 type=llir.DataType.INT,
-                        #             ),
-                        #             value=llir.Literal(0),
-                        #         ),
-                        #         cond=llir.BinOp(
-                        #             op="<",
-                        #             left=llir.Var(
-                        #                 name=f"i{self.result_tensor_var.get_name()}_stride_area",
-                        #                 type=llir.DataType.INT,
-                        #             ),
-                        #             right=llir.Var(
-                        #                 name=f"{self.result_tensor_var.get_name()}_stride_area",
-                        #                 type=llir.DataType.INT,
-                        #             ),
-                        #         ),
-                        #         update=llir.Increment(
-                        #             var=llir.Var(
-                        #                 name=f"i{self.result_tensor_var.get_name()}_stride_area",
-                        #                 type=llir.DataType.INT,
-                        #             ),
-                        #         ),
-                        #         body=[
-                        #             llir.Assign(
-                        #                 var=llir.Var(
-                        #                     name=f"{self.result_tensor_var.get_name()}_values[p{self.result_tensor_var.get_name()}{level} * {self.result_tensor_var.get_name()}_stride_area + i{self.result_tensor_var.get_name()}_stride_area]",
-                        #                     type=llir.DataType.NO_TYPE,
-                        #                 ),
-                        #                 value=llir.Var(
-                        #                     name=f"{rhs_tensor_var.get_name()}_val[{rhs_tensor_var.get_name()}{level}_stride_array[i{self.result_tensor_var.get_name()}_stride_area]]",
-                        #                     type=llir.DataType.NO_TYPE,
-                        #                 ),
-                        #             )
-                        #         ],
-                        #     )
-                        #     llir_stmts.extend(
-                        #         [
-                        #             init_stride_area,
-                        #             assign_through_stride_size
-                        #         ]
-                        #     )
-                        # else:
-                        #     llir_stmts.append(
-                        #         llir.Assign(
-                        #             var=tensor_access_llir,
-                        #             value=rhs_llir,
-                        #         )
-                        #     )
-                        llir_stmts.append(
-                            llir.Assign(
-                                var=tensor_access_llir,
-                                value=rhs_llir,
+                        # This line assigns the value of the rhs to the tensor
+                        if if_strided:
+                            stride_area=None
+                            for stride_idx, stride_size in enumerate(level_stride_sizes):
+                                if stride_size is not None:
+                                    if stride_area is None:
+                                        stride_area = llir.Var(
+                                            name=f"{self.result_tensor_var.get_name()}{stride_idx}_stride",
+                                            type=llir.DataType.INT,
+                                        )
+                                    else:
+                                        stride_area = llir.Mul(
+                                            left=stride_area,
+                                            right=llir.Var(
+                                                name=f"{self.result_tensor_var.get_name()}{stride_idx}_stride",
+                                                type=llir.DataType.INT,
+                                            ),
+                                        )
+                            init_stride_area = llir.VarInit(
+                                var=llir.Var(
+                                    name=f"{self.result_tensor_var.get_name()}_stride_area",
+                                    type=llir.DataType.INT,
+                                ),
+                                value=stride_area,
                             )
-                        )
+                            # not sure how to do this, wait for a while
+                            # rhs_tensor_var = stmt.rhs.get_tensor()
+                            level = self.result_tensor_access.level_of_index_var(index_vars[-1])
+                            rhs_tensor_var = stmt.rhs.get_tensor() # only works when rhs is also tensor access
+                            # not sure what to do if rhs is not tensor access
+                            assign_through_stride_size = llir.ForLoop(
+                                init=llir.VarInit(
+                                    var=llir.Var(
+                                        name=f"i{self.result_tensor_var.get_name()}_stride_area",
+                                        type=llir.DataType.INT,
+                                    ),
+                                    value=llir.Literal(0),
+                                ),
+                                cond=llir.BinOp(
+                                    op="<",
+                                    left=llir.Var(
+                                        name=f"i{self.result_tensor_var.get_name()}_stride_area",
+                                        type=llir.DataType.INT,
+                                    ),
+                                    right=llir.Var(
+                                        name=f"{self.result_tensor_var.get_name()}_stride_area",
+                                        type=llir.DataType.INT,
+                                    ),
+                                ),
+                                update=llir.Increment(
+                                    var=llir.Var(
+                                        name=f"i{self.result_tensor_var.get_name()}_stride_area",
+                                        type=llir.DataType.INT,
+                                    ),
+                                ),
+                                body=[
+                                    llir.Assign(
+                                        var=llir.Var(
+                                            name=f"{self.result_tensor_var.get_name()}_values[p{self.result_tensor_var.get_name()}{level} * {self.result_tensor_var.get_name()}_stride_area + i{self.result_tensor_var.get_name()}_stride_area]",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
+                                        value=llir.Var(
+                                            name=f"{rhs_tensor_var.get_name()}_val[{rhs_tensor_var.get_name()}{level}_stride_array[i{self.result_tensor_var.get_name()}_stride_area]]",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
+                                    )
+                                ],
+                            )
+                            llir_stmts.extend(
+                                [
+                                    init_stride_area,
+                                    assign_through_stride_size
+                                ]
+                            )
+                        else:
+                            llir_stmts.append(
+                                llir.Assign(
+                                    var=tensor_access_llir,
+                                    value=rhs_llir,
+                                )
+                            )
+                        # llir_stmts.append(
+                        #     llir.Assign(
+                        #         var=tensor_access_llir,
+                        #         value=rhs_llir,
+                        #     )
+                        # )
             # If the last _level of the result tensor var is sparse, then we need to set
             # the coordinates
             if not self.result_tensor_access.is_workspace():
@@ -508,26 +517,27 @@ class CINLowerer:
             if self.filter_zeros:
                 # if level_stride_sizes is not None, then we need to check if the tile is non-zero
                 # generate a first for loop to iterate over the block, and see if the block is non-zero or not
-                # stride_loop_stmts = []
-                # # assign a bool variable to check if the block is non-zero
-                # if if_strided:
-                #     stride_non_zero = llir.IfThenElse(
-                #         cond=llir.BinOp(
-                #             op="!=",
-                #             left=llir.Var(
-                #                 name="stride_non_zero",
-                #                 type=llir.DataType.NO_TYPE,
-                #             ),
-                #             right=llir.Literal(value="0"),
-                #         ),
-                #         then_body=llir_stmts,
-                #     )
-                #     stride_loop_stmts.append(
-                #         stride_non_zero
-                #     )
+                
+                # assign a bool variable to check if the block is non-zero
+                stride_loop_stmts = []
+                if if_strided:
+                    stride_non_zero = llir.IfThenElse(
+                        cond=llir.BinOp(
+                            op="!=",
+                            left=llir.Var(
+                                name="stride_non_zero",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            right=llir.Literal(value="0"),
+                        ),
+                        then_body=llir_stmts,
+                    )
+                    stride_loop_stmts.append(
+                        stride_non_zero
+                    )
                 
                 llir_stmts = [
-                    # stride_loop_stmts,
+                    stride_loop_stmts,
                     llir.IfThenElse(
                         cond=llir.BinOp(
                             op="!=",

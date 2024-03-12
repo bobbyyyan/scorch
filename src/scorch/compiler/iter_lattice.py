@@ -135,6 +135,8 @@ class LatticePoint:
 
     def get_for_loop_condition(self, lattice: IterationLattice) -> llir.Expr:
         condition = None
+        stride_condition = None
+        stride_size = None
 
         for it in self.get_iterators():
             this_condition = llir.BinOp(
@@ -142,6 +144,29 @@ class LatticePoint:
                 left=it.get_iterator_var_llir(),
                 right=it.get_iterator_var_end_value_llir(),
             )
+            # if stride_condition is None:
+            #     stride_size = it.iterator_var_stride_size
+            #     stride_condition = llir.BinOp(
+            #         op="<",
+            #         left=llir.Var(
+            #             name=it.get_iterator_var_llir().name + "_stride",
+            #             type=llir.DataType.INT,
+            #         ),
+            #         right=stride_size,
+            #     )
+            # else:
+            #     stride_size = llir.Mul(
+            #         left=stride_size,
+            #         right=it.iterator_var_stride_size,
+            #     )
+            #     stride_condition = llir.BinOp(
+            #         op="<",
+            #         left=llir.Var(
+            #             name=it.get_iterator_var_llir().name + "_stride",
+            #             type=llir.DataType.INT,
+            #         ),
+            #         right=stride_size,
+            #     )
             if condition is None:
                 condition = this_condition
             else:
@@ -157,8 +182,17 @@ class LatticePoint:
                 left=lattice.dense_index_var_llir,
                 right=lattice.dense_index_var_end_var_llir,
             )
+            if lattice.dense_index_var_stride_llir and lattice.dense_index_var_stride_within_dense_tensor is False:
+                stride_condition = llir.BinOp(
+                    op="<",
+                    left=llir.Var(
+                        name=lattice.dense_index_var_llir.name + "_stride",
+                        type=llir.DataType.INT,
+                    ),
+                    right=lattice.dense_index_var_stride_llir,
+                )
         assert condition is not None, "Failed to generate while condition"
-        return condition
+        return condition, stride_condition
 
     def get_while_condition(self, lattice: IterationLattice) -> llir.Expr:
         condition = None
@@ -199,7 +233,6 @@ class LatticePoint:
             lattice_ivar = lattice.index_var
             if lattice_ivar.tile_size_var and lattice_ivar.is_outer:
                 # k_out += k_tile_size;
-
                 return llir.Assign(
                     var=lattice.dense_index_var_llir,
                     value=llir.Var(
@@ -207,11 +240,16 @@ class LatticePoint:
                         type=llir.DataType.INT,
                     ),
                     op=llir.AssignOp.ADD_ASSIGN,
-                )
+                ), None
 
             else:
                 return llir.Increment(
                     var=lattice.dense_index_var_llir,
+                ), llir.Increment(
+                    var=llir.Var(
+                        name=lattice.dense_index_var_llir.name + "_stride",
+                        type=llir.DataType.INT,
+                    )
                 )
 
         it: ModeIterator = iterators[0]
@@ -231,11 +269,11 @@ class LatticePoint:
             return llir.Assign(
                 var=it.get_iterator_var_llir(),
                 value=next_level_end_var,
-            )
+            ), None
         else:
             return llir.Increment(
                 var=it.get_iterator_var_llir(),
-            )
+            ), None
 
     def get_iterators_advance_stmts(
         self, lattice: IterationLattice
@@ -430,7 +468,7 @@ class LatticePoint:
             )
 
         raise NotImplementedError(f"Unhandled CIN type {type(cin)}")
-
+    
     def get_child_subregion_loops(
         self, cin_lowerer: CINLowerer, cin: IndexStmt
     ) -> Sequence[llir.Stmt]:
@@ -444,7 +482,6 @@ class LatticePoint:
         # print("\n========== get_child_subregion_loops =========")
         # print("cin: ", cin)
         # print("self.child_lattice_points:", self.child_lattice_points)
-
         # print("self.iterators:", self.iterators)
 
         def lower_cin_and_add_to_list(
@@ -725,8 +762,8 @@ class LatticePoint:
                         d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
                     # not sure if this depends on is correct
                     # probably not
-                    # d[it.stride_non_zero_init] = it.coord_var_value_depends_on
-                    # d[it.stride_array_init] = it.coord_var_value_depends_on
+                    d[it.stride_non_zero_init] = it.coord_var_value_depends_on
+                    d[it.stride_array_init] = it.coord_var_value_depends_on
                     d[it.stride_for_loops] = it.coord_var_value_depends_on
                 elif it.coord_var_value_llir:
                     dense_coord_resolve_stmt = llir.VarInit(
@@ -766,6 +803,14 @@ class LatticePoint:
         return set(self.get_sparse_tensor_accesses()).issubset(
             set(other.get_sparse_tensor_accesses())
         )
+        
+    # def generate_strided_for_loops(self, custom_body):
+    #     return llir.ForLoop(
+    #         init=None,
+    #         cond=None,
+    #         update=None,
+    #         body=custom_body,
+    #     )
 
 
 @dataclass(frozen=False)
@@ -788,7 +833,9 @@ class IterationLattice:
     # these are only set if the iteration domain is the universe
     dense_index_var: Optional[IndexVar] = None
     dense_index_var_llir: Optional[llir.Var] = None
-    dense_index_var_end_var_llir: Optional[llir.Var] = None        
+    dense_index_var_end_var_llir: Optional[llir.Var] = None      
+    dense_index_var_stride_llir: Optional[llir.Var] = None 
+    dense_index_var_stride_within_dense_tensor: Optional[bool] = True
 
     def gen_lattice_points(self) -> List[LatticePoint]:
         """
@@ -906,6 +953,17 @@ class IterationLattice:
             level_of_current_index_var = first_dense_tensor_access.level_of_index_var(
                 parsed_index_var
             )
+            print("first_dense_tensor_var", first_dense_tensor_var)
+            level_stride_size = first_dense_tensor_var.get_level_stride_size(level_of_current_index_var)
+            if level_stride_size:
+                self.dense_index_var_stride_llir = llir.Var(
+                    name=f"{first_dense_tensor_var.name}{level_of_current_index_var}_stride",
+                    type=llir.DataType.INT,
+                )
+                self.dense_index_var_stride_within_dense_tensor = True
+                for level_format in first_dense_tensor_var.get_level_types():
+                    if level_format == LevelType.COMPRESSED:
+                        self.dense_index_var_stride_within_dense_tensor = False
             # end var is the <tensor_var_name><_level>_size, type is int
             if curr_index_var.tile_size_var and curr_index_var.is_inner:
                 self.dense_index_var_end_var_llir = llir.Var(
@@ -998,6 +1056,12 @@ class IterationLattice:
         assert self.dense_index_var_llir is not None, "Dense index var not set"
         return llir.VarInit(
             var=self.dense_index_var_llir,
+            value=llir.Literal(value=0, data_type=llir.DataType.INT),
+        ), llir.VarInit(
+            var=llir.Var(
+                name=f"{self.dense_index_var_llir.name}_stride",
+                type=llir.DataType.INT,
+            ),
             value=llir.Literal(value=0, data_type=llir.DataType.INT),
         )
 
@@ -1203,18 +1267,45 @@ class IterationLattice:
                         )
 
                 if len(iterators) == 0:
-                    if lattice_point.is_strided():
-                        for_loop = lattice_point.generate_strided_for_loops()
-                        stmts.append(for_loop)
+                    for_loop_condition, for_loop_stride_condition = lattice_point.get_for_loop_condition(lattice=self)
+                    for_loop_init, for_loop_stride_init = self.get_dense_iterator_init_stmt()
+                    for_loop_update, for_loop_stride_update = lattice_point.get_single_iterator_advance_stmt(lattice=self)
+                    print("for_loop_stride_condition: ", for_loop_stride_condition)
+                    print("for_loop_stride_init: ", for_loop_stride_init)
+                    print("for_loop_stride_update: ", for_loop_stride_update)
+                    if for_loop_stride_condition and for_loop_stride_init and for_loop_stride_update:
+                        for_loop = llir.ForLoop(
+                            init=for_loop_init,
+                            cond=for_loop_condition,
+                            update=for_loop_update,
+                            body=[
+                                llir.ForLoop(
+                                    init=for_loop_stride_init,
+                                    cond=for_loop_stride_condition,
+                                    update=for_loop_stride_update,
+                                    body=[
+                                        llir.Comment("here here here! len(iterators) == 0"),
+                                        *tiled_index_var_resolve_stmts,
+                                        llir.Comment("222"),
+                                        *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                                        llir.Comment("333"),
+                                        *result_value_index_stmts,
+                                        llir.Comment("444"),
+                                        *lattice_point.get_child_subregion_loops(
+                                            self.cin_lowerer, self.for_all_stmt.stmt
+                                        ),
+                                        llir.Comment("555"),
+                                    ],
+                                )
+                            ]
+                        )
                     else:
                         for_loop = llir.ForLoop(
-                            init=self.get_dense_iterator_init_stmt(),
-                            cond=lattice_point.get_for_loop_condition(lattice=self),
-                            update=lattice_point.get_single_iterator_advance_stmt(
-                                lattice=self
-                            ),
+                            init=for_loop_init,
+                            cond=for_loop_condition,
+                            update=for_loop_update,
                             body=[
-                                llir.Comment("here here here! len(iterators) == 0"),
+                                llir.Comment("here here here! len(iterators) == 0 non strided"),
                                 *tiled_index_var_resolve_stmts,
                                 llir.Comment("222"),
                                 *lattice_point.get_candidate_coordinate_stmts(lattice=self),
@@ -1227,28 +1318,54 @@ class IterationLattice:
                                 llir.Comment("555"),
                             ],
                         )
-                        stmts.append(for_loop)
+                    stmts.append(for_loop)
 
                 elif len(iterators) == 1 and not lattice_point.parent_lattice_point:
                     # Note: we don't want to do this for a child lattice point
                     # because we don't want to re-initialize the iterator(s)
-                    it = iterators[0]
-                    for_loop = llir.ForLoop(
-                        init=it.get_init_stmt(),
-                        cond=lattice_point.get_while_condition(lattice=self),
-                        update=lattice_point.get_single_iterator_advance_stmt(
-                            lattice=self
-                        ),
-                        body=[
-                            llir.Comment("here here here! len(iterators) == 1 and not lattice_point.parent_lattice_point"),
-                            *tiled_index_var_resolve_stmts,
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *result_value_index_stmts,
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
-                            ),
-                        ],
-                    )
+                    for_loop_condition, for_loop_stride_condition = lattice_point.get_for_loop_condition(lattice=self)
+                    for_loop_init, for_loop_stride_init = self.get_dense_iterator_init_stmt()
+                    for_loop_update, for_loop_stride_update = lattice_point.get_single_iterator_advance_stmt(lattice=self)
+                    if for_loop_stride_condition and for_loop_stride_init and for_loop_stride_update:
+                        for_loop = llir.ForLoop(
+                            init=for_loop_init,
+                            cond=for_loop_condition,
+                            update=for_loop_update,
+                            body=[
+                                llir.ForLoop(
+                                    init=for_loop_stride_init,
+                                    cond=for_loop_stride_condition,
+                                    update=for_loop_stride_update,
+                                    body=[
+                                        llir.Comment("here here here! len(iterators) == 1 and not lattice_point.parent_lattice_point"),
+                                        *tiled_index_var_resolve_stmts,
+                                        *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                                        *result_value_index_stmts,
+                                        *lattice_point.get_child_subregion_loops(
+                                            self.cin_lowerer, self.for_all_stmt.stmt
+                                        ),
+                                    ],
+                                )
+                            ]
+                        )
+                    else:
+                        it = iterators[0]
+                        for_loop = llir.ForLoop(
+                            init=it.get_init_stmt(),
+                            cond=lattice_point.get_while_condition(lattice=self),
+                            update=lattice_point.get_single_iterator_advance_stmt(
+                                lattice=self
+                            )[0],
+                            body=[
+                                llir.Comment("here here here! len(iterators) == 1 and not lattice_point.parent_lattice_point"),
+                                *tiled_index_var_resolve_stmts,
+                                *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                                *result_value_index_stmts,
+                                *lattice_point.get_child_subregion_loops(
+                                    self.cin_lowerer, self.for_all_stmt.stmt
+                                ),
+                            ],
+                        )
 
                     stmts.append(for_loop)
 
@@ -1273,23 +1390,52 @@ class IterationLattice:
                 # TODO: generate workspace for the index vars below
 
                 if len(iterators) == 0:
-                    for_loop = llir.ForLoop(
-                        init=self.get_dense_iterator_init_stmt(),
-                        cond=lattice_point.get_for_loop_condition(lattice=self),
-                        update=lattice_point.get_single_iterator_advance_stmt(
-                            lattice=self
-                        ),
-                        body=[
-                            # llir.Comment(
-                            #     f"IndexVar {index_var} not in result tensor access"
-                            # ),
-                            *tiled_index_var_resolve_stmts,
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
-                            ),
-                        ],
-                    )
+                    for_loop_condition, for_loop_stride_condition = lattice_point.get_for_loop_condition(lattice=self)
+                    for_loop_init, for_loop_stride_init = self.get_dense_iterator_init_stmt()
+                    for_loop_update, for_loop_stride_update = lattice_point.get_single_iterator_advance_stmt(lattice=self)
+                    print("for_loop_stride_condition: ", for_loop_stride_condition)
+                    print("for_loop_stride_init: ", for_loop_stride_init)
+                    print("for_loop_stride_update: ", for_loop_stride_update)
+                    if for_loop_stride_condition and for_loop_stride_init and for_loop_stride_update:
+                        for_loop = llir.ForLoop(
+                            init=for_loop_init,
+                            cond=for_loop_condition,
+                            update=for_loop_update,
+                            body=[
+                                llir.ForLoop(
+                                    init=for_loop_stride_init,
+                                    cond=for_loop_stride_condition,
+                                    update=for_loop_stride_update,
+                                    body=[
+                                        # llir.Comment(
+                                        #     f"IndexVar {index_var} not in result tensor access"
+                                        # ),
+                                        llir.Comment("here here here 3344! len(iterators) == 0"),
+                                        *tiled_index_var_resolve_stmts,
+                                        *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                                        *lattice_point.get_child_subregion_loops(
+                                            self.cin_lowerer, self.for_all_stmt.stmt
+                                        ),
+                                    ],
+                                )
+                            ]
+                        )
+                    else:
+                        for_loop = llir.ForLoop(
+                            init=for_loop_init,
+                            cond=for_loop_condition,
+                            update=for_loop_update,
+                            body=[
+                                # llir.Comment(
+                                #     f"IndexVar {index_var} not in result tensor access"
+                                # ),
+                                *tiled_index_var_resolve_stmts,
+                                *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                                *lattice_point.get_child_subregion_loops(
+                                    self.cin_lowerer, self.for_all_stmt.stmt
+                                ),
+                            ],
+                        )
                     stmts.append(for_loop)
 
                 elif len(iterators) == 1:
@@ -1299,7 +1445,7 @@ class IterationLattice:
                         cond=lattice_point.get_while_condition(lattice=self),
                         update=lattice_point.get_single_iterator_advance_stmt(
                             lattice=self
-                        ),
+                        )[0],
                         body=[
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                             *lattice_point.get_child_subregion_loops(
