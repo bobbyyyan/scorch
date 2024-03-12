@@ -189,7 +189,9 @@ class Access(Cpp):
     idx: ir.IndexVar
 
     def __str__(self):
-        tensor = self.tensor.name if isinstance(self.tensor, cin.TensorVar) else self.tensor
+        tensor = (
+            self.tensor.name if isinstance(self.tensor, cin.TensorVar) else self.tensor
+        )
         return f"{tensor}[{self.idx}]"
 
     def __repr__(self):

@@ -9,7 +9,9 @@ from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 
 @dispatch(int, cin.TensorVar, format.LevelType)
-def ArrayIndexVariable(index: int, tensor: cin.TensorVar, fmt: format.LevelType) -> cpp.Cpp:
+def ArrayIndexVariable(
+    index: int, tensor: cin.TensorVar, fmt: format.LevelType
+) -> cpp.Cpp:
     match fmt:
         case format.LevelType.DENSE:
             return cpp.Variable(f"{tensor.name}{index}")
@@ -84,9 +86,7 @@ def ArrayAccessCrd(seq: cin.IndexSeq) -> cpp.Cpp:
 
 
 @dispatch(cin.TensorVar, int, format.LevelType)
-def ArrayAccessCrd(
-    tensor: cin.TensorVar, index: int, fmt: format.LevelType
-) -> cpp.Cpp:
+def ArrayAccessCrd(tensor: cin.TensorVar, index: int, fmt: format.LevelType) -> cpp.Cpp:
     match fmt:
         case format.LevelType.DENSE:
             return ArrayIndexVariable(index, tensor, fmt)

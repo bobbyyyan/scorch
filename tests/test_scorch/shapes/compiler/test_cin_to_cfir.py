@@ -148,22 +148,28 @@ def test_slice():
     j = cin.IndexVar("j")
     A[i] = B[j]
 
-    util.assert_equal(cfir.PrettyPrint(cin_to_cfir.Lower(
-        cin.ForAll(
-            i,
-            A._assignment,
-            cin.SliceSeq(
-                cin.IndexSeq(j, B, size=8, index=0, format=LevelType.COMPRESSED),
-                start=0,
-                end=8,
-                stride=2,
-            ),
-        )
-    )),
+    util.assert_equal(
+        cfir.PrettyPrint(
+            cin_to_cfir.Lower(
+                cin.ForAll(
+                    i,
+                    A._assignment,
+                    cin.SliceSeq(
+                        cin.IndexSeq(
+                            j, B, size=8, index=0, format=LevelType.COMPRESSED
+                        ),
+                        start=0,
+                        end=8,
+                        stride=2,
+                    ),
+                )
+            )
+        ),
         """
         while i <-- B:s[j][0:8:2] 
           A:s[i] = B:s[j]
-        """)
+        """,
+    )
 
 
 def test_project():
@@ -237,10 +243,12 @@ def test_assign_2d_ss():
     Bj = cin.IndexSeq(j, B, size=10, index=1, format=LevelType.COMPRESSED)
 
     util.assert_equal(
-        cfir.PrettyPrint(cin_to_cfir.Lower(
-            cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi)
-        )), """
+        cfir.PrettyPrint(
+            cin_to_cfir.Lower(cin.ForAll(i, cin.ForAll(j, A._assignment, Bj), Bi))
+        ),
+        """
         while i <-- B:s,s[i] 
           while j <-- B:s,s[j] 
             A:s,s[i, j] = B:s,s[i, j]
-        """)
+        """,
+    )

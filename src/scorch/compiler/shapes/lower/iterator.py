@@ -10,7 +10,7 @@ from scorch.compiler.shapes.lower import cpp_util, seq_util
 
 def Init(sexpr: cin.Seq):
     """
-    Handles declaring any necessary iteration variables and 
+    Handles declaring any necessary iteration variables and
     locating the first non-zero element in the sequence.
     """
     match (sexpr):

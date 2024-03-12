@@ -83,7 +83,7 @@ def TopologicalSortRec(
 
 def TopologicalSort(lattice: IterationLattice) -> list[cin.Seq]:
     """
-    Performs a topological sort on the iteration lattice, 
+    Performs a topological sort on the iteration lattice,
     returning the list of sequence combinators.
     """
     return TopologicalSortRec(lattice.top, lattice.graph)[::-1]

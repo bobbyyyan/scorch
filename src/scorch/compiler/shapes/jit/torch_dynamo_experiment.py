@@ -15,7 +15,9 @@ after = torch.flatten(before, start_dim=0)
 after = torch.unflatten(after, dim=0, sizes=(2, 3))
 
 
-def scorch_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
+def scorch_backend(
+    gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]
+) -> Callable:
     """
     def f(...): ...
     f_opt = torch.compile(f, backend=scorch_backend)
@@ -23,7 +25,7 @@ def scorch_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor])
     print("\n(before).graph:")
     print(gm.graph)
     for node in gm.graph.nodes:
-        if node.op == 'call_function' and node.target == operator.mul:
+        if node.op == "call_function" and node.target == operator.mul:
             node.target = operator.add
     print("\n(after).graph:")
     gm.graph.lint()
