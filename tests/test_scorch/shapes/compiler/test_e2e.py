@@ -38,10 +38,6 @@ def test_assign_e2e_ds():
 
 
 def test_assign_e2e_dense():
-    import logging
-
-    logger = logging.getLogger("debug")
-    logger.setLevel(logging.DEBUG)
     A = cin.TensorVar("A", fmt=["d", "d"], shape=[2, 2])
     B = cin.TensorVar("B", fmt=["d", "d"], shape=[2, 2])
     i = cin.IndexVar("i")
