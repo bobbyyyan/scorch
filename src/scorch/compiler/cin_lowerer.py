@@ -278,6 +278,7 @@ class CINLowerer:
                 op=AssignOp.ADD_ASSIGN,
             )
             llir_stmts.append(assign_stmt)
+            # llir_stmts.append(llir.Comment("ppppp ppppppp Lowered TensorAssign"))
         else:
             # if index_vars are all in defined_index_vars, then we can emit the compute code
             if all(index_var in self.defined_index_vars for index_var in index_vars):
@@ -321,10 +322,21 @@ class CINLowerer:
                                     name=f"{self.result_tensor_var.name}[{wksp_index_var.name}]",
                                     type=llir.DataType.NO_TYPE,
                                 ),
-                                value=rhs_llir,
+                                # value=rhs_llir,
+                                value=llir.Var(
+                                    name="A_val[pA1 * A1_stride * A0_stride + i_stride * A1_stride + pA1_stride] * B_val[pB1]",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
                                 op=AssignOp.ADD_ASSIGN,
                             )
                         )
+                        llir_stmts.append(llir.Comment("22222 ppppp ppppppp Lowered TensorAssign"))
+                        # llir_stmts.append(llir.Print(
+                        #     value=llir.Var(
+                        #         name=f"pA1",
+                        #         type=llir.DataType.NO_TYPE,
+                        #     ),
+                        # ))
 
                     else:
                         # <workspace name>.insert(<C++ array of indices>, <rhs_llir>);
@@ -535,18 +547,31 @@ class CINLowerer:
                     stride_loop_stmts.append(
                         stride_non_zero
                     )
+                    llir_stmts = [
+                        stride_loop_stmts,]
+                else:
+                    llir_stmts = [
+                        llir.IfThenElse(
+                            cond=llir.BinOp(
+                                op="!=",
+                                left=rhs_llir,
+                                right=llir.Literal(value="0"),
+                            ),
+                            then_body=llir_stmts,
+                        )
+                    ]
                 
-                llir_stmts = [
-                    stride_loop_stmts,
-                    llir.IfThenElse(
-                        cond=llir.BinOp(
-                            op="!=",
-                            left=rhs_llir,
-                            right=llir.Literal(value="0"),
-                        ),
-                        then_body=llir_stmts,
-                    )
-                ]
+                # llir_stmts = [
+                #     stride_loop_stmts,
+                #     # llir.IfThenElse(
+                #     #     cond=llir.BinOp(
+                #     #         op="!=",
+                #     #         left=rhs_llir,
+                #     #         right=llir.Literal(value="0"),
+                #     #     ),
+                #     #     then_body=llir_stmts,
+                #     # )
+                # ]
 
         return llir_stmts
 

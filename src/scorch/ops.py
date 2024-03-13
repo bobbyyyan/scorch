@@ -118,6 +118,7 @@ def spmv(
     args = [result_shape]
 
     for tensor in [a, b]:
+        print("a b 000 tensor hhhh", tensor.shape, tensor.index.mode_indices, tensor.values)
         args.append(tensor.shape)  # type: ignore
         args.append(tensor.index.mode_indices)  # type: ignore
         args.append(tensor.values)  # type: ignore
@@ -228,6 +229,7 @@ def matmul_wksp(
     args = [result_shape]
 
     for tensor in [a, b]:
+        print("a b tensor hhhh", tensor.shape, tensor.index.mode_indices, tensor.values)
         args.append(tensor.shape)  # type: ignore
         args.append(tensor.index.mode_indices)  # type: ignore
         args.append(tensor.values)  # type: ignore
@@ -544,7 +546,9 @@ def einsum(
 
     # Call module.evaluate with the output shape,and the mode indices and values of each tensor
     args: Sequence[Any] = [result_shape]
+    torch.set_printoptions(profile="full")
     for tensor in tensors:
+        print("tensor hhhh", tensor.shape, tensor.index.mode_indices, tensor.values)
         args.append(tensor.shape)  # type: ignore
         args.append(tensor.index.mode_indices)  # type: ignore
         args.append(tensor.values)  # type: ignore
@@ -603,6 +607,7 @@ def lower_and_exec_cin(
     module_args = [result_shape]
 
     for arg in args:
+        print("hhhh", arg.shape, arg.index.mode_indices, arg.values)
         module_args.append(arg.shape)
         module_args.append(arg.index.mode_indices)
         module_args.append(arg.values)

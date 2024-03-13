@@ -223,7 +223,9 @@ class Tensor(torch.nn.Module):
             functions=["evaluate"],
             extra_cflags=["-O3"],
         )
-
+        print("self.shape", self.shape)
+        print("self.index.mode_indices", self.index.mode_indices)
+        print("self.storage.value", self.storage.value)
         result_cpp = module.evaluate(
             result_shape,
             self.shape,
@@ -593,6 +595,9 @@ class Tensor(torch.nn.Module):
                 ),
                 value=result_cpp._storage._value,
             )
+            print("self._storage._value", self._storage._value)
+            print("self._storage._shape", self._storage._shape)
+            print("self._storage._index.mode_indices", self._storage._index.mode_indices)
             # exit()
 
         return self

@@ -104,6 +104,11 @@ def test_spmm_dd_ds_dd_time():
     sparsity = 0.8
     random_tensor_a = torch.rand(n, n).float()
     random_tensor_b = torch.rand(n, n).float()
+    # random_tensor_a = torch.ones(n, n).float()
+    # random_tensor_b = torch.ones(n, n).float()
+    # random_tensor_a[2][2] = 2
+    # random_tensor_a = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]]).float()
+    # random_tensor_b = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]]).float()
 
     # Randomly sparsify each tensor
     random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity)
@@ -111,7 +116,11 @@ def test_spmm_dd_ds_dd_time():
 
     random_tensor_a_csr = random_tensor_a.to_sparse_csr()
     # random_tensor_a_bsr = random_tensor_a.to_sparse_bsr(block_size=(2, 2))
-
+    # mode_indices [[], [tensor([0, 2], dtype=torch.int32), tensor([0, 1], dtype=torch.int32)]]
+    # pos = [0,2]
+    # crd = [0,1]
+    
+    # tensor hhhh (4, 4) [[], [tensor([0, 2], dtype=torch.int32), tensor([0, 1], dtype=torch.int32)]] tensor([1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.])
     start_time = time.time()
     torch_result = torch.matmul(random_tensor_a_csr, random_tensor_b)
     # torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
@@ -119,7 +128,7 @@ def test_spmm_dd_ds_dd_time():
 
     tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("ds", stride_size=[4, 2])
     tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
-
+    
     time_dict = {}
     start_time = time.time()
     scorch_result = matmul(
@@ -133,7 +142,9 @@ def test_spmm_dd_ds_dd_time():
     print(f"scorch total time: {scorch_total_time}")
     print(f"scorch eval time: {scorch_eval_time}")
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
-
+    torch.set_printoptions(profile="full")
+    # print("torch_result", torch_result)
+    # print("scorch_result_torch", scorch_result_torch)
     assert torch.allclose(torch_result, scorch_result_torch)
 
 test_spmm_dd_ds_dd_time()

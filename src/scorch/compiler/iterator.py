@@ -485,22 +485,22 @@ class ModeIterator:
                         ),
                     )
 
-                self.coord_var_value_llir = llir.Add(
-                    left=llir.Mul(
-                        left=llir.Var(
-                            name=self.parent_iterator.get_iterator_var_llir().name,
-                            type=llir.DataType.INT,
-                        ),
-                        right=llir.Var(
-                            name=f"{self.tensor_var.name}{self.level}_size",
-                            type=llir.DataType.INT,
-                        ),
-                    ),
-                    right=llir.Var(
-                        name=self.index_var.name,
-                        type=llir.DataType.INT,
-                    ),
-                )
+                # self.coord_var_value_llir = llir.Add(
+                #     left=llir.Mul(
+                #         left=llir.Var(
+                #             name=self.parent_iterator.get_iterator_var_llir().name,
+                #             type=llir.DataType.INT,
+                #         ),
+                #         right=llir.Var(
+                #             name=f"{self.tensor_var.name}{self.level}_size",
+                #             type=llir.DataType.INT,
+                #         ),
+                #     ),
+                #     right=llir.Var(
+                #         name=self.index_var.name,
+                #         type=llir.DataType.INT,
+                #     ),
+                # )
                 self.coord_var_value_depends_on.extend(
                     [self.index_var, self.parent_iterator.index_var]
                 )
