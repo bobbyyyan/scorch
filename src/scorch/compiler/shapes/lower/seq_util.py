@@ -146,7 +146,7 @@ def GetChild(sexpr: cin.IndexSeq) -> Optional[cin.IndexSeq]:
     return None
 
 
-def IndexDefined(sexpr: cin.IndexSeq, defs: set[cin.Seq]):
+def IndexDefined(sexpr: cin.IndexSeq, defs: set[cin.Seq]) -> bool:
     """Returns whether one of the following conditions hold:
     (1) this is the first index,
     (2) the parent of this sequence expression is in `defs`, or
@@ -280,7 +280,7 @@ def Contains(sexpr: cin.Seq, subpoint: cin.Seq) -> bool:
 
 
 def ContainsIntersection(sexpr: cin.Seq) -> bool:
-    """Returns whether sexpr is or contains an intersection sequence expression."""
+    """Returns whether `sexpr` is or contains an intersection sequence expression."""
     match sexpr:
         case cin.IndexSeq() | cin.Universe():
             return False

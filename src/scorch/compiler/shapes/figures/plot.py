@@ -14,13 +14,13 @@ E: int = 10
 class Format(StrEnum):
     """Format of the input matrix"""
 
-    D = "d"  # dense (torch.rand)
+    DD = "d,d"  # dense (torch.rand)
     SP = "sp"  # "with probability p, A[i,j] is 0."
-    CSR = "csr"  # S + "with probability p, A[:, j] is 0"
-    CSC = "csc"  # S + "with probability p, A[i, :] is 0"
-    DS = "dbl-sp"  # SR + SC
-    USR = "uni-row"  # CSR, but guarantees each row has same # of zeros.
-    USC = "uni-col"  # CSC, but guarantees each column has same # of zeros.
+    DS = "d,s"  # S + "with probability p, A[:, j] is 0"
+    SD = "s,d"  # S + "with probability p, A[i, :] is 0"
+    DSP = "dbl-sp"  # SR + SC
+    USR = "uni-row"  # d,s, but guarantees each row has same # of zeros.
+    USC = "uni-col"  # s,d, but guarantees each column has same # of zeros.
 
 
 SPARSITIES: list[float] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -71,35 +71,35 @@ def count_values(t: torch.Tensor) -> int:
 
 def matrix(sparsity: float, format: Format):
     match format:
-        case Format.D:
+        case Format.DD:
             return dmatrix()
         case Format.SP:
             return spmatrix(sparsity)
-        case Format.CSC:
+        case Format.SD:
             m: torch.Tensor = spmatrix(sparsity)
             # Randomly select [0, sparsity * N) columns, and zero them out.
             for _ in range(0, int(sparsity * N)):
                 m[random.randrange(0, N), :] = 0
             return m
-        case Format.CSR:
-            # Randomly select [0, sparsity * N) columns, and zero them out.
-            return matrix(sparsity, Format.CSC).transpose(1, 0)
         case Format.DS:
+            # Randomly select [0, sparsity * N) columns, and zero them out.
+            return matrix(sparsity, Format.SD).transpose(1, 0)
+        case Format.DSP:
             # Randomly select [0, sparsity * N) rows AND columns, and zero them out.
-            m = matrix(sparsity, Format.CSC)
+            m = matrix(sparsity, Format.SD)
             for _ in range(0, int(sparsity * N)):
                 m[:, random.randrange(0, N)] = 0
             return m
         case Format.USC:
             k: int = N - int(sparsity * N)  # The density of non-zero values.
-            csr: Optional[torch.Tensor] = None
+            ds: Optional[torch.Tensor] = None
             for _ in range(0, N):
                 tensor: torch.Tensor = torch.zeros(size=(N,))
                 if sparsity < random.uniform(0, 1):
                     indices: torch.Tensor = torch.randperm(tensor.numel())[:k]
                     tensor[indices] = random.uniform(1, 2)  # (non-zero value)
-                csr = tensor if csr is None else torch.vstack((csr, tensor))
-            return csr
+                ds = tensor if ds is None else torch.vstack((ds, tensor))
+            return ds
         case Format.USR:
             return matrix(sparsity, Format.USC).transpose(1, 0)
         case _:
@@ -237,5 +237,5 @@ def plot_density(f: Callable, formats: list[Format] = list(Format), block=False)
 
 
 if __name__ == "__main__":
-    plot_density(torch.matmul, formats=[Format.D, Format.DS])
-    plot_nnz(torch.matmul, formats=[Format.D, Format.DS], block=True)
+    plot_density(torch.matmul, formats=[Format.DD, Format.DSP])
+    plot_nnz(torch.matmul, formats=[Format.DD, Format.DSP], block=True)

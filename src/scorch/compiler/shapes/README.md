@@ -12,7 +12,7 @@ Correctness is not guaranteed.
 
 # Debugging
 
-In case this code is touched by other engineers/researchers, I've added logging support. Hopefully this will 
-better help illustrate the compilation. This uses the Python built-in [logging](https://docs.python.org/3/howto/logging.html) 
+In case this code is touched by other engineers/researchers, I've added logging. Hopefully this will better help 
+illustrate the compilation. This uses the Python built-in [logging](https://docs.python.org/3/howto/logging.html) 
 library. To use this with `pytest`, simply append the flag: `--log-cli-level=DEBUG`. To use this with `python3`, 
 use `--log=DEBUG`. For more advanced logging techniques, refer to the library documentation.

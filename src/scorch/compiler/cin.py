@@ -1171,8 +1171,6 @@ class IndexSeq(Seq):
     size: The size of the dimension of the accessed index.
     index: The access index, e.g., for `A[i, j]` i = 0 and j = 1.
     format: The format of this sequence.
-    parent: The (optional) parent of this sequence, e.g., the parent of `j`
-            in `A[i, j]` is `i`. If this is None, then it has no parent.
     """
 
     idx: IndexVar
@@ -1180,7 +1178,6 @@ class IndexSeq(Seq):
     size: int
     index: int
     format: LevelType
-    # parent: Optional[IndexSeq] = None
 
     def __init__(
         self,

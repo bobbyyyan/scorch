@@ -11,9 +11,10 @@ import logging
 
 @dataclass
 class IterationLattice:
-    """A data structure to represent an iteration lattice.
-    top: The entry node.
-    graph: mapping from sequence expression to (edge, simplified).
+    """
+    A data structure to represent an iteration lattice.
+      top: The entry node.
+      graph: mapping from sequence expression to (edge, simplified).
     """
 
     top: cin.Seq

@@ -147,7 +147,7 @@ def Reset(sexpr: cin.Seq):
 def Valid(sexpr: cin.Seq):
     """
     Checks that the sequence has not run out of coordinates,
-    meaning no sub-sequenceh as run out. This means no iterators
+    meaning no sub-sequence has run out. This means no iterators
     have gone out of bounds, and slices/projections are still within
     a valid range.
     """

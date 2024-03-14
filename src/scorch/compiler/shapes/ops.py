@@ -15,11 +15,11 @@ import scorch.ops as experimental
 # Concrete operations on Scorch tensors. If the input tensor is PyTorch,
 # then it is converted to the Scorch equivalent.
 
+
 # Used to hygienically name code generated index variables.
+# ...I'm not a big fan of this either.
 TENSOR_INDEX_NAME = "ijklmnopqrstuvwxyz"
-
-
-# Used to hygienically name results. I know, this is bad.
+# Used to hygienically name results.
 SUFFIX = 0
 
 

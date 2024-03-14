@@ -150,13 +150,13 @@ def Simplify(expr: cpp.Cpp) -> cpp.Cpp:
                     return Simplify(cpp.And(cpp.Not(a), cpp.Not(b)))
                 case cpp.And(a, b):  # !(a && b) -> !a || !b
                     return Simplify(cpp.Or(cpp.Not(a), cpp.Not(b)))
-                case cpp.Lt(a, b):  # !(a < b) == (a >= b)
+                case cpp.Lt(a, b):  # !(a < b) -> (a >= b)
                     return Simplify(cpp.Ge(a, b))
-                case cpp.Le(a, b):  # !(a <= b) == (a > b)
+                case cpp.Le(a, b):  # !(a <= b) -> (a > b)
                     return Simplify(cpp.Gt(a, b))
-                case cpp.Ge(a, b):  # !(a >= b) == (a < b)
+                case cpp.Ge(a, b):  # !(a >= b) -> (a < b)
                     return Simplify(cpp.Lt(a, b))
-                case cpp.Gt(a, b):  # !(a > b) == (a <= b)
+                case cpp.Gt(a, b):  # !(a > b) -> (a <= b)
                     return Simplify(cpp.Le(a, b))
                 case cpp.Eq(a, b):
                     return Simplify(cpp.Ne(a, b))
