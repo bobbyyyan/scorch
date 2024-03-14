@@ -65,7 +65,7 @@ class Value(IR):
 class AbstractTensor(Value):
     """Tensor used when tracing the JIT compilation."""
 
-    # TODO(cgyurgyik): We just want to carry the necessary
+    # TODO: We just want to carry the necessary
     # description, rather than the entire data structure itself.
     _tensor: tensor.Tensor
 
@@ -94,14 +94,14 @@ class AbstractTensor(Value):
         return self._tensor.format
 
     def nnz(self) -> int:
-        # TODO(cgyurgyik): Symbolic representation...?
+        # TODO: Symbolic representation...?
         if self.format().is_dense():
             # Conservatively assume all values are non-zero.
             return functools.reduce(operator.mul, self.shape(), 1)
         return self._tensor._nnz()
 
     def __getitem__(self, key):
-        dimension = 0  # TODO(cgyurgyik): Support multi-dimensional slicing.
+        dimension = 0  # TODO: Support multi-dimensional slicing.
         (start, end, stride) = (key.start, key.stop, key.step)
         return slice(
             self,
@@ -503,7 +503,7 @@ def can_fuse(A: IR, B: IR):
         # A = B + C
         # B = D + E
         return False
-    # TODO(cgyurgyik): For prototype purposes, only supports 1-D.
+    # TODO: For prototype purposes, only supports 1-D.
     if len(A.shape()) != 1:
         return False
     return True
@@ -568,9 +568,7 @@ class ScorchRegion:
 
                 if len(V.shape()) == 1:
                     return ops.generic_vector(convert(instructions), V.shape())
-                raise NotImplementedError(
-                    type(V)
-                )  # TODO(cgyurgyik): Support different fusion.
+                raise NotImplementedError(type(V))  # TODO: Support different fusion.
             case add(lhs, rhs):
                 return ops.add(self.evaluate(lhs), self.evaluate(rhs))
             case mul(lhs, rhs):

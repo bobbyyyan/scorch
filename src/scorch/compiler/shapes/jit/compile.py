@@ -6,7 +6,7 @@ import scorch.tensor as tensor
 import torch
 
 
-# TODO(cgyurgyik): This assumes that the function name used in `func` will align with the JIT IR.
+# TODO: This assumes that the function name used in `func` will align with the JIT IR.
 # A better approach might be to walk the Python AST, and map these two.
 def _compile(func: Callable, region: ScorchRegion, args, kwargs) -> IR:
     i: int = 0

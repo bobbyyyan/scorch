@@ -8,9 +8,8 @@ from scorch.compiler import cin
 # is the same regardless of the compiler phase. This is where these representation-agnostic
 # constructs live.
 #
-# TODO(cgyurgyik): The other Scorch CIN constructs that appear in CFIR/CPP phases
-# should be translated to a "general" construct here too, e.g., TensorVar and
-# TensorAccess.
+# TODO: The other Scorch CIN constructs that appear in CFIR/CPP phases should be translated
+# to a "general" construct here too, e.g., TensorVar and TensorAccess.
 
 
 @dataclass

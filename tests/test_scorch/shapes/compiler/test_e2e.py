@@ -26,7 +26,7 @@ def test_assign_e2e_ds():
         cin.IndexSeq(i, B, size=2, index=0, format=LevelType.DENSE),
     )
     stmt: cpp.Cpp = compile.Compile(c)
-    return  # TODO(cgyurgyik): This needs to update the `pos` array.
+    return  # TODO: Sparse result not supported.
     util.assert_equal(
         cpp.PrettyPrint(
             compile.DefineFunction(

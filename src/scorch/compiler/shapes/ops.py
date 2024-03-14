@@ -363,7 +363,7 @@ def matmul(
     rhs: torch.Tensor | tensor.Tensor,
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ):
-    # TODO(cgyurgyik): Implement.
+    # TODO: Implement.
     output = experimental.matmul(lhs, rhs)
     output.name = ResultName()
     return output
@@ -375,7 +375,7 @@ def concat(
     dim: int,
     format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ):
-    # TODO(cgyurgyik): Implement.
+    # TODO: Implement.
     assert type(lhs) == type(rhs)
     if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
         return torch.concat([lhs, rhs], dim)

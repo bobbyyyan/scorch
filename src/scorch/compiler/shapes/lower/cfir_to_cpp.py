@@ -92,7 +92,6 @@ def LowerAssign(
             # Perform assignment/compute.
             cpp.Assign(LowerIndexExpr(lhs), LowerIndexExpr(rhs), op),
             # If there is a workspace, reset its value for the next loop iteration.
-            # TODO(cgyurgyik): This is only necessary if we actually read from the workspace again.
             *(
                 [cpp.Assign(LowerIndexExpr(rhs), cpp.Constant(0))]
                 if isinstance(rhs, cin.WorkspaceAccess)

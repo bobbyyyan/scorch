@@ -33,7 +33,7 @@ def test_zero_simplifications():
 
 
 def test_simplify_concat_spmv():
-    # TODO(cgyurgyik): This fails because "sd" is not supported yet.
+    # TODO: This fails because "sd" is not supported yet.
     # Reference: https://github.com/bobbyyyan/scorch/issues/3
     return
 
