@@ -185,7 +185,7 @@ class Return(Cpp):
 
 @dataclass
 class Access(Cpp):
-    tensor: cin.TensorVar
+    tensor: Variable | cin.TensorVar
     idx: ir.IndexVar
 
     def __str__(self):

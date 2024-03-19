@@ -115,7 +115,9 @@ def RemoveDense(sexpr: cin.Seq) -> Tuple[cin.Seq, list[cin.Seq]]:
             return [sexpr, []]
 
 
-def FilterLocators(locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]], point: cin.Seq):
+def FilterLocators(
+    locs: Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]], point: cin.Seq
+) -> Tuple[cin.Seq, list[Tuple[cin.Seq, cin.Seq]]]:
     return list(filter(lambda p: seq_util.Contains(point, p[0]), locs))
 
 
