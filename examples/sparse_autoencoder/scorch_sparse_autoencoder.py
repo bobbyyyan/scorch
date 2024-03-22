@@ -74,6 +74,35 @@ def get_dataset(name):
         )
         test_dataset = datasets.CIFAR10("./data", train=False, transform=transform)
         input_size = 32 * 32
+    elif name == "cifar100":
+        transform = transforms.Compose(
+            [
+                transforms.Grayscale(),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.view(-1)),
+            ]
+        )
+        train_dataset = datasets.CIFAR100(
+            "./data", train=True, download=True, transform=transform
+        )
+        test_dataset = datasets.CIFAR100("./data", train=False, transform=transform)
+        input_size = 32 * 32
+    elif name == "celeba":
+        transform = transforms.Compose(
+            [
+                transforms.Grayscale(),
+                transforms.Resize((64, 64)),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.view(-1)),
+            ]
+        )
+        train_dataset = datasets.CelebA(
+            "./data", split="train", download=True, transform=transform
+        )
+        test_dataset = datasets.CelebA(
+            "./data", split="test", download=True, transform=transform
+        )
+        input_size = 64 * 64
     else:
         raise ValueError("Unsupported dataset")
 
@@ -130,7 +159,7 @@ def main():
         "--dataset",
         type=str,
         default="mnist",
-        choices=["mnist", "cifar10"],
+        choices=["mnist", "cifar10", "cifar100", "celeba"],
         help="dataset for training/testing the model (default: 'mnist')",
     )
 
