@@ -2,10 +2,13 @@
 import pprint
 import time
 from itertools import product
+from typing import List, Dict, Any, Iterable, Union, Optional
+
 
 import torch
+from torch.utils.cpp_extension import load_inline
 
-from scorch import STensor, einsum, utils
+from scorch import STensor, einsum, utils, TensorFormat
 from scorch.compiler.cin import (
     ForAll,
     Where,
@@ -18,8 +21,9 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.format import LevelFormat, LevelType
 from scorch.ops import matmul, matmul_wksp, lower_and_exec_cin
-from scorch.storage import TensorIndex
+from scorch.storage import TensorIndex, TensorStorage
 from scorch.utils import PROJECT_ROOT_DIR, parse_format
 
 # indent 2 pretty print
