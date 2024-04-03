@@ -4,10 +4,12 @@ from pathlib import Path
 from typing import List, Dict, Any, Iterable, Union, Optional
 
 import torch
+# from scorch import Tensor
 from torch.utils.cpp_extension import load_inline
 
 from .compiler.llir import DataType
 from .format import TensorFormat, LevelFormat, LevelType
+# from .storage import TensorStorage, TensorIndex
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
@@ -40,7 +42,8 @@ def load_to_kernel_cache(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+        # extra_cflags=["-O3", "-mcpu=apple-m1", "-ffast-math", "-fno-signed-zeros"],
+        extra_cflags=["-O3", "-ffast-math", "-fno-signed-zeros"],
     )
 
     kernel_cache[kernel_name] = module

@@ -12,7 +12,7 @@ from scorch.compiler.cin import (
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.scheduler import Scheduler
-
+import pdb
 
 def test_convert_dd_ds():
     # Test converting a CSR matrix to a dense matrix
@@ -20,12 +20,14 @@ def test_convert_dd_ds():
 
     i = IndexVar("i")
     j = IndexVar("j")
+    pdb.set_trace()
 
     A = TensorVar("A", fmt="dd")
     B = TensorVar("B", fmt="ds")
 
     A[i, j] = B[i, j]
 
+    pdb.set_trace()
     cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
     lowerer = CINLowerer()
@@ -49,6 +51,7 @@ def test_elemwise_mul_1d_sss():
     a = TensorVar("a", fmt="s")
     b = TensorVar("b", fmt="s")
     c = TensorVar("c", fmt="s")
+    # pdb.set_trace()
 
     a[i] = b[i] * c[i]
 
@@ -209,6 +212,28 @@ def test_elemwise_add_1d_sds():
     print("\nC++ torch extension code:")
     print(llir_lowerer.lower_llir(lowered_llir))
 
+# def test_mat_mul_2d_tensor_ds_ds_ds():
+#     # taco "A(i,j) = B(i,k) + C(k,j)" -f=A:ds -f=B:ds: -f=C:ds
+#     i = IndexVar("i")
+#     j = IndexVar("j")
+#     k = IndexVar("k")
+#
+#     A = TensorVar("A", fmt=["dense", "sparse"])
+#     B = TensorVar("B", fmt=["dense", "sparse"])
+#     C = TensorVar("C", fmt=["dense", "sparse"])
+#
+#     A[i, j] = B[i, k] * C[k, j]
+#
+#     cin_stmt = ForAll(i, ForAll(j, ForAll(k, A._assignment)))
+#
+#     lowerer = CINLowerer()
+#
+#     lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+#
+#     llir_lowerer = LLIRLowerer()
+#
+#     print("\nC++ torch extension code:")
+#     print(llir_lowerer.lower_llir(lowered_llir))
 
 def test_elemwise_mul_3d_tensor_dss_sss_sss():
     # A[i, j, k] = B[i, j, k] * C[i, j, k]

@@ -1061,6 +1061,7 @@ class CINLowerer:
                 # malloc_stmt is the RHS
                 c_datatype = dtype_to_c_datatype(result_tensor_var.dtype)
                 sizeof_expr = llir.Sizeof(c_datatype)
+                # TODO: why is this being redefined here? can't you use result_capacity_var?
                 res_capacity_var = llir.Var(
                     name=f"{result_name}_capacity",
                     type=llir.DataType.INT,
