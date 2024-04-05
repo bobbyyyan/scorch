@@ -355,7 +355,7 @@ class STensor(torch.nn.Module):
         return tt_tensor
 
     @staticmethod
-    def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> STensor:
+    def from_torch(tensor: torch.Tensor, name: Optional[str] = None, mode_order: Optional[List[int]] = None) -> STensor:
         """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
         # and format is dense at every level
@@ -363,6 +363,10 @@ class STensor(torch.nn.Module):
         # If name is not provided, use the default name
         if name is None:
             name = "tensor"
+
+        # TODO: Should insert some error-checking with mode-order here?
+        if mode_order:
+            tensor = tensor.permute(*mode_order)
 
         if tensor.is_sparse or tensor.is_sparse_csr:
             if tensor.layout == torch.sparse_coo:
@@ -384,6 +388,7 @@ class STensor(torch.nn.Module):
                                 ]
                             ),
                             mode_indices=mode_indices,
+                            mode_order=mode_order
                         ),
                         value=tensor.values(),
                     ),
@@ -426,6 +431,7 @@ class STensor(torch.nn.Module):
                         ]
                     ),
                     mode_indices=[[] for _ in range(len(tensor.shape))],
+                    mode_order=mode_order
                 ),
                 value=tensor.flatten(),
             ),
@@ -599,6 +605,10 @@ class STensor(torch.nn.Module):
             else:
                 index_vars = default_index_vars[: len(self.shape)]
 
+            # permute index_vars based off self._storage._index.mode_order
+            if self.storage.index.mode_order:
+                index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+
             if self.has_index:
                 B = TensorVar(
                     name="B",
@@ -685,6 +695,7 @@ class STensor(torch.nn.Module):
                 index=TensorIndex(
                     tensor_format=output_format,
                     mode_indices=result_cpp.storage.index.mode_indices,
+                    mode_order=self.storage.index.mode_order
                 ),
                 value=result_cpp.storage.value,
             )
