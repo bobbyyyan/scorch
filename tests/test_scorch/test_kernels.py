@@ -73,61 +73,14 @@ def generate_tensors(a_format, b_format, result_format):
         ]
     )
 
-    a_csr = Tensor.from_torch(tensor_a_torch, "a").to_sparse("ds")
+    a_csr = Tensor.from_torch(tensor_a_torch, "a", ).to_sparse("ds")
     b_csr = Tensor.from_torch(tensor_b_torch, "b").to_sparse("ds")
     result_csr = Tensor.from_torch(tensor_result_torch, "result").to_sparse("ds")
 
-    # Hard coding tensors with the above initialization for A, B, result
-    a_csc = Tensor(
-        name="A",
-        shape=(5, 5),
-        storage=TensorStorage(
-            index=TensorIndex(
-                tensor_format=TensorFormat(
-                    level_formats=[
-                        LevelFormat(mode=LevelType.DENSE),
-                        LevelFormat(mode=LevelType.COMPRESSED)
-                    ]
-                ),
-                mode_indices=[[], [torch.tensor([0, 4, 6, 8, 9, 11], dtype=torch.int32), torch.tensor([0, 1, 2, 4, 0, 1, 0, 2, 0, 0, 4], dtype=torch.int32)]],
-            ),
-            value=torch.tensor([1., 2., 3., 5., 2., 2., 3., 3., 4., 5., 5.], dtype=torch.float32),
-        ),
-    )
-
-    b_csc = Tensor(
-        name="B",
-        shape=(5, 5),
-        storage=TensorStorage(
-            index=TensorIndex(
-                tensor_format=TensorFormat(
-                    level_formats=[
-                        LevelFormat(mode=LevelType.DENSE),
-                        LevelFormat(mode=LevelType.COMPRESSED)
-                    ]
-                ),
-                mode_indices=[[], [torch.tensor([0, 1, 2, 2, 4, 5], dtype=torch.int32), torch.tensor([0, 1, 3, 4, 4], dtype=torch.int32)]],
-            ),
-            value=torch.tensor([1., 2., 1., 3., 1.], dtype=torch.float32),
-        ),
-    )
-
-    result_csc = Tensor(
-        name="result",
-        shape=(5, 5),
-        storage=TensorStorage(
-            index=TensorIndex(
-                tensor_format=TensorFormat(
-                    level_formats=[
-                        LevelFormat(mode=LevelType.DENSE),
-                        LevelFormat(mode=LevelType.COMPRESSED)
-                    ]
-                ),
-                mode_indices=[[], [torch.tensor([0, 4, 6, 6, 8, 10], dtype=torch.int32), torch.tensor([0, 1, 2, 4, 0, 1, 0, 4, 0, 4], dtype=torch.int32)]],
-            ),
-            value=torch.tensor([1., 2., 3., 5., 4., 4., 19., 15., 5., 5.], dtype=torch.float32),
-        ),
-    )
+    # pdb.set_trace()
+    a_csc = Tensor.from_torch(tensor_a_torch, "a", [1, 0]).to_sparse("ds")
+    b_csc = Tensor.from_torch(tensor_b_torch, "b", [1, 0]).to_sparse("ds")
+    result_csc = Tensor.from_torch(tensor_result_torch, "result", [1, 0]).to_sparse("ds")
 
     format_tensor = {
         "a_csr": a_csr, "b_csr": b_csr, "result_csr": result_csr,
@@ -139,43 +92,20 @@ def generate_tensors(a_format, b_format, result_format):
 def test_spmm_csr_csr_csr():
     a, b, result = generate_tensors("csr", "csr", "csr")
     result_cpp = test_custom_kernel(a, b, result, "spmm_csr_wksp.cpp")
-    pdb.set_trace()
-    result_kernel = Tensor(
-        shape=(5, 5),
-        index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
-            tensor_format=TensorFormat(
-                level_formats=[
-                    LevelFormat(mode=LevelType.DENSE),
-                    LevelFormat(mode=LevelType.COMPRESSED)
-                ]
-            ),
-        ),
-        value=result_cpp._storage._value,
-    )
 
-    print(result_kernel.values)
-    print(result_kernel.index.mode_indices)
+    assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
+    assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
+    assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
+    assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
+
 def test_spmm_csc_csc_csc():
     a, b, result = generate_tensors("csc", "csc", "csc")
     result_cpp = test_custom_kernel(a, b, result, "spmm_csc_wksp.cpp")
-    pdb.set_trace()
-    result_kernel = Tensor(
-        shape=(5, 5),
-        index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
-            tensor_format=TensorFormat(
-                level_formats=[
-                    LevelFormat(mode=LevelType.DENSE),
-                    LevelFormat(mode=LevelType.COMPRESSED)
-                ]
-            ),
-        ),
-        value=result_cpp._storage._value,
-    )
 
-    print(result_kernel.values)
-    print(result_kernel.index.mode_indices)
+    assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
+    assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
+    assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
+    assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
 
 
 def test_custom_kernel(a, b, result, kernel_code_filename):

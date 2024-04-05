@@ -538,6 +538,7 @@ class TensorVar(IndexExpr):
     shape: Optional[Tuple[int, ...]] = None
     format: Optional[TensorFormat] = None
     dtype: torch.dtype = torch.float32
+    mode_order: Optional[List[int]] = None
 
     def __init__(
         self,
@@ -545,6 +546,7 @@ class TensorVar(IndexExpr):
         shape: Optional[Tuple[int, ...]] = None,
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
         dtype: torch.dtype = torch.float32,
+        mode_order: Optional[List[int]] = None
     ):
         super().__init__()
         self._name = name
@@ -554,6 +556,7 @@ class TensorVar(IndexExpr):
             self.format = parse_format(fmt)
 
         self.dtype = dtype
+        self.mode_order = mode_order
 
     @property
     def name(self) -> str:
@@ -570,6 +573,9 @@ class TensorVar(IndexExpr):
 
     def get_format(self) -> TensorFormat:
         assert self.format is not None, "TensorVar format is None"
+        return self.format
+
+    def get_mode_order(self) -> Optional[List[int]]:
         return self.format
 
     def get_level_types(self) -> List[LevelType]:

@@ -39,6 +39,7 @@ class TensorIndex(object):
         self,
         tensor_format: Optional[Union[TensorFormat, str, List[str]]] = None,
         mode_indices: Optional[List[List[torch.Tensor]]] = None,
+        mode_order: Optional[List[int]] = None
     ):
         self.format = parse_format(tensor_format) if tensor_format else None
         self.mode_indices = mode_indices
@@ -48,6 +49,9 @@ class TensorIndex(object):
                 for j, index in enumerate(mode_index):
                     if index.dtype != torch.int:
                         self.mode_indices[i][j] = index.int()
+
+        # TODO: should you allow to be None?
+        self.mode_order = mode_order
 
     def __str__(self):
         return "TensorIndex({})".format(self.format)
@@ -88,6 +92,10 @@ class TensorIndex(object):
         """Get the format of the tensor."""
         assert self.format, "format is None"
         return self.format
+
+    def get_mode_order(self) -> Optional[List[int]]:
+        """Get the mode order of the tensor."""
+        return self.mode_order
 
     def get_level_type(self, mode: int) -> LevelType:
         """Get the format of a mode."""

@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import pdb
 from copy import deepcopy
 from typing import Optional, Tuple, Union, List
 
@@ -300,7 +302,7 @@ class Tensor(torch.nn.Module):
         return tt_tensor
 
     @staticmethod
-    def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
+    def from_torch(tensor: torch.Tensor, name: Optional[str] = None, mode_order: Optional[List[int]] = None) -> Tensor:
         """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
         # and format is dense at every level
@@ -308,6 +310,10 @@ class Tensor(torch.nn.Module):
         # If name is not provided, use the default name
         if name is None:
             name = "tensor"
+
+        # TODO: Should insert some error-checking with mode-order here?
+        if mode_order:
+            tensor = tensor.permute(*mode_order)
 
         tt_tensor = Tensor(
             name=name,
@@ -321,10 +327,13 @@ class Tensor(torch.nn.Module):
                         ]
                     ),
                     mode_indices=[[] for _ in range(len(tensor.shape))],
+                    mode_order=mode_order
                 ),
                 value=tensor.flatten(),
             ),
         )
+
+        # pdb.set_trace()
 
         return tt_tensor
 
@@ -494,6 +503,10 @@ class Tensor(torch.nn.Module):
             else:
                 index_vars = default_index_vars[: len(self.shape)]
 
+            # permute index_vars based off self._storage._index.mode_order
+            if self._storage._index.mode_order:
+                index_vars = [index_vars[i] for i in self._storage._index.mode_order]
+
             if self.has_index:
                 B = TensorVar(
                     name="B",
@@ -576,10 +589,12 @@ class Tensor(torch.nn.Module):
                 self.storage.value,
             )
 
+            # TODO: bypassing result_cpp for mode_order, C++ code should be completely unaware?
             self._storage = TensorStorage(
                 index=TensorIndex(
                     tensor_format=output_format,
                     mode_indices=result_cpp._storage._index.mode_indices,
+                    mode_order=self._storage._index.mode_order
                 ),
                 value=result_cpp._storage._value,
             )
