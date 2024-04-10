@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pdb
 from dataclasses import dataclass, field
 from itertools import product
 from typing import List, Optional, Dict, TYPE_CHECKING, Iterable, Sequence, Union
@@ -918,6 +919,7 @@ class IterationLattice:
         return parent_to_children_lattice_points
 
     def __post_init__(self):
+        # pdb.set_trace()
         if self.lattice_points is None:
             self.lattice_points = self.gen_lattice_points()
             self.gen_parent_to_children_lattice_points()

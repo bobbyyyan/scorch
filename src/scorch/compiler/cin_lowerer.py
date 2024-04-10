@@ -22,7 +22,7 @@ from .llir import AssignOp, DataType
 from ..format import LevelType
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
-
+import pdb
 class CINLowerer:
     """
     This is a class to lower a CIN to LLIR
@@ -223,6 +223,7 @@ class CINLowerer:
         """
         Lower a TensorAssign to LLIR
         """
+        # pdb.set_trace()
         llir_stmts: List[llir.Stmt] = []
 
         rhs_llir = self.lower_IndexExpr(stmt.rhs)
@@ -1616,7 +1617,7 @@ class CINLowerer:
         Lower a ForAll to LLIR
         parent_index_var is the index var of the parent ForAll, if any
         """
-
+        # pdb.set_trace()
         # Get index variable at this forall
         index_var = stmt.get_index_var()
 

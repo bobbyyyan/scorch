@@ -166,7 +166,9 @@ class STensor(torch.nn.Module):
         """Add two tensors together."""
         # Perform element-wise addition
         # TODO: support broadcasting
-        index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+        a_index_vars = ([IndexVar(f"i{i}") for i in self.storage.index.mode_order])
+        b_index_vars = ([IndexVar(f"i{i}") for i in self.storage.index.mode_order])
+        c_index_vars = ([IndexVar(f"i{i}") for i in other.storage.index.mode_order])
         # TODO: output format inferred from input formats
         output_format = self.format
         result_shape = self.shape
@@ -174,27 +176,33 @@ class STensor(torch.nn.Module):
         A = TensorVar(
             name="A",
             fmt=output_format,
+            mode_order=self.storage.index.mode_order
         )
         B = TensorVar(
             name="B",
             fmt=self.format,
+            mode_order=self.storage.index.mode_order
         )
         C = TensorVar(
             name="C",
             fmt=other.format,
+            mode_order=other.storage.index.mode_order
         )
 
         # Assert A, B, C, and index_vars are defined
         assert A is not None, "Tensor A is not defined."
         assert B is not None, "Tensor B is not defined."
         assert C is not None, "Tensor C is not defined."
-        assert index_vars is not None, "Index variables are not defined."
+        assert a_index_vars is not None, "Index variables for A are not defined."
+        assert b_index_vars is not None, "Index variables for B are not defined."
+        assert c_index_vars is not None, "Index variables for C are not defined."
+
 
         # Generate the python code for the element-wise addition
         # e.g. A[i0, i1, ...] = B[i0, i1, ...] + C[i0, i1, ...]
-        lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs += f' + C[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        lhs = f'A[{", ".join(["a_index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        rhs = f'B[{", ".join(["b_index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        rhs += f' + C[{", ".join(["c_index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
         code = f"{lhs} = {rhs}"
         exec(code)
 
@@ -203,7 +211,7 @@ class STensor(torch.nn.Module):
         rhs = "A._assignment"
         assert ForAll is not None, "ForAll is not imported"
         for i in range(len(self.shape))[::-1]:
-            rhs = f"ForAll(index_vars[{i}], {rhs})"
+            rhs = f"ForAll(a_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
 
         lowerer = CINLowerer()
@@ -473,6 +481,11 @@ class STensor(torch.nn.Module):
         else:
             index_vars = default_index_vars[: len(self.shape)]
 
+        pdb.set_trace()
+        # permute index_vars based on self._storage._index.mode_order
+        if self.storage.index.mode_order:
+            index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+
         if self.has_index:
             B = TensorVar(
                 name="B",
@@ -556,6 +569,7 @@ class STensor(torch.nn.Module):
             index=TensorIndex(
                 tensor_format=output_format,
                 mode_indices=result_cpp.storage.index.mode_indices,
+                mode_order=self.storage.index.mode_order
             ),
             value=result_cpp.storage.value,
         )
@@ -614,6 +628,7 @@ class STensor(torch.nn.Module):
                     name="B",
                     fmt=self.format,
                     dtype=self.dtype,
+                    mode_order=self.storage.index.mode_order
                 )
             else:
                 B = TensorVar(
@@ -624,6 +639,7 @@ class STensor(torch.nn.Module):
                             for _ in range(len(self.shape))
                         ]
                     ),
+                    mode_order=self.storage.index.mode_order
                 )
 
             if fmt is None:
@@ -643,6 +659,7 @@ class STensor(torch.nn.Module):
                 fmt=output_format,
                 shape=self.shape,
                 dtype=self.dtype,
+                mode_order=self.storage.index.mode_order
             )
 
             # Assert A, B, and index_vars are defined
