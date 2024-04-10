@@ -30,19 +30,21 @@ from scorch.utils import PROJECT_ROOT_DIR, parse_format
 pp = pprint.PrettyPrinter(indent=2)
 import pdb
 
-def generate_tensors(a_format, b_format, result_format):
+
+def generate_2d_tensors(
+    a_fmt: str,
+    b_fmt: str,
+    result_fmt: str,
+    a_mode_order: Optional[List[int]] = None,
+    b_mode_order: Optional[List[int]] = None,
+    result_mode_order: Optional[List[int]] = None
+):
     """
     Generates tensors A, B, and result given their format
         - values for tensors are hard-coded for debugging purposes
     Args:
         formats can be "csc", "csr", etc. for now, only csc & csr supported
     """
-
-    # For now, assume that all 3 tensors will be csc
-    assert(a_format == "csc" or a_format == "csr")
-    assert(b_format == "csc" or b_format == "csr")
-    assert(result_format == "csc" or result_format == "csr")
-
     tensor_a_torch = torch.Tensor(
         [
             [1, 2, 3, 4, 5],
@@ -63,7 +65,27 @@ def generate_tensors(a_format, b_format, result_format):
         ]
     )
 
-    tensor_result_torch = torch.Tensor(
+    tensor_result_add_torch = torch.Tensor(
+        [
+            [2, 2, 3, 4, 5],
+            [2, 4, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 1, 0],
+            [5, 0, 0, 3, 6],
+        ]
+    )
+
+    tensor_result_elemwise_mul_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 4, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 5],
+        ]
+    )
+
+    tensor_result_matmul_torch = torch.Tensor(
         [
             [1, 4, 0, 19, 5],
             [2, 4, 0, 0, 0],
@@ -73,24 +95,45 @@ def generate_tensors(a_format, b_format, result_format):
         ]
     )
 
-    a_csr = Tensor.from_torch(tensor_a_torch, "a", ).to_sparse("ds")
-    b_csr = Tensor.from_torch(tensor_b_torch, "b").to_sparse("ds")
-    result_csr = Tensor.from_torch(tensor_result_torch, "result").to_sparse("ds")
+    a = Tensor.from_torch(tensor_a_torch, "a", a_mode_order).to_sparse(a_fmt)
+    b = Tensor.from_torch(tensor_b_torch, "b", b_mode_order).to_sparse(b_fmt)
+    result_add = Tensor.from_torch(tensor_result_add_torch, "result_add", result_mode_order).to_sparse(result_fmt)
+    result_elemwise_mul = Tensor.from_torch(tensor_result_elemwise_mul_torch, "result_elemwise_mul", result_mode_order).to_sparse(result_fmt)
+    result_matmul = Tensor.from_torch(tensor_result_matmul_torch, "result_matmul", result_mode_order).to_sparse(result_fmt)
 
-    # pdb.set_trace()
-    a_csc = Tensor.from_torch(tensor_a_torch, "a", [1, 0]).to_sparse("ds")
-    b_csc = Tensor.from_torch(tensor_b_torch, "b", [1, 0]).to_sparse("ds")
-    result_csc = Tensor.from_torch(tensor_result_torch, "result", [1, 0]).to_sparse("ds")
+    return a, b, result_add, result_elemwise_mul, result_matmul
 
-    format_tensor = {
-        "a_csr": a_csr, "b_csr": b_csr, "result_csr": result_csr,
-        "a_csc": a_csc, "b_csc": b_csc, "result_csc": result_csc
-    }
 
-    return format_tensor[f"a_{a_format}"], format_tensor[f"b_{b_format}"], format_tensor[f"result_{result_format}"]
+def test_generate_tensor_3d():
+    tensor_result_torch = torch.Tensor(
+        [
+            [
+                [1, 0, 0],
+                [0, 0, 1],
+                [1, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 1, 0],
+                [1, 1, 0],
+                [0, 0, 0],
+            ]
+        ]
+    )
+
+    # result_3d_normal_ddd = Tensor.from_torch(tensor_result_torch, "3d_normal")
+    result_3d_normal_dss = Tensor.from_torch(tensor_result_torch, "3d_normal").to_sparse("dss")
+    assert(result_3d_normal_dss._storage._value.tolist() == [1., 1., 1., 1., 1., 1.])
+    # result_3d_reverse_dss = Tensor.from_torch(tensor_result_torch, "3d_reverse", [2, 1, 0]).to_sparse("dss")
+    pdb.set_trace()
+
 
 def test_spmm_csr_csr_csr():
-    a, b, result = generate_tensors("csr", "csr", "csr")
+    a, b, _, _, result = generate_2d_tensors("ds", "ds", "ds")
     result_cpp = test_custom_kernel(a, b, result, "spmm_csr_wksp.cpp")
 
     assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
@@ -98,14 +141,48 @@ def test_spmm_csr_csr_csr():
     assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
     assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
 
+
 def test_spmm_csc_csc_csc():
-    a, b, result = generate_tensors("csc", "csc", "csc")
+    a, b, _, _, result = generate_2d_tensors("ds", "ds", "ds", [1, 0], [1, 0], [1, 0])
     result_cpp = test_custom_kernel(a, b, result, "spmm_csc_wksp.cpp")
 
     assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
     assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
     assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
     assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
+
+
+def test_sparse_to_dense_csc():
+    a, _, _, _, _ = generate_2d_tensors("csc", "csc", "csc")
+    a_dense = a.to_dense()
+    pdb.set_trace()
+    print(a_dense.shape)
+
+
+def test_elemwise_2d_add_csc_csc_csc():
+    a, b, result, _, _ = generate_2d_tensors("ds", "ds", "ds", [1, 0], [1, 0], [1, 0])
+    pdb.set_trace()
+    result_cpp = a + b
+
+    assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
+    assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
+    assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
+    assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
+    # pdb.set_trace()
+    print(result)
+
+
+def test_elemwise_2d_add_csr_csr_csc():
+    a, b, result, _, _ = generate_2d_tensors("ds", "ds", "ds", [0, 1], [1, 0], [0, 1])
+
+    result_cpp = a + b
+
+    assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
+    assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
+    assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
+    assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
+    # pdb.set_trace()
+    print(result)
 
 
 def test_custom_kernel(a, b, result, kernel_code_filename):
