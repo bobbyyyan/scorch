@@ -69,10 +69,10 @@ def scorch_spmspm_custom(a: Tensor, b: Tensor, **kwargs):
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format="ds",
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     return result
@@ -100,10 +100,10 @@ def scorch_spmm_custom(a: Tensor, b: Tensor, **kwargs):
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format="dd",
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     return result

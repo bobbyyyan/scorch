@@ -25,8 +25,8 @@ from .tensor import Tensor
 from .utils import parse_format, topo_sort_characters, load_to_kernel_cache
 
 PROJECT_ROOT_DIR = Path(__file__)
-# while not (PROJECT_ROOT_DIR / "setup.py").exists():
-#     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
+while not (PROJECT_ROOT_DIR / "setup.py").exists():
+    PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 _kernel_cache = {}
 
@@ -126,10 +126,10 @@ def spmv(
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     return result
@@ -236,10 +236,10 @@ def matmul_wksp(
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     return result
@@ -252,8 +252,13 @@ def matmul(
 ) -> Tensor:
     """Perform a matrix multiplication."""
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        result = torch.matmul(a, b)
-        return Tensor.from_torch(result)
+        if a.is_sparse_csr and not b.is_sparse:
+            # SpMM
+            a = Tensor.from_csr(a)
+            b = Tensor.from_torch(b)
+        else:
+            result = torch.matmul(a, b)
+            return Tensor.from_torch(result)
 
     if isinstance(a, torch.Tensor):
         a = Tensor.from_torch(a)
@@ -274,7 +279,7 @@ def matmul(
             args.append(tensor.index.mode_indices)  # type: ignore
             args.append(tensor.values)  # type: ignore
 
-        spmm_csr = ops.spmm_csr
+        spmm_csr = ops.spmm_csr_float
 
         start_time = time.time()
         result_cpp = spmm_csr(*args)
@@ -341,8 +346,13 @@ def einsum(
     # Create a mapping from each index string to the list of LevelFormats
     # of the levels it indexes into each input tensor
     index_str_to_level_formats = {}
+    tensors_new = []
     for index_strs, tensor in zip(input_index_strs, tensors):
+        if isinstance(tensor, torch.Tensor):
+            tensor = Tensor.from_torch(tensor)
+
         assert isinstance(tensor, Tensor), "Input tensor is not a Scorch Tensor"
+        tensors_new.append(tensor)
 
         for i, index_str in enumerate(index_strs):
             if index_str not in index_str_to_level_formats:
@@ -350,6 +360,8 @@ def einsum(
             index_str_to_level_formats[index_str].append(
                 tensor.format.get_level_formats()[i]
             )
+
+    tensors = tensors_new
 
     # Create TensorVar's for each tensor
     tensor_vars = []
@@ -482,7 +494,7 @@ def einsum(
 
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        print("\n\n", cpp_code)
+        # print("\n\n", cpp_code)
 
         # Read header_cpp_code from csrc/header.cpp
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
@@ -562,10 +574,10 @@ def einsum(
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     if "time_dict" in kwargs:
@@ -621,10 +633,10 @@ def lower_and_exec_cin(
     result = Tensor(
         shape=tuple(result_shape),
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format="dd",
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     return result

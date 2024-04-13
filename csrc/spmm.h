@@ -3,7 +3,7 @@
 #define SCORCH_UNLIKELY(x) (x)
 #define SCORCH_RESTRICT __restrict__
 
-Tensor spmm_csr(std::vector<int> result_shape, std::vector<int> A_shape,
+Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
                 torch::Tensor A_values, std::vector<int> B_shape,
                 std::vector<std::vector<torch::Tensor>> B_mode_indices,

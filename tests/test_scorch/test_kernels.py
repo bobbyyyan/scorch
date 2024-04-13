@@ -554,10 +554,10 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     assert result.shape == (5, 5)
@@ -705,10 +705,10 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
 #     result = Tensor(
 #         shape=result_shape,
 #         index=TensorIndex(
-#             mode_indices=result_cpp._storage._index.mode_indices,
+#             mode_indices=result_cpp.storage.index.mode_indices,
 #             tensor_format=output_format,
 #         ),
-#         value=result_cpp._storage._value,
+#         value=result_cpp.storage.value,
 #     )
 #
 #     assert result.shape == (5, 5)
@@ -1233,10 +1233,10 @@ def test_spmm_ss_dd_dd_ikj_gustavson():
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     assert result.shape == (5, 5)
@@ -1351,10 +1351,10 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     assert result.shape == (5, 5)
@@ -1454,10 +1454,10 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     assert result.shape == (dim_n, dim_n)
@@ -1571,10 +1571,10 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
     result = Tensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp._storage._index.mode_indices,
+            mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
         ),
-        value=result_cpp._storage._value,
+        value=result_cpp.storage.value,
     )
 
     assert result.shape == (5, 5)

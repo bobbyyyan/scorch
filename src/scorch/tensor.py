@@ -237,10 +237,10 @@ class Tensor(torch.nn.Module):
         result = Tensor(
             shape=result_shape,
             index=TensorIndex(
-                mode_indices=result_cpp._storage._index.mode_indices,
+                mode_indices=result_cpp.storage.index.mode_indices,
                 tensor_format=output_format,
             ),
-            value=result_cpp._storage._value,
+            value=result_cpp.storage.value,
         )
 
         return result
@@ -355,6 +355,32 @@ class Tensor(torch.nn.Module):
         # If name is not provided, use the default name
         if name is None:
             name = "tensor"
+
+        if tensor.is_sparse:
+            if tensor.layout == torch.sparse_coo:
+                mode_indices = []
+                tensor_indices = tensor.indices()
+                for i in range(tensor.dim()):
+                    mode_indices.append([tensor_indices[i]])
+
+                tt_tensor = Tensor(
+                    name=name,
+                    shape=tuple(tensor.shape),
+                    storage=TensorStorage(
+                        index=TensorIndex(
+                            tensor_format=TensorFormat(
+                                level_formats=[
+                                    LevelFormat(mode=LevelType.COORDINATE)
+                                    for _ in range(len(tensor.shape))
+                                ]
+                            ),
+                            mode_indices=mode_indices,
+                        ),
+                        value=tensor.values(),
+                    ),
+                )
+
+                return tt_tensor
 
         tt_tensor = Tensor(
             name=name,
@@ -491,9 +517,9 @@ class Tensor(torch.nn.Module):
         new_storage = TensorStorage(
             index=TensorIndex(
                 tensor_format=output_format,
-                mode_indices=result_cpp._storage._index.mode_indices,
+                mode_indices=result_cpp.storage.index.mode_indices,
             ),
-            value=result_cpp._storage._value,
+            value=result_cpp.storage.value,
         )
 
         if in_place:
@@ -626,9 +652,9 @@ class Tensor(torch.nn.Module):
             self._storage = TensorStorage(
                 index=TensorIndex(
                     tensor_format=output_format,
-                    mode_indices=result_cpp._storage._index.mode_indices,
+                    mode_indices=result_cpp.storage.index.mode_indices,
                 ),
-                value=result_cpp._storage._value,
+                value=result_cpp.storage.value,
             )
 
         return self

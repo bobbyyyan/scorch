@@ -186,6 +186,28 @@ def test_elemwise_add_1d_dss():
     print(llir_lowerer.lower_llir(lowered_llir))
 
 
+def test_elemwise_add_2d_ds_ds():
+    i = IndexVar("i")
+    j = IndexVar("j")
+
+    A = TensorVar("A", fmt="ds")
+    B = TensorVar("B", fmt="ds")
+    C = TensorVar("C", fmt="ds")
+
+    C[i, j] = A[i, j] + B[i, j]
+
+    cin_stmt = ForAll(i, ForAll(j, C._assignment))
+
+    lowerer = CINLowerer()
+
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+
+    print("\nC++ torch extension code:")
+    print(llir_lowerer.lower_llir(lowered_llir))
+
+
 def test_elemwise_add_1d_sds():
     # elementwise vector addition code generation
     # a[i] = b[i] + c[i]

@@ -10,8 +10,8 @@ from .compiler.llir import DataType
 from .format import TensorFormat, LevelFormat, LevelType
 
 PROJECT_ROOT_DIR = Path(__file__)
-# while not (PROJECT_ROOT_DIR / "setup.py").exists():
-#     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
+while not (PROJECT_ROOT_DIR / "setup.py").exists():
+    PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 import time
 

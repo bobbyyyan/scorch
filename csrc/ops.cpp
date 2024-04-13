@@ -6,7 +6,7 @@
 
 namespace scorch {
   PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("spmm_csr", &spmm_csr, "Sparse matrix multiplication");
+    m.def("spmm_csr_float", &spmm_csr_float, "Sparse matrix multiplication");
 
     pybind11::class_<Tensor>(m, "Tensor")
       .def(pybind11::init<>())
