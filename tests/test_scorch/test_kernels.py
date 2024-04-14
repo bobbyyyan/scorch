@@ -431,6 +431,23 @@ def test_elemwise_matrix_mul_ss_oo_ss():
     assert result.values.tolist() == [1.0, 4.0, 9.0, 16.0, 25.0]
 
 
+def test_elemwise_mul_4d_dddd_oooo_dddd():
+    # random 4D tensors
+    tensor_a_torch = torch.rand(2, 3, 4, 5)
+    tensor_b_torch = torch.rand(2, 3, 4, 5)
+
+    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oooo")
+    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("dddd")
+
+    result = einsum("ijkl,ijkl->ijkl", a_sparse, b_sparse, format="dddd")
+
+    assert result.shape == (2, 3, 4, 5)
+    assert len(result.index.mode_indices) == 4
+
+    result_torch = tensor_a_torch * tensor_b_torch
+    assert torch.allclose(result.to_torch(), result_torch)
+
+
 def test_ij_i_j_ss_s_s():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3])
     tensor_b_torch = torch.Tensor([7, 8, 0, 9])

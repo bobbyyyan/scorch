@@ -1,3 +1,6 @@
+*.pth
+*.pt
+data
 .idea
 .vscode
 playground.ipynb

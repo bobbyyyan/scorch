@@ -113,21 +113,18 @@ class ModeIterator:
                             ),
                         )
                     )
-                    # If the next level is also a coordinate _level, then we need to
-                    # initialize the next level's end iterator as well
-                    if (self.tensor_access.num_levels - 1) > self._level and (
-                        self.tensor_access.child_level_type_of_index_var(self.index_var)
-                        == LevelType.COORDINATE
-                    ):
-                        stmts.append(
-                            llir.VarInit(
-                                var=llir.Var(
-                                    name=f"p{self.tensor_var.name}{self.level + 1}_end",
-                                    type=llir.DataType.INT,
-                                ),
-                                value=llir.Literal(0),
+                    # For all future levels, initialize the end iterator to 0 for all the levels that are also coordinate levels
+                    for i in range(1, self.tensor_access.num_levels):
+                        if self.tensor_access.level_types()[i] == LevelType.COORDINATE:
+                            stmts.append(
+                                llir.VarInit(
+                                    var=llir.Var(
+                                        name=f"p{self.tensor_var.name}{i}_end",
+                                        type=llir.DataType.INT,
+                                    ),
+                                    value=llir.Literal(0),
+                                )
                             )
-                        )
 
                 return stmts
             else:
@@ -148,7 +145,7 @@ class ModeIterator:
             self.level_type == LevelType.COMPRESSED
             or self.level_type == LevelType.COORDINATE
         ):
-            # if this is the parent-most coordinate _level,
+            # if this is the parent-most coordinate level,
             # initialize the bounds using the size of the crd array
             if self.level == 0 and self.level_type == LevelType.COORDINATE:
                 # int pB0 = 0;
@@ -169,21 +166,18 @@ class ModeIterator:
                             ),
                         )
                     )
-                    # If the next level is also a coordinate _level, then we need to
-                    # initialize the next level's end iterator as well
-                    if (self.tensor_access.num_levels - 1) > self._level and (
-                        self.tensor_access.child_level_type_of_index_var(self.index_var)
-                        == LevelType.COORDINATE
-                    ):
-                        stmts.append(
-                            llir.VarInit(
-                                var=llir.Var(
-                                    name=f"p{self.tensor_var.name}{self.level + 1}_end",
-                                    type=llir.DataType.INT,
-                                ),
-                                value=llir.Literal(0),
+                    # For all future levels, initialize the end iterator to 0 for all the levels that are also coordinate levels
+                    for i in range(1, self.tensor_access.num_levels):
+                        if self.tensor_access.level_types()[i] == LevelType.COORDINATE:
+                            stmts.append(
+                                llir.VarInit(
+                                    var=llir.Var(
+                                        name=f"p{self.tensor_var.name}{i}_end",
+                                        type=llir.DataType.INT,
+                                    ),
+                                    value=llir.Literal(0),
+                                )
                             )
-                        )
 
                 return stmts
             else:
@@ -357,11 +351,11 @@ class ModeIterator:
             )
 
             if self.parent_iterator:
-                # e.g. int pB1 = j * B1_size + k;
+                # e.g. int pB1 = pB0 * B1_size + k;
                 self.coord_var_value_llir = llir.Add(
                     left=llir.Mul(
                         left=llir.Var(
-                            name=self.parent_iterator.get_iterator_var_llir().name,
+                            name=f"p{self.tensor_var.name}{self.parent_iterator.level}",
                             type=llir.DataType.INT,
                         ),
                         right=llir.Var(
@@ -378,6 +372,14 @@ class ModeIterator:
                 self.coord_var_value_depends_on.extend(
                     [self.index_var, self.parent_iterator.index_var]
                 )
+            else:
+                # e.g. int pB0 = i;
+                self.coord_var_value_llir = llir.Var(
+                    name=self.index_var.name,
+                    type=llir.DataType.INT,
+                )
+
+                self.coord_var_value_depends_on.append(self.index_var)
 
     def __str__(self) -> str:
         return f"ModeIterator({self.tensor_var}, {self.index_var}, {self.level})"

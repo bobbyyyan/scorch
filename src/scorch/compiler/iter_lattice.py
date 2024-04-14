@@ -1127,9 +1127,7 @@ class IterationLattice:
                 level = result_tensor_access.level_of_index_var(index_var)
                 level_type = result_tensor_access.level_type_of_index_var(index_var)
 
-                result_value_index_stmts: List[llir.Stmt] = [
-                    llir.Comment("Resolve index into dense level of values array"),
-                ]
+                result_value_index_stmts: List[llir.Stmt] = []
                 # Index into result value array: p<result tensor var name><_level>
                 result_index_var = llir.Var(
                     name=f"p{result_tensor_var.name}{level}",
@@ -1176,6 +1174,11 @@ class IterationLattice:
                                 ),
                             )
                         )
+
+                if result_value_index_stmts:
+                    result_value_index_stmts = [
+                        llir.Comment("Resolve index into dense level of values array")
+                    ] + result_value_index_stmts
 
                 if len(iterators) == 0:
                     for_loop = llir.ForLoop(
