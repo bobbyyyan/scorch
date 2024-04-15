@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchtext.datasets import IMDB
+from torchtext.datasets import IMDB, AG_NEWS
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 
@@ -61,17 +61,17 @@ class BigBirdSparseAttention(nn.Module):
                 :, :, i : i + self.block_size, i : seq_length - self.block_size + i + 1
             ] = False
 
-        # Create sparse tensor from attention scores
-        # indices = mask.nonzero().t()
-        # values = attention_scores[mask]
-        # sparse_attention_scores = torch.sparse_coo_tensor(indices, values, (batch_size, self.num_heads, seq_length, seq_length))
+        # Apply mask to attention scores: set masked positions to a large negative value
+        attention_scores = attention_scores.masked_fill(mask, float("-inf"))
 
         # Apply softmax to sparse attention scores
-        # attention_probs = torch.sparse.softmax(sparse_attention_scores, dim=-1).to_dense()
         attention_probs = torch.softmax(attention_scores, dim=-1)
 
         # Perform sparse matrix multiplication
+        start_time = time.time()
         context = torch.einsum("bhij,bhjd->bhid", attention_probs, value)
+        end_time = time.time()
+        print(f"Sparse matrix multiplication time: {end_time - start_time}s")
         context = context.contiguous().view(batch_size, seq_length, self.embed_dim)
 
         return context
@@ -127,6 +127,7 @@ class BigBirdModel(nn.Module):
         intermediate_size,
         hidden_dropout_prob,
         attention_probs_dropout_prob,
+        num_classes,
     ):
         super(BigBirdModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -145,7 +146,7 @@ class BigBirdModel(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.pooler = nn.Linear(embed_dim, 2)
+        self.pooler = nn.Linear(embed_dim, num_classes)
 
     def forward(self, input_ids):
         hidden_states = self.embedding(input_ids)
@@ -195,15 +196,23 @@ def test(model, device, test_loader, criterion):
             correct += pred.eq(labels.view_as(pred)).sum().item()
     end_time = time.time()
     test_loss /= len(test_loader.dataset)
+    accuracy = 100.0 * correct / len(test_loader.dataset)
     print(
-        f"\nTest set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({100. * correct / len(test_loader.dataset):.0f}%)\n"
+        f"\nTest set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n"
     )
-    print(f"Inference time: {end_time - start_time}s")
+    print(f"Inference time: {end_time - start_time:.2f}s")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Big Bird Sparse Transformer Benchmark"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="imdb",
+        choices=["imdb", "ag_news"],
+        help="dataset to use for training and testing (default: imdb)",
     )
     parser.add_argument(
         "--mode",
@@ -219,7 +228,7 @@ def main():
         help="input batch size for training (default: 64)",
     )
     parser.add_argument(
-        "--epochs", type=int, default=1, help="number of epochs to train (default: 5)"
+        "--epochs", type=int, default=1, help="number of epochs to train (default: 1)"
     )
     parser.add_argument(
         "--lr", type=float, default=0.001, help="learning rate (default: 0.001)"
@@ -234,14 +243,20 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load and preprocess the IMDB dataset
+    # Load and preprocess the dataset
+    if args.dataset == "imdb":
+        train_iter, test_iter = IMDB(split=("train", "test"))
+        num_classes = 2
+    else:
+        train_iter, test_iter = AG_NEWS(split=("train", "test"))
+        num_classes = 4
+
     tokenizer = get_tokenizer("basic_english")
 
     def yield_tokens(data_iter):
         for _, text in data_iter:
             yield tokenizer(text)
 
-    train_iter, test_iter = IMDB(split=("train", "test"))
     vocab = build_vocab_from_iterator(yield_tokens(train_iter), specials=["<unk>"])
     vocab.set_default_index(vocab["<unk>"])
 
@@ -249,15 +264,19 @@ def main():
         return vocab(tokenizer(x))
 
     def label_pipeline(x):
-        return 1 if x == "pos" else 0
+        return int(x) - 1 if args.dataset == "ag_news" else 1 if x == "pos" else 0
 
-    # Create data loaders
-    train_dataset = list(
-        map(lambda x: (label_pipeline(x[0]), text_pipeline(x[1])), train_iter)
-    )
-    test_dataset = list(
-        map(lambda x: (label_pipeline(x[0]), text_pipeline(x[1])), test_iter)
-    )
+    train_iter, test_iter = IMDB(split=("train", "test"))
+    train_dataset = list(train_iter)
+    test_dataset = list(test_iter)
+
+    train_dataset = [
+        (label_pipeline(label), text_pipeline(text)) for label, text in train_dataset
+    ]
+    test_dataset = [
+        (label_pipeline(label), text_pipeline(text)) for label, text in test_dataset
+    ]
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -268,30 +287,30 @@ def main():
         test_dataset, batch_size=args.batch_size, collate_fn=collate_batch
     )
 
-    # Initialize the model
     model = BigBirdModel(
-        len(vocab),
+        vocab_size=len(vocab),
         embed_dim=128,
-        num_heads=2,
+        num_heads=4,
         num_layers=2,
         block_size=16,
-        num_random_blocks=3,
-        num_sliding_blocks=3,
+        num_random_blocks=2,
+        num_sliding_blocks=2,
         intermediate_size=256,
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
+        num_classes=num_classes,
     ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
     criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     if args.mode == "train":
         for epoch in range(1, args.epochs + 1):
             train(model, device, train_loader, optimizer, criterion, epoch)
+            test(model, device, test_loader, criterion)
         torch.save(model.state_dict(), args.model_path)
-        print(f"Model saved to {args.model_path}")
     else:
         model.load_state_dict(torch.load(args.model_path))
-        print(f"Model loaded from {args.model_path}")
         test(model, device, test_loader, criterion)
 
 
