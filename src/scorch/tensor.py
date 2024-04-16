@@ -217,7 +217,7 @@ class Tensor(torch.nn.Module):
         for i in range(len(self.shape))[::-1]:
             rhs = f"ForAll(a_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
-        # pdb.set_trace()
+        pdb.set_trace()
 
         lowerer = CINLowerer()
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -359,6 +359,20 @@ class Tensor(torch.nn.Module):
             torch_tensor = torch_tensor.type(self.dtype)
         # Reshape the torch.Tensor to the original shape
         torch_tensor = torch_tensor.reshape(dense_tensor.shape)
+
+        def generate_mode_order_permutation(mode_order_start: List[int], mode_order_end: List[int]) -> List[int]:
+            permutation_ = []
+            for dim in mode_order_end:
+                permutation_.append(mode_order_start.index(dim))
+            return permutation_
+
+        # permute torch_tensor if it has non-default mode order
+        default_mode_order = [i for i in range(self.dim())]
+
+        if self._storage._index.mode_order and self._storage._index.mode_order != default_mode_order:
+            permutation = generate_mode_order_permutation(self._storage._index.mode_order, default_mode_order)
+            torch_tensor = torch_tensor.permute(*permutation)
+
         return torch_tensor
 
     def to_dense(
@@ -392,6 +406,7 @@ class Tensor(torch.nn.Module):
                 name="B",
                 fmt=self.format,
                 dtype=self.dtype,
+                mode_order=self._storage._index.mode_order
             )
         else:
             B = TensorVar(
@@ -403,6 +418,7 @@ class Tensor(torch.nn.Module):
                     ]
                 ),
                 dtype=self.dtype,
+                mode_order=self._storage._index.mode_order
             )
 
         if fmt is None:
@@ -420,6 +436,7 @@ class Tensor(torch.nn.Module):
             name="A",
             fmt=output_format,
             dtype=self.dtype,
+            mode_order=self._storage._index.mode_order
         )
 
         # Assert A, B, and index_vars are defined
@@ -490,6 +507,7 @@ class Tensor(torch.nn.Module):
     def to_sparse(
         self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None
     ) -> Tensor:
+        # pdb.set_trace()
         """Convert the Scorch tensor to a sparse Scorch tensor."""
         if len(self.shape) == 1:
             # Find indexes of non-zero elements in self.values, flatten them
