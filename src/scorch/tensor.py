@@ -166,8 +166,17 @@ class Tensor(torch.nn.Module):
 
     def __add__(self, other) -> Tensor:
         """Add two tensors together."""
+        # Change mode order of other to match self if they are different (naive)
+        other_fmt = other.format
+        if self._storage._index.mode_order != other._storage._index.mode_order:
+            other = Tensor.from_torch(other.to_torch(), other.name, self._storage._index.mode_order)
+
+        if not other_fmt.is_dense():
+            other.to_sparse(other_fmt)
+
         # Perform element-wise addition
         # TODO: support broadcasting
+        # index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
         a_index_vars = ([IndexVar(f"i{i}") for i in self._storage._index.mode_order])
         b_index_vars = ([IndexVar(f"i{i}") for i in self._storage._index.mode_order])
         c_index_vars = ([IndexVar(f"i{i}") for i in other._storage._index.mode_order])
@@ -217,7 +226,7 @@ class Tensor(torch.nn.Module):
         for i in range(len(self.shape))[::-1]:
             rhs = f"ForAll(a_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
-        pdb.set_trace()
+        # pdb.set_trace()
 
         lowerer = CINLowerer()
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -538,9 +547,8 @@ class Tensor(torch.nn.Module):
             else:
                 index_vars = default_index_vars[: len(self.shape)]
 
-            # permute index_vars based off self._storage._index.mode_order
-            if self._storage._index.mode_order:
-                index_vars = [index_vars[i] for i in self._storage._index.mode_order]
+            # permute index_vars based on self._storage._index.mode_order
+            index_vars = [index_vars[i] for i in self._storage._index.mode_order]
 
             if self.has_index:
                 B = TensorVar(
@@ -573,6 +581,7 @@ class Tensor(torch.nn.Module):
             else:
                 output_format = parse_format(fmt)
 
+            # TODO: change output mode_order to mode order that is passed in
             A = TensorVar(
                 name="A",
                 fmt=output_format,
@@ -628,7 +637,6 @@ class Tensor(torch.nn.Module):
                 self.storage.value,
             )
 
-            # TODO: bypassing result_cpp for mode_order, C++ code should be completely unaware?
             self._storage = TensorStorage(
                 index=TensorIndex(
                     tensor_format=output_format,

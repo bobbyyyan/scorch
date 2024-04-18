@@ -202,6 +202,18 @@ def test_elemwise_2d_add_csc_csc_csc():
     # pdb.set_trace()
     print(result)
 
+def test_elemwise_2d_add_csr_csr_coo():
+    a, b, result, _, _ = generate_2d_tensors("ds", "oo", "ds")
+    # pdb.set_trace()
+    result_cpp = a + b
+
+    assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
+    assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
+    assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
+    assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
+    # pdb.set_trace()
+    print(result)
+
 
 def test_elemwise_2d_add_csr_csr_csc():
     a, b, result, _, _ = generate_2d_tensors("ds", "ds", "ds", [0, 1], [1, 0], [0, 1])
@@ -856,7 +868,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
 #     j = IndexVar("j")
 #     k = IndexVar("k")
 #
-#     A = TensorVar("A", fmt=["dense", "sparse"])
+    # A = TensorVar("A", fmt=["dense", "sparse"])
 #     B = TensorVar("B", fmt=["dense", "sparse"])
 #     C = TensorVar("C", fmt=["dense", "sparse"])
 #
