@@ -165,6 +165,7 @@ class STensor(torch.nn.Module):
     def __add__(self, other) -> STensor:
         """Add two tensors together."""
         # Change mode order of other to match self if they are different (naive)
+        # pdb.set_trace()
         other_fmt = other.format
         if self.storage.index.mode_order != other.storage.index.mode_order:
             other = Tensor.from_torch(other.to_torch(), other.name, self.storage.index.mode_order)
@@ -505,7 +506,7 @@ class STensor(torch.nn.Module):
         else:
             index_vars = default_index_vars[: len(self.shape)]
 
-        pdb.set_trace()
+        # pdb.set_trace()
         # permute index_vars based on self._storage._index.mode_order
         if self.storage.index.mode_order:
             index_vars = [index_vars[i] for i in self.storage.index.mode_order]
