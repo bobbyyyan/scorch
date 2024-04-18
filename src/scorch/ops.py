@@ -438,7 +438,7 @@ def einsum(
                 output_level_formats[i - 1] = LevelFormat(LevelType.DENSE)
 
         output_format = TensorFormat(output_level_formats)
-        print(f"\nUnspecified output format, using inferred {output_format}")
+        # print(f"\nUnspecified output format, using inferred {output_format}")
     else:
         output_format = parse_format(output_format)
 
@@ -476,11 +476,11 @@ def einsum(
 
     cin_stmt = eval(rhs)
 
-    print("CIN:\n", cin_stmt)
+    # print("CIN:\n", cin_stmt)
 
     cin_stmt = Scheduler.auto_schedule(cin_stmt)
 
-    print("Auto-scheduled CIN:\n", cin_stmt)
+    # print("Auto-scheduled CIN:\n", cin_stmt)
 
     if str(cin_stmt) in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")

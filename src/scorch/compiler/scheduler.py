@@ -458,10 +458,10 @@ class Scheduler:
         all_index_vars = cin.index_vars
         tensor_accesses = cin.tensor_accesses
 
-        print("Auto-scheduling CIN statement" f"\n{cin}")
+        # print("Auto-scheduling CIN statement" f"\n{cin}")
 
-        print(f"Index vars: {all_index_vars}")
-        print(f"Tensor accesses: {tensor_accesses}")
+        # print(f"Index vars: {all_index_vars}")
+        # print(f"Tensor accesses: {tensor_accesses}")
 
         index_vars_to_tile: List[IndexVar] = []
         index_vars_sparse: Set[IndexVar] = set()
@@ -507,7 +507,7 @@ class Scheduler:
             if index_var not in cin.no_tile_list
         ]
 
-        print(f"Index vars to tile: {index_vars_to_tile}")
+        # print(f"Index vars to tile: {index_vars_to_tile}")
 
         for index_var in index_vars_to_tile:
             cin = Scheduler.add_tile(cin, index_var, 32)
