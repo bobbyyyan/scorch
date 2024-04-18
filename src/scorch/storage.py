@@ -50,8 +50,7 @@ class TensorIndex(object):
                     if index.dtype != torch.int:
                         self.mode_indices[i][j] = index.int()
 
-        # TODO: should you allow to be None?
-        self.mode_order = mode_order
+        self.mode_order = mode_order if mode_order else [i for i in range(self.get_order())]
 
     def __str__(self):
         return "TensorIndex({})".format(self.format)

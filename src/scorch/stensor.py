@@ -164,6 +164,14 @@ class STensor(torch.nn.Module):
 
     def __add__(self, other) -> STensor:
         """Add two tensors together."""
+        # Change mode order of other to match self if they are different (naive)
+        other_fmt = other.format
+        if self.storage.index.mode_order != other.storage.index.mode_order:
+            other = Tensor.from_torch(other.to_torch(), other.name, self.storage.index.mode_order)
+
+        if not other_fmt.is_dense():
+            other.to_sparse(other_fmt)
+
         # Perform element-wise addition
         # TODO: support broadcasting
         a_index_vars = ([IndexVar(f"i{i}") for i in self.storage.index.mode_order])
@@ -214,6 +222,7 @@ class STensor(torch.nn.Module):
         for i in range(len(self.shape))[::-1]:
             rhs = f"ForAll(a_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
+        # pdb.set_trace()
 
         lowerer = CINLowerer()
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -637,9 +646,8 @@ class STensor(torch.nn.Module):
             else:
                 index_vars = default_index_vars[: len(self.shape)]
 
-            # permute index_vars based off self._storage._index.mode_order
-            if self.storage.index.mode_order:
-                index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+            # permute index_vars based on self._storage._index.mode_order
+            index_vars = [index_vars[i] for i in self.storage.index.mode_order]
 
             if self.has_index:
                 B = TensorVar(
