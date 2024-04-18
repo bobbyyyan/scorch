@@ -48,31 +48,50 @@ class BigBirdSparseAttention(nn.Module):
             self.head_dim**0.5 + 1e-6
         )
 
-        # Create sparse attention mask
-        mask = torch.ones(
-            batch_size, self.num_heads, seq_length, seq_length, dtype=torch.bool
-        )
-        mask[:, :, :: self.block_size, :: self.block_size] = False
-        for i in range(self.num_sliding_blocks):
-            mask[
-                :, :, i : seq_length - self.block_size + i + 1, i : i + self.block_size
-            ] = False
-            mask[
-                :, :, i : i + self.block_size, i : seq_length - self.block_size + i + 1
-            ] = False
+        # Compute sparse indices for the attention mask
+        indices = []
+        for b in range(batch_size):
+            for h in range(self.num_heads):
+                for i in range(seq_length):
+                    for j in range(
+                        max(0, i - self.num_sliding_blocks),
+                        min(seq_length, i + self.num_sliding_blocks + 1),
+                    ):
+                        if i % self.block_size == 0 and j % self.block_size == 0:
+                            indices.append((b, h, i, j))
 
-        # Apply mask to attention scores: set masked positions to a large negative value
-        attention_scores = attention_scores.masked_fill(mask, float("-inf"))
+        # Convert indices to tensor
+        indices = torch.tensor(indices, dtype=torch.long).t()
+
+        # Extract the values at these indices from attention_scores
+        values = attention_scores.view(-1)[
+            indices[0]
+            * attention_scores.size(1)
+            * attention_scores.size(2)
+            * attention_scores.size(3)
+            + indices[1] * attention_scores.size(2) * attention_scores.size(3)
+            + indices[2] * attention_scores.size(3)
+            + indices[3]
+        ]
+
+        sparse_attention_scores = torch.sparse_coo_tensor(
+            indices, values, attention_scores.size()
+        )
 
         # Apply softmax to sparse attention scores
-        attention_probs = torch.softmax(attention_scores, dim=-1)
+        attention_probs = torch.sparse.softmax(sparse_attention_scores, dim=-1)
 
         # Perform sparse matrix multiplication
-        start_time = time.time()
-        context = torch.einsum("bhij,bhjd->bhid", attention_probs, value)
-        end_time = time.time()
-        print(f"Sparse matrix multiplication time: {end_time - start_time}s")
+        # start_time = time.time()
+        context = torch.einsum("bhij,bhjd->bhid", attention_probs.to_dense(), value)
+        # end_time = time.time()
+        # print(f"einsum time: {end_time - start_time}s")
         context = context.contiguous().view(batch_size, seq_length, self.embed_dim)
+
+        # Reshape back to the original context size
+        context = context.transpose(1, 2).reshape(
+            batch_size, seq_length, self.embed_dim
+        )
 
         return context
 
@@ -236,10 +255,12 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="bigbird_model_sparse.pt",
         help="path to save/load the model",
     )
     args = parser.parse_args()
+
+    if args.model_path is None:
+        args.model_path = f"model/bigbird_model_sparse_{args.dataset}.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -266,7 +287,6 @@ def main():
     def label_pipeline(x):
         return int(x) - 1 if args.dataset == "ag_news" else 1 if x == "pos" else 0
 
-    train_iter, test_iter = IMDB(split=("train", "test"))
     train_dataset = list(train_iter)
     test_dataset = list(test_iter)
 
