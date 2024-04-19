@@ -556,7 +556,7 @@ class TensorVar(IndexExpr):
             self.format = parse_format(fmt)
 
         self.dtype = dtype
-        self.mode_order = mode_order
+        self.mode_order = mode_order if mode_order else [i for i in range(self.levels)]
 
     @property
     def name(self) -> str:

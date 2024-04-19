@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Union
 
 from . import llir
 from .cin import TensorVar, TensorAccess, IndexVar
 from ..format import LevelType
+
+import pdb
+import pprint
 
 
 @dataclass(frozen=False)
@@ -357,23 +360,49 @@ class ModeIterator:
             )
 
             if self.parent_iterator:
-                # e.g. int pB1 = j * B1_size + k;
-                self.coord_var_value_llir = llir.Add(
-                    left=llir.Mul(
-                        left=llir.Var(
-                            name=self.parent_iterator.get_iterator_var_llir().name,
-                            type=llir.DataType.INT,
-                        ),
-                        right=llir.Var(
-                            name=f"{self.tensor_var.name}{self.level}_size",
-                            type=llir.DataType.INT,
-                        ),
-                    ),
-                    right=llir.Var(
-                        name=self.index_var.name,
+                def find_coord_var_value_llir(
+                        curr_iterator: ModeIterator,
+                        prev_levels_size: Optional[Union[llir.Var, llir.Mul]]
+                ):
+                    curr_index_var = llir.Var(
+                        name=curr_iterator.index_var.name,
                         type=llir.DataType.INT,
-                    ),
-                )
+                    )
+
+                    if curr_iterator._level == 0:
+                        if prev_levels_size is None:
+                            return curr_index_var
+                        else:
+                            return llir.Mul(
+                                left=curr_index_var,
+                                right=prev_levels_size
+                            )
+                    else:
+                        if prev_levels_size is None:
+                            cur_level_size = curr_index_var
+                            prev_levels_size = llir.Var(
+                                name=f"{curr_iterator.tensor_var.name}{curr_iterator._level}_size",
+                                type=llir.DataType.INT
+                            )
+                        else:
+                            cur_level_size = llir.Mul(
+                                left=curr_index_var,
+                                right=prev_levels_size
+                            )
+                            prev_levels_size = llir.Mul(
+                                left=llir.Var(
+                                    name=f"{curr_iterator.tensor_var.name}{curr_iterator._level}_size",
+                                    type=llir.DataType.INT
+                                ),
+                                right=prev_levels_size
+                            )
+
+                        return llir.Add(
+                            left=find_coord_var_value_llir(curr_iterator.parent_iterator, prev_levels_size),
+                            right=cur_level_size
+                        )
+
+                self.coord_var_value_llir = find_coord_var_value_llir(self, None)
 
                 self.coord_var_value_depends_on.extend(
                     [self.index_var, self.parent_iterator.index_var]
