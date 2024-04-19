@@ -12,7 +12,13 @@ from torchtext.vocab import build_vocab_from_iterator
 
 class BigBirdSparseAttention(nn.Module):
     def __init__(
-        self, embed_dim, num_heads, block_size, num_random_blocks, num_sliding_blocks
+        self,
+        embed_dim,
+        num_heads,
+        block_size,
+        num_random_blocks,
+        num_sliding_blocks,
+        inference=False,
     ):
         super(BigBirdSparseAttention, self).__init__()
         self.embed_dim = embed_dim
@@ -20,6 +26,7 @@ class BigBirdSparseAttention(nn.Module):
         self.block_size = block_size
         self.num_random_blocks = num_random_blocks
         self.num_sliding_blocks = num_sliding_blocks
+        self.inference = inference
         self.head_dim = embed_dim // num_heads
         self.query = nn.Linear(embed_dim, embed_dim)
         self.key = nn.Linear(embed_dim, embed_dim)
@@ -80,12 +87,23 @@ class BigBirdSparseAttention(nn.Module):
 
         # Apply softmax to sparse attention scores
         attention_probs = torch.sparse.softmax(sparse_attention_scores, dim=-1)
+        if self.inference:
+            batch_size, num_heads, seq_len, _ = attention_probs.shape
+            hidden_size = value.shape[-1]
 
-        # Perform sparse matrix multiplication
-        # start_time = time.time()
-        context = torch.einsum("bhij,bhjd->bhid", attention_probs.to_dense(), value)
-        # end_time = time.time()
-        # print(f"einsum time: {end_time - start_time}s")
+            context = torch.zeros(
+                batch_size, num_heads, seq_len, hidden_size, device=value.device
+            )
+
+            for b in range(batch_size):
+                for h in range(num_heads):
+                    attention_probs_bh = attention_probs[
+                        b, h
+                    ]  # (seq_len, seq_len) sparse tensor
+                    value_bh = value[b, h]  # (seq_len, hidden_size) dense tensor
+                    context[b, h] = torch.sparse.mm(attention_probs_bh, value_bh)
+        else:
+            context = torch.einsum("bhij,bhjd->bhid", attention_probs.to_dense(), value)
         context = context.contiguous().view(batch_size, seq_length, self.embed_dim)
 
         # Reshape back to the original context size
@@ -107,10 +125,16 @@ class BigBirdBlock(nn.Module):
         intermediate_size,
         hidden_dropout_prob,
         attention_probs_dropout_prob,
+        inference=False,
     ):
         super(BigBirdBlock, self).__init__()
         self.attention = BigBirdSparseAttention(
-            embed_dim, num_heads, block_size, num_random_blocks, num_sliding_blocks
+            embed_dim,
+            num_heads,
+            block_size,
+            num_random_blocks,
+            num_sliding_blocks,
+            inference,
         )
         self.intermediate = nn.Linear(embed_dim, intermediate_size)
         self.output = nn.Linear(intermediate_size, embed_dim)
@@ -147,6 +171,7 @@ class BigBirdModel(nn.Module):
         hidden_dropout_prob,
         attention_probs_dropout_prob,
         num_classes,
+        inference=False,
     ):
         super(BigBirdModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -161,6 +186,7 @@ class BigBirdModel(nn.Module):
                     intermediate_size,
                     hidden_dropout_prob,
                     attention_probs_dropout_prob,
+                    inference,
                 )
                 for _ in range(num_layers)
             ]
@@ -307,6 +333,8 @@ def main():
         test_dataset, batch_size=args.batch_size, collate_fn=collate_batch
     )
 
+    is_inference = args.mode == "test"
+
     model = BigBirdModel(
         vocab_size=len(vocab),
         embed_dim=128,
@@ -319,19 +347,20 @@ def main():
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         num_classes=num_classes,
+        inference=is_inference,
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    if args.mode == "train":
+    if is_inference:
+        model.load_state_dict(torch.load(args.model_path))
+        test(model, device, test_loader, criterion)
+    else:
         for epoch in range(1, args.epochs + 1):
             train(model, device, train_loader, optimizer, criterion, epoch)
             test(model, device, test_loader, criterion)
         torch.save(model.state_dict(), args.model_path)
-    else:
-        model.load_state_dict(torch.load(args.model_path))
-        test(model, device, test_loader, criterion)
 
 
 if __name__ == "__main__":

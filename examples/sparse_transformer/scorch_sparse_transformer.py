@@ -82,11 +82,7 @@ class BigBirdSparseAttention(nn.Module):
         # Apply softmax to sparse attention scores
         attention_probs = torch.sparse.softmax(sparse_attention_scores, dim=-1)
 
-        # Perform sparse matrix multiplication
-        # start_time = time.time()
         context = scorch.einsum("bhij,bhjd->bhid", attention_probs, value).to_torch()
-        # end_time = time.time()
-        # print(f"sparse einsum time: {end_time - start_time}s")
         context = context.contiguous().view(batch_size, seq_length, self.embed_dim)
 
         # Reshape back to the original context size
