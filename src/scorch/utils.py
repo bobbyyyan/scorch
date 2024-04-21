@@ -43,7 +43,8 @@ def load_to_kernel_cache(
         name=kernel_name,
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+        # extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+        extra_cflags=["-O3", "-ffast-math", "-fno-signed-zeros"],
         build_directory=PROJECT_ROOT_DIR / "build",
     )
     end_time = time.time()
