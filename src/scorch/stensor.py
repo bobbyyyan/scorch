@@ -170,8 +170,8 @@ class STensor(torch.nn.Module):
         if self.storage.index.mode_order != other.storage.index.mode_order:
             other = Tensor.from_torch(other.to_torch(), other.name, self.storage.index.mode_order)
 
-        if not other_fmt.is_dense():
-            other.to_sparse(other_fmt)
+            if not other_fmt.is_dense():
+                other.to_sparse(other_fmt)
 
         # Perform element-wise addition
         # TODO: support broadcasting

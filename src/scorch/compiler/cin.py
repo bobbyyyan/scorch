@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import pdb
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
@@ -556,7 +558,7 @@ class TensorVar(IndexExpr):
             self.format = parse_format(fmt)
 
         self.dtype = dtype
-        self.mode_order = mode_order if mode_order else [i for i in range(self.levels)]
+        self.mode_order = mode_order if mode_order else ([i for i in range(self.levels)] if fmt else None)
 
     @property
     def name(self) -> str:
@@ -576,7 +578,7 @@ class TensorVar(IndexExpr):
         return self.format
 
     def get_mode_order(self) -> Optional[List[int]]:
-        return self.format
+        return self.mode_order
 
     def get_level_types(self) -> List[LevelType]:
         return self.get_format().get_level_types()

@@ -1,4 +1,5 @@
 # pretty print
+import pdb
 import pprint
 import time
 from itertools import product
@@ -203,7 +204,7 @@ def test_elemwise_matrix_mul_oo_oo_oo():
     a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
     b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
 
-    result = einsum("ij->ij", a_sparse, b_sparse, format="oo")
+    result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
 
     assert result.shape == (5, 5)
     assert len(result.index.mode_indices) == 2
