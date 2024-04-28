@@ -2,7 +2,7 @@ import time
 
 import torch
 
-from scorch import Tensor, matmul, einsum
+from scorch import STensor, matmul, einsum
 from scorch.compiler.cin import (
     TensorAssign,
     ForAll,
@@ -33,8 +33,8 @@ def test_spmm_dd_ds_dd_tiled_time():
     torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("ds")
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("ds")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
     i = IndexVar("i")
     j = IndexVar("j")
@@ -117,8 +117,8 @@ def test_spmm_dd_ds_dd_time():
     # torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("ds")
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("ds")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
     time_dict = {}
     start_time = time.time()
@@ -157,8 +157,8 @@ def test_spmv_d_oo_d_time():
     torch_result = torch.matmul(random_tensor_a_sparse, random_tensor_x)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("oo")
-    tensor_x_scorch = Tensor.from_torch(random_tensor_x, "x")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("oo")
+    tensor_x_scorch = STensor.from_torch(random_tensor_x, "x")
 
     time_dict = {}
     start_time = time.time()
@@ -200,9 +200,9 @@ def test_sddmm_dd_ds_dd_dd_time():
     )
     torch_time = time.time() - start_time
 
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse("ds")
-    tensor_c_scorch = Tensor.from_torch(random_tensor_c, "C")
-    tensor_d_scorch = Tensor.from_torch(random_tensor_d, "D")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B").to_sparse("ds")
+    tensor_c_scorch = STensor.from_torch(random_tensor_c, "C")
+    tensor_d_scorch = STensor.from_torch(random_tensor_d, "D")
 
     time_dict = {}
     start_time = time.time()

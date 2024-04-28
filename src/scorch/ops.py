@@ -21,7 +21,7 @@ from .compiler.codegen import LLIRLowerer
 from .compiler.scheduler import Scheduler
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorIndex
-from .tensor import Tensor
+from .stensor import STensor
 from .utils import parse_format, topo_sort_characters, load_to_kernel_cache
 
 PROJECT_ROOT_DIR = Path(__file__)
@@ -46,11 +46,11 @@ _kernel_cache = {}
 
 
 def spmv(
-    a: Tensor,
-    b: Tensor,
+    a: STensor,
+    b: STensor,
     output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
     **kwargs,
-) -> Tensor:
+) -> STensor:
     if output_format is None:
         output_format = parse_format("d")
     elif not isinstance(output_format, TensorFormat):
@@ -123,7 +123,7 @@ def spmv(
         time_dict["eval_time"] = eval_time
     # m
 
-    result = Tensor(
+    result = STensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -136,15 +136,15 @@ def spmv(
 
 
 def matmul_wksp(
-    a: Union[torch.Tensor, Tensor],
-    b: Union[torch.Tensor, Tensor],
+    a: Union[torch.Tensor, STensor],
+    b: Union[torch.Tensor, STensor],
     output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
     **kwargs,
-) -> Tensor:
+) -> STensor:
     if isinstance(a, torch.Tensor):
-        a = Tensor.from_torch(a).to_sparse()
+        a = STensor.from_torch(a).to_sparse()
     if isinstance(b, torch.Tensor):
-        b = Tensor.from_torch(b).to_sparse()
+        b = STensor.from_torch(b).to_sparse()
 
     if output_format is None:
         output_format = parse_format("ds")
@@ -233,7 +233,7 @@ def matmul_wksp(
         time_dict["eval_time"] = eval_time
     # print("Time taken for evaluate:", eval_time)
 
-    result = Tensor(
+    result = STensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -246,24 +246,27 @@ def matmul_wksp(
 
 
 def matmul(
-    a: Union[torch.Tensor, Tensor],
-    b: Union[torch.Tensor, Tensor],
+    a: Union[torch.Tensor, STensor],
+    b: Union[torch.Tensor, STensor],
     **kwargs: Any,
-) -> Tensor:
-    """Perform a matrix multiplication."""
+) -> Union[torch.Tensor, STensor]:
+    """Matrix multiplication."""
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         if a.is_sparse_csr and not b.is_sparse:
             # SpMM
-            a = Tensor.from_csr(a)
-            b = Tensor.from_torch(b)
+            device = a.device
+            a = STensor.from_csr(a)
+            b = STensor.from_torch(b)
         else:
-            result = torch.matmul(a, b)
-            return Tensor.from_torch(result)
+            return torch.matmul(a, b)
 
     if isinstance(a, torch.Tensor):
-        a = Tensor.from_torch(a)
+        a = STensor.from_torch(a)
     if isinstance(b, torch.Tensor):
-        b = Tensor.from_torch(b)
+        b = STensor.from_torch(b)
 
     if a.dim() == 2 and b.dim() == 1:
         return spmv(a, b, **kwargs)
@@ -271,6 +274,7 @@ def matmul(
     use_cache = kwargs.get("use_cache", True)
 
     if str(a.format) == "d,s" and str(b.format) == "d,d" and use_cache:
+
         result_shape = (a.shape[0], b.shape[1])
         args = [result_shape]
 
@@ -285,7 +289,7 @@ def matmul(
         result_cpp = spmm_csr(*args)
         end_time = time.time()
         eval_time = end_time - start_time
-        print("[spmm_csr] eval_time:", eval_time)
+        # print("[spmm_csr] eval_time:", eval_time)
         if "time_dict" in kwargs:
             kwargs["time_dict"]["eval_time"] = eval_time
 
@@ -297,7 +301,7 @@ def matmul(
         #     eval_time = end_time - start_time
         #     print("[spmm_csr_ones] eval_time:", eval_time)
 
-        result = Tensor(
+        result = STensor(
             shape=result_shape,
             index=TensorIndex(
                 mode_indices=result_cpp.storage.index.mode_indices,
@@ -305,7 +309,8 @@ def matmul(
             ),
             value=result_cpp.storage.value,
         )
-
+        result = result.to_torch()
+        result = result.to(device)
         return result
 
     return einsum("ij,jk->ik", a, b, **kwargs)
@@ -313,10 +318,10 @@ def matmul(
 
 def einsum(
     expression: str,
-    *tensors: Optional[Union[torch.Tensor, Tensor]],
+    *tensors: Optional[Union[torch.Tensor, STensor]],
     compile_only: Optional[bool] = False,
     **kwargs: Any,
-) -> Tensor:
+) -> STensor:
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
     # elementwise multiplication or "ik,kj->ij" for matrix multiplication
 
@@ -349,9 +354,9 @@ def einsum(
     tensors_new = []
     for index_strs, tensor in zip(input_index_strs, tensors):
         if isinstance(tensor, torch.Tensor):
-            tensor = Tensor.from_torch(tensor)
+            tensor = STensor.from_torch(tensor)
 
-        assert isinstance(tensor, Tensor), "Input tensor is not a Scorch Tensor"
+        assert isinstance(tensor, STensor), "Input tensor is not a Scorch Tensor"
         tensors_new.append(tensor)
 
         for i, index_str in enumerate(index_strs):
@@ -368,7 +373,7 @@ def einsum(
     tensor_names_available = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     output_tensor_dtype = None
     for i, tensor in enumerate(tensors):
-        if isinstance(tensor, Tensor):
+        if isinstance(tensor, STensor):
             tensor_name = tensor_names_available.pop(0)
             tensor_vars.append(
                 TensorVar(name=tensor_name, fmt=tensor.format, dtype=tensor.dtype)
@@ -542,13 +547,13 @@ def einsum(
         print(f"Cached kernel for {cin_stmt}")
 
     if compile_only:
-        return Tensor("Compile only")
+        return STensor("Compile only")
 
     # Create a mapping from each index string to the size of the dimension
     # it indexes
     index_str_to_size = {}
     for index_strs, tensor in zip(input_index_strs, tensors):
-        assert isinstance(tensor, Tensor)
+        assert isinstance(tensor, STensor)
         for i, index_str in enumerate(index_strs):
             if index_str not in index_str_to_size:
                 index_str_to_size[index_str] = tensor.shape[i]
@@ -571,7 +576,7 @@ def einsum(
     eval_time = end_time - start_time
     # print("Time taken for evaluate:", eval_time)
 
-    result = Tensor(
+    result = STensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -588,17 +593,17 @@ def einsum(
 
 
 def lower_and_exec_cin(
-    cin_stmt: IndexStmt, result_shape: Sequence[int], *args: Tensor, **kwargs
-) -> Tensor:
+    cin_stmt: IndexStmt, result_shape: Sequence[int], *args: STensor, **kwargs
+) -> STensor:
     """Lower a CIN statement to LLIR then codegen and call on the input tensors.
 
     Args:
         cin_stmt (IndexStmt): CIN statement to lower.
         result_shape (Sequence[int]): Shape of the result tensor.
-        *args (Tensor): Input tensors.
+        *args (STensor): Input tensors.
 
     Returns:
-        Tensor: Output tensor.
+        STensor: Output tensor.
     """
     # Lower to LLIR
     lowerer = CINLowerer()
@@ -630,7 +635,7 @@ def lower_and_exec_cin(
     if "time_dict" in kwargs:
         kwargs["time_dict"]["eval_time"] = eval_time
 
-    result = Tensor(
+    result = STensor(
         shape=tuple(result_shape),
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -643,9 +648,9 @@ def lower_and_exec_cin(
 
 
 def precompile_kernels():
-    DS = Tensor(index=TensorIndex(tensor_format="ds"))
-    DD = Tensor(index=TensorIndex(tensor_format="dd"))
-    OO = Tensor(index=TensorIndex(tensor_format="oo"))
+    DS = STensor(index=TensorIndex(tensor_format="ds"))
+    DD = STensor(index=TensorIndex(tensor_format="dd"))
+    OO = STensor(index=TensorIndex(tensor_format="oo"))
 
     einsum("ik,kj->ij", DS, DD, compile_only=True, format="dd")
     einsum("ik,kj->ij", OO, DD, compile_only=True, format="dd")

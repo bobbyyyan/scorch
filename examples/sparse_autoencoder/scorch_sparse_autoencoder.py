@@ -1,11 +1,10 @@
 import argparse
 import time
-import torch
+import scorch as torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-import scorch
 
 import warnings
 
@@ -35,7 +34,7 @@ class SparseLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, input):
-        return scorch.matmul(input, self.weight.t()) + self.bias
+        return torch.matmul(input, self.weight.t()) + self.bias
 
 
 class SparseAutoencoder(nn.Module):
@@ -213,9 +212,7 @@ def main():
 
     elif args.mode == "test":
         model.load_state_dict(
-            torch.load(
-                f"models/{dataset_name}_sparse_autoencoder.pt", map_location=device
-            )
+            torch.load(f"models/{dataset_name}_sparse_autoencoder.pt")
         )
         test(model, device, test_loader)
 

@@ -212,9 +212,7 @@ def main():
 
     elif args.mode == "test":
         model.load_state_dict(
-            torch.load(
-                f"models/{dataset_name}_sparse_autoencoder.pt", map_location=device
-            )
+            torch.load(f"models/{dataset_name}_sparse_autoencoder.pt")
         )
         test(model, device, test_loader)
 

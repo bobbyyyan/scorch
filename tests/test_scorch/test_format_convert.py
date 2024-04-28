@@ -1,12 +1,12 @@
 import torch
 
-from scorch import Tensor
+from scorch import STensor
 from scorch.storage import TensorIndex
 
 
 def test_2d_ss_oo():
     # Test converting a COO matrix to a DCSR (sparse, sparse) matrix
-    matrix = Tensor(
+    matrix = STensor(
         shape=(5, 5),
         index=TensorIndex(
             tensor_format="oo",
@@ -33,7 +33,7 @@ def test_2d_ds_oo_random():
     torch_tensor = torch.rand(10, 10)
     # Randomly sparsify
     torch_tensor[torch.rand(10, 10) < 0.9] = 0
-    scorch_tensor = Tensor.from_torch(torch_tensor).to_sparse("oo")
+    scorch_tensor = STensor.from_torch(torch_tensor).to_sparse("oo")
     scorch_tensor = scorch_tensor.to_sparse("ds")
 
     assert torch.allclose(torch_tensor, scorch_tensor.to_torch())
@@ -55,7 +55,7 @@ def test_2d_ds_oo_2():
             0.8072,
         ]
     )
-    matrix = Tensor.from_coo(
+    matrix = STensor.from_coo(
         indices=torch.tensor(
             [[0, 1, 1, 2, 2, 3, 3, 5, 5, 6, 9], [6, 0, 9, 2, 9, 0, 6, 0, 7, 1, 5]]
         ),
@@ -86,7 +86,7 @@ def test_2d_ds_oo_2():
 
 def test_2d_ds_oo():
     # Test converting a COO matrix to a CSR (dense, sparse) matrix
-    matrix = Tensor(
+    matrix = STensor(
         shape=(5, 5),
         index=TensorIndex(
             tensor_format="oo",
@@ -117,7 +117,7 @@ def test_2d_oo_dd():
             [0, 0, 0, 0, 5],
         ]
     )
-    matrix = Tensor.from_torch(matrix)
+    matrix = STensor.from_torch(matrix)
 
     matrix = matrix.to_sparse("oo")
 
@@ -131,7 +131,7 @@ def test_2d_oo_dd():
 
 def test_2d_dd_ds():
     # Test converting a CSR matrix to a dense matrix
-    coo_matrix = Tensor(
+    coo_matrix = STensor(
         shape=(5, 5),
         index=TensorIndex(
             tensor_format="oo",
@@ -154,7 +154,7 @@ def test_2d_dd_ds():
 
 def test_2d_dd_oo():
     # Test converting a COO matrix to a dense matrix
-    matrix = Tensor(
+    matrix = STensor(
         shape=(5, 5),
         index=TensorIndex(
             tensor_format="oo",
@@ -212,7 +212,7 @@ def test_2d_ss_dd():
             [0, 0, 0, 0, 8],
         ]
     )
-    matrix = Tensor.from_torch(matrix)
+    matrix = STensor.from_torch(matrix)
     matrix.to_sparse("ss")
 
     assert len(matrix.index.mode_indices) == 2

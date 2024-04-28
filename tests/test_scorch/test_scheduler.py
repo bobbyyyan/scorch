@@ -2,7 +2,7 @@ import time
 
 import torch
 
-from scorch import Tensor, matmul
+from scorch import STensor, matmul
 from scorch.compiler.cin import IndexVar, ForAll, TensorAssign, TensorVar, Operation
 from scorch.compiler.scheduler import Scheduler
 
@@ -74,8 +74,8 @@ def test_spmm_dd_oo_dd_smaller_than_tilesize():
     # torch_result = torch.sparse.mm(random_tensor_a_coo, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("oo")
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("oo")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
     time_dict = {}
     start_time = time.time()

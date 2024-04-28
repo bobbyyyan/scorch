@@ -36,7 +36,7 @@ class Window(object):
         return Window(deepcopy(self.offset), deepcopy(self.shape), deepcopy(self.step))
 
 
-class Tensor(torch.nn.Module):
+class STensor(torch.nn.Module):
     """A tensor stored in custom format."""
 
     _name: Optional[str]
@@ -162,7 +162,7 @@ class Tensor(torch.nn.Module):
         """Get the number of dimensions."""
         return len(self.shape)
 
-    def __add__(self, other) -> Tensor:
+    def __add__(self, other) -> STensor:
         """Add two tensors together."""
         # Perform element-wise addition
         # TODO: support broadcasting
@@ -234,7 +234,7 @@ class Tensor(torch.nn.Module):
             other.storage.value,
         )
 
-        result = Tensor(
+        result = STensor(
             shape=result_shape,
             index=TensorIndex(
                 mode_indices=result_cpp.storage.index.mode_indices,
@@ -245,13 +245,13 @@ class Tensor(torch.nn.Module):
 
         return result
 
-    def __mul__(self, other) -> Tensor:
+    def __mul__(self, other) -> STensor:
         """Multiply two tensors together."""
         raise NotImplementedError()
 
-    def copy(self) -> Tensor:
+    def copy(self) -> STensor:
         """Copy the tensor."""
-        return Tensor(
+        return STensor(
             name=self._name,
             shape=self.shape,
             storage=self.storage.copy(),
@@ -261,7 +261,7 @@ class Tensor(torch.nn.Module):
     def from_csr(
         csr_matrix: torch.Tensor,
         name: Optional[str] = None,
-    ) -> Tensor:
+    ) -> STensor:
         """
         Create a Tensor from a PyTorch CSR tensor.
 
@@ -285,7 +285,7 @@ class Tensor(torch.nn.Module):
         # We only handle 2D CSR tensors here
         assert len(shape) == 2, "CSR format is only valid for 2D matrices."
 
-        tt_tensor = Tensor(
+        tt_tensor = STensor(
             name=name,
             shape=shape,
             storage=TensorStorage(
@@ -310,7 +310,7 @@ class Tensor(torch.nn.Module):
         values: torch.Tensor,
         shape: Tuple[int, ...],
         name: Optional[str] = None,
-    ) -> Tensor:
+    ) -> STensor:
         """
         Create a Tensor from a COO tensor.
         :param indices:
@@ -327,7 +327,7 @@ class Tensor(torch.nn.Module):
         for i in range(len(shape)):
             mode_indices.append([indices[i]])
 
-        tt_tensor = Tensor(
+        tt_tensor = STensor(
             name=name,
             shape=tuple(shape),
             storage=TensorStorage(
@@ -347,7 +347,7 @@ class Tensor(torch.nn.Module):
         return tt_tensor
 
     @staticmethod
-    def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> Tensor:
+    def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> STensor:
         """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
         # and format is dense at every level
@@ -363,7 +363,7 @@ class Tensor(torch.nn.Module):
                 for i in range(tensor.dim()):
                     mode_indices.append([tensor_indices[i]])
 
-                tt_tensor = Tensor(
+                tt_tensor = STensor(
                     name=name,
                     shape=tuple(tensor.shape),
                     storage=TensorStorage(
@@ -382,7 +382,7 @@ class Tensor(torch.nn.Module):
 
                 return tt_tensor
 
-        tt_tensor = Tensor(
+        tt_tensor = STensor(
             name=name,
             shape=tuple(tensor.shape),
             storage=TensorStorage(
@@ -418,7 +418,7 @@ class Tensor(torch.nn.Module):
         self,
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
         in_place: bool = False,
-    ) -> Tensor:
+    ) -> STensor:
         """Convert the Scorch tensor to a dense Scorch tensor."""
 
         # If self is already dense at every level, return self
@@ -526,7 +526,7 @@ class Tensor(torch.nn.Module):
             self._storage = new_storage
             return self
 
-        new_tensor = Tensor(
+        new_tensor = STensor(
             name=self._name,
             shape=self.shape,
             storage=new_storage,
@@ -536,7 +536,7 @@ class Tensor(torch.nn.Module):
 
     def to_sparse(
         self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None
-    ) -> Tensor:
+    ) -> STensor:
         """Convert the Scorch tensor to a sparse Scorch tensor."""
         if len(self.shape) == 1:
             # Find indexes of non-zero elements in self.values, flatten them
