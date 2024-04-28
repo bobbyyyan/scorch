@@ -507,6 +507,10 @@ class CINLowerer:
                         name=f"coo_workspace<{wksp_ctype.value}, {wksp.dim}>",
                         args=[
                             llir.Literal(value=f"{1024}"),
+                            llir.Var(
+                                name="result_shape",
+                                type=llir.DataType.STD_VECTOR_INT,
+                            )
                         ],
                     ),
                 )
