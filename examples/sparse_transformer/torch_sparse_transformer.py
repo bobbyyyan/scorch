@@ -1,5 +1,6 @@
 import argparse
 import time
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -248,6 +249,19 @@ def test(model, device, test_loader, criterion):
     print(f"Inference time: {end_time - start_time:.2f}s")
 
 
+def YAHOO_ANSWERS(split=("train", "test")):
+    train_df = pd.read_csv("data/yahoo_answers_csv/train.csv", header=None)
+    test_df = pd.read_csv("data/yahoo_answers_csv/test.csv", header=None)
+
+    # labels in first column, text in second, third, and fourth columns
+    train_iter = [(row[0], f"{row[1]} {row[2]} {row[3]}") for row in train_df.itertuples(index=False, name=None)]
+    test_iter = [(row[0], f"{row[1]} {row[2]} {row[3]}") for row in test_df.itertuples(index=False, name=None)]
+
+    # train_iter = [(row[0], row[1]) for row in train_df.itertuples(index=False, name=None)]
+    # test_iter = [(row[0], row[1]) for row in test_df.itertuples(index=False, name=None)]
+
+    return train_iter, test_iter
+
 def main():
     parser = argparse.ArgumentParser(
         description="Big Bird Sparse Transformer Benchmark"
@@ -256,7 +270,7 @@ def main():
         "--dataset",
         type=str,
         default="imdb",
-        choices=["imdb", "ag_news"],
+        choices=["imdb", "ag_news", "yahoo_answers"],
         help="dataset to use for training and testing (default: imdb)",
     )
     parser.add_argument(
@@ -294,9 +308,13 @@ def main():
     if args.dataset == "imdb":
         train_iter, test_iter = IMDB(split=("train", "test"))
         num_classes = 2
-    else:
+    elif args.dataset == "ag_news":
         train_iter, test_iter = AG_NEWS(split=("train", "test"))
         num_classes = 4
+    elif args.dataset == "yahoo_answers":
+        train_iter, test_iter = YAHOO_ANSWERS()
+        num_classes = 10
+
 
     tokenizer = get_tokenizer("basic_english")
 
@@ -311,7 +329,13 @@ def main():
         return vocab(tokenizer(x))
 
     def label_pipeline(x):
-        return int(x) - 1 if args.dataset == "ag_news" else 1 if x == "pos" else 0
+        if args.dataset == "ag_news":
+            return int(x) - 1
+        elif args.dataset == "imdb":
+            return 1 if x == "pos" else 0
+        elif args.dataset == "yahoo_answers":
+            return int(x) - 1
+
 
     train_dataset = list(train_iter)
     test_dataset = list(test_iter)
@@ -360,7 +384,7 @@ def main():
         for epoch in range(1, args.epochs + 1):
             train(model, device, train_loader, optimizer, criterion, epoch)
             test(model, device, test_loader, criterion)
-        torch.save(model.state_dict(), args.model_path)
+            torch.save(model.state_dict(), args.model_path + f".{epoch}_epochs")
 
 
 if __name__ == "__main__":

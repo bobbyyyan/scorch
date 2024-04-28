@@ -1,6 +1,7 @@
 import argparse
 import time
-import torch
+import pandas as pd
+import scorch as torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -8,7 +9,7 @@ from torch.utils.data import DataLoader
 from torchtext.datasets import IMDB, AG_NEWS
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
-import scorch
+
 
 
 class BigBirdSparseAttention(nn.Module):
@@ -82,7 +83,7 @@ class BigBirdSparseAttention(nn.Module):
         # Apply softmax to sparse attention scores
         attention_probs = torch.sparse.softmax(sparse_attention_scores, dim=-1)
 
-        context = scorch.einsum("bhij,bhjd->bhid", attention_probs, value).to_torch()
+        context = torch.einsum("bhij,bhjd->bhid", attention_probs, value).to_torch()
         context = context.contiguous().view(batch_size, seq_length, self.embed_dim)
 
         # Reshape back to the original context size
@@ -218,6 +219,18 @@ def test(model, device, test_loader, criterion):
     )
     print(f"Inference time: {end_time - start_time:.2f}s")
 
+def YAHOO_ANSWERS(split=("train", "test")):
+    train_df = pd.read_csv("data/yahoo_answers_csv/train.csv", header=None)
+    test_df = pd.read_csv("data/yahoo_answers_csv/test.csv", header=None)
+
+    # labels in first column, text in second, third, and fourth columns
+    train_iter = [(row[0], f"{row[1]} {row[2]} {row[3]}") for row in train_df.itertuples(index=False, name=None)]
+    test_iter = [(row[0], f"{row[1]} {row[2]} {row[3]}") for row in test_df.itertuples(index=False, name=None)]
+
+    # train_iter = [(row[0], row[1]) for row in train_df.itertuples(index=False, name=None)]
+    # test_iter = [(row[0], row[1]) for row in test_df.itertuples(index=False, name=None)]
+
+    return train_iter, test_iter
 
 def main():
     parser = argparse.ArgumentParser(
@@ -227,7 +240,7 @@ def main():
         "--dataset",
         type=str,
         default="imdb",
-        choices=["imdb", "ag_news"],
+        choices=["imdb", "ag_news", "yahoo_answers"],
         help="dataset to use for training and testing (default: imdb)",
     )
     parser.add_argument(
@@ -261,13 +274,15 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load and preprocess the dataset
     if args.dataset == "imdb":
         train_iter, test_iter = IMDB(split=("train", "test"))
         num_classes = 2
-    else:
+    elif args.dataset == "ag_news":
         train_iter, test_iter = AG_NEWS(split=("train", "test"))
         num_classes = 4
+    elif args.dataset == "yahoo_answers":
+        train_iter, test_iter = YAHOO_ANSWERS()
+        num_classes = 10
 
     tokenizer = get_tokenizer("basic_english")
 
@@ -282,7 +297,12 @@ def main():
         return vocab(tokenizer(x))
 
     def label_pipeline(x):
-        return int(x) - 1 if args.dataset == "ag_news" else 1 if x == "pos" else 0
+        if args.dataset == "ag_news":
+            return int(x) - 1
+        elif args.dataset == "imdb":
+            return 1 if x == "pos" else 0
+        elif args.dataset == "yahoo_answers":
+            return int(x) - 1
 
     train_dataset = list(train_iter)
     test_dataset = list(test_iter)
