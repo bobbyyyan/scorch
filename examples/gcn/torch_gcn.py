@@ -9,6 +9,15 @@ from utils import load_dataset
 
 from torch_scatter import scatter_add
 
+import warnings
+
+# Suppress specific PyTorch UserWarning about Sparse CSR tensor support
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="Sparse CSR tensor support is in beta state.*",
+)
+
 args_dict = {}
 
 
@@ -40,18 +49,9 @@ class GCNScatterGather(nn.Module):
         self.conv2 = GCNConvScatterGather(hidden_channels, out_channels)
 
     def forward(self, x, edge_index):
-        start_time = time.perf_counter()
         x = self.conv1(x, edge_index)
-        end_time = time.perf_counter()
-        print(f"self.conv1(x, edge_index) took {end_time - start_time} s")
-
         x = F.relu(x)
-
-        start_time = time.perf_counter()
         x = self.conv2(x, edge_index)
-        end_time = time.perf_counter()
-        print(f"self.conv2(x, edge_index) took {end_time - start_time} s")
-
         return x
 
 
@@ -74,13 +74,8 @@ class GCNConv(nn.Module):
             )
             print(f"Adjacency Sparsity: {adj_sparsity * 100:.2f}%")
 
-        start_time = time.perf_counter()
         out = torch.matmul(adjacency, x)
-        end_time = time.perf_counter()
-        print(f"torch.matmul(adjacency, x) took {end_time - start_time} s")
-
         out = self.lin(out)
-
         out += self.bias
 
         return out
@@ -93,20 +88,10 @@ class GCN(nn.Module):
         self.conv2 = GCNConv(hidden_channels, out_channels)
 
     def forward(self, x, adjacency):
-        start_time = time.perf_counter()
-        # print the first 10 elements of x
         x = self.conv1(x, adjacency)
-        end_time = time.perf_counter()
-        print(f"self.conv1(x, adjacency) took {end_time - start_time} s")
-
         x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
-
-        start_time = time.perf_counter()
         x = self.conv2(x, adjacency)
-        end_time = time.perf_counter()
-        print(f"self.conv2(x, adjacency) took {end_time - start_time} s")
-
         return F.log_softmax(x, dim=1)
 
 

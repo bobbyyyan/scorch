@@ -75,17 +75,11 @@ class GCN(torch.nn.Module):
         self.conv2 = GCNConv(hidden_channels, out_channels, normalize=False)
 
     def forward(self, x, edge_index):
-        start_time = time.perf_counter()
         x = self.conv1(x, edge_index)
-        end_time = time.perf_counter()
-        print(f"self.conv1(x, edge_index) took {end_time - start_time} s")
 
         x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
-        start_time = time.perf_counter()
         x = self.conv2(x, edge_index)
-        end_time = time.perf_counter()
-        print(f"self.conv2(x, edge_index) took {end_time - start_time} s")
 
         return F.log_softmax(x, dim=1)
 
