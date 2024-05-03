@@ -573,7 +573,7 @@ class CINLowerer:
                 llir.VarDecl(
                     llir.Var(
                         name="T_val_vec",
-                        type=llir.DataType.CVECTOR_INT,
+                        type=llir.DataType.CVECTOR_FLOAT32,
                     )
                 )
             )
@@ -729,7 +729,7 @@ class CINLowerer:
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
-                                name=f"T{i}_crd_vec.size()",
+                                name=f"{{T{i}_crd_vec.size()}}",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
@@ -776,7 +776,7 @@ class CINLowerer:
                             type=llir.DataType.NO_TYPE,
                         ),
                         llir.Var(
-                            name=f"T_val_vec.size()",
+                            name=f"{{T_val_vec.size()}}",
                             type=llir.DataType.NO_TYPE,
                         ),
                         llir.Var(
