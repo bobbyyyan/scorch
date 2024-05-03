@@ -19,7 +19,7 @@ from .cin import (
 )
 from .iter_lattice import IterationLattice
 from .llir import AssignOp, DataType
-from ..format import LevelType
+from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
 import pdb
@@ -519,7 +519,7 @@ class CINLowerer:
         return [
             *workspace_init_stmts,
             *self.lower_ProducerIndexStmt(stmt.producer),
-            *self.lower_ConsumerIndexStmt(stmt.consumer),
+            *self.lower_ConsumerIndexStmt(stmt.consumer, stmt == self.outermost_stmt),
         ]
 
     def lower_ProducerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
@@ -532,10 +532,276 @@ class CINLowerer:
         else:
             return [result]
 
-    def lower_ConsumerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
+    def lower_outer_ConsumerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
+        # pdb.set_trace()
+        workspaces = stmt.get_workspaces()
+        wksp = workspaces[0]
+        workspace_accesses = stmt.get_workspace_accesses()
+        wksp_access: WorkspaceAccess = workspace_accesses[0]
+        wksp_index_vars = wksp_access.get_index_vars()
+
+        result_tensor_accesses = stmt.get_result_tensor_accesses()
+        result_tensor_access: TensorAccess = result_tensor_accesses[0]
+        result_tensor_name = result_tensor_access.get_tensor().get_name()
+
+
+        intermediate_tensor_vec_decl_stmts = []
+
+        # Declare cvector<int> T0_crd_vec, cvector<int> T1_crd_vec, etc.
+        for level in range(len(wksp_index_vars)):
+            intermediate_tensor_vec_decl_stmts.append(
+                llir.VarDecl(
+                    llir.Var(
+                        name=f"T{level}_crd_vec",
+                        type=llir.DataType.CVECTOR_INT,
+                    )
+                )
+            )
+
+        # Declare cvector<float> T_val_vec;
+        intermediate_tensor_vec_decl_stmts.append(
+            llir.VarDecl(
+                llir.Var(
+                    name="T_val_vec",
+                    type=llir.DataType.CVECTOR_INT,
+                )
+            )
+        )
+
+        # Initialize int pT = 0
+        intermediate_tensor_level_iterator = llir.Var(
+            name="pT",
+            type=llir.DataType.INT,
+        )
+        intermediate_tensor_vec_decl_stmts.append(
+            llir.VarInit(
+                var=intermediate_tensor_level_iterator,
+                value=llir.Literal(0),
+            )
+        )
+
+        # call .sort() on the workspace
+        # <wksp's name>.sort();
+        wksp_sort_stmt = llir.FunctionCallStmt(
+            name=f"{wksp.get_name()}.sort",
+            args=[],
+        )
+
+        # TODO: can I make these assertions?
+        assert len(wksp_access.get_index_vars()) > 1
+        assert not wksp_access.is_dense()
+
+
+        # For loop
+        # for (const auto& pair : <wksp's name>) {
+        #    <body statement>
+        # }
+
+        loop_var = llir.Var(
+            name="it",
+            type=llir.DataType.CONST_AUTO_REF,
+        )
+
+        loop_array = llir.Var(
+            name=f"{wksp.get_name()}",
+            type=llir.DataType.AUTO,
+        )
+
+        loop_body: List[llir.Stmt] = []
+
+        # T0_crd_vec[pT] = it.first[0], T1_crd_vec[pT] = it.first[1];
+        for i in range(len(wksp_access.get_index_vars())):
+            loop_body.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=f"T{i}_crd_vec[{intermediate_tensor_level_iterator.name}]",
+                        type=llir.DataType.INT,
+                    ),
+                    value=llir.Var(
+                        name=f"{loop_var.name}.first[{i}]",
+                        type=llir.DataType.INT,
+                    ),
+                )
+            )
+
+        # T_val_vec[pT] = it.second;
+        loop_body.append(
+            llir.Assign(
+                var=llir.Var(
+                    name=f"T_val_vec[{intermediate_tensor_level_iterator.name}]",
+                    type=llir.DataType.INT,
+                ),
+                value=llir.Var(
+                    name=f"{loop_var.name}.second",
+                    type=llir.DataType.INT,
+                ),
+            )
+        )
+
+        # pT++;
+        loop_body.append(
+            llir.Increment(
+                var=intermediate_tensor_level_iterator,
+            )
+        )
+
+        loop_stmt = llir.ForLoopAuto(
+            var=loop_var,
+            array=loop_array,
+            body=loop_body,
+        )
+
+        intermediate_tensor_assembly_stmts = []
+
+        for i in range(len(wksp_index_vars)):
+            # torch::Tensor T0_crd_torch = torch::from_blob(
+            #   T0_crd_vec.data(), {T0_crd_vec.size()}, T0_crd_vec.get_deleter(), torch::kInt
+            # )
+            level_crd_tensor_var = llir.Var(
+                name=f"T{i}_crd_tensor",
+                type=llir.DataType.TORCH_TENSOR,
+            )
+            intermediate_tensor_assembly_stmts.append(
+                llir.VarInit(
+                    var=level_crd_tensor_var,
+                    value=llir.FunctionCall(
+                        name="torch::from_blob",
+                        args=[
+                            llir.Var(
+                                name=f"T{i}_crd_vec.data()",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"T{i}_crd_vec.size()",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"T{i}_crd_vec.get_deleter()",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name="torch::kInt",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                        ],
+                    ),
+                )
+            )
+
+            # int* T0_crd = T0_crd_tensor.data_ptr<int>();
+            intermediate_tensor_assembly_stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"T{i}_crd",
+                        type=llir.DataType.PTR_INT,
+                    ),
+                    value=llir.Var(
+                        name=f"{level_crd_tensor_var.name}.data_ptr<int>()",
+                        type=llir.DataType.PTR_INT,
+                    ),
+                )
+            )
+
+        # torch::Tensor T_val_tensor = torch::from_blob(
+        #   T_val_vec.data(), {T_val_vec.size()}, T_val_vec.get_deleter(), torch::kFloat32
+        # );
+        intermediate_tensor_assembly_stmts.append(
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"T_val_torch",
+                    type=llir.DataType.TORCH_TENSOR,
+                ),
+                value=llir.FunctionCall(
+                    name="torch::from_blob",
+                    args=[
+                        llir.Var(
+                            name=f"T_val_vec.data()",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        llir.Var(
+                            name=f"T_val_vec.size()",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        llir.Var(
+                            name=f"T_val_vec.get_deleter()",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        llir.Var(
+                            name="torch::kFloat32",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    ],
+                ),
+            )
+        )
+
+        # float* T_val = T_val_tensor.data_ptr<float>();
+        intermediate_tensor_assembly_stmts.append(
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"T_val",
+                    type=llir.DataType.PTR_FLOAT32,
+                ),
+                value=llir.Var(
+                    name="T_val_torch.data_ptr<float>()",
+                    type=llir.DataType.PTR_FLOAT32,
+                ),
+            )
+        )
+
+        result_tensor = result_tensor_access.get_tensor()
+        result_index_vars = result_tensor_access.get_index_vars()
+
+        T = TensorVar(
+            name="T",
+            fmt=TensorFormat(
+                level_formats=[
+                    LevelFormat(mode=LevelType.COORDINATE)
+                    for _ in range(len(result_index_vars))
+                ]
+            ),
+            mode_order=result_tensor.mode_order
+        )
+
+        # pdb.set_trace()
+        # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
+        lhs = f'result_tensor[{", ".join(["result_index_vars[{i}]".format(i=i) for i in range(len(result_index_vars))])}]'
+        rhs = f'T[{", ".join(["result_index_vars[{i}]".format(i=i) for i in range(len(result_index_vars))])}]'
+        code = f"{lhs} = {rhs}"
+        exec(code)
+
+        # pdb.set_trace()
+        rhs = f"result_tensor._assignment"
+        assert ForAll is not None, "ForAll is not imported"
+        for i in range(len(result_index_vars)-1, -1, -1):
+            rhs = f"ForAll(result_index_vars[{i}], {rhs})"
+        cin_stmt = eval(rhs)
+
+        # pdb.set_trace()
+        result_conversion_stmts = self.lower_IndexStmt(cin_stmt)
+        if not isinstance(result_conversion_stmts, list):
+            result_conversion_stmts = [result_conversion_stmts]
+
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower outer consumer CIN"),
+            *intermediate_tensor_vec_decl_stmts,
+            llir.BlankLine(),
+            wksp_sort_stmt,
+            loop_stmt,
+            llir.BlankLine(),
+            *intermediate_tensor_assembly_stmts,
+            llir.BlankLine(),
+            *result_conversion_stmts
+        ]
+
+    def lower_ConsumerIndexStmt(self, stmt: IndexStmt, is_outer: bool) -> List[llir.Stmt]:
         """
         Lower a ConsumerIndexStmt to LLIR
         """
+        if is_outer:
+            return self.lower_outer_ConsumerIndexStmt(stmt)
+
         workspaces = stmt.get_workspaces()
         wksp = workspaces[0]
         workspace_accesses = stmt.get_workspace_accesses()

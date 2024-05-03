@@ -4,13 +4,12 @@ from typing import Optional, Tuple, Union, List
 
 import torch
 
-from .compiler.cin import TensorVar, ForAll, IndexVar
+from .compiler.cin import TensorVar, ForAll, IndexVar, Workspace, Where, TensorAssign, Operation
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorStorage, TensorIndex, TensorStorageView
 from .utils import PROJECT_ROOT_DIR, parse_format
-
 
 class Window(object):
     """A tensor window object that describes the slice into a physical storage (TensorStorage)
@@ -708,7 +707,7 @@ class STensor(torch.nn.Module):
                 rhs = f"ForAll(index_vars[{i}], {rhs})"
             cin_stmt = eval(rhs)
 
-            # print("\n\ncin_stmt: ", cin_stmt)
+            print("\n\ncin_stmt: ", cin_stmt)
 
             lowerer = CINLowerer(filter_zeros=True)
             lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -743,5 +742,119 @@ class STensor(torch.nn.Module):
                 ),
                 value=result_cpp.storage.value,
             )
+
+        return self
+
+    def change_mode_order(self, mode_order: List[int]) -> Tensor:
+        # TODO: can I make these assertions?
+        assert self.has_index, "self.storage.index is None"
+        assert self.dtype is not None, "self.dtype is None"
+        assert self.shape is not None, "self.shape is None"
+        assert self.format is not None, "self.format is None"
+
+        if self.storage.index.mode_order == mode_order:
+            return self
+
+        default_index_vars = [
+            IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+        ]
+        if len(self.shape) > len(default_index_vars):
+            ordered_index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+        else:
+            ordered_index_vars = default_index_vars[: len(self.shape)]
+
+        b_index_vars = [ordered_index_vars[i] for i in self.storage.index.mode_order]
+        a_index_vars = [ordered_index_vars[i] for i in mode_order]
+
+        B = TensorVar(
+            name="B",
+            fmt=self.format,
+            shape=self.shape,
+            dtype=self.dtype,
+            mode_order=self.storage.index.mode_order
+        )
+
+        A = TensorVar(
+            name="A",
+            fmt=self.format,
+            shape=self.shape,
+            dtype=self.dtype,
+            mode_order=mode_order
+        )
+
+        # Assert A, B, and index_vars are defined
+        assert A is not None, "A is not defined"
+        assert B is not None, "B is not defined"
+        assert a_index_vars is not None, "a_index_vars is not defined"
+        assert b_index_vars is not None, "b_index_vars is not defined"
+
+        workspace = Workspace(
+            name="wksp",
+            dim=len(self.shape),
+        )
+
+        producer_stmt = TensorAssign(
+            workspace[tuple(a_index_vars)],
+            B[tuple(b_index_vars)],
+        )
+
+        for index_var in b_index_vars[::-1]:
+            producer_stmt = ForAll(
+                index_var,
+                producer_stmt
+            )
+
+        consumer_stmt = TensorAssign(
+            A[tuple(a_index_vars)],
+            workspace[tuple(a_index_vars)],
+        )
+
+        for index_var in a_index_vars[::-1]:
+            consumer_stmt = ForAll(
+                index_var,
+                consumer_stmt
+            )
+
+        cin_stmt = Where(
+            producer=producer_stmt,
+            consumer=consumer_stmt
+        )
+
+        # pdb.set_trace()
+
+        lowerer = CINLowerer(filter_zeros=True)
+        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer()
+        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+        print("change_mode_order_wksp cpp_code:\n\n", cpp_code)
+
+        # Read header_cpp_code from csrc/header.cpp
+        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+            header_cpp_code = f.read()
+
+        module = torch.utils.cpp_extension.load_inline(
+            name="kernel",
+            cpp_sources=[header_cpp_code, cpp_code],
+            functions=["evaluate"],
+            extra_cflags=["-O3"],
+        )
+
+        # TODO: change result shape, not always self.shape
+        result_cpp = module.evaluate(
+            self.shape,
+            self.shape,
+            self.index.mode_indices,
+            self.storage.value,
+        )
+
+        self._storage = TensorStorage(
+            index=TensorIndex(
+                tensor_format=self.format,
+                mode_indices=result_cpp.storage.index.mode_indices,
+                mode_order=mode_order
+            ),
+            value=result_cpp.storage.value,
+        )
 
         return self
