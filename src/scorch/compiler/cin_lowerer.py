@@ -533,7 +533,6 @@ class CINLowerer:
             return [result]
 
     def lower_outer_ConsumerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
-        # pdb.set_trace()
         workspaces = stmt.get_workspaces()
         wksp = workspaces[0]
         workspace_accesses = stmt.get_workspace_accesses()
@@ -544,41 +543,48 @@ class CINLowerer:
         result_tensor_access: TensorAccess = result_tensor_accesses[0]
         result_tensor_name = result_tensor_access.get_tensor().get_name()
 
+        result_is_coord = True
+
+        for level_type in result_tensor_access.get_tensor().get_format().get_level_types():
+            if level_type != LevelType.COORDINATE:
+                result_is_coord = False
+                break
 
         intermediate_tensor_vec_decl_stmts = []
+        intermediate_tensor_level_iterator = llir.Var(
+            name="pT",
+            type=llir.DataType.INT,
+        )
 
-        # Declare cvector<int> T0_crd_vec, cvector<int> T1_crd_vec, etc.
-        for level in range(len(wksp_index_vars)):
+        if not result_is_coord:
+            # Declare cvector<int> T0_crd_vec, cvector<int> T1_crd_vec, etc.
+            for level in range(len(wksp_index_vars)):
+                intermediate_tensor_vec_decl_stmts.append(
+                    llir.VarDecl(
+                        llir.Var(
+                            name=f"T{level}_crd_vec",
+                            type=llir.DataType.CVECTOR_INT,
+                        )
+                    )
+                )
+
+            # Declare cvector<float> T_val_vec;
             intermediate_tensor_vec_decl_stmts.append(
                 llir.VarDecl(
                     llir.Var(
-                        name=f"T{level}_crd_vec",
+                        name="T_val_vec",
                         type=llir.DataType.CVECTOR_INT,
                     )
                 )
             )
 
-        # Declare cvector<float> T_val_vec;
-        intermediate_tensor_vec_decl_stmts.append(
-            llir.VarDecl(
-                llir.Var(
-                    name="T_val_vec",
-                    type=llir.DataType.CVECTOR_INT,
+            # Initialize int pT = 0
+            intermediate_tensor_vec_decl_stmts.append(
+                llir.VarInit(
+                    var=intermediate_tensor_level_iterator,
+                    value=llir.Literal(0),
                 )
             )
-        )
-
-        # Initialize int pT = 0
-        intermediate_tensor_level_iterator = llir.Var(
-            name="pT",
-            type=llir.DataType.INT,
-        )
-        intermediate_tensor_vec_decl_stmts.append(
-            llir.VarInit(
-                var=intermediate_tensor_level_iterator,
-                value=llir.Literal(0),
-            )
-        )
 
         # call .sort() on the workspace
         # <wksp's name>.sort();
@@ -609,47 +615,98 @@ class CINLowerer:
 
         loop_body: List[llir.Stmt] = []
 
-        # T0_crd_vec[pT] = it.first[0], T1_crd_vec[pT] = it.first[1];
-        for i in range(len(wksp_access.get_index_vars())):
+        if result_is_coord:
+            # A0_crd[pA0] = it.first[0]; A1_crd[pA1] = it.first[1];
+            for i in range(len(wksp_access.get_index_vars())):
+                loop_body.append(
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"{result_tensor_name}{i}_crd[p{result_tensor_name}{i}]",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Var(
+                            name=f"{loop_var.name}.first[{i}]",
+                            type=llir.DataType.INT,
+                        ),
+                    )
+                )
+
+            # A_values[pA0] = it.second;
             loop_body.append(
                 llir.Assign(
                     var=llir.Var(
-                        name=f"T{i}_crd_vec[{intermediate_tensor_level_iterator.name}]",
+                        name=f"{result_tensor_name}_values[p{result_tensor_name}0]",
                         type=llir.DataType.INT,
                     ),
                     value=llir.Var(
-                        name=f"{loop_var.name}.first[{i}]",
+                        name=f"{loop_var.name}.second",
                         type=llir.DataType.INT,
                     ),
                 )
             )
 
-        # T_val_vec[pT] = it.second;
-        loop_body.append(
-            llir.Assign(
-                var=llir.Var(
-                    name=f"T_val_vec[{intermediate_tensor_level_iterator.name}]",
-                    type=llir.DataType.INT,
-                ),
-                value=llir.Var(
-                    name=f"{loop_var.name}.second",
-                    type=llir.DataType.INT,
-                ),
-            )
-        )
+            for i in range(len(wksp_access.get_index_vars())):
+                # pA0++; pA1++;
+                loop_body.append(
+                    llir.Increment(
+                        var=llir.Var(
+                            name=f"p{result_tensor_name}{i}",
+                            type=llir.DataType.INT,
+                        ),
+                    )
+                )
+        else:
+            # T0_crd_vec[pT] = it.first[0], T1_crd_vec[pT] = it.first[1];
+            for i in range(len(wksp_access.get_index_vars())):
+                loop_body.append(
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"T{i}_crd_vec[{intermediate_tensor_level_iterator.name}]",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Var(
+                            name=f"{loop_var.name}.first[{i}]",
+                            type=llir.DataType.INT,
+                        ),
+                    )
+                )
 
-        # pT++;
-        loop_body.append(
-            llir.Increment(
-                var=intermediate_tensor_level_iterator,
+            # T_val_vec[pT] = it.second;
+            loop_body.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=f"T_val_vec[{intermediate_tensor_level_iterator.name}]",
+                        type=llir.DataType.INT,
+                    ),
+                    value=llir.Var(
+                        name=f"{loop_var.name}.second",
+                        type=llir.DataType.INT,
+                    ),
+                )
             )
-        )
+
+            # pT++;
+            loop_body.append(
+                llir.Increment(
+                    var=intermediate_tensor_level_iterator,
+                )
+            )
 
         loop_stmt = llir.ForLoopAuto(
             var=loop_var,
             array=loop_array,
             body=loop_body,
         )
+
+        if result_is_coord:
+            return [
+                llir.BlankLine(),
+                llir.Comment("Lower outer consumer CIN"),
+                *intermediate_tensor_vec_decl_stmts,
+                llir.BlankLine(),
+                wksp_sort_stmt,
+                loop_stmt,
+            ]
 
         intermediate_tensor_assembly_stmts = []
 
