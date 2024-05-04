@@ -541,6 +541,8 @@ class CINLowerer:
 
         result_tensor_accesses = stmt.get_result_tensor_accesses()
         result_tensor_access: TensorAccess = result_tensor_accesses[0]
+        result_tensor = result_tensor_access.get_tensor()
+        result_index_vars = result_tensor_access.get_index_vars()
         result_tensor_name = result_tensor_access.get_tensor().get_name()
 
         result_is_coord = True
@@ -550,31 +552,52 @@ class CINLowerer:
                 result_is_coord = False
                 break
 
-        intermediate_tensor_vec_decl_stmts = []
+        intermediate_tensor_var = TensorVar(
+            name="T",
+            fmt=TensorFormat(
+                level_formats=[
+                    LevelFormat(mode=LevelType.COORDINATE)
+                    for _ in range(len(result_index_vars))
+                ]
+            ),
+            dtype=self.result_tensor_var.dtype,
+            mode_order=result_tensor.mode_order
+        )
+
         intermediate_tensor_level_iterator = llir.Var(
-            name="pT",
+            name=f"p{intermediate_tensor_var.get_name()}",
             type=llir.DataType.INT,
         )
+
+        intermediate_tensor_crd_vecs = []
+        intermediate_tensor_val_vec = llir.Var(
+                        name=f"{intermediate_tensor_var.get_name()}_val_vec",
+                        type=llir.DataType.cvector_type(
+                            dtype_to_c_datatype(intermediate_tensor_var.dtype)
+                        ),
+                    )
+
+        intermediate_tensor_vec_decl_stmts = []
 
         if not result_is_coord:
             # Declare cvector<int> T0_crd_vec, cvector<int> T1_crd_vec, etc.
             for level in range(len(wksp_index_vars)):
+                intermediate_tensor_crd_vecs.append(
+                    llir.Var(
+                        name=f"{intermediate_tensor_var.get_name()}{level}_crd_vec",
+                        type=llir.DataType.CVECTOR_INT,
+                    )
+                )
                 intermediate_tensor_vec_decl_stmts.append(
                     llir.VarDecl(
-                        llir.Var(
-                            name=f"T{level}_crd_vec",
-                            type=llir.DataType.CVECTOR_INT,
-                        )
+                        intermediate_tensor_crd_vecs[level]
                     )
                 )
 
             # Declare cvector<float> T_val_vec;
             intermediate_tensor_vec_decl_stmts.append(
                 llir.VarDecl(
-                    llir.Var(
-                        name="T_val_vec",
-                        type=llir.DataType.CVECTOR_FLOAT32,
-                    )
+                    intermediate_tensor_val_vec
                 )
             )
 
@@ -661,7 +684,7 @@ class CINLowerer:
                 loop_body.append(
                     llir.Assign(
                         var=llir.Var(
-                            name=f"T{i}_crd_vec[{intermediate_tensor_level_iterator.name}]",
+                            name=f"{intermediate_tensor_crd_vecs[i].name}[{intermediate_tensor_level_iterator.name}]",
                             type=llir.DataType.INT,
                         ),
                         value=llir.Var(
@@ -675,7 +698,7 @@ class CINLowerer:
             loop_body.append(
                 llir.Assign(
                     var=llir.Var(
-                        name=f"T_val_vec[{intermediate_tensor_level_iterator.name}]",
+                        name=f"{intermediate_tensor_val_vec.name}[{intermediate_tensor_level_iterator.name}]",
                         type=llir.DataType.INT,
                     ),
                     value=llir.Var(
@@ -709,31 +732,35 @@ class CINLowerer:
             ]
 
         intermediate_tensor_assembly_stmts = []
+        intermediate_crd_tensors = []
 
         for i in range(len(wksp_index_vars)):
             # torch::Tensor T0_crd_torch = torch::from_blob(
             #   T0_crd_vec.data(), {T0_crd_vec.size()}, T0_crd_vec.get_deleter(), torch::kInt
             # )
-            level_crd_tensor_var = llir.Var(
-                name=f"T{i}_crd_tensor",
-                type=llir.DataType.TORCH_TENSOR,
+            intermediate_crd_tensors.append(
+                llir.Var(
+                    name=f"{intermediate_tensor_var.get_name()}{i}_crd_tensor",
+                    type=llir.DataType.TORCH_TENSOR,
+                )
             )
+
             intermediate_tensor_assembly_stmts.append(
                 llir.VarInit(
-                    var=level_crd_tensor_var,
+                    var=intermediate_crd_tensors[i],
                     value=llir.FunctionCall(
                         name="torch::from_blob",
                         args=[
                             llir.Var(
-                                name=f"T{i}_crd_vec.data()",
+                                name=f"{intermediate_tensor_crd_vecs[i].name}.data()",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
-                                name=f"{{T{i}_crd_vec.size()}}",
+                                name=f"{{{intermediate_tensor_crd_vecs[i].name}.size()}}",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
-                                name=f"T{i}_crd_vec.get_deleter()",
+                                name=f"{intermediate_tensor_crd_vecs[i].name}.get_deleter()",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
@@ -749,42 +776,46 @@ class CINLowerer:
             intermediate_tensor_assembly_stmts.append(
                 llir.VarInit(
                     var=llir.Var(
-                        name=f"T{i}_crd",
+                        name=f"{intermediate_tensor_var.get_name()}{i}_crd",
                         type=llir.DataType.PTR_INT,
                     ),
                     value=llir.Var(
-                        name=f"{level_crd_tensor_var.name}.data_ptr<int>()",
+                        name=f"{intermediate_crd_tensors[i].name}.data_ptr<int>()",
                         type=llir.DataType.PTR_INT,
                     ),
                 )
             )
+
+        intermediate_val_tensor = llir.Var(
+            name=f"{intermediate_tensor_var.get_name()}_val_tensor",
+            type=llir.DataType.TORCH_TENSOR,
+        )
 
         # torch::Tensor T_val_tensor = torch::from_blob(
         #   T_val_vec.data(), {T_val_vec.size()}, T_val_vec.get_deleter(), torch::kFloat32
         # );
         intermediate_tensor_assembly_stmts.append(
             llir.VarInit(
-                var=llir.Var(
-                    name=f"T_val_torch",
-                    type=llir.DataType.TORCH_TENSOR,
-                ),
+                var=intermediate_val_tensor,
                 value=llir.FunctionCall(
                     name="torch::from_blob",
                     args=[
                         llir.Var(
-                            name=f"T_val_vec.data()",
+                            name=f"{intermediate_tensor_val_vec.name}.data()",
                             type=llir.DataType.NO_TYPE,
                         ),
                         llir.Var(
-                            name=f"{{T_val_vec.size()}}",
+                            name=f"{{{intermediate_tensor_val_vec.name}.size()}}",
                             type=llir.DataType.NO_TYPE,
                         ),
                         llir.Var(
-                            name=f"T_val_vec.get_deleter()",
+                            name=f"{intermediate_tensor_val_vec.name}.get_deleter()",
                             type=llir.DataType.NO_TYPE,
                         ),
                         llir.Var(
-                            name="torch::kFloat32",
+                            name=get_pytorch_c_dtype_str(
+                                    intermediate_tensor_var.dtype
+                                ),
                             type=llir.DataType.NO_TYPE,
                         ),
                     ],
@@ -793,37 +824,26 @@ class CINLowerer:
         )
 
         # float* T_val = T_val_tensor.data_ptr<float>();
+        data_type = dtype_to_c_datatype(intermediate_tensor_var.dtype)
+        ptr_type = llir.DataType.ptr_type(intermediate_tensor_var.dtype)
+
         intermediate_tensor_assembly_stmts.append(
             llir.VarInit(
                 var=llir.Var(
-                    name=f"T_val",
-                    type=llir.DataType.PTR_FLOAT32,
+                    name=f"{intermediate_tensor_var.get_name()}_val",
+                    type=ptr_type,
                 ),
                 value=llir.Var(
-                    name="T_val_torch.data_ptr<float>()",
-                    type=llir.DataType.PTR_FLOAT32,
+                    name=f"{intermediate_val_tensor.name}.data_ptr<{data_type.value}>()",
+                    type=ptr_type,
                 ),
             )
-        )
-
-        result_tensor = result_tensor_access.get_tensor()
-        result_index_vars = result_tensor_access.get_index_vars()
-
-        T = TensorVar(
-            name="T",
-            fmt=TensorFormat(
-                level_formats=[
-                    LevelFormat(mode=LevelType.COORDINATE)
-                    for _ in range(len(result_index_vars))
-                ]
-            ),
-            mode_order=result_tensor.mode_order
         )
 
         # pdb.set_trace()
         # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
         lhs = f'result_tensor[{", ".join(["result_index_vars[{i}]".format(i=i) for i in range(len(result_index_vars))])}]'
-        rhs = f'T[{", ".join(["result_index_vars[{i}]".format(i=i) for i in range(len(result_index_vars))])}]'
+        rhs = f'intermediate_tensor_var[{", ".join(["result_index_vars[{i}]".format(i=i) for i in range(len(result_index_vars))])}]'
         code = f"{lhs} = {rhs}"
         exec(code)
 
