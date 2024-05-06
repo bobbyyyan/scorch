@@ -84,7 +84,7 @@ class GCN(torch.nn.Module):
         return F.log_softmax(x, dim=1)
 
 
-def train(model, data, device, dataset_name, split_idx=None):
+def train(model, data, device, dataset_name, split_idx=None, batch_size=1, epochs=200):
     # Initialize optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
 
@@ -97,20 +97,40 @@ def train(model, data, device, dataset_name, split_idx=None):
 
     # Train the model
     model.train()
-    for epoch in tqdm(range(200), desc="Training", unit="epoch"):
-        optimizer.zero_grad()
-        out = model(data.x.to(device), data.edge_index.to(device))
-        loss = F.nll_loss(out[train_mask], data.y.view(-1)[train_mask].to(device))
-        loss.backward()
-        optimizer.step()
+    for epoch in tqdm(range(epochs), desc="Training", unit="epoch"):
+        if dataset_name == "reddit":
+            # Mini-batch training for Reddit dataset
+            perm = torch.randperm(data.num_nodes)
+            num_batches = (data.num_nodes + batch_size - 1) // batch_size
+            batches = tqdm(range(num_batches), desc=f"Epoch {epoch+1}", unit="batch", leave=False)
+            for batch_idx in batches:
+                batch_start = batch_idx * batch_size
+                batch_end = min(batch_start + batch_size, data.num_nodes)
+                batch_nodes = perm[batch_start:batch_end]
+                batch_data = data.subgraph(batch_nodes)
+
+                optimizer.zero_grad()
+                out = model(batch_data.x.to(device), batch_data.edge_index.to(device))
+                loss = F.nll_loss(out[batch_data.train_mask], batch_data.y.view(-1)[batch_data.train_mask].to(device))
+                loss.backward()
+                optimizer.step()
+
+                # Update progress bar
+                batches.set_postfix({"Loss": loss.item()})
+        else:
+            # Full-batch training for other datasets
+            optimizer.zero_grad()
+            out = model(data.x.to(device), data.edge_index.to(device))
+            loss = F.nll_loss(out[train_mask], data.y.view(-1)[train_mask].to(device))
+            loss.backward()
+            optimizer.step()
 
     # Save weights
-    # Make weights/ directory if it doesn't exist
     os.makedirs("weights", exist_ok=True)
     torch.save(model.state_dict(), f"weights/gcn_{dataset_name.lower()}_weights.pth")
 
 
-def inference(model, data, device, dataset_name, split_idx=None):
+def inference(model, data, device, dataset_name, split_idx=None, batch_size=1):
     # Load weights and prepare for inference
     model.load_state_dict(torch.load(f"weights/gcn_{dataset_name.lower()}_weights.pth"))
     model.eval()
@@ -125,15 +145,44 @@ def inference(model, data, device, dataset_name, split_idx=None):
     # Perform inference and measure time
     start_time = time.time()
 
-    with torch.no_grad():
-        logits = model(data.x.to(device), data.edge_index.to(device))
-        pred = logits.argmax(dim=1)
+    if dataset_name == "reddit":
+        # Mini-batch inference for Reddit dataset
+        test_nodes = test_mask.nonzero(as_tuple=True)[0]
+        perm = torch.randperm(test_nodes.size(0))
+        num_batches = (test_nodes.size(0) + batch_size - 1) // batch_size
+        batches = tqdm(range(num_batches), desc="Inference", unit="batch")
+
+        correct = 0
+        total = 0
+
+        for batch_idx in batches:
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, test_nodes.size(0))
+            batch_nodes = test_nodes[perm[batch_start:batch_end]]
+            batch_data = data.subgraph(batch_nodes)
+
+            with torch.no_grad():
+                logits = model(batch_data.x.to(device), batch_data.edge_index.to(device))
+                pred = logits.argmax(dim=1)
+
+            batch_correct = int((pred == batch_data.y.view(-1)).sum())
+            batch_total = batch_nodes.size(0)
+
+            correct += batch_correct
+            total += batch_total
+
+        accuracy = correct / total
+    else:
+        # Full-batch inference for other datasets
+        with torch.no_grad():
+            logits = model(data.x.to(device), data.edge_index.to(device))
+            pred = logits.argmax(dim=1)
+
+        correct = int((pred[test_mask] == data.y.view(-1)[test_mask]).sum())
+        total = int(test_mask.sum())
+        accuracy = correct / total
 
     inference_time = time.time() - start_time
-
-    # Calculate accuracy
-    correct = float((pred[test_mask] == data.y.view(-1)[test_mask]).sum().item())
-    accuracy = correct / test_mask.sum().item()
 
     print(f"Inference time: {inference_time:.6f} seconds")
     print(f"Accuracy: {accuracy:.4f}")
@@ -152,7 +201,19 @@ def main():
         "--dataset",
         type=str,
         default="cora",
-        choices=["cora", "pubmed", "citeseer", "reddit", "ogbn-arxiv", "dblp"],
+        choices=["cora", "pubmed", "citeseer", "reddit", "ogbn-arxiv"],
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="Batch size for mini-batch (only applicable for Reddit dataset).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=200,
+        help="Number of training epochs (default: 200).",
     )
     args = parser.parse_args()
 
@@ -173,9 +234,9 @@ def main():
     model = GCN(in_channels, hidden_channels, out_channels).to(device)
 
     if args.mode.lower() == "train":
-        train(model, data, device, args.dataset, split_idx)
+        train(model, data, device, args.dataset, split_idx, batch_size=args.batch_size, epochs=args.epochs)
     elif args.mode.lower() == "test":
-        inference(model, data, device, args.dataset, split_idx)
+        inference(model, data, device, args.dataset, split_idx, batch_size=args.batch_size)
     else:
         raise ValueError(
             f"Mode {args.mode} not recognized. Choose from 'train' or 'test'."
