@@ -313,7 +313,43 @@ def matmul(
         result = result.to(device)
         return result
 
-    return einsum("ij,jk->ik", a, b, **kwargs)
+    if str(a.format) == "o,o" and str(b.format) == "d,d" and use_cache:
+
+        result_shape = (a.shape[0], b.shape[1])
+        args = [result_shape]
+
+        for tensor in [a, b]:
+            args.append(tensor.shape)  # type: ignore
+            args.append(tensor.index.mode_indices)  # type: ignore
+            args.append(tensor.values)  # type: ignore
+
+        spmm_csr = ops.spmm_coo_float
+
+        start_time = time.time()
+        result_cpp = spmm_csr(*args)
+        end_time = time.time()
+        eval_time = end_time - start_time
+        # print("[spmm_csr] eval_time:", eval_time)
+        if "time_dict" in kwargs:
+            kwargs["time_dict"]["eval_time"] = eval_time
+
+        result = STensor(
+            shape=result_shape,
+            index=TensorIndex(
+                mode_indices=result_cpp.storage.index.mode_indices,
+                tensor_format="dd",
+            ),
+            value=result_cpp.storage.value,
+        )
+        result = result.to_torch()
+        result = result.to(device)
+        return result
+
+    result = einsum("ij,jk->ik", a, b, **kwargs)
+    if isinstance(result, STensor) and result.format.is_dense():
+        result = result.to_torch()
+
+    return result
 
 
 def einsum(
