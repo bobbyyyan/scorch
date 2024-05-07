@@ -519,7 +519,7 @@ class CINLowerer:
         return [
             *workspace_init_stmts,
             *self.lower_ProducerIndexStmt(stmt.producer),
-            *self.lower_ConsumerIndexStmt(stmt.consumer, stmt == self.outermost_stmt),
+            *self.lower_ConsumerIndexStmt(stmt.consumer),
         ]
 
     def lower_ProducerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
@@ -872,11 +872,12 @@ class CINLowerer:
             *result_conversion_stmts
         ]
 
-    def lower_ConsumerIndexStmt(self, stmt: IndexStmt, is_outer: bool) -> List[llir.Stmt]:
+    def lower_ConsumerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
         """
         Lower a ConsumerIndexStmt to LLIR
         """
-        if is_outer:
+        if stmt.parent == self.outermost_stmt:
+            pdb.set_trace()
             return self.lower_outer_ConsumerIndexStmt(stmt)
 
         workspaces = stmt.get_workspaces()

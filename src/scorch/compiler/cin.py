@@ -154,6 +154,7 @@ class IndexStmt(CIN):
     def __init__(self, lhs: Optional[IndexExpr], rhs: Optional[IndexExpr]):
         self.lhs = lhs
         self.rhs = rhs
+        self.parent = None
 
     def __str__(self):
         return f"IndexStmt(lhs={self.lhs}, rhs={self.rhs})"
@@ -306,6 +307,10 @@ class IndexStmt(CIN):
                 tile_size_vars.append(index_var.tile_size_var)
 
         return tile_size_vars
+
+    def set_parent(self, parent: IndexStmt) -> None:
+        self.parent = parent
+
 
 
 class IndexVar(IndexExpr):
@@ -986,6 +991,7 @@ class ForAll(IndexStmt):
         super(ForAll, self).__init__(None, None)
         self.index_var = index_var
         self.stmt = stmt
+        self.stmt.set_parent(self)
 
     def get_index_var(self) -> IndexVar:
         return self.index_var
@@ -1001,7 +1007,7 @@ class ForAll(IndexStmt):
         visitor.visit(self.stmt)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class Where(IndexStmt):
     """
     A where statement involves a producer statement and a consumer statement.
@@ -1011,6 +1017,10 @@ class Where(IndexStmt):
 
     producer: IndexStmt
     consumer: IndexStmt
+
+    def __post_init__(self):
+        self.producer.set_parent(self)
+        self.consumer.set_parent(self)
 
     def __str__(self):
         return f"Where(\n\tproducer={self.producer}, \n\tconsumer={self.consumer}\n)"
