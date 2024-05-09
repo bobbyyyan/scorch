@@ -877,7 +877,6 @@ class CINLowerer:
         Lower a ConsumerIndexStmt to LLIR
         """
         if stmt.parent == self.outermost_stmt:
-            pdb.set_trace()
             return self.lower_outer_ConsumerIndexStmt(stmt)
 
         workspaces = stmt.get_workspaces()

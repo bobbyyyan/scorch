@@ -304,7 +304,7 @@ class ModeIterator:
 
         elif self.level_type == LevelType.COMPRESSED:
             self.iterator_var_begin_value_llir = llir.Var(
-                name=f"{self._tensor_var.name}{self._level}_pos[{self.parent_index_var.name}]"
+                name=f"{self._tensor_var.name}{self._level}_pos[p{self._tensor_var.name}{self.level-1}]"
                 if self.parent_index_var
                 else f"{self._tensor_var.name}{self._level}_pos[0]",
                 type=llir.DataType.INT,
@@ -314,7 +314,7 @@ class ModeIterator:
                 type=llir.DataType.INT,
             )
             self.iterator_var_end_value_llir = llir.Var(
-                name=f"{self._tensor_var.name}{self._level}_pos[{self.parent_index_var.name} + 1]"
+                name=f"{self._tensor_var.name}{self._level}_pos[p{self._tensor_var.name}{self.level-1} + 1]"
                 if self.parent_index_var
                 else f"{self._tensor_var.name}{self._level}_pos[1]",
                 type=llir.DataType.INT,

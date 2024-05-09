@@ -163,14 +163,9 @@ class STensor(torch.nn.Module):
 
     def __add__(self, other) -> STensor:
         """Add two tensors together."""
-        # Change mode order of other to match self if they are different (naive)
-        # pdb.set_trace()
-        other_fmt = other.format
+        # Change mode order of other to match self if they are different
         if self.storage.index.mode_order != other.storage.index.mode_order:
-            other = Tensor.from_torch(other.to_torch(), other.name, self.storage.index.mode_order)
-
-            if not other_fmt.is_dense():
-                other.to_sparse(other_fmt)
+            other.change_mode_order(self.storage.index.mode_order)
 
         # Perform element-wise addition
         # TODO: support broadcasting
@@ -765,6 +760,7 @@ class STensor(torch.nn.Module):
 
         b_index_vars = [ordered_index_vars[i] for i in self.storage.index.mode_order]
         a_index_vars = [ordered_index_vars[i] for i in mode_order]
+        result_shape = tuple(self.shape[i] for i in mode_order)
 
         B = TensorVar(
             name="B",
@@ -777,7 +773,7 @@ class STensor(torch.nn.Module):
         A = TensorVar(
             name="A",
             fmt=self.format,
-            shape=self.shape,
+            shape=result_shape,
             dtype=self.dtype,
             mode_order=mode_order
         )
@@ -842,7 +838,7 @@ class STensor(torch.nn.Module):
 
         # TODO: change result shape, not always self.shape
         result_cpp = module.evaluate(
-            self.shape,
+            result_shape,
             self.shape,
             self.index.mode_indices,
             self.storage.value,
@@ -856,5 +852,7 @@ class STensor(torch.nn.Module):
             ),
             value=result_cpp.storage.value,
         )
+
+        self._shape = result_shape
 
         return self
