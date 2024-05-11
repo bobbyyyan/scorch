@@ -7,7 +7,18 @@ ext_modules = [
         [
             "csrc/ops.cpp",
         ],
-        extra_compile_args=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+        extra_compile_args=[
+            "-O3",
+            "-march=native",
+            "-ffast-math",
+            "-fno-signed-zeros",
+            "-fopenmp",
+            "-funsafe-math-optimizations",
+            "-freciprocal-math",
+            "-ftree-vectorize",
+            "-flto",
+            "-funroll-loops",
+        ],
     )
 ]
 

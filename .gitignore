@@ -1,3 +1,6 @@
+*.csv
+*.pdf
+
 *.pth
 *.pt
 data

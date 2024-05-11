@@ -29,17 +29,20 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Initialize tile sizes
-  constexpr int kTile_k = 4096;
+  constexpr int kTile_k = 1024;
 
   int residual_k_start = (B1_size / kTile_k) * kTile_k;
 
+  #pragma omp parallel for
   for (int i = 0; i < A0_size; i++) {
     // Resolve index into dense level of values array
     int pC0 = i;
 
     for (int k_out = 0; k_out < residual_k_start; k_out += kTile_k) {
       // Initialize workspaces
-      float *accum_c = new float[kTile_k]();
+      float accum_c[kTile_k] = {};
+      // float *accum_c = new float[kTile_k]();
+
       // Initialize iterators
       int pA1_end = A1_pos[i + 1];
 
@@ -63,13 +66,18 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
         int pC1 = pC0 * C1_size + k;
         C_values[pC1] += accum_c[k_in];
       }
+
+      // delete[] accum_c;
     }
   }
 
   if (residual_k_start < B1_size) {
+    int tile_k_width = B1_size - residual_k_start;
+
+    #pragma omp parallel for
+
     for (int i = 0; i < A0_size; i++) {
       int pC0 = i;
-      int tile_k_width = B1_size - residual_k_start;
 
       float *accum_c = new float[tile_k_width]();
       int pA1_end = A1_pos[i + 1];
@@ -152,8 +160,10 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
 
       // Resolve index into dense level of values array
       int pC0 = i;
+
+      float wksp[kTile_k] = {};
       // Initialize workspaces
-      float* wksp = new float[kTile_k]();
+      // float* wksp = new float[kTile_k]();
 
       for (int pA1 = pA0; pA1 < pA1_end; pA1++) {
         // Resolve coordinates
@@ -177,6 +187,8 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
         int pC1 = pC0 * C1_size + k;
         C_values[pC1] += wksp[k_in];
       }
+
+      // delete[] wksp;
     }
   }
 
