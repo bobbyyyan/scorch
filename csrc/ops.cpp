@@ -3,6 +3,7 @@
 #include "header.h"
 
 #include "spmm.h"
+#include "kernels.h"
 
 namespace scorch {
   PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
