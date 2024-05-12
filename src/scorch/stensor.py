@@ -412,9 +412,7 @@ class STensor(torch.nn.Module):
                     ),
                 )
 
-                return tt_tensor
-
-                return tt_tensor
+            return tt_tensor
 
         tt_tensor = STensor(
             name=name,

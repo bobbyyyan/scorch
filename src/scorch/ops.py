@@ -279,10 +279,13 @@ def matmul(
 
     kernel_op = None
 
+    result_format = None
+
     if use_cache:
         if str(a.format) == "d,s" and str(b.format) == "d,d":
             kernel_op = ops.spmm_csr_float
         elif str(a.format) == "o,o" and str(b.format) == "o,o" and use_cache:
+            result_format = parse_format("oo")
             kernel_op = ops.spmspm_coo_float
         elif str(a.format) == "o,o" and str(b.format) == "d,d" and use_cache:
             kernel_op = ops.spmm_coo_float
@@ -302,7 +305,7 @@ def matmul(
             shape=result_shape,
             index=TensorIndex(
                 mode_indices=result_cpp.storage.index.mode_indices,
-                tensor_format="dd",
+                tensor_format="dd" if result_format is None else result_format,
             ),
             value=result_cpp.storage.value,
         )

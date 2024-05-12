@@ -10,6 +10,8 @@ namespace scorch {
     m.def("spmm_csr_float", &spmm_csr_float, "Sparse matrix multiplication (CSR)");
     m.def("spmm_coo_float", &spmm_coo_float, "Sparse matrix multiplication (COO)");
 
+    m.def("spmspm_coo_float", &spmspm_coo_float, "Sparse matrix-sparse matrix multiplication (COO)");
+
     pybind11::class_<Tensor>(m, "Tensor")
       .def(pybind11::init<>())
       .def_readwrite("storage", &Tensor::storage);
