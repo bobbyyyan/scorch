@@ -44,7 +44,7 @@ Tensor spmspm_coo_float(std::vector<int> result_shape, std::vector<int> A_shape,
     }
 
     // Initialize workspaces
-    auto wksp = coo_workspace_1d<float, 1>(2048);
+    auto wksp = coo_workspace_1d<float, 1>(1024);
     // Initialize iterators
     int pA1 = pA0;
     int pB0 = 0;

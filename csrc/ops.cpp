@@ -1,5 +1,3 @@
-#include <torch/extension.h>
-
 #include "header.h"
 
 #include "spmm.h"
