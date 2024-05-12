@@ -359,6 +359,7 @@ class STensor(torch.nn.Module):
         if tensor.is_sparse:
             if tensor.layout == torch.sparse_coo:
                 mode_indices = []
+                tensor = tensor.coalesce()
                 tensor_indices = tensor.indices()
                 for i in range(tensor.dim()):
                     mode_indices.append([tensor_indices[i]])

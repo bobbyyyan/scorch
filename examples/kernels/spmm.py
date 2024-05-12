@@ -8,6 +8,15 @@ import pandas as pd
 import scorch
 from tqdm import tqdm
 
+import warnings
+
+# Suppress specific PyTorch UserWarning about Sparse CSR tensor support
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="Sparse CSR tensor support is in beta state.*",
+)
+
 def scipy_sparse_to_torch_sparse(matrix, format='csr'):
     if format == 'coo':
         matrix = matrix.tocoo()
@@ -26,26 +35,36 @@ def scipy_sparse_to_torch_sparse(matrix, format='csr'):
     else:
         raise ValueError("Unsupported format: only 'coo' and 'csr' are supported")
 
-matrices = ssgetpy.search(limit=50)
+# Set random seed for reproducibility
+np.random.seed(15)
+torch.manual_seed(15)
+
+matrices = ssgetpy.search(limit=5000)
 
 results = []
 
 for matrix in tqdm(matrices, desc="Benchmarking Matrices"):
     try:
-        sparse_matrix_mm = matrix.download(format='MM', extract=True)
+        print(f"Processing matrix {matrix.id} {matrix.name} in group {matrix.group} with {matrix.nnz} NNZ...")
+        # sparse_matrix_mm = matrix.download(format='MM', extract=True)
+
         matrix_path = Path(f"~/.ssgetpy/MM/{matrix.group}/{matrix.name}/{matrix.name}.mtx").expanduser()
         sparse_matrix = mmread(matrix_path.resolve())
+        print(f"Matrix shape: {sparse_matrix.shape}")
 
-        torch_sparse_matrix = scipy_sparse_to_torch_sparse(sparse_matrix, format='csr')
+        matrix_format = 'csr'
+        torch_sparse_matrix = scipy_sparse_to_torch_sparse(sparse_matrix, format=matrix_format)
         dense_matrix = torch.rand((torch_sparse_matrix.shape[1], 100), dtype=torch.float32)
         nnz = sparse_matrix.nnz
 
         for framework in ["PyTorch", "Scorch"]:
-            for _ in range(20):
-                start_time = time.time()
+            print(f"Benchmarking {framework}...")
+            for _ in range(10):
                 if framework == "PyTorch":
+                    start_time = time.time()
                     result = torch.sparse.mm(torch_sparse_matrix, dense_matrix)
-                else:  # Scorch
+                elif framework == "Scorch":
+                    start_time = time.time()
                     result = scorch.matmul(torch_sparse_matrix, dense_matrix)
                 end_time = time.time()
 
@@ -57,6 +76,7 @@ for matrix in tqdm(matrices, desc="Benchmarking Matrices"):
                     'Rows': torch_sparse_matrix.shape[0],
                     'Columns': torch_sparse_matrix.shape[1],
                     'NNZ': nnz,
+                    'Format': matrix_format,
                     'Runtime': end_time - start_time
                 })
 
@@ -67,32 +87,45 @@ results_df = pd.DataFrame(results)
 results_df.to_csv("spmm_benchmark_results.csv", index=False)
 print("Benchmarking complete. Results saved to 'spmm_benchmark_results.csv'.")
 
-
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# Load results from the CSV
-results_df = pd.read_csv("spmm_benchmark_results.csv", dtype={"Runtime": float, "NNZ": int})
-
 # Plot settings
-sns.set(style="whitegrid")
+sns.set(style="white", context="talk")
 
 # Plotting
-plt.figure(figsize=(10, 6))
+plt.figure(figsize=(12, 6))
+
+plt.rcParams.update({
+    'grid.linestyle': ' ',
+    'font.size': 17,
+    'axes.labelsize': 22,
+    'axes.titlesize': 24,
+    'xtick.labelsize': 22,
+    'ytick.labelsize': 18,
+    # Legend settings
+    'legend.fontsize': 22,
+    'legend.title_fontsize': 24,
+    # Legend dot size
+    'legend.markerscale': 5,
+
+})
 for framework in ['PyTorch', 'Scorch']:
     sub_df = results_df[results_df['Framework'] == framework]
     mean_runtime = sub_df.groupby('NNZ')['Runtime'].mean()
     std_runtime = sub_df.groupby('NNZ')['Runtime'].std()
 
-    plt.plot(mean_runtime.index, mean_runtime, label=f'{framework}')
-    plt.fill_between(mean_runtime.index, mean_runtime-std_runtime, mean_runtime+std_runtime, alpha=0.3)
+    # Using scatter plot for data points, adjust size using 's' and transparency using 'alpha'
+    plt.scatter(mean_runtime.index, mean_runtime, label=f'{framework}', s=2, alpha=0.7)  # smaller size
+    # Optional: Adjust error bars
+    # plt.errorbar(mean_runtime.index, mean_runtime, yerr=std_runtime, fmt='o', alpha=0.3, capsize=3, markersize=2)
 
 plt.xlabel('Number of Non-Zeros (NNZ)')
 plt.ylabel('Average Runtime (seconds)')
-plt.title('Sparse Matrix Multiplication Performance')
+plt.title('Sparse Matrix Multiplication (SpMM) Performance')
 plt.legend()
 plt.xscale('log')
-# plt.yscale('log')
-plt.savefig("spmm_benchmark_plot.pdf")
+plt.yscale('log')
+plt.savefig("spmm_benchmark_plot.pdf", bbox_inches='tight')
 plt.show()
