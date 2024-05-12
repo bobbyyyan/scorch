@@ -18,6 +18,8 @@ warnings.filterwarnings(
     message="Sparse CSR tensor support is in beta state.*",
 )
 
+csv_filename = "sddmm_benchmark_results.csv"
+
 def scipy_sparse_to_torch_sparse(matrix, format='csr'):
     if format == 'coo':
         matrix = matrix.tocoo()
@@ -45,11 +47,9 @@ matrices = [matrix for matrix in matrices if max(matrix.rows, matrix.cols) < 120
 
 results = []
 
-for matrix in tqdm(matrices, desc="Benchmarking SDDMM"):
+for idx, matrix in enumerate(tqdm(matrices, desc="Benchmarking SDDMM")):
     try:
         print(f"Processing matrix {matrix.id} {matrix.name} in group {matrix.group} with {matrix.nnz} NNZ...")
-        # sparse_matrix_mm = matrix.download(format='MM', extract=True)
-
         matrix_path = Path(f"~/.ssgetpy/MM/{matrix.group}/{matrix.name}/{matrix.name}.mtx").expanduser()
         sparse_matrix = mmread(matrix_path.resolve())
         print(f"Matrix shape: {sparse_matrix.shape}")
@@ -84,13 +84,19 @@ for matrix in tqdm(matrices, desc="Benchmarking SDDMM"):
                     'Runtime': end_time - start_time
                 })
 
+        # Save to CSV every 10 matrices
+        if (idx + 1) % 10 == 0:
+            results_df = pd.DataFrame(results)
+            results_df.to_csv(csv_filename, index=False)
+            print(f"Partial results saved to '{csv_filename}'.")
+
     except Exception as e:
         traceback.print_exc()
         print(f"Error processing matrix {matrix.name} in group {matrix.group}: {e}")
 
 results_df = pd.DataFrame(results)
-results_df.to_csv("sddmm_benchmark_results.csv", index=False)
-print("Benchmarking complete. Results saved to 'sddmm_benchmark_results.csv'.")
+results_df.to_csv(csv_filename, index=False)
+print(f"Benchmarking complete. Results saved to '{csv_filename}'.")
 
 import pandas as pd
 import matplotlib.pyplot as plt
