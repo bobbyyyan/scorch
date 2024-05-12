@@ -306,13 +306,15 @@ class STensor(torch.nn.Module):
 
     @staticmethod
     def from_coo(
-        indices: torch.Tensor,
-        values: torch.Tensor,
-        shape: Tuple[int, ...],
+        coo_matrix: Optional[torch.Tensor] = None,
+        indices: Optional[torch.Tensor] = None,
+        values: Optional[torch.Tensor] = None,
+        shape: Optional[Tuple[int, ...]] = None,
         name: Optional[str] = None,
     ) -> STensor:
         """
         Create a Tensor from a COO tensor.
+        :param coo_matrix: A torch sparse tensor in COO format
         :param indices:
         :param values:
         :param shape:
@@ -322,6 +324,12 @@ class STensor(torch.nn.Module):
         # If name is not provided, use the default name
         if name is None:
             name = "tensor"
+
+        if coo_matrix is not None:
+            coo_matrix = coo_matrix.coalesce()
+            indices = coo_matrix.indices()
+            values = coo_matrix.values()
+            shape = coo_matrix.shape
 
         mode_indices = []
         for i in range(len(shape)):
@@ -380,6 +388,31 @@ class STensor(torch.nn.Module):
                         value=tensor.values(),
                     ),
                 )
+
+            elif tensor.layout == torch.sparse_csr:
+                crow_indices = tensor.crow_indices()
+                col_indices = tensor.col_indices()
+                values = tensor.values()
+                shape = tensor.size()
+
+                tt_tensor = STensor(
+                    name=name,
+                    shape=shape,
+                    storage=TensorStorage(
+                        index=TensorIndex(
+                            tensor_format=TensorFormat(
+                                level_formats=[
+                                    LevelFormat(mode=LevelType.DENSE),
+                                    LevelFormat(mode=LevelType.COMPRESSED),
+                                ]
+                            ),
+                            mode_indices=[[], [crow_indices, col_indices]],
+                        ),
+                        value=values,
+                    ),
+                )
+
+                return tt_tensor
 
                 return tt_tensor
 
