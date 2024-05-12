@@ -235,6 +235,86 @@ public:
 
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
+
+template <typename T, int N>
+class coo_workspace_1d {
+  static constexpr int BLOCK_SIZE = 1024;
+
+  T* _values;
+  int* _indices;
+  bool* _setFlags;
+  int _size;
+
+ public:
+  explicit coo_workspace_1d(int capacity) {
+    _values = (T*)malloc(sizeof(T) * capacity);
+    _indices = (int*)malloc(sizeof(int) * capacity);
+    _setFlags = (bool*)calloc(capacity, sizeof(bool));
+    _size = 0;
+  }
+
+  explicit coo_workspace_1d() : coo_workspace_1d(BLOCK_SIZE) {}
+
+  ~coo_workspace_1d() {
+    free(_values);
+    free(_indices);
+    free(_setFlags);
+  }
+
+    void insert(const int coord, T value) {
+    if (!_setFlags[coord]) {
+      _values[coord] = value;
+      _indices[_size] = coord;
+      _setFlags[coord] = true;
+      _size++;
+    } else {
+      _values[coord] += value;
+    }
+  }
+
+  void sort() {
+    std::qsort(_indices, _size, sizeof(int), [](const void* a, const void* b) {
+      return *(const int*)a - *(const int*)b;
+    });
+  }
+
+  void clear() {
+    _size = 0;
+    std::fill_n(_setFlags, BLOCK_SIZE, false);
+  }
+
+  class iterator {
+    int _index;
+    T* _values;
+    int* _indices;
+
+   public:
+    iterator(int index, T* values, int* indices)
+        : _index(index), _values(values), _indices(indices) {}
+
+    iterator& operator++() {
+      _index++;
+      return *this;
+    }
+
+    bool operator!=(const iterator& other) const {
+      return _index != other._index;
+    }
+
+    std::pair<int, T> operator*() const {
+      int index = _indices[_index];
+      return {index, _values[index]};
+    }
+  };
+
+  iterator begin() { return iterator(0, _values, _indices); }
+
+  iterator end() { return iterator(_size, _values, _indices); }
+
+  int size() const { return _size; }
+};
 
 template <typename T, int N>
 class coo_workspace {
