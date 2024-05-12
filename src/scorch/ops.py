@@ -255,7 +255,11 @@ def matmul(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        if a.is_sparse_csr and not b.is_sparse:
+        if a.is_sparse and b.is_sparse:
+            if a.layout == torch.sparse_coo and b.layout == torch.sparse_coo:
+                a = STensor.from_torch(a)
+                b = STensor.from_torch(b)
+        elif a.is_sparse_csr and not b.is_sparse:
             # SpMM
             device = a.device
             a = STensor.from_csr(a)
@@ -273,8 +277,17 @@ def matmul(
 
     use_cache = kwargs.get("use_cache", True)
 
-    if str(a.format) == "d,s" and str(b.format) == "d,d" and use_cache:
+    kernel_op = None
 
+    if use_cache:
+        if str(a.format) == "d,s" and str(b.format) == "d,d":
+            kernel_op = ops.spmm_csr_float
+        elif str(a.format) == "o,o" and str(b.format) == "o,o" and use_cache:
+            kernel_op = ops.spmspm_coo_float
+        elif str(a.format) == "o,o" and str(b.format) == "d,d" and use_cache:
+            kernel_op = ops.spmm_coo_float
+
+    if kernel_op:
         result_shape = (a.shape[0], b.shape[1])
         args = [result_shape]
 
@@ -283,23 +296,7 @@ def matmul(
             args.append(tensor.index.mode_indices)  # type: ignore
             args.append(tensor.values)  # type: ignore
 
-        spmm_csr = ops.spmm_csr_float
-
-        start_time = time.time()
-        result_cpp = spmm_csr(*args)
-        end_time = time.time()
-        eval_time = end_time - start_time
-        # print("[spmm_csr] eval_time:", eval_time)
-        if "time_dict" in kwargs:
-            kwargs["time_dict"]["eval_time"] = eval_time
-
-        # if torch.all(a.values.eq(1)):
-        #     spmm_csr_ones = _kernel_cache["spmm_csr_ones"]
-        #     start_time = time.time()
-        #     result_cpp = spmm_csr_ones.evaluate(*args)
-        #     end_time = time.time()
-        #     eval_time = end_time - start_time
-        #     print("[spmm_csr_ones] eval_time:", eval_time)
+        result_cpp = kernel_op(*args)
 
         result = STensor(
             shape=result_shape,
@@ -309,43 +306,9 @@ def matmul(
             ),
             value=result_cpp.storage.value,
         )
-        result = result.to_torch()
-        result = result.to(device)
-        return result
+    else:
+        result = einsum("ij,jk->ik", a, b, **kwargs)
 
-    if str(a.format) == "o,o" and str(b.format) == "d,d" and use_cache:
-
-        result_shape = (a.shape[0], b.shape[1])
-        args = [result_shape]
-
-        for tensor in [a, b]:
-            args.append(tensor.shape)  # type: ignore
-            args.append(tensor.index.mode_indices)  # type: ignore
-            args.append(tensor.values)  # type: ignore
-
-        spmm_csr = ops.spmm_coo_float
-
-        start_time = time.time()
-        result_cpp = spmm_csr(*args)
-        end_time = time.time()
-        eval_time = end_time - start_time
-        # print("[spmm_csr] eval_time:", eval_time)
-        if "time_dict" in kwargs:
-            kwargs["time_dict"]["eval_time"] = eval_time
-
-        result = STensor(
-            shape=result_shape,
-            index=TensorIndex(
-                mode_indices=result_cpp.storage.index.mode_indices,
-                tensor_format="dd",
-            ),
-            value=result_cpp.storage.value,
-        )
-        result = result.to_torch()
-        result = result.to(device)
-        return result
-
-    result = einsum("ij,jk->ik", a, b, **kwargs)
     if isinstance(result, STensor) and result.format.is_dense():
         result = result.to_torch()
 
@@ -540,36 +503,6 @@ def einsum(
         # Read header_cpp_code from csrc/header.cpp
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
             header_cpp_code = f.read()
-
-        # # Write "#include <torch/extension.h>" + "\n" + '#include "header.cpp"' + "\n" + cpp_code to a file
-        # # and PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("evaluate", &evaluate); }
-        # with open(PROJECT_ROOT_DIR / "csrc/kernel.cpp", "w") as f:
-        #     f.write("#include <torch/extension.h>\n")
-        #     f.write('#include "header.cpp"\n')
-        #     f.write(cpp_code)
-        #     f.write(
-        #         f"""
-        #         PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-        #           m.def("evaluate", &evaluate);
-        #             pybind11::class_<Tensor>(m, "Tensor")
-        #               .def(pybind11::init<>())
-        #               .def_readwrite("_storage", &Tensor::_storage);
-        #             pybind11::class_<TensorStorage>(m, "TensorStorage")
-        #               .def(pybind11::init<>())
-        #               .def_readwrite("_value", &TensorStorage::_value)
-        #               .def_readwrite("_index", &TensorStorage::_index);
-        #             pybind11::class_<TensorIndex>(m, "TensorIndex")
-        #               .def(pybind11::init<>())
-        #               .def_readwrite("mode_indices", &TensorIndex::mode_indices);
-        #         }}
-        #         """
-        #     )
-        #
-        # # Load the C++ code using PyTorch's C++ extension
-        # module = torch.utils.cpp_extension.load(
-        #     name="kernel",
-        #     sources=[str(PROJECT_ROOT_DIR / "csrc/kernel.cpp")],
-        # )
 
         module = torch.utils.cpp_extension.load_inline(
             name="kernel",
