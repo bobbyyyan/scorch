@@ -3,7 +3,14 @@
 #define SCORCH_UNLIKELY(x) (x)
 #define SCORCH_RESTRICT __restrict__
 
-Tensor spmspm_coo_float(std::vector<int> result_shape, std::vector<int> A_shape, std::vector<std::vector<torch::Tensor>> A_mode_indices, torch::Tensor A_values, std::vector<int> B_shape, std::vector<std::vector<torch::Tensor>> B_mode_indices, torch::Tensor B_values) {
+Tensor spmspm_coo_float(
+  std::vector<int> result_shape,
+  std::vector<int> A_shape,
+  std::vector<std::vector<torch::Tensor>> A_mode_indices,
+  torch::Tensor A_values,
+  std::vector<int> B_shape,
+  std::vector<std::vector<torch::Tensor>> B_mode_indices,
+  torch::Tensor B_values) {
 
   // Get A's level & value arrays
   torch::Tensor A0_crd_tensor = A_mode_indices[0][0];

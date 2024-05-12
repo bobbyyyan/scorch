@@ -234,25 +234,42 @@ public:
 #ifndef SPARSE_ML_COO_WORKSPACE_H
 #define SPARSE_ML_COO_WORKSPACE_H
 
-#include <unordered_map>
-#include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <iostream>
+#include <vector>
+#include <unordered_map>
 
 template <typename T, int N>
 class coo_workspace_1d {
-  static constexpr int BLOCK_SIZE = 1024;
+  static constexpr int INITIAL_CAPACITY = 1024;
+  static constexpr int GROWTH_FACTOR = 2;
+  static constexpr int BLOCK_SIZE = N;
 
   T* _values;
   int* _indices;
   bool* _setFlags;
   int _size;
+  int _capacity;
 
  public:
-  explicit coo_workspace_1d(int capacity) {
-    _values = (T*)malloc(sizeof(T) * capacity);
-    _indices = (int*)malloc(sizeof(int) * capacity);
-    _setFlags = (bool*)calloc(capacity, sizeof(bool));
+  explicit coo_workspace_1d(int capacity = INITIAL_CAPACITY) : _capacity(capacity) {
+    _values = (T*)malloc(sizeof(T) * _capacity);
+    if (!_values) throw std::bad_alloc();
+
+    _indices = (int*)malloc(sizeof(int) * _capacity);
+    if (!_indices) {
+      free(_values);
+      throw std::bad_alloc();
+    }
+
+    _setFlags = (bool*)calloc(_capacity, sizeof(bool));
+    if (!_setFlags) {
+      free(_values);
+      free(_indices);
+      throw std::bad_alloc();
+    }
+
     _size = 0;
   }
 
@@ -264,26 +281,45 @@ class coo_workspace_1d {
     free(_setFlags);
   }
 
-    void insert(const int coord, T value) {
+  void insert(const int coord, T value) {
+    if (coord >= _capacity) {
+      resize(std::max(coord + 1, _capacity * GROWTH_FACTOR));
+    }
+
     if (!_setFlags[coord]) {
       _values[coord] = value;
-      _indices[_size] = coord;
+      _indices[_size++] = coord;
       _setFlags[coord] = true;
-      _size++;
     } else {
       _values[coord] += value;
     }
   }
 
+  void resize(int new_capacity) {
+    _values = (T*)realloc(_values, sizeof(T) * new_capacity);
+    _indices = (int*)realloc(_indices, sizeof(int) * new_capacity);
+    bool* new_setFlags = (bool*)realloc(_setFlags, sizeof(bool) * new_capacity);
+
+    if (!_values || !_indices || !new_setFlags) {
+        throw std::bad_alloc();
+    }
+
+    // Initialize the newly allocated memory for _setFlags to false
+    std::fill(new_setFlags + _capacity, new_setFlags + new_capacity, false);
+
+    _setFlags = new_setFlags;
+    _capacity = new_capacity;
+  }
+
   void sort() {
-    std::qsort(_indices, _size, sizeof(int), [](const void* a, const void* b) {
-      return *(const int*)a - *(const int*)b;
+    std::sort(_indices, _indices + _size, [this](int a, int b) {
+      return a < b;
     });
   }
 
   void clear() {
     _size = 0;
-    std::fill_n(_setFlags, BLOCK_SIZE, false);
+    std::fill_n(_setFlags, _capacity, false);
   }
 
   class iterator {

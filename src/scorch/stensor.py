@@ -364,7 +364,7 @@ class STensor(torch.nn.Module):
         if name is None:
             name = "tensor"
 
-        if tensor.is_sparse:
+        if tensor.is_sparse or tensor.is_sparse_csr:
             if tensor.layout == torch.sparse_coo:
                 mode_indices = []
                 tensor = tensor.coalesce()

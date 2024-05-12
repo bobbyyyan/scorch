@@ -2076,3 +2076,24 @@ def test_spmv_d_oo_d():
     print(f"scorch total time: {scorch_total_time}")
     print(f"scorch eval time: {scorch_eval_time}")
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
+
+
+def test_sddmm_csr():
+    n = 1025
+    sparsity = 0.99
+    sparse_tensor = torch.rand(n, n)
+    sparse_tensor = sparse_tensor * (torch.rand(n, n) > sparsity).float()
+    sparse_tensor = sparse_tensor.to_sparse_csr()
+
+    dense_tensor_a = torch.rand(n, n)
+    dense_tensor_b = torch.rand(n, n)
+
+    torch_result = torch.mul(
+        sparse_tensor, torch.matmul(dense_tensor_a, dense_tensor_b)
+    )
+
+    scorch_result = einsum(
+        "ij,ik,kj->ij", sparse_tensor, dense_tensor_a, dense_tensor_b
+    )
+
+    assert torch_result.values().allclose(scorch_result.values)

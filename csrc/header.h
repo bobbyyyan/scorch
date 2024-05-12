@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <omp.h>
 
 typedef struct {
   std::vector<std::vector<torch::Tensor>> mode_indices;
@@ -297,12 +298,16 @@ class coo_workspace_1d {
   void resize(int new_capacity) {
     _values = (T*)realloc(_values, sizeof(T) * new_capacity);
     _indices = (int*)realloc(_indices, sizeof(int) * new_capacity);
-    _setFlags = (bool*)realloc(_setFlags, sizeof(bool) * new_capacity);
+    bool* new_setFlags = (bool*)realloc(_setFlags, sizeof(bool) * new_capacity);
 
-    if (!_values || !_indices || !_setFlags) {
-      throw std::bad_alloc();
+    if (!_values || !_indices || !new_setFlags) {
+        throw std::bad_alloc();
     }
 
+    // Initialize the newly allocated memory for _setFlags to false
+    std::fill(new_setFlags + _capacity, new_setFlags + new_capacity, false);
+
+    _setFlags = new_setFlags;
     _capacity = new_capacity;
   }
 
