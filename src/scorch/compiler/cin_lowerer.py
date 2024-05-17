@@ -894,27 +894,141 @@ class CINLowerer:
         if not wksp_index_vars:
             stmts: List[llir.Stmt] = []
 
-            index_var = result_tensor_access.get_index_vars()[0]
+            index_var = result_tensor_access.get_index_vars()[-1]
             level = result_tensor_access.level_of_index_var(index_var)
             level_type = result_tensor_access.level_type_of_index_var(index_var)
 
             if level_type == LevelType.DENSE:
                 # <result tensor name>_values[<result level iterator>] = <wksp's name>;
                 stmts.append(
+                    llir.IfThenElse(
+                        cond=llir.BinOp(
+                            op="!=",
+                            left=llir.Var(
+                                name=f"{wksp.name}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            right=llir.Literal(0),
+                        ),
+                        then_body=[
+                            llir.Assign(
+                                var=llir.Var(
+                                    name=f"{result_tensor_name}_values[p{result_tensor_name}{level}]",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                value=llir.Var(
+                                    name=f"{wksp.get_name()}",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                            )
+                        ],
+                    )
+                )
+            elif level_type == LevelType.COMPRESSED:
+                result_level_iterator_var = llir.Var(
+                    name=f"p{result_tensor_name}{level}",
+                    type=llir.DataType.INT,
+                )
+                stmts.append(
+                    llir.IfThenElse(
+                        cond=llir.BinOp(
+                            op="!=",
+                            left=llir.Var(
+                                    name=f"{wksp.name}",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                            right=llir.Literal(0),
+                        ),
+                        then_body=[
+                            llir.Assign(
+                                var=llir.Var(
+                                    name=f"{result_tensor_name}_values[{result_level_iterator_var.name}]",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                value=llir.Var(
+                                    name=f"{wksp.name}",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                op=AssignOp.ASSIGN,
+                            ),
+                            llir.Assign(
+                                var=llir.Var(
+                                    name=f"{result_tensor_name}{level}_crd[{result_level_iterator_var.name}]",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                value=llir.Var(
+                                    name=f"{index_var.name}",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                op=AssignOp.ASSIGN,
+                            ),
+                            llir.Increment(result_level_iterator_var)
+                        ],
+                    )
+                )
+            elif level_type == LevelType.COORDINATE:
+                # pdb.set_trace()
+                then_body_stmts = []
+
+                # C0_crd[pC0] = i, C1_crd[pC1] = j;
+                for index, index_var in enumerate(result_tensor_access.indices):
+                    then_body_stmts.append(
+                        llir.Assign(
+                            var=llir.Var(
+                                name=f"{result_tensor_name}{index}_crd[p{result_tensor_name}{index}]",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            value=llir.Var(
+                                name=f"{index_var.name}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            op=AssignOp.ASSIGN,
+                        )
+                    )
+
+                # C_values[pC0] = wksp;
+                then_body_stmts.append(
                     llir.Assign(
                         var=llir.Var(
-                            name=f"{result_tensor_name}_values[{index_var.name}]",
+                            name=f"{result_tensor_name}_values[p{result_tensor_name}0]",
                             type=llir.DataType.NO_TYPE,
                         ),
                         value=llir.Var(
-                            name=f"{wksp.get_name()}",
+                            name=f"{wksp.name}",
                             type=llir.DataType.NO_TYPE,
                         ),
+                        op=AssignOp.ASSIGN,
                     )
                 )
+
+                # pC0++, pC1++
+                for i in range(len(result_tensor_access.indices)):
+                    then_body_stmts.append(
+                        llir.Increment(
+                            var=llir.Var(
+                                name=f"p{result_tensor_name}{i}",
+                                type=llir.DataType.INT,
+                            ),
+                        )
+                    )
+
+                stmts.append(
+                    llir.IfThenElse(
+                        cond=llir.BinOp(
+                            op="!=",
+                            left=llir.Var(
+                                name=f"{wksp.name}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            right=llir.Literal(0),
+                        ),
+                        then_body=then_body_stmts
+                    )
+                )
+
             else:
                 raise NotImplementedError(
-                    "TODO: need to handle assembly of workspace with sparse level"
+                    "TODO: need to handle assembly of workspace of other level types"
                 )
             return [
                 llir.BlankLine(),
