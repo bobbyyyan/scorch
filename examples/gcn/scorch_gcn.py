@@ -17,6 +17,7 @@ warnings.filterwarnings(
     message="Sparse CSR tensor support is in beta state.*",
 )
 
+
 class GraphConvolution(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(GraphConvolution, self).__init__()

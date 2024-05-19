@@ -1,48 +1,47 @@
 # Scorch
 
-[![pytest](https://github.com/bobbyyyan/scorch/actions/workflows/pytest.yml/badge.svg)](https://github.com/bobbyyyan/scorch/actions/workflows/pytest.yml)
+Scorch is a Python library for sparse machine learning, built on top of PyTorch. It provides sparse implementations of key PyTorch operations, allowing you to work with sparse tensors seamlessly.
 
-## Getting started
+## Getting Started
 
-```
-cd scorch
-pipenv install --dev
-pipenv shell
-```
+To get started with Scorch, follow these steps:
 
-### Setting up development environment
+1. Clone the Scorch repository and change into the project directory:
+   ```shell
+   git clone <repository-url>
+   cd scorch
+   ```
 
-#### Install Ninja
+2. Create a new conda environment and install the required dependencies:
+   ```shell
+   conda create -n scorch python=3.11
+   conda activate scorch
+   pip install -r requirements.txt
+   ```
 
-Ninja is required to load C++ extension. To install, use `pip install ninja`.
+3. Install Scorch and its dependencies:
+   ```shell
+   pip install .
+   ```
 
-#### Install libtorch
+## Usage
 
-libtorch is needed to test generated C++ code. See https://pytorch.org/get-started/locally/ for more details. For M1 Mac, see instructions on how to build the latest version of libtorch below.
+To use Scorch in your PyTorch projects, simply import it as follows:
 
-#### Building libtorch for M1 Mac
-
-```shell
-git clone -b main --recurse-submodule https://github.com/pytorch/pytorch.git
-cd pytorch
-mkdir build && cd build
-cmake -D BUILD_SHARED_LIBS:BOOL=ON \
-      -D CMAKE_BUILD_TYPE:STRING=Release \
-      -D PYTHON_EXECUTABLE:PATH=`which python3` \
-      -D CMAKE_INSTALL_PREFIX:PATH=../libtorch  \
-      ..
-cmake --build . --target install --parallel 20
+```python
+import scorch as torch
 ```
 
-#### Edit includepath
+With this import statement, you can use Scorch's sparse implementations of PyTorch operations. For example:
 
-You may want to edit the include path in your IDE to include the libtorch headers.
+```python
+# Create sparse tensors
+sparse_tensor1 = torch.sparse_coo_tensor(...)
+sparse_tensor2 = torch.sparse_coo_tensor(...)
 
-For VSCode, edit include path to include the following so that intellisense works.
+# Perform sparse matrix multiplication
+result = torch.matmul(sparse_tensor1, sparse_tensor2)
 
-```
-${workspaceFolder}/**
-~/libtorch/include/**
-~/libtorch/include/torch/**
-~/libtorch/include/torch/csrc/api/include/**
+# Perform sparse einsum operation
+result = torch.einsum('ij,jk->ik', sparse_tensor1, sparse_tensor2)
 ```

@@ -19,7 +19,7 @@ class BigBirdSparseAttention(nn.Module):
         block_size,
         num_random_blocks,
         num_sliding_blocks,
-        inference=False,
+        inference=True,
     ):
         super(BigBirdSparseAttention, self).__init__()
         self.embed_dim = embed_dim
@@ -126,7 +126,7 @@ class BigBirdBlock(nn.Module):
         intermediate_size,
         hidden_dropout_prob,
         attention_probs_dropout_prob,
-        inference=False,
+        inference=True,
     ):
         super(BigBirdBlock, self).__init__()
         self.attention = BigBirdSparseAttention(
@@ -172,7 +172,7 @@ class BigBirdModel(nn.Module):
         hidden_dropout_prob,
         attention_probs_dropout_prob,
         num_classes,
-        inference=False,
+        inference=True,
     ):
         super(BigBirdModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -254,13 +254,20 @@ def YAHOO_ANSWERS(split=("train", "test")):
     test_df = pd.read_csv("data/yahoo_answers_csv/test.csv", header=None)
 
     # labels in first column, text in second, third, and fourth columns
-    train_iter = [(row[0], f"{row[1]} {row[2]} {row[3]}") for row in train_df.itertuples(index=False, name=None)]
-    test_iter = [(row[0], f"{row[1]} {row[2]} {row[3]}") for row in test_df.itertuples(index=False, name=None)]
+    train_iter = [
+        (row[0], f"{row[1]} {row[2]} {row[3]}")
+        for row in train_df.itertuples(index=False, name=None)
+    ]
+    test_iter = [
+        (row[0], f"{row[1]} {row[2]} {row[3]}")
+        for row in test_df.itertuples(index=False, name=None)
+    ]
 
     # train_iter = [(row[0], row[1]) for row in train_df.itertuples(index=False, name=None)]
     # test_iter = [(row[0], row[1]) for row in test_df.itertuples(index=False, name=None)]
 
     return train_iter, test_iter
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -315,7 +322,6 @@ def main():
         train_iter, test_iter = YAHOO_ANSWERS()
         num_classes = 10
 
-
     tokenizer = get_tokenizer("basic_english")
 
     def yield_tokens(data_iter):
@@ -335,7 +341,6 @@ def main():
             return 1 if x == "pos" else 0
         elif args.dataset == "yahoo_answers":
             return int(x) - 1
-
 
     train_dataset = list(train_iter)
     test_dataset = list(test_iter)

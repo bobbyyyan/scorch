@@ -102,7 +102,9 @@ def train(model, data, device, dataset_name, split_idx=None, batch_size=1, epoch
             # Mini-batch training for Reddit dataset
             perm = torch.randperm(data.num_nodes)
             num_batches = (data.num_nodes + batch_size - 1) // batch_size
-            batches = tqdm(range(num_batches), desc=f"Epoch {epoch+1}", unit="batch", leave=False)
+            batches = tqdm(
+                range(num_batches), desc=f"Epoch {epoch+1}", unit="batch", leave=False
+            )
             for batch_idx in batches:
                 batch_start = batch_idx * batch_size
                 batch_end = min(batch_start + batch_size, data.num_nodes)
@@ -111,7 +113,10 @@ def train(model, data, device, dataset_name, split_idx=None, batch_size=1, epoch
 
                 optimizer.zero_grad()
                 out = model(batch_data.x.to(device), batch_data.edge_index.to(device))
-                loss = F.nll_loss(out[batch_data.train_mask], batch_data.y.view(-1)[batch_data.train_mask].to(device))
+                loss = F.nll_loss(
+                    out[batch_data.train_mask],
+                    batch_data.y.view(-1)[batch_data.train_mask].to(device),
+                )
                 loss.backward()
                 optimizer.step()
 
@@ -162,7 +167,9 @@ def inference(model, data, device, dataset_name, split_idx=None, batch_size=1):
             batch_data = data.subgraph(batch_nodes)
 
             with torch.no_grad():
-                logits = model(batch_data.x.to(device), batch_data.edge_index.to(device))
+                logits = model(
+                    batch_data.x.to(device), batch_data.edge_index.to(device)
+                )
                 pred = logits.argmax(dim=1)
 
             batch_correct = int((pred == batch_data.y.view(-1)).sum())
@@ -234,9 +241,19 @@ def main():
     model = GCN(in_channels, hidden_channels, out_channels).to(device)
 
     if args.mode.lower() == "train":
-        train(model, data, device, args.dataset, split_idx, batch_size=args.batch_size, epochs=args.epochs)
+        train(
+            model,
+            data,
+            device,
+            args.dataset,
+            split_idx,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+        )
     elif args.mode.lower() == "test":
-        inference(model, data, device, args.dataset, split_idx, batch_size=args.batch_size)
+        inference(
+            model, data, device, args.dataset, split_idx, batch_size=args.batch_size
+        )
     else:
         raise ValueError(
             f"Mode {args.mode} not recognized. Choose from 'train' or 'test'."

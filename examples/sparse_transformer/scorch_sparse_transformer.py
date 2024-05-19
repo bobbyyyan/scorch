@@ -11,10 +11,15 @@ from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 
 
-
 class BigBirdSparseAttention(nn.Module):
     def __init__(
-        self, embed_dim, num_heads, block_size, num_random_blocks, num_sliding_blocks
+        self,
+        embed_dim,
+        num_heads,
+        block_size,
+        num_random_blocks,
+        num_sliding_blocks,
+        inference=True,
     ):
         super(BigBirdSparseAttention, self).__init__()
         self.embed_dim = embed_dim
@@ -22,6 +27,7 @@ class BigBirdSparseAttention(nn.Module):
         self.block_size = block_size
         self.num_random_blocks = num_random_blocks
         self.num_sliding_blocks = num_sliding_blocks
+        self.inference = inference
         self.head_dim = embed_dim // num_heads
         self.query = nn.Linear(embed_dim, embed_dim)
         self.key = nn.Linear(embed_dim, embed_dim)
@@ -105,10 +111,16 @@ class BigBirdBlock(nn.Module):
         intermediate_size,
         hidden_dropout_prob,
         attention_probs_dropout_prob,
+        inference=True,
     ):
         super(BigBirdBlock, self).__init__()
         self.attention = BigBirdSparseAttention(
-            embed_dim, num_heads, block_size, num_random_blocks, num_sliding_blocks
+            embed_dim,
+            num_heads,
+            block_size,
+            num_random_blocks,
+            num_sliding_blocks,
+            inference,
         )
         self.intermediate = nn.Linear(embed_dim, intermediate_size)
         self.output = nn.Linear(intermediate_size, embed_dim)
@@ -145,6 +157,7 @@ class BigBirdModel(nn.Module):
         hidden_dropout_prob,
         attention_probs_dropout_prob,
         num_classes,
+        inference=True,
     ):
         super(BigBirdModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -159,6 +172,7 @@ class BigBirdModel(nn.Module):
                     intermediate_size,
                     hidden_dropout_prob,
                     attention_probs_dropout_prob,
+                    inference,
                 )
                 for _ in range(num_layers)
             ]
@@ -219,18 +233,26 @@ def test(model, device, test_loader, criterion):
     )
     print(f"Inference time: {end_time - start_time:.2f}s")
 
+
 def YAHOO_ANSWERS(split=("train", "test")):
     train_df = pd.read_csv("data/yahoo_answers_csv/train.csv", header=None)
     test_df = pd.read_csv("data/yahoo_answers_csv/test.csv", header=None)
 
     # labels in first column, text in second, third, and fourth columns
-    train_iter = [(row[0], f"{row[1]} {row[2]} {row[3]}") for row in train_df.itertuples(index=False, name=None)]
-    test_iter = [(row[0], f"{row[1]} {row[2]} {row[3]}") for row in test_df.itertuples(index=False, name=None)]
+    train_iter = [
+        (row[0], f"{row[1]} {row[2]} {row[3]}")
+        for row in train_df.itertuples(index=False, name=None)
+    ]
+    test_iter = [
+        (row[0], f"{row[1]} {row[2]} {row[3]}")
+        for row in test_df.itertuples(index=False, name=None)
+    ]
 
     # train_iter = [(row[0], row[1]) for row in train_df.itertuples(index=False, name=None)]
     # test_iter = [(row[0], row[1]) for row in test_df.itertuples(index=False, name=None)]
 
     return train_iter, test_iter
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -324,6 +346,8 @@ def main():
         test_dataset, batch_size=args.batch_size, collate_fn=collate_batch
     )
 
+    is_inference = args.mode == "test"
+
     model = BigBirdModel(
         vocab_size=len(vocab),
         embed_dim=128,
@@ -336,19 +360,20 @@ def main():
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         num_classes=num_classes,
+        inference=is_inference,
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    if args.mode == "train":
+    if is_inference:
+        model.load_state_dict(torch.load(args.model_path))
+        test(model, device, test_loader, criterion)
+    else:
         for epoch in range(1, args.epochs + 1):
             train(model, device, train_loader, optimizer, criterion, epoch)
             test(model, device, test_loader, criterion)
-        torch.save(model.state_dict(), args.model_path)
-    else:
-        model.load_state_dict(torch.load(args.model_path))
-        test(model, device, test_loader, criterion)
+            torch.save(model.state_dict(), args.model_path + f".{epoch}_epochs")
 
 
 if __name__ == "__main__":

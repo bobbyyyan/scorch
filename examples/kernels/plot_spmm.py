@@ -30,17 +30,18 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+csv_filename = "spmm_benchmark_results.csv"
 
 # Load results from the CSV
 results_df = pd.read_csv(
-    "spmm_benchmark_results.csv", dtype={"Runtime": float, "NNZ": int}
+    csv_filename, dtype={"Runtime": float, "NNZ": int}
 )
 
 # Plot settings
 sns.set(style="white", context="talk")
 
 # Plotting
-plt.figure(figsize=(12, 6))
+plt.figure(figsize=(15, 6))
 
 plt.rcParams.update(
     {
@@ -53,27 +54,35 @@ plt.rcParams.update(
         # Legend settings
         "legend.fontsize": 22,
         "legend.title_fontsize": 24,
-        # Legend dot size
+        # Legend bold text
         "legend.markerscale": 5,
     }
 )
-for framework in ["PyTorch", "Scorch"]:
+
+colors = ["#19526c", "#fc764a", "#1AACAC", "#E7B10A", "#ED5AB3"]
+
+framework_colors = {
+    "PyTorch": colors[0],
+    "Scorch": colors[1],
+}
+
+for framework in ["Scorch", "PyTorch"]:
     sub_df = results_df[results_df["Framework"] == framework]
     mean_runtime = sub_df.groupby("NNZ")["Runtime"].mean()
     std_runtime = sub_df.groupby("NNZ")["Runtime"].std()
 
     # Using scatter plot for data points, adjust size using 's' and transparency using 'alpha'
     plt.scatter(
-        mean_runtime.index, mean_runtime, label=f"{framework}", s=2, alpha=0.7
+        mean_runtime.index, mean_runtime, label=f"{framework}", s=2, alpha=0.7, color=framework_colors[framework]
     )  # smaller size
     # Optional: Adjust error bars
     # plt.errorbar(mean_runtime.index, mean_runtime, yerr=std_runtime, fmt='o', alpha=0.3, capsize=3, markersize=2)
 
-plt.xlabel("Number of Non-Zeros (NNZ)")
-plt.ylabel("Average Runtime (seconds)")
-plt.title("Sparse Matrix Multiplication (SpMM) Performance")
+# plt.xlabel("Number of Non-Zeros (NNZ)")
+# plt.ylabel("Average Runtime (seconds)")
+plt.title("SpMM Performance")
 plt.legend()
 plt.xscale("log")
 plt.yscale("log")
-plt.savefig("spmm_benchmark_plot.pdf", bbox_inches="tight")
+plt.savefig("spmm.svg", bbox_inches="tight")
 plt.show()
