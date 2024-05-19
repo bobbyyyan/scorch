@@ -139,10 +139,6 @@ public:
     // function to remove the element at a particular index
     inline void remove(int index) {
         if (index < _size) {
-            // for (int i = index; i < _size - 1; i++) {
-            //     _data[i] = _data[i + 1];
-            // }
-            // use memcpy for better performance
              memcpy(_data + index, _data + index + 1, sizeof(T) * (_size - index - 1));
             _size--;
         }
@@ -158,13 +154,29 @@ public:
                 _capacity *= 2;
                 _data = temp;
             }
-            // for (int i = _size; i > index; i--) {
-            //     _data[i] = _data[i - 1];
-            // }
-            // use memcpy for better performance
             memcpy(_data + index + 1, _data + index, sizeof(T) * (_size - index));
             _data[index] = element;
             _size++;
+        }
+    }
+
+    // function to insert multiple elements at a particular index
+    inline void insert(int index, const T* elements, int count) {
+        if (index <= _size) {
+            if (_size + count > _capacity) {
+                while (_size + count > _capacity) {
+                    _capacity *= 2;
+                }
+                T* temp = (T*) malloc(sizeof(T) * _capacity);
+                memcpy(temp, _data, sizeof(T) * index);
+                memcpy(temp + index + count, _data + index, sizeof(T) * (_size - index));
+                free(_data);
+                _data = temp;
+            } else {
+                memmove(_data + index + count, _data + index, sizeof(T) * (_size - index));
+            }
+            memcpy(_data + index, elements, sizeof(T) * count);
+            _size += count;
         }
     }
 

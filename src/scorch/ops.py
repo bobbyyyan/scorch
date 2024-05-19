@@ -255,14 +255,12 @@ def matmul(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        if a.is_sparse and b.is_sparse:
-            if a.layout == torch.sparse_coo and b.layout == torch.sparse_coo:
-                a = STensor.from_torch(a)
-                b = STensor.from_torch(b)
-        elif a.is_sparse_csr and not b.is_sparse:
-            # SpMM
+        if a.is_sparse and b.is_sparse and a.layout == torch.sparse_coo and b.layout == torch.sparse_coo:
+            a = a.to_sparse_csr()
+            b = b.to_sparse_csr()
+        if a.is_sparse or a.is_sparse_csr or b.is_sparse or b.is_sparse_csr:
             device = a.device
-            a = STensor.from_csr(a)
+            a = STensor.from_torch(a)
             b = STensor.from_torch(b)
         else:
             return torch.matmul(a, b)
@@ -284,6 +282,9 @@ def matmul(
     if use_cache:
         if str(a.format) == "d,s" and str(b.format) == "d,d":
             kernel_op = ops.spmm_csr_float
+        elif str(a.format) == "d,s" and str(b.format) == "d,s" and use_cache:
+            result_format = parse_format("ds")
+            kernel_op = ops.spmspm_csr_float
         elif str(a.format) == "o,o" and str(b.format) == "o,o" and use_cache:
             result_format = parse_format("oo")
             kernel_op = ops.spmspm_coo_float

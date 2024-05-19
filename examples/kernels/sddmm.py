@@ -43,7 +43,7 @@ np.random.seed(15)
 torch.manual_seed(15)
 
 matrices = ssgetpy.search(limit=5000)
-matrices = [matrix for matrix in matrices if max(matrix.rows, matrix.cols) < 120000]
+matrices = [matrix for matrix in matrices if max(matrix.rows, matrix.cols) < 800000]
 
 results = []
 
@@ -54,7 +54,7 @@ for idx, matrix in enumerate(tqdm(matrices, desc="Benchmarking SDDMM")):
         sparse_matrix = mmread(matrix_path.resolve())
         print(f"Matrix shape: {sparse_matrix.shape}")
 
-        matrix_format = 'csr'
+        matrix_format = 'coo'
         torch_sparse_matrix = scipy_sparse_to_torch_sparse(sparse_matrix, format=matrix_format)
         dense_matrix_A = torch.rand((torch_sparse_matrix.shape[0], 1), dtype=torch.float32)
         dense_matrix_B = torch.rand((1, torch_sparse_matrix.shape[1]), dtype=torch.float32)
@@ -84,11 +84,10 @@ for idx, matrix in enumerate(tqdm(matrices, desc="Benchmarking SDDMM")):
                     'Runtime': end_time - start_time
                 })
 
-        # Save to CSV every 10 matrices
-        if (idx + 1) % 10 == 0:
-            results_df = pd.DataFrame(results)
-            results_df.to_csv(csv_filename, index=False)
-            print(f"Partial results saved to '{csv_filename}'.")
+        # Save to CSV every matrix
+        results_df = pd.DataFrame(results)
+        results_df.to_csv(csv_filename, index=False)
+        print(f"Partial results saved to '{csv_filename}'.")
 
     except Exception as e:
         traceback.print_exc()

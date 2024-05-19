@@ -12,8 +12,10 @@ from ogb.nodeproppred import DglNodePropPredDataset
 class DGLGCN(torch.nn.Module):
     def __init__(self, num_features, num_classes):
         super(DGLGCN, self).__init__()
-        self.conv1 = GraphConv(num_features, 128, allow_zero_in_degree=True, norm='none')
-        self.conv2 = GraphConv(128, num_classes, allow_zero_in_degree=True, norm='none')
+        self.conv1 = GraphConv(
+            num_features, 128, allow_zero_in_degree=True, norm="none"
+        )
+        self.conv2 = GraphConv(128, num_classes, allow_zero_in_degree=True, norm="none")
 
     def forward(self, g, x):
         x = self.conv1(g, x)
@@ -82,8 +84,10 @@ def main():
         state_dict = torch.load(weights_file, map_location=device)
         new_state_dict = {}
         for key, value in state_dict.items():
-            new_key = key.replace("lin.weight", "weight")  # Adjust key for DGL model weight
-            if 'bias' in new_key:
+            new_key = key.replace(
+                "lin.weight", "weight"
+            )  # Adjust key for DGL model weight
+            if "bias" in new_key:
                 new_key = new_key.replace("lin.bias", "bias")
             # Transpose the weight matrices
             if "weight" in new_key:
@@ -95,6 +99,7 @@ def main():
         inference(model_dgl, g, device)
     else:
         print(f"Weight file not found: {weights_file}")
+
 
 if __name__ == "__main__":
     main()

@@ -9,6 +9,7 @@ import pandas as pd
 import scorch
 from tqdm import tqdm
 
+import traceback
 import warnings
 
 # Suppress specific PyTorch UserWarning about Sparse CSR tensor support
@@ -17,6 +18,8 @@ warnings.filterwarnings(
     category=UserWarning,
     message="Sparse CSR tensor support is in beta state.*",
 )
+
+csv_filename = "spmspm_benchmark_results.csv"
 
 def scipy_sparse_to_torch_sparse(matrix, format='csr'):
     if format == 'coo':
@@ -40,12 +43,13 @@ def scipy_sparse_to_torch_sparse(matrix, format='csr'):
 np.random.seed(15)
 torch.manual_seed(15)
 
-matrices = ssgetpy.search(limit=5000)[0:1]
-matrices = [matrix for matrix in matrices if matrix.nnz < 2700000000]
+matrices = ssgetpy.search(limit=5000)
+matrices = [matrix for matrix in matrices if max(matrix.rows, matrix.cols) < 100000]
+matrices = [matrix for matrix in matrices if matrix.nnz < 10000000]
 
 results = []
 
-for matrix in tqdm(matrices, desc="Benchmarking Matrices"):
+for matrix in tqdm(matrices, desc="Benchmarking SpMSpM"):
     try:
         print(f"Processing matrix {matrix.id} {matrix.name} in group {matrix.group} with {matrix.nnz} NNZ...")
         # sparse_matrix_mm = matrix.download(format='MM', extract=True)
@@ -64,6 +68,8 @@ for matrix in tqdm(matrices, desc="Benchmarking Matrices"):
         matrix_format = 'coo'
         torch_sparse_matrix = scipy_sparse_to_torch_sparse(sparse_matrix, format=matrix_format)
         torch_sparse_matrix_transpose = torch_sparse_matrix.transpose(0, 1)
+        if matrix_format == 'csr':
+            torch_sparse_matrix_transpose = torch_sparse_matrix_transpose.to_sparse_csr()
         nnz = sparse_matrix.nnz
 
         for framework in ["PyTorch", "Scorch"]:
@@ -89,11 +95,17 @@ for matrix in tqdm(matrices, desc="Benchmarking Matrices"):
                     'Runtime': end_time - start_time
                 })
 
+        # Save to CSV every matrix
+        results_df = pd.DataFrame(results)
+        results_df.to_csv(csv_filename, index=False)
+        print(f"Partial results saved to '{csv_filename}'.")
+
     except Exception as e:
+        traceback.print_exc()
         print(f"Error processing matrix {matrix.name} in group {matrix.group}: {e}")
 
 results_df = pd.DataFrame(results)
-results_df.to_csv("spmspm_benchmark_results.csv", index=False)
+results_df.to_csv(csv_filename, index=False)
 print("Benchmarking complete. Results saved to 'spmspm_benchmark_results.csv'.")
 
 import pandas as pd
@@ -132,7 +144,7 @@ for framework in ['PyTorch', 'Scorch']:
 
 plt.xlabel('Number of Non-Zeros (NNZ)')
 plt.ylabel('Average Runtime (seconds)')
-plt.title('Sparse Matrix Multiplication (SpMM) Performance')
+plt.title('SpMSpM Runtime')
 plt.legend()
 plt.xscale('log')
 plt.yscale('log')

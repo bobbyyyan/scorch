@@ -158,7 +158,11 @@ def inference(model, data, device, dataset_name, split_idx=None, batch_size=1):
                     adjacency = data.adj_t
                 else:
                     adjacency = (
-                        data.adj_t.to_dense().clone().detach().to(torch.float).to(device)
+                        data.adj_t.to_dense()
+                        .clone()
+                        .detach()
+                        .to(torch.float)
+                        .to(device)
                     )
             else:
                 if data.edge_index.dim() == 2 and data.edge_index.shape[0] != 2:
