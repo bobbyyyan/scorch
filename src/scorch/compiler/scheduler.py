@@ -250,7 +250,7 @@ class Scheduler:
                 self.visit(forall.stmt)
 
             def visit_WorkspaceAccess(self, workspace_access: WorkspaceAccess):
-                if workspace_access.indices[-1] == self.old_index_var:
+                if workspace_access.indices and workspace_access.indices[-1] == self.old_index_var:
                     workspace_access.indices[-1] = self.new_index_var
                     workspace_access.update_indices(workspace_access.indices)
 

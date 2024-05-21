@@ -1,4 +1,5 @@
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Union, Sequence, Optional, List
 
@@ -341,11 +342,28 @@ def einsum(
     # Make sure the index strings are unique, keeping the order
     unique_index_strs = list(dict.fromkeys(unique_index_strs))
     result_index_strs = list(expression.split("->")[1])
-    input_index_strs_concat = expression.split("->")[0]
-    index_strs_by_schedule = topo_sort_characters(
-        input_index_strs_concat, priority=result_index_strs
-    )
+    index_strs_concat = expression.split("->")[0].split(",") + ["".join(result_index_strs)]
+    index_strs_by_schedule,  new_index_strs = topo_sort_characters(index_strs_concat, tensors)
     input_index_strs = [list(x) for x in expression.split("->")[0].split(",")]
+
+    index_str_to_mode_index = defaultdict(list)
+    for tensor_index in range(len(input_index_strs)):
+        for level in range(len(input_index_strs[tensor_index])):
+            index_str_to_mode_index[input_index_strs[tensor_index][level]].append(
+                tensors[tensor_index].storage.index.mode_order[level]
+            )
+    final_mode_order = [index_str_to_mode_index[index_str][0] for index_str in result_index_strs]
+
+    temp_mode_order = None
+    for tensor_index, new_index_str in new_index_strs.items():
+        if tensor_index == 2:
+            result_index_strs = list(new_index_str)
+            temp_mode_order = [index_str_to_mode_index[index_str][0] for index_str in result_index_strs]
+        else:
+            input_index_strs[tensor_index] = list(new_index_str)
+            mode_order = [index_str_to_mode_index[index_str][0] for index_str in input_index_strs[tensor_index]]
+            tensors[tensor_index].change_mode_order(mode_order)
+
     # Create a list of IndexVar objects, and a dict mapping index strings
     # to IndexVar objects
     index_vars = [IndexVar(index_str) for index_str in unique_index_strs]
@@ -502,7 +520,7 @@ def einsum(
 
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        # print("\n\n", cpp_code)
+        print("\n\n", cpp_code)
 
         # Read header_cpp_code from csrc/header.cpp
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
@@ -554,6 +572,7 @@ def einsum(
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
+            mode_order=temp_mode_order if temp_mode_order else final_mode_order
         ),
         value=result_cpp.storage.value,
     )
@@ -561,6 +580,9 @@ def einsum(
     if "time_dict" in kwargs:
         time_dict = kwargs["time_dict"]
         time_dict["eval_time"] = eval_time
+
+    if temp_mode_order:
+        result.change_mode_order(final_mode_order)
 
     return result
 
