@@ -1,3 +1,4 @@
+import pdb
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -345,7 +346,7 @@ def einsum(
     index_strs_concat = expression.split("->")[0].split(",") + ["".join(result_index_strs)]
     index_strs_by_schedule,  new_index_strs = topo_sort_characters(index_strs_concat, tensors)
     input_index_strs = [list(x) for x in expression.split("->")[0].split(",")]
-
+    pdb.set_trace()
     index_str_to_mode_index = defaultdict(list)
     for tensor_index in range(len(input_index_strs)):
         for level in range(len(input_index_strs[tensor_index])):

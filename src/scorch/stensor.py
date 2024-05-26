@@ -741,7 +741,7 @@ class STensor(torch.nn.Module):
 
         return self
 
-    def change_mode_order(self, mode_order: List[int]) -> Tensor:
+    def change_mode_order(self, mode_order: List[int]) -> STensor:
         # TODO: can I make these assertions?
         assert self.has_index, "self.storage.index is None"
         assert self.dtype is not None, "self.dtype is None"
@@ -776,7 +776,7 @@ class STensor(torch.nn.Module):
             fmt=self.format,
             shape=result_shape,
             dtype=self.dtype,
-            mode_order=mode_order
+            mode_order=mode_order[:]
         )
 
         # Assert A, B, and index_vars are defined
@@ -849,7 +849,7 @@ class STensor(torch.nn.Module):
             index=TensorIndex(
                 tensor_format=self.format,
                 mode_indices=result_cpp.storage.index.mode_indices,
-                mode_order=mode_order
+                mode_order=mode_order[:]
             ),
             value=result_cpp.storage.value,
         )

@@ -2,7 +2,8 @@ import pdb
 
 import torch
 
-from scorch import Tensor
+import random
+from scorch import STensor
 
 
 def test_change_mode_order_2d_dd():
@@ -15,9 +16,9 @@ def test_change_mode_order_2d_dd():
             [5, 0, 0, 0, 5],
         ]
     )
-    a_row = Tensor.from_torch(tensor_a_torch, "a_row", [0, 1])
-    a_col = Tensor.from_torch(tensor_a_torch, "a_col", [1, 0])
-    a = Tensor.from_torch(tensor_a_torch, "a", [0, 1])
+    a_row = STensor.from_torch(tensor_a_torch, "a_row", [0, 1])
+    a_col = STensor.from_torch(tensor_a_torch, "a_col", [1, 0])
+    a = STensor.from_torch(tensor_a_torch, "a", [0, 1])
 
     a.change_mode_order([1, 0])
     assert a.storage.value.tolist() == a_col.storage.value.tolist()
@@ -38,9 +39,9 @@ def test_change_mode_order_2d_ds():
             [5, 0, 0, 0, 5],
         ]
     )
-    a_row = Tensor.from_torch(tensor_a_torch, "a_row", [0, 1]).to_sparse("ds")
-    a_col = Tensor.from_torch(tensor_a_torch, "a_col", [1, 0]).to_sparse("ds")
-    a = Tensor.from_torch(tensor_a_torch, "a", [0, 1]).to_sparse("ds")
+    a_row = STensor.from_torch(tensor_a_torch, "a_row", [0, 1]).to_sparse("ds")
+    a_col = STensor.from_torch(tensor_a_torch, "a_col", [1, 0]).to_sparse("ds")
+    a = STensor.from_torch(tensor_a_torch, "a", [0, 1]).to_sparse("ds")
 
     a.change_mode_order([1, 0])
     assert a.storage.value.tolist() == a_col.storage.value.tolist()
@@ -65,9 +66,9 @@ def test_change_mode_order_2d_oo():
             [5, 0, 0, 0, 5],
         ]
     )
-    a_row = Tensor.from_torch(tensor_a_torch, "a_row", [0, 1]).to_sparse("oo")
-    a_col = Tensor.from_torch(tensor_a_torch, "a_col", [1, 0]).to_sparse("oo")
-    a = Tensor.from_torch(tensor_a_torch, "a", [0, 1]).to_sparse("oo")
+    a_row = STensor.from_torch(tensor_a_torch, "a_row", [0, 1]).to_sparse("oo")
+    a_col = STensor.from_torch(tensor_a_torch, "a_col", [1, 0]).to_sparse("oo")
+    a = STensor.from_torch(tensor_a_torch, "a", [0, 1]).to_sparse("oo")
 
     a.change_mode_order([1, 0])
     assert a.storage.value.tolist() == a_col.storage.value.tolist()
@@ -92,9 +93,9 @@ def test_change_mode_order_2d_ss():
             [5, 0, 0, 0, 5],
         ]
     )
-    a_row = Tensor.from_torch(tensor_a_torch, "a_row", [0, 1]).to_sparse("ss")
-    a_col = Tensor.from_torch(tensor_a_torch, "a_col", [1, 0]).to_sparse("ss")
-    a = Tensor.from_torch(tensor_a_torch, "a", [0, 1]).to_sparse("ss")
+    a_row = STensor.from_torch(tensor_a_torch, "a_row", [0, 1]).to_sparse("ss")
+    a_col = STensor.from_torch(tensor_a_torch, "a_col", [1, 0]).to_sparse("ss")
+    a = STensor.from_torch(tensor_a_torch, "a", [0, 1]).to_sparse("ss")
 
     a.change_mode_order([1, 0])
     assert a.storage.value.tolist() == a_col.storage.value.tolist()
@@ -133,9 +134,9 @@ def test_change_mode_order_3d_dss():
             ]
         ]
     )
-    a_default = Tensor.from_torch(tensor_a_torch, "a_default", [0, 1, 2]).to_sparse("dss")
-    a_reverse = Tensor.from_torch(tensor_a_torch, "a_reverse", [2, 1, 0]).to_sparse("dss")
-    a = Tensor.from_torch(tensor_a_torch, "a", [0, 1, 2]).to_sparse("dss")
+    a_default = STensor.from_torch(tensor_a_torch, "a_default", [0, 1, 2]).to_sparse("dss")
+    a_reverse = STensor.from_torch(tensor_a_torch, "a_reverse", [2, 1, 0]).to_sparse("dss")
+    a = STensor.from_torch(tensor_a_torch, "a", [0, 1, 2]).to_sparse("dss")
 
     a.change_mode_order([2, 1, 0])
     assert a.storage.value.tolist() == a_reverse.storage.value.tolist()
@@ -175,9 +176,9 @@ def test_change_mode_order_3d_sss():
         ]
     )
 
-    a_default = Tensor.from_torch(tensor_a_torch, "a_default").to_sparse("sss")
-    a_reverse = Tensor.from_torch(tensor_a_torch, "a_reverse", [2, 1, 0]).to_sparse("sss")
-    a = Tensor.from_torch(tensor_a_torch, "a", [0, 1, 2]).to_sparse("sss")
+    a_default = STensor.from_torch(tensor_a_torch, "a_default").to_sparse("sss")
+    a_reverse = STensor.from_torch(tensor_a_torch, "a_reverse", [2, 1, 0]).to_sparse("sss")
+    a = STensor.from_torch(tensor_a_torch, "a", [0, 1, 2]).to_sparse("sss")
 
     a.change_mode_order([2, 1, 0])
     assert a.storage.value.tolist() == a_reverse.storage.value.tolist()
@@ -220,11 +221,11 @@ def test_tensor_addition_2d_csr_csc():
         ]
     )
 
-    a_csr = Tensor.from_torch(tensor_a_torch, "a_csr", [0, 1]).to_sparse("ds")
-    a_csc = Tensor.from_torch(tensor_a_torch, "a_csc", [1, 0]).to_sparse("ds")
+    a_csr = STensor.from_torch(tensor_a_torch, "a_csr", [0, 1]).to_sparse("ds")
+    a_csc = STensor.from_torch(tensor_a_torch, "a_csc", [1, 0]).to_sparse("ds")
 
-    b_csr = Tensor.from_torch(tensor_b_torch, "b_csr", [0, 1]).to_sparse("ds")
-    b_csc = Tensor.from_torch(tensor_b_torch, "b_csc", [1, 0]).to_sparse("ds")
+    b_csr = STensor.from_torch(tensor_b_torch, "b_csr", [0, 1]).to_sparse("ds")
+    b_csc = STensor.from_torch(tensor_b_torch, "b_csc", [1, 0]).to_sparse("ds")
 
     c_csr = a_csr + b_csc
 
@@ -240,6 +241,44 @@ def test_tensor_addition_2d_csr_csc():
     assert c_csc.storage.index.mode_indices[1][1].tolist() == [0, 1, 2, 4, 0, 1, 0, 2, 0, 3, 4, 0, 4]
     assert c_csc.storage.index.mode_order == [1, 0]
 
+
+def test_change_mode_order_3d_random_sss():
+    tensor_a_torch = torch.Tensor(
+        [
+            [
+                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 4, 0],
+                [5, 6, 0],
+                [0, 0, 0],
+            ],
+        ]
+    )
+    a = STensor.from_torch(tensor_a_torch, "a", [0, 1, 2]).to_sparse("sss")
+
+    mode_order = [0, 1, 2]
+    for _ in range(10):
+        random.shuffle(mode_order)
+        print(mode_order)
+        a.change_mode_order(mode_order)
+
+    a.change_mode_order([0, 1, 2])
+    assert a.storage.value.tolist() == [1., 2., 3., 4., 5., 6.]
+    assert a.storage.index.mode_indices[0][0].tolist() == [0, 2]
+    assert a.storage.index.mode_indices[0][1].tolist() == [0, 2]
+    assert a.storage.index.mode_indices[1][0].tolist() == [0, 3, 5]
+    assert a.storage.index.mode_indices[1][1].tolist() == [0, 1, 2, 0, 1]
+    assert a.storage.index.mode_indices[2][0].tolist() == [0, 1, 2, 3, 4, 6]
+    assert a.storage.index.mode_indices[2][1].tolist() == [0, 2, 0, 1, 0, 1]
+    assert a.storage.index.mode_order == [0, 1, 2]
 
 
 

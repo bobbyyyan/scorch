@@ -3,13 +3,10 @@ import pdb
 import pprint
 import time
 from itertools import product
-from typing import List, Dict, Any, Iterable, Union, Optional
-
 
 import torch
-from torch.utils.cpp_extension import load_inline
 
-from scorch import Tensor, einsum, utils, TensorFormat
+from scorch import STensor, einsum, utils
 from scorch.compiler.cin import (
     ForAll,
     Where,
@@ -22,13 +19,13 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
-from scorch.format import LevelFormat, LevelType
 from scorch.ops import matmul, matmul_wksp, lower_and_exec_cin
-from scorch.storage import TensorIndex, TensorStorage
+from scorch.storage import TensorIndex
 from scorch.utils import PROJECT_ROOT_DIR, parse_format
 
 # indent 2 pretty print
 pp = pprint.PrettyPrinter(indent=2)
+
 
 def test_dense_copy():
     tensor_a_torch = torch.Tensor(
@@ -41,7 +38,7 @@ def test_dense_copy():
         ]
     )
 
-    tensor_a = Tensor.from_torch(tensor_a_torch, "A")
+    tensor_a = STensor.from_torch(tensor_a_torch, "A")
 
     tensor_a_dense = tensor_a.to_dense()
 
@@ -68,8 +65,8 @@ def test_sparse_to_dense():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
 
     a_sparse_to_torch = a_sparse.to_torch()
     b_sparse_to_torch = b_sparse.to_torch()
@@ -82,8 +79,8 @@ def test_to_torch():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
+    sp_vector_a = STensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = STensor.from_torch(tensor_b_torch).to_sparse("s")
 
     sp_vector_a_to_torch = sp_vector_a.to_torch()
     sp_vector_b_to_torch = sp_vector_b.to_torch()
@@ -96,8 +93,8 @@ def test_elemwise_vector_mul_sss():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
+    sp_vector_a = STensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = STensor.from_torch(tensor_b_torch).to_sparse("s")
 
     result = einsum("i,i->i", sp_vector_a, sp_vector_b, format="s")
 
@@ -115,8 +112,8 @@ def test_elemwise_vector_add_sss():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
+    sp_vector_a = STensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = STensor.from_torch(tensor_b_torch).to_sparse("s")
 
     result = sp_vector_a + sp_vector_b
 
@@ -135,9 +132,9 @@ def test_elemwise_vector_add_sss_2():
     tensor_b_torch = torch.Tensor([0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     tensor_c_torch = torch.Tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
-    sp_vector_c = Tensor.from_torch(tensor_c_torch).to_sparse("s")
+    sp_vector_a = STensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = STensor.from_torch(tensor_b_torch).to_sparse("s")
+    sp_vector_c = STensor.from_torch(tensor_c_torch).to_sparse("s")
 
     result = sp_vector_a + sp_vector_b + sp_vector_c
 
@@ -155,8 +152,8 @@ def test_elemwise_vector_mul_dss():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4, 5, 0])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5, 0, 14])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse("s")
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse("s")
+    sp_vector_a = STensor.from_torch(tensor_a_torch).to_sparse("s")
+    sp_vector_b = STensor.from_torch(tensor_b_torch).to_sparse("s")
 
     result = einsum("i,i->i", sp_vector_a, sp_vector_b, format="d")
 
@@ -201,8 +198,8 @@ def test_elemwise_matrix_mul_oo_oo_oo():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
 
     result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
 
@@ -236,8 +233,8 @@ def test_elemwise_matrix_mul_oo_ss_oo():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ss")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ss")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("oo")
 
     result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
 
@@ -271,8 +268,8 @@ def test_elemwise_matrix_mul_oo_oo_ss():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
 
     result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
 
@@ -306,8 +303,8 @@ def test_elemwise_matrix_mul_oo_ss_ss():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ss")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ss")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
 
     result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
 
@@ -341,8 +338,8 @@ def test_elemwise_matrix_mul_oo_ds_ds():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     result = einsum("ij,ij->ij", a_sparse, b_sparse, format="oo")
 
@@ -381,8 +378,8 @@ def test_elemwise_matrix_mul_ss_ss_ss():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ss")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ss")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
 
     result = einsum("ij,ij->ij", a_sparse, b_sparse, format="ss")
 
@@ -418,8 +415,8 @@ def test_elemwise_matrix_mul_ss_oo_ss():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ss")
 
     result = einsum("ij,ij->ij", a_sparse, b_sparse, format="ss")
 
@@ -440,8 +437,8 @@ def test_elemwise_mul_4d_dddd_oooo_dddd():
     tensor_a_torch = torch.rand(2, 3, 4, 5)
     tensor_b_torch = torch.rand(2, 3, 4, 5)
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oooo")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("dddd")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("oooo")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("dddd")
 
     result = einsum("ijkl,ijkl->ijkl", a_sparse, b_sparse, format="dddd")
 
@@ -456,8 +453,8 @@ def test_ij_i_j_ss_s_s():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3])
     tensor_b_torch = torch.Tensor([7, 8, 0, 9])
 
-    sp_vector_a = Tensor.from_torch(tensor_a_torch).to_sparse()
-    sp_vector_b = Tensor.from_torch(tensor_b_torch).to_sparse()
+    sp_vector_a = STensor.from_torch(tensor_a_torch).to_sparse()
+    sp_vector_b = STensor.from_torch(tensor_b_torch).to_sparse()
 
     result = einsum("i,j->ij", sp_vector_a, sp_vector_b, format="ss")
 
@@ -558,8 +555,8 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     output_format = parse_format("ds")
 
@@ -572,7 +569,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
         args.append(tensor._storage.value)  # type: ignore
 
     result_cpp = module.evaluate(*args)
-    result = Tensor(
+    result = STensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -813,10 +810,9 @@ def test_dense_matmul():
     tensor_a_torch = torch.rand(100, 200)
     tensor_b_torch = torch.rand(200, 300)
     torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
-
     scorch_result = matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch_result.tolist() == scorch_result.to_torch().tolist()
+    assert torch_result.tolist() == scorch_result.tolist()
 
 
 def test_matmul_ds_dd_dd():
@@ -824,8 +820,8 @@ def test_matmul_ds_dd_dd():
     tensor_b_torch = torch.randint(0, 1000, (n, n))
     tensor_a_torch = torch.randint(0, 1000, (n, n))
 
-    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
-    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+    a_scorch = STensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_scorch = STensor.from_torch(tensor_b_torch, "B").to_dense()
 
     torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
 
@@ -840,8 +836,8 @@ def todo_test_matmul_ds_dd_dd_large():
     tensor_b_torch = torch.randint(0, 1000, (n, n))
     tensor_a_torch = torch.randint(0, 1000, (n, n))
 
-    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
-    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+    a_scorch = STensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_scorch = STensor.from_torch(tensor_b_torch, "B").to_dense()
 
     torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
 
@@ -865,8 +861,8 @@ def todo_test_matmul_wksp_dd_oo_dd_time():
     torch_result = torch.matmul(random_tensor_a, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("oo")
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("oo")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
     start_time = time.time()
     scorch_result = matmul_wksp(tensor_a_scorch, tensor_b_scorch, output_format="dd")
@@ -891,8 +887,8 @@ def test_matmul_wksp_ds_time():
     torch_result = torch.matmul(random_tensor_a, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse()
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse()
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse()
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B").to_sparse()
 
     start_time = time.time()
     scorch_result = matmul_wksp(tensor_a_scorch, tensor_b_scorch, output_format="ds")
@@ -922,8 +918,8 @@ def test_spmm_ds_ds_dd_time():
     torch_result = torch.matmul(random_tensor_a, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("ds")
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("ds")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
     time_dict = {}
     start_time = time.time()
@@ -959,8 +955,8 @@ def todo_test_spmm_dd_oo_dd_wksp_time():
     torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("oo")
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("oo")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
     time_dict = {}
     start_time = time.time()
@@ -996,8 +992,8 @@ def test_spmm_dd_ds_dd_wksp_time():
     torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("ds")
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("ds")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
     time_dict = {}
     start_time = time.time()
@@ -1036,8 +1032,8 @@ def test_spmm_dd_oo_dd_time():
     torch_result = torch.matmul(random_tensor_a_coo, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("oo")
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("oo")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
     time_dict = {}
     start_time = time.time()
@@ -1075,8 +1071,8 @@ def test_matmul_time():
     torch_result = torch.matmul(random_tensor_a, random_tensor_b)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse()
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse()
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse()
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B").to_sparse()
 
     start_time = time.time()
     scorch_result = matmul(tensor_a_scorch, tensor_b_scorch, format="ds")
@@ -1092,8 +1088,8 @@ def test_matmul_dd_dd_dd():
     tensor_a_torch = torch.rand(n, n)
     tensor_b_torch = torch.rand(n, n)
 
-    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_dense()
-    b_scorch = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+    a_scorch = STensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_scorch = STensor.from_torch(tensor_b_torch, "B").to_dense()
 
     scorch_result = einsum("ik,kj->ij", a_scorch, b_scorch, format="dd")
 
@@ -1108,8 +1104,8 @@ def test_matmul_ds_ds_ds():
     tensor_a_torch = torch.rand(n, n)
     tensor_b_torch = torch.rand(n, n)
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     result = matmul(a_sparse, b_sparse, output_format="ds")
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
@@ -1127,8 +1123,8 @@ def test_spmm_ds_ds_ds_random():
     tensor_a_torch = tensor_a_torch * (torch.rand(dim_n, dim_n) > sparsity).float()
     tensor_b_torch = tensor_b_torch * (torch.rand(dim_n, dim_n) > sparsity).float()
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     result = matmul_wksp(a_sparse, b_sparse, output_format="ds")
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
@@ -1237,8 +1233,8 @@ def test_spmm_ss_dd_dd_ikj_gustavson():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_dense()
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_dense()
 
     output_format = parse_format("ss")
 
@@ -1251,7 +1247,7 @@ def test_spmm_ss_dd_dd_ikj_gustavson():
         args.append(tensor._storage.value)  # type: ignore
 
     result_cpp = module.evaluate(*args)
-    result = Tensor(
+    result = STensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -1355,8 +1351,8 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_dense()
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_dense()
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_dense()
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_dense()
 
     output_format = parse_format("ds")
 
@@ -1369,7 +1365,7 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
         args.append(tensor._storage.value)  # type: ignore
 
     result_cpp = module.evaluate(*args)
-    result = Tensor(
+    result = STensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -1458,8 +1454,8 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
     tensor_a_torch = torch.rand(dim_n, dim_n)
     tensor_b_torch = torch.rand(dim_n, dim_n)
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     output_format = parse_format("ds")
 
@@ -1472,7 +1468,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
         args.append(tensor._storage.value)  # type: ignore
 
     result_cpp = module.evaluate(*args)
-    result = Tensor(
+    result = STensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -1575,8 +1571,8 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     output_format = parse_format("ss")
 
@@ -1589,7 +1585,7 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
         args.append(tensor._storage.value)  # type: ignore
 
     result_cpp = module.evaluate(*args)
-    result = Tensor(
+    result = STensor(
         shape=result_shape,
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
@@ -1657,8 +1653,8 @@ def test_spmm_ss_ds_ds():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     # result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
     result = matmul_wksp(a_sparse, b_sparse, output_format="ss")
@@ -1707,14 +1703,14 @@ def test_matmul_dd_ds_dd():
     tensor_a_torch = torch.rand(n, n)
     tensor_b_torch = torch.rand(n, n)
 
-    a_scorch = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_scorch = Tensor.from_torch(tensor_b_torch, "B")
+    a_scorch = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_scorch = STensor.from_torch(tensor_b_torch, "B")
 
     result = matmul(a_scorch, b_scorch, format="dd")
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch.allclose(result.to_torch(), result_torch)
+    assert torch.allclose(result, result_torch)
 
 
 def test_spmm_dd_ds_ds():
@@ -1737,8 +1733,8 @@ def test_spmm_dd_ds_ds():
         ]
     )
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     result = einsum("ik,kj->ij", a_sparse, b_sparse, format="dd")
 
@@ -1793,8 +1789,8 @@ def test_spmm_dd_multi_multi():
         ]
     )
 
-    tensor_a = Tensor.from_torch(tensor_a_torch, "A")
-    tensor_b = Tensor.from_torch(tensor_b_torch, "B")
+    tensor_a = STensor.from_torch(tensor_a_torch, "A")
+    tensor_b = STensor.from_torch(tensor_b_torch, "B")
 
     input_formats = ["ds", "ss", "oo"]
 
@@ -1860,8 +1856,8 @@ def test_spmm_ds_multi_multi():
         ]
     )
 
-    tensor_a = Tensor.from_torch(tensor_a_torch, "A")
-    tensor_b = Tensor.from_torch(tensor_b_torch, "B")
+    tensor_a = STensor.from_torch(tensor_a_torch, "A")
+    tensor_b = STensor.from_torch(tensor_b_torch, "B")
 
     input_formats = ["ds", "ss", "oo"]
 
@@ -1934,8 +1930,8 @@ def test_spmm_ss_multi_multi():
         ]
     )
 
-    tensor_a = Tensor.from_torch(tensor_a_torch, "A")
-    tensor_b = Tensor.from_torch(tensor_b_torch, "B")
+    tensor_a = STensor.from_torch(tensor_a_torch, "A")
+    tensor_b = STensor.from_torch(tensor_b_torch, "B")
 
     input_formats = ["ds", "ss", "oo"]
 
@@ -2013,9 +2009,9 @@ def test_sddmm_ds_ds_dd_dd():
 
     torch_time = time.time() - start_time
 
-    tensor_b_scorch = Tensor.from_torch(random_tensor_b, "B").to_sparse("ds")
-    tensor_c_scorch = Tensor.from_torch(random_tensor_c, "C")
-    tensor_d_scorch = Tensor.from_torch(random_tensor_d, "D")
+    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B").to_sparse("ds")
+    tensor_c_scorch = STensor.from_torch(random_tensor_c, "C")
+    tensor_d_scorch = STensor.from_torch(random_tensor_d, "D")
 
     time_dict = {}
     start_time = time.time()
@@ -2058,8 +2054,8 @@ def test_spmv_d_oo_d():
     torch_result = torch.matmul(random_tensor_a_sparse, random_tensor_x)
     torch_time = time.time() - start_time
 
-    tensor_a_scorch = Tensor.from_torch(random_tensor_a, "A").to_sparse("oo")
-    tensor_x_scorch = Tensor.from_torch(random_tensor_x, "x")
+    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("oo")
+    tensor_x_scorch = STensor.from_torch(random_tensor_x, "x")
 
     time_dict = {}
     start_time = time.time()
@@ -2080,3 +2076,24 @@ def test_spmv_d_oo_d():
     print(f"scorch total time: {scorch_total_time}")
     print(f"scorch eval time: {scorch_eval_time}")
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
+
+
+def test_sddmm_csr():
+    n = 1025
+    sparsity = 0.99
+    sparse_tensor = torch.rand(n, n)
+    sparse_tensor = sparse_tensor * (torch.rand(n, n) > sparsity).float()
+    sparse_tensor = sparse_tensor.to_sparse_csr()
+
+    dense_tensor_a = torch.rand(n, n)
+    dense_tensor_b = torch.rand(n, n)
+
+    torch_result = torch.mul(
+        sparse_tensor, torch.matmul(dense_tensor_a, dense_tensor_b)
+    )
+
+    scorch_result = einsum(
+        "ij,ik,kj->ij", sparse_tensor, dense_tensor_a, dense_tensor_b
+    )
+
+    assert torch_result.values().allclose(scorch_result.values)
