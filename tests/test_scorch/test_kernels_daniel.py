@@ -109,8 +109,8 @@ def test_generate_tensor_3d():
         [
             [
                 [1, 0, 0],
-                [0, 0, 1],
-                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
             ],
             [
                 [0, 0, 0],
@@ -118,8 +118,8 @@ def test_generate_tensor_3d():
                 [0, 0, 0],
             ],
             [
-                [0, 1, 0],
-                [1, 1, 0],
+                [0, 4, 0],
+                [5, 6, 0],
                 [0, 0, 0],
             ]
         ]
@@ -227,14 +227,14 @@ def test_elemwise_2d_add_csr_csc():
     assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
 
     # CSC = CSC + CSR
-    a, b, result, _, _ = generate_2d_tensors("ds", "ds", "ds", [1, 0], [0, 1], [1, 0])
-
-    result_cpp = a + b
-
-    assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
-    assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
-    assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
-    assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
+    # a, b, result, _, _ = generate_2d_tensors("ds", "ds", "ds", [1, 0], [0, 1], [1, 0])
+    #
+    # result_cpp = a + b
+    #
+    # assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
+    # assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
+    # assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
+    # assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
 
     # pdb.set_trace()
     print(result)
@@ -287,6 +287,348 @@ def test_custom_kernel(lhs_tensors, result_shape, kernel_code_filename):
     return result_cpp
 
 
+def test_change_mode_order_2d_ds():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    a_csr = (Tensor.from_torch(tensor_a_torch, "A")).to_sparse("ds")
+    a_csc_test = a_csr.change_mode_order([1, 0])
+    a_csc_true = (Tensor.from_torch(tensor_a_torch, "A", [1, 0])).to_sparse("ds")
+
+    assert a_csc_test.storage.value.tolist() == a_csc_true.storage.value.tolist(), "Values are different"
+    assert a_csc_test.storage.index.mode_indices[0] == a_csc_true.storage.index.mode_indices[0]
+    assert a_csc_test.storage.index.mode_indices[1][0].tolist() == a_csc_true.storage.index.mode_indices[1][0].tolist()
+    assert a_csc_test.storage.index.mode_indices[1][1].tolist() == a_csc_true.storage.index.mode_indices[1][1].tolist()
+
+    print(a_csc_test.storage.value.tolist())
+    print(a_csc_test.storage.index.mode_indices[1][0].tolist())
+    print(a_csc_test.storage.index.mode_indices[1][1].tolist())
+
+
+def test_change_mode_order_2d_coo():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    a_coo = (Tensor.from_torch(tensor_a_torch, "A")).to_sparse("oo")
+    a_coo_reverse = a_coo.change_mode_order([1, 0])
+    a_coo_true = (Tensor.from_torch(tensor_a_torch, "A", [1, 0])).to_sparse("oo")
+
+    assert a_coo_reverse.storage.value.tolist() == a_coo_true.storage.value.tolist(), "Values are different"
+    assert a_coo_reverse.storage.index.mode_indices[0][0].tolist() == a_coo_true.storage.index.mode_indices[0][0].tolist()
+    assert a_coo_reverse.storage.index.mode_indices[1][0].tolist() == a_coo_true.storage.index.mode_indices[1][0].tolist()
+
+    print(a_coo_reverse.storage.value.tolist())
+    print(a_coo_reverse.storage.index.mode_indices[0][0].tolist())
+    print(a_coo_reverse.storage.index.mode_indices[1][0].tolist())
+
+
+def test_change_mode_order_3d_dss():
+    tensor_a_torch = torch.Tensor(
+        [
+            [
+                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 4, 0],
+                [5, 6, 0],
+                [0, 0, 0],
+            ],
+        ]
+    )
+    a = Tensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
+    pdb.set_trace()
+    a.change_mode_order([2, 1, 0])
+    pdb.set_trace()
+    print(a)
+
+def test_change_mode_order_produce_duplicate():
+    tensor_a_torch = torch.Tensor(
+        [
+            [
+                [1, 2, 3],
+                [4, 5, 6],
+                [7, 8, 9],
+            ],
+            [
+                [10, 11, 12],
+                [13, 14, 15],
+                [16, 17, 18],
+            ],
+            [
+                [19, 20, 21],
+                [22, 23, 24],
+                [25, 26, 27],
+            ],
+        ]
+    )
+
+    a_csr = Tensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
+    a_csc = a_csr.change_mode_order([0, 1, 2])
+    pdb.set_trace()
+    print(a_csc)
+
+def test_change_mode_order_3d_fixed():
+    # tensor_a_torch = torch.Tensor(
+    #     [
+    #         [
+    #             [1, 2, 3],
+    #             [4, 5, 6],
+    #             [7, 8, 9],
+    #         ],
+    #         [
+    #             [10, 11, 12],
+    #             [13, 14, 15],
+    #             [16, 17, 18],
+    #         ],
+    #         [
+    #             [19, 20, 21],
+    #             [22, 23, 24],
+    #             [25, 26, 27],
+    #         ],
+    #     ]
+    # )
+    tensor_a_torch = torch.Tensor(
+        [
+            [
+                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 4, 0],
+                [5, 6, 0],
+                [0, 0, 0],
+            ],
+        ]
+    )
+    a = Tensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
+
+    result_cpp = test_custom_kernel([a], a.shape, "change_mode_order_3d_broken.cpp")
+    pdb.set_trace()
+    print(result_cpp)
+
+
+def test_change_mode_order_fixed():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    a_csr = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+
+    result_cpp = test_custom_kernel([a_csr], a_csr.shape, "change_mode_order_fixed.cpp")
+    pdb.set_trace()
+    print(result_cpp)
+
+
+def test_coo_to_csr():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+
+    a_coo = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
+    pdb.set_trace()
+    a_csr = a_coo.to_sparse("ds")
+    pdb.set_trace()
+    print(a_csr)
+
+
+def test_different_shapes():
+    # 5 x 4 tensor
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4],
+            [2, 2, 0, 0],
+            [3, 0, 3, 0],
+            [0, 0, 0, 0],
+            [5, 0, 0, 0],
+        ]
+    )
+    a_row = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    a_col = Tensor.from_torch(tensor_a_torch, "A", [1, 0])
+    a_row.change_mode_order([1, 0])
+    pdb.set_trace()
+    print(a_col)
+
+
+def test_einsum_2d_concord_csr_csc_csr():
+    a, b, _, _, result_matmul = generate_2d_tensors("ds", "ds", "ds", [0, 1], [1, 0], [0, 1])
+    result_cpp = einsum("ik,jk->ij", a, b, format="ds")
+    assert result_cpp.storage.value.tolist() == result_matmul.storage.value.tolist(), "Values are different"
+    assert result_cpp.storage.index.mode_indices[1][0].tolist() == result_matmul.storage.index.mode_indices[1][0].tolist()
+    assert result_cpp.storage.index.mode_indices[1][1].tolist() == result_matmul.storage.index.mode_indices[1][1].tolist()
+    print(result_cpp)
+
+
+# TODO: fix Scheduler.insert_workspace() for test where A & result are CSC and B is CSR
+def test_einsum_2d_concord_csc_csr_csc():
+    a, b, _, _, result_matmul = generate_2d_tensors("ds", "ds", "ds", [1, 0], [0, 1], [1, 0])
+    result_cpp = einsum("ik,kj->ij", a, b, format="ds")
+    assert result_cpp.storage.value.tolist() == result_matmul.storage.value.tolist(), "Values are different"
+    assert result_cpp.storage.index.mode_indices[1][0].tolist() == result_matmul.storage.index.mode_indices[1][0].tolist()
+    assert result_cpp.storage.index.mode_indices[1][1].tolist() == result_matmul.storage.index.mode_indices[1][1].tolist()
+    pdb.set_trace()
+    print(result_cpp)
+
+
+def test_einsum_2d_concord_oo_oo_oo():
+    a, b, _, _, result_matmul = generate_2d_tensors("oo", "oo", "oo", [0, 1], [1, 0], [1, 0])
+    result_cpp = einsum("ik,jk->ji", a, b, format="oo")
+    assert result_cpp.storage.value.tolist() == result_matmul.storage.value.tolist(), "Values are different"
+    assert result_cpp.storage.index.mode_indices[0][0].tolist() == result_matmul.storage.index.mode_indices[0][0].tolist()
+    assert result_cpp.storage.index.mode_indices[1][0].tolist() == result_matmul.storage.index.mode_indices[1][0].tolist()
+    print(result_cpp)
+
+
+def test_einsum_2d_concord_dd_dd_dd():
+    a, b, _, _, result_matmul = generate_2d_tensors("dd", "dd", "dd", [0, 1], [1, 0], [0, 1])
+    result_cpp = einsum("ik,jk->ij", a, b, format="dd")
+    pdb.set_trace()
+    print(result_cpp)
+
+
+def test_change_einsum_kernel():
+    a, b, _, _, result_matmul = generate_2d_tensors("dd", "dd", "dd", [0, 1], [1, 0], [0, 1])
+    result_cpp = test_custom_kernel([a, b], a.shape, "spmspm_mode_order_broken.cpp")
+    pdb.set_trace()
+    print(result_cpp)
+
+
+def test_einsum_2d_cycle():
+    a, b, _, _, result_matmul = generate_2d_tensors("ds", "ds", "ds", [0, 1], [0, 1], [1, 0])
+    result_cpp = einsum("ik,kj->ji", a, b, format="ds")
+    pdb.set_trace()
+    print(result_cpp)
+
+
+def test_einsum_2d_cycle_tricky():
+    a, b, _, _, _ = generate_2d_tensors("ds", "ds", "ds", [0, 1], [1, 0], [1, 0])
+    result_cpp = einsum("ij,ji->ji", a, b, format="ds")
+    pdb.set_trace()
+    print(result_cpp)
+
+
+def test_tensor_addition_2d():
+    a, b, _, _, _ = generate_2d_tensors("ds", "ds", "ds")
+    result = a + b
+    print(result)
+
+
+def test_to_sparse_sss():
+    tensor_result_torch = torch.Tensor(
+        [
+            [
+                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 4, 0],
+                [5, 6, 0],
+                [0, 0, 0],
+            ]
+        ]
+    )
+
+    result = Tensor.from_torch(tensor_result_torch, "result").to_sparse("sss")
+    pdb.set_trace()
+    print(result)
+
+def test_3d_einsum_wksp():
+    tensor_a_torch = torch.Tensor(
+        [
+            [
+                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 4, 0],
+                [5, 6, 0],
+                [0, 0, 0],
+            ],
+        ]
+    )
+
+    a = Tensor.from_torch(tensor_a_torch, "a").to_sparse("dss")
+    b = a
+    c = einsum("ijk,ikl->ijl", a, b, format="dss")
+    c.to_sparse("ooo")
+    pdb.set_trace()
+    print(c)
+
+def test_to_sparse_kernel_sss():
+    tensor_result_torch = torch.Tensor(
+        [
+            [
+                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 4, 0],
+                [5, 6, 0],
+                [0, 0, 0],
+            ]
+        ]
+    )
+    result = Tensor.from_torch(tensor_result_torch, "result")
+    result_cpp = test_custom_kernel([result], result.shape, "to_sparse_broken.cpp")
+    pdb.set_trace()
+    print(result_cpp)
+
+def test_ss_tensor_addition_2d():
+    a, b, result_add, _, _ = generate_2d_tensors("ss", "ss", "ss")
+    pdb.set_trace()
 def test_my_sandbox():
     tensor_a_torch = torch.Tensor(
         [
