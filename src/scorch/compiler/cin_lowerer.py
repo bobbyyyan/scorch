@@ -1338,6 +1338,12 @@ class CINLowerer:
                                         )
                                     ],
                                 ),
+                                llir.Increment(
+                                    var=llir.Var(
+                                        name=f"p{result_tensor_name}{level - 1}",
+                                        type=llir.DataType.INT,
+                                    )
+                                ),
                             ],
                         )
                     )

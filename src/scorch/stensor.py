@@ -252,6 +252,7 @@ class STensor(torch.nn.Module):
             index=TensorIndex(
                 mode_indices=result_cpp.storage.index.mode_indices,
                 tensor_format=output_format,
+                mode_order=self.storage.index.mode_order
             ),
             value=result_cpp.storage.value,
         )
