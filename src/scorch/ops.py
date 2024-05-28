@@ -346,7 +346,14 @@ def einsum(
     index_strs_concat = expression.split("->")[0].split(",") + ["".join(result_index_strs)]
     index_strs_by_schedule,  new_index_strs = topo_sort_characters(index_strs_concat, tensors)
     input_index_strs = [list(x) for x in expression.split("->")[0].split(",")]
-    pdb.set_trace()
+
+    converted_tensors = []
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor):
+            tensor = STensor.from_torch(tensor)
+        converted_tensors.append(tensor)
+    tensors = tuple(converted_tensors)
+
     index_str_to_mode_index = defaultdict(list)
     for tensor_index in range(len(input_index_strs)):
         for level in range(len(input_index_strs[tensor_index])):
@@ -375,9 +382,6 @@ def einsum(
     index_str_to_level_formats = {}
     tensors_new = []
     for index_strs, tensor in zip(input_index_strs, tensors):
-        if isinstance(tensor, torch.Tensor):
-            tensor = STensor.from_torch(tensor)
-
         assert isinstance(tensor, STensor), "Input tensor is not a Scorch Tensor"
         tensors_new.append(tensor)
 

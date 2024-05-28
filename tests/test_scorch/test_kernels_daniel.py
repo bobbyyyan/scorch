@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Iterable, Union, Optional
 import torch
 from torch.utils.cpp_extension import load_inline
 
-from scorch import Tensor, einsum, utils, TensorFormat
+from scorch import STensor, einsum, utils, TensorFormat
 from scorch.compiler.cin import (
     ForAll,
     Where,
@@ -95,11 +95,11 @@ def generate_2d_tensors(
         ]
     )
 
-    a = Tensor.from_torch(tensor_a_torch, "a", a_mode_order).to_sparse(a_fmt)
-    b = Tensor.from_torch(tensor_b_torch, "b", b_mode_order).to_sparse(b_fmt)
-    result_add = Tensor.from_torch(tensor_result_add_torch, "result_add", result_mode_order).to_sparse(result_fmt)
-    result_elemwise_mul = Tensor.from_torch(tensor_result_elemwise_mul_torch, "result_elemwise_mul", result_mode_order).to_sparse(result_fmt)
-    result_matmul = Tensor.from_torch(tensor_result_matmul_torch, "result_matmul", result_mode_order).to_sparse(result_fmt)
+    a = STensor.from_torch(tensor_a_torch, "a", a_mode_order).to_sparse(a_fmt)
+    b = STensor.from_torch(tensor_b_torch, "b", b_mode_order).to_sparse(b_fmt)
+    result_add = STensor.from_torch(tensor_result_add_torch, "result_add", result_mode_order).to_sparse(result_fmt)
+    result_elemwise_mul = STensor.from_torch(tensor_result_elemwise_mul_torch, "result_elemwise_mul", result_mode_order).to_sparse(result_fmt)
+    result_matmul = STensor.from_torch(tensor_result_matmul_torch, "result_matmul", result_mode_order).to_sparse(result_fmt)
 
     return a, b, result_add, result_elemwise_mul, result_matmul
 
@@ -126,7 +126,7 @@ def test_generate_tensor_3d():
     )
 
     # result_3d_normal_ddd = Tensor.from_torch(tensor_result_torch, "3d_normal")
-    result_3d_normal_dss = Tensor.from_torch(tensor_result_torch, "3d_normal").to_sparse("dss")
+    result_3d_normal_dss = STensor.from_torch(tensor_result_torch, "3d_normal").to_sparse("dss")
     assert(result_3d_normal_dss._storage._value.tolist() == [1., 1., 1., 1., 1., 1.])
     # result_3d_reverse_dss = Tensor.from_torch(tensor_result_torch, "3d_reverse", [2, 1, 0]).to_sparse("dss")
     pdb.set_trace()
@@ -152,7 +152,7 @@ def test_generate_tensor_3d_kernel():
         ]
     )
 
-    a = Tensor.from_torch(tensor_result_torch, "3d_normal")
+    a = STensor.from_torch(tensor_result_torch, "3d_normal")
     # shape doesn't change, can pass in input shape
     result_cpp = test_custom_kernel([a], a.shape, "tensor_assign_3d.cpp")
     assert result_cpp._storage._value.tolist() == [1., 1., 1., 1., 1., 1.]
@@ -297,9 +297,9 @@ def test_change_mode_order_2d_ds():
             [5, 0, 0, 0, 5],
         ]
     )
-    a_csr = (Tensor.from_torch(tensor_a_torch, "A")).to_sparse("ds")
+    a_csr = (STensor.from_torch(tensor_a_torch, "A")).to_sparse("ds")
     a_csc_test = a_csr.change_mode_order([1, 0])
-    a_csc_true = (Tensor.from_torch(tensor_a_torch, "A", [1, 0])).to_sparse("ds")
+    a_csc_true = (STensor.from_torch(tensor_a_torch, "A", [1, 0])).to_sparse("ds")
 
     assert a_csc_test.storage.value.tolist() == a_csc_true.storage.value.tolist(), "Values are different"
     assert a_csc_test.storage.index.mode_indices[0] == a_csc_true.storage.index.mode_indices[0]
@@ -321,9 +321,9 @@ def test_change_mode_order_2d_coo():
             [5, 0, 0, 0, 5],
         ]
     )
-    a_coo = (Tensor.from_torch(tensor_a_torch, "A")).to_sparse("oo")
+    a_coo = (STensor.from_torch(tensor_a_torch, "A")).to_sparse("oo")
     a_coo_reverse = a_coo.change_mode_order([1, 0])
-    a_coo_true = (Tensor.from_torch(tensor_a_torch, "A", [1, 0])).to_sparse("oo")
+    a_coo_true = (STensor.from_torch(tensor_a_torch, "A", [1, 0])).to_sparse("oo")
 
     assert a_coo_reverse.storage.value.tolist() == a_coo_true.storage.value.tolist(), "Values are different"
     assert a_coo_reverse.storage.index.mode_indices[0][0].tolist() == a_coo_true.storage.index.mode_indices[0][0].tolist()
@@ -354,7 +354,7 @@ def test_change_mode_order_3d_dss():
             ],
         ]
     )
-    a = Tensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
+    a = STensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
     pdb.set_trace()
     a.change_mode_order([2, 1, 0])
     pdb.set_trace()
@@ -381,7 +381,7 @@ def test_change_mode_order_produce_duplicate():
         ]
     )
 
-    a_csr = Tensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
+    a_csr = STensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
     a_csc = a_csr.change_mode_order([0, 1, 2])
     pdb.set_trace()
     print(a_csc)
@@ -425,7 +425,7 @@ def test_change_mode_order_3d_fixed():
             ],
         ]
     )
-    a = Tensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
+    a = STensor.from_torch(tensor_a_torch, "A").to_sparse("dss")
 
     result_cpp = test_custom_kernel([a], a.shape, "change_mode_order_3d_broken.cpp")
     pdb.set_trace()
@@ -442,7 +442,7 @@ def test_change_mode_order_fixed():
             [5, 0, 0, 0, 5],
         ]
     )
-    a_csr = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    a_csr = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
 
     result_cpp = test_custom_kernel([a_csr], a_csr.shape, "change_mode_order_fixed.cpp")
     pdb.set_trace()
@@ -460,7 +460,7 @@ def test_coo_to_csr():
         ]
     )
 
-    a_coo = Tensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
+    a_coo = STensor.from_torch(tensor_a_torch, "A").to_sparse("oo")
     pdb.set_trace()
     a_csr = a_coo.to_sparse("ds")
     pdb.set_trace()
@@ -478,8 +478,8 @@ def test_different_shapes():
             [5, 0, 0, 0],
         ]
     )
-    a_row = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    a_col = Tensor.from_torch(tensor_a_torch, "A", [1, 0])
+    a_row = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    a_col = STensor.from_torch(tensor_a_torch, "A", [1, 0])
     a_row.change_mode_order([1, 0])
     pdb.set_trace()
     print(a_col)
@@ -569,7 +569,7 @@ def test_to_sparse_sss():
         ]
     )
 
-    result = Tensor.from_torch(tensor_result_torch, "result").to_sparse("sss")
+    result = STensor.from_torch(tensor_result_torch, "result").to_sparse("sss")
     pdb.set_trace()
     print(result)
 
@@ -594,7 +594,7 @@ def test_3d_einsum_wksp():
         ]
     )
 
-    a = Tensor.from_torch(tensor_a_torch, "a").to_sparse("dss")
+    a = STensor.from_torch(tensor_a_torch, "a").to_sparse("dss")
     b = a
     c = einsum("ijk,ikl->ijl", a, b, format="dss")
     c.to_sparse("ooo")
@@ -621,7 +621,7 @@ def test_to_sparse_kernel_sss():
             ]
         ]
     )
-    result = Tensor.from_torch(tensor_result_torch, "result")
+    result = STensor.from_torch(tensor_result_torch, "result")
     result_cpp = test_custom_kernel([result], result.shape, "to_sparse_broken.cpp")
     pdb.set_trace()
     print(result_cpp)
@@ -650,8 +650,8 @@ def test_my_sandbox():
     )
 
 
-    a_sparse = Tensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = Tensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
+    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
+    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
     result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ds")
 
