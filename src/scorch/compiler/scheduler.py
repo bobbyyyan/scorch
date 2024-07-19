@@ -1,4 +1,5 @@
 import copy
+import pdb
 from typing import List, Set
 
 from scorch.compiler.cin import (
@@ -283,7 +284,7 @@ class Scheduler:
 
         This function should be idempotent.
         """
-
+        # pdb.set_trace()
         # Collect all the reduction variables
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(cin)
@@ -353,10 +354,13 @@ class Scheduler:
             indices=free_vars_after_last_reduction,
         )
 
-        parent_forall: ForAll = new_cin
+        # TODO: rename parent_forall to something else; not necessarily ForAll statement at the end
+        parent_forall = new_cin
+        # pdb.set_trace()
         while (
             isinstance(parent_forall.stmt, ForAll)
             and parent_forall.stmt.index_var != next_reduction_var
+            and parent_forall.index_var != next_reduction_var
         ):
             parent_forall = parent_forall.stmt
 
@@ -401,8 +405,8 @@ class Scheduler:
         )
 
         """
-
-        reduction_forall = parent_forall.stmt
+        # pdb.set_trace()
+        reduction_forall = parent_forall if parent_forall.index_var == next_reduction_var else parent_forall.stmt
 
         # If we have already inserted a workspace, then we should not insert another one.
         if isinstance(reduction_forall, Where):
@@ -446,17 +450,23 @@ class Scheduler:
             new_cin.no_tile_list.append(producer_forall.index_var)
 
         # Replace the reduction forall with the Where statement
-        parent_forall.stmt = where_stmt
+        if parent_forall.stmt.index_var == next_reduction_var:
+            parent_forall.stmt = where_stmt
+        else:
+            new_cin = where_stmt
 
+        # pdb.set_trace()
         new_cin.inserted_workspace = True
 
         return new_cin
 
     @staticmethod
     def auto_schedule(cin: CIN) -> CIN:
+        # pdb.set_trace()
         cin = Scheduler.insert_workspace(cin, allow_dense=True)
         all_index_vars = cin.index_vars
         tensor_accesses = cin.tensor_accesses
+        # pdb.set_trace()
 
         # print("Auto-scheduling CIN statement" f"\n{cin}")
 

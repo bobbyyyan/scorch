@@ -1,6 +1,9 @@
 from __future__ import annotations
+
+import pdb
 from copy import deepcopy
 from typing import Optional, Tuple, Union, List
+from torch.utils.cpp_extension import load, load_inline
 
 import torch
 
@@ -170,8 +173,8 @@ class STensor(torch.nn.Module):
         # Perform element-wise addition
         # TODO: support broadcasting
         a_index_vars = ([IndexVar(f"i{i}") for i in self.storage.index.mode_order])
-        b_index_vars = ([IndexVar(f"i{i}") for i in self.storage.index.mode_order])
-        c_index_vars = ([IndexVar(f"i{i}") for i in other.storage.index.mode_order])
+
+        index_vars = ([IndexVar(f"i{i}") for i in range(len(self.shape))])
         # TODO: output format inferred from input formats
         output_format = self.format
         result_shape = self.shape
@@ -197,16 +200,15 @@ class STensor(torch.nn.Module):
         assert A is not None, "Tensor A is not defined."
         assert B is not None, "Tensor B is not defined."
         assert C is not None, "Tensor C is not defined."
+        assert index_vars is not None, "Index vars is not defined."
         assert a_index_vars is not None, "Index variables for A are not defined."
-        assert b_index_vars is not None, "Index variables for B are not defined."
-        assert c_index_vars is not None, "Index variables for C are not defined."
 
 
         # Generate the python code for the element-wise addition
         # e.g. A[i0, i1, ...] = B[i0, i1, ...] + C[i0, i1, ...]
-        lhs = f'A[{", ".join(["a_index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs = f'B[{", ".join(["b_index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs += f' + C[{", ".join(["c_index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
+        rhs += f' + C[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
         code = f"{lhs} = {rhs}"
         exec(code)
 
@@ -217,7 +219,6 @@ class STensor(torch.nn.Module):
         for i in range(len(self.shape))[::-1]:
             rhs = f"ForAll(a_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
-        # pdb.set_trace()
 
         lowerer = CINLowerer()
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -381,6 +382,8 @@ class STensor(torch.nn.Module):
         # TODO: Should insert some error-checking with mode-order here?
         if mode_order:
             tensor = tensor.permute(*mode_order)
+        else:
+            mode_order = [i for i in range(len(tensor.shape))]
 
         if tensor.is_sparse or tensor.is_sparse_csr:
             if tensor.layout == torch.sparse_coo:
@@ -426,6 +429,7 @@ class STensor(torch.nn.Module):
                                 ]
                             ),
                             mode_indices=[[], [crow_indices, col_indices]],
+                            mode_order=mode_order
                         ),
                         value=values,
                     ),
@@ -642,8 +646,8 @@ class STensor(torch.nn.Module):
             else:
                 index_vars = default_index_vars[: len(self.shape)]
 
-            # permute index_vars based on self._storage._index.mode_order
-            index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+            # permute index_vars based on mode_order (DO NOT DELETE: used to generate cin_stmt)
+            ordered_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
 
             if self.has_index:
                 B = TensorVar(
@@ -700,7 +704,7 @@ class STensor(torch.nn.Module):
             rhs = "A._assignment"
             assert ForAll is not None, "ForAll is not imported"
             for i in range(len(self.shape))[::-1]:
-                rhs = f"ForAll(index_vars[{i}], {rhs})"
+                rhs = f"ForAll(ordered_index_vars[{i}], {rhs})"
             cin_stmt = eval(rhs)
 
             print("\n\ncin_stmt: ", cin_stmt)
@@ -755,12 +759,12 @@ class STensor(torch.nn.Module):
             IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
         ]
         if len(self.shape) > len(default_index_vars):
-            ordered_index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
         else:
-            ordered_index_vars = default_index_vars[: len(self.shape)]
+            index_vars = default_index_vars[: len(self.shape)]
 
-        b_index_vars = [ordered_index_vars[i] for i in self.storage.index.mode_order]
-        a_index_vars = [ordered_index_vars[i] for i in mode_order]
+        b_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+        a_index_vars = [index_vars[i] for i in mode_order]
         result_shape = tuple(self.shape[i] for i in mode_order)
 
         B = TensorVar(
@@ -768,7 +772,7 @@ class STensor(torch.nn.Module):
             fmt=self.format,
             shape=self.shape,
             dtype=self.dtype,
-            mode_order=self.storage.index.mode_order
+            mode_order=self.storage.index.mode_order[:]
         )
 
         A = TensorVar(
@@ -788,11 +792,13 @@ class STensor(torch.nn.Module):
         workspace = Workspace(
             name="wksp",
             dim=len(self.shape),
+            mode_order=mode_order[:]
         )
+        # pdb.set_trace()
 
         producer_stmt = TensorAssign(
-            workspace[tuple(a_index_vars)],
-            B[tuple(b_index_vars)],
+            workspace[tuple(index_vars)],
+            B[tuple(index_vars)],
         )
 
         for index_var in b_index_vars[::-1]:
@@ -802,8 +808,8 @@ class STensor(torch.nn.Module):
             )
 
         consumer_stmt = TensorAssign(
-            A[tuple(a_index_vars)],
-            workspace[tuple(a_index_vars)],
+            A[tuple(index_vars)],
+            workspace[tuple(index_vars)],
         )
 
         for index_var in a_index_vars[::-1]:
@@ -817,7 +823,7 @@ class STensor(torch.nn.Module):
             consumer=consumer_stmt
         )
 
-        # pdb.set_trace()
+        print("\n\nchange_mode_order cin_stmt: ", cin_stmt)
 
         lowerer = CINLowerer(filter_zeros=True)
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)

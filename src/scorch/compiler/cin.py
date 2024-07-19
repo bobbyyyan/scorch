@@ -563,7 +563,15 @@ class TensorVar(IndexExpr):
             self.format = parse_format(fmt)
 
         self.dtype = dtype
-        self.mode_order = mode_order if mode_order else ([i for i in range(self.levels)] if fmt else None)
+        self.mode_order = mode_order if mode_order else ([i for i in range(len(self.shape))] if self.shape else None)
+
+        # TODO: this is messy code, clean up
+        if not self.mode_order:
+            self.mode_order = [i for i in range(self.format.get_order())]
+
+        if self.mode_order is None:
+            pdb.set_trace()
+            assert False
 
     @property
     def name(self) -> str:
@@ -605,6 +613,7 @@ class TensorVar(IndexExpr):
         """
         Set self._assignment to the processed node.
         """
+        # pdb.set_trace()
         self._assignment = TensorAssign(TensorAccess(self, key), value)
 
     def __str__(self):
@@ -631,14 +640,22 @@ class Workspace(TensorVar):
         dtype: torch.dtype = torch.float32,
         dense: bool = False,
         tile_size_var: Optional[TileSizeVar] = None,
+        mode_order: Optional[List[int]] = None,
     ):
-        super().__init__()
-        self.name = name
+        # TODO: attributes to be initialized before superclass to set TensorVar mode_order
         self.dim = dim
-        self.dtype = dtype
         self.dense = dense
+
+        super().__init__()
+
+        self.name = name
+        self.dtype = dtype
         self._tile_size_var = tile_size_var
         self.workspace_accesses = []
+        self.mode_order = mode_order
+
+        if not self.mode_order:
+            self.mode_order = [i for i in range(self.dim)]
 
     @property
     def is_tiled(self) -> bool:
@@ -665,6 +682,7 @@ class Workspace(TensorVar):
 
     @property
     def format(self) -> TensorFormat:
+        # pdb.set_trace()
         if self.dense:
             return parse_format(["d"] * self.dim)
         return parse_format(["o"] * self.dim)
@@ -719,6 +737,10 @@ class TensorAccess(IndexExpr):
             for ivar in self.indices:
                 ivar.add_tensor_access(self)
 
+        if self.tensor.mode_order is None:
+            pdb.set_trace()
+            assert False
+
     def is_dense(self) -> bool:
         return self.tensor.is_dense()
 
@@ -731,15 +753,25 @@ class TensorAccess(IndexExpr):
     def get_index_vars(self) -> List[IndexVar]:
         return self.indices
 
+    def get_sorted_index_vars(self) -> List[IndexVar]:
+        indices = self.get_index_vars()
+        return [indices[i] for i in self.tensor.mode_order]
+
     def has_index_var(self, index_var: IndexVar) -> bool:
         return self.indices and index_var in self.indices
 
     def get_parent_index_var(self, index_var: IndexVar) -> Optional[IndexVar]:
-        index_var_index = self.indices.index(index_var)
-        return self.indices[index_var_index - 1] if index_var_index > 0 else None
+        sorted_index_vars = [self.indices[i] for i in self.tensor.mode_order]
+        mode = sorted_index_vars.index(index_var)
+        if mode == 0:
+            return None
+        else:
+            return sorted_index_vars[mode - 1]
 
     def level_of_index_var(self, index: IndexVar) -> int:
-        return self.indices.index(index)
+        # pdb.set_trace()
+        sorted_index_vars = [self.indices[i] for i in self.tensor.mode_order]
+        return sorted_index_vars.index(index)
 
     def level_type_of_index_var(self, index: IndexVar) -> LevelType:
         return self.tensor.get_level_types()[self.level_of_index_var(index)]
@@ -809,7 +841,10 @@ class TensorAccess(IndexExpr):
         return TensorAccess(self.tensor, self.indices + [index])
 
     def __str__(self):
-        return f"{self.tensor}[{', '.join([str(i) for i in self.indices])}]"
+        return (
+            f"{self.tensor}[{', '.join([str(i) for i in self.tensor.mode_order])}]"
+            f"[{', '.join([str(i) for i in self.indices])}]"
+        )
 
     def __repr__(self):
         return str(self)
@@ -858,7 +893,7 @@ class WorkspaceAccess(TensorAccess):
         visitor.visit(self.tensor)
 
     def __str__(self):
-        return f"{self.tensor}[{self.indices}]"
+        return f"{self.tensor}{self.tensor.mode_order}[{self.indices}]"
         # return f"TensorAccess(tensor={self.tensor}, indices={self.indices})"
 
 

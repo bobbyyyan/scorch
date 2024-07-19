@@ -95,6 +95,7 @@ class LatticePoint:
     def set_index_var_and_gen_iterators(
         self, index_var: IndexVar
     ) -> List[ModeIterator]:
+        # pdb.set_trace()
         self.set_index_var(index_var)
 
         if index_var.has_parent:
@@ -115,7 +116,6 @@ class LatticePoint:
             )
             for ta in self.get_dense_tensor_accesses()
         ]
-
         return self.iterators
 
     def filter_and_set_children(
@@ -827,9 +827,10 @@ class IterationLattice:
                 if parsed_index_var not in cin.indices:
                     return []
                 # if index variable correspond to a dense level, put in locators
+                # pdb.set_trace()
                 if (
                     cin.get_tensor().get_level_types()[
-                        cin.get_index_vars().index(parsed_index_var)
+                        cin.get_sorted_index_vars().index(parsed_index_var)
                     ]
                     == LevelType.DENSE
                 ):
@@ -1106,6 +1107,7 @@ class IterationLattice:
             assert isinstance(
                 result_tensor_access, TensorAccess
             ), "Result tensor access is None"
+            # pdb.set_trace()
 
             stmts: List[llir.Stmt] = []
 
@@ -1134,6 +1136,7 @@ class IterationLattice:
             ):
                 level = result_tensor_access.level_of_index_var(index_var)
                 level_type = result_tensor_access.level_type_of_index_var(index_var)
+                # TODO: I think this is where your bug is
 
                 result_value_index_stmts: List[llir.Stmt] = []
                 # Index into result value array: p<result tensor var name><_level>
@@ -1229,6 +1232,7 @@ class IterationLattice:
                     stmts.append(for_loop)
 
                 else:
+                    # pdb.set_trace()
                     while_loop = llir.WhileLoop(
                         cond=lattice_point.get_while_condition(lattice=self),
                         body=[
@@ -1268,6 +1272,7 @@ class IterationLattice:
                     stmts.append(for_loop)
 
                 elif len(iterators) == 1:
+                    # pdb.set_trace()
                     it = iterators[0]
                     for_loop = llir.ForLoop(
                         init=it.get_init_stmt(),

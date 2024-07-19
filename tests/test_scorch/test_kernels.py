@@ -478,6 +478,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
     A = TensorVar("A", fmt=["dense", "sparse"])
     B = TensorVar("B", fmt=["dense", "sparse"])
     C = TensorVar("C", fmt=["dense", "sparse"])
+    # pdb.set_trace()
 
     workspace = Workspace(
         name="wksp",

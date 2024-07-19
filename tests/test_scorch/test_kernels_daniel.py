@@ -180,6 +180,37 @@ def test_spmm_csc_csc_csc():
     assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
     assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
 
+def test_einsum_coo():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0],
+            [0, 0, 0, 3, 1],
+        ]
+    )
+
+    # a_csr = STensor.from_torch(tensor_a_torch, "a_csr", [0, 1]).to_sparse("oo")
+    a_csc = STensor.from_torch(tensor_a_torch, "a_csc", [1, 0]).to_sparse("oo")
+
+    b_csr = STensor.from_torch(tensor_b_torch, "b_csr", [0, 1]).to_sparse("oo")
+    # b_csc = STensor.from_torch(tensor_b_torch, "b_csc", [1, 0]).to_sparse("oo")
+    result_cpp = test_custom_kernel([a_csc, b_csr], a_csc.shape, "einsum_coo.cpp")
+    pdb.set_trace()
+    # assert result_cpp._storage._value.tolist() == result._storage._value.tolist(), "Values are different"
+    # assert result_cpp._storage._index.mode_indices[0] == result._storage._index.mode_indices[0]
+    # assert result_cpp._storage._index.mode_indices[1][0].tolist() == result._storage._index.mode_indices[1][0].tolist()
+    # assert result_cpp._storage._index.mode_indices[1][1].tolist() == result._storage._index.mode_indices[1][1].tolist()
 
 def test_sparse_to_dense_csc():
     a, _, _, _, _ = generate_2d_tensors("ds", "ds", "ds", [1, 0], [1, 0], [1, 0])
@@ -487,6 +518,7 @@ def test_different_shapes():
 
 def test_einsum_2d_concord_csr_csc_csr():
     a, b, _, _, result_matmul = generate_2d_tensors("ds", "ds", "ds", [0, 1], [1, 0], [0, 1])
+    pdb.set_trace()
     result_cpp = einsum("ik,jk->ij", a, b, format="ds")
     assert result_cpp.storage.value.tolist() == result_matmul.storage.value.tolist(), "Values are different"
     assert result_cpp.storage.index.mode_indices[1][0].tolist() == result_matmul.storage.index.mode_indices[1][0].tolist()

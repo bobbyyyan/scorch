@@ -163,7 +163,9 @@ class CINLowerer:
         """
         Lower a TensorAccess to LLIR
         """
-        last_index_var = tensor_access.indices[-1]
+        # pdb.set_trace()
+        sorted_index_vars = [tensor_access.indices[i] for i in tensor_access.tensor.mode_order]
+        last_index_var = sorted_index_vars[-1]
 
         # If the level_type corresponding to the last index var is dense, then we can just use
         # the index var as the index into the value array
@@ -232,6 +234,7 @@ class CINLowerer:
         assert self.result_tensor_access, "result tensor access is None"
         is_workspace = self.result_tensor_access.is_workspace()
         index_vars = self.result_tensor_access.get_index_vars()
+        sorted_index_vars = [index_vars[i] for i in self.result_tensor_access.tensor.mode_order]
         # If index_vars is None (empty), that means we have a scalar workspace
         # Then just do <tensor> += <rhs_llir>
         if not index_vars:
@@ -257,7 +260,7 @@ class CINLowerer:
                         type=llir.DataType.NO_TYPE,
                     )
                 else:
-                    level = self.result_tensor_access.level_of_index_var(index_vars[-1])
+                    level = self.result_tensor_access.level_of_index_var(sorted_index_vars[-1])
                     tensor_access_llir = llir.Var(
                         name=f"{values_llir_name}[p{self.result_tensor_var.name}{level}]",
                         type=llir.DataType.NO_TYPE,
@@ -272,13 +275,14 @@ class CINLowerer:
                     assert isinstance(self.result_tensor_access, WorkspaceAccess)
                     wksp_access: WorkspaceAccess = self.result_tensor_access
                     wksp_index_vars = wksp_access.get_index_vars()
+                    sorted_wksp_index_vars = [wksp_index_vars[i] for i in wksp_access.tensor.mode_order]
 
                     if wksp_access.is_dense():
                         # <workspace name>[<C++ array of indices>] += <rhs_llir>;
                         assert (
-                            len(wksp_index_vars) == 1
+                            len(sorted_wksp_index_vars) == 1
                         ), "dense workspace has more than 1 index var"
-                        wksp_index_var = wksp_index_vars[0]
+                        wksp_index_var = sorted_wksp_index_vars[0]
                         llir_stmts.append(
                             llir.Assign(
                                 var=llir.Var(
@@ -303,7 +307,7 @@ class CINLowerer:
                                                 name=ivar.name,
                                                 type=llir.DataType.INT,
                                             )
-                                            for ivar in wksp_index_vars
+                                            for ivar in sorted_wksp_index_vars
                                         ],
                                         data_type=llir.DataType.INT,
                                     ),
@@ -405,6 +409,7 @@ class CINLowerer:
             # we need to wrap llir_stmts in an if block,
             # the condition is whether the input value is non-zero
             if self.filter_zeros:
+                # pdb.set_trace()
                 llir_stmts = [
                     llir.IfThenElse(
                         cond=llir.BinOp(
@@ -526,6 +531,7 @@ class CINLowerer:
         """
         Lower a ProducerIndexStmt to LLIR
         """
+        # pdb.set_trace()
         result = self.lower_IndexStmt(stmt)
         if isinstance(result, list):
             return result
@@ -840,6 +846,7 @@ class CINLowerer:
             )
         )
 
+        # TODO: this is where your bug is
         # pdb.set_trace()
         # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
         lhs = f'result_tensor[{", ".join(["result_index_vars[{i}]".format(i=i) for i in range(len(result_index_vars))])}]'
@@ -850,9 +857,11 @@ class CINLowerer:
         # pdb.set_trace()
         rhs = f"result_tensor._assignment"
         assert ForAll is not None, "ForAll is not imported"
-        for i in range(len(result_index_vars)-1, -1, -1):
-            rhs = f"ForAll(result_index_vars[{i}], {rhs})"
+        sorted_result_index_vars = [result_index_vars[i] for i in result_tensor.mode_order]
+        for i in range(len(sorted_result_index_vars)-1, -1, -1):
+            rhs = f"ForAll(sorted_result_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
+        # pdb.set_trace()
 
         # pdb.set_trace()
         result_conversion_stmts = self.lower_IndexStmt(cin_stmt)
@@ -894,7 +903,7 @@ class CINLowerer:
         if not wksp_index_vars:
             stmts: List[llir.Stmt] = []
 
-            index_var = result_tensor_access.get_index_vars()[-1]
+            index_var = result_tensor_access.get_sorted_index_vars()[-1]
             level = result_tensor_access.level_of_index_var(index_var)
             level_type = result_tensor_access.level_type_of_index_var(index_var)
 
@@ -967,7 +976,7 @@ class CINLowerer:
                     )
                 )
             elif level_type == LevelType.COORDINATE:
-                # pdb.set_trace()
+                pdb.set_trace()
                 then_body_stmts = []
 
                 # C0_crd[pC0] = i, C1_crd[pC1] = j;
@@ -1744,18 +1753,29 @@ class CINLowerer:
                 *result_tensor_level_sizes,
             ]
 
-            # A mapping from IndexVar to a list of (TensorVar, _level: int, LevelType) tuples
+        # if len(rhs_tensor_accesses) == 2:
+        #     pdb.set_trace()
+
+        # A mapping from IndexVar to a list of (TensorVar, _level: int, LevelType) tuples
         self.index_var_to_rhs_tensor_level_type = {}
         for tensor_access in rhs_tensor_accesses:
             index_vars = tensor_access.get_index_vars()
             tensor_var = tensor_access.get_tensor()
             tensor_level_types = tensor_var.get_level_types()
-            for level, index_var in enumerate(index_vars):
+            mode_order = tensor_var.get_mode_order()
+            for i, index_var in enumerate(index_vars):
+                index_var_level = mode_order[i]
                 if index_var not in self.index_var_to_rhs_tensor_level_type:
                     self.index_var_to_rhs_tensor_level_type[index_var] = []
                 self.index_var_to_rhs_tensor_level_type[index_var].append(
-                    [tensor_var, level, tensor_level_types[level]]
+                    [tensor_var, index_var_level, tensor_level_types[index_var_level]]
                 )
+            # for level, index_var in enumerate(index_vars):
+            #     if index_var not in self.index_var_to_rhs_tensor_level_type:
+            #         self.index_var_to_rhs_tensor_level_type[index_var] = []
+            #     self.index_var_to_rhs_tensor_level_type[index_var].append(
+            #         [tensor_var, level, tensor_level_types[level]]
+            #     )
 
         self.index_var_to_result_tensor_level_type = {}
         for tensor_access in result_tensor_accesses:
@@ -1764,11 +1784,14 @@ class CINLowerer:
                 continue
             tensor_var = tensor_access.get_tensor()
             tensor_level_types = tensor_var.get_level_types()
-            for level, index_var in enumerate(index_vars):
+            mode_order = tensor_var.get_mode_order()
+            # pdb.set_trace()
+            for i, index_var in enumerate(index_vars):
+                index_var_level = mode_order[i]
                 if index_var not in self.index_var_to_result_tensor_level_type:
                     self.index_var_to_result_tensor_level_type[index_var] = []
                 self.index_var_to_result_tensor_level_type[index_var].append(
-                    [tensor_var, level, tensor_level_types[level]]
+                    [tensor_var, index_var_level, tensor_level_types[index_var_level]]
                 )
 
         # Initialize index into result if any _level if compressed

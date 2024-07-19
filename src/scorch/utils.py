@@ -1,4 +1,5 @@
 import math
+import pdb
 from collections import defaultdict, deque
 from itertools import chain
 from pathlib import Path
@@ -44,8 +45,8 @@ def load_to_kernel_cache(
         name=kernel_name,
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        # extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
-        extra_cflags=["-O3", "-ffast-math", "-fno-signed-zeros"],
+        extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+        # extra_cflags=["-O3", "-ffast-math", "-fno-signed-zeros"],
         build_directory=PROJECT_ROOT_DIR / "build",
     )
     end_time = time.time()
@@ -55,6 +56,7 @@ def load_to_kernel_cache(
 
 
 def topo_sort_characters(substrings, tensors):
+    # pdb.set_trace()
     # Create a directed graph
     graph = defaultdict(list)
     in_degree = defaultdict(int)
