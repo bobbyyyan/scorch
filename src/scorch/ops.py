@@ -365,21 +365,7 @@ def einsum(
                          + [''.join(result_index_strs_sorted)])
 
     # pdb.set_trace()
-    index_strs_by_schedule, new_index_strs = topo_sort_characters(index_strs_concat, tensors)
-
-    # pdb.set_trace()
-
-    # change mode order of input tensors if necessary
-    # for tensor_index, new_index_str in new_index_strs.items():
-    #     # Change this code
-    #     pdb.set_trace()
-    #     if tensor_index == 2:
-    #         result_index_strs_sorted = list(new_index_str)
-    #         temp_mode_order = [index_str_to_mode_index[index_str][0] for index_str in result_index_strs_sorted]
-    #     else:
-    #         input_index_strs_sorted[tensor_index] = list(new_index_str)
-    #         mode_order = [index_str_to_mode_index[index_str][0] for index_str in input_index_strs_sorted[tensor_index]]
-    #         tensors[tensor_index].change_mode_order(mode_order)
+    index_strs_by_schedule = topo_sort_characters(index_strs_concat, tensors)
 
     # Create a list of IndexVar objects, and a dict mapping index strings
     # to IndexVar objects

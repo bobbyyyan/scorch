@@ -97,41 +97,15 @@ def topo_sort_characters(substrings, tensors):
     # Run topological sort
     result = topo_sort()
 
-    new_substrings = {}
     if len(result) < len(nodes):
-        inverted_edges = resolve_cycles(nodes, graph, in_degree, substrings, tensors)
+        resolve_cycles(nodes, graph, in_degree, substrings, tensors)
         # Re-run topo_sort with new graph, in_degree
         result = topo_sort()
 
         if len(result) < len(nodes):
             raise ValueError("resolve_cycles did not resolve cycles!")
 
-        for tensor_index, edges_to_invert in inverted_edges.items():
-            tensor_index_var_strs = list(substrings[tensor_index])
-            tensor_edges = [(substrings[tensor_index][i], substrings[tensor_index][i + 1])
-                            for i in range(len(substrings[tensor_index]) - 1)]
-            for edge in edges_to_invert:
-                tensor_edges.remove((edge[0], edge[1]))
-                tensor_edges.append((edge[1], edge[0]))
-
-            adj_list = {}
-            reverse_adj_list = {}
-            for start_edge, end_edge in tensor_edges:
-                adj_list[start_edge] = end_edge
-                reverse_adj_list[end_edge] = start_edge
-
-            start_node = next(node for node in tensor_index_var_strs if node not in reverse_adj_list)
-            new_substr = []
-            current_node = start_node
-
-            while current_node in adj_list:
-                new_substr.append(current_node)
-                current_node = adj_list[current_node]
-            new_substr.append(current_node)
-
-            new_substrings[tensor_index] = ''.join(new_substr)
-
-    return result, new_substrings
+    return result
 
 
 def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
@@ -224,8 +198,6 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
         in_degree[edge_to_invert[1]] -= 1
         for tensor_index in tensor_indices:
             inverted_edges[tensor_index].append(edge_to_invert)
-
-    return inverted_edges
 
 
 def parse_format(fmt: Union[List[str], str, TensorFormat]) -> TensorFormat:
