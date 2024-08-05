@@ -29,7 +29,7 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Initialize tile sizes
-  constexpr int kTile_k = 1024;
+  constexpr int kTile_k = 16;
 
   int residual_k_start = (B1_size / kTile_k) * kTile_k;
 
