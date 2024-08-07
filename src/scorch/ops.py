@@ -341,7 +341,6 @@ def einsum(
     # e.g. ["i", "j", "k"]
     tensors = tuple(STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors)
 
-    # pdb.set_trace()
     unique_index_strs = list(expression.replace(",", "").replace("->", ""))
 
     # Make sure the index strings are unique, keeping the order
@@ -364,7 +363,6 @@ def einsum(
     index_strs_concat = ([''.join(index_str) for index_str in input_index_strs_sorted]
                          + [''.join(result_index_strs_sorted)])
 
-    # pdb.set_trace()
     index_strs_by_schedule = topo_sort_characters(index_strs_concat, tensors)
 
     # Create a list of IndexVar objects, and a dict mapping index strings
@@ -389,7 +387,6 @@ def einsum(
             )
 
     tensors = tensors_new
-    # pdb.set_trace()
 
     index_str_to_mode_index = {index_str: i for i, index_str in enumerate(result_index_strs)}
 
@@ -401,14 +398,7 @@ def einsum(
 
     final_mode_order = output_mode_order if output_mode_order else temp_mode_order
 
-    # if final_mode_order != temp_mode_order:
-        # pdb.set_trace()
-
-    # TODO: this is just a temporary fix
-    # final_mode_order = [i for i in range(len(result_index_strs))]
-
     #change the mode order of input tensors if necessary
-    # pdb.set_trace()
     for tensor_index, input_index_str in enumerate(input_index_strs):
         new_mode_order = []
         input_index_str_to_mode_index = {s: i for i, s in enumerate(input_index_str)}
@@ -416,7 +406,6 @@ def einsum(
             if index_str in input_index_str:
                 new_mode_order.append(input_index_str_to_mode_index[index_str])
 
-    # pdb.set_trace()
     # Create TensorVar's for each tensor
     tensor_vars = []
     tensor_names_available = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -541,15 +530,11 @@ def einsum(
 
     # print("CIN:\n", cin_stmt)
     # Currently assuming this cin_stmt will dictate any required tensor tranpositions
-    # pdb.set_trace()
     cin_stmt = Scheduler.auto_schedule(cin_stmt)
-
-    # pdb.set_trace()
 
     # TODO: do more tensor transpositions if needed from the auto-scheduler
 
     # print("Auto-scheduled CIN:\n", cin_stmt)
-    # pdb.set_trace()
     if str(cin_stmt) in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
         module = _kernel_cache[str(cin_stmt)]

@@ -569,9 +569,6 @@ class TensorVar(IndexExpr):
         if not self.mode_order:
             self.mode_order = [i for i in range(self.format.get_order())]
 
-        if self.mode_order is None:
-            pdb.set_trace()
-            assert False
 
     @property
     def name(self) -> str:
@@ -613,7 +610,6 @@ class TensorVar(IndexExpr):
         """
         Set self._assignment to the processed node.
         """
-        # pdb.set_trace()
         self._assignment = TensorAssign(TensorAccess(self, key), value)
 
     def __str__(self):
@@ -682,7 +678,6 @@ class Workspace(TensorVar):
 
     @property
     def format(self) -> TensorFormat:
-        # pdb.set_trace()
         if self.dense:
             return parse_format(["d"] * self.dim)
         return parse_format(["o"] * self.dim)
@@ -737,10 +732,6 @@ class TensorAccess(IndexExpr):
             for ivar in self.indices:
                 ivar.add_tensor_access(self)
 
-        if self.tensor.mode_order is None:
-            pdb.set_trace()
-            assert False
-
     def is_dense(self) -> bool:
         return self.tensor.is_dense()
 
@@ -761,16 +752,12 @@ class TensorAccess(IndexExpr):
         return self.indices and index_var in self.indices
 
     def get_parent_index_var(self, index_var: IndexVar) -> Optional[IndexVar]:
-        sorted_index_vars = [self.indices[i] for i in self.tensor.mode_order]
+        sorted_index_vars = self.get_sorted_index_vars()
         mode = sorted_index_vars.index(index_var)
-        if mode == 0:
-            return None
-        else:
-            return sorted_index_vars[mode - 1]
+        return None if mode == 0 else sorted_index_vars[mode - 1]
 
     def level_of_index_var(self, index: IndexVar) -> int:
-        # pdb.set_trace()
-        sorted_index_vars = [self.indices[i] for i in self.tensor.mode_order]
+        sorted_index_vars = self.get_sorted_index_vars()
         return sorted_index_vars.index(index)
 
     def level_type_of_index_var(self, index: IndexVar) -> LevelType:

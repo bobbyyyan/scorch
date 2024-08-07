@@ -62,7 +62,6 @@ class ModeIterator:
         return self.iterator_var_begin_value_llir
 
     def get_iterator_var_end_var_llir(self) -> llir.Var:
-        # pdb.set_trace()
         assert (
             self.iterator_var_end_var_llir is not None
         ), "iterator_var_end_var_llir is None"
@@ -200,7 +199,6 @@ class ModeIterator:
         return stmts
 
     def __post_init__(self):
-        # pdb.set_trace()
         # IndexVar must be provided
         assert (
             self.index_var is not None

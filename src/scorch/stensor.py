@@ -794,7 +794,6 @@ class STensor(torch.nn.Module):
             dim=len(self.shape),
             mode_order=mode_order[:]
         )
-        # pdb.set_trace()
 
         producer_stmt = TensorAssign(
             workspace[tuple(index_vars)],

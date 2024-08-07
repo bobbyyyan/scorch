@@ -56,7 +56,6 @@ def load_to_kernel_cache(
 
 
 def topo_sort_characters(substrings, tensors):
-    # pdb.set_trace()
     # Create a directed graph
     graph = defaultdict(list)
     in_degree = defaultdict(int)

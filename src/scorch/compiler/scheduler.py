@@ -284,7 +284,6 @@ class Scheduler:
 
         This function should be idempotent.
         """
-        # pdb.set_trace()
         # Collect all the reduction variables
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(cin)
@@ -354,9 +353,8 @@ class Scheduler:
             indices=free_vars_after_last_reduction,
         )
 
-        # TODO: rename parent_forall to something else; not necessarily ForAll statement at the end
+        # Note: parent_forall not necessarily ForAll statement at the end
         parent_forall = new_cin
-        # pdb.set_trace()
         while (
             isinstance(parent_forall.stmt, ForAll)
             and parent_forall.stmt.index_var != next_reduction_var
@@ -405,7 +403,6 @@ class Scheduler:
         )
 
         """
-        # pdb.set_trace()
         reduction_forall = parent_forall if parent_forall.index_var == next_reduction_var else parent_forall.stmt
 
         # If we have already inserted a workspace, then we should not insert another one.
@@ -455,7 +452,6 @@ class Scheduler:
         else:
             new_cin = where_stmt
 
-        # pdb.set_trace()
         new_cin.inserted_workspace = True
 
         return new_cin
