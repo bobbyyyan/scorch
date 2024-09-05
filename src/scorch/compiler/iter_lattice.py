@@ -245,18 +245,43 @@ class LatticePoint:
                 stmts.append(llir.BlankLine())
                 stmts.append(llir.Comment("Advance iterators"))
             for it in iterators:
-                stmts.append(
-                    llir.Assign(
-                        var=it.get_iterator_var_llir(),
-                        value=llir.BinOp(
-                            op="==",
-                            left=it.get_coord_var_llir(),
-                            right=self.get_index_var_llir(),
-                        ),
-                        op=llir.AssignOp.ADD_ASSIGN,
-                        cast=True,
+                if (
+                    it.level_type == LevelType.COORDINATE
+                    and it.level + 1 < it.tensor_var.levels
+                ):
+                    # e.g. if k_A == k then pA0 = pA1_end;
+                    stmts.append(
+                        llir.IfThenElse(
+                            cond=llir.BinOp(
+                                op="==",
+                                left=it.get_coord_var_llir(),
+                                right=self.get_index_var_llir(),
+                            ),
+                            then_body=[
+                                llir.Assign(
+                                    var=it.get_iterator_var_llir(),
+                                    value=llir.Var(
+                                        name=f"p{it.tensor_var.name}{it.level + 1}_end",
+                                        type=llir.DataType.INT,
+                                    ),
+                                )
+                            ],
+                        )
                     )
-                )
+                else:
+                    # e.g. pA0 += (int) k_A == k;
+                    stmts.append(
+                        llir.Assign(
+                            var=it.get_iterator_var_llir(),
+                            value=llir.BinOp(
+                                op="==",
+                                left=it.get_coord_var_llir(),
+                                right=self.get_index_var_llir(),
+                            ),
+                            op=llir.AssignOp.ADD_ASSIGN,
+                            cast=True,
+                        )
+                    )
             if lattice.dense_index_var_llir:
                 lattice_ivar = lattice.index_var
                 if lattice_ivar.tile_size_var and lattice_ivar.is_outer:
