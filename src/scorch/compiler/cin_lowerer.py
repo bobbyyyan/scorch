@@ -971,7 +971,7 @@ class CINLowerer:
                 then_body_stmts = []
 
                 # C0_crd[pC0] = i, C1_crd[pC1] = j;
-                for index, index_var in enumerate(result_tensor_access.indices):
+                for index, index_var in enumerate(result_tensor_access.get_sorted_index_vars()):
                     then_body_stmts.append(
                         llir.Assign(
                             var=llir.Var(

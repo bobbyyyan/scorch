@@ -450,7 +450,7 @@ def test_change_mode_order_3d_random_sss():
     assert a.storage.index.mode_order == [0, 1, 2]
 
 
-def test_einsum_2d_csr_csc_concordant():
+def test_einsum_2d_concordant_ds():
     tensor_a_torch = torch.Tensor(
         [
             [1, 2, 3, 4, 5],
@@ -470,30 +470,22 @@ def test_einsum_2d_csr_csc_concordant():
         ]
     )
 
-    a_torch_coo = tensor_a_torch.to_sparse_coo()
-    b_torch_coo = tensor_b_torch.to_sparse_coo()
-    c_torch_coo = torch.sparse.mm(a_torch_coo, b_torch_coo)
+    a_csr = STensor.from_torch(tensor_a_torch, "a_csr", [0, 1]).to_sparse("ds")
+    a_csc = STensor.from_torch(tensor_a_torch, "a_csc", [1, 0]).to_sparse("ds")
 
-    a_csr = STensor.from_torch(tensor_a_torch, "a_csr", [0, 1]).to_sparse("oo")
-    a_csc = STensor.from_torch(tensor_a_torch, "a_csc", [1, 0]).to_sparse("oo")
+    b_csr = STensor.from_torch(tensor_b_torch, "b_csr", [0, 1]).to_sparse("ds")
+    b_csc = STensor.from_torch(tensor_b_torch, "b_csc", [1, 0]).to_sparse("ds")
 
-    b_csr = STensor.from_torch(tensor_b_torch, "b_csr", [0, 1]).to_sparse("oo")
-    b_csc = STensor.from_torch(tensor_b_torch, "b_csc", [1, 0]).to_sparse("oo")
+    c_csr = einsum("ik,kj->ij", a_csr, b_csc, format="ds", output_mode_order=[0, 1])
+    assert torch.allclose(c_csr.values, torch.Tensor([1, 4, 19, 5, 2, 4, 3, 5, 15, 5]))
+    assert c_csr.storage.index.mode_indices[1][0].tolist() == [0, 4, 6, 7, 7, 10]
+    assert c_csr.storage.index.mode_indices[1][1].tolist() == [0, 1, 3, 4, 0, 1, 0, 0, 3, 4]
+    assert c_csr.storage.index.mode_order == [0, 1]
 
-    # c_csr = einsum("ik,kj->ij", a_csr, b_csc, format="ds", output_mode_order=[0, 1])
-    # assert c_csr.storage.value.tolist() == [1., 4., 19., 5., 2., 4., 3., 5., 15., 5.]
-    # assert c_csr.storage.index.mode_indices[1][0].tolist() == [0, 4, 6, 7, 7, 10]
-    # assert c_csr.storage.index.mode_indices[1][1].tolist() == [0, 1, 3, 4, 0, 1, 0, 0, 3, 4]
-    # assert c_csr.storage.index.mode_order == [0, 1]
-
-    c_csr = einsum("ik,kj->ij", a_csc, b_csr, format="oo", output_mode_order=[0, 1])
-    assert torch.allclose(c_csr.values, c_torch_coo.values())
-    assert torch.allclose(
-        c_csr.index.mode_indices[0][0], c_torch_coo.indices()[0].int()
-    )
-    assert torch.allclose(
-        c_csr.index.mode_indices[1][0], c_torch_coo.indices()[1].int()
-    )
+    c_csr = einsum("ik,kj->ij", a_csc, b_csr, format="ds", output_mode_order=[0, 1])
+    assert torch.allclose(c_csr.values, torch.Tensor([1, 4, 19, 5, 2, 4, 3, 5, 15, 5]))
+    assert c_csr.storage.index.mode_indices[1][0].tolist() == [0, 4, 6, 7, 7, 10]
+    assert c_csr.storage.index.mode_indices[1][1].tolist() == [0, 1, 3, 4, 0, 1, 0, 0, 3, 4]
     assert c_csr.storage.index.mode_order == [0, 1]
 
     c_csc = einsum("ik,kj->ij", a_csc, b_csr, format="ds", output_mode_order=[1, 0])
@@ -530,8 +522,7 @@ def test_einsum_2d_csr_csc_concordant():
     ]
     assert c_csc.storage.index.mode_order == [1, 0]
 
-
-def test_einsum_2d_csc_discordant():
+def test_einsum_2d_discordant_ds():
     tensor_a_torch = torch.Tensor(
         [
             [1, 2, 3, 4, 5],
@@ -612,3 +603,136 @@ def test_einsum_2d_csc_discordant():
         4,
     ]
     assert c_csc.storage.index.mode_order == [1, 0]
+
+def test_einsum_2d_concordant_oo():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0],
+            [0, 0, 0, 3, 1],
+        ]
+    )
+
+    a_torch_coo = tensor_a_torch.to_sparse_coo()
+    b_torch_coo = tensor_b_torch.to_sparse_coo()
+    c_torch_coo = torch.sparse.mm(a_torch_coo, b_torch_coo)
+    c_torch_coo_transposed = c_torch_coo.transpose(0, 1).coalesce()
+
+    a_default = STensor.from_torch(tensor_a_torch, "a_csr", [0, 1]).to_sparse("oo")
+    a_inverted = STensor.from_torch(tensor_a_torch, "a_csc", [1, 0]).to_sparse("oo")
+
+    b_default = STensor.from_torch(tensor_b_torch, "b_csr", [0, 1]).to_sparse("oo")
+    b_inverted = STensor.from_torch(tensor_b_torch, "b_csc", [1, 0]).to_sparse("oo")
+
+    c_default = einsum("ik,kj->ij", a_default, b_inverted, format="oo", output_mode_order=[0, 1])
+    assert torch.allclose(c_default.values, c_torch_coo.values())
+    assert torch.allclose(
+        c_default.index.mode_indices[0][0], c_torch_coo.indices()[0].int()
+    )
+    assert torch.allclose(
+        c_default.index.mode_indices[1][0], c_torch_coo.indices()[1].int()
+    )
+    assert c_default.storage.index.mode_order == [0, 1]
+
+    c_default = einsum("ik,kj->ij", a_inverted, b_default, format="oo", output_mode_order=[0, 1])
+    assert torch.allclose(c_default.values, c_torch_coo.values())
+    assert torch.allclose(
+        c_default.index.mode_indices[0][0], c_torch_coo.indices()[0].int()
+    )
+    assert torch.allclose(
+        c_default.index.mode_indices[1][0], c_torch_coo.indices()[1].int()
+    )
+    assert c_default.storage.index.mode_order == [0, 1]
+
+    c_inverted = einsum("ik,kj->ij", a_default, b_inverted, format="oo", output_mode_order=[1, 0])
+    assert torch.allclose(c_inverted.values, c_torch_coo_transposed.values())
+    assert torch.allclose(
+        c_inverted.index.mode_indices[0][0], c_torch_coo_transposed.indices()[0].int()
+    )
+    assert torch.allclose(
+        c_inverted.index.mode_indices[1][0], c_torch_coo_transposed.indices()[1].int()
+    )
+    assert c_inverted.storage.index.mode_order == [1, 0]
+
+    c_inverted = einsum("ik,kj->ij", a_inverted, b_default, format="oo", output_mode_order=[1, 0])
+    assert torch.allclose(c_inverted.values, c_torch_coo_transposed.values())
+    assert torch.allclose(
+        c_inverted.index.mode_indices[0][0], c_torch_coo_transposed.indices()[0].int()
+    )
+    assert torch.allclose(
+        c_inverted.index.mode_indices[1][0], c_torch_coo_transposed.indices()[1].int()
+    )
+    assert c_inverted.storage.index.mode_order == [1, 0]
+
+
+def test_einsum_3d():
+    tensor_a_torch = torch.Tensor(
+        [
+            [
+                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 4, 0],
+                [5, 6, 0],
+                [0, 0, 0],
+            ],
+        ]
+    )
+
+    tensor_b_torch = torch.Tensor(
+        [
+            [
+                [0, 4, 0],
+                [5, 6, 0],
+                [0, 0, 0],
+            ],
+            [
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            [
+                [1, 0, 0],
+                [0, 0, 2],
+                [3, 0, 0],
+            ],
+        ]
+    )
+
+    a_default = STensor.from_torch(tensor_a_torch, "a_default", [0, 1, 2]).to_sparse("dss")
+    a_reverse = STensor.from_torch(tensor_a_torch, "a_reverse", [2, 1, 0]).to_sparse("dss")
+
+    b_default = STensor.from_torch(tensor_b_torch, "b_default", [0, 1, 2]).to_sparse("dss")
+    b_reverse = STensor.from_torch(tensor_b_torch, "b_reverse", [2, 1, 0]).to_sparse("dss")
+
+    c = einsum("bij,bjk->bik", a_default, b_reverse, format="dss", output_mode_order=[0, 1, 2])
+    assert c.storage.value.tolist() == [4., 12.,  8.,  5., 12.]
+    assert c.storage.index.mode_indices[1][0].tolist() == [0, 2, 2, 4]
+    assert c.storage.index.mode_indices[1][1].tolist() == [0, 2, 0, 1]
+    assert c.storage.index.mode_indices[2][0].tolist() == [0, 1, 2, 3, 5]
+    assert c.storage.index.mode_indices[2][1].tolist() == [1, 1, 2, 0, 2]
+
+    c = einsum("bij,bjk->bik", a_reverse, b_default, format="dss", output_mode_order=[2, 1, 0])
+    assert c.storage.value.tolist() == [5., 4., 12., 8., 12.]
+    assert c.storage.index.mode_indices[1][0].tolist() == [0, 1, 3, 5]
+    assert c.storage.index.mode_indices[1][1].tolist() == [1, 0, 2, 0, 1]
+    assert c.storage.index.mode_indices[2][0].tolist() == [0, 1, 2, 3, 4, 5]
+    assert c.storage.index.mode_indices[2][1].tolist() == [2, 0, 0, 2, 2]

@@ -398,13 +398,14 @@ def einsum(
 
     final_mode_order = output_mode_order if output_mode_order else temp_mode_order
 
-    #change the mode order of input tensors if necessary
+    # change the mode order of input tensors if necessary
     for tensor_index, input_index_str in enumerate(input_index_strs):
         new_mode_order = []
         input_index_str_to_mode_index = {s: i for i, s in enumerate(input_index_str)}
         for index_str in index_strs_by_schedule:
             if index_str in input_index_str:
                 new_mode_order.append(input_index_str_to_mode_index[index_str])
+        tensors[tensor_index].change_mode_order(new_mode_order)
 
     # Create TensorVar's for each tensor
     tensor_vars = []
@@ -452,6 +453,7 @@ def einsum(
 
         # Create a list of LevelFormat objects
         output_level_formats = []
+        # TODO: check if should be result_index_strs_sorted?
         for index_str in result_index_strs:
             level_format = LevelFormat(LevelType.DENSE)
             # Use the index_str_to_level_formats to get the list of LevelFormats
@@ -515,7 +517,6 @@ def einsum(
     assert result_tensor_var is not None, "result_tensor_var is not defined"
     code = f"result_tensor_var[{lhs_inside}] = {rhs}"
 
-    # pdb.set_trace()
     exec(code)
 
     # print("result_tensor_var._assignment:", result_tensor_var._assignment)
