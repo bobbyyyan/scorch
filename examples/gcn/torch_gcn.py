@@ -223,6 +223,13 @@ def main():
         help="Use gather-scatter implementation.",
     )
 
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        default=False,
+        help="Use GPU.",
+    )
+
     args = parser.parse_args()
 
     # Convert dataset to lowercase
@@ -253,7 +260,13 @@ def main():
     else:
         model = GCN(in_channels, hidden_channels, out_channels)
 
-    device = torch.device("cpu")
+    if args.gpu and torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    data = data.to(device)
+    model = model.to(device)
 
     # Inference
     inference(model, data, device, args.dataset, split_idx, args.batch_size)

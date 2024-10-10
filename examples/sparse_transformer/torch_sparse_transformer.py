@@ -37,6 +37,7 @@ class BigBirdSparseAttention(nn.Module):
         nn.init.xavier_uniform_(self.value.weight)
 
     def forward(self, hidden_states):
+        device = hidden_states.device
         batch_size, seq_length, _ = hidden_states.size()
         query = self.query(hidden_states)
         key = self.key(hidden_states)
@@ -69,7 +70,7 @@ class BigBirdSparseAttention(nn.Module):
                             indices.append((b, h, i, j))
 
         # Convert indices to tensor
-        indices = torch.tensor(indices, dtype=torch.long).t()
+        indices = torch.tensor(indices, dtype=torch.long).t().to(device)
 
         # Extract the values at these indices from attention_scores
         values = attention_scores.view(-1)[
@@ -80,7 +81,7 @@ class BigBirdSparseAttention(nn.Module):
             + indices[1] * attention_scores.size(2) * attention_scores.size(3)
             + indices[2] * attention_scores.size(3)
             + indices[3]
-        ]
+        ].to(device)
 
         sparse_attention_scores = torch.sparse_coo_tensor(
             indices, values, attention_scores.size()
@@ -304,12 +305,25 @@ def main():
         type=str,
         help="path to save/load the model",
     )
+
+    # Make the GPU argument a flag
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        default=False,
+        help="whether to use GPU for training/testing (default: False)",
+    )
+
+
     args = parser.parse_args()
 
     if args.model_path is None:
         args.model_path = f"model/bigbird_model_sparse_{args.dataset}.pt"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.gpu:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cpu")
 
     # Load and preprocess the dataset
     if args.dataset == "imdb":

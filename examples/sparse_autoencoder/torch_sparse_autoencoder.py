@@ -188,7 +188,9 @@ def main():
     dataset_name = args.dataset
 
     use_cuda = not args.no_cuda and torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
+    # device = torch.device("cuda" if use_cuda else "cpu")
+    device = torch.device("cpu")
+    print(f"Using device: {device}")
 
     train_kwargs = {"batch_size": args.batch_size}
     test_kwargs = {"batch_size": args.test_batch_size}
