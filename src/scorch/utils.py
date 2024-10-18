@@ -145,26 +145,23 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
 
     # Finds the cheapest edge to invert based on tensor shape and already inverted edges
     def invert_cheapest_edge(edges):
-        inverted_tensor_indices_set = {idx for edge in inverted_edges for idx in inverted_edge_to_tensor_indices[edge]}
-        inverted_tensor_indices = list(inverted_tensor_indices_set)
+        inverted_tensor_indices = list(inverted_edges.keys())
 
-        # Find edge associated with the smallest tensor, tiebreaker goes to result tensor
+        # Find edge associated with the smallest tensor, tiebreaker goes to result tensor. Represents cost as a tuple.
         def edge_cost(edge):
-            tensor_indices_ = edges_to_tensor_indices[edge]
-            return (0, -max(tensor_indices_)) \
-                if set(tensor_indices_).issubset(set(inverted_tensor_indices)) \
-                else (sum(tensor_index_to_size[index] for index in tensor_indices_), -max(tensor_indices_))
+            edge_tensor_indices = edges_to_tensor_indices[edge]
+            return (0, -(max(edge_tensor_indices))) \
+                if set(edge_tensor_indices).issubset(set(inverted_tensor_indices)) \
+                else (sum(tensor_index_to_size[index] for index in edge_tensor_indices), -max(edge_tensor_indices))
 
         min_cost_edge = min(edges, key=edge_cost)
         min_cost_tensor_indices = edges_to_tensor_indices[min_cost_edge]
-        inverted_edge_to_tensor_indices[min_cost_edge] = min_cost_tensor_indices
         return min_cost_edge, min_cost_tensor_indices
 
     inverted_edges = defaultdict(list)
-    inverted_edge_to_tensor_indices = {}
     edges_to_tensor_indices = defaultdict(list)
 
-    # Build dictionary from edges in graph to indices of tensors they appear in
+    # Build dictionary from edges (tuples) in graph to indices of tensors they appear in
     for tensor_index, substring in enumerate(substrings):
         for i in range(len(substring) - 1):
             edges_to_tensor_indices[(substring[i], substring[i + 1])].append(tensor_index)
@@ -192,9 +189,13 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
             break
         edge_to_invert, tensor_indices = invert_cheapest_edge(cycle_edges)
         graph[edge_to_invert[0]].remove(edge_to_invert[1])
-        graph[edge_to_invert[1]].append(edge_to_invert[0])
-        in_degree[edge_to_invert[0]] += 1
         in_degree[edge_to_invert[1]] -= 1
+
+        # If the cycle is just two edges, we will remove one edge, not invert it
+        if edge_to_invert[0] not in graph[edge_to_invert[1]]:
+            graph[edge_to_invert[1]].append(edge_to_invert[0])
+            in_degree[edge_to_invert[0]] += 1
+
         for tensor_index in tensor_indices:
             inverted_edges[tensor_index].append(edge_to_invert)
 
