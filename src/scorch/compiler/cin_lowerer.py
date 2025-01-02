@@ -23,6 +23,8 @@ from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
 import pdb
+
+
 class CINLowerer:
     """
     This is a class to lower a CIN to LLIR
@@ -259,7 +261,9 @@ class CINLowerer:
                         type=llir.DataType.NO_TYPE,
                     )
                 else:
-                    level = self.result_tensor_access.level_of_index_var(sorted_index_vars[-1])
+                    level = self.result_tensor_access.level_of_index_var(
+                        sorted_index_vars[-1]
+                    )
                     tensor_access_llir = llir.Var(
                         name=f"{values_llir_name}[p{self.result_tensor_var.name}{level}]",
                         type=llir.DataType.NO_TYPE,
@@ -274,7 +278,9 @@ class CINLowerer:
                     assert isinstance(self.result_tensor_access, WorkspaceAccess)
                     wksp_access: WorkspaceAccess = self.result_tensor_access
                     wksp_index_vars = wksp_access.get_index_vars()
-                    sorted_wksp_index_vars = [wksp_index_vars[i] for i in wksp_access.tensor.mode_order]
+                    sorted_wksp_index_vars = [
+                        wksp_index_vars[i] for i in wksp_access.tensor.mode_order
+                    ]
 
                     if wksp_access.is_dense():
                         # <workspace name>[<C++ array of indices>] += <rhs_llir>;
@@ -513,7 +519,7 @@ class CINLowerer:
                             llir.Var(
                                 name="result_shape",
                                 type=llir.DataType.STD_VECTOR_INT,
-                            )
+                            ),
                         ],
                     ),
                 )
@@ -550,7 +556,9 @@ class CINLowerer:
 
         result_is_coord = True
 
-        for level_type in result_tensor_access.get_tensor().get_format().get_level_types():
+        for level_type in (
+            result_tensor_access.get_tensor().get_format().get_level_types()
+        ):
             if level_type != LevelType.COORDINATE:
                 result_is_coord = False
                 break
@@ -564,7 +572,7 @@ class CINLowerer:
                 ]
             ),
             dtype=self.result_tensor_var.dtype,
-            mode_order=result_tensor.mode_order
+            mode_order=result_tensor.mode_order,
         )
 
         intermediate_tensor_level_iterator = llir.Var(
@@ -574,11 +582,11 @@ class CINLowerer:
 
         intermediate_tensor_crd_vecs = []
         intermediate_tensor_val_vec = llir.Var(
-                        name=f"{intermediate_tensor_var.get_name()}_val_vec",
-                        type=llir.DataType.cvector_type(
-                            dtype_to_c_datatype(intermediate_tensor_var.dtype)
-                        ),
-                    )
+            name=f"{intermediate_tensor_var.get_name()}_val_vec",
+            type=llir.DataType.cvector_type(
+                dtype_to_c_datatype(intermediate_tensor_var.dtype)
+            ),
+        )
 
         intermediate_tensor_vec_decl_stmts = []
 
@@ -592,16 +600,12 @@ class CINLowerer:
                     )
                 )
                 intermediate_tensor_vec_decl_stmts.append(
-                    llir.VarDecl(
-                        intermediate_tensor_crd_vecs[level]
-                    )
+                    llir.VarDecl(intermediate_tensor_crd_vecs[level])
                 )
 
             # Declare cvector<float> T_val_vec;
             intermediate_tensor_vec_decl_stmts.append(
-                llir.VarDecl(
-                    intermediate_tensor_val_vec
-                )
+                llir.VarDecl(intermediate_tensor_val_vec)
             )
 
             # Initialize int pT = 0
@@ -622,7 +626,6 @@ class CINLowerer:
         # TODO: can I make these assertions?
         assert len(wksp_access.get_index_vars()) > 1
         assert not wksp_access.is_dense()
-
 
         # For loop
         # for (const auto& pair : <wksp's name>) {
@@ -816,9 +819,7 @@ class CINLowerer:
                             type=llir.DataType.NO_TYPE,
                         ),
                         llir.Var(
-                            name=get_pytorch_c_dtype_str(
-                                    intermediate_tensor_var.dtype
-                                ),
+                            name=get_pytorch_c_dtype_str(intermediate_tensor_var.dtype),
                             type=llir.DataType.NO_TYPE,
                         ),
                     ],
@@ -852,7 +853,7 @@ class CINLowerer:
         rhs = f"result_tensor._assignment"
         assert ForAll is not None, "ForAll is not imported"
         sorted_result_index_vars = result_tensor_access.get_sorted_index_vars()
-        for i in range(len(sorted_result_index_vars)-1, -1, -1):
+        for i in range(len(sorted_result_index_vars) - 1, -1, -1):
             rhs = f"ForAll(sorted_result_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
 
@@ -870,7 +871,7 @@ class CINLowerer:
             llir.BlankLine(),
             *intermediate_tensor_assembly_stmts,
             llir.BlankLine(),
-            *result_conversion_stmts
+            *result_conversion_stmts,
         ]
 
     def lower_ConsumerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
@@ -935,9 +936,9 @@ class CINLowerer:
                         cond=llir.BinOp(
                             op="!=",
                             left=llir.Var(
-                                    name=f"{wksp.name}",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
+                                name=f"{wksp.name}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
                             right=llir.Literal(0),
                         ),
                         then_body=[
@@ -963,7 +964,7 @@ class CINLowerer:
                                 ),
                                 op=AssignOp.ASSIGN,
                             ),
-                            llir.Increment(result_level_iterator_var)
+                            llir.Increment(result_level_iterator_var),
                         ],
                     )
                 )
@@ -971,7 +972,9 @@ class CINLowerer:
                 then_body_stmts = []
 
                 # C0_crd[pC0] = i, C1_crd[pC1] = j;
-                for index, index_var in enumerate(result_tensor_access.get_sorted_index_vars()):
+                for index, index_var in enumerate(
+                    result_tensor_access.get_sorted_index_vars()
+                ):
                     then_body_stmts.append(
                         llir.Assign(
                             var=llir.Var(
@@ -1022,7 +1025,7 @@ class CINLowerer:
                             ),
                             right=llir.Literal(0),
                         ),
-                        then_body=then_body_stmts
+                        then_body=then_body_stmts,
                     )
                 )
 
@@ -1282,6 +1285,22 @@ class CINLowerer:
                 ),
             )
         )
+
+        # If the parent level is also a coordinate level, we need to set the parent level's coordinate as well
+        if parent_level_type == LevelType.COORDINATE:
+            # <result tensor name><parent level>_crd[<result level iterator>] = <wksp_access's second index var's name>;
+            loop_body.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=f"{result_tensor_name}{level - 1}_crd[{result_level_iterator_name}]",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    value=llir.Var(
+                        name=f"{parent_index_var.name}",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                )
+            )
 
         # <result level iterator>++;
         loop_body.append(
