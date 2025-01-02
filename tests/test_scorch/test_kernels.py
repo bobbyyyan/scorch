@@ -1013,6 +1013,35 @@ def test_spmm_dd_ds_dd_wksp_time():
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
 
 
+def test_matmul_oo_oo_oo():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0],
+            [0, 0, 0, 3, 1],
+        ]
+    )
+
+    tensor_a = STensor.from_torch(tensor_a_torch, "a").to_sparse("oo")
+    tensor_b = STensor.from_torch(tensor_b_torch, "b").to_sparse("oo")
+    tensor_c = einsum("ik,kj->ij", tensor_a, tensor_b, format="oo")
+
+    tensor_c_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    assert torch.allclose(tensor_c_torch, tensor_c.to_torch())
+
+
 def test_spmm_dd_oo_dd_time():
     """
     Compare speed of torch and scorch matmul
