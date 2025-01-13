@@ -26,9 +26,15 @@ spmm = load_inline(
     name="kernel",
     cpp_sources=[header_cpp_code, spmm_cpp_code],
     functions=["evaluate"],
+    # extra_cflags=[
+    #     "-O3",
+    #     "-march=native",
+    #     "-ffast-math",
+    #     "-fno-signed-zeros",
+    #     "-Werror",
+    # ],
     extra_cflags=[
         "-O3",
-        "-march=native",
         "-ffast-math",
         "-fno-signed-zeros",
         "-Werror",
@@ -40,9 +46,15 @@ spmspm = load_inline(
     cpp_sources=[spmspm_cpp_code],
     extra_include_paths=["kernels/"],
     functions=["evaluate"],
+    # extra_cflags=[
+    #     "-O3",
+    #     "-march=native",
+    #     "-ffast-math",
+    #     "-fno-signed-zeros",
+    #     "-Werror",
+    # ],
     extra_cflags=[
         "-O3",
-        "-march=native",
         "-ffast-math",
         "-fno-signed-zeros",
         "-Werror",

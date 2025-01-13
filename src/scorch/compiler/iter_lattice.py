@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pdb
 from dataclasses import dataclass, field
 from itertools import product
 from typing import List, Optional, Dict, TYPE_CHECKING, Iterable, Sequence, Union
@@ -114,7 +115,6 @@ class LatticePoint:
             )
             for ta in self.get_dense_tensor_accesses()
         ]
-
         return self.iterators
 
     def filter_and_set_children(
@@ -245,18 +245,43 @@ class LatticePoint:
                 stmts.append(llir.BlankLine())
                 stmts.append(llir.Comment("Advance iterators"))
             for it in iterators:
-                stmts.append(
-                    llir.Assign(
-                        var=it.get_iterator_var_llir(),
-                        value=llir.BinOp(
-                            op="==",
-                            left=it.get_coord_var_llir(),
-                            right=self.get_index_var_llir(),
-                        ),
-                        op=llir.AssignOp.ADD_ASSIGN,
-                        cast=True,
+                if (
+                    it.level_type == LevelType.COORDINATE
+                    and it.level + 1 < it.tensor_var.levels
+                ):
+                    # e.g. if k_A == k then pA0 = pA1_end;
+                    stmts.append(
+                        llir.IfThenElse(
+                            cond=llir.BinOp(
+                                op="==",
+                                left=it.get_coord_var_llir(),
+                                right=self.get_index_var_llir(),
+                            ),
+                            then_body=[
+                                llir.Assign(
+                                    var=it.get_iterator_var_llir(),
+                                    value=llir.Var(
+                                        name=f"p{it.tensor_var.name}{it.level + 1}_end",
+                                        type=llir.DataType.INT,
+                                    ),
+                                )
+                            ],
+                        )
                     )
-                )
+                else:
+                    # e.g. pA0 += (int) k_A == k;
+                    stmts.append(
+                        llir.Assign(
+                            var=it.get_iterator_var_llir(),
+                            value=llir.BinOp(
+                                op="==",
+                                left=it.get_coord_var_llir(),
+                                right=self.get_index_var_llir(),
+                            ),
+                            op=llir.AssignOp.ADD_ASSIGN,
+                            cast=True,
+                        )
+                    )
             if lattice.dense_index_var_llir:
                 lattice_ivar = lattice.index_var
                 if lattice_ivar.tile_size_var and lattice_ivar.is_outer:
@@ -828,7 +853,7 @@ class IterationLattice:
                 # if index variable correspond to a dense level, put in locators
                 if (
                     cin.get_tensor().get_level_types()[
-                        cin.get_index_vars().index(parsed_index_var)
+                        cin.get_sorted_index_vars().index(parsed_index_var)
                     ]
                     == LevelType.DENSE
                 ):
@@ -918,6 +943,7 @@ class IterationLattice:
         return parent_to_children_lattice_points
 
     def __post_init__(self):
+        # pdb.set_trace()
         if self.lattice_points is None:
             self.lattice_points = self.gen_lattice_points()
             self.gen_parent_to_children_lattice_points()
@@ -1046,6 +1072,12 @@ class IterationLattice:
                                                 type=llir.DataType.INT,
                                             )
                                         ],
+                                    ),
+                                    llir.Increment(
+                                        var=llir.Var(
+                                            name=f"p{result_tensor_name}{level - 1}",
+                                            type=llir.DataType.INT,
+                                        )
                                     ),
                                 ],
                             )

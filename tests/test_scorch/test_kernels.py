@@ -1,4 +1,5 @@
 # pretty print
+import pdb
 import pprint
 import time
 from itertools import product
@@ -477,6 +478,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
     A = TensorVar("A", fmt=["dense", "sparse"])
     B = TensorVar("B", fmt=["dense", "sparse"])
     C = TensorVar("C", fmt=["dense", "sparse"])
+    # pdb.set_trace()
 
     workspace = Workspace(
         name="wksp",
@@ -809,10 +811,9 @@ def test_dense_matmul():
     tensor_a_torch = torch.rand(100, 200)
     tensor_b_torch = torch.rand(200, 300)
     torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
-
     scorch_result = matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch_result.tolist() == scorch_result.to_torch().tolist()
+    assert torch_result.tolist() == scorch_result.tolist()
 
 
 def test_matmul_ds_dd_dd():
@@ -1010,6 +1011,35 @@ def test_spmm_dd_ds_dd_wksp_time():
     print(f"scorch total time: {scorch_total_time}")
     print(f"scorch eval time: {scorch_eval_time}")
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
+
+
+def test_matmul_oo_oo_oo():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0],
+            [0, 0, 0, 3, 1],
+        ]
+    )
+
+    tensor_a = STensor.from_torch(tensor_a_torch, "a").to_sparse("oo")
+    tensor_b = STensor.from_torch(tensor_b_torch, "b").to_sparse("oo")
+    tensor_c = einsum("ik,kj->ij", tensor_a, tensor_b, format="oo")
+
+    tensor_c_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
+
+    assert torch.allclose(tensor_c_torch, tensor_c.to_torch())
 
 
 def test_spmm_dd_oo_dd_time():
@@ -1710,7 +1740,7 @@ def test_matmul_dd_ds_dd():
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch.allclose(result.to_torch(), result_torch)
+    assert torch.allclose(result, result_torch)
 
 
 def test_spmm_dd_ds_ds():

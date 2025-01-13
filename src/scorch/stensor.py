@@ -1,16 +1,18 @@
 from __future__ import annotations
+
+import pdb
 from copy import deepcopy
 from typing import Optional, Tuple, Union, List
+from torch.utils.cpp_extension import load, load_inline
 
 import torch
 
-from .compiler.cin import TensorVar, ForAll, IndexVar
+from .compiler.cin import TensorVar, ForAll, IndexVar, Workspace, Where, TensorAssign, Operation
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorStorage, TensorIndex, TensorStorageView
 from .utils import PROJECT_ROOT_DIR, parse_format
-
 
 class Window(object):
     """A tensor window object that describes the slice into a physical storage (TensorStorage)
@@ -164,31 +166,43 @@ class STensor(torch.nn.Module):
 
     def __add__(self, other) -> STensor:
         """Add two tensors together."""
+        # Change mode order of other to match self if they are different
+        if self.storage.index.mode_order != other.storage.index.mode_order:
+            other.change_mode_order(self.storage.index.mode_order)
+
         # Perform element-wise addition
         # TODO: support broadcasting
-        index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+        a_index_vars = ([IndexVar(f"i{i}") for i in self.storage.index.mode_order])
+
+        index_vars = ([IndexVar(f"i{i}") for i in range(len(self.shape))])
         # TODO: output format inferred from input formats
         output_format = self.format
         result_shape = self.shape
 
+        # TODO: should infer mode_order, fmt from LHS of addition expression
         A = TensorVar(
             name="A",
             fmt=output_format,
+            mode_order=self.storage.index.mode_order
         )
         B = TensorVar(
             name="B",
             fmt=self.format,
+            mode_order=self.storage.index.mode_order
         )
         C = TensorVar(
             name="C",
             fmt=other.format,
+            mode_order=other.storage.index.mode_order
         )
 
         # Assert A, B, C, and index_vars are defined
         assert A is not None, "Tensor A is not defined."
         assert B is not None, "Tensor B is not defined."
         assert C is not None, "Tensor C is not defined."
-        assert index_vars is not None, "Index variables are not defined."
+        assert index_vars is not None, "Index vars is not defined."
+        assert a_index_vars is not None, "Index variables for A are not defined."
+
 
         # Generate the python code for the element-wise addition
         # e.g. A[i0, i1, ...] = B[i0, i1, ...] + C[i0, i1, ...]
@@ -203,7 +217,7 @@ class STensor(torch.nn.Module):
         rhs = "A._assignment"
         assert ForAll is not None, "ForAll is not imported"
         for i in range(len(self.shape))[::-1]:
-            rhs = f"ForAll(index_vars[{i}], {rhs})"
+            rhs = f"ForAll(a_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
 
         lowerer = CINLowerer()
@@ -239,6 +253,7 @@ class STensor(torch.nn.Module):
             index=TensorIndex(
                 mode_indices=result_cpp.storage.index.mode_indices,
                 tensor_format=output_format,
+                mode_order=self.storage.index.mode_order
             ),
             value=result_cpp.storage.value,
         )
@@ -355,7 +370,7 @@ class STensor(torch.nn.Module):
         return tt_tensor
 
     @staticmethod
-    def from_torch(tensor: torch.Tensor, name: Optional[str] = None) -> STensor:
+    def from_torch(tensor: torch.Tensor, name: Optional[str] = None, mode_order: Optional[List[int]] = None) -> STensor:
         """Create a Tensor from a torch.Tensor."""
         # torch.Tensor is dense, so shape is the same as torch tensor,
         # and format is dense at every level
@@ -363,6 +378,12 @@ class STensor(torch.nn.Module):
         # If name is not provided, use the default name
         if name is None:
             name = "tensor"
+
+        # TODO: Should insert some error-checking with mode-order here?
+        if mode_order:
+            tensor = tensor.permute(*mode_order)
+        else:
+            mode_order = [i for i in range(len(tensor.shape))]
 
         if tensor.is_sparse or tensor.is_sparse_csr:
             if tensor.layout == torch.sparse_coo:
@@ -384,6 +405,7 @@ class STensor(torch.nn.Module):
                                 ]
                             ),
                             mode_indices=mode_indices,
+                            mode_order=mode_order
                         ),
                         value=tensor.values(),
                     ),
@@ -407,6 +429,7 @@ class STensor(torch.nn.Module):
                                 ]
                             ),
                             mode_indices=[[], [crow_indices, col_indices]],
+                            mode_order=mode_order
                         ),
                         value=values,
                     ),
@@ -426,6 +449,7 @@ class STensor(torch.nn.Module):
                         ]
                     ),
                     mode_indices=[[] for _ in range(len(tensor.shape))],
+                    mode_order=mode_order
                 ),
                 value=tensor.flatten(),
             ),
@@ -444,6 +468,20 @@ class STensor(torch.nn.Module):
             torch_tensor = torch_tensor.type(self.dtype)
         # Reshape the torch.Tensor to the original shape
         torch_tensor = torch_tensor.reshape(dense_tensor.shape)
+
+        def generate_mode_order_permutation(mode_order_start: List[int], mode_order_end: List[int]) -> List[int]:
+            permutation_ = []
+            for dim in mode_order_end:
+                permutation_.append(mode_order_start.index(dim))
+            return permutation_
+
+        # permute torch_tensor if it has non-default mode order
+        default_mode_order = [i for i in range(self.dim())]
+
+        if self.storage.index.mode_order and self.storage.index.mode_order != default_mode_order:
+            permutation = generate_mode_order_permutation(self.storage.index.mode_order, default_mode_order)
+            torch_tensor = torch_tensor.permute(*permutation)
+
         return torch_tensor
 
     def to_dense(
@@ -467,11 +505,17 @@ class STensor(torch.nn.Module):
         else:
             index_vars = default_index_vars[: len(self.shape)]
 
+        # pdb.set_trace()
+        # permute index_vars based on self._storage._index.mode_order
+        if self.storage.index.mode_order:
+            index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+
         if self.has_index:
             B = TensorVar(
                 name="B",
                 fmt=self.format,
                 dtype=self.dtype,
+                mode_order=self.storage.index.mode_order
             )
         else:
             B = TensorVar(
@@ -483,6 +527,7 @@ class STensor(torch.nn.Module):
                     ]
                 ),
                 dtype=self.dtype,
+                mode_order=self.storage.index.mode_order
             )
 
         if fmt is None:
@@ -500,6 +545,7 @@ class STensor(torch.nn.Module):
             name="A",
             fmt=output_format,
             dtype=self.dtype,
+            mode_order=self.storage.index.mode_order
         )
 
         # Assert A, B, and index_vars are defined
@@ -550,6 +596,7 @@ class STensor(torch.nn.Module):
             index=TensorIndex(
                 tensor_format=output_format,
                 mode_indices=result_cpp.storage.index.mode_indices,
+                mode_order=self.storage.index.mode_order
             ),
             value=result_cpp.storage.value,
         )
@@ -599,11 +646,15 @@ class STensor(torch.nn.Module):
             else:
                 index_vars = default_index_vars[: len(self.shape)]
 
+            # permute index_vars based on mode_order (DO NOT DELETE: used to generate cin_stmt)
+            ordered_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+
             if self.has_index:
                 B = TensorVar(
                     name="B",
                     fmt=self.format,
                     dtype=self.dtype,
+                    mode_order=self.storage.index.mode_order
                 )
             else:
                 B = TensorVar(
@@ -614,6 +665,7 @@ class STensor(torch.nn.Module):
                             for _ in range(len(self.shape))
                         ]
                     ),
+                    mode_order=self.storage.index.mode_order
                 )
 
             if fmt is None:
@@ -633,6 +685,7 @@ class STensor(torch.nn.Module):
                 fmt=output_format,
                 shape=self.shape,
                 dtype=self.dtype,
+                mode_order=self.storage.index.mode_order
             )
 
             # Assert A, B, and index_vars are defined
@@ -651,10 +704,10 @@ class STensor(torch.nn.Module):
             rhs = "A._assignment"
             assert ForAll is not None, "ForAll is not imported"
             for i in range(len(self.shape))[::-1]:
-                rhs = f"ForAll(index_vars[{i}], {rhs})"
+                rhs = f"ForAll(ordered_index_vars[{i}], {rhs})"
             cin_stmt = eval(rhs)
 
-            # print("\n\ncin_stmt: ", cin_stmt)
+            print("\n\ncin_stmt: ", cin_stmt)
 
             lowerer = CINLowerer(filter_zeros=True)
             lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -685,8 +738,127 @@ class STensor(torch.nn.Module):
                 index=TensorIndex(
                     tensor_format=output_format,
                     mode_indices=result_cpp.storage.index.mode_indices,
+                    mode_order=self.storage.index.mode_order
                 ),
                 value=result_cpp.storage.value,
             )
+
+        return self
+
+    def change_mode_order(self, mode_order: List[int]) -> STensor:
+        # TODO: can I make these assertions?
+        assert self.has_index, "self.storage.index is None"
+        assert self.dtype is not None, "self.dtype is None"
+        assert self.shape is not None, "self.shape is None"
+        assert self.format is not None, "self.format is None"
+
+        if self.storage.index.mode_order == mode_order:
+            return self
+
+        default_index_vars = [
+            IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+        ]
+        if len(self.shape) > len(default_index_vars):
+            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+        else:
+            index_vars = default_index_vars[: len(self.shape)]
+
+        b_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+        a_index_vars = [index_vars[i] for i in mode_order]
+        result_shape = tuple(self.shape[i] for i in mode_order)
+
+        B = TensorVar(
+            name="B",
+            fmt=self.format,
+            shape=self.shape,
+            dtype=self.dtype,
+            mode_order=self.storage.index.mode_order[:]
+        )
+
+        A = TensorVar(
+            name="A",
+            fmt=self.format,
+            shape=result_shape,
+            dtype=self.dtype,
+            mode_order=mode_order[:]
+        )
+
+        # Assert A, B, and index_vars are defined
+        assert A is not None, "A is not defined"
+        assert B is not None, "B is not defined"
+        assert a_index_vars is not None, "a_index_vars is not defined"
+        assert b_index_vars is not None, "b_index_vars is not defined"
+
+        workspace = Workspace(
+            name="wksp",
+            dim=len(self.shape),
+            mode_order=mode_order[:]
+        )
+
+        producer_stmt = TensorAssign(
+            workspace[tuple(index_vars)],
+            B[tuple(index_vars)],
+        )
+
+        for index_var in b_index_vars[::-1]:
+            producer_stmt = ForAll(
+                index_var,
+                producer_stmt
+            )
+
+        consumer_stmt = TensorAssign(
+            A[tuple(index_vars)],
+            workspace[tuple(index_vars)],
+        )
+
+        for index_var in a_index_vars[::-1]:
+            consumer_stmt = ForAll(
+                index_var,
+                consumer_stmt
+            )
+
+        cin_stmt = Where(
+            producer=producer_stmt,
+            consumer=consumer_stmt
+        )
+
+        print("\n\nchange_mode_order cin_stmt: ", cin_stmt)
+
+        lowerer = CINLowerer(filter_zeros=True)
+        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer()
+        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+
+        print("change_mode_order_wksp cpp_code:\n\n", cpp_code)
+
+        # Read header_cpp_code from csrc/header.cpp
+        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+            header_cpp_code = f.read()
+
+        module = torch.utils.cpp_extension.load_inline(
+            name="kernel",
+            cpp_sources=[header_cpp_code, cpp_code],
+            functions=["evaluate"],
+            extra_cflags=["-O3"],
+        )
+
+        # TODO: change result shape, not always self.shape
+        result_cpp = module.evaluate(
+            result_shape,
+            self.shape,
+            self.index.mode_indices,
+            self.storage.value,
+        )
+
+        self._storage = TensorStorage(
+            index=TensorIndex(
+                tensor_format=self.format,
+                mode_indices=result_cpp.storage.index.mode_indices,
+                mode_order=mode_order[:]
+            ),
+            value=result_cpp.storage.value,
+        )
+
+        self._shape = result_shape
 
         return self

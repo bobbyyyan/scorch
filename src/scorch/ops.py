@@ -1,4 +1,6 @@
+import pdb
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Union, Sequence, Optional, List
 
@@ -337,15 +339,32 @@ def einsum(
 
     # unique_index_strs should be a list of unique index strings
     # e.g. ["i", "j", "k"]
+    tensors = tuple(STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors)
+
     unique_index_strs = list(expression.replace(",", "").replace("->", ""))
+
     # Make sure the index strings are unique, keeping the order
     unique_index_strs = list(dict.fromkeys(unique_index_strs))
-    result_index_strs = list(expression.split("->")[1])
-    input_index_strs_concat = expression.split("->")[0]
-    index_strs_by_schedule = topo_sort_characters(
-        input_index_strs_concat, priority=result_index_strs
-    )
     input_index_strs = [list(x) for x in expression.split("->")[0].split(",")]
+    result_index_strs = list(expression.split("->")[1])
+
+    # Change operand substrings in expression to match mode order
+    input_index_strs_sorted = [
+        [input_index_strs[i][index] for index in tensors[i].storage.index.mode_order]
+        for i in range(len(tensors))
+    ]
+
+    # Change result substring to match output mode order if provided
+    output_mode_order = kwargs.get("output_mode_order", None)
+    result_index_strs_sorted = [result_index_strs[i] for i in output_mode_order] \
+        if output_mode_order \
+        else result_index_strs
+
+    index_strs_concat = ([''.join(index_str) for index_str in input_index_strs_sorted]
+                         + [''.join(result_index_strs_sorted)])
+
+    index_strs_by_schedule = topo_sort_characters(index_strs_concat, tensors)
+
     # Create a list of IndexVar objects, and a dict mapping index strings
     # to IndexVar objects
     index_vars = [IndexVar(index_str) for index_str in unique_index_strs]
@@ -353,16 +372,14 @@ def einsum(
 
     # Create a mapping from each index string to the list of LevelFormats
     # of the levels it indexes into each input tensor
+    # TODO: confirm that this is the correct ordering
     index_str_to_level_formats = {}
     tensors_new = []
-    for index_strs, tensor in zip(input_index_strs, tensors):
-        if isinstance(tensor, torch.Tensor):
-            tensor = STensor.from_torch(tensor)
-
+    for sorted_index_strs, tensor in zip(input_index_strs_sorted, tensors):
         assert isinstance(tensor, STensor), "Input tensor is not a Scorch Tensor"
         tensors_new.append(tensor)
 
-        for i, index_str in enumerate(index_strs):
+        for i, index_str in enumerate(sorted_index_strs):
             if index_str not in index_str_to_level_formats:
                 index_str_to_level_formats[index_str] = []
             index_str_to_level_formats[index_str].append(
@@ -370,6 +387,25 @@ def einsum(
             )
 
     tensors = tensors_new
+
+    index_str_to_mode_index = {index_str: i for i, index_str in enumerate(result_index_strs)}
+
+    # temp_mode_order holds the scheduler recommended mode order of the result tensor
+    temp_mode_order = []
+    for index_str in index_strs_by_schedule:
+        if index_str in result_index_strs:
+            temp_mode_order.append(index_str_to_mode_index[index_str])
+
+    final_mode_order = output_mode_order if output_mode_order else temp_mode_order
+
+    # change the mode order of input tensors if necessary
+    for tensor_index, input_index_str in enumerate(input_index_strs):
+        new_mode_order = []
+        input_index_str_to_mode_index = {s: i for i, s in enumerate(input_index_str)}
+        for index_str in index_strs_by_schedule:
+            if index_str in input_index_str:
+                new_mode_order.append(input_index_str_to_mode_index[index_str])
+        tensors[tensor_index].change_mode_order(new_mode_order)
 
     # Create TensorVar's for each tensor
     tensor_vars = []
@@ -379,7 +415,12 @@ def einsum(
         if isinstance(tensor, STensor):
             tensor_name = tensor_names_available.pop(0)
             tensor_vars.append(
-                TensorVar(name=tensor_name, fmt=tensor.format, dtype=tensor.dtype)
+                TensorVar(
+                    name=tensor_name,
+                    fmt=tensor.format,
+                    dtype=tensor.dtype,
+                    mode_order=tensor.storage.index.mode_order
+                )
             )
             if output_tensor_dtype is None:
                 output_tensor_dtype = tensor.dtype
@@ -412,6 +453,7 @@ def einsum(
 
         # Create a list of LevelFormat objects
         output_level_formats = []
+        # TODO: check if should be result_index_strs_sorted?
         for index_str in result_index_strs:
             level_format = LevelFormat(LevelType.DENSE)
             # Use the index_str_to_level_formats to get the list of LevelFormats
@@ -453,7 +495,10 @@ def einsum(
     # Create the result TensorVar
     assert output_tensor_dtype is not None, "Output tensor type is not defined"
     result_tensor_var = TensorVar(
-        name=tensor_names_available.pop(0), fmt=output_format, dtype=output_tensor_dtype
+        name=tensor_names_available.pop(0),
+        fmt=output_format,
+        dtype=output_tensor_dtype,
+        mode_order=temp_mode_order,
     )
 
     # Generate the python code for constructing the TensorAccess's, and TensorAssign and execute it
@@ -485,11 +530,12 @@ def einsum(
     cin_stmt = eval(rhs)
 
     # print("CIN:\n", cin_stmt)
-
+    # Currently assuming this cin_stmt will dictate any required tensor tranpositions
     cin_stmt = Scheduler.auto_schedule(cin_stmt)
 
-    # print("Auto-scheduled CIN:\n", cin_stmt)
+    # TODO: do more tensor transpositions if needed from the auto-scheduler
 
+    # print("Auto-scheduled CIN:\n", cin_stmt)
     if str(cin_stmt) in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
         module = _kernel_cache[str(cin_stmt)]
@@ -502,7 +548,7 @@ def einsum(
 
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        # print("\n\n", cpp_code)
+        print("\n\n", cpp_code)
 
         # Read header_cpp_code from csrc/header.cpp
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
@@ -554,6 +600,7 @@ def einsum(
         index=TensorIndex(
             mode_indices=result_cpp.storage.index.mode_indices,
             tensor_format=output_format,
+            mode_order=temp_mode_order if temp_mode_order else final_mode_order
         ),
         value=result_cpp.storage.value,
     )
@@ -561,6 +608,10 @@ def einsum(
     if "time_dict" in kwargs:
         time_dict = kwargs["time_dict"]
         time_dict["eval_time"] = eval_time
+
+    # Convert to final mode order if it is different from temporary mode order
+    if temp_mode_order:
+        result.change_mode_order(final_mode_order)
 
     return result
 
