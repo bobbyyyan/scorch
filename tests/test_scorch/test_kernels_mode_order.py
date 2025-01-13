@@ -676,6 +676,58 @@ def test_einsum_2d_concordant_oo():
     assert c_inverted.storage.index.mode_order == [1, 0]
 
 
+def test_einsum_2d_discordant_oo():
+    tensor_a_torch = torch.Tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [2, 2, 0, 0, 0],
+            [3, 0, 3, 0, 0],
+            [0, 0, 0, 0, 0],
+            [5, 0, 0, 0, 5],
+        ]
+    )
+    tensor_b_torch = torch.Tensor(
+        [
+            [1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0],
+            [0, 0, 0, 3, 1],
+        ]
+    )
+
+    a_torch_coo = tensor_a_torch.to_sparse_coo()
+    b_torch_coo = tensor_b_torch.to_sparse_coo()
+    c_torch_coo = torch.sparse.mm(a_torch_coo, b_torch_coo)
+    c_torch_coo_transposed = c_torch_coo.transpose(0, 1).coalesce()
+
+    a_default = STensor.from_torch(tensor_a_torch, "a_csr", [0, 1]).to_sparse("oo")
+    a_inverted = STensor.from_torch(tensor_a_torch, "a_csc", [1, 0]).to_sparse("oo")
+
+    b_default = STensor.from_torch(tensor_b_torch, "b_csr", [0, 1]).to_sparse("oo")
+    b_inverted = STensor.from_torch(tensor_b_torch, "b_csc", [1, 0]).to_sparse("oo")
+
+    c_default = einsum("ik,kj->ij", a_inverted, b_inverted, format="oo", output_mode_order=[0, 1])
+    assert torch.allclose(c_default.values, c_torch_coo.values())
+    assert torch.allclose(
+        c_default.index.mode_indices[0][0], c_torch_coo.indices()[0].int()
+    )
+    assert torch.allclose(
+        c_default.index.mode_indices[1][0], c_torch_coo.indices()[1].int()
+    )
+    assert c_default.storage.index.mode_order == [0, 1]
+
+    c_inverted = einsum("ik,kj->ij", a_default, b_default, format="oo", output_mode_order=[1, 0])
+    assert torch.allclose(c_inverted.values, c_torch_coo_transposed.values())
+    assert torch.allclose(
+        c_inverted.index.mode_indices[0][0], c_torch_coo_transposed.indices()[0].int()
+    )
+    assert torch.allclose(
+        c_inverted.index.mode_indices[1][0], c_torch_coo_transposed.indices()[1].int()
+    )
+    assert c_inverted.storage.index.mode_order == [1, 0]
+
+
 def test_einsum_3d():
     tensor_a_torch = torch.Tensor(
         [
