@@ -15,7 +15,6 @@ from tests.test_scorch.test_helpers import (
     create_elementwise_operation,
 )
 
-
 def test_elemwise_mul_1d_sss():
     """
     Elementwise vector multiplication code generation
