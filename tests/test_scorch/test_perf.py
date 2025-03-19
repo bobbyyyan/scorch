@@ -127,14 +127,18 @@ def test_spmm_dd_ds_dd_time():
     )
     scorch_total_time = time.time() - start_time
     scorch_eval_time = time_dict["eval_time"]
-    scorch_result_torch = scorch_result.to_torch()
 
     print(f"torch time: {torch_time}")
     print(f"scorch total time: {scorch_total_time}")
     print(f"scorch eval time: {scorch_eval_time}")
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
 
-    assert torch.allclose(torch_result, scorch_result_torch)
+    if isinstance(scorch_result, torch.Tensor):
+        assert torch.allclose(scorch_result, torch_result)
+    elif isinstance(scorch_result, STensor):
+        assert torch.allclose(scorch_result.to_torch(), torch_result)
+    else:
+        raise ValueError(f"Unexpected result type: {type(scorch_result)}")
 
 
 def test_spmv_d_oo_d_time():

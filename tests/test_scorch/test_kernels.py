@@ -812,8 +812,12 @@ def test_dense_matmul():
 
     scorch_result = matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch_result.tolist() == scorch_result.to_torch().tolist()
-
+    if isinstance(scorch_result, torch.Tensor):
+        assert torch.allclose(scorch_result, torch_result)
+    elif isinstance(scorch_result, STensor):
+        assert torch.allclose(scorch_result.to_torch(), torch_result)
+    else:
+        raise ValueError(f"Unexpected result type: {type(scorch_result)}")
 
 def test_matmul_ds_dd_dd():
     n = 1024
@@ -1045,7 +1049,12 @@ def test_spmm_dd_oo_dd_time():
 
     # Assert that the results are the same
 
-    assert torch.allclose(torch_result, scorch_result.to_torch())
+    if isinstance(scorch_result, torch.Tensor):
+        assert torch.allclose(scorch_result, torch_result)
+    elif isinstance(scorch_result, STensor):
+        assert torch.allclose(scorch_result.to_torch(), torch_result)
+    else:
+        raise ValueError(f"Unexpected result type: {type(scorch_result)}")
 
     print(f"torch time: {torch_time}")
     print(f"scorch total time: {scorch_total_time}")
@@ -1710,7 +1719,12 @@ def test_matmul_dd_ds_dd():
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch.allclose(result.to_torch(), result_torch)
+    if isinstance(result, torch.Tensor):
+        assert torch.allclose(result, result_torch)
+    elif isinstance(result, STensor):
+        assert torch.allclose(result.to_torch(), result_torch)
+    else:
+        raise ValueError(f"Unexpected result type: {type(result)}")
 
 
 def test_spmm_dd_ds_ds():

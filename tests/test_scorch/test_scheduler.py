@@ -86,8 +86,12 @@ def test_spmm_dd_oo_dd_smaller_than_tilesize():
     scorch_eval_time = time_dict["eval_time"]
 
     # Assert that the results are the same
-
-    assert torch.allclose(torch_result, scorch_result.to_torch())
+    if isinstance(scorch_result, torch.Tensor):
+        assert torch.allclose(scorch_result, torch_result)
+    elif isinstance(scorch_result, STensor):
+        assert torch.allclose(scorch_result.to_torch(), torch_result)
+    else:
+        raise ValueError(f"Unexpected result type: {type(scorch_result)}")
 
     print(f"torch time: {torch_time}")
     print(f"scorch total time: {scorch_total_time}")

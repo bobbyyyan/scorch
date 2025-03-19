@@ -274,6 +274,7 @@ def matmul(
         return spmv(a, b, **kwargs)
 
     use_cache = kwargs.get("use_cache", True)
+    time_dict = kwargs.get("time_dict", {})
 
     kernel_op = None
 
@@ -300,7 +301,13 @@ def matmul(
             args.append(tensor.index.mode_indices)  # type: ignore
             args.append(tensor.values)  # type: ignore
 
+        start_time = time.time()
         result_cpp = kernel_op(*args)
+        end_time = time.time()
+        eval_time = end_time - start_time
+        if "time_dict" in kwargs:
+            time_dict = kwargs["time_dict"]
+            time_dict["eval_time"] = eval_time
 
         result = STensor(
             shape=result_shape,
