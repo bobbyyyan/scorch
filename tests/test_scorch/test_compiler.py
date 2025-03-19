@@ -1,3 +1,20 @@
+"""
+Helper functions:
+- lower_and_print: Handles lowering and code generation for CIN statements
+- create_index_vars: Creates IndexVar objects for tensor operations
+- create_tensor_vars: Creates TensorVar objects with the specified formats
+- create_elementwise_operation: Creates elementwise operations like multiplication and addition
+- create_matrix_vector_operation: Creates matrix-vector operations
+- create_matrix_multiplication: Creates matrix multiplication operations
+- create_workspace_operation: Creates operations that use workspaces for intermediate results
+
+Each test function follows a similar pattern:
+1. Create index variables
+2. Create tensor variables
+3. Define the operation using the helper functions
+4. Lower the CIN statement and generate code
+"""
+
 from scorch.compiler.cin import (
     IndexVar,
     TensorVar,
@@ -14,54 +31,316 @@ from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.scheduler import Scheduler
 
 
+def lower_and_print(cin_stmt, filter_zeros=False, no_comments=False):
+    """
+    Helper function to lower a CIN statement and print the generated C++ code.
+
+    Args:
+        cin_stmt: The CIN statement to lower
+        filter_zeros: Whether to filter zeros in the CINLowerer
+        no_comments: Whether to include comments in the output code
+
+    Returns:
+        The generated C++ code
+    """
+    print("\nCIN statement:")
+    print(cin_stmt)
+
+    lowerer = CINLowerer(filter_zeros=filter_zeros)
+    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+
+    llir_lowerer = LLIRLowerer()
+    cpp_code = llir_lowerer.lower_llir(lowered_llir, no_comments=no_comments)
+
+    print("\nC++ torch extension code:")
+    print(cpp_code)
+
+    return cpp_code
+
+
+def create_index_vars(*names):
+    """
+    Create index variables with the given names.
+
+    Args:
+        *names: Variable number of strings representing index variable names
+
+    Returns:
+        A tuple of IndexVar objects
+    """
+    return tuple(IndexVar(name) for name in names)
+
+
+def create_tensor_vars(tensor_specs):
+    """
+    Create tensor variables with the given specifications.
+
+    Args:
+        tensor_specs: A dict mapping tensor names to format specifications
+            Format can be a string or a list of strings
+
+    Returns:
+        A dict mapping tensor names to TensorVar objects
+    """
+    return {name: TensorVar(name, fmt=fmt) for name, fmt in tensor_specs.items()}
+
+
+def create_elementwise_operation(tensors, index_vars, operation_type="mul", index_maps=None):
+    """
+    Create a common elementwise operation (multiplication or addition) on tensors.
+
+    Args:
+        tensors: Dict mapping tensor names to TensorVar objects
+        index_vars: Tuple of IndexVar objects
+        operation_type: String, either "mul" or "add"
+        index_maps: Optional dict mapping tensor names to lists of index expressions
+                    to allow for different index ordering per tensor
+
+    Returns:
+        A CIN statement representing the operation
+    """
+    # Get the tensor names (assume first one is result, rest are operands)
+    tensor_names = list(tensors.keys())
+    result_name = tensor_names[0]
+    operand_names = tensor_names[1:]
+
+    # Create the assignment
+    result = tensors[result_name]
+    indices = list(index_vars)
+
+    # Create the right-hand side of the assignment
+    first_operand = operand_names[0]
+    if index_maps and first_operand in index_maps:
+        first_indices = index_maps[first_operand]
+    else:
+        first_indices = indices
+
+    rhs = tensors[first_operand][first_indices]
+
+    for operand_name in operand_names[1:]:
+        if index_maps and operand_name in index_maps:
+            operand_indices = index_maps[operand_name]
+        else:
+            operand_indices = indices
+
+        operand = tensors[operand_name][operand_indices]
+        if operation_type == "mul":
+            rhs = rhs * operand
+        else:  # add
+            rhs = rhs + operand
+
+    # Create the assignment
+    result[indices] = rhs
+
+    # Nest the ForAll statements
+    stmt = result._assignment
+    for idx in reversed(indices):
+        stmt = ForAll(idx, stmt)
+
+    return stmt
+
+
+def create_matrix_vector_operation(tensors, index_vars, vector_dim_index, operation_type="mul", preserve_vector_dim=True):
+    """
+    Create a matrix-vector operation on tensors.
+
+    Args:
+        tensors: Dict mapping tensor names to TensorVar objects.
+            Expected to have a result tensor, a matrix, and a vector.
+        index_vars: Tuple of IndexVar objects.
+        vector_dim_index: The index of the dimension that the vector uses.
+        operation_type: String, either "mul" or "add"
+        preserve_vector_dim: Whether to keep the vector dimension in the result tensor.
+                            Set to True for operations like A[i,j] = B[i,j] * C[j]
+                            Set to False for operations like A[i] = B[i,j] * C[j]
+
+    Returns:
+        A CIN statement representing the operation
+    """
+    # Get the tensor names (assume first one is result, rest are operands)
+    tensor_names = list(tensors.keys())
+    result_name = tensor_names[0]
+    matrix_name = tensor_names[1]
+    vector_name = tensor_names[2]
+
+    # Create the assignment
+    result = tensors[result_name]
+    matrix = tensors[matrix_name]
+    vector = tensors[vector_name]
+
+    # Create indices for the result, matrix, and vector
+    matrix_indices = list(index_vars)
+    vector_indices = [index_vars[vector_dim_index]]
+
+    # For preserving all dimensions in the result
+    if preserve_vector_dim:
+        result_indices = list(index_vars)
+    else:
+        # For dropping the vector dimension from the result
+        result_indices = [idx for i, idx in enumerate(index_vars) if i != vector_dim_index]
+
+    # Create the right-hand side of the assignment
+    if operation_type == "mul":
+        rhs = matrix[matrix_indices] * vector[vector_indices]
+    else:  # add
+        rhs = matrix[matrix_indices] + vector[vector_indices]
+
+    # Create the assignment
+    result[result_indices] = rhs
+
+    # Nest the ForAll statements
+    stmt = result._assignment
+    for idx in reversed(index_vars):
+        stmt = ForAll(idx, stmt)
+
+    return stmt
+
+
+def create_matrix_multiplication(tensors, index_vars, contract_idx_pos, op=Operation.ADD):
+    """
+    Create a matrix multiplication operation.
+
+    Args:
+        tensors: Dict mapping tensor names to TensorVar objects.
+            Expected to have a result matrix and two operand matrices.
+        index_vars: Tuple of IndexVar objects (i, j, k) where k is the contraction index.
+        contract_idx_pos: The position of the contraction index in the index_vars tuple.
+        op: The operation to use for the assignment (e.g., Operation.ADD).
+
+    Returns:
+        A CIN statement representing the matrix multiplication
+    """
+    # Get the tensor names (assume first one is result, rest are operands)
+    tensor_names = list(tensors.keys())
+    result_name = tensor_names[0]
+    left_matrix_name = tensor_names[1]
+    right_matrix_name = tensor_names[2]
+
+    # Get the tensors
+    result = tensors[result_name]
+    left = tensors[left_matrix_name]
+    right = tensors[right_matrix_name]
+
+    # Get the indices
+    i, j, k = index_vars
+
+    # Create the assignment
+    result[i, j] = left[i, k] * right[k, j]
+    result._assignment.op = op
+
+    # Create the nested ForAll statement with the proper loop order (i, k, j)
+    # This is a common loop order for SpMM operations
+    cin_stmt = ForAll(i, ForAll(k, ForAll(j, result._assignment)))
+
+    return cin_stmt
+
+
+def create_workspace_operation(tensors, workspace, index_vars, operation_type="mul"):
+    """
+    Create an operation that uses a workspace for intermediate results.
+    Common pattern for sparse matrix operations like SpMM with the Gustavson algorithm.
+
+    Args:
+        tensors: Dict mapping tensor names to TensorVar objects.
+            Expected to have a result tensor and two operand tensors.
+        workspace: The workspace object to use.
+        index_vars: Tuple of IndexVar objects (i, j, k).
+        operation_type: String, either "mul" or "add"
+
+    Returns:
+        A CIN statement using a workspace with Gustavson pattern
+    """
+    # Get the tensor names
+    tensor_names = list(tensors.keys())
+    result_name = tensor_names[0]
+    left_name = tensor_names[1]
+    right_name = tensor_names[2]
+
+    # Get the tensors
+    result = tensors[result_name]
+    left = tensors[left_name]
+    right = tensors[right_name]
+
+    # Get the indices
+    i, j, k = index_vars
+
+    # Create the producer statement: accumulates B[i,k] * C[k,j] into workspace[j]
+    if operation_type == "mul":
+        rhs = left[i, k] * right[k, j]
+    else:  # add
+        rhs = left[i, k] + right[k, j]
+
+    producer = ForAll(
+        k,
+        ForAll(
+            j,
+            TensorAssign(
+                workspace[j],
+                rhs,
+                op=Operation.ADD,
+            ),
+        ),
+    )
+
+    # Create the consumer statement: assigns workspace[j] to A[i,j]
+    consumer = ForAll(
+        j,
+        TensorAssign(
+            result[i, j],
+            workspace[j],
+        ),
+    )
+
+    # Combine with Where and wrap in the outer ForAll(i)
+    cin_stmt = ForAll(i, Where(producer=producer, consumer=consumer))
+
+    return cin_stmt
+
+
 def test_convert_dd_ds():
     # Test converting a CSR matrix to a dense matrix
     # A[i, j] = B[i, j]
 
-    i = IndexVar("i")
-    j = IndexVar("j")
+    # Create index variables
+    i, j = create_index_vars("i", "j")
 
-    A = TensorVar("A", fmt="dd")
-    B = TensorVar("B", fmt="ds")
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": "dd",
+        "B": "ds"
+    })
 
-    A[i, j] = B[i, j]
+    # Create the assignment
+    tensors["A"][i, j] = tensors["B"][i, j]
 
-    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+    # Create the CIN statement
+    cin_stmt = ForAll(i, ForAll(j, tensors["A"]._assignment))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_1d_sss():
     # elementwise vector multiplication code generation
     # a[i] = b[i] * c[i]
-    # taco "a(i) = b(i)*c(i)" -f=a:s -f=b:s -f=c:s -print-evaluate
+    # taco "a(i) = b(i)*c(i)" -f=a:s:0 -f=b:s:0 -f=c:s:0 -print-evaluate
     # Reference: http://tensor-compiler.org/codegen.html?expr=a(i)=b(i)*c(i)&format=a:s:0;b:s:0;c:s:0
 
-    i = IndexVar("i")
+    # Create index variables
+    i = create_index_vars("i")[0]
 
-    a = TensorVar("a", fmt="s")
-    b = TensorVar("b", fmt="s")
-    c = TensorVar("c", fmt="s")
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "a": "s",
+        "b": "s",
+        "c": "s"
+    })
 
-    a[i] = b[i] * c[i]
+    # Create the CIN statement for elementwise multiplication
+    cin_stmt = create_elementwise_operation(tensors, (i,), operation_type="mul")
 
-    cin_stmt = ForAll(i, a._assignment)
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_1d_dss():
@@ -79,14 +358,7 @@ def test_elemwise_mul_1d_dss():
 
     cin_stmt = ForAll(i, a._assignment)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_1d_sds():
@@ -104,14 +376,7 @@ def test_elemwise_mul_1d_sds():
 
     cin_stmt = ForAll(i, a._assignment)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_add_1d_sssd():
@@ -129,37 +394,28 @@ def test_elemwise_mul_add_1d_sssd():
 
     cin_stmt = ForAll(i, a._assignment)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_add_1d_sss():
     # elementwise vector addition code generation
     # a[i] = b[i] + c[i]
-    i = IndexVar("i")
 
-    a = TensorVar("a", fmt="s")
-    b = TensorVar("b", fmt="s")
-    c = TensorVar("c", fmt="s")
+    # Create index variables
+    i = create_index_vars("i")[0]
 
-    a[i] = b[i] + c[i]
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "a": "s",
+        "b": "s",
+        "c": "s"
+    })
 
-    cin_stmt = ForAll(i, a._assignment)
+    # Create the CIN statement for elementwise addition
+    cin_stmt = create_elementwise_operation(tensors, (i,), operation_type="add")
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_add_1d_dss():
@@ -176,14 +432,7 @@ def test_elemwise_add_1d_dss():
 
     cin_stmt = ForAll(i, a._assignment)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_add_2d_ds_ds():
@@ -198,14 +447,7 @@ def test_elemwise_add_2d_ds_ds():
 
     cin_stmt = ForAll(i, ForAll(j, C._assignment))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_add_1d_sds():
@@ -222,14 +464,7 @@ def test_elemwise_add_1d_sds():
 
     cin_stmt = ForAll(i, a._assignment)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_3d_tensor_dss_sss_sss():
@@ -247,38 +482,29 @@ def test_elemwise_mul_3d_tensor_dss_sss_sss():
 
     cin_stmt = ForAll(i, ForAll(j, ForAll(k, A._assignment)))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_convert_4d_ssss_oooo():
     # taco "A(i,j,k,l) = B(i,j,k,l)" -f=A:ssss:0,1,2,3 -f=B:uccq:0,1,2,3 -print-evaluate
-    i = IndexVar("i")
-    j = IndexVar("j")
-    k = IndexVar("k")
-    l = IndexVar("l")
 
-    A = TensorVar("A", fmt=["sparse", "sparse", "sparse", "sparse"])
-    B = TensorVar("B", fmt=["coord", "coord", "coord", "coord"])
+    # Create index variables
+    i, j, k, l = create_index_vars("i", "j", "k", "l")
 
-    A[i, j, k, l] = B[i, j, k, l]
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["sparse", "sparse", "sparse", "sparse"],
+        "B": ["coord", "coord", "coord", "coord"]
+    })
 
-    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
+    # Create the assignment
+    tensors["A"][i, j, k, l] = tensors["B"][i, j, k, l]
 
-    lowerer = CINLowerer(filter_zeros=True)
+    # Create the CIN statement
+    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, tensors["A"]._assignment))))
 
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print with filter_zeros=True
+    lower_and_print(cin_stmt, filter_zeros=True)
 
 
 def test_elemwise_mul_4d_oooo_ssss_ssss():
@@ -296,14 +522,7 @@ def test_elemwise_mul_4d_oooo_ssss_ssss():
 
     cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_4d_ssss_ssss_ssss():
@@ -322,14 +541,7 @@ def test_elemwise_mul_4d_ssss_ssss_ssss():
 
     cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_4d_ssss_oooo_oooo():
@@ -348,14 +560,7 @@ def test_elemwise_mul_4d_ssss_oooo_oooo():
 
     cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_4d_ssdd_ssss_ssss():
@@ -374,14 +579,7 @@ def test_elemwise_mul_4d_ssdd_ssss_ssss():
 
     cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_4d_dddd_ssss_ssss():
@@ -400,40 +598,7 @@ def test_elemwise_mul_4d_dddd_ssss_ssss():
 
     cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
-
-
-def test_elemwise_mul_4d_ddss_dddd_ssss():
-    # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
-    # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ddss -f=B:dddd -f=C:ssss -print-evaluate
-    i = IndexVar("i")
-    j = IndexVar("j")
-    k = IndexVar("k")
-    l = IndexVar("l")
-
-    A = TensorVar("A", fmt=["dense", "dense", "sparse", "sparse"])
-    B = TensorVar("B", fmt=["dense", "dense", "dense", "dense"])
-    C = TensorVar("C", fmt=["sparse", "sparse", "sparse", "sparse"])
-
-    A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
-
-    cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_4d_ddss_ssss_ssss():
@@ -452,14 +617,7 @@ def test_elemwise_mul_4d_ddss_ssss_ssss():
 
     cin_stmt = ForAll(i, ForAll(j, ForAll(k, ForAll(l, A._assignment))))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_2d_ss_dd_ds():
@@ -478,14 +636,7 @@ def test_elemwise_mul_2d_ss_dd_ds():
 
     cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_matrix_vector_mul_codegen():
@@ -493,25 +644,22 @@ def test_matrix_vector_mul_codegen():
     # A[i, j] = B[i, j] * C[j]
     # Reference: http://tensor-compiler.org/codegen.html?expr=A(i,j)=B(i,j)*c(j)&format=A:ss:0,1;B:ss:0,1;c:s:0
 
-    i = IndexVar("i")
-    j = IndexVar("j")
+    # Create index variables
+    i, j = create_index_vars("i", "j")
 
-    A = TensorVar("A", fmt=["sparse", "sparse"])
-    B = TensorVar("B", fmt=["sparse", "sparse"])
-    C = TensorVar("C", fmt=["sparse"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["sparse", "sparse"],
+        "B": ["sparse", "sparse"],
+        "C": ["sparse"]
+    })
 
-    A[i, j] = B[i, j] * C[j]
+    # Create the CIN statement for matrix-vector multiplication
+    # The vector uses dimension 1 (j index)
+    cin_stmt = create_matrix_vector_operation(tensors, (i, j), vector_dim_index=1, operation_type="mul")
 
-    cin_stmt = ForAll(i, ForAll(j, A._assignment))
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_2d_ss_ss_ss():
@@ -519,25 +667,21 @@ def test_elemwise_mul_2d_ss_ss_ss():
     # A[i, j] = B[i, j] * C[i, j]
     # taco "A(i,j) = B(i,j) * C(i,j)" -f=A:ss -f=B:ss -f=C:ss -print-evaluate
 
-    i = IndexVar("i")
-    j = IndexVar("j")
+    # Create index variables
+    i, j = create_index_vars("i", "j")
 
-    A = TensorVar("A", fmt=["sparse", "sparse"])
-    B = TensorVar("B", fmt=["sparse", "sparse"])
-    C = TensorVar("C", fmt=["sparse", "sparse"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["sparse", "sparse"],
+        "B": ["sparse", "sparse"],
+        "C": ["sparse", "sparse"]
+    })
 
-    A[i, j] = B[i, j] * C[i, j]
+    # Create the CIN statement for elementwise multiplication
+    cin_stmt = create_elementwise_operation(tensors, (i, j), operation_type="mul")
 
-    cin_stmt = ForAll(i, ForAll(j, A._assignment))
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_2d_oo_oo_oo():
@@ -553,14 +697,7 @@ def test_elemwise_mul_2d_oo_oo_oo():
 
     cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_2d_ds_dd_ds():
@@ -576,14 +713,7 @@ def test_elemwise_mul_2d_ds_dd_ds():
 
     cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_2d_dd_dd_ds():
@@ -599,14 +729,7 @@ def test_elemwise_mul_2d_dd_dd_ds():
 
     cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_2d_ds_ss_ss():
@@ -625,117 +748,94 @@ def test_elemwise_mul_2d_ds_ss_ss():
 
     cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_matrix_add_ss_ss_ss():
-    # elementwise matrix multiplication code generation
-    # A[i, j] = B[i, j] * C[i, j]
+    # elementwise matrix addition
+    # A[i, j] = B[i, j] + C[i, j]
     # taco "A(i,j) = B(i,j) + C(i,j)" -f=A:ss -f=B:ss -f=C:ss -print-evaluate
 
-    i = IndexVar("i")
-    j = IndexVar("j")
+    # Create index variables
+    i, j = create_index_vars("i", "j")
 
-    A = TensorVar("A", fmt=["sparse", "sparse"])
-    B = TensorVar("B", fmt=["sparse", "sparse"])
-    C = TensorVar("C", fmt=["sparse", "sparse"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["sparse", "sparse"],
+        "B": ["sparse", "sparse"],
+        "C": ["sparse", "sparse"]
+    })
 
-    A[i, j] = B[i, j] + C[i, j]
+    # Create the CIN statement for elementwise addition
+    cin_stmt = create_elementwise_operation(tensors, (i, j), operation_type="add")
 
-    cin_stmt = ForAll(i, ForAll(j, A._assignment))
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_matrix_add_ds_ss_ss():
-    # elementwise matrix multiplication code generation
-    # A[i, j] = B[i, j] * C[i, j]
+    # elementwise matrix addition
+    # A[i, j] = B[i, j] + C[i, j]
     # taco "A(i,j) = B(i,j) + C(i,j)" -f=A:ds -f=B:ss -f=C:ss -print-evaluate
 
-    i = IndexVar("i")
-    j = IndexVar("j")
+    # Create index variables
+    i, j = create_index_vars("i", "j")
 
-    A = TensorVar("A", fmt=["dense", "sparse"])
-    B = TensorVar("B", fmt=["sparse", "sparse"])
-    C = TensorVar("C", fmt=["sparse", "sparse"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["dense", "sparse"],
+        "B": ["sparse", "sparse"],
+        "C": ["sparse", "sparse"]
+    })
 
-    A[i, j] = B[i, j] + C[i, j]
+    # Create the CIN statement for elementwise addition
+    cin_stmt = create_elementwise_operation(tensors, (i, j), operation_type="add")
 
-    cin_stmt = ForAll(i, ForAll(j, A._assignment))
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_matrix_add_sd_ss_ss():
-    # elementwise matrix multiplication code generation
-    # A[i, j] = B[i, j] * C[i, j]
-    # taco "A(i,j) = B(i,j) + C(i,j)" -f=A:ss -f=B:ss -f=C:ss -print-evaluate
+    # elementwise matrix addition
+    # A[i, j] = B[i, j] + C[i, j]
+    # taco "A(i,j) = B(i,j) + C(i,j)" -f=A:sd -f=B:ss -f=C:ss -print-evaluate
 
-    i = IndexVar("i")
-    j = IndexVar("j")
+    # Create index variables
+    i, j = create_index_vars("i", "j")
 
-    A = TensorVar("A", fmt=["sparse", "dense"])
-    B = TensorVar("B", fmt=["sparse", "sparse"])
-    C = TensorVar("C", fmt=["sparse", "sparse"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["sparse", "dense"],
+        "B": ["sparse", "sparse"],
+        "C": ["sparse", "sparse"]
+    })
 
-    A[i, j] = B[i, j] + C[i, j]
+    # Create the CIN statement for elementwise addition
+    cin_stmt = create_elementwise_operation(tensors, (i, j), operation_type="add")
 
-    cin_stmt = ForAll(i, ForAll(j, A._assignment))
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_2d_codegen_2():
     # elementwise matrix multiplication code generation
     # A[i, j] = B[i, j] * C[i, j]
 
-    i = IndexVar("i")
-    j = IndexVar("j")
+    # Create index variables
+    i, j = create_index_vars("i", "j")
 
-    A = TensorVar("A", fmt=["sparse", "sparse"])
-    B = TensorVar("B", fmt=["sparse", "dense"])
-    C = TensorVar("C", fmt=["sparse", "dense"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["sparse", "sparse"],
+        "B": ["sparse", "dense"],
+        "C": ["sparse", "dense"]
+    })
 
-    A[i, j] = B[i, j] * C[i, j]
+    # Create the CIN statement for elementwise multiplication
+    cin_stmt = create_elementwise_operation(tensors, (i, j), operation_type="mul")
 
-    cin_stmt = ForAll(i, ForAll(j, A._assignment))
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_mul_2d_diff_order_codegen():
@@ -746,25 +846,26 @@ def test_elemwise_mul_2d_diff_order_codegen():
     # B: dense, dense
     # C: dense, dense
 
-    i = IndexVar("i")
-    j = IndexVar("j")
+    # Create index variables
+    i, j = create_index_vars("i", "j")
 
-    A = TensorVar("A", fmt=["sparse", "sparse"])
-    B = TensorVar("B", fmt=["dense", "dense"])
-    C = TensorVar("C", fmt=["dense", "dense"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["sparse", "sparse"],
+        "B": ["dense", "dense"],
+        "C": ["dense", "dense"]
+    })
 
-    A[i, j] = B[i, j] * C[j, i]
+    # Define index mapping for C tensor (j,i instead of i,j)
+    index_maps = {
+        "C": [j, i]  # Reversed order of indices
+    }
 
-    cin_stmt = ForAll(i, ForAll(j, A._assignment))
+    # Create the CIN statement for elementwise multiplication with custom index ordering
+    cin_stmt = create_elementwise_operation(tensors, (i, j), operation_type="mul", index_maps=index_maps)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_elemwise_matrix_add_mul_codegen():
@@ -788,14 +889,7 @@ def test_elemwise_matrix_add_mul_codegen():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_sddmm_codegen():
@@ -816,14 +910,7 @@ def test_sddmm_codegen():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmv_codegen():
@@ -841,91 +928,70 @@ def test_spmv_codegen():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmv_wksp_codegen():
     # taco "y(i) = A(i, j) * x(j)" -f=y:d -f=A:ds -f=x:d -print-evaluate
-    i = IndexVar("i")
-    j = IndexVar("j")
+    i, j = create_index_vars("i", "j")
 
-    y = TensorVar("y", fmt=["dense"])
-    A = TensorVar("A", fmt=["dense", "sparse"])
-    x = TensorVar("x", fmt=["dense"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "y": ["dense"],
+        "A": ["dense", "sparse"],
+        "x": ["dense"]
+    })
 
-    """
-    y[i] = ForAll(i,
-        Where(
-            producer=ForAll(j, workspace[0] = A[i, j] * x[j]),
-            consumer=(y[i] = workspace[0])
-        )
+    # Create a workspace
+    workspace = Workspace(name="wksp", dim=0)
+
+    # Create the CIN statement for SpMV with workspace
+    # For SpMV: y[i] = A[i,j] * x[j]
+    # Producer: ForAll(j, workspace += A[i,j] * x[j])
+    # Consumer: y[i] = workspace
+
+    producer = ForAll(
+        j,
+        TensorAssign(
+            workspace.get_default_access(),
+            tensors["A"][i, j] * tensors["x"][j],
+            op=Operation.ADD,
+        ),
     )
-    """
 
-    workspace = Workspace(
-        name="wksp",
-        dim=0,
+    consumer = TensorAssign(
+        tensors["y"][i],
+        workspace.get_default_access(),
     )
 
     cin_stmt = ForAll(
         i,
         Where(
-            producer=ForAll(
-                j,
-                TensorAssign(
-                    workspace.get_default_access(), A[i, j] * x[j], op=Operation.ADD
-                ),
-            ),
-            consumer=TensorAssign(
-                y[i],
-                workspace.get_default_access(),
-            ),
+            producer=producer,
+            consumer=consumer,
         ),
     )
 
-    print("\nCIN statement:")
-    print(cin_stmt)
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_codegen():
     # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
-    i = IndexVar("i")
-    j = IndexVar("j")
-    k = IndexVar("k")
+    i, j, k = create_index_vars("i", "j", "k")
 
-    A = TensorVar("A", fmt=["dense", "sparse"])
-    B = TensorVar("B", fmt=["dense", "sparse"])
-    C = TensorVar("C", fmt=["dense", "sparse"])
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["dense", "sparse"],
+        "B": ["dense", "sparse"],
+        "C": ["dense", "sparse"]
+    })
 
-    A[i, j] = B[i, k] * C[k, j]
+    # Create the CIN statement for sparse matrix multiplication
+    cin_stmt = create_matrix_multiplication(tensors, (i, j, k), contract_idx_pos=2)
 
-    cin_stmt = ForAll(i, ForAll(k, ForAll(j, A._assignment)))
-
-    print("\nCIN statement:")
-    print(cin_stmt)
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_ttm_ddd_dds_dd_ijkm():
@@ -948,15 +1014,7 @@ def test_ttm_ddd_dds_dd_ijkm():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_mttkrp_dd_sss_dd_dd_ijkm():
@@ -980,15 +1038,7 @@ def test_mttkrp_dd_sss_dd_dd_ijkm():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_dd_dd_ds_ijk_gustavson():
@@ -1020,14 +1070,7 @@ def test_spmm_dd_dd_ds_ijk_gustavson():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_ds_ds_ds_kij_outer_workspace():
@@ -1082,15 +1125,7 @@ def test_spmm_ds_ds_ds_kij_outer_workspace():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    cpp_code = llir_lowerer.lower_llir(lowered_llir)
-    print("\nC++ torch extension code:")
-    print(cpp_code)
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
@@ -1142,14 +1177,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_dd_ds_dd_ijk():
@@ -1169,14 +1197,7 @@ def test_spmm_dd_ds_dd_ijk():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_dd_ds_dd_ijk_auto_tile():
@@ -1197,14 +1218,7 @@ def test_spmm_dd_ds_dd_ijk_auto_tile():
     print("\nTiled CIN statement:")
     print(tiled_cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(tiled_cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(tiled_cin_stmt)
 
 
 def test_spmm_dd_ds_dd_tiled():
@@ -1273,26 +1287,18 @@ def test_spmm_dd_ds_dd_tiled():
 
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-
-    print(llir_lowerer.lower_llir(lowered_llir, no_comments=True))
+    lower_and_print(cin_stmt)
 
 
-def test_spmm_ds_ds_dd_ikj_gustavson_workspace():
-    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:dd -print-evaluate
+def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
+    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
 
     A = TensorVar("A", fmt="ds")
     B = TensorVar("B", fmt="ds")
-    C = TensorVar("C", fmt="dd")
+    C = TensorVar("C", fmt="ds")
 
     workspace = Workspace(
         name="wksp",
@@ -1333,14 +1339,7 @@ def test_spmm_ds_ds_dd_ikj_gustavson_workspace():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
@@ -1384,14 +1383,7 @@ def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_dd_ds_ds():
@@ -1422,14 +1414,7 @@ def test_spmm_dd_ds_ds():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_spmm_sd_ds_ds():
@@ -1449,40 +1434,34 @@ def test_spmm_sd_ds_ds():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    lower_and_print(cin_stmt)
 
 
 def test_ij_i_j_ss_s_s():
     # taco "A(i, j) = B(i) * C(j)" -f=A:ss -f=B:s -f=C:s -print-evaluate
-    i = IndexVar("i")
-    j = IndexVar("j")
 
-    A = TensorVar("A", fmt=["sparse", "sparse"])
-    B = TensorVar("B", fmt=["sparse"])
-    C = TensorVar("C", fmt=["sparse"])
+    # Create index variables
+    i, j = create_index_vars("i", "j")
+
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["sparse", "sparse"],
+        "B": ["sparse"],
+        "C": ["sparse"]
+    })
+
+    # Create the assignment
+    A = tensors["A"]
+    B = tensors["B"]
+    C = tensors["C"]
 
     A[i, j] = B[i] * C[j]
 
+    # Create the CIN statement
     cin_stmt = ForAll(i, ForAll(j, A._assignment))
 
-    print("\nCIN statement:")
-    print(cin_stmt)
-
-    lowerer = CINLowerer()
-
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-
-    llir_lowerer = LLIRLowerer()
-
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
 
 
 def test_coo_to_csr():
@@ -1500,11 +1479,46 @@ def test_coo_to_csr():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lowerer = CINLowerer()
+    lower_and_print(cin_stmt)
 
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
 
-    llir_lowerer = LLIRLowerer()
+def test_elemwise_mul_4d_ddss_dddd_ssss():
+    # A[i, j, k, l] = B[i, j, k, l] * C[i, j, k, l]
+    # taco "A(i,j,k,l) = B(i,j,k,l) * C(i,j,k,l)" -f=A:ddss -f=B:dddd -f=C:ssss -print-evaluate
 
-    print("\nC++ torch extension code:")
-    print(llir_lowerer.lower_llir(lowered_llir))
+    # Create index variables
+    i, j, k, l = create_index_vars("i", "j", "k", "l")
+
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["dense", "dense", "sparse", "sparse"],
+        "B": ["dense", "dense", "dense", "dense"],
+        "C": ["sparse", "sparse", "sparse", "sparse"]
+    })
+
+    # Create the CIN statement for elementwise multiplication
+    cin_stmt = create_elementwise_operation(tensors, (i, j, k, l), operation_type="mul")
+
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)
+
+
+def test_spmm_ikj_gustavson_workspace():
+    # taco "A(i, j) = B(i, k) * C(k, j)" -f=A:ds -f=B:ds -f=C:ds -print-evaluate
+    i, j, k = create_index_vars("i", "j", "k")
+
+    # Create tensor variables
+    tensors = create_tensor_vars({
+        "A": ["dense", "sparse"],
+        "B": ["dense", "sparse"],
+        "C": ["dense", "sparse"]
+    })
+
+    # Create a workspace
+    workspace = Workspace(name="wksp", dim=1)
+
+    # Create the CIN statement for SpMM with Gustavson workspace pattern
+    cin_stmt = create_workspace_operation(tensors, workspace, (i, j, k), operation_type="mul")
+
+    # Lower and print the generated code
+    lower_and_print(cin_stmt)

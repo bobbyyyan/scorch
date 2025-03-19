@@ -1,3 +1,10 @@
+figures
+examples/**/*.pt**
+sample-kernels-archive/
+examples
+*.bak
+test.md
+
 *.csv
 *.pdf
 
