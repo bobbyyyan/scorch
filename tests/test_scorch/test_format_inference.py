@@ -17,7 +17,12 @@ def test_spmm_oo_dd_fmtinf():
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch.allclose(result.to_torch(), result_torch)
+    if isinstance(result, torch.Tensor):
+        assert torch.allclose(result, result_torch)
+    elif isinstance(result, STensor):
+        assert torch.allclose(result.to_torch(), result_torch)
+    else:
+        raise ValueError(f"Unexpected result type: {type(result)}")
 
 
 def test_spmm_ds_dd_fmtinf():
@@ -33,4 +38,9 @@ def test_spmm_ds_dd_fmtinf():
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
-    assert torch.allclose(result.to_torch(), result_torch)
+    if isinstance(result, torch.Tensor):
+        assert torch.allclose(result, result_torch)
+    elif isinstance(result, STensor):
+        assert torch.allclose(result.to_torch(), result_torch)
+    else:
+        raise ValueError(f"Unexpected result type: {type(result)}")
