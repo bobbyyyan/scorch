@@ -3,11 +3,14 @@
 #define SCORCH_UNLIKELY(x) (x)
 #define SCORCH_RESTRICT __restrict__
 
+// Global constants for optimization
+const int kUnrollFactor = 16;
+
 Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
                 torch::Tensor A_values, std::vector<int> B_shape,
                 std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values) {
+                torch::Tensor B_values, int tile_size = 32) {
   // Init result tensor level sizes
   int C0_size = result_shape[0];
   int C1_size = result_shape[1];
@@ -28,8 +31,8 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
   float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
   memset(C_values, 0, sizeof(float) * C_capacity);
 
-  // Initialize tile sizes
-  constexpr int kTile_k = 16;
+  // Use the tile size parameter
+  int kTile_k = tile_size;
 
   int residual_k_start = (B1_size / kTile_k) * kTile_k;
 
@@ -40,8 +43,7 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
 
     for (int k_out = 0; k_out < residual_k_start; k_out += kTile_k) {
       // Initialize workspaces
-      float accum_c[kTile_k] = {};
-      // float *accum_c = new float[kTile_k]();
+      float *accum_c = new float[kTile_k]();
 
       // Initialize iterators
       int pA1_end = A1_pos[i + 1];
@@ -50,7 +52,6 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
         // Resolve coordinates
         int j = A1_crd[pA1];
 
-        SCORCH_PRAGMA_UNROLL
         for (int k_in = 0; SCORCH_LIKELY(k_in < kTile_k); k_in++) {
           // Resolve tiled index var
           int k = k_out + k_in;
@@ -67,7 +68,7 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
         C_values[pC1] += accum_c[k_in];
       }
 
-      // delete[] accum_c;
+      delete[] accum_c;
     }
   }
 
@@ -98,6 +99,69 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
       delete[] accum_c;
     }
   }
+  // Assemble final result
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) {
+    { free(ptr); }
+  };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+Tensor spmm_csr_float_untiled(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  // Init result tensor level sizes
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  // Get A's level & value arrays
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  // Get B's level & value arrays
+  int B0_size = B_shape[0];
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  // Initialize result value array
+  int C_capacity = C0_size * C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  #pragma omp parallel for
+  for (int i = 0; i < A0_size; i++) {
+    // Resolve index into dense level of values array
+    int pC0 = i;
+    int pA1_end = A1_pos[i + 1];
+
+    // For each row i, iterate through all columns k directly
+    for (int k = 0; k < B1_size; k++) {
+      float accum = 0.0f;
+
+      // Iterate through the non-zero elements in row i
+      for (int pA1 = A1_pos[i]; pA1 < pA1_end; pA1++) {
+        // Resolve coordinates
+        int j = A1_crd[pA1];
+
+        // Resolve dense coordinates
+        int pB1 = j * B1_size + k;
+        accum += A_val[pA1] * B_val[pB1];
+      }
+
+      // Add to result
+      int pC1 = pC0 * C1_size + k;
+      C_values[pC1] += accum;
+    }
+  }
+
   // Assemble final result
   Tensor C;
   auto C_values_deleter = [](void *ptr) {
@@ -233,6 +297,658 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
   Tensor C;
   auto C_values_deleter = [](void* ptr) {{ free(ptr); }};
   torch::Tensor C_values_torch = torch::from_blob(C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+Tensor spmm_csr_float_optimized(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 128) {
+  // Init result tensor level sizes
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  // Get A's level & value arrays
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  // Get B's level & value arrays
+  int B0_size = B_shape[0];
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  // Initialize result value array
+  int C_capacity = C0_size * C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  // Use the tile size parameter with a reasonable default
+  int kTile_k = tile_size;
+
+  // Compute how many tiles we need
+  int num_tiles = (B1_size + kTile_k - 1) / kTile_k;
+
+  #pragma omp parallel
+  {
+    // Pre-allocate thread-local workspace to avoid repeated allocations
+    // This is a significant optimization - only allocate once per thread
+    float* thread_workspace = new float[kTile_k]();
+
+    #pragma omp for
+    for (int i = 0; i < A0_size; i++) {
+      // Resolve index into dense level of values array
+      int pC0 = i;
+      int pA1_begin = A1_pos[i];
+      int pA1_end = A1_pos[i + 1];
+      int nnz_in_row = pA1_end - pA1_begin;
+
+      // Skip empty rows
+      if (nnz_in_row == 0) continue;
+
+      // Process each tile
+      for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
+        int k_out = tile_idx * kTile_k;
+        int k_limit = std::min(k_out + kTile_k, B1_size);
+        int actual_tile_size = k_limit - k_out;
+
+        // Clear workspace for this tile
+        memset(thread_workspace, 0, sizeof(float) * actual_tile_size);
+
+        // Process all non-zeros in this row for current tile
+        for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+          int j = A1_crd[pA1];
+          float a_val = A_val[pA1];
+
+          // Base index for B values
+          int pB1_base = j * B1_size + k_out;
+
+          // Process tile elements with loop unrolling for better vectorization
+          int k_in = 0;
+
+          // Process blocks of 4 elements for better vectorization
+          for (; k_in + 3 < actual_tile_size; k_in += 4) {
+            thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+            thread_workspace[k_in + 1] += a_val * B_val[pB1_base + k_in + 1];
+            thread_workspace[k_in + 2] += a_val * B_val[pB1_base + k_in + 2];
+            thread_workspace[k_in + 3] += a_val * B_val[pB1_base + k_in + 3];
+          }
+
+          // Handle remaining elements
+          for (; k_in < actual_tile_size; k_in++) {
+            thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+          }
+        }
+
+        // Write results to output with direct indexing
+        for (int k_in = 0; k_in < actual_tile_size; k_in++) {
+          int pC1 = pC0 * C1_size + (k_out + k_in);
+          C_values[pC1] = thread_workspace[k_in];
+        }
+      }
+    }
+
+    // Clean up thread-local storage
+    delete[] thread_workspace;
+  }
+
+  // Assemble final result
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) {
+    { free(ptr); }
+  };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+Tensor spmm_csr_float_turbo(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 128) {
+  // Init result tensor level sizes
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  // Get A's level & value arrays
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  // Get B's level & value arrays
+  int B0_size = B_shape[0];
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  // Initialize result value array
+  int C_capacity = C0_size * C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  // Calculate optimal tile size for the current matrix
+  // The heuristic here is to use a larger tile size for larger matrices
+  // but avoid excessive memory usage per thread
+  int max_nnz_per_row = 0;
+  for (int i = 0; i < A0_size; i++) {
+    int row_nnz = A1_pos[i + 1] - A1_pos[i];
+    max_nnz_per_row = std::max(max_nnz_per_row, row_nnz);
+  }
+
+  // Adjust tile size based on matrix properties
+  int optimal_tile_size = tile_size;
+  if (max_nnz_per_row > 1000 && B1_size > 500) {
+    optimal_tile_size = std::min(tile_size, 64); // Use smaller tiles for very dense rows
+  } else if (max_nnz_per_row < 10 && B1_size > 1000) {
+    optimal_tile_size = std::max(tile_size, 256); // Use larger tiles for very sparse rows
+  }
+
+  int kTile_k = optimal_tile_size;
+
+  #pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < A0_size; i++) {
+    int pC0 = i;
+    int pA1_begin = A1_pos[i];
+    int pA1_end = A1_pos[i + 1];
+    int nnz_in_row = pA1_end - pA1_begin;
+
+    // Skip rows with no non-zeros
+    if (SCORCH_UNLIKELY(nnz_in_row == 0)) continue;
+
+    // Allocate thread-local workspace once per row
+    // This avoids repeated allocation/deallocation inside the tile loop
+    float* accum_c = new float[kTile_k]();
+
+    // Process each row in tiles
+    for (int k_out = 0; k_out < B1_size; k_out += kTile_k) {
+      // Calculate actual tile width to handle final partial tile
+      int k_width = std::min(kTile_k, B1_size - k_out);
+
+      // Clear workspace for this tile
+      if (k_width == kTile_k) {
+        memset(accum_c, 0, sizeof(float) * kTile_k);
+      } else {
+        memset(accum_c, 0, sizeof(float) * k_width);
+      }
+
+      // For each non-zero element in the current row
+      for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+        int j = A1_crd[pA1];
+        float a_val = A_val[pA1];
+        int pB1_base = j * B1_size + k_out;
+
+        // Full tile processing
+        if (SCORCH_LIKELY(k_width == kTile_k)) {
+          // Process blocks of 8 elements where possible using SIMD-friendly pattern
+          int k_in = 0;
+          for (; k_in + 7 < kTile_k; k_in += 8) {
+            accum_c[k_in] += a_val * B_val[pB1_base + k_in];
+            accum_c[k_in + 1] += a_val * B_val[pB1_base + k_in + 1];
+            accum_c[k_in + 2] += a_val * B_val[pB1_base + k_in + 2];
+            accum_c[k_in + 3] += a_val * B_val[pB1_base + k_in + 3];
+            accum_c[k_in + 4] += a_val * B_val[pB1_base + k_in + 4];
+            accum_c[k_in + 5] += a_val * B_val[pB1_base + k_in + 5];
+            accum_c[k_in + 6] += a_val * B_val[pB1_base + k_in + 6];
+            accum_c[k_in + 7] += a_val * B_val[pB1_base + k_in + 7];
+          }
+
+          // Process remaining elements
+          for (; k_in < kTile_k; k_in++) {
+            accum_c[k_in] += a_val * B_val[pB1_base + k_in];
+          }
+        } else {
+          // Partial tile processing (last tile in row)
+          for (int k_in = 0; k_in < k_width; k_in++) {
+            accum_c[k_in] += a_val * B_val[pB1_base + k_in];
+          }
+        }
+      }
+
+      // Write accumulated results to output matrix
+      for (int k_in = 0; k_in < k_width; k_in++) {
+        int pC1 = pC0 * C1_size + (k_out + k_in);
+        C_values[pC1] = accum_c[k_in];
+      }
+    }
+
+    // Free thread-local workspace
+    delete[] accum_c;
+  }
+
+  // Assemble final result
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) {
+    { free(ptr); }
+  };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 256) {
+  // Init result tensor level sizes
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  // Get A's level & value arrays
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  // Get B's level & value arrays
+  int B0_size = B_shape[0];
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  // Initialize result value array
+  int C_capacity = C0_size * C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  // Calculate statistics for adaptive tiling
+  int total_nnz = 0;
+  int max_nnz_per_row = 0;
+  int rows_with_nnz = 0;
+
+  for (int i = 0; i < A0_size; i++) {
+    int row_nnz = A1_pos[i + 1] - A1_pos[i];
+    total_nnz += row_nnz;
+    if (row_nnz > 0) rows_with_nnz++;
+    max_nnz_per_row = std::max(max_nnz_per_row, row_nnz);
+  }
+
+  float avg_nnz_per_row = rows_with_nnz > 0 ? (float)total_nnz / rows_with_nnz : 0;
+
+  // Adaptive tile size based on matrix characteristics
+  int default_tile_size = tile_size;
+
+  // Adjust default tile size based on sparsity pattern
+  if (avg_nnz_per_row < 5 && B1_size > 1000) {
+    // Larger tiles for very sparse matrices
+    default_tile_size = std::max(512, tile_size);
+  } else if (avg_nnz_per_row > 100 || max_nnz_per_row > 1000) {
+    // Smaller tiles for matrices with dense rows
+    default_tile_size = std::min(tile_size, 128);
+  }
+
+  // Ensure tile size is aligned to 16 bytes for SIMD operations
+  default_tile_size = (default_tile_size + 15) & ~15;
+
+  // Determine optimal thread count
+  int num_threads = omp_get_max_threads();
+  if (A0_size < 1000 || (avg_nnz_per_row < 10 && A0_size < 10000)) {
+    // Use fewer threads for small or very sparse matrices
+    num_threads = std::min(num_threads, 4);
+  }
+  omp_set_num_threads(num_threads);
+
+  // Process all rows in a single parallel region with dynamic scheduling
+  #pragma omp parallel
+  {
+    // Each thread allocates its own workspace aligned to cache line (64 bytes)
+    float* SCORCH_RESTRICT thread_workspace =
+        (float*)aligned_alloc(64, sizeof(float) * default_tile_size);
+
+    #pragma omp for schedule(dynamic, 16)
+    for (int i = 0; i < A0_size; i++) {
+      int pC0 = i;
+      int pA1_begin = A1_pos[i];
+      int pA1_end = A1_pos[i + 1];
+      int nnz_in_row = pA1_end - pA1_begin;
+
+      // Skip empty rows
+      if (SCORCH_UNLIKELY(nnz_in_row == 0)) continue;
+
+      // Special case for very sparse rows (1-2 non-zeros)
+      // Direct computation without tiling is more efficient
+      if (SCORCH_UNLIKELY(nnz_in_row <= 2)) {
+        for (int k = 0; k < B1_size; k++) {
+          float accum = 0.0f;
+          for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+            int j = A1_crd[pA1];
+            int pB1 = j * B1_size + k;
+            accum += A_val[pA1] * B_val[pB1];
+          }
+          int pC1 = pC0 * C1_size + k;
+          C_values[pC1] = accum;
+        }
+        continue;
+      }
+
+      // Choose tile size based on row density
+      int row_tile_size;
+      if (nnz_in_row > 100) {
+        // Dense rows: use smaller tiles for better cache utilization
+        row_tile_size = std::min(default_tile_size, 128);
+      } else {
+        // Other rows: use the default tile size
+        row_tile_size = default_tile_size;
+      }
+
+      // Process the row in tiles
+      for (int k_out = 0; k_out < B1_size; k_out += row_tile_size) {
+        int k_width = std::min(row_tile_size, B1_size - k_out);
+
+        // Clear the workspace for this tile
+        memset(thread_workspace, 0, sizeof(float) * k_width);
+
+        // Process all non-zeros in this row for the current tile
+        for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+          int j = A1_crd[pA1];
+          float a_val = A_val[pA1];
+          int pB1_base = j * B1_size + k_out;
+
+          // Simple prefetch of next element's data if available
+          if (pA1 + 1 < pA1_end) {
+            __builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size + k_out], 0, 3);
+          }
+
+          // Full tile processing with manual unrolling for SIMD efficiency
+          if (SCORCH_LIKELY(k_width == row_tile_size)) {
+            int k_in = 0;
+
+            // Use aggressive unrolling in blocks of 16 for better vectorization
+            SCORCH_PRAGMA_UNROLL
+            for (; k_in + 15 < row_tile_size; k_in += 16) {
+              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+              thread_workspace[k_in + 1] += a_val * B_val[pB1_base + k_in + 1];
+              thread_workspace[k_in + 2] += a_val * B_val[pB1_base + k_in + 2];
+              thread_workspace[k_in + 3] += a_val * B_val[pB1_base + k_in + 3];
+              thread_workspace[k_in + 4] += a_val * B_val[pB1_base + k_in + 4];
+              thread_workspace[k_in + 5] += a_val * B_val[pB1_base + k_in + 5];
+              thread_workspace[k_in + 6] += a_val * B_val[pB1_base + k_in + 6];
+              thread_workspace[k_in + 7] += a_val * B_val[pB1_base + k_in + 7];
+              thread_workspace[k_in + 8] += a_val * B_val[pB1_base + k_in + 8];
+              thread_workspace[k_in + 9] += a_val * B_val[pB1_base + k_in + 9];
+              thread_workspace[k_in + 10] += a_val * B_val[pB1_base + k_in + 10];
+              thread_workspace[k_in + 11] += a_val * B_val[pB1_base + k_in + 11];
+              thread_workspace[k_in + 12] += a_val * B_val[pB1_base + k_in + 12];
+              thread_workspace[k_in + 13] += a_val * B_val[pB1_base + k_in + 13];
+              thread_workspace[k_in + 14] += a_val * B_val[pB1_base + k_in + 14];
+              thread_workspace[k_in + 15] += a_val * B_val[pB1_base + k_in + 15];
+            }
+
+            // Handle remaining elements
+            for (; k_in < row_tile_size; k_in++) {
+              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+            }
+          } else {
+            // Handle partial tile (last tile in row)
+            for (int k_in = 0; k_in < k_width; k_in++) {
+              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+            }
+          }
+        }
+
+        // Write accumulated results directly to output matrix
+        int pC1_base = pC0 * C1_size + k_out;
+        int k_in = 0;
+
+        // Use block writes for better memory performance
+        for (; k_in + 15 < k_width; k_in += 16) {
+          C_values[pC1_base + k_in] = thread_workspace[k_in];
+          C_values[pC1_base + k_in + 1] = thread_workspace[k_in + 1];
+          C_values[pC1_base + k_in + 2] = thread_workspace[k_in + 2];
+          C_values[pC1_base + k_in + 3] = thread_workspace[k_in + 3];
+          C_values[pC1_base + k_in + 4] = thread_workspace[k_in + 4];
+          C_values[pC1_base + k_in + 5] = thread_workspace[k_in + 5];
+          C_values[pC1_base + k_in + 6] = thread_workspace[k_in + 6];
+          C_values[pC1_base + k_in + 7] = thread_workspace[k_in + 7];
+          C_values[pC1_base + k_in + 8] = thread_workspace[k_in + 8];
+          C_values[pC1_base + k_in + 9] = thread_workspace[k_in + 9];
+          C_values[pC1_base + k_in + 10] = thread_workspace[k_in + 10];
+          C_values[pC1_base + k_in + 11] = thread_workspace[k_in + 11];
+          C_values[pC1_base + k_in + 12] = thread_workspace[k_in + 12];
+          C_values[pC1_base + k_in + 13] = thread_workspace[k_in + 13];
+          C_values[pC1_base + k_in + 14] = thread_workspace[k_in + 14];
+          C_values[pC1_base + k_in + 15] = thread_workspace[k_in + 15];
+        }
+
+        // Handle remaining elements
+        for (; k_in < k_width; k_in++) {
+          C_values[pC1_base + k_in] = thread_workspace[k_in];
+        }
+      }
+    }
+
+    // Clean up thread-local workspace
+    free(thread_workspace);
+  }
+
+  // Restore default thread count
+  omp_set_num_threads(omp_get_max_threads());
+
+  // Assemble final result
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) {
+    { free(ptr); }
+  };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+Tensor spmm_csr_float_apex(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 256) {
+  // Init result tensor level sizes
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  // Get A's level & value arrays
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  // Get B's level & value arrays
+  int B0_size = B_shape[0];
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  // Initialize result value array
+  int C_capacity = C0_size * C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  // Calculate statistics for adaptive tiling
+  int total_nnz = 0;
+  int max_nnz_per_row = 0;
+  int rows_with_nnz = 0;
+
+  for (int i = 0; i < A0_size; i++) {
+    int row_nnz = A1_pos[i + 1] - A1_pos[i];
+    total_nnz += row_nnz;
+    if (row_nnz > 0) rows_with_nnz++;
+    max_nnz_per_row = std::max(max_nnz_per_row, row_nnz);
+  }
+
+  float avg_nnz_per_row = rows_with_nnz > 0 ? (float)total_nnz / rows_with_nnz : 0;
+
+  // Adaptive tile size based on matrix characteristics
+  int default_tile_size = tile_size;
+
+  // Adjust default tile size based on sparsity pattern
+  if (avg_nnz_per_row < 5 && B1_size > 1000) {
+    // Larger tiles for very sparse matrices
+    default_tile_size = std::max(512, tile_size);
+  } else if (avg_nnz_per_row > 100 || max_nnz_per_row > 1000) {
+    // Smaller tiles for matrices with dense rows
+    default_tile_size = std::min(tile_size, 128);
+  }
+
+  // Ensure tile size is aligned to 16 bytes for SIMD operations
+  default_tile_size = (default_tile_size + 15) & ~15;
+
+  // Determine optimal thread count
+  int num_threads = omp_get_max_threads();
+  if (A0_size < 1000 || (avg_nnz_per_row < 10 && A0_size < 10000)) {
+    // Use fewer threads for small or very sparse matrices
+    num_threads = std::min(num_threads, 4);
+  }
+  omp_set_num_threads(num_threads);
+
+  // Process all rows in a single parallel region with dynamic scheduling
+  #pragma omp parallel
+  {
+    // Each thread allocates its own workspace aligned to cache line (64 bytes)
+    float* SCORCH_RESTRICT thread_workspace =
+        (float*)aligned_alloc(64, sizeof(float) * default_tile_size);
+
+    #pragma omp for schedule(dynamic, 16)
+    for (int i = 0; i < A0_size; i++) {
+      int pC0 = i;
+      int pA1_begin = A1_pos[i];
+      int pA1_end = A1_pos[i + 1];
+      int nnz_in_row = pA1_end - pA1_begin;
+
+      // Skip empty rows
+      if (SCORCH_UNLIKELY(nnz_in_row == 0)) continue;
+
+      // Special case for very sparse rows (1-2 non-zeros)
+      // Direct computation without tiling is more efficient
+      if (SCORCH_UNLIKELY(nnz_in_row <= 2)) {
+        for (int k = 0; k < B1_size; k++) {
+          float accum = 0.0f;
+          for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+            int j = A1_crd[pA1];
+            int pB1 = j * B1_size + k;
+            accum += A_val[pA1] * B_val[pB1];
+          }
+          int pC1 = pC0 * C1_size + k;
+          C_values[pC1] = accum;
+        }
+        continue;
+      }
+
+      // Choose tile size based on row density
+      int row_tile_size;
+      if (nnz_in_row > 100) {
+        // Dense rows: use smaller tiles for better cache utilization
+        row_tile_size = std::min(default_tile_size, 128);
+      } else {
+        // Other rows: use the default tile size
+        row_tile_size = default_tile_size;
+      }
+
+      // Process the row in tiles
+      for (int k_out = 0; k_out < B1_size; k_out += row_tile_size) {
+        int k_width = std::min(row_tile_size, B1_size - k_out);
+
+        // Clear the workspace for this tile
+        memset(thread_workspace, 0, sizeof(float) * k_width);
+
+        // Process all non-zeros in this row for the current tile
+        for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+          int j = A1_crd[pA1];
+          float a_val = A_val[pA1];
+          int pB1_base = j * B1_size + k_out;
+
+          // Simple prefetch of next element's data if available
+          if (pA1 + 1 < pA1_end) {
+            __builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size + k_out], 0, 3);
+          }
+
+          // Full tile processing with manual unrolling for SIMD efficiency
+          if (SCORCH_LIKELY(k_width == row_tile_size)) {
+            int k_in = 0;
+
+            // Use aggressive unrolling in blocks of 16 for better vectorization
+            SCORCH_PRAGMA_UNROLL
+            for (; k_in + 15 < row_tile_size; k_in += 16) {
+              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+              thread_workspace[k_in + 1] += a_val * B_val[pB1_base + k_in + 1];
+              thread_workspace[k_in + 2] += a_val * B_val[pB1_base + k_in + 2];
+              thread_workspace[k_in + 3] += a_val * B_val[pB1_base + k_in + 3];
+              thread_workspace[k_in + 4] += a_val * B_val[pB1_base + k_in + 4];
+              thread_workspace[k_in + 5] += a_val * B_val[pB1_base + k_in + 5];
+              thread_workspace[k_in + 6] += a_val * B_val[pB1_base + k_in + 6];
+              thread_workspace[k_in + 7] += a_val * B_val[pB1_base + k_in + 7];
+              thread_workspace[k_in + 8] += a_val * B_val[pB1_base + k_in + 8];
+              thread_workspace[k_in + 9] += a_val * B_val[pB1_base + k_in + 9];
+              thread_workspace[k_in + 10] += a_val * B_val[pB1_base + k_in + 10];
+              thread_workspace[k_in + 11] += a_val * B_val[pB1_base + k_in + 11];
+              thread_workspace[k_in + 12] += a_val * B_val[pB1_base + k_in + 12];
+              thread_workspace[k_in + 13] += a_val * B_val[pB1_base + k_in + 13];
+              thread_workspace[k_in + 14] += a_val * B_val[pB1_base + k_in + 14];
+              thread_workspace[k_in + 15] += a_val * B_val[pB1_base + k_in + 15];
+            }
+
+            // Handle remaining elements
+            for (; k_in < row_tile_size; k_in++) {
+              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+            }
+          } else {
+            // Handle partial tile (last tile in row)
+            for (int k_in = 0; k_in < k_width; k_in++) {
+              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+            }
+          }
+        }
+
+        // Write accumulated results directly to output matrix
+        int pC1_base = pC0 * C1_size + k_out;
+        int k_in = 0;
+
+        // Use block writes for better memory performance
+        for (; k_in + 15 < k_width; k_in += 16) {
+          C_values[pC1_base + k_in] = thread_workspace[k_in];
+          C_values[pC1_base + k_in + 1] = thread_workspace[k_in + 1];
+          C_values[pC1_base + k_in + 2] = thread_workspace[k_in + 2];
+          C_values[pC1_base + k_in + 3] = thread_workspace[k_in + 3];
+          C_values[pC1_base + k_in + 4] = thread_workspace[k_in + 4];
+          C_values[pC1_base + k_in + 5] = thread_workspace[k_in + 5];
+          C_values[pC1_base + k_in + 6] = thread_workspace[k_in + 6];
+          C_values[pC1_base + k_in + 7] = thread_workspace[k_in + 7];
+          C_values[pC1_base + k_in + 8] = thread_workspace[k_in + 8];
+          C_values[pC1_base + k_in + 9] = thread_workspace[k_in + 9];
+          C_values[pC1_base + k_in + 10] = thread_workspace[k_in + 10];
+          C_values[pC1_base + k_in + 11] = thread_workspace[k_in + 11];
+          C_values[pC1_base + k_in + 12] = thread_workspace[k_in + 12];
+          C_values[pC1_base + k_in + 13] = thread_workspace[k_in + 13];
+          C_values[pC1_base + k_in + 14] = thread_workspace[k_in + 14];
+          C_values[pC1_base + k_in + 15] = thread_workspace[k_in + 15];
+        }
+
+        // Handle remaining elements
+        for (; k_in < k_width; k_in++) {
+          C_values[pC1_base + k_in] = thread_workspace[k_in];
+        }
+      }
+    }
+
+    // Clean up thread-local workspace
+    free(thread_workspace);
+  }
+
+  // Restore default thread count
+  omp_set_num_threads(omp_get_max_threads());
+
+  // Assemble final result
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) {
+    { free(ptr); }
+  };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;

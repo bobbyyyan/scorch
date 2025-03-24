@@ -4,7 +4,7 @@ from typing import Any, Union, Sequence, Optional, List
 
 import torch
 from torch.utils.cpp_extension import load, load_inline
-import scorch_ops as ops
+import scorch._C.ops as ops
 
 from .compiler.cin import (
     IndexVar,
@@ -282,7 +282,7 @@ def matmul(
 
     if use_cache:
         if str(a.format) == "d,s" and str(b.format) == "d,d":
-            kernel_op = ops.spmm_csr_float
+            kernel_op = ops.spmm_csr_float_ultra
         elif str(a.format) == "d,s" and str(b.format) == "d,s" and use_cache:
             result_format = parse_format("ds")
             kernel_op = ops.spmspm_csr_float

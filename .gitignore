@@ -1,7 +1,11 @@
+examples/**/archive/
+examples/moe-v1
+examples/**/*.svg
+*.tmp
 figures
 examples/**/*.pt**
+examples/archive
 sample-kernels-archive/
-examples
 *.bak
 test.md
 
@@ -390,3 +394,16 @@ cython_debug/
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,visualstudiocode,pycharm,python,c++,cuda
+examples/sparse_transformer/torch_sparse_transformer v1.py
+csrc/spmm-working.h
+csrc/test-spmspm.h
+examples/gat/pyg_gat-v1.py
+examples/gcn/env-studio.yml
+examples/kernels/download_all_ss-parallel-log.py
+examples/kernels/download_all_ss-parallel-log-v1.py
+examples/sparse_transformer/scorch_sparse_transformer v1.py
+examples/sparse_transformer/torch_sparse_transformer v2.py
+examples/sparse_transformer/torch_sparse_transformer v3.py
+examples/kernels/download_all_ss-parallel2.py
+examples/kernels/download_all_ss-parallel.py
+examples/sparse_autoencoder/torch_sparse_transformer.py

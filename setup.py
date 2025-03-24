@@ -3,7 +3,7 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 ext_modules = [
     CppExtension(
-        "scorch_ops",
+        "scorch._C.ops",
         [
             "csrc/ops.cpp",
         ],

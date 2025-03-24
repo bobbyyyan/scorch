@@ -1,7 +1,9 @@
 import torch
+from . import _C
 from .ops import einsum, matmul, matmul_wksp, precompile_kernels
 from .stensor import STensor
 from .format import TensorFormat
+from .storage import TensorIndex
 
 from_torch = STensor.from_torch
 from_coo = STensor.from_coo
@@ -22,10 +24,12 @@ __version__ = "0.0.1"
 __all__ = [
     "STensor",
     "TensorFormat",
+    "TensorIndex",
     "einsum",
     "from_torch",
     "from_coo",
     "matmul",
     "matmul_wksp",
+    "_C",
     "__version__",
 ]
