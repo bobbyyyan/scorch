@@ -75,7 +75,14 @@ def run_benchmark():
             print(f"Processing matrix {matrix.id} {matrix.name} in group {matrix.group} with {matrix.nnz} NNZ...")
             # sparse_matrix_mm = matrix.download(format='MM', extract=True)
 
-            matrix_path = Path(f"~/.ssgetpy/MM/{matrix.group}/{matrix.name}/{matrix.name}.mtx").expanduser()
+            node_name = os.uname().nodename
+            if "sapling" in node_name:
+                matrix_path = Path(f"/scratch2/suitesparse/{matrix.name}.mtx")
+            elif "redwood" in node_name:
+                matrix_path = Path(f"/scratch/suitesparse/{matrix.name}/{matrix.name}.mtx")
+            else:
+                matrix_path = Path(f"~/.ssgetpy/MM/{matrix.group}/{matrix.name}/{matrix.name}.mtx").expanduser()
+
             sparse_matrix = mmread(matrix_path.resolve())
             print(f"Matrix shape: {sparse_matrix.shape}")
 
