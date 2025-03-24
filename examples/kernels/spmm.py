@@ -56,15 +56,21 @@ def run_benchmark():
     np.random.seed(15)
     torch.manual_seed(15)
 
+    # Generate timestamp once at the beginning
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    csv_filename = f"spmm_benchmark_{timestamp}.csv"
+
     matrices = ssgetpy.search(limit=5000)
 
     # Remove specific problematic indices
-    idxs_to_remove = [1905, 2459]
+    # idxs_to_remove = [1905, 2459]
+    idxs_to_remove = [2511]
     matrices = [m for m in matrices if m.id not in idxs_to_remove]
 
     results = []
+    save_interval = 10  # Save after every 10 matrices
 
-    for matrix in tqdm(matrices, desc="Benchmarking Matrices"):
+    for i, matrix in enumerate(tqdm(matrices, desc="Benchmarking Matrices")):
         try:
             print(f"Processing matrix {matrix.id} {matrix.name} in group {matrix.group} with {matrix.nnz} NNZ...")
             # sparse_matrix_mm = matrix.download(format='MM', extract=True)
@@ -101,15 +107,22 @@ def run_benchmark():
                         'Runtime': end_time - start_time
                     })
 
+            # Periodically save results to avoid data loss
+            if (i + 1) % save_interval == 0 or i == len(matrices) - 1:
+                results_df = pd.DataFrame(results)
+                results_df.to_csv(csv_filename, index=False)
+                print(f"Saving interim results to '{csv_filename}' after processing {i+1}/{len(matrices)} matrices.")
+
         except Exception as e:
             print(f"Error processing matrix {matrix.name} in group {matrix.group}: {e}")
 
+            # Save on exception to preserve data collected so far
+            if results:
+                results_df = pd.DataFrame(results)
+                results_df.to_csv(csv_filename, index=False)
+                print(f"Saved partial results to '{csv_filename}' after error.")
+
     results_df = pd.DataFrame(results)
-
-    # Generate timestamp and create filename with timestamp
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    csv_filename = f"spmm_benchmark_{timestamp}.csv"
-
     results_df.to_csv(csv_filename, index=False)
     print(f"Benchmarking complete. Results saved to '{csv_filename}'.")
     return results_df, csv_filename

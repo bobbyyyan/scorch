@@ -554,10 +554,30 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
   int B1_size = B_shape[1];
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
-  // Initialize result value array
-  int C_capacity = C0_size * C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
-  memset(C_values, 0, sizeof(float) * C_capacity);
+  // Initialize result value array - use size_t to avoid integer overflow
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+
+  // Check if allocation size is reasonable - 256GB limit is arbitrary but reasonable
+  const size_t MAX_DENSE_ALLOCATION = (size_t)256 * 1024 * 1024 * 1024;
+  size_t allocation_size = C_capacity * sizeof(float);
+
+  if (allocation_size > MAX_DENSE_ALLOCATION) {
+    std::stringstream ss;
+    ss << "Attempted to allocate " << (allocation_size / (1024.0 * 1024.0 * 1024.0))
+       << " GB for dense output matrix (" << C0_size << " x " << C1_size
+       << "). This exceeds the maximum allocation size of "
+       << (MAX_DENSE_ALLOCATION / (1024.0 * 1024.0 * 1024.0)) << " GB.";
+    throw std::runtime_error(ss.str());
+  }
+
+  float* SCORCH_RESTRICT C_values = (float *)malloc(allocation_size);
+  if (!C_values) {
+    std::stringstream ss;
+    ss << "Failed to allocate " << (allocation_size / (1024.0 * 1024.0))
+       << " MB for dense output matrix (" << C0_size << " x " << C1_size << ")";
+    throw std::runtime_error(ss.str());
+  }
+  memset(C_values, 0, allocation_size);
 
   // Calculate statistics for adaptive tiling
   int total_nnz = 0;
@@ -585,7 +605,7 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
     default_tile_size = std::min(tile_size, 128);
   }
 
-  // Ensure tile size is aligned to 16 bytes for SIMD operations
+  // Ensure tile size is a multiple of 16 for SIMD operations
   default_tile_size = (default_tile_size + 15) & ~15;
 
   // Determine optimal thread count
@@ -599,134 +619,170 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
   // Process all rows in a single parallel region with dynamic scheduling
   #pragma omp parallel
   {
+    // Ensure allocation size is a multiple of the alignment (64 bytes)
+    // Each float is 4 bytes, so we need to align to 16 floats (64/4)
+    size_t aligned_tile_size = ((default_tile_size + 15) / 16) * 16;
+    size_t aligned_bytes = aligned_tile_size * sizeof(float);
+
     // Each thread allocates its own workspace aligned to cache line (64 bytes)
-    float* SCORCH_RESTRICT thread_workspace =
-        (float*)aligned_alloc(64, sizeof(float) * default_tile_size);
+    float* SCORCH_RESTRICT thread_workspace = nullptr;
 
-    #pragma omp for schedule(dynamic, 16)
-    for (int i = 0; i < A0_size; i++) {
-      int pC0 = i;
-      int pA1_begin = A1_pos[i];
-      int pA1_end = A1_pos[i + 1];
-      int nnz_in_row = pA1_end - pA1_begin;
+    #if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200112L)
+    // Use posix_memalign which has better error handling
+    if (posix_memalign((void**)&thread_workspace, 64, aligned_bytes) != 0) {
+      thread_workspace = nullptr; // Ensure it's null on failure
+    }
+    #else
+    // Fallback to aligned_alloc
+    thread_workspace = (float*)aligned_alloc(64, aligned_bytes);
+    #endif
 
-      // Skip empty rows
-      if (SCORCH_UNLIKELY(nnz_in_row == 0)) continue;
+    // Check if allocation succeeded
+    if (thread_workspace == nullptr) {
+      // Handle allocation failure gracefully
+      #pragma omp critical
+      {
+        fprintf(stderr, "Failed to allocate thread workspace memory\n");
+      }
+      // Skip computation in this thread, others can continue
+    } else {
+      #pragma omp for schedule(dynamic, 16)
+      for (int i = 0; i < A0_size; i++) {
+        int pC0 = i;
+        int pA1_begin = A1_pos[i];
+        int pA1_end = A1_pos[i + 1];
+        int nnz_in_row = pA1_end - pA1_begin;
 
-      // Special case for very sparse rows (1-2 non-zeros)
-      // Direct computation without tiling is more efficient
-      if (SCORCH_UNLIKELY(nnz_in_row <= 2)) {
-        for (int k = 0; k < B1_size; k++) {
-          float accum = 0.0f;
+        // Skip empty rows
+        if (SCORCH_UNLIKELY(nnz_in_row == 0)) continue;
+
+        // Special case for very sparse rows (1-2 non-zeros)
+        // Direct computation without tiling is more efficient
+        if (SCORCH_UNLIKELY(nnz_in_row <= 2)) {
+          for (int k = 0; k < B1_size; k++) {
+            float accum = 0.0f;
+            for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+              int j = A1_crd[pA1];
+              int pB1 = j * B1_size + k;
+              accum += A_val[pA1] * B_val[pB1];
+            }
+            // Use 64-bit index calculation to avoid overflow
+            size_t pC1 = (size_t)pC0 * (size_t)C1_size + (size_t)k;
+            C_values[pC1] = accum;
+          }
+          continue;
+        }
+
+        // Choose tile size based on row density
+        int row_tile_size;
+        if (nnz_in_row > 100) {
+          // Dense rows: use smaller tiles for better cache utilization
+          row_tile_size = std::min(default_tile_size, 128);
+          // Ensure it's still a multiple of 16
+          row_tile_size = (row_tile_size + 15) & ~15;
+        } else {
+          // Other rows: use the default tile size (already aligned)
+          row_tile_size = default_tile_size;
+        }
+
+        // Use the smallest of the aligned tile size and row_tile_size
+        int tile_to_use = std::min((int)aligned_tile_size, row_tile_size);
+
+        // Process the row in tiles
+        for (int k_out = 0; k_out < B1_size; k_out += tile_to_use) {
+          int k_width = std::min(tile_to_use, B1_size - k_out);
+
+          // Clear the workspace for this tile
+          memset(thread_workspace, 0, sizeof(float) * k_width);
+
+          // Process all non-zeros in this row for the current tile
           for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
             int j = A1_crd[pA1];
-            int pB1 = j * B1_size + k;
-            accum += A_val[pA1] * B_val[pB1];
-          }
-          int pC1 = pC0 * C1_size + k;
-          C_values[pC1] = accum;
-        }
-        continue;
-      }
+            float a_val = A_val[pA1];
+            // Use 64-bit calculation to avoid integer overflow
+            size_t pB1_base = (size_t)j * (size_t)B1_size + (size_t)k_out;
 
-      // Choose tile size based on row density
-      int row_tile_size;
-      if (nnz_in_row > 100) {
-        // Dense rows: use smaller tiles for better cache utilization
-        row_tile_size = std::min(default_tile_size, 128);
-      } else {
-        // Other rows: use the default tile size
-        row_tile_size = default_tile_size;
-      }
-
-      // Process the row in tiles
-      for (int k_out = 0; k_out < B1_size; k_out += row_tile_size) {
-        int k_width = std::min(row_tile_size, B1_size - k_out);
-
-        // Clear the workspace for this tile
-        memset(thread_workspace, 0, sizeof(float) * k_width);
-
-        // Process all non-zeros in this row for the current tile
-        for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
-          int j = A1_crd[pA1];
-          float a_val = A_val[pA1];
-          int pB1_base = j * B1_size + k_out;
-
-          // Simple prefetch of next element's data if available
-          if (pA1 + 1 < pA1_end) {
-            __builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size + k_out], 0, 3);
-          }
-
-          // Full tile processing with manual unrolling for SIMD efficiency
-          if (SCORCH_LIKELY(k_width == row_tile_size)) {
-            int k_in = 0;
-
-            // Use aggressive unrolling in blocks of 16 for better vectorization
-            SCORCH_PRAGMA_UNROLL
-            for (; k_in + 15 < row_tile_size; k_in += 16) {
-              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
-              thread_workspace[k_in + 1] += a_val * B_val[pB1_base + k_in + 1];
-              thread_workspace[k_in + 2] += a_val * B_val[pB1_base + k_in + 2];
-              thread_workspace[k_in + 3] += a_val * B_val[pB1_base + k_in + 3];
-              thread_workspace[k_in + 4] += a_val * B_val[pB1_base + k_in + 4];
-              thread_workspace[k_in + 5] += a_val * B_val[pB1_base + k_in + 5];
-              thread_workspace[k_in + 6] += a_val * B_val[pB1_base + k_in + 6];
-              thread_workspace[k_in + 7] += a_val * B_val[pB1_base + k_in + 7];
-              thread_workspace[k_in + 8] += a_val * B_val[pB1_base + k_in + 8];
-              thread_workspace[k_in + 9] += a_val * B_val[pB1_base + k_in + 9];
-              thread_workspace[k_in + 10] += a_val * B_val[pB1_base + k_in + 10];
-              thread_workspace[k_in + 11] += a_val * B_val[pB1_base + k_in + 11];
-              thread_workspace[k_in + 12] += a_val * B_val[pB1_base + k_in + 12];
-              thread_workspace[k_in + 13] += a_val * B_val[pB1_base + k_in + 13];
-              thread_workspace[k_in + 14] += a_val * B_val[pB1_base + k_in + 14];
-              thread_workspace[k_in + 15] += a_val * B_val[pB1_base + k_in + 15];
+            // Simple prefetch of next element's data if available
+            if (pA1 + 1 < pA1_end) {
+              __builtin_prefetch(&B_val[(size_t)A1_crd[pA1 + 1] * (size_t)B1_size + (size_t)k_out], 0, 3);
             }
 
-            // Handle remaining elements
-            for (; k_in < row_tile_size; k_in++) {
-              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
-            }
-          } else {
-            // Handle partial tile (last tile in row)
-            for (int k_in = 0; k_in < k_width; k_in++) {
-              thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+            // Full tile processing with manual unrolling for SIMD efficiency
+            if (SCORCH_LIKELY(k_width == tile_to_use)) {
+              int k_in = 0;
+
+              // Use aggressive unrolling in blocks of 16 for better vectorization
+              SCORCH_PRAGMA_UNROLL
+              for (; k_in + 15 < tile_to_use; k_in += 16) {
+                thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+                thread_workspace[k_in + 1] += a_val * B_val[pB1_base + k_in + 1];
+                thread_workspace[k_in + 2] += a_val * B_val[pB1_base + k_in + 2];
+                thread_workspace[k_in + 3] += a_val * B_val[pB1_base + k_in + 3];
+                thread_workspace[k_in + 4] += a_val * B_val[pB1_base + k_in + 4];
+                thread_workspace[k_in + 5] += a_val * B_val[pB1_base + k_in + 5];
+                thread_workspace[k_in + 6] += a_val * B_val[pB1_base + k_in + 6];
+                thread_workspace[k_in + 7] += a_val * B_val[pB1_base + k_in + 7];
+                thread_workspace[k_in + 8] += a_val * B_val[pB1_base + k_in + 8];
+                thread_workspace[k_in + 9] += a_val * B_val[pB1_base + k_in + 9];
+                thread_workspace[k_in + 10] += a_val * B_val[pB1_base + k_in + 10];
+                thread_workspace[k_in + 11] += a_val * B_val[pB1_base + k_in + 11];
+                thread_workspace[k_in + 12] += a_val * B_val[pB1_base + k_in + 12];
+                thread_workspace[k_in + 13] += a_val * B_val[pB1_base + k_in + 13];
+                thread_workspace[k_in + 14] += a_val * B_val[pB1_base + k_in + 14];
+                thread_workspace[k_in + 15] += a_val * B_val[pB1_base + k_in + 15];
+              }
+
+              // Handle remaining elements
+              for (; k_in < tile_to_use; k_in++) {
+                thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+              }
+            } else {
+              // Handle partial tile (last tile in row)
+              for (int k_in = 0; k_in < k_width; k_in++) {
+                thread_workspace[k_in] += a_val * B_val[pB1_base + k_in];
+              }
             }
           }
-        }
 
-        // Write accumulated results directly to output matrix
-        int pC1_base = pC0 * C1_size + k_out;
-        int k_in = 0;
+          // Write accumulated results directly to output matrix
+          // Use 64-bit index calculation to avoid overflow
+          size_t pC1_base = (size_t)pC0 * (size_t)C1_size + (size_t)k_out;
+          int k_in = 0;
 
-        // Use block writes for better memory performance
-        for (; k_in + 15 < k_width; k_in += 16) {
-          C_values[pC1_base + k_in] = thread_workspace[k_in];
-          C_values[pC1_base + k_in + 1] = thread_workspace[k_in + 1];
-          C_values[pC1_base + k_in + 2] = thread_workspace[k_in + 2];
-          C_values[pC1_base + k_in + 3] = thread_workspace[k_in + 3];
-          C_values[pC1_base + k_in + 4] = thread_workspace[k_in + 4];
-          C_values[pC1_base + k_in + 5] = thread_workspace[k_in + 5];
-          C_values[pC1_base + k_in + 6] = thread_workspace[k_in + 6];
-          C_values[pC1_base + k_in + 7] = thread_workspace[k_in + 7];
-          C_values[pC1_base + k_in + 8] = thread_workspace[k_in + 8];
-          C_values[pC1_base + k_in + 9] = thread_workspace[k_in + 9];
-          C_values[pC1_base + k_in + 10] = thread_workspace[k_in + 10];
-          C_values[pC1_base + k_in + 11] = thread_workspace[k_in + 11];
-          C_values[pC1_base + k_in + 12] = thread_workspace[k_in + 12];
-          C_values[pC1_base + k_in + 13] = thread_workspace[k_in + 13];
-          C_values[pC1_base + k_in + 14] = thread_workspace[k_in + 14];
-          C_values[pC1_base + k_in + 15] = thread_workspace[k_in + 15];
-        }
+          // Use block writes for better memory performance
+          for (; k_in + 15 < k_width; k_in += 16) {
+            C_values[pC1_base + k_in] = thread_workspace[k_in];
+            C_values[pC1_base + k_in + 1] = thread_workspace[k_in + 1];
+            C_values[pC1_base + k_in + 2] = thread_workspace[k_in + 2];
+            C_values[pC1_base + k_in + 3] = thread_workspace[k_in + 3];
+            C_values[pC1_base + k_in + 4] = thread_workspace[k_in + 4];
+            C_values[pC1_base + k_in + 5] = thread_workspace[k_in + 5];
+            C_values[pC1_base + k_in + 6] = thread_workspace[k_in + 6];
+            C_values[pC1_base + k_in + 7] = thread_workspace[k_in + 7];
+            C_values[pC1_base + k_in + 8] = thread_workspace[k_in + 8];
+            C_values[pC1_base + k_in + 9] = thread_workspace[k_in + 9];
+            C_values[pC1_base + k_in + 10] = thread_workspace[k_in + 10];
+            C_values[pC1_base + k_in + 11] = thread_workspace[k_in + 11];
+            C_values[pC1_base + k_in + 12] = thread_workspace[k_in + 12];
+            C_values[pC1_base + k_in + 13] = thread_workspace[k_in + 13];
+            C_values[pC1_base + k_in + 14] = thread_workspace[k_in + 14];
+            C_values[pC1_base + k_in + 15] = thread_workspace[k_in + 15];
+          }
 
-        // Handle remaining elements
-        for (; k_in < k_width; k_in++) {
-          C_values[pC1_base + k_in] = thread_workspace[k_in];
+          // Handle remaining elements
+          for (; k_in < k_width; k_in++) {
+            C_values[pC1_base + k_in] = thread_workspace[k_in];
+          }
         }
       }
+
+      // Clean up thread-local workspace safely
+      #if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200112L)
+      free(thread_workspace);
+      #else
+      free(thread_workspace);
+      #endif
     }
-
-    // Clean up thread-local workspace
-    free(thread_workspace);
   }
 
   // Restore default thread count
@@ -738,7 +794,7 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
     { free(ptr); }
   };
   torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
