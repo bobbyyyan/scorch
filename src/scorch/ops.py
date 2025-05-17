@@ -121,7 +121,6 @@ def spmv(
     if "time_dict" in kwargs:
         time_dict = kwargs["time_dict"]
         time_dict["eval_time"] = eval_time
-    # m
 
     result = STensor(
         shape=result_shape,
@@ -263,7 +262,7 @@ def matmul(
             a = STensor.from_torch(a)
             b = STensor.from_torch(b)
         else:
-            return torch.matmul(a, b)
+            return STensor.from_torch(torch.matmul(a, b))
 
     if isinstance(a, torch.Tensor):
         a = STensor.from_torch(a)
@@ -319,9 +318,6 @@ def matmul(
         )
     else:
         result = einsum("ij,jk->ik", a, b, **kwargs)
-
-    if isinstance(result, STensor) and result.format.is_dense():
-        result = result.to_torch()
 
     return result
 
