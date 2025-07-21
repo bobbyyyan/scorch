@@ -407,3 +407,4 @@ examples/sparse_transformer/torch_sparse_transformer v3.py
 examples/kernels/download_all_ss-parallel2.py
 examples/kernels/download_all_ss-parallel.py
 examples/sparse_autoencoder/torch_sparse_transformer.py
+examples/kernels/print_all_ss.py

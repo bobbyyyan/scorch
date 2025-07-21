@@ -10,6 +10,11 @@ namespace scorch {
          pybind11::arg("A_mode_indices"), pybind11::arg("A_values"),
          pybind11::arg("B_shape"), pybind11::arg("B_mode_indices"),
          pybind11::arg("B_values"), pybind11::arg("tile_size") = 32);
+    m.def("spmm_csr_float_tiled_i_k", &spmm_csr_float_tiled_i_k, "Sparse matrix multiplication with i and k tiling (CSR)",
+         pybind11::arg("result_shape"), pybind11::arg("A_shape"),
+         pybind11::arg("A_mode_indices"), pybind11::arg("A_values"),
+         pybind11::arg("B_shape"), pybind11::arg("B_mode_indices"),
+         pybind11::arg("B_values"), pybind11::arg("i_tile_size") = 16, pybind11::arg("k_tile_size") = 32);
     m.def("spmm_csr_float_optimized", &spmm_csr_float_optimized, "Optimized sparse matrix multiplication (CSR)",
          pybind11::arg("result_shape"), pybind11::arg("A_shape"),
          pybind11::arg("A_mode_indices"), pybind11::arg("A_values"),
