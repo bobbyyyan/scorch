@@ -493,21 +493,40 @@ def einsum(
 
     # print("CIN:\n", cin_stmt)
 
+    # Timing: autoscheduling phase
+    time_dict = kwargs.get("time_dict", {})
+
+    start_time_autoschedule = time.time()
     cin_stmt = Scheduler.auto_schedule(cin_stmt)
+    end_time_autoschedule = time.time()
+    time_dict["autoschedule_time"] = end_time_autoschedule - start_time_autoschedule
 
     # print("Auto-scheduled CIN:\n", cin_stmt)
 
     if str(cin_stmt) in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
         module = _kernel_cache[str(cin_stmt)]
+        # Mark that cache was used
+        time_dict["cache_hit"] = True
+        time_dict["cin_lowering_time"] = 0
+        time_dict["llir_lowering_time"] = 0
+        time_dict["cpp_compilation_time"] = 0
     else:
+        time_dict["cache_hit"] = False
+
+        # Timing: CIN lowering
+        start_time_cin_lowering = time.time()
         lowerer = CINLowerer()
-
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        end_time_cin_lowering = time.time()
+        time_dict["cin_lowering_time"] = end_time_cin_lowering - start_time_cin_lowering
 
+        # Timing: LLIR lowering (code generation)
+        start_time_llir_lowering = time.time()
         llir_lowerer = LLIRLowerer()
-
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        end_time_llir_lowering = time.time()
+        time_dict["llir_lowering_time"] = end_time_llir_lowering - start_time_llir_lowering
 
         # print("\n\n", cpp_code)
 
@@ -515,12 +534,16 @@ def einsum(
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
             header_cpp_code = f.read()
 
+        # Timing: C++ compilation
+        start_time_cpp_compilation = time.time()
         module = torch.utils.cpp_extension.load_inline(
             name="kernel",
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=["-O3"],
         )
+        end_time_cpp_compilation = time.time()
+        time_dict["cpp_compilation_time"] = end_time_cpp_compilation - start_time_cpp_compilation
 
         _kernel_cache[str(cin_stmt)] = module
 
@@ -565,9 +588,7 @@ def einsum(
         value=result_cpp.storage.value,
     )
 
-    if "time_dict" in kwargs:
-        time_dict = kwargs["time_dict"]
-        time_dict["eval_time"] = eval_time
+    time_dict["eval_time"] = eval_time
 
     return result
 
