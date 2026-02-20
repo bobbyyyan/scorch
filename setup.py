@@ -1,16 +1,43 @@
+import os
 import platform
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 # Handle OpenMP flags for different platforms
+extra_compile_args = [
+    "-O3",
+    "-march=native",
+    "-ffast-math",
+    "-funroll-loops",
+]
+extra_link_args = []
+
 if platform.system() == "Darwin":
-    # macOS: use Xpreprocessor flag and link against Homebrew libomp
-    openmp_compile_args = ["-Xpreprocessor", "-fopenmp"]
-    openmp_link_args = ["-lomp", "-L/opt/homebrew/opt/libomp/lib"]
+    # macOS: use Xpreprocessor flag for OpenMP
+    extra_compile_args.extend(["-Xpreprocessor", "-fopenmp"])
+
+    # Check for libomp in common locations
+    libomp_paths = [
+        "/opt/homebrew/opt/libomp",  # Apple Silicon Homebrew
+        "/usr/local/opt/libomp",      # Intel Mac Homebrew
+    ]
+
+    libomp_path = None
+    for path in libomp_paths:
+        if os.path.exists(path):
+            libomp_path = path
+            break
+
+    if libomp_path:
+        extra_compile_args.append(f"-I{libomp_path}/include")
+        extra_link_args.extend(["-lomp", f"-L{libomp_path}/lib"])
+    else:
+        # Fall back to system paths, libomp may be installed elsewhere
+        extra_link_args.append("-lomp")
 else:
     # Linux: standard OpenMP support
-    openmp_compile_args = ["-fopenmp"]
-    openmp_link_args = ["-fopenmp"]
+    extra_compile_args.append("-fopenmp")
+    extra_link_args.append("-fopenmp")
 
 ext_modules = [
     CppExtension(
@@ -18,19 +45,8 @@ ext_modules = [
         [
             "csrc/ops.cpp",
         ],
-        extra_compile_args=[
-            "-O3",
-            "-march=native",
-            "-ffast-math",
-            # "-fno-signed-zeros",
-            *openmp_compile_args,
-            # "-funsafe-math-optimizations",
-            # "-freciprocal-math",
-            # "-ftree-vectorize",
-            # "-flto",
-            "-funroll-loops",
-        ],
-        extra_link_args=openmp_link_args,
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
     )
 ]
 
