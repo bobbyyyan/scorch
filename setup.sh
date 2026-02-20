@@ -125,6 +125,11 @@ else
     ENV_ACTIVATE_CMD="source venv/bin/activate"
 fi
 
+# Upgrade pip and setuptools to ensure PEP 660 editable install support
+echo
+echo "Upgrading pip and setuptools..."
+pip install --upgrade pip setuptools
+
 # Install scorch in editable/develop mode
 # Use --no-build-isolation since setup.py imports torch at the top level
 echo
