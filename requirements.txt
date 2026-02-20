@@ -1,6 +1,7 @@
 numpy
 scipy
 torch
+ninja
 
 # Development
 black
