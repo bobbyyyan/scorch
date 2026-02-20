@@ -1,3 +1,4 @@
+import glob
 import platform
 from collections import defaultdict, deque
 from itertools import chain
@@ -80,8 +81,16 @@ def get_extra_ldflags() -> List[str]:
             else:
                 ldflags.append("-lomp")
     else:
-        # Linux: standard OpenMP support
-        ldflags.append("-fopenmp")
+        # Linux: link against PyTorch's bundled libgomp to avoid
+        # dual-runtime conflicts (PyTorch's copy vs system copy)
+        torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
+        gomp_libs = glob.glob(os.path.join(torch_lib_path, "libgomp*.so*"))
+
+        if gomp_libs:
+            ldflags.extend([gomp_libs[0], f"-Wl,-rpath,{torch_lib_path}"])
+        else:
+            # Fallback: use system OpenMP (no bundled libgomp = no conflict)
+            ldflags.append("-fopenmp")
 
     return ldflags
 while not (PROJECT_ROOT_DIR / "setup.py").exists():

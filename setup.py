@@ -1,3 +1,4 @@
+import glob
 import os
 import platform
 import torch
@@ -47,7 +48,12 @@ if platform.system() == "Darwin":
 else:
     # Linux: standard OpenMP support
     extra_compile_args.append("-fopenmp")
-    extra_link_args.append("-fopenmp")
+    torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
+    gomp_libs = glob.glob(os.path.join(torch_lib_path, "libgomp*.so*"))
+    if gomp_libs:
+        extra_link_args.extend([gomp_libs[0], f"-Wl,-rpath,{torch_lib_path}"])
+    else:
+        extra_link_args.append("-fopenmp")
 
 ext_modules = [
     CppExtension(
