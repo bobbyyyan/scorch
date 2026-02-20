@@ -22,7 +22,7 @@ from .compiler.scheduler import Scheduler
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorIndex
 from .stensor import STensor
-from .utils import parse_format, topo_sort_characters, load_to_kernel_cache
+from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
@@ -98,7 +98,7 @@ def spmv(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=get_extra_cflags(),
     )
     # end_time = time.time()
 
@@ -208,7 +208,7 @@ def matmul_wksp(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=get_extra_cflags(),
     )
     # end_time = time.time()
 
@@ -519,7 +519,7 @@ def einsum(
             name="kernel",
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
-            extra_cflags=["-O3"],
+            extra_cflags=get_extra_cflags(),
         )
 
         _kernel_cache[str(cin_stmt)] = module
@@ -598,7 +598,7 @@ def lower_and_exec_cin(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=get_extra_cflags(),
     )
 
     module_args: List[Any] = [result_shape]

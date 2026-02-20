@@ -9,7 +9,7 @@ from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorStorage, TensorIndex, TensorStorageView
-from .utils import PROJECT_ROOT_DIR, parse_format
+from .utils import PROJECT_ROOT_DIR, parse_format, get_extra_cflags
 
 
 class Window(object):
@@ -221,7 +221,7 @@ class STensor(torch.nn.Module):
             name="kernel",
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
-            extra_cflags=["-O3"],
+            extra_cflags=get_extra_cflags(),
         )
 
         result_cpp = module.evaluate(
@@ -536,7 +536,7 @@ class STensor(torch.nn.Module):
             name="kernel",
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
-            extra_cflags=["-O3"],
+            extra_cflags=get_extra_cflags(),
         )
 
         result_cpp = module.evaluate(
@@ -671,7 +671,7 @@ class STensor(torch.nn.Module):
                 name="kernel",
                 cpp_sources=[header_cpp_code, cpp_code],
                 functions=["evaluate"],
-                extra_cflags=["-O3"],
+                extra_cflags=get_extra_cflags(),
             )
 
             result_cpp = module.evaluate(

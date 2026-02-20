@@ -43,6 +43,12 @@ pip install -r requirements.txt
 # Use setup.py develop since setup.py imports torch at the top level
 echo
 echo "Installing scorch in develop mode..."
+
+# On macOS, set C++ include path to find standard library headers
+if [[ "$(uname)" == "Darwin" ]]; then
+    export CPLUS_INCLUDE_PATH="/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
+fi
+
 python setup.py develop
 
 # Verify installation

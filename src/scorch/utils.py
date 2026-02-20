@@ -1,3 +1,4 @@
+import platform
 from collections import defaultdict, deque
 from itertools import chain
 from pathlib import Path
@@ -10,6 +11,29 @@ from .compiler.llir import DataType
 from .format import TensorFormat, LevelFormat, LevelType
 
 PROJECT_ROOT_DIR = Path(__file__)
+
+
+def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
+    """Get platform-specific extra compiler flags for torch cpp_extension.
+
+    On macOS, adds the C++ standard library include path needed for compilation.
+
+    Args:
+        base_flags: Base compiler flags to include. Defaults to ["-O3"].
+
+    Returns:
+        List of compiler flags including platform-specific additions.
+    """
+    if base_flags is None:
+        base_flags = ["-O3"]
+    flags = list(base_flags)
+
+    if platform.system() == "Darwin":
+        # macOS needs explicit C++ stdlib include path for torch JIT compilation
+        sdk_path = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+        flags.append(f"-isystem{sdk_path}/usr/include/c++/v1")
+
+    return flags
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
@@ -43,7 +67,7 @@ def load_to_kernel_cache(
         name=kernel_name,
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"],
+        extra_cflags=get_extra_cflags(["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"]),
         build_directory=PROJECT_ROOT_DIR / "build",
     )
     end_time = time.time()

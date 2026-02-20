@@ -1,5 +1,16 @@
+import platform
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CppExtension
+
+# Handle OpenMP flags for different platforms
+if platform.system() == "Darwin":
+    # macOS: use Xpreprocessor flag and link against Homebrew libomp
+    openmp_compile_args = ["-Xpreprocessor", "-fopenmp"]
+    openmp_link_args = ["-lomp", "-L/opt/homebrew/opt/libomp/lib"]
+else:
+    # Linux: standard OpenMP support
+    openmp_compile_args = ["-fopenmp"]
+    openmp_link_args = ["-fopenmp"]
 
 ext_modules = [
     CppExtension(
@@ -12,13 +23,14 @@ ext_modules = [
             "-march=native",
             "-ffast-math",
             # "-fno-signed-zeros",
-            "-fopenmp",
+            *openmp_compile_args,
             # "-funsafe-math-optimizations",
             # "-freciprocal-math",
             # "-ftree-vectorize",
             # "-flto",
             "-funroll-loops",
         ],
+        extra_link_args=openmp_link_args,
     )
 ]
 
