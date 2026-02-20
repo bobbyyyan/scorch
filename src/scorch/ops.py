@@ -22,7 +22,7 @@ from .compiler.scheduler import Scheduler
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorIndex
 from .stensor import STensor
-from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags
+from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags, get_extra_ldflags
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
@@ -99,6 +99,7 @@ def spmv(
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=get_extra_cflags(),
+        extra_ldflags=get_extra_ldflags(),
     )
     # end_time = time.time()
 
@@ -209,6 +210,7 @@ def matmul_wksp(
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=get_extra_cflags(),
+        extra_ldflags=get_extra_ldflags(),
     )
     # end_time = time.time()
 
@@ -599,6 +601,7 @@ def lower_and_exec_cin(
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=get_extra_cflags(),
+        extra_ldflags=get_extra_ldflags(),
     )
 
     module_args: List[Any] = [result_shape]

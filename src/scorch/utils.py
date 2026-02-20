@@ -13,6 +13,8 @@ from .format import TensorFormat, LevelFormat, LevelType
 PROJECT_ROOT_DIR = Path(__file__)
 
 
+import os
+
 def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
     """Get platform-specific extra compiler flags for torch cpp_extension.
 
@@ -33,7 +35,55 @@ def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
         sdk_path = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
         flags.append(f"-isystem{sdk_path}/usr/include/c++/v1")
 
+        # OpenMP flags for macOS - use PyTorch's bundled libomp to avoid runtime conflicts
+        flags.extend(["-Xpreprocessor", "-fopenmp"])
+
+        # Add OpenMP header path from Homebrew (headers only)
+        for header_path in ["/opt/homebrew/opt/libomp/include", "/usr/local/opt/libomp/include"]:
+            if os.path.exists(header_path):
+                flags.append(f"-I{header_path}")
+                break
+    else:
+        # Linux: standard OpenMP support
+        flags.append("-fopenmp")
+
     return flags
+
+
+def get_extra_ldflags() -> List[str]:
+    """Get platform-specific extra linker flags for torch cpp_extension.
+
+    On macOS, links against PyTorch's bundled libomp to avoid runtime conflicts
+    with Homebrew's libomp.
+
+    Returns:
+        List of linker flags.
+    """
+    ldflags = []
+
+    if platform.system() == "Darwin":
+        # Link against PyTorch's bundled libomp to avoid runtime conflicts
+        torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
+        torch_omp = os.path.join(torch_lib_path, "libomp.dylib")
+
+        if os.path.exists(torch_omp):
+            # Use full path to avoid linker finding Homebrew's libomp
+            ldflags.append(torch_omp)
+            # Add rpath so it finds the right library at runtime
+            ldflags.append(f"-Wl,-rpath,{torch_lib_path}")
+        else:
+            # Fall back to Homebrew's libomp
+            for lib_path in ["/opt/homebrew/opt/libomp/lib", "/usr/local/opt/libomp/lib"]:
+                if os.path.exists(lib_path):
+                    ldflags.extend(["-lomp", f"-L{lib_path}"])
+                    break
+            else:
+                ldflags.append("-lomp")
+    else:
+        # Linux: standard OpenMP support
+        ldflags.append("-fopenmp")
+
+    return ldflags
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
@@ -68,6 +118,7 @@ def load_to_kernel_cache(
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=get_extra_cflags(["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"]),
+        extra_ldflags=get_extra_ldflags(),
         build_directory=PROJECT_ROOT_DIR / "build",
     )
     end_time = time.time()

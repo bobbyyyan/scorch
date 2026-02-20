@@ -41,7 +41,6 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
     for (int k_out = 0; k_out < residual_k_start; k_out += kTile_k) {
       // Initialize workspaces
       float accum_c[kTile_k] = {};
-      // float *accum_c = new float[kTile_k]();
 
       // Initialize iterators
       int pA1_end = A1_pos[i + 1];
@@ -66,8 +65,6 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
         int pC1 = pC0 * C1_size + k;
         C_values[pC1] += accum_c[k_in];
       }
-
-      // delete[] accum_c;
     }
   }
 
@@ -75,7 +72,6 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
     int tile_k_width = B1_size - residual_k_start;
 
     #pragma omp parallel for
-
     for (int i = 0; i < A0_size; i++) {
       int pC0 = i;
 
@@ -100,9 +96,7 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
   }
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void *ptr) {
-    { free(ptr); }
-  };
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
   torch::Tensor C_values_torch = torch::from_blob(
       C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
@@ -162,8 +156,6 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
       int pC0 = i;
 
       float wksp[kTile_k] = {};
-      // Initialize workspaces
-      // float* wksp = new float[kTile_k]();
 
       for (int pA1 = pA0; pA1 < pA1_end; pA1++) {
         // Resolve coordinates
@@ -187,8 +179,6 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
         int pC1 = pC0 * C1_size + k;
         C_values[pC1] += wksp[k_in];
       }
-
-      // delete[] wksp;
     }
   }
 
@@ -226,12 +216,13 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
         // Lower consumer CIN
         int pC1 = pC0 * C1_size + k;
         C_values[pC1] += wksp[0];
+        delete[] wksp;
       }
     }
   }
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void* ptr) {{ free(ptr); }};
+  auto C_values_deleter = [](void* ptr) { free(ptr); };
   torch::Tensor C_values_torch = torch::from_blob(C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
