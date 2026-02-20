@@ -51,10 +51,10 @@ if command -v conda &> /dev/null; then
     echo "Activating conda environment..."
     conda activate scorch
 
-    # Install PyTorch via conda for better macOS compatibility
+    # Install PyTorch and pybind11 via conda for better macOS compatibility
     echo
-    echo "Installing PyTorch via conda..."
-    conda install -y pytorch -c pytorch
+    echo "Installing PyTorch and pybind11 via conda..."
+    conda install -y pytorch pybind11 -c pytorch
 
     # Install other dependencies via pip
     # Note: numpy<2 required for compatibility with conda pytorch
