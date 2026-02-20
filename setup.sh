@@ -34,12 +34,18 @@ if command -v conda &> /dev/null; then
     # Initialize conda for this shell
     eval "$(conda shell.bash hook)"
 
-    # Create conda environment if it doesn't exist
-    if ! conda env list | grep -q "^scorch "; then
-        echo "Creating conda environment 'scorch'..."
-        # Use Python 3.11 which has best PyTorch compatibility
-        conda create -y -n scorch python=3.11
+    # Backup existing scorch environment if it exists
+    if conda env list | grep -q "^scorch "; then
+        BACKUP_NAME="scorch_backup_$(date +%Y%m%d_%H%M%S)"
+        echo "Existing 'scorch' environment found. Backing up to '$BACKUP_NAME'..."
+        conda create -n "$BACKUP_NAME" --clone scorch -y
+        conda env remove -n scorch -y
     fi
+
+    # Create fresh conda environment
+    echo "Creating conda environment 'scorch'..."
+    # Use Python 3.11 which has best PyTorch compatibility
+    conda create -y -n scorch python=3.11
 
     # Activate conda environment
     echo "Activating conda environment..."
