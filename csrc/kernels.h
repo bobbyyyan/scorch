@@ -23,7 +23,7 @@ Tensor spmspm_csr(
 
   // Init result level indices
   cvector<int> C1_pos(A0_size + 1);
-  memset(C1_pos.data(), 0, C1_pos.size() * sizeof(int));
+  memset(C1_pos.data(), 0, (A0_size + 1) * sizeof(int));
   cvector<int> C1_crd;
   cvector<scalar_t> C_values;
 
