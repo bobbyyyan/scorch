@@ -3,6 +3,7 @@ import pprint
 import time
 from itertools import product
 
+import pytest
 import torch
 
 from scorch import STensor, einsum, utils
@@ -1062,7 +1063,8 @@ def test_spmm_dd_oo_dd_time():
     print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
 
 
-def test_matmul_time():
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_matmul_time(use_cache):
     """
     Compare speed of torch and scorch matmul
     Use random tensors
@@ -1084,7 +1086,7 @@ def test_matmul_time():
     tensor_b_scorch = STensor.from_torch(random_tensor_b, "B").to_sparse()
 
     start_time = time.time()
-    scorch_result = matmul(tensor_a_scorch, tensor_b_scorch, format="ds")
+    scorch_result = matmul(tensor_a_scorch, tensor_b_scorch, format="ds", use_cache=use_cache)
     scorch_time = time.time() - start_time
 
     print(f"torch time: {torch_time}")
@@ -1108,7 +1110,8 @@ def test_matmul_dd_dd_dd():
     assert result_torch.allclose(scorch_result_torch)
 
 
-def test_matmul_ds_ds_ds():
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_matmul_ds_ds_ds(use_cache):
     n = 64
     tensor_a_torch = torch.rand(n, n)
     tensor_b_torch = torch.rand(n, n)
@@ -1116,7 +1119,7 @@ def test_matmul_ds_ds_ds():
     a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
 
-    result = matmul(a_sparse, b_sparse, output_format="ds")
+    result = matmul(a_sparse, b_sparse, output_format="ds", use_cache=use_cache)
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
     assert torch.allclose(result.to_torch(), result_torch)
@@ -1707,7 +1710,8 @@ def test_spmm_ss_ds_ds():
     ]
 
 
-def test_matmul_dd_ds_dd():
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_matmul_dd_ds_dd(use_cache):
     n = 64
     tensor_a_torch = torch.rand(n, n)
     tensor_b_torch = torch.rand(n, n)
@@ -1715,7 +1719,7 @@ def test_matmul_dd_ds_dd():
     a_scorch = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
     b_scorch = STensor.from_torch(tensor_b_torch, "B")
 
-    result = matmul(a_scorch, b_scorch, format="dd")
+    result = matmul(a_scorch, b_scorch, format="dd", use_cache=use_cache)
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 

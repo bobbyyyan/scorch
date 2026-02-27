@@ -1,10 +1,12 @@
+import pytest
 import torch
 
 import scorch
 from scorch import STensor, einsum
 
 
-def test_spmm_oo_dd_fmtinf():
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_spmm_oo_dd_fmtinf(use_cache):
     n = 64
     tensor_a_torch = torch.rand(n, n)
     tensor_b_torch = torch.rand(n, n)
@@ -13,7 +15,7 @@ def test_spmm_oo_dd_fmtinf():
     b_scorch = STensor.from_torch(tensor_b_torch, "B").to_dense()
 
     # result = einsum("ik,kj->ij", a_scorch, b_scorch)
-    result = scorch.matmul(a_scorch, b_scorch)
+    result = scorch.matmul(a_scorch, b_scorch, use_cache=use_cache)
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
@@ -25,7 +27,8 @@ def test_spmm_oo_dd_fmtinf():
         raise ValueError(f"Unexpected result type: {type(result)}")
 
 
-def test_spmm_ds_dd_fmtinf():
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_spmm_ds_dd_fmtinf(use_cache):
     n = 64
     tensor_a_torch = torch.rand(n, n)
     tensor_b_torch = torch.rand(n, n)
@@ -34,7 +37,7 @@ def test_spmm_ds_dd_fmtinf():
     b_scorch = STensor.from_torch(tensor_b_torch, "B").to_dense()
 
     # result = einsum("ik,kj->ij", a_scorch, b_scorch)
-    result = scorch.matmul(a_scorch, b_scorch)
+    result = scorch.matmul(a_scorch, b_scorch, use_cache=use_cache)
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
