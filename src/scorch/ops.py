@@ -465,33 +465,24 @@ def einsum(
         name=tensor_names_available.pop(0), fmt=output_format, dtype=output_tensor_dtype
     )
 
-    # Generate the python code for constructing the TensorAccess's, and TensorAssign and execute it
+    # Build RHS expression: product of all tensor accesses
     assert index_var_dict, "index_var_dict is empty"
-    rhs = ""
+    rhs_expr = None
     for i, tensor_var in enumerate(tensor_vars):
-        inside = ", ".join(
-            [f'index_var_dict["{index_str}"]' for index_str in input_index_strs[i]]
-        )
-        rhs += f"tensor_vars[{i}][{inside}]"
-        if i < len(tensor_vars) - 1:
-            rhs += " * "
-    lhs_inside = ", ".join(
-        [f'index_var_dict["{index_str}"]' for index_str in result_index_strs]
-    )
+        indices = [index_var_dict[s] for s in input_index_strs[i]]
+        access = tensor_var[indices[0]] if len(indices) == 1 else tensor_var[tuple(indices)]
+        rhs_expr = access if rhs_expr is None else rhs_expr * access
+
+    # Build LHS access and create assignment
     assert result_tensor_var is not None, "result_tensor_var is not defined"
-    code = f"result_tensor_var[{lhs_inside}] = {rhs}"
+    lhs_indices = [index_var_dict[s] for s in result_index_strs]
+    lhs_key = lhs_indices[0] if len(lhs_indices) == 1 else tuple(lhs_indices)
+    result_tensor_var[lhs_key] = rhs_expr
 
-    exec(code)
-
-    # print("result_tensor_var._assignment:", result_tensor_var._assignment)
-
-    # Generate the python code for constructing the ForAll's and execute it
-    rhs = "result_tensor_var._assignment"
-    assert ForAll is not None, "ForAll is not imported"
-    for i, index_str in enumerate(index_strs_by_schedule[::-1]):
-        rhs = f'ForAll(index_var_dict["{index_str}"], {rhs})'
-
-    cin_stmt = eval(rhs)
+    # Wrap in nested ForAll loops (outermost first in schedule, built inside-out)
+    cin_stmt = result_tensor_var._assignment
+    for index_str in reversed(index_strs_by_schedule):
+        cin_stmt = ForAll(index_var_dict[index_str], cin_stmt)
 
     # print("CIN:\n", cin_stmt)
 
