@@ -11,6 +11,30 @@ class LevelType(Enum):
     COORDINATE = "o"
 
 
+# Canonical mapping from string aliases to LevelType.
+_STR_TO_LEVEL_TYPE = {
+    "dense": LevelType.DENSE,
+    "d": LevelType.DENSE,
+    "compressed": LevelType.COMPRESSED,
+    "sparse": LevelType.COMPRESSED,
+    "c": LevelType.COMPRESSED,
+    "s": LevelType.COMPRESSED,
+    "singleton": LevelType.SINGLETON,
+    "single": LevelType.SINGLETON,
+    "coordinate": LevelType.COORDINATE,
+    "coord": LevelType.COORDINATE,
+    "o": LevelType.COORDINATE,
+}
+
+
+def _parse_level_type(s: str) -> LevelType:
+    """Convert a string alias to a LevelType, or raise ValueError."""
+    try:
+        return _STR_TO_LEVEL_TYPE[s]
+    except KeyError:
+        raise ValueError(f"Invalid format string: {s}")
+
+
 class LevelFormat(object):
     """
     A level format has a type: compressed, dense, or singleton
@@ -20,22 +44,13 @@ class LevelFormat(object):
     _mode: LevelType
     _bit_width: Optional[int]
 
-    # For the constructor, mode may be a string or a LevelType
-    # if mode is a string, then we need to convert it to a LevelType
-
     def __init__(
         self,
         mode: Union[str, LevelType],
         bit_width: Optional[int] = None,
     ):
         if isinstance(mode, str):
-            # convert string to LevelType
-            if mode == "dense":
-                mode = LevelType.DENSE
-            elif mode == "compressed":
-                mode = LevelType.COMPRESSED
-            elif mode == "singleton":
-                mode = LevelType.SINGLETON
+            mode = _parse_level_type(mode)
         assert isinstance(mode, LevelType)
         self._mode = mode
         self._bit_width = bit_width
@@ -76,8 +91,6 @@ class TensorFormat(object):
     # TODO: extend to support other fill values
     _fill_value: Optional[float] = 0.0
 
-    # Initializer takes in a single LevelFormat or a list of LevelFormats
-    # or None (for a 0-order tensor/scalar)
     def __init__(
         self,
         level_formats: Optional[
@@ -88,31 +101,13 @@ class TensorFormat(object):
             self._level_formats = []
         elif isinstance(level_formats, LevelFormat):
             self._level_formats = [level_formats]
-        elif isinstance(level_formats, str):
-            level_formats = list(level_formats)
-
-        if isinstance(level_formats, list):
-            self._level_formats = []
-            for level_format in level_formats:
-                if isinstance(level_format, str):
-                    if level_format in ["dense", "d"]:
-                        self._level_formats.append(LevelFormat(mode=LevelType.DENSE))
-                    elif level_format in ["compressed", "sparse", "c", "s"]:
-                        self._level_formats.append(
-                            LevelFormat(mode=LevelType.COMPRESSED)
-                        )
-                    elif level_format in ["singleton", "single", "s"]:
-                        self._level_formats.append(
-                            LevelFormat(mode=LevelType.SINGLETON)
-                        )
-                    elif level_format in ["coordinate", "coord", "o"]:
-                        self._level_formats.append(
-                            LevelFormat(mode=LevelType.COORDINATE)
-                        )
-                    else:
-                        raise ValueError(f"Invalid format string: {level_format}")
-                elif isinstance(level_format, LevelFormat):
-                    self._level_formats.append(level_format)
+        else:
+            if isinstance(level_formats, str):
+                level_formats = list(level_formats)
+            self._level_formats = [
+                lf if isinstance(lf, LevelFormat) else LevelFormat(mode=_parse_level_type(lf))
+                for lf in level_formats
+            ]
 
     def get_level_formats(self) -> List[LevelFormat]:
         assert self._level_formats is not None, "level_formats is None"

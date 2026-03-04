@@ -9,7 +9,7 @@ import torch
 from torch.utils.cpp_extension import load_inline, load
 
 from .compiler.llir import DataType
-from .format import TensorFormat, LevelFormat, LevelType
+from .format import TensorFormat
 
 PROJECT_ROOT_DIR = Path(__file__)
 
@@ -194,26 +194,15 @@ def parse_format(fmt: Union[List[str], str, TensorFormat]) -> TensorFormat:
     """Convert a list of format strings to a TensorFormat.
 
     Args:
-        fmt (List[str]): List of format strings.
+        fmt: A TensorFormat (returned as-is), a string like "ds", or a list
+            of format strings like ["dense", "compressed"].
 
     Returns:
         TensorFormat: TensorFormat object.
     """
     if isinstance(fmt, TensorFormat):
         return fmt
-    if isinstance(fmt, str):
-        fmt = list(fmt)
-    level_formats = []
-    for format_str in fmt:
-        if format_str in ["dense", "d"]:
-            level_formats.append(LevelFormat(mode=LevelType.DENSE))
-        elif format_str in ["compressed", "sparse", "c", "s"]:
-            level_formats.append(LevelFormat(mode=LevelType.COMPRESSED))
-        elif format_str in ["coordinate", "coord", "o"]:
-            level_formats.append(LevelFormat(mode=LevelType.COORDINATE))
-        else:
-            raise ValueError(f"Invalid format string: {format_str}")
-    return TensorFormat(level_formats=level_formats)
+    return TensorFormat(level_formats=fmt)
 
 
 PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE: Dict[torch.dtype, str] = {
