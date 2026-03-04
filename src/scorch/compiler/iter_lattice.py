@@ -24,7 +24,7 @@ from .cin import (
     Where,
 )
 from ..format import LevelType
-from .iterator import ModeIterator
+from .iterator import ModeIterator, IteratorBase
 
 
 @dataclass(frozen=False)
@@ -36,8 +36,8 @@ class LatticePoint:
 
     sparse_tensor_accesses: List[TensorAccess] = field(default_factory=list)
     dense_tensor_accesses: List[TensorAccess] = field(default_factory=list)
-    iterators: Optional[List[ModeIterator]] = field(default_factory=list)
-    dense_iterators: List[ModeIterator] = field(default_factory=list)
+    iterators: Optional[List[IteratorBase]] = field(default_factory=list)
+    dense_iterators: List[IteratorBase] = field(default_factory=list)
     child_lattice_points: List["LatticePoint"] = field(default_factory=list)
     parent_lattice_point: Optional["LatticePoint"] = None  # type: ignore
     index_var: Optional[IndexVar] = None
@@ -93,7 +93,7 @@ class LatticePoint:
 
     def set_index_var_and_gen_iterators(
         self, index_var: IndexVar
-    ) -> List[ModeIterator]:
+    ) -> List[IteratorBase]:
         self.set_index_var(index_var)
 
         if index_var.has_parent:
@@ -209,7 +209,7 @@ class LatticePoint:
                     var=lattice.dense_index_var_llir,
                 )
 
-        it: ModeIterator = iterators[0]
+        it: IteratorBase = iterators[0]
         next_level = it.level + 1
         tensor_var = it.tensor_var
 
@@ -298,7 +298,7 @@ class LatticePoint:
             # then advance by setting
             # p{tensor_name}{current_level}
             # to p{tensor_name}{next_level}_end
-            iterator: ModeIterator = iterators[0]
+            iterator: IteratorBase = iterators[0]
             next_level = iterator.level + 1
             tensor_var = iterator.tensor_var
             assert tensor_var is not None, "Tensor var not set"
@@ -328,7 +328,7 @@ class LatticePoint:
 
         return stmts
 
-    def get_iterators(self) -> Sequence[ModeIterator]:
+    def get_iterators(self) -> Sequence[IteratorBase]:
         assert self.iterators is not None, "Iterators not set"
         return self.iterators
 
