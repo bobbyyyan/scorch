@@ -23,6 +23,423 @@ from ..format import LevelType
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
 
+class ResultTensorAssembler:
+    """Assembles LLIR statements for result tensor initialization and final construction."""
+
+    def __init__(self, tensor_var: TensorVar):
+        self.tensor_var = tensor_var
+        self.name = tensor_var.get_name()
+        self.level_types = tensor_var.get_level_types()
+        self.is_dense = tensor_var.is_dense()
+        self.dtype = tensor_var.dtype
+
+    def emit_value_array_init(self) -> List[llir.Stmt]:
+        """Emit value array initialization: dense malloc+memset or sparse cvector decl."""
+        stmts: List[llir.Stmt] = []
+        if self.is_dense:
+            # capacity = product of all dimension sizes
+            res_capacity_expr: llir.Expr = llir.Var(
+                name=f"{self.name}0_size",
+                type=llir.DataType.INT,
+            )
+            for i in range(1, self.tensor_var.levels):
+                res_capacity_expr = llir.BinOp(
+                    left=res_capacity_expr,
+                    op="*",
+                    right=llir.Var(
+                        name=f"{self.name}{i}_size",
+                        type=llir.DataType.INT,
+                    ),
+                )
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.name}_capacity",
+                        type=llir.DataType.INT,
+                    ),
+                    value=res_capacity_expr,
+                )
+            )
+
+            # malloc + cast
+            c_datatype = dtype_to_c_datatype(self.dtype)
+            sizeof_expr = llir.Sizeof(c_datatype)
+            res_capacity_var = llir.Var(
+                name=f"{self.name}_capacity",
+                type=llir.DataType.INT,
+            )
+            malloc = llir.FunctionCall(
+                name="malloc",
+                args=[llir.BinOp(left=sizeof_expr, op="*", right=res_capacity_var)],
+            )
+            malloc = llir.Cast(
+                expr=malloc,
+                data_type=llir.DataType.ptr_type(c_datatype),
+            )
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.name}_values",
+                        type=llir.DataType.ptr_type(self.dtype),
+                    ),
+                    value=malloc,
+                )
+            )
+
+            # memset to zero
+            stmts.append(
+                llir.FunctionCallStmt(
+                    name="memset",
+                    args=[
+                        llir.Var(
+                            name=f"{self.name}_values",
+                            type=llir.DataType.ptr_type(self.dtype),
+                        ),
+                        llir.Literal(0),
+                        llir.BinOp(
+                            left=sizeof_expr,
+                            op="*",
+                            right=res_capacity_var,
+                        ),
+                    ],
+                )
+            )
+        else:
+            stmts.append(
+                llir.VarDecl(
+                    llir.Var(
+                        name=f"{self.name}_values",
+                        type=llir.DataType.cvector_type(
+                            dtype_to_c_datatype(self.dtype)
+                        ),
+                    )
+                )
+            )
+        return stmts
+
+    def emit_level_indices_init(self) -> List[llir.Stmt]:
+        """Emit per-level index array initialization for COMPRESSED/COORDINATE levels."""
+        stmts: List[llir.Stmt] = []
+        for i, level_type in enumerate(self.level_types):
+            if level_type == LevelType.COMPRESSED:
+                # cvector<int> pos and crd
+                stmts.append(
+                    llir.VarDecl(
+                        llir.Var(
+                            name=f"{self.name}{i}_pos",
+                            type=llir.DataType.CVECTOR_INT,
+                        )
+                    )
+                )
+                stmts.append(
+                    llir.VarDecl(
+                        llir.Var(
+                            name=f"{self.name}{i}_crd",
+                            type=llir.DataType.CVECTOR_INT,
+                        )
+                    )
+                )
+                # pos[0] = 0
+                stmts.append(
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"{self.name}{i}_pos[0]",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Literal(0),
+                    )
+                )
+                # int p<name><i> = 0
+                stmts.append(
+                    llir.VarInit(
+                        llir.Var(
+                            name=f"p{self.name}{i}",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Literal(0),
+                    )
+                )
+                # int <name><i>_pos_index = 0
+                stmts.append(
+                    llir.VarInit(
+                        llir.Var(
+                            name=f"{self.name}{i}_pos_index",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Literal(0),
+                    )
+                )
+                stmts.append(llir.BlankLine())
+
+                # Dense-parent pos init loop
+                if i > 0 and self.level_types[i - 1] == LevelType.DENSE:
+                    loop_var_name = f"p{self.name}{i}"
+                    loop_var = llir.Var(
+                        name=loop_var_name,
+                        type=llir.DataType.INT,
+                    )
+                    loop = llir.ForLoop(
+                        init=llir.VarInit(
+                            var=loop_var,
+                            value=llir.Literal(1),
+                        ),
+                        cond=llir.BinOp(
+                            left=loop_var,
+                            op="<=",
+                            right=llir.Var(
+                                name=f"{self.name}{i - 1}_size",
+                                type=llir.DataType.INT,
+                            ),
+                        ),
+                        update=llir.Increment(
+                            var=loop_var,
+                        ),
+                        body=[
+                            llir.Assign(
+                                var=llir.Var(
+                                    name=f"{self.name}{i}_pos[{loop_var_name}]",
+                                    type=llir.DataType.INT,
+                                ),
+                                value=llir.Literal(0),
+                            )
+                        ],
+                    )
+                    stmts.append(loop)
+
+            elif level_type == LevelType.COORDINATE:
+                # cvector<int> crd
+                stmts.append(
+                    llir.VarDecl(
+                        llir.Var(
+                            name=f"{self.name}{i}_crd",
+                            type=llir.DataType.CVECTOR_INT,
+                        )
+                    )
+                )
+                # int p<name><i> = 0
+                stmts.append(
+                    llir.VarInit(
+                        llir.Var(
+                            name=f"p{self.name}{i}",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.Literal(0),
+                    )
+                )
+                stmts.append(llir.BlankLine())
+
+        return stmts
+
+    def _get_mode_index_set(self, i: int, level_type: LevelType) -> str:
+        """Return the mode index set string for a given level."""
+        tensor_level_name = f"{self.name}{i}"
+        if level_type == LevelType.DENSE:
+            return "{}"
+        elif level_type == LevelType.COMPRESSED:
+            return f"{{{tensor_level_name}_pos_torch, {tensor_level_name}_crd_torch}}"
+        elif level_type == LevelType.COORDINATE:
+            return f"{{{tensor_level_name}_crd_torch}}"
+
+    def emit_final_assembly(self) -> List[llir.Stmt]:
+        """Emit TacoTensor decl, from_blob conversions, index/value assignment, and return."""
+        stmts: List[llir.Stmt] = []
+
+        # TacoTensor decl
+        stmts.extend(
+            [
+                llir.Comment("Assemble final result"),
+                llir.VarDecl(
+                    var=llir.Var(
+                        name=f"{self.name}",
+                        type=llir.DataType.TACO_TENSOR,
+                    )
+                ),
+            ]
+        )
+
+        # Per-level from_blob for pos/crd
+        for i, level_type in enumerate(self.level_types):
+            tensor_level_name = f"{self.name}{i}"
+
+            if level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
+                if level_type == LevelType.COMPRESSED:
+                    # pos_torch
+                    stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor_level_name}_pos_torch",
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            value=llir.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_pos.data()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{{{tensor_level_name}_pos.size()}}",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_pos.get_deleter()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name="torch::kInt",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                ],
+                            ),
+                        )
+                    )
+
+                # crd_torch
+                stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{tensor_level_name}_crd_torch",
+                            type=llir.DataType.TORCH_TENSOR,
+                        ),
+                        value=llir.FunctionCall(
+                            name="torch::from_blob",
+                            args=[
+                                llir.Var(
+                                    name=f"{tensor_level_name}_crd.data()",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                llir.Var(
+                                    name=f"{{{tensor_level_name}_crd.size()}}",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                llir.Var(
+                                    name=f"{tensor_level_name}_crd.get_deleter()",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                llir.Var(
+                                    name="torch::kInt",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                            ],
+                        ),
+                    )
+                )
+
+        # Values from_blob
+        res_values_torch_var = llir.Var(
+            name=f"{self.name}_values_torch",
+            type=llir.DataType.TORCH_TENSOR,
+        )
+        if self.is_dense:
+            # Lambda deleter + from_blob with capacity
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.name}_values_deleter",
+                        type=llir.DataType.AUTO,
+                    ),
+                    value=llir.Var(
+                        name="[](void* ptr) {{ free(ptr); }}",
+                        type=llir.DataType.AUTO,
+                    ),
+                )
+            )
+            stmts.append(
+                llir.VarInit(
+                    var=res_values_torch_var,
+                    value=llir.FunctionCall(
+                        name="torch::from_blob",
+                        args=[
+                            llir.Var(
+                                name=f"{self.name}_values",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"{{{self.name}_capacity}}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"{self.name}_values_deleter",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=get_pytorch_c_dtype_str(self.dtype),
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                        ],
+                    ),
+                )
+            )
+        else:
+            # from_blob with cvector data/size/deleter
+            stmts.append(
+                llir.VarInit(
+                    var=res_values_torch_var,
+                    value=llir.FunctionCall(
+                        name="torch::from_blob",
+                        args=[
+                            llir.Var(
+                                name=f"{self.name}_values.data()",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"{{{self.name}_values.size()}}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"{self.name}_values.get_deleter()",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=get_pytorch_c_dtype_str(self.dtype),
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                        ],
+                    ),
+                )
+            )
+
+        # mode_indices assignment
+        stmts.append(
+            llir.Assign(
+                var=llir.Var(
+                    name=f"{self.name}._storage._index.mode_indices",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                value=llir.Var(
+                    name=f"{{{', '.join([self._get_mode_index_set(i, lt) for i, lt in enumerate(self.level_types)])}}}",
+                    type=llir.DataType.NO_TYPE,
+                ),
+            )
+        )
+
+        # _value assignment
+        stmts.append(
+            llir.Assign(
+                var=llir.Var(
+                    name=f"{self.name}._storage._value",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                value=llir.Var(
+                    name=f"{self.name}_values_torch",
+                    type=llir.DataType.NO_TYPE,
+                ),
+            )
+        )
+
+        # return statement
+        stmts.append(
+            llir.Return(
+                value=llir.Var(
+                    name=f"{self.name}",
+                    type=llir.DataType.NO_TYPE,
+                )
+            )
+        )
+
+        return stmts
+
+
 class CINLowerer:
     """
     This is a class to lower a CIN to LLIR
@@ -1020,220 +1437,9 @@ class CINLowerer:
             self.tensor_var_to_llir[result_tensor_var] = self.lower_TensorVar(
                 result_tensor_var
             )
-            result_name = result_tensor_var.get_name()
-            # If the result tensor var is fully dense, then we use malloc
-            # instead of cvector
-            if result_tensor_var.is_dense():
-                # Initialize a variable <result_name>_capacity to be
-                # the product of all the dimensions of the result tensor
-                # e.g. int A0_capacity = A0_size * A1_size * A2_size;
-                result_capacity_var = llir.Var(
-                    name=f"{result_name}_capacity",
-                    type=llir.DataType.INT,
-                )
-                # Base capacity is A0_size
-                res_capacity_expr = llir.Var(
-                    name=f"{result_name}0_size",
-                    type=llir.DataType.INT,
-                )
-                for i in range(1, result_tensor_var.levels):
-                    res_capacity_expr = llir.BinOp(
-                        left=res_capacity_expr,
-                        op="*",
-                        right=llir.Var(
-                            name=f"{result_name}{i}_size",
-                            type=llir.DataType.INT,
-                        ),
-                    )
-                init_capacity_stmt = llir.VarInit(
-                    var=result_capacity_var,
-                    value=res_capacity_expr,
-                )
-                tensor_value_array_init_stmts.append(init_capacity_stmt)
-
-                # use malloc
-                # <result c datatype>* restrict <result_name>_values
-                #  = (<result c datatype>*)malloc(sizeof(<result c datatype>) * A_capacity);
-                result_val_var = llir.Var(
-                    name=f"{result_name}_values",
-                    type=llir.DataType.ptr_type(result_tensor_var.dtype),
-                )
-                # malloc_stmt is the RHS
-                c_datatype = dtype_to_c_datatype(result_tensor_var.dtype)
-                sizeof_expr = llir.Sizeof(c_datatype)
-                res_capacity_var = llir.Var(
-                    name=f"{result_name}_capacity",
-                    type=llir.DataType.INT,
-                )
-
-                malloc = llir.FunctionCall(
-                    name="malloc",
-                    args=[llir.BinOp(left=sizeof_expr, op="*", right=res_capacity_var)],
-                )
-                # Cast malloc to the correct type
-                malloc = llir.Cast(
-                    expr=malloc,
-                    data_type=llir.DataType.ptr_type(c_datatype),
-                )
-
-                tensor_value_array_init_stmts.append(
-                    llir.VarInit(
-                        var=result_val_var,
-                        value=malloc,
-                    )
-                )
-
-                # if we use malloc, we should also memset the result tensor to 0
-                # memset(<result_name>_values, 0, sizeof(<result c datatype>) * A_capacity);
-                tensor_value_array_init_stmts.append(
-                    llir.FunctionCallStmt(
-                        name="memset",
-                        args=[
-                            result_val_var,
-                            llir.Literal(0),
-                            llir.BinOp(
-                                left=sizeof_expr,
-                                op="*",
-                                right=res_capacity_var,
-                            ),
-                        ],
-                    )
-                )
-
-            else:
-                tensor_value_array_init_stmts.append(
-                    llir.VarDecl(
-                        llir.Var(
-                            name=f"{result_name}_values",
-                            type=llir.DataType.cvector_type(
-                                dtype_to_c_datatype(result_tensor_var.dtype)
-                            ),
-                        )
-                    )
-                )
-
-            result_level_types = result_tensor_var.get_level_types()
-            for i, level_type in enumerate(result_level_types):
-                if level_type == LevelType.COMPRESSED:
-                    # e.g. cvector<int> a0_pos;
-                    result_level_indices_init_stmts.append(
-                        llir.VarDecl(
-                            llir.Var(
-                                name=f"{result_name}{i}_pos",
-                                type=llir.DataType.CVECTOR_INT,
-                            )
-                        )
-                    )
-
-                    # e.g. cvector<int> a0_crd;
-                    result_level_indices_init_stmts.append(
-                        llir.VarDecl(
-                            llir.Var(
-                                name=f"{result_name}{i}_crd",
-                                type=llir.DataType.CVECTOR_INT,
-                            )
-                        )
-                    )
-
-                    # e.g. a0_pos[0] = 0;
-                    result_level_indices_init_stmts.append(
-                        llir.Assign(
-                            var=llir.Var(
-                                name=f"{result_name}{i}_pos[0]",
-                                type=llir.DataType.INT,
-                            ),
-                            value=llir.Literal(0),
-                        )
-                    )
-
-                    # e.g. int pa0 = 0;
-                    result_level_indices_init_stmts.append(
-                        llir.VarInit(
-                            llir.Var(
-                                name=f"p{result_name}{i}",
-                                type=llir.DataType.INT,
-                            ),
-                            value=llir.Literal(0),
-                        )
-                    )
-
-                    # e.g. int a0_pos_index = 0;
-                    result_level_indices_init_stmts.append(
-                        llir.VarInit(
-                            llir.Var(
-                                name=f"{result_name}{i}_pos_index",
-                                type=llir.DataType.INT,
-                            ),
-                            value=llir.Literal(0),
-                        )
-                    )
-
-                    result_level_indices_init_stmts.append(llir.BlankLine())
-
-                    # TODO: If parent level of this level is dense, then we also add
-                    # a for loop to initialize the pos array to all zeros from the 2nd
-                    # element to the last element
-                    # e.g. for (int p<tensor_name><i> = 1; p<tensor_name><i> < <tensor_name><i-1>_size + 1; p<tensor_name><i>++) {
-                    # e.g.     <tensor_name><i>_pos[p<tensor_name><i>] = 0;
-                    # e.g. }
-                    if i > 0 and result_level_types[i - 1] == LevelType.DENSE:
-                        loop_var_name = f"p{result_name}{i}"
-                        loop_var = llir.Var(
-                            name=loop_var_name,
-                            type=llir.DataType.INT,
-                        )
-                        loop = llir.ForLoop(
-                            init=llir.VarInit(
-                                var=loop_var,
-                                value=llir.Literal(1),
-                            ),
-                            cond=llir.BinOp(
-                                left=loop_var,
-                                op="<=",
-                                right=llir.Var(
-                                    name=f"{result_name}{i - 1}_size",
-                                    type=llir.DataType.INT,
-                                ),
-                            ),
-                            update=llir.Increment(
-                                var=loop_var,
-                            ),
-                            body=[
-                                llir.Assign(
-                                    var=llir.Var(
-                                        name=f"{result_name}{i}_pos[{loop_var_name}]",
-                                        type=llir.DataType.INT,
-                                    ),
-                                    value=llir.Literal(0),
-                                )
-                            ],
-                        )
-
-                        result_level_indices_init_stmts.append(loop)
-
-                elif level_type == LevelType.COORDINATE:
-                    # e.g. cvector<int> a0_crd;
-                    result_level_indices_init_stmts.append(
-                        llir.VarDecl(
-                            llir.Var(
-                                name=f"{result_name}{i}_crd",
-                                type=llir.DataType.CVECTOR_INT,
-                            )
-                        )
-                    )
-
-                    # e.g. int pa0 = 0;
-                    result_level_indices_init_stmts.append(
-                        llir.VarInit(
-                            llir.Var(
-                                name=f"p{result_name}{i}",
-                                type=llir.DataType.INT,
-                            ),
-                            value=llir.Literal(0),
-                        )
-                    )
-
-                    result_level_indices_init_stmts.append(llir.BlankLine())
+            assembler = ResultTensorAssembler(result_tensor_var)
+            tensor_value_array_init_stmts.extend(assembler.emit_value_array_init())
+            result_level_indices_init_stmts.extend(assembler.emit_level_indices_init())
 
         if result_level_indices_init_stmts:
             result_level_indices_init_stmts = [
@@ -1385,221 +1591,9 @@ class CINLowerer:
                 ]
             )
 
-            if self.final_result_tensor_var:
-                body_stmts.extend(
-                    [
-                        llir.Comment("Assemble final result"),
-                        llir.VarDecl(
-                            var=llir.Var(
-                                name=f"{self.final_result_tensor_var.get_name()}",
-                                type=llir.DataType.TACO_TENSOR,
-                            )
-                        ),
-                    ]
-                )
-
-            # torch::Tensor a0_pos_torch = torch::from_blob(a0_pos.data(), {a0_pos.size()}, a0_pos.get_deleter(), torch::kInt);
             assert self.final_result_tensor_var is not None, "No final result tensor"
-            for i, level_type in enumerate(
-                self.final_result_tensor_var.get_level_types()
-            ):
-                tensor_level_name = f"{self.final_result_tensor_var.get_name()}{i}"
-
-                if level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
-                    if level_type == LevelType.COMPRESSED:
-                        # Emit {tensor_level_name}_pos_torch array
-                        body_stmts.append(
-                            llir.VarInit(
-                                var=llir.Var(
-                                    name=f"{tensor_level_name}_pos_torch",
-                                    type=llir.DataType.TORCH_TENSOR,
-                                ),
-                                value=llir.FunctionCall(
-                                    name="torch::from_blob",
-                                    args=[
-                                        llir.Var(
-                                            name=f"{tensor_level_name}_pos.data()",
-                                            type=llir.DataType.NO_TYPE,
-                                        ),
-                                        llir.Var(
-                                            name=f"{{{tensor_level_name}_pos.size()}}",
-                                            type=llir.DataType.NO_TYPE,
-                                        ),
-                                        llir.Var(
-                                            name=f"{tensor_level_name}_pos.get_deleter()",
-                                            type=llir.DataType.NO_TYPE,
-                                        ),
-                                        llir.Var(
-                                            name="torch::kInt",
-                                            type=llir.DataType.NO_TYPE,
-                                        ),
-                                    ],
-                                ),
-                            )
-                        )
-
-                    # Emit {tensor_level_name}_crd_torch array
-                    body_stmts.append(
-                        llir.VarInit(
-                            var=llir.Var(
-                                name=f"{tensor_level_name}_crd_torch",
-                                type=llir.DataType.TORCH_TENSOR,
-                            ),
-                            value=llir.FunctionCall(
-                                name="torch::from_blob",
-                                args=[
-                                    llir.Var(
-                                        name=f"{tensor_level_name}_crd.data()",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{{{tensor_level_name}_crd.size()}}",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{tensor_level_name}_crd.get_deleter()",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name="torch::kInt",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                ],
-                            ),
-                        )
-                    )
-
-            # Emit result value array
-            final_result_name = self.final_result_tensor_var.get_name()
-            res_values_torch_var = llir.Var(
-                name=f"{final_result_name}_values_torch",
-                type=llir.DataType.TORCH_TENSOR,
-            )
-            # If final result tensor var is dense, then first create a lambda deleter
-            # function that will delete the result value array
-            if self.final_result_tensor_var.is_dense():
-                # auto deleter = [](void* ptr) { free(ptr); };
-                body_stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{final_result_name}_values_deleter",
-                            type=llir.DataType.AUTO,
-                        ),
-                        value=llir.Var(
-                            name="[](void* ptr) {{ free(ptr); }}",
-                            type=llir.DataType.AUTO,
-                        ),
-                    )
-                )
-                body_stmts.append(
-                    llir.VarInit(
-                        var=res_values_torch_var,
-                        value=llir.FunctionCall(
-                            name="torch::from_blob",
-                            args=[
-                                llir.Var(
-                                    name=f"{final_result_name}_values",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=f"{{{final_result_name}_capacity}}",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=f"{final_result_name}_values_deleter",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=get_pytorch_c_dtype_str(
-                                        self.final_result_tensor_var.dtype
-                                    ),
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                            ],
-                        ),
-                    )
-                )
-
-            else:
-                body_stmts.append(
-                    llir.VarInit(
-                        var=res_values_torch_var,
-                        value=llir.FunctionCall(
-                            name="torch::from_blob",
-                            args=[
-                                llir.Var(
-                                    name=f"{final_result_name}_values.data()",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=f"{{{final_result_name}_values.size()}}",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=f"{final_result_name}_values.get_deleter()",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=get_pytorch_c_dtype_str(
-                                        self.final_result_tensor_var.dtype
-                                    ),
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                            ],
-                        ),
-                    )
-                )
-
-            # Emit result tensor index assignment
-            # e.g. A._storage._index.mode_indices = {{A0_pos_torch, A0_crd_torch}, {A1_pos_torch, A1_crd_torch}};
-
-            def get_result_mode_index_set(i, level_type: LevelType):
-                assert self.final_result_tensor_var, "Result tensor variable not set"
-                tensor_level_name = f"{self.final_result_tensor_var.get_name()}{i}"
-                if level_type == LevelType.DENSE:
-                    return "{}"
-                elif level_type == LevelType.COMPRESSED:
-                    return f"{{{tensor_level_name}_pos_torch, {tensor_level_name}_crd_torch}}"
-                elif level_type == LevelType.COORDINATE:
-                    return f"{{{tensor_level_name}_crd_torch}}"
-
-            body_stmts.append(
-                llir.Assign(
-                    var=llir.Var(
-                        name=f"{self.final_result_tensor_var.get_name()}._storage._index.mode_indices",
-                        type=llir.DataType.NO_TYPE,
-                    ),
-                    value=llir.Var(
-                        name=f"{{{', '.join([get_result_mode_index_set(i, level_type) for i, level_type in enumerate(self.final_result_tensor_var.get_level_types())])}}}",
-                        type=llir.DataType.NO_TYPE,
-                    ),
-                )
-            )
-
-            # Emit result tensor value assignment
-            # e.g. A._storage._value = A_values_torch;
-            body_stmts.append(
-                llir.Assign(
-                    var=llir.Var(
-                        name=f"{self.final_result_tensor_var.get_name()}._storage._value",
-                        type=llir.DataType.NO_TYPE,
-                    ),
-                    value=llir.Var(
-                        name=f"{self.final_result_tensor_var.get_name()}_values_torch",
-                        type=llir.DataType.NO_TYPE,
-                    ),
-                )
-            )
-
-            # Emit return statement
-            body_stmts.append(
-                llir.Return(
-                    value=llir.Var(
-                        name=f"{self.final_result_tensor_var.get_name()}",
-                        type=llir.DataType.NO_TYPE,
-                    )
-                )
-            )
+            final_assembler = ResultTensorAssembler(self.final_result_tensor_var)
+            body_stmts.extend(final_assembler.emit_final_assembly())
 
             return llir.Function(
                 return_type=llir.DataType.TACO_TENSOR,
