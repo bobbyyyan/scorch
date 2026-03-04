@@ -27,6 +27,294 @@ from ..format import LevelType
 from .iterator import ModeIterator, IteratorBase
 
 
+class CoordinateResolver:
+    """Resolves candidate coordinates for a lattice point.
+
+    Handles loading coordinates from iterators, resolving among multiple
+    iterators, assembling compressed levels, finding iterator ends for
+    coordinate levels, and resolving dense coordinates.
+    """
+
+    def __init__(
+        self, lattice_point: LatticePoint, lattice: IterationLattice
+    ) -> None:
+        self._lp = lattice_point
+        self._lattice = lattice
+
+    def resolve(self) -> Sequence[llir.Stmt]:
+        """Produce all coordinate resolution statements."""
+        stmts: List[llir.Stmt] = []
+        iterators = self._lp.get_iterators()
+
+        stmts.extend(self._load_coordinates(iterators))
+        stmts.extend(self._resolve_coordinates(iterators))
+        stmts.extend(self._assemble_compressed_level())
+        stmts.extend(self._find_coordinate_level_iterator_ends(iterators))
+        stmts.extend(self._resolve_dense_coordinates())
+        return stmts
+
+    # ------------------------------------------------------------------
+    # Individual concerns
+    # ------------------------------------------------------------------
+
+    def _load_coordinates(
+        self, iterators: List[ModeIterator]
+    ) -> List[llir.Stmt]:
+        """Load coordinate variables from each iterator."""
+        if not (len(iterators) > 1 or self._lattice.dense_index_var_llir):
+            return []
+        # If we have a dense universe, then we still need to resolve
+        # the sparse coordinate even if we have a single iterator
+        if not iterators:
+            return []
+        stmts: List[llir.Stmt] = [llir.Comment("Load coordinates")]
+        for it in iterators:
+            stmts.append(
+                llir.VarInit(
+                    var=it.get_coord_var_llir(),
+                    value=it.get_coord_var_value_llir(),
+                )
+            )
+        return stmts
+
+    def _resolve_coordinates(
+        self, iterators: List[ModeIterator]
+    ) -> List[llir.Stmt]:
+        """Resolve the winning coordinate among iterators."""
+        if len(iterators) > 1 or self._lattice.dense_index_var_llir:
+            # Only need to break ties among the resolved sparse coordinates
+            # if we don't have a dense domain
+            if not self._lattice.dense_index_var_llir:
+                return [
+                    llir.BlankLine(),
+                    llir.Comment("Resolve coordinates"),
+                    llir.VarInit(
+                        var=self._lp.get_index_var_llir(),
+                        value=llir.FunctionCall(
+                            name="std::min",
+                            args=[
+                                llir.Array(
+                                    values=[
+                                        it.get_coord_var_llir()
+                                        for it in iterators
+                                    ],
+                                    data_type=llir.DataType.INT,
+                                )
+                            ],
+                        ),
+                    ),
+                    llir.BlankLine(),
+                ]
+            return []
+
+        if len(iterators) == 1:
+            return [
+                llir.Comment("Resolve coordinates"),
+                llir.VarInit(
+                    var=self._lp.get_index_var_llir(),
+                    value=iterators[0].get_coord_var_value_llir(),
+                ),
+                llir.BlankLine(),
+            ]
+
+        return []
+
+    def _assemble_compressed_level(self) -> List[llir.Stmt]:
+        """Emit the assembly loop for a COMPRESSED child level.
+
+        If the current level is a COMPRESSED level, and the previous level
+        is a DENSE level for the result tensor access, then we need to
+        add assembly loop::
+
+            for (; A1_pos_index < i; A1_pos_index++) {
+                A1_pos[A1_pos_index + 1] = A1_crd.size();
+            }
+        """
+        result_tensor_access = self._lattice.cin_lowerer.result_tensor_access
+        result_tensor_var = self._lattice.cin_lowerer.result_tensor_var
+        result_tensor_name = result_tensor_var.name
+
+        index_var = self._lp.get_index_var()
+        index_var_llir = self._lp.get_index_var_llir()
+
+        if not result_tensor_access.has_index_var(index_var):
+            return []
+
+        child_level = result_tensor_access.level_of_index_var(index_var) + 1
+        curr_level_type = result_tensor_access.level_type_of_index_var(index_var)
+        child_level_type = result_tensor_access.child_level_type_of_index_var(
+            index_var
+        )
+        if not (
+            curr_level_type == LevelType.DENSE
+            and child_level_type == LevelType.COMPRESSED
+        ):
+            return []
+
+        pos_index_var_llir = llir.Var(
+            name=f"{result_tensor_name}{child_level}_pos_index",
+            type=llir.DataType.INT,
+        )
+        return [
+            llir.Comment("Assemble COMPRESSED level"),
+            llir.ForLoop(
+                init=None,
+                cond=llir.BinOp(
+                    op="<",
+                    left=pos_index_var_llir,
+                    right=index_var_llir,
+                ),
+                update=llir.Increment(var=pos_index_var_llir),
+                body=[
+                    # A1_pos[A1_pos_index + 1] = A1_crd.size();
+                    llir.Assign(
+                        var=llir.Var(
+                            name=f"{result_tensor_name}{child_level}_pos[{pos_index_var_llir.name} + 1]",
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.FunctionCall(
+                            name=f"{result_tensor_name}{child_level}_crd.size",
+                            args=[],
+                        ),
+                    )
+                ],
+            ),
+        ]
+
+    def _find_coordinate_level_iterator_ends(
+        self, iterators: List[ModeIterator]
+    ) -> List[llir.Stmt]:
+        """Find iterator ends for coordinate-level iterators.
+
+        Once the coordinate is known, compute the end of iterators for the
+        next level of coordinate-type iterators. e.g.::
+
+            int pB1_end = pB0;
+            while (pB1_end < pB0_end && B0_crd[pB1_end].item<int>() == i) {
+              pB1_end++;
+            }
+        """
+        resolution_stmts: List[llir.Stmt] = []
+        for it in iterators:
+            if it.level_type != LevelType.COORDINATE:
+                continue
+            if (it.level + 1) >= it.tensor_var.levels:
+                continue
+
+            next_level_iterator_end_llir = llir.Var(
+                name=f"p{it.tensor_var.name}{it.level + 1}_end",
+                type=llir.DataType.INT,
+            )
+
+            assert (
+                next_level_iterator_end_llir is not None
+            ), "next_level_iterator_end_llir cannot be None"
+            assert (
+                it.iterator_var_llir is not None
+            ), "it.iterator_var_llir cannot be None"
+            # int pB1_end = pB0;
+            resolution_stmts.append(
+                llir.Assign(
+                    var=next_level_iterator_end_llir,
+                    value=llir.BinOp(
+                        op="+",
+                        left=it.iterator_var_llir,
+                        right=llir.Literal(value=1),
+                    ),
+                )
+            )
+
+            # while (pB1_end < pB0_end && B0_crd[pB1_end].item<int>() == i) {
+            #   pB1_end++;
+            # }
+            assert (
+                it.iterator_var_end_var_llir is not None
+            ), "it.iterator_var_end_var_llir cannot be None"
+
+            resolution_stmts.append(
+                llir.WhileLoop(
+                    cond=llir.BinOp(
+                        op="&&",
+                        left=llir.BinOp(
+                            op="<",
+                            left=next_level_iterator_end_llir,
+                            right=it.iterator_var_end_var_llir,
+                        ),
+                        right=llir.BinOp(
+                            op="==",
+                            left=llir.ArrayAccess(
+                                array=llir.Var(
+                                    name=f"{it.tensor_var.name}{it.level}_crd",
+                                    type=llir.DataType.ARRAY_INT,
+                                ),
+                                index=next_level_iterator_end_llir,
+                            ),
+                            right=self._lp.get_index_var_llir(),
+                        ),
+                    ),
+                    body=[
+                        llir.Increment(
+                            var=next_level_iterator_end_llir,
+                        )
+                    ],
+                )
+            )
+            resolution_stmts.append(llir.BlankLine())
+
+        if not resolution_stmts:
+            return []
+        return [
+            llir.Comment("Find iterator end for coordinate level"),
+            *resolution_stmts,
+        ]
+
+    def _resolve_dense_coordinates(self) -> List[llir.Stmt]:
+        """Resolve dense coordinates whose dependencies are satisfied."""
+        cin_lowerer = self._lattice.cin_lowerer
+        assert cin_lowerer is not None, "CIN lowerer is None"
+
+        dense_iterators_resolve_stmts: List[llir.Stmt] = []
+        d = cin_lowerer.dense_coord_resolve_stmt_to_dep_index_vars
+
+        if self._lp.dense_iterators:
+            for it in self._lp.dense_iterators:
+                if it.coord_var_value_llir:
+                    dense_coord_resolve_stmt = llir.VarInit(
+                        var=it.get_coord_var_llir(),
+                        value=it.get_coord_var_value_llir(),
+                    )
+
+                    d_stmts: List[llir.VarInit] = list(d.keys())
+                    to_resolve_index_var_names = [
+                        stmt.var.name for stmt in d_stmts
+                    ]
+
+                    if (
+                        dense_coord_resolve_stmt.var.name
+                        not in to_resolve_index_var_names
+                    ):
+                        d[dense_coord_resolve_stmt] = (
+                            it.coord_var_value_depends_on
+                        )
+
+        defined_index_vars = set(cin_lowerer.defined_index_vars)
+
+        d_copy = d.copy()
+        for stmt, dep_index_vars in d_copy.items():
+            # if dep_index_vars is a subset of defined_index_vars, then we can resolve the dense coordinate
+            if set(dep_index_vars).issubset(defined_index_vars):
+                dense_iterators_resolve_stmts.append(stmt)
+                # remove this statement from the dictionary
+                del d[stmt]
+
+        if not dense_iterators_resolve_stmts:
+            return []
+        return [
+            llir.Comment("Resolve dense coordinates"),
+            *dense_iterators_resolve_stmts,
+        ]
+
+
 @dataclass(frozen=False)
 class LatticePoint:
     """
@@ -513,225 +801,7 @@ class LatticePoint:
     def get_candidate_coordinate_stmts(
         self, lattice: IterationLattice
     ) -> Sequence[llir.Stmt]:
-        stmts: List[llir.Stmt] = []
-        iterators = self.get_iterators()
-
-        if len(iterators) > 1 or lattice.dense_index_var_llir:
-            # If we have a dense universe, then we still need to resolve
-            # the sparse coordinate even if we have a single iterator
-            if iterators:
-                stmts.append(llir.Comment("Load coordinates"))
-                for it in iterators:
-                    stmts.append(
-                        llir.VarInit(
-                            var=it.get_coord_var_llir(),
-                            value=it.get_coord_var_value_llir(),
-                        )
-                    )
-            # Only need to break ties among the resolved sparse coordinates
-            # if we don't have a dense domain
-            if not lattice.dense_index_var_llir:
-                stmts.append(llir.BlankLine())
-                stmts.append(llir.Comment("Resolve coordinates"))
-                stmts.append(
-                    llir.VarInit(
-                        var=self.get_index_var_llir(),
-                        value=llir.FunctionCall(
-                            name="std::min",
-                            args=[
-                                llir.Array(
-                                    values=[
-                                        it.get_coord_var_llir() for it in iterators
-                                    ],
-                                    data_type=llir.DataType.INT,
-                                )
-                            ],
-                        ),
-                    )
-                )
-                stmts.append(llir.BlankLine())
-
-        elif len(iterators) == 1:
-            stmts.append(llir.Comment("Resolve coordinates"))
-            stmts.append(
-                llir.VarInit(
-                    var=self.get_index_var_llir(),
-                    value=iterators[0].get_coord_var_value_llir(),
-                )
-            )
-            stmts.append(llir.BlankLine())
-
-        result_tensor_access = lattice.cin_lowerer.result_tensor_access
-        result_tensor_var = lattice.cin_lowerer.result_tensor_var
-        result_tensor_name = result_tensor_var.name
-        # If the current level is a COMPRESSED level, and the previous level
-        # is a DENSE level for the result tensor access, then we need to
-        # add assembly loop:
-        #   for (; A1_pos_index < i; A1_pos_index++) {
-        #       A1_pos[A1_pos_index + 1] = A1_crd.size();
-        #   }
-        index_var = self.get_index_var()
-        index_var_llir = self.get_index_var_llir()
-
-        if result_tensor_access.has_index_var(index_var):
-            child_level = result_tensor_access.level_of_index_var(index_var) + 1
-            curr_level_type = result_tensor_access.level_type_of_index_var(index_var)
-            child_level_type = result_tensor_access.child_level_type_of_index_var(
-                index_var
-            )
-            if (
-                curr_level_type == LevelType.DENSE
-                and child_level_type == LevelType.COMPRESSED
-            ):
-                stmts.append(llir.Comment("Assemble COMPRESSED level"))
-                pos_index_var_llir = llir.Var(
-                    name=f"{result_tensor_name}{child_level}_pos_index",
-                    type=llir.DataType.INT,
-                )
-                stmts.append(
-                    llir.ForLoop(
-                        init=None,
-                        cond=llir.BinOp(
-                            op="<",
-                            left=pos_index_var_llir,
-                            right=index_var_llir,
-                        ),
-                        update=llir.Increment(var=pos_index_var_llir),
-                        body=[
-                            # A1_pos[A1_pos_index + 1] = A1_crd.size();
-                            llir.Assign(
-                                var=llir.Var(
-                                    name=f"{result_tensor_name}{child_level}_pos[{pos_index_var_llir.name} + 1]",
-                                    type=llir.DataType.INT,
-                                ),
-                                value=llir.FunctionCall(
-                                    name=f"{result_tensor_name}{child_level}_crd.size",
-                                    args=[],
-                                ),
-                            )
-                        ],
-                    )
-                )
-
-        coordinate_level_iterator_end_resolution_stmts: List[llir.Stmt] = []
-        # e.g. once i is known, we can compute the end of the iterators for the second level
-        #    int pB1_end = pB0;
-        #    while (pB1_end < pB0_end && B0_crd[pB1_end].item<int>() == i) {
-        #      pB1_end++;
-        #    }
-        for it in iterators:
-            # Only do this for coordinate levels
-            if it.level_type == LevelType.COORDINATE:
-                # If the next _level is still a valid _level
-                if (it.level + 1) < it.tensor_var.levels:
-                    next_level_iterator_end_llir = llir.Var(
-                        name=f"p{it.tensor_var.name}{it.level + 1}_end",
-                        type=llir.DataType.INT,
-                    )
-
-                    # int pB1_end = pB0;
-                    assert (
-                        next_level_iterator_end_llir is not None
-                    ), "next_level_iterator_end_llir cannot be None"
-                    assert (
-                        it.iterator_var_llir is not None
-                    ), "it.iterator_var_llir cannot be None"
-                    coordinate_level_iterator_end_resolution_stmts.append(
-                        llir.Assign(
-                            var=next_level_iterator_end_llir,
-                            value=llir.BinOp(
-                                op="+",
-                                left=it.iterator_var_llir,
-                                right=llir.Literal(value=1),
-                            ),
-                        )
-                    )
-
-                    # while (pB1_end < pB0_end && B0_crd[pB1_end].item<int>() == i) {
-                    #   pB1_end++;
-                    # }
-                    assert (
-                        it.iterator_var_end_var_llir is not None
-                    ), "it.iterator_var_end_var_llir cannot be None"
-
-                    coordinate_level_iterator_end_resolution_stmts.append(
-                        llir.WhileLoop(
-                            cond=llir.BinOp(
-                                op="&&",
-                                left=llir.BinOp(
-                                    op="<",
-                                    left=next_level_iterator_end_llir,
-                                    right=it.iterator_var_end_var_llir,
-                                ),
-                                right=llir.BinOp(
-                                    op="==",
-                                    left=llir.ArrayAccess(
-                                        array=llir.Var(
-                                            name=f"{it.tensor_var.name}{it.level}_crd",
-                                            type=llir.DataType.ARRAY_INT,
-                                        ),
-                                        index=next_level_iterator_end_llir,
-                                    ),
-                                    # left=llir.Var(
-                                    #     name=f"{it.tensor_var.name}{it.level}_crd[{next_level_iterator_end_llir.name}]",
-                                    #     type=llir.DataType.INT,
-                                    # ),
-                                    right=self.get_index_var_llir(),
-                                ),
-                            ),
-                            body=[
-                                llir.Increment(
-                                    var=next_level_iterator_end_llir,
-                                )
-                            ],
-                        )
-                    )
-                    coordinate_level_iterator_end_resolution_stmts.append(
-                        llir.BlankLine()
-                    )
-
-        if coordinate_level_iterator_end_resolution_stmts:
-            stmts.append(llir.Comment("Find iterator end for coordinate level"))
-            stmts.extend(coordinate_level_iterator_end_resolution_stmts)
-
-        cin_lowerer = lattice.cin_lowerer
-        assert cin_lowerer is not None, "CIN lowerer is None"
-
-        dense_iterators_resolve_stmts: List[llir.Stmt] = []
-        d = cin_lowerer.dense_coord_resolve_stmt_to_dep_index_vars
-
-        if self.dense_iterators:
-            for it in self.dense_iterators:
-                if it.coord_var_value_llir:
-                    dense_coord_resolve_stmt = llir.VarInit(
-                        var=it.get_coord_var_llir(),
-                        value=it.get_coord_var_value_llir(),
-                    )
-
-                    d_stmts: List[llir.VarInit] = list(d.keys())
-                    to_resolve_index_var_names = [stmt.var.name for stmt in d_stmts]
-
-                    if (
-                        dense_coord_resolve_stmt.var.name
-                        not in to_resolve_index_var_names
-                    ):
-                        d[dense_coord_resolve_stmt] = it.coord_var_value_depends_on
-
-        defined_index_vars = set(cin_lowerer.defined_index_vars)
-
-        d_copy = d.copy()
-        for stmt, dep_index_vars in d_copy.items():
-            # if dep_index_vars is a subset of defined_index_vars, then we can resolve the dense coordinate
-            if set(dep_index_vars).issubset(defined_index_vars):
-                dense_iterators_resolve_stmts.append(stmt)
-                # remove this statement from the dictionary
-                del d[stmt]
-
-        if dense_iterators_resolve_stmts:
-            stmts.append(llir.Comment("Resolve dense coordinates"))
-            stmts.extend(dense_iterators_resolve_stmts)
-
-        return stmts
+        return CoordinateResolver(self, lattice).resolve()
 
     def is_child_of(self, other: LatticePoint) -> bool:
         """
