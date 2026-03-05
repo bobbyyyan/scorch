@@ -250,7 +250,7 @@ class Scheduler:
                 self.visit(forall.stmt)
 
             def visit_WorkspaceAccess(self, workspace_access: WorkspaceAccess):
-                if workspace_access.indices[-1] == self.old_index_var:
+                if workspace_access.indices and workspace_access.indices[-1] == self.old_index_var:
                     workspace_access.indices[-1] = self.new_index_var
                     workspace_access.update_indices(workspace_access.indices)
 
@@ -353,10 +353,12 @@ class Scheduler:
             indices=free_vars_after_last_reduction,
         )
 
-        parent_forall: ForAll = new_cin
+        # Note: parent_forall not necessarily ForAll statement at the end
+        parent_forall = new_cin
         while (
             isinstance(parent_forall.stmt, ForAll)
             and parent_forall.stmt.index_var != next_reduction_var
+            and parent_forall.index_var != next_reduction_var
         ):
             parent_forall = parent_forall.stmt
 
@@ -402,7 +404,7 @@ class Scheduler:
 
         """
 
-        reduction_forall = parent_forall.stmt
+        reduction_forall = parent_forall if parent_forall.index_var == next_reduction_var else parent_forall.stmt
 
         # If we have already inserted a workspace, then we should not insert another one.
         if isinstance(reduction_forall, Where):
@@ -446,7 +448,10 @@ class Scheduler:
             new_cin.no_tile_list.append(producer_forall.index_var)
 
         # Replace the reduction forall with the Where statement
-        parent_forall.stmt = where_stmt
+        if parent_forall.stmt.index_var == next_reduction_var:
+            parent_forall.stmt = where_stmt
+        else:
+            new_cin = where_stmt
 
         new_cin.inserted_workspace = True
 

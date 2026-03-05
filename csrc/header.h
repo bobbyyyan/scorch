@@ -377,18 +377,20 @@ class coo_workspace {
   std::vector<Entry> _entries;
   std::unordered_map<int, int> _existingCoords;
   std::vector<int> _sortedIndices;
+  std::vector<int> _resultShape;
 
  public:
-  explicit coo_workspace(int capacity) {
+  explicit coo_workspace(int capacity, const std::vector<int> &result_shape)
+        : _resultShape(result_shape) {
     _entries.reserve(capacity);
   }
 
-  explicit coo_workspace() : coo_workspace(BLOCK_SIZE) {}
+  explicit coo_workspace() : coo_workspace(BLOCK_SIZE, {}) {}
 
   void insert(const std::vector<int>& coord, T value) {
-    int index = coord[N - 1];
-    for (int i = N - 2; i >= 0; i--) {
-      index = index * N + coord[i];
+    int index = coord[0];
+    for (int i = 1; i < N; i++){
+        index = index * _resultShape[i] + coord[i];
     }
 
     auto existingCoordIt = _existingCoords.find(index);
