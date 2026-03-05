@@ -478,7 +478,6 @@ class CINLowerer:
         """
         # Iterate over the levels in tensor, then depending on whether it is sparse or dense, generate the bound
         # variables
-        # TODO: handle COO
         stmts: List[llir.Stmt] = []
         level_types = tensor.get_level_types()
         for level, level_type in enumerate(level_types):
@@ -867,9 +866,7 @@ class CINLowerer:
                 continue
 
             if wksp.dim == 1:
-                # TODO: if the workspace is dense, then
-                # float* <workspace name> = new float[<workspace size>]();
-                # change float to the corresponding ctype
+                # Dense workspace: allocate a zeroed array of the appropriate ctype
                 if wksp.is_dense():
                     if wksp.is_tiled:
                         workspace_init_stmts.append(
@@ -1417,7 +1414,8 @@ class CINLowerer:
             args=[],
         )
 
-        # TODO: handle dense accumulator workspace
+        # Dense accumulator workspace: iterate over all indices and
+        # write non-zero values to the result tensor
         if wksp_access.is_dense():
             assert (
                 len(wksp_index_vars) == 1
@@ -1703,8 +1701,9 @@ class CINLowerer:
                             ],
                         )
                     )
-            # if previous _level is dense: A1_pos.push_back(A1_crd.size())
-            # TODO: if previous _level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
+            # Assemble pos array for this compressed level:
+            # - Dense parent: A1_pos.push_back(A1_crd.size())
+            # - Compressed parent: A1_pos[A0_crd.size()] = A1_crd.size()
             assembled_pos_array = False
             if level > 0:
                 assert parent_index_var is not None, "Parent index var is None"

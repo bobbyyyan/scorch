@@ -560,11 +560,15 @@ class TensorVar(IndexExpr):
             self.format = parse_format(fmt)
 
         self.dtype = dtype
-        self.mode_order = mode_order if mode_order else ([i for i in range(len(self.shape))] if self.shape else None)
 
-        # TODO: this is messy code, clean up
-        if not self.mode_order:
-            self.mode_order = [i for i in range(self.format.get_order())]
+        if mode_order:
+            self.mode_order = mode_order
+        elif self.shape:
+            self.mode_order = list(range(len(self.shape)))
+        elif self.format:
+            self.mode_order = list(range(self.format.get_order()))
+        else:
+            self.mode_order = None
 
     @property
     def name(self) -> str:
@@ -634,7 +638,9 @@ class Workspace(TensorVar):
         tile_size_var: Optional[TileSizeVar] = None,
         mode_order: Optional[List[int]] = None,
     ):
-        # TODO: attributes to be initialized before superclass to set TensorVar mode_order
+        # dim and dense must be set before super().__init__() because
+        # TensorVar derives default mode_order from format, which for
+        # Workspace depends on these attributes.
         self.dim = dim
         self.dense = dense
 
@@ -715,7 +721,6 @@ class TensorAccess(IndexExpr):
         tensor: TensorVar,
         indices: Union[IndexVar, List[IndexVar]],
     ):
-        # TODO
         super(TensorAccess, self).__init__()
 
         self.tensor = tensor
@@ -964,7 +969,6 @@ class TensorAssign(IndexStmt):
         rhs: IndexExpr,
         op: Optional[Operation] = None,
     ):
-        # TODO
         super(TensorAssign, self).__init__(lhs, rhs)
         self.op = op
 
@@ -1005,7 +1009,6 @@ class ForAll(IndexStmt):
     """
 
     def __init__(self, index_var: IndexVar, stmt: IndexStmt):
-        # TODO
         super(ForAll, self).__init__(None, None)
         self.index_var = index_var
         self.stmt = stmt

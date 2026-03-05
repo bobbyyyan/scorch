@@ -1060,8 +1060,9 @@ class IterationLattice:
                                 ],
                             )
                         )
-                # If previous level is dense: A1_pos[A1_pos_index + 1] = A1_crd.size()
-                # TODO: if previous level is sparse: A1_pos[A0_crd.size()] = A1_crd.size()
+                # Assemble pos array for this compressed level:
+                # - Dense parent: A1_pos[A1_pos_index + 1] = A1_crd.size()
+                # - Compressed parent: A1_pos[A0_crd.size()] = A1_crd.size()
                 assembled_pos_array = False
                 if level > 0:
                     parent_index_var = result_tensor_access.get_parent_index_var(
