@@ -844,6 +844,21 @@ class IterationLattice:
             self.for_all_stmt
         )
 
+        # Broadcast dimension: index var appears only in the result tensor,
+        # not in any RHS tensor.  Generate a dense lattice point using the
+        # result tensor access so the loop iterates over the full range.
+        if (
+            not lattice_points
+            and self.cin_lowerer
+            and self.cin_lowerer.result_tensor_access
+            and self.cin_lowerer.result_tensor_access.has_index_var(parsed_index_var)
+        ):
+            lattice_points = [
+                LatticePoint(
+                    dense_tensor_accesses=[self.cin_lowerer.result_tensor_access]
+                )
+            ]
+
         # Set the lattice pointer for each lattice point
         for lattice_point in lattice_points:
             lattice_point.lattice = self
@@ -1131,9 +1146,18 @@ class IterationLattice:
                 )
                 self.cin_lowerer.defined_index_vars.append(index_var.parent)
 
+            # Skip result index generation when the result tensor access
+            # is already used as a lattice point dense access (broadcast
+            # dimension) — its position variable is already emitted by
+            # get_candidate_coordinate_stmts.
+            result_already_in_lattice = (
+                result_tensor_access in lattice_point.get_dense_tensor_accesses()
+            )
+
             if (
                 not result_tensor_access.is_workspace()
                 and result_tensor_access.has_index_var(index_var)
+                and not result_already_in_lattice
             ):
                 level = result_tensor_access.level_of_index_var(index_var)
                 level_type = result_tensor_access.level_type_of_index_var(index_var)

@@ -673,6 +673,59 @@ def einsum(
     return result
 
 
+def _align_mode_orders_to_loop_order(
+    cin_stmt: IndexStmt, args: tuple
+) -> None:
+    """Align input tensor mode orders to the CIN loop order.
+
+    The lowerer requires parent physical levels to be iterated before child
+    levels.  When a tensor's mode_order doesn't match the loop nesting, the
+    generated code references coordinate variables before they are defined.
+    This mirrors the alignment that ``einsum`` performs (ops.py L581-591).
+
+    Mutates TensorVar.mode_order in *cin_stmt* and calls
+    ``STensor.change_mode_order`` on the corresponding *args* entries.
+    """
+    # 1. Extract loop order
+    loop_order_names: List[str] = []
+    curr: IndexStmt = cin_stmt
+    while isinstance(curr, ForAll):
+        loop_order_names.append(curr.index_var.name)
+        curr = curr.stmt
+
+    if not loop_order_names:
+        return
+
+    # 2. Get RHS tensor accesses (left-to-right order matches *args*)
+    rhs_accesses = cin_stmt.get_rhs_tensor_accesses()
+    if len(rhs_accesses) != len(args):
+        return  # can't align if we don't have a 1:1 mapping
+
+    for ta, stensor in zip(rhs_accesses, args):
+        tv = ta.get_tensor()
+        index_var_names = [iv.name for iv in ta.get_index_vars()]
+        # Filter loop order to vars present in this tensor
+        desired_names = [n for n in loop_order_names if n in index_var_names]
+        desired_mode_order = [index_var_names.index(n) for n in desired_names]
+
+        # Skip when tiling/broadcasting causes a rank mismatch
+        if len(desired_mode_order) != len(tv.mode_order):
+            continue
+        if list(tv.mode_order) != desired_mode_order:
+            tv.mode_order = desired_mode_order
+            if stensor.has_index and stensor.shape is not None:
+                stensor.change_mode_order(desired_mode_order)
+
+    # 3. Also align the output tensor
+    if isinstance(curr, TensorAssign):
+        lhs_tv = curr.lhs.get_tensor()
+        lhs_names = [iv.name for iv in curr.lhs.get_index_vars()]
+        desired_names = [n for n in loop_order_names if n in lhs_names]
+        desired_mode_order = [lhs_names.index(n) for n in desired_names]
+        if len(desired_mode_order) == len(lhs_tv.mode_order) and list(lhs_tv.mode_order) != desired_mode_order:
+            lhs_tv.mode_order = desired_mode_order
+
+
 def lower_and_exec_cin(
     cin_stmt: IndexStmt, result_shape: Sequence[int], *args: STensor, **kwargs
 ) -> STensor:
@@ -686,6 +739,8 @@ def lower_and_exec_cin(
     Returns:
         STensor: Output tensor.
     """
+    _align_mode_orders_to_loop_order(cin_stmt, args)
+
     # Lower to LLIR
     lowerer = CINLowerer()
     lowered_llir = lowerer.lower_IndexStmt(cin_stmt)

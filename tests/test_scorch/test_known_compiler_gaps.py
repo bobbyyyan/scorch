@@ -1,4 +1,3 @@
-import pytest
 import torch
 
 from scorch import STensor
@@ -64,10 +63,6 @@ def _build_broadcast_lhs_vec_cin(
     return ForAll(i, ForAll(j, ForAll(k, stmt)))
 
 
-@pytest.mark.xfail(
-    reason="Known gap: mode-order interactions can fail for transposed sparse/dense SpMM",
-    strict=False,
-)
 def test_known_gap_spmm_transposed_mode_order():
     torch.manual_seed(0)
     n = 16
@@ -90,10 +85,6 @@ def test_known_gap_spmm_transposed_mode_order():
     assert torch.allclose(result.to_torch(), expected, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.xfail(
-    reason="Known gap: 3-loop broadcasted reduction C[i,k]+=A[i,j]*b[j] has unsupported sparse paths",
-    strict=False,
-)
 def test_known_gap_broadcast_rhs_vector():
     torch.manual_seed(1)
     n = 16
@@ -117,10 +108,6 @@ def test_known_gap_broadcast_rhs_vector():
     assert torch.allclose(result.to_torch(), expected, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.xfail(
-    reason="Known gap: 3-loop broadcasted reduction C[i,k]+=a[i]*B[j,k] with sparse vector is unstable",
-    strict=False,
-)
 def test_known_gap_broadcast_lhs_vector():
     torch.manual_seed(2)
     n = 16
