@@ -755,27 +755,163 @@ class STensor(torch.nn.Module):
         assert self.shape is not None, "self.shape is None"
         assert self.format is not None, "self.format is None"
 
-        if self.storage.index.mode_order == mode_order:
+        dim = len(self.shape)
+        assert len(mode_order) == dim, "mode_order must match tensor order"
+        assert sorted(mode_order) == list(
+            range(dim)
+        ), "mode_order must be a permutation"
+
+        old_mode_order = (
+            self.storage.index.mode_order[:]
+            if self.storage.index.mode_order is not None
+            else [i for i in range(dim)]
+        )
+
+        if old_mode_order == mode_order:
+            return self
+
+        # old_mode_order maps physical_axis -> logical_axis.
+        # Compute inverse: logical_axis -> physical_axis.
+        inv_old_mode_order = [0] * dim
+        for physical_axis, logical_axis in enumerate(old_mode_order):
+            inv_old_mode_order[logical_axis] = physical_axis
+
+        # Convert shape from current physical layout to logical layout, then
+        # remap to the target physical layout described by mode_order.
+        logical_shape = tuple(self.shape[inv_old_mode_order[i]] for i in range(dim))
+        result_shape = tuple(logical_shape[i] for i in mode_order)
+        perm_old_to_new = [inv_old_mode_order[i] for i in mode_order]
+
+        # Fast path for 2D tensors in core formats. This avoids lowering/compiling
+        # a transpose kernel for the common matmul operands.
+        fmt_str = str(self.format)
+        if dim == 2 and fmt_str in {"d,d", "d,s", "o,o"}:
+            def _coalesce_2d_coo(
+                row: torch.Tensor, col: torch.Tensor, vals: torch.Tensor, num_cols: int
+            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                if row.numel() == 0:
+                    return row.int(), col.int(), vals
+
+                row64 = row.to(torch.int64)
+                col64 = col.to(torch.int64)
+                key = row64 * int(num_cols) + col64
+                perm = torch.argsort(key)
+                row_sorted = row64[perm]
+                col_sorted = col64[perm]
+                vals_sorted = vals[perm]
+                key_sorted = key[perm]
+
+                unique_mask = torch.ones_like(key_sorted, dtype=torch.bool)
+                if key_sorted.numel() > 1:
+                    unique_mask[1:] = key_sorted[1:] != key_sorted[:-1]
+
+                if torch.all(unique_mask).item():
+                    return row_sorted.int(), col_sorted.int(), vals_sorted
+
+                segment_ids = torch.cumsum(unique_mask.to(torch.int64), dim=0) - 1
+                unique_count = int(segment_ids[-1].item() + 1)
+                reduced_vals = torch.zeros(
+                    unique_count, dtype=vals_sorted.dtype, device=vals_sorted.device
+                )
+                reduced_vals.scatter_add_(0, segment_ids, vals_sorted)
+                unique_positions = torch.nonzero(unique_mask, as_tuple=False).flatten()
+                return (
+                    row_sorted[unique_positions].int(),
+                    col_sorted[unique_positions].int(),
+                    reduced_vals,
+                )
+
+            mode_indices = None
+            values = None
+
+            if fmt_str == "d,d":
+                dense = self.values.reshape(self.shape).permute(*perm_old_to_new)
+                values = dense.contiguous().reshape(-1)
+                mode_indices = [[], []]
+            elif fmt_str == "o,o":
+                old_coords = [
+                    self.index.mode_indices[0][0].to(torch.int64),
+                    self.index.mode_indices[1][0].to(torch.int64),
+                ]
+                new_row = old_coords[perm_old_to_new[0]]
+                new_col = old_coords[perm_old_to_new[1]]
+                coalesced_row, coalesced_col, coalesced_values = _coalesce_2d_coo(
+                    new_row,
+                    new_col,
+                    self.values,
+                    result_shape[1],
+                )
+                mode_indices = [
+                    [coalesced_row],
+                    [coalesced_col],
+                ]
+                values = coalesced_values
+            else:
+                crow_indices, col_indices = self.index.mode_indices[1]
+                row_counts = (crow_indices[1:] - crow_indices[:-1]).to(torch.int64)
+                old_row = torch.repeat_interleave(
+                    torch.arange(
+                        self.shape[0], dtype=torch.int64, device=col_indices.device
+                    ),
+                    row_counts,
+                )
+                old_col = col_indices.to(torch.int64)
+                old_coords = [old_row, old_col]
+                new_row = old_coords[perm_old_to_new[0]]
+                new_col = old_coords[perm_old_to_new[1]]
+                coalesced_row, coalesced_col, coalesced_values = _coalesce_2d_coo(
+                    new_row,
+                    new_col,
+                    self.values,
+                    result_shape[1],
+                )
+                transposed_crow = torch.zeros(
+                    result_shape[0] + 1,
+                    dtype=torch.int64,
+                    device=coalesced_row.device,
+                )
+                if coalesced_row.numel() > 0:
+                    row_nnz = torch.bincount(
+                        coalesced_row.to(torch.int64), minlength=result_shape[0]
+                    )
+                    transposed_crow[1:] = torch.cumsum(row_nnz, dim=0)
+                mode_indices = [
+                    [],
+                    [
+                        transposed_crow.int(),
+                        coalesced_col.int(),
+                    ],
+                ]
+                values = coalesced_values
+
+            self._storage = TensorStorage(
+                index=TensorIndex(
+                    tensor_format=self.format,
+                    mode_indices=mode_indices,
+                    mode_order=mode_order[:],
+                ),
+                value=values,
+            )
+            self._shape = result_shape
             return self
 
         default_index_vars = [
             IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
         ]
-        if len(self.shape) > len(default_index_vars):
-            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+        if dim > len(default_index_vars):
+            index_vars = [IndexVar(f"i{i}") for i in range(dim)]
         else:
-            index_vars = default_index_vars[: len(self.shape)]
+            index_vars = default_index_vars[:dim]
 
-        b_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+        b_index_vars = [index_vars[i] for i in old_mode_order]
         a_index_vars = [index_vars[i] for i in mode_order]
-        result_shape = tuple(self.shape[i] for i in mode_order)
 
         B = TensorVar(
             name="B",
             fmt=self.format,
             shape=self.shape,
             dtype=self.dtype,
-            mode_order=self.storage.index.mode_order[:],
+            mode_order=old_mode_order[:],
         )
 
         A = TensorVar(

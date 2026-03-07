@@ -72,7 +72,10 @@ class TensorIndex(object):
                 [index.clone().detach() for index in mode_index]
                 for mode_index in self.mode_indices
             ]
-        return TensorIndex(self.format, mode_indices)
+        mode_order = None
+        if self.mode_order is not None:
+            mode_order = self.mode_order[:]
+        return TensorIndex(self.format, mode_indices, mode_order=mode_order)
 
     def get_mode_index(self, mode: int) -> List[torch.Tensor]:
         """Get the mode index of a mode."""

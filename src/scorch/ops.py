@@ -272,11 +272,54 @@ def matmul(
     if isinstance(b, torch.Tensor):
         b = STensor.from_torch(b)
 
+    # Dense STensor x dense STensor: use torch dense matmul directly.
+    # This is both faster and more reliable than lowering through sparse
+    # scheduling paths for fully dense operands.
+    if a.format.is_dense() and b.format.is_dense():
+        start_time = time.time()
+        result_torch = torch.matmul(
+            a.to_torch(in_place=False),
+            b.to_torch(in_place=False),
+        )
+        end_time = time.time()
+        eval_time = end_time - start_time
+        if "time_dict" in kwargs:
+            time_dict = kwargs["time_dict"]
+            time_dict["eval_time"] = eval_time
+
+        output_format_kw = kwargs.get("format", None)
+        if output_format_kw is None:
+            return result_torch
+
+        output_format = parse_format(output_format_kw)
+        if output_format.is_dense():
+            return result_torch
+
+        return STensor.from_torch(result_torch).to_sparse(output_format)
+
     if a.dim() == 2 and b.dim() == 1:
         return spmv(a, b, **kwargs)
 
     use_cache = kwargs.get("use_cache", True)
     time_dict = kwargs.get("time_dict", {})
+
+    # Normalize sparse 2D operands to canonical mode order before dispatch.
+    # This keeps fast kernels correct and avoids known non-default mode-order
+    # issues in the generic path.
+    if a.dim() == 2 and b.dim() == 2:
+        default_mode_order = [0, 1]
+        has_non_default_mode_order = (
+            a.storage.index.mode_order != default_mode_order
+            or b.storage.index.mode_order != default_mode_order
+        )
+        has_sparse_input = (not a.format.is_dense()) or (not b.format.is_dense())
+        if has_non_default_mode_order and has_sparse_input:
+            if a.storage.index.mode_order != default_mode_order:
+                a = a.copy()
+                a.change_mode_order(default_mode_order)
+            if b.storage.index.mode_order != default_mode_order:
+                b = b.copy()
+                b.change_mode_order(default_mode_order)
 
     kernel_op = None
 
@@ -531,6 +574,21 @@ def einsum(
         cin_stmt = ForAll(index_var_dict[index_str], cin_stmt)
 
     # print("CIN:\n", cin_stmt)
+
+    # Align input tensor mode orders with the selected loop order to keep
+    # parent-child level traversal valid during lowering for non-canonical
+    # schedules.
+    selected_loop_order = Scheduler.select_loop_order(cin_stmt)
+    selected_loop_order_names = [index_var.name for index_var in selected_loop_order]
+    for tensor_index, input_index_str in enumerate(input_index_strs):
+        desired_index_strs = [
+            index_str for index_str in selected_loop_order_names if index_str in input_index_str
+        ]
+        desired_mode_order = [input_index_str.index(index_str) for index_str in desired_index_strs]
+        if tensors[tensor_index].storage.index.mode_order != desired_mode_order:
+            tensors[tensor_index].change_mode_order(desired_mode_order)
+        if tensor_vars[tensor_index].mode_order != desired_mode_order:
+            tensor_vars[tensor_index].mode_order = desired_mode_order
 
     cin_stmt = Scheduler.auto_schedule(cin_stmt)
 
