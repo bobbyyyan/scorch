@@ -1355,6 +1355,31 @@ class Scheduler:
             for index_var in index_vars_to_tile
             if index_var not in cin.no_tile_list
         ]
+
+        # Remove index variables whose tiling would cause sparse re-traversal.
+        # When tiling lifts the outer tile loop above a sparse loop, that sparse
+        # loop is re-executed once per tile instead of once total.  For typical
+        # problem sizes the re-traversal cost far outweighs the cache benefit
+        # of a smaller tile working set.
+        loop_order = cin.loop_order
+        if loop_order:
+            def _causes_sparse_retraversal(iv: IndexVar) -> bool:
+                if iv not in loop_order:
+                    return False
+                iv_pos = loop_order.index(iv)
+                # Tiling lifts iv_out to position 1 (after the outermost loop).
+                # Any sparse loop between position 1 and iv_pos would be nested
+                # inside the tile loop, causing re-traversal.
+                for pos in range(1, iv_pos):
+                    if loop_order[pos] in index_vars_sparse:
+                        return True
+                return False
+
+            index_vars_to_tile = [
+                iv for iv in index_vars_to_tile
+                if not _causes_sparse_retraversal(iv)
+            ]
+
         return index_vars_to_tile
 
     @staticmethod
@@ -1377,7 +1402,12 @@ class Scheduler:
         cin = Scheduler._rebuild_loop_nest(cin, loop_order)
 
         if Scheduler.should_insert_workspace(cin, loop_order):
-            cin = Scheduler.insert_workspace(cin, allow_dense=True)
+            # For dense outputs the workspace only exists to support tiling.
+            # If nothing will be tiled, the workspace is pure overhead
+            # (extra memset + copy-back per iteration).
+            will_tile = len(Scheduler._select_index_vars_to_tile(cin)) > 0
+            if not Scheduler._has_dense_output(cin) or will_tile:
+                cin = Scheduler.insert_workspace(cin, allow_dense=True)
 
         if not isinstance(cin, ForAll):
             return cin

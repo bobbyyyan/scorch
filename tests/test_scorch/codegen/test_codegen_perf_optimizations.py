@@ -9,7 +9,9 @@ def _lower_to_cpp(cin_stmt) -> str:
     return LLIRLowerer().lower_llir(lowered)
 
 
-def test_spmm_codegen_emits_parallel_restrict_unroll_and_stack_workspace():
+def test_spmm_codegen_emits_parallel_restrict_no_workspace():
+    """SpMM with sparse input should NOT tile or use workspace, since tiling
+    would force re-traversal of the sparse structure once per tile."""
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
@@ -24,8 +26,9 @@ def test_spmm_codegen_emits_parallel_restrict_unroll_and_stack_workspace():
 
     assert "#pragma omp parallel for" in cpp_code
     assert "__restrict__" in cpp_code
-    assert "#pragma unroll" in cpp_code
-    assert "float wksp[kTile_" in cpp_code
+    # No workspace or tiling: accumulate directly into output
+    assert "wksp" not in cpp_code
+    assert "kTile_" not in cpp_code
 
 
 def test_non_tiled_dense_workspace_is_zero_initialized_and_freed():

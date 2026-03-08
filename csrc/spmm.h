@@ -1,8 +1,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #include "prebuilt_types.h"
 
@@ -1185,6 +1191,889 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
   auto C_values_deleter = [](void *ptr) {
     { free(ptr); }
   };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+// ============================================================================
+// Novel SpMM Kernel Variants
+// ============================================================================
+
+// Variant 1: Direct-to-C Accumulation (No Workspace)
+// Hypothesis: Workspace alloc + memset + copy-back is unnecessary overhead
+// since C is pre-zeroed and each row is independent.
+Tensor spmm_csr_float_direct(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  #pragma omp parallel for schedule(dynamic, 16)
+  for (int i = 0; i < A0_size; i++) {
+    int pA1_begin = A1_pos[i];
+    int pA1_end = A1_pos[i + 1];
+    if (pA1_begin == pA1_end) continue;
+
+    float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+
+    for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+      int j = A1_crd[pA1];
+      float a_val = A_val[pA1];
+      const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
+
+      // Prefetch next B row
+      if (pA1 + 1 < pA1_end) {
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA1 + 1] * (size_t)B1_size, 0, 1);
+      }
+
+      // 16-wide manual unroll
+      int k = 0;
+      for (; k + 15 < B1_size; k += 16) {
+        C_row[k]      += a_val * B_row[k];
+        C_row[k + 1]  += a_val * B_row[k + 1];
+        C_row[k + 2]  += a_val * B_row[k + 2];
+        C_row[k + 3]  += a_val * B_row[k + 3];
+        C_row[k + 4]  += a_val * B_row[k + 4];
+        C_row[k + 5]  += a_val * B_row[k + 5];
+        C_row[k + 6]  += a_val * B_row[k + 6];
+        C_row[k + 7]  += a_val * B_row[k + 7];
+        C_row[k + 8]  += a_val * B_row[k + 8];
+        C_row[k + 9]  += a_val * B_row[k + 9];
+        C_row[k + 10] += a_val * B_row[k + 10];
+        C_row[k + 11] += a_val * B_row[k + 11];
+        C_row[k + 12] += a_val * B_row[k + 12];
+        C_row[k + 13] += a_val * B_row[k + 13];
+        C_row[k + 14] += a_val * B_row[k + 14];
+        C_row[k + 15] += a_val * B_row[k + 15];
+      }
+      for (; k < B1_size; k++) {
+        C_row[k] += a_val * B_row[k];
+      }
+    }
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+// Variant 2: Explicit ARM NEON Vectorization
+// Hypothesis: Explicit NEON FMA intrinsics may beat auto-vectorization
+// for the scatter-add inner loop.
+Tensor spmm_csr_float_neon(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  #pragma omp parallel for schedule(dynamic, 16)
+  for (int i = 0; i < A0_size; i++) {
+    int pA1_begin = A1_pos[i];
+    int pA1_end = A1_pos[i + 1];
+    if (pA1_begin == pA1_end) continue;
+
+    float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+
+    for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+      int j = A1_crd[pA1];
+      float a_val = A_val[pA1];
+      const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
+
+      // Prefetch next B row
+      if (pA1 + 1 < pA1_end) {
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA1 + 1] * (size_t)B1_size, 0, 1);
+      }
+
+#ifdef __ARM_NEON
+      float32x4_t va = vdupq_n_f32(a_val);
+      int k = 0;
+      // Process 16 floats per iteration (4 NEON registers x 4 floats)
+      for (; k + 15 < B1_size; k += 16) {
+        float32x4_t c0 = vld1q_f32(C_row + k);
+        float32x4_t c1 = vld1q_f32(C_row + k + 4);
+        float32x4_t c2 = vld1q_f32(C_row + k + 8);
+        float32x4_t c3 = vld1q_f32(C_row + k + 12);
+        float32x4_t b0 = vld1q_f32(B_row + k);
+        float32x4_t b1 = vld1q_f32(B_row + k + 4);
+        float32x4_t b2 = vld1q_f32(B_row + k + 8);
+        float32x4_t b3 = vld1q_f32(B_row + k + 12);
+        c0 = vfmaq_f32(c0, va, b0);
+        c1 = vfmaq_f32(c1, va, b1);
+        c2 = vfmaq_f32(c2, va, b2);
+        c3 = vfmaq_f32(c3, va, b3);
+        vst1q_f32(C_row + k, c0);
+        vst1q_f32(C_row + k + 4, c1);
+        vst1q_f32(C_row + k + 8, c2);
+        vst1q_f32(C_row + k + 12, c3);
+      }
+      // Handle 4-wide remainder
+      for (; k + 3 < B1_size; k += 4) {
+        float32x4_t c = vld1q_f32(C_row + k);
+        float32x4_t b = vld1q_f32(B_row + k);
+        c = vfmaq_f32(c, va, b);
+        vst1q_f32(C_row + k, c);
+      }
+      // Scalar remainder
+      for (; k < B1_size; k++) {
+        C_row[k] += a_val * B_row[k];
+      }
+#else
+      // Fallback: scalar with 16-wide unroll
+      int k = 0;
+      for (; k + 15 < B1_size; k += 16) {
+        C_row[k]      += a_val * B_row[k];
+        C_row[k + 1]  += a_val * B_row[k + 1];
+        C_row[k + 2]  += a_val * B_row[k + 2];
+        C_row[k + 3]  += a_val * B_row[k + 3];
+        C_row[k + 4]  += a_val * B_row[k + 4];
+        C_row[k + 5]  += a_val * B_row[k + 5];
+        C_row[k + 6]  += a_val * B_row[k + 6];
+        C_row[k + 7]  += a_val * B_row[k + 7];
+        C_row[k + 8]  += a_val * B_row[k + 8];
+        C_row[k + 9]  += a_val * B_row[k + 9];
+        C_row[k + 10] += a_val * B_row[k + 10];
+        C_row[k + 11] += a_val * B_row[k + 11];
+        C_row[k + 12] += a_val * B_row[k + 12];
+        C_row[k + 13] += a_val * B_row[k + 13];
+        C_row[k + 14] += a_val * B_row[k + 14];
+        C_row[k + 15] += a_val * B_row[k + 15];
+      }
+      for (; k < B1_size; k++) {
+        C_row[k] += a_val * B_row[k];
+      }
+#endif
+    }
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+// Variant 3: Multi-Row Merge for B-Row Reuse
+// Hypothesis: Processing a panel of R rows together lets us load each B-row
+// once and scatter to all rows that share that column, reducing total B-row loads.
+Tensor spmm_csr_float_row_panel(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  constexpr int PANEL_SIZE = 8;
+  int num_panels = (A0_size + PANEL_SIZE - 1) / PANEL_SIZE;
+
+  struct PanelEntry {
+    int col;
+    int row;   // row index within panel (0 to PANEL_SIZE-1)
+    float val;
+  };
+
+  #pragma omp parallel
+  {
+    // Thread-local entry buffer to avoid repeated allocation
+    std::vector<PanelEntry> entries;
+
+    #pragma omp for schedule(dynamic)
+    for (int panel = 0; panel < num_panels; panel++) {
+      int i_start = panel * PANEL_SIZE;
+      int i_end = std::min(i_start + PANEL_SIZE, A0_size);
+      int panel_rows = i_end - i_start;
+
+      // Collect all (col, row_in_panel, a_val) entries
+      int total_nnz = 0;
+      for (int r = 0; r < panel_rows; r++) {
+        total_nnz += A1_pos[i_start + r + 1] - A1_pos[i_start + r];
+      }
+
+      if (total_nnz == 0) continue;
+
+      entries.clear();
+      entries.reserve(total_nnz);
+
+      for (int r = 0; r < panel_rows; r++) {
+        int i = i_start + r;
+        for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
+          entries.push_back({A1_crd[pA1], r, A_val[pA1]});
+        }
+      }
+
+      // Sort by column for B-row reuse
+      std::sort(entries.begin(), entries.end(),
+                [](const PanelEntry& a, const PanelEntry& b) {
+                  return a.col < b.col;
+                });
+
+      // Process sorted entries - B row stays in cache across entries with same col
+      int idx = 0;
+      int num_entries = (int)entries.size();
+      while (idx < num_entries) {
+        int j = entries[idx].col;
+        const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
+
+        // Prefetch next unique column's B row
+        int next_idx = idx + 1;
+        while (next_idx < num_entries && entries[next_idx].col == j) next_idx++;
+        if (next_idx < num_entries) {
+          __builtin_prefetch(
+              B_val + (size_t)entries[next_idx].col * (size_t)B1_size, 0, 1);
+        }
+
+        // Scatter to all rows in panel that reference this column
+        while (idx < num_entries && entries[idx].col == j) {
+          float a_val = entries[idx].val;
+          float* SCORCH_RESTRICT C_row =
+              C_values + (size_t)(i_start + entries[idx].row) * (size_t)C1_size;
+
+          int k = 0;
+          for (; k + 15 < B1_size; k += 16) {
+            C_row[k]      += a_val * B_row[k];
+            C_row[k + 1]  += a_val * B_row[k + 1];
+            C_row[k + 2]  += a_val * B_row[k + 2];
+            C_row[k + 3]  += a_val * B_row[k + 3];
+            C_row[k + 4]  += a_val * B_row[k + 4];
+            C_row[k + 5]  += a_val * B_row[k + 5];
+            C_row[k + 6]  += a_val * B_row[k + 6];
+            C_row[k + 7]  += a_val * B_row[k + 7];
+            C_row[k + 8]  += a_val * B_row[k + 8];
+            C_row[k + 9]  += a_val * B_row[k + 9];
+            C_row[k + 10] += a_val * B_row[k + 10];
+            C_row[k + 11] += a_val * B_row[k + 11];
+            C_row[k + 12] += a_val * B_row[k + 12];
+            C_row[k + 13] += a_val * B_row[k + 13];
+            C_row[k + 14] += a_val * B_row[k + 14];
+            C_row[k + 15] += a_val * B_row[k + 15];
+          }
+          for (; k < B1_size; k++) {
+            C_row[k] += a_val * B_row[k];
+          }
+          idx++;
+        }
+      }
+    }
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+// Variant 4: K-Parallel with Direct Output
+// Hypothesis: K-tile parallelism combined with direct-to-C writes eliminates
+// workspace overhead while keeping well-balanced k-parallel structure.
+// Each thread owns disjoint C columns, so no workspace or atomics needed.
+Tensor spmm_csr_float_k_parallel(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  // Tile size = 32 floats = 128 bytes = 1 Apple Silicon cache line
+  constexpr int kTile = 32;
+  int num_k_tiles = (B1_size + kTile - 1) / kTile;
+
+  #pragma omp parallel for schedule(static)
+  for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+    int k_start = k_tile * kTile;
+    int k_end = std::min(k_start + kTile, B1_size);
+    int k_width = k_end - k_start;
+
+    for (int i = 0; i < A0_size; i++) {
+      int pA1_begin = A1_pos[i];
+      int pA1_end = A1_pos[i + 1];
+      if (pA1_begin == pA1_end) continue;
+
+      float* SCORCH_RESTRICT C_ptr = C_values + (size_t)i * (size_t)C1_size + k_start;
+
+      for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+        int j = A1_crd[pA1];
+        float a_val = A_val[pA1];
+        const float* SCORCH_RESTRICT B_ptr =
+            B_val + (size_t)j * (size_t)B1_size + k_start;
+
+        // Direct accumulation into C (no workspace needed)
+        if (SCORCH_LIKELY(k_width == kTile)) {
+          SCORCH_PRAGMA_UNROLL
+          for (int k = 0; k < kTile; k++) {
+            C_ptr[k] += a_val * B_ptr[k];
+          }
+        } else {
+          for (int k = 0; k < k_width; k++) {
+            C_ptr[k] += a_val * B_ptr[k];
+          }
+        }
+      }
+    }
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+// Variant 5: Row-Sorted by NNZ Count
+// Hypothesis: Sorting rows by nnz count improves load balancing and enables
+// density-specific code paths without branch misprediction.
+Tensor spmm_csr_float_sorted_rows(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  // Sort row indices by nnz count (descending)
+  std::vector<int> sorted_rows(A0_size);
+  std::iota(sorted_rows.begin(), sorted_rows.end(), 0);
+  std::sort(sorted_rows.begin(), sorted_rows.end(), [&](int a, int b) {
+    return (A1_pos[a + 1] - A1_pos[a]) > (A1_pos[b + 1] - A1_pos[b]);
+  });
+
+  // Find boundary indices in sorted order
+  constexpr int SPARSE_THRESHOLD = 4;
+  int empty_start = A0_size;
+  int sparse_start = A0_size;
+  for (int idx = 0; idx < A0_size; idx++) {
+    int nnz = A1_pos[sorted_rows[idx] + 1] - A1_pos[sorted_rows[idx]];
+    if (nnz == 0) {
+      empty_start = idx;
+      if (sparse_start == A0_size) sparse_start = idx;
+      break;
+    }
+    if (nnz <= SPARSE_THRESHOLD && sparse_start == A0_size) {
+      sparse_start = idx;
+    }
+  }
+
+  // Dense rows (nnz > threshold): tiled processing with workspace
+  constexpr int kTile = 128;
+
+  #pragma omp parallel
+  {
+    float workspace[kTile];
+
+    #pragma omp for schedule(static)
+    for (int idx = 0; idx < sparse_start; idx++) {
+      int i = sorted_rows[idx];
+      int pA1_begin = A1_pos[i];
+      int pA1_end = A1_pos[i + 1];
+      float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+
+      for (int k_out = 0; k_out < B1_size; k_out += kTile) {
+        int k_width = std::min(kTile, B1_size - k_out);
+        memset(workspace, 0, sizeof(float) * k_width);
+
+        for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+          int j = A1_crd[pA1];
+          float a_val = A_val[pA1];
+          const float* SCORCH_RESTRICT B_ptr =
+              B_val + (size_t)j * (size_t)B1_size + k_out;
+
+          if (pA1 + 1 < pA1_end) {
+            __builtin_prefetch(
+                B_val + (size_t)A1_crd[pA1 + 1] * (size_t)B1_size + k_out, 0, 3);
+          }
+
+          SCORCH_PRAGMA_UNROLL
+          for (int k = 0; k < k_width; k++) {
+            workspace[k] += a_val * B_ptr[k];
+          }
+        }
+
+        for (int k = 0; k < k_width; k++) {
+          C_row[k_out + k] = workspace[k];
+        }
+      }
+    }
+  }
+
+  // Sparse rows (nnz <= threshold): direct saxpy, no tiling overhead
+  #pragma omp parallel for schedule(static)
+  for (int idx = sparse_start; idx < empty_start; idx++) {
+    int i = sorted_rows[idx];
+    int pA1_begin = A1_pos[i];
+    int pA1_end = A1_pos[i + 1];
+    float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+
+    for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+      int j = A1_crd[pA1];
+      float a_val = A_val[pA1];
+      const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
+
+      for (int k = 0; k < B1_size; k++) {
+        C_row[k] += a_val * B_row[k];
+      }
+    }
+  }
+
+  // Empty rows: skip entirely (C is already zeroed)
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// Round 2 optimizations: targeting SuiteSparse SpMM with large k
+// ════════════════════════════════════════════════════════════════════════════
+
+// Variant 7: NEON 2-NNZ Unroll + Deep Prefetch
+// Process pairs of nnz entries per inner loop to halve C reads/writes,
+// provide 2 independent FMA chains for ILP, and prefetch 3 B-rows ahead.
+Tensor spmm_csr_float_neon2(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  #pragma omp parallel for schedule(dynamic, 16)
+  for (int i = 0; i < A0_size; i++) {
+    int pA1_begin = A1_pos[i];
+    int pA1_end = A1_pos[i + 1];
+    if (pA1_begin >= pA1_end) continue;
+
+    float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+    int nnz_count = pA1_end - pA1_begin;
+    int pA1 = pA1_begin;
+
+    // Process pairs of nnz
+    int pair_end = pA1_begin + (nnz_count / 2) * 2;
+
+#ifdef __ARM_NEON
+    for (; pA1 < pair_end; pA1 += 2) {
+      int j0 = A1_crd[pA1];
+      int j1 = A1_crd[pA1 + 1];
+      float a_val0 = A_val[pA1];
+      float a_val1 = A_val[pA1 + 1];
+      const float* SCORCH_RESTRICT B_row0 = B_val + (size_t)j0 * (size_t)B1_size;
+      const float* SCORCH_RESTRICT B_row1 = B_val + (size_t)j1 * (size_t)B1_size;
+
+      // Deep prefetch: 3 B-rows ahead
+      if (pA1 + 2 < pA1_end) {
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA1 + 2] * (size_t)B1_size, 0, 1);
+      }
+      if (pA1 + 3 < pA1_end) {
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA1 + 3] * (size_t)B1_size, 0, 1);
+      }
+
+      float32x4_t va0 = vdupq_n_f32(a_val0);
+      float32x4_t va1 = vdupq_n_f32(a_val1);
+
+      int k = 0;
+      for (; k + 15 < B1_size; k += 16) {
+        // Load C once
+        float32x4_t c0 = vld1q_f32(C_row + k);
+        float32x4_t c1 = vld1q_f32(C_row + k + 4);
+        float32x4_t c2 = vld1q_f32(C_row + k + 8);
+        float32x4_t c3 = vld1q_f32(C_row + k + 12);
+
+        // FMA chain 1: B_row0
+        c0 = vfmaq_f32(c0, va0, vld1q_f32(B_row0 + k));
+        c1 = vfmaq_f32(c1, va0, vld1q_f32(B_row0 + k + 4));
+        c2 = vfmaq_f32(c2, va0, vld1q_f32(B_row0 + k + 8));
+        c3 = vfmaq_f32(c3, va0, vld1q_f32(B_row0 + k + 12));
+
+        // FMA chain 2: B_row1
+        c0 = vfmaq_f32(c0, va1, vld1q_f32(B_row1 + k));
+        c1 = vfmaq_f32(c1, va1, vld1q_f32(B_row1 + k + 4));
+        c2 = vfmaq_f32(c2, va1, vld1q_f32(B_row1 + k + 8));
+        c3 = vfmaq_f32(c3, va1, vld1q_f32(B_row1 + k + 12));
+
+        // Store C once
+        vst1q_f32(C_row + k, c0);
+        vst1q_f32(C_row + k + 4, c1);
+        vst1q_f32(C_row + k + 8, c2);
+        vst1q_f32(C_row + k + 12, c3);
+      }
+      for (; k + 3 < B1_size; k += 4) {
+        float32x4_t c = vld1q_f32(C_row + k);
+        c = vfmaq_f32(c, va0, vld1q_f32(B_row0 + k));
+        c = vfmaq_f32(c, va1, vld1q_f32(B_row1 + k));
+        vst1q_f32(C_row + k, c);
+      }
+      for (; k < B1_size; k++) {
+        C_row[k] += a_val0 * B_row0[k] + a_val1 * B_row1[k];
+      }
+    }
+
+    // Handle odd trailing nnz
+    for (; pA1 < pA1_end; pA1++) {
+      int j = A1_crd[pA1];
+      float a_val = A_val[pA1];
+      const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
+      float32x4_t va = vdupq_n_f32(a_val);
+      int k = 0;
+      for (; k + 15 < B1_size; k += 16) {
+        float32x4_t c0 = vld1q_f32(C_row + k);
+        float32x4_t c1 = vld1q_f32(C_row + k + 4);
+        float32x4_t c2 = vld1q_f32(C_row + k + 8);
+        float32x4_t c3 = vld1q_f32(C_row + k + 12);
+        c0 = vfmaq_f32(c0, va, vld1q_f32(B_row + k));
+        c1 = vfmaq_f32(c1, va, vld1q_f32(B_row + k + 4));
+        c2 = vfmaq_f32(c2, va, vld1q_f32(B_row + k + 8));
+        c3 = vfmaq_f32(c3, va, vld1q_f32(B_row + k + 12));
+        vst1q_f32(C_row + k, c0);
+        vst1q_f32(C_row + k + 4, c1);
+        vst1q_f32(C_row + k + 8, c2);
+        vst1q_f32(C_row + k + 12, c3);
+      }
+      for (; k < B1_size; k++) {
+        C_row[k] += a_val * B_row[k];
+      }
+    }
+#else
+    // Scalar fallback
+    for (; pA1 < pA1_end; pA1++) {
+      int j = A1_crd[pA1];
+      float a_val = A_val[pA1];
+      const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
+      for (int k = 0; k < B1_size; k++) {
+        C_row[k] += a_val * B_row[k];
+      }
+    }
+#endif
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+
+// Variant 8: NEON 4-NNZ Unroll + Deep Prefetch
+// Process quads of nnz entries for maximum ILP: 4 independent FMA chains,
+// quarter the C reads/writes, prefetch 5 B-rows ahead.
+Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  #pragma omp parallel for schedule(dynamic, 16)
+  for (int i = 0; i < A0_size; i++) {
+    int pA1_begin = A1_pos[i];
+    int pA1_end = A1_pos[i + 1];
+    if (pA1_begin >= pA1_end) continue;
+
+    float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+    int nnz_count = pA1_end - pA1_begin;
+    int pA1 = pA1_begin;
+    int quad_end = pA1_begin + (nnz_count / 4) * 4;
+
+#ifdef __ARM_NEON
+    // Process quads of nnz
+    for (; pA1 < quad_end; pA1 += 4) {
+      float a0 = A_val[pA1], a1 = A_val[pA1+1], a2 = A_val[pA1+2], a3 = A_val[pA1+3];
+      const float* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA1]   * (size_t)B1_size;
+      const float* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA1+1] * (size_t)B1_size;
+      const float* SCORCH_RESTRICT B2 = B_val + (size_t)A1_crd[pA1+2] * (size_t)B1_size;
+      const float* SCORCH_RESTRICT B3 = B_val + (size_t)A1_crd[pA1+3] * (size_t)B1_size;
+
+      // Deep prefetch: 5 B-rows ahead
+      for (int pf = 4; pf < 8 && pA1 + pf < pA1_end; pf++) {
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA1 + pf] * (size_t)B1_size, 0, 1);
+      }
+
+      float32x4_t va0 = vdupq_n_f32(a0);
+      float32x4_t va1 = vdupq_n_f32(a1);
+      float32x4_t va2 = vdupq_n_f32(a2);
+      float32x4_t va3 = vdupq_n_f32(a3);
+
+      int k = 0;
+      for (; k + 15 < B1_size; k += 16) {
+        float32x4_t c0 = vld1q_f32(C_row + k);
+        float32x4_t c1 = vld1q_f32(C_row + k + 4);
+        float32x4_t c2 = vld1q_f32(C_row + k + 8);
+        float32x4_t c3 = vld1q_f32(C_row + k + 12);
+
+        c0 = vfmaq_f32(c0, va0, vld1q_f32(B0 + k));
+        c1 = vfmaq_f32(c1, va0, vld1q_f32(B0 + k + 4));
+        c2 = vfmaq_f32(c2, va0, vld1q_f32(B0 + k + 8));
+        c3 = vfmaq_f32(c3, va0, vld1q_f32(B0 + k + 12));
+
+        c0 = vfmaq_f32(c0, va1, vld1q_f32(B1 + k));
+        c1 = vfmaq_f32(c1, va1, vld1q_f32(B1 + k + 4));
+        c2 = vfmaq_f32(c2, va1, vld1q_f32(B1 + k + 8));
+        c3 = vfmaq_f32(c3, va1, vld1q_f32(B1 + k + 12));
+
+        c0 = vfmaq_f32(c0, va2, vld1q_f32(B2 + k));
+        c1 = vfmaq_f32(c1, va2, vld1q_f32(B2 + k + 4));
+        c2 = vfmaq_f32(c2, va2, vld1q_f32(B2 + k + 8));
+        c3 = vfmaq_f32(c3, va2, vld1q_f32(B2 + k + 12));
+
+        c0 = vfmaq_f32(c0, va3, vld1q_f32(B3 + k));
+        c1 = vfmaq_f32(c1, va3, vld1q_f32(B3 + k + 4));
+        c2 = vfmaq_f32(c2, va3, vld1q_f32(B3 + k + 8));
+        c3 = vfmaq_f32(c3, va3, vld1q_f32(B3 + k + 12));
+
+        vst1q_f32(C_row + k, c0);
+        vst1q_f32(C_row + k + 4, c1);
+        vst1q_f32(C_row + k + 8, c2);
+        vst1q_f32(C_row + k + 12, c3);
+      }
+      for (; k + 3 < B1_size; k += 4) {
+        float32x4_t c = vld1q_f32(C_row + k);
+        c = vfmaq_f32(c, va0, vld1q_f32(B0 + k));
+        c = vfmaq_f32(c, va1, vld1q_f32(B1 + k));
+        c = vfmaq_f32(c, va2, vld1q_f32(B2 + k));
+        c = vfmaq_f32(c, va3, vld1q_f32(B3 + k));
+        vst1q_f32(C_row + k, c);
+      }
+      for (; k < B1_size; k++) {
+        C_row[k] += a0 * B0[k] + a1 * B1[k] + a2 * B2[k] + a3 * B3[k];
+      }
+    }
+
+    // Handle remainder (1-3 nnz) with single-nnz NEON
+    for (; pA1 < pA1_end; pA1++) {
+      int j = A1_crd[pA1];
+      float a_val = A_val[pA1];
+      const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
+      float32x4_t va = vdupq_n_f32(a_val);
+      int k = 0;
+      for (; k + 15 < B1_size; k += 16) {
+        vst1q_f32(C_row + k,      vfmaq_f32(vld1q_f32(C_row + k),      va, vld1q_f32(B_row + k)));
+        vst1q_f32(C_row + k + 4,  vfmaq_f32(vld1q_f32(C_row + k + 4),  va, vld1q_f32(B_row + k + 4)));
+        vst1q_f32(C_row + k + 8,  vfmaq_f32(vld1q_f32(C_row + k + 8),  va, vld1q_f32(B_row + k + 8)));
+        vst1q_f32(C_row + k + 12, vfmaq_f32(vld1q_f32(C_row + k + 12), va, vld1q_f32(B_row + k + 12)));
+      }
+      for (; k < B1_size; k++) {
+        C_row[k] += a_val * B_row[k];
+      }
+    }
+#else
+    for (; pA1 < pA1_end; pA1++) {
+      int j = A1_crd[pA1];
+      float a_val = A_val[pA1];
+      const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
+      for (int k = 0; k < B1_size; k++) {
+        C_row[k] += a_val * B_row[k];
+      }
+    }
+#endif
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+
+// Variant 9: Large-Tile NEON with Direct Accumulation
+// Tile k at 128 (outer loop) so B working set per tile fits in L2 (~2.5MB for n=5000).
+// Uses NEON inner loop, dynamic scheduling, and direct C accumulation (no workspace copy).
+// Re-traverses sparse structure 16x for k=2048 but all B loads are L2 hits.
+Tensor spmm_csr_float_tiled_neon(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  int B1_size = B_shape[1];
+  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  constexpr int kTile = 128;
+
+  // Tile k (output columns) in the outer loop
+  for (int k_out = 0; k_out < B1_size; k_out += kTile) {
+    int k_width = std::min(kTile, B1_size - k_out);
+
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (int i = 0; i < A0_size; i++) {
+      int pA1_begin = A1_pos[i];
+      int pA1_end = A1_pos[i + 1];
+      if (pA1_begin >= pA1_end) continue;
+
+      float* SCORCH_RESTRICT C_ptr = C_values + (size_t)i * (size_t)C1_size + k_out;
+
+#ifdef __ARM_NEON
+      for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+        int j = A1_crd[pA1];
+        float a_val = A_val[pA1];
+        const float* SCORCH_RESTRICT B_ptr = B_val + (size_t)j * (size_t)B1_size + k_out;
+
+        if (pA1 + 1 < pA1_end) {
+          __builtin_prefetch(B_val + (size_t)A1_crd[pA1 + 1] * (size_t)B1_size + k_out, 0, 1);
+        }
+
+        float32x4_t va = vdupq_n_f32(a_val);
+        int k = 0;
+        for (; k + 15 < k_width; k += 16) {
+          float32x4_t c0 = vld1q_f32(C_ptr + k);
+          float32x4_t c1 = vld1q_f32(C_ptr + k + 4);
+          float32x4_t c2 = vld1q_f32(C_ptr + k + 8);
+          float32x4_t c3 = vld1q_f32(C_ptr + k + 12);
+          c0 = vfmaq_f32(c0, va, vld1q_f32(B_ptr + k));
+          c1 = vfmaq_f32(c1, va, vld1q_f32(B_ptr + k + 4));
+          c2 = vfmaq_f32(c2, va, vld1q_f32(B_ptr + k + 8));
+          c3 = vfmaq_f32(c3, va, vld1q_f32(B_ptr + k + 12));
+          vst1q_f32(C_ptr + k, c0);
+          vst1q_f32(C_ptr + k + 4, c1);
+          vst1q_f32(C_ptr + k + 8, c2);
+          vst1q_f32(C_ptr + k + 12, c3);
+        }
+        for (; k + 3 < k_width; k += 4) {
+          float32x4_t c = vld1q_f32(C_ptr + k);
+          c = vfmaq_f32(c, va, vld1q_f32(B_ptr + k));
+          vst1q_f32(C_ptr + k, c);
+        }
+        for (; k < k_width; k++) {
+          C_ptr[k] += a_val * B_ptr[k];
+        }
+      }
+#else
+      for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
+        int j = A1_crd[pA1];
+        float a_val = A_val[pA1];
+        const float* SCORCH_RESTRICT B_ptr = B_val + (size_t)j * (size_t)B1_size + k_out;
+        for (int k = 0; k < k_width; k++) {
+          C_ptr[k] += a_val * B_ptr[k];
+        }
+      }
+#endif
+    }
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
   torch::Tensor C_values_torch = torch::from_blob(
       C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};

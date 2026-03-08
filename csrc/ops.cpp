@@ -141,6 +141,24 @@ void bind_experimental_spmm_variants(py::module_& m) {
                      "Sparse matrix multiplication (COO)");
   bind_binary_kernel(m, "spmspm_coo_float", &spmspm_coo_float_opt,
                      "Sparse matrix-sparse matrix multiplication (COO)");
+
+  // Novel SpMM variants
+  bind_binary_kernel(m, "spmm_csr_float_direct", &spmm_csr_float_direct,
+                     "Direct-to-C accumulation SpMM (no workspace)");
+  bind_binary_kernel(m, "spmm_csr_float_neon", &spmm_csr_float_neon,
+                     "Explicit ARM NEON vectorized SpMM");
+  bind_binary_kernel(m, "spmm_csr_float_row_panel", &spmm_csr_float_row_panel,
+                     "Multi-row panel SpMM with B-row reuse");
+  bind_binary_kernel(m, "spmm_csr_float_k_parallel", &spmm_csr_float_k_parallel,
+                     "K-parallel SpMM with direct output");
+  bind_binary_kernel(m, "spmm_csr_float_sorted_rows", &spmm_csr_float_sorted_rows,
+                     "Row-sorted SpMM with density-specific code paths");
+  bind_binary_kernel(m, "spmm_csr_float_neon2", &spmm_csr_float_neon2,
+                     "NEON 2-NNZ unroll with deep prefetch");
+  bind_binary_kernel(m, "spmm_csr_float_neon4", &spmm_csr_float_neon4,
+                     "NEON 4-NNZ unroll with deep prefetch");
+  bind_binary_kernel(m, "spmm_csr_float_tiled_neon", &spmm_csr_float_tiled_neon,
+                     "Large-tile NEON (128) with direct accumulation");
 }
 
 }  // namespace
