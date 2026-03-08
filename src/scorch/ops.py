@@ -3,8 +3,6 @@ from pathlib import Path
 from typing import Any, Union, Sequence, Optional, List
 
 import torch
-from torch.utils.cpp_extension import load, load_inline
-import scorch_ops as ops
 
 from .compiler.cin import (
     IndexVar,
@@ -20,6 +18,7 @@ from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
 from .compiler.scheduler import Scheduler
 from .format import TensorFormat, LevelFormat, LevelType
+from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
 from .storage import TensorIndex
 from .stensor import STensor
 from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags, get_extra_ldflags
@@ -254,14 +253,11 @@ def matmul(
 ) -> Union[torch.Tensor, STensor]:
     """Matrix multiplication."""
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         if a.is_sparse and b.is_sparse and a.layout == torch.sparse_coo and b.layout == torch.sparse_coo:
             a = a.to_sparse_csr()
             b = b.to_sparse_csr()
         if a.is_sparse or a.is_sparse_csr or b.is_sparse or b.is_sparse_csr:
-            device = a.device
             a = STensor.from_torch(a)
             b = STensor.from_torch(b)
         else:
@@ -297,11 +293,40 @@ def matmul(
 
         return STensor.from_torch(result_torch).to_sparse(output_format)
 
-    if a.dim() == 2 and b.dim() == 1:
-        return spmv(a, b, **kwargs)
-
     use_cache = kwargs.get("use_cache", True)
-    time_dict = kwargs.get("time_dict", {})
+    time_dict = kwargs.get("time_dict", None)
+    requested_output_format = kwargs.get("format", kwargs.get("output_format", None))
+
+    if a.dim() == 2 and b.dim() == 1:
+        default_mode_order = [0, 1]
+        if (not a.format.is_dense()) and a.storage.index.mode_order != default_mode_order:
+            a = a.copy()
+            a.change_mode_order(default_mode_order)
+
+        if use_cache:
+            resolved = resolve_prebuilt_matmul(
+                a, b, output_format=requested_output_format
+            )
+            if resolved is not None:
+                result_cpp, result_shape = execute_prebuilt_binary_kernel(
+                    resolved.fn, a, b, time_dict=time_dict
+                )
+                result = STensor(
+                    shape=result_shape,
+                    index=TensorIndex(
+                        mode_indices=result_cpp.storage.index.mode_indices,
+                        tensor_format=resolved.output_format,
+                    ),
+                    value=result_cpp.storage.value,
+                )
+                if result.format.is_dense():
+                    return result.to_torch()
+                return result
+
+        spmv_kwargs = dict(kwargs)
+        if "format" in spmv_kwargs and "output_format" not in spmv_kwargs:
+            spmv_kwargs["output_format"] = spmv_kwargs.pop("format")
+        return spmv(a, b, **spmv_kwargs)
 
     # Normalize sparse 2D operands to canonical mode order before dispatch.
     # This keeps fast kernels correct and avoids known non-default mode-order
@@ -321,47 +346,24 @@ def matmul(
                 b = b.copy()
                 b.change_mode_order(default_mode_order)
 
-    kernel_op = None
-
-    result_format = None
-
     if use_cache:
-        if str(a.format) == "d,s" and str(b.format) == "d,d":
-            kernel_op = ops.spmm_csr_float
-        elif str(a.format) == "d,s" and str(b.format) == "d,s" and use_cache:
-            result_format = parse_format("ds")
-            kernel_op = ops.spmspm_csr_float
-        elif str(a.format) == "o,o" and str(b.format) == "o,o" and use_cache:
-            result_format = parse_format("oo")
-            kernel_op = ops.spmspm_coo_float
-        elif str(a.format) == "o,o" and str(b.format) == "d,d" and use_cache:
-            kernel_op = ops.spmm_coo_float
-
-    if kernel_op:
-        result_shape = (a.shape[0], b.shape[1])
-        args = [result_shape]
-
-        for tensor in [a, b]:
-            args.append(tensor.shape)  # type: ignore
-            args.append(tensor.index.mode_indices)  # type: ignore
-            args.append(tensor.values)  # type: ignore
-
-        start_time = time.time()
-        result_cpp = kernel_op(*args)
-        end_time = time.time()
-        eval_time = end_time - start_time
-        if "time_dict" in kwargs:
-            time_dict = kwargs["time_dict"]
-            time_dict["eval_time"] = eval_time
-
-        result = STensor(
-            shape=result_shape,
-            index=TensorIndex(
-                mode_indices=result_cpp.storage.index.mode_indices,
-                tensor_format="dd" if result_format is None else result_format,
-            ),
-            value=result_cpp.storage.value,
+        resolved = resolve_prebuilt_matmul(
+            a, b, output_format=requested_output_format
         )
+        if resolved is not None:
+            result_cpp, result_shape = execute_prebuilt_binary_kernel(
+                resolved.fn, a, b, time_dict=time_dict
+            )
+            result = STensor(
+                shape=result_shape,
+                index=TensorIndex(
+                    mode_indices=result_cpp.storage.index.mode_indices,
+                    tensor_format=resolved.output_format,
+                ),
+                value=result_cpp.storage.value,
+            )
+        else:
+            result = einsum("ij,jk->ik", a, b, **kwargs)
     else:
         result = einsum("ij,jk->ik", a, b, **kwargs)
 

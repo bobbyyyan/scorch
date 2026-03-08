@@ -4,6 +4,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "prebuilt_types.h"
+
 #define SCORCH_PRAGMA_UNROLL _Pragma("unroll")
 #define SCORCH_LIKELY(x) __builtin_expect(!!(x), 1)
 #define SCORCH_UNLIKELY(x) (x)
@@ -12,7 +14,8 @@
 // Global constants for optimization
 const int kUnrollFactor = 16;
 
-Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
+template <typename scalar_t>
+Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
                 torch::Tensor A_values, std::vector<int> B_shape,
                 std::vector<std::vector<torch::Tensor>> B_mode_indices,
@@ -25,17 +28,18 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
   int A0_size = A_shape[0];
   int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
   int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
-  float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+  scalar_t* SCORCH_RESTRICT A_val = A_values.data_ptr<scalar_t>();
 
   // Get B's level & value arrays
   int B0_size = B_shape[0];
   int B1_size = B_shape[1];
-  float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+  scalar_t* SCORCH_RESTRICT B_val = B_values.data_ptr<scalar_t>();
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
-  memset(C_values, 0, sizeof(float) * C_capacity);
+  scalar_t* SCORCH_RESTRICT C_values =
+      (scalar_t *)malloc(sizeof(scalar_t) * C_capacity);
+  memset(C_values, 0, sizeof(scalar_t) * C_capacity);
 
   // Fast path: fixed tile size that matches the best compiler-generated strategy.
   // This avoids heap allocation in the hot loop and enables full unrolling.
@@ -48,13 +52,13 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
     #pragma omp parallel for schedule(static)
     for (int j_out = 0; j_out < full_j_end; j_out += kFastTile) {
       for (int i = 0; i < A0_size; i++) {
-        float accum_c[kFastTile] = {};
+        scalar_t accum_c[kFastTile] = {};
         int pA1_begin = A1_pos[i];
         int pA1_end = A1_pos[i + 1];
 
         for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
           int j = A1_crd[pA1];
-          float a_val = A_val[pA1];
+          scalar_t a_val = A_val[pA1];
           size_t pB1_base = (size_t)j * (size_t)B1_size + (size_t)j_out;
 
           SCORCH_PRAGMA_UNROLL
@@ -78,7 +82,7 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
         int pA1_end = A1_pos[i + 1];
 
         for (int j_out = full_j_end; j_out < B1_size; j_out++) {
-          float accum = 0.0f;
+          scalar_t accum = static_cast<scalar_t>(0);
           for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
             int j = A1_crd[pA1];
             size_t pB1 = (size_t)j * (size_t)B1_size + (size_t)j_out;
@@ -93,7 +97,7 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
     // Generic path for custom tile sizes, still avoiding per-tile heap allocations.
     #pragma omp parallel
     {
-      std::vector<float> accum_c(kTile, 0.0f);
+      std::vector<scalar_t> accum_c(kTile, static_cast<scalar_t>(0));
 
       #pragma omp for schedule(static)
       for (int i = 0; i < A0_size; i++) {
@@ -102,11 +106,11 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
 
         for (int j_out = 0; j_out < B1_size; j_out += kTile) {
           int j_width = std::min(kTile, B1_size - j_out);
-          memset(accum_c.data(), 0, sizeof(float) * j_width);
+          memset(accum_c.data(), 0, sizeof(scalar_t) * j_width);
 
           for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
             int j = A1_crd[pA1];
-            float a_val = A_val[pA1];
+            scalar_t a_val = A_val[pA1];
             size_t pB1_base = (size_t)j * (size_t)B1_size + (size_t)j_out;
 
             for (int j_in = 0; j_in < j_width; j_in++) {
@@ -128,10 +132,42 @@ Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
     { free(ptr); }
   };
   torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
+      C_values, {C_capacity}, C_values_deleter, scorch_torch_dtype<scalar_t>());
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
+}
+
+Tensor spmm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 32) {
+  return spmm_csr_typed<float>(
+      result_shape,
+      A_shape,
+      A_mode_indices,
+      A_values,
+      B_shape,
+      B_mode_indices,
+      B_values,
+      tile_size);
+}
+
+Tensor spmm_csr_double(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 32) {
+  return spmm_csr_typed<double>(
+      result_shape,
+      A_shape,
+      A_mode_indices,
+      A_values,
+      B_shape,
+      B_mode_indices,
+      B_values,
+      tile_size);
 }
 
 Tensor spmm_csr_float_untiled(std::vector<int> result_shape, std::vector<int> A_shape,

@@ -6,6 +6,47 @@
 #include <vector>
 #include <algorithm>
 
+#include "prebuilt_types.h"
+
+template <typename scalar_t>
+Tensor spmv_csr(
+  std::vector<int> result_shape,
+  std::vector<int> A_shape,
+  std::vector<std::vector<torch::Tensor>> A_mode_indices,
+  torch::Tensor A_values,
+  std::vector<int> B_shape,
+  std::vector<std::vector<torch::Tensor>> B_mode_indices,
+  torch::Tensor B_values) {
+  (void)B_shape;
+  (void)B_mode_indices;
+
+  int* A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  scalar_t* A_val = A_values.data_ptr<scalar_t>();
+  scalar_t* B_val = B_values.data_ptr<scalar_t>();
+
+  int C0_size = result_shape[0];
+  scalar_t* C_values = (scalar_t*)malloc(sizeof(scalar_t) * C0_size);
+
+  #pragma omp parallel for schedule(static)
+  for (int i = 0; i < C0_size; i++) {
+    scalar_t accum = static_cast<scalar_t>(0);
+    for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
+      int j = A1_crd[pA1];
+      accum += A_val[pA1] * B_val[j];
+    }
+    C_values[i] = accum;
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {C0_size}, C_values_deleter, scorch_torch_dtype<scalar_t>());
+  C.storage.index.mode_indices = {{}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
 template <typename scalar_t>
 Tensor spmspm_csr(
   std::vector<int> result_shape, std::vector<int> A_shape, std::vector<std::vector<torch::Tensor>> A_mode_indices, torch::Tensor A_values, std::vector<int> B_shape, std::vector<std::vector<torch::Tensor>> B_mode_indices, torch::Tensor B_values) {
@@ -85,7 +126,11 @@ Tensor spmspm_csr(
   Tensor C;
   torch::Tensor C1_pos_torch = torch::from_blob(C1_pos.data(), {C1_pos.size()}, C1_pos.get_deleter(), torch::kInt);
   torch::Tensor C1_crd_torch = torch::from_blob(C1_crd.data(), {C1_crd.size()}, C1_crd.get_deleter(), torch::kInt);
-  torch::Tensor C_values_torch = torch::from_blob(C_values.data(), {C_values.size()}, C_values.get_deleter(), torch::kFloat32);
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values.data(),
+      {C_values.size()},
+      C_values.get_deleter(),
+      scorch_torch_dtype<scalar_t>());
   C.storage.index.mode_indices = {{}, {C1_pos_torch, C1_crd_torch}};
   C.storage.value = C_values_torch;
   return C;
