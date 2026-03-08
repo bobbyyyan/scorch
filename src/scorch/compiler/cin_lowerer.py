@@ -81,6 +81,7 @@ class ResultTensorAssembler:
                     var=llir.Var(
                         name=f"{self.name}_values",
                         type=llir.DataType.ptr_type(self.dtype),
+                        is_restrict=True,
                     ),
                     value=malloc,
                 )
@@ -500,6 +501,7 @@ class CINLowerer:
                         var=llir.Var(
                             name=f"{tensor.name}{level}_pos",
                             type=llir.DataType.PTR_INT,
+                            is_restrict=True,
                         ),
                         value=llir.Var(
                             name=f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()",
@@ -513,6 +515,7 @@ class CINLowerer:
                         var=llir.Var(
                             name=f"{tensor.name}{level}_crd",
                             type=llir.DataType.PTR_INT,
+                            is_restrict=True,
                         ),
                         value=llir.Var(
                             name=f"{tensor.name}_mode_indices[{level}][1].data_ptr<int>()",
@@ -538,6 +541,7 @@ class CINLowerer:
                         var=llir.Var(
                             name=f"{tensor.name}{level}_crd",
                             type=llir.DataType.PTR_INT,
+                            is_restrict=True,
                         ),
                         value=llir.Var(
                             name=f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()",
@@ -555,7 +559,7 @@ class CINLowerer:
         data_type = dtype_to_c_datatype(tensor.dtype)
         ptr_type = llir.DataType.ptr_type(tensor.dtype)
         return llir.VarInit(
-            var=llir.Var(name=f"{tensor.name}_val", type=ptr_type),
+            var=llir.Var(name=f"{tensor.name}_val", type=ptr_type, is_restrict=True),
             value=llir.Var(
                 name=f"{tensor.name}_values.data_ptr<{data_type.value}>()",
                 type=ptr_type,
@@ -846,6 +850,7 @@ class CINLowerer:
         workspace_init_stmts: List[llir.Stmt] = [
             llir.Comment("Initialize workspaces"),
         ]
+        workspace_cleanup_stmts: List[llir.Stmt] = []
         for wksp in workspaces:
             assert isinstance(wksp, Workspace), "workspace is not a Workspace"
             # coo_workspace<tensor's ctype> <tensor's name> = coo_workspace<tensor's ctype>(<tensor's dim>);
@@ -868,16 +873,18 @@ class CINLowerer:
             if wksp.dim == 1:
                 # Dense workspace: allocate a zeroed array of the appropriate ctype
                 if wksp.is_dense():
-                    if wksp.is_tiled:
+                    if wksp.is_tiled and wksp.tile_size_var:
+                        # Tiled dense workspaces have compile-time bounds. Use stack allocation
+                        # so inner kernels avoid heap traffic.
                         workspace_init_stmts.append(
                             llir.VarInit(
                                 var=llir.Var(
-                                    name=wksp.get_name(),
-                                    type=wksp_ctype_ptr,
+                                    name=f"{wksp.get_name()}[{wksp.tile_size_var.name}]",
+                                    type=wksp_ctype,
                                 ),
-                                value=llir.FunctionCall(
-                                    name=f"new {wksp_ctype.value}[{wksp.tile_size_var.name}]",
-                                    args=[],
+                                value=llir.Array(
+                                    values=[],
+                                    data_type=wksp_ctype,
                                 ),
                             )
                         )
@@ -887,12 +894,16 @@ class CINLowerer:
                                 var=llir.Var(
                                     name=wksp.get_name(),
                                     type=wksp_ctype_ptr,
+                                    is_restrict=True,
                                 ),
                                 value=llir.FunctionCall(
                                     name=f"new {wksp_ctype.value}[{wksp.size_llir_var.name}]",
                                     args=[],
                                 ),
                             )
+                        )
+                        workspace_cleanup_stmts.append(
+                            llir.RawStmt(code=f"delete[] {wksp.get_name()}")
                         )
                 else:
                     # If the workspace is 1-dimensional, use optimized 1D workspace implementation
@@ -938,6 +949,7 @@ class CINLowerer:
             *workspace_init_stmts,
             *self.lower_ProducerIndexStmt(stmt.producer),
             *self.lower_ConsumerIndexStmt(stmt.consumer),
+            *workspace_cleanup_stmts,
         ]
 
     def lower_ProducerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
@@ -1525,6 +1537,7 @@ class CINLowerer:
                     var=loop_var,
                 ),
                 body=loop_body,
+                unroll=True,
             )
 
             return [
@@ -2014,6 +2027,57 @@ class CINLowerer:
 
         return []
 
+    def _should_parallelize_outer_forall(self, index_var: IndexVar) -> bool:
+        if not self.final_result_tensor_var or not self.final_result_tensor_var.is_dense():
+            return False
+        if not self.final_result_tensor_access:
+            return False
+        if self.final_result_tensor_access.has_index_var(index_var):
+            return True
+        if (
+            index_var.has_parent
+            and self.final_result_tensor_access.has_index_var(index_var.parent)
+        ):
+            return True
+        for result_index_var in self.final_result_tensor_access.get_index_vars():
+            if result_index_var.has_parent and result_index_var.parent == index_var:
+                return True
+        return False
+
+    @staticmethod
+    def _is_openmp_compatible_for_loop(for_loop: llir.ForLoop) -> bool:
+        if not isinstance(for_loop.init, llir.VarInit):
+            return False
+        if not isinstance(for_loop.init.var, llir.Var):
+            return False
+        loop_var = for_loop.init.var
+
+        if isinstance(for_loop.update, llir.Increment):
+            if for_loop.update.var.name != loop_var.name:
+                return False
+        elif isinstance(for_loop.update, llir.Assign):
+            if for_loop.update.var.name != loop_var.name:
+                return False
+            if for_loop.update.op not in (AssignOp.ADD_ASSIGN, AssignOp.SUB_ASSIGN):
+                return False
+        else:
+            return False
+
+        if not isinstance(for_loop.cond, llir.BinOp):
+            return False
+        if for_loop.cond.op not in ("<", "<=", ">", ">="):
+            return False
+        if not isinstance(for_loop.cond.left, llir.Var):
+            return False
+        return for_loop.cond.left.name == loop_var.name
+
+    @classmethod
+    def _mark_first_for_loop_parallel(cls, stmts: List[llir.Stmt]) -> None:
+        for llir_stmt in stmts:
+            if isinstance(llir_stmt, llir.ForLoop) and cls._is_openmp_compatible_for_loop(llir_stmt):
+                llir_stmt.omp_parallel_for = True
+                return
+
     def lower_ForAll(self, stmt: ForAll) -> List[llir.Stmt]:
         """
         Lower a ForAll to LLIR
@@ -2022,6 +2086,9 @@ class CINLowerer:
 
         # Get index variable at this forall
         index_var = stmt.get_index_var()
+        is_outermost_forall = not self.seen_outermost_forall
+        if is_outermost_forall:
+            self.seen_outermost_forall = True
 
         self.defined_index_vars.append(index_var)
 
@@ -2069,6 +2136,8 @@ class CINLowerer:
                 *iter_lattice.get_lattice_loops(),
             ]
         )
+        if is_outermost_forall and self._should_parallelize_outer_forall(index_var):
+            self._mark_first_for_loop_parallel(stmts)
 
         return stmts
 

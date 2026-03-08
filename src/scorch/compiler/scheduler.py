@@ -764,8 +764,6 @@ class Scheduler:
             return False
         if not isinstance(cin, ForAll):
             return False
-        if Scheduler._has_dense_output(cin):
-            return False
 
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(cin)
@@ -786,6 +784,32 @@ class Scheduler:
             return False
 
         last_reduction_pos = max(loop_pos[index_var] for index_var in reductions_in_loop)
+        free_after_last_reduction = [
+            index_var
+            for index_var in free_vars
+            if index_var in loop_pos and loop_pos[index_var] > last_reduction_pos
+        ]
+        if not free_after_last_reduction:
+            return False
+
+        if Scheduler._has_dense_output(cin):
+            # For dense outputs, keep workspace insertion conservative:
+            # only enable a 1D dense accumulator over a trailing dense axis.
+            if len(free_after_last_reduction) != 1:
+                return False
+            result_tensor_accesses = cin.get_result_tensor_accesses()
+            if not result_tensor_accesses:
+                return False
+            result_tensor_access = result_tensor_accesses[0]
+            free_index_var = free_after_last_reduction[0]
+            if not result_tensor_access.has_index_var(free_index_var):
+                return False
+            if (
+                result_tensor_access.level_type_of_index_var(free_index_var)
+                != LevelType.DENSE
+            ):
+                return False
+
         return any(
             index_var in loop_pos and loop_pos[index_var] > last_reduction_pos
             for index_var in free_vars

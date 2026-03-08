@@ -14,6 +14,11 @@ class LLIRLowerer:
     indent_level = 0
     no_comments = False
 
+    @staticmethod
+    def _lower_typed_var(var: llir.Var) -> str:
+        qualifier = "__restrict__ " if var.is_restrict else ""
+        return f"{var.type.value} {qualifier}{var.name}"
+
     def lower_llir(
         self,
         ir: Union[LLIR_NODE, List[LLIR_NODE], str, List[str]],
@@ -42,7 +47,7 @@ class LLIRLowerer:
 
         elif isinstance(ir, llir.VarInit):
             return self.lower_llir(
-                f"{ir.var.type.value} {ir.var.name} {ir.op} {self.lower_llir(ir.value)};",
+                f"{self._lower_typed_var(ir.var)} {ir.op} {self.lower_llir(ir.value)};",
                 indent_level,
             )
 
@@ -79,7 +84,11 @@ class LLIRLowerer:
             return ir.name
 
         elif isinstance(ir, llir.VarDecl):
-            return self.lower_llir(f"{ir.var.type.value} {ir.var.name};", indent_level)
+            return self.lower_llir(f"{self._lower_typed_var(ir.var)};", indent_level)
+
+        elif isinstance(ir, llir.RawStmt):
+            suffix = ";" if ir.add_semicolon else ""
+            return self.lower_llir(f"{ir.code}{suffix}", indent_level)
 
         elif isinstance(ir, llir.Increment):
             if no_semicolon:
@@ -150,9 +159,17 @@ class LLIRLowerer:
         ir: Union[llir.WhileLoop, llir.ForLoop, llir.ForLoopAuto],
         indent_level: int = 0,
     ) -> str:
+        pragma_lines: List[str] = []
         if isinstance(ir, llir.WhileLoop):
             header = f"while ({self.lower_llir(ir.cond)}) {{"
         elif isinstance(ir, llir.ForLoop):
+            if ir.omp_parallel_for:
+                omp_pragma = "#pragma omp parallel for"
+                if ir.omp_schedule:
+                    omp_pragma += f" schedule({ir.omp_schedule})"
+                pragma_lines.append(omp_pragma)
+            if ir.unroll:
+                pragma_lines.append("#pragma unroll")
             init_lowered = self.lower_llir(ir.init) if ir.init is not None else ";"
             header = (
                 f"for ({init_lowered} {self.lower_llir(ir.cond)};"
@@ -166,13 +183,20 @@ class LLIRLowerer:
         else:
             raise ValueError(f"Unknown loop type: {type(ir)}")
 
-        return (
+        loop_text = (
             self.lower_llir(header, indent_level)
             + "\n"
             + self.lower_llir(ir.body, indent_level + 1)
             + "\n"
             + self.lower_llir("}", indent_level)
         )
+        if not pragma_lines:
+            return loop_text
+
+        pragma_text = "\n".join(
+            self.lower_llir(pragma_line, indent_level) for pragma_line in pragma_lines
+        )
+        return pragma_text + "\n" + loop_text
 
     def lower_conditional(
         self, ir: llir.IfThenElse, indent_level: int = 0
@@ -244,7 +268,7 @@ class LLIRLowerer:
         assert all([arg.type for arg in args]), "All args must have types"
         header = (
             f"{ir.return_type.value} {ir.name}"
-            + f"({', '.join([f'{arg.type.value} {arg.name}' for arg in args])}) {{"
+            + f"({', '.join([self._lower_typed_var(arg) for arg in args])}) {{"
         )
         return (
             self.lower_llir(header, indent_level)

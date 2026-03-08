@@ -240,6 +240,7 @@ class Var(Expr):
     name: str
     type: DataType
     is_ptr: bool = False
+    is_restrict: bool = False
 
     def __hash__(self):
         return hash(self.name)
@@ -392,6 +393,14 @@ class BlankLine(Stmt):
         pass
 
 
+@dataclass(frozen=False)
+class RawStmt(Stmt):
+    """A raw statement emitted verbatim."""
+
+    code: str
+    add_semicolon: bool = True
+
+
 class Continue(Stmt):
     """A continue statement."""
 
@@ -464,11 +473,17 @@ class ForLoop(Stmt):
         cond: Expr,
         update: Union[Increment, VarInit, FunctionCall],
         body: List[Stmt],
+        omp_parallel_for: bool = False,
+        omp_schedule: Optional[str] = None,
+        unroll: bool = False,
     ):
         self.init = init
         self.cond = cond
         self.update = update
         self.body = body
+        self.omp_parallel_for = omp_parallel_for
+        self.omp_schedule = omp_schedule
+        self.unroll = unroll
 
 
 # A for loop styled for (auto XXX : YYY) { ... }

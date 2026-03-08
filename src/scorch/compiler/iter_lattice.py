@@ -1134,6 +1134,9 @@ class IterationLattice:
             # p{result_tensor_var}{level}
 
             index_var = lattice_point.get_index_var()
+            should_unroll_loop = bool(
+                index_var.tile_size_var and index_var.is_inner
+            )
 
             tiled_index_var_resolve_stmts: List[llir.Stmt] = []
 
@@ -1230,6 +1233,7 @@ class IterationLattice:
                                 self.cin_lowerer, self.for_all_stmt.stmt
                             ),
                         ],
+                        unroll=should_unroll_loop,
                     )
                     stmts.append(for_loop)
 
@@ -1301,6 +1305,7 @@ class IterationLattice:
                             ),
                             *coord_advance_stmts,
                         ],
+                        unroll=should_unroll_loop,
                     )
 
                     stmts.append(for_loop)
@@ -1341,6 +1346,7 @@ class IterationLattice:
                                 self.cin_lowerer, self.for_all_stmt.stmt
                             ),
                         ],
+                        unroll=should_unroll_loop,
                     )
                     stmts.append(for_loop)
 
@@ -1358,6 +1364,7 @@ class IterationLattice:
                                 self.cin_lowerer, self.for_all_stmt.stmt
                             ),
                         ],
+                        unroll=should_unroll_loop,
                     )
 
                     stmts.append(for_loop)
