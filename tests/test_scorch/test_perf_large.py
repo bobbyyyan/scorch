@@ -77,7 +77,7 @@ def test_spmm_variants_and_compiler_large_tensor():
 
     for name, fn in variant_fns.items():
         result, median_time = _median_time(lambda f=fn: f(*kernel_args).storage.value)
-        assert torch.allclose(result, reference, atol=1e-3, rtol=1e-3), name
+        assert torch.allclose(result.view_as(reference), reference, atol=1e-3, rtol=1e-3), name
         variant_medians[name] = median_time
 
     compiler_eval_times: List[float] = []
