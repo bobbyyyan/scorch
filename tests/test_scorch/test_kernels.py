@@ -945,8 +945,8 @@ def todo_test_spmm_dd_oo_dd_wksp_time():
 
 
 def test_spmm_dd_ds_dd_wksp_time():
-    n = 200
-    sparsity = 0.99
+    n = 50
+    sparsity = 0.8
     random_tensor_a = torch.rand(n, n).float()
     random_tensor_b = torch.rand(n, n).float()
 
@@ -2023,8 +2023,8 @@ def test_spmv_d_oo_d():
     """
     # y[i] = sum_j A[i, j] * x[j]
     # Randomly generate sparse matrix A, which is m by n
-    m = 10000
-    n = 10000
+    m = 1000
+    n = 1000
     sparsity = 0.9
     random_tensor_a = torch.rand(m, n)
     random_tensor_x = torch.rand(n)

@@ -13,11 +13,6 @@ import scorch_ops as ops
 from scorch import STensor
 
 
-if os.getenv("SCORCH_RUN_PERF") != "1":
-    pytest.skip(
-        "Set SCORCH_RUN_PERF=1 to run large performance tests",
-        allow_module_level=True,
-    )
 
 
 def _make_spmm_inputs(
