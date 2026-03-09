@@ -447,6 +447,16 @@ class Scheduler:
             if len(sorted_index_vars) < 2:
                 continue
 
+            # Dense tensors can be accessed in any order via index arithmetic
+            # (e.g., A[i*N + j]). No physical data restructuring is needed.
+            if all(
+                not Scheduler._is_sparse_level(
+                    tensor_access.level_type_of_index_var(iv)
+                )
+                for iv in sorted_index_vars
+            ):
+                continue
+
             violates = any(
                 loop_pos[sorted_index_vars[i]] > loop_pos[sorted_index_vars[i + 1]]
                 for i in range(len(sorted_index_vars) - 1)
@@ -577,6 +587,16 @@ class Scheduler:
                 if index_var in allowed_index_vars
             ]
             if len(sorted_index_vars) < 2:
+                continue
+
+            # Dense tensors support any access order via index arithmetic;
+            # mode-order constraints are only hard requirements for sparse levels.
+            if all(
+                not Scheduler._is_sparse_level(
+                    tensor_access.level_type_of_index_var(iv)
+                )
+                for iv in sorted_index_vars
+            ):
                 continue
 
             tensor = tensor_access.get_tensor()
@@ -1277,30 +1297,65 @@ class Scheduler:
         # requires the innermost loop to correspond to a result-tensor level,
         # and workspace insertion needs free variables after the reduction to
         # define the workspace dimensions.
+        #
+        # Only skip forced reordering for all-coordinate (COO) output when
+        # an input tensor shares the exact same index variables as the output
+        # (e.g., SDDMM's S[i,j] determines output sparsity).  For SpMM-like
+        # ops where output sparsity differs from any single input, we still
+        # need the workspace path.
         if not Scheduler._has_dense_output(cin):
-            cin_ivar_getter = CINIndexVariablesGetter()
-            cin_ivar_getter.visit(cin)
-            reduction_vars = set(
-                Scheduler._unique_index_vars(cin_ivar_getter.get_reduction_vars())
-            )
-            if reduction_vars:
-                reductions_in_loop = [v for v in loop_order if v in reduction_vars]
-                if reductions_in_loop:
-                    last_red_pos = max(loop_order.index(v) for v in reductions_in_loop)
-                    free_after = [
-                        v for v in loop_order[last_red_pos + 1:]
-                        if v not in reduction_vars
-                    ]
-                    if not free_after:
-                        free_vars = [v for v in loop_order if v not in reduction_vars]
-                        if free_vars:
-                            last_free = free_vars[-1]
-                            idx = loop_order.index(last_free)
-                            loop_order = (
-                                loop_order[:idx]
-                                + loop_order[idx + 1:]
-                                + [last_free]
+            _needs_forced_reorder = True
+            _result_accesses = cin.get_result_tensor_accesses()
+            if _result_accesses:
+                _non_ws = [a for a in _result_accesses
+                           if not isinstance(a.tensor, Workspace)]
+                if _non_ws:
+                    _result_ivs = set(
+                        iv.name for iv in _non_ws[0].get_index_vars()
+                    )
+                    _all_coo = all(
+                        lt == LevelType.COORDINATE
+                        for lt in _non_ws[0].get_tensor().get_level_types()
+                    )
+                    # Check if an input tensor mirrors the output sparsity
+                    if _all_coo:
+                        _rhs_accesses = [
+                            a for a in cin.tensor_accesses
+                            if a not in _result_accesses
+                               and not a.is_workspace()
+                        ]
+                        for _rhs in _rhs_accesses:
+                            _rhs_ivs = set(
+                                iv.name for iv in _rhs.get_index_vars()
                             )
+                            if _rhs_ivs == _result_ivs:
+                                _needs_forced_reorder = False
+                                break
+
+            if _needs_forced_reorder:
+                cin_ivar_getter = CINIndexVariablesGetter()
+                cin_ivar_getter.visit(cin)
+                reduction_vars = set(
+                    Scheduler._unique_index_vars(cin_ivar_getter.get_reduction_vars())
+                )
+                if reduction_vars:
+                    reductions_in_loop = [v for v in loop_order if v in reduction_vars]
+                    if reductions_in_loop:
+                        last_red_pos = max(loop_order.index(v) for v in reductions_in_loop)
+                        free_after = [
+                            v for v in loop_order[last_red_pos + 1:]
+                            if v not in reduction_vars
+                        ]
+                        if not free_after:
+                            free_vars = [v for v in loop_order if v not in reduction_vars]
+                            if free_vars:
+                                last_free = free_vars[-1]
+                                idx = loop_order.index(last_free)
+                                loop_order = (
+                                    loop_order[:idx]
+                                    + loop_order[idx + 1:]
+                                    + [last_free]
+                                )
 
         return loop_order
 

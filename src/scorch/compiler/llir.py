@@ -476,6 +476,7 @@ class ForLoop(Stmt):
         omp_parallel_for: bool = False,
         omp_schedule: Optional[str] = None,
         unroll: bool = False,
+        simd: bool = False,
     ):
         self.init = init
         self.cond = cond
@@ -484,6 +485,7 @@ class ForLoop(Stmt):
         self.omp_parallel_for = omp_parallel_for
         self.omp_schedule = omp_schedule
         self.unroll = unroll
+        self.simd = simd
 
 
 # A for loop styled for (auto XXX : YYY) { ... }

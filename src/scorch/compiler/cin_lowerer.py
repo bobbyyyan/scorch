@@ -458,6 +458,8 @@ class CINLowerer:
         self.outermost_stmt: Optional[IndexStmt] = None
 
         self.result_value_array_sparse_index_llir = None
+        self._scalar_accum_mode = False
+        self._used_scalar_accum = False
         self.index_var_to_rhs_tensor_level_type = None
         self.index_var_to_result_tensor_level_type = None
 
@@ -647,6 +649,19 @@ class CINLowerer:
         llir_stmts: List[llir.Stmt] = []
 
         rhs_llir = self.lower_IndexExpr(stmt.rhs)
+
+        # Scalar accumulation mode: accumulate into local register.
+        # Coordinate emission and position increment are handled by
+        # the enclosing free-variable ForAll level (see iter_lattice.py).
+        if self._scalar_accum_mode:
+            llir_stmts.append(
+                llir.Assign(
+                    var=llir.Var(name="_accum", type=llir.DataType.NO_TYPE),
+                    value=rhs_llir,
+                    op=AssignOp.ADD_ASSIGN,
+                )
+            )
+            return llir_stmts
 
         # if we are at the bottommost level, we can emit compute code
         assert self.result_tensor_access, "result tensor access is None"
@@ -2228,6 +2243,315 @@ class CINLowerer:
                     llir_stmt.omp_schedule = "dynamic, 16"
                 return
 
+    @classmethod
+    def _collect_output_arrays(cls, stmts: List[llir.Stmt], output_arrays: List[str]) -> None:
+        """Collect output array names (e.g., D_values, D0_crd) from Assign stmts."""
+        import re
+        for stmt in stmts:
+            if isinstance(stmt, llir.Assign) and isinstance(stmt.var, llir.Var):
+                m = re.match(r'^(\w+)\[', stmt.var.name)
+                if m:
+                    arr_name = m.group(1)
+                    if arr_name not in output_arrays:
+                        output_arrays.append(arr_name)
+            elif isinstance(stmt, llir.ForLoop):
+                cls._collect_output_arrays(stmt.body, output_arrays)
+            elif isinstance(stmt, llir.WhileLoop):
+                cls._collect_output_arrays(stmt.body, output_arrays)
+            elif isinstance(stmt, llir.IfThenElse):
+                if stmt.then_body:
+                    cls._collect_output_arrays(stmt.then_body, output_arrays)
+                if stmt.else_body:
+                    cls._collect_output_arrays(stmt.else_body, output_arrays)
+
+    @classmethod
+    def _replace_output_pos_with_input_pos(cls, stmts: List[llir.Stmt], input_iter_var: str) -> None:
+        """Replace shared output position variable (pD1) with input iterator position
+        for thread-safe parallel output. Finds inner ForLoop over pA1..pA1_end and
+        replaces pD<N> references with pA1 in the loop body."""
+        import re
+        for stmt in stmts:
+            if isinstance(stmt, llir.ForLoop):
+                # Find the sparse inner loop iterating pA1
+                if (isinstance(stmt.init, llir.VarInit)
+                        and isinstance(stmt.init.var, llir.Var)
+                        and stmt.init.var.name.startswith("p")):
+                    inner_pos_var = stmt.init.var.name  # e.g. "pA1"
+                    cls._rewrite_output_pos_vars(stmt.body, inner_pos_var)
+                else:
+                    cls._replace_output_pos_with_input_pos(stmt.body, input_iter_var)
+            elif isinstance(stmt, llir.WhileLoop):
+                cls._replace_output_pos_with_input_pos(stmt.body, input_iter_var)
+            elif isinstance(stmt, llir.IfThenElse):
+                if stmt.then_body:
+                    cls._replace_output_pos_with_input_pos(stmt.then_body, input_iter_var)
+                if stmt.else_body:
+                    cls._replace_output_pos_with_input_pos(stmt.else_body, input_iter_var)
+
+    @classmethod
+    def _rewrite_output_pos_vars(cls, stmts: List[llir.Stmt], input_pos_var: str) -> None:
+        """Replace output position variables (pD1, pD0) in Assign/Increment stmts
+        with the input position variable for thread-safe writes."""
+        import re
+        to_remove = []
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt, llir.Assign) and isinstance(stmt.var, llir.Var):
+                # Replace pD<N> in array index: D_values[pD1] -> D_values[pA1]
+                m = re.match(r'^(.+)\[p([A-Z])\d+\]$', stmt.var.name)
+                if m and m.group(1).startswith(m.group(2)):
+                    # This is an output array write like D_values[pD1] or D0_crd[pD1]
+                    stmt.var.name = re.sub(r'\[p[A-Z]\d+\]', f'[{input_pos_var}]', stmt.var.name)
+            elif isinstance(stmt, llir.Increment) and isinstance(stmt.var, llir.Var):
+                # Remove pD1++ (no longer needed, position is input-derived)
+                if re.match(r'^p[A-Z]\d+$', stmt.var.name):
+                    # Check it's an output pos var, not an input one
+                    if stmt.var.name != input_pos_var:
+                        to_remove.append(i)
+            elif isinstance(stmt, llir.ForLoop):
+                cls._rewrite_output_pos_vars(stmt.body, input_pos_var)
+            elif isinstance(stmt, llir.WhileLoop):
+                cls._rewrite_output_pos_vars(stmt.body, input_pos_var)
+        for i in reversed(to_remove):
+            stmts.pop(i)
+
+    def _should_parallelize_coo_outer(self, index_var: IndexVar) -> bool:
+        """Check if the outermost ForAll iterates a COORDINATE level and
+        the output is all-COO, suitable for group-based parallelization."""
+        if not self.final_result_tensor_var or not self.final_result_tensor_access:
+            return False
+        # Output must be all-coordinate (COO)
+        for lt in self.final_result_tensor_var.get_level_types():
+            if lt != LevelType.COORDINATE:
+                return False
+        return True
+
+    @classmethod
+    def _transform_coo_loop_for_openmp(cls, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
+        """Transform the outer COO WhileLoop into a group-indexed ForLoop
+        with OpenMP parallelism.
+
+        Finds the outermost WhileLoop that iterates over COO coordinate
+        levels (identified by the pA0 = pA1_end update pattern) and replaces
+        it with a pre-scan + parallel for over row groups.
+        """
+        result: List[llir.Stmt] = []
+        transformed = False
+
+        for stmt in stmts:
+            if transformed or not isinstance(stmt, (llir.WhileLoop, llir.ForLoop)):
+                result.append(stmt)
+                continue
+
+            body = stmt.body
+            coo_update = None
+            iter_var = None
+            end_var = None
+
+            # Detect COO outer loop: ForLoop with non-standard update pA0 = pA1_end
+            if isinstance(stmt, llir.ForLoop):
+                if (isinstance(stmt.update, llir.Assign)
+                        and isinstance(stmt.update.var, llir.Var)
+                        and isinstance(stmt.update.value, llir.Var)
+                        and "_end" in stmt.update.value.name):
+                    iter_var = stmt.update.var.name
+                    end_var = stmt.update.value.name
+                    coo_update = stmt.update  # sentinel, won't be in body
+                else:
+                    result.append(stmt)
+                    continue
+            else:
+                # WhileLoop: look for pA0 = pA1_end in body
+                for body_stmt in body:
+                    if (isinstance(body_stmt, llir.Assign)
+                            and isinstance(body_stmt.var, llir.Var)
+                            and body_stmt.var.name.startswith("p")
+                            and isinstance(body_stmt.value, llir.Var)
+                            and "_end" in body_stmt.value.name
+                            and body_stmt.op == AssignOp.ASSIGN):
+                        coo_update = body_stmt
+                        iter_var = body_stmt.var.name
+                        end_var = body_stmt.value.name
+
+            if coo_update is None:
+                result.append(stmt)
+                continue
+
+            # Find the coordinate array name from VarInit in body
+            # e.g., i = A0_crd[pA0]
+            crd_array = None
+            coord_var_name = None
+            for body_stmt in body:
+                if (isinstance(body_stmt, llir.VarInit)
+                        and isinstance(body_stmt.value, llir.Var)
+                        and "_crd[" in body_stmt.value.name):
+                    val_name = body_stmt.value.name
+                    bracket_pos = val_name.index("[")
+                    crd_array = val_name[:bracket_pos]
+                    coord_var_name = body_stmt.var.name
+                    break
+
+            if crd_array is None:
+                result.append(stmt)
+                continue
+
+            # Extract the end bound from the loop condition
+            outer_end_var = None
+            if (isinstance(stmt.cond, llir.BinOp)
+                    and isinstance(stmt.cond.right, llir.Var)):
+                outer_end_var = stmt.cond.right.name
+
+            if outer_end_var is None:
+                result.append(stmt)
+                continue
+
+            # Build the inner body: everything except the COO advance
+            inner_body = [s for s in body if s is not coo_update]
+
+            # Remove from inner body:
+            # 1. The coordinate VarInit (we set it from _group_starts)
+            # 2. The "find iterator end" WhileLoop (group boundaries
+            #    already encode this)
+            # 3. The VarInit for pA1_end (already set in group header)
+            inner_body_filtered = []
+            for s in inner_body:
+                # Remove: int i = A0_crd[pA0]
+                if (isinstance(s, llir.VarInit)
+                        and isinstance(s.value, llir.Var)
+                        and "_crd[" in s.value.name
+                        and s.var.name == coord_var_name):
+                    continue
+                # Remove: while (pA1_end < pA0_end && ...) { pA1_end++; }
+                if isinstance(s, llir.WhileLoop):
+                    # Check if this is the iterator-end-finding loop
+                    if any(isinstance(bs, llir.Increment) for bs in s.body):
+                        continue
+                # Remove: pA1_end = pA0 + 1 (iterator end init)
+                if (isinstance(s, llir.VarInit)
+                        and isinstance(s.var, llir.Var)
+                        and s.var.name == end_var):
+                    continue
+                # Remove: pA1_end = pA0 + 1 (as Assign)
+                if (isinstance(s, llir.Assign)
+                        and isinstance(s.var, llir.Var)
+                        and s.var.name == end_var):
+                    continue
+                inner_body_filtered.append(s)
+
+            # Thread-safety for output position: use input position pA1
+            # as output position since nnz_out == nnz_in for SDDMM-like
+            # kernels (no filtering). Replace pD1 references in the body.
+            cls._replace_output_pos_with_input_pos(inner_body_filtered, iter_var)
+
+            # Collect output array names that need pre-allocation
+            output_arrays: List[str] = []
+            import re as _re
+            cls._collect_output_arrays(inner_body_filtered, output_arrays)
+
+            # Pre-scan code
+            pre_scan_stmts: List[llir.Stmt] = [
+                llir.Comment("Pre-compute row group boundaries for OpenMP"),
+                llir.VarDecl(
+                    llir.Var(name="_group_starts", type=llir.DataType.CVECTOR_INT)
+                ),
+                llir.Assign(
+                    var=llir.Var(name="_group_starts[0]", type=llir.DataType.INT),
+                    value=llir.Literal(0),
+                ),
+                llir.VarInit(
+                    var=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                    value=llir.Literal(1),
+                ),
+                # Scan loop
+                llir.ForLoop(
+                    init=llir.VarInit(
+                        var=llir.Var(name="_p", type=llir.DataType.INT),
+                        value=llir.Literal(1),
+                    ),
+                    cond=llir.BinOp(
+                        op="<",
+                        left=llir.Var(name="_p", type=llir.DataType.INT),
+                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT),
+                    ),
+                    update=llir.Increment(
+                        var=llir.Var(name="_p", type=llir.DataType.INT),
+                    ),
+                    body=[
+                        llir.IfThenElse(
+                            cond=llir.BinOp(
+                                op="!=",
+                                left=llir.Var(name=f"{crd_array}[_p]", type=llir.DataType.NO_TYPE),
+                                right=llir.Var(name=f"{crd_array}[_p - 1]", type=llir.DataType.NO_TYPE),
+                            ),
+                            then_body=[
+                                llir.Assign(
+                                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT),
+                                    value=llir.Var(name="_p", type=llir.DataType.INT),
+                                ),
+                                llir.Increment(
+                                    var=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                llir.Assign(
+                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT),
+                    value=llir.Var(name=outer_end_var, type=llir.DataType.INT),
+                ),
+                llir.BlankLine(),
+            ]
+
+            # Group loop body
+            group_body: List[llir.Stmt] = [
+                llir.VarInit(
+                    var=llir.Var(name=iter_var, type=llir.DataType.INT),
+                    value=llir.Var(name="_group_starts[_g]", type=llir.DataType.INT),
+                ),
+                llir.VarInit(
+                    var=llir.Var(name=end_var, type=llir.DataType.INT),
+                    value=llir.Var(name="_group_starts[_g + 1]", type=llir.DataType.INT),
+                ),
+                llir.VarInit(
+                    var=llir.Var(name=coord_var_name, type=llir.DataType.INT),
+                    value=llir.Var(name=f"{crd_array}[{iter_var}]", type=llir.DataType.INT),
+                ),
+                *inner_body_filtered,
+            ]
+
+            # Group for loop with OpenMP
+            group_loop = llir.ForLoop(
+                init=llir.VarInit(
+                    var=llir.Var(name="_g", type=llir.DataType.INT),
+                    value=llir.Literal(0),
+                ),
+                cond=llir.BinOp(
+                    op="<",
+                    left=llir.Var(name="_g", type=llir.DataType.INT),
+                    right=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                ),
+                update=llir.Increment(
+                    var=llir.Var(name="_g", type=llir.DataType.INT),
+                ),
+                body=group_body,
+                omp_parallel_for=True,
+                omp_schedule="dynamic, 16",
+            )
+
+            # Pre-allocate output arrays for thread-safe parallel writes
+            prealloc_stmts: List[llir.Stmt] = []
+            for arr_name in output_arrays:
+                prealloc_stmts.append(llir.RawStmt(
+                    code=f"{arr_name}.resize({outer_end_var})",
+                    add_semicolon=True,
+                ))
+
+            result.extend(pre_scan_stmts)
+            result.extend(prealloc_stmts)
+            result.append(group_loop)
+            transformed = True
+
+        return result
+
     def lower_ForAll(self, stmt: ForAll) -> List[llir.Stmt]:
         """
         Lower a ForAll to LLIR
@@ -2288,6 +2612,10 @@ class CINLowerer:
         )
         if is_outermost_forall and self._should_parallelize_outer_forall(index_var):
             self._mark_first_for_loop_parallel(stmts)
+        elif (is_outermost_forall
+              and self._used_scalar_accum
+              and self._should_parallelize_coo_outer(index_var)):
+            stmts = self._transform_coo_loop_for_openmp(stmts)
 
         return stmts
 

@@ -90,6 +90,9 @@ class LLIRLowerer:
             suffix = ";" if ir.add_semicolon else ""
             return self.lower_llir(f"{ir.code}{suffix}", indent_level)
 
+        elif isinstance(ir, llir.Break):
+            return self.lower_llir("break;", indent_level)
+
         elif isinstance(ir, llir.Increment):
             if no_semicolon:
                 return self.lower_llir(f"{ir.var.name}++", indent_level)
@@ -170,6 +173,8 @@ class LLIRLowerer:
                 pragma_lines.append(omp_pragma)
             if ir.unroll:
                 pragma_lines.append("#pragma unroll")
+            if ir.simd:
+                pragma_lines.append("#pragma omp simd")
             init_lowered = self.lower_llir(ir.init) if ir.init is not None else ";"
             header = (
                 f"for ({init_lowered} {self.lower_llir(ir.cond)};"

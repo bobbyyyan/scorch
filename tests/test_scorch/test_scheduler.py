@@ -85,7 +85,10 @@ def test_apply_mode_order_constraints_breaks_cycle():
     )
 
     constrained = Scheduler.apply_mode_order_constraints(stmt, [j, i])
-    assert [v.name for v in constrained] == ["i", "j"]
+    # All tensors are fully dense, so no mode-order edges are created
+    # (dense tensors support any access order via index arithmetic).
+    # The input order [j, i] is preserved unchanged.
+    assert [v.name for v in constrained] == ["j", "i"]
 
 
 def test_should_insert_workspace_depends_on_reduction_position():

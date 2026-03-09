@@ -995,6 +995,118 @@ class IterationLattice:
             value=llir.Literal(value=0, data_type=llir.DataType.INT),
         )
 
+    def _tile_bound_var(self, parent_index_var: IndexVar) -> str | None:
+        """Return the dimension-size variable name that bounds *parent_index_var*
+        in the first dense tensor access that contains it, or None."""
+        assert self.cin_lowerer is not None
+        lattice_points = self.get_lattice_points()
+        for lp in lattice_points:
+            for ta in lp.get_dense_tensor_accesses():
+                if ta.has_index_var(parent_index_var):
+                    tv = ta.get_tensor()
+                    level = ta.level_of_index_var(parent_index_var)
+                    return f"{tv.name}{level}_size"
+        return None
+
+    def _should_use_scalar_accum(self, index_var: IndexVar) -> bool:
+        """Check if this ForAll should use scalar accumulation for child reduction."""
+        assert self.cin_lowerer is not None
+        result_tensor_access = self.cin_lowerer.result_tensor_access
+        result_tensor_var = self.cin_lowerer.result_tensor_var
+        if result_tensor_access is None or result_tensor_var is None:
+            return False
+        if result_tensor_access.is_workspace():
+            return False
+        if not result_tensor_access.has_index_var(index_var):
+            return False
+
+        # Result must be all-coordinate (COO)
+        for lt in result_tensor_var.get_level_types():
+            if lt != LevelType.COORDINATE:
+                return False
+
+        # This must be the last result level
+        if (result_tensor_access.level_of_index_var(index_var)
+                != result_tensor_var.levels - 1):
+            return False
+
+        # Child must be a ForAll with a reduction variable (not in result)
+        child_stmt = self.for_all_stmt.stmt
+        if not isinstance(child_stmt, ForAll):
+            return False
+        child_iv = child_stmt.get_index_var()
+        return not result_tensor_access.has_index_var(child_iv)
+
+    def _wrap_child_subregion(
+        self, lattice_point: "LatticePoint", index_var: IndexVar
+    ) -> list:
+        """Get child subregion loops, wrapping with scalar accumulation if needed."""
+        assert self.cin_lowerer is not None
+        result_tensor_access = self.cin_lowerer.result_tensor_access
+        result_tensor_var = self.cin_lowerer.result_tensor_var
+
+        use_scalar_accum = self._should_use_scalar_accum(index_var)
+        if use_scalar_accum:
+            self.cin_lowerer._scalar_accum_mode = True
+
+        child_subregion = list(lattice_point.get_child_subregion_loops(
+            self.cin_lowerer, self.for_all_stmt.stmt
+        ))
+
+        if use_scalar_accum:
+            self.cin_lowerer._scalar_accum_mode = False
+            self.cin_lowerer._used_scalar_accum = True
+            assert result_tensor_var is not None
+            assert result_tensor_access is not None
+            result_name = result_tensor_var.name
+            n_levels = result_tensor_var.levels
+            pos_var = f"p{result_name}{n_levels - 1}"
+
+            # Pre: float _accum = 0.0f;
+            accum_init = llir.VarInit(
+                var=llir.Var(name="_accum", type=llir.DataType.FLOAT32),
+                value=llir.Literal(value="0.0f", data_type=llir.DataType.FLOAT32),
+            )
+
+            # Post: D_values[pD1] = _accum; D0_crd[pD1] = i; D1_crd[pD1] = j; pD1++;
+            post_stmts: list = []
+            post_stmts.append(llir.Assign(
+                var=llir.Var(
+                    name=f"{result_name}_values[{pos_var}]",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                value=llir.Var(name="_accum", type=llir.DataType.NO_TYPE),
+            ))
+            sorted_result_ivars = result_tensor_access.get_sorted_index_vars()
+            for level_idx, level_iv in enumerate(sorted_result_ivars):
+                post_stmts.append(llir.Assign(
+                    var=llir.Var(
+                        name=f"{result_name}{level_idx}_crd[{pos_var}]",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    value=llir.Var(name=level_iv.name, type=llir.DataType.NO_TYPE),
+                ))
+            post_stmts.append(llir.Increment(
+                var=llir.Var(name=pos_var, type=llir.DataType.INT),
+            ))
+
+            # Mark SIMD on dense reduction loops inside the child subregion
+            self._mark_simd_on_reduction_loops(child_subregion)
+
+            child_subregion = [accum_init] + child_subregion + post_stmts
+
+        return child_subregion
+
+    @staticmethod
+    def _mark_simd_on_reduction_loops(stmts: list) -> None:
+        """Mark dense reduction loops inside scalar accumulation for SIMD."""
+        from .cin_lowerer import CINLowerer
+        for stmt in stmts:
+            if isinstance(stmt, llir.ForLoop):
+                if (not CINLowerer._has_sparse_inner_loop(stmt.body)
+                        and not stmt.omp_parallel_for):
+                    stmt.simd = True
+
     def get_lattice_loops(self) -> List[llir.Stmt]:
         """
         Generate the outermost loops, one for each lattice point.
@@ -1149,6 +1261,30 @@ class IterationLattice:
                 )
                 self.cin_lowerer.defined_index_vars.append(index_var.parent)
 
+                # Guard against out-of-bounds when tile size exceeds
+                # the remaining dimension.  The unrolled inner loop
+                # iterates up to the compile-time tile constant, so we
+                # need a runtime break when the resolved index overshoots.
+                parent_iv = index_var.parent
+                _bound_name = self._tile_bound_var(parent_iv)
+                if _bound_name:
+                    tiled_index_var_resolve_stmts.append(
+                        llir.IfThenElse(
+                            cond=llir.BinOp(
+                                op=">=",
+                                left=llir.Var(
+                                    name=parent_iv.name,
+                                    type=llir.DataType.INT,
+                                ),
+                                right=llir.Var(
+                                    name=_bound_name,
+                                    type=llir.DataType.INT,
+                                ),
+                            ),
+                            then_body=[llir.Break()],
+                        )
+                    )
+
             # Skip result index generation when the result tensor access
             # is already used as a lattice point dense access (broadcast
             # dimension) — its position variable is already emitted by
@@ -1229,9 +1365,7 @@ class IterationLattice:
                             *tiled_index_var_resolve_stmts,
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                             *result_value_index_stmts,
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
-                            ),
+                            *self._wrap_child_subregion(lattice_point, index_var),
                         ],
                         unroll=should_unroll_loop,
                     )
@@ -1300,9 +1434,7 @@ class IterationLattice:
                             *tiled_index_var_resolve_stmts,
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                             *result_value_index_stmts,
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
-                            ),
+                            *self._wrap_child_subregion(lattice_point, index_var),
                             *coord_advance_stmts,
                         ],
                         unroll=should_unroll_loop,
@@ -1317,8 +1449,7 @@ class IterationLattice:
                             *tiled_index_var_resolve_stmts,
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                             *result_value_index_stmts,
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
+                            *self._wrap_child_subregion(lattice_point, index_var
                             ),
                             *lattice_point.get_iterators_advance_stmts(lattice=self),
                         ],
@@ -1337,14 +1468,9 @@ class IterationLattice:
                             lattice=self
                         ),
                         body=[
-                            # llir.Comment(
-                            #     f"IndexVar {index_var} not in result tensor access"
-                            # ),
                             *tiled_index_var_resolve_stmts,
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
-                            ),
+                            *self._wrap_child_subregion(lattice_point, index_var),
                         ],
                         unroll=should_unroll_loop,
                     )
@@ -1360,9 +1486,7 @@ class IterationLattice:
                         ),
                         body=[
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
-                            ),
+                            *self._wrap_child_subregion(lattice_point, index_var),
                         ],
                         unroll=should_unroll_loop,
                     )
@@ -1373,14 +1497,9 @@ class IterationLattice:
                     while_loop = llir.WhileLoop(
                         cond=lattice_point.get_while_condition(lattice=self),
                         body=[
-                            # llir.Comment(
-                            #     f"IndexVar {index_var} not in result tensor access"
-                            # ),
                             *tiled_index_var_resolve_stmts,
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *lattice_point.get_child_subregion_loops(
-                                self.cin_lowerer, self.for_all_stmt.stmt
-                            ),
+                            *self._wrap_child_subregion(lattice_point, index_var),
                             *lattice_point.get_iterators_advance_stmts(lattice=self),
                         ],
                     )
