@@ -28,6 +28,7 @@ while not (PROJECT_ROOT_DIR / "setup.py").exists():
     PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 _kernel_cache = {}
+_einsum_dispatch_cache = {}
 
 # start_time = time.time()
 # # Register custom classes
@@ -394,6 +395,71 @@ def einsum(
         STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors
     )
 
+    # ── Fast dispatch cache ─────────────────────────────────────────────
+    # On a cache hit, skip the entire scheduling pipeline (select_loop_order
+    # + auto_schedule) which dominates wall-clock time for cached kernels.
+    _dispatch_key = None
+    if not compile_only:
+        _dispatch_key = (
+            expression,
+            tuple(str(t.format) for t in tensors),
+            tuple(t.dtype for t in tensors),
+            kwargs.get("format", None),
+            tuple(kwargs.get("output_mode_order", ())) if kwargs.get("output_mode_order") else None,
+        )
+        _cached = _einsum_dispatch_cache.get(_dispatch_key)
+        if _cached is not None:
+            _module = _cached[0]
+            _output_fmt = _cached[1]
+            _temp_mo = _cached[2]
+            _final_mo = _cached[3]
+            _input_mos = _cached[4]
+            _input_idx_strs = _cached[5]
+            _result_idx_strs = _cached[6]
+
+            # Set correct mode orders on input tensors
+            for _t, _mo in zip(tensors, _input_mos):
+                if _t.storage.index.mode_order != _mo:
+                    _t.change_mode_order(_mo)
+
+            # Compute result shape from expression + current tensor shapes
+            _idx_to_size: dict = {}
+            for _idxs, _t in zip(_input_idx_strs, tensors):
+                for _i, _s in enumerate(_idxs):
+                    if _s not in _idx_to_size:
+                        _idx_to_size[_s] = _t.shape[_i]
+            _result_shape = tuple(_idx_to_size[_s] for _s in _result_idx_strs)
+
+            # Build args and evaluate
+            _args: List[Any] = [_result_shape]
+            for _t in tensors:
+                _args.append(_t.shape)
+                _args.append(_t.index.mode_indices)
+                _args.append(_t.values)
+
+            _t0 = time.time()
+            _result_cpp = _module.evaluate(*_args)
+            _eval_time = time.time() - _t0
+
+            _result = STensor(
+                shape=_result_shape,
+                index=TensorIndex(
+                    mode_indices=_result_cpp.storage.index.mode_indices,
+                    tensor_format=_output_fmt,
+                    mode_order=_temp_mo if _temp_mo else _final_mo,
+                ),
+                value=_result_cpp.storage.value,
+            )
+
+            if "time_dict" in kwargs:
+                kwargs["time_dict"]["eval_time"] = _eval_time
+
+            if _temp_mo:
+                _result.change_mode_order(_final_mo)
+
+            return _result
+    # ── End fast dispatch ────────────────────────────────────────────────
+
     # unique_index_strs should be a list of unique index strings
     # e.g. ["i", "j", "k"]
     unique_index_strs = list(expression.replace(",", "").replace("->", ""))
@@ -623,6 +689,18 @@ def einsum(
         )
 
         _kernel_cache[str(cin_stmt)] = module
+
+    # Populate the dispatch cache so future calls skip scheduling entirely.
+    if _dispatch_key is not None:
+        _einsum_dispatch_cache[_dispatch_key] = (
+            module,
+            output_format,
+            temp_mode_order,
+            final_mode_order,
+            [list(t.storage.index.mode_order) for t in tensors],
+            input_index_strs,
+            result_index_strs,
+        )
 
     if compile_only:
         return STensor("Compile only")
