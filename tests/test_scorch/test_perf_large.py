@@ -1,12 +1,9 @@
-import os
 import statistics
 import time
 from typing import Callable, Dict, List, Tuple
 
 import pytest
 import torch
-
-os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/tmp/torch_extensions")
 
 import scorch
 import scorch_ops as ops

@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import math
 import platform
 from collections import defaultdict, deque
@@ -13,6 +14,53 @@ from .compiler.llir import DataType
 from .format import TensorFormat, LevelFormat, LevelType
 
 PROJECT_ROOT_DIR = Path(__file__)
+
+
+def _kernel_name(*sources: str) -> str:
+    """Deterministic name from kernel source so torch's disk cache persists.
+
+    Includes torch version in the hash so a PyTorch upgrade invalidates
+    all cached .so files (they link against libtorch).
+    """
+    h = hashlib.md5(("".join(sources) + torch.__version__).encode()).hexdigest()[:12]
+    return f"kernel_{h}"
+
+
+_so_cache: dict = {}
+
+
+def _load_kernel(name: str, cpp_sources, functions, extra_cflags, extra_ldflags):
+    """Load a compiled kernel, using a persistent .so cache when possible.
+
+    PyTorch's JIT_EXTENSION_VERSIONER is in-memory only, so load_inline
+    always recompiles on the first call in each process (~7s).  We bypass
+    it by checking if the .so already exists on disk and loading it directly.
+    """
+    if name in _so_cache:
+        return _so_cache[name]
+
+    import importlib.util
+    from torch.utils.cpp_extension import _get_build_directory, load_inline
+
+    build_dir = _get_build_directory(name, verbose=False)
+    so_path = os.path.join(build_dir, f"{name}.so")
+
+    if os.path.isfile(so_path):
+        # .so exists — load directly without invoking ninja
+        spec = importlib.util.spec_from_file_location(name, so_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    else:
+        module = load_inline(
+            name=name,
+            cpp_sources=cpp_sources,
+            functions=functions,
+            extra_cflags=extra_cflags,
+            extra_ldflags=extra_ldflags,
+        )
+
+    _so_cache[name] = module
+    return module
 
 
 import os

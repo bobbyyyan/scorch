@@ -9,7 +9,7 @@ from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorStorage, TensorIndex, TensorStorageView
-from .utils import PROJECT_ROOT_DIR, parse_format, get_extra_cflags, get_extra_ldflags
+from .utils import PROJECT_ROOT_DIR, parse_format, get_extra_cflags, get_extra_ldflags, _kernel_name, _load_kernel
 
 
 class Window(object):
@@ -225,8 +225,8 @@ class STensor(torch.nn.Module):
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
             header_cpp_code = f.read()
 
-        module = torch.utils.cpp_extension.load_inline(
-            name="kernel",
+        module = _load_kernel(
+            name=_kernel_name(header_cpp_code, cpp_code),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=get_extra_cflags(),
@@ -568,8 +568,8 @@ class STensor(torch.nn.Module):
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
             header_cpp_code = f.read()
 
-        module = torch.utils.cpp_extension.load_inline(
-            name="kernel",
+        module = _load_kernel(
+            name=_kernel_name(header_cpp_code, cpp_code),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=get_extra_cflags(),
@@ -711,8 +711,8 @@ class STensor(torch.nn.Module):
             with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
                 header_cpp_code = f.read()
 
-            module = torch.utils.cpp_extension.load_inline(
-                name="kernel",
+            module = _load_kernel(
+                name=_kernel_name(header_cpp_code, cpp_code),
                 cpp_sources=[header_cpp_code, cpp_code],
                 functions=["evaluate"],
                 extra_cflags=get_extra_cflags(),
@@ -957,8 +957,8 @@ class STensor(torch.nn.Module):
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
             header_cpp_code = f.read()
 
-        module = torch.utils.cpp_extension.load_inline(
-            name="kernel",
+        module = _load_kernel(
+            name=_kernel_name(header_cpp_code, cpp_code),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=get_extra_cflags(),

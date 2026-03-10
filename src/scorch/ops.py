@@ -21,7 +21,7 @@ from .format import TensorFormat, LevelFormat, LevelType
 from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
 from .storage import TensorIndex
 from .stensor import STensor
-from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags, get_extra_ldflags
+from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags, get_extra_ldflags, _kernel_name, _load_kernel
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
@@ -94,8 +94,8 @@ def spmv(
         header_cpp_code = f.read()
 
     # start_time = time.time()
-    module = torch.utils.cpp_extension.load_inline(
-        name="kernel",
+    module = _load_kernel(
+        name=_kernel_name(header_cpp_code, cpp_code),
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=get_extra_cflags(),
@@ -205,8 +205,8 @@ def matmul_wksp(
         header_cpp_code = f.read()
 
     # start_time = time.time()
-    module = torch.utils.cpp_extension.load_inline(
-        name="kernel",
+    module = _load_kernel(
+        name=_kernel_name(header_cpp_code, cpp_code),
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=get_extra_cflags(),
@@ -680,8 +680,8 @@ def einsum(
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
             header_cpp_code = f.read()
 
-        module = torch.utils.cpp_extension.load_inline(
-            name="kernel",
+        module = _load_kernel(
+            name=_kernel_name(header_cpp_code, cpp_code),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=get_extra_cflags(),
@@ -830,8 +830,8 @@ def lower_and_exec_cin(
     with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
         header_cpp_code = f.read()
 
-    module = torch.utils.cpp_extension.load_inline(
-        name="kernel",
+    module = _load_kernel(
+        name=_kernel_name(header_cpp_code, cpp_code),
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=get_extra_cflags(),
