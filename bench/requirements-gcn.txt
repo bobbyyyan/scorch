@@ -1,0 +1,5 @@
+# Optional dependencies for bench/bench_gcn.py
+# Install with: pip install -r bench/requirements-gcn.txt
+torch_geometric
+dgl
+ogb
