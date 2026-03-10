@@ -25,7 +25,7 @@ Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
                 torch::Tensor A_values, std::vector<int> B_shape,
                 std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values, int tile_size = 32) {
+                torch::Tensor B_values, int tile_size = 0) {
   // Init result tensor level sizes
   int C0_size = result_shape[0];
   int C1_size = result_shape[1];
@@ -47,91 +47,28 @@ Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
       (scalar_t *)malloc(sizeof(scalar_t) * C_capacity);
   memset(C_values, 0, sizeof(scalar_t) * C_capacity);
 
-  // Fast path: fixed tile size that matches the best compiler-generated strategy.
-  // This avoids heap allocation in the hot loop and enables full unrolling.
-  constexpr int kFastTile = 32;
-  int kTile = tile_size > 0 ? tile_size : kFastTile;
+  // Row-parallel loop: i (rows) -> j (sparse) -> k (dense columns).
+  // Traverses the sparse structure once per row, and dynamic scheduling
+  // handles load imbalance from varying row densities.
+  #pragma omp parallel for schedule(dynamic, 16)
+  for (int i = 0; i < A0_size; i++) {
+    int pC0 = i;
+    int pA1_end = A1_pos[i + 1];
 
-  if (kTile == kFastTile) {
-    int full_j_end = (B1_size / kFastTile) * kFastTile;
+    for (int pA1 = A1_pos[i]; pA1 < pA1_end; pA1++) {
+      if (pA1 + 1 < pA1_end)
+        __builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1);
+      int j = A1_crd[pA1];
+      scalar_t a_val = A_val[pA1];
+      size_t pB0 = (size_t)j * (size_t)B1_size;
+      size_t pC1_base = (size_t)pC0 * (size_t)C1_size;
 
-    #pragma omp parallel for schedule(static)
-    for (int j_out = 0; j_out < full_j_end; j_out += kFastTile) {
-      for (int i = 0; i < A0_size; i++) {
-        scalar_t accum_c[kFastTile] = {};
-        int pA1_begin = A1_pos[i];
-        int pA1_end = A1_pos[i + 1];
-
-        for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
-          int j = A1_crd[pA1];
-          scalar_t a_val = A_val[pA1];
-          size_t pB1_base = (size_t)j * (size_t)B1_size + (size_t)j_out;
-
-          SCORCH_PRAGMA_UNROLL
-          for (int j_in = 0; j_in < kFastTile; j_in++) {
-            accum_c[j_in] += a_val * B_val[pB1_base + j_in];
-          }
-        }
-
-        size_t pC1_base = (size_t)i * (size_t)C1_size + (size_t)j_out;
-        SCORCH_PRAGMA_UNROLL
-        for (int j_in = 0; j_in < kFastTile; j_in++) {
-          C_values[pC1_base + j_in] = accum_c[j_in];
-        }
-      }
-    }
-
-    if (full_j_end < B1_size) {
-      #pragma omp parallel for schedule(static)
-      for (int i = 0; i < A0_size; i++) {
-        int pA1_begin = A1_pos[i];
-        int pA1_end = A1_pos[i + 1];
-
-        for (int j_out = full_j_end; j_out < B1_size; j_out++) {
-          scalar_t accum = static_cast<scalar_t>(0);
-          for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
-            int j = A1_crd[pA1];
-            size_t pB1 = (size_t)j * (size_t)B1_size + (size_t)j_out;
-            accum += A_val[pA1] * B_val[pB1];
-          }
-          size_t pC1 = (size_t)i * (size_t)C1_size + (size_t)j_out;
-          C_values[pC1] = accum;
-        }
-      }
-    }
-  } else {
-    // Generic path for custom tile sizes, still avoiding per-tile heap allocations.
-    #pragma omp parallel
-    {
-      std::vector<scalar_t> accum_c(kTile, static_cast<scalar_t>(0));
-
-      #pragma omp for schedule(static)
-      for (int i = 0; i < A0_size; i++) {
-        int pA1_begin = A1_pos[i];
-        int pA1_end = A1_pos[i + 1];
-
-        for (int j_out = 0; j_out < B1_size; j_out += kTile) {
-          int j_width = std::min(kTile, B1_size - j_out);
-          memset(accum_c.data(), 0, sizeof(scalar_t) * j_width);
-
-          for (int pA1 = pA1_begin; pA1 < pA1_end; pA1++) {
-            int j = A1_crd[pA1];
-            scalar_t a_val = A_val[pA1];
-            size_t pB1_base = (size_t)j * (size_t)B1_size + (size_t)j_out;
-
-            for (int j_in = 0; j_in < j_width; j_in++) {
-              accum_c[j_in] += a_val * B_val[pB1_base + j_in];
-            }
-          }
-
-          size_t pC1_base = (size_t)i * (size_t)C1_size + (size_t)j_out;
-          for (int j_in = 0; j_in < j_width; j_in++) {
-            C_values[pC1_base + j_in] = accum_c[j_in];
-          }
-        }
+      for (int k = 0; k < B1_size; k++) {
+        C_values[pC1_base + k] += a_val * B_val[pB0 + k];
       }
     }
   }
+
   // Assemble final result
   Tensor C;
   auto C_values_deleter = [](void *ptr) {
