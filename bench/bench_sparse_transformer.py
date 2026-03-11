@@ -352,21 +352,21 @@ def run_attention_layer(
             head_out = torch.sparse.mm(attn_csr, V_h)  # (S, D)
 
         elif mode == "scorch":
-            # Gather-based SDDMM (same as sparse-pytorch — einsum kernel
-            # is slower due to sequential iteration; gather benefits from
-            # vectorized BLAS despite creating larger temporaries)
-            rows = mask_data["rows"]
-            cols = mask_data["cols"]
+            # SDDMM via scorch.einsum: S[i,j] = M[i,j] * Q[i,k] * K[j,k]
+            # Auto-infers COO output → scalar-accum path → SIMD reduction
+            mask_st = mask_data["scorch_mask"]
+            Q_st = STensor.from_torch(Q_h, "Q")
+            K_st = STensor.from_torch(K_h, "K")
+            scores_st = scorch.einsum("ij,ik,jk->ij", mask_st, Q_st, K_st)
+            score_vals = scores_st.values * attn.scale
 
-            score_vals = (Q_h[rows] * K_h[cols]).sum(dim=-1) * attn.scale
-
-            # CSR-native softmax: no format conversion needed
+            # CSR-native softmax: COO values are in row-major (CSR) order
             csr = mask_data["csr"]
             crow = csr.crow_indices()
             col_idx = csr.col_indices()
             attn_vals = _sparse_softmax_csr_vectorized(crow, score_vals, S)
 
-            # SpMM via scorch.matmul (11x faster than torch.sparse.mm)
+            # SpMM via scorch.matmul
             attn_csr = torch.sparse_csr_tensor(crow, col_idx, attn_vals, (S, S))
             attn_st = STensor.from_csr(attn_csr, "attn")
             head_out = scorch.matmul(attn_st, V_h, format="dd")  # (S, D)
