@@ -1303,6 +1303,18 @@ class Scheduler:
         # (e.g., SDDMM's S[i,j] determines output sparsity).  For SpMM-like
         # ops where output sparsity differs from any single input, we still
         # need the workspace path.
+        #
+        # NOTE: For SDDMM-like patterns (S[i,j] = M[i,j]*Q[i,k]*K[j,k])
+        # where an input tensor mirrors the output sparsity, the optimal
+        # loop order is i→j→k (reduction innermost).  The cost model
+        # correctly identifies this as cheapest, but the lowerer cannot
+        # handle reduction-innermost for non-COO sparse outputs.  For COO
+        # output, the scalar-accum path in iter_lattice.py handles this
+        # correctly — einsum() auto-infers COO format for SDDMM patterns
+        # to leverage this (see ops.py format inference).  For CSR output
+        # (explicit format="ds"), the forced reorder still applies.
+        # TODO: Extend _should_use_scalar_accum in iter_lattice.py to
+        # support CSR output, then remove the _all_coo gate below.
         if not Scheduler._has_dense_output(cin):
             _needs_forced_reorder = True
             _result_accesses = cin.get_result_tensor_accesses()

@@ -132,3 +132,91 @@ def test_auto_schedule_spmm_dense_output_no_workspace():
     outer_loop_names, body = _loop_names(scheduled)
     assert not isinstance(body, Where)
     assert not scheduled.inserted_workspace
+
+
+def _build_sddmm_cin(fmt_s: str, fmt_m: str, fmt_q: str, fmt_k: str, loop_order: str) -> ForAll:
+    """Build CIN for SDDMM: S[i,j] = M[i,j] * Q[i,k] * K[j,k]"""
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    ivars = {"i": i, "j": j, "k": k}
+
+    S = TensorVar("S", fmt=fmt_s)
+    M = TensorVar("M", fmt=fmt_m)
+    Q = TensorVar("Q", fmt=fmt_q)
+    K = TensorVar("K", fmt=fmt_k)
+
+    assign = TensorAssign(S[i, j], M[i, j] * Q[i, k] * K[j, k], op=Operation.ADD)
+
+    stmt = assign
+    for ch in reversed(loop_order):
+        stmt = ForAll(ivars[ch], stmt)
+
+    assert isinstance(stmt, ForAll)
+    return stmt
+
+
+def test_sddmm_cost_model_prefers_reduction_innermost():
+    """The cost model correctly identifies i,j,k (reduction innermost) as
+    the cheapest loop order for SDDMM.  This verifies the cost model is
+    sound even though the lowerer can't currently emit this order."""
+    stmt = _build_sddmm_cin(
+        fmt_s="ds", fmt_m="ds", fmt_q="dd", fmt_k="dd", loop_order="ijk"
+    )
+    init_order = Scheduler.init_loop_order(stmt)
+    optimized = Scheduler.optimize_loop_order(stmt, init_order)
+    constrained = Scheduler.apply_mode_order_constraints(stmt, optimized)
+    names = [v.name for v in constrained]
+    assert names == ["i", "j", "k"], (
+        f"Cost model should prefer [i, j, k] but got {names}"
+    )
+
+
+def test_select_loop_order_sddmm_forced_reorder():
+    """SDDMM S[i,j] = M[i,j] * Q[i,k] * K[j,k] with CSR output currently
+    gets forced to i,k,j because the lowerer requires the innermost loop to
+    correspond to a result-tensor level (it cannot handle reduction-innermost
+    for sparse outputs).
+
+    This is a known suboptimality: the cost model prefers i,j,k (1.5x cheaper)
+    but the codegen constraint forces i,k,j, causing 32x redundant sparse
+    traversal and workspace overhead.  When scalar-accumulator codegen is added
+    to the lowerer, this test should be updated to assert [i, j, k]."""
+    stmt = _build_sddmm_cin(
+        fmt_s="ds", fmt_m="ds", fmt_q="dd", fmt_k="dd", loop_order="ijk"
+    )
+    loop_order = Scheduler.select_loop_order(stmt)
+    names = [v.name for v in loop_order]
+    # Current (suboptimal) behavior: forced reorder moves j after k
+    assert names == ["i", "k", "j"], (
+        f"Expected [i, k, j] (current forced reorder), got {names}. "
+        "If you're seeing [i, j, k], the lowerer may now support "
+        "reduction-innermost for sparse outputs — update this test!"
+    )
+
+
+def test_select_loop_order_sddmm_coo_output():
+    """SDDMM with all-COO output skips the forced reorder because the
+    existing COO check recognises the matching sparsity pattern."""
+    stmt = _build_sddmm_cin(
+        fmt_s="oo", fmt_m="ds", fmt_q="dd", fmt_k="dd", loop_order="ijk"
+    )
+    loop_order = Scheduler.select_loop_order(stmt)
+    names = [v.name for v in loop_order]
+    assert names == ["i", "j", "k"]
+
+
+def test_auto_schedule_sddmm_uses_workspace():
+    """SDDMM with CSR output currently requires workspace insertion due to
+    the forced i,k,j loop order (free var j after reduction k).  When
+    scalar-accumulator codegen is added, this should change to no workspace
+    with loop order i,j,k."""
+    stmt = _build_sddmm_cin(
+        fmt_s="ds", fmt_m="ds", fmt_q="dd", fmt_k="dd", loop_order="ijk"
+    )
+    scheduled = Scheduler.auto_schedule(stmt)
+
+    loop_names, body = _loop_names(scheduled)
+    assert loop_names == ["i"]
+    assert isinstance(body, Where), "Current codegen requires workspace for SDDMM"
+    assert scheduled.inserted_workspace

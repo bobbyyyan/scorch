@@ -608,6 +608,34 @@ def einsum(
             ):
                 output_level_formats[i - 1] = LevelFormat(LevelType.DENSE)
 
+        # For SDDMM-like patterns (sparse output with reduction variables
+        # where an input tensor mirrors the output sparsity), use all-COO
+        # output to enable the scalar-accum codegen path.  This gives
+        # optimal loop order (reduction innermost), no workspace, and SIMD
+        # vectorization of the dense reduction.
+        _has_sparse_output = any(
+            lf.get_level_type() in (LevelType.COMPRESSED, LevelType.COORDINATE)
+            for lf in output_level_formats
+        )
+        if _has_sparse_output:
+            _result_set = set(result_index_strs)
+            _reduction_strs = [s for s in unique_index_strs if s not in _result_set]
+            if _reduction_strs:
+                # Check if any input tensor has the same index variables as
+                # the output and contains sparse levels (SDDMM pattern).
+                for inp_strs, tensor in zip(input_index_strs, tensors):
+                    if set(inp_strs) == _result_set:
+                        _inp_level_types = tensor.format.get_level_types()
+                        if any(
+                            lt in (LevelType.COMPRESSED, LevelType.COORDINATE)
+                            for lt in _inp_level_types
+                        ):
+                            output_level_formats = [
+                                LevelFormat(LevelType.COORDINATE)
+                                for _ in output_level_formats
+                            ]
+                            break
+
         output_format = TensorFormat(output_level_formats)
         # print(f"\nUnspecified output format, using inferred {output_format}")
     else:

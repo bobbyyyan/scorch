@@ -345,6 +345,71 @@ class TestSDDMM:
         expected = torch.einsum("ij,ik,kj->ij", b_torch, c_torch, d_torch)
         assert_close(result, expected)
 
+    def test_sddmm_auto_format_uses_coo_and_scalar_accum(self):
+        """When no format is specified, SDDMM should auto-infer COO output
+        to enable the scalar-accum codegen path (i,j,k loop order, no
+        workspace, SIMD-vectorized reduction)."""
+        from scorch.format import LevelType
+
+        torch.manual_seed(701)
+        b_torch = make_sparse_2d(30, 50, 0.85, seed=701)
+        c_torch = torch.rand(30, 20)
+        d_torch = torch.rand(20, 50)
+
+        b_st = STensor.from_torch(b_torch).to_sparse("ds")
+        c_st = STensor.from_torch(c_torch)
+        d_st = STensor.from_torch(d_torch)
+
+        # No explicit format — should auto-infer COO for SDDMM
+        result = einsum("ij,ik,kj->ij", b_st, c_st, d_st)
+
+        # Check format BEFORE assert_close, because to_torch() densifies
+        # the STensor in-place.
+        level_types = result.index.format.get_level_types()
+        assert all(lt == LevelType.COORDINATE for lt in level_types), (
+            f"Expected all-COO output for SDDMM auto-format, got {level_types}"
+        )
+
+        expected = torch.einsum("ij,ik,kj->ij", b_torch, c_torch, d_torch)
+        assert_close(result, expected)
+
+    def test_sddmm_auto_format_alternative_subscripts(self):
+        """SDDMM detection should work for the ij,ik,jk->ij variant too."""
+        torch.manual_seed(702)
+        mask = make_sparse_2d(40, 40, 0.9, seed=702)
+        Q = torch.rand(40, 16)
+        K = torch.rand(40, 16)
+
+        mask_st = STensor.from_torch(mask).to_sparse("ds")
+        Q_st = STensor.from_torch(Q)
+        K_st = STensor.from_torch(K)
+
+        result = einsum("ij,ik,jk->ij", mask_st, Q_st, K_st)
+        expected = (Q @ K.T) * mask
+        assert_close(result, expected)
+
+    @pytest.mark.parametrize("n,d,sparsity", [
+        (16, 8, 0.5),
+        (64, 32, 0.9),
+        (128, 16, 0.95),
+        (256, 64, 0.99),
+    ])
+    def test_sddmm_auto_format_various_sizes(self, n, d, sparsity):
+        """SDDMM auto-format correctness across various matrix sizes,
+        head dimensions, and sparsity levels."""
+        torch.manual_seed(n + d)
+        mask = make_sparse_2d(n, n, sparsity, seed=n + d)
+        Q = torch.rand(n, d)
+        K = torch.rand(n, d)
+
+        mask_st = STensor.from_torch(mask).to_sparse("ds")
+        Q_st = STensor.from_torch(Q)
+        K_st = STensor.from_torch(K)
+
+        result = einsum("ij,ik,jk->ij", mask_st, Q_st, K_st)
+        expected = (Q @ K.T) * mask
+        assert_close(result, expected)
+
 
 # ===================================================================
 # 9. TTM Correctness
