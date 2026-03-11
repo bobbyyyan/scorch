@@ -20,6 +20,73 @@
 // Global constants for optimization
 const int kUnrollFactor = 16;
 
+// ---------------------------------------------------------------------------
+// Fused SpMM + bias + ReLU:  C[i,k] = max(0, sum_j A[i,j]*B[j,k] + bias[k])
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t, bool apply_relu>
+Tensor spmm_csr_bias_act(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, torch::Tensor bias_values) {
+  int C0_size = result_shape[0];
+  int C1_size = result_shape[1];
+
+  int A0_size = A_shape[0];
+  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  scalar_t* SCORCH_RESTRICT A_val = A_values.data_ptr<scalar_t>();
+
+  int B1_size = B_shape[1];
+  scalar_t* SCORCH_RESTRICT B_val = B_values.data_ptr<scalar_t>();
+  scalar_t* SCORCH_RESTRICT bias_val = bias_values.data_ptr<scalar_t>();
+
+  int C_capacity = C0_size * C1_size;
+  scalar_t* SCORCH_RESTRICT C_values =
+      (scalar_t *)malloc(sizeof(scalar_t) * C_capacity);
+
+  #pragma omp parallel for schedule(dynamic, 16)
+  for (int i = 0; i < A0_size; i++) {
+    size_t pC1_base = (size_t)i * (size_t)C1_size;
+    int pA1_end = A1_pos[i + 1];
+
+    // Initialize row with bias (avoid separate memset + bias pass)
+    for (int k = 0; k < B1_size; k++) {
+      C_values[pC1_base + k] = bias_val[k];
+    }
+
+    // Accumulate SpMM
+    for (int pA1 = A1_pos[i]; pA1 < pA1_end; pA1++) {
+      if (pA1 + 1 < pA1_end)
+        __builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1);
+      int j = A1_crd[pA1];
+      scalar_t a_val = A_val[pA1];
+      size_t pB0 = (size_t)j * (size_t)B1_size;
+
+      for (int k = 0; k < B1_size; k++) {
+        C_values[pC1_base + k] += a_val * B_val[pB0 + k];
+      }
+    }
+
+    // Apply ReLU in-place (same cache line, no extra memory pass)
+    if constexpr (apply_relu) {
+      for (int k = 0; k < B1_size; k++) {
+        scalar_t val = C_values[pC1_base + k];
+        C_values[pC1_base + k] = val > 0 ? val : 0;
+      }
+    }
+  }
+
+  Tensor C;
+  auto C_values_deleter = [](void *ptr) { free(ptr); };
+  torch::Tensor C_values_torch = torch::from_blob(
+      C_values, {C_capacity}, C_values_deleter, scorch_torch_dtype<scalar_t>());
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
 template <typename scalar_t>
 Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,

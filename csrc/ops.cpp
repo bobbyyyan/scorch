@@ -161,11 +161,55 @@ void bind_experimental_spmm_variants(py::module_& m) {
                      "Large-tile NEON (128) with direct accumulation");
 }
 
+// Fused SpMM + bias + ReLU wrappers
+Tensor spmm_csr_bias_relu_float(
+    std::vector<int> result_shape, std::vector<int> A_shape,
+    std::vector<std::vector<torch::Tensor>> A_mode_indices,
+    torch::Tensor A_values, std::vector<int> B_shape,
+    std::vector<std::vector<torch::Tensor>> B_mode_indices,
+    torch::Tensor B_values, torch::Tensor bias) {
+  return spmm_csr_bias_act<float, true>(
+      result_shape, A_shape, A_mode_indices, A_values,
+      B_shape, B_mode_indices, B_values, bias);
+}
+
+Tensor spmm_csr_bias_float(
+    std::vector<int> result_shape, std::vector<int> A_shape,
+    std::vector<std::vector<torch::Tensor>> A_mode_indices,
+    torch::Tensor A_values, std::vector<int> B_shape,
+    std::vector<std::vector<torch::Tensor>> B_mode_indices,
+    torch::Tensor B_values, torch::Tensor bias) {
+  return spmm_csr_bias_act<float, false>(
+      result_shape, A_shape, A_mode_indices, A_values,
+      B_shape, B_mode_indices, B_values, bias);
+}
+
+using FusedKernelFn = Tensor (*)(std::vector<int>, std::vector<int>,
+                                  std::vector<std::vector<torch::Tensor>>,
+                                  torch::Tensor, std::vector<int>,
+                                  std::vector<std::vector<torch::Tensor>>,
+                                  torch::Tensor, torch::Tensor);
+
+void bind_fused_kernel(py::module_& m, const char* name, FusedKernelFn fn,
+                       const char* doc) {
+  m.def(name, fn, doc, py::arg("result_shape"), py::arg("A_shape"),
+        py::arg("A_mode_indices"), py::arg("A_values"), py::arg("B_shape"),
+        py::arg("B_mode_indices"), py::arg("B_values"), py::arg("bias"));
+}
+
+void bind_fused_spmm_variants(py::module_& m) {
+  bind_fused_kernel(m, "spmm_csr_bias_relu_float", &spmm_csr_bias_relu_float,
+                    "Fused SpMM + bias + ReLU (CSR x dense)");
+  bind_fused_kernel(m, "spmm_csr_bias_float", &spmm_csr_bias_float,
+                    "Fused SpMM + bias (CSR x dense, no activation)");
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     bind_prebuilt_kernel_family(m);
     bind_experimental_spmm_variants(m);
+    bind_fused_spmm_variants(m);
 
     py::class_<Tensor>(m, "Tensor")
       .def(py::init<>())

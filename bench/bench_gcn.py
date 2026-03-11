@@ -329,6 +329,56 @@ def scorch_gcn_forward(
     return F.log_softmax(x, dim=1)
 
 
+def _get_fused_kernels():
+    """Load fused SpMM+bias+ReLU kernels from scorch_ops."""
+    import scorch_ops
+
+    return scorch_ops.spmm_csr_bias_relu_float, scorch_ops.spmm_csr_bias_float
+
+
+def scorch_fused_gcn_forward(
+    x: torch.Tensor,
+    adj_csr: torch.Tensor,
+    weights: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Scorch GCN forward with fused SpMM+bias+ReLU kernels.
+
+    Fuses the SpMM, bias add, and ReLU into a single C++ kernel per layer,
+    eliminating 2 extra memory passes over the (N, H) output per layer.
+    """
+    spmm_bias_relu, spmm_bias = _get_fused_kernels()
+
+    # Extract CSR structure
+    crow = adj_csr.crow_indices().to(torch.int32)
+    col = adj_csr.col_indices().to(torch.int32)
+    val = adj_csr.values()
+    N = adj_csr.size(0)
+    A_shape = [N, N]
+    A_mode_indices = [[], [crow, col]]
+
+    # Layer 1: transform -> fused(SpMM + bias + ReLU)
+    x = F.linear(x, weights["conv1.lin.weight"])
+    H = x.size(1)
+    result = spmm_bias_relu(
+        [N, H], A_shape, A_mode_indices, val,
+        [N, H], [[], []], x.contiguous().view(-1),
+        weights["conv1.bias"],
+    )
+    x = result.storage.value.view(N, H)
+
+    # Layer 2: transform -> fused(SpMM + bias) (no ReLU before softmax)
+    x = F.linear(x, weights["conv2.lin.weight"])
+    C = x.size(1)
+    result = spmm_bias(
+        [N, C], A_shape, A_mode_indices, val,
+        [N, C], [[], []], x.contiguous().view(-1),
+        weights["conv2.bias"],
+    )
+    x = result.storage.value.view(N, C)
+
+    return F.log_softmax(x, dim=1)
+
+
 class PyGGCN(nn.Module):
     """2-layer GCN using PyG GCNConv (normalization done externally)."""
 
@@ -489,6 +539,23 @@ def run_scorch(
     return acc, timing
 
 
+def run_scorch_fused(
+    dataset: GraphDataset,
+    adj_csr: torch.Tensor,
+    weights: Dict[str, torch.Tensor],
+    warmup: int,
+    repeats: int,
+) -> Tuple[float, TimingSummary]:
+    with torch.no_grad():
+        def fn() -> torch.Tensor:
+            return scorch_fused_gcn_forward(dataset.x, adj_csr, weights)
+
+        logits, timing = benchmark_fn(fn, warmup=warmup, repeats=repeats)
+
+    acc = _accuracy(logits, dataset.y, dataset.test_mask)
+    return acc, timing
+
+
 def run_pyg(
     dataset: GraphDataset,
     edge_index: torch.Tensor,
@@ -602,7 +669,7 @@ def train_gcn(dataset: GraphDataset) -> TorchGCN:
 # Benchmark orchestration
 # ---------------------------------------------------------------------------
 
-FRAMEWORK_ORDER = ["PyTorch", "Scorch", "PyG", "DGL"]
+FRAMEWORK_ORDER = ["PyTorch", "Scorch", "Scorch (fused)", "PyG", "DGL"]
 
 
 def benchmark_dataset(
@@ -677,6 +744,25 @@ def benchmark_dataset(
                     else:
                         max_diff = (
                             (sc_logits - reference_logits).abs().max().item()
+                        )
+                        print(
+                            f"    Correctness: WARN (max_diff={max_diff:.6f})"
+                        )
+            elif fw == "Scorch (fused)":
+                acc, timing = run_scorch_fused(
+                    dataset, adj_csr, weights, warmup, repeats
+                )
+                # Correctness check vs PyTorch
+                if reference_logits is not None:
+                    with torch.no_grad():
+                        fused_logits = scorch_fused_gcn_forward(
+                            dataset.x, adj_csr, weights
+                        )
+                    if torch.allclose(fused_logits, reference_logits, atol=1e-4):
+                        print("    Correctness: PASS (matches PyTorch)")
+                    else:
+                        max_diff = (
+                            (fused_logits - reference_logits).abs().max().item()
                         )
                         print(
                             f"    Correctness: WARN (max_diff={max_diff:.6f})"
@@ -810,7 +896,7 @@ def main() -> None:
     bench_parser.add_argument(
         "--frameworks",
         nargs="+",
-        default=["pytorch", "scorch", "pyg", "dgl"],
+        default=["pytorch", "scorch", "scorch (fused)", "pyg", "dgl"],
         help="Frameworks to benchmark (default: all)",
     )
 
