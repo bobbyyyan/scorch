@@ -207,6 +207,22 @@ public:
 
 
 // ####################################
+// ==== BEGIN === ACTIVATION HELPERS ===
+// ####################################
+
+template<typename T> inline T scorch_relu(T x) { return x > T(0) ? x : T(0); }
+template<typename T> inline T scorch_sigmoid(T x) { return T(1) / (T(1) + std::exp(-x)); }
+template<typename T> inline T scorch_tanh(T x) { return std::tanh(x); }
+template<typename T> inline T scorch_gelu(T x) {
+  return x * T(0.5) * (T(1) + std::tanh(T(0.7978845608) * (x + T(0.044715) * x * x * x)));
+}
+
+// ####################################
+// ===== END === ACTIVATION HELPERS ====
+// ####################################
+
+
+// ####################################
 // ===== BEGIN === COO WKSP IMPL ======
 // ####################################
 

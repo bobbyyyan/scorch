@@ -1129,6 +1129,34 @@ class CINIndexVariablesGetter(CINVisitorAccept):
         return self.free_vars
 
 
+@dataclass
+class PostOp:
+    """A single post-operation to fuse after a contraction."""
+    kind: str  # "add", "mul", "relu", "gelu", "tanh", "sigmoid"
+    tensor_name: Optional[str] = None  # for "add"/"mul": name of extra tensor arg
+
+
+@dataclass
+class PostOps:
+    """Sequence of post-operations with metadata about extra tensor arguments."""
+    ops: List[PostOp]
+    extra_tensors: List[str]  # tensor names needing extra kernel args
+
+    def __str__(self) -> str:
+        return ",".join(
+            f"{op.kind}({op.tensor_name})" if op.tensor_name else op.kind
+            for op in self.ops
+        )
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, PostOps):
+            return False
+        return str(self) == str(other)
+
+
 class LoopOrderGetter(CINVisitor):
     index_vars_ordered: List[IndexVar] = []
     free_vars: List[IndexVar] = []

@@ -16,6 +16,8 @@ from .cin import (
     Where,
     WorkspaceAccess,
     Workspace,
+    PostOp,
+    PostOps,
 )
 from .iter_lattice import IterationLattice
 from .llir import AssignOp, DataType
@@ -446,8 +448,9 @@ class CINLowerer:
     This is a class to lower a CIN to LLIR
     """
 
-    def __init__(self, filter_zeros=False):
+    def __init__(self, filter_zeros=False, post_ops: Optional[PostOps] = None):
         self.filter_zeros: bool = filter_zeros
+        self.post_ops: Optional[PostOps] = post_ops
         self.defined_index_vars: List[IndexVar] = []
 
         self.dense_coord_resolve_stmt_to_dep_index_vars: Dict[
@@ -473,6 +476,51 @@ class CINLowerer:
 
         self.need_compute: List[TensorVar] = []
         self.tensor_var_to_llir: Dict[TensorVar, llir.Expr] = {}
+
+    def _emit_post_ops(self, output_var_name: str, index_expr: str) -> List[llir.Stmt]:
+        """Emit LLIR statements for post-ops on output_var_name[index_expr]."""
+        if not self.post_ops or not self.post_ops.ops:
+            return []
+        stmts: List[llir.Stmt] = []
+        target = llir.Var(
+            name=f"{output_var_name}[{index_expr}]",
+            type=llir.DataType.NO_TYPE,
+        )
+        for op in self.post_ops.ops:
+            if op.kind == "add":
+                stmts.append(
+                    llir.Assign(
+                        var=target,
+                        value=llir.Var(
+                            name=f"{op.tensor_name}_val[{index_expr}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        op=AssignOp.ADD_ASSIGN,
+                    )
+                )
+            elif op.kind == "mul":
+                stmts.append(
+                    llir.Assign(
+                        var=target,
+                        value=llir.Var(
+                            name=f"{op.tensor_name}_val[{index_expr}]",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        op=AssignOp.MUL_ASSIGN,
+                    )
+                )
+            elif op.kind in ("relu", "gelu", "tanh", "sigmoid"):
+                stmts.append(
+                    llir.Assign(
+                        var=target,
+                        value=llir.FunctionCall(
+                            name=f"scorch_{op.kind}",
+                            args=[target],
+                        ),
+                        op=AssignOp.ASSIGN,
+                    )
+                )
+        return stmts
 
     @staticmethod
     def get_level_arrays(tensor: TensorVar) -> List[llir.Stmt]:
@@ -1475,6 +1523,14 @@ class CINLowerer:
                     )
                 )
 
+                # Inject post-ops (bias add, relu, etc.) after workspace -> output write
+                loop_body.extend(
+                    self._emit_post_ops(
+                        f"{result_tensor_name}_values",
+                        result_level_iterator_name,
+                    )
+                )
+
                 for_loop = llir.ForLoop(
                     init=llir.VarInit(
                         var=loop_var,
@@ -2008,7 +2064,38 @@ class CINLowerer:
                     )
                 )
 
+            # Append extra tensor args for PostOps (bias, scale, etc.)
+            if self.post_ops and self.post_ops.extra_tensors:
+                for tname in self.post_ops.extra_tensors:
+                    kernel_args.append(
+                        llir.Var(
+                            name=f"{tname}_values",
+                            type=llir.DataType.TORCH_TENSOR,
+                        )
+                    )
+
             body_stmts: List[llir.Stmt] = []
+
+            # Extract data pointers for PostOps extra tensors
+            postop_ptr_stmts: List[llir.Stmt] = []
+            if self.post_ops and self.post_ops.extra_tensors:
+                _postop_dtype = self.final_result_tensor_var.dtype
+                c_dtype = dtype_to_c_datatype(_postop_dtype)
+                ptr_type = llir.DataType.ptr_type(_postop_dtype)
+                for tname in self.post_ops.extra_tensors:
+                    postop_ptr_stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tname}_val",
+                                type=ptr_type,
+                                is_restrict=True,
+                            ),
+                            value=llir.Var(
+                                name=f"{tname}_values.data_ptr<{c_dtype.value}>()",
+                                type=ptr_type,
+                            ),
+                        )
+                    )
 
             recurse_stmts = self.lower_IndexStmt(stmt, recurse=True)
             if not isinstance(recurse_stmts, list):
@@ -2026,6 +2113,7 @@ class CINLowerer:
                     llir.Comment("Initialize result value array"),
                     *tensor_value_array_init_stmts,
                     *tile_size_vars_init_stmts,
+                    *postop_ptr_stmts,
                     # *result_index_init_stmts,
                     llir.BlankLine(),
                     *recurse_stmts,
