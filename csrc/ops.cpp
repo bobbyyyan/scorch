@@ -159,6 +159,9 @@ void bind_experimental_spmm_variants(py::module_& m) {
                      "NEON 4-NNZ unroll with deep prefetch");
   bind_binary_kernel(m, "spmm_csr_float_tiled_neon", &spmm_csr_float_tiled_neon,
                      "Large-tile NEON (128) with direct accumulation");
+  bind_binary_kernel_with_tile(
+      m, "spmm_csr_float_v2", &spmm_csr_float_v2,
+      "Workspace + 2-nnz ILP + k-tiling SpMM", 256);
 }
 
 // Fused SpMM + bias + ReLU wrappers

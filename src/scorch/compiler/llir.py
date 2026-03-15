@@ -477,6 +477,8 @@ class ForLoop(Stmt):
         omp_schedule: Optional[str] = None,
         unroll: bool = False,
         simd: bool = False,
+        pre_parallel_body: Optional[List[Stmt]] = None,
+        post_parallel_body: Optional[List[Stmt]] = None,
     ):
         self.init = init
         self.cond = cond
@@ -486,6 +488,10 @@ class ForLoop(Stmt):
         self.omp_schedule = omp_schedule
         self.unroll = unroll
         self.simd = simd
+        # Stmts placed inside #pragma omp parallel but before/after the for loop.
+        # When set, codegen splits "parallel for" into "parallel { pre; for; post }".
+        self.pre_parallel_body = pre_parallel_body
+        self.post_parallel_body = post_parallel_body
 
 
 # A for loop styled for (auto XXX : YYY) { ... }

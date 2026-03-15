@@ -166,6 +166,32 @@ class LLIRLowerer:
         if isinstance(ir, llir.WhileLoop):
             header = f"while ({self.lower_llir(ir.cond)}) {{"
         elif isinstance(ir, llir.ForLoop):
+            # When pre/post_parallel_body is set, split into:
+            #   #pragma omp parallel { pre; #pragma omp for ...; post }
+            if ir.omp_parallel_for and (ir.pre_parallel_body or ir.post_parallel_body):
+                omp_for = "#pragma omp for"
+                if ir.omp_schedule:
+                    omp_for += f" schedule({ir.omp_schedule})"
+                init_lowered = self.lower_llir(ir.init) if ir.init is not None else ";"
+                for_header = (
+                    f"for ({init_lowered} {self.lower_llir(ir.cond)};"
+                    f" {self.lower_llir(ir.update, no_semicolon=True)}) {{"
+                )
+                parts = [
+                    self.lower_llir("#pragma omp parallel", indent_level),
+                    self.lower_llir("{", indent_level),
+                ]
+                if ir.pre_parallel_body:
+                    parts.append(self.lower_llir(ir.pre_parallel_body, indent_level + 1))
+                parts.append(self.lower_llir(omp_for, indent_level + 1))
+                parts.append(self.lower_llir(for_header, indent_level + 1))
+                parts.append(self.lower_llir(ir.body, indent_level + 2))
+                parts.append(self.lower_llir("}", indent_level + 1))
+                if ir.post_parallel_body:
+                    parts.append(self.lower_llir(ir.post_parallel_body, indent_level + 1))
+                parts.append(self.lower_llir("}", indent_level))
+                return "\n".join(parts)
+
             if ir.omp_parallel_for:
                 omp_pragma = "#pragma omp parallel for"
                 if ir.omp_schedule:

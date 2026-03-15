@@ -156,9 +156,12 @@ def matmul_wksp(
     A = TensorVar("A", fmt=a.format)
     B = TensorVar("B", fmt=b.format)
 
+    # Use a dense workspace when the output is dense (avoids COO hash-map overhead).
+    wksp_dense = output_format.is_dense()
     workspace = Workspace(
         name="wksp",
         dim=1,
+        dense=wksp_dense,
     )
 
     i = IndexVar("i")

@@ -866,6 +866,11 @@ class CINLowerer:
             llir.Comment("Initialize workspaces"),
         ]
         workspace_cleanup_stmts: List[llir.Stmt] = []
+        # Per-thread workspace allocation (hoisted outside the for loop but
+        # inside the OMP parallel region) and per-iteration memset.
+        self._workspace_alloc_stmts: List[llir.Stmt] = []
+        self._workspace_free_stmts: List[llir.Stmt] = []
+        self._workspace_memset_stmts: List[llir.Stmt] = []
         for wksp in workspaces:
             assert isinstance(wksp, Workspace), "workspace is not a Workspace"
             # coo_workspace<tensor's ctype> <tensor's name> = coo_workspace<tensor's ctype>(<tensor's dim>);
@@ -904,21 +909,43 @@ class CINLowerer:
                             )
                         )
                     else:
-                        workspace_init_stmts.append(
-                            llir.VarInit(
-                                var=llir.Var(
-                                    name=wksp.get_name(),
-                                    type=wksp_ctype_ptr,
-                                    is_restrict=True,
+                        # Aligned allocation hoisted to per-thread (outside for loop).
+                        # memset per iteration (inside for loop).
+                        size_llir = wksp.size_llir_var
+                        size_var = size_llir.name
+                        # The workspace size variable may reference a dense tensor
+                        # dimension (e.g. B1_size). Resolve it to the actual C++ name
+                        # so it's available in the hoisted parallel region.
+                        wksp_access = [wa for wa in wksp.workspace_accesses
+                                       if wa.indices and len(wa.indices) == 1][0]
+                        idx_var = wksp_access.indices[0]
+                        dense_ta = [ta for ta in idx_var.tensor_accesses
+                                    if ta.is_dense() and idx_var in ta.indices
+                                    and not ta.is_workspace()][0]
+                        level = dense_ta.level_of_index_var(idx_var)
+                        actual_size = f"{dense_ta.tensor.name}{level}_size"
+
+                        ctype = wksp_ctype.value
+                        wname = wksp.get_name()
+                        aligned_size = f"(((size_t){actual_size} + 15) & ~15)"
+                        self._workspace_alloc_stmts.extend([
+                            llir.RawStmt(
+                                code=f"int {size_var} = {actual_size}"
+                            ),
+                            llir.RawStmt(
+                                code=(
+                                    f"{ctype}* __restrict__ {wname} = "
+                                    f"({ctype}*)aligned_alloc(64, {aligned_size} * sizeof({ctype}))"
                                 ),
-                                value=llir.FunctionCall(
-                                    name=f"new {wksp_ctype.value}[{wksp.size_llir_var.name}]",
-                                    args=[],
-                                ),
-                            )
+                            ),
+                        ])
+                        self._workspace_free_stmts.append(
+                            llir.RawStmt(code=f"free({wname})")
                         )
-                        workspace_cleanup_stmts.append(
-                            llir.RawStmt(code=f"delete[] {wksp.get_name()}")
+                        self._workspace_memset_stmts.append(
+                            llir.RawStmt(
+                                code=f"memset({wname}, 0, {size_var} * sizeof({ctype}))"
+                            )
                         )
                 else:
                     # If the workspace is 1-dimensional, use optimized 1D workspace implementation
@@ -962,6 +989,7 @@ class CINLowerer:
 
         return [
             *workspace_init_stmts,
+            *self._workspace_memset_stmts,
             *self.lower_ProducerIndexStmt(stmt.producer),
             *self.lower_ConsumerIndexStmt(stmt.consumer),
             *workspace_cleanup_stmts,
@@ -1441,8 +1469,9 @@ class CINLowerer:
             args=[],
         )
 
-        # Dense accumulator workspace: iterate over all indices and
-        # write non-zero values to the result tensor
+        # Dense accumulator workspace: write to the result tensor.
+        # When the result level is dense and contiguous, use memcpy
+        # (pure store, avoids cold read-modify-write on large output).
         if wksp_access.is_dense():
             assert (
                 len(wksp_index_vars) == 1
@@ -1450,6 +1479,38 @@ class CINLowerer:
             wksp_index_var = wksp_index_vars[0]
 
             if not wksp_index_var.tile_size_var:
+                # Check if the result level is dense (contiguous layout).
+                result_level_type = result_tensor_access.level_type_of_index_var(
+                    wksp_index_var
+                )
+                result_is_dense = (result_level_type is not None
+                                   and result_level_type.name == "DENSE")
+
+                if result_is_dense:
+                    # Emit memcpy: the workspace has the full row, write once.
+                    wname = wksp.get_name()
+                    size_var = wksp_index_var.size_llir_var.name
+                    ctype_str = dtype_to_c_datatype(wksp.dtype).value
+                    # Resolve the base pointer for this row in C.
+                    resolve_stmts = result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+                    # The iterator for the row start: pC<level> with j=0
+                    # is just pC_prev * C_level_size (which is result_level_iterator_name with j=0).
+                    # We can compute it as: &C_values[pC0 * C1_size]
+                    prev_iter = f"p{result_tensor_name}{level - 1}" if level > 0 else "0"
+                    c_level_size = f"{result_tensor_name}{level}_size"
+                    return [
+                        llir.BlankLine(),
+                        llir.Comment("Write workspace to output (memcpy — pure store)"),
+                        llir.RawStmt(
+                            code=(
+                                f"memcpy(&{result_tensor_name}_values"
+                                f"[{prev_iter} * {c_level_size}], "
+                                f"{wname}, {size_var} * sizeof({ctype_str}))"
+                            )
+                        ),
+                    ]
+
+                # Fallback: element-by-element assignment (= not +=)
                 loop_var = llir.Var(
                     name=f"{wksp_index_var.name}",
                     type=llir.DataType.INT,
@@ -1471,7 +1532,7 @@ class CINLowerer:
                             name=f"{wksp.get_name()}[{loop_var.name}]",
                             type=llir.DataType.NO_TYPE,
                         ),
-                        op=AssignOp.ADD_ASSIGN,
+                        op=AssignOp.ASSIGN,
                     )
                 )
 
@@ -1493,7 +1554,7 @@ class CINLowerer:
                 return [
                     llir.BlankLine(),
                     llir.Comment(
-                        "TODO: Lower consumer CIN for dense accumulator workspace"
+                        "Write workspace to output"
                     ),
                     for_loop,
                 ]
@@ -2232,15 +2293,21 @@ class CINLowerer:
             return CINLowerer._find_val_array_access(expr.right, pos_to_stride)
         return None
 
-    @classmethod
-    def _mark_first_for_loop_parallel(cls, stmts: List[llir.Stmt]) -> None:
+    def _mark_first_for_loop_parallel(self, stmts: List[llir.Stmt]) -> None:
         for llir_stmt in stmts:
-            if isinstance(llir_stmt, llir.ForLoop) and cls._is_openmp_compatible_for_loop(llir_stmt):
+            if isinstance(llir_stmt, llir.ForLoop) and self._is_openmp_compatible_for_loop(llir_stmt):
                 llir_stmt.omp_parallel_for = True
                 # Use dynamic scheduling when body contains sparse loops,
                 # since rows have varying nnz counts causing load imbalance.
-                if cls._has_sparse_inner_loop(llir_stmt.body):
-                    llir_stmt.omp_schedule = "dynamic, 16"
+                if self._has_sparse_inner_loop(llir_stmt.body):
+                    llir_stmt.omp_schedule = "dynamic, 64"
+                # Hoist per-thread workspace alloc/free outside the for loop
+                # but inside the OMP parallel region.
+                alloc = getattr(self, '_workspace_alloc_stmts', [])
+                free = getattr(self, '_workspace_free_stmts', [])
+                if alloc or free:
+                    llir_stmt.pre_parallel_body = alloc or None
+                    llir_stmt.post_parallel_body = free or None
                 return
 
     @classmethod
