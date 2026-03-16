@@ -152,74 +152,69 @@ def matmul_wksp(
     elif not isinstance(output_format, TensorFormat):
         output_format = parse_format(output_format)
 
-    C = TensorVar("C", fmt=output_format)
-    A = TensorVar("A", fmt=a.format)
-    B = TensorVar("B", fmt=b.format)
+    # ── Module cache: skip CIN→LLIR→codegen on repeat calls ──────────
+    _cache_key = (str(a.format), str(b.format), str(output_format))
+    if not hasattr(matmul_wksp, '_module_cache'):
+        matmul_wksp._module_cache = {}
 
-    # Use a dense workspace when the output is dense (avoids COO hash-map overhead).
-    wksp_dense = output_format.is_dense()
-    workspace = Workspace(
-        name="wksp",
-        dim=1,
-        dense=wksp_dense,
-    )
+    module = matmul_wksp._module_cache.get(_cache_key)
+    if module is None:
+        C = TensorVar("C", fmt=output_format)
+        A = TensorVar("A", fmt=a.format)
+        B = TensorVar("B", fmt=b.format)
 
-    i = IndexVar("i")
-    j = IndexVar("j")
-    k = IndexVar("k")
+        # Use a dense workspace when the output is dense (avoids COO hash-map overhead).
+        wksp_dense = output_format.is_dense()
+        workspace = Workspace(
+            name="wksp",
+            dim=1,
+            dense=wksp_dense,
+        )
 
-    cin_stmt = ForAll(
-        i,
-        Where(
-            producer=ForAll(
-                k,
-                ForAll(
+        i = IndexVar("i")
+        j = IndexVar("j")
+        k = IndexVar("k")
+
+        cin_stmt = ForAll(
+            i,
+            Where(
+                producer=ForAll(
+                    k,
+                    ForAll(
+                        j,
+                        TensorAssign(
+                            workspace[j],
+                            A[i, k] * B[k, j],
+                            op=Operation.ADD,
+                        ),
+                    ),
+                ),
+                consumer=ForAll(
                     j,
                     TensorAssign(
+                        C[i, j],
                         workspace[j],
-                        A[i, k] * B[k, j],
-                        op=Operation.ADD,
                     ),
                 ),
             ),
-            consumer=ForAll(
-                j,
-                TensorAssign(
-                    C[i, j],
-                    workspace[j],
-                ),
-            ),
-        ),
-    )
+        )
 
-    lowerer = CINLowerer()
+        lowerer = CINLowerer()
+        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer()
+        cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+            header_cpp_code = f.read()
 
-    llir_lowerer = LLIRLowerer()
-
-    cpp_code = llir_lowerer.lower_llir(lowered_llir)
-
-    # print("\n C++ CODE:\n")
-    # print(cpp_code)
-
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
-
-    # start_time = time.time()
-    module = _load_kernel(
-        name=_kernel_name(header_cpp_code, cpp_code),
-        cpp_sources=[header_cpp_code, cpp_code],
-        functions=["evaluate"],
-        extra_cflags=get_extra_cflags(),
-        extra_ldflags=get_extra_ldflags(),
-    )
-    # end_time = time.time()
-
-    # compile_time = end_time - start_time
-    #  Print kernel compile time to 5 decimal places
-    # print(f"Kernel compile time: {compile_time:.5f} seconds")
+        module = _load_kernel(
+            name=_kernel_name(header_cpp_code, cpp_code),
+            cpp_sources=[header_cpp_code, cpp_code],
+            functions=["evaluate"],
+            extra_cflags=get_extra_cflags(),
+            extra_ldflags=get_extra_ldflags(),
+        )
+        matmul_wksp._module_cache[_cache_key] = module
 
     result_shape = (a.shape[0], b.shape[1])
     args = [result_shape]
