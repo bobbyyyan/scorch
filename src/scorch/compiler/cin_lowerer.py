@@ -2215,13 +2215,13 @@ class CINLowerer:
             if not crd_array:
                 continue
 
-            # Find a dense values array and its stride by inspecting the inner
-            # dense ForLoop.  We look for:
+            # Find ALL dense values arrays and their strides by inspecting
+            # the inner dense ForLoop.  We look for:
             #   VarInit pB1 = Add(Mul(pB0, B1_size), j)  → stride = B1_size
             #   Assign  C[pC1] += BinOp(*, A_val[pA1], B_val[pB1])
             #                                              → dense_val = B_val
-            dense_val_array = None
-            dense_stride = None
+            # Collect all (val_array, stride) pairs for multi-prefetch.
+            dense_arrays_found: List[tuple] = []  # [(val_array, stride), ...]
             for body_stmt in stmt.body:
                 if not isinstance(body_stmt, llir.ForLoop):
                     continue
@@ -2236,29 +2236,53 @@ class CINLowerer:
                                 and add.left.op == "*"
                                 and isinstance(add.left.right, llir.Var)):
                             pos_to_stride[inner_stmt.var.name] = add.left.right.name
-                # Now find Assign nodes that use _val arrays indexed by those pos vars
+                # Find ALL Assign nodes that use _val arrays indexed by those pos vars
                 for inner_stmt in body_stmt.body:
                     if not isinstance(inner_stmt, llir.Assign):
                         continue
-                    # Find _val[pos] references in the expression tree
-                    val = inner_stmt.value
-                    found = CINLowerer._find_val_array_access(val, pos_to_stride)
-                    if found:
-                        dense_val_array, dense_stride = found
-                        break
-                if dense_val_array:
-                    break
+                    CINLowerer._find_all_val_array_accesses(
+                        inner_stmt.value, pos_to_stride, dense_arrays_found
+                    )
 
-            if not dense_val_array or not dense_stride:
+            if not dense_arrays_found:
                 continue
 
-            # Insert prefetch for the next sparse element's B-row
-            prefetch_code = (
-                f"if ({iter_var} + 1 < {end_var}) "
-                f"__builtin_prefetch(&{dense_val_array}["
-                f"{crd_array}[{iter_var} + 1] * {dense_stride}], 0, 1)"
-            )
-            stmt.body.insert(0, llir.RawStmt(code=prefetch_code, add_semicolon=True))
+            # Also check for hoisted pointer accesses (_X_val_ptr patterns)
+            # which reference the sparse coordinate indirectly through the
+            # base pointer computation.  For these, we need to prefetch
+            # using the original val array + coordinate.
+            # The hoisted pointers are: _B_val_ptr = &B_val[pB0 * B1_size]
+            # where pB0 comes from the coordinate.  We detect this by
+            # looking for RawStmt pointer declarations in the loop body.
+            import re as _re
+            for body_stmt in stmt.body:
+                if isinstance(body_stmt, llir.RawStmt) and "_ptr" in body_stmt.code:
+                    m = _re.match(
+                        r'const float\* __restrict__ _(\w+_val)_ptr = &(\w+_val)\[(\w+) \* (\w+)\]',
+                        body_stmt.code,
+                    )
+                    if m:
+                        val_array = m.group(2)
+                        stride = m.group(4)
+                        if (val_array, stride) not in dense_arrays_found:
+                            dense_arrays_found.append((val_array, stride))
+
+            # Insert prefetch for ALL dense arrays accessed via the sparse coordinate
+            prefetch_stmts = []
+            seen = set()
+            for dense_val_array, dense_stride in dense_arrays_found:
+                key = (dense_val_array, dense_stride)
+                if key in seen:
+                    continue
+                seen.add(key)
+                prefetch_code = (
+                    f"if ({iter_var} + 1 < {end_var}) "
+                    f"__builtin_prefetch(&{dense_val_array}["
+                    f"{crd_array}[{iter_var} + 1] * {dense_stride}], 0, 1)"
+                )
+                prefetch_stmts.append(llir.RawStmt(code=prefetch_code, add_semicolon=True))
+            for ps in reversed(prefetch_stmts):
+                stmt.body.insert(0, ps)
 
     @staticmethod
     def _hoist_dense_pointers(stmts: List[llir.Stmt]) -> None:
@@ -2422,6 +2446,33 @@ class CINLowerer:
             expr.array = CINLowerer._rewrite_expr_refs(expr.array, replacements)
             expr.index = CINLowerer._rewrite_expr_refs(expr.index, replacements)
         return expr
+
+    @staticmethod
+    def _find_all_val_array_accesses(
+        expr: llir.Expr, pos_to_stride: Dict[str, str],
+        results: List[tuple],
+    ) -> None:
+        """Like _find_val_array_access but collects ALL matches into results."""
+        import re
+        if isinstance(expr, llir.Var):
+            m = re.match(r'^(\w+_val)\[(\w+)\]$', expr.name)
+            if m:
+                arr_name, pos_var = m.group(1), m.group(2)
+                if pos_var in pos_to_stride:
+                    pair = (arr_name, pos_to_stride[pos_var])
+                    if pair not in results:
+                        results.append(pair)
+        if isinstance(expr, llir.BinOp):
+            CINLowerer._find_all_val_array_accesses(expr.left, pos_to_stride, results)
+            CINLowerer._find_all_val_array_accesses(expr.right, pos_to_stride, results)
+        if isinstance(expr, llir.ArrayAccess):
+            if (isinstance(expr.array, llir.Var)
+                    and "_val" in expr.array.name
+                    and isinstance(expr.index, llir.Var)
+                    and expr.index.name in pos_to_stride):
+                pair = (expr.array.name, pos_to_stride[expr.index.name])
+                if pair not in results:
+                    results.append(pair)
 
     @staticmethod
     def _find_val_array_access(
