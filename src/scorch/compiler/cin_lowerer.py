@@ -2077,6 +2077,7 @@ class CINLowerer:
 
             # Post-lowering optimizations on the LLIR
             self._insert_sparse_prefetch(recurse_stmts)
+            self._hoist_dense_pointers(recurse_stmts)
 
             body_stmts.extend(
                 [
@@ -2258,6 +2259,169 @@ class CINLowerer:
                 f"{crd_array}[{iter_var} + 1] * {dense_stride}], 0, 1)"
             )
             stmt.body.insert(0, llir.RawStmt(code=prefetch_code, add_semicolon=True))
+
+    @staticmethod
+    def _hoist_dense_pointers(stmts: List[llir.Stmt]) -> None:
+        """Hoist base-pointer computation out of dense inner loops.
+
+        Transforms:
+            for (int k = 0; k < B1_size; k++) {
+                int pB1 = pB0 * B1_size + k;
+                ... B_val[pB1] ...
+            }
+        Into:
+            const float* __restrict__ _B_val_ptr = &B_val[pB0 * B1_size];
+            for (int k = 0; k < B1_size; k++) {
+                ... _B_val_ptr[k] ...
+            }
+
+        This makes the stride-1 access pattern explicit to the auto-vectorizer
+        and eliminates per-iteration multiply.  General: applies to any dense
+        tensor level accessed inside an inner loop.
+        """
+        import re
+        for stmt in stmts:
+            if isinstance(stmt, llir.ForLoop):
+                CINLowerer._hoist_dense_pointers(stmt.body)
+            if not isinstance(stmt, llir.ForLoop):
+                continue
+
+            # Find the loop variable name from the update (e.g. k++ → k)
+            if not isinstance(stmt.update, llir.Increment):
+                continue
+            loop_var = stmt.update.var.name
+
+            # Collect position VarInits: pB1 = pB0 * B1_size + k
+            # where k is the loop variable.
+            hoistable: list = []  # (var_name, base_expr, stride_expr, idx_in_body)
+            for idx, s in enumerate(stmt.body):
+                if not isinstance(s, llir.VarInit):
+                    continue
+                val = s.value
+                # Pattern: Add(Mul(base, stride), loop_var)
+                if (isinstance(val, llir.Add)
+                        and isinstance(val.left, llir.BinOp)
+                        and val.left.op == "*"
+                        and isinstance(val.right, llir.Var)
+                        and val.right.name == loop_var):
+                    base = val.left.left
+                    stride = val.left.right
+                    if isinstance(base, llir.Var) and isinstance(stride, llir.Var):
+                        hoistable.append((s.var.name, base.name, stride.name, idx))
+
+            if not hoistable:
+                continue
+
+            # Find which _val arrays use these position vars
+            # by scanning Assign/VarInit for patterns like "X_val[pB1]"
+            pos_to_val_array: dict = {}  # pos_var → val_array_name
+            for s in stmt.body:
+                if isinstance(s, llir.Assign):
+                    CINLowerer._collect_val_array_refs(s.value, pos_to_val_array)
+                    CINLowerer._collect_val_array_refs(
+                        llir.Var(name=s.var.name, type=llir.DataType.NO_TYPE),
+                        pos_to_val_array,
+                    )
+
+            # Build pointer declarations and rewrite references
+            ptr_decls: list = []
+            indices_to_remove: set = set()
+            replacements: dict = {}  # old "X_val[pB1]" → new "_X_val_ptr[k]"
+
+            for pos_var, base, stride, idx in hoistable:
+                val_array = pos_to_val_array.get(pos_var)
+                if not val_array:
+                    continue
+                ptr_name = f"_{val_array}_ptr"
+                ptr_decls.append(llir.RawStmt(
+                    code=(
+                        f"const float* __restrict__ {ptr_name} = "
+                        f"&{val_array}[{base} * {stride}]"
+                    ),
+                ))
+                replacements[f"{val_array}[{pos_var}]"] = f"{ptr_name}[{loop_var}]"
+                indices_to_remove.add(idx)
+
+            if not ptr_decls:
+                continue
+
+            # Insert pointer declarations before the loop
+            # Find the loop's position in its parent and insert before it.
+            # Since we're iterating stmts and stmt is in stmts, we use a
+            # deferred approach: store on the loop node.
+            stmt._hoisted_ptr_decls = ptr_decls
+
+            # Remove the position VarInits from the loop body
+            stmt.body = [s for i, s in enumerate(stmt.body) if i not in indices_to_remove]
+
+            # Rewrite references in the loop body
+            CINLowerer._rewrite_val_refs(stmt.body, replacements)
+
+        # Second pass: insert hoisted declarations before loops that have them
+        i = 0
+        while i < len(stmts):
+            s = stmts[i]
+            decls = getattr(s, '_hoisted_ptr_decls', None)
+            if decls:
+                for d in reversed(decls):
+                    stmts.insert(i, d)
+                    i += 1
+                delattr(s, '_hoisted_ptr_decls')
+            i += 1
+
+    @staticmethod
+    def _collect_val_array_refs(expr, pos_to_val: dict) -> None:
+        """Find _val[pos_var] patterns in an expression tree."""
+        import re
+        if isinstance(expr, llir.Var):
+            m = re.match(r'^(\w+_val)\[(\w+)\]$', expr.name)
+            if m:
+                pos_to_val[m.group(2)] = m.group(1)
+        if isinstance(expr, llir.BinOp):
+            CINLowerer._collect_val_array_refs(expr.left, pos_to_val)
+            CINLowerer._collect_val_array_refs(expr.right, pos_to_val)
+        if isinstance(expr, llir.ArrayAccess):
+            CINLowerer._collect_val_array_refs(expr.array, pos_to_val)
+            CINLowerer._collect_val_array_refs(expr.index, pos_to_val)
+
+    @staticmethod
+    def _rewrite_val_refs(stmts: list, replacements: dict) -> None:
+        """Rewrite _val[pos] → _ptr[loop_var] in LLIR statement trees."""
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt, llir.Assign):
+                stmt.var = CINLowerer._rewrite_expr_refs(stmt.var, replacements)
+                stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
+            elif isinstance(stmt, llir.VarInit):
+                stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
+            elif isinstance(stmt, llir.ForLoop):
+                CINLowerer._rewrite_val_refs(stmt.body, replacements)
+            elif isinstance(stmt, llir.IfThenElse):
+                if stmt.then_body:
+                    CINLowerer._rewrite_val_refs(stmt.then_body, replacements)
+                if stmt.else_body:
+                    CINLowerer._rewrite_val_refs(stmt.else_body, replacements)
+                if stmt.then_body_list:
+                    for body in stmt.then_body_list:
+                        CINLowerer._rewrite_val_refs(body, replacements)
+            elif isinstance(stmt, llir.RawStmt):
+                for old, new in replacements.items():
+                    stmt.code = stmt.code.replace(old, new)
+
+    @staticmethod
+    def _rewrite_expr_refs(expr, replacements: dict):
+        """Rewrite variable references in an expression."""
+        if isinstance(expr, llir.Var):
+            for old, new in replacements.items():
+                if expr.name == old or old in expr.name:
+                    expr = llir.Var(name=expr.name.replace(old, new), type=expr.type)
+            return expr
+        if isinstance(expr, llir.BinOp):
+            expr.left = CINLowerer._rewrite_expr_refs(expr.left, replacements)
+            expr.right = CINLowerer._rewrite_expr_refs(expr.right, replacements)
+        if isinstance(expr, llir.ArrayAccess):
+            expr.array = CINLowerer._rewrite_expr_refs(expr.array, replacements)
+            expr.index = CINLowerer._rewrite_expr_refs(expr.index, replacements)
+        return expr
 
     @staticmethod
     def _find_val_array_access(
@@ -2678,7 +2842,8 @@ class CINLowerer:
 
             # ── Optimization: flat parallel loop when each nonzero is
             # independent (scalar accumulator mode). Skips the serial
-            # group-boundary scan entirely. ──────────────────────────
+            # group-boundary scan entirely. Also replaces cvector with
+            # raw malloc for zero-overhead array access. ─────────────
             if self._used_scalar_accum:
                 # Build a flat loop body: for each nonzero p, read
                 # coordinates inline and execute the inner body.
@@ -2713,6 +2878,13 @@ class CINLowerer:
                     var=llir.Var(name=end_var, type=llir.DataType.INT),
                     value=llir.Var(name=f"{iter_var} + 1", type=llir.DataType.INT),
                 ))
+                # Rewrite output array accesses to bypass cvector bounds checks:
+                # arr[idx] → arr.data()[idx] for pre-allocated arrays.
+                for arr_name in output_arrays:
+                    CINLowerer._rewrite_val_refs(inner_body_filtered, {
+                        f"{arr_name}[": f"{arr_name}.data()[",
+                    })
+
                 flat_body.extend(inner_body_filtered)
 
                 flat_loop = llir.ForLoop(
