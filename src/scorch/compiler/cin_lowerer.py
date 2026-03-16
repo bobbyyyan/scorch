@@ -26,12 +26,13 @@ from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 class ResultTensorAssembler:
     """Assembles LLIR statements for result tensor initialization and final construction."""
 
-    def __init__(self, tensor_var: TensorVar):
+    def __init__(self, tensor_var: TensorVar, known_nnz_var: Optional[str] = None):
         self.tensor_var = tensor_var
         self.name = tensor_var.get_name()
         self.level_types = tensor_var.get_level_types()
         self.is_dense = tensor_var.is_dense()
         self.dtype = tensor_var.dtype
+        self.known_nnz_var = known_nnz_var
 
     def emit_value_array_init(self) -> List[llir.Stmt]:
         """Emit value array initialization: dense malloc+memset or sparse cvector decl."""
@@ -103,6 +104,28 @@ class ResultTensorAssembler:
                             right=res_capacity_var,
                         ),
                     ],
+                )
+            )
+        elif self.known_nnz_var:
+            # Known-nnz path: raw malloc instead of cvector
+            c_datatype = dtype_to_c_datatype(self.dtype)
+            sizeof_expr = llir.Sizeof(c_datatype)
+            nnz_var = llir.Var(name=self.known_nnz_var, type=llir.DataType.INT)
+            malloc = llir.FunctionCall(
+                name="malloc",
+                args=[llir.BinOp(left=sizeof_expr, op="*", right=nnz_var)],
+            )
+            malloc = llir.Cast(
+                expr=malloc,
+                data_type=llir.DataType.ptr_type(c_datatype),
+            )
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.name}_values",
+                        type=llir.DataType.ptr_type(c_datatype),
+                    ),
+                    value=malloc,
                 )
             )
         else:
@@ -208,15 +231,22 @@ class ResultTensorAssembler:
                     stmts.append(loop)
 
             elif level_type == LevelType.COORDINATE:
-                # cvector<int> crd
-                stmts.append(
-                    llir.VarDecl(
-                        llir.Var(
-                            name=f"{self.name}{i}_crd",
-                            type=llir.DataType.CVECTOR_INT,
+                if self.known_nnz_var:
+                    # Known-nnz path: raw malloc instead of cvector
+                    stmts.append(llir.RawStmt(
+                        code=f"int* {self.name}{i}_crd = (int*)malloc(sizeof(int) * {self.known_nnz_var})",
+                        add_semicolon=True,
+                    ))
+                else:
+                    # cvector<int> crd
+                    stmts.append(
+                        llir.VarDecl(
+                            llir.Var(
+                                name=f"{self.name}{i}_crd",
+                                type=llir.DataType.CVECTOR_INT,
+                            )
                         )
                     )
-                )
                 # int p<name><i> = 0
                 stmts.append(
                     llir.VarInit(
@@ -258,6 +288,13 @@ class ResultTensorAssembler:
             ]
         )
 
+        # Emit shared free deleter if using known-nnz raw malloc path
+        if self.known_nnz_var and not self.is_dense:
+            stmts.append(llir.RawStmt(
+                code="auto _free_deleter = [](void* p){ free(p); }",
+                add_semicolon=True,
+            ))
+
         # Per-level from_blob for pos/crd
         for i, level_type in enumerate(self.level_types):
             tensor_level_name = f"{self.name}{i}"
@@ -296,35 +333,67 @@ class ResultTensorAssembler:
                     )
 
                 # crd_torch
-                stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{tensor_level_name}_crd_torch",
-                            type=llir.DataType.TORCH_TENSOR,
-                        ),
-                        value=llir.FunctionCall(
-                            name="torch::from_blob",
-                            args=[
-                                llir.Var(
-                                    name=f"{tensor_level_name}_crd.data()",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=f"{{{tensor_level_name}_crd.size()}}",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=f"{tensor_level_name}_crd.get_deleter()",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name="torch::kInt",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                            ],
-                        ),
+                if self.known_nnz_var and level_type == LevelType.COORDINATE:
+                    # Raw pointer path: use pointer directly with known nnz size
+                    stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor_level_name}_crd_torch",
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            value=llir.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_crd",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{{{self.known_nnz_var}}}",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name="_free_deleter",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name="torch::kInt",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                ],
+                            ),
+                        )
                     )
-                )
+                else:
+                    stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor_level_name}_crd_torch",
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            value=llir.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_crd.data()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{{{tensor_level_name}_crd.size()}}",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_crd.get_deleter()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name="torch::kInt",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                ],
+                            ),
+                        )
+                    )
 
         # Values from_blob
         res_values_torch_var = llir.Var(
@@ -361,6 +430,34 @@ class ResultTensorAssembler:
                             ),
                             llir.Var(
                                 name=f"{self.name}_values_deleter",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=get_pytorch_c_dtype_str(self.dtype),
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                        ],
+                    ),
+                )
+            )
+        elif self.known_nnz_var:
+            # Raw pointer path: use pointer directly with known nnz size
+            stmts.append(
+                llir.VarInit(
+                    var=res_values_torch_var,
+                    value=llir.FunctionCall(
+                        name="torch::from_blob",
+                        args=[
+                            llir.Var(
+                                name=f"{self.name}_values",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"{{{self.known_nnz_var}}}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name="_free_deleter",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
@@ -462,6 +559,8 @@ class CINLowerer:
         self._used_scalar_accum = False
         self.index_var_to_rhs_tensor_level_type = None
         self.index_var_to_result_tensor_level_type = None
+
+        self._known_nnz_var: Optional[str] = None
 
         self.result_tensor_var: Optional[TensorVar] = None
         self.result_tensor_access: Optional[TensorAccess] = None
@@ -2081,11 +2180,54 @@ class CINLowerer:
             self._eliminate_single_iteration_loops(recurse_stmts)
             self._hoist_loop_invariant_factors(recurse_stmts)
 
+            # Known-nnz detection: if scalar accum was used and output is sparse,
+            # we know nnz_out == nnz_in. Re-emit init stmts with raw malloc.
+            known_nnz_init_stmts: List[llir.Stmt] = []
+            if (self._used_scalar_accum
+                    and self.final_result_tensor_var
+                    and not self.final_result_tensor_var.is_dense()):
+                # Find a COO input tensor to get nnz from
+                coo_crd_tensor = None
+                for tensor in rhs_tensor_vars:
+                    for lvl, lt in enumerate(tensor.get_level_types()):
+                        if lt == LevelType.COORDINATE:
+                            coo_crd_tensor = f"{tensor.get_name()}{lvl}_crd_tensor"
+                            break
+                    if coo_crd_tensor:
+                        break
+
+                if coo_crd_tensor:
+                    self._known_nnz_var = "_known_nnz"
+                    known_nnz_init_stmts.append(llir.RawStmt(
+                        code=f"int _known_nnz = {coo_crd_tensor}.size(0)",
+                        add_semicolon=True,
+                    ))
+
+                    # Re-emit init stmts with known_nnz_var
+                    tensor_value_array_init_stmts = []
+                    result_level_indices_init_stmts = []
+                    for result_tensor_var in non_workspace_result_tensor_vars:
+                        assembler = ResultTensorAssembler(
+                            result_tensor_var, known_nnz_var=self._known_nnz_var
+                        )
+                        tensor_value_array_init_stmts.extend(
+                            assembler.emit_value_array_init()
+                        )
+                        result_level_indices_init_stmts.extend(
+                            assembler.emit_level_indices_init()
+                        )
+                    if result_level_indices_init_stmts:
+                        result_level_indices_init_stmts = [
+                            llir.Comment("Init result level indices"),
+                            *result_level_indices_init_stmts,
+                        ]
+
             body_stmts.extend(
                 [
                     *result_tensor_level_sizes,
                     *tensor_level_array_assign_stmts,
                     llir.BlankLine(),
+                    *known_nnz_init_stmts,
                     *result_level_indices_init_stmts,
                     llir.Comment("Initialize result value array"),
                     *tensor_value_array_init_stmts,
@@ -2097,7 +2239,10 @@ class CINLowerer:
             )
 
             assert self.final_result_tensor_var is not None, "No final result tensor"
-            final_assembler = ResultTensorAssembler(self.final_result_tensor_var)
+            final_assembler = ResultTensorAssembler(
+                self.final_result_tensor_var,
+                known_nnz_var=self._known_nnz_var,
+            )
             body_stmts.extend(final_assembler.emit_final_assembly())
 
             return llir.Function(
@@ -2601,6 +2746,12 @@ class CINLowerer:
                 continue
             loop_var = s.update.var.name
 
+            # Collect all variable names defined inside the loop body so
+            # we never hoist a factor that references them.
+            body_defined_vars = set()
+            body_defined_vars.add(loop_var)
+            CINLowerer._collect_defined_vars(s.body, body_defined_vars)
+
             # Look for accumulation: _accum += expr where expr contains
             # a factor that doesn't reference loop_var or any _ptr[loop_var]
             for j, body_s in enumerate(s.body):
@@ -2611,6 +2762,10 @@ class CINLowerer:
                     continue
 
                 accum_var = body_s.var.name
+                # Only hoist when accumulating into a simple scalar,
+                # not an array element (e.g. C_values[pC1])
+                if "[" in accum_var:
+                    continue
                 # Collect all multiplicative factors
                 factors = []
                 CINLowerer._collect_mul_factors(body_s.value, factors)
@@ -2619,11 +2774,14 @@ class CINLowerer:
                     continue
 
                 # Find factors that don't reference the loop variable
+                # or any variable defined inside the loop body
                 invariant = []
                 variant = []
                 for f in factors:
                     name = f.name if isinstance(f, llir.Var) else ""
-                    if loop_var in name or "_ptr[" in name:
+                    if "_ptr[" in name:
+                        variant.append(f)
+                    elif any(v in name for v in body_defined_vars):
                         variant.append(f)
                     else:
                         invariant.append(f)
@@ -2668,6 +2826,24 @@ class CINLowerer:
                 break  # only hoist from first accumulation found
 
             i += 1
+
+    @staticmethod
+    def _collect_defined_vars(stmts: list, out: set) -> None:
+        """Collect all variable names defined in a statement list (recursively)."""
+        for s in stmts:
+            if isinstance(s, llir.VarInit) and isinstance(s.var, llir.Var):
+                out.add(s.var.name)
+            elif isinstance(s, llir.ForLoop):
+                if isinstance(s.init, llir.VarInit) and isinstance(s.init.var, llir.Var):
+                    out.add(s.init.var.name)
+                CINLowerer._collect_defined_vars(s.body, out)
+            elif isinstance(s, llir.WhileLoop):
+                CINLowerer._collect_defined_vars(s.body, out)
+            elif isinstance(s, llir.IfThenElse):
+                if s.then_body:
+                    CINLowerer._collect_defined_vars(s.then_body, out)
+                if s.else_body:
+                    CINLowerer._collect_defined_vars(s.else_body, out)
 
     @staticmethod
     def _collect_mul_factors(expr, factors: list) -> None:
@@ -3111,6 +3287,10 @@ class CINLowerer:
             # group-boundary scan entirely. Also replaces cvector with
             # raw malloc for zero-overhead array access. ─────────────
             if self._used_scalar_accum:
+                # Detect known-nnz: sparse output + scalar accum → nnz_out == nnz_in
+                if (self.final_result_tensor_var
+                        and not self.final_result_tensor_var.is_dense()):
+                    self._known_nnz_var = "_known_nnz"
                 # Build a flat loop body: for each nonzero p, read
                 # coordinates inline and execute the inner body.
                 flat_body: List[llir.Stmt] = [
@@ -3144,12 +3324,13 @@ class CINLowerer:
                     var=llir.Var(name=end_var, type=llir.DataType.INT),
                     value=llir.Var(name=f"{iter_var} + 1", type=llir.DataType.INT),
                 ))
-                # Rewrite output array accesses to bypass cvector bounds checks:
-                # arr[idx] → arr.data()[idx] for pre-allocated arrays.
-                for arr_name in output_arrays:
-                    CINLowerer._rewrite_val_refs(inner_body_filtered, {
-                        f"{arr_name}[": f"{arr_name}.data()[",
-                    })
+                if not self._known_nnz_var:
+                    # Rewrite output array accesses to bypass cvector bounds checks:
+                    # arr[idx] → arr.data()[idx] for pre-allocated arrays.
+                    for arr_name in output_arrays:
+                        CINLowerer._rewrite_val_refs(inner_body_filtered, {
+                            f"{arr_name}[": f"{arr_name}.data()[",
+                        })
 
                 flat_body.extend(inner_body_filtered)
 
@@ -3171,7 +3352,8 @@ class CINLowerer:
                     omp_schedule="dynamic, 64",
                 )
 
-                result.extend(prealloc_stmts)
+                if not self._known_nnz_var:
+                    result.extend(prealloc_stmts)
                 result.append(flat_loop)
                 transformed = True
             else:
