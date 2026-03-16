@@ -434,3 +434,72 @@ Tensor spmspm_coo_float_opt(
   C.storage.value = C_values_torch;
   return C;
 }
+
+// ---------------------------------------------------------------------------
+// SDDMM: D[i,j] = S[i,j] * dot(A[i,:], B[j,:])
+// S is COO (o,o), A and B are dense (d,d) row-major.
+// ---------------------------------------------------------------------------
+
+Tensor sddmm_coo_float_prebuilt(
+    std::vector<int> result_shape,
+    std::vector<int> S_shape,
+    std::vector<std::vector<torch::Tensor>> S_mode_indices,
+    torch::Tensor S_values,
+    std::vector<int> A_shape,
+    std::vector<std::vector<torch::Tensor>> A_mode_indices,
+    torch::Tensor A_values,
+    std::vector<int> B_shape,
+    std::vector<std::vector<torch::Tensor>> B_mode_indices,
+    torch::Tensor B_values) {
+
+  const int nnz = S_values.numel();
+  const int K = A_shape[1];
+
+  const int* SCORCH_RESTRICT S_row = S_mode_indices[0][0].data_ptr<int>();
+  const int* SCORCH_RESTRICT S_col = S_mode_indices[1][0].data_ptr<int>();
+  const float* SCORCH_RESTRICT S_val = S_values.data_ptr<float>();
+  const float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+  const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  float* SCORCH_RESTRICT D_val = (float*)malloc(sizeof(float) * nnz);
+
+  const int nthreads = omp_get_max_threads();
+  const int chunk = std::max(16, std::min(256, nnz / (nthreads * 128)));
+  std::atomic<int> next_p{0};
+
+  #pragma omp parallel
+  {
+    while (true) {
+      const int start = next_p.fetch_add(chunk, std::memory_order_relaxed);
+      if (start >= nnz) break;
+      const int end = std::min(start + chunk, nnz);
+
+      for (int p = start; p < end; p++) {
+        const int i = S_row[p];
+        const int j = S_col[p];
+        const float s = S_val[p];
+        const float* SCORCH_RESTRICT A_row = A_val + (size_t)i * K;
+        const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * K;
+
+        if (p + 1 < end) {
+          __builtin_prefetch(A_val + (size_t)S_row[p + 1] * K, 0, 1);
+          __builtin_prefetch(B_val + (size_t)S_col[p + 1] * K, 0, 1);
+        }
+
+        float dot = 0;
+        for (int k = 0; k < K; k++) {
+          dot += A_row[k] * B_row[k];
+        }
+        D_val[p] = s * dot;
+      }
+    }
+  }
+
+  Tensor D;
+  auto deleter = [](void* ptr) { free(ptr); };
+  torch::Tensor D_values_torch = torch::from_blob(
+      D_val, {(long long)nnz}, deleter, torch::kFloat32);
+  D.storage.index.mode_indices = S_mode_indices;
+  D.storage.value = D_values_torch;
+  return D;
+}

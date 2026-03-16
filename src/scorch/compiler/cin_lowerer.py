@@ -2457,8 +2457,7 @@ class CINLowerer:
                 return False
         return True
 
-    @classmethod
-    def _transform_coo_loop_for_openmp(cls, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
+    def _transform_coo_loop_for_openmp(self, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
         """Transform the outer COO WhileLoop into a group-indexed ForLoop
         with OpenMP parallelism.
 
@@ -2572,12 +2571,12 @@ class CINLowerer:
             # Thread-safety for output position: use input position pA1
             # as output position since nnz_out == nnz_in for SDDMM-like
             # kernels (no filtering). Replace pD1 references in the body.
-            cls._replace_output_pos_with_input_pos(inner_body_filtered, iter_var)
+            CINLowerer._replace_output_pos_with_input_pos(inner_body_filtered, iter_var)
 
             # Collect output array names that need pre-allocation
             output_arrays: List[str] = []
             import re as _re
-            cls._collect_output_arrays(inner_body_filtered, output_arrays)
+            CINLowerer._collect_output_arrays(inner_body_filtered, output_arrays)
 
             # Pre-scan code
             pre_scan_stmts: List[llir.Stmt] = [
@@ -2677,10 +2676,71 @@ class CINLowerer:
                     add_semicolon=True,
                 ))
 
-            result.extend(pre_scan_stmts)
-            result.extend(prealloc_stmts)
-            result.append(group_loop)
-            transformed = True
+            # ── Optimization: flat parallel loop when each nonzero is
+            # independent (scalar accumulator mode). Skips the serial
+            # group-boundary scan entirely. ──────────────────────────
+            if self._used_scalar_accum:
+                # Build a flat loop body: for each nonzero p, read
+                # coordinates inline and execute the inner body.
+                flat_body: List[llir.Stmt] = [
+                    llir.VarInit(
+                        var=llir.Var(name=coord_var_name, type=llir.DataType.INT),
+                        value=llir.Var(
+                            name=f"{crd_array}[{iter_var}]",
+                            type=llir.DataType.INT,
+                        ),
+                    ),
+                ]
+                # The inner body already has the inner loop and accum
+                # write. We just need to set the end_var for the inner
+                # loop. For a flat loop, each "group" is one nonzero's
+                # row segment. We find the end by scanning forward.
+                # But for scalar accum, the inner loop (over j within
+                # the same row) is already inside inner_body_filtered.
+                # We set pA1_end to iter_var+1 to process just this one
+                # nonzero if there's no actual inner sparse loop,
+                # or keep the original behavior for grouped inner loops.
+                #
+                # Actually, for SDDMM the inner_body_filtered already
+                # contains the for(pA1=pA0; pA1<pA1_end; pA1++) loop
+                # which iterates over nonzeros in this row group.
+                # For a flat loop, we want pA1=iter_var, pA1_end=iter_var+1
+                # so we process exactly one nonzero per flat iteration.
+                #
+                # We handle this by setting the group boundaries to
+                # single-element ranges.
+                flat_body.append(llir.VarInit(
+                    var=llir.Var(name=end_var, type=llir.DataType.INT),
+                    value=llir.Var(name=f"{iter_var} + 1", type=llir.DataType.INT),
+                ))
+                flat_body.extend(inner_body_filtered)
+
+                flat_loop = llir.ForLoop(
+                    init=llir.VarInit(
+                        var=llir.Var(name=iter_var, type=llir.DataType.INT),
+                        value=llir.Literal(0),
+                    ),
+                    cond=llir.BinOp(
+                        op="<",
+                        left=llir.Var(name=iter_var, type=llir.DataType.INT),
+                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT),
+                    ),
+                    update=llir.Increment(
+                        var=llir.Var(name=iter_var, type=llir.DataType.INT),
+                    ),
+                    body=flat_body,
+                    omp_parallel_for=True,
+                    omp_schedule="dynamic, 64",
+                )
+
+                result.extend(prealloc_stmts)
+                result.append(flat_loop)
+                transformed = True
+            else:
+                result.extend(pre_scan_stmts)
+                result.extend(prealloc_stmts)
+                result.append(group_loop)
+                transformed = True
 
         return result
 

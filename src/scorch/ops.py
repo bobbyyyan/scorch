@@ -398,6 +398,35 @@ def einsum(
         STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors
     )
 
+    # ── Prebuilt SDDMM dispatch ────────────────────────────────────────
+    # Pattern: 'ij,ik,jk->ij' with S(COO), A(dense), B(dense)
+    if (not compile_only
+            and expression == "ij,ik,jk->ij"
+            and len(tensors) == 3
+            and tensors[0].values.dtype == torch.float32
+            and str(tensors[0].format) == "o,o"
+            and str(tensors[1].format) == "d,d"
+            and str(tensors[2].format) == "d,d"):
+        import scorch_ops as _ops
+        _sddmm_fn = getattr(_ops, "sddmm_coo_float_prebuilt", None)
+        if _sddmm_fn is not None:
+            S, A, B = tensors
+            result_shape = S.shape
+            result_cpp = _sddmm_fn(
+                result_shape,
+                S.shape, S.index.mode_indices, S.values,
+                A.shape, A.index.mode_indices, A.values,
+                B.shape, B.index.mode_indices, B.values,
+            )
+            return STensor(
+                shape=result_shape,
+                index=TensorIndex(
+                    mode_indices=result_cpp.storage.index.mode_indices,
+                    tensor_format=S.format,
+                ),
+                value=result_cpp.storage.value,
+            )
+
     # ── Fast dispatch cache ─────────────────────────────────────────────
     # On a cache hit, skip the entire scheduling pipeline (select_loop_order
     # + auto_schedule) which dominates wall-clock time for cached kernels.
