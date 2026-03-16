@@ -1,3 +1,6 @@
+#include <atomic>
+#include <omp.h>
+
 typedef struct {
   std::vector<std::vector<torch::Tensor>> mode_indices;
 } TensorIndex;

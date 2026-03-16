@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <numeric>
@@ -2026,40 +2027,52 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   // Round tile to multiple of 16 for SIMD alignment
   const int kTile = (tile_size + 15) & ~15;
 
+  // Adaptive chunk: scale with total work to balance scheduling overhead
+  // vs load imbalance.  clamp(nnz / (nthreads * 128), 16, 256).
+  const int total_nnz = A1_pos[A0_size];
+  const int nthreads = omp_get_max_threads();
+  const int chunk = std::max(16, std::min(256, total_nnz / (nthreads * 128)));
+  std::atomic<int> next_row{0};
+
   #pragma omp parallel
   {
     // Per-thread workspace, cache-line aligned, lives in L1
     float* SCORCH_RESTRICT ws = (float*)aligned_alloc(64, kTile * sizeof(float));
 
-    #pragma omp for schedule(dynamic, 64)
-    for (int i = 0; i < A0_size; i++) {
-      const int pA_begin = A1_pos[i];
-      const int pA_end   = A1_pos[i + 1];
-      if (pA_begin == pA_end) continue;
+    // Atomic work-stealing loop with adaptive chunk size
+    while (true) {
+      const int start = next_row.fetch_add(chunk, std::memory_order_relaxed);
+      if (start >= A0_size) break;
+      const int end = std::min(start + chunk, A0_size);
 
-      float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+      for (int i = start; i < end; i++) {
+        const int pA_begin = A1_pos[i];
+        const int pA_end   = A1_pos[i + 1];
+        if (pA_begin == pA_end) continue;
 
-      for (int k_out = 0; k_out < B1_size; k_out += kTile) {
-        const int kw = std::min(kTile, B1_size - k_out);
+        float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
 
-        memset(ws, 0, kw * sizeof(float));
+        for (int k_out = 0; k_out < B1_size; k_out += kTile) {
+          const int kw = std::min(kTile, B1_size - k_out);
 
-        for (int pA = pA_begin; pA < pA_end; pA++) {
-          const int j = A1_crd[pA];
-          const float a = A_val[pA];
-          const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size + k_out;
+          memset(ws, 0, kw * sizeof(float));
 
-          if (pA + 1 < pA_end) {
-            __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k_out, 0, 1);
+          for (int pA = pA_begin; pA < pA_end; pA++) {
+            const int j = A1_crd[pA];
+            const float a = A_val[pA];
+            const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size + k_out;
+
+            if (pA + 1 < pA_end) {
+              __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k_out, 0, 1);
+            }
+
+            for (int k = 0; k < kw; k++) {
+              ws[k] += a * B_row[k];
+            }
           }
 
-          for (int k = 0; k < kw; k++) {
-            ws[k] += a * B_row[k];
-          }
+          memcpy(C_row + k_out, ws, kw * sizeof(float));
         }
-
-        // --- Write-back: pure store to C, no read needed ---
-        memcpy(C_row + k_out, ws, kw * sizeof(float));
       }
     }
 

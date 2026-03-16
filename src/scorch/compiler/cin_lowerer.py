@@ -2297,18 +2297,83 @@ class CINLowerer:
         for llir_stmt in stmts:
             if isinstance(llir_stmt, llir.ForLoop) and self._is_openmp_compatible_for_loop(llir_stmt):
                 llir_stmt.omp_parallel_for = True
-                # Use dynamic scheduling when body contains sparse loops,
-                # since rows have varying nnz counts causing load imbalance.
-                if self._has_sparse_inner_loop(llir_stmt.body):
-                    llir_stmt.omp_schedule = "dynamic, 64"
+                has_sparse = self._has_sparse_inner_loop(llir_stmt.body)
                 # Hoist per-thread workspace alloc/free outside the for loop
                 # but inside the OMP parallel region.
                 alloc = getattr(self, '_workspace_alloc_stmts', [])
                 free = getattr(self, '_workspace_free_stmts', [])
-                if alloc or free:
-                    llir_stmt.pre_parallel_body = alloc or None
-                    llir_stmt.post_parallel_body = free or None
+
+                if has_sparse and alloc:
+                    # Use adaptive atomic work-stealing: chunk scales with
+                    # total nnz to balance scheduling overhead vs load
+                    # imbalance across all matrix sizes.
+                    llir_stmt.omp_parallel_for = True
+                    llir_stmt.omp_schedule = "dynamic, 64"  # fallback
+                    # Find the sparse pos array to compute nnz
+                    sparse_pos = self._find_sparse_pos_array(llir_stmt.body)
+                    loop_var = llir_stmt.init.var.name if llir_stmt.init else "i"
+                    loop_bound = self._extract_loop_bound(llir_stmt)
+                    if sparse_pos and loop_bound:
+                        # Replace the omp for with atomic work-stealing
+                        llir_stmt.omp_parallel_for = False
+                        adaptive_pre = list(alloc) + [
+                            llir.RawStmt(code=f"int _nnz = {sparse_pos}[{loop_bound}]"),
+                            llir.RawStmt(code=f"int _chunk = std::max(16, std::min(256, _nnz / (omp_get_num_threads() * 128)))"),
+                        ]
+                        # The atomic counter is declared BEFORE the parallel region
+                        # (shared across threads). We store it as a pre-parallel stmt.
+                        self._atomic_counter_decl = llir.RawStmt(
+                            code="std::atomic<int> _next_row{0}", add_semicolon=True,
+                        )
+                        # Wrap the loop body in an atomic work-stealing while loop
+                        # We replace the for loop entirely with raw code
+                        llir_stmt.pre_parallel_body = adaptive_pre
+                        llir_stmt.post_parallel_body = free or None
+                        # Mark that the for loop should use atomic scheduling
+                        llir_stmt._use_atomic_scheduling = True
+                        llir_stmt._atomic_chunk_var = "_chunk"
+                        llir_stmt._atomic_counter_var = "_next_row"
+                        llir_stmt._loop_bound = loop_bound
+                    else:
+                        if alloc or free:
+                            llir_stmt.pre_parallel_body = alloc or None
+                            llir_stmt.post_parallel_body = free or None
+                else:
+                    if has_sparse:
+                        llir_stmt.omp_schedule = "dynamic, 64"
+                    if alloc or free:
+                        llir_stmt.pre_parallel_body = alloc or None
+                        llir_stmt.post_parallel_body = free or None
                 return
+
+    @staticmethod
+    def _find_sparse_pos_array(body: List[llir.Stmt]) -> Optional[str]:
+        """Find the name of a sparse pos array (e.g. 'A1_pos') in loop body."""
+        import re
+        for stmt in body:
+            if isinstance(stmt, llir.VarInit):
+                code = stmt.var.name + " " + str(getattr(stmt.value, 'name', ''))
+                m = re.search(r'(\w+_pos)\[', code)
+                if m:
+                    return m.group(1)
+            if isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
+                result = CINLowerer._find_sparse_pos_array(stmt.body)
+                if result:
+                    return result
+            if isinstance(stmt, llir.RawStmt):
+                m = re.search(r'(\w+_pos)\[', stmt.code)
+                if m:
+                    return m.group(1)
+        return None
+
+    @staticmethod
+    def _extract_loop_bound(for_loop: llir.ForLoop) -> Optional[str]:
+        """Extract the upper bound variable name from a for loop condition."""
+        if isinstance(for_loop.cond, llir.BinOp) and for_loop.cond.op == "<":
+            right = for_loop.cond.right
+            if isinstance(right, llir.Var):
+                return right.name
+        return None
 
     @classmethod
     def _collect_output_arrays(cls, stmts: List[llir.Stmt], output_arrays: List[str]) -> None:

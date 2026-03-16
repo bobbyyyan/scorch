@@ -166,6 +166,39 @@ class LLIRLowerer:
         if isinstance(ir, llir.WhileLoop):
             header = f"while ({self.lower_llir(ir.cond)}) {{"
         elif isinstance(ir, llir.ForLoop):
+            # Atomic work-stealing: replace for loop with while + atomic counter
+            if getattr(ir, '_use_atomic_scheduling', False):
+                chunk_var = ir._atomic_chunk_var
+                counter_var = ir._atomic_counter_var
+                loop_bound = ir._loop_bound
+                loop_var = ir.init.var.name if ir.init else "i"
+                parts = [
+                    self.lower_llir(f"std::atomic<int> {counter_var}{{0}};", indent_level),
+                    self.lower_llir("#pragma omp parallel", indent_level),
+                    self.lower_llir("{", indent_level),
+                ]
+                if ir.pre_parallel_body:
+                    parts.append(self.lower_llir(ir.pre_parallel_body, indent_level + 1))
+                # Atomic while loop
+                parts.append(self.lower_llir(f"while (true) {{", indent_level + 1))
+                parts.append(self.lower_llir(
+                    f"const int _start = {counter_var}.fetch_add({chunk_var}, std::memory_order_relaxed);",
+                    indent_level + 2))
+                parts.append(self.lower_llir(f"if (_start >= {loop_bound}) break;", indent_level + 2))
+                parts.append(self.lower_llir(
+                    f"const int _end = std::min(_start + {chunk_var}, {loop_bound});",
+                    indent_level + 2))
+                parts.append(self.lower_llir(
+                    f"for (int {loop_var} = _start; {loop_var} < _end; {loop_var}++) {{",
+                    indent_level + 2))
+                parts.append(self.lower_llir(ir.body, indent_level + 3))
+                parts.append(self.lower_llir("}", indent_level + 2))  # close for
+                parts.append(self.lower_llir("}", indent_level + 1))  # close while
+                if ir.post_parallel_body:
+                    parts.append(self.lower_llir(ir.post_parallel_body, indent_level + 1))
+                parts.append(self.lower_llir("}", indent_level))  # close parallel
+                return "\n".join(parts)
+
             # When pre/post_parallel_body is set, split into:
             #   #pragma omp parallel { pre; #pragma omp for ...; post }
             if ir.omp_parallel_for and (ir.pre_parallel_body or ir.post_parallel_body):
