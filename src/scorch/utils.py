@@ -77,7 +77,7 @@ def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
         List of compiler flags including platform-specific additions.
     """
     if base_flags is None:
-        base_flags = ["-O3"]
+        base_flags = ["-O3", "-march=native", "-ffast-math", "-funroll-loops"]
     flags = list(base_flags)
 
     if platform.system() == "Darwin":
