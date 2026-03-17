@@ -562,6 +562,14 @@ class CINLowerer:
 
         self._known_nnz_var: Optional[str] = None
 
+        # Two-phase parallel compressed output state
+        self._where_producer_stmts: Optional[List[llir.Stmt]] = None
+        self._where_consumer_stmts: Optional[List[llir.Stmt]] = None
+        self._where_workspace_name: Optional[str] = None
+        self._where_workspace_ctype: Optional[str] = None
+        self._where_workspace_dim: Optional[int] = None
+        self._compressed_output_parallel: bool = False
+
         self.result_tensor_var: Optional[TensorVar] = None
         self.result_tensor_access: Optional[TensorAccess] = None
         self.result_tensor_value_index_var_dict: Dict[IndexVar, llir.Expr] = {}
@@ -1047,12 +1055,16 @@ class CINLowerer:
                             )
                         )
                 else:
-                    # If the workspace is 1-dimensional, use optimized 1D workspace implementation
-                    # coo_workspace_1d<tensor's ctype, tensor's dim>
+                    # Default: init workspace inside the loop (serial path).
+                    # Save metadata for potential parallel hoisting in the transform.
+                    wname = wksp.get_name()
+                    self._where_workspace_name = wname
+                    self._where_workspace_ctype = wksp_ctype.value
+                    self._where_workspace_dim = wksp.dim
                     workspace_init_stmts.append(
                         llir.VarInit(
                             var=llir.Var(
-                                name=wksp.get_name(),
+                                name=wname,
                                 type=llir.DataType.AUTO,
                             ),
                             value=llir.FunctionCall(
@@ -1086,11 +1098,15 @@ class CINLowerer:
                 )
             )
 
+        producer_stmts = self.lower_ProducerIndexStmt(stmt.producer)
+        consumer_stmts = self.lower_ConsumerIndexStmt(stmt.consumer)
+        self._where_producer_stmts = producer_stmts
+        self._where_consumer_stmts = consumer_stmts
         return [
             *workspace_init_stmts,
             *self._workspace_memset_stmts,
-            *self.lower_ProducerIndexStmt(stmt.producer),
-            *self.lower_ConsumerIndexStmt(stmt.consumer),
+            *producer_stmts,
+            *consumer_stmts,
             *workspace_cleanup_stmts,
         ]
 
@@ -2222,28 +2238,43 @@ class CINLowerer:
                             *result_level_indices_init_stmts,
                         ]
 
-            body_stmts.extend(
-                [
-                    *result_tensor_level_sizes,
-                    *tensor_level_array_assign_stmts,
-                    llir.BlankLine(),
-                    *known_nnz_init_stmts,
-                    *result_level_indices_init_stmts,
-                    llir.Comment("Initialize result value array"),
-                    *tensor_value_array_init_stmts,
-                    *tile_size_vars_init_stmts,
-                    # *result_index_init_stmts,
-                    llir.BlankLine(),
-                    *recurse_stmts,
-                ]
-            )
+            if self._compressed_output_parallel:
+                # Two-phase parallel transform already emitted output init,
+                # fill loops, and final assembly (from_blob + return).
+                # Only emit tensor level arrays (input pointers) and recurse.
+                body_stmts.extend(
+                    [
+                        *result_tensor_level_sizes,
+                        *tensor_level_array_assign_stmts,
+                        llir.BlankLine(),
+                        *tile_size_vars_init_stmts,
+                        llir.BlankLine(),
+                        *recurse_stmts,
+                    ]
+                )
+            else:
+                body_stmts.extend(
+                    [
+                        *result_tensor_level_sizes,
+                        *tensor_level_array_assign_stmts,
+                        llir.BlankLine(),
+                        *known_nnz_init_stmts,
+                        *result_level_indices_init_stmts,
+                        llir.Comment("Initialize result value array"),
+                        *tensor_value_array_init_stmts,
+                        *tile_size_vars_init_stmts,
+                        # *result_index_init_stmts,
+                        llir.BlankLine(),
+                        *recurse_stmts,
+                    ]
+                )
 
-            assert self.final_result_tensor_var is not None, "No final result tensor"
-            final_assembler = ResultTensorAssembler(
-                self.final_result_tensor_var,
-                known_nnz_var=self._known_nnz_var,
-            )
-            body_stmts.extend(final_assembler.emit_final_assembly())
+                assert self.final_result_tensor_var is not None, "No final result tensor"
+                final_assembler = ResultTensorAssembler(
+                    self.final_result_tensor_var,
+                    known_nnz_var=self._known_nnz_var,
+                )
+                body_stmts.extend(final_assembler.emit_final_assembly())
 
             return llir.Function(
                 return_type=llir.DataType.TACO_TENSOR,
@@ -2270,6 +2301,259 @@ class CINLowerer:
             if result_index_var.has_parent and result_index_var.parent == index_var:
                 return True
         return False
+
+    def _should_parallelize_compressed_where(self, index_var: IndexVar) -> bool:
+        """Check if the outermost ForAll over a dense dimension can be parallelized
+        with two-phase sparse output assembly. Generalizes to any format with
+        dense outer + compressed inner level using a sparse workspace."""
+        if not self.final_result_tensor_var or not self.final_result_tensor_access:
+            return False
+        level_types = self.final_result_tensor_var.get_level_types()
+        if len(level_types) < 2:
+            return False
+        if level_types[0] != LevelType.DENSE or level_types[1] != LevelType.COMPRESSED:
+            return False
+        if not self.final_result_tensor_access.has_index_var(index_var):
+            return False
+        if self.final_result_tensor_access.level_of_index_var(index_var) != 0:
+            return False
+        if not self._where_producer_stmts or not self._where_workspace_name:
+            return False
+        # Require at least one sparse non-workspace input tensor.
+        # Traverse the CIN to find all referenced TensorVars.
+        from .cin import Workspace, TensorAccess, CINVisitorAccept
+        class _TVCollector(CINVisitorAccept):
+            tvars: set = set()
+            def visit_TensorAccess(self, node: TensorAccess):
+                self.tvars.add(node.get_tensor())
+        collector = _TVCollector()
+        if self.outermost_stmt:
+            collector.visit(self.outermost_stmt)
+        has_sparse_input = any(
+            not tv.is_dense()
+            for tv in collector.tvars
+            if tv != self.final_result_tensor_var and not isinstance(tv, Workspace)
+        )
+        return has_sparse_input
+
+    def _transform_compressed_where_for_openmp(self, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
+        """Transform a serial ForLoop with workspace-based compressed output into
+        a two-phase parallel assembly:
+          Phase 1: Count nnz per row in parallel (workspace fill + size query)
+          Phase 2: Prefix sum + allocate output arrays
+          Phase 3: Fill values in parallel (workspace fill + sort + write)
+
+        This is generalizable to any operation with dense-outer + compressed-inner
+        output using a sparse workspace (SpMSpM, sampled operations, etc.)."""
+        import copy
+
+        # Find the outer ForLoop
+        for_loop = None
+        for_loop_idx = None
+        for idx, stmt in enumerate(stmts):
+            if isinstance(stmt, llir.ForLoop) and not isinstance(stmt, llir.ForLoopAuto):
+                if self._is_openmp_compatible_for_loop(stmt):
+                    for_loop = stmt
+                    for_loop_idx = idx
+                    break
+
+        if for_loop is None:
+            return stmts
+
+        loop_var = for_loop.init.var.name
+        loop_bound = self._extract_loop_bound(for_loop)
+        if not loop_bound:
+            return stmts
+
+        wksp_name = self._where_workspace_name
+        wksp_ctype = self._where_workspace_ctype
+        result_name = self.final_result_tensor_var.get_name()
+
+        # Extract the "work body" from the for loop: everything except
+        # compressed-level assembly stmts and consumer (sort/iterate).
+        # This includes coordinate resolution, workspace memset, and producer loops.
+        body = for_loop.body
+        work_body: List[llir.Stmt] = []
+        pos_index_name = f"{result_name}1_pos_index"
+        for stmt in body:
+            # Skip compressed assembly stmts (C1_pos_index, C1_pos[...]=...)
+            if isinstance(stmt, (llir.ForLoop, llir.ForLoopAuto)):
+                if isinstance(stmt, llir.ForLoopAuto):
+                    continue  # consumer iterate loop
+                # Check for compressed assembly loop (for (; C1_pos_index < i; ...))
+                cond = getattr(stmt, 'cond', None)
+                if (isinstance(cond, llir.BinOp)
+                        and isinstance(cond.left, llir.Var)
+                        and pos_index_name in cond.left.name):
+                    continue
+                # Check for pos init loop (pC1 = 1..C0_size)
+                init = getattr(stmt, 'init', None)
+                if (isinstance(init, llir.VarInit)
+                        and hasattr(init, 'var')
+                        and getattr(init.var, 'name', '').startswith(f"p{result_name}")):
+                    continue
+                work_body.append(stmt)
+            elif isinstance(stmt, llir.VarInit):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                if vname == wksp_name:
+                    continue  # workspace init (will be hoisted to pre_parallel_body)
+                work_body.append(stmt)
+            elif isinstance(stmt, llir.FunctionCallStmt):
+                fname = getattr(stmt, 'name', '')
+                if '.sort' in fname or '.clear' in fname:
+                    continue  # consumer sort / workspace clear
+                work_body.append(stmt)
+            elif isinstance(stmt, llir.Assign):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                if (f"{result_name}1_pos[" in vname or f"{result_name}_values[" in vname
+                        or f"{result_name}1_crd[" in vname or pos_index_name in vname):
+                    continue  # consumer writes / compressed assembly
+                work_body.append(stmt)
+            elif isinstance(stmt, llir.Increment):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                if vname == f"p{result_name}1":
+                    continue  # consumer pC1++
+                work_body.append(stmt)
+            else:
+                work_body.append(stmt)
+
+        # Phase 1: Count nnz per row
+        phase1_body = []
+        phase1_body.extend(copy.deepcopy(work_body))
+        phase1_body.append(llir.RawStmt(code=f"_row_nnz[{loop_var}] = {wksp_name}.size()"))
+        phase1_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
+
+        phase1_loop = llir.ForLoop(
+            init=copy.deepcopy(for_loop.init),
+            cond=copy.deepcopy(for_loop.cond),
+            update=copy.deepcopy(for_loop.update),
+            body=phase1_body,
+        )
+        phase1_loop.omp_parallel_for = True
+        phase1_loop.omp_schedule = "dynamic, 64"
+        wksp_type_str = f"coo_workspace_1d<{wksp_ctype}, {self._where_workspace_dim or 1}>"
+        wksp_alloc = [llir.RawStmt(code=f"auto {wksp_name} = {wksp_type_str}(result_shape[1])")]
+        phase1_loop.pre_parallel_body = wksp_alloc
+
+        # Phase 3: Fill values
+        phase3_body = []
+        phase3_body.extend(copy.deepcopy(work_body))
+        phase3_body.append(llir.RawStmt(code=f"{wksp_name}.sort()"))
+        phase3_body.append(llir.RawStmt(code=f"int _base = {result_name}1_pos_data[{loop_var}]"))
+        phase3_body.append(llir.RawStmt(code=f"int _pos = 0"))
+        phase3_body.append(llir.RawStmt(
+            code=f"for (const auto& _it : {wksp_name}) {{\n"
+                 f"          {result_name}1_crd_data[_base + _pos] = _it.first;\n"
+                 f"          {result_name}_values_data[_base + _pos] = _it.second;\n"
+                 f"          _pos++;\n"
+                 f"        }}",
+            add_semicolon=False,
+        ))
+        phase3_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
+
+        phase3_loop = llir.ForLoop(
+            init=copy.deepcopy(for_loop.init),
+            cond=copy.deepcopy(for_loop.cond),
+            update=copy.deepcopy(for_loop.update),
+            body=phase3_body,
+        )
+        phase3_loop.omp_parallel_for = True
+        phase3_loop.omp_schedule = "dynamic, 64"
+        phase3_loop.pre_parallel_body = list(wksp_alloc)
+
+        # Build the transformed stmts
+        result = []
+
+        # Keep stmts before the for loop that are NOT result tensor init
+        # (those will be replaced by our raw pointer allocations)
+        for stmt in stmts[:for_loop_idx]:
+            # Skip cvector declarations and init for the result tensor
+            if isinstance(stmt, llir.VarDecl) and hasattr(stmt, 'var'):
+                vname = getattr(stmt.var, 'name', '')
+                if any(vname.startswith(f"{result_name}{x}") for x in ['_values', '1_pos', '1_crd']):
+                    continue
+            if isinstance(stmt, llir.VarInit) and hasattr(stmt, 'var'):
+                vname = getattr(stmt.var, 'name', '')
+                if vname in (f"p{result_name}1", f"{result_name}1_pos_index"):
+                    continue
+            if isinstance(stmt, llir.Assign):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                if f"{result_name}1_pos[" in vname:
+                    continue
+            if isinstance(stmt, llir.ForLoop):
+                # Skip the pos init loop: for (pC1=1; pC1<=C0_size; ...) C1_pos[pC1]=0
+                init_var = getattr(getattr(stmt, 'init', None), 'var', None)
+                if init_var and getattr(init_var, 'name', '').startswith(f"p{result_name}"):
+                    continue
+            result.append(stmt)
+
+        c_dtype = wksp_ctype or "float"
+        sizeof_val = f"sizeof({c_dtype})"
+
+        # Phase 1: count nnz per row
+        result.append(llir.RawStmt(
+            code=f"int* _row_nnz = (int*)calloc({loop_bound}, sizeof(int))"
+        ))
+        result.append(phase1_loop)
+
+        # Phase 2: prefix sum + allocate
+        result.append(llir.RawStmt(
+            code=f"int* {result_name}1_pos_data = (int*)malloc(({loop_bound} + 1) * sizeof(int))"
+        ))
+        result.append(llir.RawStmt(code=f"{result_name}1_pos_data[0] = 0"))
+        result.append(llir.RawStmt(
+            code=f"for (int _i = 0; _i < {loop_bound}; _i++) "
+                 f"{result_name}1_pos_data[_i + 1] = {result_name}1_pos_data[_i] + _row_nnz[_i];",
+            add_semicolon=False,
+        ))
+        result.append(llir.RawStmt(
+            code=f"int _total_nnz = {result_name}1_pos_data[{loop_bound}]"
+        ))
+        result.append(llir.RawStmt(code="free(_row_nnz)"))
+        result.append(llir.RawStmt(
+            code=f"int* {result_name}1_crd_data = (int*)malloc(_total_nnz * sizeof(int))"
+        ))
+        result.append(llir.RawStmt(
+            code=f"{c_dtype}* {result_name}_values_data = ({c_dtype}*)malloc(_total_nnz * {sizeof_val})"
+        ))
+
+        # Phase 3: fill values
+        result.append(phase3_loop)
+
+        # Final assembly: from_blob with raw pointers
+        result.append(llir.RawStmt(code=f"auto _free_deleter = [](void* p) {{ free(p); }}"))
+        result.append(llir.RawStmt(
+            code=f"torch::Tensor {result_name}1_pos_torch = torch::from_blob("
+                 f"{result_name}1_pos_data, {{(long long)({loop_bound} + 1)}}, _free_deleter, torch::kInt)"
+        ))
+        result.append(llir.RawStmt(
+            code=f"torch::Tensor {result_name}1_crd_torch = torch::from_blob("
+                 f"{result_name}1_crd_data, {{(long long)_total_nnz}}, _free_deleter, torch::kInt)"
+        ))
+        _CTYPE_TO_TORCH = {
+            "float": "torch::kFloat32",
+            "double": "torch::kFloat64",
+            "int": "torch::kInt32",
+            "int32_t": "torch::kInt32",
+            "long long": "torch::kInt64",
+            "int64_t": "torch::kInt64",
+        }
+        torch_dtype = _CTYPE_TO_TORCH.get(c_dtype, "torch::kFloat32")
+        result.append(llir.RawStmt(
+            code=f"torch::Tensor {result_name}_values_torch = torch::from_blob("
+                 f"{result_name}_values_data, {{(long long)_total_nnz}}, _free_deleter, {torch_dtype})"
+        ))
+        result.append(llir.RawStmt(
+            code=f"Tensor {result_name};\n"
+                 f"  {result_name}._storage._index.mode_indices = "
+                 f"{{{{}}, {{{result_name}1_pos_torch, {result_name}1_crd_torch}}}};\n"
+                 f"  {result_name}._storage._value = {result_name}_values_torch;\n"
+                 f"  return {result_name};",
+            add_semicolon=False,
+        ))
+
+        self._compressed_output_parallel = True
+        return result
 
     @staticmethod
     def _is_openmp_compatible_for_loop(for_loop: llir.ForLoop) -> bool:
@@ -3428,6 +3712,9 @@ class CINLowerer:
               and self._used_scalar_accum
               and self._should_parallelize_coo_outer(index_var)):
             stmts = self._transform_coo_loop_for_openmp(stmts)
+        elif (is_outermost_forall
+              and self._should_parallelize_compressed_where(index_var)):
+            stmts = self._transform_compressed_where_for_openmp(stmts)
 
         return stmts
 
