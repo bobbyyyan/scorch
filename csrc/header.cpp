@@ -321,8 +321,10 @@ class coo_workspace_1d {
   }
 
   void clear() {
+    for (int i = 0; i < _size; i++) {
+      _setFlags[_indices[i]] = false;
+    }
     _size = 0;
-    std::fill_n(_setFlags, _capacity, false);
   }
 
   class iterator {
@@ -354,6 +356,88 @@ class coo_workspace_1d {
   iterator end() { return iterator(_size, _values, _indices); }
 
   int size() const { return _size; }
+};
+
+template <typename T>
+class linked_list_workspace_1d {
+  T* _sums;
+  int* _next;
+  int _head;
+  int _size;
+  int _capacity;
+
+ public:
+  explicit linked_list_workspace_1d(int capacity)
+      : _head(-2), _size(0), _capacity(capacity) {
+    _sums = (T*)calloc(_capacity, sizeof(T));
+    _next = (int*)malloc(sizeof(int) * _capacity);
+    _sorted_buf = (int*)malloc(sizeof(int) * _capacity);
+    if (!_sums || !_next || !_sorted_buf) throw std::bad_alloc();
+    std::fill_n(_next, _capacity, -1);
+  }
+
+  ~linked_list_workspace_1d() {
+    free(_sums);
+    free(_next);
+    free(_sorted_buf);
+  }
+
+  inline void insert(const int coord, T value) {
+    _sums[coord] += value;
+    if (_next[coord] == -1) {
+      _next[coord] = _head;
+      _head = coord;
+      _size++;
+    }
+  }
+
+  void sort() {}
+
+  void clear() {
+    int h = _head;
+    while (h >= 0) {
+      int tmp = h;
+      h = _next[h];
+      _next[tmp] = -1;
+      _sums[tmp] = 0;
+    }
+    _head = -2;
+    _size = 0;
+  }
+
+  int size() const { return _size; }
+
+  class iterator {
+    int _index;
+    int* _sorted_coords;
+    T* _sums;
+
+   public:
+    iterator(int index, int* sorted_coords, T* sums)
+        : _index(index), _sorted_coords(sorted_coords), _sums(sums) {}
+    iterator& operator++() { _index++; return *this; }
+    bool operator!=(const iterator& other) const { return _index != other._index; }
+    std::pair<int, T> operator*() const {
+      int c = _sorted_coords[_index];
+      return {c, _sums[c]};
+    }
+  };
+
+  int* _sorted_buf;
+  int _sorted_size = 0;
+
+  iterator begin() {
+    int pos = 0, h = _head;
+    while (h >= 0) {
+      _sorted_buf[pos++] = h;
+      h = _next[h];
+    }
+    _sorted_size = pos;
+    std::sort(_sorted_buf, _sorted_buf + _sorted_size);
+    return iterator(0, _sorted_buf, _sums);
+  }
+
+  iterator end() { return iterator(_sorted_size, _sorted_buf, _sums); }
 };
 
 template <typename T, int N>

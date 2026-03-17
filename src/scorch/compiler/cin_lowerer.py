@@ -2431,7 +2431,7 @@ class CINLowerer:
         )
         phase1_loop.omp_parallel_for = True
         phase1_loop.omp_schedule = "dynamic, 64"
-        wksp_type_str = f"coo_workspace_1d<{wksp_ctype}, {self._where_workspace_dim or 1}>"
+        wksp_type_str = f"linked_list_workspace_1d<{wksp_ctype}>"
         wksp_alloc = [llir.RawStmt(code=f"auto {wksp_name} = {wksp_type_str}(result_shape[1])")]
         phase1_loop.pre_parallel_body = wksp_alloc
 
