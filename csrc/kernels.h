@@ -265,7 +265,7 @@ Tensor spmspm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
     // Lower consumer CIN
     wksp.sort();
     for (const auto& it : wksp) {
-      int k = it.first;
+      int64_t k = it.first;
       float wksp_value = it.second;
 
       C_values[pC1] = wksp_value;
@@ -375,7 +375,7 @@ Tensor spmspm_coo_float(
     // Lower consumer CIN
     wksp.sort();
     for (const auto& it : wksp) {
-      int j = it.first;
+      int64_t j = it.first;
       float wksp_value = it.second;
 
       C_values[pC1] = wksp_value;

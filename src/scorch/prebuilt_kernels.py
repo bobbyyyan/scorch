@@ -137,6 +137,64 @@ def resolve_prebuilt_matmul(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Fused prebuilt kernel specs (SpMM + postops)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PrebuiltFusedSpec:
+    lhs_format: str
+    rhs_format: str
+    post_op_kinds: Tuple[str, ...]
+    symbol_by_dtype: Mapping[torch.dtype, Sequence[str]]
+
+
+@dataclass(frozen=True)
+class ResolvedPrebuiltFusedKernel:
+    fn: KernelFn
+    symbol_name: str
+
+
+_FUSED_PREBUILT_SPECS: List[PrebuiltFusedSpec] = [
+    # CSR x dense + bias + relu
+    PrebuiltFusedSpec(
+        lhs_format="d,s",
+        rhs_format="d,d",
+        post_op_kinds=("add", "relu"),
+        symbol_by_dtype={torch.float32: ("spmm_csr_bias_relu_float",)},
+    ),
+    # CSR x dense + bias only
+    PrebuiltFusedSpec(
+        lhs_format="d,s",
+        rhs_format="d,d",
+        post_op_kinds=("add",),
+        symbol_by_dtype={torch.float32: ("spmm_csr_bias_float",)},
+    ),
+]
+
+
+def resolve_prebuilt_fused(
+    a_format: str,
+    b_format: str,
+    post_op_kinds: Tuple[str, ...],
+    dtype: torch.dtype,
+) -> Optional[ResolvedPrebuiltFusedKernel]:
+    """Match against prebuilt fused kernels. Returns kernel or None."""
+    for spec in _FUSED_PREBUILT_SPECS:
+        if a_format != spec.lhs_format or b_format != spec.rhs_format:
+            continue
+        if post_op_kinds != spec.post_op_kinds:
+            continue
+        symbols = spec.symbol_by_dtype.get(dtype)
+        if symbols is None:
+            continue
+        fn, symbol_name = _resolve_symbol(symbols)
+        if fn is None or symbol_name is None:
+            continue
+        return ResolvedPrebuiltFusedKernel(fn=fn, symbol_name=symbol_name)
+    return None
+
+
 def execute_prebuilt_binary_kernel(
     kernel_fn: KernelFn,
     a: "STensor",

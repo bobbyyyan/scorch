@@ -138,7 +138,7 @@ class DataType(Enum):
     COO_WORKSPACE_FLOAT32_4 = "coo_workspace<float, 4>"
     COO_WORKSPACE_FLOAT32_5 = "coo_workspace<float, 5>"
 
-    STD_VECTOR_INT = "std::vector<int>"
+    STD_VECTOR_INT = "std::vector<int64_t>"
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
     ARRAY_INT = "int[]"
 

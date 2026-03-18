@@ -426,7 +426,7 @@ def einsum(
     # On a cache hit, skip the entire scheduling pipeline (select_loop_order
     # + auto_schedule) which dominates wall-clock time for cached kernels.
     _dispatch_key = None
-    if not compile_only:
+    if not compile_only and "_post_ops" not in kwargs:
         _dispatch_key = (
             expression,
             tuple(str(t.format) for t in tensors),
@@ -717,11 +717,17 @@ def einsum(
 
     # print("Auto-scheduled CIN:\n", cin_stmt)
 
-    if str(cin_stmt) in _kernel_cache:
+    # Extract PostOps for fused kernel compilation
+    _post_ops = kwargs.get("_post_ops", None)
+    _post_ops_tensors = kwargs.get("_post_ops_tensors", None)
+    _cache_key_suffix = str(_post_ops) if _post_ops else ""
+    _kernel_cache_key = str(cin_stmt) + _cache_key_suffix
+
+    if _kernel_cache_key in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
-        module = _kernel_cache[str(cin_stmt)]
+        module = _kernel_cache[_kernel_cache_key]
     else:
-        lowerer = CINLowerer()
+        lowerer = CINLowerer(post_ops=_post_ops)
 
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
 
@@ -743,7 +749,7 @@ def einsum(
             extra_ldflags=get_extra_ldflags(),
         )
 
-        _kernel_cache[str(cin_stmt)] = module
+        _kernel_cache[_kernel_cache_key] = module
 
     # Populate the dispatch cache so future calls skip scheduling entirely.
     if _dispatch_key is not None:
@@ -780,6 +786,11 @@ def einsum(
         args.append(tensor.shape)  # type: ignore
         args.append(tensor.index.mode_indices)  # type: ignore
         args.append(tensor.values)  # type: ignore
+
+    # Append extra tensors for PostOps (bias, scale, etc.)
+    if _post_ops_tensors:
+        for extra_t in _post_ops_tensors:
+            args.append(extra_t)  # type: ignore
 
     start_time = time.time()
     result_cpp = module.evaluate(*args)

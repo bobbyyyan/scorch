@@ -329,53 +329,31 @@ def scorch_gcn_forward(
     return F.log_softmax(x, dim=1)
 
 
-def _get_fused_kernels():
-    """Load fused SpMM+bias+ReLU kernels from scorch_ops."""
-    import scorch_ops
+@scorch.compile
+def _fused_spmm_bias_relu(adj, x, bias):
+    h = scorch.matmul(adj, x, format="dd")
+    h = h + bias
+    return torch.relu(h)
 
-    return scorch_ops.spmm_csr_bias_relu_float, scorch_ops.spmm_csr_bias_float
+
+@scorch.compile
+def _fused_spmm_bias(adj, x, bias):
+    h = scorch.matmul(adj, x, format="dd")
+    return h + bias
 
 
 def scorch_fused_gcn_forward(
     x: torch.Tensor,
-    adj_csr: torch.Tensor,
+    adj_scorch: STensor,
     weights: Dict[str, torch.Tensor],
 ) -> torch.Tensor:
-    """Scorch GCN forward with fused SpMM+bias+ReLU kernels.
-
-    Fuses the SpMM, bias add, and ReLU into a single C++ kernel per layer,
-    eliminating 2 extra memory passes over the (N, H) output per layer.
-    """
-    spmm_bias_relu, spmm_bias = _get_fused_kernels()
-
-    # Extract CSR structure
-    crow = adj_csr.crow_indices().to(torch.int32)
-    col = adj_csr.col_indices().to(torch.int32)
-    val = adj_csr.values()
-    N = adj_csr.size(0)
-    A_shape = [N, N]
-    A_mode_indices = [[], [crow, col]]
-
+    """Scorch GCN forward with @scorch.compile fused kernels."""
     # Layer 1: transform -> fused(SpMM + bias + ReLU)
     x = F.linear(x, weights["conv1.lin.weight"])
-    H = x.size(1)
-    result = spmm_bias_relu(
-        [N, H], A_shape, A_mode_indices, val,
-        [N, H], [[], []], x.contiguous().view(-1),
-        weights["conv1.bias"],
-    )
-    x = result.storage.value.view(N, H)
-
+    x = _fused_spmm_bias_relu(adj_scorch, x, weights["conv1.bias"])
     # Layer 2: transform -> fused(SpMM + bias) (no ReLU before softmax)
     x = F.linear(x, weights["conv2.lin.weight"])
-    C = x.size(1)
-    result = spmm_bias(
-        [N, C], A_shape, A_mode_indices, val,
-        [N, C], [[], []], x.contiguous().view(-1),
-        weights["conv2.bias"],
-    )
-    x = result.storage.value.view(N, C)
-
+    x = _fused_spmm_bias(adj_scorch, x, weights["conv2.bias"])
     return F.log_softmax(x, dim=1)
 
 
@@ -546,9 +524,11 @@ def run_scorch_fused(
     warmup: int,
     repeats: int,
 ) -> Tuple[float, TimingSummary]:
+    adj_scorch = STensor.from_csr(adj_csr, "adj")
+
     with torch.no_grad():
         def fn() -> torch.Tensor:
-            return scorch_fused_gcn_forward(dataset.x, adj_csr, weights)
+            return scorch_fused_gcn_forward(dataset.x, adj_scorch, weights)
 
         logits, timing = benchmark_fn(fn, warmup=warmup, repeats=repeats)
 
@@ -754,9 +734,10 @@ def benchmark_dataset(
                 )
                 # Correctness check vs PyTorch
                 if reference_logits is not None:
+                    adj_st_fused = STensor.from_csr(adj_csr, "adj")
                     with torch.no_grad():
                         fused_logits = scorch_fused_gcn_forward(
-                            dataset.x, adj_csr, weights
+                            dataset.x, adj_st_fused, weights
                         )
                     if torch.allclose(fused_logits, reference_logits, atol=1e-4):
                         print("    Correctness: PASS (matches PyTorch)")
