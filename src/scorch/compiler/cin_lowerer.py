@@ -41,7 +41,7 @@ class ResultTensorAssembler:
             # capacity = product of all dimension sizes
             res_capacity_expr: llir.Expr = llir.Var(
                 name=f"{self.name}0_size",
-                type=llir.DataType.INT,
+                type=llir.DataType.INT64,
             )
             for i in range(1, self.tensor_var.levels):
                 res_capacity_expr = llir.BinOp(
@@ -49,14 +49,14 @@ class ResultTensorAssembler:
                     op="*",
                     right=llir.Var(
                         name=f"{self.name}{i}_size",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                 )
             stmts.append(
                 llir.VarInit(
                     var=llir.Var(
                         name=f"{self.name}_capacity",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                     value=res_capacity_expr,
                 )
@@ -67,7 +67,7 @@ class ResultTensorAssembler:
             sizeof_expr = llir.Sizeof(c_datatype)
             res_capacity_var = llir.Var(
                 name=f"{self.name}_capacity",
-                type=llir.DataType.INT,
+                type=llir.DataType.INT64,
             )
             malloc = llir.FunctionCall(
                 name="malloc",
@@ -110,7 +110,7 @@ class ResultTensorAssembler:
             # Known-nnz path: raw malloc instead of cvector
             c_datatype = dtype_to_c_datatype(self.dtype)
             sizeof_expr = llir.Sizeof(c_datatype)
-            nnz_var = llir.Var(name=self.known_nnz_var, type=llir.DataType.INT)
+            nnz_var = llir.Var(name=self.known_nnz_var, type=llir.DataType.INT64)
             malloc = llir.FunctionCall(
                 name="malloc",
                 args=[llir.BinOp(left=sizeof_expr, op="*", right=nnz_var)],
@@ -168,7 +168,7 @@ class ResultTensorAssembler:
                     llir.Assign(
                         var=llir.Var(
                             name=f"{self.name}{i}_pos[0]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Literal(0),
                     )
@@ -178,7 +178,7 @@ class ResultTensorAssembler:
                     llir.VarInit(
                         llir.Var(
                             name=f"p{self.name}{i}",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Literal(0),
                     )
@@ -188,7 +188,7 @@ class ResultTensorAssembler:
                     llir.VarInit(
                         llir.Var(
                             name=f"{self.name}{i}_pos_index",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Literal(0),
                     )
@@ -200,7 +200,7 @@ class ResultTensorAssembler:
                     loop_var_name = f"p{self.name}{i}"
                     loop_var = llir.Var(
                         name=loop_var_name,
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     )
                     loop = llir.ForLoop(
                         init=llir.VarInit(
@@ -212,7 +212,7 @@ class ResultTensorAssembler:
                             op="<=",
                             right=llir.Var(
                                 name=f"{self.name}{i - 1}_size",
-                                type=llir.DataType.INT,
+                                type=llir.DataType.INT64,
                             ),
                         ),
                         update=llir.Increment(
@@ -222,7 +222,7 @@ class ResultTensorAssembler:
                             llir.Assign(
                                 var=llir.Var(
                                     name=f"{self.name}{i}_pos[{loop_var_name}]",
-                                    type=llir.DataType.INT,
+                                    type=llir.DataType.INT64,
                                 ),
                                 value=llir.Literal(0),
                             )
@@ -252,7 +252,7 @@ class ResultTensorAssembler:
                     llir.VarInit(
                         llir.Var(
                             name=f"p{self.name}{i}",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Literal(0),
                     )
@@ -596,11 +596,11 @@ class CINLowerer:
                     llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_size",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"{tensor.name}_shape[{level}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -847,11 +847,11 @@ class CINLowerer:
                                         values=[
                                             llir.Var(
                                                 name=ivar.name,
-                                                type=llir.DataType.INT,
+                                                type=llir.DataType.INT64,
                                             )
                                             for ivar in sorted_wksp_index_vars
                                         ],
-                                        data_type=llir.DataType.INT,
+                                        data_type=llir.DataType.INT64,
                                     ),
                                     rhs_llir,
                                 ],
@@ -1037,7 +1037,7 @@ class CINLowerer:
                         aligned_size = f"(((size_t){actual_size} + 15) & ~15)"
                         self._workspace_alloc_stmts.extend([
                             llir.RawStmt(
-                                code=f"int {size_var} = {actual_size}"
+                                code=f"int64_t {size_var} = {actual_size}"
                             ),
                             llir.RawStmt(
                                 code=(
@@ -1164,7 +1164,7 @@ class CINLowerer:
 
         intermediate_tensor_iterator = llir.Var(
             name=f"p{intermediate_tensor_var.get_name()}",
-            type=llir.DataType.INT,
+            type=llir.DataType.INT64,
         )
 
         # Build intermediate cvector declarations (only for non-coord path)
@@ -1213,11 +1213,11 @@ class CINLowerer:
                     llir.Assign(
                         var=llir.Var(
                             name=f"{result_tensor_name}{i}_crd[p{result_tensor_name}{i}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"{loop_var.name}.first[{i}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -1226,11 +1226,11 @@ class CINLowerer:
                 llir.Assign(
                     var=llir.Var(
                         name=f"{result_tensor_name}_values[p{result_tensor_name}0]",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                     value=llir.Var(
                         name=f"{loop_var.name}.second",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                 )
             )
@@ -1240,7 +1240,7 @@ class CINLowerer:
                     llir.Increment(
                         var=llir.Var(
                             name=f"p{result_tensor_name}{i}",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -1251,11 +1251,11 @@ class CINLowerer:
                     llir.Assign(
                         var=llir.Var(
                             name=f"{intermediate_crd_vecs[i].name}[{intermediate_tensor_iterator.name}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"{loop_var.name}.first[{i}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -1264,11 +1264,11 @@ class CINLowerer:
                 llir.Assign(
                     var=llir.Var(
                         name=f"{intermediate_val_vec.name}[{intermediate_tensor_iterator.name}]",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                     value=llir.Var(
                         name=f"{loop_var.name}.second",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                 )
             )
@@ -1489,7 +1489,7 @@ class CINLowerer:
                                 args=[
                                     llir.Var(
                                         name=index_var.name,
-                                        type=llir.DataType.INT,
+                                        type=llir.DataType.INT64,
                                     )
                                 ],
                             ),
@@ -1500,7 +1500,7 @@ class CINLowerer:
                             llir.Increment(
                                 var=llir.Var(
                                     name=f"p{result_tensor_name}{level}",
-                                    type=llir.DataType.INT,
+                                    type=llir.DataType.INT64,
                                 )
                             ),
                         ],
@@ -1519,7 +1519,7 @@ class CINLowerer:
                                 args=[
                                     llir.Var(
                                         name=ivar.name,
-                                        type=llir.DataType.INT,
+                                        type=llir.DataType.INT64,
                                     )
                                 ],
                             )
@@ -1628,7 +1628,7 @@ class CINLowerer:
                 # Fallback: element-by-element assignment (= not +=)
                 loop_var = llir.Var(
                     name=f"{wksp_index_var.name}",
-                    type=llir.DataType.INT,
+                    type=llir.DataType.INT64,
                 )
 
                 loop_body: List[llir.Stmt] = []
@@ -1684,7 +1684,7 @@ class CINLowerer:
             # }
             loop_var = llir.Var(
                 name=f"{wksp_index_var.name}",
-                type=llir.DataType.INT,
+                type=llir.DataType.INT64,
             )
 
             loop_body: List[llir.Stmt] = []
@@ -1721,7 +1721,7 @@ class CINLowerer:
                     left=loop_var,
                     right=llir.Var(
                         name=wksp_index_var.tile_size_var.name,
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                 ),
                 update=llir.Increment(
@@ -1764,7 +1764,7 @@ class CINLowerer:
                 llir.VarInit(
                     var=llir.Var(
                         name=wksp_access.get_index_vars()[0].name,
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                     value=llir.Var(
                         name=f"{loop_var.name}.first",
@@ -1778,7 +1778,7 @@ class CINLowerer:
                     llir.VarInit(
                         var=llir.Var(
                             name=index_var.name,
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"{loop_var.name}.first[{i}]",
@@ -1889,7 +1889,7 @@ class CINLowerer:
                                 ),
                                 right=llir.Var(
                                     name=f"p{result_tensor_name}{level}",
-                                    type=llir.DataType.INT,
+                                    type=llir.DataType.INT64,
                                 ),
                             ),
                             then_body=[
@@ -1898,7 +1898,7 @@ class CINLowerer:
                                     args=[
                                         llir.Var(
                                             name=parent_index_var.name,
-                                            type=llir.DataType.INT,
+                                            type=llir.DataType.INT64,
                                         )
                                     ],
                                 ),
@@ -1917,7 +1917,7 @@ class CINLowerer:
                         llir.Assign(
                             var=llir.Var(
                                 name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level - 1}_crd.size()]",
-                                type=llir.DataType.INT,
+                                type=llir.DataType.INT64,
                             ),
                             value=llir.FunctionCall(
                                 name=f"{result_tensor_name}{level}_crd.size",
@@ -1933,7 +1933,7 @@ class CINLowerer:
                 #     llir.Assign(
                 #         var=llir.Var(
                 #             name=f"{result_tensor_name}{level}_pos[p{result_tensor_name}{level}]",
-                #             type=llir.DataType.INT,
+                #             type=llir.DataType.INT64,
                 #         ),
                 #         value=llir.FunctionCall(
                 #             name=f"{result_tensor_name}{level}_crd.size",
@@ -1946,7 +1946,7 @@ class CINLowerer:
                     llir.Assign(
                         var=llir.Var(
                             name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level}_pos_index + 1]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.FunctionCall(
                             name=f"{result_tensor_name}{level}_crd.size",
@@ -1962,7 +1962,7 @@ class CINLowerer:
                 #             llir.Var(
                 #                 name=f"{result_tensor_name}{level}_crd.size()",
                 #                 # name=f"p{result_tensor_var.name}{_level}",
-                #                 type=llir.DataType.INT,
+                #                 type=llir.DataType.INT64,
                 #             )
                 #         ],
                 #     )
@@ -2076,11 +2076,11 @@ class CINLowerer:
                     llir.VarInit(
                         llir.Var(
                             name=f"{self.result_tensor_var.get_name()}{i}_size",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"result_shape[{i}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -2140,7 +2140,7 @@ class CINLowerer:
             self.result_value_array_sparse_index_llir = llir.Var(
                 # name=f"p{self.result_tensor_var.name}{self.result_tensor_access.level_of_index_var(result_last_compressed_index_var)}",
                 name=f"p{self.result_tensor_var.name}{self.result_tensor_var.levels - 1}",
-                type=llir.DataType.INT,
+                type=llir.DataType.INT64,
             )
             self.result_tensor_value_index_var_dict[
                 result_last_compressed_index_var
@@ -2149,7 +2149,7 @@ class CINLowerer:
             result_index_init_stmts.append(
                 llir.VarInit(
                     var=self.result_value_array_sparse_index_llir,
-                    value=llir.Literal(value=0, data_type=llir.DataType.INT),
+                    value=llir.Literal(value=0, data_type=llir.DataType.INT64),
                 )
             )
 
@@ -2309,7 +2309,7 @@ class CINLowerer:
         if not self.final_result_tensor_var or not self.final_result_tensor_access:
             return False
         level_types = self.final_result_tensor_var.get_level_types()
-        if len(level_types) < 2:
+        if len(level_types) != 2:
             return False
         if level_types[0] != LevelType.DENSE or level_types[1] != LevelType.COMPRESSED:
             return False
@@ -3475,26 +3475,26 @@ class CINLowerer:
                     llir.Var(name="_group_starts", type=llir.DataType.CVECTOR_INT)
                 ),
                 llir.Assign(
-                    var=llir.Var(name="_group_starts[0]", type=llir.DataType.INT),
+                    var=llir.Var(name="_group_starts[0]", type=llir.DataType.INT64),
                     value=llir.Literal(0),
                 ),
                 llir.VarInit(
-                    var=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                    var=llir.Var(name="_n_groups", type=llir.DataType.INT64),
                     value=llir.Literal(1),
                 ),
                 # Scan loop
                 llir.ForLoop(
                     init=llir.VarInit(
-                        var=llir.Var(name="_p", type=llir.DataType.INT),
+                        var=llir.Var(name="_p", type=llir.DataType.INT64),
                         value=llir.Literal(1),
                     ),
                     cond=llir.BinOp(
                         op="<",
-                        left=llir.Var(name="_p", type=llir.DataType.INT),
-                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT),
+                        left=llir.Var(name="_p", type=llir.DataType.INT64),
+                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT64),
                     ),
                     update=llir.Increment(
-                        var=llir.Var(name="_p", type=llir.DataType.INT),
+                        var=llir.Var(name="_p", type=llir.DataType.INT64),
                     ),
                     body=[
                         llir.IfThenElse(
@@ -3505,19 +3505,19 @@ class CINLowerer:
                             ),
                             then_body=[
                                 llir.Assign(
-                                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT),
-                                    value=llir.Var(name="_p", type=llir.DataType.INT),
+                                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT64),
+                                    value=llir.Var(name="_p", type=llir.DataType.INT64),
                                 ),
                                 llir.Increment(
-                                    var=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                                    var=llir.Var(name="_n_groups", type=llir.DataType.INT64),
                                 ),
                             ],
                         ),
                     ],
                 ),
                 llir.Assign(
-                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT),
-                    value=llir.Var(name=outer_end_var, type=llir.DataType.INT),
+                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT64),
+                    value=llir.Var(name=outer_end_var, type=llir.DataType.INT64),
                 ),
                 llir.BlankLine(),
             ]
@@ -3525,16 +3525,16 @@ class CINLowerer:
             # Group loop body
             group_body: List[llir.Stmt] = [
                 llir.VarInit(
-                    var=llir.Var(name=iter_var, type=llir.DataType.INT),
-                    value=llir.Var(name="_group_starts[_g]", type=llir.DataType.INT),
+                    var=llir.Var(name=iter_var, type=llir.DataType.INT64),
+                    value=llir.Var(name="_group_starts[_g]", type=llir.DataType.INT64),
                 ),
                 llir.VarInit(
-                    var=llir.Var(name=end_var, type=llir.DataType.INT),
-                    value=llir.Var(name="_group_starts[_g + 1]", type=llir.DataType.INT),
+                    var=llir.Var(name=end_var, type=llir.DataType.INT64),
+                    value=llir.Var(name="_group_starts[_g + 1]", type=llir.DataType.INT64),
                 ),
                 llir.VarInit(
-                    var=llir.Var(name=coord_var_name, type=llir.DataType.INT),
-                    value=llir.Var(name=f"{crd_array}[{iter_var}]", type=llir.DataType.INT),
+                    var=llir.Var(name=coord_var_name, type=llir.DataType.INT64),
+                    value=llir.Var(name=f"{crd_array}[{iter_var}]", type=llir.DataType.INT64),
                 ),
                 *inner_body_filtered,
             ]
@@ -3542,16 +3542,16 @@ class CINLowerer:
             # Group for loop with OpenMP
             group_loop = llir.ForLoop(
                 init=llir.VarInit(
-                    var=llir.Var(name="_g", type=llir.DataType.INT),
+                    var=llir.Var(name="_g", type=llir.DataType.INT64),
                     value=llir.Literal(0),
                 ),
                 cond=llir.BinOp(
                     op="<",
-                    left=llir.Var(name="_g", type=llir.DataType.INT),
-                    right=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                    left=llir.Var(name="_g", type=llir.DataType.INT64),
+                    right=llir.Var(name="_n_groups", type=llir.DataType.INT64),
                 ),
                 update=llir.Increment(
-                    var=llir.Var(name="_g", type=llir.DataType.INT),
+                    var=llir.Var(name="_g", type=llir.DataType.INT64),
                 ),
                 body=group_body,
                 omp_parallel_for=True,
@@ -3579,10 +3579,10 @@ class CINLowerer:
                 # coordinates inline and execute the inner body.
                 flat_body: List[llir.Stmt] = [
                     llir.VarInit(
-                        var=llir.Var(name=coord_var_name, type=llir.DataType.INT),
+                        var=llir.Var(name=coord_var_name, type=llir.DataType.INT64),
                         value=llir.Var(
                             name=f"{crd_array}[{iter_var}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     ),
                 ]
@@ -3605,8 +3605,8 @@ class CINLowerer:
                 # We handle this by setting the group boundaries to
                 # single-element ranges.
                 flat_body.append(llir.VarInit(
-                    var=llir.Var(name=end_var, type=llir.DataType.INT),
-                    value=llir.Var(name=f"{iter_var} + 1", type=llir.DataType.INT),
+                    var=llir.Var(name=end_var, type=llir.DataType.INT64),
+                    value=llir.Var(name=f"{iter_var} + 1", type=llir.DataType.INT64),
                 ))
                 if not self._known_nnz_var:
                     # Rewrite output array accesses to bypass cvector bounds checks:
@@ -3620,16 +3620,16 @@ class CINLowerer:
 
                 flat_loop = llir.ForLoop(
                     init=llir.VarInit(
-                        var=llir.Var(name=iter_var, type=llir.DataType.INT),
+                        var=llir.Var(name=iter_var, type=llir.DataType.INT64),
                         value=llir.Literal(0),
                     ),
                     cond=llir.BinOp(
                         op="<",
-                        left=llir.Var(name=iter_var, type=llir.DataType.INT),
-                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT),
+                        left=llir.Var(name=iter_var, type=llir.DataType.INT64),
+                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT64),
                     ),
                     update=llir.Increment(
-                        var=llir.Var(name=iter_var, type=llir.DataType.INT),
+                        var=llir.Var(name=iter_var, type=llir.DataType.INT64),
                     ),
                     body=flat_body,
                     omp_parallel_for=True,
@@ -3761,5 +3761,5 @@ class CINLowerer:
         """
         return llir.Var(
             name=ivar.name,
-            type=llir.DataType.INT,
+            type=llir.DataType.INT64,
         )

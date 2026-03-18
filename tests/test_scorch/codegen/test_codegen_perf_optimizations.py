@@ -66,5 +66,6 @@ def test_non_tiled_dense_workspace_is_zero_initialized_and_freed():
     )
 
     cpp_code = _lower_to_cpp(cin_stmt)
-    assert "new float[" in cpp_code and "]()" in cpp_code
-    assert "delete[] wksp;" in cpp_code
+    assert "aligned_alloc(" in cpp_code
+    assert "memset(wksp, 0," in cpp_code
+    assert "free(wksp);" in cpp_code

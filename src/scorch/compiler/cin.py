@@ -357,10 +357,10 @@ class IndexVar(IndexExpr):
             # int self.name = lhs.name + rhs.name
             return [
                 llir.VarInit(
-                    var=llir.Var(self.name, llir.DataType.INT),
+                    var=llir.Var(self.name, llir.DataType.INT64),
                     value=llir.Add(
-                        left=llir.Var(self.expr.lhs.name, llir.DataType.INT),
-                        right=llir.Var(self.expr.rhs.name, llir.DataType.INT),
+                        left=llir.Var(self.expr.lhs.name, llir.DataType.INT64),
+                        right=llir.Var(self.expr.rhs.name, llir.DataType.INT64),
                     ),
                 )
             ]
@@ -410,7 +410,7 @@ class IndexVar(IndexExpr):
         # <tensor name>{level}_size
         return llir.Var(
             name=f"{tensor_access.tensor.name}{level}_size",
-            type=llir.DataType.INT,
+            type=llir.DataType.INT64,
         )
 
     def __str__(self):
@@ -804,7 +804,7 @@ class TensorAccess(IndexExpr):
                 parent_level = level - 1
                 coord_var_llir = llir.Var(
                     name=f"p{tensor_name}{level}",
-                    type=llir.DataType.INT,
+                    type=llir.DataType.INT64,
                 )
                 return [
                     llir.VarInit(
@@ -813,14 +813,14 @@ class TensorAccess(IndexExpr):
                             left=llir.Mul(
                                 left=llir.Var(
                                     name=f"p{tensor_name}{parent_level}",
-                                    type=llir.DataType.INT,
+                                    type=llir.DataType.INT64,
                                 ),
                                 right=llir.Var(
                                     name=f"{tensor_name}{level}_size",
-                                    type=llir.DataType.INT,
+                                    type=llir.DataType.INT64,
                                 ),
                             ),
-                            right=llir.Var(name=index_var.name, type=llir.DataType.INT),
+                            right=llir.Var(name=index_var.name, type=llir.DataType.INT64),
                         ),
                     )
                 ]

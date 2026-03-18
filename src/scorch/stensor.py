@@ -219,7 +219,7 @@ class STensor(torch.nn.Module):
         llir_lowerer = LLIRLowerer()
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        print("\n\ncpp_code:\n\n", cpp_code)
+        # print("\n\ncpp_code:\n\n", cpp_code)
 
         # Read header_cpp_code from csrc/header.cpp
         with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
