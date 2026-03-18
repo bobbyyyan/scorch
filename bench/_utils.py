@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
+import os
 import shutil
 import statistics
 import subprocess
@@ -31,7 +31,11 @@ from scorch import STensor
 # Constants
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = Path.home() / ".cache" / "scorch_suitesparse"
+_NODE_NAME = os.uname().nodename
+_ON_REDWOOD = "redwood" in _NODE_NAME
+
+SUITESPARSE_SHARED_DIR = Path("/scratch/suitesparse")
+CACHE_DIR = SUITESPARSE_SHARED_DIR if _ON_REDWOOD else Path.home() / ".cache" / "scorch_suitesparse"
 
 COLORS: Dict[str, str] = {
     "Scorch": "#fc764a",
@@ -103,6 +107,24 @@ MATRIX_SETS: Dict[str, List[MatrixEntry]] = {
 }
 
 
+def discover_local_matrices() -> List[MatrixEntry]:
+    """Scan CACHE_DIR for all available matrices (sorted by name).
+
+    Returns MatrixEntry tuples with ssid=0 and group="local" for
+    matrices discovered on disk.
+    """
+    entries: List[MatrixEntry] = []
+    if not CACHE_DIR.is_dir():
+        return entries
+    for subdir in sorted(CACHE_DIR.iterdir()):
+        if not subdir.is_dir():
+            continue
+        mtx = subdir / f"{subdir.name}.mtx"
+        if mtx.exists():
+            entries.append((0, "local", subdir.name, ""))
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # Matrix download & conversion
 # ---------------------------------------------------------------------------
@@ -110,11 +132,22 @@ MATRIX_SETS: Dict[str, List[MatrixEntry]] = {
 SUITESPARSE_URL = "https://suitesparse-collection-website.herokuapp.com/MM"
 
 
+def _resolve_matrix_path(name: str) -> Path:
+    """Return the expected .mtx path inside CACHE_DIR.
+
+    On redwood the layout is ``{name}/{name}.mtx``.
+    On other machines the flat cache layout ``{name}.mtx`` is used.
+    """
+    if _ON_REDWOOD:
+        return CACHE_DIR / name / f"{name}.mtx"
+    return CACHE_DIR / f"{name}.mtx"
+
+
 def download_matrix(ssid: int, group: str, name: str) -> scipy.sparse.csr_matrix:
     """Download a SuiteSparse matrix via curl, cache locally, return as scipy CSR."""
-    cache_path = CACHE_DIR / f"{name}.mtx"
-    if cache_path.exists():
-        mat = scipy.io.mmread(str(cache_path))
+    mtx_path = _resolve_matrix_path(name)
+    if mtx_path.exists():
+        mat = scipy.io.mmread(str(mtx_path))
         return scipy.sparse.csr_matrix(mat, dtype=np.float32)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -136,12 +169,44 @@ def download_matrix(ssid: int, group: str, name: str) -> scipy.sparse.csr_matrix
     extracted = CACHE_DIR / name / f"{name}.mtx"
     if extracted.exists():
         mat = scipy.io.mmread(str(extracted))
-        shutil.copy2(str(extracted), str(cache_path))
-    elif cache_path.exists():
-        mat = scipy.io.mmread(str(cache_path))
+        # On non-redwood machines, also copy to the flat cache for faster lookup
+        if not _ON_REDWOOD:
+            flat = CACHE_DIR / f"{name}.mtx"
+            shutil.copy2(str(extracted), str(flat))
+    elif (CACHE_DIR / f"{name}.mtx").exists():
+        mat = scipy.io.mmread(str(CACHE_DIR / f"{name}.mtx"))
     else:
         raise RuntimeError(f"Could not find downloaded matrix for {name} (id={ssid})")
     return scipy.sparse.csr_matrix(mat, dtype=np.float32)
+
+
+def load_matrix(name: str) -> scipy.sparse.csr_matrix:
+    """Load a matrix from the local cache by name (no download)."""
+    mtx_path = _resolve_matrix_path(name)
+    if not mtx_path.exists():
+        raise FileNotFoundError(f"Matrix {name!r} not found at {mtx_path}")
+    mat = scipy.io.mmread(str(mtx_path))
+    return scipy.sparse.csr_matrix(mat, dtype=np.float32)
+
+
+def completed_matrices(csv_path: Path) -> set:
+    """Return the set of MatrixName values already present in *csv_path*.
+
+    Used by --continue mode to skip matrices that were already benchmarked.
+    Both frameworks (Scorch and PyTorch) must be present for a matrix to be
+    considered complete.
+    """
+    if not csv_path.exists():
+        return set()
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return set()
+    if "MatrixName" not in df.columns or "Framework" not in df.columns:
+        return set()
+    names_by_fw = df.groupby("MatrixName")["Framework"].apply(set)
+    return {name for name, fws in names_by_fw.items()
+            if {"Scorch", "PyTorch"} <= fws}
 
 
 def scipy_to_torch(matrix: scipy.sparse.spmatrix, fmt: str = "csr") -> torch.Tensor:
@@ -255,12 +320,11 @@ CSV_COLUMNS = [
 
 
 class ResultsCollector:
-    """Collect benchmark rows and save incrementally to CSV."""
+    """Collect benchmark rows and save incrementally to CSV via pandas."""
 
     def __init__(self, csv_path: Path) -> None:
         self.csv_path = csv_path
         self.rows: List[Dict[str, Any]] = []
-        self._wrote_header = False
 
     def append(
         self,
@@ -284,16 +348,15 @@ class ResultsCollector:
             "Runtime": runtime,
         }
         self.rows.append(row)
-        self._write_row(row)
+        self._flush_row(row)
 
-    def _write_row(self, row: Dict[str, Any]) -> None:
-        write_header = not self.csv_path.exists() or not self._wrote_header
-        with open(self.csv_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-            if write_header:
-                writer.writeheader()
-                self._wrote_header = True
-            writer.writerow(row)
+    def _flush_row(self, row: Dict[str, Any]) -> None:
+        new_df = pd.DataFrame([row], columns=CSV_COLUMNS)
+        file_exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
+        new_df.to_csv(
+            self.csv_path, mode="a", index=False,
+            header=not file_exists,
+        )
 
     def to_dataframe(self) -> pd.DataFrame:
         return pd.DataFrame(self.rows, columns=CSV_COLUMNS)

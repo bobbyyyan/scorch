@@ -28,12 +28,13 @@ from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 class ResultTensorAssembler:
     """Assembles LLIR statements for result tensor initialization and final construction."""
 
-    def __init__(self, tensor_var: TensorVar):
+    def __init__(self, tensor_var: TensorVar, known_nnz_var: Optional[str] = None):
         self.tensor_var = tensor_var
         self.name = tensor_var.get_name()
         self.level_types = tensor_var.get_level_types()
         self.is_dense = tensor_var.is_dense()
         self.dtype = tensor_var.dtype
+        self.known_nnz_var = known_nnz_var
 
     def emit_value_array_init(self) -> List[llir.Stmt]:
         """Emit value array initialization: dense malloc+memset or sparse cvector decl."""
@@ -42,7 +43,7 @@ class ResultTensorAssembler:
             # capacity = product of all dimension sizes
             res_capacity_expr: llir.Expr = llir.Var(
                 name=f"{self.name}0_size",
-                type=llir.DataType.INT,
+                type=llir.DataType.INT64,
             )
             for i in range(1, self.tensor_var.levels):
                 res_capacity_expr = llir.BinOp(
@@ -50,14 +51,14 @@ class ResultTensorAssembler:
                     op="*",
                     right=llir.Var(
                         name=f"{self.name}{i}_size",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                 )
             stmts.append(
                 llir.VarInit(
                     var=llir.Var(
                         name=f"{self.name}_capacity",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                     value=res_capacity_expr,
                 )
@@ -68,7 +69,7 @@ class ResultTensorAssembler:
             sizeof_expr = llir.Sizeof(c_datatype)
             res_capacity_var = llir.Var(
                 name=f"{self.name}_capacity",
-                type=llir.DataType.INT,
+                type=llir.DataType.INT64,
             )
             malloc = llir.FunctionCall(
                 name="malloc",
@@ -105,6 +106,28 @@ class ResultTensorAssembler:
                             right=res_capacity_var,
                         ),
                     ],
+                )
+            )
+        elif self.known_nnz_var:
+            # Known-nnz path: raw malloc instead of cvector
+            c_datatype = dtype_to_c_datatype(self.dtype)
+            sizeof_expr = llir.Sizeof(c_datatype)
+            nnz_var = llir.Var(name=self.known_nnz_var, type=llir.DataType.INT64)
+            malloc = llir.FunctionCall(
+                name="malloc",
+                args=[llir.BinOp(left=sizeof_expr, op="*", right=nnz_var)],
+            )
+            malloc = llir.Cast(
+                expr=malloc,
+                data_type=llir.DataType.ptr_type(c_datatype),
+            )
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.name}_values",
+                        type=llir.DataType.ptr_type(c_datatype),
+                    ),
+                    value=malloc,
                 )
             )
         else:
@@ -147,7 +170,7 @@ class ResultTensorAssembler:
                     llir.Assign(
                         var=llir.Var(
                             name=f"{self.name}{i}_pos[0]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Literal(0),
                     )
@@ -157,7 +180,7 @@ class ResultTensorAssembler:
                     llir.VarInit(
                         llir.Var(
                             name=f"p{self.name}{i}",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Literal(0),
                     )
@@ -167,7 +190,7 @@ class ResultTensorAssembler:
                     llir.VarInit(
                         llir.Var(
                             name=f"{self.name}{i}_pos_index",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Literal(0),
                     )
@@ -179,7 +202,7 @@ class ResultTensorAssembler:
                     loop_var_name = f"p{self.name}{i}"
                     loop_var = llir.Var(
                         name=loop_var_name,
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     )
                     loop = llir.ForLoop(
                         init=llir.VarInit(
@@ -191,7 +214,7 @@ class ResultTensorAssembler:
                             op="<=",
                             right=llir.Var(
                                 name=f"{self.name}{i - 1}_size",
-                                type=llir.DataType.INT,
+                                type=llir.DataType.INT64,
                             ),
                         ),
                         update=llir.Increment(
@@ -201,7 +224,7 @@ class ResultTensorAssembler:
                             llir.Assign(
                                 var=llir.Var(
                                     name=f"{self.name}{i}_pos[{loop_var_name}]",
-                                    type=llir.DataType.INT,
+                                    type=llir.DataType.INT64,
                                 ),
                                 value=llir.Literal(0),
                             )
@@ -210,21 +233,28 @@ class ResultTensorAssembler:
                     stmts.append(loop)
 
             elif level_type == LevelType.COORDINATE:
-                # cvector<int> crd
-                stmts.append(
-                    llir.VarDecl(
-                        llir.Var(
-                            name=f"{self.name}{i}_crd",
-                            type=llir.DataType.CVECTOR_INT,
+                if self.known_nnz_var:
+                    # Known-nnz path: raw malloc instead of cvector
+                    stmts.append(llir.RawStmt(
+                        code=f"int* {self.name}{i}_crd = (int*)malloc(sizeof(int) * {self.known_nnz_var})",
+                        add_semicolon=True,
+                    ))
+                else:
+                    # cvector<int> crd
+                    stmts.append(
+                        llir.VarDecl(
+                            llir.Var(
+                                name=f"{self.name}{i}_crd",
+                                type=llir.DataType.CVECTOR_INT,
+                            )
                         )
                     )
-                )
                 # int p<name><i> = 0
                 stmts.append(
                     llir.VarInit(
                         llir.Var(
                             name=f"p{self.name}{i}",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Literal(0),
                     )
@@ -259,6 +289,13 @@ class ResultTensorAssembler:
                 ),
             ]
         )
+
+        # Emit shared free deleter if using known-nnz raw malloc path
+        if self.known_nnz_var and not self.is_dense:
+            stmts.append(llir.RawStmt(
+                code="auto _free_deleter = [](void* p){ free(p); }",
+                add_semicolon=True,
+            ))
 
         # Per-level from_blob for pos/crd
         for i, level_type in enumerate(self.level_types):
@@ -298,35 +335,67 @@ class ResultTensorAssembler:
                     )
 
                 # crd_torch
-                stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{tensor_level_name}_crd_torch",
-                            type=llir.DataType.TORCH_TENSOR,
-                        ),
-                        value=llir.FunctionCall(
-                            name="torch::from_blob",
-                            args=[
-                                llir.Var(
-                                    name=f"{tensor_level_name}_crd.data()",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=f"{{{tensor_level_name}_crd.size()}}",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name=f"{tensor_level_name}_crd.get_deleter()",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                                llir.Var(
-                                    name="torch::kInt",
-                                    type=llir.DataType.NO_TYPE,
-                                ),
-                            ],
-                        ),
+                if self.known_nnz_var and level_type == LevelType.COORDINATE:
+                    # Raw pointer path: use pointer directly with known nnz size
+                    stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor_level_name}_crd_torch",
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            value=llir.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_crd",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{{{self.known_nnz_var}}}",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name="_free_deleter",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name="torch::kInt",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                ],
+                            ),
+                        )
                     )
-                )
+                else:
+                    stmts.append(
+                        llir.VarInit(
+                            var=llir.Var(
+                                name=f"{tensor_level_name}_crd_torch",
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            value=llir.FunctionCall(
+                                name="torch::from_blob",
+                                args=[
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_crd.data()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{{{tensor_level_name}_crd.size()}}",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=f"{tensor_level_name}_crd.get_deleter()",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name="torch::kInt",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                ],
+                            ),
+                        )
+                    )
 
         # Values from_blob
         res_values_torch_var = llir.Var(
@@ -363,6 +432,34 @@ class ResultTensorAssembler:
                             ),
                             llir.Var(
                                 name=f"{self.name}_values_deleter",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=get_pytorch_c_dtype_str(self.dtype),
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                        ],
+                    ),
+                )
+            )
+        elif self.known_nnz_var:
+            # Raw pointer path: use pointer directly with known nnz size
+            stmts.append(
+                llir.VarInit(
+                    var=res_values_torch_var,
+                    value=llir.FunctionCall(
+                        name="torch::from_blob",
+                        args=[
+                            llir.Var(
+                                name=f"{self.name}_values",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=f"{{{self.known_nnz_var}}}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name="_free_deleter",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
@@ -466,6 +563,16 @@ class CINLowerer:
         self.index_var_to_rhs_tensor_level_type = None
         self.index_var_to_result_tensor_level_type = None
 
+        self._known_nnz_var: Optional[str] = None
+
+        # Two-phase parallel compressed output state
+        self._where_producer_stmts: Optional[List[llir.Stmt]] = None
+        self._where_consumer_stmts: Optional[List[llir.Stmt]] = None
+        self._where_workspace_name: Optional[str] = None
+        self._where_workspace_ctype: Optional[str] = None
+        self._where_workspace_dim: Optional[int] = None
+        self._compressed_output_parallel: bool = False
+
         self.result_tensor_var: Optional[TensorVar] = None
         self.result_tensor_access: Optional[TensorAccess] = None
         self.result_tensor_value_index_var_dict: Dict[IndexVar, llir.Expr] = {}
@@ -537,11 +644,11 @@ class CINLowerer:
                     llir.VarInit(
                         var=llir.Var(
                             name=f"{tensor.name}{level}_size",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"{tensor.name}_shape[{level}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -788,11 +895,11 @@ class CINLowerer:
                                         values=[
                                             llir.Var(
                                                 name=ivar.name,
-                                                type=llir.DataType.INT,
+                                                type=llir.DataType.INT64,
                                             )
                                             for ivar in sorted_wksp_index_vars
                                         ],
-                                        data_type=llir.DataType.INT,
+                                        data_type=llir.DataType.INT64,
                                     ),
                                     rhs_llir,
                                 ],
@@ -914,6 +1021,11 @@ class CINLowerer:
             llir.Comment("Initialize workspaces"),
         ]
         workspace_cleanup_stmts: List[llir.Stmt] = []
+        # Per-thread workspace allocation (hoisted outside the for loop but
+        # inside the OMP parallel region) and per-iteration memset.
+        self._workspace_alloc_stmts: List[llir.Stmt] = []
+        self._workspace_free_stmts: List[llir.Stmt] = []
+        self._workspace_memset_stmts: List[llir.Stmt] = []
         for wksp in workspaces:
             assert isinstance(wksp, Workspace), "workspace is not a Workspace"
             # coo_workspace<tensor's ctype> <tensor's name> = coo_workspace<tensor's ctype>(<tensor's dim>);
@@ -952,29 +1064,55 @@ class CINLowerer:
                             )
                         )
                     else:
-                        workspace_init_stmts.append(
-                            llir.VarInit(
-                                var=llir.Var(
-                                    name=wksp.get_name(),
-                                    type=wksp_ctype_ptr,
-                                    is_restrict=True,
+                        # Aligned allocation hoisted to per-thread (outside for loop).
+                        # memset per iteration (inside for loop).
+                        size_llir = wksp.size_llir_var
+                        size_var = size_llir.name
+                        # The workspace size variable may reference a dense tensor
+                        # dimension (e.g. B1_size). Resolve it to the actual C++ name
+                        # so it's available in the hoisted parallel region.
+                        wksp_access = [wa for wa in wksp.workspace_accesses
+                                       if wa.indices and len(wa.indices) == 1][0]
+                        idx_var = wksp_access.indices[0]
+                        dense_ta = [ta for ta in idx_var.tensor_accesses
+                                    if ta.is_dense() and idx_var in ta.indices
+                                    and not ta.is_workspace()][0]
+                        level = dense_ta.level_of_index_var(idx_var)
+                        actual_size = f"{dense_ta.tensor.name}{level}_size"
+
+                        ctype = wksp_ctype.value
+                        wname = wksp.get_name()
+                        aligned_size = f"(((size_t){actual_size} + 15) & ~15)"
+                        self._workspace_alloc_stmts.extend([
+                            llir.RawStmt(
+                                code=f"int64_t {size_var} = {actual_size}"
+                            ),
+                            llir.RawStmt(
+                                code=(
+                                    f"{ctype}* __restrict__ {wname} = "
+                                    f"({ctype}*)aligned_alloc(64, {aligned_size} * sizeof({ctype}))"
                                 ),
-                                value=llir.FunctionCall(
-                                    name=f"new {wksp_ctype.value}[{wksp.size_llir_var.name}]",
-                                    args=[],
-                                ),
+                            ),
+                        ])
+                        self._workspace_free_stmts.append(
+                            llir.RawStmt(code=f"free({wname})")
+                        )
+                        self._workspace_memset_stmts.append(
+                            llir.RawStmt(
+                                code=f"memset({wname}, 0, {size_var} * sizeof({ctype}))"
                             )
                         )
-                        workspace_cleanup_stmts.append(
-                            llir.RawStmt(code=f"delete[] {wksp.get_name()}")
-                        )
                 else:
-                    # If the workspace is 1-dimensional, use optimized 1D workspace implementation
-                    # coo_workspace_1d<tensor's ctype, tensor's dim>
+                    # Default: init workspace inside the loop (serial path).
+                    # Save metadata for potential parallel hoisting in the transform.
+                    wname = wksp.get_name()
+                    self._where_workspace_name = wname
+                    self._where_workspace_ctype = wksp_ctype.value
+                    self._where_workspace_dim = wksp.dim
                     workspace_init_stmts.append(
                         llir.VarInit(
                             var=llir.Var(
-                                name=wksp.get_name(),
+                                name=wname,
                                 type=llir.DataType.AUTO,
                             ),
                             value=llir.FunctionCall(
@@ -1008,10 +1146,15 @@ class CINLowerer:
                 )
             )
 
+        producer_stmts = self.lower_ProducerIndexStmt(stmt.producer)
+        consumer_stmts = self.lower_ConsumerIndexStmt(stmt.consumer)
+        self._where_producer_stmts = producer_stmts
+        self._where_consumer_stmts = consumer_stmts
         return [
             *workspace_init_stmts,
-            *self.lower_ProducerIndexStmt(stmt.producer),
-            *self.lower_ConsumerIndexStmt(stmt.consumer),
+            *self._workspace_memset_stmts,
+            *producer_stmts,
+            *consumer_stmts,
             *workspace_cleanup_stmts,
         ]
 
@@ -1069,7 +1212,7 @@ class CINLowerer:
 
         intermediate_tensor_iterator = llir.Var(
             name=f"p{intermediate_tensor_var.get_name()}",
-            type=llir.DataType.INT,
+            type=llir.DataType.INT64,
         )
 
         # Build intermediate cvector declarations (only for non-coord path)
@@ -1118,11 +1261,11 @@ class CINLowerer:
                     llir.Assign(
                         var=llir.Var(
                             name=f"{result_tensor_name}{i}_crd[p{result_tensor_name}{i}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"{loop_var.name}.first[{i}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -1131,11 +1274,11 @@ class CINLowerer:
                 llir.Assign(
                     var=llir.Var(
                         name=f"{result_tensor_name}_values[p{result_tensor_name}0]",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                     value=llir.Var(
                         name=f"{loop_var.name}.second",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                 )
             )
@@ -1145,7 +1288,7 @@ class CINLowerer:
                     llir.Increment(
                         var=llir.Var(
                             name=f"p{result_tensor_name}{i}",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -1156,11 +1299,11 @@ class CINLowerer:
                     llir.Assign(
                         var=llir.Var(
                             name=f"{intermediate_crd_vecs[i].name}[{intermediate_tensor_iterator.name}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"{loop_var.name}.first[{i}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -1169,11 +1312,11 @@ class CINLowerer:
                 llir.Assign(
                     var=llir.Var(
                         name=f"{intermediate_val_vec.name}[{intermediate_tensor_iterator.name}]",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                     value=llir.Var(
                         name=f"{loop_var.name}.second",
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                 )
             )
@@ -1394,7 +1537,7 @@ class CINLowerer:
                                 args=[
                                     llir.Var(
                                         name=index_var.name,
-                                        type=llir.DataType.INT,
+                                        type=llir.DataType.INT64,
                                     )
                                 ],
                             ),
@@ -1405,7 +1548,7 @@ class CINLowerer:
                             llir.Increment(
                                 var=llir.Var(
                                     name=f"p{result_tensor_name}{level}",
-                                    type=llir.DataType.INT,
+                                    type=llir.DataType.INT64,
                                 )
                             ),
                         ],
@@ -1424,7 +1567,7 @@ class CINLowerer:
                                 args=[
                                     llir.Var(
                                         name=ivar.name,
-                                        type=llir.DataType.INT,
+                                        type=llir.DataType.INT64,
                                     )
                                 ],
                             )
@@ -1489,8 +1632,9 @@ class CINLowerer:
             args=[],
         )
 
-        # Dense accumulator workspace: iterate over all indices and
-        # write non-zero values to the result tensor
+        # Dense accumulator workspace: write to the result tensor.
+        # When the result level is dense and contiguous, use memcpy
+        # (pure store, avoids cold read-modify-write on large output).
         if wksp_access.is_dense():
             assert (
                 len(wksp_index_vars) == 1
@@ -1498,9 +1642,41 @@ class CINLowerer:
             wksp_index_var = wksp_index_vars[0]
 
             if not wksp_index_var.tile_size_var:
+                # Check if the result level is dense (contiguous layout).
+                result_level_type = result_tensor_access.level_type_of_index_var(
+                    wksp_index_var
+                )
+                result_is_dense = (result_level_type is not None
+                                   and result_level_type.name == "DENSE")
+
+                if result_is_dense:
+                    # Emit memcpy: the workspace has the full row, write once.
+                    wname = wksp.get_name()
+                    size_var = wksp_index_var.size_llir_var.name
+                    ctype_str = dtype_to_c_datatype(wksp.dtype).value
+                    # Resolve the base pointer for this row in C.
+                    resolve_stmts = result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+                    # The iterator for the row start: pC<level> with j=0
+                    # is just pC_prev * C_level_size (which is result_level_iterator_name with j=0).
+                    # We can compute it as: &C_values[pC0 * C1_size]
+                    prev_iter = f"p{result_tensor_name}{level - 1}" if level > 0 else "0"
+                    c_level_size = f"{result_tensor_name}{level}_size"
+                    return [
+                        llir.BlankLine(),
+                        llir.Comment("Write workspace to output (memcpy — pure store)"),
+                        llir.RawStmt(
+                            code=(
+                                f"memcpy(&{result_tensor_name}_values"
+                                f"[{prev_iter} * {c_level_size}], "
+                                f"{wname}, {size_var} * sizeof({ctype_str}))"
+                            )
+                        ),
+                    ]
+
+                # Fallback: element-by-element assignment (= not +=)
                 loop_var = llir.Var(
                     name=f"{wksp_index_var.name}",
-                    type=llir.DataType.INT,
+                    type=llir.DataType.INT64,
                 )
 
                 loop_body: List[llir.Stmt] = []
@@ -1519,7 +1695,7 @@ class CINLowerer:
                             name=f"{wksp.get_name()}[{loop_var.name}]",
                             type=llir.DataType.NO_TYPE,
                         ),
-                        op=AssignOp.ADD_ASSIGN,
+                        op=AssignOp.ASSIGN,
                     )
                 )
 
@@ -1549,7 +1725,7 @@ class CINLowerer:
                 return [
                     llir.BlankLine(),
                     llir.Comment(
-                        "TODO: Lower consumer CIN for dense accumulator workspace"
+                        "Write workspace to output"
                     ),
                     for_loop,
                 ]
@@ -1564,7 +1740,7 @@ class CINLowerer:
             # }
             loop_var = llir.Var(
                 name=f"{wksp_index_var.name}",
-                type=llir.DataType.INT,
+                type=llir.DataType.INT64,
             )
 
             loop_body: List[llir.Stmt] = []
@@ -1601,7 +1777,7 @@ class CINLowerer:
                     left=loop_var,
                     right=llir.Var(
                         name=wksp_index_var.tile_size_var.name,
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                 ),
                 update=llir.Increment(
@@ -1644,7 +1820,7 @@ class CINLowerer:
                 llir.VarInit(
                     var=llir.Var(
                         name=wksp_access.get_index_vars()[0].name,
-                        type=llir.DataType.INT,
+                        type=llir.DataType.INT64,
                     ),
                     value=llir.Var(
                         name=f"{loop_var.name}.first",
@@ -1658,7 +1834,7 @@ class CINLowerer:
                     llir.VarInit(
                         var=llir.Var(
                             name=index_var.name,
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"{loop_var.name}.first[{i}]",
@@ -1769,7 +1945,7 @@ class CINLowerer:
                                 ),
                                 right=llir.Var(
                                     name=f"p{result_tensor_name}{level}",
-                                    type=llir.DataType.INT,
+                                    type=llir.DataType.INT64,
                                 ),
                             ),
                             then_body=[
@@ -1778,7 +1954,7 @@ class CINLowerer:
                                     args=[
                                         llir.Var(
                                             name=parent_index_var.name,
-                                            type=llir.DataType.INT,
+                                            type=llir.DataType.INT64,
                                         )
                                     ],
                                 ),
@@ -1797,7 +1973,7 @@ class CINLowerer:
                         llir.Assign(
                             var=llir.Var(
                                 name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level - 1}_crd.size()]",
-                                type=llir.DataType.INT,
+                                type=llir.DataType.INT64,
                             ),
                             value=llir.FunctionCall(
                                 name=f"{result_tensor_name}{level}_crd.size",
@@ -1813,7 +1989,7 @@ class CINLowerer:
                 #     llir.Assign(
                 #         var=llir.Var(
                 #             name=f"{result_tensor_name}{level}_pos[p{result_tensor_name}{level}]",
-                #             type=llir.DataType.INT,
+                #             type=llir.DataType.INT64,
                 #         ),
                 #         value=llir.FunctionCall(
                 #             name=f"{result_tensor_name}{level}_crd.size",
@@ -1826,7 +2002,7 @@ class CINLowerer:
                     llir.Assign(
                         var=llir.Var(
                             name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level}_pos_index + 1]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.FunctionCall(
                             name=f"{result_tensor_name}{level}_crd.size",
@@ -1842,7 +2018,7 @@ class CINLowerer:
                 #             llir.Var(
                 #                 name=f"{result_tensor_name}{level}_crd.size()",
                 #                 # name=f"p{result_tensor_var.name}{_level}",
-                #                 type=llir.DataType.INT,
+                #                 type=llir.DataType.INT64,
                 #             )
                 #         ],
                 #     )
@@ -1956,11 +2132,11 @@ class CINLowerer:
                     llir.VarInit(
                         llir.Var(
                             name=f"{self.result_tensor_var.get_name()}{i}_size",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                         value=llir.Var(
                             name=f"result_shape[{i}]",
-                            type=llir.DataType.INT,
+                            type=llir.DataType.INT64,
                         ),
                     )
                 )
@@ -2020,7 +2196,7 @@ class CINLowerer:
             self.result_value_array_sparse_index_llir = llir.Var(
                 # name=f"p{self.result_tensor_var.name}{self.result_tensor_access.level_of_index_var(result_last_compressed_index_var)}",
                 name=f"p{self.result_tensor_var.name}{self.result_tensor_var.levels - 1}",
-                type=llir.DataType.INT,
+                type=llir.DataType.INT64,
             )
             self.result_tensor_value_index_var_dict[
                 result_last_compressed_index_var
@@ -2029,7 +2205,7 @@ class CINLowerer:
             result_index_init_stmts.append(
                 llir.VarInit(
                     var=self.result_value_array_sparse_index_llir,
-                    value=llir.Literal(value=0, data_type=llir.DataType.INT),
+                    value=llir.Literal(value=0, data_type=llir.DataType.INT64),
                 )
             )
 
@@ -2103,26 +2279,91 @@ class CINLowerer:
 
             # Post-lowering optimizations on the LLIR
             self._insert_sparse_prefetch(recurse_stmts)
+            self._hoist_dense_pointers(recurse_stmts)
+            self._eliminate_single_iteration_loops(recurse_stmts)
+            self._hoist_loop_invariant_factors(recurse_stmts)
 
-            body_stmts.extend(
-                [
-                    *result_tensor_level_sizes,
-                    *tensor_level_array_assign_stmts,
-                    llir.BlankLine(),
-                    *result_level_indices_init_stmts,
-                    llir.Comment("Initialize result value array"),
-                    *tensor_value_array_init_stmts,
-                    *tile_size_vars_init_stmts,
-                    *postop_ptr_stmts,
-                    # *result_index_init_stmts,
-                    llir.BlankLine(),
-                    *recurse_stmts,
-                ]
-            )
+            # Known-nnz detection: if scalar accum was used and output is sparse,
+            # we know nnz_out == nnz_in. Re-emit init stmts with raw malloc.
+            known_nnz_init_stmts: List[llir.Stmt] = []
+            if (self._used_scalar_accum
+                    and self.final_result_tensor_var
+                    and not self.final_result_tensor_var.is_dense()):
+                # Find a COO input tensor to get nnz from
+                coo_crd_tensor = None
+                for tensor in rhs_tensor_vars:
+                    for lvl, lt in enumerate(tensor.get_level_types()):
+                        if lt == LevelType.COORDINATE:
+                            coo_crd_tensor = f"{tensor.get_name()}{lvl}_crd_tensor"
+                            break
+                    if coo_crd_tensor:
+                        break
 
-            assert self.final_result_tensor_var is not None, "No final result tensor"
-            final_assembler = ResultTensorAssembler(self.final_result_tensor_var)
-            body_stmts.extend(final_assembler.emit_final_assembly())
+                if coo_crd_tensor:
+                    self._known_nnz_var = "_known_nnz"
+                    known_nnz_init_stmts.append(llir.RawStmt(
+                        code=f"int _known_nnz = {coo_crd_tensor}.size(0)",
+                        add_semicolon=True,
+                    ))
+
+                    # Re-emit init stmts with known_nnz_var
+                    tensor_value_array_init_stmts = []
+                    result_level_indices_init_stmts = []
+                    for result_tensor_var in non_workspace_result_tensor_vars:
+                        assembler = ResultTensorAssembler(
+                            result_tensor_var, known_nnz_var=self._known_nnz_var
+                        )
+                        tensor_value_array_init_stmts.extend(
+                            assembler.emit_value_array_init()
+                        )
+                        result_level_indices_init_stmts.extend(
+                            assembler.emit_level_indices_init()
+                        )
+                    if result_level_indices_init_stmts:
+                        result_level_indices_init_stmts = [
+                            llir.Comment("Init result level indices"),
+                            *result_level_indices_init_stmts,
+                        ]
+
+            if self._compressed_output_parallel:
+                # Two-phase parallel transform already emitted output init,
+                # fill loops, and final assembly (from_blob + return).
+                # Only emit tensor level arrays (input pointers) and recurse.
+                body_stmts.extend(
+                    [
+                        *result_tensor_level_sizes,
+                        *tensor_level_array_assign_stmts,
+                        llir.BlankLine(),
+                        *tile_size_vars_init_stmts,
+                        *postop_ptr_stmts,
+                        llir.BlankLine(),
+                        *recurse_stmts,
+                    ]
+                )
+            else:
+                body_stmts.extend(
+                    [
+                        *result_tensor_level_sizes,
+                        *tensor_level_array_assign_stmts,
+                        llir.BlankLine(),
+                        *known_nnz_init_stmts,
+                        *result_level_indices_init_stmts,
+                        llir.Comment("Initialize result value array"),
+                        *tensor_value_array_init_stmts,
+                        *tile_size_vars_init_stmts,
+                        *postop_ptr_stmts,
+                        # *result_index_init_stmts,
+                        llir.BlankLine(),
+                        *recurse_stmts,
+                    ]
+                )
+
+                assert self.final_result_tensor_var is not None, "No final result tensor"
+                final_assembler = ResultTensorAssembler(
+                    self.final_result_tensor_var,
+                    known_nnz_var=self._known_nnz_var,
+                )
+                body_stmts.extend(final_assembler.emit_final_assembly())
 
             return llir.Function(
                 return_type=llir.DataType.TACO_TENSOR,
@@ -2149,6 +2390,259 @@ class CINLowerer:
             if result_index_var.has_parent and result_index_var.parent == index_var:
                 return True
         return False
+
+    def _should_parallelize_compressed_where(self, index_var: IndexVar) -> bool:
+        """Check if the outermost ForAll over a dense dimension can be parallelized
+        with two-phase sparse output assembly. Generalizes to any format with
+        dense outer + compressed inner level using a sparse workspace."""
+        if not self.final_result_tensor_var or not self.final_result_tensor_access:
+            return False
+        level_types = self.final_result_tensor_var.get_level_types()
+        if len(level_types) != 2:
+            return False
+        if level_types[0] != LevelType.DENSE or level_types[1] != LevelType.COMPRESSED:
+            return False
+        if not self.final_result_tensor_access.has_index_var(index_var):
+            return False
+        if self.final_result_tensor_access.level_of_index_var(index_var) != 0:
+            return False
+        if not self._where_producer_stmts or not self._where_workspace_name:
+            return False
+        # Require at least one sparse non-workspace input tensor.
+        # Traverse the CIN to find all referenced TensorVars.
+        from .cin import Workspace, TensorAccess, CINVisitorAccept
+        class _TVCollector(CINVisitorAccept):
+            tvars: set = set()
+            def visit_TensorAccess(self, node: TensorAccess):
+                self.tvars.add(node.get_tensor())
+        collector = _TVCollector()
+        if self.outermost_stmt:
+            collector.visit(self.outermost_stmt)
+        has_sparse_input = any(
+            not tv.is_dense()
+            for tv in collector.tvars
+            if tv != self.final_result_tensor_var and not isinstance(tv, Workspace)
+        )
+        return has_sparse_input
+
+    def _transform_compressed_where_for_openmp(self, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
+        """Transform a serial ForLoop with workspace-based compressed output into
+        a two-phase parallel assembly:
+          Phase 1: Count nnz per row in parallel (workspace fill + size query)
+          Phase 2: Prefix sum + allocate output arrays
+          Phase 3: Fill values in parallel (workspace fill + sort + write)
+
+        This is generalizable to any operation with dense-outer + compressed-inner
+        output using a sparse workspace (SpMSpM, sampled operations, etc.)."""
+        import copy
+
+        # Find the outer ForLoop
+        for_loop = None
+        for_loop_idx = None
+        for idx, stmt in enumerate(stmts):
+            if isinstance(stmt, llir.ForLoop) and not isinstance(stmt, llir.ForLoopAuto):
+                if self._is_openmp_compatible_for_loop(stmt):
+                    for_loop = stmt
+                    for_loop_idx = idx
+                    break
+
+        if for_loop is None:
+            return stmts
+
+        loop_var = for_loop.init.var.name
+        loop_bound = self._extract_loop_bound(for_loop)
+        if not loop_bound:
+            return stmts
+
+        wksp_name = self._where_workspace_name
+        wksp_ctype = self._where_workspace_ctype
+        result_name = self.final_result_tensor_var.get_name()
+
+        # Extract the "work body" from the for loop: everything except
+        # compressed-level assembly stmts and consumer (sort/iterate).
+        # This includes coordinate resolution, workspace memset, and producer loops.
+        body = for_loop.body
+        work_body: List[llir.Stmt] = []
+        pos_index_name = f"{result_name}1_pos_index"
+        for stmt in body:
+            # Skip compressed assembly stmts (C1_pos_index, C1_pos[...]=...)
+            if isinstance(stmt, (llir.ForLoop, llir.ForLoopAuto)):
+                if isinstance(stmt, llir.ForLoopAuto):
+                    continue  # consumer iterate loop
+                # Check for compressed assembly loop (for (; C1_pos_index < i; ...))
+                cond = getattr(stmt, 'cond', None)
+                if (isinstance(cond, llir.BinOp)
+                        and isinstance(cond.left, llir.Var)
+                        and pos_index_name in cond.left.name):
+                    continue
+                # Check for pos init loop (pC1 = 1..C0_size)
+                init = getattr(stmt, 'init', None)
+                if (isinstance(init, llir.VarInit)
+                        and hasattr(init, 'var')
+                        and getattr(init.var, 'name', '').startswith(f"p{result_name}")):
+                    continue
+                work_body.append(stmt)
+            elif isinstance(stmt, llir.VarInit):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                if vname == wksp_name:
+                    continue  # workspace init (will be hoisted to pre_parallel_body)
+                work_body.append(stmt)
+            elif isinstance(stmt, llir.FunctionCallStmt):
+                fname = getattr(stmt, 'name', '')
+                if '.sort' in fname or '.clear' in fname:
+                    continue  # consumer sort / workspace clear
+                work_body.append(stmt)
+            elif isinstance(stmt, llir.Assign):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                if (f"{result_name}1_pos[" in vname or f"{result_name}_values[" in vname
+                        or f"{result_name}1_crd[" in vname or pos_index_name in vname):
+                    continue  # consumer writes / compressed assembly
+                work_body.append(stmt)
+            elif isinstance(stmt, llir.Increment):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                if vname == f"p{result_name}1":
+                    continue  # consumer pC1++
+                work_body.append(stmt)
+            else:
+                work_body.append(stmt)
+
+        # Phase 1: Count nnz per row
+        phase1_body = []
+        phase1_body.extend(copy.deepcopy(work_body))
+        phase1_body.append(llir.RawStmt(code=f"_row_nnz[{loop_var}] = {wksp_name}.size()"))
+        phase1_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
+
+        phase1_loop = llir.ForLoop(
+            init=copy.deepcopy(for_loop.init),
+            cond=copy.deepcopy(for_loop.cond),
+            update=copy.deepcopy(for_loop.update),
+            body=phase1_body,
+        )
+        phase1_loop.omp_parallel_for = True
+        phase1_loop.omp_schedule = "dynamic, 64"
+        wksp_type_str = f"linked_list_workspace_1d<{wksp_ctype}>"
+        wksp_alloc = [llir.RawStmt(code=f"auto {wksp_name} = {wksp_type_str}(result_shape[1])")]
+        phase1_loop.pre_parallel_body = wksp_alloc
+
+        # Phase 3: Fill values
+        phase3_body = []
+        phase3_body.extend(copy.deepcopy(work_body))
+        phase3_body.append(llir.RawStmt(code=f"{wksp_name}.sort()"))
+        phase3_body.append(llir.RawStmt(code=f"int _base = {result_name}1_pos_data[{loop_var}]"))
+        phase3_body.append(llir.RawStmt(code=f"int _pos = 0"))
+        phase3_body.append(llir.RawStmt(
+            code=f"for (const auto& _it : {wksp_name}) {{\n"
+                 f"          {result_name}1_crd_data[_base + _pos] = _it.first;\n"
+                 f"          {result_name}_values_data[_base + _pos] = _it.second;\n"
+                 f"          _pos++;\n"
+                 f"        }}",
+            add_semicolon=False,
+        ))
+        phase3_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
+
+        phase3_loop = llir.ForLoop(
+            init=copy.deepcopy(for_loop.init),
+            cond=copy.deepcopy(for_loop.cond),
+            update=copy.deepcopy(for_loop.update),
+            body=phase3_body,
+        )
+        phase3_loop.omp_parallel_for = True
+        phase3_loop.omp_schedule = "dynamic, 64"
+        phase3_loop.pre_parallel_body = list(wksp_alloc)
+
+        # Build the transformed stmts
+        result = []
+
+        # Keep stmts before the for loop that are NOT result tensor init
+        # (those will be replaced by our raw pointer allocations)
+        for stmt in stmts[:for_loop_idx]:
+            # Skip cvector declarations and init for the result tensor
+            if isinstance(stmt, llir.VarDecl) and hasattr(stmt, 'var'):
+                vname = getattr(stmt.var, 'name', '')
+                if any(vname.startswith(f"{result_name}{x}") for x in ['_values', '1_pos', '1_crd']):
+                    continue
+            if isinstance(stmt, llir.VarInit) and hasattr(stmt, 'var'):
+                vname = getattr(stmt.var, 'name', '')
+                if vname in (f"p{result_name}1", f"{result_name}1_pos_index"):
+                    continue
+            if isinstance(stmt, llir.Assign):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                if f"{result_name}1_pos[" in vname:
+                    continue
+            if isinstance(stmt, llir.ForLoop):
+                # Skip the pos init loop: for (pC1=1; pC1<=C0_size; ...) C1_pos[pC1]=0
+                init_var = getattr(getattr(stmt, 'init', None), 'var', None)
+                if init_var and getattr(init_var, 'name', '').startswith(f"p{result_name}"):
+                    continue
+            result.append(stmt)
+
+        c_dtype = wksp_ctype or "float"
+        sizeof_val = f"sizeof({c_dtype})"
+
+        # Phase 1: count nnz per row
+        result.append(llir.RawStmt(
+            code=f"int* _row_nnz = (int*)calloc({loop_bound}, sizeof(int))"
+        ))
+        result.append(phase1_loop)
+
+        # Phase 2: prefix sum + allocate
+        result.append(llir.RawStmt(
+            code=f"int* {result_name}1_pos_data = (int*)malloc(({loop_bound} + 1) * sizeof(int))"
+        ))
+        result.append(llir.RawStmt(code=f"{result_name}1_pos_data[0] = 0"))
+        result.append(llir.RawStmt(
+            code=f"for (int _i = 0; _i < {loop_bound}; _i++) "
+                 f"{result_name}1_pos_data[_i + 1] = {result_name}1_pos_data[_i] + _row_nnz[_i];",
+            add_semicolon=False,
+        ))
+        result.append(llir.RawStmt(
+            code=f"int _total_nnz = {result_name}1_pos_data[{loop_bound}]"
+        ))
+        result.append(llir.RawStmt(code="free(_row_nnz)"))
+        result.append(llir.RawStmt(
+            code=f"int* {result_name}1_crd_data = (int*)malloc(_total_nnz * sizeof(int))"
+        ))
+        result.append(llir.RawStmt(
+            code=f"{c_dtype}* {result_name}_values_data = ({c_dtype}*)malloc(_total_nnz * {sizeof_val})"
+        ))
+
+        # Phase 3: fill values
+        result.append(phase3_loop)
+
+        # Final assembly: from_blob with raw pointers
+        result.append(llir.RawStmt(code=f"auto _free_deleter = [](void* p) {{ free(p); }}"))
+        result.append(llir.RawStmt(
+            code=f"torch::Tensor {result_name}1_pos_torch = torch::from_blob("
+                 f"{result_name}1_pos_data, {{(long long)({loop_bound} + 1)}}, _free_deleter, torch::kInt)"
+        ))
+        result.append(llir.RawStmt(
+            code=f"torch::Tensor {result_name}1_crd_torch = torch::from_blob("
+                 f"{result_name}1_crd_data, {{(long long)_total_nnz}}, _free_deleter, torch::kInt)"
+        ))
+        _CTYPE_TO_TORCH = {
+            "float": "torch::kFloat32",
+            "double": "torch::kFloat64",
+            "int": "torch::kInt32",
+            "int32_t": "torch::kInt32",
+            "long long": "torch::kInt64",
+            "int64_t": "torch::kInt64",
+        }
+        torch_dtype = _CTYPE_TO_TORCH.get(c_dtype, "torch::kFloat32")
+        result.append(llir.RawStmt(
+            code=f"torch::Tensor {result_name}_values_torch = torch::from_blob("
+                 f"{result_name}_values_data, {{(long long)_total_nnz}}, _free_deleter, {torch_dtype})"
+        ))
+        result.append(llir.RawStmt(
+            code=f"Tensor {result_name};\n"
+                 f"  {result_name}._storage._index.mode_indices = "
+                 f"{{{{}}, {{{result_name}1_pos_torch, {result_name}1_crd_torch}}}};\n"
+                 f"  {result_name}._storage._value = {result_name}_values_torch;\n"
+                 f"  return {result_name};",
+            add_semicolon=False,
+        ))
+
+        self._compressed_output_parallel = True
+        return result
 
     @staticmethod
     def _is_openmp_compatible_for_loop(for_loop: llir.ForLoop) -> bool:
@@ -2241,13 +2735,13 @@ class CINLowerer:
             if not crd_array:
                 continue
 
-            # Find a dense values array and its stride by inspecting the inner
-            # dense ForLoop.  We look for:
+            # Find ALL dense values arrays and their strides by inspecting
+            # the inner dense ForLoop.  We look for:
             #   VarInit pB1 = Add(Mul(pB0, B1_size), j)  → stride = B1_size
             #   Assign  C[pC1] += BinOp(*, A_val[pA1], B_val[pB1])
             #                                              → dense_val = B_val
-            dense_val_array = None
-            dense_stride = None
+            # Collect all (val_array, stride) pairs for multi-prefetch.
+            dense_arrays_found: List[tuple] = []  # [(val_array, stride), ...]
             for body_stmt in stmt.body:
                 if not isinstance(body_stmt, llir.ForLoop):
                     continue
@@ -2262,29 +2756,487 @@ class CINLowerer:
                                 and add.left.op == "*"
                                 and isinstance(add.left.right, llir.Var)):
                             pos_to_stride[inner_stmt.var.name] = add.left.right.name
-                # Now find Assign nodes that use _val arrays indexed by those pos vars
+                # Find ALL Assign nodes that use _val arrays indexed by those pos vars
                 for inner_stmt in body_stmt.body:
                     if not isinstance(inner_stmt, llir.Assign):
                         continue
-                    # Find _val[pos] references in the expression tree
-                    val = inner_stmt.value
-                    found = CINLowerer._find_val_array_access(val, pos_to_stride)
-                    if found:
-                        dense_val_array, dense_stride = found
-                        break
-                if dense_val_array:
-                    break
+                    CINLowerer._find_all_val_array_accesses(
+                        inner_stmt.value, pos_to_stride, dense_arrays_found
+                    )
 
-            if not dense_val_array or not dense_stride:
+            if not dense_arrays_found:
                 continue
 
-            # Insert prefetch for the next sparse element's B-row
-            prefetch_code = (
-                f"if ({iter_var} + 1 < {end_var}) "
-                f"__builtin_prefetch(&{dense_val_array}["
-                f"{crd_array}[{iter_var} + 1] * {dense_stride}], 0, 1)"
-            )
-            stmt.body.insert(0, llir.RawStmt(code=prefetch_code, add_semicolon=True))
+            # Also check for hoisted pointer accesses (_X_val_ptr patterns)
+            # which reference the sparse coordinate indirectly through the
+            # base pointer computation.  For these, we need to prefetch
+            # using the original val array + coordinate.
+            # The hoisted pointers are: _B_val_ptr = &B_val[pB0 * B1_size]
+            # where pB0 comes from the coordinate.  We detect this by
+            # looking for RawStmt pointer declarations in the loop body.
+            import re as _re
+            for body_stmt in stmt.body:
+                if isinstance(body_stmt, llir.RawStmt) and "_ptr" in body_stmt.code:
+                    m = _re.match(
+                        r'const float\* __restrict__ _(\w+_val)_ptr = &(\w+_val)\[(\w+) \* (\w+)\]',
+                        body_stmt.code,
+                    )
+                    if m:
+                        val_array = m.group(2)
+                        stride = m.group(4)
+                        if (val_array, stride) not in dense_arrays_found:
+                            dense_arrays_found.append((val_array, stride))
+
+            # Insert prefetch for ALL dense arrays accessed via the sparse coordinate
+            prefetch_stmts = []
+            seen = set()
+            for dense_val_array, dense_stride in dense_arrays_found:
+                key = (dense_val_array, dense_stride)
+                if key in seen:
+                    continue
+                seen.add(key)
+                prefetch_code = (
+                    f"if ({iter_var} + 1 < {end_var}) "
+                    f"__builtin_prefetch(&{dense_val_array}["
+                    f"{crd_array}[{iter_var} + 1] * {dense_stride}], 0, 1)"
+                )
+                prefetch_stmts.append(llir.RawStmt(code=prefetch_code, add_semicolon=True))
+            for ps in reversed(prefetch_stmts):
+                stmt.body.insert(0, ps)
+
+    @staticmethod
+    def _hoist_dense_pointers(stmts: List[llir.Stmt]) -> None:
+        """Hoist base-pointer computation out of dense inner loops.
+
+        Transforms:
+            for (int k = 0; k < B1_size; k++) {
+                int pB1 = pB0 * B1_size + k;
+                ... B_val[pB1] ...
+            }
+        Into:
+            const float* __restrict__ _B_val_ptr = &B_val[pB0 * B1_size];
+            for (int k = 0; k < B1_size; k++) {
+                ... _B_val_ptr[k] ...
+            }
+
+        This makes the stride-1 access pattern explicit to the auto-vectorizer
+        and eliminates per-iteration multiply.  General: applies to any dense
+        tensor level accessed inside an inner loop.
+        """
+        import re
+        for stmt in stmts:
+            if isinstance(stmt, llir.ForLoop):
+                CINLowerer._hoist_dense_pointers(stmt.body)
+            if not isinstance(stmt, llir.ForLoop):
+                continue
+
+            # Find the loop variable name from the update (e.g. k++ → k)
+            if not isinstance(stmt.update, llir.Increment):
+                continue
+            loop_var = stmt.update.var.name
+
+            # Collect position VarInits: pB1 = pB0 * B1_size + k
+            # where k is the loop variable.
+            hoistable: list = []  # (var_name, base_expr, stride_expr, idx_in_body)
+            for idx, s in enumerate(stmt.body):
+                if not isinstance(s, llir.VarInit):
+                    continue
+                val = s.value
+                # Pattern: Add(Mul(base, stride), loop_var)
+                if (isinstance(val, llir.Add)
+                        and isinstance(val.left, llir.BinOp)
+                        and val.left.op == "*"
+                        and isinstance(val.right, llir.Var)
+                        and val.right.name == loop_var):
+                    base = val.left.left
+                    stride = val.left.right
+                    if isinstance(base, llir.Var) and isinstance(stride, llir.Var):
+                        hoistable.append((s.var.name, base.name, stride.name, idx))
+
+            if not hoistable:
+                continue
+
+            # Find which _val arrays use these position vars
+            # by scanning Assign/VarInit for patterns like "X_val[pB1]"
+            pos_to_val_array: dict = {}  # pos_var → val_array_name
+            for s in stmt.body:
+                if isinstance(s, llir.Assign):
+                    CINLowerer._collect_val_array_refs(s.value, pos_to_val_array)
+                    CINLowerer._collect_val_array_refs(
+                        llir.Var(name=s.var.name, type=llir.DataType.NO_TYPE),
+                        pos_to_val_array,
+                    )
+
+            # Build pointer declarations and rewrite references
+            ptr_decls: list = []
+            indices_to_remove: set = set()
+            replacements: dict = {}  # old "X_val[pB1]" → new "_X_val_ptr[k]"
+
+            for pos_var, base, stride, idx in hoistable:
+                val_array = pos_to_val_array.get(pos_var)
+                if not val_array:
+                    continue
+                ptr_name = f"_{val_array}_ptr"
+                ptr_decls.append(llir.RawStmt(
+                    code=(
+                        f"const float* __restrict__ {ptr_name} = "
+                        f"&{val_array}[{base} * {stride}]"
+                    ),
+                ))
+                replacements[f"{val_array}[{pos_var}]"] = f"{ptr_name}[{loop_var}]"
+                indices_to_remove.add(idx)
+
+            if not ptr_decls:
+                continue
+
+            # Insert pointer declarations before the loop
+            # Find the loop's position in its parent and insert before it.
+            # Since we're iterating stmts and stmt is in stmts, we use a
+            # deferred approach: store on the loop node.
+            stmt._hoisted_ptr_decls = ptr_decls
+
+            # Remove the position VarInits from the loop body
+            stmt.body = [s for i, s in enumerate(stmt.body) if i not in indices_to_remove]
+
+            # Rewrite references in the loop body
+            CINLowerer._rewrite_val_refs(stmt.body, replacements)
+
+        # Second pass: insert hoisted declarations before loops that have them
+        i = 0
+        while i < len(stmts):
+            s = stmts[i]
+            decls = getattr(s, '_hoisted_ptr_decls', None)
+            if decls:
+                for d in reversed(decls):
+                    stmts.insert(i, d)
+                    i += 1
+                delattr(s, '_hoisted_ptr_decls')
+            i += 1
+
+    @staticmethod
+    def _collect_val_array_refs(expr, pos_to_val: dict) -> None:
+        """Find _val[pos_var] patterns in an expression tree."""
+        import re
+        if isinstance(expr, llir.Var):
+            m = re.match(r'^(\w+_val)\[(\w+)\]$', expr.name)
+            if m:
+                pos_to_val[m.group(2)] = m.group(1)
+        if isinstance(expr, llir.BinOp):
+            CINLowerer._collect_val_array_refs(expr.left, pos_to_val)
+            CINLowerer._collect_val_array_refs(expr.right, pos_to_val)
+        if isinstance(expr, llir.ArrayAccess):
+            CINLowerer._collect_val_array_refs(expr.array, pos_to_val)
+            CINLowerer._collect_val_array_refs(expr.index, pos_to_val)
+
+    @staticmethod
+    def _rewrite_val_refs(stmts: list, replacements: dict) -> None:
+        """Rewrite _val[pos] → _ptr[loop_var] in LLIR statement trees."""
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt, llir.Assign):
+                stmt.var = CINLowerer._rewrite_expr_refs(stmt.var, replacements)
+                stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
+            elif isinstance(stmt, llir.VarInit):
+                stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
+            elif isinstance(stmt, llir.ForLoop):
+                CINLowerer._rewrite_val_refs(stmt.body, replacements)
+            elif isinstance(stmt, llir.IfThenElse):
+                if stmt.then_body:
+                    CINLowerer._rewrite_val_refs(stmt.then_body, replacements)
+                if stmt.else_body:
+                    CINLowerer._rewrite_val_refs(stmt.else_body, replacements)
+                if stmt.then_body_list:
+                    for body in stmt.then_body_list:
+                        CINLowerer._rewrite_val_refs(body, replacements)
+            elif isinstance(stmt, llir.RawStmt):
+                for old, new in replacements.items():
+                    stmt.code = stmt.code.replace(old, new)
+
+    @staticmethod
+    def _rewrite_expr_refs(expr, replacements: dict):
+        """Rewrite variable references in an expression."""
+        if isinstance(expr, llir.Var):
+            for old, new in replacements.items():
+                if expr.name == old or old in expr.name:
+                    expr = llir.Var(name=expr.name.replace(old, new), type=expr.type)
+            return expr
+        if isinstance(expr, llir.BinOp):
+            expr.left = CINLowerer._rewrite_expr_refs(expr.left, replacements)
+            expr.right = CINLowerer._rewrite_expr_refs(expr.right, replacements)
+        if isinstance(expr, llir.ArrayAccess):
+            expr.array = CINLowerer._rewrite_expr_refs(expr.array, replacements)
+            expr.index = CINLowerer._rewrite_expr_refs(expr.index, replacements)
+        return expr
+
+    @staticmethod
+    def _find_all_val_array_accesses(
+        expr: llir.Expr, pos_to_stride: Dict[str, str],
+        results: List[tuple],
+    ) -> None:
+        """Like _find_val_array_access but collects ALL matches into results."""
+        import re
+        if isinstance(expr, llir.Var):
+            m = re.match(r'^(\w+_val)\[(\w+)\]$', expr.name)
+            if m:
+                arr_name, pos_var = m.group(1), m.group(2)
+                if pos_var in pos_to_stride:
+                    pair = (arr_name, pos_to_stride[pos_var])
+                    if pair not in results:
+                        results.append(pair)
+        if isinstance(expr, llir.BinOp):
+            CINLowerer._find_all_val_array_accesses(expr.left, pos_to_stride, results)
+            CINLowerer._find_all_val_array_accesses(expr.right, pos_to_stride, results)
+        if isinstance(expr, llir.ArrayAccess):
+            if (isinstance(expr.array, llir.Var)
+                    and "_val" in expr.array.name
+                    and isinstance(expr.index, llir.Var)
+                    and expr.index.name in pos_to_stride):
+                pair = (expr.array.name, pos_to_stride[expr.index.name])
+                if pair not in results:
+                    results.append(pair)
+
+    # ------------------------------------------------------------------
+    # Optimization pass: eliminate single-iteration loops
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _eliminate_single_iteration_loops(stmts: List[llir.Stmt]) -> None:
+        """Replace ForLoops that execute exactly once with their inlined body.
+
+        Detects the pattern generated by the flat-loop optimization:
+            int pA1_end = pA0 + 1;
+            for (int pA1 = pA0; pA1 < pA1_end; pA1++) { body }
+
+        Since pA1_end == pA0 + 1, the loop runs once with pA1 == pA0.
+        Replace with body, substituting pA1 → pA0.
+        """
+        import re
+        # First recurse into nested loops
+        for s in stmts:
+            if isinstance(s, llir.ForLoop):
+                CINLowerer._eliminate_single_iteration_loops(s.body)
+            elif isinstance(s, llir.IfThenElse):
+                if s.then_body:
+                    CINLowerer._eliminate_single_iteration_loops(s.then_body)
+                if s.else_body:
+                    CINLowerer._eliminate_single_iteration_loops(s.else_body)
+
+        # Collect known single-step bounds: var_name → base_name
+        # from VarInit like: int pA1_end = pA0 + 1;
+        single_step_bounds: Dict[str, str] = {}
+        for s in stmts:
+            if isinstance(s, llir.VarInit) and isinstance(s.value, llir.Var):
+                m = re.match(r'^(\w+) \+ 1$', s.value.name)
+                if m:
+                    single_step_bounds[s.var.name] = m.group(1)
+
+        # Find and replace single-iteration loops
+        i = 0
+        while i < len(stmts):
+            s = stmts[i]
+            if (isinstance(s, llir.ForLoop)
+                    and isinstance(s.init, llir.VarInit)
+                    and isinstance(s.cond, llir.BinOp)
+                    and s.cond.op == "<"
+                    and isinstance(s.cond.right, llir.Var)):
+                loop_var = s.init.var.name
+                end_var = s.cond.right.name
+                # Check if init value == base and end == base + 1
+                init_val = None
+                if isinstance(s.init.value, llir.Var):
+                    init_val = s.init.value.name
+                elif isinstance(s.init.value, llir.Literal):
+                    init_val = str(s.init.value.value)
+
+                base = single_step_bounds.get(end_var)
+                if base is not None and init_val == base and loop_var != base:
+                    # This loop runs exactly once with loop_var == base.
+                    # Inline the body, replacing loop_var with base.
+                    inlined = []
+                    for body_s in s.body:
+                        inlined.append(body_s)
+                    CINLowerer._rewrite_val_refs(inlined, {
+                        f"{loop_var}]": f"{base}]",
+                        f"[{loop_var}]": f"[{base}]",
+                        f"{loop_var} ": f"{base} ",
+                    })
+                    # Also remove the end_var VarInit
+                    stmts[:] = [x for x in stmts if not (
+                        isinstance(x, llir.VarInit)
+                        and isinstance(x.var, llir.Var)
+                        and x.var.name == end_var
+                    )]
+                    # Find the new index of s after removal
+                    try:
+                        i = stmts.index(s)
+                    except ValueError:
+                        break
+                    stmts[i:i+1] = inlined
+                    continue
+            i += 1
+
+    # ------------------------------------------------------------------
+    # Optimization pass: hoist loop-invariant multiplicative factors
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hoist_loop_invariant_factors(stmts: List[llir.Stmt]) -> None:
+        """Hoist loop-invariant factors out of inner accumulation loops.
+
+        Transforms:
+            for (int k = 0; k < K; k++) {
+                _accum += A_val[pA1] * _B_ptr[k] * _C_ptr[k];
+            }
+        Into:
+            float _inv_0 = A_val[pA1];
+            for (int k = 0; k < K; k++) {
+                _accum += _B_ptr[k] * _C_ptr[k];
+            }
+            _accum *= _inv_0;
+
+        This is valid under -ffast-math (FP associativity) and reduces
+        multiplies in the inner loop from N to N+1.
+        """
+        import re
+        for s in stmts:
+            if isinstance(s, llir.ForLoop):
+                CINLowerer._hoist_loop_invariant_factors(s.body)
+            elif isinstance(s, llir.IfThenElse):
+                if s.then_body:
+                    CINLowerer._hoist_loop_invariant_factors(s.then_body)
+                if s.else_body:
+                    CINLowerer._hoist_loop_invariant_factors(s.else_body)
+
+        i = 0
+        while i < len(stmts):
+            s = stmts[i]
+            if not isinstance(s, llir.ForLoop):
+                i += 1
+                continue
+
+            # Find the loop variable
+            if not isinstance(s.update, llir.Increment):
+                i += 1
+                continue
+            loop_var = s.update.var.name
+
+            # Collect all variable names defined inside the loop body so
+            # we never hoist a factor that references them.
+            body_defined_vars = set()
+            body_defined_vars.add(loop_var)
+            CINLowerer._collect_defined_vars(s.body, body_defined_vars)
+
+            # Look for accumulation: _accum += expr where expr contains
+            # a factor that doesn't reference loop_var or any _ptr[loop_var]
+            for j, body_s in enumerate(s.body):
+                if not (isinstance(body_s, llir.Assign)
+                        and body_s.op.value == "+="
+                        and isinstance(body_s.value, llir.BinOp)
+                        and body_s.value.op == "*"):
+                    continue
+
+                accum_var = body_s.var.name
+                # Only hoist when accumulating into a simple scalar,
+                # not an array element (e.g. C_values[pC1])
+                if "[" in accum_var:
+                    continue
+                # Collect all multiplicative factors
+                factors = []
+                CINLowerer._collect_mul_factors(body_s.value, factors)
+
+                if len(factors) < 2:
+                    continue
+
+                # Find factors that don't reference the loop variable
+                # or any variable defined inside the loop body
+                invariant = []
+                variant = []
+                for f in factors:
+                    name = f.name if isinstance(f, llir.Var) else ""
+                    if "_ptr[" in name:
+                        variant.append(f)
+                    elif any(v in name for v in body_defined_vars):
+                        variant.append(f)
+                    else:
+                        invariant.append(f)
+
+                if not invariant or not variant:
+                    continue
+
+                # Build the hoisted factor expression
+                inv_name = f"_inv_{i}"
+                if len(invariant) == 1:
+                    inv_expr = invariant[0]
+                else:
+                    inv_expr = invariant[0]
+                    for f in invariant[1:]:
+                        inv_expr = llir.BinOp(left=inv_expr, op="*", right=f)
+
+                # Build the reduced inner expression (only variant factors)
+                if len(variant) == 1:
+                    new_inner = variant[0]
+                else:
+                    new_inner = variant[0]
+                    for f in variant[1:]:
+                        new_inner = llir.BinOp(left=new_inner, op="*", right=f)
+
+                # Replace the accumulation
+                s.body[j] = llir.Assign(
+                    var=body_s.var,
+                    value=new_inner,
+                    op=body_s.op,
+                )
+
+                # Insert hoisted var before the loop, multiply after
+                inv_var_init = llir.RawStmt(
+                    code=f"float {inv_name} = {CINLowerer._expr_to_str(inv_expr)}"
+                )
+                post_mul = llir.RawStmt(
+                    code=f"{accum_var} *= {inv_name}"
+                )
+                stmts.insert(i, inv_var_init)
+                i += 1  # skip past the init we just inserted
+                stmts.insert(i + 1, post_mul)
+                break  # only hoist from first accumulation found
+
+            i += 1
+
+    @staticmethod
+    def _collect_defined_vars(stmts: list, out: set) -> None:
+        """Collect all variable names defined in a statement list (recursively)."""
+        for s in stmts:
+            if isinstance(s, llir.VarInit) and isinstance(s.var, llir.Var):
+                out.add(s.var.name)
+            elif isinstance(s, llir.ForLoop):
+                if isinstance(s.init, llir.VarInit) and isinstance(s.init.var, llir.Var):
+                    out.add(s.init.var.name)
+                CINLowerer._collect_defined_vars(s.body, out)
+            elif isinstance(s, llir.WhileLoop):
+                CINLowerer._collect_defined_vars(s.body, out)
+            elif isinstance(s, llir.IfThenElse):
+                if s.then_body:
+                    CINLowerer._collect_defined_vars(s.then_body, out)
+                if s.else_body:
+                    CINLowerer._collect_defined_vars(s.else_body, out)
+
+    @staticmethod
+    def _collect_mul_factors(expr, factors: list) -> None:
+        """Flatten a tree of multiplies into a list of leaf factors."""
+        if isinstance(expr, llir.BinOp) and expr.op == "*":
+            CINLowerer._collect_mul_factors(expr.left, factors)
+            CINLowerer._collect_mul_factors(expr.right, factors)
+        else:
+            factors.append(expr)
+
+    @staticmethod
+    def _expr_to_str(expr) -> str:
+        """Quick-and-dirty LLIR expr to C++ string."""
+        if isinstance(expr, llir.Var):
+            return expr.name
+        if isinstance(expr, llir.Literal):
+            return str(expr.value)
+        if isinstance(expr, llir.BinOp):
+            return f"({CINLowerer._expr_to_str(expr.left)} {expr.op} {CINLowerer._expr_to_str(expr.right)})"
+        return str(expr)
 
     @staticmethod
     def _find_val_array_access(
@@ -2320,16 +3272,87 @@ class CINLowerer:
             return CINLowerer._find_val_array_access(expr.right, pos_to_stride)
         return None
 
-    @classmethod
-    def _mark_first_for_loop_parallel(cls, stmts: List[llir.Stmt]) -> None:
+    def _mark_first_for_loop_parallel(self, stmts: List[llir.Stmt]) -> None:
         for llir_stmt in stmts:
-            if isinstance(llir_stmt, llir.ForLoop) and cls._is_openmp_compatible_for_loop(llir_stmt):
+            if isinstance(llir_stmt, llir.ForLoop) and self._is_openmp_compatible_for_loop(llir_stmt):
                 llir_stmt.omp_parallel_for = True
-                # Use dynamic scheduling when body contains sparse loops,
-                # since rows have varying nnz counts causing load imbalance.
-                if cls._has_sparse_inner_loop(llir_stmt.body):
-                    llir_stmt.omp_schedule = "dynamic, 16"
+                has_sparse = self._has_sparse_inner_loop(llir_stmt.body)
+                # Hoist per-thread workspace alloc/free outside the for loop
+                # but inside the OMP parallel region.
+                alloc = getattr(self, '_workspace_alloc_stmts', [])
+                free = getattr(self, '_workspace_free_stmts', [])
+
+                if has_sparse and alloc:
+                    # Use adaptive atomic work-stealing: chunk scales with
+                    # total nnz to balance scheduling overhead vs load
+                    # imbalance across all matrix sizes.
+                    llir_stmt.omp_parallel_for = True
+                    llir_stmt.omp_schedule = "dynamic, 64"  # fallback
+                    # Find the sparse pos array to compute nnz
+                    sparse_pos = self._find_sparse_pos_array(llir_stmt.body)
+                    loop_var = llir_stmt.init.var.name if llir_stmt.init else "i"
+                    loop_bound = self._extract_loop_bound(llir_stmt)
+                    if sparse_pos and loop_bound:
+                        # Replace the omp for with atomic work-stealing
+                        llir_stmt.omp_parallel_for = False
+                        adaptive_pre = list(alloc) + [
+                            llir.RawStmt(code=f"int _nnz = {sparse_pos}[{loop_bound}]"),
+                            llir.RawStmt(code=f"int _chunk = std::max(16, std::min(256, _nnz / (omp_get_num_threads() * 128)))"),
+                        ]
+                        # The atomic counter is declared BEFORE the parallel region
+                        # (shared across threads). We store it as a pre-parallel stmt.
+                        self._atomic_counter_decl = llir.RawStmt(
+                            code="std::atomic<int> _next_row{0}", add_semicolon=True,
+                        )
+                        # Wrap the loop body in an atomic work-stealing while loop
+                        # We replace the for loop entirely with raw code
+                        llir_stmt.pre_parallel_body = adaptive_pre
+                        llir_stmt.post_parallel_body = free or None
+                        # Mark that the for loop should use atomic scheduling
+                        llir_stmt._use_atomic_scheduling = True
+                        llir_stmt._atomic_chunk_var = "_chunk"
+                        llir_stmt._atomic_counter_var = "_next_row"
+                        llir_stmt._loop_bound = loop_bound
+                    else:
+                        if alloc or free:
+                            llir_stmt.pre_parallel_body = alloc or None
+                            llir_stmt.post_parallel_body = free or None
+                else:
+                    if has_sparse:
+                        llir_stmt.omp_schedule = "dynamic, 64"
+                    if alloc or free:
+                        llir_stmt.pre_parallel_body = alloc or None
+                        llir_stmt.post_parallel_body = free or None
                 return
+
+    @staticmethod
+    def _find_sparse_pos_array(body: List[llir.Stmt]) -> Optional[str]:
+        """Find the name of a sparse pos array (e.g. 'A1_pos') in loop body."""
+        import re
+        for stmt in body:
+            if isinstance(stmt, llir.VarInit):
+                code = stmt.var.name + " " + str(getattr(stmt.value, 'name', ''))
+                m = re.search(r'(\w+_pos)\[', code)
+                if m:
+                    return m.group(1)
+            if isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
+                result = CINLowerer._find_sparse_pos_array(stmt.body)
+                if result:
+                    return result
+            if isinstance(stmt, llir.RawStmt):
+                m = re.search(r'(\w+_pos)\[', stmt.code)
+                if m:
+                    return m.group(1)
+        return None
+
+    @staticmethod
+    def _extract_loop_bound(for_loop: llir.ForLoop) -> Optional[str]:
+        """Extract the upper bound variable name from a for loop condition."""
+        if isinstance(for_loop.cond, llir.BinOp) and for_loop.cond.op == "<":
+            right = for_loop.cond.right
+            if isinstance(right, llir.Var):
+                return right.name
+        return None
 
     @classmethod
     def _collect_output_arrays(cls, stmts: List[llir.Stmt], output_arrays: List[str]) -> None:
@@ -2413,8 +3436,7 @@ class CINLowerer:
                 return False
         return True
 
-    @classmethod
-    def _transform_coo_loop_for_openmp(cls, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
+    def _transform_coo_loop_for_openmp(self, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
         """Transform the outer COO WhileLoop into a group-indexed ForLoop
         with OpenMP parallelism.
 
@@ -2528,12 +3550,12 @@ class CINLowerer:
             # Thread-safety for output position: use input position pA1
             # as output position since nnz_out == nnz_in for SDDMM-like
             # kernels (no filtering). Replace pD1 references in the body.
-            cls._replace_output_pos_with_input_pos(inner_body_filtered, iter_var)
+            CINLowerer._replace_output_pos_with_input_pos(inner_body_filtered, iter_var)
 
             # Collect output array names that need pre-allocation
             output_arrays: List[str] = []
             import re as _re
-            cls._collect_output_arrays(inner_body_filtered, output_arrays)
+            CINLowerer._collect_output_arrays(inner_body_filtered, output_arrays)
 
             # Pre-scan code
             pre_scan_stmts: List[llir.Stmt] = [
@@ -2542,26 +3564,26 @@ class CINLowerer:
                     llir.Var(name="_group_starts", type=llir.DataType.CVECTOR_INT)
                 ),
                 llir.Assign(
-                    var=llir.Var(name="_group_starts[0]", type=llir.DataType.INT),
+                    var=llir.Var(name="_group_starts[0]", type=llir.DataType.INT64),
                     value=llir.Literal(0),
                 ),
                 llir.VarInit(
-                    var=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                    var=llir.Var(name="_n_groups", type=llir.DataType.INT64),
                     value=llir.Literal(1),
                 ),
                 # Scan loop
                 llir.ForLoop(
                     init=llir.VarInit(
-                        var=llir.Var(name="_p", type=llir.DataType.INT),
+                        var=llir.Var(name="_p", type=llir.DataType.INT64),
                         value=llir.Literal(1),
                     ),
                     cond=llir.BinOp(
                         op="<",
-                        left=llir.Var(name="_p", type=llir.DataType.INT),
-                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT),
+                        left=llir.Var(name="_p", type=llir.DataType.INT64),
+                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT64),
                     ),
                     update=llir.Increment(
-                        var=llir.Var(name="_p", type=llir.DataType.INT),
+                        var=llir.Var(name="_p", type=llir.DataType.INT64),
                     ),
                     body=[
                         llir.IfThenElse(
@@ -2572,19 +3594,19 @@ class CINLowerer:
                             ),
                             then_body=[
                                 llir.Assign(
-                                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT),
-                                    value=llir.Var(name="_p", type=llir.DataType.INT),
+                                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT64),
+                                    value=llir.Var(name="_p", type=llir.DataType.INT64),
                                 ),
                                 llir.Increment(
-                                    var=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                                    var=llir.Var(name="_n_groups", type=llir.DataType.INT64),
                                 ),
                             ],
                         ),
                     ],
                 ),
                 llir.Assign(
-                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT),
-                    value=llir.Var(name=outer_end_var, type=llir.DataType.INT),
+                    var=llir.Var(name="_group_starts[_n_groups]", type=llir.DataType.INT64),
+                    value=llir.Var(name=outer_end_var, type=llir.DataType.INT64),
                 ),
                 llir.BlankLine(),
             ]
@@ -2592,16 +3614,16 @@ class CINLowerer:
             # Group loop body
             group_body: List[llir.Stmt] = [
                 llir.VarInit(
-                    var=llir.Var(name=iter_var, type=llir.DataType.INT),
-                    value=llir.Var(name="_group_starts[_g]", type=llir.DataType.INT),
+                    var=llir.Var(name=iter_var, type=llir.DataType.INT64),
+                    value=llir.Var(name="_group_starts[_g]", type=llir.DataType.INT64),
                 ),
                 llir.VarInit(
-                    var=llir.Var(name=end_var, type=llir.DataType.INT),
-                    value=llir.Var(name="_group_starts[_g + 1]", type=llir.DataType.INT),
+                    var=llir.Var(name=end_var, type=llir.DataType.INT64),
+                    value=llir.Var(name="_group_starts[_g + 1]", type=llir.DataType.INT64),
                 ),
                 llir.VarInit(
-                    var=llir.Var(name=coord_var_name, type=llir.DataType.INT),
-                    value=llir.Var(name=f"{crd_array}[{iter_var}]", type=llir.DataType.INT),
+                    var=llir.Var(name=coord_var_name, type=llir.DataType.INT64),
+                    value=llir.Var(name=f"{crd_array}[{iter_var}]", type=llir.DataType.INT64),
                 ),
                 *inner_body_filtered,
             ]
@@ -2609,16 +3631,16 @@ class CINLowerer:
             # Group for loop with OpenMP
             group_loop = llir.ForLoop(
                 init=llir.VarInit(
-                    var=llir.Var(name="_g", type=llir.DataType.INT),
+                    var=llir.Var(name="_g", type=llir.DataType.INT64),
                     value=llir.Literal(0),
                 ),
                 cond=llir.BinOp(
                     op="<",
-                    left=llir.Var(name="_g", type=llir.DataType.INT),
-                    right=llir.Var(name="_n_groups", type=llir.DataType.INT),
+                    left=llir.Var(name="_g", type=llir.DataType.INT64),
+                    right=llir.Var(name="_n_groups", type=llir.DataType.INT64),
                 ),
                 update=llir.Increment(
-                    var=llir.Var(name="_g", type=llir.DataType.INT),
+                    var=llir.Var(name="_g", type=llir.DataType.INT64),
                 ),
                 body=group_body,
                 omp_parallel_for=True,
@@ -2633,10 +3655,85 @@ class CINLowerer:
                     add_semicolon=True,
                 ))
 
-            result.extend(pre_scan_stmts)
-            result.extend(prealloc_stmts)
-            result.append(group_loop)
-            transformed = True
+            # ── Optimization: flat parallel loop when each nonzero is
+            # independent (scalar accumulator mode). Skips the serial
+            # group-boundary scan entirely. Also replaces cvector with
+            # raw malloc for zero-overhead array access. ─────────────
+            if self._used_scalar_accum:
+                # Detect known-nnz: sparse output + scalar accum → nnz_out == nnz_in
+                if (self.final_result_tensor_var
+                        and not self.final_result_tensor_var.is_dense()):
+                    self._known_nnz_var = "_known_nnz"
+                # Build a flat loop body: for each nonzero p, read
+                # coordinates inline and execute the inner body.
+                flat_body: List[llir.Stmt] = [
+                    llir.VarInit(
+                        var=llir.Var(name=coord_var_name, type=llir.DataType.INT64),
+                        value=llir.Var(
+                            name=f"{crd_array}[{iter_var}]",
+                            type=llir.DataType.INT64,
+                        ),
+                    ),
+                ]
+                # The inner body already has the inner loop and accum
+                # write. We just need to set the end_var for the inner
+                # loop. For a flat loop, each "group" is one nonzero's
+                # row segment. We find the end by scanning forward.
+                # But for scalar accum, the inner loop (over j within
+                # the same row) is already inside inner_body_filtered.
+                # We set pA1_end to iter_var+1 to process just this one
+                # nonzero if there's no actual inner sparse loop,
+                # or keep the original behavior for grouped inner loops.
+                #
+                # Actually, for SDDMM the inner_body_filtered already
+                # contains the for(pA1=pA0; pA1<pA1_end; pA1++) loop
+                # which iterates over nonzeros in this row group.
+                # For a flat loop, we want pA1=iter_var, pA1_end=iter_var+1
+                # so we process exactly one nonzero per flat iteration.
+                #
+                # We handle this by setting the group boundaries to
+                # single-element ranges.
+                flat_body.append(llir.VarInit(
+                    var=llir.Var(name=end_var, type=llir.DataType.INT64),
+                    value=llir.Var(name=f"{iter_var} + 1", type=llir.DataType.INT64),
+                ))
+                if not self._known_nnz_var:
+                    # Rewrite output array accesses to bypass cvector bounds checks:
+                    # arr[idx] → arr.data()[idx] for pre-allocated arrays.
+                    for arr_name in output_arrays:
+                        CINLowerer._rewrite_val_refs(inner_body_filtered, {
+                            f"{arr_name}[": f"{arr_name}.data()[",
+                        })
+
+                flat_body.extend(inner_body_filtered)
+
+                flat_loop = llir.ForLoop(
+                    init=llir.VarInit(
+                        var=llir.Var(name=iter_var, type=llir.DataType.INT64),
+                        value=llir.Literal(0),
+                    ),
+                    cond=llir.BinOp(
+                        op="<",
+                        left=llir.Var(name=iter_var, type=llir.DataType.INT64),
+                        right=llir.Var(name=outer_end_var, type=llir.DataType.INT64),
+                    ),
+                    update=llir.Increment(
+                        var=llir.Var(name=iter_var, type=llir.DataType.INT64),
+                    ),
+                    body=flat_body,
+                    omp_parallel_for=True,
+                    omp_schedule="dynamic, 64",
+                )
+
+                if not self._known_nnz_var:
+                    result.extend(prealloc_stmts)
+                result.append(flat_loop)
+                transformed = True
+            else:
+                result.extend(pre_scan_stmts)
+                result.extend(prealloc_stmts)
+                result.append(group_loop)
+                transformed = True
 
         return result
 
@@ -2704,6 +3801,9 @@ class CINLowerer:
               and self._used_scalar_accum
               and self._should_parallelize_coo_outer(index_var)):
             stmts = self._transform_coo_loop_for_openmp(stmts)
+        elif (is_outermost_forall
+              and self._should_parallelize_compressed_where(index_var)):
+            stmts = self._transform_compressed_where_for_openmp(stmts)
 
         return stmts
 
@@ -2750,5 +3850,5 @@ class CINLowerer:
         """
         return llir.Var(
             name=ivar.name,
-            type=llir.DataType.INT,
+            type=llir.DataType.INT64,
         )

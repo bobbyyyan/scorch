@@ -1,3 +1,6 @@
+#include <atomic>
+#include <omp.h>
+
 typedef struct {
   std::vector<std::vector<torch::Tensor>> mode_indices;
 } TensorIndex;
@@ -263,17 +266,17 @@ class coo_workspace_1d {
   static constexpr int BLOCK_SIZE = N;
 
   T* _values;
-  int* _indices;
+  int64_t* _indices;
   bool* _setFlags;
-  int _size;
-  int _capacity;
+  int64_t _size;
+  int64_t _capacity;
 
  public:
-  explicit coo_workspace_1d(int capacity = INITIAL_CAPACITY) : _capacity(capacity) {
+  explicit coo_workspace_1d(int64_t capacity = INITIAL_CAPACITY) : _capacity(capacity) {
     _values = (T*)malloc(sizeof(T) * _capacity);
     if (!_values) throw std::bad_alloc();
 
-    _indices = (int*)malloc(sizeof(int) * _capacity);
+    _indices = (int64_t*)malloc(sizeof(int64_t) * _capacity);
     if (!_indices) {
       free(_values);
       throw std::bad_alloc();
@@ -297,9 +300,9 @@ class coo_workspace_1d {
     free(_setFlags);
   }
 
-  void insert(const int coord, T value) {
+  void insert(int64_t coord, T value) {
     if (coord >= _capacity) {
-      resize(std::max(coord + 1, _capacity * GROWTH_FACTOR));
+      resize(std::max(coord + 1, _capacity * (int64_t)GROWTH_FACTOR));
     }
 
     if (!_setFlags[coord]) {
@@ -311,9 +314,9 @@ class coo_workspace_1d {
     }
   }
 
-  void resize(int new_capacity) {
+  void resize(int64_t new_capacity) {
     _values = (T*)realloc(_values, sizeof(T) * new_capacity);
-    _indices = (int*)realloc(_indices, sizeof(int) * new_capacity);
+    _indices = (int64_t*)realloc(_indices, sizeof(int64_t) * new_capacity);
     bool* new_setFlags = (bool*)realloc(_setFlags, sizeof(bool) * new_capacity);
 
     if (!_values || !_indices || !new_setFlags) {
@@ -328,23 +331,25 @@ class coo_workspace_1d {
   }
 
   void sort() {
-    std::sort(_indices, _indices + _size, [this](int a, int b) {
+    std::sort(_indices, _indices + _size, [this](int64_t a, int64_t b) {
       return a < b;
     });
   }
 
   void clear() {
+    for (int64_t i = 0; i < _size; i++) {
+      _setFlags[_indices[i]] = false;
+    }
     _size = 0;
-    std::fill_n(_setFlags, _capacity, false);
   }
 
   class iterator {
-    int _index;
+    int64_t _index;
     T* _values;
-    int* _indices;
+    int64_t* _indices;
 
    public:
-    iterator(int index, T* values, int* indices)
+    iterator(int64_t index, T* values, int64_t* indices)
         : _index(index), _values(values), _indices(indices) {}
 
     iterator& operator++() {
@@ -356,8 +361,8 @@ class coo_workspace_1d {
       return _index != other._index;
     }
 
-    std::pair<int, T> operator*() const {
-      int index = _indices[_index];
+    std::pair<int64_t, T> operator*() const {
+      int64_t index = _indices[_index];
       return {index, _values[index]};
     }
   };
@@ -366,7 +371,89 @@ class coo_workspace_1d {
 
   iterator end() { return iterator(_size, _values, _indices); }
 
-  int size() const { return _size; }
+  int64_t size() const { return _size; }
+};
+
+template <typename T>
+class linked_list_workspace_1d {
+  T* _sums;
+  int64_t* _next;
+  int64_t _head;
+  int64_t _size;
+  int64_t _capacity;
+
+ public:
+  explicit linked_list_workspace_1d(int64_t capacity)
+      : _head(-2), _size(0), _capacity(capacity) {
+    _sums = (T*)calloc(_capacity, sizeof(T));
+    _next = (int64_t*)malloc(sizeof(int64_t) * _capacity);
+    _sorted_buf = (int64_t*)malloc(sizeof(int64_t) * _capacity);
+    if (!_sums || !_next || !_sorted_buf) throw std::bad_alloc();
+    std::fill_n(_next, _capacity, (int64_t)-1);
+  }
+
+  ~linked_list_workspace_1d() {
+    free(_sums);
+    free(_next);
+    free(_sorted_buf);
+  }
+
+  inline void insert(int64_t coord, T value) {
+    _sums[coord] += value;
+    if (_next[coord] == -1) {
+      _next[coord] = _head;
+      _head = coord;
+      _size++;
+    }
+  }
+
+  void sort() {}
+
+  void clear() {
+    int64_t h = _head;
+    while (h >= 0) {
+      int64_t tmp = h;
+      h = _next[h];
+      _next[tmp] = -1;
+      _sums[tmp] = 0;
+    }
+    _head = -2;
+    _size = 0;
+  }
+
+  int64_t size() const { return _size; }
+
+  class iterator {
+    int64_t _index;
+    int64_t* _sorted_coords;
+    T* _sums;
+
+   public:
+    iterator(int64_t index, int64_t* sorted_coords, T* sums)
+        : _index(index), _sorted_coords(sorted_coords), _sums(sums) {}
+    iterator& operator++() { _index++; return *this; }
+    bool operator!=(const iterator& other) const { return _index != other._index; }
+    std::pair<int64_t, T> operator*() const {
+      int64_t c = _sorted_coords[_index];
+      return {c, _sums[c]};
+    }
+  };
+
+  int64_t* _sorted_buf;
+  int64_t _sorted_size = 0;
+
+  iterator begin() {
+    int64_t pos = 0, h = _head;
+    while (h >= 0) {
+      _sorted_buf[pos++] = h;
+      h = _next[h];
+    }
+    _sorted_size = pos;
+    std::sort(_sorted_buf, _sorted_buf + _sorted_size);
+    return iterator(0, _sorted_buf, _sums);
+  }
+
+  iterator end() { return iterator(_sorted_size, _sorted_buf, _sums); }
 };
 
 template <typename T, int N>
@@ -374,25 +461,25 @@ class coo_workspace {
   static constexpr int BLOCK_SIZE = 1024;
 
   struct Entry {
-    int coords[N];
+    int64_t coords[N];
     T value;
   };
 
   std::vector<Entry> _entries;
-  std::unordered_map<int, int> _existingCoords;
+  std::unordered_map<int64_t, int> _existingCoords;
   std::vector<int> _sortedIndices;
-  std::vector<int> _resultShape;
+  std::vector<int64_t> _resultShape;
 
  public:
-  explicit coo_workspace(int capacity, const std::vector<int> &result_shape)
+  explicit coo_workspace(int capacity, const std::vector<int64_t> &result_shape)
         : _resultShape(result_shape) {
     _entries.reserve(capacity);
   }
 
   explicit coo_workspace() : coo_workspace(BLOCK_SIZE, {}) {}
 
-  void insert(const std::vector<int>& coord, T value) {
-    int index = coord[0];
+  void insert(const std::vector<int64_t>& coord, T value) {
+    int64_t index = coord[0];
     for (int i = 1; i < N; i++){
         index = index * _resultShape[i] + coord[i];
     }
@@ -444,9 +531,9 @@ class coo_workspace {
       return _index != other._index;
     }
 
-    std::pair<std::vector<int>, T> operator*() const {
+    std::pair<std::vector<int64_t>, T> operator*() const {
       int sortedIndex = (*_sortedIndices)[_index];
-      std::vector<int> coord(_entries[sortedIndex].coords, _entries[sortedIndex].coords + N);
+      std::vector<int64_t> coord(_entries[sortedIndex].coords, _entries[sortedIndex].coords + N);
       return {coord, _entries[sortedIndex].value};
     }
   };

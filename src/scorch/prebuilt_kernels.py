@@ -42,7 +42,7 @@ _MATMUL_PREBUILT_SPECS: List[PrebuiltMatmulSpec] = [
         rhs_format="d,d",
         output_format="dd",
         symbol_by_dtype={
-            torch.float32: ("prebuilt_spmm_csr_f32", "spmm_csr_float"),
+            torch.float32: ("spmm_csr_float_v2", "prebuilt_spmm_csr_f32", "spmm_csr_float"),
             torch.float64: ("prebuilt_spmm_csr_f64", "spmm_csr_double"),
             torch.int32: ("prebuilt_spmm_csr_i32",),
             torch.int64: ("prebuilt_spmm_csr_i64",),

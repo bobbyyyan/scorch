@@ -51,16 +51,22 @@ if command -v conda &> /dev/null; then
     echo "Activating conda environment..."
     conda activate scorch
 
-    # Install PyTorch and pybind11 via conda for better macOS compatibility
+    # Install PyTorch and pybind11 via conda
     echo
     echo "Installing PyTorch and pybind11 via conda..."
-    conda install -y pytorch pybind11 -c pytorch
+    if [[ "$(uname -m)" == "x86_64" ]]; then
+        # On x86_64, pin mkl<2025 to avoid missing libittnotify.so (VTune ITT)
+        # dependency introduced in MKL 2025+
+        conda install -y pytorch pybind11 "mkl<2025" -c pytorch
+    else
+        conda install -y pytorch pybind11 -c pytorch
+    fi
 
     # Install other dependencies via pip
     # Note: numpy<2 required for compatibility with conda pytorch
     echo
     echo "Installing other dependencies..."
-    pip install "numpy<2" scipy ninja black flake8 mypy pytest
+    pip install "numpy<2" scipy ninja black flake8 mypy pytest matplotlib pandas seaborn
 
     # Set up environment variables for torch C++ extensions
     # This ensures CC/CXX are set every time the environment is activated

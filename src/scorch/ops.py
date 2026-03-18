@@ -152,71 +152,69 @@ def matmul_wksp(
     elif not isinstance(output_format, TensorFormat):
         output_format = parse_format(output_format)
 
-    C = TensorVar("C", fmt=output_format)
-    A = TensorVar("A", fmt=a.format)
-    B = TensorVar("B", fmt=b.format)
+    # ── Module cache: skip CIN→LLIR→codegen on repeat calls ──────────
+    _cache_key = (str(a.format), str(b.format), str(output_format))
+    if not hasattr(matmul_wksp, '_module_cache'):
+        matmul_wksp._module_cache = {}
 
-    workspace = Workspace(
-        name="wksp",
-        dim=1,
-    )
+    module = matmul_wksp._module_cache.get(_cache_key)
+    if module is None:
+        C = TensorVar("C", fmt=output_format)
+        A = TensorVar("A", fmt=a.format)
+        B = TensorVar("B", fmt=b.format)
 
-    i = IndexVar("i")
-    j = IndexVar("j")
-    k = IndexVar("k")
+        # Use a dense workspace when the output is dense (avoids COO hash-map overhead).
+        wksp_dense = output_format.is_dense()
+        workspace = Workspace(
+            name="wksp",
+            dim=1,
+            dense=wksp_dense,
+        )
 
-    cin_stmt = ForAll(
-        i,
-        Where(
-            producer=ForAll(
-                k,
-                ForAll(
+        i = IndexVar("i")
+        j = IndexVar("j")
+        k = IndexVar("k")
+
+        cin_stmt = ForAll(
+            i,
+            Where(
+                producer=ForAll(
+                    k,
+                    ForAll(
+                        j,
+                        TensorAssign(
+                            workspace[j],
+                            A[i, k] * B[k, j],
+                            op=Operation.ADD,
+                        ),
+                    ),
+                ),
+                consumer=ForAll(
                     j,
                     TensorAssign(
+                        C[i, j],
                         workspace[j],
-                        A[i, k] * B[k, j],
-                        op=Operation.ADD,
                     ),
                 ),
             ),
-            consumer=ForAll(
-                j,
-                TensorAssign(
-                    C[i, j],
-                    workspace[j],
-                ),
-            ),
-        ),
-    )
+        )
 
-    lowerer = CINLowerer()
+        lowerer = CINLowerer()
+        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer()
+        cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
+            header_cpp_code = f.read()
 
-    llir_lowerer = LLIRLowerer()
-
-    cpp_code = llir_lowerer.lower_llir(lowered_llir)
-
-    # print("\n C++ CODE:\n")
-    # print(cpp_code)
-
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
-
-    # start_time = time.time()
-    module = _load_kernel(
-        name=_kernel_name(header_cpp_code, cpp_code),
-        cpp_sources=[header_cpp_code, cpp_code],
-        functions=["evaluate"],
-        extra_cflags=get_extra_cflags(),
-        extra_ldflags=get_extra_ldflags(),
-    )
-    # end_time = time.time()
-
-    # compile_time = end_time - start_time
-    #  Print kernel compile time to 5 decimal places
-    # print(f"Kernel compile time: {compile_time:.5f} seconds")
+        module = _load_kernel(
+            name=_kernel_name(header_cpp_code, cpp_code),
+            cpp_sources=[header_cpp_code, cpp_code],
+            functions=["evaluate"],
+            extra_cflags=get_extra_cflags(),
+            extra_ldflags=get_extra_ldflags(),
+        )
+        matmul_wksp._module_cache[_cache_key] = module
 
     result_shape = (a.shape[0], b.shape[1])
     args = [result_shape]
@@ -394,6 +392,35 @@ def einsum(
     tensors = tuple(
         STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors
     )
+
+    # ── Prebuilt SDDMM dispatch ────────────────────────────────────────
+    # Pattern: 'ij,ik,jk->ij' with S(COO), A(dense), B(dense)
+    if (not compile_only
+            and expression == "ij,ik,jk->ij"
+            and len(tensors) == 3
+            and tensors[0].values.dtype == torch.float32
+            and str(tensors[0].format) == "o,o"
+            and str(tensors[1].format) == "d,d"
+            and str(tensors[2].format) == "d,d"):
+        import scorch_ops as _ops
+        _sddmm_fn = getattr(_ops, "sddmm_coo_float_prebuilt", None)
+        if _sddmm_fn is not None:
+            S, A, B = tensors
+            result_shape = S.shape
+            result_cpp = _sddmm_fn(
+                result_shape,
+                S.shape, S.index.mode_indices, S.values,
+                A.shape, A.index.mode_indices, A.values,
+                B.shape, B.index.mode_indices, B.values,
+            )
+            return STensor(
+                shape=result_shape,
+                index=TensorIndex(
+                    mode_indices=result_cpp.storage.index.mode_indices,
+                    tensor_format=S.format,
+                ),
+                value=result_cpp.storage.value,
+            )
 
     # ── Fast dispatch cache ─────────────────────────────────────────────
     # On a cache hit, skip the entire scheduling pipeline (select_loop_order

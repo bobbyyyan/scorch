@@ -138,7 +138,7 @@ class DataType(Enum):
     COO_WORKSPACE_FLOAT32_4 = "coo_workspace<float, 4>"
     COO_WORKSPACE_FLOAT32_5 = "coo_workspace<float, 5>"
 
-    STD_VECTOR_INT = "std::vector<int>"
+    STD_VECTOR_INT = "std::vector<int64_t>"
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
     ARRAY_INT = "int[]"
 
@@ -477,6 +477,8 @@ class ForLoop(Stmt):
         omp_schedule: Optional[str] = None,
         unroll: bool = False,
         simd: bool = False,
+        pre_parallel_body: Optional[List[Stmt]] = None,
+        post_parallel_body: Optional[List[Stmt]] = None,
     ):
         self.init = init
         self.cond = cond
@@ -486,6 +488,10 @@ class ForLoop(Stmt):
         self.omp_schedule = omp_schedule
         self.unroll = unroll
         self.simd = simd
+        # Stmts placed inside #pragma omp parallel but before/after the for loop.
+        # When set, codegen splits "parallel for" into "parallel { pre; for; post }".
+        self.pre_parallel_body = pre_parallel_body
+        self.post_parallel_body = post_parallel_body
 
 
 # A for loop styled for (auto XXX : YYY) { ... }

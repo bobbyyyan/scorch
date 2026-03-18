@@ -159,6 +159,9 @@ void bind_experimental_spmm_variants(py::module_& m) {
                      "NEON 4-NNZ unroll with deep prefetch");
   bind_binary_kernel(m, "spmm_csr_float_tiled_neon", &spmm_csr_float_tiled_neon,
                      "Large-tile NEON (128) with direct accumulation");
+  bind_binary_kernel_with_tile(
+      m, "spmm_csr_float_v2", &spmm_csr_float_v2,
+      "Workspace + 2-nnz ILP + k-tiling SpMM", 256);
 }
 
 // Fused SpMM + bias + ReLU wrappers
@@ -204,12 +207,22 @@ void bind_fused_spmm_variants(py::module_& m) {
                     "Fused SpMM + bias (CSR x dense, no activation)");
 }
 
+void bind_sddmm_variants(py::module_& m) {
+  m.def("sddmm_coo_float_prebuilt", &sddmm_coo_float_prebuilt,
+        "Prebuilt SDDMM kernel (COO x dense x dense)",
+        py::arg("result_shape"),
+        py::arg("S_shape"), py::arg("S_mode_indices"), py::arg("S_values"),
+        py::arg("A_shape"), py::arg("A_mode_indices"), py::arg("A_values"),
+        py::arg("B_shape"), py::arg("B_mode_indices"), py::arg("B_values"));
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     bind_prebuilt_kernel_family(m);
     bind_experimental_spmm_variants(m);
     bind_fused_spmm_variants(m);
+    bind_sddmm_variants(m);
 
     py::class_<Tensor>(m, "Tensor")
       .def(py::init<>())
