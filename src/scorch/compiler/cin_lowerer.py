@@ -2398,9 +2398,11 @@ class CINLowerer:
         if not self.final_result_tensor_var or not self.final_result_tensor_access:
             return False
         level_types = self.final_result_tensor_var.get_level_types()
-        if len(level_types) != 2:
+        if len(level_types) < 2:
             return False
-        if level_types[0] != LevelType.DENSE or level_types[1] != LevelType.COMPRESSED:
+        if level_types[0] != LevelType.DENSE:
+            return False
+        if any(lt != LevelType.COMPRESSED for lt in level_types[1:]):
             return False
         if not self.final_result_tensor_access.has_index_var(index_var):
             return False
@@ -2425,15 +2427,268 @@ class CINLowerer:
         )
         return has_sparse_input
 
+    @staticmethod
+    def _transform_result_writes(
+        stmts: List[llir.Stmt],
+        result_name: str,
+        compressed_levels: List[int],
+        mode: str,
+    ) -> List[llir.Stmt]:
+        """Recursively walk LLIR statements and transform result-tensor writes.
+
+        *mode* is ``'count'`` (Phase 1 – replace writes with counter increments)
+        or ``'fill'`` (Phase 3 – replace writes with raw-pointer array stores).
+
+        *compressed_levels* is a sorted list of compressed level numbers,
+        e.g. ``[1]`` for 2-D ``ds`` or ``[1, 2]`` for 3-D ``dss``.
+        """
+        from .codegen import LLIRLowerer
+        _cg = LLIRLowerer()
+
+        leaf = compressed_levels[-1]
+        new: List[llir.Stmt] = []
+
+        for stmt in stmts:
+            # ── Assign to result arrays ────────────────────────────────
+            if isinstance(stmt, llir.Assign):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+
+                # C_values[pCl] = val
+                if f"{result_name}_values[" in vname:
+                    if mode == 'count':
+                        continue
+                    val = _cg.lower_llir(stmt.value)
+                    new.append(llir.RawStmt(
+                        code=f"{result_name}_values_data[_base{leaf} + _pos{leaf}] = {val}"))
+                    continue
+
+                # C{l}_crd[pCl] = coord
+                matched = None
+                for l in compressed_levels:
+                    if f"{result_name}{l}_crd[" in vname:
+                        matched = l
+                        break
+                if matched is not None:
+                    if mode == 'count':
+                        new.append(llir.RawStmt(code=f"_cnt{matched}++"))
+                    else:
+                        val = _cg.lower_llir(stmt.value)
+                        new.append(llir.RawStmt(
+                            code=f"{result_name}{matched}_crd_data"
+                                 f"[_base{matched} + _pos{matched}] = {val}"))
+                    continue
+
+                # C{l}_pos[...] = C{l}_crd.size()  (pos boundary update)
+                skip = False
+                for l in compressed_levels:
+                    if f"{result_name}{l}_pos[" in vname:
+                        skip = True
+                        break
+                if skip:
+                    continue  # handled by IfThenElse transform
+
+                new.append(stmt)
+                continue
+
+            # ── Increment pC{l} ────────────────────────────────────────
+            if isinstance(stmt, llir.Increment):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                handled = False
+                for l in compressed_levels:
+                    if vname == f"p{result_name}{l}":
+                        if mode == 'fill':
+                            new.append(llir.RawStmt(code=f"_pos{l}++"))
+                        # count → remove
+                        handled = True
+                        break
+                if not handled:
+                    new.append(stmt)
+                continue
+
+            # ── FunctionCallStmt ───────────────────────────────────────
+            if isinstance(stmt, llir.FunctionCallStmt):
+                fname = getattr(stmt, 'name', '')
+
+                # C{l}_crd.push_back(coord)
+                push_matched = None
+                for l in compressed_levels:
+                    if fname == f"{result_name}{l}_crd.push_back":
+                        push_matched = l
+                        break
+                if push_matched is not None:
+                    l = push_matched
+                    if mode == 'count':
+                        new.append(llir.RawStmt(code=f"_cnt{l}++"))
+                    else:
+                        arg = _cg.lower_llir(stmt.args[0]) if stmt.args else "0"
+                        new.append(llir.RawStmt(
+                            code=f"{result_name}{l}_crd_data"
+                                 f"[_base{l} + _pos{l}] = {arg}"))
+                        new.append(llir.RawStmt(code=f"_pos{l}++"))
+                        # pos boundary for next compressed level
+                        idx = compressed_levels.index(l)
+                        if idx + 1 < len(compressed_levels):
+                            nl = compressed_levels[idx + 1]
+                            new.append(llir.RawStmt(
+                                code=f"{result_name}{nl}_pos_data"
+                                     f"[_base{l} + _pos{l}] = "
+                                     f"_base{nl} + _pos{nl}"))
+                    continue
+
+                # C_values.push_back(val)
+                if fname == f"{result_name}_values.push_back":
+                    if mode == 'fill':
+                        arg = _cg.lower_llir(stmt.args[0]) if stmt.args else "0"
+                        new.append(llir.RawStmt(
+                            code=f"{result_name}_values_data"
+                                 f"[_base{leaf} + _pos{leaf}] = {arg}"))
+                    continue
+
+                # wksp.sort()
+                if '.sort' in fname:
+                    if mode == 'fill':
+                        new.append(stmt)
+                    continue  # count → skip
+
+                # everything else
+                new.append(stmt)
+                continue
+
+            # ── VarInit for pC{l} ──────────────────────────────────────
+            if isinstance(stmt, llir.VarInit):
+                vname = getattr(getattr(stmt, 'var', None), 'name', '')
+                skip = False
+                for l in compressed_levels:
+                    if vname == f"p{result_name}{l}":
+                        skip = True
+                        break
+                if skip:
+                    continue
+                new.append(stmt)
+                continue
+
+            # ── IfThenElse: C{l}_pos.back() < pC{l}  ──────────────────
+            if isinstance(stmt, llir.IfThenElse):
+                cond = stmt.cond
+                matched = None
+                if (isinstance(cond, llir.BinOp) and cond.op == '<'
+                        and isinstance(cond.left, llir.FunctionCall)):
+                    for l in compressed_levels:
+                        if cond.left.name == f"{result_name}{l}_pos.back":
+                            matched = l
+                            break
+                if matched is not None:
+                    l = matched
+                    # parent compressed level (if any)
+                    idx = compressed_levels.index(l)
+                    parent_l = compressed_levels[idx - 1] if idx > 0 else None
+
+                    if mode == 'count':
+                        cnt_var = f"_cnt{l}"
+                        prev_var = f"_prev{l}"
+                        then = []
+                        if parent_l is not None:
+                            then.append(llir.RawStmt(code=f"_cnt{parent_l}++"))
+                        then.append(llir.RawStmt(code=f"{prev_var} = {cnt_var}"))
+                        new.append(llir.IfThenElse(
+                            cond=llir.BinOp(
+                                op=">",
+                                left=llir.Var(name=cnt_var, type=llir.DataType.INT64),
+                                right=llir.Var(name=prev_var, type=llir.DataType.INT64),
+                            ),
+                            then_body=then,
+                        ))
+                    else:  # fill
+                        pos_var = f"_pos{l}"
+                        prev_var = f"_prev{l}"
+                        then = []
+                        # extract coord from push_back in serial then_body
+                        coord = None
+                        if stmt.then_body:
+                            for tb in stmt.then_body:
+                                if (isinstance(tb, llir.FunctionCallStmt)
+                                        and '.push_back' in tb.name
+                                        and tb.args):
+                                    coord = _cg.lower_llir(tb.args[0])
+                                    break
+                        if parent_l is not None and coord is not None:
+                            then.append(llir.RawStmt(
+                                code=f"{result_name}{parent_l}_crd_data"
+                                     f"[_base{parent_l} + _pos{parent_l}] = "
+                                     f"{coord}"))
+                            then.append(llir.RawStmt(code=f"_pos{parent_l}++"))
+                            then.append(llir.RawStmt(
+                                code=f"{result_name}{l}_pos_data"
+                                     f"[_base{parent_l} + _pos{parent_l}] = "
+                                     f"_base{l} + {pos_var}"))
+                        then.append(llir.RawStmt(
+                            code=f"{prev_var} = {pos_var}"))
+                        new.append(llir.IfThenElse(
+                            cond=llir.BinOp(
+                                op=">",
+                                left=llir.Var(name=pos_var, type=llir.DataType.INT64),
+                                right=llir.Var(name=prev_var, type=llir.DataType.INT64),
+                            ),
+                            then_body=then,
+                        ))
+                    continue
+                else:
+                    # Not a result assembly if-block – recurse into bodies
+                    if stmt.then_body:
+                        stmt.then_body = CINLowerer._transform_result_writes(
+                            stmt.then_body, result_name, compressed_levels, mode)
+                    if stmt.else_body:
+                        stmt.else_body = CINLowerer._transform_result_writes(
+                            stmt.else_body, result_name, compressed_levels, mode)
+                    if stmt.then_body_list:
+                        stmt.then_body_list = [
+                            CINLowerer._transform_result_writes(
+                                b, result_name, compressed_levels, mode)
+                            for b in stmt.then_body_list]
+                    new.append(stmt)
+                    continue
+
+            # ── Recurse into loops ─────────────────────────────────────
+            if isinstance(stmt, llir.ForLoop):
+                stmt.body = CINLowerer._transform_result_writes(
+                    stmt.body, result_name, compressed_levels, mode)
+                if stmt.pre_parallel_body:
+                    stmt.pre_parallel_body = CINLowerer._transform_result_writes(
+                        stmt.pre_parallel_body, result_name,
+                        compressed_levels, mode)
+                if stmt.post_parallel_body:
+                    stmt.post_parallel_body = CINLowerer._transform_result_writes(
+                        stmt.post_parallel_body, result_name,
+                        compressed_levels, mode)
+                new.append(stmt)
+                continue
+
+            if isinstance(stmt, llir.ForLoopAuto):
+                stmt.body = CINLowerer._transform_result_writes(
+                    stmt.body, result_name, compressed_levels, mode)
+                new.append(stmt)
+                continue
+
+            if isinstance(stmt, llir.WhileLoop):
+                stmt.body = CINLowerer._transform_result_writes(
+                    stmt.body, result_name, compressed_levels, mode)
+                new.append(stmt)
+                continue
+
+            # ── Default: keep ──────────────────────────────────────────
+            new.append(stmt)
+
+        return new
+
     def _transform_compressed_where_for_openmp(self, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
         """Transform a serial ForLoop with workspace-based compressed output into
         a two-phase parallel assembly:
-          Phase 1: Count nnz per row in parallel (workspace fill + size query)
+          Phase 1: Count nnz per level in parallel
           Phase 2: Prefix sum + allocate output arrays
-          Phase 3: Fill values in parallel (workspace fill + sort + write)
+          Phase 3: Fill values in parallel
 
-        This is generalizable to any operation with dense-outer + compressed-inner
-        output using a sparse workspace (SpMSpM, sampled operations, etc.)."""
+        Generalised to any 'd,s,s,...,s' output (one dense outer level followed
+        by M compressed levels)."""
         import copy
 
         # Find the outer ForLoop
@@ -2457,60 +2712,76 @@ class CINLowerer:
         wksp_name = self._where_workspace_name
         wksp_ctype = self._where_workspace_ctype
         result_name = self.final_result_tensor_var.get_name()
+        level_types = self.final_result_tensor_var.get_level_types()
+        compressed_levels = [i for i, lt in enumerate(level_types)
+                             if lt == LevelType.COMPRESSED]
+        leaf = compressed_levels[-1]
+        first_cl = compressed_levels[0]
 
-        # Extract the "work body" from the for loop: everything except
-        # compressed-level assembly stmts and consumer (sort/iterate).
-        # This includes coordinate resolution, workspace memset, and producer loops.
+        # ── Extract work_body ──────────────────────────────────────────
+        # Keep everything in the outer loop body EXCEPT top-level
+        # compressed-level-1 assembly stmts (pos_index loops, pos
+        # assignments) and the top-level workspace VarInit (hoisted
+        # to pre_parallel_body).  Everything else — including nested
+        # consumer code — stays; the recursive transformer handles it.
         body = for_loop.body
         work_body: List[llir.Stmt] = []
-        pos_index_name = f"{result_name}1_pos_index"
+        pos_index_name = f"{result_name}{first_cl}_pos_index"
+        wksp_hoisted = False
+
         for stmt in body:
-            # Skip compressed assembly stmts (C1_pos_index, C1_pos[...]=...)
-            if isinstance(stmt, (llir.ForLoop, llir.ForLoopAuto)):
-                if isinstance(stmt, llir.ForLoopAuto):
-                    continue  # consumer iterate loop
-                # Check for compressed assembly loop (for (; C1_pos_index < i; ...))
+            if isinstance(stmt, llir.ForLoop):
                 cond = getattr(stmt, 'cond', None)
                 if (isinstance(cond, llir.BinOp)
                         and isinstance(cond.left, llir.Var)
                         and pos_index_name in cond.left.name):
-                    continue
-                # Check for pos init loop (pC1 = 1..C0_size)
+                    continue  # C1_pos_index assembly loop
                 init = getattr(stmt, 'init', None)
                 if (isinstance(init, llir.VarInit)
                         and hasattr(init, 'var')
-                        and getattr(init.var, 'name', '').startswith(f"p{result_name}")):
-                    continue
+                        and getattr(init.var, 'name', '').startswith(
+                            f"p{result_name}")):
+                    continue  # pos init loop
                 work_body.append(stmt)
             elif isinstance(stmt, llir.VarInit):
                 vname = getattr(getattr(stmt, 'var', None), 'name', '')
                 if vname == wksp_name:
-                    continue  # workspace init (will be hoisted to pre_parallel_body)
-                work_body.append(stmt)
-            elif isinstance(stmt, llir.FunctionCallStmt):
-                fname = getattr(stmt, 'name', '')
-                if '.sort' in fname or '.clear' in fname:
-                    continue  # consumer sort / workspace clear
+                    wksp_hoisted = True
+                    continue  # hoisted to pre_parallel_body
                 work_body.append(stmt)
             elif isinstance(stmt, llir.Assign):
                 vname = getattr(getattr(stmt, 'var', None), 'name', '')
-                if (f"{result_name}1_pos[" in vname or f"{result_name}_values[" in vname
-                        or f"{result_name}1_crd[" in vname or pos_index_name in vname):
-                    continue  # consumer writes / compressed assembly
-                work_body.append(stmt)
-            elif isinstance(stmt, llir.Increment):
-                vname = getattr(getattr(stmt, 'var', None), 'name', '')
-                if vname == f"p{result_name}1":
-                    continue  # consumer pC1++
+                if f"{result_name}{first_cl}_pos[" in vname:
+                    continue  # top-level pos assembly
                 work_body.append(stmt)
             else:
                 work_body.append(stmt)
 
-        # Phase 1: Count nnz per row
-        phase1_body = []
-        phase1_body.extend(copy.deepcopy(work_body))
-        phase1_body.append(llir.RawStmt(code=f"_row_nnz[{loop_var}] = {wksp_name}.size()"))
-        phase1_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
+        # ── Workspace hoisting ─────────────────────────────────────────
+        wksp_alloc: List[llir.Stmt] = []
+        if wksp_hoisted:
+            wksp_type_str = f"linked_list_workspace_1d<{wksp_ctype}>"
+            wksp_alloc = [llir.RawStmt(
+                code=f"auto {wksp_name} = {wksp_type_str}"
+                     f"(result_shape[{first_cl}])")]
+
+        # ── Phase 1: count nnz per level ───────────────────────────────
+        phase1_body: List[llir.Stmt] = []
+        for l in compressed_levels:
+            phase1_body.append(llir.RawStmt(code=f"int _cnt{l} = 0"))
+        for l in compressed_levels[1:]:
+            phase1_body.append(llir.RawStmt(code=f"int _prev{l} = 0"))
+
+        p1_work = copy.deepcopy(work_body)
+        p1_work = self._transform_result_writes(
+            p1_work, result_name, compressed_levels, 'count')
+        phase1_body.extend(p1_work)
+
+        for l in compressed_levels:
+            phase1_body.append(llir.RawStmt(
+                code=f"_count{l}[{loop_var}] = _cnt{l}"))
+        if wksp_hoisted:
+            phase1_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
 
         phase1_loop = llir.ForLoop(
             init=copy.deepcopy(for_loop.init),
@@ -2520,25 +2791,31 @@ class CINLowerer:
         )
         phase1_loop.omp_parallel_for = True
         phase1_loop.omp_schedule = "dynamic, 64"
-        wksp_type_str = f"linked_list_workspace_1d<{wksp_ctype}>"
-        wksp_alloc = [llir.RawStmt(code=f"auto {wksp_name} = {wksp_type_str}(result_shape[1])")]
-        phase1_loop.pre_parallel_body = wksp_alloc
+        if wksp_alloc:
+            phase1_loop.pre_parallel_body = list(wksp_alloc)
 
-        # Phase 3: Fill values
-        phase3_body = []
-        phase3_body.extend(copy.deepcopy(work_body))
-        phase3_body.append(llir.RawStmt(code=f"{wksp_name}.sort()"))
-        phase3_body.append(llir.RawStmt(code=f"int _base = {result_name}1_pos_data[{loop_var}]"))
-        phase3_body.append(llir.RawStmt(code=f"int _pos = 0"))
-        phase3_body.append(llir.RawStmt(
-            code=f"for (const auto& _it : {wksp_name}) {{\n"
-                 f"          {result_name}1_crd_data[_base + _pos] = _it.first;\n"
-                 f"          {result_name}_values_data[_base + _pos] = _it.second;\n"
-                 f"          _pos++;\n"
-                 f"        }}",
-            add_semicolon=False,
-        ))
-        phase3_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
+        # ── Phase 3: fill values ───────────────────────────────────────
+        phase3_body: List[llir.Stmt] = []
+        for l in compressed_levels:
+            phase3_body.append(llir.RawStmt(
+                code=f"int64_t _base{l} = _offset{l}[{loop_var}]"))
+            phase3_body.append(llir.RawStmt(code=f"int _pos{l} = 0"))
+        for l in compressed_levels[1:]:
+            phase3_body.append(llir.RawStmt(code=f"int _prev{l} = 0"))
+        # start pos boundaries for non-first compressed levels
+        for l in compressed_levels[1:]:
+            parent_l = compressed_levels[compressed_levels.index(l) - 1]
+            phase3_body.append(llir.RawStmt(
+                code=f"{result_name}{l}_pos_data[_base{parent_l}] = "
+                     f"(int)_base{l}"))
+
+        p3_work = copy.deepcopy(work_body)
+        p3_work = self._transform_result_writes(
+            p3_work, result_name, compressed_levels, 'fill')
+        phase3_body.extend(p3_work)
+
+        if wksp_hoisted:
+            phase3_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
 
         phase3_loop = llir.ForLoop(
             init=copy.deepcopy(for_loop.init),
@@ -2548,77 +2825,111 @@ class CINLowerer:
         )
         phase3_loop.omp_parallel_for = True
         phase3_loop.omp_schedule = "dynamic, 64"
-        phase3_loop.pre_parallel_body = list(wksp_alloc)
+        if wksp_alloc:
+            phase3_loop.pre_parallel_body = list(wksp_alloc)
 
-        # Build the transformed stmts
-        result = []
-
-        # Keep stmts before the for loop that are NOT result tensor init
-        # (those will be replaced by our raw pointer allocations)
+        # ── Strip pre-loop result tensor declarations ──────────────────
+        result: List[llir.Stmt] = []
         for stmt in stmts[:for_loop_idx]:
-            # Skip cvector declarations and init for the result tensor
             if isinstance(stmt, llir.VarDecl) and hasattr(stmt, 'var'):
                 vname = getattr(stmt.var, 'name', '')
-                if any(vname.startswith(f"{result_name}{x}") for x in ['_values', '1_pos', '1_crd']):
+                if vname.startswith(f"{result_name}_values"):
+                    continue
+                skip = False
+                for l in compressed_levels:
+                    if (vname.startswith(f"{result_name}{l}_pos")
+                            or vname.startswith(f"{result_name}{l}_crd")):
+                        skip = True
+                        break
+                if skip:
                     continue
             if isinstance(stmt, llir.VarInit) and hasattr(stmt, 'var'):
                 vname = getattr(stmt.var, 'name', '')
-                if vname in (f"p{result_name}1", f"{result_name}1_pos_index"):
+                skip = False
+                for l in compressed_levels:
+                    if vname in (f"p{result_name}{l}",
+                                 f"{result_name}{l}_pos_index"):
+                        skip = True
+                        break
+                if skip:
                     continue
             if isinstance(stmt, llir.Assign):
                 vname = getattr(getattr(stmt, 'var', None), 'name', '')
-                if f"{result_name}1_pos[" in vname:
+                skip = False
+                for l in compressed_levels:
+                    if f"{result_name}{l}_pos[" in vname:
+                        skip = True
+                        break
+                if skip:
                     continue
             if isinstance(stmt, llir.ForLoop):
-                # Skip the pos init loop: for (pC1=1; pC1<=C0_size; ...) C1_pos[pC1]=0
                 init_var = getattr(getattr(stmt, 'init', None), 'var', None)
-                if init_var and getattr(init_var, 'name', '').startswith(f"p{result_name}"):
+                if (init_var and getattr(init_var, 'name', '').startswith(
+                        f"p{result_name}")):
                     continue
             result.append(stmt)
 
         c_dtype = wksp_ctype or "float"
         sizeof_val = f"sizeof({c_dtype})"
 
-        # Phase 1: count nnz per row
-        result.append(llir.RawStmt(
-            code=f"int* _row_nnz = (int*)calloc({loop_bound}, sizeof(int))"
-        ))
+        # ── Phase 1: count arrays + loop ───────────────────────────────
+        for l in compressed_levels:
+            result.append(llir.RawStmt(
+                code=f"int* _count{l} = (int*)calloc({loop_bound}, sizeof(int))"))
         result.append(phase1_loop)
 
-        # Phase 2: prefix sum + allocate
-        result.append(llir.RawStmt(
-            code=f"int* {result_name}1_pos_data = (int*)malloc(({loop_bound} + 1) * sizeof(int))"
-        ))
-        result.append(llir.RawStmt(code=f"{result_name}1_pos_data[0] = 0"))
-        result.append(llir.RawStmt(
-            code=f"for (int _i = 0; _i < {loop_bound}; _i++) "
-                 f"{result_name}1_pos_data[_i + 1] = {result_name}1_pos_data[_i] + _row_nnz[_i];",
-            add_semicolon=False,
-        ))
-        result.append(llir.RawStmt(
-            code=f"int _total_nnz = {result_name}1_pos_data[{loop_bound}]"
-        ))
-        result.append(llir.RawStmt(code="free(_row_nnz)"))
-        result.append(llir.RawStmt(
-            code=f"int* {result_name}1_crd_data = (int*)malloc(_total_nnz * sizeof(int))"
-        ))
-        result.append(llir.RawStmt(
-            code=f"{c_dtype}* {result_name}_values_data = ({c_dtype}*)malloc(_total_nnz * {sizeof_val})"
-        ))
+        # ── Phase 2: prefix sums + allocate ────────────────────────────
+        for l in compressed_levels:
+            result.append(llir.RawStmt(
+                code=f"int64_t* _offset{l} = (int64_t*)malloc("
+                     f"({loop_bound} + 1) * sizeof(int64_t))"))
+            result.append(llir.RawStmt(code=f"_offset{l}[0] = 0"))
+            result.append(llir.RawStmt(
+                code=f"for (int _i = 0; _i < {loop_bound}; _i++) "
+                     f"_offset{l}[_i + 1] = _offset{l}[_i] + _count{l}[_i];",
+                add_semicolon=False))
+        for l in compressed_levels:
+            result.append(llir.RawStmt(
+                code=f"int64_t _total{l} = _offset{l}[{loop_bound}]"))
+        for l in compressed_levels:
+            result.append(llir.RawStmt(code=f"free(_count{l})"))
 
-        # Phase 3: fill values
+        # C{first_cl}_pos_data: size B+1, copied from _offset{first_cl}
+        result.append(llir.RawStmt(
+            code=f"int* {result_name}{first_cl}_pos_data = "
+                 f"(int*)malloc(({loop_bound} + 1) * sizeof(int))"))
+        result.append(llir.RawStmt(
+            code=f"for (int _i = 0; _i <= {loop_bound}; _i++) "
+                 f"{result_name}{first_cl}_pos_data[_i] = "
+                 f"(int)_offset{first_cl}[_i];",
+            add_semicolon=False))
+
+        # crd arrays
+        for l in compressed_levels:
+            result.append(llir.RawStmt(
+                code=f"int* {result_name}{l}_crd_data = "
+                     f"(int*)malloc(_total{l} * sizeof(int))"))
+
+        # pos arrays for non-first compressed levels
+        for i, l in enumerate(compressed_levels[:-1]):
+            nl = compressed_levels[i + 1]
+            result.append(llir.RawStmt(
+                code=f"int* {result_name}{nl}_pos_data = "
+                     f"(int*)malloc((_total{l} + 1) * sizeof(int))"))
+
+        # values array (sized by leaf-level total)
+        result.append(llir.RawStmt(
+            code=f"{c_dtype}* {result_name}_values_data = "
+                 f"({c_dtype}*)malloc(_total{leaf} * {sizeof_val})"))
+
+        # ── Phase 3: fill values ───────────────────────────────────────
         result.append(phase3_loop)
 
-        # Final assembly: from_blob with raw pointers
-        result.append(llir.RawStmt(code=f"auto _free_deleter = [](void* p) {{ free(p); }}"))
-        result.append(llir.RawStmt(
-            code=f"torch::Tensor {result_name}1_pos_torch = torch::from_blob("
-                 f"{result_name}1_pos_data, {{(long long)({loop_bound} + 1)}}, _free_deleter, torch::kInt)"
-        ))
-        result.append(llir.RawStmt(
-            code=f"torch::Tensor {result_name}1_crd_torch = torch::from_blob("
-                 f"{result_name}1_crd_data, {{(long long)_total_nnz}}, _free_deleter, torch::kInt)"
-        ))
+        # free offset arrays (no longer needed)
+        for l in compressed_levels:
+            result.append(llir.RawStmt(code=f"free(_offset{l})"))
+
+        # ── Final assembly: from_blob ──────────────────────────────────
         _CTYPE_TO_TORCH = {
             "float": "torch::kFloat32",
             "double": "torch::kFloat64",
@@ -2629,17 +2940,47 @@ class CINLowerer:
         }
         torch_dtype = _CTYPE_TO_TORCH.get(c_dtype, "torch::kFloat32")
         result.append(llir.RawStmt(
-            code=f"torch::Tensor {result_name}_values_torch = torch::from_blob("
-                 f"{result_name}_values_data, {{(long long)_total_nnz}}, _free_deleter, {torch_dtype})"
-        ))
+            code="auto _free_deleter = [](void* p) { free(p); }"))
+
+        for l in compressed_levels:
+            if l == first_cl:
+                pos_size = f"(long long)({loop_bound} + 1)"
+            else:
+                parent_l = compressed_levels[compressed_levels.index(l) - 1]
+                pos_size = f"(long long)(_total{parent_l} + 1)"
+            result.append(llir.RawStmt(
+                code=f"torch::Tensor {result_name}{l}_pos_torch = "
+                     f"torch::from_blob({result_name}{l}_pos_data, "
+                     f"{{{pos_size}}}, _free_deleter, torch::kInt)"))
+            result.append(llir.RawStmt(
+                code=f"torch::Tensor {result_name}{l}_crd_torch = "
+                     f"torch::from_blob({result_name}{l}_crd_data, "
+                     f"{{(long long)_total{l}}}, _free_deleter, torch::kInt)"))
+
+        result.append(llir.RawStmt(
+            code=f"torch::Tensor {result_name}_values_torch = "
+                 f"torch::from_blob({result_name}_values_data, "
+                 f"{{(long long)_total{leaf}}}, _free_deleter, {torch_dtype})"))
+
+        # mode_indices: {{}, {pos,crd}, {pos,crd}, ...}
+        mi_parts = []
+        for i in range(len(level_types)):
+            if i == 0:
+                mi_parts.append("{}")
+            else:
+                mi_parts.append(
+                    f"{{{result_name}{i}_pos_torch, "
+                    f"{result_name}{i}_crd_torch}}")
+        mi_str = ", ".join(mi_parts)
+
         result.append(llir.RawStmt(
             code=f"Tensor {result_name};\n"
                  f"  {result_name}._storage._index.mode_indices = "
-                 f"{{{{}}, {{{result_name}1_pos_torch, {result_name}1_crd_torch}}}};\n"
-                 f"  {result_name}._storage._value = {result_name}_values_torch;\n"
+                 f"{{{mi_str}}};\n"
+                 f"  {result_name}._storage._value = "
+                 f"{result_name}_values_torch;\n"
                  f"  return {result_name};",
-            add_semicolon=False,
-        ))
+            add_semicolon=False))
 
         self._compressed_output_parallel = True
         return result
