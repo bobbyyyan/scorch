@@ -2,46 +2,36 @@
 
 Scorch is a Python library for sparse machine learning, built on top of PyTorch. It provides sparse implementations of key PyTorch operations, allowing you to work with sparse tensors seamlessly.
 
-## Getting Started
+## Quick Start
 
-To get started with Scorch, follow these steps:
-
-1. Clone the Scorch repository and change into the project directory:
-   ```shell
-   git clone <repository-url>
-   cd scorch
-   ```
-
-2. Create a new conda environment and install the required dependencies:
-   ```shell
-   conda create -n scorch python=3.11
-   conda activate scorch
-   pip install -r requirements.txt
-   ```
-
-3. Install Scorch and its dependencies:
-   ```shell
-   pip install .
-   ```
-
-## Usage
-
-To use Scorch in your PyTorch projects, simply import it as follows:
+Create sparse tensors and run operations with a familiar API:
 
 ```python
-import scorch as torch
+import torch
+import scorch
+
+# Create STensors from PyTorch tensors
+A = scorch.from_torch(torch.tensor([[1., 0., 2.], [0., 3., 0.], [4., 0., 5.]]), "A")
+B = scorch.from_torch(torch.tensor([[1., 2.], [3., 4.], [5., 6.]]), "B")
+
+# Matrix multiply
+C = scorch.matmul(A, B)
+print(C)
+
+# Einstein summation
+D = scorch.einsum("ij,jk->ik", A, B)
+print(D.to_torch())
 ```
 
-With this import statement, you can use Scorch's sparse implementations of PyTorch operations. For example:
-
-```python
-# Create sparse tensors
-sparse_tensor1 = torch.sparse_coo_tensor(...)
-sparse_tensor2 = torch.sparse_coo_tensor(...)
-
-# Perform sparse matrix multiplication
-result = torch.matmul(sparse_tensor1, sparse_tensor2)
-
-# Perform sparse einsum operation
-result = torch.einsum('ij,jk->ik', sparse_tensor1, sparse_tensor2)
 ```
+tensor([[11., 14.],
+        [ 9., 12.],
+        [29., 38.]])
+tensor([[11., 14.],
+        [ 9., 12.],
+        [29., 38.]])
+```
+
+> **Note:** The first call compiles a specialized C++ kernel via JIT. Subsequent calls reuse the cached kernel and run at full speed.
+
+> Scorch uses a [format notation](#format-system) where each dimension is dense (`d`), compressed (`s`), or coordinate (`o`) -- so CSR is simply `(d,s)`.
