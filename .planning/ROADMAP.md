@@ -12,8 +12,8 @@ This roadmap delivers a complete README rewrite for Scorch's public open-source 
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Quick Start and API Verification** - Write runnable STensor code examples and verify they work against the current API
-- [ ] **Phase 2: Project Identity** - Title, badges, and "What is Scorch" description
+- [x] **Phase 1: Quick Start and API Verification** - Write runnable STensor code examples and verify they work against the current API
+- [x] **Phase 2: Project Identity** - Title, badges, and "What is Scorch" description
 - [ ] **Phase 3: Installation Guide** - Prerequisites listing and installation instructions with platform-specific notes
 - [ ] **Phase 4: Format System** - Explanation of d/cs/o/s notation with mapping table to familiar formats
 - [ ] **Phase 5: PyTorch Drop-in Compatibility** - Demonstrate `import scorch as torch` usage with before/after comparison
@@ -147,8 +147,8 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Quick Start and API Verification | 0/1 | Planning complete | - |
-| 2. Project Identity | 0/1 | Planning complete | - |
+| 1. Quick Start and API Verification | 1/1 | Complete | 2026-03-19 |
+| 2. Project Identity | 1/1 | Complete | 2026-03-22 |
 | 3. Installation Guide | 0/? | Not started | - |
 | 4. Format System | 0/? | Not started | - |
 | 5. PyTorch Drop-in Compatibility | 0/? | Not started | - |
