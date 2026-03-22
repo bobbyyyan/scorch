@@ -1,6 +1,13 @@
-# Scorch
+# 🔥 Scorch
 
-Scorch is a Python library for sparse machine learning, built on top of PyTorch. It provides sparse implementations of key PyTorch operations, allowing you to work with sparse tensors seamlessly.
+A compiler-based sparse tensor library for PyTorch.
+
+[![CI](https://img.shields.io/github/actions/workflow/status/bobbyyyan/scorch/pytest.yml?branch=main&style=flat)](https://github.com/bobbyyyan/scorch/actions/workflows/pytest.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0%2B-ee4c2c?style=flat&logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Paper](https://img.shields.io/badge/CGO%202026-paper-blueviolet?style=flat)](https://fredrikbk.com/cgo26scorch.html)
+[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS-blue?style=flat)](https://github.com/bobbyyyan/scorch)
 
 ## Quick Start
 
