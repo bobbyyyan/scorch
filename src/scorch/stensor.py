@@ -36,8 +36,17 @@ class Window(object):
         return Window(deepcopy(self.offset), deepcopy(self.shape), deepcopy(self.step))
 
 
-class STensor(torch.nn.Module):
-    """A tensor stored in custom format."""
+class STensor:
+    """A tensor stored in custom format.
+
+    NOTE: This is a plain Python class, not an ``nn.Module``. STensor holds its
+    payload inside ``self._storage`` (a ``TensorStorage``), never as a direct
+    tensor attribute, so ``nn.Module`` registered nothing useful — it only added
+    per-instance ``__init__``/``__setattr__``/``isinstance`` overhead that
+    dominated matmul latency on small matrices. STensors are transient data, are
+    never registered as submodules, and carry no autograd, so dropping Module is
+    behaviour-preserving.
+    """
 
     _name: Optional[str]
 
@@ -58,7 +67,6 @@ class STensor(torch.nn.Module):
         value: Optional[torch.Tensor] = None,
         requires_grad: Optional[bool] = False,
     ) -> None:
-        super().__init__()
         if storage is not None:
             self._storage = storage
         else:

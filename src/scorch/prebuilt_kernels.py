@@ -101,7 +101,37 @@ def _resolve_symbol(candidates: Sequence[str]) -> Tuple[Optional[KernelFn], Opti
     return None, None
 
 
+# Resolution depends only on (ranks, format strings, requested output format,
+# dtypes) — all static for a given kernel shape — so memoize it. On a warm call
+# this collapses the whole spec scan + repeated parse_format() calls into a
+# single dict lookup, eliminating a large slice of the per-call Python overhead
+# that dominates SpMM latency on small matrices. The key space is tiny and
+# bounded (a handful of formats/ranks/dtypes), so no eviction is needed.
+_RESOLVE_MISS = object()
+_resolve_matmul_cache: dict = {}
+
+
 def resolve_prebuilt_matmul(
+    a: "STensor",
+    b: "STensor",
+    output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
+) -> Optional[ResolvedPrebuiltKernel]:
+    of_key = tuple(output_format) if isinstance(output_format, list) else output_format
+    if of_key is not None and not isinstance(of_key, (str, tuple)):
+        of_key = str(of_key)
+    cache_key = (
+        a.dim(), b.dim(), str(a.format), str(b.format),
+        of_key, a.values.dtype, b.values.dtype,
+    )
+    cached = _resolve_matmul_cache.get(cache_key, _RESOLVE_MISS)
+    if cached is not _RESOLVE_MISS:
+        return cached
+    resolved = _resolve_prebuilt_matmul_uncached(a, b, output_format)
+    _resolve_matmul_cache[cache_key] = resolved
+    return resolved
+
+
+def _resolve_prebuilt_matmul_uncached(
     a: "STensor",
     b: "STensor",
     output_format: Optional[Union[TensorFormat, str, List[str]]] = None,

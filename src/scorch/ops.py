@@ -353,6 +353,14 @@ def matmul(
             result_cpp, result_shape = execute_prebuilt_binary_kernel(
                 resolved.fn, a, b, time_dict=time_dict
             )
+            # Fast path: a dense output kernel already produced a contiguous
+            # row-major value buffer. Return it reshaped directly, skipping the
+            # STensor/TensorIndex construction and the to_dense()/to_torch()
+            # round-trip — all pure per-call Python overhead here, since the
+            # result is default mode order with matching dtype (exactly what
+            # to_torch() would have reconstructed).
+            if resolved.output_format.is_dense():
+                return result_cpp.storage.value.reshape(result_shape)
             result = STensor(
                 shape=result_shape,
                 index=TensorIndex(
