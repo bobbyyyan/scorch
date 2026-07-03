@@ -2030,11 +2030,18 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   // Adaptive chunk: scale with total work to balance scheduling overhead
   // vs load imbalance.  clamp(nnz / (nthreads * 128), 16, 256).
   const int total_nnz = A1_pos[A0_size];
-  const int nthreads = omp_get_max_threads();
+  // Work-aware thread cap: a small A_sparse @ B_dense product (nnz*k below a few
+  // million flops) is swamped by OpenMP fork/join across all cores — a 24-row
+  // product spent more time in barriers than computing. Cap the worker count by
+  // the work so small products use few threads; the cap only binds below
+  // ~GRAIN*max_threads, so large products keep every core. Pairs with the
+  // adaptive chunk below (which already scales the schedule grain with work).
+  const long work = (long)total_nnz * (long)B1_size;
+  const int nthreads = (int)std::clamp<long>(work / 150000L, 1L, (long)omp_get_max_threads());
   const int chunk = std::max(16, std::min(256, total_nnz / (nthreads * 128)));
   std::atomic<int> next_row{0};
 
-  #pragma omp parallel
+  #pragma omp parallel num_threads(nthreads)
   {
     // Per-thread workspace, cache-line aligned, lives in L1
     float* SCORCH_RESTRICT ws = (float*)aligned_alloc(64, kTile * sizeof(float));
