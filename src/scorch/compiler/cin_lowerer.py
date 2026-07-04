@@ -3712,9 +3712,12 @@ class CINLowerer:
         return None
 
     # Min work per thread for the SpGEMM 2-phase path, where `work` is the true flop
-    # (A_nnz*avg_B_row). Larger than the header's A_nnz default (500) because flop is
-    # ~avg_B_row bigger; validated on redwood (see csrc/header.cpp comment).
-    _CG_FLOP_GRAIN = 1500
+    # (A_nnz*avg_B_row). Emitted by NAME (not as a literal) so the codegen flop grain
+    # lives in the single tuning surface csrc/scorch_policy.h and picks up the Phase 4b
+    # per-host autotuned value; the header (via header.cpp) is prepended to every
+    # generated kernel so the macro resolves. Defaults to 1500 there — larger than the
+    # A_nnz default (500) because flop is ~avg_B_row bigger; validated on redwood.
+    _CG_FLOP_GRAIN = "SCORCH_GRAIN_CODEGEN_SPGEMM"
 
     def _apply_parallel_policy(self, loop, body=None, chunk=True,
                                work_expr=None, grain=None):

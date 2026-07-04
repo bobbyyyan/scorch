@@ -16,13 +16,36 @@ from .format import TensorFormat, LevelFormat, LevelType
 PROJECT_ROOT_DIR = Path(__file__)
 
 
+def _policy_header_text() -> str:
+    """Text of the shared parallel-policy header(s), folded into the JIT kernel
+    cache key. csrc/header.cpp (hashed as a kernel source) only ``#include``s
+    csrc/scorch_policy.h, so its own text does NOT reflect the policy constants'
+    values — a Phase 4b autotune that rewrites scorch_policy.h /
+    scorch_policy_tuned.h would otherwise leave cached .so files stale. Reading
+    the included text here makes any retune change the hash and force a recompile.
+    """
+    text = ""
+    for name in ("csrc/scorch_policy.h", "csrc/scorch_policy_tuned.h"):
+        try:
+            text += (PROJECT_ROOT_DIR / name).read_text()
+        except OSError:
+            pass  # tuned header is optional; a missing base header just omits it
+    return text
+
+
 def _kernel_name(*sources: str) -> str:
     """Deterministic name from kernel source so torch's disk cache persists.
 
     Includes torch version in the hash so a PyTorch upgrade invalidates
-    all cached .so files (they link against libtorch).
+    all cached .so files (they link against libtorch). Also folds in the shared
+    parallel-policy header text so Phase 4b per-host retuning invalidates them.
     """
-    h = hashlib.md5(("".join(sources) + torch.__version__).encode()).hexdigest()[:12]
+    keyed = "".join(sources) + _policy_header_text() + torch.__version__
+    if os.environ.get("SCORCH_JIT_TUNE_HOOKS"):
+        # Instrumented sweep kernels carry extra getenv branches (same text, -D flag),
+        # so key them apart from clean kernels to avoid serving one for the other.
+        keyed += "|scorch_tune_hooks"
+    h = hashlib.md5(keyed.encode()).hexdigest()[:12]
     return f"kernel_{h}"
 
 
@@ -102,6 +125,12 @@ def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
     # The preamble is text-prepended into a build-dir main.cpp, so the quote-
     # include only resolves with csrc/ on the compiler's search path.
     flags.append(f"-I{PROJECT_ROOT_DIR / 'csrc'}")
+
+    # Install-time autotune: build JIT kernels with the SCORCH_TUNE_HOOKS sweep hooks
+    # so the codegen thread/chunk policy is tunable in-process too (mirrors setup.py's
+    # SCORCH_BUILD_TUNE_HOOKS for the prebuilt kernels). Off in the shipped path.
+    if os.environ.get("SCORCH_JIT_TUNE_HOOKS"):
+        flags.append("-DSCORCH_TUNE_HOOKS")
 
     return flags
 

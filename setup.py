@@ -14,6 +14,12 @@ extra_compile_args = [
 ]
 extra_link_args = []
 
+# Install-time autotune builds an instrumented scorch_ops so tools/autotune_policy.py
+# can sweep the OpenMP thread/chunk policy in-process (see csrc/scorch_policy.h). The
+# shipped build never sets this -> the sweep hooks compile out (zero overhead).
+if os.environ.get("SCORCH_BUILD_TUNE_HOOKS"):
+    extra_compile_args.append("-DSCORCH_TUNE_HOOKS")
+
 if platform.system() == "Darwin":
     # macOS: use Xpreprocessor flag for OpenMP
     extra_compile_args.extend(["-Xpreprocessor", "-fopenmp"])
