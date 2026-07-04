@@ -1,5 +1,7 @@
 #include <atomic>
 #include <omp.h>
+#include <cstdlib>
+#include <cstdio>
 
 typedef struct {
   std::vector<std::vector<torch::Tensor>> mode_indices;
@@ -222,6 +224,79 @@ template<typename T> inline T scorch_gelu(T x) {
 
 // ####################################
 // ===== END === ACTIVATION HELPERS ====
+// ####################################
+
+
+// ####################################
+// == BEGIN == PARALLEL POLICY HELPERS ==
+// ####################################
+//
+// Work-aware OpenMP thread cap + adaptive schedule chunk, shared by JIT-
+// generated kernels (emitted by compiler/codegen.py). Same lesson as the
+// prebuilt spmspm/spmm kernels: unconditional all-cores over-threads small
+// products and a coarse fixed chunk starves load-balance on hybrid P+E CPUs.
+//
+// Env override hooks (for tuning; unset = built-in default):
+//   SCORCH_CG_THREADS  force nthreads
+//   SCORCH_CG_CHUNK    force schedule chunk
+//   SCORCH_CG_GRAIN    min work (nnz) per thread (default 500)
+//   SCORCH_CG_ROWQ     min rows per thread (default 16)
+//   SCORCH_CG_CPT      target chunks per thread (default 7)
+//
+// Tuning (redwood i9-14900K, ds-path codegen SpGEMM, validated back-to-back vs the
+// old all-cores+chunk64 policy): GRAIN=500 + ROWQ=16 + CPT=7 beats the old policy on
+// a 7-size dense panel (~0.70x runtime) AND on ultra-sparse ~1nnz/row products
+// (0.81-0.92x), capturing ~91% of the per-size threads x chunk oracle. `work` here
+// is A_nnz (outer-operand nnz), so GRAIN is ~avg_B_row smaller than the prebuilt
+// kernels' flop-based GRAIN=3000. The nnz work bound throttles tiny/ultra-sparse
+// products (the documented over-threading risk); rows/16 drives normal matrices to
+// ~all cores now that the adaptive fine chunk removed the P+E over-threading cliff.
+//   SCORCH_CG_DEBUG    print the (work,rows)->(nt,chunk) decision to stderr
+
+inline long _scorch_env_long(const char* name, long dflt) {
+  const char* e = getenv(name);
+  if (e && *e) { long v = atol(e); if (v > 0) return v; }
+  return dflt;
+}
+
+// work < 0 means "unknown" -> cap by rows only.
+inline int scorch_nthreads(long work, long rows) {
+  const char* forced = getenv("SCORCH_CG_THREADS");
+  if (forced && *forced) { int v = atoi(forced); if (v > 0) return v; }
+  int hw = omp_get_num_procs();          // stable; torch mutates omp_get_max_threads
+  long rowq = _scorch_env_long("SCORCH_CG_ROWQ", 16);
+  long n = rows / rowq;
+  if (work >= 0) {
+    long grain = _scorch_env_long("SCORCH_CG_GRAIN", 500);
+    long by_work = work / grain;
+    if (by_work < n) n = by_work;
+  }
+  if (n < 1) n = 1;
+  if (n > (long)hw) n = hw;
+  return (int)n;
+}
+
+inline int scorch_chunk(long rows, long work) {
+  int nt = scorch_nthreads(work, rows);
+  const char* forced = getenv("SCORCH_CG_CHUNK");
+  int chunk;
+  if (forced && *forced) { chunk = atoi(forced); if (chunk < 1) chunk = 1; }
+  else {
+    long cpt = _scorch_env_long("SCORCH_CG_CPT", 7);
+    long c = rows / (nt * cpt);
+    if (c < 4) c = 4;
+    if (c > 64) c = 64;
+    chunk = (int)c;
+  }
+  if (getenv("SCORCH_CG_DEBUG")) {
+    fprintf(stderr, "[scorch_cg] work=%ld rows=%ld -> nt=%d chunk=%d\n",
+            work, rows, nt, chunk);
+  }
+  return chunk;
+}
+
+// ####################################
+// === END === PARALLEL POLICY HELPERS ==
 // ####################################
 
 

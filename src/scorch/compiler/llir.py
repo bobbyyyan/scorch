@@ -479,6 +479,8 @@ class ForLoop(Stmt):
         simd: bool = False,
         pre_parallel_body: Optional[List[Stmt]] = None,
         post_parallel_body: Optional[List[Stmt]] = None,
+        omp_num_threads: Optional[str] = None,
+        omp_chunk_expr: Optional[str] = None,
     ):
         self.init = init
         self.cond = cond
@@ -488,6 +490,12 @@ class ForLoop(Stmt):
         self.omp_schedule = omp_schedule
         self.unroll = unroll
         self.simd = simd
+        # Work-aware parallel policy (compiler/codegen.py emits these).
+        # omp_num_threads: C++ expr for num_threads(...) (e.g. scorch_nthreads(work,rows)).
+        # omp_chunk_expr:  C++ expr for the dynamic schedule chunk; when set the
+        #   schedule becomes "dynamic, <omp_chunk_expr>" overriding omp_schedule's chunk.
+        self.omp_num_threads = omp_num_threads
+        self.omp_chunk_expr = omp_chunk_expr
         # Stmts placed inside #pragma omp parallel but before/after the for loop.
         # When set, codegen splits "parallel for" into "parallel { pre; for; post }".
         self.pre_parallel_body = pre_parallel_body

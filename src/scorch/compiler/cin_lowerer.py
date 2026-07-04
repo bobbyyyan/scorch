@@ -2791,6 +2791,7 @@ class CINLowerer:
         )
         phase1_loop.omp_parallel_for = True
         phase1_loop.omp_schedule = "dynamic, 64"
+        self._apply_parallel_policy(phase1_loop, body=phase1_body)
         if wksp_alloc:
             phase1_loop.pre_parallel_body = list(wksp_alloc)
 
@@ -2825,6 +2826,7 @@ class CINLowerer:
         )
         phase3_loop.omp_parallel_for = True
         phase3_loop.omp_schedule = "dynamic, 64"
+        self._apply_parallel_policy(phase3_loop, body=phase3_body)
         if wksp_alloc:
             phase3_loop.pre_parallel_body = list(wksp_alloc)
 
@@ -3654,16 +3656,21 @@ class CINLowerer:
                         llir_stmt._atomic_chunk_var = "_chunk"
                         llir_stmt._atomic_counter_var = "_next_row"
                         llir_stmt._loop_bound = loop_bound
+                        # Work-aware thread cap; chunk stays the atomic _chunk above.
+                        llir_stmt.omp_num_threads = (
+                            f"scorch_nthreads({sparse_pos}[{loop_bound}], {loop_bound})")
                     else:
                         if alloc or free:
                             llir_stmt.pre_parallel_body = alloc or None
                             llir_stmt.post_parallel_body = free or None
+                        self._apply_parallel_policy(llir_stmt)
                 else:
                     if has_sparse:
                         llir_stmt.omp_schedule = "dynamic, 64"
                     if alloc or free:
                         llir_stmt.pre_parallel_body = alloc or None
                         llir_stmt.post_parallel_body = free or None
+                    self._apply_parallel_policy(llir_stmt)
                 return
 
     @staticmethod
@@ -3694,6 +3701,26 @@ class CINLowerer:
             if isinstance(right, llir.Var):
                 return right.name
         return None
+
+    def _apply_parallel_policy(self, loop, body=None, chunk=True):
+        """Attach a work-aware thread cap (+ adaptive schedule chunk) to a parallel
+        ForLoop. codegen.py emits these as num_threads(scorch_nthreads(work,rows)) and
+        schedule(dynamic, scorch_chunk(rows, work)) (helpers in csrc/header.cpp).
+
+        rows = loop bound; work = nnz (<pos>[<bound>]) when a sparse pos array is found
+        in the body, else -1 (thread cap by rows only). No-op when the bound can't be
+        determined. chunk=False keeps the loop's own chunk (e.g. the atomic work-
+        stealing _chunk) and only applies the thread cap.
+        """
+        bound = self._extract_loop_bound(loop)
+        if not bound:
+            return
+        search_body = body if body is not None else loop.body
+        pos = self._find_sparse_pos_array(search_body)
+        work = f"{pos}[{bound}]" if pos else "-1"
+        loop.omp_num_threads = f"scorch_nthreads({work}, {bound})"
+        if chunk:
+            loop.omp_chunk_expr = f"scorch_chunk({bound}, {work})"
 
     @classmethod
     def _collect_output_arrays(cls, stmts: List[llir.Stmt], output_arrays: List[str]) -> None:
@@ -3987,6 +4014,7 @@ class CINLowerer:
                 omp_parallel_for=True,
                 omp_schedule="dynamic, 16",
             )
+            self._apply_parallel_policy(group_loop, body=group_body)
 
             # Pre-allocate output arrays for thread-safe parallel writes
             prealloc_stmts: List[llir.Stmt] = []
@@ -4065,6 +4093,7 @@ class CINLowerer:
                     omp_parallel_for=True,
                     omp_schedule="dynamic, 64",
                 )
+                self._apply_parallel_policy(flat_loop, body=flat_body)
 
                 if not self._known_nnz_var:
                     result.extend(prealloc_stmts)

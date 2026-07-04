@@ -157,6 +157,23 @@ class LLIRLowerer:
 
         raise ValueError(f"Unknown expression type: {type(ir)}")
 
+    @staticmethod
+    def _omp_num_threads_clause(ir: "llir.ForLoop") -> str:
+        """`` num_threads(<expr>)`` when a work-aware thread cap is set, else ``""``."""
+        expr = getattr(ir, "omp_num_threads", None)
+        return f" num_threads({expr})" if expr else ""
+
+    @staticmethod
+    def _omp_schedule_clause(ir: "llir.ForLoop") -> str:
+        """`` schedule(...)`` clause. An adaptive chunk expr (omp_chunk_expr)
+        overrides the static chunk baked into omp_schedule."""
+        chunk_expr = getattr(ir, "omp_chunk_expr", None)
+        if chunk_expr:
+            return f" schedule(dynamic, {chunk_expr})"
+        if ir.omp_schedule:
+            return f" schedule({ir.omp_schedule})"
+        return ""
+
     def lower_loop_construct(
         self,
         ir: Union[llir.WhileLoop, llir.ForLoop, llir.ForLoopAuto],
@@ -174,7 +191,7 @@ class LLIRLowerer:
                 loop_var = ir.init.var.name if ir.init else "i"
                 parts = [
                     self.lower_llir(f"std::atomic<int> {counter_var}{{0}};", indent_level),
-                    self.lower_llir("#pragma omp parallel", indent_level),
+                    self.lower_llir("#pragma omp parallel" + self._omp_num_threads_clause(ir), indent_level),
                     self.lower_llir("{", indent_level),
                 ]
                 if ir.pre_parallel_body:
@@ -202,16 +219,14 @@ class LLIRLowerer:
             # When pre/post_parallel_body is set, split into:
             #   #pragma omp parallel { pre; #pragma omp for ...; post }
             if ir.omp_parallel_for and (ir.pre_parallel_body or ir.post_parallel_body):
-                omp_for = "#pragma omp for"
-                if ir.omp_schedule:
-                    omp_for += f" schedule({ir.omp_schedule})"
+                omp_for = "#pragma omp for" + self._omp_schedule_clause(ir)
                 init_lowered = self.lower_llir(ir.init) if ir.init is not None else ";"
                 for_header = (
                     f"for ({init_lowered} {self.lower_llir(ir.cond)};"
                     f" {self.lower_llir(ir.update, no_semicolon=True)}) {{"
                 )
                 parts = [
-                    self.lower_llir("#pragma omp parallel", indent_level),
+                    self.lower_llir("#pragma omp parallel" + self._omp_num_threads_clause(ir), indent_level),
                     self.lower_llir("{", indent_level),
                 ]
                 if ir.pre_parallel_body:
@@ -226,9 +241,9 @@ class LLIRLowerer:
                 return "\n".join(parts)
 
             if ir.omp_parallel_for:
-                omp_pragma = "#pragma omp parallel for"
-                if ir.omp_schedule:
-                    omp_pragma += f" schedule({ir.omp_schedule})"
+                omp_pragma = ("#pragma omp parallel for"
+                              + self._omp_num_threads_clause(ir)
+                              + self._omp_schedule_clause(ir))
                 pragma_lines.append(omp_pragma)
             if ir.unroll:
                 pragma_lines.append("#pragma unroll")
