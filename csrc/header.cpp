@@ -1,7 +1,6 @@
 #include <atomic>
 #include <omp.h>
 #include <cstdlib>
-#include <cstdio>
 
 typedef struct {
   std::vector<std::vector<torch::Tensor>> mode_indices;
@@ -236,39 +235,27 @@ template<typename T> inline T scorch_gelu(T x) {
 // prebuilt spmspm/spmm kernels: unconditional all-cores over-threads small
 // products and a coarse fixed chunk starves load-balance on hybrid P+E CPUs.
 //
-// Env override hooks (for tuning; unset = built-in default):
-//   SCORCH_CG_THREADS  force nthreads
-//   SCORCH_CG_CHUNK    force schedule chunk
-//   SCORCH_CG_GRAIN    min work (nnz) per thread (default 500)
-//   SCORCH_CG_ROWQ     min rows per thread (default 16)
-//   SCORCH_CG_CPT      target chunks per thread (default 7)
-//
-// Tuning (redwood i9-14900K, ds-path codegen SpGEMM, validated back-to-back vs the
-// old all-cores+chunk64 policy): GRAIN=500 + ROWQ=16 + CPT=7 beats the old policy on
-// a 7-size dense panel (~0.70x runtime) AND on ultra-sparse ~1nnz/row products
-// (0.81-0.92x), capturing ~91% of the per-size threads x chunk oracle. `work` here
-// is A_nnz (outer-operand nnz), so GRAIN is ~avg_B_row smaller than the prebuilt
-// kernels' flop-based GRAIN=3000. The nnz work bound throttles tiny/ultra-sparse
-// products (the documented over-threading risk); rows/16 drives normal matrices to
-// ~all cores now that the adaptive fine chunk removed the P+E over-threading cliff.
-//   SCORCH_CG_DEBUG    print the (work,rows)->(nt,chunk) decision to stderr
-
-inline long _scorch_env_long(const char* name, long dflt) {
-  const char* e = getenv(name);
-  if (e && *e) { long v = atol(e); if (v > 0) return v; }
-  return dflt;
-}
+// `grain_default` is the min work per thread; the caller passes it because the
+// meaning of `work` differs by call site (validated on redwood i9-14900K, ds-path
+// codegen SpGEMM, back-to-back vs the old all-cores+chunk64 policy):
+//   - SpGEMM 2-phase path: work = true flop A_nnz*avg_B_row -> grain_default=1500.
+//     Recovers the small-DENSE giveback (n=128/256: the flop pushes them to the rows
+//     cap, ~0.2-0.4x runtime vs old) while keeping ultra-sparse ~1nnz/row products at
+//     their ~8-thread optimum (0.77-0.96x); higher grain throttles them below it.
+//   - other sites: work = A_nnz (outer-operand nnz) -> grain_default=500 (the 2-arg
+//     default below). A_nnz is ~avg_B_row smaller than flop, so it wants a smaller
+//     grain; unifying every site on flop+one grain is a follow-up.
+// The rows/16 bound drives normal matrices to ~all cores (the adaptive fine chunk
+// removed the P+E over-threading cliff); the work bound throttles tiny/ultra-sparse
+// products. Constants (grain, 16 rows/thread, ~7 chunks/thread) tuned on redwood; a
+// per-host autotune to replace them is a follow-up.
 
 // work < 0 means "unknown" -> cap by rows only.
-inline int scorch_nthreads(long work, long rows) {
-  const char* forced = getenv("SCORCH_CG_THREADS");
-  if (forced && *forced) { int v = atoi(forced); if (v > 0) return v; }
+inline int scorch_nthreads(long work, long rows, long grain_default = 500) {
   int hw = omp_get_num_procs();          // stable; torch mutates omp_get_max_threads
-  long rowq = _scorch_env_long("SCORCH_CG_ROWQ", 16);
-  long n = rows / rowq;
+  long n = rows / 16;                     // >= ~16 rows per worker
   if (work >= 0) {
-    long grain = _scorch_env_long("SCORCH_CG_GRAIN", 500);
-    long by_work = work / grain;
+    long by_work = work / grain_default;  // >= grain_default work per worker
     if (by_work < n) n = by_work;
   }
   if (n < 1) n = 1;
@@ -276,23 +263,12 @@ inline int scorch_nthreads(long work, long rows) {
   return (int)n;
 }
 
-inline int scorch_chunk(long rows, long work) {
-  int nt = scorch_nthreads(work, rows);
-  const char* forced = getenv("SCORCH_CG_CHUNK");
-  int chunk;
-  if (forced && *forced) { chunk = atoi(forced); if (chunk < 1) chunk = 1; }
-  else {
-    long cpt = _scorch_env_long("SCORCH_CG_CPT", 7);
-    long c = rows / (nt * cpt);
-    if (c < 4) c = 4;
-    if (c > 64) c = 64;
-    chunk = (int)c;
-  }
-  if (getenv("SCORCH_CG_DEBUG")) {
-    fprintf(stderr, "[scorch_cg] work=%ld rows=%ld -> nt=%d chunk=%d\n",
-            work, rows, nt, chunk);
-  }
-  return chunk;
+inline int scorch_chunk(long rows, long work, long grain_default = 500) {
+  int nt = scorch_nthreads(work, rows, grain_default);
+  long c = rows / (nt * 7);               // ~7 dynamic-schedule chunks per worker
+  if (c < 4) c = 4;
+  if (c > 64) c = 64;
+  return (int)c;
 }
 
 // ####################################

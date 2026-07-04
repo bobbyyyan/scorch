@@ -2791,7 +2791,13 @@ class CINLowerer:
         )
         phase1_loop.omp_parallel_for = True
         phase1_loop.omp_schedule = "dynamic, 64"
-        self._apply_parallel_policy(phase1_loop, body=phase1_body)
+        # Both operands are known here, so drive the thread cap by true SpGEMM flop
+        # (A_nnz*avg_B_row) rather than A_nnz alone; falls back to A_nnz when the
+        # B-side pos array can't be found (dense B, self-product, exotic format).
+        flop_work = self._spgemm_flop_work_expr(phase1_body, loop_bound)
+        self._apply_parallel_policy(
+            phase1_loop, body=phase1_body, work_expr=flop_work,
+            grain=self._CG_FLOP_GRAIN if flop_work else None)
         if wksp_alloc:
             phase1_loop.pre_parallel_body = list(wksp_alloc)
 
@@ -2826,7 +2832,10 @@ class CINLowerer:
         )
         phase3_loop.omp_parallel_for = True
         phase3_loop.omp_schedule = "dynamic, 64"
-        self._apply_parallel_policy(phase3_loop, body=phase3_body)
+        flop_work3 = self._spgemm_flop_work_expr(phase3_body, loop_bound)
+        self._apply_parallel_policy(
+            phase3_loop, body=phase3_body, work_expr=flop_work3,
+            grain=self._CG_FLOP_GRAIN if flop_work3 else None)
         if wksp_alloc:
             phase3_loop.pre_parallel_body = list(wksp_alloc)
 
@@ -3702,25 +3711,109 @@ class CINLowerer:
                 return right.name
         return None
 
-    def _apply_parallel_policy(self, loop, body=None, chunk=True):
+    # Min work per thread for the SpGEMM 2-phase path, where `work` is the true flop
+    # (A_nnz*avg_B_row). Larger than the header's A_nnz default (500) because flop is
+    # ~avg_B_row bigger; validated on redwood (see csrc/header.cpp comment).
+    _CG_FLOP_GRAIN = 1500
+
+    def _apply_parallel_policy(self, loop, body=None, chunk=True,
+                               work_expr=None, grain=None):
         """Attach a work-aware thread cap (+ adaptive schedule chunk) to a parallel
         ForLoop. codegen.py emits these as num_threads(scorch_nthreads(work,rows)) and
         schedule(dynamic, scorch_chunk(rows, work)) (helpers in csrc/header.cpp).
 
-        rows = loop bound; work = nnz (<pos>[<bound>]) when a sparse pos array is found
-        in the body, else -1 (thread cap by rows only). No-op when the bound can't be
-        determined. chunk=False keeps the loop's own chunk (e.g. the atomic work-
-        stealing _chunk) and only applies the thread cap.
+        rows = loop bound; work = the C++ work estimate. When work_expr is given it is
+        used verbatim (e.g. the true SpGEMM flop A_nnz*avg_B_row from the 2-phase path,
+        where both operands are known); otherwise work = nnz (<pos>[<bound>]) for the
+        first sparse pos array found in the body, else -1 (thread cap by rows only).
+        grain, when given, is emitted as the helpers' grain_default arg (the flop path
+        passes _CG_FLOP_GRAIN; A_nnz sites omit it and get the header's 500 default).
+        No-op when the bound can't be determined. chunk=False keeps the loop's own chunk
+        (e.g. the atomic work-stealing _chunk) and only applies the thread cap.
         """
         bound = self._extract_loop_bound(loop)
         if not bound:
             return
-        search_body = body if body is not None else loop.body
-        pos = self._find_sparse_pos_array(search_body)
-        work = f"{pos}[{bound}]" if pos else "-1"
-        loop.omp_num_threads = f"scorch_nthreads({work}, {bound})"
+        if work_expr is not None:
+            work = work_expr
+        else:
+            search_body = body if body is not None else loop.body
+            pos = self._find_sparse_pos_array(search_body)
+            work = f"{pos}[{bound}]" if pos else "-1"
+        gsuf = f", {grain}" if grain is not None else ""
+        loop.omp_num_threads = f"scorch_nthreads({work}, {bound}{gsuf})"
         if chunk:
-            loop.omp_chunk_expr = f"scorch_chunk({bound}, {work})"
+            loop.omp_chunk_expr = f"scorch_chunk({bound}, {work}{gsuf})"
+
+    @staticmethod
+    def _parse_pos(pos_name: str):
+        """Split a sparse pos array name into (operand_prefix, level) per the codegen
+        naming convention: 'A1_pos' -> ('A', 1), 'B0_pos' -> ('B', 0). None if it
+        doesn't parse. A pos array exists only for a COMPRESSED level, so a level-0 pos
+        (e.g. 'B0_pos') signals a compressed outer level (no materialised <op>0_size)."""
+        import re
+        m = re.match(r'([A-Za-z_]\w*?)(\d+)_pos$', pos_name)
+        return (m.group(1), int(m.group(2))) if m else None
+
+    def _find_all_sparse_pos_arrays(self, body) -> List[str]:
+        """All distinct sparse pos array names (e.g. ['A1_pos', 'B1_pos']) referenced
+        anywhere in `body`, in first-seen order. Generalises _find_sparse_pos_array
+        (which returns only the first, and misses pos arrays hidden in ForLoop
+        init/cond) by rendering the body to C++ text and scanning it. Returns [] if
+        rendering fails, so callers fall back to the A_nnz-only estimate."""
+        import re
+        try:
+            from .codegen import LLIRLowerer
+            text = LLIRLowerer().lower_llir(list(body))
+        except Exception:
+            return []
+        found: List[str] = []
+        for m in re.finditer(r'(\w+_pos)\[', text):
+            if m.group(1) not in found:
+                found.append(m.group(1))
+        return found
+
+    def _spgemm_flop_work_expr(self, body, bound) -> Optional[str]:
+        """True SpGEMM-flop work estimate for the thread cap: A_nnz * avg_B_row, the
+        same estimate the prebuilt spmspm_csr kernel uses. A_nnz is the outer (A-side)
+        operand's nnz; avg_B_row is the second (B-side) operand's mean row length
+        (B_nnz/B0_size + 1). Returns None (caller falls back to the A_nnz-only estimate)
+        unless BOTH operands are CSR-like with a DENSE outer level, because only then
+        are <op>0_size (the outer dim) and <op><leaf>_pos[<op>0_size] (total nnz) real
+        declared vars. In particular a compressed-outer B (format 'ss', 'oo', ...) has
+        no <B>0_size var, so we must NOT reference it — that would be undeclared-id.
+        """
+        # Levels that have a pos array, grouped by operand prefix. A pos array exists
+        # only for a compressed level, so `0 in levels[op]` == compressed outer level.
+        levels: Dict[str, set] = {}
+        for p in self._find_all_sparse_pos_arrays(body):
+            parsed = self._parse_pos(p)
+            if parsed:
+                levels.setdefault(parsed[0], set()).add(parsed[1])
+
+        # A-side prefix from the loop bound (`<A>0_size`). If A had a compressed outer
+        # level the loop bound wouldn't be a plain size var, so this already implies A
+        # is dense-outer (its <A>0_size is declared).
+        if not bound.endswith("0_size"):
+            return None
+        a_prefix = bound[:-len("0_size")]
+        if a_prefix not in levels or 0 in levels[a_prefix]:
+            return None
+
+        # B-side: a DIFFERENT operand that is also dense-outer (no level-0 pos), so
+        # <B>0_size is a materialised shape var and <B><leaf>_pos[<B>0_size] = B_nnz.
+        b_prefix = next((pref for pref, lv in levels.items()
+                         if pref != a_prefix and 0 not in lv), None)
+        if b_prefix is None:
+            return None
+
+        a_nnz = f"(long){a_prefix}{max(levels[a_prefix])}_pos[{bound}]"
+        b_outer = f"{b_prefix}0_size"
+        b_nnz = f"{b_prefix}{max(levels[b_prefix])}_pos[{b_outer}]"
+        # (long) forces 64-bit multiply so a big flop can't overflow int (the prebuilt
+        # kernel likewise holds A_nnz/flop_est as long). avg_B_row guards B0_size==0
+        # (empty contraction dim), matching the prebuilt's `B0_size>0?(B_nnz/B0_size)+1:1`.
+        return f"{a_nnz} * ({b_outer} > 0 ? ({b_nnz} / {b_outer}) + 1 : 1)"
 
     @classmethod
     def _collect_output_arrays(cls, stmts: List[llir.Stmt], output_arrays: List[str]) -> None:
