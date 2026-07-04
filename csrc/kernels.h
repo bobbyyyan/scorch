@@ -8,6 +8,7 @@
 #include <numeric>
 
 #include "prebuilt_types.h"
+#include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.cpp)
 
 template <typename scalar_t>
 Tensor spmv_csr(
@@ -71,19 +72,15 @@ Tensor spmspm_csr(
   const long B_nnz = B1_pos[B0_size];
   const long avg_B_row = B0_size > 0 ? (B_nnz / B0_size) + 1 : 1;
   const long flop_est = A_nnz * avg_B_row;
-  // Portable grain-size + adaptive-chunk threading (no machine- or benchmark-specific
-  // constants). The dynamic-schedule chunk is the dominant lever: a coarse fixed chunk
-  // starves load-balancing, so the join barrier stalls on the slowest cores (e.g. the
-  // E-cores of a hybrid Intel P+E CPU, a 4-7x cliff) and few-row matrices run out of
-  // chunks to hand out. So (a) bound the worker count two ways and take the smaller —
-  // by WORK (one worker per GRAIN flops, so each thread's share exceeds its fork/join
-  // and O(rows) workspace cost) and by ROWS (>=~16 rows per worker) — then (b) size the
-  // schedule chunk to ~7 chunks per worker so every core, fast or slow, stays fed.
-  // omp_get_num_procs() is the stable OS count; omp_get_max_threads() is mutated by torch.
-  const int hw = omp_get_num_procs();
-  const long GRAIN = 3000;  // min flops per worker to amortize its fork/join + workspace
-  int nthreads = (int)std::clamp<long>(std::min(flop_est / GRAIN, (long)A0_size / 16), 1L, (long)hw);
-  int chunk = (int)std::clamp<long>((long)A0_size / ((long)nthreads * 7), 4L, 64L);
+  // Work-aware thread cap + adaptive schedule chunk from the shared policy
+  // (csrc/scorch_policy.h): work = flop_est (A_nnz*avg_B_row), grain = SCORCH_GRAIN_SPMSPM.
+  // scorch_nthreads reproduces this kernel's former inline decision exactly —
+  // clamp(min(flop_est/3000, A0_size/16), 1, omp_get_num_procs()) — and scorch_chunk the
+  // matching clamp(A0_size/(nthreads*7), 4, 64). The dynamic-schedule chunk is the dominant
+  // lever: a coarse fixed chunk starves load-balancing so the join barrier stalls on the
+  // slowest cores (e.g. a hybrid Intel P+E CPU's E-cores, a 4-7x cliff).
+  const int nthreads = scorch_nthreads(flop_est, A0_size, SCORCH_GRAIN_SPMSPM);
+  const int chunk = scorch_chunk(A0_size, flop_est, SCORCH_GRAIN_SPMSPM);
 
   // Phase 1: Count nnz per row in parallel
   int* row_nnz = (int*)calloc(A0_size, sizeof(int));

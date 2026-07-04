@@ -533,7 +533,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
     )
 
     tensor_a_torch = torch.Tensor(
@@ -678,7 +678,7 @@ def test_spmm_ds_ds_ds_kij_outer():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
     )
 
     tensor_b_torch = torch.Tensor(
@@ -1187,7 +1187,7 @@ def test_spmm_ss_dd_dd_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
     )
 
     tensor_a_torch = torch.Tensor(
@@ -1305,7 +1305,7 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
     )
 
     tensor_a_torch = torch.Tensor(
@@ -1424,7 +1424,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
     )
 
     tensor_a_torch = torch.rand(dim_n, dim_n)
@@ -1525,7 +1525,7 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3"],
+        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
     )
 
     tensor_a_torch = torch.Tensor(

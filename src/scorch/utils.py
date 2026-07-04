@@ -97,6 +97,12 @@ def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
         # Linux: standard OpenMP support
         flags.append("-fopenmp")
 
+    # The JIT preamble (csrc/header.cpp) #includes "scorch_policy.h" (the shared
+    # thread-cap / chunk policy, also used by the prebuilt scorch_ops kernels).
+    # The preamble is text-prepended into a build-dir main.cpp, so the quote-
+    # include only resolves with csrc/ on the compiler's search path.
+    flags.append(f"-I{PROJECT_ROOT_DIR / 'csrc'}")
+
     return flags
 
 

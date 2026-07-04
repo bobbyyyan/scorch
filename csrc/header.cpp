@@ -230,46 +230,13 @@ template<typename T> inline T scorch_gelu(T x) {
 // == BEGIN == PARALLEL POLICY HELPERS ==
 // ####################################
 //
-// Work-aware OpenMP thread cap + adaptive schedule chunk, shared by JIT-
-// generated kernels (emitted by compiler/codegen.py). Same lesson as the
-// prebuilt spmspm/spmm kernels: unconditional all-cores over-threads small
-// products and a coarse fixed chunk starves load-balance on hybrid P+E CPUs.
-//
-// `grain_default` is the min work per thread; the caller passes it because the
-// meaning of `work` differs by call site (validated on redwood i9-14900K, ds-path
-// codegen SpGEMM, back-to-back vs the old all-cores+chunk64 policy):
-//   - SpGEMM 2-phase path: work = true flop A_nnz*avg_B_row -> grain_default=1500.
-//     Recovers the small-DENSE giveback (n=128/256: the flop pushes them to the rows
-//     cap, ~0.2-0.4x runtime vs old) while keeping ultra-sparse ~1nnz/row products at
-//     their ~8-thread optimum (0.77-0.96x); higher grain throttles them below it.
-//   - other sites: work = A_nnz (outer-operand nnz) -> grain_default=500 (the 2-arg
-//     default below). A_nnz is ~avg_B_row smaller than flop, so it wants a smaller
-//     grain; unifying every site on flop+one grain is a follow-up.
-// The rows/16 bound drives normal matrices to ~all cores (the adaptive fine chunk
-// removed the P+E over-threading cliff); the work bound throttles tiny/ultra-sparse
-// products. Constants (grain, 16 rows/thread, ~7 chunks/thread) tuned on redwood; a
-// per-host autotune to replace them is a follow-up.
-
-// work < 0 means "unknown" -> cap by rows only.
-inline int scorch_nthreads(long work, long rows, long grain_default = 500) {
-  int hw = omp_get_num_procs();          // stable; torch mutates omp_get_max_threads
-  long n = rows / 16;                     // >= ~16 rows per worker
-  if (work >= 0) {
-    long by_work = work / grain_default;  // >= grain_default work per worker
-    if (by_work < n) n = by_work;
-  }
-  if (n < 1) n = 1;
-  if (n > (long)hw) n = hw;
-  return (int)n;
-}
-
-inline int scorch_chunk(long rows, long work, long grain_default = 500) {
-  int nt = scorch_nthreads(work, rows, grain_default);
-  long c = rows / (nt * 7);               // ~7 dynamic-schedule chunks per worker
-  if (c < 4) c = 4;
-  if (c > 64) c = 64;
-  return (int)c;
-}
+// Work-aware OpenMP thread cap (scorch_nthreads) + adaptive schedule chunk
+// (scorch_chunk) for the JIT-generated kernels emitted by compiler/codegen.py.
+// The single source of truth is csrc/scorch_policy.h (shared with the prebuilt
+// scorch_ops kernels spmspm_csr / spmm_csr_float_v2). This preamble is text-
+// prepended to every generated kernel; src/scorch/utils.py get_extra_cflags()
+// adds csrc/ to the JIT `-I` path so this include resolves at compile time.
+#include "scorch_policy.h"
 
 // ####################################
 // === END === PARALLEL POLICY HELPERS ==

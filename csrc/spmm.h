@@ -12,6 +12,7 @@
 #endif
 
 #include "prebuilt_types.h"
+#include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.cpp)
 
 #define SCORCH_PRAGMA_UNROLL _Pragma("unroll")
 #define SCORCH_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -2027,18 +2028,17 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   // Round tile to multiple of 16 for SIMD alignment
   const int kTile = (tile_size + 15) & ~15;
 
-  // Adaptive chunk: scale with total work to balance scheduling overhead
-  // vs load imbalance.  clamp(nnz / (nthreads * 128), 16, 256).
+  // Work-aware thread cap + adaptive schedule chunk from the shared policy
+  // (csrc/scorch_policy.h): work = nnz*k, grain = SCORCH_GRAIN_SPMM. A small
+  // A_sparse @ B_dense product (nnz*k below a few million flops) is swamped by
+  // OpenMP fork/join across all cores — a 24-row product spent more time in
+  // barriers than computing — so scorch_nthreads throttles it; the cap only binds
+  // below ~GRAIN*num_procs, so large products keep every core. `chunk` is the
+  // number of rows each worker steals per next_row.fetch_add below.
   const int total_nnz = A1_pos[A0_size];
-  // Work-aware thread cap: a small A_sparse @ B_dense product (nnz*k below a few
-  // million flops) is swamped by OpenMP fork/join across all cores — a 24-row
-  // product spent more time in barriers than computing. Cap the worker count by
-  // the work so small products use few threads; the cap only binds below
-  // ~GRAIN*max_threads, so large products keep every core. Pairs with the
-  // adaptive chunk below (which already scales the schedule grain with work).
   const long work = (long)total_nnz * (long)B1_size;
-  const int nthreads = (int)std::clamp<long>(work / 150000L, 1L, (long)omp_get_max_threads());
-  const int chunk = std::max(16, std::min(256, total_nnz / (nthreads * 128)));
+  const int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
+  const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
   std::atomic<int> next_row{0};
 
   #pragma omp parallel num_threads(nthreads)
