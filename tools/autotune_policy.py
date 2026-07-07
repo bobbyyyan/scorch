@@ -1,16 +1,47 @@
 #!/usr/bin/env python
-"""Per-host autotune for scorch's OpenMP parallel policy (Phase 4b).
+"""Per-host autotune (ADVISORY) for scorch's OpenMP parallel policy (Phase 4b/4d).
 
-Measures THIS build machine and writes ``csrc/scorch_policy_tuned.h`` with the
-thread-cap / schedule-chunk constants that best fit its cores, then rebuilds a
-clean ``scorch_ops``. When the autotune is skipped (CI, cross-compile, plain
-``pip install``), the redwood-tuned defaults baked into ``csrc/scorch_policy.h``
-apply and everything still compiles — the tuned header is optional.
+Measures THIS build machine across a threads x chunk grid and REPORTS the policy
+constants that best fit its cores. It is **advisory-first**: by default it writes
+nothing and changes no build — you read the report and decide. Pass ``--adopt`` to
+opt in to writing ``csrc/scorch_policy_tuned.h`` (gitignored) and a clean rebuild.
+When no tuned header is present (CI, cross-compile, plain ``pip install``, or you
+never ran ``--adopt``), the redwood-tuned defaults baked into
+``csrc/scorch_policy.h`` apply and everything still compiles — the tuned header is
+optional and always removable (delete it to revert).
 
-Why a machine measurement at all: the policy SHAPE (throttle small products,
-adaptive chunk) is machine-stable, but the CONSTANTS are not. Redwood's hybrid
-P+E i9 wants ~8 threads for an ultra-sparse product; an Apple M5 wants 1. Same
-formula, different grain. This tool re-fits the grain per host.
+Why measure at all: the policy SHAPE (throttle small products, adaptive chunk) is
+machine-stable, but the CONSTANTS are not. Redwood's hybrid P+E i9 wants ~8 threads
+for an ultra-sparse product; an Apple M5 wants 1. Same formula, different constants.
+
+Safe scope — which knobs ``--adopt`` may change
+-----------------------------------------------
+The tuning surface splits by WHAT each knob depends on, and only PART of it is
+faithfully predictable from a panel measured on one host:
+
+  KNOB                              DEPENDS ON                  PANEL-FAITHFUL?
+  chunks/thread, chunk_min/max      CPU cache / core structure  YES (transfers)
+  work grains, rows/thread          the workload's matrix       NO  (needs the
+  (any thread-COUNT knob)           STRUCTURE distribution          full collection)
+
+So ``--adopt`` by DEFAULT tunes ONLY the machine-intrinsic CHUNK-shape knobs
+(``SCORCH_CHUNKS_PER_THREAD`` / ``SCORCH_CHUNK_MIN`` / ``SCORCH_CHUNK_MAX``): they
+set the load-balance grain GIVEN a thread count, are CPU cache/core-intrinsic, and a
+panel measures them faithfully — they DID transfer in Phase 4b. The work GRAINS and
+``SCORCH_ROWS_PER_THREAD`` (rpt sets the thread cap nt=rows/rpt — a thread-COUNT
+knob) are FROZEN to their shipped, 1714-validated defaults.
+
+Tuning the grains / rpt is opt-in via ``--tune-grains`` and prints a loud warning:
+a panel — even a big real-SuiteSparse one — does NOT predict the full collection for
+a thread-count change. In Phase 4c a work-plateau FORM won a 47-matrix
+distribution-weighted redwood panel (gmean 3.68->4.10, 0 non-tiny regressions) yet
+LOST the full 1714 back-to-back sweep (gmean 8.03 vs 8.39, 139 non-tiny catastrophic
+losses) — because best_nt is not a function of flop; the discriminator is matrix
+structure a small panel can't represent. Any grain / rpt change MUST be validated
+with a full-collection back-to-back A/B before shipping — a maintainer activity, not
+an install step. Even the chunk-knob adoption is only PANEL-validated (not
+1714-validated), which is exactly why the DEFAULT is advisory and ``--adopt`` is a
+deliberate human opt-in after reading the report.
 
 Flow
 ----
@@ -18,16 +49,19 @@ Flow
    kernels' thread count and schedule chunk can be forced per-run via the
    ``SCORCH_TUNE_THREADS`` / ``SCORCH_TUNE_CHUNK`` env vars — no rebuild per cell.
    The shipped library never sets that define, so the hooks compile out.
-2. Sweep a synthetic panel across a threads x chunk grid, BACK-TO-BACK in one
-   process (never cross-time; median of repeats), recording runtime per cell.
-   This is the methodology validated on redwood — cross-time comparisons on a
-   shared box are unreliable, so we only ever compare cells measured adjacently.
-3. Offline-fit the constants: grid-search (grain, rows/thread, chunks/thread,
-   chunk bounds) against the measured grid (each candidate's predicted cell ->
-   its measured runtime) and maximise the per-matrix geomean speedup. The
-   winning fit is compared to the shipped defaults on the SAME measurements.
-4. Only if the fit beats the defaults by a margin, write the tuned header.
-   Otherwise keep the defaults (the sweep is only worthwhile if it wins).
+2. Sweep a panel across a threads x chunk grid, BACK-TO-BACK in one process
+   (never cross-time; median of repeats), recording runtime per cell. This is the
+   methodology validated on redwood — cross-time comparisons on a shared box are
+   unreliable, so we only ever compare cells measured adjacently.
+3. Offline-fit the constants: grid-search against the measured grid (each
+   candidate's predicted cell -> its measured runtime) and maximise the per-matrix
+   geomean speedup. By DEFAULT only the machine-intrinsic chunk-shape knobs vary
+   (grains + rows/thread pinned to their defaults); ``--tune-grains`` also searches
+   the grains + rows/thread. The winning fit is compared to the shipped defaults on
+   the SAME measurements.
+4. REPORT the fit vs the defaults and STOP, writing nothing — UNLESS ``--adopt`` is
+   given AND the fit beats the defaults by ``--margin``, in which case write the
+   tuned header (only the knobs that DIFFER from the defaults) and continue.
 5. Rebuild a CLEAN ``scorch_ops`` (no hooks). JIT kernels re-tune for free —
    ``utils._kernel_name`` folds the policy-header text into its cache hash, so
    rewriting the constants invalidates stale ``.so`` files automatically.
@@ -48,12 +82,15 @@ Two data sources feed the sweep:
 
 Usage
 -----
-    python tools/autotune_policy.py                       # auto: real if a dataset
-                                                          #   is found, else synthetic
+    python tools/autotune_policy.py                       # ADVISORY: sweep + fit +
+                                                          #   report, write NOTHING
+    python tools/autotune_policy.py --adopt               # tune CHUNK knobs, write
+                                                          #   tuned header + rebuild
     python tools/autotune_policy.py --matrices /scratch/suitesparse   # real panel
-    python tools/autotune_policy.py --download 40         # fetch ~40 real matrices, tune
-    python tools/autotune_policy.py --matrices DIR --dry-run   # sweep + fit, write nothing
-    python tools/autotune_policy.py --freeze-grains       # tune only chunk/topology knobs
+    python tools/autotune_policy.py --download 40         # fetch ~40 real matrices
+    python tools/autotune_policy.py --adopt --tune-grains  # ALSO tune grains/rows-per-
+                                                          #   thread (warned; needs a
+                                                          #   full-1714 A/B before ship)
     python tools/autotune_policy.py --reps 7 --rounds 3   # more measurement budget
     python tools/autotune_policy.py --kernels spmspm      # tune one kernel only
 
@@ -67,8 +104,9 @@ for the CHUNK / topology knobs but NOT for the work GRAINS: uniform data lacks t
 skewed ultra-sparse tail that the SuiteSparse-validated grains (spmspm 3000)
 protect, so a full synthetic fit tends to pick a smaller grain (more threads) that
 can regress real workloads. On redwood the full synthetic fit wanted grain 1000
-(+15%) but `--freeze-grains` — tuning only chunk sizing — gave a defensible +6.5%
-without touching the grains. A REAL-matrix panel (`--matrices`/`--download`) is
+(+15%) but freezing the grains — tuning only chunk sizing, now the DEFAULT scope —
+gave a defensible +6.5% without touching the grains. A REAL-matrix panel
+(`--matrices`/`--download`) is
 stronger evidence — it sees the skewed tail — but is still not a blank check for a
 grain change: a modest panel's unweighted geomean can be dominated by a few
 low-work/many-row outliers and pick a smaller grain that OVER-THREADS the mid-band
@@ -77,8 +115,12 @@ fit wanted spmspm grain 3000->500 for +8.8% panel geomean, yet per-matrix it
 regressed the mid-band up to 2.4x; ~all the win was the topology knobs, and grain
 3000 was actually best at the default topology.) So: prefer a real panel over
 synthetic; inspect the per-matrix breakdown (or use a larger, distribution-faithful
-`--panel-size`) before trusting a grain drop; `--freeze-grains` remains the
-conservative choice.
+`--panel-size`) before trusting a grain drop; keeping the grains frozen (the DEFAULT
+scope — `--tune-grains` opts out) remains the conservative choice. This whole caveat
+is why the tool is advisory-first and freezes grains + rows-per-thread by default —
+Phase 4c/B then proved a thread-count FORM that won a 47-matrix real panel still LOST
+the full 1714, so grain / rows-per-thread changes now require a full-collection A/B
+(see the "Safe scope" section above).
 """
 import argparse
 import json
@@ -778,24 +820,34 @@ CMIN_CANDIDATES = [2, 4, 8]
 CMAX_CANDIDATES = [32, 64, 128]
 
 
-def fit(measurements, kernels, freeze_grains=False):
-    """Joint grid-search: shared (rpt,cpt,cmin,cmax) across kernels + a per-kernel
-    grain. Objective = geomean of per-kernel geomean-speedups. Returns (best,
-    default) constant-sets and their scores on the identical measurements.
+def fit(measurements, kernels, tune_grains=False):
+    """Joint grid-search over the OpenMP policy constants against the measured grid.
+    Objective = geomean of per-kernel geomean-speedups. Returns (best, default)
+    constant-sets and their scores on the identical measurements.
 
-    freeze_grains restricts each grain to its shipped default, so only the
-    machine-topology knobs (rows/thr, chunks/thr, chunk bounds) are tuned. Use it
-    when you don't want a thin synthetic panel re-deriving the SuiteSparse-validated
-    work grains (which encode the matrix-shape distribution, not just the machine)."""
+    By DEFAULT (tune_grains=False) only the machine-intrinsic CHUNK-shape knobs vary
+    (chunks/thr, chunk_min, chunk_max) — they set the load-balance grain GIVEN a
+    thread count, are CPU cache/core-intrinsic, and a panel measures them faithfully
+    (Phase 4b). The workload-distribution-sensitive knobs — the per-kernel work
+    GRAINS and SCORCH_ROWS_PER_THREAD (rpt sets the thread cap nt=rows/rpt, a
+    thread-COUNT knob) — stay pinned to their shipped, 1714-validated defaults: they
+    encode the SuiteSparse matrix-shape distribution, not just this machine, and a
+    panel (even a big real one) does NOT predict the full collection for a
+    thread-count change (Phase 4c/B). ``tune_grains=True`` re-enables their search
+    for a maintainer who will validate any change with a full-collection A/B."""
     hw = measurements["hw"]
     nt_grid = measurements["nt_grid"]
     chunk_grid = measurements["chunk_grid"]
     kdata = {k: measurements["kernels"][k] for k in kernels}
     grain_choices = {
-        k: ([DEFAULTS[f"SCORCH_GRAIN_{k.upper()}"]] if freeze_grains
-            else GRAIN_CANDIDATES[k])
+        k: (GRAIN_CANDIDATES[k] if tune_grains
+            else [DEFAULTS[f"SCORCH_GRAIN_{k.upper()}"]])
         for k in kernels
     }
+    # rows/thread sets the thread cap (nt = rows/rpt), so it is a thread-COUNT knob,
+    # not a chunk-shape knob — freeze it with the grains unless --tune-grains is set.
+    rpt_choices = (RPT_CANDIDATES if tune_grains
+                   else [DEFAULTS["SCORCH_ROWS_PER_THREAD"]])
 
     def combined(rpt, cpt, cmin, cmax):
         per_kernel = {}
@@ -812,7 +864,7 @@ def fit(measurements, kernels, freeze_grains=False):
         return score, per_kernel
 
     best = None
-    for rpt in RPT_CANDIDATES:
+    for rpt in rpt_choices:
         for cpt in CPT_CANDIDATES:
             for cmin in CMIN_CANDIDATES:
                 for cmax in CMAX_CANDIDATES:
@@ -851,10 +903,24 @@ def fit(measurements, kernels, freeze_grains=False):
 
 
 # ------------------------------------------------------------------ header write
+# Knobs the tuned header may override, in emission order. Mirrors the #ifndef-guarded
+# macros in csrc/scorch_policy.h (and DEFAULTS above).
+_WRITABLE_KNOBS = ("SCORCH_GRAIN_SPMSPM", "SCORCH_GRAIN_SPMM", "SCORCH_ROWS_PER_THREAD",
+                   "SCORCH_CHUNKS_PER_THREAD", "SCORCH_CHUNK_MIN", "SCORCH_CHUNK_MAX")
+
+
 def write_tuned_header(tuned, meta):
+    """Write the gitignored per-host override header. Emits a ``#define`` ONLY for a
+    knob whose value DIFFERS from the shipped default, so the generated file is a
+    transparent diff: a reader (and the advisory report) can confirm at a glance that
+    the default ``--adopt`` scope touches only the CHUNK-shape knobs and leaves the
+    workload-sensitive grains / rows-per-thread at their 1714-validated defaults."""
+    changed = [(k, tuned[k]) for k in _WRITABLE_KNOBS
+               if k in tuned and tuned[k] != DEFAULTS[k]]
     lines = [
-        "// GENERATED by tools/autotune_policy.py — DO NOT EDIT, DO NOT COMMIT.",
-        "// Per-host OpenMP policy constants measured on this build machine.",
+        "// GENERATED by tools/autotune_policy.py --adopt — DO NOT EDIT, DO NOT COMMIT.",
+        "// Per-host OpenMP policy overrides measured on this build machine.",
+        "// Only knobs that DIFFER from the shipped scorch_policy.h defaults appear.",
         f"// host: {meta['host']}  logical_cores: {meta['hw']}",
         f"// tuned_geomean_speedup: {meta['tuned_score']:.3f}  "
         f"vs default: {meta['default_score']:.3f}  (+{meta['gain_pct']:.1f}%)",
@@ -862,10 +928,8 @@ def write_tuned_header(tuned, meta):
         "// to the shipped redwood defaults in scorch_policy.h.",
         "#pragma once",
     ]
-    for key in ("SCORCH_GRAIN_SPMSPM", "SCORCH_GRAIN_SPMM", "SCORCH_ROWS_PER_THREAD",
-                "SCORCH_CHUNKS_PER_THREAD", "SCORCH_CHUNK_MIN", "SCORCH_CHUNK_MAX"):
-        if key in tuned:
-            lines.append(f"#define {key} {tuned[key]}L")
+    for key, val in changed:
+        lines.append(f"#define {key} {val}L")
     TUNED_H.write_text("\n".join(lines) + "\n")
 
 
@@ -956,12 +1020,21 @@ def main():
     ap.add_argument("--panel-size", type=int, default=DEFAULT_PANEL_SIZE,
                     help="target size of the stratified real-matrix panel (~30-60)")
     ap.add_argument("--margin", type=float, default=0.02,
-                    help="min fractional gain over defaults to adopt the tune")
-    ap.add_argument("--freeze-grains", action="store_true",
-                    help="tune only machine-topology knobs (rows/thr, chunks/thr, "
-                    "chunk bounds); keep the SuiteSparse-validated work grains")
+                    help="min fractional gain over defaults for --adopt to write the tune")
+    ap.add_argument("--adopt", action="store_true",
+                    help="opt in to WRITING csrc/scorch_policy_tuned.h + a clean rebuild. "
+                    "Default is advisory (report only, change nothing). Scoped to the "
+                    "machine-intrinsic CHUNK knobs unless --tune-grains is also given.")
+    ap.add_argument("--tune-grains", action="store_true",
+                    help="ALSO search the work grains + rows-per-thread (thread-COUNT "
+                    "knobs), not just the chunk-shape knobs. These are SuiteSparse-"
+                    "distribution-sensitive: a panel does NOT predict the full 1714 "
+                    "(Phase 4c/B) — validate any change with a full-collection back-to-"
+                    "back A/B before shipping. Prints a loud warning.")
     ap.add_argument("--dry-run", action="store_true",
-                    help="sweep + fit + report, but write no header and don't rebuild")
+                    help="deprecated no-op: the DEFAULT is already advisory (report only, "
+                    "write nothing). Kept so old invocations still write nothing; forces "
+                    "no-adopt even if --adopt is also passed.")
     ap.add_argument("--keep-json", metavar="PATH", help="save the raw sweep JSON here")
     args = ap.parse_args()
 
@@ -990,6 +1063,19 @@ def main():
         REPO / "build" / "autotune_sweep.json")
     Path(json_path).parent.mkdir(parents=True, exist_ok=True)
 
+    if args.tune_grains:
+        bar = "!" * 72
+        print(f"\n[tune-grains] {bar}")
+        print("[tune-grains] --tune-grains: ALSO searching the work grains + rows-per-thread.")
+        print("[tune-grains] These are THREAD-COUNT knobs and SuiteSparse-distribution-")
+        print("[tune-grains] sensitive. A panel — even a big real one — does NOT predict the")
+        print("[tune-grains] full 1714 collection for a thread-count change: in Phase 4c a")
+        print("[tune-grains] work-plateau FORM won a 47-matrix dist-weighted panel yet LOST")
+        print("[tune-grains] the full 1714 back-to-back (gmean 8.03 vs 8.39, 139 non-tiny")
+        print("[tune-grains] catastrophic losses). VALIDATE any grain / rows-per-thread")
+        print("[tune-grains] change with a FULL-collection back-to-back A/B before shipping.")
+        print(f"[tune-grains] {bar}\n")
+
     # 1. instrumented build so the sweep can force any (nt, chunk) in-process
     build_scorch_ops(tune_hooks=True)
 
@@ -1015,14 +1101,23 @@ def main():
         real_panel = panel_desc.startswith("real")
         n_matrices = measurements.get("n_matrices", 0)
 
-        # 3. offline fit against the measured grid
-        res = fit(measurements, kernels, freeze_grains=args.freeze_grains)
+        # 3. offline fit against the measured grid. By default only the machine-
+        #    intrinsic chunk-shape knobs vary; --tune-grains also searches the
+        #    thread-count knobs (grains + rows/thread).
+        res = fit(measurements, kernels, tune_grains=args.tune_grains)
         gain = res["tuned_score"] / res["default_score"] - 1.0
+        # Advisory-first: writing the tuned header is a deliberate opt-in (--adopt);
+        # --dry-run forces no-adopt so old invocations keep writing nothing.
+        adopt = args.adopt and not args.dry_run
+
         print("\n==== autotune result "
               f"({host}, {measurements['hw']} logical cores) ====")
         print(f"  panel: {'REAL SuiteSparse' if real_panel else 'SYNTHETIC uniform-random'}"
               f" ({n_matrices} matrices)"
               + ("" if real_panel else "  — grains NOT faithfully tunable"))
+        print("  scope: " + ("grains + rows/thr + chunk knobs (--tune-grains)"
+              if args.tune_grains else
+              "CHUNK knobs only (grains + rows/thr frozen at 1714-validated defaults)"))
         for k in kernels:
             tg, ts = res["tuned_per_kernel"][k]
             dg, ds = res["default_per_kernel"][k]
@@ -1035,10 +1130,34 @@ def main():
         print(f"  combined geomean speedup  default={res['default_score']:.3f}  "
               f"tuned={res['tuned_score']:.3f}  gain={gain*100:+.1f}%")
 
-        if args.dry_run:
-            print("\n[dry-run] no header written. Restoring a clean build.")
+        # Thread-count changes are only reachable under --tune-grains (the default
+        # safe scope pins grains + rows/thread), but detect them unconditionally so
+        # the adopt path always names what it is about to write.
+        threadcount_changes = [
+            (k, DEFAULTS[f"SCORCH_GRAIN_{k.upper()}"],
+             res["tuned"][f"SCORCH_GRAIN_{k.upper()}"])
+            for k in kernels
+            if res["tuned"][f"SCORCH_GRAIN_{k.upper()}"]
+            != DEFAULTS[f"SCORCH_GRAIN_{k.upper()}"]
+        ]
+        if res["tuned"]["SCORCH_ROWS_PER_THREAD"] != DEFAULTS["SCORCH_ROWS_PER_THREAD"]:
+            threadcount_changes.append(
+                ("rows/thr", DEFAULTS["SCORCH_ROWS_PER_THREAD"],
+                 res["tuned"]["SCORCH_ROWS_PER_THREAD"]))
+
+        if not adopt:
+            # 4a. ADVISORY (default): report only, write nothing, leave the build's
+            #     adoption state untouched. --adopt is the deliberate human opt-in.
+            print("\n[advisory] report only — no header written, build unchanged"
+                  + (" (--dry-run)" if args.dry_run else "") + ".")
+            if args.tune_grains:
+                print("  Re-run with --adopt --tune-grains to write the tune "
+                      "(grains + rows/thr included).")
+            else:
+                print(f"  Re-run with --adopt to write csrc/{TUNED_H.name} "
+                      "(CHUNK knobs only) and rebuild.")
         elif gain < args.margin:
-            # 4a. keep the shipped defaults — the tune didn't clear the margin
+            # 4b. keep the shipped defaults — the tune didn't clear the margin
             print(f"\n[keep-defaults] gain {gain*100:+.1f}% < margin "
                   f"{args.margin*100:.1f}% — the defaults already fit this host; "
                   "not writing a tuned header.")
@@ -1046,60 +1165,32 @@ def main():
                 TUNED_H.unlink()
                 print("  removed a stale scorch_policy_tuned.h")
         else:
-            # 4b. adopt — the tune wins by the margin
-            grain_changes = [
-                (k, DEFAULTS[f"SCORCH_GRAIN_{k.upper()}"],
-                 res["tuned"][f"SCORCH_GRAIN_{k.upper()}"])
-                for k in kernels
-                if res["tuned"][f"SCORCH_GRAIN_{k.upper()}"]
-                != DEFAULTS[f"SCORCH_GRAIN_{k.upper()}"]
-            ]
-            if grain_changes and real_panel:
-                # A REAL panel sees the skewed tail (stronger evidence than synthetic),
-                # BUT a modest panel's unweighted geomean can be dominated by a few
-                # low-work/many-row outliers and pick a smaller grain that over-threads
-                # the MID-BAND into a hybrid CPU's E-core cliff (observed on redwood: a
-                # 40-matrix real fit wanted spmspm 3000->500 for +8.8% geomean, yet
-                # per-matrix it regressed the mid-band up to 2.4x; ~all the win was the
-                # topology knobs, and grain 3000 was best at the default topology). So a
-                # real-panel grain change is better-founded than synthetic but still not
-                # a blank check.
-                print("\n[note] the fit changed a work grain (REAL panel, "
-                      f"{n_matrices} matrices): "
-                      + ", ".join(f"{k} {d}->{t}" for k, d, t in grain_changes) + ".")
-                print("  Stronger evidence than a synthetic panel, but a modest panel's"
-                      " geomean can be")
-                print("  outlier-dominated and a smaller grain risks OVER-THREADING the"
-                      " mid-band on hybrid")
-                print("  CPUs. Inspect the per-matrix breakdown / use a larger,"
-                      " distribution-faithful panel")
-                print("  (bigger --panel-size), or --freeze-grains, before trusting a"
-                      " grain drop.")
-            elif grain_changes:
-                # The work grains encode the SuiteSparse matrix-shape distribution, not
-                # just this machine. A uniform-random synthetic panel can't see the
-                # skewed ultra-sparse tail the default grain protects, so it tends to
-                # pick a smaller grain (more threads) that may REGRESS real workloads.
-                print("\n[WARNING] the fit changed a work grain "
-                      + ", ".join(f"{k} {d}->{t}" for k, d, t in grain_changes) + ".")
-                print("  Grains are SuiteSparse-distribution-sensitive; a synthetic panel"
-                      " can over-thread the")
-                print("  real skewed tail. VALIDATE against a real-matrix sweep (rerun with"
-                      " --matrices PATH")
-                print("  or --download N) before trusting this, or re-run with"
-                      " --freeze-grains to tune")
-                print("  only the machine-topology knobs (chunk sizing).")
+            # 4c. adopt — the tune wins by the margin
+            if threadcount_changes:
+                # Only reachable with --tune-grains (the safe scope can't move a
+                # thread-count knob). The upfront [tune-grains] banner already warned;
+                # name the specific change being written and repeat the 1714 rule.
+                print("\n[note] the tune changes a THREAD-COUNT knob (--tune-grains): "
+                      + ", ".join(f"{k} {d}->{t}" for k, d, t in threadcount_changes)
+                      + ".")
+                print("  A panel does NOT predict the full 1714 for a thread-count "
+                      "change (Phase 4c/B: a")
+                print("  47-matrix panel win LOST the full 1714, 139 non-tiny "
+                      "catastrophic losses). VALIDATE")
+                print("  this with a FULL-collection back-to-back A/B before shipping "
+                      "the change.")
             meta = {"host": host, "hw": measurements["hw"],
                     "tuned_score": res["tuned_score"],
                     "default_score": res["default_score"], "gain_pct": gain * 100}
             write_tuned_header(res["tuned"], meta)
-            print(f"\n[write] {TUNED_H.relative_to(REPO)}")
+            print(f"\n[write] {TUNED_H.relative_to(REPO)} "
+                  "(only the knobs that differ from the shipped defaults)")
 
         # 5. clean rebuild: picks up the tuned constants (if written); JIT cache
         #    busts automatically (policy-header text is in the kernel-name hash).
         build_scorch_ops(tune_hooks=False)
         clean_restored = True
-        if not args.dry_run and TUNED_H.exists():
+        if adopt and TUNED_H.exists():
             print("[done] tuned + clean-built. Prebuilt kernels use the new "
                   "constants; JIT kernels re-tune on next compile.")
     finally:
