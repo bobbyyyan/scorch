@@ -794,19 +794,29 @@ def sweep_worker(out_path, kernels, reps, rounds, k_spmm,
 
 
 # -------------------------------------------------------------------------- fit
-def _score_theta(entries, grain, rpt, cpt, cmin, cmax, nt_grid, chunk_grid, hw):
-    """Per-matrix geomean speedup for a candidate constant-set over one kernel's
-    measured grid. Predicted (nt,chunk) is snapped to the nearest measured cell."""
-    logs = []
-    for e in entries.values():
+def _gmean(xs):
+    return math.exp(sum(math.log(max(x, 1e-9)) for x in xs) / len(xs)) if xs else 0.0
+
+
+def _predict_ms(entries, grain, rpt, cpt, cmin, cmax, nt_grid, chunk_grid, hw):
+    """Per-matrix predicted runtime (ms) for a candidate constant-set: the policy's
+    (nt, chunk) snapped to the nearest MEASURED cell. Keyed by matrix label so a
+    candidate can be compared to the default matrix-for-matrix (regression scoring)."""
+    out = {}
+    for lbl, e in entries.items():
         nt = predict_nthreads(e["work"], e["rows"], grain, rpt, hw)
         ch = predict_chunk(e["rows"], nt, cpt, cmin, cmax)
-        cell = f"{snap(nt, nt_grid)},{snap(ch, chunk_grid)}"
-        ms = e["cells"][cell]
-        if ms <= 0:
-            continue
-        logs.append(math.log(e["torch_ms"] / ms))
-    return math.exp(sum(logs) / len(logs)) if logs else 0.0
+        ms = e["cells"][f"{snap(nt, nt_grid)},{snap(ch, chunk_grid)}"]
+        if ms > 0:
+            out[lbl] = ms
+    return out
+
+
+def _score_theta(entries, grain, rpt, cpt, cmin, cmax, nt_grid, chunk_grid, hw):
+    """Per-matrix geomean speedup vs torch for a candidate constant-set over one
+    kernel's measured grid. Predicted (nt,chunk) is snapped to the nearest cell."""
+    ms = _predict_ms(entries, grain, rpt, cpt, cmin, cmax, nt_grid, chunk_grid, hw)
+    return _gmean([entries[lbl]["torch_ms"] / m for lbl, m in ms.items()])
 
 
 # Candidate space for the offline fit (cheap — pure lookups over the measured grid).
@@ -820,48 +830,86 @@ CMIN_CANDIDATES = [2, 4, 8]
 CMAX_CANDIDATES = [32, 64, 128]
 
 
-def fit(measurements, kernels, tune_grains=False):
+def fit(measurements, kernels, tune_grains=False, objective="minregret", reg_tol=0.03):
     """Joint grid-search over the OpenMP policy constants against the measured grid.
-    Objective = geomean of per-kernel geomean-speedups. Returns (best, default)
-    constant-sets and their scores on the identical measurements.
+    Returns (best, default) constant-sets and their scores on the identical data.
 
-    By DEFAULT (tune_grains=False) only the machine-intrinsic CHUNK-shape knobs vary
-    (chunks/thr, chunk_min, chunk_max) — they set the load-balance grain GIVEN a
-    thread count, are CPU cache/core-intrinsic, and a panel measures them faithfully
-    (Phase 4b). The workload-distribution-sensitive knobs — the per-kernel work
-    GRAINS and SCORCH_ROWS_PER_THREAD (rpt sets the thread cap nt=rows/rpt, a
-    thread-COUNT knob) — stay pinned to their shipped, 1714-validated defaults: they
-    encode the SuiteSparse matrix-shape distribution, not just this machine, and a
-    panel (even a big real one) does NOT predict the full collection for a
-    thread-count change (Phase 4c/B). ``tune_grains=True`` re-enables their search
-    for a maintainer who will validate any change with a full-collection A/B."""
+    ``objective`` chooses what "best" means — the lesson of the full-1714 sweeps is
+    that this choice matters more than the panel size:
+
+      * ``"geomean"`` — maximize the per-matrix geomean speedup vs torch. This is the
+        historical objective, and it is exactly what chases the panel-geomean MIRAGE:
+        on a small panel it happily picks an aggressive grain (redwood 1000, M5 12000)
+        that then CATASTROPHICALLY regresses hundreds of matrices on the full
+        collection (grain 500/1000 => 1012/490 catastrophic; validated 2026-07).
+      * ``"minregret"`` (DEFAULT) — regression-averse: pick the constant-set that first
+        MINIMIZES the number of panel matrices regressed >reg_tol vs the shipped
+        default, and only then maximizes the geomean improvement over the default. A
+        candidate must PARETO-improve the default (no matrix meaningfully slower) to be
+        adopted. For a single global grain this reduces to "keep the default unless a
+        change strictly dominates" — which is the correct, safe behavior and the reason
+        every regression-aware objective (minimax, tail percentile, regret) selected
+        grain 3000 on the full 1714 while only geomean moved off it.
+
+    ``tune_grains`` gates whether the work GRAINS + rows/thread (thread-COUNT knobs)
+    are searched at all; when False only the machine-intrinsic chunk-shape knobs vary.
+    Even with grains frozen, ``minregret`` still governs the chunk-knob choice — it
+    won't adopt a chunk shape that regresses panel matrices for a geomean bump."""
     hw = measurements["hw"]
     nt_grid = measurements["nt_grid"]
     chunk_grid = measurements["chunk_grid"]
     kdata = {k: measurements["kernels"][k] for k in kernels}
+    d = DEFAULTS
     grain_choices = {
         k: (GRAIN_CANDIDATES[k] if tune_grains
-            else [DEFAULTS[f"SCORCH_GRAIN_{k.upper()}"]])
+            else [d[f"SCORCH_GRAIN_{k.upper()}"]])
         for k in kernels
     }
     # rows/thread sets the thread cap (nt = rows/rpt), so it is a thread-COUNT knob,
     # not a chunk-shape knob — freeze it with the grains unless --tune-grains is set.
     rpt_choices = (RPT_CANDIDATES if tune_grains
-                   else [DEFAULTS["SCORCH_ROWS_PER_THREAD"]])
+                   else [d["SCORCH_ROWS_PER_THREAD"]])
+
+    # Default per-matrix predicted times per kernel — the baseline every candidate is
+    # scored against for regressions (minregret). Computed once; the default is fixed.
+    default_ms = {
+        k: _predict_ms(kdata[k], d[f"SCORCH_GRAIN_{k.upper()}"],
+                       d["SCORCH_ROWS_PER_THREAD"], d["SCORCH_CHUNKS_PER_THREAD"],
+                       d["SCORCH_CHUNK_MIN"], d["SCORCH_CHUNK_MAX"],
+                       nt_grid, chunk_grid, hw)
+        for k in kernels
+    }
+
+    def kernel_eval(k, grain, rpt, cpt, cmin, cmax):
+        """(geomean_vs_torch, n_regress_vs_default, geomean_ratio_vs_default)."""
+        ms = _predict_ms(kdata[k], grain, rpt, cpt, cmin, cmax, nt_grid, chunk_grid, hw)
+        gm_torch = _gmean([kdata[k][lbl]["torch_ms"] / m for lbl, m in ms.items()])
+        dms = default_ms[k]
+        ratios = [dms[lbl] / ms[lbl] for lbl in ms if lbl in dms]   # >1 = faster
+        n_reg = sum(1 for r in ratios if r < 1.0 - reg_tol)
+        return gm_torch, n_reg, _gmean(ratios) if ratios else 1.0
+
+    def sel_key(objective, n_reg, gm_torch, gm_ratio):
+        # what the search MAXIMIZES: minregret is lexicographic (fewest regressions
+        # first, then biggest improvement over the default); geomean is the old scalar.
+        return (-n_reg, gm_ratio) if objective == "minregret" else gm_torch
 
     def combined(rpt, cpt, cmin, cmax):
-        per_kernel = {}
+        per_kernel = {}          # k -> (grain, gm_torch, n_reg)
         for k in kernels:
-            best_g, best_s = None, -1.0
+            best = None
             for g in grain_choices[k]:
-                s = _score_theta(kdata[k], g, rpt, cpt, cmin, cmax,
-                                 nt_grid, chunk_grid, hw)
-                if s > best_s:
-                    best_g, best_s = g, s
-            per_kernel[k] = (best_g, best_s)
-        score = math.exp(sum(math.log(max(s, 1e-9)) for _, s in per_kernel.values())
-                         / len(per_kernel))
-        return score, per_kernel
+                gm_torch, n_reg, gm_ratio = kernel_eval(k, g, rpt, cpt, cmin, cmax)
+                key = sel_key(objective, n_reg, gm_torch, gm_ratio)
+                if best is None or key > best[0]:
+                    best = (key, g, gm_torch, n_reg, gm_ratio)
+            _, g, gm_torch, n_reg, gm_ratio = best
+            per_kernel[k] = (g, gm_torch, n_reg, gm_ratio)
+        gm_combined = _gmean([v[1] for v in per_kernel.values()])
+        total_reg = sum(v[2] for v in per_kernel.values())
+        ratio_combined = _gmean([v[3] for v in per_kernel.values()])
+        sel = ((-total_reg, ratio_combined) if objective == "minregret" else gm_combined)
+        return sel, gm_combined, total_reg, per_kernel
 
     best = None
     for rpt in rpt_choices:
@@ -870,13 +918,11 @@ def fit(measurements, kernels, tune_grains=False):
                 for cmax in CMAX_CANDIDATES:
                     if cmin >= cmax:
                         continue
-                    score, per_kernel = combined(rpt, cpt, cmin, cmax)
-                    cand = (score, rpt, cpt, cmin, cmax, per_kernel)
-                    if best is None or score > best[0]:
-                        best = cand
+                    sel, gm_combined, total_reg, per_kernel = combined(rpt, cpt, cmin, cmax)
+                    if best is None or sel > best[0]:
+                        best = (sel, gm_combined, total_reg, rpt, cpt, cmin, cmax, per_kernel)
 
     # Default constant-set scored on the SAME measurements (honest baseline).
-    d = DEFAULTS
     def_per_kernel = {}
     for k in kernels:
         s = _score_theta(kdata[k], d[f"SCORCH_GRAIN_{k.upper()}"],
@@ -884,10 +930,9 @@ def fit(measurements, kernels, tune_grains=False):
                          d["SCORCH_CHUNK_MIN"], d["SCORCH_CHUNK_MAX"],
                          nt_grid, chunk_grid, hw)
         def_per_kernel[k] = (d[f"SCORCH_GRAIN_{k.upper()}"], s)
-    def_score = math.exp(sum(math.log(max(s, 1e-9)) for _, s in def_per_kernel.values())
-                         / len(def_per_kernel))
+    def_score = _gmean([s for _, s in def_per_kernel.values()])
 
-    score, rpt, cpt, cmin, cmax, per_kernel = best
+    _sel, gm_combined, total_reg, rpt, cpt, cmin, cmax, per_kernel = best
     tuned = {
         "SCORCH_ROWS_PER_THREAD": rpt,
         "SCORCH_CHUNKS_PER_THREAD": cpt,
@@ -897,7 +942,11 @@ def fit(measurements, kernels, tune_grains=False):
     for k in kernels:
         tuned[f"SCORCH_GRAIN_{k.upper()}"] = per_kernel[k][0]
     return {
-        "tuned": tuned, "tuned_score": score, "tuned_per_kernel": per_kernel,
+        "tuned": tuned, "tuned_score": gm_combined,
+        # tuned_per_kernel kept as (grain, geomean) 2-tuples for the report path.
+        "tuned_per_kernel": {k: (v[0], v[1]) for k, v in per_kernel.items()},
+        "tuned_regress": {k: v[2] for k, v in per_kernel.items()},
+        "tuned_regress_total": total_reg, "objective": objective, "reg_tol": reg_tol,
         "default_score": def_score, "default_per_kernel": def_per_kernel,
     }
 
@@ -1031,6 +1080,16 @@ def main():
                     "distribution-sensitive: a panel does NOT predict the full 1714 "
                     "(Phase 4c/B) — validate any change with a full-collection back-to-"
                     "back A/B before shipping. Prints a loud warning.")
+    ap.add_argument("--objective", choices=["minregret", "geomean"], default="minregret",
+                    help="fit objective. 'minregret' (default) is regression-averse: "
+                    "adopt a constant-set only if it PARETO-improves the shipped default "
+                    "on the panel (no matrix regressed >reg_tol), then maximize the "
+                    "improvement — this is what stops the tool chasing the panel-geomean "
+                    "mirage that picked catastrophic grains on the full 1714. 'geomean' "
+                    "is the old max-geomean-vs-torch objective (kept for comparison).")
+    ap.add_argument("--reg-tol", type=float, default=0.03,
+                    help="per-matrix slowdown vs default that counts as a regression for "
+                    "--objective minregret (default 0.03 = 3%%)")
     ap.add_argument("--dry-run", action="store_true",
                     help="deprecated no-op: the DEFAULT is already advisory (report only, "
                     "write nothing). Kept so old invocations still write nothing; forces "
@@ -1104,7 +1163,8 @@ def main():
         # 3. offline fit against the measured grid. By default only the machine-
         #    intrinsic chunk-shape knobs vary; --tune-grains also searches the
         #    thread-count knobs (grains + rows/thread).
-        res = fit(measurements, kernels, tune_grains=args.tune_grains)
+        res = fit(measurements, kernels, tune_grains=args.tune_grains,
+                  objective=args.objective, reg_tol=args.reg_tol)
         gain = res["tuned_score"] / res["default_score"] - 1.0
         # Advisory-first: writing the tuned header is a deliberate opt-in (--adopt);
         # --dry-run forces no-adopt so old invocations keep writing nothing.
@@ -1118,11 +1178,17 @@ def main():
         print("  scope: " + ("grains + rows/thr + chunk knobs (--tune-grains)"
               if args.tune_grains else
               "CHUNK knobs only (grains + rows/thr frozen at 1714-validated defaults)"))
+        print(f"  objective: {res['objective']}"
+              + (f" (regression-averse, reg_tol={res['reg_tol']*100:.0f}%; "
+                 f"{res['tuned_regress_total']} panel matrix(es) regressed by the tune)"
+                 if res['objective'] == "minregret"
+                 else " (max geomean-vs-torch — panel-mirage-prone; prefer minregret)"))
         for k in kernels:
             tg, ts = res["tuned_per_kernel"][k]
             dg, ds = res["default_per_kernel"][k]
+            moved = "  (unchanged)" if tg == dg else f"  ({res['tuned_regress'][k]} regressed)"
             print(f"  {k:7s}  default grain={dg:<7d} geomean={ds:.3f}   ->   "
-                  f"tuned grain={tg:<7d} geomean={ts:.3f}")
+                  f"tuned grain={tg:<7d} geomean={ts:.3f}{moved}")
         print(f"  shared: rows/thr={res['tuned']['SCORCH_ROWS_PER_THREAD']} "
               f"chunks/thr={res['tuned']['SCORCH_CHUNKS_PER_THREAD']} "
               f"chunk=[{res['tuned']['SCORCH_CHUNK_MIN']},{res['tuned']['SCORCH_CHUNK_MAX']}]  "
