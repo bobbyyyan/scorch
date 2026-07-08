@@ -230,6 +230,7 @@ def execute_prebuilt_binary_kernel(
     a: "STensor",
     b: "STensor",
     time_dict: Optional[dict] = None,
+    nthreads: Optional[int] = None,
 ) -> Tuple[Any, Tuple[int, ...]]:
     if b.dim() == 2:
         result_shape: Tuple[int, ...] = (a.shape[0], b.shape[1])
@@ -245,7 +246,12 @@ def execute_prebuilt_binary_kernel(
         args.append(tensor.values)  # type: ignore[arg-type]
 
     start_time = time.time()
-    result_cpp = kernel_fn(*args)
+    # nthreads is only supplied for kernels that accept nthreads_override (the
+    # drop-in SpMM, spmm_csr_float_v2); the caller gates on symbol_name.
+    if nthreads is not None:
+        result_cpp = kernel_fn(*args, nthreads_override=nthreads)
+    else:
+        result_cpp = kernel_fn(*args)
     end_time = time.time()
 
     if time_dict is not None:

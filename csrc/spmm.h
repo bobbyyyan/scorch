@@ -2236,7 +2236,8 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
                 torch::Tensor A_values, std::vector<int> B_shape,
                 std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values, int tile_size = 256) {
+                torch::Tensor B_values, int tile_size = 256,
+                int nthreads_override = -1) {
   const int C0_size = result_shape[0];
   const int C1_size = result_shape[1];
 
@@ -2308,7 +2309,35 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   // width so row-parallelism isn't starved; k>=16 behavior is unchanged.
   const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
   const long work = (long)total_nnz * k_eff;
-  const int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
+  // Composition override: when this drop-in SpMM runs inside a host (torch)
+  // pipeline, the surrounding dense ops use the host thread count (e.g. 16); the
+  // throttled policy count (e.g. 11 for a narrow-k GCN layer) then forces a
+  // libgomp thread-team RESHAPE at every op boundary (~15% of a sub-ms GCN
+  // forward). The caller (ops.py drop-in matmul) passes the ambient host count so
+  // one warm team spans the pipeline. We adopt it ONLY for products that clear
+  // the existing fork/join floor (work >= SCORCH_GRAIN_SPMM): tiny products
+  // (arc130-class) that the policy throttles to avoid fork/join blowup keep the
+  // policy count (the SuiteSparse panel's small cells stay byte-identical; a
+  // forced 16 threads made a 130-row product 1.7x slower). max() keeps big
+  // graphs on their (possibly >host) policy count so we never under-thread.
+  // nthreads_override<=0 => pure policy (the standalone/panel default).
+  const int policy_nt = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
+  int nthreads = policy_nt;
+  if (nthreads_override > 0 && work >= SCORCH_GRAIN_SPMM) {
+    // Adopt the host thread count to avoid the pipeline team-reshape, but bound
+    // it two ways so the panel can't regress: (1) never beyond the row-
+    // parallelism ceiling by_rows = rows/ROWS_PER_THREAD — a 130-row product at
+    // wide K clears the work floor yet can't feed 16 workers, so cap at what the
+    // rows support; (2) never below the policy (max) so big graphs keep their
+    // possibly-higher policy count. This removes only the by_work throttle that
+    // starves tall-skinny GCN SpMM (many rows, narrow k), which is the reshape
+    // culprit, while keeping every protection that guards small/tiny products.
+    const long by_rows = (long)A0_size / SCORCH_ROWS_PER_THREAD;
+    long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
+    const long hw = (long)omp_get_num_procs();   // never oversubscribe the box
+    if (cand > hw) cand = hw;
+    if (cand > (long)nthreads) nthreads = (int)cand;
+  }
   const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
   std::atomic<int> next_row{0};
 

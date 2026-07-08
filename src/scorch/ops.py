@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 from typing import Any, Union, Sequence, Optional, List
@@ -29,6 +30,19 @@ while not (PROJECT_ROOT_DIR / "setup.py").exists():
 
 _kernel_cache = {}
 _einsum_dispatch_cache = {}
+
+# Composition thread-count matching for the drop-in CSR-SpMM (spmm_csr_float_v2).
+# When a scorch SpMM is used as a torch op inside a host pipeline (e.g. a GCN
+# layer: F.linear -> scorch.matmul -> ...), the SpMM's throttled policy thread
+# count differs from the host's (torch) thread count, forcing a libgomp team
+# reshape at every op boundary (~15% of a sub-ms GCN forward). Passing
+# torch.get_num_threads() lets the kernel keep one warm team spanning the
+# pipeline; the kernel only adopts it above the fork/join floor and caps it by
+# row-parallelism, so tiny/standalone products (the SuiteSparse panel) are
+# unaffected. On by default (non-fused GCN forward: pubmed 0.78x -> 1.15x vs
+# PyTorch, cora/citeseer +5-6%, big graphs neutral, panel safe). Set
+# SCORCH_MATCH_HOST_THREADS=0 to fall back to the pure standalone policy.
+_MATCH_HOST_THREADS = os.environ.get("SCORCH_MATCH_HOST_THREADS", "1") == "1"
 
 # start_time = time.time()
 # # Register custom classes
@@ -350,8 +364,11 @@ def matmul(
             a, b, output_format=requested_output_format
         )
         if resolved is not None:
+            nthreads = None
+            if _MATCH_HOST_THREADS and resolved.symbol_name == "spmm_csr_float_v2":
+                nthreads = torch.get_num_threads()
             result_cpp, result_shape = execute_prebuilt_binary_kernel(
-                resolved.fn, a, b, time_dict=time_dict
+                resolved.fn, a, b, time_dict=time_dict, nthreads=nthreads
             )
             # Fast path: a dense output kernel already produced a contiguous
             # row-major value buffer. Return it reshaped directly, skipping the

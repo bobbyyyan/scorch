@@ -159,9 +159,15 @@ void bind_experimental_spmm_variants(py::module_& m) {
                      "NEON 4-NNZ unroll with deep prefetch");
   bind_binary_kernel(m, "spmm_csr_float_tiled_neon", &spmm_csr_float_tiled_neon,
                      "Large-tile NEON (128) with direct accumulation");
-  bind_binary_kernel_with_tile(
-      m, "spmm_csr_float_v2", &spmm_csr_float_v2,
-      "Workspace + 2-nnz ILP + k-tiling SpMM", 256);
+  // Bound explicitly (not via bind_binary_kernel_with_tile) because v2 carries an
+  // extra optional nthreads_override arg — the composition thread-count hint the
+  // drop-in matmul dispatch passes to avoid host<->kernel team reshape.
+  m.def("spmm_csr_float_v2", &spmm_csr_float_v2,
+        "Workspace + 2-nnz ILP + k-tiling SpMM",
+        py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
+        py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
+        py::arg("B_values"), py::arg("tile_size") = 256,
+        py::arg("nthreads_override") = -1);
 }
 
 // Fused SpMM + bias + ReLU wrappers
