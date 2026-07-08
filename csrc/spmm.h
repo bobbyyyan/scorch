@@ -11,6 +11,10 @@
 #include <arm_neon.h>
 #endif
 
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
+
 #include "prebuilt_types.h"
 #include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.cpp)
 
@@ -2006,6 +2010,61 @@ Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_sh
 
 
 // ---------------------------------------------------------------------------
+#if defined(__AVX2__) && defined(__FMA__)
+// Register-blocked narrow-k SpMM row kernel: accumulate the whole output row in
+// NVEC YMM registers across the row's nonzeros (2-nnz ILP for two independent
+// FMA chains), with a masked load/store on the final partial vector. Avoids the
+// workspace round-trip (memset + per-nnz ws load/store + memcpy) that dominated
+// MKL for narrow k — the 0.5-0.8x gap at k<=16, and the k=32 dense case.
+// NVEC = ceil(k/8), specialized 1..4 (k<=32).
+template <int NVEC>
+static inline void scorch_spmm_row_regblock(
+    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
+    const float* SCORCH_RESTRICT B_val, int B1_size,
+    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end, __m256i mask_last) {
+  __m256 acc0[NVEC], acc1[NVEC];
+  #pragma unroll
+  for (int v = 0; v < NVEC; v++) {
+    acc0[v] = _mm256_setzero_ps();
+    acc1[v] = _mm256_setzero_ps();
+  }
+  int pA = pA_begin;
+  for (; pA + 1 < pA_end; pA += 2) {
+    const float* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+    const float* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size;
+    if (pA + 2 < pA_end)
+      __builtin_prefetch(B_val + (size_t)A1_crd[pA + 2] * (size_t)B1_size, 0, 1);
+    const __m256 a0 = _mm256_set1_ps(A_val[pA]);
+    const __m256 a1 = _mm256_set1_ps(A_val[pA + 1]);
+    #pragma unroll
+    for (int v = 0; v < NVEC; v++) {
+      const __m256 b0 = (v == NVEC - 1) ? _mm256_maskload_ps(B0 + 8 * v, mask_last)
+                                        : _mm256_loadu_ps(B0 + 8 * v);
+      const __m256 b1 = (v == NVEC - 1) ? _mm256_maskload_ps(B1 + 8 * v, mask_last)
+                                        : _mm256_loadu_ps(B1 + 8 * v);
+      acc0[v] = _mm256_fmadd_ps(a0, b0, acc0[v]);
+      acc1[v] = _mm256_fmadd_ps(a1, b1, acc1[v]);
+    }
+  }
+  if (pA < pA_end) {
+    const float* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+    const __m256 a0 = _mm256_set1_ps(A_val[pA]);
+    #pragma unroll
+    for (int v = 0; v < NVEC; v++) {
+      const __m256 b0 = (v == NVEC - 1) ? _mm256_maskload_ps(B0 + 8 * v, mask_last)
+                                        : _mm256_loadu_ps(B0 + 8 * v);
+      acc0[v] = _mm256_fmadd_ps(a0, b0, acc0[v]);
+    }
+  }
+  #pragma unroll
+  for (int v = 0; v < NVEC; v++) {
+    const __m256 r = _mm256_add_ps(acc0[v], acc1[v]);
+    if (v == NVEC - 1) _mm256_maskstore_ps(C_row + 8 * v, mask_last, r);
+    else _mm256_storeu_ps(C_row + 8 * v, r);
+  }
+}
+#endif
+
 // spmm_csr_float_v2 — workspace-based direct accumulation with 2-nnz ILP
 //
 // Key ideas:
@@ -2049,15 +2108,41 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   // below ~GRAIN*num_procs, so large products keep every core. `chunk` is the
   // number of rows each worker steals per next_row.fetch_add below.
   const int total_nnz = A1_pos[A0_size];
-  const long work = (long)total_nnz * (long)B1_size;
+  // Thread-cap work measure: a B-row gather touches a full 64B cache line (16
+  // f32) regardless of how narrow k is, so a tall-skinny product (many rows,
+  // k<16) is memory-bound at ~one line per nnz. Crediting only nnz*k here
+  // throttled such shapes to near-serial (a 19.7K-row k=3 GCN layer capped to 2
+  // threads despite abundant row-parallelism). Floor the k term at the line
+  // width so row-parallelism isn't starved; k>=16 behavior is unchanged.
+  const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
+  const long work = (long)total_nnz * k_eff;
   const int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
   const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
   std::atomic<int> next_row{0};
 
+  // Narrow-k register-blocked path (K<=16): hold the whole output row in YMM
+  // accumulators across the row's nonzeros, masked AVX2 load/store, 2-nnz ILP.
+  // The workspace path below round-trips through memory (memset + per-nnz ws
+  // load/store + memcpy) which dominates when K is tiny and the k-loop is below
+  // one SIMD lane — that was the 0.5-0.8x-of-MKL narrow-k gap (GCN k=3/16). For
+  // K>16 the workspace path already matches/beats MKL, so it is unchanged.
+#if defined(__AVX2__) && defined(__FMA__)
+  // Register-block when the whole output row fits in <=4 YMM accumulators (k<=32).
+  const bool narrow_k = (B1_size >= 1 && B1_size <= 32);
+  const int nvec = (B1_size + 7) / 8;              // 1..4 when narrow_k
+  const int mlast = B1_size - 8 * (nvec - 1);      // valid lanes in last vec, 1..8
+  const __m256i mask_last = _mm256_setr_epi32(
+      mlast>0?-1:0, mlast>1?-1:0, mlast>2?-1:0, mlast>3?-1:0,
+      mlast>4?-1:0, mlast>5?-1:0, mlast>6?-1:0, mlast>7?-1:0);
+#else
+  const bool narrow_k = false;
+#endif
+
   #pragma omp parallel num_threads(nthreads)
   {
-    // Per-thread workspace, cache-line aligned, lives in L1
-    float* SCORCH_RESTRICT ws = (float*)aligned_alloc(64, kTile * sizeof(float));
+    // Per-thread workspace (wide-k path only); cache-line aligned, lives in L1.
+    float* SCORCH_RESTRICT ws =
+        narrow_k ? nullptr : (float*)aligned_alloc(64, kTile * sizeof(float));
 
     // Atomic work-stealing loop with adaptive chunk size
     while (true) {
@@ -2071,6 +2156,18 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
         if (pA_begin == pA_end) continue;
 
         float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+
+#if defined(__AVX2__) && defined(__FMA__)
+        if (narrow_k) {
+          switch (nvec) {
+            case 1: scorch_spmm_row_regblock<1>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+            case 2: scorch_spmm_row_regblock<2>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+            case 3: scorch_spmm_row_regblock<3>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+            case 4: scorch_spmm_row_regblock<4>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+          }
+          continue;
+        }
+#endif
 
         for (int k_out = 0; k_out < B1_size; k_out += kTile) {
           const int kw = std::min(kTile, B1_size - k_out);
