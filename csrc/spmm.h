@@ -2156,8 +2156,45 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float*)malloc(sizeof(float) * C_capacity);
-  memset(C_values, 0, sizeof(float) * C_capacity);
+
+  // Output allocation + zeroing. Every code path below (regblock / regtile /
+  // workspace memcpy) ASSIGNS all C1_size entries of each NON-empty output row,
+  // so only structurally-empty rows (and any tail rows C0_size>A0_size) need
+  // pre-zeroing. The legacy path malloc'd a raw buffer and memset the WHOLE
+  // thing single-threaded before the parallel region — a serial O(C0*C1)
+  // zero-fault per call (14MB for a 14K-row k=256 product) that MKL never pays
+  // (its dense output is written in full by the kernel, from a pooled buffer).
+  // We (a) allocate via torch::empty (the same CPU allocator MKL's output uses,
+  // so scorch and MKL are apples-to-apples on allocation) and (b) zero only the
+  // rows the kernel won't touch. FEM/graph adjacencies have no empty rows ->
+  // the zeroing is a single O(rows) index scan. Correctness is identical: a
+  // non-empty row is fully overwritten by the kernel; an empty row is zeroed
+  // here.
+  torch::Tensor C_values_torch;
+  float* SCORCH_RESTRICT C_values;
+  bool torch_alloc = true, zero_empty_only = true;
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B hook: SCORCH_SPMM_ALLOC bit0=torch_alloc, bit1=zero_empty_only.
+  // 0 = malloc + full memset (legacy); 3 = torch::empty + empty-only (default).
+  { const char* e = std::getenv("SCORCH_SPMM_ALLOC");
+    if (e && *e) { long v = std::atol(e); torch_alloc = v & 1; zero_empty_only = v & 2; } }
+#endif
+  if (torch_alloc) {
+    C_values_torch = torch::empty({(long long)C_capacity}, torch::kFloat32);
+    C_values = C_values_torch.data_ptr<float>();
+  } else {
+    C_values = (float*)malloc(sizeof(float) * C_capacity);
+  }
+  if (zero_empty_only) {
+    for (int i = 0; i < A0_size; i++)
+      if (A1_pos[i] == A1_pos[i + 1])
+        memset(C_values + (size_t)i * (size_t)C1_size, 0, sizeof(float) * (size_t)C1_size);
+    if (C0_size > A0_size)
+      memset(C_values + (size_t)A0_size * (size_t)C1_size, 0,
+             sizeof(float) * (size_t)(C0_size - A0_size) * (size_t)C1_size);
+  } else {
+    memset(C_values, 0, sizeof(float) * C_capacity);
+  }
 
   // Round tile to multiple of 16 for SIMD alignment
   const int kTile = (tile_size + 15) & ~15;
@@ -2285,9 +2322,11 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   }
 
   Tensor C;
-  auto C_values_deleter = [](void* ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  if (!torch_alloc) {
+    auto C_values_deleter = [](void* ptr) { free(ptr); };
+    C_values_torch = torch::from_blob(
+        C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
+  }
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
