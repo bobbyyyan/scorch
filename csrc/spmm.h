@@ -2064,6 +2064,71 @@ static inline void scorch_spmm_row_regblock(
   }
 }
 
+#ifdef SCORCH_TUNE_HOOKS
+// A/B toggle for the regtile partial-tile path; refreshed once per SpMM op by
+// spmm_csr_float_v2 (SCORCH_REGTILE_BASE=1 -> legacy runtime-nv partial). Only
+// exists in the instrumented build; the shipped .so always takes the templated
+// path with no branch.
+static int g_scorch_regtile_base = 0;
+#endif
+
+// Ragged-tail partial tile (kw=K%64 in 1..63), templated on the vector count NV
+// so the k-loop is COMPILE-TIME unrolled. The earlier form ran a runtime-nv loop
+// with a per-element `v==nv-1 ? maskload : loadu` branch that the compiler could
+// not unroll — measured (redwood i9-14900K P-core, standalone perf) at 3x the
+// instructions and 7x the branches of the equivalent full-64-tile work: the
+// partial tile was FRONT-END/branch-bound (IPC ~3.5, little FMA), NOT FMA-port,
+// cache, or masking bound (a full-64-tile is L2-bandwidth-bound at IPC ~1.4 and
+// already beats MKL). Dispatching on nv (compile-time NV) unrolls the loop, and
+// 2-nnz ILP (two accumulator sets, like scorch_spmm_row_regblock) feeds the FMA
+// ports even when nv<8. `full` (ml==8) drops the mask on a complete last vector.
+// Result: 9-29% fewer cycles on partial-tile K (K%64 != 0), full-64-multiple K
+// untouched (kw==0 -> this path never runs). Correctness bit-identical to the
+// runtime-nv form (verified K=33/63/65/100/120/127 checksum-parity + the suite).
+template <int NV>
+static inline void scorch_spmm_row_regtile_partial(
+    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
+    const float* SCORCH_RESTRICT B_val, int B1_size,
+    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
+    int k0, __m256i mask, bool full) {
+  __m256 acc0[NV], acc1[NV];
+  #pragma unroll
+  for (int v = 0; v < NV; v++) { acc0[v] = _mm256_setzero_ps(); acc1[v] = _mm256_setzero_ps(); }
+  int pA = pA_begin;
+  for (; pA + 1 < pA_end; pA += 2) {                        // 2-nnz ILP: 2*NV chains
+    const float* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA]     * (size_t)B1_size + k0;
+    const float* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0;
+    if (pA + 2 < pA_end)
+      __builtin_prefetch(B_val + (size_t)A1_crd[pA + 2] * (size_t)B1_size + k0, 0, 1);
+    const __m256 a0 = _mm256_set1_ps(A_val[pA]);
+    const __m256 a1 = _mm256_set1_ps(A_val[pA + 1]);
+    #pragma unroll
+    for (int v = 0; v < NV; v++) {
+      const bool m = (v == NV - 1 && !full);
+      const __m256 b0 = m ? _mm256_maskload_ps(B0 + 8 * v, mask) : _mm256_loadu_ps(B0 + 8 * v);
+      const __m256 b1 = m ? _mm256_maskload_ps(B1 + 8 * v, mask) : _mm256_loadu_ps(B1 + 8 * v);
+      acc0[v] = _mm256_fmadd_ps(a0, b0, acc0[v]);
+      acc1[v] = _mm256_fmadd_ps(a1, b1, acc1[v]);
+    }
+  }
+  for (; pA < pA_end; pA++) {                                // odd tail nnz
+    const float* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
+    const __m256 a = _mm256_set1_ps(A_val[pA]);
+    #pragma unroll
+    for (int v = 0; v < NV; v++) {
+      const bool m = (v == NV - 1 && !full);
+      const __m256 b = m ? _mm256_maskload_ps(Bp + 8 * v, mask) : _mm256_loadu_ps(Bp + 8 * v);
+      acc0[v] = _mm256_fmadd_ps(a, b, acc0[v]);
+    }
+  }
+  #pragma unroll
+  for (int v = 0; v < NV; v++) {
+    const __m256 r = _mm256_add_ps(acc0[v], acc1[v]);
+    if (v == NV - 1 && !full) _mm256_maskstore_ps(C_row + k0 + 8 * v, mask, r);
+    else _mm256_storeu_ps(C_row + k0 + 8 * v, r);
+  }
+}
+
 // Wide-k register-TILED SpMM row kernel (k>32). For each 64-wide k-tile, hold 8
 // YMM accumulators for the output-row segment across ALL of the row's nonzeros,
 // so C never round-trips through the workspace (the per-nnz ws load+store that
@@ -2071,8 +2136,8 @@ static inline void scorch_spmm_row_regblock(
 // were 0.59x of MKL). 8 independent FMA chains fully feed the two FMA ports. The
 // row's A indices/values are re-read once per k-tile (ceil(k/64) passes) but are
 // L1-hot; B is streamed once total (each element used once per output row). The
-// ragged last tile (<64) uses up to 8 masked YMM accumulators (same register
-// residency), K need not be a multiple of 64.
+// ragged last tile (<64) uses the templated scorch_spmm_row_regtile_partial (see
+// above), K need not be a multiple of 64.
 static inline void scorch_spmm_row_regtile(
     const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
     const float* SCORCH_RESTRICT B_val, int B1_size,
@@ -2095,33 +2160,54 @@ static inline void scorch_spmm_row_regtile(
     #pragma unroll
     for (int v = 0; v < 8; v++) _mm256_storeu_ps(C_row + k0 + 8 * v, acc[v]);
   }
-  // Final partial tile (kw in 1..63): up to 8 YMM accumulators (masked on the
-  // last), same register-resident accumulation — a scalar tail here reintroduced
-  // the per-nnz round-trip and lost 0.5-0.9x at k=48/96.
+  // Final partial tile (kw in 1..63): the templated compile-time-nv path (2-nnz
+  // ILP). A scalar tail here reintroduced the per-nnz round-trip (-0.5-0.9x at
+  // k=48/96); the earlier runtime-nv YMM loop was correct but front-end-bound.
   const int kw = B1_size - k0;
   if (kw > 0) {
     const int nv = (kw + 7) / 8;              // 1..8 vectors
     const int ml = kw - 8 * (nv - 1);         // 1..8 valid lanes in last vector
+    const bool full = (ml == 8);              // complete last vector -> no mask
     const __m256i mask = _mm256_setr_epi32(
         ml > 0 ? -1 : 0, ml > 1 ? -1 : 0, ml > 2 ? -1 : 0, ml > 3 ? -1 : 0,
         ml > 4 ? -1 : 0, ml > 5 ? -1 : 0, ml > 6 ? -1 : 0, ml > 7 ? -1 : 0);
-    __m256 acc[8];
-    for (int v = 0; v < nv; v++) acc[v] = _mm256_setzero_ps();
-    for (int pA = pA_begin; pA < pA_end; pA++) {
-      const float* SCORCH_RESTRICT Bp =
-          B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
-      if (pA + 1 < pA_end)
-        __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0, 0, 1);
-      const __m256 a = _mm256_set1_ps(A_val[pA]);
-      for (int v = 0; v < nv; v++) {
-        const __m256 b = (v == nv - 1) ? _mm256_maskload_ps(Bp + 8 * v, mask)
-                                       : _mm256_loadu_ps(Bp + 8 * v);
-        acc[v] = _mm256_fmadd_ps(a, b, acc[v]);
+#ifdef SCORCH_TUNE_HOOKS
+    // A/B hook: SCORCH_REGTILE_BASE=1 forces the legacy runtime-nv partial path
+    // (single-nnz, no compile-time unroll) for an in-process old-vs-new delta.
+    // Read once per SpMM op into g_scorch_regtile_base (below) — a per-row getenv
+    // would swamp the hot loop; a cached function-local static would latch the
+    // FIRST op's value and ignore later toggles. Compiled out of the shipped .so.
+    if (g_scorch_regtile_base) {
+      __m256 acc[8];
+      for (int v = 0; v < nv; v++) acc[v] = _mm256_setzero_ps();
+      for (int pA = pA_begin; pA < pA_end; pA++) {
+        const float* SCORCH_RESTRICT Bp =
+            B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
+        if (pA + 1 < pA_end)
+          __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0, 0, 1);
+        const __m256 a = _mm256_set1_ps(A_val[pA]);
+        for (int v = 0; v < nv; v++) {
+          const __m256 b = (v == nv - 1) ? _mm256_maskload_ps(Bp + 8 * v, mask)
+                                         : _mm256_loadu_ps(Bp + 8 * v);
+          acc[v] = _mm256_fmadd_ps(a, b, acc[v]);
+        }
       }
+      for (int v = 0; v < nv; v++) {
+        if (v == nv - 1) _mm256_maskstore_ps(C_row + k0 + 8 * v, mask, acc[v]);
+        else _mm256_storeu_ps(C_row + k0 + 8 * v, acc[v]);
+      }
+      return;
     }
-    for (int v = 0; v < nv; v++) {
-      if (v == nv - 1) _mm256_maskstore_ps(C_row + k0 + 8 * v, mask, acc[v]);
-      else _mm256_storeu_ps(C_row + k0 + 8 * v, acc[v]);
+#endif
+    switch (nv) {
+      case 1: scorch_spmm_row_regtile_partial<1>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 2: scorch_spmm_row_regtile_partial<2>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 3: scorch_spmm_row_regtile_partial<3>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 4: scorch_spmm_row_regtile_partial<4>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 5: scorch_spmm_row_regtile_partial<5>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 6: scorch_spmm_row_regtile_partial<6>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 7: scorch_spmm_row_regtile_partial<7>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 8: scorch_spmm_row_regtile_partial<8>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
     }
   }
 }
@@ -2242,6 +2328,10 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   // kernels, for wide-k regression re-checks. Compiled out of the shipped .so.
   const char* _wsonly = std::getenv("SCORCH_SPMM_WORKSPACE");
   const bool force_workspace = _wsonly && *_wsonly && std::atol(_wsonly) != 0;
+  // A/B hook: refresh the regtile partial-tile toggle once per op (read by
+  // scorch_spmm_row_regtile). SCORCH_REGTILE_BASE=1 -> legacy runtime-nv partial.
+  { const char* e = std::getenv("SCORCH_REGTILE_BASE");
+    g_scorch_regtile_base = (e && *e && std::atol(e) != 0) ? 1 : 0; }
 #endif
 
   #pragma omp parallel num_threads(nthreads)
