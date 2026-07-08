@@ -2063,6 +2063,68 @@ static inline void scorch_spmm_row_regblock(
     else _mm256_storeu_ps(C_row + 8 * v, r);
   }
 }
+
+// Wide-k register-TILED SpMM row kernel (k>32). For each 64-wide k-tile, hold 8
+// YMM accumulators for the output-row segment across ALL of the row's nonzeros,
+// so C never round-trips through the workspace (the per-nnz ws load+store that
+// dominates the cache-hot wide-k case — banded/locality dense matrices at k=64
+// were 0.59x of MKL). 8 independent FMA chains fully feed the two FMA ports. The
+// row's A indices/values are re-read once per k-tile (ceil(k/64) passes) but are
+// L1-hot; B is streamed once total (each element used once per output row). The
+// ragged last tile (<64) uses up to 8 masked YMM accumulators (same register
+// residency), K need not be a multiple of 64.
+static inline void scorch_spmm_row_regtile(
+    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
+    const float* SCORCH_RESTRICT B_val, int B1_size,
+    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end) {
+  int k0 = 0;
+  for (; k0 + 64 <= B1_size; k0 += 64) {
+    __m256 acc[8];
+    #pragma unroll
+    for (int v = 0; v < 8; v++) acc[v] = _mm256_setzero_ps();
+    for (int pA = pA_begin; pA < pA_end; pA++) {
+      const float* SCORCH_RESTRICT Bp =
+          B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
+      if (pA + 1 < pA_end)
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0, 0, 1);
+      const __m256 a = _mm256_set1_ps(A_val[pA]);
+      #pragma unroll
+      for (int v = 0; v < 8; v++)
+        acc[v] = _mm256_fmadd_ps(a, _mm256_loadu_ps(Bp + 8 * v), acc[v]);
+    }
+    #pragma unroll
+    for (int v = 0; v < 8; v++) _mm256_storeu_ps(C_row + k0 + 8 * v, acc[v]);
+  }
+  // Final partial tile (kw in 1..63): up to 8 YMM accumulators (masked on the
+  // last), same register-resident accumulation — a scalar tail here reintroduced
+  // the per-nnz round-trip and lost 0.5-0.9x at k=48/96.
+  const int kw = B1_size - k0;
+  if (kw > 0) {
+    const int nv = (kw + 7) / 8;              // 1..8 vectors
+    const int ml = kw - 8 * (nv - 1);         // 1..8 valid lanes in last vector
+    const __m256i mask = _mm256_setr_epi32(
+        ml > 0 ? -1 : 0, ml > 1 ? -1 : 0, ml > 2 ? -1 : 0, ml > 3 ? -1 : 0,
+        ml > 4 ? -1 : 0, ml > 5 ? -1 : 0, ml > 6 ? -1 : 0, ml > 7 ? -1 : 0);
+    __m256 acc[8];
+    for (int v = 0; v < nv; v++) acc[v] = _mm256_setzero_ps();
+    for (int pA = pA_begin; pA < pA_end; pA++) {
+      const float* SCORCH_RESTRICT Bp =
+          B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
+      if (pA + 1 < pA_end)
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0, 0, 1);
+      const __m256 a = _mm256_set1_ps(A_val[pA]);
+      for (int v = 0; v < nv; v++) {
+        const __m256 b = (v == nv - 1) ? _mm256_maskload_ps(Bp + 8 * v, mask)
+                                       : _mm256_loadu_ps(Bp + 8 * v);
+        acc[v] = _mm256_fmadd_ps(a, b, acc[v]);
+      }
+    }
+    for (int v = 0; v < nv; v++) {
+      if (v == nv - 1) _mm256_maskstore_ps(C_row + k0 + 8 * v, mask, acc[v]);
+      else _mm256_storeu_ps(C_row + k0 + 8 * v, acc[v]);
+    }
+  }
+}
 #endif
 
 // spmm_csr_float_v2 — workspace-based direct accumulation with 2-nnz ILP
@@ -2138,11 +2200,24 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   const bool narrow_k = false;
 #endif
 
+#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
+  // A/B hook: force the legacy workspace path instead of the AVX2 register
+  // kernels, for wide-k regression re-checks. Compiled out of the shipped .so.
+  const char* _wsonly = std::getenv("SCORCH_SPMM_WORKSPACE");
+  const bool force_workspace = _wsonly && *_wsonly && std::atol(_wsonly) != 0;
+#endif
+
   #pragma omp parallel num_threads(nthreads)
   {
-    // Per-thread workspace (wide-k path only); cache-line aligned, lives in L1.
-    float* SCORCH_RESTRICT ws =
-        narrow_k ? nullptr : (float*)aligned_alloc(64, kTile * sizeof(float));
+    // Per-thread workspace for the fallback path (cache-line aligned, lives in
+    // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
+    // row, so the shipped build never touches it (nullptr; free(nullptr) is a
+    // no-op). Allocated only for the non-AVX2 fallback or the force_workspace hook.
+#if defined(__AVX2__) && defined(__FMA__) && !defined(SCORCH_TUNE_HOOKS)
+    float* SCORCH_RESTRICT ws = nullptr;
+#else
+    float* SCORCH_RESTRICT ws = (float*)aligned_alloc(64, kTile * sizeof(float));
+#endif
 
     // Atomic work-stealing loop with adaptive chunk size
     while (true) {
@@ -2158,12 +2233,25 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
         float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
 
 #if defined(__AVX2__) && defined(__FMA__)
-        if (narrow_k) {
-          switch (nvec) {
-            case 1: scorch_spmm_row_regblock<1>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
-            case 2: scorch_spmm_row_regblock<2>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
-            case 3: scorch_spmm_row_regblock<3>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
-            case 4: scorch_spmm_row_regblock<4>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+        // AVX2 register-resident kernels own every row: narrow k (<=32) holds the
+        // whole output row in YMM accumulators (regblock); wide k (>32) is
+        // register-TILED in 64-wide k-tiles (regtile). Both avoid the per-nnz
+        // workspace round-trip that dominated the cache-hot wide-k case (banded
+        // dense k=64 was 0.59x of MKL). The workspace loop below is the non-AVX2
+        // fallback (or the force_workspace A/B hook).
+#ifdef SCORCH_TUNE_HOOKS
+        if (!force_workspace)
+#endif
+        {
+          if (narrow_k) {
+            switch (nvec) {
+              case 1: scorch_spmm_row_regblock<1>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+              case 2: scorch_spmm_row_regblock<2>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+              case 3: scorch_spmm_row_regblock<3>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+              case 4: scorch_spmm_row_regblock<4>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+            }
+          } else {
+            scorch_spmm_row_regtile(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
           }
           continue;
         }
