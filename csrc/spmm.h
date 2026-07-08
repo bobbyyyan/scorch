@@ -48,7 +48,20 @@ Tensor spmm_csr_bias_act(std::vector<int> result_shape, std::vector<int> A_shape
   scalar_t* SCORCH_RESTRICT C_values =
       (scalar_t *)malloc(sizeof(scalar_t) * C_capacity);
 
-  #pragma omp parallel for schedule(dynamic, 16)
+  // Work-aware thread cap + adaptive schedule chunk from the shared policy
+  // (csrc/scorch_policy.h), matching spmm_csr_float_v2: work = nnz*k with k
+  // floored at the 64B cache-line width (16 f32) so tall-skinny products aren't
+  // starved. Without this the fused kernel inherited omp_get_max_threads() —
+  // torch's default (e.g. 6 on an Apple M-series, whose perf-core count is all
+  // torch sees) — which throttled this bandwidth-bound SpMM to a fraction of the
+  // cores on big high-degree graphs, while the non-fused v2 path used all procs.
+  const int total_nnz = A1_pos[A0_size];
+  const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
+  const long work = (long)total_nnz * k_eff;
+  const int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
+  const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
+
+  #pragma omp parallel for schedule(dynamic, chunk) num_threads(nthreads)
   for (int i = 0; i < A0_size; i++) {
     size_t pC1_base = (size_t)i * (size_t)C1_size;
     int pA1_end = A1_pos[i + 1];
