@@ -98,13 +98,26 @@
 #endif
 
 // Work-aware OpenMP thread cap. work < 0 means "unknown" -> cap by rows only.
-inline int scorch_nthreads(long work, long rows, long grain_default = SCORCH_GRAIN_DEFAULT) {
+//
+// `nfloor` (default 1 = no-op for the SuiteSparse SpMM / SpMSpM / codegen callers,
+// which stay byte-identical) sets a minimum worker count applied BEFORE the hw
+// cap. The fused GCN kernel passes nfloor = omp_get_max_threads() so it never
+// drops below the platform's default parallelism -- torch's per-platform thread
+// count, which on a hybrid P+E CPU is the P-core count. That keeps the
+// small/narrow-K GCN shapes at full P-core width (the nnz*k throttle alone
+// collapsed them to ~1 thread), while big work still escalates via by_work up to
+// omp_get_num_procs() so M5's bandwidth-bound big graphs keep all cores. Because
+// this only ever RAISES the count toward what the platform already offers, it
+// cannot reintroduce an all-cores E-core cliff beyond torch's own default.
+inline int scorch_nthreads(long work, long rows, long grain_default = SCORCH_GRAIN_DEFAULT,
+                           int nfloor = 1) {
   int hw = omp_get_num_procs();               // stable; torch mutates omp_get_max_threads
   long n = rows / SCORCH_ROWS_PER_THREAD;     // >= ~16 rows per worker
   if (work >= 0) {
     long by_work = work / grain_default;      // >= grain_default work per worker
     if (by_work < n) n = by_work;
   }
+  if (n < (long)nfloor) n = (long)nfloor;     // platform floor (default 1)
   if (n < 1) n = 1;
   if (n > (long)hw) n = hw;
 #ifdef SCORCH_TUNE_HOOKS

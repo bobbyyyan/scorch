@@ -52,20 +52,27 @@ Tensor spmm_csr_bias_act(std::vector<int> result_shape, std::vector<int> A_shape
   scalar_t* SCORCH_RESTRICT C_values =
       (scalar_t *)malloc(sizeof(scalar_t) * C_capacity);
 
-  // Work-aware thread cap + adaptive schedule chunk from the shared policy
-  // (csrc/scorch_policy.h), matching spmm_csr_float_v2: work = nnz*k with k
-  // floored at the 64B cache-line width (16 f32) so tall-skinny products aren't
-  // starved. Without this the fused kernel inherited omp_get_max_threads() —
-  // torch's default (e.g. 6 on an Apple M-series, whose perf-core count is all
-  // torch sees) — which throttled this bandwidth-bound SpMM to a fraction of the
-  // cores on big high-degree graphs, while the non-fused v2 path used all procs.
+  // Work-escalated thread cap, FLOORED at the platform default (omp_get_max_threads
+  // = torch's per-platform thread count, i.e. the P-core count on a hybrid P+E CPU).
+  // Unlike the non-fused SpMM panel kernel (spmm_csr_float_v2), spmm_csr_bias_act
+  // is ONLY ever a GCN/GNN layer: a low-reuse, bandwidth-bound sparse @ dense
+  // product. v2's nnz*k throttle (SCORCH_GRAIN_SPMM, tuned to keep small SuiteSparse
+  // products off the E-core cliff) is wrong here -- it collapsed the small/narrow-K
+  // GCN shapes to ~1 thread and regressed the fused path +14..33% on x86. Flooring
+  // at omp_get_max_threads() keeps those shapes at full P-core width (recovering
+  // the pre-6a59ea3 numbers) without ever exceeding what the platform already uses
+  // for dense ops, so no new E-core cliff. Big graphs still escalate past the floor
+  // via by_work up to omp_get_num_procs(), preserving the M5 fix (reddit 6->18
+  // threads). k floored at the 64B cache line (16 f32). This kernel is not on the
+  // SuiteSparse SpMM panel, so none of this perturbs that panel. Fixed dynamic
+  // chunk 16 matches the pre-regression schedule (proven good on all 6 graphs).
   const int total_nnz = A1_pos[A0_size];
   const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
   const long work = (long)total_nnz * k_eff;
-  const int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
-  const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
+  const int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM,
+                                       omp_get_max_threads());
 
-  #pragma omp parallel for schedule(dynamic, chunk) num_threads(nthreads)
+  #pragma omp parallel for schedule(dynamic, 16) num_threads(nthreads)
   for (int i = 0; i < A0_size; i++) {
     size_t pC1_base = (size_t)i * (size_t)C1_size;
     int pA1_end = A1_pos[i + 1];
