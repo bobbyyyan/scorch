@@ -64,6 +64,27 @@ DEFAULT_CONFIG = TransformerConfig()
 
 SEQ_LENGTHS = [512, 1024, 2048, 4096]
 
+# Wide sweep used by the multi-config grid benchmark (--configs).
+WIDE_SEQ_LENGTHS = [256, 512, 1024, 2048, 4096, 8192]
+
+# Named transformer variants — the "wide set" swept to build an AE-style
+# normalized-speedup grid (one panel per config, x = seq_len). They span two
+# axes at once: model SIZE (embed/heads/ffn/layers, i.e. work per attended pair)
+# and attention WINDOW (which sets the sparsity of the Longformer mask at a
+# given seq_len). vocab/classes/dropout inherit the frozen dataclass defaults;
+# dropout is inert under eval(). All share max_seq_len=8192 so 8192 fits the
+# sinusoidal positional-encoding buffer exactly.
+CONFIGS: Dict[str, "TransformerConfig"] = {
+    #                        embed  heads  ffn   layers  window
+    "small-w64":  TransformerConfig(embed_dim=256,  num_heads=8,  ffn_dim=1024, num_layers=4, window_size=64,  max_seq_len=8192),
+    "base-w128":  TransformerConfig(embed_dim=512,  num_heads=8,  ffn_dim=2048, num_layers=6, window_size=128, max_seq_len=8192),
+    "large-w128": TransformerConfig(embed_dim=768,  num_heads=12, ffn_dim=3072, num_layers=6, window_size=128, max_seq_len=8192),
+    "narrow-w32": TransformerConfig(embed_dim=256,  num_heads=8,  ffn_dim=1024, num_layers=4, window_size=32,  max_seq_len=8192),
+    "wide-w256":  TransformerConfig(embed_dim=256,  num_heads=8,  ffn_dim=1024, num_layers=4, window_size=256, max_seq_len=8192),
+    "xl-w128":    TransformerConfig(embed_dim=1024, num_heads=16, ffn_dim=4096, num_layers=8, window_size=128, max_seq_len=8192),
+}
+CONFIG_ORDER = list(CONFIGS.keys())
+
 FRAMEWORK_ORDER = ["Dense PyTorch", "Sparse PyTorch", "Scorch"]
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -198,27 +219,33 @@ def build_longformer_mask(
 
     - Sliding window: each token attends to window_size tokens on each side
     - Global: first num_global tokens attend to/from all positions
+
+    Vectorized band construction (``|i - j| <= window``) so build time stays
+    O(seq_len^2) once rather than O(window * seq_len^2) via a per-offset diagonal
+    loop — essential for wide windows at long sequence lengths (e.g. window=256
+    at seq_len=8192, where the old loop allocated a 67M-element matrix 513×).
     """
-    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool)
-    # Sliding window via diagonal offsets
-    for offset in range(-window_size, window_size + 1):
-        mask |= torch.diag(torch.ones(seq_len - abs(offset), dtype=torch.bool), diagonal=offset)
+    idx = torch.arange(seq_len, dtype=torch.int32)
+    mask = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs_() <= window_size
     # Global tokens: first num_global tokens attend to/from all positions
     mask[:num_global, :] = True
     mask[:, :num_global] = True
     return mask
 
 
-# Cache for precomputed masks at different sequence lengths
-_mask_cache: Dict[int, Dict[str, Any]] = {}
+# Cache for precomputed masks, keyed by (seq_len, window_size, num_global) — the
+# mask depends on all three, so keying on seq_len alone would return the wrong
+# mask when sweeping several configs with different windows in one process.
+_mask_cache: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
 
 
 def get_mask_data(
     seq_len: int, config: TransformerConfig
 ) -> Dict[str, Any]:
-    """Get or compute cached mask data for a given sequence length."""
-    if seq_len in _mask_cache:
-        return _mask_cache[seq_len]
+    """Get or compute cached mask data for a given (seq_len, window, global)."""
+    key = (seq_len, config.window_size, config.num_global)
+    if key in _mask_cache:
+        return _mask_cache[key]
 
     mask_bool = build_longformer_mask(seq_len, config.window_size, config.num_global)
 
@@ -247,7 +274,7 @@ def get_mask_data(
         "nnz": nnz,
         "sparsity": sparsity,
     }
-    _mask_cache[seq_len] = data
+    _mask_cache[key] = data
     return data
 
 # ---------------------------------------------------------------------------
@@ -358,13 +385,16 @@ def run_attention_layer(
             Q_st = STensor.from_torch(Q_h, "Q")
             K_st = STensor.from_torch(K_h, "K")
             scores_st = scorch.einsum("ij,ik,jk->ij", mask_st, Q_st, K_st)
-            score_vals = scores_st.values * attn.scale
 
-            # CSR-native softmax: COO values are in row-major (CSR) order
+            # CSR-native row softmax (scale folded in). The SDDMM emits COO values
+            # in row-major (== CSR) order, so scorch.sparse_softmax_csr walks each
+            # row's contiguous span with no scatter — replacing the torch scatter
+            # chain (repeat_interleave/scatter_reduce/scatter_add) that profiled at
+            # ~59% of this layer, and folding away the separate `* scale` pass.
             csr = mask_data["csr"]
             crow = csr.crow_indices()
             col_idx = csr.col_indices()
-            attn_vals = _sparse_softmax_csr_vectorized(crow, score_vals, S)
+            attn_vals = scorch.sparse_softmax_csr(crow, scores_st.values, attn.scale)
 
             # SpMM via scorch.matmul
             attn_csr = torch.sparse_csr_tensor(crow, col_idx, attn_vals, (S, S))
@@ -592,7 +622,7 @@ def train_model(
 # ---------------------------------------------------------------------------
 
 ST_CSV_COLUMNS = [
-    "SeqLen", "Sparsity", "NNZ", "Framework", "Median_ms", "Min_ms", "Std_ms",
+    "Config", "SeqLen", "Sparsity", "NNZ", "Framework", "Median_ms", "Min_ms", "Std_ms",
 ]
 
 
@@ -606,6 +636,7 @@ class STResultsCollector:
 
     def append(
         self,
+        config_name: str,
         seq_len: int,
         sparsity: float,
         nnz: int,
@@ -613,6 +644,7 @@ class STResultsCollector:
         timing: TimingSummary,
     ) -> None:
         row = {
+            "Config": config_name,
             "SeqLen": seq_len,
             "Sparsity": f"{sparsity:.4f}",
             "NNZ": nnz,
@@ -645,13 +677,14 @@ def benchmark_seq_lengths(
     warmup: int,
     repeats: int,
     collector: Optional[STResultsCollector] = None,
+    config_name: str = "default",
 ) -> List[Dict[str, Any]]:
     """Run inference benchmark across sequence lengths."""
     all_results: List[Dict[str, Any]] = []
 
     for seq_len in seq_lengths:
         print(f"\n{'=' * 60}")
-        print(f"Sequence length: {seq_len}")
+        print(f"[{config_name}] Sequence length: {seq_len}")
         print(f"{'=' * 60}")
 
         mask_data = get_mask_data(seq_len, config)
@@ -702,9 +735,10 @@ def benchmark_seq_lengths(
                 )
 
                 if collector is not None:
-                    collector.append(seq_len, sparsity, nnz, fw, timing)
+                    collector.append(config_name, seq_len, sparsity, nnz, fw, timing)
 
                 all_results.append({
+                    "config": config_name,
                     "seq_len": seq_len,
                     "sparsity": sparsity,
                     "nnz": nnz,
@@ -763,7 +797,15 @@ def plot_results(
     csv_path: Path,
     output_path: Path,
 ) -> None:
-    """Line plot: x = seq_len, y = median runtime (ms), one line per framework."""
+    """Runtime line plot(s): x = seq_len, y = median ms, one line per framework.
+
+    If the CSV spans multiple configs (a ``Config`` column with >1 value), draw
+    a grid with one subplot per config; otherwise a single panel. This is the
+    raw-runtime view; the normalized-speedup grid is produced by the standalone
+    ``bench_results/plot_transformer_speedup.py`` script.
+    """
+    import math as _math
+
     import pandas as pd
 
     df = pd.read_csv(csv_path)
@@ -772,42 +814,46 @@ def plot_results(
         return
 
     setup_plot_style()
-    fig, ax = plt.subplots(figsize=(10, 6))
 
     fw_colors = {
         "Dense PyTorch": COLORS["PyTorch"],
         "Sparse PyTorch": EXTRA_COLORS[0],
         "Scorch": COLORS["Scorch"],
     }
-    fw_markers = {
-        "Dense PyTorch": "s",
-        "Sparse PyTorch": "^",
-        "Scorch": "o",
-    }
+    fw_markers = {"Dense PyTorch": "s", "Sparse PyTorch": "^", "Scorch": "o"}
 
-    for fw in FRAMEWORK_ORDER:
-        fw_data = df[df["Framework"] == fw].sort_values("SeqLen")
-        if fw_data.empty:
-            continue
-        ax.errorbar(
-            fw_data["SeqLen"],
-            fw_data["Median_ms"],
-            yerr=fw_data["Std_ms"],
-            label=fw,
-            color=fw_colors.get(fw, "gray"),
-            marker=fw_markers.get(fw, "o"),
-            linewidth=2,
-            markersize=8,
-            capsize=4,
-        )
+    configs = list(df["Config"].unique()) if "Config" in df.columns else ["all"]
 
-    ax.set_xlabel("Sequence Length")
-    ax.set_ylabel("Median Runtime (ms)")
-    ax.set_title("Sparse Attention Transformer Inference")
-    ax.legend(fontsize=12)
-    ax.grid(True, alpha=0.3)
-    ax.set_xscale("log", base=2)
+    ncols = min(3, len(configs))
+    nrows = _math.ceil(len(configs) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 5 * nrows), squeeze=False)
 
+    for idx, cfg in enumerate(configs):
+        ax = axes[idx // ncols, idx % ncols]
+        cdf = df[df["Config"] == cfg] if "Config" in df.columns else df
+        for fw in FRAMEWORK_ORDER:
+            fw_data = cdf[cdf["Framework"] == fw].sort_values("SeqLen")
+            if fw_data.empty:
+                continue
+            ax.errorbar(
+                fw_data["SeqLen"], fw_data["Median_ms"], yerr=fw_data["Std_ms"],
+                label=fw, color=fw_colors.get(fw, "gray"),
+                marker=fw_markers.get(fw, "o"), linewidth=2, markersize=7, capsize=3,
+            )
+        ax.set_xlabel("Sequence Length")
+        ax.set_ylabel("Median Runtime (ms)")
+        ax.set_title(str(cfg))
+        # override the global legend.markerscale=5 (tuned for tiny scatter
+        # markers) so these size-7 line markers don't balloon in the legend box
+        ax.legend(fontsize=11, markerscale=0.9, loc="upper left", framealpha=0.9)
+        ax.grid(True, alpha=0.3)
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+
+    for j in range(len(configs), nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+
+    fig.suptitle("Sparse Attention Transformer Inference — Median Runtime", fontsize=15)
     fig.tight_layout()
     fig.savefig(str(output_path), bbox_inches="tight", dpi=150)
     plt.close(fig)
@@ -816,6 +862,39 @@ def plot_results(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def build_config_model(name: str, seed: int = 1234) -> Tuple[SparseTransformer, TransformerConfig]:
+    """Build an eval-mode model for a named config.
+
+    Weights are seeded random-init. This is a *timing* benchmark: all three
+    framework paths (dense / sparse-pytorch / scorch) execute the identical
+    masked-attention math on the same weights, so runtime — and the pairwise
+    correctness check against Dense PyTorch — are independent of whether the
+    weights are trained. Random-init avoids per-config IMDB training while
+    keeping the comparison honest (same weights across frameworks). ``imdb``
+    is special-cased to load a trained checkpoint if one exists.
+    """
+    if name == "imdb":
+        weight_path = WEIGHT_DIR / "sparse_transformer_imdb.pt"
+        if not weight_path.exists():
+            raise FileNotFoundError(
+                f"config 'imdb' needs trained weights at {weight_path} (run 'train')"
+            )
+        checkpoint = torch.load(weight_path, weights_only=False)
+        config = checkpoint["config"]
+        model = SparseTransformer(config)
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        return model, config
+
+    if name not in CONFIGS:
+        raise KeyError(f"unknown config '{name}' (choices: {', '.join(CONFIG_ORDER)}, imdb)")
+    config = CONFIGS[name]
+    torch.manual_seed(seed)
+    model = SparseTransformer(config)
+    model.eval()
+    return model, config
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -836,8 +915,13 @@ def main() -> None:
     # --- bench ---
     bench_parser = subparsers.add_parser("bench", help="Benchmark sparse transformer inference")
     bench_parser.add_argument(
+        "--configs", nargs="+", default=["all"],
+        help="Model configs to sweep ('all' or names from "
+             f"{CONFIG_ORDER}; 'imdb' loads trained weights). Default: all",
+    )
+    bench_parser.add_argument(
         "--seq-lengths", nargs="+", type=int, default=None,
-        help=f"Sequence lengths to benchmark (default: {SEQ_LENGTHS})",
+        help=f"Sequence lengths to benchmark (default: {WIDE_SEQ_LENGTHS})",
     )
     bench_parser.add_argument(
         "--frameworks", nargs="+", default=["dense-pytorch", "sparse-pytorch", "scorch"],
@@ -881,7 +965,14 @@ def main() -> None:
         csv_path = output_dir / "sparse_transformer_results.csv"
         plot_path = output_dir / f"sparse_transformer.{args.format}"
 
-        seq_lengths = args.seq_lengths if args.seq_lengths is not None else SEQ_LENGTHS
+        seq_lengths = args.seq_lengths if args.seq_lengths is not None else WIDE_SEQ_LENGTHS
+
+        # Resolve config list
+        req = args.configs
+        if any(c.lower() == "all" for c in req):
+            config_names = list(CONFIG_ORDER)
+        else:
+            config_names = req
 
         # Normalize framework names
         fw_map = {
@@ -892,37 +983,57 @@ def main() -> None:
         frameworks = [fw_map.get(f.lower(), f) for f in args.frameworks]
 
         if not args.plot_only:
-            # Load model
-            weight_path = WEIGHT_DIR / "sparse_transformer_imdb.pt"
-            if not weight_path.exists():
-                print(f"Weights not found at {weight_path}. Run 'train' first.")
-                return
-
-            checkpoint = torch.load(weight_path, weights_only=False)
-            config = checkpoint["config"]
-            model = SparseTransformer(config)
-            model.load_state_dict(checkpoint["state_dict"])
-            model.eval()
-
-            print(f"Loaded model from {weight_path}")
-            print(f"  embed_dim={config.embed_dim}, heads={config.num_heads}, "
-                  f"layers={config.num_layers}, window={config.window_size}")
-
-            # Remove old CSV
+            # Remove old CSV so we start fresh (collector appends incrementally)
             if csv_path.exists():
                 csv_path.unlink()
-
             collector = STResultsCollector(csv_path)
 
-            benchmark_seq_lengths(
-                model=model,
-                config=config,
-                seq_lengths=seq_lengths,
-                frameworks=frameworks,
-                warmup=args.warmup,
-                repeats=args.repeats,
-                collector=collector,
-            )
+            # Pre-warm the JIT kernels ONCE (untimed) before any measurement.
+            # The scorch einsum-SDDMM and matmul-SpMM kernels are format-keyed
+            # (CSR mask + dense Q/K/V) — identical across every config/seq_len —
+            # so they compile exactly once. Doing it here keeps that one-time
+            # ~30-60s compile out of the first measured cell (otherwise the very
+            # first Scorch inference is ~20x inflated). torch.sparse.mm has no
+            # such compile step but we warm it too for symmetry.
+            try:
+                _pw_model, _pw_cfg = build_config_model(config_names[0])
+                _pw_mask = get_mask_data(64, _pw_cfg)
+                _pw_ids = torch.randint(0, _pw_cfg.vocab_size, (1, 64))
+                with torch.no_grad():
+                    for _m in ("sparse-pytorch", "scorch"):
+                        if _m == "scorch" and "Scorch" not in frameworks:
+                            continue
+                        if _m == "sparse-pytorch" and "Sparse PyTorch" not in frameworks:
+                            continue
+                        print(f"  pre-warming kernels: {_m} ...", flush=True)
+                        run_inference(_pw_model, _pw_ids, _pw_mask, _m)
+                del _pw_model
+            except Exception as e:  # pragma: no cover - best-effort warmup
+                print(f"  (kernel pre-warm skipped: {e})")
+
+            print(f"Sweeping {len(config_names)} config(s) × {len(seq_lengths)} "
+                  f"seq-len(s): {config_names}")
+
+            for config_name in config_names:
+                model, config = build_config_model(config_name)
+                nparams = sum(p.numel() for p in model.parameters())
+                print(f"\n{'#' * 64}")
+                print(f"# CONFIG: {config_name}  "
+                      f"(embed={config.embed_dim}, heads={config.num_heads}, "
+                      f"ffn={config.ffn_dim}, layers={config.num_layers}, "
+                      f"window={config.window_size}, params={nparams/1e6:.1f}M)")
+                print(f"{'#' * 64}")
+
+                benchmark_seq_lengths(
+                    model=model,
+                    config=config,
+                    seq_lengths=seq_lengths,
+                    frameworks=frameworks,
+                    warmup=args.warmup,
+                    repeats=args.repeats,
+                    collector=collector,
+                    config_name=config_name,
+                )
 
         # Plot
         if csv_path.exists():
