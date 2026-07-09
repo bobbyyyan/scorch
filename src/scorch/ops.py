@@ -419,6 +419,28 @@ _ACT_CODES = {None: 0, "none": 0, "identity": 0, "relu": 1, "sigmoid": 2}
 _EMPTY_MODE_INDICES = [[], []]
 
 
+def fast_transpose(x: torch.Tensor) -> torch.Tensor:
+    """Materialize the transpose of a 2D float32 tensor, fast.
+
+    Returns a contiguous ``[C, R]`` tensor equal (bit-identical) to
+    ``x.T.contiguous()`` for a ``[R, C]`` input, using the prebuilt cache-blocked
+    ``scorch_transpose_2d_float`` (AVX2 8x8 / NEON 4x4 / scalar micro-tiles). This
+    exists because ``torch.Tensor.T.contiguous()`` is a naive element-scatter that
+    runs ~5x below memory bandwidth; once the fused ``sparse_linear`` epilogue is
+    folded away, that input transpose is 40-66% of the whole forward.
+
+    Falls back to ``x.T.contiguous()`` if the kernel is unavailable or the input
+    is not a 2D float32 tensor (exactness is preserved either way).
+    """
+    import scorch_ops as _native
+
+    fn = getattr(_native, "scorch_transpose_2d_float", None)
+    if fn is None or x.dim() != 2 or x.dtype != torch.float32:
+        return x.T.contiguous()
+    nthreads = torch.get_num_threads() if _MATCH_HOST_THREADS else -1
+    return fn(x.contiguous(), nthreads)
+
+
 def sparse_linear_fm(
     x_fm: Union[torch.Tensor, STensor],
     weight: STensor,
@@ -540,16 +562,18 @@ def sparse_linear(
     call; pass a pre-built STensor in a hot loop to avoid the conversion).
     ``activation`` -- ``None`` / ``"relu"`` / ``"sigmoid"``.
 
-    Internally transposes ``x`` into feature-major ``[in, batch]``, runs the fused
-    feature-major kernel (``sparse_linear_fm``), and transposes the result back —
-    the SAME transpose pattern ``torch.sparse.mm(W, x.T).T`` already pays, so this
-    matches MKL's layout cost while fusing the epilogue MKL runs as separate ops.
-    For a multi-layer chain, ``sparse_linear_fm`` (staying feature-major end to
-    end) avoids the intermediate transposes, though measured equivalent here.
+    Internally transposes ``x`` into feature-major ``[in, batch]`` (via the fast
+    cache-blocked ``fast_transpose`` — NOT torch's cache-hostile
+    ``x.T.contiguous()``, which would dominate the fused forward), runs the fused
+    feature-major kernel (``sparse_linear_fm``), and returns the result's
+    transpose as a lazy view — the SAME transpose pattern
+    ``torch.sparse.mm(W, x.T).T`` MKL already pays, minus MKL's separate bias/act
+    epilogue. For a multi-layer chain, ``sparse_linear_fm`` (staying feature-major
+    end to end) avoids the intermediate transposes.
     """
     if isinstance(weight, torch.Tensor) and not isinstance(weight, STensor):
         weight = STensor.from_csr(weight.to_sparse_csr(), "weight")
-    x_fm = x.T.contiguous()
+    x_fm = fast_transpose(x)
     y_fm = sparse_linear_fm(x_fm, weight, bias, activation)
     return y_fm.T
 

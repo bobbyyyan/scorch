@@ -1,6 +1,7 @@
 import torch
 from .ops import (
     einsum,
+    fast_transpose,
     matmul,
     matmul_wksp,
     precompile_kernels,
@@ -32,6 +33,7 @@ __all__ = [
     "TensorFormat",
     "compile",
     "einsum",
+    "fast_transpose",
     "from_torch",
     "from_coo",
     "matmul",

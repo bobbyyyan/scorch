@@ -181,6 +181,13 @@ void bind_experimental_spmm_variants(py::module_& m) {
         py::arg("B_values"), py::arg("bias_values"), py::arg("act"),
         py::arg("tile_size") = 256,
         py::arg("nthreads_override") = -1, py::arg("atparallel") = false);
+  // Fast cache-blocked [R,C]->[C,R] float32 transpose (AVX2 8x8 / NEON 4x4 /
+  // scalar micro-tiles). Materializes the feature-major input for the drop-in
+  // sparse_linear path ~2-3x faster than torch's cache-hostile x.T.contiguous().
+  // Pass the host thread count to launch on torch's warm intra-op pool.
+  m.def("scorch_transpose_2d_float", &scorch_transpose_2d_float,
+        "Fast cache-blocked 2D float32 transpose ([R,C]->[C,R])",
+        py::arg("src"), py::arg("nthreads_override") = -1);
 }
 
 // Fused SpMM + bias + ReLU wrappers

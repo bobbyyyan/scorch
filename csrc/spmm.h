@@ -2727,6 +2727,161 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   return C;
 }
 
+// ---------------------------------------------------------------------------
+// scorch_transpose_2d_float — fast cache-blocked 2D transpose of a contiguous
+// float32 [R, C] matrix into a contiguous [C, R] matrix.
+//
+// The drop-in Linear path (scorch.sparse_linear) must materialize the natural
+// [batch, in] activation as FEATURE-MAJOR [in, batch] to feed the fused kernel.
+// torch's `x.T.contiguous()` (identically `empty + copy_`) does a naive element
+// scatter -- for each dst[c,r] = src[r,c] it strides the SOURCE by a full row
+// (C floats) -- which runs ~5x below DRAM bandwidth on the i9-14900K (~17 GB/s
+// vs ~85 GB/s DDR5): cache-hostile, access-pattern-bound (no thread speedup),
+// and once the bias/act epilogue is fused away it is 40-66% of the WHOLE fused
+// forward on every autoencoder. This blocks the transpose into cache-resident
+// tiles and uses an AVX2 8x8 (NEON 4x4 / scalar) in-register transpose per
+// micro-tile, converting the long-stride scatter into blocked sequential access
+// to approach bandwidth.
+//
+// Bit-identical to `x.T.contiguous()` (a transpose is exact -- only the
+// traversal order differs). Reached only via the Linear path; never touches the
+// FEM/GCN SpMM (the guardrail is the API boundary).
+// ---------------------------------------------------------------------------
+
+#if defined(__AVX2__) && defined(__FMA__)
+// Transpose one 8x8 float tile: reads 8 rows of src (stride `ss` floats apart),
+// writes 8 rows of dst (stride `ds` floats apart). Standard AVX2 unpack/shuffle/
+// permute transpose (loadu/storeu -- tiles need not be 32B-aligned).
+static inline void scorch_transpose_8x8_avx2(const float* SCORCH_RESTRICT src,
+                                             int64_t ss,
+                                             float* SCORCH_RESTRICT dst,
+                                             int64_t ds) {
+  __m256 r0 = _mm256_loadu_ps(src + 0 * ss);
+  __m256 r1 = _mm256_loadu_ps(src + 1 * ss);
+  __m256 r2 = _mm256_loadu_ps(src + 2 * ss);
+  __m256 r3 = _mm256_loadu_ps(src + 3 * ss);
+  __m256 r4 = _mm256_loadu_ps(src + 4 * ss);
+  __m256 r5 = _mm256_loadu_ps(src + 5 * ss);
+  __m256 r6 = _mm256_loadu_ps(src + 6 * ss);
+  __m256 r7 = _mm256_loadu_ps(src + 7 * ss);
+  __m256 t0 = _mm256_unpacklo_ps(r0, r1);
+  __m256 t1 = _mm256_unpackhi_ps(r0, r1);
+  __m256 t2 = _mm256_unpacklo_ps(r2, r3);
+  __m256 t3 = _mm256_unpackhi_ps(r2, r3);
+  __m256 t4 = _mm256_unpacklo_ps(r4, r5);
+  __m256 t5 = _mm256_unpackhi_ps(r4, r5);
+  __m256 t6 = _mm256_unpacklo_ps(r6, r7);
+  __m256 t7 = _mm256_unpackhi_ps(r6, r7);
+  __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x44);
+  __m256 s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+  __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x44);
+  __m256 s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+  __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x44);
+  __m256 s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+  __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x44);
+  __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+  _mm256_storeu_ps(dst + 0 * ds, _mm256_permute2f128_ps(s0, s4, 0x20));
+  _mm256_storeu_ps(dst + 1 * ds, _mm256_permute2f128_ps(s1, s5, 0x20));
+  _mm256_storeu_ps(dst + 2 * ds, _mm256_permute2f128_ps(s2, s6, 0x20));
+  _mm256_storeu_ps(dst + 3 * ds, _mm256_permute2f128_ps(s3, s7, 0x20));
+  _mm256_storeu_ps(dst + 4 * ds, _mm256_permute2f128_ps(s0, s4, 0x31));
+  _mm256_storeu_ps(dst + 5 * ds, _mm256_permute2f128_ps(s1, s5, 0x31));
+  _mm256_storeu_ps(dst + 6 * ds, _mm256_permute2f128_ps(s2, s6, 0x31));
+  _mm256_storeu_ps(dst + 7 * ds, _mm256_permute2f128_ps(s3, s7, 0x31));
+}
+#elif defined(__ARM_NEON)
+// Transpose one 4x4 float tile (NEON vtrnq + vcombine). src rows stride `ss`
+// floats apart, dst rows stride `ds` floats apart.
+static inline void scorch_transpose_4x4_neon(const float* SCORCH_RESTRICT src,
+                                             int64_t ss,
+                                             float* SCORCH_RESTRICT dst,
+                                             int64_t ds) {
+  float32x4_t r0 = vld1q_f32(src + 0 * ss);
+  float32x4_t r1 = vld1q_f32(src + 1 * ss);
+  float32x4_t r2 = vld1q_f32(src + 2 * ss);
+  float32x4_t r3 = vld1q_f32(src + 3 * ss);
+  float32x4x2_t a = vtrnq_f32(r0, r1);
+  float32x4x2_t b = vtrnq_f32(r2, r3);
+  vst1q_f32(dst + 0 * ds,
+            vcombine_f32(vget_low_f32(a.val[0]), vget_low_f32(b.val[0])));
+  vst1q_f32(dst + 1 * ds,
+            vcombine_f32(vget_low_f32(a.val[1]), vget_low_f32(b.val[1])));
+  vst1q_f32(dst + 2 * ds,
+            vcombine_f32(vget_high_f32(a.val[0]), vget_high_f32(b.val[0])));
+  vst1q_f32(dst + 3 * ds,
+            vcombine_f32(vget_high_f32(a.val[1]), vget_high_f32(b.val[1])));
+}
+#endif
+
+// Transpose the tile rows [rB0,rB1) x cols [cB0,cB1) of a contiguous [R,C] source
+// into the [C,R] destination. Uses SIMD micro-tiles where both extents allow,
+// scalar for the edges. R/C are the full source dims (= dst/src strides).
+static inline void scorch_transpose_block(const float* SCORCH_RESTRICT S,
+                                          float* SCORCH_RESTRICT D, int64_t R,
+                                          int64_t C, int64_t rB0, int64_t rB1,
+                                          int64_t cB0, int64_t cB1) {
+  int64_t c = cB0;
+#if defined(__AVX2__) && defined(__FMA__)
+  for (; c + 8 <= cB1; c += 8) {
+    int64_t r = rB0;
+    for (; r + 8 <= rB1; r += 8)
+      scorch_transpose_8x8_avx2(S + r * C + c, C, D + c * R + r, R);
+    for (; r < rB1; ++r)  // row tail for this 8-wide column strip
+      for (int64_t cc = c; cc < c + 8; ++cc) D[cc * R + r] = S[r * C + cc];
+  }
+#elif defined(__ARM_NEON)
+  for (; c + 4 <= cB1; c += 4) {
+    int64_t r = rB0;
+    for (; r + 4 <= rB1; r += 4)
+      scorch_transpose_4x4_neon(S + r * C + c, C, D + c * R + r, R);
+    for (; r < rB1; ++r)
+      for (int64_t cc = c; cc < c + 4; ++cc) D[cc * R + r] = S[r * C + cc];
+  }
+#endif
+  for (; c < cB1; ++c)  // column tail (scalar)
+    for (int64_t r = rB0; r < rB1; ++r) D[c * R + r] = S[r * C + c];
+}
+
+torch::Tensor scorch_transpose_2d_float(torch::Tensor src,
+                                        int nthreads_override = -1) {
+  TORCH_CHECK(src.dim() == 2, "scorch_transpose_2d_float expects a 2D tensor");
+  src = src.contiguous();
+  const int64_t R = src.size(0);
+  const int64_t C = src.size(1);
+  torch::Tensor dst_t = torch::empty({C, R}, src.options());
+  const float* SCORCH_RESTRICT S = src.data_ptr<float>();
+  float* SCORCH_RESTRICT D = dst_t.data_ptr<float>();
+  if (R == 0 || C == 0) return dst_t;
+
+  // Cache-block edge: a BSxBS float tile (64x64 = 16KB) plus its transpose stays
+  // resident in L1/L2 so the scattered writes to D hit warm lines.
+  constexpr int64_t BS = 64;
+  const int64_t ncblk = (C + BS - 1) / BS;
+
+  // Process a range of column blocks -> writes a contiguous band of dst rows.
+  auto do_cblks = [&](int64_t b0, int64_t b1) {
+    for (int64_t cb = b0; cb < b1; ++cb) {
+      const int64_t cB0 = cb * BS;
+      const int64_t cB1 = std::min(cB0 + BS, C);
+      for (int64_t rB0 = 0; rB0 < R; rB0 += BS) {
+        const int64_t rB1 = std::min(rB0 + BS, R);
+        scorch_transpose_block(S, D, R, C, rB0, rB1, cB0, cB1);
+      }
+    }
+  };
+
+  // Access-pattern-bound, so threading mainly helps the wide (stl10) cases;
+  // share torch's warm intra-op pool (the SAME pool the fused kernel consuming
+  // this output runs on) when the caller passes the host thread count.
+  if (nthreads_override > 0 && ncblk > 1) {
+    at::parallel_for(0, ncblk, 1,
+                     [&](int64_t b0, int64_t b1) { do_cblks(b0, b1); });
+  } else {
+    do_cblks(0, ncblk);
+  }
+  return dst_t;
+}
+
 // Variant 9: Large-Tile NEON with Direct Accumulation
 // Tile k at 128 (outer loop) so B working set per tile fits in L2 (~2.5MB for n=5000).
 // Uses NEON inner loop, dynamic scheduling, and direct C accumulation (no workspace copy).
