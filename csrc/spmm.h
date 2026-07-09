@@ -2569,6 +2569,53 @@ static inline void scorch_apply_row_bias_act(float* SCORCH_RESTRICT C_row,
   }
 }
 
+#if defined(__ARM_NEON)
+// NEON register-tiled SpMM output row (ARM analogue of the AVX2 scorch_spmm_row_
+// regtile; the default ARM inner kernel for the fused Linear path). Accumulates
+// C_row[0..B1_size) = sum_nnz a*B_row directly in NEON registers, tiling the free
+// dim into 32-wide strips held in 8 float32x4 accumulators — 8 independent FMA
+// chains hide the ~4-cycle FMA latency without a 2-nnz unroll. This avoids the
+// scalar workspace loop's per-nnz round-trip (memset + ws L1 load/store + memcpy),
+// which measured ~10-14% of the fused forward on M5 across the AE grid. Tail
+// free-dim (B1_size % 32) done scalar.
+static inline void scorch_spmm_row_neon_regtile(
+    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
+    const float* SCORCH_RESTRICT B_val, int B1_size,
+    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end) {
+  int k0 = 0;
+  for (; k0 + 32 <= B1_size; k0 += 32) {
+    float32x4_t c0 = vdupq_n_f32(0.f), c1 = vdupq_n_f32(0.f),
+                c2 = vdupq_n_f32(0.f), c3 = vdupq_n_f32(0.f),
+                c4 = vdupq_n_f32(0.f), c5 = vdupq_n_f32(0.f),
+                c6 = vdupq_n_f32(0.f), c7 = vdupq_n_f32(0.f);
+    for (int pA = pA_begin; pA < pA_end; pA++) {
+      const float* SCORCH_RESTRICT B = B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
+      if (pA + 1 < pA_end)
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0, 0, 1);
+      const float32x4_t va = vdupq_n_f32(A_val[pA]);
+      c0 = vfmaq_f32(c0, va, vld1q_f32(B));
+      c1 = vfmaq_f32(c1, va, vld1q_f32(B + 4));
+      c2 = vfmaq_f32(c2, va, vld1q_f32(B + 8));
+      c3 = vfmaq_f32(c3, va, vld1q_f32(B + 12));
+      c4 = vfmaq_f32(c4, va, vld1q_f32(B + 16));
+      c5 = vfmaq_f32(c5, va, vld1q_f32(B + 20));
+      c6 = vfmaq_f32(c6, va, vld1q_f32(B + 24));
+      c7 = vfmaq_f32(c7, va, vld1q_f32(B + 28));
+    }
+    vst1q_f32(C_row + k0, c0);      vst1q_f32(C_row + k0 + 4, c1);
+    vst1q_f32(C_row + k0 + 8, c2);  vst1q_f32(C_row + k0 + 12, c3);
+    vst1q_f32(C_row + k0 + 16, c4); vst1q_f32(C_row + k0 + 20, c5);
+    vst1q_f32(C_row + k0 + 24, c6); vst1q_f32(C_row + k0 + 28, c7);
+  }
+  for (; k0 < B1_size; k0++) {
+    float acc = 0.f;
+    for (int pA = pA_begin; pA < pA_end; pA++)
+      acc += A_val[pA] * B_val[(size_t)A1_crd[pA] * (size_t)B1_size + k0];
+    C_row[k0] = acc;
+  }
+}
+#endif
+
 Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
                 std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
@@ -2635,6 +2682,15 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   const bool narrow_k = false;
 #endif
 
+#if defined(__ARM_NEON)
+  // NEON register-tiled inner kernel is the ARM default; SCORCH_NEON_REGTILE=0
+  // forces the scalar workspace loop (A/B escape hatch, mirrors
+  // SCORCH_SPMM_ATPARALLEL). Read once per op.
+  bool use_neon_regtile = true;
+  if (const char* _nr = std::getenv("SCORCH_NEON_REGTILE"))
+    if (*_nr) use_neon_regtile = (std::atol(_nr) != 0);
+#endif
+
   // Per-worker body: atomic row work-stealing, byte-identical distribution to v2.
   // Computes each output row via the AVX2 regblock/regtile kernels (or the non-
   // AVX2 workspace fallback), then folds bias+act into the SAME parallel region.
@@ -2674,6 +2730,24 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
         } else {
           scorch_spmm_row_regtile(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
         }
+#elif defined(__ARM_NEON)
+        if (use_neon_regtile) {
+          scorch_spmm_row_neon_regtile(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
+        } else {
+          for (int k_out = 0; k_out < B1_size; k_out += kTile) {
+            const int kw = std::min(kTile, B1_size - k_out);
+            memset(ws, 0, kw * sizeof(float));
+            for (int pA = pA_begin; pA < pA_end; pA++) {
+              const int j = A1_crd[pA];
+              const float a = A_val[pA];
+              const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size + k_out;
+              if (pA + 1 < pA_end)
+                __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k_out, 0, 1);
+              for (int k = 0; k < kw; k++) ws[k] += a * B_row[k];
+            }
+            memcpy(C_row + k_out, ws, kw * sizeof(float));
+          }
+        }
 #else
         for (int k_out = 0; k_out < B1_size; k_out += kTile) {
           const int kw = std::min(kTile, B1_size - k_out);
@@ -2711,9 +2785,34 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   if (const char* _atpf = std::getenv("SCORCH_SPMM_ATPARALLEL"))
     if (*_atpf) use_atparallel = (std::atol(_atpf) != 0);
   if (use_atparallel) {
-    at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
-      for (int64_t w = wbeg; w < wend; ++w) worker();
-    });
+    // E-CORE RECRUIT (M5/hybrid-P+E fix). at::parallel_for runs on torch's intra-op
+    // pool, whose size is torch's per-platform default thread count. On Apple M-series
+    // that default is the P-core count (6) and EXCLUDES the 12 E-cores, so a
+    // bandwidth-bound Linear-SpMM (which scales with total memory bandwidth, i.e.
+    // with EVERY core) is capped at ~1/3 the machine and runs ~2-2.5x slower than it
+    // must (measured across the AE grid @<=0.95). The work-aware `nthreads` already
+    // escalates to the full hardware core count (scorch_nthreads caps at
+    // omp_get_num_procs()); when it justifies at least 2x the ATen pool we launch our
+    // own omp team at that count to pull in the idle E-cores. Gating on 2x-the-pool
+    // (a) keeps tiny near-empty layers, whose by-work nthreads stays <= the pool, on
+    // the warm at::parallel_for pool (no fork/join over-threading — those regressed
+    // ~12% under an unconditional omp team) and (b) makes the recruit fire ONLY on a
+    // P-core-only-subset pool: on a non-hybrid / all-physical-cores pool (e.g. x86
+    // redwood: pool=24 = every physical core, omp_get_num_procs()=32 counts only SMT
+    // siblings) nthreads<=32 < 2*24=48 can never trigger, so the x86 pipeline-pool
+    // launch (its measured svhn edge) is byte-unchanged. Env SCORCH_SPMM_ATPARALLEL
+    // still forces the choice for A/B (1 => this branch; 0 => the omp branch below).
+    const int atpool = at::get_num_threads();
+    if (nthreads >= 2 * atpool) {
+      #pragma omp parallel num_threads(nthreads)
+      {
+        worker();
+      }
+    } else {
+      at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
+        for (int64_t w = wbeg; w < wend; ++w) worker();
+      });
+    }
   } else {
     #pragma omp parallel num_threads(nthreads)
     {
