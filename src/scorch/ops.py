@@ -44,6 +44,18 @@ _einsum_dispatch_cache = {}
 # SCORCH_MATCH_HOST_THREADS=0 to fall back to the pure standalone policy.
 _MATCH_HOST_THREADS = os.environ.get("SCORCH_MATCH_HOST_THREADS", "1") == "1"
 
+# Composition, part two: for the same drop-in pipeline SpMM, launch the kernel's
+# workers on torch's own intra-op pool (at::parallel_for) instead of a private
+# libgomp team, so the SpMM shares one warm pool with the surrounding torch
+# epilogue (bias/activation) — a private omp team's threads sleep between ops
+# under the default passive OMP policy and re-wake per call, a pool-transition tax
+# that dominated the sparse-AE @0.99 mid-size gap (cur/mkl 1.2-1.3 -> ~0.9, 6/7
+# apples-to-apples wins vs MKL). Fires together with _MATCH_HOST_THREADS; the
+# kernel gates it to products that can feed the full host pool, so row-starved
+# tiny products (the SuiteSparse panel's 130-row cell) keep omp. On by default;
+# set SCORCH_ATPARALLEL_PIPELINE=0 to force the private-team launch.
+_ATPARALLEL_PIPELINE = os.environ.get("SCORCH_ATPARALLEL_PIPELINE", "1") == "1"
+
 # start_time = time.time()
 # # Register custom classes
 # load(
@@ -365,10 +377,13 @@ def matmul(
         )
         if resolved is not None:
             nthreads = None
+            atparallel = False
             if _MATCH_HOST_THREADS and resolved.symbol_name == "spmm_csr_float_v2":
                 nthreads = torch.get_num_threads()
+                atparallel = _ATPARALLEL_PIPELINE
             result_cpp, result_shape = execute_prebuilt_binary_kernel(
-                resolved.fn, a, b, time_dict=time_dict, nthreads=nthreads
+                resolved.fn, a, b, time_dict=time_dict, nthreads=nthreads,
+                atparallel=atparallel,
             )
             # Fast path: a dense output kernel already produced a contiguous
             # row-major value buffer. Return it reshaped directly, skipping the

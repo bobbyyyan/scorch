@@ -231,6 +231,7 @@ def execute_prebuilt_binary_kernel(
     b: "STensor",
     time_dict: Optional[dict] = None,
     nthreads: Optional[int] = None,
+    atparallel: bool = False,
 ) -> Tuple[Any, Tuple[int, ...]]:
     if b.dim() == 2:
         result_shape: Tuple[int, ...] = (a.shape[0], b.shape[1])
@@ -246,10 +247,12 @@ def execute_prebuilt_binary_kernel(
         args.append(tensor.values)  # type: ignore[arg-type]
 
     start_time = time.time()
-    # nthreads is only supplied for kernels that accept nthreads_override (the
-    # drop-in SpMM, spmm_csr_float_v2); the caller gates on symbol_name.
+    # nthreads/atparallel are only supplied for the drop-in SpMM (spmm_csr_float_v2,
+    # the only kernel accepting nthreads_override/atparallel); the caller gates on
+    # symbol_name. atparallel launches the SpMM on torch's intra-op pool so it
+    # shares one warm team with the pipeline's torch epilogue.
     if nthreads is not None:
-        result_cpp = kernel_fn(*args, nthreads_override=nthreads)
+        result_cpp = kernel_fn(*args, nthreads_override=nthreads, atparallel=atparallel)
     else:
         result_cpp = kernel_fn(*args)
     end_time = time.time()

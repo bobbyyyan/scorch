@@ -17,6 +17,8 @@
 
 #include "prebuilt_types.h"
 #include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.cpp)
+#include <ATen/Parallel.h>  // at::parallel_for (pipeline-pool composition A/B)
+#include <cstdlib>          // std::getenv / std::atol (runtime A/B flag)
 
 #define SCORCH_PRAGMA_UNROLL _Pragma("unroll")
 #define SCORCH_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -2237,7 +2239,7 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
                 torch::Tensor A_values, std::vector<int> B_shape,
                 std::vector<std::vector<torch::Tensor>> B_mode_indices,
                 torch::Tensor B_values, int tile_size = 256,
-                int nthreads_override = -1) {
+                int nthreads_override = -1, bool atparallel = false) {
   const int C0_size = result_shape[0];
   const int C1_size = result_shape[1];
 
@@ -2370,8 +2372,14 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
     g_scorch_regtile_base = (e && *e && std::atol(e) != 0) ? 1 : 0; }
 #endif
 
-  #pragma omp parallel num_threads(nthreads)
-  {
+  // The per-worker body (atomic row work-stealing). Factored into a lambda so it
+  // can be launched EITHER through a private libgomp team (#pragma omp, default)
+  // OR through torch's own intra-op pool (at::parallel_for). The latter shares
+  // one warm pool with the surrounding torch epilogue (bias/act) so there is no
+  // cross-runtime thread-team reformation at each op boundary — the drop-in-
+  // pipeline "same thread pool" composition. Work distribution is byte-identical
+  // (same next_row atomic, same regblock/regtile kernels); only the launch differs.
+  auto scorch_spmm_worker = [&]() {
     // Per-thread workspace for the fallback path (cache-line aligned, lives in
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
     // row, so the shipped build never touches it (nullptr; free(nullptr) is a
@@ -2445,6 +2453,40 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
     }
 
     free(ws);
+  };
+
+  // Launch. Default: private libgomp team (#pragma omp) — byte-identical to the
+  // pre-composition kernel. When this is a drop-in pipeline op (the caller sets
+  // `atparallel` together with nthreads_override), run the SAME workers on torch's
+  // own intra-op pool via at::parallel_for so the SpMM shares one warm team with
+  // the surrounding torch epilogue (bias/act): no cross-runtime team reformation
+  // at each op boundary — the sparse-AE @0.99 pool-transition tax (mid-size @0.99
+  // cur/mkl 1.2-1.3 -> 0.9). Gate it to products that (a) clear the fork/join
+  // floor (work >= grain, same test that adopts the host count) AND (b) can feed
+  // the FULL host pool: a ROW-STARVED product (rows < nthreads_override*
+  // ROWS_PER_THREAD) leaves too few rows per worker, so at::parallel_for's task
+  // fan-out costs more than a raw omp team. That row-count test is the exact
+  // discriminator measured on the SuiteSparse panel: only arc130 (130 rows) is
+  // row-starved and it is the ONLY cell at::parallel_for regresses; every AE layer
+  // (>=512 rows) and GCN graph clears it and is neutral-to-better. at::parallel_for
+  // over [0,nthreads) grain 1 spawns min(nthreads, at::get_num_threads()) workers,
+  // each draining rows via the atomic, so a short/excess worker count stays
+  // correct. Env SCORCH_SPMM_ATPARALLEL forces the choice for A/B (1/0), bypassing
+  // the gate.
+  bool use_atparallel = atparallel && nthreads_override > 0
+      && work >= SCORCH_GRAIN_SPMM
+      && (long)A0_size >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
+  if (const char* _atpf = std::getenv("SCORCH_SPMM_ATPARALLEL"))
+    if (*_atpf) use_atparallel = (std::atol(_atpf) != 0);
+  if (use_atparallel) {
+    at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
+      for (int64_t w = wbeg; w < wend; ++w) scorch_spmm_worker();
+    });
+  } else {
+    #pragma omp parallel num_threads(nthreads)
+    {
+      scorch_spmm_worker();
+    }
   }
 
   Tensor C;
