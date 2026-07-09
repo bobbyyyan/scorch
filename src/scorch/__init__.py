@@ -7,6 +7,7 @@ from .ops import (
     precompile_kernels,
     sparse_linear,
     sparse_linear_fm,
+    sparse_softmax_csr,
 )
 from .stensor import STensor
 from .format import TensorFormat
@@ -40,5 +41,6 @@ __all__ = [
     "matmul_wksp",
     "sparse_linear",
     "sparse_linear_fm",
+    "sparse_softmax_csr",
     "__version__",
 ]

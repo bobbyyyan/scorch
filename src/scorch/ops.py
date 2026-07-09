@@ -441,6 +441,43 @@ def fast_transpose(x: torch.Tensor) -> torch.Tensor:
     return fn(x.contiguous(), nthreads)
 
 
+def sparse_softmax_csr(
+    crow_indices: torch.Tensor,
+    values: torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Row-wise softmax over the nonzeros of a CSR value array, ``scale`` folded in.
+
+    Returns ``softmax(scale * values)`` computed per CSR row span
+    ``[crow[i], crow[i+1])``, matching a torch scatter softmax up to float
+    rounding. Backs the sparse-attention chain (SDDMM -> softmax -> SpMM): the
+    prebuilt ``scorch_sparse_softmax_csr_float`` walks each row's contiguous span
+    sequentially (max, exp+sum, normalize) with no scatter and no nnz-sized
+    intermediates, parallel over rows on torch's warm intra-op pool.
+
+    Falls back to a torch segment-softmax if the kernel is unavailable or the
+    values are not float32 (exactness preserved either way).
+    """
+    import scorch_ops as _native
+
+    fn = getattr(_native, "scorch_sparse_softmax_csr_float", None)
+    if fn is None or values.dtype != torch.float32:
+        crow = crow_indices.long()
+        nrows = crow.numel() - 1
+        row_ids = torch.repeat_interleave(
+            torch.arange(nrows, device=values.device), crow[1:] - crow[:-1]
+        )
+        logits = values * scale
+        row_max = torch.full((nrows,), float("-inf"), device=values.device)
+        row_max.scatter_reduce_(0, row_ids, logits, reduce="amax", include_self=False)
+        exp_vals = torch.exp(logits - row_max[row_ids])
+        row_sum = torch.zeros(nrows, device=values.device)
+        row_sum.scatter_add_(0, row_ids, exp_vals)
+        return exp_vals / row_sum[row_ids]
+    nthreads = torch.get_num_threads() if _MATCH_HOST_THREADS else -1
+    return fn(crow_indices, values.contiguous(), float(scale), nthreads)
+
+
 def sparse_linear_fm(
     x_fm: Union[torch.Tensor, STensor],
     weight: STensor,

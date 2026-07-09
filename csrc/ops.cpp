@@ -188,6 +188,13 @@ void bind_experimental_spmm_variants(py::module_& m) {
   m.def("scorch_transpose_2d_float", &scorch_transpose_2d_float,
         "Fast cache-blocked 2D float32 transpose ([R,C]->[C,R])",
         py::arg("src"), py::arg("nthreads_override") = -1);
+  // Row-wise CSR softmax (scale folded in): the scatter-free replacement for the
+  // torch scatter softmax in the sparse-attention chain. Parallel over rows on
+  // torch's warm intra-op pool when the host thread count is passed.
+  m.def("scorch_sparse_softmax_csr_float", &scorch_sparse_softmax_csr_float,
+        "Row-wise softmax over CSR value spans (softmax of scale*values)",
+        py::arg("crow_indices"), py::arg("values"), py::arg("scale") = 1.0,
+        py::arg("nthreads_override") = -1);
 }
 
 // Fused SpMM + bias + ReLU wrappers

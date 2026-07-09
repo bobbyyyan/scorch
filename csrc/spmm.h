@@ -2998,6 +2998,73 @@ torch::Tensor scorch_transpose_2d_float(torch::Tensor src,
   return dst_t;
 }
 
+// scorch_sparse_softmax_csr_float — row-wise softmax over the nonzeros of a CSR
+// value array, with the attention `scale` folded in (softmax over `scale * v`).
+//
+// This is the "lever 1" replacement for the sparse-attention softmax that the
+// transformer bench previously did in torch as a scatter chain
+// (repeat_interleave -> scatter_reduce(amax) -> exp -> scatter_add -> divide),
+// run once PER HEAD. That chain is random-access (scatter) and ~6-16x above the
+// memory-traffic floor; profiled at ~59% of the whole Scorch attention layer.
+//
+// Here each row's nonzeros live in a CONTIGUOUS CSR span [crow[i], crow[i+1]),
+// so the softmax is three sequential passes over that span (max, exp+sum,
+// normalize) with NO scatter and NO intermediate nnz-sized allocations. Rows are
+// independent -> parallel over rows on torch's warm intra-op pool (same pool the
+// surrounding SpMM/SDDMM share) when the caller passes the host thread count.
+//
+// Numerics match the torch reference bit-for-bit up to float rounding: subtract
+// the row max for stability, exponentiate, divide by the row sum. The row-max is
+// seeded from the first element (NOT -INFINITY) so the code is safe under the
+// build's -ffast-math (no reliance on inf semantics). Empty rows are left zero.
+torch::Tensor scorch_sparse_softmax_csr_float(torch::Tensor crow_indices,
+                                              torch::Tensor values,
+                                              double scale = 1.0,
+                                              int nthreads_override = -1) {
+  TORCH_CHECK(crow_indices.dim() == 1, "crow_indices must be 1-D");
+  TORCH_CHECK(values.dim() == 1, "values must be 1-D");
+  auto crow = crow_indices.to(torch::kInt64).contiguous();
+  values = values.contiguous();
+  const int64_t nrows = crow.size(0) - 1;
+  torch::Tensor out = torch::empty_like(values);
+  if (nrows <= 0) return out;
+
+  const int64_t* SCORCH_RESTRICT rp = crow.data_ptr<int64_t>();
+  const float* SCORCH_RESTRICT v = values.data_ptr<float>();
+  float* SCORCH_RESTRICT o = out.data_ptr<float>();
+  const float sc = (float)scale;
+
+  auto do_rows = [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) {
+      const int64_t s = rp[i], e = rp[i + 1];
+      if (s >= e) continue;
+      float m = v[s] * sc;                       // seed from first (ffast-math safe)
+      for (int64_t j = s + 1; j < e; ++j) {
+        const float x = v[j] * sc;
+        if (x > m) m = x;
+      }
+      float sum = 0.0f;
+      for (int64_t j = s; j < e; ++j) {
+        const float ex = std::exp(v[j] * sc - m);
+        o[j] = ex;
+        sum += ex;
+      }
+      const float inv = 1.0f / sum;
+      for (int64_t j = s; j < e; ++j) o[j] *= inv;
+    }
+  };
+
+  // Parallel over rows only when the caller opts in (host thread count) and there
+  // is more than one row; grain of 128 rows keeps per-task overhead negligible.
+  if (nthreads_override > 0 && nrows > 1) {
+    at::parallel_for(0, nrows, 128,
+                     [&](int64_t r0, int64_t r1) { do_rows(r0, r1); });
+  } else {
+    do_rows(0, nrows);
+  }
+  return out;
+}
+
 // Variant 9: Large-Tile NEON with Direct Accumulation
 // Tile k at 128 (outer loop) so B working set per tile fits in L2 (~2.5MB for n=5000).
 // Uses NEON inner loop, dynamic scheduling, and direct C accumulation (no workspace copy).
