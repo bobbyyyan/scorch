@@ -2480,9 +2480,26 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   if (const char* _atpf = std::getenv("SCORCH_SPMM_ATPARALLEL"))
     if (*_atpf) use_atparallel = (std::atol(_atpf) != 0);
   if (use_atparallel) {
-    at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
-      for (int64_t w = wbeg; w < wend; ++w) scorch_spmm_worker();
-    });
+    // E-CORE RECRUIT (M5/hybrid-P+E). at::parallel_for runs on torch's intra-op
+    // pool, which on Apple M-series is the 6 P-cores and excludes the 12 E-cores.
+    // When the work-aware nthreads justifies >= 2x that pool, launch our own omp
+    // team to pull in the idle E-cores on this bandwidth-bound SpMM. The 2x-the-pool
+    // gate keeps small/row-starved products (incl. the FEM panel's arc130 and the
+    // small GCN graphs, whose by-work nthreads stays <= the pool) on the warm pool,
+    // and can NEVER fire on an all-physical-cores pool (x86: pool=24, nproc=32 w/
+    // SMT, nthreads<=32 < 48) -- so the x86 pipeline-pool launch and the FEM panel
+    // guardrail are byte-unchanged. Identical gate to spmm_csr_linear_fused_float.
+    const int atpool = at::get_num_threads();
+    if (nthreads >= 2 * atpool) {
+      #pragma omp parallel num_threads(nthreads)
+      {
+        scorch_spmm_worker();
+      }
+    } else {
+      at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
+        for (int64_t w = wbeg; w < wend; ++w) scorch_spmm_worker();
+      });
+    }
   } else {
     #pragma omp parallel num_threads(nthreads)
     {
