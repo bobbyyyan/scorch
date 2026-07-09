@@ -412,6 +412,148 @@ def matmul(
     return result
 
 
+# Activation codes for the fused Linear kernel (must match spmm.h
+# scorch_act_scalar / scorch_apply_row_bias_act).
+_ACT_CODES = {None: 0, "none": 0, "identity": 0, "relu": 1, "sigmoid": 2}
+# Empty mode-indices for a dense operand (reused so the chain allocates no lists).
+_EMPTY_MODE_INDICES = [[], []]
+
+
+def sparse_linear_fm(
+    x_fm: Union[torch.Tensor, STensor],
+    weight: STensor,
+    bias: Optional[torch.Tensor] = None,
+    activation: Optional[str] = None,
+) -> torch.Tensor:
+    """Fused feature-major sparse Linear layer.
+
+    Computes ``Y = act(weight @ x_fm + bias[:, None])`` in ONE prebuilt parallel
+    region (SpMM + per-output-channel bias + activation), returning a dense,
+    FEATURE-MAJOR result — so an autoencoder forward stays feature-major
+    throughout (transpose the input once in, transpose the output once out) with
+    NO per-layer transpose and NO separate torch bias/act epilogue.
+
+    ``x_fm``   -- dense activation ``[in, batch]`` in FEATURE-MAJOR (row = input
+                  feature) layout (a torch.Tensor or dense STensor). The output of
+                  a previous ``sparse_linear_fm`` (already ``[out, batch]``) feeds
+                  straight in.
+    ``weight`` -- sparse CSR STensor ``[out, in]`` (the Linear weight, as in
+                  ``F.linear``: ``y = x @ weight.T``).
+    ``bias``   -- optional dense ``[out]`` bias, added per output channel.
+    ``activation`` -- ``None`` / ``"relu"`` / ``"sigmoid"``.
+
+    Returns a dense torch.Tensor ``[out, batch]``.
+
+    Routes to the prebuilt ``spmm_csr_linear_fused_float`` kernel (v2's fast
+    regtile/regblock inner loops + the fused epilogue). Carries the same pipeline
+    composition hints as the drop-in ``matmul`` SpMM (``_MATCH_HOST_THREADS`` /
+    ``_ATPARALLEL_PIPELINE``). This is a DISTINCT entry point from ``matmul``, so
+    the FEM/GCN SpMM path (``scorch.matmul`` -> ``spmm_csr_float_v2`` /
+    ``spmm_csr_bias_act``) never reaches this kernel — the guardrail is the API
+    boundary.
+    """
+    import scorch_ops as _native
+
+    act = _ACT_CODES.get(activation, None)
+    if act is None:
+        raise ValueError(f"unsupported activation {activation!r}")
+
+    # Extract the dense feature-major operand [in, batch] WITHOUT wrapping it in an
+    # STensor — a dense operand needs only its shape, empty mode-indices, and flat
+    # values, so the full STensor.from_torch construction (TensorFormat/TensorIndex
+    # objects) is pure per-layer overhead in a chain. A dense STensor input is
+    # unwrapped the same cheap way.
+    if isinstance(x_fm, torch.Tensor):
+        x_vals = x_fm.reshape(-1)
+        in_dim = int(x_fm.shape[0])
+        batch = int(x_fm.shape[1])
+    else:
+        x_vals = x_fm.values
+        in_dim = int(x_fm.shape[0])
+        batch = int(x_fm.shape[1])
+    out_dim = int(weight.shape[0])
+    result_shape = [out_dim, batch]
+
+    if bias is None:
+        bias_t = torch.zeros(out_dim, dtype=torch.float32)
+    else:
+        bias_t = bias if bias.dtype == torch.float32 else bias.to(torch.float32)
+        bias_t = bias_t.contiguous()
+
+    fn = getattr(_native, "spmm_csr_linear_fused_float", None)
+    if (
+        fn is None
+        or weight.values.dtype != torch.float32
+        or x_vals.dtype != torch.float32
+    ):
+        # Fallback (kernel unavailable / unsupported dtype): dense reference in
+        # feature-major layout so the op still produces the right result.
+        w_dense = weight.to_torch()
+        x_dense = x_vals.reshape(in_dim, batch)
+        y = torch.matmul(w_dense, x_dense) + bias_t.view(-1, 1)
+        if act == 1:
+            return torch.relu(y)
+        if act == 2:
+            return torch.sigmoid(y)
+        return y
+
+    nthreads = -1
+    atparallel = False
+    if _MATCH_HOST_THREADS:
+        nthreads = torch.get_num_threads()
+        atparallel = _ATPARALLEL_PIPELINE
+
+    result_cpp = fn(
+        result_shape,
+        list(weight.shape),
+        weight.index.mode_indices,
+        weight.values,
+        [in_dim, batch],
+        _EMPTY_MODE_INDICES,
+        x_vals,
+        bias_t,
+        act,
+        256,
+        nthreads,
+        atparallel,
+    )
+    return result_cpp.storage.value.reshape(result_shape)
+
+
+def sparse_linear(
+    x: torch.Tensor,
+    weight: Union[STensor, torch.Tensor],
+    bias: Optional[torch.Tensor] = None,
+    activation: Optional[str] = None,
+) -> torch.Tensor:
+    """Drop-in ``F.linear`` with a sparse weight, fused with bias + activation.
+
+    Computes ``act(x @ weight.T + bias)`` for a NATURAL-layout activation
+    ``x`` ``[batch, in]``, returning ``[batch, out]`` — the exact signature of
+    ``torch.nn.functional.linear`` (plus an optional fused activation). This is
+    the transparent per-call entry point: replace ``act(F.linear(x, W, b))`` with
+    ``scorch.sparse_linear(x, W, b, "relu")`` and the SpMM + bias + activation run
+    in ONE prebuilt parallel region.
+
+    ``weight`` may be a sparse CSR ``STensor`` ``[out, in]`` (preferred — build it
+    once and reuse) or a dense ``torch.Tensor`` ``[out, in]`` (converted to CSR per
+    call; pass a pre-built STensor in a hot loop to avoid the conversion).
+    ``activation`` -- ``None`` / ``"relu"`` / ``"sigmoid"``.
+
+    Internally transposes ``x`` into feature-major ``[in, batch]``, runs the fused
+    feature-major kernel (``sparse_linear_fm``), and transposes the result back —
+    the SAME transpose pattern ``torch.sparse.mm(W, x.T).T`` already pays, so this
+    matches MKL's layout cost while fusing the epilogue MKL runs as separate ops.
+    For a multi-layer chain, ``sparse_linear_fm`` (staying feature-major end to
+    end) avoids the intermediate transposes, though measured equivalent here.
+    """
+    if isinstance(weight, torch.Tensor) and not isinstance(weight, STensor):
+        weight = STensor.from_csr(weight.to_sparse_csr(), "weight")
+    x_fm = x.T.contiguous()
+    y_fm = sparse_linear_fm(x_fm, weight, bias, activation)
+    return y_fm.T
+
+
 def einsum(
     expression: str,
     *tensors: Optional[Union[torch.Tensor, STensor]],

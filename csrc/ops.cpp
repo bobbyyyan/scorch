@@ -170,6 +170,17 @@ void bind_experimental_spmm_variants(py::module_& m) {
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
         py::arg("B_values"), py::arg("tile_size") = 256,
         py::arg("nthreads_override") = -1, py::arg("atparallel") = false);
+  // Fused feature-major Linear: Y[out,batch] = act(W @ X[in,batch] + bias[:,None])
+  // with per-OUTPUT-CHANNEL (per-row) bias + activation folded into v2's parallel
+  // region (see spmm.h). act: 0=identity, 1=relu, 2=sigmoid. Same composition hints
+  // as v2. Reached only via scorch.sparse_linear_fm (never FEM/GCN's scorch.matmul).
+  m.def("spmm_csr_linear_fused_float", &spmm_csr_linear_fused_float,
+        "Fused feature-major SpMM + per-output-channel bias + activation",
+        py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
+        py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
+        py::arg("B_values"), py::arg("bias_values"), py::arg("act"),
+        py::arg("tile_size") = 256,
+        py::arg("nthreads_override") = -1, py::arg("atparallel") = false);
 }
 
 // Fused SpMM + bias + ReLU wrappers

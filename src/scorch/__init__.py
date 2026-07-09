@@ -1,5 +1,12 @@
 import torch
-from .ops import einsum, matmul, matmul_wksp, precompile_kernels
+from .ops import (
+    einsum,
+    matmul,
+    matmul_wksp,
+    precompile_kernels,
+    sparse_linear,
+    sparse_linear_fm,
+)
 from .stensor import STensor
 from .format import TensorFormat
 from .trace import compile
@@ -29,5 +36,7 @@ __all__ = [
     "from_coo",
     "matmul",
     "matmul_wksp",
+    "sparse_linear",
+    "sparse_linear_fm",
     "__version__",
 ]

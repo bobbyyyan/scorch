@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <numeric>
@@ -2495,6 +2496,232 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
     C_values_torch = torch::from_blob(
         C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   }
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+// ---------------------------------------------------------------------------
+// spmm_csr_linear_fused_float — feature-major fused Linear layer:
+//     Y[o, b] = act( sum_{i in nnz(W[o,:])} W[o,i] * X[i, b]  +  bias[o] )
+// for a sparse CSR weight W[out, in] (A) and a dense, FEATURE-MAJOR activation
+// X[in, batch] (B, row-major). Output Y is [out, batch], feature-major, so a
+// whole autoencoder forward stays feature-major throughout (transpose X once in,
+// once out) — no per-layer transpose, and NO separate torch bias/act epilogue.
+//
+// This IS spmm_csr_float_v2 (same regtile/regblock inner loops, same thread
+// policy, same at::parallel_for pool composition) with the Linear epilogue folded
+// INTO the parallel region: after a worker computes an output row Y[o,:] (all
+// `batch` free-dim entries), it adds the per-OUTPUT-CHANNEL scalar bias[o]
+// (broadcast over the batch) and applies the activation, before moving on. One
+// warm parallel region does SpMM + bias + act with the row still hot in cache —
+// the composition tax the shipped unfused path pays at every SpMM->torch-epilogue
+// handoff under passive OMP is gone.
+//
+// Bias here is PER-ROW (per output channel), a scalar broadcast over the free
+// dim — distinct from spmm_csr_bias_act (per-free-dim/per-column bias, correct
+// for a GCN [nodes,features] output). act: 0=identity, 1=relu, 2=sigmoid.
+// Structurally-empty output channels (W row o all-zero, e.g. svhn enc1 after a
+// global 99% prune) yield Y[o,:] = act(bias[o]) — bias/act still apply.
+//
+// Reached ONLY via scorch.sparse_linear_fm; scorch.matmul (FEM/GCN) routes to v2
+// / spmm_csr_bias_act and never reaches this kernel — the guardrail is the API
+// boundary.
+// ---------------------------------------------------------------------------
+
+// Numerically stable logistic sigmoid. The naive 1/(1+expf(-x)) overflows expf
+// to +inf for large-magnitude x; the build uses -ffast-math, which assumes no
+// inf/NaN and turns that into a NaN. Clamping x to [-87,87] keeps expf(-x) finite
+// (expf(87) < FLT_MAX) so it never overflows — and the clamp is branchless
+// (vminps/vmaxps), so -O3 -ffast-math -march=native vectorizes callers of this
+// (the dec2 sigmoid layer) instead of the per-element `x>=0` branch blocking them.
+// sigmoid saturates to 0/1 far outside [-87,87], so this matches torch within 1e-3.
+static inline float scorch_sigmoidf(float x) {
+  x = x < -87.f ? -87.f : x;
+  x = x > 87.f ? 87.f : x;
+  return 1.f / (1.f + expf(-x));
+}
+
+// Scalar activation: 0=identity, 1=relu, 2=sigmoid.
+static inline float scorch_act_scalar(float x, int act) {
+  if (act == 1) return x > 0.f ? x : 0.f;
+  if (act == 2) return scorch_sigmoidf(x);
+  return x;
+}
+
+// Apply per-output-channel bias `bo` (broadcast over the free dim) then the
+// activation to a fully-computed output row of length n. -O3/-ffast-math
+// vectorize the identity/relu forms; sigmoid uses expf per element (the same
+// work torch's sigmoid does, and only the AE's final layer).
+static inline void scorch_apply_row_bias_act(float* SCORCH_RESTRICT C_row,
+                                             int n, float bo, int act) {
+  if (act == 1) {          // relu
+    for (int k = 0; k < n; k++) {
+      const float v = C_row[k] + bo;
+      C_row[k] = v > 0.f ? v : 0.f;
+    }
+  } else if (act == 2) {   // sigmoid (scorch_sigmoidf inlines to a vectorizable
+    for (int k = 0; k < n; k++) {   // clamp + 1/(1+e^-z); see scorch_sigmoidf)
+      C_row[k] = scorch_sigmoidf(C_row[k] + bo);
+    }
+  } else {                 // identity
+    for (int k = 0; k < n; k++) C_row[k] += bo;
+  }
+}
+
+Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
+                std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, torch::Tensor bias_values, int act,
+                int tile_size = 256,
+                int nthreads_override = -1, bool atparallel = false) {
+  const int C0_size = result_shape[0];
+  const int C1_size = result_shape[1];
+
+  const int A0_size = A_shape[0];
+  const int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  const int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  const float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+
+  const int B1_size = B_shape[1];
+  const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+  const float* SCORCH_RESTRICT bias_val = bias_values.data_ptr<float>();
+
+  const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+
+  // Output allocation. Every output row in [0, A0_size) is FULLY written by the
+  // worker below (empty channels -> act(bias); non-empty -> regtile + epilogue),
+  // so no pre-zeroing pass is needed. Allocate via torch::empty (same CPU
+  // allocator MKL's output uses -> apples-to-apples). A tail C0_size>A0_size
+  // (never happens for a Linear layer, where out==A0_size) is zeroed for safety.
+  torch::Tensor C_values_torch = torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
+  if (C0_size > A0_size)
+    memset(C_values + (size_t)A0_size * (size_t)C1_size, 0,
+           sizeof(float) * (size_t)(C0_size - A0_size) * (size_t)C1_size);
+
+  const int kTile = (tile_size + 15) & ~15;
+
+  // Thread policy / schedule chunk — IDENTICAL to spmm_csr_float_v2 (see there for
+  // the full rationale): work = nnz*max(k,16), grain = SCORCH_GRAIN_SPMM; adopt
+  // the host thread count when the caller passes nthreads_override (avoids the
+  // pipeline team-reshape), bounded by the row-parallelism ceiling and floored at
+  // the policy count.
+  const int total_nnz = A1_pos[A0_size];
+  const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
+  const long work = (long)total_nnz * k_eff;
+  const int policy_nt = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
+  int nthreads = policy_nt;
+  if (nthreads_override > 0 && work >= SCORCH_GRAIN_SPMM) {
+    const long by_rows = (long)A0_size / SCORCH_ROWS_PER_THREAD;
+    long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
+    const long hw = (long)omp_get_num_procs();
+    if (cand > hw) cand = hw;
+    if (cand > (long)nthreads) nthreads = (int)cand;
+  }
+  const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
+  std::atomic<int> next_row{0};
+
+#if defined(__AVX2__) && defined(__FMA__)
+  const bool narrow_k = (B1_size >= 1 && B1_size <= 32);
+  const int nvec = (B1_size + 7) / 8;
+  const int mlast = B1_size - 8 * (nvec - 1);
+  const __m256i mask_last = _mm256_setr_epi32(
+      mlast>0?-1:0, mlast>1?-1:0, mlast>2?-1:0, mlast>3?-1:0,
+      mlast>4?-1:0, mlast>5?-1:0, mlast>6?-1:0, mlast>7?-1:0);
+#else
+  const bool narrow_k = false;
+#endif
+
+  // Per-worker body: atomic row work-stealing, byte-identical distribution to v2.
+  // Computes each output row via the AVX2 regblock/regtile kernels (or the non-
+  // AVX2 workspace fallback), then folds bias+act into the SAME parallel region.
+  auto worker = [&]() {
+#if defined(__AVX2__) && defined(__FMA__)
+    float* SCORCH_RESTRICT ws = nullptr;
+#else
+    float* SCORCH_RESTRICT ws = (float*)aligned_alloc(64, kTile * sizeof(float));
+#endif
+    while (true) {
+      const int start = next_row.fetch_add(chunk, std::memory_order_relaxed);
+      if (start >= A0_size) break;
+      const int end = std::min(start + chunk, A0_size);
+
+      for (int i = start; i < end; i++) {
+        const int pA_begin = A1_pos[i];
+        const int pA_end   = A1_pos[i + 1];
+        float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+        const float bo = bias_val[i];
+
+        // Structurally-empty output channel: Y[o,:] = act(bias[o]) (constant).
+        if (pA_begin == pA_end) {
+          const float ev = scorch_act_scalar(bo, act);
+          for (int k = 0; k < C1_size; k++) C_row[k] = ev;
+          continue;
+        }
+
+        // Compute the raw SpMM output row into C_row.
+#if defined(__AVX2__) && defined(__FMA__)
+        if (narrow_k) {
+          switch (nvec) {
+            case 1: scorch_spmm_row_regblock<1>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+            case 2: scorch_spmm_row_regblock<2>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+            case 3: scorch_spmm_row_regblock<3>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+            case 4: scorch_spmm_row_regblock<4>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last); break;
+          }
+        } else {
+          scorch_spmm_row_regtile(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
+        }
+#else
+        for (int k_out = 0; k_out < B1_size; k_out += kTile) {
+          const int kw = std::min(kTile, B1_size - k_out);
+          memset(ws, 0, kw * sizeof(float));
+          for (int pA = pA_begin; pA < pA_end; pA++) {
+            const int j = A1_crd[pA];
+            const float a = A_val[pA];
+            const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size + k_out;
+            if (pA + 1 < pA_end)
+              __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k_out, 0, 1);
+            for (int k = 0; k < kw; k++) ws[k] += a * B_row[k];
+          }
+          memcpy(C_row + k_out, ws, kw * sizeof(float));
+        }
+#endif
+        // Fused epilogue: bias + activation, row still hot in cache.
+        scorch_apply_row_bias_act(C_row, C1_size, bo, act);
+      }
+    }
+    free(ws);
+  };
+
+  // Launch. Unlike v2 (which gates at::parallel_for on work>=grain AND a row-
+  // starvation floor to protect the SuiteSparse FEM panel — arc130 regresses on
+  // torch's pool), the fused Linear kernel is reached ONLY via sparse_linear_fm
+  // and NEVER by any FEM/GCN SpMM, so neither guard is needed. Here the whole
+  // point is that EVERY layer of a fused autoencoder chain shares ONE warm torch
+  // pool — including the tiny near-empty layers (svhn enc1=0nnz / enc2), whose
+  // private-libgomp team would otherwise force a mid-chain pool transition into
+  // the dec1/dec2 at::parallel_for layers. So when the caller opts into pool-
+  // sharing (atparallel + host thread count) we launch on torch's intra-op pool
+  // unconditionally; that measured faster on svhn @0.99 than v2's gate. Env
+  // SCORCH_SPMM_ATPARALLEL still forces the choice for A/B (1/0).
+  bool use_atparallel = atparallel && nthreads_override > 0;
+  if (const char* _atpf = std::getenv("SCORCH_SPMM_ATPARALLEL"))
+    if (*_atpf) use_atparallel = (std::atol(_atpf) != 0);
+  if (use_atparallel) {
+    at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
+      for (int64_t w = wbeg; w < wend; ++w) worker();
+    });
+  } else {
+    #pragma omp parallel num_threads(nthreads)
+    {
+      worker();
+    }
+  }
+
+  Tensor C;
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
