@@ -195,6 +195,16 @@ void bind_experimental_spmm_variants(py::module_& m) {
         "Row-wise softmax over CSR value spans (softmax of scale*values)",
         py::arg("crow_indices"), py::arg("values"), py::arg("scale") = 1.0,
         py::arg("nthreads_override") = -1);
+  // Fused sparse (masked) multi-head attention over a shared CSR mask: one pass
+  // computes softmax(scale * Q.K) . V over each row's nonzero columns, batched
+  // over heads, taking Q/K/V as [S,H,D] directly (no per-head slice) and the CSR
+  // mask once. Replaces the per-head SDDMM -> softmax -> SpMM chain + CSR
+  // round-trip. Pass the host thread count to run on torch's warm intra-op pool.
+  m.def("scorch_sparse_attention_csr_float", &scorch_sparse_attention_csr_float,
+        "Fused sparse multi-head attention (SDDMM + row-softmax + weighted-V)",
+        py::arg("crow_indices"), py::arg("col_indices"), py::arg("Q"),
+        py::arg("K"), py::arg("V"), py::arg("scale") = 1.0,
+        py::arg("nthreads_override") = -1);
 }
 
 // Fused SpMM + bias + ReLU wrappers

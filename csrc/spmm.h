@@ -3065,6 +3065,150 @@ torch::Tensor scorch_sparse_softmax_csr_float(torch::Tensor crow_indices,
   return out;
 }
 
+// scorch_sparse_attention_csr_float — fused sparse (masked) multi-head attention
+// over a shared CSR mask. The "lever 2" ceiling for the sparse-attention bench:
+// one native pass computes the whole attention output, replacing the per-head
+// three-kernel chain (SDDMM -> softmax -> SpMM) driven by a Python H x L loop with
+// CSR round-tripping and per-head .contiguous() copies between stages.
+//
+// Layout: Q/K/V are dense [S, H, D] row-major (Q[i,h,d] at (i*H + h)*D + d) —
+// taken directly from `q_proj(x).view(S, H, D)`, with NO per-head slice/copy. The
+// mask is the CSR structure (crow[S+1], col[nnz]) passed ONCE; its stored values
+// are the 0/1 attend pattern, so structural presence == attend and we compute the
+// raw scaled dot for each nonzero (no per-value multiply). Output is dense
+// [S, H, D] (feeds straight into the out-projection after a reshape to [S, H*D]).
+//
+// Per row i (the parallel unit) and head h, a two-pass softmax over the row's
+// nonzero columns j in [crow[i], crow[i+1]) — rows are tiny (~2W+1 for the window,
+// S for the few global rows) so a row stays L1/L2-resident:
+//   pass 1: score[jj] = scale * dot(Q[i,h], K[j,h]); track the row max m.
+//   pass 2: w = exp(score[jj] - m); l += w; acc[d] += w * V[j,h,d].
+//   out[i,h,d] = acc[d] / l.
+// This is exactly softmax(scale * Q[i,h].K[j,h]) . V over the attended j, i.e. the
+// masked-attention math the dense path does with -inf fills — identical up to
+// float rounding. The row max is seeded from the first nonzero (NOT -INFINITY) so
+// the code is safe under the build's -ffast-math (matches the lever-1 softmax).
+//
+// One thread-local scratch (score buffer sized to the widest row + a D-wide V
+// accumulator) is allocated once per parallel task, so there are NO nnz-sized
+// intermediates and NO heap churn per row/head. Rows are independent -> parallel
+// over rows on torch's warm intra-op pool (the same pool the projections run on)
+// when the caller passes the host thread count.
+torch::Tensor scorch_sparse_attention_csr_float(torch::Tensor crow_indices,
+                                                torch::Tensor col_indices,
+                                                torch::Tensor Q, torch::Tensor K,
+                                                torch::Tensor V,
+                                                double scale = 1.0,
+                                                int nthreads_override = -1) {
+  TORCH_CHECK(crow_indices.dim() == 1, "crow_indices must be 1-D");
+  TORCH_CHECK(col_indices.dim() == 1, "col_indices must be 1-D");
+  TORCH_CHECK(Q.dim() == 3 && K.dim() == 3 && V.dim() == 3,
+              "Q/K/V must be [S, H, D]");
+
+  auto crow = crow_indices.to(torch::kInt64).contiguous();
+  auto col = col_indices.to(torch::kInt64).contiguous();
+  Q = Q.contiguous();
+  K = K.contiguous();
+  V = V.contiguous();
+
+  const int64_t S = Q.size(0);
+  const int64_t H = Q.size(1);
+  const int64_t D = Q.size(2);
+  TORCH_CHECK(crow.size(0) == S + 1, "crow length must be S+1");
+  TORCH_CHECK(K.size(0) == S && V.size(0) == S, "K/V must have S rows");
+  TORCH_CHECK(K.size(1) == H && K.size(2) == D && V.size(1) == H &&
+                  V.size(2) == D,
+              "K/V head/dim must match Q");
+
+  torch::Tensor out = torch::empty({S, H, D}, Q.options());
+  if (S == 0) return out;
+
+  const int64_t* SCORCH_RESTRICT rp = crow.data_ptr<int64_t>();
+  const int64_t* SCORCH_RESTRICT cp = col.data_ptr<int64_t>();
+  const float* SCORCH_RESTRICT Qp = Q.data_ptr<float>();
+  const float* SCORCH_RESTRICT Kp = K.data_ptr<float>();
+  const float* SCORCH_RESTRICT Vp = V.data_ptr<float>();
+  float* SCORCH_RESTRICT Op = out.data_ptr<float>();
+  const float sc = (float)scale;
+  const int64_t HD = H * D;
+
+  // Widest row -> score-buffer size. The few global rows attend to all S columns,
+  // so the buffer must cover S; window rows use only their prefix. One O(S) scan.
+  int64_t max_len = 0;
+  for (int64_t i = 0; i < S; ++i) {
+    const int64_t len = rp[i + 1] - rp[i];
+    if (len > max_len) max_len = len;
+  }
+
+  auto do_rows = [&](int64_t r0, int64_t r1) {
+    // One allocation per parallel task: [max_len score buffer | D-wide V accum].
+    std::vector<float> scratch(max_len + D);
+    float* SCORCH_RESTRICT scores = scratch.data();
+    float* SCORCH_RESTRICT acc = scratch.data() + max_len;
+    for (int64_t i = r0; i < r1; ++i) {
+      const int64_t s = rp[i], e = rp[i + 1];
+      float* SCORCH_RESTRICT out_i = Op + i * HD;
+      if (s >= e) {  // empty row (never happens for this mask; kept safe)
+        for (int64_t t = 0; t < HD; ++t) out_i[t] = 0.0f;
+        continue;
+      }
+      const int64_t len = e - s;
+      for (int64_t h = 0; h < H; ++h) {
+        const float* SCORCH_RESTRICT q = Qp + i * HD + h * D;
+
+        // Pass 1: scaled Q.K scores over the row's nonzeros + running max. Seed
+        // the max from the first nonzero (ffast-math safe, matches lever-1).
+        float m;
+        {
+          const float* SCORCH_RESTRICT k0 = Kp + cp[s] * HD + h * D;
+          float dot0 = 0.0f;
+          for (int64_t d = 0; d < D; ++d) dot0 += q[d] * k0[d];
+          scores[0] = dot0 * sc;
+          m = scores[0];
+        }
+        for (int64_t jj = 1; jj < len; ++jj) {
+          const float* SCORCH_RESTRICT krow = Kp + cp[s + jj] * HD + h * D;
+          if (jj + 1 < len) {
+            __builtin_prefetch(Kp + cp[s + jj + 1] * HD + h * D, 0, 1);
+          }
+          float dot = 0.0f;
+          for (int64_t d = 0; d < D; ++d) dot += q[d] * krow[d];
+          const float sco = dot * sc;
+          scores[jj] = sco;
+          if (sco > m) m = sco;
+        }
+
+        // Pass 2: exp(score - max), row sum, and weighted-V accumulation.
+        for (int64_t d = 0; d < D; ++d) acc[d] = 0.0f;
+        float l = 0.0f;
+        for (int64_t jj = 0; jj < len; ++jj) {
+          const float* SCORCH_RESTRICT vrow = Vp + cp[s + jj] * HD + h * D;
+          if (jj + 1 < len) {
+            __builtin_prefetch(Vp + cp[s + jj + 1] * HD + h * D, 0, 1);
+          }
+          const float w = std::exp(scores[jj] - m);
+          l += w;
+          for (int64_t d = 0; d < D; ++d) acc[d] += w * vrow[d];
+        }
+        const float inv = 1.0f / l;
+        float* SCORCH_RESTRICT out_ih = out_i + h * D;
+        for (int64_t d = 0; d < D; ++d) out_ih[d] = acc[d] * inv;
+      }
+    }
+  };
+
+  // Parallel over rows on torch's warm intra-op pool when the caller opts in
+  // (host thread count) and there is more than one row. Small grain: per-row work
+  // is heavy (H * len * D), so a few rows per task already amortizes task overhead
+  // and keeps the lone heavy global row from stalling the join barrier.
+  if (nthreads_override > 0 && S > 1) {
+    at::parallel_for(0, S, 8, [&](int64_t r0, int64_t r1) { do_rows(r0, r1); });
+  } else {
+    do_rows(0, S);
+  }
+  return out;
+}
+
 // Variant 9: Large-Tile NEON with Direct Accumulation
 // Tile k at 128 (outer loop) so B working set per tile fits in L2 (~2.5MB for n=5000).
 // Uses NEON inner loop, dynamic scheduling, and direct C accumulation (no workspace copy).

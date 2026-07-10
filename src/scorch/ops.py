@@ -478,6 +478,86 @@ def sparse_softmax_csr(
     return fn(crow_indices, values.contiguous(), float(scale), nthreads)
 
 
+def _sparse_attention_fallback(
+    crow_indices: torch.Tensor,
+    col_indices: torch.Tensor,
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Pure-torch reference for ``sparse_attention`` (kernel unavailable/dtype).
+
+    Reproduces the fused kernel's math head-by-head with a gather SDDMM, the
+    CSR-native row softmax (``sparse_softmax_csr``, itself torch-fallback safe),
+    and a torch sparse SpMM — so the API always returns the right ``[S,H,D]``.
+    """
+    S, H, D = int(Q.shape[0]), int(Q.shape[1]), int(Q.shape[2])
+    crow = crow_indices.long()
+    col = col_indices.long()
+    counts = crow[1:] - crow[:-1]
+    rows = torch.repeat_interleave(torch.arange(S, device=Q.device), counts)
+    out = torch.empty_like(Q)
+    for h in range(H):
+        Qh, Kh, Vh = Q[:, h, :], K[:, h, :], V[:, h, :]
+        score = (Qh[rows] * Kh[col]).sum(dim=-1)  # (nnz,)
+        attn = sparse_softmax_csr(crow_indices, score.contiguous(), scale)
+        attn_csr = torch.sparse_csr_tensor(crow, col, attn, (S, S))
+        out[:, h, :] = torch.sparse.mm(attn_csr, Vh.contiguous())
+    return out
+
+
+def sparse_attention(
+    crow_indices: torch.Tensor,
+    col_indices: torch.Tensor,
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Fused sparse (masked) multi-head attention over a shared CSR mask.
+
+    Computes, for each query row ``i`` and head ``h``,
+    ``out[i,h] = sum_j softmax_j(scale * Q[i,h]·K[j,h]) * V[j,h]`` over the row's
+    attended columns ``j`` (the nonzeros of the CSR mask ``crow``/``col``) — i.e.
+    the same masked-attention math the dense path does with ``-inf`` fills, over
+    exactly the mask's structural nonzeros.
+
+    ``Q``/``K``/``V`` are dense ``[S, H, D]`` float32 tensors (as produced by
+    ``q_proj(x).view(S, H, D)``); the CSR mask structure is passed once. Returns a
+    dense ``[S, H, D]`` tensor. The prebuilt ``scorch_sparse_attention_csr_float``
+    does the whole thing in ONE parallel pass over rows (inline SDDMM + two-pass
+    row softmax in registers + weighted-V accumulation), batched over heads — no
+    per-head kernel dispatch, no nnz-sized intermediates, no CSR round-trip. This
+    is "lever 2" for the sparse-attention bench: it removes the residual per-head
+    Python-dispatch/materialization overhead left after the CSR-native softmax
+    (``sparse_softmax_csr``, "lever 1").
+
+    Falls back to a pure-torch per-head reference if the kernel is unavailable or
+    the tensors are not float32 (result identical up to float rounding).
+    """
+    import scorch_ops as _native
+
+    fn = getattr(_native, "scorch_sparse_attention_csr_float", None)
+    if (
+        fn is None
+        or Q.dtype != torch.float32
+        or K.dtype != torch.float32
+        or V.dtype != torch.float32
+    ):
+        return _sparse_attention_fallback(crow_indices, col_indices, Q, K, V, scale)
+    nthreads = torch.get_num_threads() if _MATCH_HOST_THREADS else -1
+    return fn(
+        crow_indices,
+        col_indices,
+        Q.contiguous(),
+        K.contiguous(),
+        V.contiguous(),
+        float(scale),
+        nthreads,
+    )
+
+
 def sparse_linear_fm(
     x_fm: Union[torch.Tensor, STensor],
     weight: STensor,
