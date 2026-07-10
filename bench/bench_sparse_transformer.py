@@ -85,7 +85,22 @@ CONFIGS: Dict[str, "TransformerConfig"] = {
 }
 CONFIG_ORDER = list(CONFIGS.keys())
 
-FRAMEWORK_ORDER = ["Dense PyTorch", "Sparse PyTorch", "Scorch"]
+# Two Scorch attention paths are benchmarked side by side so the fusion win is
+# visible directly in the figure: "Scorch (unfused)" is the per-head
+# SDDMM -> CSR-softmax -> SpMM chain ("lever 1"), "Scorch (fused)" is the single
+# fused sparse-FlashAttention kernel scorch.sparse_attention ("lever 2"). Both are
+# checked against Dense PyTorch for correctness.
+FRAMEWORK_ORDER = [
+    "Dense PyTorch", "Sparse PyTorch", "Scorch (unfused)", "Scorch (fused)",
+]
+
+# Framework name -> run_attention_layer mode.
+FRAMEWORK_MODE = {
+    "Dense PyTorch": "dense",
+    "Sparse PyTorch": "sparse-pytorch",
+    "Scorch (unfused)": "scorch",
+    "Scorch (fused)": "scorch-fused",
+}
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 WEIGHT_DIR = Path(__file__).resolve().parent.parent / "weights"
@@ -346,6 +361,19 @@ def run_attention_layer(
     Q = attn.q_proj(x).view(B, S, H, D)  # (1, S, H, D)
     K = attn.k_proj(x).view(B, S, H, D)
     V = attn.v_proj(x).view(B, S, H, D)
+
+    if mode == "scorch-fused":
+        # Lever 2: one fused sparse-FlashAttention kernel over the whole layer.
+        # Takes Q/K/V as [S,H,D] directly (no per-head slice/.contiguous) and the
+        # CSR mask once, computing inline SDDMM + two-pass row softmax + weighted-V
+        # in a single pass over each row's nonzeros, batched over heads — no
+        # per-head Python dispatch, no nnz-sized intermediates, no CSR round-trip.
+        csr = mask_data["csr"]
+        out_shd = scorch.sparse_attention(
+            csr.crow_indices(), csr.col_indices(),
+            Q[0], K[0], V[0], attn.scale,
+        )  # (S, H, D)
+        return attn.out_proj(out_shd.reshape(1, S, E))
 
     heads_out = []
 
@@ -702,13 +730,7 @@ def benchmark_seq_lengths(
             if fw.lower() not in [f.lower() for f in frameworks]:
                 continue
 
-            # Map framework name to mode
-            mode_map = {
-                "Dense PyTorch": "dense",
-                "Sparse PyTorch": "sparse-pytorch",
-                "Scorch": "scorch",
-            }
-            mode = mode_map[fw]
+            mode = FRAMEWORK_MODE[fw]
 
             print(f"\n  {fw}:")
             try:
@@ -818,9 +840,13 @@ def plot_results(
     fw_colors = {
         "Dense PyTorch": COLORS["PyTorch"],
         "Sparse PyTorch": EXTRA_COLORS[0],
-        "Scorch": COLORS["Scorch"],
+        "Scorch (unfused)": "#f4a98a",   # light coral (lever 1)
+        "Scorch (fused)": COLORS["Scorch"],  # full coral (lever 2)
     }
-    fw_markers = {"Dense PyTorch": "s", "Sparse PyTorch": "^", "Scorch": "o"}
+    fw_markers = {
+        "Dense PyTorch": "s", "Sparse PyTorch": "^",
+        "Scorch (unfused)": "D", "Scorch (fused)": "o",
+    }
 
     configs = list(df["Config"].unique()) if "Config" in df.columns else ["all"]
 
@@ -924,8 +950,10 @@ def main() -> None:
         help=f"Sequence lengths to benchmark (default: {WIDE_SEQ_LENGTHS})",
     )
     bench_parser.add_argument(
-        "--frameworks", nargs="+", default=["dense-pytorch", "sparse-pytorch", "scorch"],
-        help="Frameworks to benchmark (default: all)",
+        "--frameworks", nargs="+",
+        default=["dense-pytorch", "sparse-pytorch", "scorch-unfused", "scorch-fused"],
+        help="Frameworks to benchmark (default: all four; 'scorch' aliases the "
+             "fused ceiling)",
     )
     bench_parser.add_argument(
         "--warmup", type=int, default=5, help="Warmup iterations (default: 5)",
@@ -977,8 +1005,11 @@ def main() -> None:
         # Normalize framework names
         fw_map = {
             "dense-pytorch": "Dense PyTorch",
+            "dense": "Dense PyTorch",
             "sparse-pytorch": "Sparse PyTorch",
-            "scorch": "Scorch",
+            "scorch-unfused": "Scorch (unfused)",
+            "scorch-fused": "Scorch (fused)",
+            "scorch": "Scorch (fused)",  # bare alias -> the fused ceiling
         }
         frameworks = [fw_map.get(f.lower(), f) for f in args.frameworks]
 
@@ -1000,11 +1031,10 @@ def main() -> None:
                 _pw_mask = get_mask_data(64, _pw_cfg)
                 _pw_ids = torch.randint(0, _pw_cfg.vocab_size, (1, 64))
                 with torch.no_grad():
-                    for _m in ("sparse-pytorch", "scorch"):
-                        if _m == "scorch" and "Scorch" not in frameworks:
+                    for _fw in ("Sparse PyTorch", "Scorch (unfused)", "Scorch (fused)"):
+                        if _fw not in frameworks:
                             continue
-                        if _m == "sparse-pytorch" and "Sparse PyTorch" not in frameworks:
-                            continue
+                        _m = FRAMEWORK_MODE[_fw]
                         print(f"  pre-warming kernels: {_m} ...", flush=True)
                         run_inference(_pw_model, _pw_ids, _pw_mask, _m)
                 del _pw_model
