@@ -2519,6 +2519,115 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
 }
 
 // ---------------------------------------------------------------------------
+// spmm_csr_float_tilej — column-panel ("tile-j") SpMM for the HIGH-DEGREE,
+// OPERAND-OVER-LLC thrash regime (reddit/products-class graphs, and any wide-B
+// scattered general-library workload). Reached ONLY when the adaptive tiling
+// selector (src/scorch/tiling.py, wired in ops.matmul) fires — i.e. when the
+// dense operand B (J*4N bytes) exceeds the last-level cache AND the degree is
+// high enough that column-blocking recovers more B-reuse than it costs in output
+// re-traffic (the thrash-and-tile rule). On every OTHER shape the selector routes
+// to spmm_csr_float_v2 (byte-unchanged), so this kernel can only ever ADD a win.
+//
+// v2 streams each output row full-width once (row-major). When B thrashes DRAM
+// (reddit @k=256: B is 239MB >> 24MB SLC), v2 re-fetches most of B from DRAM per
+// row -> bandwidth-bound at ~70 GFLOP/s. tile-j blocks the CONTRACTION dim j into
+// panels of width Jc = C/(4N) columns: for each panel it sweeps all M rows, so the
+// panel's <=Jc B-rows (Jc*4N ~ C bytes) stay cache-resident and are reused across
+// the M rows. Measured M5 reddit: 1.07x/1.41x/1.84x/2.00x over v2 at N=32/64/128/
+// 256, bit-exact. No panel materialization: CSR rows are column-sorted, so each
+// panel's slice of a row is a contiguous [lower_bound(j0), lower_bound(j1)) range.
+//
+// C accumulates across panels, so it is FULLY zeroed first (v2 zeros only empty
+// rows because it writes each row once); the panels run as barrier-separated
+// omp-for loops inside ONE parallel region (panel p finishes before p+1, so the
+// per-row accumulation is race-free and each panel's B stays hot). Raw omp
+// num_threads(nthreads) engages M5's E-cores directly (no at::parallel_for cap) —
+// tile-j only fires on big BW-bound work where all cores are wanted; on x86 this
+// is the same all-physical-cores launch v2 uses. Jc is passed from Python (the
+// selector knows the queried cache size); Jc<=0 or >=J degenerates to a single
+// full-width panel (== a slower v2, never reached because the selector gates it).
+// ---------------------------------------------------------------------------
+Tensor spmm_csr_float_tilej(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int Jc = 0, int nthreads_override = -1) {
+  const int C0_size = result_shape[0];
+  const int C1_size = result_shape[1];              // == N
+  const int A0_size = A_shape[0];
+  const int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  const int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  const float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+  const int J = B_shape[0];                         // contraction dim
+  const int N = B_shape[1];
+  const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
+  // tile-j accumulates across panels, so C starts zeroed. torch::zeros gets a
+  // clean buffer from the same allocator MKL uses (the O(rows) empty-only trick
+  // v2 uses does not apply here — every row is +='d across panels).
+  torch::Tensor C_values_torch = torch::zeros({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
+
+  // Panel width. Guard degenerate inputs -> single full-width panel.
+  if (Jc <= 0 || Jc > J) Jc = J;
+  const int npanel = (J + Jc - 1) / Jc;
+
+  // Work-aware thread cap (same policy as v2). tile-j fires only on big thrash
+  // work, so this returns every core; raw omp num_threads() then pulls in M5's
+  // E-cores (unlike v2's at::parallel_for pipeline pool). Adopt a >policy host
+  // count if supplied (never below policy so big graphs keep all cores).
+  const long total_nnz = A1_pos[A0_size];
+  const long k_eff = N < 16 ? 16L : (long)N;
+  const long work = total_nnz * k_eff;
+  int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
+  if (nthreads_override > 0) {
+    const long hw = (long)omp_get_num_procs();
+    long cand = (long)nthreads_override < hw ? (long)nthreads_override : hw;
+    if (cand > (long)nthreads) nthreads = (int)cand;
+  }
+
+  // One fresh parallel-for PER PANEL (matches the validated prototype). All
+  // threads sweep the SAME panel together, so its <=Jc B-rows stay cache-hot and
+  // are reused across the M rows — that is tile-j's recovered reuse. The fork/join
+  // between panels (npanel = J/Jc <= ~20) also lets the OS rebalance across M5's
+  // P+E clusters; a single persistent team pinned threads and HALVED throughput.
+  // Panels run sequentially, and within a panel each row i is owned by one thread,
+  // so the per-row accumulation is race-free.
+  for (int p = 0; p < npanel; ++p) {
+    const int j0 = p * Jc;
+    const int j1 = std::min(j0 + Jc, J);
+    #pragma omp parallel for schedule(dynamic, 64) num_threads(nthreads)
+    for (int i = 0; i < A0_size; ++i) {
+      const int rb = A1_pos[i];
+      const int re = A1_pos[i + 1];
+      if (rb == re) continue;
+      // contiguous slice [pb,pe) of row i whose columns fall in [j0,j1)
+      const int* SCORCH_RESTRICT lo = std::lower_bound(A1_crd + rb, A1_crd + re, j0);
+      const int* SCORCH_RESTRICT hi = std::lower_bound(lo, A1_crd + re, j1);
+      int pb = (int)(lo - A1_crd);
+      const int pe = (int)(hi - A1_crd);
+      if (pb == pe) continue;
+      float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+      for (; pb < pe; ++pb) {
+        const float a = A_val[pb];
+        const float* SCORCH_RESTRICT B_row = B_val + (size_t)A1_crd[pb] * (size_t)N;
+        if (pb + 1 < pe)
+          __builtin_prefetch(B_val + (size_t)A1_crd[pb + 1] * (size_t)N, 0, 1);
+        // plain loop: -O3 -march=native -ffast-math auto-vectorizes cleanly (a
+        // manual 16-wide unroll here measured ~2x SLOWER on ARM/NEON).
+        for (int k = 0; k < N; ++k) C_row[k] += a * B_row[k];
+      }
+    }
+  }
+
+  Tensor C;
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+// ---------------------------------------------------------------------------
 // spmm_csr_linear_fused_float — feature-major fused Linear layer:
 //     Y[o, b] = act( sum_{i in nnz(W[o,:])} W[o,i] * X[i, b]  +  bias[o] )
 // for a sparse CSR weight W[out, in] (A) and a dense, FEATURE-MAJOR activation

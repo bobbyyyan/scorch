@@ -170,6 +170,16 @@ void bind_experimental_spmm_variants(py::module_& m) {
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
         py::arg("B_values"), py::arg("tile_size") = 256,
         py::arg("nthreads_override") = -1, py::arg("atparallel") = false);
+  // Column-panel ("tile-j") SpMM for the high-degree operand-over-LLC thrash
+  // regime (reddit/products-class). Reached only when the adaptive tiling selector
+  // (scorch.tiling / ops.matmul) fires; v2 serves every other shape. Jc = panel
+  // width in contraction columns (~C/(4N)); Jc<=0 degenerates to full-width.
+  m.def("spmm_csr_float_tilej", &spmm_csr_float_tilej,
+        "Column-panel (tile-j) SpMM for high-degree operand-over-LLC graphs",
+        py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
+        py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
+        py::arg("B_values"), py::arg("Jc") = 0,
+        py::arg("nthreads_override") = -1);
   // Fused feature-major Linear: Y[out,batch] = act(W @ X[in,batch] + bias[:,None])
   // with per-OUTPUT-CHANNEL (per-row) bias + activation folded into v2's parallel
   // region (see spmm.h). act: 0=identity, 1=relu, 2=sigmoid. Same composition hints

@@ -20,6 +20,8 @@ from .compiler.codegen import LLIRLowerer
 from .compiler.scheduler import Scheduler
 from .format import TensorFormat, LevelFormat, LevelType
 from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
+from .tiling import maybe_dispatch as _tiling_maybe_dispatch
+from .tiling import is_candidate as _tiling_is_candidate
 from .storage import TensorIndex
 from .stensor import STensor
 from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags, get_extra_ldflags, _kernel_name, _load_kernel
@@ -381,10 +383,32 @@ def matmul(
             if _MATCH_HOST_THREADS and resolved.symbol_name == "spmm_csr_float_v2":
                 nthreads = torch.get_num_threads()
                 atparallel = _ATPARALLEL_PIPELINE
-            result_cpp, result_shape = execute_prebuilt_binary_kernel(
-                resolved.fn, a, b, time_dict=time_dict, nthreads=nthreads,
-                atparallel=atparallel,
-            )
+            result_cpp = None
+            result_shape = None
+            # Adaptive tiling selector: on the drop-in CSR@dense SpMM, route the
+            # high-degree operand-over-LLC thrash regime (reddit/products-class) to
+            # the column-panel kernel spmm_csr_float_tilej; v2 serves everything
+            # else byte-unchanged. Provably no-regression: v2 is always the probe
+            # baseline, so the memoized choice is never slower than v2 (see
+            # tiling.maybe_dispatch). Only engages when the cheap O(1) pre-filter
+            # says a shape can even benefit — no overhead on GCN-small/AE/panel.
+            if resolved.symbol_name == "spmm_csr_float_v2" and _tiling_is_candidate(a, b):
+                _rshape = [a.shape[0], b.shape[1]]
+
+                def _v2_fn(nt):
+                    rc, _ = execute_prebuilt_binary_kernel(
+                        resolved.fn, a, b, nthreads=nt, atparallel=atparallel)
+                    return rc
+
+                disp = _tiling_maybe_dispatch(a, b, _rshape, _v2_fn, nthreads)
+                if disp is not None:
+                    result_cpp, _ = disp
+                    result_shape = tuple(_rshape)
+            if result_cpp is None:
+                result_cpp, result_shape = execute_prebuilt_binary_kernel(
+                    resolved.fn, a, b, time_dict=time_dict, nthreads=nthreads,
+                    atparallel=atparallel,
+                )
             # Fast path: a dense output kernel already produced a contiguous
             # row-major value buffer. Return it reshaped directly, skipping the
             # STensor/TensorIndex construction and the to_dense()/to_torch()
