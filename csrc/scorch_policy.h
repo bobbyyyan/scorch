@@ -97,6 +97,17 @@
 #  define SCORCH_CHUNK_MAX 64L
 #endif
 
+// Dense-output parallel zero-fill threshold (csrc/header.cpp scorch_zero_dense,
+// called by the JIT dense-output kernels): minimum OUTPUT BYTES at which the zero
+// is parallelized across all cores. Below this a single memset is used — fork/join
+// would exceed the saving. 256 KB keeps >= 2 pages per thread even at 32 threads
+// and has a clear no-regression margin above the serial/parallel crossover (~32-64
+// KB on redwood); every meaningful win (large outputs) is >= 1 MB. This is a
+// zero-fill span threshold, NOT a work grain, so it is bytes rather than flop/nnz.
+#ifndef SCORCH_MEMSET_GRAIN_BYTES
+#  define SCORCH_MEMSET_GRAIN_BYTES 262144L
+#endif
+
 // Work-aware OpenMP thread cap. work < 0 means "unknown" -> cap by rows only.
 //
 // `nfloor` (default 1 = no-op for the SuiteSparse SpMM / SpMSpM / codegen callers,

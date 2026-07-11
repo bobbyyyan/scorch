@@ -1,6 +1,7 @@
 #include <atomic>
 #include <omp.h>
 #include <cstdlib>
+#include <cstring>
 
 typedef struct {
   std::vector<std::vector<torch::Tensor>> mode_indices;
@@ -237,6 +238,54 @@ template<typename T> inline T scorch_gelu(T x) {
 // prepended to every generated kernel; src/scorch/utils.py get_extra_cflags()
 // adds csrc/ to the JIT `-I` path so this include resolves at compile time.
 #include "scorch_policy.h"
+
+// Parallel dense-output zero-fill for the generated dense-output kernels.
+//
+// A dense-output codegen kernel mallocs the full C0*C1 result buffer and must
+// zero it before the parallel `C[...] += ...` accumulate. (Unlike the prebuilt
+// SpMM, which ASSIGNS each non-empty row and so can zero empty rows only, the
+// generic kernel accumulates and needs the WHOLE buffer zeroed.) The original
+// codegen did that zero with a single-threaded memset that runs BEFORE the
+// parallel region — a serial page-fault + zero of the entire output. For a large
+// / low-degree output that serial zero is a large fraction of runtime (measured
+// on redwood: ~70% at degree 8, and the dominant cost for hypersparse outputs).
+//
+// scorch_zero_dense zeroes the buffer in parallel instead: each thread memsets a
+// contiguous span, so the page faults and zero stores spread across cores. The
+// zero is bandwidth-bound with a single one-shot barrier (unlike a dynamic
+// compute loop it has no E-core straggler cliff — measured: including the E-cores
+// HELPS), so it uses the full omp_get_num_procs(). It is a BINARY policy: a single
+// memset below SCORCH_MEMSET_GRAIN_BYTES (where fork/join would exceed the saving),
+// full parallelism above. A ramped small thread count is deliberately avoided — a
+// 2-thread team next to the hw-thread compute region triggered a ~140us libgomp
+// small-team reconfiguration cost on redwood, so we never emit a small non-full
+// team. Result is bit-identical to the memset (the whole buffer is zeroed).
+// Allocator-agnostic: it keeps malloc, so it avoids the torch-CPU-allocator
+// mid-size regression that a torch::empty/zeros swap would risk.
+template <typename T>
+static inline void scorch_zero_dense(T* __restrict__ p, int64_t n) {
+  const int64_t bytes = n * (int64_t)sizeof(T);
+#ifdef SCORCH_TUNE_HOOKS
+  // In-process A/B: SCORCH_CODEGEN_ALLOC=0 forces the legacy serial memset.
+  { const char* e = std::getenv("SCORCH_CODEGEN_ALLOC");
+    if (e && *e && std::atol(e) == 0) { std::memset(p, 0, (size_t)bytes); return; } }
+#endif
+  const int nt = omp_get_num_procs();
+  if (bytes < SCORCH_MEMSET_GRAIN_BYTES || nt <= 1) {
+    std::memset(p, 0, (size_t)bytes);
+    return;
+  }
+  #pragma omp parallel num_threads(nt)
+  {
+    const int t = omp_get_thread_num();
+    const int nthr = omp_get_num_threads();
+    const int64_t chunk = (n + nthr - 1) / nthr;
+    int64_t lo = (int64_t)t * chunk;
+    int64_t hi = lo + chunk;
+    if (hi > n) hi = n;
+    if (hi > lo) std::memset(p + lo, 0, (size_t)(hi - lo) * sizeof(T));
+  }
+}
 
 // ####################################
 // === END === PARALLEL POLICY HELPERS ==

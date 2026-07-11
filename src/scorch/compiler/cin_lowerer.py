@@ -90,21 +90,22 @@ class ResultTensorAssembler:
                 )
             )
 
-            # memset to zero
+            # Zero the whole dense buffer before the parallel += accumulate. The
+            # generated kernel accumulates into C, so it needs the full buffer
+            # zeroed (not empty-rows-only like the prebuilt SpMM). scorch_zero_dense
+            # (csrc/header.cpp) parallelizes that zero across cores for large
+            # outputs — where the serial memset was a big fraction of runtime — and
+            # falls back to a single memset below SCORCH_MEMSET_GRAIN_BYTES. Takes
+            # the element count; it computes the byte span internally.
             stmts.append(
                 llir.FunctionCallStmt(
-                    name="memset",
+                    name="scorch_zero_dense",
                     args=[
                         llir.Var(
                             name=f"{self.name}_values",
                             type=llir.DataType.ptr_type(self.dtype),
                         ),
-                        llir.Literal(0),
-                        llir.BinOp(
-                            left=sizeof_expr,
-                            op="*",
-                            right=res_capacity_var,
-                        ),
+                        res_capacity_var,
                     ],
                 )
             )
