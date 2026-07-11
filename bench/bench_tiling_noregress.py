@@ -2,8 +2,8 @@
 r"""bench_tiling_noregress.py — the Phase-B no-regression + opportunity grid for
 the adaptive tiling selector wired into scorch.matmul (spmm_csr_float_v2 -> tile-j).
 
-For every matrix x N it times scorch.matmul with the selector ON vs OFF (toggling
-tiling._ENABLED in-process, so thermal drift cancels) and reports the ratio +
+For every matrix x N it times scorch.matmul with the selector ON vs OFF (switching
+the autotune level in-process via set_autotune, so thermal drift cancels) and reports the ratio +
 correctness + which route the selector chose. The CLAUDE.md gate: NEUTRAL (~1.0)
 on everything the selector should not touch (FEM/banded, low-degree, small-operand
 graphs, AE weights), and a WIN only where it fires (high-degree scattered:
@@ -36,33 +36,44 @@ def to_st(csr):
 
 
 _CONTROL = os.environ.get("NR_CONTROL", "0") == "1"
+# The "on" arm's autotune level (the "off" arm is always level "off" = pure v2).
+# Default "balanced" preserves this harness's original semantics (probe on); set
+# NR_LEVEL=analytic / max to A/B those levels against the v2 baseline instead.
+_ON_LEVEL = os.environ.get("NR_LEVEL", "balanced")
+
+
+def _set_arm(on: bool):
+    """Select the tiling arm via the autotune level (replaces the old
+    tiling._ENABLED toggle): the 'on' arm uses NR_LEVEL, the 'off' arm pure v2."""
+    tiling.set_autotune(_ON_LEVEL if on else "off")
 
 
 def bench_ab(call, w=3, r=15):
     """INTERLEAVED rotated-round A/B (cancels thermal/contention drift on a shared
     box — the timing gotcha that makes a sequential all-on-then-all-off comparison
-    show phantom regressions on sub-ms kernels). Toggles tiling._ENABLED per call so
-    on/off alternate within each round. Returns (t_on_med, t_off_med). The probe
-    fires once during the ON warmup, then memoizes -> timed ON calls run the chosen
-    route (v2 byte-identical to OFF for a v2-route).
+    show phantom regressions on sub-ms kernels). Switches the autotune level per
+    call (NR_LEVEL for ON, "off" for OFF) so on/off alternate within each round.
+    Returns (t_on_med, t_off_med). The probe fires once during the ON warmup, then
+    memoizes -> timed ON calls run the chosen route (v2 byte-identical to OFF for a
+    v2-route).
 
-    NR_CONTROL=1 forces BOTH arms to _ENABLED=False (identical v2 code both sides),
+    NR_CONTROL=1 forces BOTH arms to level "off" (identical v2 code both sides),
     so the reported 'ratio' is the pure measurement NOISE FLOOR for that shape — any
     v2-route 'regression' at or above this floor is noise, not a real slowdown."""
     on_flag = False if _CONTROL else True
-    tiling._ENABLED = on_flag
+    _set_arm(on_flag)
     for _ in range(w):
         call()
-    tiling._ENABLED = False
+    _set_arm(False)
     for _ in range(w):
         call()
     ton, toff = [], []
     for _ in range(r):
-        tiling._ENABLED = on_flag
+        _set_arm(on_flag)
         t0 = time.perf_counter(); call(); ton.append(time.perf_counter() - t0)
-        tiling._ENABLED = False
+        _set_arm(False)
         t0 = time.perf_counter(); call(); toff.append(time.perf_counter() - t0)
-    tiling._ENABLED = True
+    _set_arm(True)
     return statistics.median(ton), statistics.median(toff)
 
 
@@ -137,7 +148,7 @@ def main():
             ref = torch.from_numpy(csr @ B.numpy())
             Bs = scorch.STensor.from_torch(B)
             tiling._decision.clear()
-            tiling._ENABLED = True
+            _set_arm(True)
             out = scorch.matmul(A_st, Bs)   # primes the probe/memo + gives route
             route = list(tiling._decision.values())
             route = route[0][0] if route else "v2"
@@ -180,7 +191,7 @@ def main():
                 ref = torch.from_numpy(csr @ B.numpy())
                 Bs = scorch.STensor.from_torch(B)
                 tiling._decision.clear()
-                tiling._ENABLED = True
+                _set_arm(True)
                 out = scorch.matmul(A_st, Bs)
                 route = list(tiling._decision.values())
                 route = route[0][0] if route else "v2"

@@ -371,14 +371,42 @@ def compile_fused(spec: FusionSpec, args: tuple) -> Callable:
 # ---------------------------------------------------------------------------
 
 class compile:
-    """Decorator that traces a function with torch.fx and compiles fused kernels."""
+    """Decorator that traces a function with torch.fx and compiles fused kernels.
 
-    def __init__(self, fn: Callable):
+    Usable bare (``@scorch.compile``) or parameterized with a per-call autotune
+    level escape hatch (``@scorch.compile(autotune="max")``); the traced function
+    then runs inside that autotune scope (thread-local, like ``with
+    scorch.autotune(level)``). The autotune level tunes the SpMM tiling selector
+    (see scorch.set_autotune); it does not change the fused kernel's numerics."""
+
+    def __init__(self, fn: Optional[Callable] = None, *,
+                 autotune: Optional[str] = None):
+        self._autotune = autotune
+        # Parameterized form @compile(autotune=...) is called with no fn: defer
+        # until the decorated function arrives via the first __call__.
+        self._pending = fn is None
         self.fn = fn
         self._fx_graph: Optional[torch.fx.GraphModule] = None
         self._cache: Dict[tuple, Callable] = {}
 
     def __call__(self, *args: Any) -> Any:
+        # Parameterized-decorator form: @compile(autotune=...) returns this
+        # instance, which is then called with the function to wrap.
+        if self._pending:
+            if len(args) != 1 or not callable(args[0]):
+                raise TypeError(
+                    "scorch.compile(autotune=...) must decorate a callable")
+            return compile(args[0], autotune=self._autotune)
+
+        if self._autotune is not None:
+            from .tiling import autotune as _autotune_scope
+            with _autotune_scope(self._autotune):
+                return self._run(args)
+        return self._run(args)
+
+    def _run(self, args: tuple) -> Any:
+        # _run is only reached in execution mode, where fn was provided.
+        assert self.fn is not None
         # Trace once
         if self._fx_graph is None:
             self._fx_graph = _symbolic_trace(self.fn)

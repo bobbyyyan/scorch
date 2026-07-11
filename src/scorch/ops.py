@@ -29,6 +29,7 @@ from .format import TensorFormat, LevelFormat, LevelType
 from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
 from .tiling import maybe_dispatch as _tiling_maybe_dispatch
 from .tiling import is_candidate as _tiling_is_candidate
+from .tiling import _current_level as _tiling_current_level
 from .storage import TensorIndex
 from .stensor import STensor
 from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags, get_extra_ldflags, _kernel_name, _load_kernel
@@ -399,19 +400,26 @@ def matmul(
             # baseline, so the memoized choice is never slower than v2 (see
             # tiling.maybe_dispatch). Only engages when the cheap O(1) pre-filter
             # says a shape can even benefit — no overhead on GCN-small/AE/panel.
-            if resolved.symbol_name == "spmm_csr_float_v2" and _tiling_is_candidate(a, b):
-                _rshape = [a.shape[0], b.shape[1]]
+            if resolved.symbol_name == "spmm_csr_float_v2":
+                # Resolve the autotune level ONCE so is_candidate and
+                # maybe_dispatch see a consistent value (a CM could exit between
+                # two lookups). Only touched on the v2 symbol -> other prebuilt
+                # kernels (bias_act/fused) stay byte-identical.
+                _lvl = _tiling_current_level()
+                if _tiling_is_candidate(a, b, level=_lvl):
+                    _rshape = [a.shape[0], b.shape[1]]
 
-                def _v2_fn(nt):
-                    rc, _ = execute_prebuilt_binary_kernel(
-                        resolved.fn, a, b, nthreads=nt, atparallel=atparallel)
-                    return rc
+                    def _v2_fn(nt):
+                        rc, _ = execute_prebuilt_binary_kernel(
+                            resolved.fn, a, b, nthreads=nt, atparallel=atparallel)
+                        return rc
 
-                disp = _tiling_maybe_dispatch(
-                    a, b, _rshape, _v2_fn, nthreads, time_dict=time_dict)
-                if disp is not None:
-                    result_cpp, _ = disp
-                    result_shape = tuple(_rshape)
+                    disp = _tiling_maybe_dispatch(
+                        a, b, _rshape, _v2_fn, nthreads,
+                        time_dict=time_dict, level=_lvl)
+                    if disp is not None:
+                        result_cpp, _ = disp
+                        result_shape = tuple(_rshape)
             if result_cpp is None:
                 result_cpp, result_shape = execute_prebuilt_binary_kernel(
                     resolved.fn, a, b, time_dict=time_dict, nthreads=nthreads,

@@ -13,6 +13,12 @@ from .ops import (
 from .stensor import STensor
 from .format import TensorFormat
 from .trace import compile
+from .tiling import (
+    autotune,
+    clear_autotune_cache,
+    get_autotune,
+    set_autotune,
+)
 
 from_torch = STensor.from_torch
 from_coo = STensor.from_coo
@@ -33,13 +39,17 @@ __version__ = "0.0.1"
 __all__ = [
     "STensor",
     "TensorFormat",
+    "autotune",
+    "clear_autotune_cache",
     "compile",
     "einsum",
     "fast_transpose",
     "from_torch",
     "from_coo",
+    "get_autotune",
     "matmul",
     "matmul_wksp",
+    "set_autotune",
     "sparse_attention",
     "sparse_linear",
     "sparse_linear_fm",
