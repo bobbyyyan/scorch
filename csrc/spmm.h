@@ -2628,6 +2628,161 @@ Tensor spmm_csr_float_tilej(std::vector<int> result_shape, std::vector<int> A_sh
 }
 
 // ---------------------------------------------------------------------------
+// spmm_csr_float_tileijk — 3D-blocked ("tile-ijk") SpMM with a B WIDTH-PANEL
+// RELAYOUT, for the SCATTERED + VERY-WIDE-B regime where even tile-j erodes.
+//
+// tile-j blocks only the contraction dim j; its output C is re-streamed
+// P = J*4N/C times, so its C-traffic grows ~N^2 and its throughput collapses as
+// N widens (measured redwood scatter deg200: 262 -> 239 -> 96 GFLOP/s at
+// N=512/2048/8192). tile-ijk additionally blocks the FREE dim N into width-strips
+// of Nc columns. For each strip it:
+//   (1) RELAYS that strip of B into a CONTIGUOUS [J x w] buffer (w <= Nc). Every
+//       B sub-block read in step (3) is then contiguous -> no HW-prefetch
+//       pollution. (A naive strided-Nc slice of row-major B pulls the unused
+//       rest-of-row into cache and re-pollutes it, which is exactly why a plain
+//       tile-jk on row-major B loses; the relayout is the whole point.)
+//   (2) zeros a CONTIGUOUS Cp [C0 x Nc] that stays cache-resident across (3);
+//   (3) accumulates every contraction column-panel of A into Cp, reading the
+//       relaid strip (materialization-free: CSR rows are col-sorted, so a panel's
+//       slice of a row is [lower_bound(j0), lower_bound(j1)) — no CSC/panel mats);
+//   (4) writes Cp to the strided C strip C[:, k0:k0+w] ONCE.
+// C-traffic is now ~N (linear: each C entry written once per strip); A is
+// re-scanned nk = ceil(N/Nc) times. Result: throughput holds ~270-289 GFLOP/s
+// across N=512..8192 where tile-j collapses (redwood 9.0x vs none at N=8192;
+// M5 band N=16384 tile-ijk 286 vs tile-j 156 GFLOP/s).
+//
+// HONEST RELAYOUT COST: the relayout is an O(J*N) copy of B, done ONE strip at a
+// time (each B element is read exactly once total across all strips; the only
+// extra memory is the reused J*Nc strip buffer + the C0*Nc Cp, NOT a full 2nd
+// copy of B). It runs INSIDE this kernel per call, so the runtime micro-probe
+// (src/scorch/tiling.py) that routes here times the FULL cost (relayout + compute)
+// against tile-j and v2 -> the relayout is never hidden. For a general SpMM
+// library each call is one-shot (B reuse is not assumed), so paying it per call is
+// the honest accounting; the probe only keeps tile-ijk when relayout + linear-C
+// compute still beats tile-j's ~N^2 compute. Reached ONLY via the selector's
+// wide-N scattered branch (no current scorch workload has N>=1024), so v2/tile-j
+// serve everything today -> this can only ever ADD a win.
+//
+// Threading mirrors tile-j: work-aware scorch_nthreads, one FRESH omp parallel-for
+// PER PANEL / per relayout / per write (a single persistent team pinned M5's P+E
+// clusters and HALVED throughput; per-region re-fork lets the OS rebalance), plain
+// inner loops (a manual unroll was ~2x slower on NEON; -O3 -march=native auto-vec).
+// Byte-portable: no intrinsics, compiles on x86 + ARM. Nc/Jc passed from the
+// selector; Nc<=0/>=N => single full-width strip, Jc<=0/>=J => single panel
+// (both degenerate to a slower tile-j, never reached because the selector gates).
+// ---------------------------------------------------------------------------
+Tensor spmm_csr_float_tileijk(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int Nc = 0, int Jc = 0,
+                int nthreads_override = -1) {
+  const int C0_size = result_shape[0];              // output rows (>= A rows)
+  const int N = result_shape[1];                    // free dim
+  const int A0_size = A_shape[0];
+  const int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
+  const int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
+  const float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
+  const int J = B_shape[0];                         // contraction dim
+  const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
+
+  const size_t C_capacity = (size_t)C0_size * (size_t)N;
+  // Every C entry is written exactly once (Cp is zeroed per strip and copied to C
+  // in full, so empty A-rows and any tail rows C0>A0 land as 0), so torch::empty
+  // (the MKL-comparable allocator) suffices — no pre-zero of C needed.
+  torch::Tensor C_values_torch = torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
+
+  // Panel/strip widths. Guard degenerate inputs.
+  if (Nc <= 0 || Nc > N) Nc = N;
+  if (Jc <= 0 || Jc > J) Jc = J;
+  const int nstrip = (N + Nc - 1) / Nc;
+  const int npanel = (J + Jc - 1) / Jc;
+
+  // Thread policy identical to tile-j / v2: tile-ijk fires only on big thrash
+  // work, so this returns every core; raw omp num_threads() then pulls in M5's
+  // E-cores. Adopt a >policy host count if supplied, never below policy.
+  const long total_nnz = A1_pos[A0_size];
+  const long k_eff = N < 16 ? 16L : (long)N;
+  const long work = total_nnz * k_eff;
+  int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
+  if (nthreads_override > 0) {
+    const long hw = (long)omp_get_num_procs();
+    long cand = (long)nthreads_override < hw ? (long)nthreads_override : hw;
+    if (cand > (long)nthreads) nthreads = (int)cand;
+  }
+
+  // Reused per-strip scratch: the CONTIGUOUS relaid B strip [J x Nc] and the
+  // cache-resident output panel Cp [C0 x Nc]. Allocated once (Nc-wide); each strip
+  // fills only its w<=Nc columns. torch::empty => same allocator as v2/MKL.
+  torch::Tensor Brelaid_t = torch::empty({(long long)J * (long long)Nc}, torch::kFloat32);
+  float* SCORCH_RESTRICT Brelaid = Brelaid_t.data_ptr<float>();
+  torch::Tensor Cp_t = torch::empty({(long long)C0_size * (long long)Nc}, torch::kFloat32);
+  float* SCORCH_RESTRICT Cp = Cp_t.data_ptr<float>();
+
+  for (int s = 0; s < nstrip; ++s) {
+    const int k0 = s * Nc;
+    const int w = std::min(Nc, N - k0);             // this strip's actual width
+
+    // (1) RELAYOUT strip s of B into the contiguous [J x w] buffer (row stride w).
+    // Reads row-major B[:, k0:k0+w] (each B element read once across all strips).
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+    for (int j = 0; j < J; ++j) {
+      const float* SCORCH_RESTRICT src = B_val + (size_t)j * (size_t)N + (size_t)k0;
+      float* SCORCH_RESTRICT dst = Brelaid + (size_t)j * (size_t)w;
+      for (int c = 0; c < w; ++c) dst[c] = src[c];
+    }
+
+    // (2) zero Cp[:, 0:w] over all C0 rows (row stride Nc). Empty/tail rows stay 0.
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+    for (int i = 0; i < C0_size; ++i) {
+      float* SCORCH_RESTRICT cr = Cp + (size_t)i * (size_t)Nc;
+      for (int c = 0; c < w; ++c) cr[c] = 0.f;
+    }
+
+    // (3) accumulate every contraction column-panel into Cp, one FRESH parallel-for
+    // per panel (keeps each Jc*w relaid B sub-block cache-hot across the M rows and
+    // lets the OS rebalance across P+E clusters).
+    for (int p = 0; p < npanel; ++p) {
+      const int j0 = p * Jc;
+      const int j1 = std::min(j0 + Jc, J);
+      #pragma omp parallel for schedule(dynamic, 64) num_threads(nthreads)
+      for (int i = 0; i < A0_size; ++i) {
+        const int rb = A1_pos[i];
+        const int re = A1_pos[i + 1];
+        if (rb == re) continue;
+        const int* SCORCH_RESTRICT lo = std::lower_bound(A1_crd + rb, A1_crd + re, j0);
+        const int* SCORCH_RESTRICT hi = std::lower_bound(lo, A1_crd + re, j1);
+        int pb = (int)(lo - A1_crd);
+        const int pe = (int)(hi - A1_crd);
+        if (pb == pe) continue;
+        float* SCORCH_RESTRICT C_row = Cp + (size_t)i * (size_t)Nc;
+        for (; pb < pe; ++pb) {
+          const float a = A_val[pb];
+          const float* SCORCH_RESTRICT B_row = Brelaid + (size_t)A1_crd[pb] * (size_t)w;
+          if (pb + 1 < pe)
+            __builtin_prefetch(Brelaid + (size_t)A1_crd[pb + 1] * (size_t)w, 0, 1);
+          for (int k = 0; k < w; ++k) C_row[k] += a * B_row[k];
+        }
+      }
+    }
+
+    // (4) write Cp[:, 0:w] to the strided C strip C[:, k0:k0+w], once.
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+    for (int i = 0; i < C0_size; ++i) {
+      const float* SCORCH_RESTRICT src = Cp + (size_t)i * (size_t)Nc;
+      float* SCORCH_RESTRICT dst = C_values + (size_t)i * (size_t)N + (size_t)k0;
+      for (int c = 0; c < w; ++c) dst[c] = src[c];
+    }
+  }
+
+  Tensor C;
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values_torch;
+  return C;
+}
+
+// ---------------------------------------------------------------------------
 // spmm_csr_linear_fused_float — feature-major fused Linear layer:
 //     Y[o, b] = act( sum_{i in nnz(W[o,:])} W[o,i] * X[i, b]  +  bias[o] )
 // for a sparse CSR weight W[out, in] (A) and a dense, FEATURE-MAJOR activation

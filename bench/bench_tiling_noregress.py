@@ -154,6 +154,50 @@ def main():
                 verd = "WIN" if ratio > 1.03 else ("~tie" if ratio >= 0.97 else "LOSS?")
             ok = "OK" if err < 1e-3 else "CORR-FAIL"
             print(f"{nm[:30]:30s}{M:9d}{deg:6.0f}{N:6d}  {route:>7s} {ratio:6.2f}x {err:9.1e}  {verd} {ok}")
+    # ---- WIDE-N tile-ijk opportunity block --------------------------------
+    # No current scorch workload has N>=512, so tile-ijk never fires in the grid
+    # above (N<=256). To exercise it we run the SCATTERED synthetics (the reddit /
+    # general-library analog) at wide N, where tile-j's ~N^2 output re-traffic
+    # erodes and the width-panel relayout wins. These matrices are small enough (M
+    # ~20-30K) that J*N stays under the memory cap even at N=4096. v2 stays the
+    # probe baseline, so this is still no-regression: a 'tileijk'/'tilej' route is
+    # only chosen when the probe measured it faster than v2.
+    wide_Ns = [int(x) for x in os.environ.get("NR_WIDE_NS", "2048,4096").split(",") if x]
+    if wide_Ns:
+        wide_grid = [("scatter200 (wide)", A.m_scatter(20000, 200)),
+                     ("scatter120 (wide)", A.m_scatter(30000, 120, seed=2))]
+        print("\n" + "=" * 60)
+        print(f"WIDE-N tile-ijk opportunity (Ns={wide_Ns})")
+        print(hdr); print("-" * len(hdr))
+        for nm, csr in wide_grid:
+            M, J = csr.shape
+            deg = csr.nnz / M
+            A_st = to_st(csr)
+            for N in wide_Ns:
+                if J * N > 400_000_000:
+                    continue
+                torch.manual_seed(0); B = torch.rand(J, N, dtype=torch.float32)
+                ref = torch.from_numpy(csr @ B.numpy())
+                Bs = scorch.STensor.from_torch(B)
+                tiling._decision.clear()
+                tiling._ENABLED = True
+                out = scorch.matmul(A_st, Bs)
+                route = list(tiling._decision.values())
+                route = route[0][0] if route else "v2"
+                r = out if isinstance(out, torch.Tensor) else out.to_torch()
+                err = (r.double() - ref.double()).norm().item() / (ref.double().norm().item() + 1e-30)
+                t_on, t_off = bench_ab(lambda: scorch.matmul(A_st, Bs))
+                ratio = t_off / t_on
+                if route == "v2":
+                    worst_v2 = min(worst_v2, ratio)
+                    verd = "neutral" if ratio >= 0.97 else "REGRESSION"
+                    if ratio < 0.97:
+                        regressions.append((nm, N, ratio))
+                else:
+                    verd = "WIN" if ratio > 1.03 else ("~tie" if ratio >= 0.97 else "LOSS?")
+                ok = "OK" if err < 1e-3 else "CORR-FAIL"
+                print(f"{nm[:30]:30s}{M:9d}{deg:6.0f}{N:6d}  {route:>7s} {ratio:6.2f}x {err:9.1e}  {verd} {ok}")
+
     print("\n" + "=" * 60)
     print(f"worst v2-route ratio (must be >=0.97): {worst_v2:.3f}")
     if regressions:

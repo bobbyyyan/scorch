@@ -180,6 +180,18 @@ void bind_experimental_spmm_variants(py::module_& m) {
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
         py::arg("B_values"), py::arg("Jc") = 0,
         py::arg("nthreads_override") = -1);
+  // 3D-blocked (tile-ijk) SpMM with a B width-panel relayout, for the scattered +
+  // very-wide-B regime where even tile-j erodes (its C re-traffic grows ~N^2).
+  // Blocks the free dim N into Nc-wide strips, relays each strip of B contiguous,
+  // accumulates into a cache-resident Cp, writes C once (C-traffic ~N). Reached
+  // only when the selector's wide-N branch probes it; v2/tile-j serve everything
+  // else. Nc=free-dim strip width, Jc=contraction-panel width (both <=0 degenerate).
+  m.def("spmm_csr_float_tileijk", &spmm_csr_float_tileijk,
+        "Tile-ijk SpMM (B width-panel relayout) for scattered very-wide-B graphs",
+        py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
+        py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
+        py::arg("B_values"), py::arg("Nc") = 0, py::arg("Jc") = 0,
+        py::arg("nthreads_override") = -1);
   // Fused feature-major Linear: Y[out,batch] = act(W @ X[in,batch] + bias[:,None])
   // with per-OUTPUT-CHANNEL (per-row) bias + activation folded into v2's parallel
   // region (see spmm.h). act: 0=identity, 1=relu, 2=sigmoid. Same composition hints

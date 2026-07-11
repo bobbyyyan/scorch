@@ -400,7 +400,8 @@ def matmul(
                         resolved.fn, a, b, nthreads=nt, atparallel=atparallel)
                     return rc
 
-                disp = _tiling_maybe_dispatch(a, b, _rshape, _v2_fn, nthreads)
+                disp = _tiling_maybe_dispatch(
+                    a, b, _rshape, _v2_fn, nthreads, time_dict=time_dict)
                 if disp is not None:
                     result_cpp, _ = disp
                     result_shape = tuple(_rshape)
