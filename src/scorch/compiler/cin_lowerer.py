@@ -1750,6 +1750,28 @@ class CINLowerer:
 
             loop_body.extend(wksp_index_var.parent.get_resolve_llir_stmts())
 
+            # REGBLOCK: bound the unrolled flush to the valid free-dim range. The
+            # producer (iter_lattice) guards its tiled reduction with a `break`; the
+            # consumer flush needs the same guard, else a ragged tail (dim % tile != 0)
+            # writes past the row — out-of-bounds at the last rows. Gated so the
+            # default tiling path stays byte-identical.
+            from .scheduler import _regblock_enabled as _rb
+            if _rb():
+                _bound = f"{result_tensor_name}{level}_size"
+                loop_body.append(
+                    llir.IfThenElse(
+                        cond=llir.BinOp(
+                            op=">=",
+                            left=llir.Var(
+                                name=wksp_index_var.parent.name,
+                                type=llir.DataType.INT,
+                            ),
+                            right=llir.Var(name=_bound, type=llir.DataType.INT),
+                        ),
+                        then_body=[llir.Break()],
+                    )
+                )
+
             loop_body.extend(
                 result_tensor_access.get_level_iterator_resolve_stmts(level=level)
             )

@@ -1,8 +1,10 @@
 import copy
 import math
+import os
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from scorch.compiler.cin import (
     CIN,
@@ -18,6 +20,70 @@ from scorch.compiler.cin import (
     WorkspaceAccess,
 )
 from scorch.format import LevelType
+
+
+# Per-call override for the register-block decision. When not None it takes
+# precedence over the SCORCH_REGBLOCK env var. Phase 2b lowers the SAME CIN twice
+# (regblock forced OFF -> baseline nest, forced ON -> tiled nest) and stitches a
+# runtime free-dim branch (see ops._build_regblock_dual_path); the two lowerings
+# must be able to select their path independently of the process-wide env.
+_REGBLOCK_FORCE: Optional[bool] = None
+
+
+def _regblock_enabled() -> bool:
+    """SCORCH_REGBLOCK=1 opts into the free-dim register-block tiling (Phase 2 of
+    the codegen-parity work): tile the dense free/output dim of a sparse contraction
+    so the output tile accumulates in a stack-local buffer across the reduction
+    (register-eligible) instead of round-tripping memory per nonzero.
+
+    A per-call `regblock_force(...)` override wins over the env var when set.
+
+    Default OFF -> codegen is byte-identical to before. See codegen-parity notes.
+    """
+    if _REGBLOCK_FORCE is not None:
+        return _REGBLOCK_FORCE
+    return os.environ.get("SCORCH_REGBLOCK", "0") == "1"
+
+
+@contextmanager
+def regblock_force(value: Optional[bool]):
+    """Temporarily force `_regblock_enabled()` to `value` (or restore env-driven
+    behavior with None). Used by the Phase 2b dual-path builder to lower the baseline
+    and register-block nests from one CIN. Nestable and exception-safe."""
+    global _REGBLOCK_FORCE
+    prev = _REGBLOCK_FORCE
+    _REGBLOCK_FORCE = value
+    try:
+        yield
+    finally:
+        _REGBLOCK_FORCE = prev
+
+
+def _regblock_max_n() -> int:
+    """Runtime free-dim cutoff for the dual-path branch (SCORCH_REGBLOCK_MAX_N,
+    default 8): the register-block arm runs only when the free/output dim size is
+    <= this. It is ALSO used as the tile width so the regblock arm is always a
+    single tile (no sparse re-traversal, no ragged tail). Data (doc 04): N<=3 wins,
+    N>=16 regresses; 8 places the threshold between them (tune with N in {4,8})."""
+    try:
+        n = int(os.environ.get("SCORCH_REGBLOCK_MAX_N", "8"))
+    except ValueError:
+        return 8
+    return n if n > 0 else 8
+
+
+def _regblock_tile_width() -> int:
+    """Free-dim tile width for the register-block path. Defaults to REGBLOCK_MAX_N so
+    the regblock arm is single-tile; SCORCH_REGBLOCK_T overrides for experiments."""
+    env = os.environ.get("SCORCH_REGBLOCK_T")
+    if env is not None:
+        try:
+            t = int(env)
+            if t > 0:
+                return t
+        except ValueError:
+            pass
+    return _regblock_max_n()
 
 
 @dataclass(frozen=True)
@@ -1083,6 +1149,18 @@ class Scheduler:
         )
         replace_index_var_visitor.visit(where_stmt)
 
+        # REGBLOCK: keep the original outermost (row) loop on top so it remains the
+        # parallel loop and the thread policy stays row-based; insert k_out as its
+        # child -> nest [i, k_out, ..., k_in]. This matches add_tile's own docstring
+        # (i outside k_out). The default path below instead wraps k_out outermost;
+        # it is preserved byte-identical when regblock is off. Naively wrapping k_out
+        # outermost here would parallelize over the few free-dim tiles (serial for
+        # narrow N) and mis-size the thread policy — see codegen-parity doc 03.
+        if _regblock_enabled() and isinstance(cin, ForAll):
+            kout_forall = ForAll(index_var=outer_index_var, stmt=cin.stmt)
+            cin.stmt = kout_forall
+            return cin
+
         # Wrap the new_cin in a new ForAll loop, with the outer index var.
         # Preserve scheduler metadata carried on the root CIN node.
         wrapped = ForAll(
@@ -1428,8 +1506,14 @@ class Scheduler:
         # loop is re-executed once per tile instead of once total.  For typical
         # problem sizes the re-traversal cost far outweighs the cache benefit
         # of a smaller tile working set.
+        # The register-block path (SCORCH_REGBLOCK) DELIBERATELY tiles the free dim
+        # even though it re-traverses the sparse contraction once per tile: the cost
+        # model's "re-traversal loses" assumption is inverted when the output tile is
+        # register-resident (the sparse indices are L1-hot across the ceil(N/T) passes,
+        # and holding the accumulator in registers removes the per-nonzero output
+        # round-trip). So skip this guard when regblock is on. Byte-identical when off.
         loop_order = cin.loop_order
-        if loop_order:
+        if loop_order and not _regblock_enabled():
             def _causes_sparse_retraversal(iv: IndexVar) -> bool:
                 if iv not in loop_order:
                     return False
@@ -1453,8 +1537,9 @@ class Scheduler:
     def _apply_tiling_heuristics(cin: CIN) -> CIN:
         if not isinstance(cin, ForAll):
             return cin
+        tile_width = _regblock_tile_width() if _regblock_enabled() else 32
         for index_var in Scheduler._select_index_vars_to_tile(cin):
-            cin = Scheduler.add_tile(cin, index_var, 32)
+            cin = Scheduler.add_tile(cin, index_var, tile_width)
         return cin
 
     @staticmethod

@@ -1,10 +1,12 @@
+import copy
 import os
 import time
 from pathlib import Path
-from typing import Any, Union, Sequence, Optional, List
+from typing import Any, Union, Sequence, Optional, List, Tuple
 
 import torch
 
+from .compiler import llir
 from .compiler.cin import (
     IndexVar,
     TensorVar,
@@ -17,7 +19,12 @@ from .compiler.cin import (
 )
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
-from .compiler.scheduler import Scheduler
+from .compiler.scheduler import (
+    Scheduler,
+    _regblock_enabled,
+    _regblock_max_n,
+    regblock_force,
+)
 from .format import TensorFormat, LevelFormat, LevelType
 from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
 from .tiling import maybe_dispatch as _tiling_maybe_dispatch
@@ -720,6 +727,160 @@ def sparse_linear(
     return y_fm.T
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2b (codegen-parity): register-block dual-path kernel emission.
+#
+# The free-dim register-block transform (holding the output tile in a stack-local
+# accumulator across a row's nonzeros) WINS for narrow N (<=~3) but REGRESSES for
+# wide N (re-traversal of the sparse row per free-dim tile). Because ONE
+# format-keyed kernel serves all N, the fix is a RUNTIME branch inside the kernel on
+# the free-dim size: register-block nest for small N (single tile, no re-traversal),
+# the byte-identical baseline memory-destination nest for large N. This preserves
+# wide-k parity by construction (the regblock arm cannot fire for large N) — the same
+# discipline as the spmm.h nfloor / E-core-recruit gates.
+#
+# We build it by lowering the SAME (unscheduled) CIN twice — regblock forced OFF and
+# ON — and splicing the two top-level compute loops under one llir.IfThenElse. See
+# codegen-parity/04-phase2-results.md for the route evaluation (LLIR if-stitch chosen
+# over an N-bucketed cache key).
+#
+# ROLLOUT: dual-path emission now defaults ON via `_regblock_dual_active()` after
+# validation on M5 (2026-07-09) and x86/redwood (2026-07-10) showed it is
+# neutral-or-better across the whole grid — narrow-k register-block WIN (x86 rb/base
+# geomean 0.89), wide-k byte-identical else-arm PARITY. This is DECOUPLED from the
+# scheduler's `SCORCH_REGBLOCK` env (which stays default OFF, so a direct
+# `Scheduler.auto_schedule` caller — and the two schedule-shape tests — is unchanged):
+# `_build_regblock_dual_path` forces the tiling LOCALLY via `regblock_force`, so it
+# needs nothing from the global env. Escape hatch: `SCORCH_REGBLOCK_DUAL=0` restores
+# the pre-flip single baseline path (also byte-identical to before the whole feature).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _regblock_dual_active() -> bool:
+    """Whether `einsum` emits the register-block dual-path kernel for the qualifying
+    pattern (dense output, sparse contraction, a tileable free dim).
+
+    Default TRUE post-validation (see the module comment above). Set
+    ``SCORCH_REGBLOCK_DUAL=0`` to restore the pre-flip single baseline path. This is
+    intentionally SEPARATE from the scheduler's ``SCORCH_REGBLOCK`` / ``_regblock_enabled()``
+    (default OFF): the dual builder forces its two lowerings locally, so flipping the
+    per-op default here leaves every direct ``auto_schedule`` caller untouched. When the
+    dual-path does not apply (non-qualifying pattern → `_build_regblock_dual_path`
+    returns None), einsum falls back to the byte-identical baseline single path.
+    """
+    return os.environ.get("SCORCH_REGBLOCK_DUAL", "1") != "0"
+
+
+def _find_top_compute_loop(
+    body: List[llir.Stmt],
+) -> Tuple[Optional[int], Optional[llir.ForLoop]]:
+    """Locate the single top-level compute loop in a lowered function body.
+
+    Prefer the omp-parallel-for row loop; fall back to a lone top-level ForLoop.
+    Returns (None, None) when the shape is ambiguous (0 or >1 candidates) so the
+    caller can safely decline the dual-path stitch.
+    """
+    for_loops = [(i, s) for i, s in enumerate(body) if isinstance(s, llir.ForLoop)]
+    if not for_loops:
+        return None, None
+    parallel = [(i, s) for i, s in for_loops if getattr(s, "omp_parallel_for", False)]
+    if len(parallel) == 1:
+        return parallel[0]
+    if len(for_loops) == 1:
+        return for_loops[0]
+    return None, None
+
+
+def _regblock_free_size_expr(row_loop: llir.ForLoop) -> Optional[llir.Expr]:
+    """Extract the free-dim size expression from the register-block row loop.
+
+    The tiled nest contains a `for (k_out = 0; k_out < <free_size>; k_out += kTile)`
+    loop; its bound (`cond.right`) IS the free-dim extent as the lowerer computed it
+    (e.g. `B1_size`). Using it avoids hard-coding a variable name. Returns None if no
+    `*_out` tile loop is found.
+    """
+    def _walk(stmts: List[llir.Stmt]) -> Optional[llir.Expr]:
+        for s in stmts:
+            if isinstance(s, llir.ForLoop):
+                init = getattr(s, "init", None)
+                var = getattr(init, "var", None) if init is not None else None
+                name = getattr(var, "name", "") or ""
+                if name.endswith("_out"):
+                    cond = getattr(s, "cond", None)
+                    right = getattr(cond, "right", None) if cond is not None else None
+                    if right is not None:
+                        return right
+                found = _walk(getattr(s, "body", None) or [])
+                if found is not None:
+                    return found
+        return None
+
+    return _walk(getattr(row_loop, "body", None) or [])
+
+
+def _stitch_regblock_dual_path(
+    fn_rb: llir.Function, fn_base: llir.Function, cutoff_n: int
+) -> Optional[llir.Function]:
+    """Splice the register-block and baseline compute loops under one runtime branch.
+
+    Keeps `fn_rb`'s prologue (a strict superset of the baseline's — it only adds the
+    `kTile` decl) and epilogue, replacing its single top-level compute loop with
+    `if (free_size <= cutoff_n) { <regblock loop> } else { <baseline loop> }`.
+    Returns None (decline) if either function's compute region is ambiguous or the
+    free-dim size expression can't be found.
+    """
+    idx_rb, loop_rb = _find_top_compute_loop(fn_rb.body)
+    _, loop_base = _find_top_compute_loop(fn_base.body)
+    if loop_rb is None or loop_base is None or idx_rb is None:
+        return None
+    free_expr = _regblock_free_size_expr(loop_rb)
+    if free_expr is None:
+        return None
+    cond = llir.BinOp(
+        op="<=",
+        left=free_expr,
+        right=llir.Literal(value=cutoff_n, data_type=llir.DataType.INT64),
+    )
+    branch = llir.IfThenElse(cond=cond, then_body=[loop_rb], else_body=[loop_base])
+    new_body = list(fn_rb.body)
+    new_body[idx_rb] = branch
+    fn_rb.body = new_body
+    return fn_rb
+
+
+def _build_regblock_dual_path(
+    cin_unscheduled: IndexStmt, post_ops: Any
+) -> Optional[Tuple[llir.Function, str]]:
+    """Build the Phase 2b dual-path kernel from an unscheduled CIN.
+
+    Schedules + lowers the CIN twice (regblock forced OFF -> baseline nest, ON ->
+    tiled nest) and stitches a runtime free-dim branch. Returns (Function, cache_key)
+    or None when the register-block path doesn't apply (schedules identical) or the
+    stitch can't be formed safely — the caller then falls back to the baseline path.
+    """
+    # auto_schedule mutates the CIN in place, so schedule each arm from a pristine copy.
+    with regblock_force(False):
+        cin_base = Scheduler.auto_schedule(copy.deepcopy(cin_unscheduled))
+    with regblock_force(True):
+        cin_rb = Scheduler.auto_schedule(copy.deepcopy(cin_unscheduled))
+    if str(cin_base) == str(cin_rb):
+        # Register-block didn't change the schedule (pattern doesn't qualify) ->
+        # nothing to branch on; let the caller use the plain baseline path.
+        return None
+
+    with regblock_force(False):
+        fn_base = CINLowerer(post_ops=post_ops).lower_IndexStmt(cin_base)
+    with regblock_force(True):
+        fn_rb = CINLowerer(post_ops=post_ops).lower_IndexStmt(cin_rb)
+    if not (isinstance(fn_base, llir.Function) and isinstance(fn_rb, llir.Function)):
+        return None
+
+    stitched = _stitch_regblock_dual_path(fn_rb, fn_base, _regblock_max_n())
+    if stitched is None:
+        return None
+    return stitched, str(cin_rb) + "|rbdual"
+
+
 def einsum(
     expression: str,
     *tensors: Optional[Union[torch.Tensor, STensor]],
@@ -1061,23 +1222,46 @@ def einsum(
         if tensor_vars[tensor_index].mode_order != desired_mode_order:
             tensor_vars[tensor_index].mode_order = desired_mode_order
 
-    cin_stmt = Scheduler.auto_schedule(cin_stmt)
-
-    # print("Auto-scheduled CIN:\n", cin_stmt)
-
     # Extract PostOps for fused kernel compilation
     _post_ops = kwargs.get("_post_ops", None)
     _post_ops_tensors = kwargs.get("_post_ops_tensors", None)
     _cache_key_suffix = str(_post_ops) if _post_ops else ""
-    _kernel_cache_key = str(cin_stmt) + _cache_key_suffix
+
+    # Phase 2b (codegen-parity): emit ONE kernel that branches at runtime on the
+    # free-dim size — register-block for small N (single tile, no re-traversal), the
+    # byte-identical baseline nest for large N. Default ON via `_regblock_dual_active()`
+    # (post M5+x86 validation); `SCORCH_REGBLOCK_DUAL=0` restores the single path.
+    # When the pattern doesn't qualify, `_build_regblock_dual_path` returns None and
+    # the else-branch below emits the byte-identical baseline (unchanged from before).
+    _dual_llir: Optional[llir.Function] = None
+    if _regblock_dual_active() and _post_ops is None:
+        _dual = _build_regblock_dual_path(cin_stmt, _post_ops)
+        if _dual is not None:
+            _dual_llir, _kernel_cache_key = _dual
+            _kernel_cache_key = _kernel_cache_key + _cache_key_suffix
+
+    if _dual_llir is None:
+        # Default single path. When regblock is on but the dual-path wasn't
+        # applicable, force it OFF here so we never ship the wide-k-regressing
+        # single-path tiled kernel as a silent fallback.
+        if _regblock_enabled():
+            with regblock_force(False):
+                cin_stmt = Scheduler.auto_schedule(cin_stmt)
+        else:
+            cin_stmt = Scheduler.auto_schedule(cin_stmt)
+        _kernel_cache_key = str(cin_stmt) + _cache_key_suffix
+
+    # print("Auto-scheduled CIN:\n", cin_stmt)
 
     if _kernel_cache_key in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
         module = _kernel_cache[_kernel_cache_key]
     else:
-        lowerer = CINLowerer(post_ops=_post_ops)
-
-        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        if _dual_llir is not None:
+            lowered_llir: Union[llir.Stmt, List[llir.Stmt]] = _dual_llir
+        else:
+            lowerer = CINLowerer(post_ops=_post_ops)
+            lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
 
         llir_lowerer = LLIRLowerer()
 
