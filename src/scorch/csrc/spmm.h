@@ -429,7 +429,8 @@ Tensor spmm_csr_float_optimized(std::vector<int> result_shape, std::vector<int> 
   int kTile_k = tile_size;
 
   // Compute how many tiles we need
-  int num_tiles = (B1_size + kTile_k - 1) / kTile_k;
+  int num_tiles = static_cast<int>(
+      (static_cast<int64_t>(B1_size) + kTile_k - 1) / kTile_k);
 
   #pragma omp parallel
   {
@@ -1137,14 +1138,16 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
   int kTile_i = i_tile_size;
   int kTile_k = k_tile_size;
 
-  int num_i_tiles = (A0_size + kTile_i - 1) / kTile_i;
+  int num_i_tiles = static_cast<int>(
+      (static_cast<int64_t>(A0_size) + kTile_i - 1) / kTile_i);
   int residual_k_start = (B1_size / kTile_k) * kTile_k;
 
   #pragma omp parallel for
   for (int i_tile = 0; i_tile < num_i_tiles; i_tile++) {
     // Calculate the start and end of this i-tile
     int i_start = i_tile * kTile_i;
-    int i_end = std::min(i_start + kTile_i, A0_size);
+    int i_end = static_cast<int>(std::min<int64_t>(
+        static_cast<int64_t>(i_start) + kTile_i, A0_size));
 
     for (int k_out = 0; k_out < residual_k_start; k_out += kTile_k) {
       // For each i-tile and k-tile, process the computation

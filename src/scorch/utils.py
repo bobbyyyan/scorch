@@ -7,13 +7,13 @@ import time
 from collections import defaultdict, deque
 from importlib import resources
 from itertools import chain
-from typing import List, Dict, Any, Iterable, Union, Optional
+from typing import List, Dict, Any, Iterable, Optional
 
 import torch
 from torch.utils.cpp_extension import load_inline
 
 from .compiler.llir import DataType
-from .format import TensorFormat, LevelFormat, LevelType
+from .format import parse_format  # noqa: F401 - compatibility re-export
 
 _NATIVE_RESOURCES = resources.files("scorch").joinpath("csrc")
 
@@ -43,6 +43,11 @@ def jit_preamble_text() -> str:
     loaders.
     """
     template = native_resource_text("header.cpp")
+    abi_include = '#include "native_abi.h"'
+    if template.count(abi_include) != 1:
+        raise RuntimeError("packaged header.cpp must include native_abi.h once")
+    template = template.replace(abi_include, native_resource_text("native_abi.h"), 1)
+
     include = '#include "scorch_policy.h"'
     if template.count(include) != 1:
         raise RuntimeError("packaged header.cpp must include scorch_policy.h once")
@@ -364,33 +369,6 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
 
         for tensor_index in tensor_indices:
             inverted_edges[tensor_index].append(edge_to_invert)
-
-
-def parse_format(fmt: Union[List[str], str, TensorFormat]) -> TensorFormat:
-    """Convert a list of format strings to a TensorFormat.
-
-    Args:
-        fmt: A TensorFormat (returned as-is), a string like "ds", or a list
-            of format strings like ["dense", "compressed"].
-
-    Returns:
-        TensorFormat: TensorFormat object.
-    """
-    if isinstance(fmt, TensorFormat):
-        return fmt
-    if isinstance(fmt, str):
-        fmt = list(fmt)
-    level_formats = []
-    for format_str in fmt:
-        if format_str in ["dense", "d"]:
-            level_formats.append(LevelFormat(mode=LevelType.DENSE))
-        elif format_str in ["compressed", "sparse", "c", "s"]:
-            level_formats.append(LevelFormat(mode=LevelType.COMPRESSED))
-        elif format_str in ["coordinate", "coord", "o"]:
-            level_formats.append(LevelFormat(mode=LevelType.COORDINATE))
-        else:
-            raise ValueError(f"Invalid format string: {format_str}")
-    return TensorFormat(level_formats=level_formats)
 
 
 PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE: Dict[torch.dtype, str] = {

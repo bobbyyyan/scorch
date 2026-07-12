@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict, Union, Sequence
 
 from . import llir
 from .cin import (
@@ -2335,6 +2335,80 @@ class CINLowerer:
                         )
                     )
 
+            # Every load_inline ``evaluate`` function is a public native ABI.
+            # Validate its by-value arguments before emitting any nested container
+            # access or data_ptr call.  The shared helper also range-checks int64
+            # indices and replaces only these local mode-index handles with int32
+            # copies, matching the legacy generated pointer type without mutating
+            # caller-owned tensors.
+            abi_validation_stmts: List[llir.Stmt] = []
+
+            def _cpp_int_vector(values: Sequence[int]) -> str:
+                return "{" + ", ".join(str(int(value)) for value in values) + "}"
+
+            result_contract = self.final_result_tensor_var or self.result_tensor_var
+            if result_contract is not None:
+                expected_result_shape = result_contract.shape or ()
+                expected_result_rank = len(result_contract.get_level_types())
+                abi_validation_stmts.append(
+                    llir.RawStmt(
+                        code=(
+                            "scorch_native::validate_jit_result_shape("
+                            f"result_shape, {_cpp_int_vector(expected_result_shape)}, "
+                            f"{expected_result_rank}, "
+                            '"evaluate")'
+                        ),
+                        add_semicolon=True,
+                    )
+                )
+
+            level_kind_code = {
+                LevelType.DENSE: 0,
+                LevelType.COMPRESSED: 1,
+                LevelType.COORDINATE: 2,
+            }
+            for tensor in rhs_tensor_vars:
+                level_types = tensor.get_level_types()
+                try:
+                    level_kinds = [level_kind_code[level] for level in level_types]
+                except KeyError as error:
+                    raise ValueError(
+                        f"unsupported JIT level type {error.args[0]} for ABI validation"
+                    ) from error
+                mode_order = tensor.get_mode_order() or list(range(len(level_types)))
+                expected_shape = tensor.shape or ()
+                tname = tensor.get_name()
+                abi_validation_stmts.append(
+                    llir.RawStmt(
+                        code=(
+                            "scorch_native::validate_jit_tensor("
+                            f'"evaluate", "{tname}", {tname}_shape, '
+                            f"{tname}_mode_indices, {tname}_values, "
+                            f"{get_pytorch_c_dtype_str(tensor.dtype)}, "
+                            f"{_cpp_int_vector(level_kinds)}, "
+                            f"{_cpp_int_vector(mode_order)}, "
+                            f"{_cpp_int_vector(expected_shape)})"
+                        ),
+                        add_semicolon=True,
+                    )
+                )
+
+            if self.post_ops and self.post_ops.extra_tensors:
+                postop_dtype = get_pytorch_c_dtype_str(
+                    self.final_result_tensor_var.dtype
+                )
+                for tname in self.post_ops.extra_tensors:
+                    abi_validation_stmts.append(
+                        llir.RawStmt(
+                            code=(
+                                "scorch_native::validate_jit_extra_tensor("
+                                f'{tname}_values, {postop_dtype}, "evaluate", '
+                                f'"{tname}_values")'
+                            ),
+                            add_semicolon=True,
+                        )
+                    )
+
             body_stmts: List[llir.Stmt] = []
 
             # Extract data pointers for PostOps extra tensors
@@ -2420,6 +2494,7 @@ class CINLowerer:
                 # Only emit tensor level arrays (input pointers) and recurse.
                 body_stmts.extend(
                     [
+                        *abi_validation_stmts,
                         *result_tensor_level_sizes,
                         *tensor_level_array_assign_stmts,
                         llir.BlankLine(),
@@ -2432,6 +2507,7 @@ class CINLowerer:
             else:
                 body_stmts.extend(
                     [
+                        *abi_validation_stmts,
                         *result_tensor_level_sizes,
                         *tensor_level_array_assign_stmts,
                         llir.BlankLine(),

@@ -243,7 +243,7 @@ def execute_prebuilt_binary_kernel(
     args = [result_shape]
     for tensor in [a, b]:
         args.append(tensor.shape)  # type: ignore[arg-type]
-        args.append(tensor.index.mode_indices)  # type: ignore[arg-type]
+        args.append(tensor._native_mode_indices())  # type: ignore[arg-type]
         args.append(tensor.values)  # type: ignore[arg-type]
 
     start_time = time.time()

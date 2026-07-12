@@ -1,7 +1,24 @@
-from enum import Enum
-from typing import Optional, Union, List
+from __future__ import annotations
 
-from .compiler import llir
+from dataclasses import dataclass
+from enum import Enum
+import json
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+
+from .exceptions import TensorFormatError, TensorTypeError
+
+if TYPE_CHECKING:
+    from .compiler import llir
 
 
 class LevelType(Enum):
@@ -35,9 +52,8 @@ class LevelType(Enum):
     synonyms -- both parse to ``COMPRESSED`` (there is no ``c``-vs-``s``
     distinction), as do the words ``"sparse"`` and ``"compressed"``.
 
-    ``SINGLETON`` constructs fine in a ``TensorFormat`` but is **reserved /
-    not-yet-supported** end-to-end: ``utils.parse_format`` rejects it (so it
-    cannot be an op ``output_format``), and the lowering path branches only on
+    ``SINGLETON`` is parsed consistently by the canonical format parser but is
+    still reserved for future lowering; generated kernels currently support
     ``DENSE`` / ``COMPRESSED`` / ``COORDINATE``.
 
     Examples
@@ -78,14 +94,23 @@ _STR_TO_LEVEL_TYPE = {
 
 
 def _parse_level_type(s: str) -> LevelType:
-    """Convert a string alias to a LevelType, or raise ValueError."""
+    """Convert one canonicalized string alias to a :class:`LevelType`."""
+    if not isinstance(s, str):
+        raise TensorTypeError(
+            f"level format must be a string or LevelType, got {type(s).__name__}"
+        )
+    key = s.strip().lower()
     try:
-        return _STR_TO_LEVEL_TYPE[s]
-    except KeyError:
-        raise ValueError(f"Invalid format string: {s}")
+        return _STR_TO_LEVEL_TYPE[key]
+    except KeyError as error:
+        aliases = ", ".join(sorted(_STR_TO_LEVEL_TYPE))
+        raise TensorFormatError(
+            f"invalid level format {s!r}; expected one of: {aliases}"
+        ) from error
 
 
-class LevelFormat(object):
+@dataclass(frozen=True, init=False)
+class LevelFormat:
     """The format of a single tensor mode: a level type plus optional bit width.
 
     A ``LevelFormat`` bundles one :class:`LevelType` -- ``DENSE``,
@@ -133,14 +158,31 @@ class LevelFormat(object):
         mode: Union[str, LevelType],
         bit_width: Optional[int] = None,
     ):
-        if isinstance(mode, str):
-            mode = _parse_level_type(mode)
-        assert isinstance(mode, LevelType)
-        self._mode = mode
-        self._bit_width = bit_width
+        parsed_mode = _parse_level_type(mode) if isinstance(mode, str) else mode
+        if not isinstance(parsed_mode, LevelType):
+            raise TensorTypeError(
+                "level format mode must be a string alias or LevelType, "
+                f"got {type(mode).__name__}"
+            )
+        if bit_width is not None:
+            if isinstance(bit_width, bool) or not isinstance(bit_width, int):
+                raise TensorTypeError("level format bit_width must be an integer")
+            if bit_width <= 0:
+                raise TensorFormatError("level format bit_width must be positive")
+        object.__setattr__(self, "_mode", parsed_mode)
+        object.__setattr__(self, "_bit_width", bit_width)
 
     def get_level_type(self) -> LevelType:
         return self._mode
+
+    @property
+    def bit_width(self) -> Optional[int]:
+        """Optional storage-width hint for this level."""
+        return self._bit_width
+
+    def to_dict(self) -> Mapping[str, Any]:
+        """Return a JSON-compatible canonical representation."""
+        return {"type": self._mode.name.lower(), "bit_width": self._bit_width}
 
     def __str__(self):
         # return f'"{self._mode.value}"'
@@ -166,7 +208,8 @@ class LevelPack:
         raise NotImplementedError
 
 
-class TensorFormat(object):
+@dataclass(frozen=True, init=False)
+class TensorFormat:
     """The whole-tensor physical layout: an ordered list of per-mode formats.
 
     A ``TensorFormat`` is the central format abstraction -- an ordered list of
@@ -187,24 +230,22 @@ class TensorFormat(object):
         - a ``list`` of :class:`LevelFormat` -> used directly.
         - a ``list`` of ``str`` aliases -> each parsed to a ``LevelFormat``
           (e.g. ``["dense", "compressed"]`` for CSR).
-        - a bare ``str`` -> **split one character per mode** via ``list(...)``
-          (e.g. ``"ds"`` -> ``["d", "s"]``).
+        - a compact ``str`` such as ``"ds"`` -> one character per mode.
+        - a long alias such as ``"dense"`` -> one mode.
+        - a canonical comma string such as ``"d,s"`` -> one token per mode.
 
     Notes
     -----
-    **Bare strings are split per character.** A bare ``str`` is only for the
-    single-letter alphabet ``d`` / ``s`` / ``c`` / ``o``. Multi-character
-    aliases in a bare string are mis-parsed: ``TensorFormat("singleton")``
-    splits into ``["s", "i", "n", ...]`` and raises ``ValueError`` on ``"i"``.
-    To use a long-form alias (including ``singleton``) pass a **list**, e.g.
-    ``TensorFormat(["coordinate", "singleton"])``.
+    Parsing is centralized in :func:`parse_format`; constructor calls, compiler
+    inputs, compact strings, long aliases, sequences, and the comma-delimited
+    display form all use the same grammar.
 
     ``s`` and ``c`` are synonyms for ``COMPRESSED``. ``singleton`` constructs
     fine here but is not lowered by codegen (reserved / not-yet-supported).
 
-    ``__str__`` is **comma-joined** (``str(TensorFormat("ds")) == "d,s"``),
-    which differs from the char-per-mode input string ``"ds"`` -- the
-    round-trip is not identical.
+    ``__str__`` is comma-joined (``str(TensorFormat("ds")) == "d,s"``), and
+    that representation can be parsed again. :meth:`serialize` includes level
+    bit widths and is the canonical cache/metadata form.
 
     The implicit / fill value is fixed at ``0.0`` (class attribute
     ``_fill_value``); non-zero fill values are not supported.
@@ -230,39 +271,35 @@ class TensorFormat(object):
     LevelFormat : One mode's format.
     """
 
-    _level_formats: List[LevelFormat]
+    _level_formats: Tuple[LevelFormat, ...]
 
     # Fill value default to 0.0
     # TODO: extend to support other fill values
-    _fill_value: Optional[float] = 0.0
+    _fill_value: ClassVar[Optional[float]] = 0.0
 
     def __init__(
         self,
         level_formats: Optional[
-            Union[LevelFormat, List[LevelFormat], List[str], str]
+            Union[
+                LevelFormat,
+                LevelType,
+                Sequence[Union[LevelFormat, LevelType, str]],
+                str,
+            ]
         ] = None,
     ):
-        if level_formats is None:
-            self._level_formats = []
-        elif isinstance(level_formats, LevelFormat):
-            self._level_formats = [level_formats]
-        else:
-            if isinstance(level_formats, str):
-                level_formats = list(level_formats)
-            self._level_formats = [
-                lf if isinstance(lf, LevelFormat) else LevelFormat(mode=_parse_level_type(lf))
-                for lf in level_formats
-            ]
+        object.__setattr__(
+            self, "_level_formats", _normalize_level_formats(level_formats)
+        )
 
-    def get_level_formats(self) -> List[LevelFormat]:
-        """Return the per-mode :class:`LevelFormat` list, in storage order.
+    def get_level_formats(self) -> Tuple[LevelFormat, ...]:
+        """Return immutable per-mode :class:`LevelFormat` values in storage order.
 
         Returns
         -------
-        list of LevelFormat
+        tuple of LevelFormat
             One entry per mode.
         """
-        assert self._level_formats is not None, "level_formats is None"
         return self._level_formats
 
     def get_level_types(self) -> List[LevelType]:
@@ -310,10 +347,99 @@ class TensorFormat(object):
         return ",".join([str(level_format) for level_format in self._level_formats])
 
     def __repr__(self):
-        return str(self)
+        return f"TensorFormat({str(self)!r})"
 
-    def __eq__(self, other):
-        return self._level_formats == other._level_formats
+    def to_dict(self) -> Mapping[str, Any]:
+        """Return a JSON-compatible canonical representation."""
+        return {
+            "levels": [level.to_dict() for level in self._level_formats],
+            "fill_value": self._fill_value,
+        }
 
-    def __ne__(self, other):
-        return not self.__eq__(other)
+    def serialize(self) -> str:
+        """Serialize deterministically for metadata and compiler cache keys."""
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TensorFormat":
+        """Reconstruct a format from :meth:`to_dict`."""
+        if not isinstance(data, Mapping) or "levels" not in data:
+            raise TensorFormatError("serialized tensor format must contain 'levels'")
+        fill_value = data.get("fill_value", 0.0)
+        if fill_value != 0.0:
+            raise TensorFormatError("only a zero tensor fill value is supported")
+        levels = data["levels"]
+        if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes)):
+            raise TensorFormatError("serialized tensor format levels must be a list")
+        parsed = []
+        for level in levels:
+            if not isinstance(level, Mapping) or "type" not in level:
+                raise TensorFormatError(
+                    "each serialized tensor level must contain a 'type'"
+                )
+            parsed.append(LevelFormat(level["type"], level.get("bit_width")))
+        return cls(parsed)
+
+
+FormatInput = Union[
+    TensorFormat,
+    LevelFormat,
+    LevelType,
+    Sequence[Union[LevelFormat, LevelType, str]],
+    str,
+]
+
+
+def _tokenize_format_string(value: str) -> Tuple[str, ...]:
+    text = value.strip().lower()
+    if not text:
+        return tuple()
+    if text in _STR_TO_LEVEL_TYPE:
+        return (text,)
+    if "," in text:
+        tokens = tuple(token.strip() for token in text.split(","))
+        if any(not token for token in tokens):
+            raise TensorFormatError(f"invalid comma-separated tensor format {value!r}")
+        return tokens
+    return tuple(text)
+
+
+def _normalize_level_formats(
+    value: Optional[
+        Union[
+            LevelFormat,
+            LevelType,
+            Sequence[Union[LevelFormat, LevelType, str]],
+            str,
+        ]
+    ],
+) -> Tuple[LevelFormat, ...]:
+    if value is None:
+        return tuple()
+    if isinstance(value, LevelFormat):
+        return (value,)
+    if isinstance(value, LevelType):
+        return (LevelFormat(value),)
+    if isinstance(value, str):
+        value = _tokenize_format_string(value)
+    if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray)):
+        raise TensorTypeError(
+            "tensor format must be a string, level, or sequence of levels"
+        )
+    result = []
+    for level in value:
+        if isinstance(level, LevelFormat):
+            result.append(level)
+        elif isinstance(level, (LevelType, str)):
+            result.append(LevelFormat(level))
+        else:
+            raise TensorTypeError(
+                "tensor format levels must be LevelFormat, LevelType, or string; "
+                f"got {type(level).__name__}"
+            )
+    return tuple(result)
+
+
+def parse_format(fmt: FormatInput) -> TensorFormat:
+    """Canonical parser used by every public format-taking API."""
+    return fmt if isinstance(fmt, TensorFormat) else TensorFormat(fmt)

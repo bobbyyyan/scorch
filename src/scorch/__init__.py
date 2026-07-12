@@ -11,7 +11,20 @@ from .ops import (
     sparse_softmax_csr,
 )
 from .stensor import STensor
-from .format import TensorFormat
+from .exceptions import (
+    CompileSpecError,
+    ScorchError,
+    TensorDeviceError,
+    TensorFormatError,
+    TensorIndexError,
+    TensorLayoutError,
+    TensorStorageError,
+    TensorTypeError,
+    TensorValidationError,
+)
+from .format import LevelFormat, LevelType, TensorFormat, parse_format
+from .layout import TensorLayout, TensorMetadata, TensorSpec
+from .storage import SparseStorage, TensorIndex
 from .compiler.scheduler import RelayoutSpec, Schedule, TileSpec, schedule_force
 from .trace import compile
 from .tiling import (
@@ -26,6 +39,7 @@ from .tiling import (
 from_torch = STensor.from_torch
 from_coo = STensor.from_coo
 from_csr = STensor.from_csr
+from_components = STensor.from_components
 
 
 # precompile_kernels()
@@ -42,7 +56,24 @@ __version__ = "0.0.1"
 
 __all__ = [
     "STensor",
+    "TensorSpec",
+    "TensorLayout",
+    "TensorMetadata",
+    "SparseStorage",
+    "TensorIndex",
     "TensorFormat",
+    "LevelFormat",
+    "LevelType",
+    "parse_format",
+    "ScorchError",
+    "TensorValidationError",
+    "TensorFormatError",
+    "TensorLayoutError",
+    "TensorIndexError",
+    "TensorStorageError",
+    "TensorDeviceError",
+    "TensorTypeError",
+    "CompileSpecError",
     "RelayoutSpec",
     "Schedule",
     "TileSpec",
@@ -54,6 +85,8 @@ __all__ = [
     "fast_transpose",
     "from_torch",
     "from_coo",
+    "from_csr",
+    "from_components",
     "get_autotune",
     "matmul",
     "matmul_wksp",

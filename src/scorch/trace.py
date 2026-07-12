@@ -393,10 +393,10 @@ def _try_prebuilt_fused(spec: FusionSpec, args: tuple) -> Optional[Callable]:
             result_cpp = kernel_fn(
                 result_shape,
                 list(a_arg.shape),
-                a_arg.index.mode_indices,
+                a_arg._native_mode_indices(),
                 a_arg.values,
                 list(b_arg.shape),
-                b_arg.index.mode_indices,
+                b_arg._native_mode_indices(),
                 b_arg.values,
                 bias,
             )

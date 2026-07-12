@@ -154,30 +154,20 @@ assert TensorFormat("dd").is_dense()
 `LevelType` list), `get_order()` (the rank), and `is_dense()` (`True` only when
 *every* mode is dense — the flag ops use to pick fully-dense fast paths).
 
-:::{note}
-To test whether two formats describe the same layout, compare
-`a.get_level_types() == b.get_level_types()` — a list of enum members. Do **not**
-rely on `a == b`: `TensorFormat.__eq__` compares the underlying `LevelFormat`
-objects, which are compared by identity, so two *separately constructed* formats
-compare unequal even when they describe the same layout.
-:::
-
-:::{warning}
-**A bare string is split one character per mode** (`list("ds") → ["d", "s"]`).
-That is exactly right for the single-letter alphabet `d` / `s` / `c` / `o`, but
-it silently mangles any long-form alias. `TensorFormat("singleton")` splits into
-`["s", "i", "n", "g", …]` and raises `ValueError` on the `"i"`.
-
-To use a long-form alias — and in particular the only way to spell `singleton` —
-pass a **list**:
+`TensorFormat` and `LevelFormat` are frozen structural values, so separately
+constructed equivalent formats compare equal and have the same hash. The parser
+also accepts the comma-delimited display form:
 
 ```python
-TensorFormat(["coordinate", "singleton"])   # OK
-TensorFormat("coordinatesingleton")         # WRONG: splits into 20 characters
+assert TensorFormat("ds") == TensorFormat(["dense", "compressed"])
+assert TensorFormat("d,s") == TensorFormat("ds")
+assert TensorFormat("singleton").get_order() == 1
 ```
 
-Reserve the bare-string form for the single-letter alphabet.
-:::
+Compact strings use one character per mode, while a recognized long alias is one
+mode. `get_level_formats()` returns an immutable tuple; callers cannot mutate the
+format through a live internal list. Use `serialize()` for canonical metadata or
+cache-key serialization.
 
 ### LevelFormat
 
@@ -203,6 +193,7 @@ one for you based on the source layout. Each factory produces a fixed format:
 | {func}`~scorch.from_torch` | `torch.sparse_csr` tensor | `[DENSE, COMPRESSED]` — CSR |
 | `from_csr` | 2-D torch CSR | `[DENSE, COMPRESSED]` — CSR |
 | {func}`~scorch.from_coo` | torch COO, or raw `indices`/`values`/`shape` | `[COORDINATE]*rank` (`"oo…"`) |
+| `from_components` / `STensor.from_components` | explicit validated shape/format/index/value components | caller-specified |
 
 ```python
 import torch
@@ -280,12 +271,10 @@ formats — walking the contraction and marking each output level `DENSE` or
 sparse (compressed/coordinate) accordingly.
 
 :::{warning}
-The op-layer parser (`parse_format`) accepts only dense, compressed, and
-coordinate aliases — it **rejects `singleton`** with a `ValueError`. So even
-though `TensorFormat(["singleton"])` constructs fine, you cannot request a
-singleton output format through `matmul` / `spmv` / `matmul_wksp` today. This is
-one of two parsers with different coverage: `TensorFormat` (full alias table,
-including singleton) and `parse_format` (op layer, no singleton).
+`parse_format` is the one canonical parser used by `TensorFormat`, layouts, and
+operations. It accepts `singleton` as a structural format token, but runtime
+storage and compiler specifications reject singleton levels with a Scorch domain
+exception because lowering does not implement them yet.
 :::
 
 ## How level types drive iteration
@@ -331,25 +320,22 @@ The format system is deliberately small. Know these edges:
 
 Singleton is declared but not usable end-to-end
 : `LevelType.SINGLETON` exists and `TensorFormat(["singleton"])` constructs, but
-  the op-layer parser rejects it *and* the lowering path branches only on
-  `DENSE` / `COMPRESSED` / `COORDINATE` — there is no singleton codegen. Treat it
-  as reserved.
+  validated runtime storage and compiler specifications reject it because the
+  lowering path supports only `DENSE` / `COMPRESSED` / `COORDINATE`. Treat it as
+  a reserved structural token.
 
 `s` and `c` are identical
 : Both map to `COMPRESSED`. Don't read a semantic difference into the two
   letters.
 
-Bare strings split per character
-: Long-form aliases — and `singleton` in particular — only work in the list form.
-
-Two parsers, different coverage
-: `TensorFormat` accepts the full alias table (including singleton); the op-layer
-  `parse_format` does not.
+One parser, two string spellings
+: Compact strings such as `"ds"` are read one character per mode, while a known
+  long alias such as `"dense"` or `"singleton"` is one mode. Comma-delimited
+  canonical strings such as `"d,s"` are accepted too.
 
 `__str__` inserts commas
-: `str(TensorFormat("ds"))` is `"d,s"`, not `"ds"`. The round-trip through
-  `str()` is not identical to the input spelling — the constructor and
-  `parse_format` consume the char-per-mode form, while `__str__` comma-joins.
+: `str(TensorFormat("ds"))` is `"d,s"`, not `"ds"`. Both spellings parse to the
+  same structural value, so `TensorFormat(str(TensorFormat("ds")))` round-trips.
 
 Fill value is always 0.0
 : The implicit value of an unstored entry is fixed at `0.0`. There is no

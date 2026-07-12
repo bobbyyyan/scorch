@@ -443,9 +443,9 @@ Tensor spmspm_coo_float_opt(
   int pA0_end = A0_crd_tensor.size(0);
   int pA1_end = 0;
 
-  int B0_size = B_shape[0];
-  std::vector<int> next(B0_size, -1);
-  std::vector<float> sums(B0_size, 0);
+  int B1_size = B_shape[1];
+  std::vector<int> next(B1_size, -1);
+  std::vector<float> sums(B1_size, 0);
 
   for (int pA0 = 0; pA0 < pA0_end; pA0 = pA1_end) {
     // Resolve coordinates

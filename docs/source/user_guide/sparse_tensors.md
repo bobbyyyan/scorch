@@ -1,9 +1,8 @@
 # Sparse tensors
 
-The {class}`~scorch.STensor` is Scorch's user-facing sparse tensor. It is a thin
-*logical handle* — a name, a logical shape, a logical dtype — that delegates all of
-its numeric payload to an internal storage object holding one flat array of nonzero
-values plus a compact description of where those values live. This page covers how
+The {class}`~scorch.STensor` is Scorch's user-facing sparse tensor. It combines
+frozen metadata, a canonical logical-to-physical layout, and validated storage
+holding one flat array of values plus a compact description of where they live. This page covers how
 to build an STensor from ordinary PyTorch data, how to inspect it, how to change its
 layout, and how to hand results back to PyTorch.
 
@@ -16,8 +15,8 @@ operations that consume STensors — `matmul`, `einsum`, `spmv` — see
 :::{note}
 Scorch is a **CPU** sparse-tensor compiler. An STensor carries no autograd, and the
 device-movement methods (`.cuda()`, `.to()`) are placeholders that raise
-`NotImplementedError`. Treat STensors as transient, immutable-ish data you feed into
-Scorch ops and then materialize back to PyTorch.
+`NotImplementedError`. Layout, metadata, and storage containers are immutable value
+objects; compatibility layout-conversion methods replace those values atomically.
 :::
 
 ## A quick tour
@@ -57,8 +56,8 @@ below.
 
 ## Construction
 
-You almost never call `STensor(...)` directly — the constructor expects a
-hand-built storage object. Instead use one of the three factory functions, which are
+You almost never call `STensor(...)` directly. Instead use one of the validated
+factory functions, which are
 re-exported at module scope:
 
 | Factory | Accepts | Resulting format |
@@ -66,6 +65,7 @@ re-exported at module scope:
 | {func}`~scorch.from_torch` | dense, `torch.sparse_coo`, or `torch.sparse_csr` | inferred from the input layout |
 | {func}`~scorch.from_coo` | a torch COO tensor **or** raw `indices`/`values`/`shape` | `"oo…"` (coordinate per mode) |
 | `scorch.from_csr` | a 2-D `torch.sparse_csr` tensor | `"ds"` (CSR) |
+| `scorch.from_components` | explicit shape/format/index/value components | caller-specified |
 
 ### `from_torch` — the workhorse
 
@@ -106,7 +106,8 @@ import torch, scorch
 
 t = torch.arange(6, dtype=torch.float32).reshape(2, 3)
 m = scorch.from_torch(t, "M", mode_order=[1, 0])   # store transposed
-assert m.shape == (3, 2)                            # logical shape is permuted
+assert m.shape == (3, 2)                            # physical storage shape
+assert m.logical_shape == (2, 3)
 assert torch.equal(m.to_torch(), t)                 # to_torch inverts it back
 ```
 
@@ -135,8 +136,8 @@ assert torch.equal(a.to_torch(), b.to_torch())
 
 ### `from_csr` — 2-D CSR matrices
 
-`from_csr(csr_matrix, name=None)` is the specialized path for 2-D CSR. It asserts
-the input `is_sparse_csr` and that it is exactly 2-D, and produces the `"ds"` format
+`from_csr(csr_matrix, name=None)` is the specialized path for 2-D CSR. It validates
+the layout, device, rank, index structure, and values, and produces the `"ds"` format
 (`from_torch` on a CSR input does the same thing):
 
 ```python
@@ -149,9 +150,12 @@ assert torch.equal(W.to_torch(), dense)
 ```
 
 :::{note}
-Index arrays are coerced to 32-bit integers internally, so an `int64`
-`crow`/`col`/coordinate array you pass in becomes `int32` inside the STensor. The
-stored **values** keep their dtype.
+Index arrays retain their validated int32 or int64 dtype, recorded in
+`tensor.layout.index_dtype`. Existing native kernels use int32 pointers, so the
+checked native view range-checks int64 indices and converts only its private,
+by-value argument copy. Scorch owns copies of structural index arrays and returns
+defensive copies from public accessors, so caller mutation cannot invalidate a
+validated tensor. Caller tensors and containers are never rewritten.
 :::
 
 ## Conversion
@@ -232,20 +236,22 @@ assert torch.equal(a.to_torch(), t) # to_torch undoes the relayout
 
 ## Inspection
 
-STensor deliberately does **not** print its contents — `repr`/`str` of any STensor
-returns the bare word `Tensor`, and its storage prints `TensorStorage({})`. Do not
-rely on `print(x)` for inspection; use the accessors below instead.
+STensor deliberately does **not** print its contents — `repr`/`str` returns the
+bare word `Tensor`. Use the validated accessors below instead.
 
 | Accessor | Kind | Returns |
 |---|---|---|
-| `.shape` | property | logical shape tuple (`()` if unset) |
+| `.shape` / `.physical_shape` | property | extents in physical storage order |
+| `.logical_shape` | property | extents in original logical mode order |
 | `.dim()` | method | number of modes (rank) |
-| `.dtype` | property | logical `torch.dtype` (default `torch.float32`) |
+| `.dtype` / `.device` | property | validated value dtype and CPU device |
+| `.layout` / `.metadata` | property | frozen canonical value objects |
+| `.index_dtype` / `.mode_order` | property | index width and physical-to-logical permutation |
 | `.format` | property | the {class}`~scorch.TensorFormat` |
 | `.values` | property | the flat 1-D tensor of stored values |
 | `.index` | property | the sparsity structure (format + coordinate arrays) |
 | `.has_index` | property | whether an index is attached |
-| `.name` | property | the tensor's name (**raises if never set**) |
+| `.name` | property | non-empty tensor name (factory default `"tensor"`) |
 
 ```python
 import torch, scorch
@@ -278,18 +284,18 @@ array plus a `crd`/column-index array. A COO tensor instead stores one coordinat
 list per mode — `[[row], [col], …]`. The exact meaning of these arrays per level
 type is covered in {doc}`the format system </user_guide/format_system>`.
 
-:::{warning}
-`.name` **asserts** that a name was set — accessing it on an unnamed tensor raises
-`AssertionError`. The factory functions default the name to `"tensor"`, so
-factory-built tensors are always safe; only a hand-built `STensor(...)` without a
-name can trip this.
-:::
+Runtime tensors are complete at construction. The factories default `.name` to
+`"tensor"`; incomplete direct construction raises `TensorValidationError`
+immediately. Compile-only work uses `TensorSpec`, which never pretends to carry
+runtime values or indices.
 
 :::{note}
 STensor omits several PyTorch-style members you might reach for: there is no public
-`.nnz` (use the private `._nnz()`), no `.ndim` (use `.dim()`), and no `.device`,
-`.T`, `.size()`, or `.numel()`. There is also no `__getitem__` — you cannot index or
-slice an STensor. Use `copy()` (not the stub `clone()`) to duplicate one.
+`.nnz` (use the private `._nnz()`), no `.ndim` (use `.dim()`), and no `.T`,
+`.size()`, or `.numel()`. There is also no `__getitem__` — you cannot index or
+slice an STensor. `.device`, `.logical_shape`, `.physical_shape`, `.layout`, and
+`.index_dtype` come from validated metadata. Use `copy()` or `clone()` to duplicate
+one.
 :::
 
 ## Elementwise operators

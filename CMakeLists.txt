@@ -29,6 +29,7 @@ add_custom_target(
         src/scorch/csrc/header.cpp
         src/scorch/csrc/header.h
         src/scorch/csrc/kernels.h
+        src/scorch/csrc/native_abi.h
         src/scorch/csrc/ops.cpp
         src/scorch/csrc/prebuilt_types.h
         src/scorch/csrc/pybind.cpp

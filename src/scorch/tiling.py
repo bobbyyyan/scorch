@@ -404,7 +404,7 @@ def _signature(a, N: int) -> tuple:
     indptr/indices entries so distinct matrices with equal (M,J,nnz) don't collide;
     stable across re-wrapped STensors of the same CSR (memo survives per-call
     re-wrapping in benchmarks/training loops)."""
-    idx = a.index.mode_indices
+    idx = a._native_mode_indices()
     pos, crd = idx[1][0], idx[1][1]
     nnz = int(crd.numel())
     M = int(pos.numel()) - 1
@@ -454,7 +454,7 @@ def _locality_ratio(a, J: int) -> float:
     0.95, random 0.99) and ~0 for a well-ordered/banded one (FEM cant 0.008, band
     0.001). This is BOTH the analytic gate (_scattered) and a learned-model feature.
     Uses a private RNG so it never perturbs global torch RNG."""
-    idx = a.index.mode_indices
+    idx = a._native_mode_indices()
     pos, crd = idx[1][0], idx[1][1]
     M = int(pos.numel()) - 1
     if M <= 0:
@@ -497,7 +497,7 @@ def is_candidate(a, b, level: Optional[str] = None) -> bool:
         return False
     J = int(a.shape[1])
     N = int(b.shape[1])
-    nnz = int(a.index.mode_indices[1][1].numel())
+    nnz = int(a.storage._mode_indices[1][1].numel())
     C = query_llc()
     # learned widens the gate (operand>C only) ONLY when opted-in (SCORCH_AUTOTUNE_WIDEN=1)
     # AND a per-machine model is loaded. DEFAULT: learned uses the analytic gate (no
@@ -512,10 +512,10 @@ def _tilej_args(a, b, result_shape, Jc, nthreads):
     return [
         result_shape,
         a.shape,
-        a.index.mode_indices,
+        a._native_mode_indices(),
         a.values,
         b.shape,
-        b.index.mode_indices,
+        b._native_mode_indices(),
         b.values,
         Jc,
         nthreads,
@@ -526,10 +526,10 @@ def _tileijk_args(a, b, result_shape, Nc, Jc, nthreads):
     return [
         result_shape,
         a.shape,
-        a.index.mode_indices,
+        a._native_mode_indices(),
         a.values,
         b.shape,
-        b.index.mode_indices,
+        b._native_mode_indices(),
         b.values,
         Nc,
         Jc,
@@ -1162,7 +1162,7 @@ def _degree_cv(a) -> float:
     """Degree-skew std/mean over ~4096 sampled rows (the discriminator between
     power-law skewed graphs -- large Jc fine -- and uniform-random -- small Jc).
     Private RNG; O(sample) from indptr, never O(nnz)."""
-    pos = a.index.mode_indices[1][0]
+    pos = a.storage._mode_indices[1][0]
     M = int(pos.numel()) - 1
     if M <= 0:
         return 0.0
@@ -1280,7 +1280,7 @@ def maybe_dispatch(
     J = int(a.shape[1])
     N = int(b.shape[1])
     M = int(a.shape[0])
-    idx = a.index.mode_indices
+    idx = a._native_mode_indices()
     nnz = int(idx[1][1].numel())
     C = query_llc()
     # learned uses the WIDENED gate (operand>C only) iff opted-in AND a model is loaded;

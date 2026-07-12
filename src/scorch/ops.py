@@ -27,17 +27,18 @@ from .compiler.scheduler import (
     get_forced_schedule,
     regblock_force,
 )
+from .exceptions import CompileSpecError, TensorTypeError, TensorValidationError
 from .format import TensorFormat, LevelFormat, LevelType
+from .layout import TensorSpec
 from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
 from .tiling import maybe_dispatch as _tiling_maybe_dispatch
 from .tiling import is_candidate as _tiling_is_candidate
 from .tiling import _current_level as _tiling_current_level
 from .storage import TensorIndex
-from .stensor import STensor
+from .stensor import STensor, _finalize_generated_mode_indices
 from .utils import (
     parse_format,
     topo_sort_characters,
-    load_to_kernel_cache,
     get_extra_cflags,
     get_extra_ldflags,
     jit_preamble_text,
@@ -75,10 +76,31 @@ def _einsum_cache_key(
     schedule: Optional[Schedule],
 ) -> tuple:
     """Build the early dispatch key, including every scheduling decision."""
+
+    def layout_contract(tensor: Any) -> Any:
+        layout = getattr(tensor, "layout", None)
+        serialize = getattr(layout, "serialize", None)
+        if callable(serialize):
+            return serialize()
+        # Scheduling tools may use lightweight tensor-like objects. Preserve a
+        # deterministic fallback without weakening real tensors' canonical key.
+        shape = getattr(tensor, "shape", ()) or ()
+        mode_order = getattr(tensor, "mode_order", ()) or ()
+        return (
+            "tensor_like",
+            str(getattr(tensor, "format", None)),
+            tuple(shape),
+            tuple(mode_order),
+            str(getattr(tensor, "index_dtype", None)),
+        )
+
     return (
         expression,
-        tuple(str(t.format) for t in tensors),
-        tuple(t.dtype for t in tensors),
+        tuple(layout_contract(t) for t in tensors),
+        tuple(
+            (str(getattr(t, "dtype", None)), str(getattr(t, "device", "cpu")))
+            for t in tensors
+        ),
         str(output_format) if output_format is not None else None,
         tuple(output_mode_order) if output_mode_order else None,
         _schedule_cache_key(schedule),
@@ -91,15 +113,21 @@ def _codegen_kernel_cache_key(
     schedule: Optional[Schedule],
 ) -> str:
     """Cache a lowered CIN without allowing dtype/schedule fields to alias."""
-    tensor_dtypes = tuple(
+    tensor_contracts = tuple(
         sorted(
             {
-                (access.tensor.name, str(access.tensor.dtype))
+                (
+                    access.tensor.name,
+                    str(access.tensor.dtype),
+                    access.tensor.shape,
+                    str(access.tensor.format),
+                    tuple(access.tensor.mode_order or ()),
+                )
                 for access in cin.tensor_accesses
             }
         )
     )
-    key = str(cin) + f"|dtypes:{tensor_dtypes!r}"
+    key = str(cin) + f"|contracts:{tensor_contracts!r}"
     if post_ops:
         key += f"|post_ops:{post_ops}"
     if schedule is not None:
@@ -113,14 +141,35 @@ def _logical_index_sizes(
 ) -> dict:
     """Map logical einsum indices to sizes after physical mode reordering."""
     index_to_size = {}
-    for index_strs, tensor in zip(input_index_strs, tensors):
-        mode_order = tensor.storage.index.mode_order or list(range(tensor.dim()))
+    for operand, (index_strs, tensor) in enumerate(zip(input_index_strs, tensors)):
+        mode_order = list(tensor.mode_order)
+        if len(index_strs) != len(mode_order):
+            raise CompileSpecError(
+                f"einsum operand {operand} has {len(index_strs)} indices but "
+                f"tensor rank {len(mode_order)}"
+            )
         for logical_axis, index_str in enumerate(index_strs):
-            if index_str in index_to_size:
-                continue
             physical_axis = mode_order.index(logical_axis)
-            index_to_size[index_str] = tensor.shape[physical_axis]
+            size = tensor.shape[physical_axis]
+            previous = index_to_size.get(index_str)
+            if previous is not None and previous != size:
+                raise CompileSpecError(
+                    f"einsum index {index_str!r} has incompatible dimensions "
+                    f"{previous} and {size}"
+                )
+            index_to_size[index_str] = size
     return index_to_size
+
+
+def _with_compiler_mode_order(
+    tensor: Union[STensor, TensorSpec], mode_order: Sequence[int]
+) -> Union[STensor, TensorSpec]:
+    """Relayout a runtime tensor or functionally update a compile-only spec."""
+    if isinstance(tensor, TensorSpec):
+        return tensor.with_mode_order(mode_order)
+    result = tensor.copy()
+    result.change_mode_order(list(mode_order))
+    return result
 
 
 # Composition thread-count matching for the drop-in CSR-SpMM (spmm_csr_float_v2).
@@ -220,9 +269,10 @@ def spmv(
     elif not isinstance(output_format, TensorFormat):
         output_format = parse_format(output_format)
 
-    y = TensorVar("y", fmt=output_format)
-    A = TensorVar("A", fmt=a.format)
-    x = TensorVar("x", fmt=b.format)
+    result_shape = (a.shape[0],)
+    y = TensorVar("y", shape=result_shape, fmt=output_format, dtype=a.dtype)
+    A = TensorVar("A", shape=a.shape, fmt=a.format, dtype=a.dtype)
+    x = TensorVar("x", shape=b.shape, fmt=b.format, dtype=b.dtype)
 
     i = IndexVar("i")
     j = IndexVar("j")
@@ -269,12 +319,11 @@ def spmv(
     #  Print kernel compile time to 5 decimal places
     # print(f"Kernel compile time: {compile_time:.5f} seconds")
 
-    result_shape = (a.shape[0],)
     args = [result_shape]
 
     for tensor in [a, b]:
         args.append(tensor.shape)  # type: ignore
-        args.append(tensor.index.mode_indices)  # type: ignore
+        args.append(tensor._native_mode_indices())  # type: ignore
         args.append(tensor.values)  # type: ignore
 
     start_time = time.time()
@@ -289,7 +338,9 @@ def spmv(
     result = STensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp.storage.index.mode_indices,
+            mode_indices=_finalize_generated_mode_indices(
+                output_format, result_cpp.storage.index.mode_indices
+            ),
             tensor_format=output_format,
         ),
         value=result_cpp.storage.value,
@@ -362,15 +413,23 @@ def matmul_wksp(
         output_format = parse_format(output_format)
 
     # ── Module cache: skip CIN→LLIR→codegen on repeat calls ──────────
-    _cache_key = (str(a.format), str(b.format), str(output_format))
+    result_shape = (a.shape[0], b.shape[1])
+    _cache_key = (
+        a.layout.serialize(),
+        b.layout.serialize(),
+        str(a.dtype),
+        str(b.dtype),
+        str(output_format),
+        result_shape,
+    )
     if not hasattr(matmul_wksp, "_module_cache"):
         matmul_wksp._module_cache = {}
 
     module = matmul_wksp._module_cache.get(_cache_key)
     if module is None:
-        C = TensorVar("C", fmt=output_format)
-        A = TensorVar("A", fmt=a.format)
-        B = TensorVar("B", fmt=b.format)
+        C = TensorVar("C", shape=result_shape, fmt=output_format, dtype=a.dtype)
+        A = TensorVar("A", shape=a.shape, fmt=a.format, dtype=a.dtype)
+        B = TensorVar("B", shape=b.shape, fmt=b.format, dtype=b.dtype)
 
         # Use a dense workspace when the output is dense (avoids COO hash-map overhead).
         wksp_dense = output_format.is_dense()
@@ -424,12 +483,11 @@ def matmul_wksp(
         )
         matmul_wksp._module_cache[_cache_key] = module
 
-    result_shape = (a.shape[0], b.shape[1])
     args = [result_shape]
 
     for tensor in [a, b]:
         args.append(tensor.shape)  # type: ignore
-        args.append(tensor.index.mode_indices)  # type: ignore
+        args.append(tensor._native_mode_indices())  # type: ignore
         args.append(tensor.values)  # type: ignore
 
     start_time = time.time()
@@ -444,7 +502,9 @@ def matmul_wksp(
     result = STensor(
         shape=result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp.storage.index.mode_indices,
+            mode_indices=_finalize_generated_mode_indices(
+                output_format, result_cpp.storage.index.mode_indices
+            ),
             tensor_format=output_format,
         ),
         value=result_cpp.storage.value,
@@ -648,7 +708,10 @@ def matmul(
                 result = STensor(
                     shape=result_shape,
                     index=TensorIndex(
-                        mode_indices=result_cpp.storage.index.mode_indices,
+                        mode_indices=_finalize_generated_mode_indices(
+                            resolved.output_format,
+                            result_cpp.storage.index.mode_indices,
+                        ),
                         tensor_format=resolved.output_format,
                     ),
                     value=result_cpp.storage.value,
@@ -738,7 +801,10 @@ def matmul(
             result = STensor(
                 shape=result_shape,
                 index=TensorIndex(
-                    mode_indices=result_cpp.storage.index.mode_indices,
+                    mode_indices=_finalize_generated_mode_indices(
+                        resolved.output_format,
+                        result_cpp.storage.index.mode_indices,
+                    ),
                     tensor_format=resolved.output_format,
                 ),
                 value=result_cpp.storage.value,
@@ -1087,7 +1153,7 @@ def sparse_linear_fm(
     result_cpp = fn(
         result_shape,
         list(weight.shape),
-        weight.index.mode_indices,
+        weight._native_mode_indices(),
         weight.values,
         [in_dim, batch],
         _EMPTY_MODE_INDICES,
@@ -1332,10 +1398,10 @@ def _build_regblock_dual_path(
 
 def einsum(
     expression: str,
-    *tensors: Optional[Union[torch.Tensor, STensor]],
+    *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
     compile_only: Optional[bool] = False,
     **kwargs: Any,
-) -> STensor:
+) -> Union[STensor, TensorSpec]:
     """Compile and evaluate a numpy-style einsum over sparse/dense operands.
 
     The generic front door to the sparse-tensor compiler. Given an index-notation
@@ -1351,14 +1417,14 @@ def einsum(
         output, e.g. ``"ik,kj->ij"`` (matmul / SpMM / SpGEMM), ``"ij,ij->ij"``
         (elementwise multiply), or ``"ij,ik,jk->ij"`` (SDDMM). One character per
         index. An implicit-output form (no ``"->"``) is **not** supported and
-        raises ``IndexError``.
-    *tensors : torch.Tensor or STensor
+        raises ``CompileSpecError``.
+    *tensors : torch.Tensor, STensor, or TensorSpec
         The operands, one per comma-separated input group. ``torch.Tensor`` inputs
-        are auto-converted with ``STensor.from_torch``.
+        are auto-converted with ``STensor.from_torch``. ``TensorSpec`` operands
+        are accepted only for compile-only calls.
     compile_only : bool, default False
-        When ``True``, compile and cache the kernel but return a placeholder
-        ``STensor("Compile only")`` without executing (used by
-        :func:`precompile_kernels`).
+        When ``True``, compile and cache the kernel without executing and return
+        an immutable output ``TensorSpec`` (used by :func:`precompile_kernels`).
     **kwargs
         format : str or list or TensorFormat, optional
             Requested output format. If omitted, the output format is inferred
@@ -1384,8 +1450,8 @@ def einsum(
 
     Raises
     ------
-    IndexError
-        If ``expression`` omits the ``"->"`` output separator.
+    CompileSpecError
+        If the expression or requested output contract is malformed.
 
     Notes
     -----
@@ -1442,6 +1508,92 @@ def einsum(
     tensors = tuple(
         STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors
     )
+    if not isinstance(expression, str) or expression.count("->") != 1:
+        raise CompileSpecError("einsum expression must contain an explicit '->'")
+    input_expression, result_expression = expression.split("->")
+    input_groups = input_expression.split(",")
+    if len(input_groups) != len(tensors):
+        raise CompileSpecError(
+            f"einsum expression expects {len(input_groups)} operands, got {len(tensors)}"
+        )
+    if any(tensor is None for tensor in tensors):
+        raise TensorTypeError("einsum operands cannot be None")
+    invalid = [
+        type(tensor).__name__
+        for tensor in tensors
+        if not isinstance(tensor, (STensor, TensorSpec))
+    ]
+    if invalid:
+        raise TensorTypeError(
+            "einsum operands must be torch.Tensor, STensor, or TensorSpec; got "
+            + ", ".join(invalid)
+        )
+    if any(
+        not group or not all(label.isascii() and label.isalpha() for label in group)
+        for group in input_groups
+    ):
+        raise CompileSpecError("einsum input labels must be non-empty ASCII letters")
+    if not result_expression or not all(
+        label.isascii() and label.isalpha() for label in result_expression
+    ):
+        raise CompileSpecError("einsum result labels must be non-empty ASCII letters")
+    if len(set(result_expression)) != len(result_expression):
+        raise CompileSpecError("einsum result labels must be unique")
+    input_labels = set("".join(input_groups))
+    unknown_result_labels = [
+        label for label in result_expression if label not in input_labels
+    ]
+    if unknown_result_labels:
+        raise CompileSpecError(
+            "einsum result labels must appear in an input; unknown labels: "
+            + ", ".join(unknown_result_labels)
+        )
+    input_index_strs = [list(group) for group in input_groups]
+    result_index_strs = list(result_expression)
+    requested_output_format = kwargs.get("format")
+    if requested_output_format is not None:
+        requested_output_format = parse_format(requested_output_format)
+        if requested_output_format.get_order() != len(result_index_strs):
+            raise CompileSpecError(
+                f"einsum output format rank {requested_output_format.get_order()} "
+                f"does not match result rank {len(result_index_strs)}"
+            )
+        if any(
+            level_type == LevelType.SINGLETON
+            for level_type in requested_output_format.get_level_types()
+        ):
+            raise CompileSpecError(
+                "singleton output levels are not supported by the compiler"
+            )
+    for operand, (labels, tensor) in enumerate(zip(input_index_strs, tensors)):
+        if len(labels) != tensor.dim():
+            raise CompileSpecError(
+                f"einsum operand {operand} has {len(labels)} labels but tensor "
+                f"rank {tensor.dim()}"
+            )
+    output_mode_order = kwargs.get("output_mode_order")
+    if output_mode_order is not None:
+        if isinstance(output_mode_order, (str, bytes)) or not isinstance(
+            output_mode_order, Sequence
+        ):
+            raise CompileSpecError("output_mode_order must be a sequence of integers")
+        if any(
+            isinstance(mode, bool) or not isinstance(mode, int)
+            for mode in output_mode_order
+        ):
+            raise CompileSpecError("output_mode_order entries must be integers")
+        if len(output_mode_order) != len(result_index_strs) or sorted(
+            output_mode_order
+        ) != list(range(len(result_index_strs))):
+            raise CompileSpecError(
+                "output_mode_order must be a permutation of the result modes"
+            )
+        output_mode_order = list(output_mode_order)
+    _logical_index_sizes(input_index_strs, tensors)
+    if not compile_only and any(isinstance(tensor, TensorSpec) for tensor in tensors):
+        raise CompileSpecError(
+            "TensorSpec has no runtime payload; pass compile_only=True or use STensor"
+        )
     effective_schedule = _effective_schedule(kwargs)
 
     # ── Prebuilt SDDMM dispatch ────────────────────────────────────────
@@ -1455,6 +1607,9 @@ def einsum(
         and str(tensors[0].format) == "o,o"
         and str(tensors[1].format) == "d,d"
         and str(tensors[2].format) == "d,d"
+        and all(
+            tuple(tensor.mode_order) == tuple(range(tensor.dim())) for tensor in tensors
+        )
     ):
         import scorch_ops as _ops
 
@@ -1465,20 +1620,23 @@ def einsum(
             result_cpp = _sddmm_fn(
                 result_shape,
                 S.shape,
-                S.index.mode_indices,
+                S._native_mode_indices(),
                 S.values,
                 A.shape,
-                A.index.mode_indices,
+                A._native_mode_indices(),
                 A.values,
                 B.shape,
-                B.index.mode_indices,
+                B._native_mode_indices(),
                 B.values,
             )
             return STensor(
                 shape=result_shape,
                 index=TensorIndex(
-                    mode_indices=result_cpp.storage.index.mode_indices,
+                    mode_indices=_finalize_generated_mode_indices(
+                        S.format, result_cpp.storage.index.mode_indices
+                    ),
                     tensor_format=S.format,
+                    mode_order=S.mode_order,
                 ),
                 value=result_cpp.storage.value,
             )
@@ -1492,7 +1650,7 @@ def einsum(
             expression,
             tensors,
             kwargs.get("format", None),
-            kwargs.get("output_mode_order"),
+            output_mode_order,
             effective_schedule,
         )
         _cached = _einsum_dispatch_cache.get(_dispatch_key)
@@ -1506,19 +1664,26 @@ def einsum(
             _result_idx_strs = _cached[6]
 
             # Set correct mode orders on input tensors
-            for _t, _mo in zip(tensors, _input_mos):
-                if _t.storage.index.mode_order != _mo:
-                    _t.change_mode_order(_mo)
+            cached_tensors = list(tensors)
+            for _index, (_t, _mo) in enumerate(zip(cached_tensors, _input_mos)):
+                if list(_t.mode_order) != _mo:
+                    cached_tensors[_index] = _with_compiler_mode_order(_t, _mo)
+            tensors = tuple(cached_tensors)
 
             # Compute result shape from expression + current tensor shapes
             _idx_to_size = _logical_index_sizes(_input_idx_strs, tensors)
-            _result_shape = tuple(_idx_to_size[_s] for _s in _result_idx_strs)
+            _logical_result_shape = tuple(_idx_to_size[_s] for _s in _result_idx_strs)
+            _result_mode_order = _temp_mo or list(range(len(_logical_result_shape)))
+            _physical_result_shape = tuple(
+                _logical_result_shape[logical_mode]
+                for logical_mode in _result_mode_order
+            )
 
             # Build args and evaluate
-            _args: List[Any] = [_result_shape]
+            _args: List[Any] = [_physical_result_shape]
             for _t in tensors:
                 _args.append(_t.shape)
-                _args.append(_t.index.mode_indices)
+                _args.append(_t._native_mode_indices())
                 _args.append(_t.values)
 
             _t0 = time.time()
@@ -1526,9 +1691,11 @@ def einsum(
             _eval_time = time.time() - _t0
 
             _result = STensor(
-                shape=_result_shape,
+                shape=_physical_result_shape,
                 index=TensorIndex(
-                    mode_indices=_result_cpp.storage.index.mode_indices,
+                    mode_indices=_finalize_generated_mode_indices(
+                        _output_fmt, _result_cpp.storage.index.mode_indices
+                    ),
                     tensor_format=_output_fmt,
                     mode_order=_temp_mo if _temp_mo else _final_mo,
                 ),
@@ -1546,20 +1713,16 @@ def einsum(
 
     # unique_index_strs should be a list of unique index strings
     # e.g. ["i", "j", "k"]
-    unique_index_strs = list(expression.replace(",", "").replace("->", ""))
+    unique_index_strs = list("".join(input_groups) + result_expression)
     # Make sure the index strings are unique, keeping the order
     unique_index_strs = list(dict.fromkeys(unique_index_strs))
-    input_index_strs = [list(x) for x in expression.split("->")[0].split(",")]
-    result_index_strs = list(expression.split("->")[1])
-
     # Reorder input index strings by each tensor's mode_order
     input_index_strs_sorted = [
-        [input_index_strs[i][idx] for idx in tensors[i].storage.index.mode_order]
+        [input_index_strs[i][idx] for idx in tensors[i].mode_order]
         for i in range(len(tensors))
     ]
 
     # Reorder result index strings by output_mode_order if provided
-    output_mode_order = kwargs.get("output_mode_order", None)
     result_index_strs_sorted = (
         [result_index_strs[i] for i in output_mode_order]
         if output_mode_order
@@ -1587,20 +1750,25 @@ def einsum(
     final_mode_order = output_mode_order if output_mode_order else temp_mode_order
 
     # Change input tensor mode orders to match schedule
+    tensors = list(tensors)
     for tensor_index, input_index_str in enumerate(input_index_strs):
         new_mode_order = []
         str_to_mode = {s: i for i, s in enumerate(input_index_str)}
         for s in index_strs_by_schedule:
             if s in str_to_mode:
                 new_mode_order.append(str_to_mode[s])
-        tensors[tensor_index].change_mode_order(new_mode_order)
+        tensors[tensor_index] = _with_compiler_mode_order(
+            tensors[tensor_index], new_mode_order
+        )
+    tensors = tuple(tensors)
 
     # Create a mapping from each index string to the list of LevelFormats
     # of the levels it indexes into each input tensor
     index_str_to_level_formats = {}
     tensors_new = []
     for sorted_index_strs, tensor in zip(input_index_strs_sorted, tensors):
-        assert isinstance(tensor, STensor), "Input tensor is not a Scorch Tensor"
+        if not isinstance(tensor, (STensor, TensorSpec)):
+            raise TensorTypeError("input tensor is not a Scorch tensor or spec")
         tensors_new.append(tensor)
 
         for i, index_str in enumerate(sorted_index_strs):
@@ -1617,25 +1785,27 @@ def einsum(
     tensor_names_available = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     output_tensor_dtype = None
     for i, tensor in enumerate(tensors):
-        if isinstance(tensor, STensor):
+        if isinstance(tensor, (STensor, TensorSpec)):
             tensor_name = tensor_names_available.pop(0)
             tensor_vars.append(
                 TensorVar(
                     name=tensor_name,
                     fmt=tensor.format,
+                    shape=tensor.shape,
                     dtype=tensor.dtype,
-                    mode_order=tensor.storage.index.mode_order,
+                    mode_order=list(tensor.mode_order),
                 )
             )
             if output_tensor_dtype is None:
                 output_tensor_dtype = tensor.dtype
             else:
-                assert (
-                    output_tensor_dtype == tensor.dtype
-                ), "All tensors must have the same dtype"
+                if output_tensor_dtype != tensor.dtype:
+                    raise TensorValidationError(
+                        "all einsum operands must have the same value dtype"
+                    )
 
     # Get output format from kwargs
-    output_format = kwargs.get("format", None)
+    output_format = requested_output_format
 
     # If output format is not specified, do sparse for all levels first
     if output_format is None:
@@ -1721,20 +1891,29 @@ def einsum(
 
         output_format = TensorFormat(output_level_formats)
         # print(f"\nUnspecified output format, using inferred {output_format}")
-    else:
-        output_format = parse_format(output_format)
+    result_index_sizes = _logical_index_sizes(input_index_strs, tensors)
+    logical_result_shape = tuple(
+        result_index_sizes[index_str] for index_str in result_index_strs
+    )
+    result_mode_order = temp_mode_order or list(range(len(logical_result_shape)))
+    physical_result_shape = tuple(
+        logical_result_shape[logical_mode] for logical_mode in result_mode_order
+    )
 
     # Create the result TensorVar
-    assert output_tensor_dtype is not None, "Output tensor type is not defined"
+    if output_tensor_dtype is None:
+        raise CompileSpecError("einsum requires at least one typed operand")
     result_tensor_var = TensorVar(
         name=tensor_names_available.pop(0),
         fmt=output_format,
+        shape=physical_result_shape,
         dtype=output_tensor_dtype,
         mode_order=temp_mode_order,
     )
 
     # Build RHS expression: product of all tensor accesses
-    assert index_var_dict, "index_var_dict is empty"
+    if not index_var_dict:
+        raise CompileSpecError("einsum expression does not define any indices")
     rhs_expr = None
     for i, tensor_var in enumerate(tensor_vars):
         indices = [index_var_dict[s] for s in input_index_strs[i]]
@@ -1744,7 +1923,6 @@ def einsum(
         rhs_expr = access if rhs_expr is None else rhs_expr * access
 
     # Build LHS access and create assignment
-    assert result_tensor_var is not None, "result_tensor_var is not defined"
     lhs_indices = [index_var_dict[s] for s in result_index_strs]
     lhs_key = lhs_indices[0] if len(lhs_indices) == 1 else tuple(lhs_indices)
     result_tensor_var[lhs_key] = rhs_expr
@@ -1775,10 +1953,14 @@ def einsum(
         desired_mode_order = [
             input_index_str.index(index_str) for index_str in desired_index_strs
         ]
-        if tensors[tensor_index].storage.index.mode_order != desired_mode_order:
-            tensors[tensor_index].change_mode_order(desired_mode_order)
+        if list(tensors[tensor_index].mode_order) != desired_mode_order:
+            tensors[tensor_index] = _with_compiler_mode_order(
+                tensors[tensor_index], desired_mode_order
+            )
+        tensor_vars[tensor_index].shape = tensors[tensor_index].shape
         if tensor_vars[tensor_index].mode_order != desired_mode_order:
             tensor_vars[tensor_index].mode_order = desired_mode_order
+    tensors = tuple(tensors)
 
     # Extract PostOps for fused kernel compilation
     _post_ops = kwargs.get("_post_ops", None)
@@ -1850,28 +2032,27 @@ def einsum(
             output_format,
             temp_mode_order,
             final_mode_order,
-            [list(t.storage.index.mode_order) for t in tensors],
+            [list(t.mode_order) for t in tensors],
             input_index_strs,
             result_index_strs,
         )
 
     if compile_only:
-        return STensor("Compile only")
-
-    # Create a mapping from each index string to the size of the dimension
-    # it indexes
-    index_str_to_size = _logical_index_sizes(input_index_strs, tensors)
-
-    # Get the result shape from the expression, using index_str_to_size
-    result_shape = tuple(
-        [index_str_to_size[index_str] for index_str in result_index_strs]
-    )
+        result_mode_order = final_mode_order or list(range(len(result_index_strs)))
+        return TensorSpec(
+            output_format,
+            logical_result_shape,
+            dtype=output_tensor_dtype,
+            mode_order=result_mode_order,
+            index_dtype=torch.int32,
+            name="einsum_result",
+        )
 
     # Call module.evaluate with the output shape,and the mode indices and values of each tensor
-    args: Sequence[Any] = [result_shape]
+    args: Sequence[Any] = [physical_result_shape]
     for tensor in tensors:
         args.append(tensor.shape)  # type: ignore
-        args.append(tensor.index.mode_indices)  # type: ignore
+        args.append(tensor._native_mode_indices())  # type: ignore
         args.append(tensor.values)  # type: ignore
 
     # Append extra tensors for PostOps (bias, scale, etc.)
@@ -1886,9 +2067,11 @@ def einsum(
     # print("Time taken for evaluate:", eval_time)
 
     result = STensor(
-        shape=result_shape,
+        shape=physical_result_shape,
         index=TensorIndex(
-            mode_indices=result_cpp.storage.index.mode_indices,
+            mode_indices=_finalize_generated_mode_indices(
+                output_format, result_cpp.storage.index.mode_indices
+            ),
             tensor_format=output_format,
             mode_order=temp_mode_order if temp_mode_order else final_mode_order,
         ),
@@ -1992,6 +2175,27 @@ def lower_and_exec_cin(
     """
     _align_mode_orders_to_loop_order(cin_stmt, args)
 
+    rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+    if len(rhs_tensor_vars) != len(args):
+        raise CompileSpecError(
+            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got {len(args)}"
+        )
+    for tensor_var, arg in zip(rhs_tensor_vars, args):
+        if tensor_var.format != arg.format:
+            raise CompileSpecError(
+                f"CIN tensor {tensor_var.name!r} expects format "
+                f"{tensor_var.format}, got {arg.format}"
+            )
+        tensor_var.shape = arg.shape
+        tensor_var.dtype = arg.dtype
+        tensor_var.mode_order = list(arg.mode_order)
+
+    output_dtype = args[0].dtype if args else torch.float32
+    for tensor_var in cin_stmt.get_result_tensor_vars():
+        if not isinstance(tensor_var, Workspace):
+            tensor_var.shape = tuple(result_shape)
+            tensor_var.dtype = output_dtype
+
     # Lower to LLIR
     lowerer = CINLowerer()
     lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -2012,7 +2216,7 @@ def lower_and_exec_cin(
 
     for arg in args:
         module_args.append(arg.shape)
-        module_args.append(arg.index.mode_indices)
+        module_args.append(arg._native_mode_indices())
         module_args.append(arg.values)
 
     start_time = time.time()
@@ -2025,7 +2229,9 @@ def lower_and_exec_cin(
     result = STensor(
         shape=tuple(result_shape),
         index=TensorIndex(
-            mode_indices=result_cpp.storage.index.mode_indices,
+            mode_indices=_finalize_generated_mode_indices(
+                parse_format("dd"), result_cpp.storage.index.mode_indices
+            ),
             tensor_format="dd",
         ),
         value=result_cpp.storage.value,
@@ -2061,9 +2267,11 @@ def precompile_kernels():
     >>> scorch.precompile_kernels()   # doctest: +SKIP
     Precompiled kernels.
     """
-    DS = STensor(index=TensorIndex(tensor_format="ds"))
-    DD = STensor(index=TensorIndex(tensor_format="dd"))
-    OO = STensor(index=TensorIndex(tensor_format="oo"))
+    # Extents are irrelevant to generated code; a real, immutable rank-2 spec
+    # replaces the former format-only (and invalid) STensor placeholders.
+    DS = TensorSpec("ds", (1, 1), name="csr_spec")
+    DD = TensorSpec("dd", (1, 1), name="dense_spec")
+    OO = TensorSpec("oo", (1, 1), name="coo_spec")
 
     einsum("ik,kj->ij", DS, DD, compile_only=True, format="dd")
     einsum("ik,kj->ij", OO, DD, compile_only=True, format="dd")

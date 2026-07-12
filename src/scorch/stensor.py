@@ -1,14 +1,31 @@
 from __future__ import annotations
+from collections.abc import Sequence
 from copy import deepcopy
+from dataclasses import replace
 from typing import Optional, Tuple, Union, List
 
 import torch
 
-from .compiler.cin import TensorVar, ForAll, IndexVar, Workspace, Where, TensorAssign, Operation
+from .compiler.cin import (
+    TensorVar,
+    ForAll,
+    IndexVar,
+    Workspace,
+    Where,
+    TensorAssign,
+)
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
+from .exceptions import (
+    TensorIndexError,
+    TensorLayoutError,
+    TensorStorageError,
+    TensorTypeError,
+    TensorValidationError,
+)
 from .format import TensorFormat, LevelFormat, LevelType
-from .storage import TensorStorage, TensorIndex, TensorStorageView
+from .layout import TensorLayout, TensorMetadata
+from .storage import SparseStorage, TensorIndex
 from .utils import (
     parse_format,
     get_extra_cflags,
@@ -17,6 +34,28 @@ from .utils import (
     _kernel_name,
     _load_kernel,
 )
+
+
+def _finalize_generated_mode_indices(
+    tensor_format: TensorFormat,
+    mode_indices: Sequence[Sequence[torch.Tensor]],
+) -> List[List[torch.Tensor]]:
+    """Finish zero-initialized trailing compressed positions from JIT output."""
+    finalized = [list(arrays) for arrays in mode_indices]
+    for level, level_format in enumerate(tensor_format.get_level_formats()):
+        if level_format.get_level_type() != LevelType.COMPRESSED:
+            continue
+        positions = finalized[level][0]
+        if positions.numel() == 0 or positions[-1].item() != 0:
+            continue
+        nonzero = torch.nonzero(positions, as_tuple=False).flatten()
+        if nonzero.numel() == 0:
+            continue
+        last_written = int(nonzero[-1].item())
+        repaired = positions.clone()
+        repaired[last_written + 1 :] = repaired[last_written]
+        finalized[level][0] = repaired
+    return finalized
 
 
 class Window(object):
@@ -47,18 +86,19 @@ class STensor:
     """A sparse tensor stored in a custom, per-mode layout.
 
     ``STensor`` is Scorch's user-facing sparse tensor. It is a thin *logical*
-    handle: it records the tensor's name, logical shape, and logical dtype and
-    delegates all numeric payload to ``self._storage`` (a
-    :class:`~scorch.storage.TensorStorage`). The storage in turn pairs a flat 1-D
-    values tensor with a :class:`~scorch.storage.TensorIndex`, which holds the
-    :class:`~scorch.format.TensorFormat` (one :class:`~scorch.format.LevelType`
-    per mode — dense, compressed, or coordinate) and the coordinate arrays that
-    describe where the nonzeros live.
+    handle: one immutable :class:`~scorch.layout.TensorMetadata` owns its name,
+    dtype, device, and :class:`~scorch.layout.TensorLayout`; numeric payload and
+    structural indices live in a validated
+    :class:`~scorch.storage.SparseStorage`. The layout's
+    :class:`~scorch.format.TensorFormat` has one
+    :class:`~scorch.format.LevelType` per physical mode (dense, compressed, or
+    coordinate).
 
     Users almost never construct an ``STensor`` directly. Build one from a torch
     tensor with the factories :meth:`from_torch`, :meth:`from_csr`, or
     :meth:`from_coo` (also re-exported at module scope as ``scorch.from_torch``,
-    ``scorch.from_csr``, ``scorch.from_coo``), and exit back to PyTorch with
+    ``scorch.from_csr``, ``scorch.from_coo``), or use
+    ``scorch.from_components`` for explicit storage. Exit back to PyTorch with
     :meth:`to_torch`. Matmul is the top-level function ``scorch.matmul(a, b)`` /
     ``scorch.einsum(...)`` — ``STensor`` deliberately defines no ``__matmul__``,
     so ``a @ b`` will not work.
@@ -95,38 +135,103 @@ class STensor:
     to_torch : Materialize back to a dense ``torch.Tensor``.
     """
 
-    _name: Optional[str]
-
-    _shape: Optional[Tuple[int, ...]]
-
-    # (Logical) component type, which might be different from the physical component type in TensorStorage
-    _dtype: torch.dtype = torch.float32
-
-    # TODO: storage can also be a secondary index (TensorStorageView)
-    _storage: Optional[Union[TensorStorage, TensorStorageView]]
+    _metadata: TensorMetadata
+    _storage: SparseStorage
 
     def __init__(
         self,
         name: Optional[str] = None,
         shape: Optional[Tuple[int, ...]] = None,
-        storage: Optional[Union[TensorStorage, TensorStorageView]] = None,
+        storage: Optional[SparseStorage] = None,
         index: Optional[TensorIndex] = None,
         value: Optional[torch.Tensor] = None,
         requires_grad: Optional[bool] = False,
     ) -> None:
+        tensor_name = "tensor" if name is None else name
+        if not isinstance(requires_grad, bool):
+            raise TensorTypeError("requires_grad must be a bool")
         if storage is not None:
-            self._storage = storage
+            if index is not None or value is not None:
+                raise TensorStorageError(
+                    "storage cannot be combined with separate index or value arguments"
+                )
+            if not isinstance(storage, SparseStorage):
+                raise TensorTypeError("storage must be a SparseStorage")
+            if shape is not None:
+                if isinstance(shape, (str, bytes)) or not isinstance(shape, Sequence):
+                    raise TensorTypeError("shape must be a sequence of integers")
+                declared_shape = tuple(shape)
+                if declared_shape != storage.layout.physical_shape:
+                    raise TensorLayoutError(
+                        f"shape {declared_shape} does not match storage physical "
+                        f"shape {storage.layout.physical_shape}"
+                    )
+            runtime_storage = storage
         else:
-            self._storage = TensorStorage(index=index, value=value, shape=shape)
-        self._name = name
-        self._shape = shape
+            missing = [
+                field
+                for field, item in (
+                    ("shape", shape),
+                    ("index", index),
+                    ("value", value),
+                )
+                if item is None
+            ]
+            if missing:
+                raise TensorValidationError(
+                    "runtime STensor construction requires shape, index, and value; "
+                    f"missing {', '.join(missing)}. Use TensorSpec for compile-only tensors."
+                )
+            if not isinstance(index, TensorIndex):
+                raise TensorTypeError("index must be a TensorIndex")
+            if not isinstance(value, torch.Tensor):
+                raise TensorTypeError("value must be a torch.Tensor")
+            if shape is None:
+                raise TensorLayoutError("shape is required for runtime storage")
+            layout = TensorLayout.from_physical_shape(
+                shape, index.format, index.mode_order, index.index_dtype
+            )
+            runtime_storage = SparseStorage(layout, value, index=index)
+        metadata = TensorMetadata(
+            tensor_name,
+            runtime_storage.value.dtype,
+            runtime_storage.value.device,
+            runtime_storage.layout,
+            requires_grad,
+        )
+        self._set_state(metadata, runtime_storage)
 
-        if value is not None:
-            self._dtype = value.dtype
-        elif storage and storage.value is not None:
-            self._dtype = storage.value.dtype
+    @classmethod
+    def _from_validated(
+        cls, metadata: TensorMetadata, storage: SparseStorage
+    ) -> "STensor":
+        """Internal constructor for already assembled value objects."""
+        tensor = object.__new__(cls)
+        tensor._set_state(metadata, storage)
+        return tensor
 
-        self.requires_grad = requires_grad
+    def _set_state(self, metadata: TensorMetadata, storage: SparseStorage) -> None:
+        if not isinstance(metadata, TensorMetadata):
+            raise TensorTypeError("metadata must be TensorMetadata")
+        if not isinstance(storage, SparseStorage):
+            raise TensorTypeError("storage must be SparseStorage")
+        if metadata.layout != storage.layout:
+            raise TensorLayoutError(
+                "metadata and storage must reference the same layout"
+            )
+        if metadata.dtype != storage.value.dtype:
+            raise TensorStorageError(
+                f"metadata dtype {metadata.dtype} does not match values dtype "
+                f"{storage.value.dtype}"
+            )
+        if metadata.device != storage.value.device:
+            raise TensorStorageError(
+                f"metadata device {metadata.device} does not match values device "
+                f"{storage.value.device}"
+            )
+        storage.validate()
+        self._metadata = metadata
+        self._storage = storage
 
     def insert(self, indices, values):
         """Insert values into the tensor.
@@ -138,14 +243,12 @@ class STensor:
         values : array-like
             Values to insert at ``indices``.
 
-        Notes
-        -----
-        Not yet implemented — this method is a placeholder (no-op) and performs
-        no insertion. There is no supported in-place mutation API on ``STensor``
-        today; build a new tensor with a factory instead.
+        Raises
+        ------
+        NotImplementedError
+            Always. Build a new tensor with a factory instead.
         """
-        # TODO: Implement this.
-        pass
+        raise NotImplementedError("STensor insertion is not implemented")
 
     def _nnz(self):
         """Get the number of non-zero elements in the tensor."""
@@ -175,18 +278,14 @@ class STensor:
             The name assigned at construction (the factories default it to
             ``"tensor"``).
 
-        Raises
-        ------
-        AssertionError
-            If no name was ever set. A hand-built ``STensor(shape=...)`` with no
-            ``name`` raises on access; factory-made tensors are always safe.
+        Runtime tensors always have a validated non-empty name; factories use
+        ``"tensor"`` when none is supplied.
         """
-        assert self._name is not None, "Tensor name is not set."
-        return self._name
+        return self._metadata.name
 
     @name.setter
     def name(self, name: str) -> None:
-        self._name = name
+        self._metadata = replace(self._metadata, name=name)
 
     @property
     def values(self) -> torch.Tensor:
@@ -216,6 +315,10 @@ class STensor:
         """
         return self.storage.index
 
+    def _native_mode_indices(self) -> List[List[torch.Tensor]]:
+        """Return trusted internal index handles for native kernel calls."""
+        return self.storage._native_mode_indices()
+
     @property
     def format(self) -> TensorFormat:
         """The per-mode storage format.
@@ -228,57 +331,86 @@ class STensor:
             comma-joined level string, e.g. ``"d,d"`` (dense), ``"d,s"`` (CSR),
             or ``"o,o"`` (COO).
 
-        Raises
-        ------
-        AssertionError
-            If the index has no format set.
+        Runtime tensors always have a format whose rank matches their layout.
         """
-        tensor_format = self.index.format
-        assert tensor_format is not None, "Tensor format is not set."
-        return tensor_format
+        return self.layout.format
 
     @property
-    def storage(self) -> TensorStorage:
+    def storage(self) -> SparseStorage:
         """The physical storage container.
 
         Returns
         -------
-        TensorStorage
-            The :class:`~scorch.storage.TensorStorage` holding the flat values
-            tensor and the :class:`~scorch.storage.TensorIndex`.
-
-        Raises
-        ------
-        AssertionError
-            If no storage was set on this tensor.
+        SparseStorage
+            The frozen :class:`~scorch.storage.SparseStorage` holding flat
+            values, index arrays, and the canonical layout.
         """
-        assert self._storage is not None, "Tensor storage is not set."
         return self._storage
 
     @property
     def dtype(self):
-        """The logical component dtype (default ``torch.float32``).
+        """The authoritative component dtype.
 
         Returns
         -------
         torch.dtype
-            The logical dtype. This may differ from the physical dtype of the
-            stored values (``storage._dtype``); :meth:`to_torch` casts back to
-            this logical dtype on the way out.
+            The metadata dtype, cross-validated against stored values.
         """
-        return self._dtype
+        return self._metadata.dtype
+
+    @property
+    def device(self) -> torch.device:
+        """The authoritative runtime device."""
+        return self._metadata.device
+
+    @property
+    def layout(self) -> TensorLayout:
+        """The immutable logical-to-physical layout."""
+        return self._metadata.layout
+
+    @property
+    def metadata(self) -> TensorMetadata:
+        """The immutable runtime metadata value."""
+        return self._metadata
+
+    @property
+    def logical_shape(self) -> Tuple[int, ...]:
+        return self.layout.logical_shape
+
+    @property
+    def physical_shape(self) -> Tuple[int, ...]:
+        return self.layout.physical_shape
+
+    @property
+    def index_dtype(self) -> torch.dtype:
+        return self.layout.index_dtype
+
+    @property
+    def mode_order(self) -> Tuple[int, ...]:
+        return self.layout.permutation
+
+    @property
+    def requires_grad(self) -> bool:
+        return self._metadata.requires_grad
+
+    @requires_grad.setter
+    def requires_grad(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise TensorTypeError("requires_grad must be a bool")
+        self._metadata = replace(self._metadata, requires_grad=value)
 
     @property
     def shape(self) -> Tuple[int, ...]:
-        """The logical shape.
+        """The current physical shape (retained for API compatibility).
 
         Returns
         -------
         tuple of int
-            The tensor's shape in logical (original) axis order, or the empty
-            tuple ``()`` if the shape is unset.
+            Extents in physical storage-level order. Use
+            :attr:`logical_shape` for the original logical axis order.
         """
-        return self._shape if self._shape is not None else tuple()
+        # Compatibility: historically ``shape`` is the current physical shape.
+        return self.layout.physical_shape
 
     def __str__(self):
         """Get a string representation of the tensor."""
@@ -289,16 +421,14 @@ class STensor:
         """Get a string representation of the tensor."""
         return self.__str__()
 
-    def validate(self):
+    def validate(self) -> None:
         """Validate the tensor's internal consistency.
 
-        Raises
-        ------
-        NotImplementedError
-            Always. This method is a placeholder and performs no validation.
+        Re-runs metadata/storage agreement and sparse storage invariant checks.
+        Returns ``None`` when the tensor is valid and raises a Scorch domain
+        exception otherwise.
         """
-        # TODO: Implement this.
-        raise NotImplementedError()
+        self._set_state(self._metadata, self._storage)
 
     def to(self, device):
         """Move the tensor to a device.
@@ -314,8 +444,7 @@ class STensor:
             Always. Scorch is a CPU-only compiler library; there is no device
             transfer.
         """
-        # TODO: Implement this.
-        raise NotImplementedError()
+        raise NotImplementedError("STensor is CPU-only and does not support transfer")
 
     def cuda(self):
         """Move the tensor to the GPU.
@@ -331,18 +460,16 @@ class STensor:
     def clone(self):
         """Clone the tensor.
 
-        Raises
-        ------
-        NotImplementedError
-            Always. This method is a placeholder; use :meth:`copy` for a working
-            deep copy.
+        Returns
+        -------
+        STensor
+            An independent validated copy.
 
         See Also
         --------
         copy : The supported way to duplicate an ``STensor``.
         """
-        # TODO: Implement this.
-        raise NotImplementedError()
+        return self.copy()
 
     def dim(self):
         """Number of tensor dimensions (order).
@@ -392,8 +519,16 @@ class STensor:
         >>> torch.allclose(C.to_torch(), A.to_torch() + B.to_torch(), atol=1e-3)
         True
         """
-        # Change mode order of other to match self if different
+        if not isinstance(other, STensor):
+            raise TensorTypeError("STensor addition requires another STensor")
+        if self.logical_shape != other.logical_shape:
+            raise TensorLayoutError(
+                f"addition requires equal logical shapes, got "
+                f"{self.logical_shape} and {other.logical_shape}"
+            )
+        # Scheduling must not mutate the caller's right-hand operand.
         if self.storage.index.mode_order != other.storage.index.mode_order:
+            other = other.copy()
             other.change_mode_order(self.storage.index.mode_order)
 
         # Perform element-wise addition
@@ -407,24 +542,24 @@ class STensor:
         A = TensorVar(
             name="A",
             fmt=output_format,
+            shape=result_shape,
+            dtype=self.dtype,
             mode_order=self.storage.index.mode_order,
         )
         B = TensorVar(
             name="B",
             fmt=self.format,
+            shape=self.shape,
+            dtype=self.dtype,
             mode_order=self.storage.index.mode_order,
         )
         C = TensorVar(
             name="C",
             fmt=other.format,
+            shape=other.shape,
+            dtype=other.dtype,
             mode_order=other.storage.index.mode_order,
         )
-
-        # Assert A, B, C, and index_vars are defined
-        assert A is not None, "Tensor A is not defined."
-        assert B is not None, "Tensor B is not defined."
-        assert C is not None, "Tensor C is not defined."
-        assert index_vars is not None, "Index variables are not defined."
 
         # Generate the python code for the element-wise addition
         # e.g. A[i0, i1, ...] = B[i0, i1, ...] + C[i0, i1, ...]
@@ -437,7 +572,6 @@ class STensor:
         # Generate the python code for constructing the ForAll's and execute it
         # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
         rhs = "A._assignment"
-        assert ForAll is not None, "ForAll is not imported"
         for i in range(len(self.shape))[::-1]:
             rhs = f"ForAll(a_index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
@@ -462,17 +596,19 @@ class STensor:
         result_cpp = module.evaluate(
             result_shape,
             self.shape,
-            self.index.mode_indices,
+            self._native_mode_indices(),
             self.storage.value,
             other.shape,
-            other.index.mode_indices,
+            other._native_mode_indices(),
             other.storage.value,
         )
 
         result = STensor(
             shape=result_shape,
             index=TensorIndex(
-                mode_indices=result_cpp.storage.index.mode_indices,
+                mode_indices=_finalize_generated_mode_indices(
+                    output_format, result_cpp.storage.index.mode_indices
+                ),
                 tensor_format=output_format,
                 mode_order=self.storage.index.mode_order,
             ),
@@ -513,15 +649,43 @@ class STensor:
         STensor
             An independent copy.
 
-        Notes
-        -----
-        This is the supported way to duplicate an ``STensor`` — :meth:`clone`
-        is an unimplemented placeholder.
+        :meth:`clone` is an alias for this operation.
         """
-        return STensor(
-            name=self._name,
-            shape=self.shape,
-            storage=self.storage.copy(),
+        return STensor._from_validated(self.metadata, self.storage.copy())
+
+    @classmethod
+    def from_components(
+        cls,
+        shape: Sequence[int],
+        tensor_format: Union[TensorFormat, str, List[str]],
+        mode_indices: Sequence[Sequence[torch.Tensor]],
+        values: torch.Tensor,
+        *,
+        name: Optional[str] = None,
+        mode_order: Optional[Sequence[int]] = None,
+        index_dtype: Optional[torch.dtype] = None,
+        requires_grad: bool = False,
+    ) -> STensor:
+        """Build a fully validated runtime tensor from explicit components.
+
+        ``shape`` and ``mode_order`` describe physical storage. The constructor
+        derives logical shape, validates format rank and permutation, then checks
+        all dense/COO/compressed storage invariants before returning.
+        """
+        if isinstance(shape, (str, bytes)) or not isinstance(shape, Sequence):
+            raise TensorTypeError("shape must be a sequence of integers")
+        index = TensorIndex(
+            tensor_format=tensor_format,
+            mode_indices=mode_indices,
+            mode_order=mode_order,
+            index_dtype=index_dtype,
+        )
+        return cls(
+            name=name,
+            shape=tuple(shape),
+            index=index,
+            value=values,
+            requires_grad=requires_grad,
         )
 
     @staticmethod
@@ -534,8 +698,9 @@ class STensor:
         Wraps a 2-D ``torch.sparse_csr`` tensor as a Scorch tensor with the
         canonical CSR layout: format ``"d,s"`` (dense rows, compressed cols),
         ``mode_indices = [[], [crow_indices, col_indices]]``, and the CSR values
-        as the flat payload. No data is copied beyond referencing the input's
-        index/value arrays.
+        as the flat payload. Structural index arrays are copied into immutable
+        storage; the values buffer remains an isolated tensor view of the input
+        payload and is not silently cast.
 
         Parameters
         ----------
@@ -549,11 +714,8 @@ class STensor:
         STensor
             A Scorch tensor in CSR (``"d,s"``) format.
 
-        Raises
-        ------
-        AssertionError
-            If ``csr_matrix`` is not a sparse CSR tensor, or if it is not 2-D
-            (CSR is only valid for 2-D matrices).
+        Raises a Scorch domain exception if the input is not a valid rank-2 CPU
+        CSR tensor.
 
         Notes
         -----
@@ -577,40 +739,31 @@ class STensor:
         from_torch : Auto-detects dense/COO/CSR inputs.
         from_coo : Build from COO (arbitrary rank).
         """
-        # If name is not provided, use the default name
-        if name is None:
-            name = "tensor"
-
-        # Check if input is a PyTorch CSR tensor
-        assert csr_matrix.is_sparse_csr, "Input tensor must be a sparse CSR tensor."
+        if not isinstance(csr_matrix, torch.Tensor):
+            raise TensorTypeError("from_csr expects a torch.Tensor")
+        if csr_matrix.layout != torch.sparse_csr:
+            raise TensorStorageError("from_csr expects a sparse CSR tensor")
+        if csr_matrix.device.type != "cpu":
+            raise TensorStorageError("Scorch only supports CPU CSR tensors")
 
         # Extract the crow_indices, col_indices, and values
         crow_indices = csr_matrix.crow_indices()
         col_indices = csr_matrix.col_indices()
-        values = csr_matrix.values()
+        values = csr_matrix.values().resolve_conj().resolve_neg()
         shape = csr_matrix.size()
 
-        # We only handle 2D CSR tensors here
-        assert len(shape) == 2, "CSR format is only valid for 2D matrices."
+        if len(shape) != 2:
+            raise TensorLayoutError("CSR format is only valid for rank-2 tensors")
 
-        tt_tensor = STensor(
+        return STensor(
             name=name,
-            shape=shape,
-            storage=TensorStorage(
-                index=TensorIndex(
-                    tensor_format=TensorFormat(
-                        level_formats=[
-                            LevelFormat(mode=LevelType.DENSE),
-                            LevelFormat(mode=LevelType.COMPRESSED),
-                        ]
-                    ),
-                    mode_indices=[[], [crow_indices, col_indices]],
-                ),
-                value=values,
+            shape=tuple(shape),
+            index=TensorIndex(
+                tensor_format="ds",
+                mode_indices=[[], [crow_indices, col_indices]],
             ),
+            value=values,
         )
-
-        return tt_tensor
 
     @staticmethod
     def from_coo(
@@ -655,8 +808,9 @@ class STensor:
 
         Notes
         -----
-        Index arrays are coerced to ``torch.int`` internally. Re-exported as
-        ``scorch.from_coo``.
+        The caller's indices are never mutated or narrowed. Raw COO input is
+        coalesced into canonical int64 coordinates, and that dtype is recorded
+        by :attr:`layout`. Re-exported as ``scorch.from_coo``.
 
         Examples
         --------
@@ -672,41 +826,102 @@ class STensor:
         >>> torch.equal(a.to_torch(), coo.to_dense())
         True
         """
-        # If name is not provided, use the default name
-        if name is None:
-            name = "tensor"
-
         if coo_matrix is not None:
+            if any(item is not None for item in (indices, values, shape)):
+                raise TensorStorageError(
+                    "coo_matrix cannot be combined with indices, values, or shape"
+                )
+            if not isinstance(coo_matrix, torch.Tensor):
+                raise TensorTypeError("coo_matrix must be a torch.Tensor")
+            if coo_matrix.layout != torch.sparse_coo:
+                raise TensorStorageError("from_coo expects a sparse COO tensor")
+            if coo_matrix.device.type != "cpu":
+                raise TensorStorageError("Scorch only supports CPU COO tensors")
+            if coo_matrix.dense_dim() != 0:
+                raise TensorStorageError(
+                    "hybrid COO tensors with dense value dimensions are unsupported"
+                )
             coo_matrix = coo_matrix.coalesce()
             indices = coo_matrix.indices()
-            values = coo_matrix.values()
-            shape = coo_matrix.shape
+            values = coo_matrix.values().resolve_conj().resolve_neg()
+            shape = tuple(coo_matrix.shape)
+        else:
+            missing = [
+                field
+                for field, item in (
+                    ("indices", indices),
+                    ("values", values),
+                    ("shape", shape),
+                )
+                if item is None
+            ]
+            if missing:
+                raise TensorStorageError(
+                    "raw COO construction requires indices, values, and shape; "
+                    f"missing {', '.join(missing)}"
+                )
+            if not isinstance(indices, torch.Tensor) or not isinstance(
+                values, torch.Tensor
+            ):
+                raise TensorTypeError("COO indices and values must be torch tensors")
+            if isinstance(shape, (str, bytes)) or not isinstance(shape, Sequence):
+                raise TensorTypeError("COO shape must be a sequence of integers")
+            shape = tuple(shape)
+            # Normalize every extent before handing it to PyTorch so malformed
+            # shapes are reported as Scorch domain exceptions.
+            shape_layout = TensorLayout.from_physical_shape(
+                shape,
+                "o" * len(shape),
+                index_dtype=torch.int64,
+            )
+            shape = shape_layout.physical_shape
+            if indices.device.type != "cpu" or values.device.type != "cpu":
+                raise TensorStorageError("Scorch only supports CPU COO tensors")
+            if indices.dtype not in (torch.int32, torch.int64):
+                raise TensorIndexError("COO indices must use int32 or int64")
+            if indices.dim() != 2:
+                raise TensorIndexError("COO indices must have shape [rank, nnz]")
+            if values.dim() != 1:
+                raise TensorStorageError("COO values must be one-dimensional")
+            if indices.shape[0] != len(shape):
+                raise TensorIndexError("COO index rank does not match shape rank")
+            if indices.shape[1] != values.numel():
+                raise TensorStorageError("COO coordinate and value counts must match")
+            # Coalesce without ever modifying the caller's tensors. PyTorch's COO
+            # builder canonicalizes coordinates to int64, which is recorded in
+            # the resulting layout rather than silently narrowed to int32.
+            try:
+                canonical = torch.sparse_coo_tensor(
+                    indices.to(torch.int64),
+                    values.resolve_conj().resolve_neg(),
+                    tuple(shape),
+                    check_invariants=True,
+                ).coalesce()
+            except (RuntimeError, TypeError, ValueError, OverflowError) as error:
+                raise TensorIndexError(f"invalid COO coordinates: {error}") from error
+            indices = canonical.indices()
+            values = canonical.values()
+            shape = tuple(canonical.shape)
 
-        mode_indices = []
-        for i in range(len(shape)):
-            mode_indices.append([indices[i]])
-
-        tt_tensor = STensor(
+        if indices is None or values is None or shape is None:
+            raise TensorStorageError("COO components were not initialized")
+        mode_indices = [[indices[mode]] for mode in range(len(shape))]
+        return STensor(
             name=name,
             shape=tuple(shape),
-            storage=TensorStorage(
-                index=TensorIndex(
-                    tensor_format=TensorFormat(
-                        level_formats=[
-                            LevelFormat(mode=LevelType.COORDINATE)
-                            for _ in range(len(shape))
-                        ]
-                    ),
-                    mode_indices=mode_indices,
-                ),
-                value=values,
+            index=TensorIndex(
+                tensor_format="o" * len(shape),
+                mode_indices=mode_indices,
             ),
+            value=values,
         )
 
-        return tt_tensor
-
     @staticmethod
-    def from_torch(tensor: torch.Tensor, name: Optional[str] = None, mode_order: Optional[List[int]] = None) -> STensor:
+    def from_torch(
+        tensor: torch.Tensor,
+        name: Optional[str] = None,
+        mode_order: Optional[List[int]] = None,
+    ) -> STensor:
         """Create an STensor from a ``torch.Tensor``, auto-detecting layout.
 
         The primary constructor. Accepts a dense tensor, a ``torch.sparse_coo``
@@ -757,17 +972,46 @@ class STensor:
         from_csr : Build specifically from a CSR matrix.
         from_coo : Build from COO indices/values.
         """
-        # torch.Tensor is dense, so shape is the same as torch tensor,
-        # and format is dense at every level
-
-        # If name is not provided, use the default name
-        if name is None:
-            name = "tensor"
-
-        if mode_order:
-            tensor = tensor.permute(*mode_order)
+        if not isinstance(tensor, torch.Tensor):
+            raise TensorTypeError("from_torch expects a torch.Tensor")
+        if tensor.device.type != "cpu":
+            raise TensorStorageError("Scorch only supports CPU tensors")
+        if tensor.layout not in (
+            torch.strided,
+            torch.sparse_coo,
+            torch.sparse_csr,
+        ):
+            raise TensorStorageError(f"unsupported torch tensor layout {tensor.layout}")
+        rank = tensor.dim()
+        identity_order = list(range(rank))
+        if mode_order is None:
+            mode_order = identity_order
         else:
-            mode_order = [i for i in range(len(tensor.shape))]
+            if isinstance(mode_order, (str, bytes)) or not isinstance(
+                mode_order, Sequence
+            ):
+                raise TensorLayoutError("mode_order must be a sequence of integers")
+            if any(
+                isinstance(mode, bool) or not isinstance(mode, int)
+                for mode in mode_order
+            ):
+                raise TensorLayoutError("mode_order entries must be integers")
+            if len(mode_order) != rank or sorted(mode_order) != identity_order:
+                raise TensorLayoutError(
+                    f"mode_order must be a permutation of range({rank})"
+                )
+        mode_order = list(mode_order)
+        if tensor.layout == torch.sparse_csr and mode_order != identity_order:
+            raise TensorLayoutError(
+                "CSR tensors only support the identity mode_order; convert to COO "
+                "before applying a permutation"
+            )
+        if tensor.layout == torch.sparse_coo and tensor.dense_dim() != 0:
+            raise TensorStorageError(
+                "hybrid COO tensors with dense value dimensions are unsupported"
+            )
+        if mode_order != identity_order:
+            tensor = tensor.permute(*mode_order)
 
         if tensor.is_sparse or tensor.is_sparse_csr:
             if tensor.layout == torch.sparse_coo:
@@ -777,22 +1021,15 @@ class STensor:
                 for i in range(tensor.dim()):
                     mode_indices.append([tensor_indices[i]])
 
-                tt_tensor = STensor(
+                return STensor(
                     name=name,
                     shape=tuple(tensor.shape),
-                    storage=TensorStorage(
-                        index=TensorIndex(
-                            tensor_format=TensorFormat(
-                                level_formats=[
-                                    LevelFormat(mode=LevelType.COORDINATE)
-                                    for _ in range(len(tensor.shape))
-                                ]
-                            ),
-                            mode_indices=mode_indices,
-                            mode_order=mode_order,
-                        ),
-                        value=tensor.values(),
+                    index=TensorIndex(
+                        tensor_format="o" * rank,
+                        mode_indices=mode_indices,
+                        mode_order=mode_order,
                     ),
+                    value=tensor.values().resolve_conj().resolve_neg(),
                 )
 
             elif tensor.layout == torch.sparse_csr:
@@ -801,45 +1038,28 @@ class STensor:
                 values = tensor.values()
                 shape = tensor.size()
 
-                tt_tensor = STensor(
+                return STensor(
                     name=name,
                     shape=shape,
-                    storage=TensorStorage(
-                        index=TensorIndex(
-                            tensor_format=TensorFormat(
-                                level_formats=[
-                                    LevelFormat(mode=LevelType.DENSE),
-                                    LevelFormat(mode=LevelType.COMPRESSED),
-                                ]
-                            ),
-                            mode_indices=[[], [crow_indices, col_indices]],
-                            mode_order=mode_order,
-                        ),
-                        value=values,
+                    index=TensorIndex(
+                        tensor_format="ds",
+                        mode_indices=[[], [crow_indices, col_indices]],
+                        mode_order=mode_order,
                     ),
+                    value=values.resolve_conj().resolve_neg(),
                 )
+            raise TensorStorageError(f"unsupported sparse layout {tensor.layout}")
 
-            return tt_tensor
-
-        tt_tensor = STensor(
+        return STensor(
             name=name,
             shape=tuple(tensor.shape),
-            storage=TensorStorage(
-                index=TensorIndex(
-                    tensor_format=TensorFormat(
-                        level_formats=[
-                            LevelFormat(mode=LevelType.DENSE)
-                            for _ in range(len(tensor.shape))
-                        ]
-                    ),
-                    mode_indices=[[] for _ in range(len(tensor.shape))],
-                    mode_order=mode_order,
-                ),
-                value=tensor.flatten(),
+            index=TensorIndex(
+                tensor_format="d" * rank,
+                mode_indices=[[] for _ in range(rank)],
+                mode_order=mode_order,
             ),
+            value=tensor.resolve_conj().resolve_neg().contiguous().reshape(-1),
         )
-
-        return tt_tensor
 
     def to_torch(self, in_place=True) -> torch.Tensor:
         """Materialize to a dense ``torch.Tensor`` (exit to PyTorch).
@@ -882,7 +1102,10 @@ class STensor:
 
         # Permute back if tensor has non-default mode order
         default_mode_order = [i for i in range(self.dim())]
-        if self.storage.index.mode_order and self.storage.index.mode_order != default_mode_order:
+        if (
+            self.storage.index.mode_order
+            and self.storage.index.mode_order != default_mode_order
+        ):
             # Compute inverse permutation
             inv_perm = [0] * len(self.storage.index.mode_order)
             for i, m in enumerate(self.storage.index.mode_order):
@@ -956,6 +1179,7 @@ class STensor:
             B = TensorVar(
                 name="B",
                 fmt=self.format,
+                shape=self.shape,
                 dtype=self.dtype,
             )
         else:
@@ -967,6 +1191,7 @@ class STensor:
                         for _ in range(len(self.shape))
                     ]
                 ),
+                shape=self.shape,
                 dtype=self.dtype,
             )
 
@@ -984,13 +1209,9 @@ class STensor:
         A = TensorVar(
             name="A",
             fmt=output_format,
+            shape=self.shape,
             dtype=self.dtype,
         )
-
-        # Assert A, B, and index_vars are defined
-        assert A is not None, "A is not defined"
-        assert B is not None, "B is not defined"
-        assert index_vars is not None, "index_vars is not defined"
 
         # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
         lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
@@ -1001,7 +1222,6 @@ class STensor:
         # Generate the python code for constructing the ForAll's and execute it
         # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
         rhs = "A._assignment"
-        assert ForAll is not None, "ForAll is not imported"
         for i in range(len(self.shape))[::-1]:
             rhs = f"ForAll(index_vars[{i}], {rhs})"
         cin_stmt = eval(rhs)
@@ -1026,28 +1246,26 @@ class STensor:
         result_cpp = module.evaluate(
             self.shape,
             self.shape,
-            self.index.mode_indices,
+            self._native_mode_indices(),
             self.storage.value,
         )
 
-        new_storage = TensorStorage(
+        new_tensor = STensor(
+            name=self.name,
+            shape=self.shape,
             index=TensorIndex(
                 tensor_format=output_format,
-                mode_indices=result_cpp.storage.index.mode_indices,
+                mode_indices=_finalize_generated_mode_indices(
+                    output_format, result_cpp.storage.index.mode_indices
+                ),
                 mode_order=self.storage.index.mode_order,
             ),
             value=result_cpp.storage.value,
         )
 
         if in_place:
-            self._storage = new_storage
+            self._set_state(new_tensor.metadata, new_tensor.storage)
             return self
-
-        new_tensor = STensor(
-            name=self._name,
-            shape=self.shape,
-            storage=new_storage,
-        )
 
         return new_tensor
 
@@ -1098,20 +1316,28 @@ class STensor:
             size = len(nonzero_indices)
             # Create a filtered value tensor that only contains non-zero elements
             filtered_values = self.values[nonzero_indices]
-            self._storage = TensorStorage(
+            new_tensor = STensor(
+                name=self.name,
+                shape=self.shape,
                 index=TensorIndex(
                     tensor_format=TensorFormat(
                         level_formats=[LevelFormat(mode=LevelType.COMPRESSED)]
                     ),
                     mode_indices=[
                         [
-                            torch.Tensor([0, size]),
+                            torch.tensor(
+                                [0, size],
+                                dtype=nonzero_indices.dtype,
+                                device=nonzero_indices.device,
+                            ),
                             nonzero_indices,
                         ]
                     ],
+                    mode_order=self.storage.index.mode_order,
                 ),
                 value=filtered_values,
             )
+            self._set_state(new_tensor.metadata, new_tensor.storage)
         else:
             default_index_vars = [
                 IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
@@ -1128,6 +1354,7 @@ class STensor:
                 B = TensorVar(
                     name="B",
                     fmt=self.format,
+                    shape=self.shape,
                     dtype=self.dtype,
                     mode_order=self.storage.index.mode_order,
                 )
@@ -1140,6 +1367,8 @@ class STensor:
                             for _ in range(len(self.shape))
                         ]
                     ),
+                    shape=self.shape,
+                    dtype=self.dtype,
                     mode_order=self.storage.index.mode_order,
                 )
 
@@ -1163,11 +1392,6 @@ class STensor:
                 mode_order=self.storage.index.mode_order,
             )
 
-            # Assert A, B, and index_vars are defined
-            assert A is not None, "A is not defined"
-            assert B is not None, "B is not defined"
-            assert index_vars is not None, "index_vars is not defined"
-
             # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
             lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
             rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
@@ -1177,7 +1401,6 @@ class STensor:
             # Generate the python code for constructing the ForAll's and execute it
             # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
             rhs = "A._assignment"
-            assert ForAll is not None, "ForAll is not imported"
             for i in range(len(self.shape))[::-1]:
                 rhs = f"ForAll(ordered_index_vars[{i}], {rhs})"
             cin_stmt = eval(rhs)
@@ -1204,18 +1427,23 @@ class STensor:
             result_cpp = module.evaluate(
                 self.shape,
                 self.shape,
-                self.index.mode_indices,
+                self._native_mode_indices(),
                 self.storage.value,
             )
 
-            self._storage = TensorStorage(
+            new_tensor = STensor(
+                name=self.name,
+                shape=self.shape,
                 index=TensorIndex(
                     tensor_format=output_format,
-                    mode_indices=result_cpp.storage.index.mode_indices,
+                    mode_indices=_finalize_generated_mode_indices(
+                        output_format, result_cpp.storage.index.mode_indices
+                    ),
                     mode_order=self.storage.index.mode_order,
                 ),
                 value=result_cpp.storage.value,
             )
+            self._set_state(new_tensor.metadata, new_tensor.storage)
 
         return self
 
@@ -1243,9 +1471,9 @@ class STensor:
 
         Raises
         ------
-        AssertionError
-            If the tensor has no index/dtype/shape/format, or if ``mode_order``
-            is not a valid permutation matching the tensor order.
+        TensorLayoutError
+            If ``mode_order`` is not a valid permutation matching the tensor
+            order.
 
         Notes
         -----
@@ -1253,16 +1481,15 @@ class STensor:
         represents a transposed operand without recomputing; the general
         (non-fast-path) route triggers a JIT C++ compile on first use.
         """
-        assert self.has_index, "self.storage.index is None"
-        assert self.dtype is not None, "self.dtype is None"
-        assert self.shape is not None, "self.shape is None"
-        assert self.format is not None, "self.format is None"
-
         dim = len(self.shape)
-        assert len(mode_order) == dim, "mode_order must match tensor order"
-        assert sorted(mode_order) == list(
-            range(dim)
-        ), "mode_order must be a permutation"
+        if not isinstance(mode_order, (list, tuple)):
+            raise TensorTypeError("mode_order must be a sequence of integers")
+        if any(
+            isinstance(mode, bool) or not isinstance(mode, int) for mode in mode_order
+        ):
+            raise TensorTypeError("mode_order entries must be integers")
+        if len(mode_order) != dim or sorted(mode_order) != list(range(dim)):
+            raise TensorLayoutError(f"mode_order must be a permutation of range({dim})")
 
         old_mode_order = (
             self.storage.index.mode_order[:]
@@ -1289,11 +1516,16 @@ class STensor:
         # a transpose kernel for the common matmul operands.
         fmt_str = str(self.format)
         if dim == 2 and fmt_str in {"d,d", "d,s", "o,o"}:
+
             def _coalesce_2d_coo(
                 row: torch.Tensor, col: torch.Tensor, vals: torch.Tensor, num_cols: int
             ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 if row.numel() == 0:
-                    return row.int(), col.int(), vals
+                    return (
+                        row.to(self.index_dtype),
+                        col.to(self.index_dtype),
+                        vals,
+                    )
 
                 row64 = row.to(torch.int64)
                 col64 = col.to(torch.int64)
@@ -1309,7 +1541,11 @@ class STensor:
                     unique_mask[1:] = key_sorted[1:] != key_sorted[:-1]
 
                 if torch.all(unique_mask).item():
-                    return row_sorted.int(), col_sorted.int(), vals_sorted
+                    return (
+                        row_sorted.to(self.index_dtype),
+                        col_sorted.to(self.index_dtype),
+                        vals_sorted,
+                    )
 
                 segment_ids = torch.cumsum(unique_mask.to(torch.int64), dim=0) - 1
                 unique_count = int(segment_ids[-1].item() + 1)
@@ -1319,13 +1555,13 @@ class STensor:
                 reduced_vals.scatter_add_(0, segment_ids, vals_sorted)
                 unique_positions = torch.nonzero(unique_mask, as_tuple=False).flatten()
                 return (
-                    row_sorted[unique_positions].int(),
-                    col_sorted[unique_positions].int(),
+                    row_sorted[unique_positions].to(self.index_dtype),
+                    col_sorted[unique_positions].to(self.index_dtype),
                     reduced_vals,
                 )
 
-            mode_indices = None
-            values = None
+            mode_indices: Optional[List[List[torch.Tensor]]] = None
+            values: Optional[torch.Tensor] = None
 
             if fmt_str == "d,d":
                 dense = self.values.reshape(self.shape).permute(*perm_old_to_new)
@@ -1333,8 +1569,8 @@ class STensor:
                 mode_indices = [[], []]
             elif fmt_str == "o,o":
                 old_coords = [
-                    self.index.mode_indices[0][0].to(torch.int64),
-                    self.index.mode_indices[1][0].to(torch.int64),
+                    self.storage._mode_indices[0][0].to(torch.int64),
+                    self.storage._mode_indices[1][0].to(torch.int64),
                 ]
                 new_row = old_coords[perm_old_to_new[0]]
                 new_col = old_coords[perm_old_to_new[1]]
@@ -1350,7 +1586,7 @@ class STensor:
                 ]
                 values = coalesced_values
             else:
-                crow_indices, col_indices = self.index.mode_indices[1]
+                crow_indices, col_indices = self.storage._mode_indices[1]
                 row_counts = (crow_indices[1:] - crow_indices[:-1]).to(torch.int64)
                 old_row = torch.repeat_interleave(
                     torch.arange(
@@ -1370,7 +1606,7 @@ class STensor:
                 )
                 transposed_crow = torch.zeros(
                     result_shape[0] + 1,
-                    dtype=torch.int64,
+                    dtype=self.index_dtype,
                     device=coalesced_row.device,
                 )
                 if coalesced_row.numel() > 0:
@@ -1381,26 +1617,31 @@ class STensor:
                 mode_indices = [
                     [],
                     [
-                        transposed_crow.int(),
-                        coalesced_col.int(),
+                        transposed_crow,
+                        coalesced_col.to(self.index_dtype),
                     ],
                 ]
                 values = coalesced_values
 
-            self._storage = TensorStorage(
+            if mode_indices is None or values is None:
+                raise TensorStorageError(
+                    "mode-order conversion did not produce storage"
+                )
+            new_tensor = STensor(
+                name=self.name,
+                shape=result_shape,
                 index=TensorIndex(
                     tensor_format=self.format,
                     mode_indices=mode_indices,
                     mode_order=mode_order[:],
+                    index_dtype=self.index_dtype,
                 ),
                 value=values,
             )
-            self._shape = result_shape
+            self._set_state(new_tensor.metadata, new_tensor.storage)
             return self
 
-        default_index_vars = [
-            IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
-        ]
+        default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
         if dim > len(default_index_vars):
             index_vars = [IndexVar(f"i{i}") for i in range(dim)]
         else:
@@ -1470,19 +1711,22 @@ class STensor:
         result_cpp = module.evaluate(
             result_shape,
             self.shape,
-            self.index.mode_indices,
+            self._native_mode_indices(),
             self.storage.value,
         )
 
-        self._storage = TensorStorage(
+        new_tensor = STensor(
+            name=self.name,
+            shape=result_shape,
             index=TensorIndex(
                 tensor_format=self.format,
-                mode_indices=result_cpp.storage.index.mode_indices,
+                mode_indices=_finalize_generated_mode_indices(
+                    self.format, result_cpp.storage.index.mode_indices
+                ),
                 mode_order=mode_order[:],
             ),
             value=result_cpp.storage.value,
         )
-
-        self._shape = result_shape
+        self._set_state(new_tensor.metadata, new_tensor.storage)
 
         return self

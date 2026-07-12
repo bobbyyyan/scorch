@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "native_abi.h"
 #include "spmm.h"
 #include "kernels.h"
 
@@ -61,16 +62,58 @@ Tensor prebuilt_spmv_csr(
 }
 
 void bind_binary_kernel(py::module_& m, const char* name, BinaryKernelFn fn,
-                        const char* doc) {
-  m.def(name, fn, doc, py::arg("result_shape"), py::arg("A_shape"),
+                        const char* doc,
+                        scorch_native::BinaryContract contract,
+                        torch::ScalarType dtype) {
+  m.def(name,
+        [fn, name, contract, dtype](
+            std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+            std::vector<std::vector<torch::Tensor>> A_mode_indices,
+            torch::Tensor A_values, std::vector<int64_t> B_shape,
+            std::vector<std::vector<torch::Tensor>> B_mode_indices,
+            torch::Tensor B_values) {
+          scorch_native::validate_binary_inputs(
+              name, contract, dtype, result_shape, A_shape, A_mode_indices,
+              A_values, B_shape, B_mode_indices, B_values);
+          return fn(
+              scorch_native::narrow_legacy_shape(result_shape, name,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, name, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, name, "B_shape"),
+              B_mode_indices, B_values);
+        },
+        doc, py::arg("result_shape"), py::arg("A_shape"),
         py::arg("A_mode_indices"), py::arg("A_values"), py::arg("B_shape"),
         py::arg("B_mode_indices"), py::arg("B_values"));
 }
 
 void bind_binary_kernel_with_tile(py::module_& m, const char* name,
                                   BinaryKernelWithTileFn fn, const char* doc,
-                                  int default_tile) {
-  m.def(name, fn, doc, py::arg("result_shape"), py::arg("A_shape"),
+                                  int default_tile,
+                                  scorch_native::BinaryContract contract,
+                                  torch::ScalarType dtype) {
+  m.def(name,
+        [fn, name, contract, dtype](
+            std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+            std::vector<std::vector<torch::Tensor>> A_mode_indices,
+            torch::Tensor A_values, std::vector<int64_t> B_shape,
+            std::vector<std::vector<torch::Tensor>> B_mode_indices,
+            torch::Tensor B_values, int tile_size) {
+          scorch_native::validate_binary_inputs(
+              name, contract, dtype, result_shape, A_shape, A_mode_indices,
+              A_values, B_shape, B_mode_indices, B_values);
+          tile_size = scorch_native::validate_tile_size(
+              tile_size, name, "tile_size", B_shape[1]);
+          return fn(
+              scorch_native::narrow_legacy_shape(result_shape, name,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, name, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, name, "B_shape"),
+              B_mode_indices, B_values, tile_size);
+        },
+        doc, py::arg("result_shape"), py::arg("A_shape"),
         py::arg("A_mode_indices"), py::arg("A_values"), py::arg("B_shape"),
         py::arg("B_mode_indices"), py::arg("B_values"),
         py::arg("tile_size") = default_tile);
@@ -79,8 +122,32 @@ void bind_binary_kernel_with_tile(py::module_& m, const char* name,
 void bind_binary_kernel_with_two_tiles(py::module_& m, const char* name,
                                        BinaryKernelWithTwoTilesFn fn,
                                        const char* doc, int default_i_tile,
-                                       int default_k_tile) {
-  m.def(name, fn, doc, py::arg("result_shape"), py::arg("A_shape"),
+                                       int default_k_tile,
+                                       scorch_native::BinaryContract contract,
+                                       torch::ScalarType dtype) {
+  m.def(name,
+        [fn, name, contract, dtype](
+            std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+            std::vector<std::vector<torch::Tensor>> A_mode_indices,
+            torch::Tensor A_values, std::vector<int64_t> B_shape,
+            std::vector<std::vector<torch::Tensor>> B_mode_indices,
+            torch::Tensor B_values, int i_tile_size, int k_tile_size) {
+          scorch_native::validate_binary_inputs(
+              name, contract, dtype, result_shape, A_shape, A_mode_indices,
+              A_values, B_shape, B_mode_indices, B_values);
+          i_tile_size = scorch_native::validate_tile_size(
+              i_tile_size, name, "i_tile_size", A_shape[0]);
+          k_tile_size = scorch_native::validate_tile_size(
+              k_tile_size, name, "k_tile_size", B_shape[1]);
+          return fn(
+              scorch_native::narrow_legacy_shape(result_shape, name,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, name, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, name, "B_shape"),
+              B_mode_indices, B_values, i_tile_size, k_tile_size);
+        },
+        doc, py::arg("result_shape"), py::arg("A_shape"),
         py::arg("A_mode_indices"), py::arg("A_values"), py::arg("B_shape"),
         py::arg("B_mode_indices"), py::arg("B_values"),
         py::arg("i_tile_size") = default_i_tile,
@@ -95,11 +162,17 @@ void bind_typed_prebuilt_kernels(py::module_& m) {
   const std::string spmv_name = "prebuilt_spmv_csr_" + suffix;
 
   bind_binary_kernel_with_tile(m, spmm_name.c_str(), &prebuilt_spmm_csr<scalar_t>,
-                               "Typed prebuilt SpMM kernel (CSR x dense)", 32);
+                               "Typed prebuilt SpMM kernel (CSR x dense)", 32,
+                               scorch_native::BinaryContract::CsrDenseMatmul,
+                               scorch_torch_dtype<scalar_t>());
   bind_binary_kernel(m, spmspm_name.c_str(), &prebuilt_spmspm_csr<scalar_t>,
-                     "Typed prebuilt SpGEMM kernel (CSR x CSR)");
+                     "Typed prebuilt SpGEMM kernel (CSR x CSR)",
+                     scorch_native::BinaryContract::CsrCsrMatmul,
+                     scorch_torch_dtype<scalar_t>());
   bind_binary_kernel(m, spmv_name.c_str(), &prebuilt_spmv_csr<scalar_t>,
-                     "Typed prebuilt SpMV kernel (CSR x dense vector)");
+                     "Typed prebuilt SpMV kernel (CSR x dense vector)",
+                     scorch_native::BinaryContract::CsrDenseMatvec,
+                     scorch_torch_dtype<scalar_t>());
 }
 
 void bind_prebuilt_kernel_family(py::module_& m) {
@@ -110,61 +183,116 @@ void bind_prebuilt_kernel_family(py::module_& m) {
 
   // Legacy aliases retained for compatibility.
   bind_binary_kernel_with_tile(m, "spmm_csr_float", &spmm_csr_float,
-                               "Sparse matrix multiplication (CSR)", 32);
+                               "Sparse matrix multiplication (CSR)", 32,
+                               scorch_native::BinaryContract::CsrDenseMatmul,
+                               torch::kFloat32);
   bind_binary_kernel_with_tile(m, "spmm_csr_double", &spmm_csr_double,
                                "Sparse matrix multiplication (CSR, float64)",
-                               32);
+                               32,
+                               scorch_native::BinaryContract::CsrDenseMatmul,
+                               torch::kFloat64);
   bind_binary_kernel(m, "spmspm_csr_float", &spmspm_csr<float>,
-                     "Sparse matrix-sparse matrix multiplication (CSR)");
+                     "Sparse matrix-sparse matrix multiplication (CSR)",
+                     scorch_native::BinaryContract::CsrCsrMatmul,
+                     torch::kFloat32);
 }
 
 void bind_experimental_spmm_variants(py::module_& m) {
   bind_binary_kernel_with_two_tiles(
       m, "spmm_csr_float_tiled_i_k", &spmm_csr_float_tiled_i_k,
-      "Sparse matrix multiplication with i and k tiling (CSR)", 16, 32);
+      "Sparse matrix multiplication with i and k tiling (CSR)", 16, 32,
+      scorch_native::BinaryContract::CsrDenseMatmul, torch::kFloat32);
   bind_binary_kernel_with_tile(
       m, "spmm_csr_float_optimized", &spmm_csr_float_optimized,
-      "Optimized sparse matrix multiplication (CSR)", 128);
+      "Optimized sparse matrix multiplication (CSR)", 128,
+      scorch_native::BinaryContract::CsrDenseMatmul, torch::kFloat32);
   bind_binary_kernel_with_tile(
       m, "spmm_csr_float_turbo", &spmm_csr_float_turbo,
-      "Turbo-optimized sparse matrix multiplication (CSR)", 128);
+      "Turbo-optimized sparse matrix multiplication (CSR)", 128,
+      scorch_native::BinaryContract::CsrDenseMatmul, torch::kFloat32);
   bind_binary_kernel_with_tile(
       m, "spmm_csr_float_ultra", &spmm_csr_float_ultra,
-      "Ultra-optimized sparse matrix multiplication (CSR)", 256);
+      "Ultra-optimized sparse matrix multiplication (CSR)", 256,
+      scorch_native::BinaryContract::CsrDenseMatmul, torch::kFloat32);
   bind_binary_kernel_with_tile(
       m, "spmm_csr_float_apex", &spmm_csr_float_apex,
-      "Apex-optimized sparse matrix multiplication (CSR)", 256);
+      "Apex-optimized sparse matrix multiplication (CSR)", 256,
+      scorch_native::BinaryContract::CsrDenseMatmul, torch::kFloat32);
 
   bind_binary_kernel(m, "spmm_csr_float_untiled", &spmm_csr_float_untiled,
-                     "Sparse matrix multiplication (CSR) (untiled)");
+                     "Sparse matrix multiplication (CSR) (untiled)",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmm_coo_float", &spmm_coo_float,
-                     "Sparse matrix multiplication (COO)");
+                     "Sparse matrix multiplication (COO)",
+                     scorch_native::BinaryContract::CooDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmspm_coo_float", &spmspm_coo_float_opt,
-                     "Sparse matrix-sparse matrix multiplication (COO)");
+                     "Sparse matrix-sparse matrix multiplication (COO)",
+                     scorch_native::BinaryContract::CooCooMatmul,
+                     torch::kFloat32);
 
   // Novel SpMM variants
   bind_binary_kernel(m, "spmm_csr_float_direct", &spmm_csr_float_direct,
-                     "Direct-to-C accumulation SpMM (no workspace)");
+                     "Direct-to-C accumulation SpMM (no workspace)",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmm_csr_float_neon", &spmm_csr_float_neon,
-                     "Explicit ARM NEON vectorized SpMM");
+                     "Explicit ARM NEON vectorized SpMM",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmm_csr_float_row_panel", &spmm_csr_float_row_panel,
-                     "Multi-row panel SpMM with B-row reuse");
+                     "Multi-row panel SpMM with B-row reuse",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmm_csr_float_k_parallel", &spmm_csr_float_k_parallel,
-                     "K-parallel SpMM with direct output");
+                     "K-parallel SpMM with direct output",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmm_csr_float_sorted_rows", &spmm_csr_float_sorted_rows,
-                     "Row-sorted SpMM with density-specific code paths");
+                     "Row-sorted SpMM with density-specific code paths",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmm_csr_float_neon2", &spmm_csr_float_neon2,
-                     "NEON 2-NNZ unroll with deep prefetch");
+                     "NEON 2-NNZ unroll with deep prefetch",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmm_csr_float_neon4", &spmm_csr_float_neon4,
-                     "NEON 4-NNZ unroll with deep prefetch");
+                     "NEON 4-NNZ unroll with deep prefetch",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   bind_binary_kernel(m, "spmm_csr_float_tiled_neon", &spmm_csr_float_tiled_neon,
-                     "Large-tile NEON (128) with direct accumulation");
+                     "Large-tile NEON (128) with direct accumulation",
+                     scorch_native::BinaryContract::CsrDenseMatmul,
+                     torch::kFloat32);
   // Bound explicitly (not via bind_binary_kernel_with_tile) because v2 carries two
   // extra optional composition hints the drop-in matmul dispatch passes: the host
   // thread count (nthreads_override, avoids host<->kernel team reshape) and
   // atparallel (launch the workers on torch's intra-op pool so the SpMM shares one
   // warm team with the torch epilogue in a pipeline).
-  m.def("spmm_csr_float_v2", &spmm_csr_float_v2,
+  m.def("spmm_csr_float_v2",
+        [](std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+           std::vector<std::vector<torch::Tensor>> A_mode_indices,
+           torch::Tensor A_values, std::vector<int64_t> B_shape,
+           std::vector<std::vector<torch::Tensor>> B_mode_indices,
+           torch::Tensor B_values, int tile_size, int nthreads_override,
+           bool atparallel) {
+          constexpr const char* op = "spmm_csr_float_v2";
+          scorch_native::validate_binary_inputs(
+              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
+              B_shape, B_mode_indices, B_values);
+          tile_size = scorch_native::validate_tile_size(
+              tile_size, op, "tile_size", B_shape[1]);
+          scorch_native::validate_thread_override(nthreads_override, op);
+          return spmm_csr_float_v2(
+              scorch_native::narrow_legacy_shape(result_shape, op,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
+              B_mode_indices, B_values, tile_size, nthreads_override, atparallel);
+        },
         "Workspace + 2-nnz ILP + k-tiling SpMM",
         py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
@@ -174,7 +302,29 @@ void bind_experimental_spmm_variants(py::module_& m) {
   // regime (reddit/products-class). Reached only when the adaptive tiling selector
   // (scorch.tiling / ops.matmul) fires; v2 serves every other shape. Jc = panel
   // width in contraction columns (~C/(4N)); Jc<=0 degenerates to full-width.
-  m.def("spmm_csr_float_tilej", &spmm_csr_float_tilej,
+  m.def("spmm_csr_float_tilej",
+        [](std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+           std::vector<std::vector<torch::Tensor>> A_mode_indices,
+           torch::Tensor A_values, std::vector<int64_t> B_shape,
+           std::vector<std::vector<torch::Tensor>> B_mode_indices,
+           torch::Tensor B_values, int Jc, int nthreads_override) {
+          constexpr const char* op = "spmm_csr_float_tilej";
+          scorch_native::validate_binary_inputs(
+              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
+              B_shape, B_mode_indices, B_values);
+          TORCH_CHECK(Jc >= 0, op, ": Jc must be nonnegative, got ", Jc);
+          TORCH_CHECK(B_shape[0] > 0, op,
+                      ": zero contraction extent is not supported");
+          scorch_native::validate_thread_override(nthreads_override, op);
+          return spmm_csr_float_tilej(
+              scorch_native::narrow_legacy_shape(result_shape, op,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
+              B_mode_indices, B_values, Jc, nthreads_override);
+        },
         "Column-panel (tile-j) SpMM for high-degree operand-over-LLC graphs",
         py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
@@ -186,7 +336,30 @@ void bind_experimental_spmm_variants(py::module_& m) {
   // accumulates into a cache-resident Cp, writes C once (C-traffic ~N). Reached
   // only when the selector's wide-N branch probes it; v2/tile-j serve everything
   // else. Nc=free-dim strip width, Jc=contraction-panel width (both <=0 degenerate).
-  m.def("spmm_csr_float_tileijk", &spmm_csr_float_tileijk,
+  m.def("spmm_csr_float_tileijk",
+        [](std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+           std::vector<std::vector<torch::Tensor>> A_mode_indices,
+           torch::Tensor A_values, std::vector<int64_t> B_shape,
+           std::vector<std::vector<torch::Tensor>> B_mode_indices,
+           torch::Tensor B_values, int Nc, int Jc, int nthreads_override) {
+          constexpr const char* op = "spmm_csr_float_tileijk";
+          scorch_native::validate_binary_inputs(
+              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
+              B_shape, B_mode_indices, B_values);
+          TORCH_CHECK(Nc >= 0, op, ": Nc must be nonnegative, got ", Nc);
+          TORCH_CHECK(Jc >= 0, op, ": Jc must be nonnegative, got ", Jc);
+          TORCH_CHECK(B_shape[0] > 0 && result_shape[1] > 0, op,
+                      ": zero contraction/free extents are not supported");
+          scorch_native::validate_thread_override(nthreads_override, op);
+          return spmm_csr_float_tileijk(
+              scorch_native::narrow_legacy_shape(result_shape, op,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
+              B_mode_indices, B_values, Nc, Jc, nthreads_override);
+        },
         "Tile-ijk SpMM (B width-panel relayout) for scattered very-wide-B graphs",
         py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
@@ -196,7 +369,35 @@ void bind_experimental_spmm_variants(py::module_& m) {
   // with per-OUTPUT-CHANNEL (per-row) bias + activation folded into v2's parallel
   // region (see spmm.h). act: 0=identity, 1=relu, 2=sigmoid. Same composition hints
   // as v2. Reached only via scorch.sparse_linear_fm (never FEM/GCN's scorch.matmul).
-  m.def("spmm_csr_linear_fused_float", &spmm_csr_linear_fused_float,
+  m.def("spmm_csr_linear_fused_float",
+        [](std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+           std::vector<std::vector<torch::Tensor>> A_mode_indices,
+           torch::Tensor A_values, std::vector<int64_t> B_shape,
+           std::vector<std::vector<torch::Tensor>> B_mode_indices,
+           torch::Tensor B_values, torch::Tensor bias_values, int act,
+           int tile_size, int nthreads_override, bool atparallel) {
+          constexpr const char* op = "spmm_csr_linear_fused_float";
+          scorch_native::validate_binary_inputs(
+              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
+              B_shape, B_mode_indices, B_values);
+          scorch_native::check_flat_values(bias_values, torch::kFloat32,
+                                           A_shape[0], op, "bias_values");
+          TORCH_CHECK(act >= 0 && act <= 2, op,
+                      ": act must be 0 (identity), 1 (relu), or 2 (sigmoid), got ",
+                      act);
+          tile_size = scorch_native::validate_tile_size(
+              tile_size, op, "tile_size", B_shape[1]);
+          scorch_native::validate_thread_override(nthreads_override, op);
+          return spmm_csr_linear_fused_float(
+              scorch_native::narrow_legacy_shape(result_shape, op,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
+              B_mode_indices, B_values, bias_values, act, tile_size,
+              nthreads_override, atparallel);
+        },
         "Fused feature-major SpMM + per-output-channel bias + activation",
         py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
@@ -207,13 +408,30 @@ void bind_experimental_spmm_variants(py::module_& m) {
   // scalar micro-tiles). Materializes the feature-major input for the drop-in
   // sparse_linear path ~2-3x faster than torch's cache-hostile x.T.contiguous().
   // Pass the host thread count to launch on torch's warm intra-op pool.
-  m.def("scorch_transpose_2d_float", &scorch_transpose_2d_float,
+  m.def("scorch_transpose_2d_float",
+        [](torch::Tensor src, int nthreads_override) {
+          constexpr const char* op = "scorch_transpose_2d_float";
+          scorch_native::check_tensor_common(src, torch::kFloat32, op, "src", 2);
+          scorch_native::checked_product({src.size(0), src.size(1)}, op,
+                                         "src shape");
+          scorch_native::validate_thread_override(nthreads_override, op);
+          return scorch_transpose_2d_float(src, nthreads_override);
+        },
         "Fast cache-blocked 2D float32 transpose ([R,C]->[C,R])",
         py::arg("src"), py::arg("nthreads_override") = -1);
   // Row-wise CSR softmax (scale folded in): the scatter-free replacement for the
   // torch scatter softmax in the sparse-attention chain. Parallel over rows on
   // torch's warm intra-op pool when the host thread count is passed.
-  m.def("scorch_sparse_softmax_csr_float", &scorch_sparse_softmax_csr_float,
+  m.def("scorch_sparse_softmax_csr_float",
+        [](torch::Tensor crow_indices, torch::Tensor values, double scale,
+           int nthreads_override) {
+          constexpr const char* op = "scorch_sparse_softmax_csr_float";
+          scorch_native::validate_csr_segments(op, crow_indices, values);
+          scorch_native::validate_finite_scale(scale, op);
+          scorch_native::validate_thread_override(nthreads_override, op);
+          return scorch_sparse_softmax_csr_float(crow_indices, values, scale,
+                                                 nthreads_override);
+        },
         "Row-wise softmax over CSR value spans (softmax of scale*values)",
         py::arg("crow_indices"), py::arg("values"), py::arg("scale") = 1.0,
         py::arg("nthreads_override") = -1);
@@ -222,7 +440,18 @@ void bind_experimental_spmm_variants(py::module_& m) {
   // over heads, taking Q/K/V as [S,H,D] directly (no per-head slice) and the CSR
   // mask once. Replaces the per-head SDDMM -> softmax -> SpMM chain + CSR
   // round-trip. Pass the host thread count to run on torch's warm intra-op pool.
-  m.def("scorch_sparse_attention_csr_float", &scorch_sparse_attention_csr_float,
+  m.def("scorch_sparse_attention_csr_float",
+        [](torch::Tensor crow_indices, torch::Tensor col_indices,
+           torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale,
+           int nthreads_override) {
+          constexpr const char* op = "scorch_sparse_attention_csr_float";
+          scorch_native::validate_attention_inputs(op, crow_indices, col_indices,
+                                                   Q, K, V);
+          scorch_native::validate_finite_scale(scale, op);
+          scorch_native::validate_thread_override(nthreads_override, op);
+          return scorch_sparse_attention_csr_float(
+              crow_indices, col_indices, Q, K, V, scale, nthreads_override);
+        },
         "Fused sparse multi-head attention (SDDMM + row-softmax + weighted-V)",
         py::arg("crow_indices"), py::arg("col_indices"), py::arg("Q"),
         py::arg("K"), py::arg("V"), py::arg("scale") = 1.0,
@@ -260,7 +489,28 @@ using FusedKernelFn = Tensor (*)(std::vector<int>, std::vector<int>,
 
 void bind_fused_kernel(py::module_& m, const char* name, FusedKernelFn fn,
                        const char* doc) {
-  m.def(name, fn, doc, py::arg("result_shape"), py::arg("A_shape"),
+  m.def(name,
+        [fn, name](std::vector<int64_t> result_shape,
+                   std::vector<int64_t> A_shape,
+                   std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                   torch::Tensor A_values, std::vector<int64_t> B_shape,
+                   std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                   torch::Tensor B_values, torch::Tensor bias) {
+          scorch_native::validate_binary_inputs(
+              name, scorch_native::BinaryContract::CsrDenseMatmul,
+              torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
+              B_shape, B_mode_indices, B_values);
+          scorch_native::check_flat_values(bias, torch::kFloat32, B_shape[1],
+                                           name, "bias");
+          return fn(
+              scorch_native::narrow_legacy_shape(result_shape, name,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, name, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, name, "B_shape"),
+              B_mode_indices, B_values, bias);
+        },
+        doc, py::arg("result_shape"), py::arg("A_shape"),
         py::arg("A_mode_indices"), py::arg("A_values"), py::arg("B_shape"),
         py::arg("B_mode_indices"), py::arg("B_values"), py::arg("bias"));
 }
@@ -273,7 +523,28 @@ void bind_fused_spmm_variants(py::module_& m) {
 }
 
 void bind_sddmm_variants(py::module_& m) {
-  m.def("sddmm_coo_float_prebuilt", &sddmm_coo_float_prebuilt,
+  m.def("sddmm_coo_float_prebuilt",
+        [](std::vector<int64_t> result_shape, std::vector<int64_t> S_shape,
+           std::vector<std::vector<torch::Tensor>> S_mode_indices,
+           torch::Tensor S_values, std::vector<int64_t> A_shape,
+           std::vector<std::vector<torch::Tensor>> A_mode_indices,
+           torch::Tensor A_values, std::vector<int64_t> B_shape,
+           std::vector<std::vector<torch::Tensor>> B_mode_indices,
+           torch::Tensor B_values) {
+          constexpr const char* op = "sddmm_coo_float_prebuilt";
+          scorch_native::validate_sddmm_inputs(
+              op, result_shape, S_shape, S_mode_indices, S_values, A_shape,
+              A_mode_indices, A_values, B_shape, B_mode_indices, B_values);
+          return sddmm_coo_float_prebuilt(
+              scorch_native::narrow_legacy_shape(result_shape, op,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(S_shape, op, "S_shape"),
+              S_mode_indices, S_values,
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
+              B_mode_indices, B_values);
+        },
         "Prebuilt SDDMM kernel (COO x dense x dense)",
         py::arg("result_shape"),
         py::arg("S_shape"), py::arg("S_mode_indices"), py::arg("S_values"),
@@ -290,14 +561,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     bind_sddmm_variants(m);
 
     py::class_<Tensor>(m, "Tensor")
-      .def(py::init<>())
-      .def_readwrite("storage", &Tensor::storage);
+      .def_readonly("storage", &Tensor::storage);
     py::class_<TensorStorage>(m, "TensorStorage")
-      .def(py::init<>())
-      .def_readwrite("value", &TensorStorage::value)
-      .def_readwrite("index", &TensorStorage::index);
+      .def_readonly("value", &TensorStorage::value)
+      .def_readonly("index", &TensorStorage::index);
     py::class_<TensorIndex>(m, "TensorIndex")
-      .def(py::init<>())
-      .def_readwrite("mode_indices", &TensorIndex::mode_indices);
+      .def_readonly("mode_indices", &TensorIndex::mode_indices);
   }
 }

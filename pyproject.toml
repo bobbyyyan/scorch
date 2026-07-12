@@ -40,6 +40,7 @@ sources = ["src/scorch/csrc/ops.cpp"]
 depends = [
     "src/scorch/csrc/header.h",
     "src/scorch/csrc/kernels.h",
+    "src/scorch/csrc/native_abi.h",
     "src/scorch/csrc/prebuilt_types.h",
     "src/scorch/csrc/scorch_policy.h",
     "src/scorch/csrc/spmm.h",
@@ -61,6 +62,7 @@ scorch = [
     "csrc/header.cpp",
     "csrc/header.h",
     "csrc/kernels.h",
+    "csrc/native_abi.h",
     "csrc/ops.cpp",
     "csrc/prebuilt_types.h",
     "csrc/pybind.cpp",
