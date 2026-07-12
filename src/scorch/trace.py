@@ -371,13 +371,120 @@ def compile_fused(spec: FusionSpec, args: tuple) -> Callable:
 # ---------------------------------------------------------------------------
 
 class compile:
-    """Decorator that traces a function with torch.fx and compiles fused kernels.
+    """Trace a function with torch.fx and fuse its contraction + elementwise chain.
+
+    ``@scorch.compile`` is a *function-level* fusion decorator, distinct from
+    scorch's per-op sparse compiler. It uses ``torch.fx`` to symbolically trace
+    the decorated function, locates a single ``scorch.matmul`` contraction
+    followed by a linear chain of supported elementwise "post-ops" (bias add,
+    scale, activation), and dispatches that subgraph to either a prebuilt
+    hand-written C++ kernel or a JIT fallback. The traced graph is built once on
+    the first call and reused; the compiled kernel is memoized per input
+    signature (see Notes).
 
     Usable bare (``@scorch.compile``) or parameterized with a per-call autotune
     level escape hatch (``@scorch.compile(autotune="max")``); the traced function
     then runs inside that autotune scope (thread-local, like ``with
     scorch.autotune(level)``). The autotune level tunes the SpMM tiling selector
-    (see scorch.set_autotune); it does not change the fused kernel's numerics."""
+    (see ``scorch.set_autotune``); it does not change the fused kernel's numerics.
+
+    Parameters
+    ----------
+    fn : Callable, optional
+        The function to wrap. Supplied positionally in the bare form
+        ``@scorch.compile``. When ``None`` (the parameterized form
+        ``@scorch.compile(autotune=...)``), the instance is left pending and
+        binds the function on the next call.
+    autotune : str, optional, keyword-only
+        Autotune level forwarded to ``scorch.tiling.autotune(...)`` as a
+        thread-local scope around every execution. Accepts the same level
+        strings as the autotune ladder (e.g. ``"off"``, ``"analytic"``,
+        ``"balanced"``, ``"max"``, ``"learned"``; see ``scorch.set_autotune``).
+        When ``None``, no autotune scope is entered. Numerics-neutral: it only
+        tunes the SpMM tiling selector, never the fused output values.
+
+    Returns
+    -------
+    compile
+        A callable instance that behaves as the wrapped function, returning a
+        dense ``torch.Tensor`` result (not an ``STensor``) on both dispatch
+        paths.
+
+    Raises
+    ------
+    ValueError
+        If the traced function contains no ``scorch.matmul`` call.
+    TypeError
+        If the parameterized form ``@scorch.compile(autotune=...)`` is applied
+        to something that is not a single callable.
+
+    Notes
+    -----
+    **What it can fuse.** Exactly one ``scorch.matmul(...)`` call (spelled as
+    ``scorch.matmul``, ``scorch.ops.matmul``, or an imported ``matmul`` — only
+    ``matmul`` is patched as a leaf, *not* ``scorch.einsum``), followed by a
+    single-consumer chain of these elementwise ops:
+
+    - bias/scale written with the Python ``+`` / ``*`` operators (they trace to
+      ``operator.add`` / ``operator.mul`` — ``torch.add`` / ``torch.mul`` are
+      *not* recognized);
+    - activations ``torch.relu`` / ``torch.nn.functional.relu``,
+      ``torch.sigmoid``, ``torch.tanh``.
+
+    The other operand of a fused ``+`` / ``*`` must be a direct function argument
+    (an FX placeholder). The chain stops fusing — silently leaving later ops
+    unfused — at the first node that has multiple consumers, is computed inside
+    the function, or is an unsupported op. Note ``gelu`` is *not* fusible here
+    (it is absent from the recognized set), and the wrapper forwards only
+    positional arguments to the decorated function.
+
+    **Prebuilt vs JIT dispatch.** Two patterns hit a hand-written C++ kernel:
+    CSR (``"d,s"``) LHS × dense RHS with a ``bias`` add, optionally followed by
+    ``relu``, in float32. Everything else takes the JIT fallback, which runs the
+    contraction via ``ops.einsum`` and applies the post-ops as ordinary torch
+    ops — a correctness path that does not (yet) emit a single fused C++ kernel.
+
+    **Caching.** The FX graph is traced once and reused. Compiled kernels are
+    memoized on a key of each argument's ``(format, dtype)`` for ``STensor`` /
+    ``(rank, dtype)`` for dense tensors — *shapes are not part of the key*, so
+    calls that differ only in matrix dimensions reuse the same compiled kernel,
+    while a new format, dtype, or rank creates a fresh entry.
+
+    See Also
+    --------
+    scorch.matmul : The contraction traced as an opaque leaf.
+    scorch.set_autotune : Defines the accepted ``autotune`` level strings.
+
+    Examples
+    --------
+    A GCN-style layer that hits the prebuilt CSR + bias + relu kernel:
+
+    >>> import torch
+    >>> import scorch
+    >>> from scorch import STensor
+    >>> torch.manual_seed(42)
+    >>> mask = torch.rand(64, 64) < 0.1
+    >>> vals = torch.rand(64, 64) * mask.float()
+    >>> adj = STensor.from_csr(vals.to_sparse_csr(), "A")   # format "d,s" (CSR)
+    >>> x = torch.rand(64, 16)                              # dense torch.Tensor
+    >>> bias = torch.rand(16)
+    >>> @scorch.compile
+    ... def gcn_layer(adj, x, bias):
+    ...     h = scorch.matmul(adj, x, format="dd")  # contraction (traced leaf)
+    ...     h = h + bias                            # operator.add -> fused "add"
+    ...     return torch.relu(h)                    # torch.relu   -> fused "relu"
+    >>> out = gcn_layer(adj, x, bias)               # torch.Tensor [64, 16]
+    >>> expected = torch.relu(adj.to_torch(in_place=False) @ x + bias)
+    >>> torch.allclose(out, expected, atol=1e-4)
+    True
+
+    The parameterized form scopes SpMM autotuning around each call:
+
+    >>> @scorch.compile(autotune="max")
+    ... def fused(adj, x, bias):
+    ...     h = scorch.matmul(adj, x, format="dd")
+    ...     return torch.relu(h + bias)
+    """
 
     def __init__(self, fn: Optional[Callable] = None, *,
                  autotune: Optional[str] = None):

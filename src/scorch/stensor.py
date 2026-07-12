@@ -37,15 +37,55 @@ class Window(object):
 
 
 class STensor:
-    """A tensor stored in custom format.
+    """A sparse tensor stored in a custom, per-mode layout.
 
-    NOTE: This is a plain Python class, not an ``nn.Module``. STensor holds its
-    payload inside ``self._storage`` (a ``TensorStorage``), never as a direct
-    tensor attribute, so ``nn.Module`` registered nothing useful — it only added
-    per-instance ``__init__``/``__setattr__``/``isinstance`` overhead that
-    dominated matmul latency on small matrices. STensors are transient data, are
-    never registered as submodules, and carry no autograd, so dropping Module is
-    behaviour-preserving.
+    ``STensor`` is Scorch's user-facing sparse tensor. It is a thin *logical*
+    handle: it records the tensor's name, logical shape, and logical dtype and
+    delegates all numeric payload to ``self._storage`` (a
+    :class:`~scorch.storage.TensorStorage`). The storage in turn pairs a flat 1-D
+    values tensor with a :class:`~scorch.storage.TensorIndex`, which holds the
+    :class:`~scorch.format.TensorFormat` (one :class:`~scorch.format.LevelType`
+    per mode — dense, compressed, or coordinate) and the coordinate arrays that
+    describe where the nonzeros live.
+
+    Users almost never construct an ``STensor`` directly. Build one from a torch
+    tensor with the factories :meth:`from_torch`, :meth:`from_csr`, or
+    :meth:`from_coo` (also re-exported at module scope as ``scorch.from_torch``,
+    ``scorch.from_csr``, ``scorch.from_coo``), and exit back to PyTorch with
+    :meth:`to_torch`. Matmul is the top-level function ``scorch.matmul(a, b)`` /
+    ``scorch.einsum(...)`` — ``STensor`` deliberately defines no ``__matmul__``,
+    so ``a @ b`` will not work.
+
+    Notes
+    -----
+    This is a plain Python class, not an ``nn.Module``. Because the payload lives
+    in ``self._storage`` and never as a direct tensor attribute, ``nn.Module``
+    registered nothing useful — it only added per-instance
+    ``__init__``/``__setattr__``/``isinstance`` overhead that dominated matmul
+    latency on small matrices. STensors are transient data, are never registered
+    as submodules, and carry no autograd, so dropping ``nn.Module`` is
+    behaviour-preserving. ``requires_grad`` is stored but inert (no autograd).
+
+    Scorch is a CPU compiler library. ``repr(stensor)`` is uninformative (it
+    always prints ``"Tensor"``); inspect a tensor via :attr:`shape`,
+    ``str(x.format)`` (e.g. ``"d,s"``), :attr:`values`, and
+    ``x.index.mode_indices`` instead.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> t = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    >>> a = scorch.from_torch(t, "A")     # dense STensor, format "d,d"
+    >>> a.shape
+    (3, 4)
+    >>> torch.equal(a.to_torch(), t)
+    True
+
+    See Also
+    --------
+    from_torch : Build an STensor from a dense/COO/CSR torch tensor.
+    to_torch : Materialize back to a dense ``torch.Tensor``.
     """
 
     _name: Optional[str]
@@ -82,7 +122,21 @@ class STensor:
         self.requires_grad = requires_grad
 
     def insert(self, indices, values):
-        """Insert values into the tensor."""
+        """Insert values into the tensor.
+
+        Parameters
+        ----------
+        indices : array-like
+            Coordinates at which to insert.
+        values : array-like
+            Values to insert at ``indices``.
+
+        Notes
+        -----
+        Not yet implemented — this method is a placeholder (no-op) and performs
+        no insertion. There is no supported in-place mutation API on ``STensor``
+        today; build a new tensor with a factory instead.
+        """
         # TODO: Implement this.
         pass
 
@@ -92,12 +146,34 @@ class STensor:
 
     @property
     def has_index(self) -> bool:
-        """Return whether the tensor has an index."""
+        """Whether the tensor's storage carries a sparsity index.
+
+        Returns
+        -------
+        bool
+            ``True`` if the underlying storage has a
+            :class:`~scorch.storage.TensorIndex` (format + coordinates),
+            ``False`` for a value-only storage. Delegates to
+            ``self.storage.has_index``.
+        """
         return self.storage.has_index
 
     @property
     def name(self) -> str:
-        """Get the tensor name."""
+        """The tensor's name.
+
+        Returns
+        -------
+        str
+            The name assigned at construction (the factories default it to
+            ``"tensor"``).
+
+        Raises
+        ------
+        AssertionError
+            If no name was ever set. A hand-built ``STensor(shape=...)`` with no
+            ``name`` raises on access; factory-made tensors are always safe.
+        """
         assert self._name is not None, "Tensor name is not set."
         return self._name
 
@@ -107,35 +183,94 @@ class STensor:
 
     @property
     def values(self) -> torch.Tensor:
-        """Get the tensor value."""
+        """The flat 1-D tensor of stored (nonzero) values.
+
+        Returns
+        -------
+        torch.Tensor
+            A 1-D tensor holding every stored value in physical order — the
+            entire numeric payload. For a dense tensor this is the row-major
+            flattening; for CSR/COO it is the ``nnz`` nonzeros. Equivalent to
+            ``self.storage.value``.
+        """
         return self.storage.value
 
     @property
     def index(self) -> TensorIndex:
-        """Get the tensor index."""
+        """The sparsity index (format plus coordinate arrays).
+
+        Returns
+        -------
+        TensorIndex
+            The :class:`~scorch.storage.TensorIndex` describing structure: the
+            :class:`~scorch.format.TensorFormat`, the ``mode_indices``
+            (e.g. CSR ``[[], [crow, col]]`` or COO ``[[row], [col]]``), and the
+            ``mode_order`` permutation. Equivalent to ``self.storage.index``.
+        """
         return self.storage.index
 
     @property
     def format(self) -> TensorFormat:
-        """Get the tensor format."""
+        """The per-mode storage format.
+
+        Returns
+        -------
+        TensorFormat
+            The :class:`~scorch.format.TensorFormat`, one
+            :class:`~scorch.format.LevelType` per mode. ``str(fmt)`` renders a
+            comma-joined level string, e.g. ``"d,d"`` (dense), ``"d,s"`` (CSR),
+            or ``"o,o"`` (COO).
+
+        Raises
+        ------
+        AssertionError
+            If the index has no format set.
+        """
         tensor_format = self.index.format
         assert tensor_format is not None, "Tensor format is not set."
         return tensor_format
 
     @property
     def storage(self) -> TensorStorage:
-        """Get the tensor storage."""
+        """The physical storage container.
+
+        Returns
+        -------
+        TensorStorage
+            The :class:`~scorch.storage.TensorStorage` holding the flat values
+            tensor and the :class:`~scorch.storage.TensorIndex`.
+
+        Raises
+        ------
+        AssertionError
+            If no storage was set on this tensor.
+        """
         assert self._storage is not None, "Tensor storage is not set."
         return self._storage
 
     @property
     def dtype(self):
-        """Get the tensor logical dtype."""
+        """The logical component dtype (default ``torch.float32``).
+
+        Returns
+        -------
+        torch.dtype
+            The logical dtype. This may differ from the physical dtype of the
+            stored values (``storage._dtype``); :meth:`to_torch` casts back to
+            this logical dtype on the way out.
+        """
         return self._dtype
 
     @property
     def shape(self) -> Tuple[int, ...]:
-        """Get the tensor shape."""
+        """The logical shape.
+
+        Returns
+        -------
+        tuple of int
+            The tensor's shape in logical (original) axis order, or the empty
+            tuple ``()`` if the shape is unset.
+        """
         return self._shape if self._shape is not None else tuple()
 
     def __str__(self):
@@ -148,30 +283,108 @@ class STensor:
         return self.__str__()
 
     def validate(self):
-        """Validate the tensor."""
+        """Validate the tensor's internal consistency.
+
+        Raises
+        ------
+        NotImplementedError
+            Always. This method is a placeholder and performs no validation.
+        """
         # TODO: Implement this.
         raise NotImplementedError()
 
     def to(self, device):
-        """Move the tensor to a device."""
+        """Move the tensor to a device.
+
+        Parameters
+        ----------
+        device
+            Target device.
+
+        Raises
+        ------
+        NotImplementedError
+            Always. Scorch is a CPU-only compiler library; there is no device
+            transfer.
+        """
         # TODO: Implement this.
         raise NotImplementedError()
 
     def cuda(self):
-        """Move the tensor to the GPU."""
+        """Move the tensor to the GPU.
+
+        Raises
+        ------
+        NotImplementedError
+            Always — this delegates to :meth:`to`, which is unimplemented.
+            Scorch is CPU-only.
+        """
         return self.to(torch.cuda.current_device())
 
     def clone(self):
-        """Clone the tensor."""
+        """Clone the tensor.
+
+        Raises
+        ------
+        NotImplementedError
+            Always. This method is a placeholder; use :meth:`copy` for a working
+            deep copy.
+
+        See Also
+        --------
+        copy : The supported way to duplicate an ``STensor``.
+        """
         # TODO: Implement this.
         raise NotImplementedError()
 
     def dim(self):
-        """Get the number of dimensions."""
+        """Number of tensor dimensions (order).
+
+        Returns
+        -------
+        int
+            ``len(self.shape)``.
+
+        Notes
+        -----
+        ``STensor`` has no ``.ndim`` property; use this method instead.
+        """
         return len(self.shape)
 
     def __add__(self, other) -> STensor:
-        """Add two tensors together."""
+        """Element-wise addition of two tensors (``self + other``).
+
+        JIT-compiles and runs a codegen kernel that adds the two operands
+        element-wise. ``other`` is first relaid out (via
+        :meth:`change_mode_order`) to match ``self``'s ``mode_order``. The
+        output takes ``self``'s format.
+
+        Parameters
+        ----------
+        other : STensor
+            The right-hand operand. Must have the same shape as ``self``.
+
+        Returns
+        -------
+        STensor
+            A new tensor holding the element-wise sum.
+
+        Notes
+        -----
+        No broadcasting is performed and the output format is not inferred from
+        the inputs (it is fixed to ``self.format``). The first call incurs a C++
+        compile; compiled kernels are cached.
+
+        Examples
+        --------
+        >>> import torch
+        >>> import scorch
+        >>> A = scorch.from_torch(torch.rand(4, 4), "A")
+        >>> B = scorch.from_torch(torch.rand(4, 4), "B")
+        >>> C = A + B
+        >>> torch.allclose(C.to_torch(), A.to_torch() + B.to_torch(), atol=1e-3)
+        True
+        """
         # Change mode order of other to match self if different
         if self.storage.index.mode_order != other.storage.index.mode_order:
             other.change_mode_order(self.storage.index.mode_order)
@@ -264,11 +477,42 @@ class STensor:
         return result
 
     def __mul__(self, other) -> STensor:
-        """Multiply two tensors together."""
+        """Element-wise multiplication of two tensors (``self * other``).
+
+        Parameters
+        ----------
+        other : STensor
+            The right-hand operand.
+
+        Raises
+        ------
+        NotImplementedError
+            Always. Element-wise multiply is not yet implemented; only
+            :meth:`__add__` is available among the element-wise operators.
+
+        See Also
+        --------
+        __add__ : Element-wise addition (implemented).
+        """
         raise NotImplementedError()
 
     def copy(self) -> STensor:
-        """Copy the tensor."""
+        """Return a deep copy of the tensor.
+
+        Duplicates the storage: the values tensor is cloned and every index
+        array is cloned and detached, so the copy shares no state with the
+        original. Name and shape are preserved.
+
+        Returns
+        -------
+        STensor
+            An independent copy.
+
+        Notes
+        -----
+        This is the supported way to duplicate an ``STensor`` — :meth:`clone`
+        is an unimplemented placeholder.
+        """
         return STensor(
             name=self._name,
             shape=self.shape,
@@ -280,12 +524,53 @@ class STensor:
         csr_matrix: torch.Tensor,
         name: Optional[str] = None,
     ) -> STensor:
-        """
-        Create a Tensor from a PyTorch CSR tensor.
+        """Create an STensor from a PyTorch CSR matrix.
 
-        :param csr_matrix: A sparse tensor in CSR format
-        :param name: Optional name for the tensor
-        :return: A Tensor object
+        Wraps a 2-D ``torch.sparse_csr`` tensor as a Scorch tensor with the
+        canonical CSR layout: format ``"d,s"`` (dense rows, compressed cols),
+        ``mode_indices = [[], [crow_indices, col_indices]]``, and the CSR values
+        as the flat payload. No data is copied beyond referencing the input's
+        index/value arrays.
+
+        Parameters
+        ----------
+        csr_matrix : torch.Tensor
+            A 2-D sparse tensor in CSR format (``is_sparse_csr`` must be True).
+        name : str, optional
+            Name for the tensor. Defaults to ``"tensor"``.
+
+        Returns
+        -------
+        STensor
+            A Scorch tensor in CSR (``"d,s"``) format.
+
+        Raises
+        ------
+        AssertionError
+            If ``csr_matrix`` is not a sparse CSR tensor, or if it is not 2-D
+            (CSR is only valid for 2-D matrices).
+
+        Notes
+        -----
+        Unlike :meth:`from_torch`, this does not set an explicit ``mode_order``,
+        so the index uses the identity permutation. For n-D sparse data use
+        :meth:`from_coo`. Re-exported as ``scorch.from_csr``.
+
+        Examples
+        --------
+        >>> import torch
+        >>> import scorch
+        >>> dense = torch.tensor([[0., 2., 0.], [1., 0., 3.]])
+        >>> a = scorch.from_csr(dense.to_sparse_csr(), "W")
+        >>> str(a.format)
+        'd,s'
+        >>> torch.equal(a.to_torch(), dense)
+        True
+
+        See Also
+        --------
+        from_torch : Auto-detects dense/COO/CSR inputs.
+        from_coo : Build from COO (arbitrary rank).
         """
         # If name is not provided, use the default name
         if name is None:
@@ -330,14 +615,57 @@ class STensor:
         shape: Optional[Tuple[int, ...]] = None,
         name: Optional[str] = None,
     ) -> STensor:
-        """
-        Create a Tensor from a COO tensor.
-        :param coo_matrix: A torch sparse tensor in COO format
-        :param indices:
-        :param values:
-        :param shape:
-        :param name:
-        :return:
+        """Create an STensor from COO data (arbitrary rank).
+
+        Two calling conventions are supported:
+
+        1. Pass ``coo_matrix`` — a ``torch.sparse_coo_tensor``. It is coalesced
+           and its indices, values, and shape are read from it.
+        2. Pass ``indices``, ``values``, and ``shape`` directly to build COO
+           from raw arrays without a torch sparse tensor.
+
+        Every mode is stored as ``LevelType.COORDINATE`` (format ``"o,o,..."``)
+        with ``mode_indices[i] = [indices[i]]``. Works for any number of modes,
+        unlike :meth:`from_csr` (2-D only).
+
+        Parameters
+        ----------
+        coo_matrix : torch.Tensor, optional
+            A sparse COO tensor. If given, ``indices``/``values``/``shape`` are
+            derived from it (after coalescing) and need not be passed.
+        indices : torch.Tensor, optional
+            Coordinate array of shape ``[ndim, nnz]``. Used when ``coo_matrix``
+            is not supplied.
+        values : torch.Tensor, optional
+            The ``nnz`` nonzero values, shape ``[nnz]``.
+        shape : tuple of int, optional
+            The logical shape. Required in the raw-arrays form.
+        name : str, optional
+            Name for the tensor. Defaults to ``"tensor"``.
+
+        Returns
+        -------
+        STensor
+            A Scorch tensor in COO (``"o,o,..."``) format.
+
+        Notes
+        -----
+        Index arrays are coerced to ``torch.int`` internally. Re-exported as
+        ``scorch.from_coo``.
+
+        Examples
+        --------
+        >>> import torch
+        >>> import scorch
+        >>> i = torch.tensor([[0, 1, 1], [2, 0, 2]])
+        >>> v = torch.tensor([3., 4., 5.])
+        >>> coo = torch.sparse_coo_tensor(i, v, (2, 3)).coalesce()
+        >>> a = scorch.from_coo(coo, name="S")
+        >>> b = scorch.from_coo(indices=i, values=v, shape=(2, 3), name="S")
+        >>> str(a.format)
+        'o,o'
+        >>> torch.equal(a.to_torch(), coo.to_dense())
+        True
         """
         # If name is not provided, use the default name
         if name is None:
@@ -374,7 +702,56 @@ class STensor:
 
     @staticmethod
     def from_torch(tensor: torch.Tensor, name: Optional[str] = None, mode_order: Optional[List[int]] = None) -> STensor:
-        """Create a Tensor from a torch.Tensor."""
+        """Create an STensor from a ``torch.Tensor``, auto-detecting layout.
+
+        The primary constructor. Accepts a dense tensor, a ``torch.sparse_coo``
+        tensor, or a 2-D ``torch.sparse_csr`` tensor and picks the Scorch format
+        automatically:
+
+        - **dense** input → every mode ``DENSE`` (format ``"d,d,..."``); values
+          are the row-major flattening.
+        - **sparse_coo** input → coalesced; every mode ``COORDINATE``
+          (format ``"o,o,..."``).
+        - **sparse_csr** input (2-D) → format ``"d,s"`` (canonical CSR).
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            The source tensor (dense, COO, or CSR).
+        name : str, optional
+            Name for the tensor. Defaults to ``"tensor"``.
+        mode_order : list of int, optional
+            A permutation of the axes. If given, the input is first
+            ``tensor.permute(*mode_order)`` and the permutation is recorded on
+            the index (physical axis → logical axis), so :meth:`to_torch` can
+            invert it. Defaults to the identity order.
+
+        Returns
+        -------
+        STensor
+            A Scorch tensor whose format matches the input layout.
+
+        Notes
+        -----
+        ``mode_order`` is how Scorch represents a transposed/relaid-out operand
+        without recomputing; most tensors use the identity order.
+
+        Examples
+        --------
+        >>> import torch
+        >>> import scorch
+        >>> t = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        >>> a = scorch.from_torch(t, "A")
+        >>> str(a.format)
+        'd,d'
+        >>> torch.equal(a.to_torch(), t)
+        True
+
+        See Also
+        --------
+        from_csr : Build specifically from a CSR matrix.
+        from_coo : Build from COO indices/values.
+        """
         # torch.Tensor is dense, so shape is the same as torch tensor,
         # and format is dense at every level
 
@@ -460,7 +837,34 @@ class STensor:
         return tt_tensor
 
     def to_torch(self, in_place=True) -> torch.Tensor:
-        """Convert a Scorch Tensor to a torch.Tensor."""
+        """Materialize to a dense ``torch.Tensor`` (exit to PyTorch).
+
+        Densifies the tensor (via :meth:`to_dense`), casts the values back to
+        the logical :attr:`dtype`, reshapes to the tensor's shape, and — if the
+        tensor has a non-identity ``mode_order`` — permutes by the inverse
+        permutation so the result is returned in the original logical axis
+        order. The result is always a dense ``torch.Tensor``.
+
+        Parameters
+        ----------
+        in_place : bool, default True
+            Forwarded to :meth:`to_dense`. When ``True`` the underlying storage
+            may be replaced with the densified storage as a side effect.
+
+        Returns
+        -------
+        torch.Tensor
+            A dense tensor equal to the sparse tensor's contents.
+
+        Examples
+        --------
+        >>> import torch
+        >>> import scorch
+        >>> t = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        >>> a = scorch.from_torch(t.to_sparse_csr(), "A")
+        >>> torch.equal(a.to_torch(), t)
+        True
+        """
         # Get a dense Scorch tensor
         dense_tensor = self.to_dense(in_place=in_place)
         # Convert the dense Scorch tensor to a torch.Tensor
@@ -487,7 +891,39 @@ class STensor:
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
         in_place: bool = False,
     ) -> STensor:
-        """Convert the Scorch tensor to a dense Scorch tensor."""
+        """Densify to an all-dense ``STensor`` (stays within Scorch).
+
+        Returns an ``STensor`` (not a ``torch.Tensor``) whose format is
+        all-``DENSE`` by default. If the tensor is already dense, returns
+        ``self`` (when ``in_place``) or a copy. Otherwise Scorch JIT-compiles a
+        C++ kernel to scatter the stored values into a dense buffer.
+
+        Parameters
+        ----------
+        fmt : TensorFormat or str or list of str, optional
+            Target format (e.g. ``"dd"`` or ``["dense", "dense"]``), parsed via
+            ``parse_format``. If ``None`` the output is all-dense. Passing a
+            non-dense ``fmt`` here is an under-specified path — this method is
+            intended for densification.
+        in_place : bool, default False
+            When ``True`` the densified storage replaces ``self._storage`` and
+            ``self`` is returned; otherwise a new ``STensor`` is returned.
+
+        Returns
+        -------
+        STensor
+            A dense Scorch tensor.
+
+        Notes
+        -----
+        The first densification of a given shape/format incurs a C++ compile;
+        compiled kernels are cached. To exit to PyTorch use :meth:`to_torch`.
+
+        See Also
+        --------
+        to_sparse : The inverse (compress to a sparse format).
+        to_torch : Materialize to a dense ``torch.Tensor``.
+        """
 
         # If self is already dense at every level, return self
         if self.format.is_dense():
@@ -615,7 +1051,44 @@ class STensor:
     def to_sparse(
         self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None
     ) -> STensor:
-        """Convert the Scorch tensor to a sparse Scorch tensor."""
+        """Compress to a sparse ``STensor``, mutating in place.
+
+        Filters out zeros and stores the tensor in a sparse format. **This
+        method always mutates ``self._storage`` in place and returns ``self``**
+        (there is no ``in_place`` flag). By default every mode becomes
+        ``COMPRESSED``.
+
+        Parameters
+        ----------
+        fmt : TensorFormat or str or list of str, optional
+            Target sparse format, parsed via ``parse_format``. If ``None`` the
+            output is all-``COMPRESSED``.
+
+        Returns
+        -------
+        STensor
+            ``self``, with its storage replaced by the sparse form.
+
+        Notes
+        -----
+        The 1-D case is special-cased and builds a single compressed level
+        directly from ``torch.nonzero`` (no kernel compile). For rank ≥ 2 Scorch
+        JIT-compiles a filter-zeros kernel (honoring the tensor's ``mode_order``);
+        the first call of a given shape/format incurs a C++ compile.
+
+        Examples
+        --------
+        >>> import torch
+        >>> import scorch
+        >>> a = scorch.from_torch(torch.tensor([[0., 5.], [0., 0.]]), "A")
+        >>> _ = a.to_sparse("ss")   # both modes COMPRESSED; a mutated in place
+        >>> str(a.format)
+        's,s'
+
+        See Also
+        --------
+        to_dense : The inverse (densify).
+        """
         if len(self.shape) == 1:
             # Find indexes of non-zero elements in self.values, flatten them
             nonzero_indices = torch.nonzero(self.values).flatten()
@@ -746,17 +1219,38 @@ class STensor:
         return self
 
     def change_mode_order(self, mode_order: List[int]) -> STensor:
-        """Change the logical mode order of this tensor.
+        """Relay out the tensor into a new logical mode order (transpose).
 
-        Compiles and executes a Where(producer, consumer) CIN where the producer
-        iterates in the old mode order and the consumer iterates in the new mode
-        order, with a multi-dimensional workspace as intermediate.
+        Permutes the tensor's modes, updating storage and shape in place. A
+        fast path handles the common 2-D core formats (``"d,d"``, ``"d,s"``,
+        ``"o,o"``) without compiling a kernel; the general path compiles and
+        executes a ``Where(producer, consumer)`` CIN, where the producer
+        iterates in the old mode order and the consumer in the new one, with a
+        multi-dimensional workspace as intermediate.
 
-        Args:
-            mode_order: The new mode order permutation.
+        Parameters
+        ----------
+        mode_order : list of int
+            The new mode-order permutation. Must be a permutation of
+            ``range(self.dim())``.
 
-        Returns:
-            self, with updated storage and shape.
+        Returns
+        -------
+        STensor
+            ``self``, with updated storage and shape. If the requested order
+            already matches, ``self`` is returned unchanged.
+
+        Raises
+        ------
+        AssertionError
+            If the tensor has no index/dtype/shape/format, or if ``mode_order``
+            is not a valid permutation matching the tensor order.
+
+        Notes
+        -----
+        ``mode_order`` maps physical axis → logical axis. This is how Scorch
+        represents a transposed operand without recomputing; the general
+        (non-fast-path) route triggers a JIT C++ compile on first use.
         """
         assert self.has_index, "self.storage.index is None"
         assert self.dtype is not None, "self.dtype is None"

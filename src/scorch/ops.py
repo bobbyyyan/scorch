@@ -87,6 +87,53 @@ def spmv(
     output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
     **kwargs,
 ) -> STensor:
+    """Sparse matrix-vector product (internal; reached through ``matmul``).
+
+    Computes ``y[i] = sum_j a[i, j] * b[j]`` by lowering a per-row ``Where`` with a
+    scalar accumulating ``Workspace`` through the CIN compiler (CIN -> LLIR -> C++),
+    JIT-compiling, and executing. This is the generic-path SpMV used when the
+    prebuilt ``prebuilt_spmv_csr_*`` kernel does not match.
+
+    This function is **not exported**: ``scorch.spmv`` is not defined (it would fall
+    through ``__getattr__`` to ``torch``, which has no ``spmv``). The user-facing
+    way to reach it is ``matmul(a, x)`` with a 2-D sparse ``a`` and a 1-D ``x`` —
+    ``matmul`` tries the prebuilt CSR-SpMV kernel first and falls back to this
+    function on a miss. Reachable directly as ``scorch.ops.spmv`` for advanced use.
+
+    Parameters
+    ----------
+    a : STensor
+        2-D sparse matrix operand of shape ``(m, n)``.
+    b : STensor
+        1-D vector operand of shape ``(n,)``.
+    output_format : TensorFormat or str or list of str, optional
+        Requested output format. Defaults to ``"d"`` (a dense 1-D vector). Accepts
+        anything :func:`scorch.utils.parse_format` understands.
+    **kwargs
+        ``time_dict`` : dict, optional -- if given, ``time_dict["eval_time"]`` is
+        set to the kernel wall-clock time in seconds.
+
+    Returns
+    -------
+    STensor
+        Result of shape ``(a.shape[0],)`` in ``output_format``.
+
+    Notes
+    -----
+    ``spmv`` itself keeps no module cache; each call recompiles unless the
+    persistent ``.so`` cache in ``_load_kernel`` (keyed under
+    ``TORCH_EXTENSIONS_DIR``) hits.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> A = scorch.from_torch((torch.rand(128, 128) < 0.1).float(), "A").to_sparse("ds")
+    >>> x = torch.rand(128)
+    >>> y = scorch.matmul(A, x)   # 2-D x 1-D -> dense vector via prebuilt/spmv
+    >>> torch.allclose(y, A.to_torch() @ x, atol=1e-3, rtol=1e-3)
+    True
+    """
     if output_format is None:
         output_format = parse_format("d")
     elif not isinstance(output_format, TensorFormat):
@@ -178,6 +225,53 @@ def matmul_wksp(
     output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
     **kwargs,
 ) -> STensor:
+    """Workspace-based SpMM / SpGEMM through the CIN compiler.
+
+    Explicit workspace-lowering variant of :func:`matmul` that **always** goes
+    through the generic CIN compiler pipeline (never the prebuilt hand-written
+    kernels or the adaptive tiling selector). It builds a ``Where`` with an
+    accumulating ``Workspace`` — dense when the output format is dense (avoids the
+    COO hash-map overhead), otherwise COO-hashed — reducing over ``k`` then ``j``,
+    and JIT-compiles once per ``(a.format, b.format, output_format)`` (memoized on
+    the function attribute ``matmul_wksp._module_cache``).
+
+    Use this when you specifically want to exercise the workspace codegen path;
+    :func:`matmul` is the tuned entry point for everyday products.
+
+    Parameters
+    ----------
+    a, b : torch.Tensor or STensor
+        2-D operands. ``torch.Tensor`` inputs are **always** converted to sparse
+        via ``STensor.from_torch(...).to_sparse()`` (note the unconditional
+        ``.to_sparse()``).
+    output_format : TensorFormat or str or list of str, optional
+        Requested output format. Defaults to ``"ds"`` (CSR). Accepts anything
+        :func:`scorch.utils.parse_format` understands.
+    **kwargs
+        ``time_dict`` : dict, optional -- if given, ``time_dict["eval_time"]`` is
+        set to the kernel wall-clock time in seconds.
+
+    Returns
+    -------
+    STensor
+        Result of shape ``(a.shape[0], b.shape[1])`` in ``output_format``. Unlike
+        :func:`matmul`, a dense-format result is **not** converted back to a
+        ``torch.Tensor`` — an ``STensor`` is always returned.
+
+    See Also
+    --------
+    matmul : Tuned entry point (prebuilt kernels + tiling + thread policy).
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> A = scorch.from_torch((torch.rand(64, 64) < 0.1).float(), "A").to_sparse("ds")
+    >>> B = scorch.from_torch((torch.rand(64, 64) < 0.1).float(), "B").to_sparse("ds")
+    >>> C = scorch.matmul_wksp(A, B, output_format="ds")   # STensor (CSR)
+    >>> torch.allclose(C.to_torch(), A.to_torch() @ B.to_torch(), atol=1e-3, rtol=1e-3)
+    True
+    """
     if isinstance(a, torch.Tensor):
         a = STensor.from_torch(a).to_sparse()
     if isinstance(b, torch.Tensor):
@@ -286,7 +380,95 @@ def matmul(
     b: Union[torch.Tensor, STensor],
     **kwargs: Any,
 ) -> Union[torch.Tensor, STensor]:
-    """Matrix multiplication."""
+    """Matrix multiplication for any mix of dense and sparse operands.
+
+    The tuned public entry point for two-operand products (SpMV, SpMM, SpGEMM, and
+    the dense-dense passthrough). Dispatch proceeds through three tiers, tried in
+    order:
+
+    1. **Both-dense torch delegate.** If both operands are dense (dense
+       ``torch.Tensor`` x dense ``torch.Tensor``, or dense ``STensor`` x dense
+       ``STensor``), the product is handed to ``torch.matmul`` directly.
+    2. **Prebuilt hand-written C++ kernel.** ``resolve_prebuilt_matmul`` matches the
+       operand ranks/formats/dtype against the native ``scorch_ops`` extension
+       (CSR x dense -> dense, CSR x CSR -> CSR, COO x COO -> COO, COO x dense ->
+       dense, CSR x vector -> dense vector). On the drop-in ``spmm_csr_float_v2``
+       symbol it additionally applies the adaptive tiling selector
+       (``tiling.maybe_dispatch``, provably no-regression because v2 is always the
+       probe baseline) and the host-thread composition hints.
+    3. **Generic JIT compiler pipeline.** On a prebuilt miss the product is emitted
+       as ``einsum("ij,jk->ik", a, b, ...)`` (2-D x 1-D goes to :func:`spmv`),
+       compiling a C++ kernel through the CIN -> LLIR -> codegen pipeline.
+
+    Sparse 2-D operands are normalized to canonical mode order ``[0, 1]`` before
+    dispatch so transposed / non-default layouts stay correct on the fast paths.
+
+    Parameters
+    ----------
+    a, b : torch.Tensor or STensor
+        Operands. ``torch.Tensor`` inputs are auto-converted: dense-dense returns
+        immediately via ``torch.matmul``; two ``sparse_coo`` tensors are promoted
+        to CSR; any other sparse input triggers ``STensor.from_torch``.
+    **kwargs
+        format : str or list or TensorFormat, optional
+            Requested output format. Read as
+            ``kwargs.get("format", kwargs.get("output_format", None))``. For the
+            dense-dense path only ``format`` is consulted. When omitted for a
+            compiled product the output format is inferred (see :func:`einsum`).
+        output_format : str or list or TensorFormat, optional
+            Alias for ``format`` (see above).
+        use_cache : bool, default True
+            When ``True``, allow the prebuilt-kernel fast path and the adaptive
+            tiling selector. ``False`` forces the generic ``einsum`` path (used by
+            the compiler gap tests).
+        time_dict : dict, optional
+            If given, ``time_dict["eval_time"]`` is set to the kernel wall-clock
+            time in seconds.
+
+    Returns
+    -------
+    torch.Tensor or STensor
+        A dense ``torch.Tensor`` when the result format is dense (the common SpMM
+        case, e.g. ``ds @ dd -> dd``, and every dense-dense product), otherwise an
+        ``STensor`` (e.g. the SpGEMM ``ds @ ds -> ds``).
+
+    Other Parameters
+    ----------------
+    SCORCH_MATCH_HOST_THREADS : env, default "1"
+        Set to ``"0"`` to stop passing ``torch.get_num_threads()`` to the drop-in
+        ``spmm_csr_float_v2`` kernel (thread-team matching for GCN pipelines).
+    SCORCH_ATPARALLEL_PIPELINE : env, default "1"
+        Set to ``"0"`` to launch the SpMM on a private libgomp team instead of
+        torch's intra-op pool.
+
+    See Also
+    --------
+    einsum : The generic compiler front door matmul falls through to.
+    matmul_wksp : Explicit workspace-lowering SpMM/SpGEMM (always compiled).
+
+    Notes
+    -----
+    Compiled kernels are memoized aggressively; a stale extensions build directory
+    can mask a codegen edit, so clear ``TORCH_EXTENSIONS_DIR`` to force a recompile.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> A_dense = (torch.rand(256, 256) * (torch.rand(256, 256) < 0.1)).float()
+    >>> x = torch.rand(256, 128)
+    >>> A = scorch.from_torch(A_dense, "A").to_sparse("ds")   # CSR STensor
+    >>> Y = scorch.matmul(A, x)                                # -> dense torch.Tensor
+    >>> torch.allclose(Y, A_dense @ x, atol=1e-3, rtol=1e-3)
+    True
+
+    Sparse x sparse (SpGEMM) producing a sparse ``STensor``:
+
+    >>> B = scorch.from_torch(A_dense, "B").to_sparse("ds")
+    >>> C = scorch.matmul(A, B, format="ds")                   # -> STensor (CSR)
+    >>> torch.allclose(C.to_torch(), A_dense @ A_dense, atol=1e-3, rtol=1e-3)
+    True
+    """
 
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         if a.is_sparse and b.is_sparse and a.layout == torch.sparse_coo and b.layout == torch.sparse_coo:
@@ -471,6 +653,31 @@ def fast_transpose(x: torch.Tensor) -> torch.Tensor:
 
     Falls back to ``x.T.contiguous()`` if the kernel is unavailable or the input
     is not a 2D float32 tensor (exactness is preserved either way).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        2-D ``float32`` tensor ``[R, C]`` (fast path); any other rank/dtype takes
+        the exact ``x.T.contiguous()`` fallback.
+
+    Returns
+    -------
+    torch.Tensor
+        Contiguous ``[C, R]`` tensor, bit-identical to ``x.T.contiguous()``.
+
+    Notes
+    -----
+    Uses ``torch.get_num_threads()`` when ``SCORCH_MATCH_HOST_THREADS`` is on, else
+    ``-1``. Backs the input transpose inside :func:`sparse_linear`.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> x = torch.rand(1024, 768)
+    >>> xt = scorch.fast_transpose(x)              # [768, 1024]
+    >>> torch.equal(xt, x.T.contiguous())          # bit-identical
+    True
     """
     import scorch_ops as _native
 
@@ -497,6 +704,32 @@ def sparse_softmax_csr(
 
     Falls back to a torch segment-softmax if the kernel is unavailable or the
     values are not float32 (exactness preserved either way).
+
+    Parameters
+    ----------
+    crow_indices : torch.Tensor
+        CSR row-pointer tensor of length ``nrows + 1``.
+    values : torch.Tensor
+        CSR nonzero values (``float32`` for the fast path); softmax is computed
+        within each row's span.
+    scale : float, default 1.0
+        Multiplier folded into the logits before softmax (e.g. the attention
+        scaling ``1 / sqrt(d)``).
+
+    Returns
+    -------
+    torch.Tensor
+        Dense tensor the same length as ``values``, normalized per CSR row span.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> M = (torch.rand(8, 8) < 0.4).float()
+    >>> csr = M.to_sparse_csr()
+    >>> w = scorch.sparse_softmax_csr(csr.crow_indices(), csr.values().float())
+    >>> w.shape[0] == csr.values().numel()       # sums to 1 within each row span
+    True
     """
     import scorch_ops as _native
 
@@ -575,6 +808,35 @@ def sparse_attention(
 
     Falls back to a pure-torch per-head reference if the kernel is unavailable or
     the tensors are not float32 (result identical up to float rounding).
+
+    Parameters
+    ----------
+    crow_indices, col_indices : torch.Tensor
+        Shared CSR attention **mask** structure over the ``[S, S]`` query x key
+        grid (passed once, shared across heads).
+    Q, K, V : torch.Tensor
+        Dense ``[S, H, D]`` ``float32`` tensors (``S`` = sequence length,
+        ``H`` = heads, ``D`` = head dim).
+    scale : float, default 1.0
+        Attention scale, e.g. ``1 / sqrt(D)``, folded into the logits.
+
+    Returns
+    -------
+    torch.Tensor
+        Dense ``[S, H, D]`` attention output.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> S, H, D = 128, 4, 32
+    >>> csr = (torch.rand(S, S) < 0.1).float().to_sparse_csr()
+    >>> Q, K, V = torch.rand(S, H, D), torch.rand(S, H, D), torch.rand(S, H, D)
+    >>> out = scorch.sparse_attention(
+    ...     csr.crow_indices(), csr.col_indices(), Q, K, V, scale=1.0 / (D ** 0.5),
+    ... )
+    >>> tuple(out.shape)
+    (128, 4, 32)
     """
     import scorch_ops as _native
 
@@ -612,24 +874,44 @@ def sparse_linear_fm(
     throughout (transpose the input once in, transpose the output once out) with
     NO per-layer transpose and NO separate torch bias/act epilogue.
 
-    ``x_fm``   -- dense activation ``[in, batch]`` in FEATURE-MAJOR (row = input
-                  feature) layout (a torch.Tensor or dense STensor). The output of
-                  a previous ``sparse_linear_fm`` (already ``[out, batch]``) feeds
-                  straight in.
-    ``weight`` -- sparse CSR STensor ``[out, in]`` (the Linear weight, as in
-                  ``F.linear``: ``y = x @ weight.T``).
-    ``bias``   -- optional dense ``[out]`` bias, added per output channel.
-    ``activation`` -- ``None`` / ``"relu"`` / ``"sigmoid"``.
+    Parameters
+    ----------
+    x_fm : torch.Tensor or STensor
+        Dense activation ``[in, batch]`` in FEATURE-MAJOR (row = input feature)
+        layout. The output of a previous ``sparse_linear_fm`` (already
+        ``[out, batch]``) feeds straight in.
+    weight : STensor
+        Sparse CSR weight ``[out, in]`` (as in ``F.linear``: ``y = x @ weight.T``).
+    bias : torch.Tensor, optional
+        Dense ``[out]`` bias, added per output channel.
+    activation : str, optional
+        ``None`` / ``"relu"`` / ``"sigmoid"``.
 
-    Returns a dense torch.Tensor ``[out, batch]``.
+    Returns
+    -------
+    torch.Tensor
+        Dense ``[out, batch]`` result (feature-major).
 
+    Raises
+    ------
+    ValueError
+        If ``activation`` is not one of ``None`` / ``"none"`` / ``"identity"`` /
+        ``"relu"`` / ``"sigmoid"``.
+
+    Notes
+    -----
     Routes to the prebuilt ``spmm_csr_linear_fused_float`` kernel (v2's fast
-    regtile/regblock inner loops + the fused epilogue). Carries the same pipeline
-    composition hints as the drop-in ``matmul`` SpMM (``_MATCH_HOST_THREADS`` /
-    ``_ATPARALLEL_PIPELINE``). This is a DISTINCT entry point from ``matmul``, so
-    the FEM/GCN SpMM path (``scorch.matmul`` -> ``spmm_csr_float_v2`` /
-    ``spmm_csr_bias_act``) never reaches this kernel — the guardrail is the API
-    boundary.
+    regtile/regblock inner loops + the fused epilogue), falling back to a dense
+    torch reference when the kernel is unavailable or the dtype is not float32.
+    Carries the same pipeline composition hints as the drop-in ``matmul`` SpMM
+    (``SCORCH_MATCH_HOST_THREADS`` / ``SCORCH_ATPARALLEL_PIPELINE``). This is a
+    DISTINCT entry point from :func:`matmul`, so the FEM/GCN SpMM path
+    (``scorch.matmul`` -> ``spmm_csr_float_v2`` / ``spmm_csr_bias_act``) never
+    reaches this kernel — the guardrail is the API boundary.
+
+    See Also
+    --------
+    sparse_linear : Natural-layout ``F.linear`` drop-in built on this kernel.
     """
     import scorch_ops as _native
 
@@ -727,6 +1009,41 @@ def sparse_linear(
     ``torch.sparse.mm(W, x.T).T`` MKL already pays, minus MKL's separate bias/act
     epilogue. For a multi-layer chain, ``sparse_linear_fm`` (staying feature-major
     end to end) avoids the intermediate transposes.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Dense ``[batch, in]`` ``float32`` activation in natural layout.
+    weight : STensor or torch.Tensor
+        Sparse CSR ``STensor`` ``[out, in]`` (**preferred** — build it once and
+        reuse), or a dense ``torch.Tensor`` ``[out, in]`` which is converted to CSR
+        *per call*; pass a pre-built STensor in a hot loop to avoid the conversion.
+    bias : torch.Tensor, optional
+        Dense ``[out]`` bias.
+    activation : str, optional
+        ``None`` / ``"relu"`` / ``"sigmoid"``.
+
+    Returns
+    -------
+    torch.Tensor
+        Dense ``[batch, out]`` result.
+
+    See Also
+    --------
+    sparse_linear_fm : Feature-major variant that avoids per-layer transposes.
+    fast_transpose : The cache-blocked transpose used on the input.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> W_dense = (torch.rand(256, 512) < 0.1).float()
+    >>> W = scorch.from_csr(W_dense.to_sparse_csr(), "W")   # build CSR STensor once
+    >>> b = torch.rand(256)
+    >>> x = torch.rand(64, 512)
+    >>> y = scorch.sparse_linear(x, W, b, activation="relu")   # [64, 256]
+    >>> torch.allclose(y, torch.relu(x @ W_dense.T + b), atol=1e-3, rtol=1e-3)
+    True
     """
     if isinstance(weight, torch.Tensor) and not isinstance(weight, STensor):
         weight = STensor.from_csr(weight.to_sparse_csr(), "weight")
@@ -895,6 +1212,95 @@ def einsum(
     compile_only: Optional[bool] = False,
     **kwargs: Any,
 ) -> STensor:
+    """Compile and evaluate a numpy-style einsum over sparse/dense operands.
+
+    The generic front door to the sparse-tensor compiler. Given an index-notation
+    expression it builds Compiler Index Notation (CIN), schedules and lowers it
+    through LLIR to a C++ kernel, JIT-compiles (memoized), and executes — covering
+    the binary contraction / elementwise / SDDMM patterns the library supports.
+    :func:`matmul` falls through to this for anything the prebuilt kernels miss.
+
+    Parameters
+    ----------
+    expression : str
+        A numpy-style einsum string that **must contain an explicit** ``"->"``
+        output, e.g. ``"ik,kj->ij"`` (matmul / SpMM / SpGEMM), ``"ij,ij->ij"``
+        (elementwise multiply), or ``"ij,ik,jk->ij"`` (SDDMM). One character per
+        index. An implicit-output form (no ``"->"``) is **not** supported and
+        raises ``IndexError``.
+    *tensors : torch.Tensor or STensor
+        The operands, one per comma-separated input group. ``torch.Tensor`` inputs
+        are auto-converted with ``STensor.from_torch``.
+    compile_only : bool, default False
+        When ``True``, compile and cache the kernel but return a placeholder
+        ``STensor("Compile only")`` without executing (used by
+        :func:`precompile_kernels`).
+    **kwargs
+        format : str or list or TensorFormat, optional
+            Requested output format. If omitted, the output format is inferred
+            per-level (see Notes).
+        output_mode_order : list of int, optional
+            Permutation applied to the output modes.
+        time_dict : dict, optional
+            If given, ``time_dict["eval_time"]`` is set to the kernel wall-clock
+            time in seconds.
+        _post_ops, _post_ops_tensors : advanced/internal
+            Fused post-op chain (bias/scale/activation) and its extra operand
+            tensors, used by ``scorch.compile``. When ``_post_ops`` is set the fast
+            dispatch cache and the register-block dual-path are bypassed.
+
+    Returns
+    -------
+    STensor
+        The result (dense or sparse per the output format). Callers such as
+        :func:`matmul` convert a dense-format result back to a ``torch.Tensor``.
+
+    Raises
+    ------
+    IndexError
+        If ``expression`` omits the ``"->"`` output separator.
+
+    Notes
+    -----
+    **Output-format inference** (when ``format=`` is omitted) is decided per level:
+    *sparse * anything = sparse; dense + anything = dense; otherwise compressed*,
+    with ties preferring coordinate over compressed. A sparse level may not precede
+    a dense level (a preceding sparse level is forced dense). As a special case,
+    an SDDMM pattern (sparse output with reduction vars plus an input mirroring the
+    output sparsity) yields an all-COO output to enable the scalar-accum codegen
+    path — and there is a dedicated prebuilt fast path inside ``einsum`` for exactly
+    ``"ij,ik,jk->ij"`` with ``S`` (COO), ``A`` (dense), ``B`` (dense) float32.
+
+    For the qualifying pattern (dense output, sparse contraction, tileable free dim,
+    ``_post_ops is None``) ``einsum`` emits ONE kernel that branches at runtime on
+    the free-dim size: a register-block nest for small ``N`` and the byte-identical
+    baseline nest for large ``N``. Set ``SCORCH_REGBLOCK_DUAL=0`` to restore the
+    single baseline path (distinct from the scheduler's ``SCORCH_REGBLOCK``, default
+    off).
+
+    Historically fragile format / mode-order / loop-order combinations (transposed
+    operands, dense-STensor products, broadcast vectors) are covered by the green
+    regression tests in ``tests/test_scorch/test_known_compiler_gaps*.py`` — despite
+    the name, those are *supported* cases. Unsupported patterns surface as compiler
+    exceptions rather than documented errors.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> A = scorch.from_torch((torch.rand(64, 32) < 0.2).float(), "A").to_sparse("ds")
+    >>> B = torch.rand(32, 48)
+    >>> C = scorch.einsum("ik,kj->ij", A, B, format="dd")   # STensor, dense format
+    >>> torch.allclose(C.to_torch(), A.to_torch() @ B, atol=1e-3, rtol=1e-3)
+    True
+
+    SDDMM (sampled ``A @ B.T`` on the nonzeros of a COO mask ``S``):
+
+    >>> S = scorch.from_coo(torch.rand(50, 50).to_sparse_coo(), "S")
+    >>> Ad = torch.rand(50, 16)
+    >>> Bd = torch.rand(50, 16)
+    >>> Sd = scorch.einsum("ij,ik,jk->ij", S, Ad, Bd)       # STensor (COO)
+    """
     # e.g. expression might be e.g. "i,i->i" and "ij,ij->ij" for
     # elementwise multiplication or "ik,kj->ij" for matrix multiplication
 
@@ -1417,13 +1823,30 @@ def lower_and_exec_cin(
 ) -> STensor:
     """Lower a CIN statement to LLIR then codegen and call on the input tensors.
 
-    Args:
-        cin_stmt (IndexStmt): CIN statement to lower.
-        result_shape (Sequence[int]): Shape of the result tensor.
-        *args (STensor): Input tensors.
+    Low-level entry to the generic compiler path: aligns the operand mode orders to
+    the CIN loop order (``_align_mode_orders_to_loop_order``), lowers CIN -> LLIR ->
+    C++, JIT-loads the kernel, executes it on ``args``, and wraps the result as an
+    ``STensor``. This is the primitive the compiler gap tests use to drive the
+    pipeline directly; it is **not exported** — advanced users reach it as
+    ``scorch.ops.lower_and_exec_cin``. Most code should use :func:`matmul` or
+    :func:`einsum` instead.
 
-    Returns:
-        STensor: Output tensor.
+    Parameters
+    ----------
+    cin_stmt : IndexStmt
+        CIN statement (index-notation AST) to lower.
+    result_shape : Sequence[int]
+        Shape of the result tensor.
+    *args : STensor
+        Input tensors, matched left-to-right against the RHS tensor accesses.
+    **kwargs
+        ``time_dict`` : dict, optional -- if given, ``time_dict["eval_time"]`` is
+        set to the kernel wall-clock time in seconds.
+
+    Returns
+    -------
+    STensor
+        Output tensor. The output format is hard-coded to ``"dd"`` (dense).
     """
     _align_mode_orders_to_loop_order(cin_stmt, args)
 
@@ -1471,6 +1894,32 @@ def lower_and_exec_cin(
 
 
 def precompile_kernels():
+    """Warm the JIT cache by compiling the common SpMM / SpGEMM kernels.
+
+    Calls :func:`einsum` with ``compile_only=True`` for the frequently used
+    contraction/format combinations so the first real product does not pay the
+    schedule + codegen + C++ compile cost:
+
+    - ``ds @ dd -> dd``  (CSR x dense -> dense)
+    - ``oo @ dd -> dd``  (COO x dense -> dense)
+    - ``oo @ ds -> dd``  (COO x CSR -> dense)
+    - ``ds @ ds -> dd``  (CSR x CSR -> dense)
+    - ``ds @ ds -> ds``  (CSR x CSR -> CSR / SpGEMM)
+
+    Prints ``"Precompiled kernels."`` when done. The call at module import in
+    ``__init__.py`` is **commented out**, so this does not run automatically —
+    invoke ``scorch.precompile_kernels()`` explicitly to warm up.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> import scorch
+    >>> scorch.precompile_kernels()   # doctest: +SKIP
+    Precompiled kernels.
+    """
     DS = STensor(index=TensorIndex(tensor_format="ds"))
     DD = STensor(index=TensorIndex(tensor_format="dd"))
     OO = STensor(index=TensorIndex(tensor_format="oo"))

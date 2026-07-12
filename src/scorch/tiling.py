@@ -131,19 +131,155 @@ def _level_probes(level: str) -> bool:
 
 
 def set_autotune(level: str) -> None:
-    """Set the process-global autotune level. See scorch.set_autotune."""
+    """Set the process-global autotune level for the SpMM tiling selector.
+
+    Selects, for the whole process, how ``scorch.matmul``'s drop-in
+    **CSR-sparse x dense** SpMM path is dispatched. Autotuning affects *only*
+    that path — it does not touch einsum, other operations, or the general JIT
+    compiler. On shapes the selector does not target (essentially all GCN,
+    autoencoder, attention and FEM workloads, where the dense operand fits the
+    last-level cache) every level dispatches to the byte-identical default
+    kernel, so the level is a no-op there by design.
+
+    The level is a compiler-style ``-O`` ladder trading dispatch overhead for
+    execution speed. The eligibility gate is identical at every non-``off``
+    level; only the decision made for an already-eligible shape changes:
+
+    - ``"off"`` — no tiling; the pure default-kernel baseline.
+    - ``"analytic"`` — **default.** Cost-model pick, no kernel measurement.
+    - ``"balanced"`` — first-call micro-probe over the candidate kernels,
+      memoized in-process; the default kernel is always a candidate, so the
+      pick is never slower than the baseline.
+    - ``"max"`` — the ``balanced`` probe plus a persistent on-disk cache, so the
+      search is paid once per machine.
+    - ``"learned"`` — experimental; an offline-trained cost model. Falls back to
+      ``analytic`` unless a per-machine model file is installed.
+
+    This is the process-global default; use :class:`autotune` for a
+    thread-local, scoped override, and :func:`get_autotune` to read back the
+    effective level.
+
+    Parameters
+    ----------
+    level : str
+        One of ``"off"``, ``"analytic"``, ``"balanced"``, ``"max"``,
+        ``"learned"``. Case- and whitespace-insensitive.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If ``level`` is a string but not one of the allowed levels.
+    TypeError
+        If ``level`` is not a string.
+
+    See Also
+    --------
+    get_autotune : Read the effective level.
+    autotune : Scoped (thread-local) context-manager / decorator override.
+    clear_autotune_cache : Wipe the persistent ``"max"`` cache.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> scorch.set_autotune("max")
+    >>> scorch.get_autotune()
+    'max'
+    >>> scorch.set_autotune("off")   # pure baseline, no tiling
+    """
     global _global_level
     _global_level = _validate_level(level)
 
 
 def get_autotune() -> str:
-    """Return the effective autotune level (thread-local override wins)."""
+    """Return the effective SpMM autotune level currently in force.
+
+    Resolves the level exactly as the dispatcher does: an active thread-local
+    override (from an :class:`autotune` context manager or decorator) wins;
+    otherwise the process-global level set by :func:`set_autotune` (or its
+    environment / built-in default, ``"analytic"``) is returned.
+
+    Returns
+    -------
+    str
+        One of ``"off"``, ``"analytic"``, ``"balanced"``, ``"max"``,
+        ``"learned"``.
+
+    See Also
+    --------
+    set_autotune : Set the process-global level.
+    autotune : Scoped (thread-local) override.
+
+    Examples
+    --------
+    >>> import scorch
+    >>> scorch.set_autotune("balanced")
+    >>> with scorch.autotune("max"):
+    ...     scorch.get_autotune()      # the scoped override wins
+    'max'
+    >>> scorch.get_autotune()          # back to the global level
+    'balanced'
+    """
     return _current_level()
 
 
 class autotune:
-    """Scope the autotune level as a thread-local context manager or decorator
-    (mirrors torch.no_grad). See scorch.autotune."""
+    """Scope the SpMM autotune level, as a context manager or a decorator.
+
+    Mirrors ``torch.no_grad()``: constructing ``autotune(level)`` and entering
+    it installs a **thread-local** override of the autotune level for the
+    duration of the block, restoring the previous value on exit. The override is
+    per-thread and nests correctly; it does not affect other threads or the
+    process-global default set by :func:`set_autotune`.
+
+    Like the rest of the autotune API, this affects only ``scorch.matmul``'s
+    CSR-sparse x dense SpMM dispatch; see :func:`set_autotune` for the level
+    ladder and scope.
+
+    Two usage forms:
+
+    - **Context manager** — ``with scorch.autotune("max"): ...`` sets the
+      override for the block and restores the prior level on exit.
+    - **Decorator** — ``@scorch.autotune("balanced")`` on a function runs each
+      call inside a fresh ``autotune(level)`` scope (reentrant).
+
+    Parameters
+    ----------
+    level : str
+        One of ``"off"``, ``"analytic"``, ``"balanced"``, ``"max"``,
+        ``"learned"``. Validated at construction (case- / whitespace-
+        insensitive).
+
+    Raises
+    ------
+    ValueError
+        If ``level`` is a string but not an allowed level.
+    TypeError
+        If ``level`` is not a string.
+
+    See Also
+    --------
+    set_autotune : Set the process-global level.
+    get_autotune : Read the effective level.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import scorch
+    >>> A = scorch.from_torch(
+    ...     torch.tensor([[1., 0., 2.], [0., 3., 0.], [4., 0., 5.]]), "A"
+    ... )
+    >>> B = torch.randn(3, 128)
+    >>> with scorch.autotune("max"):     # scoped override
+    ...     C = scorch.matmul(A, B)
+    >>> @scorch.autotune("balanced")     # decorator form
+    ... def run(A, B):
+    ...     return scorch.matmul(A, B)
+    """
 
     def __init__(self, level: str):
         self.level = _validate_level(level)
@@ -500,7 +636,31 @@ def _persist_put(sig: tuple, kind: str, param) -> None:
 
 
 def clear_autotune_cache() -> None:
-    """Wipe the persistent on-disk autotune cache (used by the 'max' level)."""
+    """Wipe the persistent on-disk autotune cache used by the ``"max"`` level.
+
+    The ``"max"`` level records each measured SpMM probe winner in a per-machine
+    JSON cache (by default under ``$XDG_CACHE_HOME/scorch/autotune.json``) so the
+    search is paid only once per machine. This deletes that file and resets the
+    in-memory copy, forcing the next ``"max"`` dispatch to re-probe.
+
+    Best-effort: a missing cache file is fine and any I/O error is swallowed so a
+    failed wipe never breaks a matmul. It does **not** clear the in-process
+    per-shape decision memo (that lives for the process lifetime) nor the
+    compiled ``.so`` kernel cache.
+
+    Returns
+    -------
+    None
+
+    See Also
+    --------
+    set_autotune : Select the ``"max"`` level that writes this cache.
+
+    Examples
+    --------
+    >>> import scorch
+    >>> scorch.clear_autotune_cache()
+    """
     global _persist_cache, _cache_loaded
     _persist_cache = {}
     _cache_loaded = True
