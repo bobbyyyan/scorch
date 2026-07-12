@@ -191,6 +191,72 @@ def test_llir_continue_has_a_general_cpp_lowering():
     assert LLIRLowerer().lower_llir(llir.Continue()) == "continue;"
 
 
+def test_dense_elementwise_llir_tensor_access_metadata_survives_rewrites():
+    lowered = CINLowerer().lower_IndexStmt(_build_elementwise("dd"))
+    assert isinstance(lowered, llir.Function)
+
+    tagged_vars = []
+
+    def collect_expr(expr):
+        if isinstance(expr, llir.Var):
+            if expr.tensor_access is not None:
+                tagged_vars.append(expr)
+        elif isinstance(expr, llir.BinOp):
+            collect_expr(expr.left)
+            collect_expr(expr.right)
+        elif isinstance(expr, llir.ArrayAccess):
+            collect_expr(expr.array)
+            collect_expr(expr.index)
+
+    def collect_stmts(stmts):
+        for stmt in stmts:
+            if isinstance(stmt, llir.Assign):
+                collect_expr(stmt.var)
+                collect_expr(stmt.value)
+            elif isinstance(stmt, llir.VarInit):
+                collect_expr(stmt.value)
+            elif isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
+                collect_stmts(stmt.body)
+            elif isinstance(stmt, llir.IfThenElse):
+                for body in [stmt.then_body, stmt.else_body] + (
+                    stmt.then_body_list or []
+                ):
+                    if body:
+                        collect_stmts(body)
+
+    collect_stmts(lowered.body)
+    metadata = {var.tensor_access for var in tagged_vars}
+    assert metadata == {
+        llir.TensorAccessMetadata(
+            "ElemLeft",
+            ("r", "c"),
+            llir.TensorAccessRole.INPUT_READ,
+        ),
+        llir.TensorAccessMetadata(
+            "ElemRight",
+            ("r", "c"),
+            llir.TensorAccessRole.INPUT_READ,
+        ),
+        llir.TensorAccessMetadata(
+            "ElemOut",
+            ("r", "c"),
+            llir.TensorAccessRole.RESULT_WRITE,
+        ),
+    }
+    # Dense pointer hoisting rewrites the physical access spelling, while the
+    # logical tensor/index identity remains available to later schedule passes.
+    assert {var.name for var in tagged_vars} == {
+        "_ElemLeft_val_ptr[c]",
+        "_ElemRight_val_ptr[c]",
+        "ElemOut_values[pElemOut1]",
+    }
+
+    cpp_with_metadata = LLIRLowerer().lower_llir(lowered)
+    for var in tagged_vars:
+        var.tensor_access = None
+    assert LLIRLowerer().lower_llir(lowered) == cpp_with_metadata
+
+
 def test_ttm_row_and_free_axis_tiles_compose_with_ragged_tails():
     schedule = Schedule(
         loop_order=("a", "b", "c", "d"),
@@ -227,6 +293,160 @@ def test_ttm_row_and_free_axis_tiles_compose_with_ragged_tails():
     reference = torch.einsum("abc,cd->abd", core, factor)
 
     assert torch.allclose(result.to_torch(), reference, atol=1e-3, rtol=1e-3)
+
+
+def test_ttm_heap_result_tile_is_generic_compact_accumulation():
+    schedule = Schedule(
+        loop_order=("a", "b", "c", "d"),
+        tiles=(
+            TileSpec(
+                "d",
+                3,
+                placement="outermost",
+                accum="heap",
+                unroll=False,
+            ),
+        ),
+        tag="generic-ttm-heap-d",
+        parallel_loop="a",
+    )
+
+    scheduled = Scheduler.apply_schedule(_build_ttm(), schedule)
+    cpp = _lower_to_cpp(scheduled)
+
+    allocation = (
+        "std::vector<float> tiled_Projected_storage("
+        "(size_t) (Projected0_size * Projected1_size) * (size_t) kTile_d);"
+    )
+    init_loop = "Projected_tile_init < Projected0_size * Projected1_size"
+    copy_loop = "Projected_tile_copy < Projected0_size * Projected1_size"
+    assert allocation in cpp
+    assert cpp.index(allocation) < cpp.index("d_out = 0")
+    assert cpp.count(init_loop) == 1
+    assert cpp.count(copy_loop) == 1
+    assert "tiled_Projected[pProjected1 * kTile_d + d_in] +=" in cpp
+    assert "Projected_values[pProjected2] +=" not in cpp
+    assert "scorch_zero_dense(Projected_values, Projected_capacity)" not in cpp
+
+    torch.manual_seed(105)
+    core = torch.randn(5, 3, 4)
+    factor = torch.randn(4, 7)
+    result = einsum(
+        "abc,cd->abd",
+        STensor.from_torch(core, "Core"),
+        STensor.from_torch(factor, "Factor"),
+        format="ddd",
+        schedule=schedule,
+    )
+    reference = torch.einsum("abc,cd->abd", core, factor)
+
+    assert torch.allclose(result.to_torch(), reference, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("factory", "schedule", "message"),
+    [
+        pytest.param(
+            lambda: _build_elementwise("dd"),
+            Schedule(
+                loop_order=("r", "c"),
+                tiles=(TileSpec("c", 3, accum="heap", unroll=False),),
+            ),
+            "requires an enclosed reduction",
+            id="elementwise-no-reduction",
+        ),
+        pytest.param(
+            _build_sddmm,
+            Schedule(
+                loop_order=("r", "c", "q"),
+                tiles=(TileSpec("r", 3, accum="heap", unroll=False),),
+            ),
+            "tiled sparse-output assembly",
+            id="sddmm-sparse-result",
+        ),
+        pytest.param(
+            _build_spgemm,
+            Schedule(
+                loop_order=("r", "q", "c"),
+                tiles=(TileSpec("r", 3, accum="heap", unroll=False),),
+            ),
+            "tiled sparse-output assembly",
+            id="spgemm-sparse-result",
+        ),
+        pytest.param(
+            _build_spmv,
+            Schedule(
+                loop_order=("r", "q"),
+                tiles=(TileSpec("r", 3, accum="heap", unroll=False),),
+            ),
+            "trailing storage level",
+            id="spmv-rank-one-result",
+        ),
+        pytest.param(
+            _build_ttm,
+            Schedule(
+                loop_order=("a", "b", "c", "d"),
+                tiles=(
+                    TileSpec(
+                        "d",
+                        3,
+                        placement="outermost",
+                        accum="heap",
+                    ),
+                ),
+            ),
+            "requires an explicit parallel dense result-prefix loop",
+            id="ttm-heap-missing-safe-parallel-anchor",
+        ),
+        pytest.param(
+            _build_ttm,
+            Schedule(
+                loop_order=("a", "b", "c", "d"),
+                tiles=(
+                    TileSpec(
+                        "d",
+                        3,
+                        placement="outermost",
+                        accum="heap",
+                    ),
+                    TileSpec(
+                        "a",
+                        2,
+                        placement="outermost",
+                        accum="direct",
+                    ),
+                ),
+                parallel_loop="a",
+            ),
+            "requires.*remain outermost",
+            id="ttm-later-affine-tile-wraps-heap-tile",
+        ),
+        pytest.param(
+            _build_ttm,
+            Schedule(
+                loop_order=("a", "b", "c", "d"),
+                tiles=(
+                    TileSpec(
+                        "d",
+                        3,
+                        placement="child_of:b",
+                        accum="heap",
+                    ),
+                ),
+            ),
+            "requires.*outermost",
+            id="ttm-unsafe-lifetime",
+        ),
+    ],
+)
+def test_heap_result_tile_rejects_unsupported_non_spmm_structures_before_lowering(
+    factory, schedule, message
+):
+    stmt = factory()
+    original = str(stmt)
+    with pytest.raises((ValueError, NotImplementedError), match=message):
+        Scheduler.apply_schedule(stmt, schedule)
+    assert str(stmt) == original
 
 
 def test_sparse_elementwise_affine_tile_is_rejected_before_lowering():

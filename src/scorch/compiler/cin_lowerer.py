@@ -565,6 +565,7 @@ class CINLowerer:
         self.explicit_schedule = None
         self.panel_bounds: Dict[str, str] = {}
         self.relayout_plan = None
+        self.result_tile_plan = None
 
         self.result_value_array_sparse_index_llir = None
         self._scalar_accum_mode = False
@@ -758,17 +759,23 @@ class CINLowerer:
         tensor_var = tensor_access.get_tensor()
         level = tensor_access.level_of_index_var(last_index_var)
         level_type = tensor_var.get_level_types()[level]
+        tensor_access_metadata = self._tensor_access_metadata(
+            tensor_access,
+            llir.TensorAccessRole.INPUT_READ,
+        )
 
         if len(tensor_access.indices) == 1 and level_type == LevelType.DENSE:
             return llir.Var(
                 name=f"{tensor_access.tensor.name}_val[{last_index_var.name}]",
                 type=llir.DataType.NO_TYPE,
+                tensor_access=tensor_access_metadata,
             )
 
         return llir.Var(
             name=f"{tensor_access.tensor.name}_val"
             + f"[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]",
             type=llir.DataType.NO_TYPE,
+            tensor_access=tensor_access_metadata,
         )
 
         # if level_type == LevelType.DENSE:
@@ -799,6 +806,22 @@ class CINLowerer:
         elif isinstance(index_expr, TensorAccess):
             return self.lower_TensorAccess(index_expr)
         raise NotImplementedError
+
+    @staticmethod
+    def _tensor_access_metadata(
+        tensor_access: TensorAccess,
+        role: llir.TensorAccessRole,
+    ) -> Optional[llir.TensorAccessMetadata]:
+        """Return logical provenance for a non-workspace tensor value access."""
+        if tensor_access.is_workspace():
+            return None
+        return llir.TensorAccessMetadata(
+            tensor_name=tensor_access.tensor.name,
+            index_vars=tuple(
+                index_var.name for index_var in (tensor_access.indices or [])
+            ),
+            role=role,
+        )
 
     def lower_CIN(self, cin: CIN) -> Union[llir.Stmt, List[llir.Stmt], llir.Expr]:
         if isinstance(cin, IndexStmt):
@@ -831,6 +854,14 @@ class CINLowerer:
         # if we are at the bottommost level, we can emit compute code
         assert self.result_tensor_access, "result tensor access is None"
         is_workspace = self.result_tensor_access.is_workspace()
+        result_access_metadata = (
+            self._tensor_access_metadata(
+                self.result_tensor_access,
+                llir.TensorAccessRole.RESULT_WRITE,
+            )
+            if not is_workspace and self.result_tensor_access.is_dense()
+            else None
+        )
         index_vars = self.result_tensor_access.get_index_vars()
         sorted_index_vars = self.result_tensor_access.get_sorted_index_vars()
         # If index_vars is None (empty), that means we have a scalar workspace
@@ -856,6 +887,7 @@ class CINLowerer:
                     tensor_access_llir = llir.Var(
                         name=f"{values_llir_name}[{self.result_value_array_sparse_index_llir.name}]",
                         type=llir.DataType.NO_TYPE,
+                        tensor_access=result_access_metadata,
                     )
                 else:
                     level = self.result_tensor_access.level_of_index_var(
@@ -864,6 +896,7 @@ class CINLowerer:
                     tensor_access_llir = llir.Var(
                         name=f"{values_llir_name}[p{self.result_tensor_var.name}{level}]",
                         type=llir.DataType.NO_TYPE,
+                        tensor_access=result_access_metadata,
                     )
                     # tensor_access_llir = llir.Var(
                     #     name=f"{self.result_tensor_var.get_name()}_values"
@@ -2089,6 +2122,7 @@ class CINLowerer:
             self.explicit_schedule = getattr(stmt, "explicit_schedule", None)
             self.panel_bounds = getattr(stmt, "panel_bounds", {})
             self.relayout_plan = getattr(stmt, "relayout_plan", None)
+            self.result_tile_plan = getattr(stmt, "result_tile_plan", None)
 
         if isinstance(stmt, TensorAssign):
             return self.lower_TensorAssign(stmt)
@@ -2437,6 +2471,7 @@ class CINLowerer:
                     self.explicit_schedule,
                     self.panel_bounds,
                     self.relayout_plan,
+                    self.result_tile_plan,
                 )
             return function
 
@@ -3524,7 +3559,13 @@ class CINLowerer:
         if isinstance(expr, llir.Var):
             for old, new in replacements.items():
                 if expr.name == old or old in expr.name:
-                    expr = llir.Var(name=expr.name.replace(old, new), type=expr.type)
+                    expr = llir.Var(
+                        name=expr.name.replace(old, new),
+                        type=expr.type,
+                        is_ptr=expr.is_ptr,
+                        is_restrict=expr.is_restrict,
+                        tensor_access=expr.tensor_access,
+                    )
             return expr
         if isinstance(expr, llir.BinOp):
             expr.left = CINLowerer._rewrite_expr_refs(expr.left, replacements)

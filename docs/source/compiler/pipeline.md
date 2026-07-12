@@ -158,8 +158,14 @@ the full-row position range becomes a pair of coordinate-window
 `std::lower_bound` expressions, and the panel loop is placed outside the tagged
 parallel row loop. A validated dense-operand relayout is completed in the same
 post-lowering pass: it allocates reusable vector-backed storage, inserts the
-panel/strip pack before the parallel row loop, redirects the operand read and its
-prefetch, and rejects any compute read that remains unpacked.
+panel- or enclosing-tile-scoped pack before parallel row computation, redirects
+the selected operand read and its prefetch using logical tensor-access metadata,
+and rejects any compute read that remains unstaged. An affine tile with
+`accum="heap"` independently redirects dense-result updates into a compact
+prefix-by-tile buffer, initializes it at tile entry, and copies it out at tile
+exit. Both storage choices are validated from CIN formats, accesses, index roles,
+and loop dominance before lowering; neither relies on expression text or operand
+position.
 
 Loop order is picked by a small **calibrated cost model** that weighs
 per-iteration cost, workspace insert/sort/transpose costs, and an estimated

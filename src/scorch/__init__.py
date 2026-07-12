@@ -17,6 +17,7 @@ from .trace import compile
 from .tiling import (
     autotune,
     clear_autotune_cache,
+    compiler_schedule_search_space,
     get_autotune,
     schedule_from_tuner_choice,
     set_autotune,
@@ -28,6 +29,7 @@ from_csr = STensor.from_csr
 
 
 # precompile_kernels()
+
 
 def __getattr__(name):
     """
@@ -46,6 +48,7 @@ __all__ = [
     "TileSpec",
     "autotune",
     "clear_autotune_cache",
+    "compiler_schedule_search_space",
     "compile",
     "einsum",
     "fast_transpose",

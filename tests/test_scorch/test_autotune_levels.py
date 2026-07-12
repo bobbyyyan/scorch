@@ -8,6 +8,7 @@ bit-correctness at EVERY level plus the eligibility gate staying byte-neutral on
 ineligible shapes. Levels change WHICH kernel/width runs, never the numerics, so
 every level must match the same torch reference (CLAUDE.md correctness convention).
 """
+
 import json
 import threading
 from types import SimpleNamespace
@@ -51,8 +52,11 @@ def _make_eligible(M=800, J=800, deg=70, N=64, seed=0):
         A[r, cols] = torch.randn(deg, generator=g)
     B = torch.randn(J, N, generator=g, dtype=torch.float32)
     Acsr = A.to_sparse_csr()
-    A_st = STensor.from_torch(torch.sparse_csr_tensor(
-        Acsr.crow_indices(), Acsr.col_indices(), Acsr.values(), size=A.shape))
+    A_st = STensor.from_torch(
+        torch.sparse_csr_tensor(
+            Acsr.crow_indices(), Acsr.col_indices(), Acsr.values(), size=A.shape
+        )
+    )
     return A_st, STensor.from_torch(B), A @ B
 
 
@@ -121,11 +125,144 @@ def test_schedule_from_tuner_choice_maps_tileijk_with_explicit_names():
             operand="DenseRhs",
             pack_var="column",
             strip_width=32,
+            scope_var="reduction",
         ),
         tag="tuner-tileijk",
         parallel_loop="row",
     )
     assert T.schedule_from_tuner_choice is scorch.schedule_from_tuner_choice
+
+
+@pytest.mark.parametrize(
+    ("scope_var", "accum"),
+    [
+        pytest.param("reduction", "direct", id="panel-direct"),
+        pytest.param("reduction", "heap", id="panel-heap"),
+        pytest.param("column", "direct", id="full-direct"),
+        pytest.param("column", "heap", id="full-heap"),
+    ],
+)
+def test_schedule_from_extended_tuner_choice_maps_storage_dimensions(scope_var, accum):
+    schedule = scorch.schedule_from_tuner_choice(
+        ("tileijk", (32, 17, scope_var, accum)),
+        row_var="row",
+        panel_var="reduction",
+        free_var="column",
+        packed_operand="DenseRhs",
+    )
+
+    assert schedule is not None
+    assert schedule.tiles[0].accum == accum
+    assert schedule.tiles[1].accum == "direct"
+    assert schedule.relayout is not None
+    assert schedule.relayout.scope_var == scope_var
+
+
+def test_compiler_schedule_search_space_is_complete_immutable_and_deduplicated():
+    choices = scorch.compiler_schedule_search_space(
+        nc_values=[16, 32, 16],
+        jc_values=(4, 8),
+        panel_var="reduction",
+        free_var="column",
+    )
+
+    assert isinstance(choices, tuple)
+    assert len(choices) == 16
+    assert choices[0] == ("tileijk", (16, 4, "reduction", "direct"))
+    assert choices[-1] == ("tileijk", (32, 8, "column", "heap"))
+    assert {
+        (choice[1][0], choice[1][1], choice[1][2], choice[1][3]) for choice in choices
+    } == {
+        (nc, jc, scope_var, accum)
+        for nc in (16, 32)
+        for jc in (4, 8)
+        for scope_var in ("reduction", "column")
+        for accum in ("direct", "heap")
+    }
+
+    schedules = tuple(
+        scorch.schedule_from_tuner_choice(
+            choice,
+            row_var="row",
+            panel_var="reduction",
+            free_var="column",
+            packed_operand="DenseRhs",
+        )
+        for choice in choices
+    )
+    assert all(schedule is not None for schedule in schedules)
+    assert len({schedule.cache_key for schedule in schedules}) == len(schedules)
+    assert T.compiler_schedule_search_space is scorch.compiler_schedule_search_space
+
+
+def test_compiler_schedule_space_does_not_mutate_native_tuner_state():
+    native_choice = ("tileijk", (8, 4))
+    T._decision["native-sentinel"] = native_choice
+    persistent_sentinel = {"native": ["tileijk", [8, 4]]}
+    T._persist_cache = persistent_sentinel
+    cache_version = T._CACHE_VERSION
+    feature_schema = T._FEATURES
+
+    choices = scorch.compiler_schedule_search_space(
+        [8], [4], panel_var="reduction", free_var="column"
+    )
+    for choice in choices:
+        scorch.schedule_from_tuner_choice(
+            choice,
+            row_var="row",
+            panel_var="reduction",
+            free_var="column",
+            packed_operand="DenseRhs",
+        )
+
+    assert T._decision == {"native-sentinel": native_choice}
+    assert T._persist_cache is persistent_sentinel
+    assert T._CACHE_VERSION == cache_version
+    assert T._FEATURES is feature_schema
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        ({"nc_values": 8, "jc_values": [4]}, TypeError, "nc_values"),
+        ({"nc_values": "8", "jc_values": [4]}, TypeError, "nc_values"),
+        ({"nc_values": [], "jc_values": [4]}, ValueError, "nc_values"),
+        ({"nc_values": [True], "jc_values": [4]}, TypeError, "nc_values entry"),
+        ({"nc_values": [8], "jc_values": [0]}, ValueError, "jc_values entry"),
+        (
+            {"nc_values": [8], "jc_values": [4], "panel_var": None},
+            TypeError,
+            "panel_var",
+        ),
+        (
+            {"nc_values": [8], "jc_values": [4], "free_var": ""},
+            ValueError,
+            "free_var",
+        ),
+        (
+            {
+                "nc_values": [8],
+                "jc_values": [4],
+                "panel_var": "same",
+                "free_var": "same",
+            },
+            ValueError,
+            "distinct",
+        ),
+    ],
+)
+def test_compiler_schedule_search_space_rejects_invalid_dimensions(
+    kwargs, error, message
+):
+    complete = {
+        "nc_values": [8],
+        "jc_values": [4],
+        "panel_var": "reduction",
+        "free_var": "column",
+    }
+    complete.update(kwargs)
+    with pytest.raises(error, match=message):
+        scorch.compiler_schedule_search_space(**complete)
 
 
 @pytest.mark.parametrize("choice", [("v2", None), ("tilej", 17)])
@@ -152,10 +289,15 @@ def test_schedule_from_tuner_choice_returns_none_for_other_valid_choices(choice)
         (("v2", 1), ValueError, "parameter None"),
         (("tilej", True), TypeError, "positive integer"),
         (("tilej", 0), ValueError, "positive integer"),
-        (("tileijk", [8, 4]), TypeError, r"\(Nc, Jc\) tuple"),
+        (("tileijk", [8, 4]), TypeError, r"\(Nc, Jc\).*tuple"),
         (("tileijk", (8,)), ValueError, r"exactly \(Nc, Jc\)"),
+        (("tileijk", (8, 4, "column")), ValueError, "scope_var, accum"),
         (("tileijk", (True, 4)), TypeError, "Nc must be"),
         (("tileijk", (8, 0)), ValueError, "Jc must be"),
+        (("tileijk", (8, 4, 1, "direct")), TypeError, "scope_var"),
+        (("tileijk", (8, 4, "row", "direct")), ValueError, "panel_var or free_var"),
+        (("tileijk", (8, 4, "column", 1)), TypeError, "accum must be"),
+        (("tileijk", (8, 4, "column", "stack")), ValueError, "direct.*heap"),
     ],
 )
 def test_schedule_from_tuner_choice_rejects_non_normalized_choices(
@@ -209,7 +351,7 @@ def test_schedule_adapter_does_not_replace_native_tuner_dispatch(monkeypatch):
     monkeypatch.setattr(T, "_tileijk_args", lambda *args: ["native-arguments"])
 
     schedule = scorch.schedule_from_tuner_choice(
-        ("tileijk", (8, 4)),
+        ("tileijk", (8, 4, "column", "heap")),
         row_var="row",
         panel_var="reduction",
         free_var="column",
@@ -218,6 +360,9 @@ def test_schedule_adapter_does_not_replace_native_tuner_dispatch(monkeypatch):
     dispatched = T._dispatch_decision(None, None, None, "tileijk", (8, 4), -1)
 
     assert schedule is not None
+    assert schedule.tiles[0].accum == "heap"
+    assert schedule.relayout is not None
+    assert schedule.relayout.scope_var == "column"
     assert dispatched == (native_result, True)
     assert calls == [("native-arguments",)]
 
@@ -350,11 +495,16 @@ def test_analytic_routes_tiled_and_off_routes_none():
 def test_ineligible_shape_never_a_candidate_at_any_level():
     # Realistic LLC; a small low-degree shape must never qualify (byte-neutral v2).
     g = torch.Generator().manual_seed(3)
-    A = (torch.rand(64, 64, generator=g) < 0.1).float() * torch.randn(64, 64, generator=g)
+    A = (torch.rand(64, 64, generator=g) < 0.1).float() * torch.randn(
+        64, 64, generator=g
+    )
     B = torch.randn(64, 16, generator=g)
     Acsr = A.to_sparse_csr()
-    A_st = STensor.from_torch(torch.sparse_csr_tensor(
-        Acsr.crow_indices(), Acsr.col_indices(), Acsr.values(), size=A.shape))
+    A_st = STensor.from_torch(
+        torch.sparse_csr_tensor(
+            Acsr.crow_indices(), Acsr.col_indices(), Acsr.values(), size=A.shape
+        )
+    )
     B_st = STensor.from_torch(B)
     ref = A @ B
     for lvl in ("off", "analytic", "balanced", "max"):

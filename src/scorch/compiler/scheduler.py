@@ -4,12 +4,13 @@ import os
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
 from scorch.compiler.cin import (
+    BinaryOp,
     CIN,
     CINIndexVariablesGetter,
     CINVisitorAccept,
@@ -111,7 +112,10 @@ class TileSpec:
 
     Affine tiles are represented in CIN. ``panel`` requests a sparse coordinate
     window such as SpMM tile-j; it is completed after concrete compressed
-    iterators have been lowered to LLIR.
+    iterators have been lowered to LLIR. ``accum`` selects result lifetime:
+    ``direct`` updates final storage, ``stack`` uses the existing row-local tile
+    workspace, and ``heap`` uses a compact dense-prefix-by-tile buffer initialized
+    at the affine outer-tile entry and copied out at its exit.
     """
 
     index_var: str
@@ -169,17 +173,29 @@ class TileSpec:
 
 @dataclass(frozen=True)
 class RelayoutSpec:
-    """Pack one dense input across a tiled logical variable.
+    """Stage one dense input across a tiled logical variable.
 
     ``operand`` names the input tensor to stage, ``pack_var`` names its
-    contiguous tiled dimension, and ``strip_width`` is the packed row stride.
-    The current implementation recognizes the structurally compatible
-    CSR-by-dense contraction used by tile-ijk schedules.
+    contiguous tiled dimension, and ``strip_width`` is the staged row stride.
+    ``scope_var`` is the logical tiled loop whose outer iteration refreshes the
+    staged contents.  For example, selecting a reduction-panel variable stages
+    one panel, while selecting ``pack_var`` stages the full remaining access at
+    the enclosing free-axis tile.  It is a logical loop anchor, not a kernel or
+    tensor-role enum.
+
+    ``scope_var=None`` is retained as a compatibility spelling for the unique
+    panel variable.  :class:`Schedule` canonicalizes it to that explicit logical
+    name before computing cache identity.
+
+    The current lowering recognizes structurally compatible rank-2 dense reads
+    in a CSR-by-dense contraction, but the schedule primitive itself only names
+    an access, a tiled axis, and a refresh scope.
     """
 
     operand: str
     pack_var: str
     strip_width: int
+    scope_var: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.operand, str) or not isinstance(self.pack_var, str):
@@ -190,6 +206,11 @@ class RelayoutSpec:
             raise TypeError("RelayoutSpec.strip_width must be an integer")
         if self.strip_width <= 0:
             raise ValueError("RelayoutSpec.strip_width must be greater than zero")
+        if self.scope_var is not None:
+            if not isinstance(self.scope_var, str):
+                raise TypeError("RelayoutSpec.scope_var must be a string or None")
+            if not self.scope_var:
+                raise ValueError("RelayoutSpec.scope_var must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -199,9 +220,28 @@ class _RelayoutPlan:
     operand: str
     pack_var: str
     panel_var: str
+    scope_var: str
     row_var: str
+    access_index_vars: Tuple[str, ...]
     operand_panel_level: int
     operand_pack_level: int
+
+
+@dataclass(frozen=True)
+class _ResultTilePlan:
+    """CIN-derived metadata for a heap-backed dense result tile.
+
+    The compact buffer covers every dense result prefix position and one tile of
+    the trailing free axis.  It is initialized at the affine outer-tile entry,
+    receives redirected result updates for all enclosed reductions/panels, and
+    is copied to the final result at outer-tile exit.
+    """
+
+    result: str
+    tile_var: str
+    result_level: int
+    result_prefix_vars: Tuple[str, ...]
+    access_index_vars: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -239,6 +279,14 @@ class Schedule:
             raise TypeError("Schedule.tiles must contain TileSpec instances")
         if self.relayout is not None and not isinstance(self.relayout, RelayoutSpec):
             raise TypeError("Schedule.relayout must be a RelayoutSpec or None")
+        if self.relayout is not None and self.relayout.scope_var is None:
+            panel_tiles = [tile for tile in self.tiles if tile.kind == "panel"]
+            if len(panel_tiles) == 1:
+                object.__setattr__(
+                    self,
+                    "relayout",
+                    replace(self.relayout, scope_var=panel_tiles[0].index_var),
+                )
         tile_names = [tile.index_var for tile in self.tiles]
         if len(tile_names) != len(set(tile_names)):
             raise ValueError("Schedule cannot tile the same index variable twice")
@@ -1807,6 +1855,173 @@ class Scheduler:
         matches[0].parallel = True
 
     @staticmethod
+    def _validate_heap_result_tile(
+        cin: CIN,
+        schedule: Schedule,
+        reduction_names: Set[str],
+    ) -> Optional[_ResultTilePlan]:
+        """Validate a compact heap-backed result tile before transforming CIN.
+
+        Eligibility comes from the dense result access, physical level order,
+        free/reduction roles, and schedule loop anchors.  The compact buffer
+        covers every dense result prefix position and one trailing-axis tile.
+        """
+        heap_tiles = [tile for tile in schedule.tiles if tile.accum == "heap"]
+        if not heap_tiles:
+            return None
+        if len(heap_tiles) != 1:
+            raise NotImplementedError(
+                "Heap accumulation currently supports exactly one result tile"
+            )
+
+        tile = heap_tiles[0]
+        if tile.kind != "affine":
+            raise ValueError("Heap accumulation requires an affine result tile")
+        if tile.placement != "outermost":
+            raise ValueError(
+                "Heap accumulation requires its affine tile to be outermost so "
+                "the compact result spans every enclosed reduction"
+            )
+        tile_position = schedule.tiles.index(tile)
+        outer_wrappers = []
+        for candidate in schedule.tiles[tile_position + 1 :]:
+            affine_at_root = candidate.kind == "affine" and (
+                candidate.placement == "outermost"
+                or (
+                    candidate.placement.startswith("at_depth:")
+                    and int(candidate.placement.split(":", 1)[1]) == 0
+                )
+            )
+            panel_at_root = (
+                candidate.kind == "panel" and candidate.placement == "outermost"
+            )
+            if affine_at_root or panel_at_root:
+                outer_wrappers.append(candidate.index_var)
+        if outer_wrappers:
+            raise ValueError(
+                "Heap accumulation requires its affine result tile to remain "
+                "outermost after all scheduled tiles are applied; later root "
+                f"tiles would wrap it: {outer_wrappers}"
+            )
+        if tile.parallel:
+            raise ValueError(
+                "A heap-backed result tile uses shared reusable storage; its "
+                "outer tile loop must be serial"
+            )
+        if schedule.parallel_loop in (
+            tile.index_var,
+            f"{tile.index_var}_out",
+            f"{tile.index_var}_in",
+        ):
+            raise ValueError(
+                "A heap-backed result tile cannot select its shared tile loop "
+                "for parallel execution"
+            )
+
+        assignment: CIN = cin
+        while isinstance(assignment, ForAll):
+            assignment = assignment.stmt
+        if not isinstance(assignment, TensorAssign) or assignment.op not in (
+            None,
+            Operation.ADD,
+        ):
+            raise NotImplementedError(
+                "Heap accumulation requires one additive result assignment"
+            )
+        if not reduction_names:
+            raise NotImplementedError(
+                "Heap accumulation requires an enclosed reduction to accumulate"
+            )
+        if tile.index_var in reduction_names:
+            raise ValueError(
+                "Heap accumulation must tile a free result axis, not a reduction"
+            )
+
+        result_accesses = [
+            access
+            for access in cin.get_result_tensor_accesses()
+            if not isinstance(access.tensor, Workspace)
+        ]
+        if len(result_accesses) != 1 or not result_accesses[0].is_dense():
+            raise NotImplementedError(
+                "Heap accumulation requires exactly one dense result tensor"
+            )
+        result_access = result_accesses[0]
+        result_names = tuple(
+            index_var.name for index_var in result_access.get_sorted_index_vars()
+        )
+        if len(result_names) < 2 or result_names[-1] != tile.index_var:
+            raise NotImplementedError(
+                "Heap accumulation requires the tiled free axis to be the dense "
+                "result's trailing storage level"
+            )
+        parallel_anchors = [
+            candidate.index_var for candidate in schedule.tiles if candidate.parallel
+        ]
+        if schedule.parallel_loop is not None:
+            parallel_anchors.append(schedule.parallel_loop)
+        for anchor in parallel_anchors:
+            logical_anchor = anchor
+            for candidate in schedule.tiles:
+                if anchor in (
+                    f"{candidate.index_var}_out",
+                    f"{candidate.index_var}_in",
+                ):
+                    logical_anchor = candidate.index_var
+                    break
+            if logical_anchor not in result_names[:-1]:
+                raise ValueError(
+                    "Heap accumulation may parallelize only a dense result-prefix "
+                    f"loop; {anchor!r} does not partition compact result rows"
+                )
+        if any(level != LevelType.DENSE for level in result_access.level_types()):
+            raise NotImplementedError(
+                "Heap accumulation currently supports all-dense result storage"
+            )
+        tile_index_var = Scheduler._find_index_var_by_name(cin, tile.index_var)
+        result_level = result_access.level_of_index_var(tile_index_var)
+        if result_level != result_access.num_levels - 1:
+            raise NotImplementedError(
+                "Heap accumulation requires the tiled free axis at the final "
+                "result storage level"
+            )
+        if result_access.tensor.dtype not in (torch.float32, torch.float64):
+            raise NotImplementedError(
+                "Heap accumulation supports float32 or float64 dense results"
+            )
+        if not parallel_anchors:
+            raise ValueError(
+                "Heap accumulation requires an explicit parallel dense "
+                "result-prefix loop so the shared outer result-tile loop remains "
+                "serial"
+            )
+
+        return _ResultTilePlan(
+            result=result_access.tensor.name,
+            tile_var=tile.index_var,
+            result_level=result_level,
+            result_prefix_vars=result_names[:-1],
+            access_index_vars=tuple(
+                index_var.name for index_var in result_access.indices
+            ),
+        )
+
+    @staticmethod
+    def _multiplicative_rhs_accesses(
+        expr: CIN,
+    ) -> Optional[List[TensorAccess]]:
+        """Collect tensor leaves when an RHS is purely multiplicative."""
+        if isinstance(expr, TensorAccess):
+            return [expr]
+        if not isinstance(expr, BinaryOp) or expr.op != Operation.MUL:
+            return None
+        left = Scheduler._multiplicative_rhs_accesses(expr.left)
+        right = Scheduler._multiplicative_rhs_accesses(expr.right)
+        if left is None or right is None:
+            return None
+        return left + right
+
+    @staticmethod
     def _validate_relayout(
         cin: CIN,
         schedule: Schedule,
@@ -1861,7 +2076,24 @@ class Scheduler:
                 "Packed relayout requires pack_var to be the operand's contiguous "
                 "last storage level"
             )
+        multiplicative_accesses = Scheduler._multiplicative_rhs_accesses(assignment.rhs)
+        if multiplicative_accesses is None or sorted(
+            id(access) for access in multiplicative_accesses
+        ) != sorted(id(access) for access in rhs_accesses):
+            raise NotImplementedError(
+                "Packed relayout requires the staged dense and compressed "
+                "accesses to participate in one multiplicative contraction "
+                "expression"
+            )
         panel_var = packed_names[0]
+        scope_var = relayout.scope_var
+        if scope_var not in (panel_var, relayout.pack_var):
+            raise ValueError(
+                "RelayoutSpec.scope_var must name either the staged access's "
+                f"panel axis {panel_var!r} or tiled axis {relayout.pack_var!r}; "
+                f"got {scope_var!r}"
+            )
+        assert scope_var is not None
 
         if len(panel_tiles) != 1 or panel_tiles[0].index_var != panel_var:
             raise ValueError(
@@ -1889,9 +2121,9 @@ class Scheduler:
                 "Relayout strip_width must match the affine pack tile width "
                 f"({relayout.strip_width} != {pack_tile.width})"
             )
-        if pack_tile.accum != "direct":
+        if pack_tile.accum not in ("direct", "heap"):
             raise NotImplementedError(
-                "Packed relayout currently requires direct output accumulation"
+                "Packed relayout supports direct or heap-backed output accumulation"
             )
         expected_panel_placement = f"child_of:{relayout.pack_var}_out"
         if (
@@ -1983,7 +2215,11 @@ class Scheduler:
             operand=relayout.operand,
             pack_var=relayout.pack_var,
             panel_var=panel_var,
+            scope_var=scope_var,
             row_var=row_var,
+            access_index_vars=tuple(
+                index_var.name for index_var in packed_access.indices
+            ),
             operand_panel_level=packed_access.level_of_index_var(
                 Scheduler._find_index_var_by_name(cin, panel_var)
             ),
@@ -2034,10 +2270,6 @@ class Scheduler:
                 "with Schedule.parallel_loop"
             )
         for tile in schedule.tiles:
-            if tile.accum == "heap":
-                raise NotImplementedError(
-                    "Heap-backed tiled accumulators are not implemented"
-                )
             if tile.kind == "panel" and tile.accum != "direct":
                 raise NotImplementedError(
                     "Sparse panel tiles currently require accum='direct'"
@@ -2116,6 +2348,12 @@ class Scheduler:
                 "Reduction loops cannot be selected for parallel execution: "
                 f"{parallel_reductions}"
             )
+
+        result_tile_plan = Scheduler._validate_heap_result_tile(
+            cin,
+            schedule,
+            reduction_names,
+        )
 
         for tile in panel_tiles:
             target = Scheduler._find_index_var_by_name(cin, tile.index_var)
@@ -2280,6 +2518,7 @@ class Scheduler:
         cin.explicit_schedule = schedule
         cin.panel_bounds = panel_bounds
         cin.relayout_plan = relayout_plan
+        cin.result_tile_plan = result_tile_plan
         return cin
 
     @staticmethod

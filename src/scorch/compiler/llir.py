@@ -1,7 +1,7 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Any, Union, TypeVar, Sequence
+from typing import List, Optional, Any, Union, TypeVar, Sequence, Tuple
 
 import torch
 
@@ -229,6 +229,27 @@ class DataType(Enum):
             raise NotImplementedError(f"Unsupported type: {py_type}")
 
 
+class TensorAccessRole(Enum):
+    """The logical role of a tensor value access emitted from CIN."""
+
+    INPUT_READ = "input_read"
+    RESULT_WRITE = "result_write"
+
+
+@dataclass(frozen=True)
+class TensorAccessMetadata:
+    """Immutable CIN provenance for a generated tensor value access.
+
+    ``index_vars`` preserves the logical access order from CIN, independently of
+    the physical position expression stored in :class:`Var.name`. Schedule passes
+    can therefore identify an access without parsing generated C++ fragments.
+    """
+
+    tensor_name: str
+    index_vars: Tuple[str, ...]
+    role: TensorAccessRole
+
+
 """
 Expression nodes
 """
@@ -242,6 +263,11 @@ class Var(Expr):
     type: DataType
     is_ptr: bool = False
     is_restrict: bool = False
+    tensor_access: Optional[TensorAccessMetadata] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __hash__(self):
         return hash(self.name)

@@ -47,7 +47,13 @@ def _panel_j_schedule(tile_width: int = 4) -> Schedule:
     )
 
 
-def _packed_tileijk_schedule(nc: int = 4, jc: int = 3) -> Schedule:
+def _packed_tileijk_schedule(
+    nc: int = 4,
+    jc: int = 3,
+    *,
+    scope_var: str = "j",
+    accum: str = "direct",
+) -> Schedule:
     return Schedule(
         loop_order=("i", "j", "k"),
         tiles=(
@@ -55,7 +61,7 @@ def _packed_tileijk_schedule(nc: int = 4, jc: int = 3) -> Schedule:
                 "k",
                 nc,
                 placement="outermost",
-                accum="direct",
+                accum=accum,
                 unroll=False,
             ),
             TileSpec(
@@ -66,8 +72,8 @@ def _packed_tileijk_schedule(nc: int = 4, jc: int = 3) -> Schedule:
                 accum="direct",
             ),
         ),
-        relayout=RelayoutSpec("B", "k", nc),
-        tag="packed-tile-ijk",
+        relayout=RelayoutSpec("B", "k", nc, scope_var=scope_var),
+        tag=f"packed-tile-ijk-{scope_var}-{accum}",
         parallel_loop="i",
     )
 
@@ -275,6 +281,73 @@ def test_tuner_packed_tileijk_emits_pack_before_parallel_compute():
 
 
 @pytest.mark.parametrize(
+    ("scope_var", "accum"),
+    [("j", "direct"), ("k", "direct"), ("j", "heap"), ("k", "heap")],
+    ids=("panel-direct", "full-direct", "panel-compact", "full-compact"),
+)
+def test_tuner_packed_tileijk_storage_scopes_and_loop_nesting(scope_var, accum):
+    schedule = _packed_tileijk_schedule(scope_var=scope_var, accum=accum)
+    scheduled = Scheduler.apply_schedule(_build_spmm_cin(), schedule)
+    cpp = LLIRLowerer().lower_llir(CINLowerer().lower_IndexStmt(scheduled))
+
+    k_loop = "for (int64_t k_out = 0; k_out < B1_size; k_out += kTile_k)"
+    panel_loop = "for (int64_t j_out = 0; j_out < B0_size; j_out += kTile_j)"
+    row_loop = "for (int64_t i = 0; i < A0_size; i++)"
+    if scope_var == "j":
+        allocation = (
+            "std::vector<float> packed_B_storage((size_t) kTile_j * "
+            "(size_t) kTile_k);"
+        )
+        pack_loop = "for (int64_t j_pack = j_out; j_pack < j_out_end; j_pack++)"
+        packed_read = "packed_B[(j - j_out) * kTile_k + k_in]"
+        assert cpp.index(panel_loop) < cpp.index(pack_loop) < cpp.index(row_loop)
+        assert "packed_B[(j_pack - j_out) * kTile_k + k_pack] =" in cpp
+    else:
+        allocation = (
+            "std::vector<float> packed_B_storage((size_t) B0_size * "
+            "(size_t) kTile_k);"
+        )
+        pack_loop = "for (int64_t j_pack = 0; j_pack < B0_size; j_pack++)"
+        packed_read = "packed_B[j * kTile_k + k_in]"
+        assert cpp.index(k_loop) < cpp.index(pack_loop) < cpp.index(panel_loop)
+        assert "packed_B[j_pack * kTile_k + k_pack] =" in cpp
+
+    assert cpp.index(allocation) < cpp.index(k_loop)
+    assert cpp.index(pack_loop) < cpp.index(row_loop)
+    assert "B_val[j_pack * B1_size + k_packed]" in cpp
+    assert "B_val[pB1]" not in cpp
+    assert packed_read in cpp
+
+    if accum == "direct":
+        assert cpp.count("scorch_zero_dense(C_values, C_capacity)") == 1
+        assert "tiled_C_storage" not in cpp
+        assert f"C_values[pC1] += A_val[pA1] * {packed_read}" in cpp
+    else:
+        allocation_c = (
+            "std::vector<float> tiled_C_storage((size_t) (C0_size) * "
+            "(size_t) kTile_k);"
+        )
+        init_loop = (
+            "for (int64_t C_tile_init = 0; C_tile_init < C0_size; " "C_tile_init++)"
+        )
+        copy_loop = (
+            "for (int64_t C_tile_copy = 0; C_tile_copy < C0_size; " "C_tile_copy++)"
+        )
+        assert cpp.index(allocation_c) < cpp.index(k_loop)
+        assert cpp.count(init_loop) == 1
+        assert cpp.count(copy_loop) == 1
+        assert cpp.index(k_loop) < cpp.index(init_loop) < cpp.index(panel_loop)
+        assert cpp.index(panel_loop) < cpp.index(copy_loop)
+        assert "scorch_zero_dense(C_values, C_capacity)" not in cpp
+        assert f"tiled_C[pC0 * kTile_k + k_in] += A_val[pA1] * {packed_read}" in cpp
+        assert "C_values[pC1] +=" not in cpp
+        assert (
+            "C_values[C_tile_copy * C1_size + k_copy_logical] = "
+            "tiled_C[C_tile_copy * kTile_k + k_tile_copy];"
+        ) in cpp
+
+
+@pytest.mark.parametrize(
     ("m", "j", "n", "empty_row"),
     [
         (7, 10, 11, 2),
@@ -283,7 +356,14 @@ def test_tuner_packed_tileijk_emits_pack_before_parallel_compute():
     ],
     ids=("ragged-all", "rectangular", "wide-multi-k-panel"),
 )
-def test_tuner_packed_tileijk_matches_torch_with_ragged_panels(m, j, n, empty_row):
+@pytest.mark.parametrize(
+    ("scope_var", "accum"),
+    [("j", "direct"), ("k", "direct"), ("j", "heap"), ("k", "heap")],
+    ids=("panel-direct", "full-direct", "panel-compact", "full-compact"),
+)
+def test_tuner_packed_tileijk_matches_torch_with_ragged_panels(
+    m, j, n, empty_row, scope_var, accum
+):
     torch.manual_seed(m * 100 + j * 10 + n)
     a = torch.randn(m, j, dtype=torch.float32)
     a = a * (torch.rand(m, j) < 0.4)
@@ -293,7 +373,7 @@ def test_tuner_packed_tileijk_matches_torch_with_ragged_panels(m, j, n, empty_ro
     result = matmul(
         a.to_sparse_csr(),
         b,
-        schedule=_packed_tileijk_schedule(),
+        schedule=_packed_tileijk_schedule(scope_var=scope_var, accum=accum),
     )
     reference = a @ b
 
@@ -302,23 +382,32 @@ def test_tuner_packed_tileijk_matches_torch_with_ragged_panels(m, j, n, empty_ro
     assert torch.count_nonzero(result[empty_row]).item() == 0
 
 
-@pytest.mark.parametrize(("j", "n"), [(0, 7), (5, 0)])
-def test_tuner_packed_tileijk_handles_zero_sized_domains(j, n):
-    m = 4
+@pytest.mark.parametrize(("m", "j", "n"), [(4, 0, 7), (4, 5, 0), (0, 5, 7)])
+@pytest.mark.parametrize(
+    ("scope_var", "accum"),
+    [("j", "direct"), ("k", "direct"), ("j", "heap"), ("k", "heap")],
+    ids=("panel-direct", "full-direct", "panel-compact", "full-compact"),
+)
+def test_tuner_packed_tileijk_handles_zero_sized_domains(m, j, n, scope_var, accum):
     a = torch.zeros((m, j), dtype=torch.float32)
     b = torch.randn((j, n), dtype=torch.float32)
 
     result = matmul(
         a.to_sparse_csr(),
         b,
-        schedule=_packed_tileijk_schedule(),
+        schedule=_packed_tileijk_schedule(scope_var=scope_var, accum=accum),
     )
 
     assert result.shape == (m, n)
     assert torch.equal(result, a @ b)
 
 
-def test_tuner_packed_tileijk_uses_generated_float64_storage():
+@pytest.mark.parametrize(
+    ("scope_var", "accum"),
+    [("j", "direct"), ("k", "direct"), ("j", "heap"), ("k", "heap")],
+    ids=("panel-direct", "full-direct", "panel-compact", "full-compact"),
+)
+def test_tuner_packed_tileijk_uses_generated_float64_storage(scope_var, accum):
     torch.manual_seed(21)
     a = torch.randn(4, 7, dtype=torch.float64)
     a = a * (torch.rand(4, 7) < 0.4)
@@ -327,12 +416,16 @@ def test_tuner_packed_tileijk_uses_generated_float64_storage():
     for access in stmt.tensor_accesses:
         access.tensor.dtype = torch.float64
 
-    scheduled = Scheduler.apply_schedule(stmt, _packed_tileijk_schedule())
+    schedule = _packed_tileijk_schedule(scope_var=scope_var, accum=accum)
+    scheduled = Scheduler.apply_schedule(stmt, schedule)
     cpp = LLIRLowerer().lower_llir(CINLowerer().lower_IndexStmt(scheduled))
-    result = matmul(a.to_sparse_csr(), b, schedule=_packed_tileijk_schedule())
+    result = matmul(a.to_sparse_csr(), b, schedule=schedule)
 
     assert "std::vector<double> packed_B_storage" in cpp
     assert "double* __restrict__ packed_B" in cpp
+    if accum == "heap":
+        assert "std::vector<double> tiled_C_storage" in cpp
+        assert "double* __restrict__ tiled_C" in cpp
     assert torch.allclose(result, a @ b, atol=1e-10, rtol=1e-10)
 
 

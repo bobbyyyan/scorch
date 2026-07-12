@@ -59,6 +59,7 @@ Env (the Python API is primary; env is for override/CI):
   SCORCH_LLC_BYTES=<n>     override the queried last-level cache size (gate knob).
   SCORCH_TILING_DEG_FLOOR / _NIJK_MIN / _LOC_MIN  gate knobs, unchanged at all levels.
 """
+
 from __future__ import annotations
 
 import functools
@@ -70,7 +71,7 @@ import platform
 import subprocess
 import threading
 import time
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -91,8 +92,7 @@ def _validate_level(level) -> str:
         raise TypeError(f"autotune level must be a str, got {type(level).__name__}")
     lvl = level.strip().lower()
     if lvl not in _LEVELS:
-        raise ValueError(
-            f"unknown autotune level {level!r}; expected one of {_LEVELS}")
+        raise ValueError(f"unknown autotune level {level!r}; expected one of {_LEVELS}")
     return lvl
 
 
@@ -347,8 +347,9 @@ def query_llc() -> int:
         if platform.system() == "Darwin":
             for key in ("hw.perflevel0.l2cachesize", "hw.l2cachesize"):
                 try:
-                    out = subprocess.check_output(["sysctl", "-n", key],
-                                                  stderr=subprocess.DEVNULL).strip()
+                    out = subprocess.check_output(
+                        ["sysctl", "-n", key], stderr=subprocess.DEVNULL
+                    ).strip()
                     if out:
                         val = int(out)
                         break
@@ -362,13 +363,19 @@ def query_llc() -> int:
                     sz = os.path.join(base, entry, "size")
                     if os.path.isfile(sz):
                         s = open(sz).read().strip()
-                        mult = 1024 if s.endswith("K") else (1024 * 1024 if s.endswith("M") else 1)
+                        mult = (
+                            1024
+                            if s.endswith("K")
+                            else (1024 * 1024 if s.endswith("M") else 1)
+                        )
                         n = int(s.rstrip("KM")) * mult
                         best = max(best, n)
             val = best or None
     except Exception:
         val = None
-    _llc_bytes = val or (16 * 1024 * 1024 if platform.system() == "Darwin" else 36 * 1024 * 1024)
+    _llc_bytes = val or (
+        16 * 1024 * 1024 if platform.system() == "Darwin" else 36 * 1024 * 1024
+    )
     return _llc_bytes
 
 
@@ -402,12 +409,22 @@ def _signature(a, N: int) -> tuple:
     nnz = int(crd.numel())
     M = int(pos.numel()) - 1
     J = int(a.shape[1])
+
     # sample without materializing: a couple of interior entries
     def s(t, i):
         n = t.numel()
         return int(t[i % n].item()) if n else 0
-    return (M, J, nnz, N, s(pos, M // 3), s(pos, 2 * M // 3),
-            s(crd, nnz // 3), s(crd, 2 * nnz // 3))
+
+    return (
+        M,
+        J,
+        nnz,
+        N,
+        s(pos, M // 3),
+        s(pos, 2 * M // 3),
+        s(crd, nnz // 3),
+        s(crd, 2 * nnz // 3),
+    )
 
 
 _LOC_MIN = float(os.environ.get("SCORCH_TILING_LOC_MIN", "0.3"))
@@ -486,20 +503,111 @@ def is_candidate(a, b, level: Optional[str] = None) -> bool:
     # AND a per-machine model is loaded. DEFAULT: learned uses the analytic gate (no
     # widening) and only improves the within-gate pick. Either way the 99% (operand<=C)
     # short-circuits to v2 at int-comparison cost.
-    if (level == "learned" and _LEARNED_WIDEN
-            and _load_learned_model() is not None):
+    if level == "learned" and _LEARNED_WIDEN and _load_learned_model() is not None:
         return _eligible_learned(J, nnz, N, C)
     return _eligible(J, nnz, N, C)
 
 
 def _tilej_args(a, b, result_shape, Jc, nthreads):
-    return ([result_shape, a.shape, a.index.mode_indices, a.values,
-             b.shape, b.index.mode_indices, b.values, Jc, nthreads])
+    return [
+        result_shape,
+        a.shape,
+        a.index.mode_indices,
+        a.values,
+        b.shape,
+        b.index.mode_indices,
+        b.values,
+        Jc,
+        nthreads,
+    ]
 
 
 def _tileijk_args(a, b, result_shape, Nc, Jc, nthreads):
-    return ([result_shape, a.shape, a.index.mode_indices, a.values,
-             b.shape, b.index.mode_indices, b.values, Nc, Jc, nthreads])
+    return [
+        result_shape,
+        a.shape,
+        a.index.mode_indices,
+        a.values,
+        b.shape,
+        b.index.mode_indices,
+        b.values,
+        Nc,
+        Jc,
+        nthreads,
+    ]
+
+
+def _compiler_structural_name(field: str, value: object) -> str:
+    """Validate one user-provided tensor or logical-index name."""
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string")
+    if not value:
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _positive_tuner_width(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be a positive integer")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _unique_tuner_widths(name: str, values: Iterable[int]) -> Tuple[int, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{name} must be an iterable of positive integers")
+    try:
+        candidates = tuple(values)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be an iterable of positive integers") from exc
+    if not candidates:
+        raise ValueError(f"{name} must contain at least one width")
+
+    widths = []
+    seen = set()
+    for value in candidates:
+        width = _positive_tuner_width(f"{name} entry", value)
+        if width not in seen:
+            seen.add(width)
+            widths.append(width)
+    return tuple(widths)
+
+
+def compiler_schedule_search_space(
+    nc_values: Iterable[int],
+    jc_values: Iterable[int],
+    *,
+    panel_var: str,
+    free_var: str,
+) -> Tuple[tuple, ...]:
+    """Build the opt-in compiler tile-ijk tuner choice space.
+
+    The returned immutable choices form the Cartesian product of ``Nc``, ``Jc``,
+    operand staging scope, and result accumulation placement. Staging is scoped
+    to either the sparse panel tile (``panel_var``) or the enclosing dense free-axis
+    tile (``free_var``); accumulation is either direct to the result or through a
+    heap-backed compact result tile. Each choice can be passed to
+    :func:`schedule_from_tuner_choice`.
+
+    This helper only describes compiler schedules. It does not participate in the
+    production native selector, its persistent cache, or its learned-model features.
+    Duplicate widths are removed while preserving the caller's order.
+    """
+    panel_var = _compiler_structural_name("panel_var", panel_var)
+    free_var = _compiler_structural_name("free_var", free_var)
+    if panel_var == free_var:
+        raise ValueError("panel_var and free_var must name distinct index variables")
+
+    ncs = _unique_tuner_widths("nc_values", nc_values)
+    jcs = _unique_tuner_widths("jc_values", jc_values)
+    return tuple(
+        ("tileijk", (nc, jc, scope_var, accum))
+        for nc in ncs
+        for jc in jcs
+        for scope_var in (panel_var, free_var)
+        for accum in ("direct", "heap")
+    )
 
 
 def schedule_from_tuner_choice(
@@ -512,10 +620,14 @@ def schedule_from_tuner_choice(
 ) -> Optional[Schedule]:
     """Translate a normalized tile-ijk tuner choice into a compiler schedule.
 
-    The structural names are deliberately required: the runtime tuner selects only
-    tile widths, while the compiler owns the mapping from those widths to tensor
-    accesses and index variables. Non-tile-ijk choices have no compiler adapter yet
-    and return ``None``. This helper is opt-in and is not used by production dispatch.
+    The structural names are deliberately required: the compiler owns the mapping
+    from tuner decisions to tensor accesses and index variables. The legacy
+    ``("tileijk", (Nc, Jc))`` form remains an alias for panel-scoped staging with
+    direct result accumulation. The compiler-only extended form is
+    ``("tileijk", (Nc, Jc, scope_var, accum))``, where ``scope_var`` must be the
+    supplied panel or free logical variable and ``accum`` is ``"direct"`` or
+    ``"heap"``. Non-tile-ijk choices have no compiler adapter yet and return
+    ``None``. This helper is opt-in and is not used by production dispatch.
     """
     structural_names = {
         "row_var": row_var,
@@ -524,10 +636,10 @@ def schedule_from_tuner_choice(
         "packed_operand": packed_operand,
     }
     for field, value in structural_names.items():
-        if not isinstance(value, str):
-            raise TypeError(f"{field} must be a string")
-        if not value:
-            raise ValueError(f"{field} must be a non-empty string")
+        _compiler_structural_name(field, value)
+    index_names = (row_var, panel_var, free_var)
+    if len(set(index_names)) != len(index_names):
+        raise ValueError("row_var, panel_var, and free_var must be distinct")
 
     if not isinstance(choice, tuple):
         raise TypeError("tuner choice must be a (kind, parameter) tuple")
@@ -543,30 +655,40 @@ def schedule_from_tuner_choice(
             f"{kind!r}; expected 'v2', 'tilej', or 'tileijk'"
         )
 
-    def positive_width(name: str, value: object) -> int:
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"{name} must be a positive integer")
-        if value <= 0:
-            raise ValueError(f"{name} must be a positive integer")
-        return value
-
     if kind == "v2":
         if parameter is not None:
             raise ValueError("normalized 'v2' choice must use parameter None")
         return None
 
     if kind == "tilej":
-        positive_width("tilej Jc", parameter)
+        _positive_tuner_width("tilej Jc", parameter)
         return None
 
     if not isinstance(parameter, tuple):
-        raise TypeError("normalized 'tileijk' parameter must be an (Nc, Jc) tuple")
-    if len(parameter) != 2:
-        raise ValueError(
-            "normalized 'tileijk' parameter must contain exactly (Nc, Jc)"
+        raise TypeError(
+            "normalized 'tileijk' parameter must be an "
+            "(Nc, Jc) or (Nc, Jc, scope_var, accum) tuple"
         )
-    nc = positive_width("tileijk Nc", parameter[0])
-    jc = positive_width("tileijk Jc", parameter[1])
+    if len(parameter) not in (2, 4):
+        raise ValueError(
+            "normalized 'tileijk' parameter must contain exactly (Nc, Jc) or "
+            "(Nc, Jc, scope_var, accum)"
+        )
+    nc = _positive_tuner_width("tileijk Nc", parameter[0])
+    jc = _positive_tuner_width("tileijk Jc", parameter[1])
+    scope_var = panel_var
+    accum = "direct"
+    if len(parameter) == 4:
+        scope_var = _compiler_structural_name("tileijk scope_var", parameter[2])
+        if scope_var not in (panel_var, free_var):
+            raise ValueError(
+                "tileijk scope_var must name the supplied panel_var or free_var"
+            )
+        accum = parameter[3]
+        if not isinstance(accum, str):
+            raise TypeError("tileijk accum must be a string")
+        if accum not in ("direct", "heap"):
+            raise ValueError("tileijk accum must be 'direct' or 'heap'")
 
     return Schedule(
         loop_order=(row_var, panel_var, free_var),
@@ -575,7 +697,7 @@ def schedule_from_tuner_choice(
                 free_var,
                 nc,
                 placement="outermost",
-                accum="direct",
+                accum=accum,
                 unroll=False,
             ),
             TileSpec(
@@ -590,6 +712,7 @@ def schedule_from_tuner_choice(
             operand=packed_operand,
             pack_var=free_var,
             strip_width=nc,
+            scope_var=scope_var,
         ),
         tag="tuner-tileijk",
         parallel_loop=row_var,
@@ -600,11 +723,16 @@ def _dispatch_decision(a, b, result_shape, kind, param, nt):
     """Run the memoized winner. Returns (result_cpp, True) for a tiled kernel or
     None (== 'use the caller's byte-identical v2 path') for kind 'v2'."""
     if kind == "tilej":
-        return _ops.spmm_csr_float_tilej(*_tilej_args(a, b, result_shape, param, nt)), True
+        return (
+            _ops.spmm_csr_float_tilej(*_tilej_args(a, b, result_shape, param, nt)),
+            True,
+        )
     if kind == "tileijk":
         Nc, Jc = param
-        return _ops.spmm_csr_float_tileijk(
-            *_tileijk_args(a, b, result_shape, Nc, Jc, nt)), True
+        return (
+            _ops.spmm_csr_float_tileijk(*_tileijk_args(a, b, result_shape, Nc, Jc, nt)),
+            True,
+        )
     return None  # v2
 
 
@@ -646,7 +774,8 @@ def _cache_path() -> Optional[str]:
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     else:
         base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
-            os.path.expanduser("~"), ".cache")
+            os.path.expanduser("~"), ".cache"
+        )
     return os.path.join(base, "scorch", "autotune.json")
 
 
@@ -659,9 +788,14 @@ def _machine_id() -> str:
     brand = ""
     try:
         if platform.system() == "Darwin":
-            brand = subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                stderr=subprocess.DEVNULL).decode().strip()
+            brand = (
+                subprocess.check_output(
+                    ["sysctl", "-n", "machdep.cpu.brand_string"],
+                    stderr=subprocess.DEVNULL,
+                )
+                .decode()
+                .strip()
+            )
         elif platform.system() == "Linux" and os.path.isfile("/proc/cpuinfo"):
             with open("/proc/cpuinfo") as f:
                 for line in f:
@@ -670,8 +804,13 @@ def _machine_id() -> str:
                         break
     except Exception:
         brand = ""
-    parts = (platform.system(), platform.machine(), brand,
-             str(os.cpu_count()), str(query_llc()))
+    parts = (
+        platform.system(),
+        platform.machine(),
+        brand,
+        str(os.cpu_count()),
+        str(query_llc()),
+    )
     _machine_id_val = hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
     return _machine_id_val
 
@@ -778,10 +917,10 @@ def _ijk_beats_tilej_bytes(N, M, J, nnz, Jc_tj, Nc, C):
     BN = 4.0 * N
     Cwr = M * BN
     A = 8.0 * nnz
-    P = max(1, -(-J // max(1, Jc_tj)))            # ceil(J / Jc_tj)
+    P = max(1, -(-J // max(1, Jc_tj)))  # ceil(J / Jc_tj)
     tj = J * BN + P * 2 * Cwr + A + P * M * 4
-    nk = max(1, -(-N // max(1, Nc)))              # ceil(N / Nc)
-    ijk = J * BN + Cwr + A * nk + 2 * J * BN      # compute + relayout
+    nk = max(1, -(-N // max(1, Nc)))  # ceil(N / Nc)
+    ijk = J * BN + Cwr + A * nk + 2 * J * BN  # compute + relayout
     return ijk < tj
 
 
@@ -797,10 +936,23 @@ def _ijk_beats_tilej_bytes(N, M, J, nnz, Jc_tj, Nc, C):
 # Feature vector order (a candidate row). All quantities are cheap / inference-
 # computable from CSR metadata + a fixed-size sample; no O(nnz) wavefront.
 _FEATURES = (
-    "f_log_degree", "f_locality", "f_degree_cv", "f_log2_N", "f_thrash",
-    "f_log_nnz", "f_log_M", "f_log_J", "f_log_operand", "f_log_output",
-    "f_is_tilej", "f_is_tileijk", "f_jc_frac", "f_log_P", "f_log_nk",
-    "f_log_cand_bytes", "f_cand_over_output",
+    "f_log_degree",
+    "f_locality",
+    "f_degree_cv",
+    "f_log2_N",
+    "f_thrash",
+    "f_log_nnz",
+    "f_log_M",
+    "f_log_J",
+    "f_log_operand",
+    "f_log_output",
+    "f_is_tilej",
+    "f_is_tileijk",
+    "f_jc_frac",
+    "f_log_P",
+    "f_log_nk",
+    "f_log_cand_bytes",
+    "f_cand_over_output",
 )
 
 _LEARNED_MARGIN = float(os.environ.get("SCORCH_AUTOTUNE_MARGIN", "0.03"))
@@ -837,7 +989,9 @@ def _cand_bytes(kind, M, J, nnz, N, Jc, Nc) -> float:
 def _featurize(M, J, nnz, N, C, locality, degree_cv, kind, Jc, Nc):
     """Canonical feature vector (order == _FEATURES) for one candidate. Pure function
     of cheap inputs; imported by the offline trainer so train==serve by construction."""
-    Jf = max(1.0, float(J)); Nf = max(1.0, float(N)); Mf = max(1.0, float(M))
+    Jf = max(1.0, float(J))
+    Nf = max(1.0, float(N))
+    Mf = max(1.0, float(M))
     nnzf = max(1.0, float(nnz))
     degree = nnzf / Jf
     operand = Jf * 4.0 * Nf
@@ -846,11 +1000,23 @@ def _featurize(M, J, nnz, N, C, locality, degree_cv, kind, Jc, Nc):
     P = max(1, -(-int(J) // max(1, int(Jc)))) if kind == "tilej" else 0
     nk = max(1, -(-int(N) // max(1, int(Nc)))) if kind == "tileijk" else 0
     return [
-        math.log(max(1e-6, degree)), float(locality), float(degree_cv), math.log2(Nf),
-        operand / C, math.log(nnzf), math.log(Mf), math.log(Jf),
-        math.log(max(1.0, operand)), math.log(output),
-        float(kind == "tilej"), float(kind == "tileijk"),
-        float(Jc) / Jf, math.log1p(P), math.log1p(nk), math.log(cb), cb / output,
+        math.log(max(1e-6, degree)),
+        float(locality),
+        float(degree_cv),
+        math.log2(Nf),
+        operand / C,
+        math.log(nnzf),
+        math.log(Mf),
+        math.log(Jf),
+        math.log(max(1.0, operand)),
+        math.log(output),
+        float(kind == "tilej"),
+        float(kind == "tileijk"),
+        float(Jc) / Jf,
+        math.log1p(P),
+        math.log1p(nk),
+        math.log(cb),
+        cb / output,
     ]
 
 
@@ -867,9 +1033,13 @@ def _build_stacked(spec: dict) -> dict:
     maxdepth = 0
     for i, t in enumerate(trees):
         n = len(t["feature"])
-        feat[i, :n] = t["feature"]; thr[i, :n] = t["threshold"]
-        left[i, :n] = t["left"]; right[i, :n] = t["right"]; val[i, :n] = t["value"]
-        d = 0; stack = [(0, 0)]
+        feat[i, :n] = t["feature"]
+        thr[i, :n] = t["threshold"]
+        left[i, :n] = t["left"]
+        right[i, :n] = t["right"]
+        val[i, :n] = t["value"]
+        d = 0
+        stack = [(0, 0)]
         while stack:
             node, dd = stack.pop()
             if t["left"][node] == -1:
@@ -878,9 +1048,18 @@ def _build_stacked(spec: dict) -> dict:
                 stack.append((t["left"][node], dd + 1))
                 stack.append((t["right"][node], dd + 1))
         maxdepth = max(maxdepth, d)
-    return dict(T=T, feat=feat, thr=thr, left=left, right=right, val=val,
-                init=float(spec["init"]), lr=float(spec["learning_rate"]),
-                maxdepth=maxdepth, feature_names=list(spec["feature_names"]))
+    return dict(
+        T=T,
+        feat=feat,
+        thr=thr,
+        left=left,
+        right=right,
+        val=val,
+        init=float(spec["init"]),
+        lr=float(spec["learning_rate"]),
+        maxdepth=maxdepth,
+        feature_names=list(spec["feature_names"]),
+    )
 
 
 def _walker_predict(stacked: dict, X) -> "np.ndarray":
@@ -893,9 +1072,13 @@ def _walker_predict(stacked: dict, X) -> "np.ndarray":
     X as float32 internally, so a float64 compare near a split boundary would take a
     different branch and desync the walker from sklearn.predict (the export we ship)."""
     X = np.asarray(X, dtype=np.float32)
-    K = X.shape[0]; T = stacked["T"]
-    feat = stacked["feat"]; thr = stacked["thr"]
-    left = stacked["left"]; right = stacked["right"]; val = stacked["val"]
+    K = X.shape[0]
+    T = stacked["T"]
+    feat = stacked["feat"]
+    thr = stacked["thr"]
+    left = stacked["left"]
+    right = stacked["right"]
+    val = stacked["val"]
     trange = np.arange(T)[None, :]
     krange = np.arange(K)[:, None]
     state = np.zeros((K, T), dtype=np.int64)
@@ -921,16 +1104,17 @@ def _user_cache_dir() -> str:
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     else:
         base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
-            os.path.expanduser("~"), ".cache")
+            os.path.expanduser("~"), ".cache"
+        )
     return os.path.join(base, "scorch")
 
 
 def _learned_model_path() -> Optional[str]:
     env = os.environ.get("SCORCH_AUTOTUNE_MODEL")
     if env == "0":
-        return None                       # learned disabled -> analytic fallback
+        return None  # learned disabled -> analytic fallback
     if env:
-        return env                        # explicit override
+        return env  # explicit override
     mid = _machine_id()
     cand = os.path.join(_user_cache_dir(), f"autotune_model_{mid}.json")
     if os.path.isfile(cand):
@@ -955,13 +1139,15 @@ def _load_learned_model() -> Optional[dict]:
     try:
         with open(path) as f:
             spec = json.load(f)
-        if (spec.get("version") != _LEARNED_VERSION
-                or spec.get("machine_id") != _machine_id()
-                or list(spec.get("feature_names", [])) != list(_FEATURES)):
+        if (
+            spec.get("version") != _LEARNED_VERSION
+            or spec.get("machine_id") != _machine_id()
+            or list(spec.get("feature_names", [])) != list(_FEATURES)
+        ):
             return None
         _learned_model = _build_stacked(spec)
     except Exception:
-        _learned_model = None            # any error -> silent analytic fallback
+        _learned_model = None  # any error -> silent analytic fallback
     return _learned_model
 
 
@@ -1015,16 +1201,20 @@ def _learned_decide(a, b, M, J, N, nnz, C, model):
         Nc, Jci = _ijk_params(N, M, J, C)
         if Nc < N:
             cands.append(("tileijk", int(Jci), int(Nc)))
-    X = np.array([_featurize(M, J, nnz, N, C, loc, dcv, k, jc, nc)
-                  for (k, jc, nc) in cands], dtype=np.float64)
-    pred = _walker_predict(model, X)          # predicted log-time (lower = faster)
+    X = np.array(
+        [_featurize(M, J, nnz, N, C, loc, dcv, k, jc, nc) for (k, jc, nc) in cands],
+        dtype=np.float64,
+    )
+    pred = _walker_predict(model, X)  # predicted log-time (lower = faster)
     v2_pred = float(pred[0])
     # v2 floor: only leave v2 for a tiled kernel the model predicts BEATS v2 by margin.
     best = None
     for i in range(1, len(cands)):
         if best is None or pred[i] < pred[best]:
             best = i
-    if best is not None and float(pred[best]) < v2_pred + math.log(max(1e-9, 1.0 - _LEARNED_MARGIN)):
+    if best is not None and float(pred[best]) < v2_pred + math.log(
+        max(1e-9, 1.0 - _LEARNED_MARGIN)
+    ):
         k, jc, nc = cands[best]
         return ("tilej", jc) if k == "tilej" else ("tileijk", (nc, jc))
     return ("v2", None)
@@ -1035,23 +1225,35 @@ def _confirm_vs_v2(a, b, result_shape, kind, param, nt, v2_fn, nthreads):
     v2} once each, keep the faster. Guarantees no-regression-vs-v2 at ~1/N-th the full
     probe cost (only 2 candidates, not the whole ladder)."""
     if kind == "tilej":
-        win = lambda: _ops.spmm_csr_float_tilej(*_tilej_args(a, b, result_shape, param, nt))
+        win = lambda: _ops.spmm_csr_float_tilej(
+            *_tilej_args(a, b, result_shape, param, nt)
+        )
     else:
         win = lambda: _ops.spmm_csr_float_tileijk(
-            *_tileijk_args(a, b, result_shape, param[0], param[1], nt))
+            *_tileijk_args(a, b, result_shape, param[0], param[1], nt)
+        )
 
     def _t(fn):
         fn()
         best = float("inf")
         for _ in range(2):
-            t0 = time.perf_counter(); fn(); best = min(best, time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            fn()
+            best = min(best, time.perf_counter() - t0)
         return best
 
     return (kind, param) if _t(win) < _t(lambda: v2_fn(nthreads)) else ("v2", None)
 
 
-def maybe_dispatch(a, b, result_shape, v2_fn, nthreads: Optional[int],
-                   time_dict: Optional[dict] = None, level: Optional[str] = None):
+def maybe_dispatch(
+    a,
+    b,
+    result_shape,
+    v2_fn,
+    nthreads: Optional[int],
+    time_dict: Optional[dict] = None,
+    level: Optional[str] = None,
+):
     """Return (result_cpp, used_tiled: bool) or None to signal 'use the caller's
     normal v2 path'. Only ever returns a tiled kernel (tile-j / tile-ijk) when it
     has been MEASURED (balanced/max probe) or picked by the cost model (analytic)
@@ -1141,7 +1343,8 @@ def maybe_dispatch(a, b, result_shape, v2_fn, nthreads: Optional[int],
             analytic_ok = _eligible(J, nnz, N, C) and _scattered(a, J)
             if _LEARNED_CONFIRM or (_LEARNED_WIDEN and not analytic_ok):
                 kind, param = _confirm_vs_v2(
-                    a, b, result_shape, kind, param, nt, v2_fn, nthreads)
+                    a, b, result_shape, kind, param, nt, v2_fn, nthreads
+                )
         _decision[memo_key] = (kind, param)
         if kind == "v2":
             return None
@@ -1192,13 +1395,25 @@ def maybe_dispatch(a, b, result_shape, v2_fn, nthreads: Optional[int],
     # Heterogeneous param slot (None | Jc int | (Nc,Jc) tuple) -> annotate `list`.
     cands: list = [("v2", None, lambda: v2_fn(nthreads))]
     for jc in _jc_ladder(Jc):
-        cands.append(("tilej", jc,
-                      lambda jc=jc: _ops.spmm_csr_float_tilej(
-                          *_tilej_args(a, b, result_shape, jc, nt))))
+        cands.append(
+            (
+                "tilej",
+                jc,
+                lambda jc=jc: _ops.spmm_csr_float_tilej(
+                    *_tilej_args(a, b, result_shape, jc, nt)
+                ),
+            )
+        )
     if ijk is not None:
-        cands.append(("tileijk", ijk,
-                      lambda: _ops.spmm_csr_float_tileijk(
-                          *_tileijk_args(a, b, result_shape, ijk[0], ijk[1], nt))))
+        cands.append(
+            (
+                "tileijk",
+                ijk,
+                lambda: _ops.spmm_csr_float_tileijk(
+                    *_tileijk_args(a, b, result_shape, ijk[0], ijk[1], nt)
+                ),
+            )
+        )
 
     best_t = float("inf")
     best_kind, best_param, best_out = "v2", None, None

@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import torch
@@ -85,7 +85,11 @@ def _packed_schedule(
     operand="B",
     nc=4,
     jc=3,
+    scope=None,
+    accum="direct",
 ) -> Schedule:
+    if scope is None:
+        scope = panel
     return Schedule(
         loop_order=(row, panel, pack),
         tiles=(
@@ -93,7 +97,7 @@ def _packed_schedule(
                 pack,
                 nc,
                 placement="outermost",
-                accum="direct",
+                accum=accum,
                 unroll=False,
             ),
             TileSpec(
@@ -104,8 +108,8 @@ def _packed_schedule(
                 accum="direct",
             ),
         ),
-        relayout=RelayoutSpec(operand, pack, nc),
-        tag="packed-tile-ijk",
+        relayout=RelayoutSpec(operand, pack, nc, scope_var=scope),
+        tag=f"packed-tile-ijk-{scope}-{accum}",
         parallel_loop=row,
     )
 
@@ -476,12 +480,29 @@ def test_unsupported_or_unsafe_schedule_requests_are_rejected():
         lambda: TileSpec("k", 4, placement="child_of:"),
         lambda: TileSpec("k", 4, placement="at_depth:-1"),
         lambda: RelayoutSpec("B", "k", True),
+        lambda: RelayoutSpec("B", "k", 4, scope_var=1),
+        lambda: RelayoutSpec("B", "k", 4, scope_var=""),
         lambda: Schedule(parallel_loop=1),
     ],
 )
 def test_schedule_constructor_validation(factory):
     with pytest.raises((TypeError, ValueError)):
         factory()
+
+
+def test_storage_schedule_fields_are_immutable_and_legacy_scope_is_canonical():
+    relayout = RelayoutSpec("B", "k", 4, scope_var="k")
+    with pytest.raises(FrozenInstanceError):
+        relayout.scope_var = "j"
+
+    legacy = replace(
+        _packed_schedule(),
+        relayout=RelayoutSpec("B", "k", 4),
+    )
+    explicit_panel = _packed_schedule(scope="j")
+    assert legacy.relayout is not None
+    assert legacy.relayout.scope_var == "j"
+    assert legacy.cache_key == explicit_panel.cache_key
 
 
 def test_packed_relayout_is_structural_and_name_independent():
@@ -514,6 +535,43 @@ def test_packed_relayout_is_structural_and_name_independent():
     assert cpp.index(pack_loop) < cpp.index(row_loop)
     assert cpp.count("scorch_zero_dense(Output_values, Output_capacity)") == 1
     assert "Output_values[pOutput1] +=" in cpp
+
+
+def test_full_stage_and_heap_result_are_structural_and_name_independent():
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope="free",
+        accum="heap",
+    )
+
+    cpp = _lower_to_cpp(Scheduler.apply_schedule(_build_named_spmm(), schedule))
+
+    full_stage = (
+        "std::vector<float> packed_DenseInput_storage("
+        "(size_t) DenseInput0_size * (size_t) kTile_free);"
+    )
+    compact_result = (
+        "std::vector<float> tiled_Output_storage("
+        "(size_t) (Output0_size) * (size_t) kTile_free);"
+    )
+    pack_loop = (
+        "for (int64_t reduce_pack = 0; "
+        "reduce_pack < DenseInput0_size; reduce_pack++)"
+    )
+    panel_loop = (
+        "for (int64_t reduce_out = 0; reduce_out < DenseInput0_size; "
+        "reduce_out += kTile_reduce)"
+    )
+    assert full_stage in cpp
+    assert compact_result in cpp
+    assert cpp.index(pack_loop) < cpp.index(panel_loop)
+    assert "packed_DenseInput[reduce * kTile_free + free_in]" in cpp
+    assert "tiled_Output[pOutput0 * kTile_free + free_in] +=" in cpp
+    assert "Output_values[pOutput1] +=" not in cpp
+    assert "scorch_zero_dense(Output_values, Output_capacity)" not in cpp
 
 
 def test_packed_relayout_generates_hygienic_staging_names():
@@ -571,6 +629,35 @@ def test_packed_and_unpacked_schedules_cannot_alias_either_cache():
     )
 
 
+def test_all_storage_strategy_crosses_have_distinct_schedule_and_codegen_keys():
+    schedules = [
+        replace(_packed_schedule(scope=scope, accum=accum), tag="same-human-tag")
+        for scope in ("j", "k")
+        for accum in ("direct", "heap")
+    ]
+    cin = _build_spmm()
+
+    class FakeTensor:
+        format = "d,s"
+        dtype = "float32"
+
+    tensors = (FakeTensor(), FakeTensor())
+    assert len({schedule.cache_key for schedule in schedules}) == 4
+    assert (
+        len(
+            {
+                _einsum_cache_key("ij,jk->ik", tensors, "dd", None, schedule)
+                for schedule in schedules
+            }
+        )
+        == 4
+    )
+    assert (
+        len({_codegen_kernel_cache_key(cin, None, schedule) for schedule in schedules})
+        == 4
+    )
+
+
 @pytest.mark.parametrize(
     ("schedule", "error", "message"),
     [
@@ -623,11 +710,96 @@ def test_packed_and_unpacked_schedules_cannot_alias_either_cache():
             ValueError,
             "outermost affine tile",
         ),
+        (
+            _packed_schedule(scope="i"),
+            ValueError,
+            "scope_var must name either",
+        ),
+        (
+            _packed_schedule(accum="stack"),
+            NotImplementedError,
+            "direct or heap-backed",
+        ),
+        (
+            replace(
+                _packed_schedule(accum="heap"),
+                tiles=(
+                    TileSpec(
+                        "k",
+                        4,
+                        placement="child_of:i",
+                        accum="heap",
+                        unroll=False,
+                    ),
+                    TileSpec(
+                        "j",
+                        3,
+                        placement="child_of:k_out",
+                        kind="panel",
+                        accum="direct",
+                    ),
+                ),
+            ),
+            ValueError,
+            "Heap accumulation requires.*outermost",
+        ),
+        (
+            Schedule(
+                loop_order=("i", "j", "k"),
+                tiles=(
+                    TileSpec(
+                        "k",
+                        4,
+                        placement="outermost",
+                        parallel=True,
+                        accum="heap",
+                        unroll=False,
+                    ),
+                ),
+            ),
+            ValueError,
+            "shared reusable storage",
+        ),
     ],
-    ids=("missing-pack-tile", "mismatched-width", "wrong-operand", "placement"),
+    ids=(
+        "missing-pack-tile",
+        "mismatched-width",
+        "wrong-operand",
+        "placement",
+        "invalid-scope",
+        "stack-result",
+        "heap-placement",
+        "parallel-heap-tile",
+    ),
 )
 def test_packed_relayout_rejects_incompatible_schedules(schedule, error, message):
     with pytest.raises(error, match=message):
+        Scheduler.apply_schedule(_build_spmm(), schedule)
+
+
+def test_heap_result_tile_rejects_outermost_panel_wrapper_before_lowering():
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec(
+                "k",
+                4,
+                placement="outermost",
+                accum="heap",
+                unroll=False,
+            ),
+            TileSpec(
+                "j",
+                3,
+                placement="outermost",
+                kind="panel",
+                accum="direct",
+            ),
+        ),
+        parallel_loop="i",
+    )
+
+    with pytest.raises(ValueError, match="requires.*remain outermost"):
         Scheduler.apply_schedule(_build_spmm(), schedule)
 
 
@@ -648,6 +820,42 @@ def test_packed_relayout_rejects_unsupported_format_and_dtype():
             _build_named_spmm(dtype=torch.int32),
             named_schedule,
         )
+
+
+def test_packed_relayout_rejects_ambiguous_repeated_staged_access():
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    out = TensorVar("C", fmt="dd")
+    sparse = TensorVar("A", fmt="ds")
+    dense = TensorVar("B", fmt="dd")
+    first_read = dense[j, k]
+    second_read = dense[j, k]
+    assignment = TensorAssign(
+        out[i, k],
+        sparse[i, j] * (first_read + second_read),
+        op=Operation.ADD,
+    )
+    stmt = ForAll(i, ForAll(j, ForAll(k, assignment)))
+
+    with pytest.raises(ValueError, match="exactly one input tensor access"):
+        Scheduler.apply_schedule(stmt, _packed_schedule())
+
+
+def test_packed_relayout_rejects_union_expression_before_lowering():
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    out = TensorVar("C", fmt="dd")
+    sparse = TensorVar("A", fmt="ds")
+    dense = TensorVar("B", fmt="dd")
+    assignment = TensorAssign(
+        out[i, k],
+        sparse[i, j] + dense[j, k],
+        op=Operation.ADD,
+    )
+    stmt = ForAll(i, ForAll(j, ForAll(k, assignment)))
+    original = str(stmt)
+
+    with pytest.raises(NotImplementedError, match="multiplicative contraction"):
+        Scheduler.apply_schedule(stmt, _packed_schedule())
+    assert str(stmt) == original
 
 
 def test_packed_relayout_rejects_non_additive_assignment():

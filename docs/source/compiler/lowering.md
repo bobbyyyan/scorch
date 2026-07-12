@@ -258,12 +258,45 @@ parallel row loop per panel. This tile-j form requires sorted compressed
 coordinates, matching the prebuilt kernel's requirement. Affine `i`/`k` tiles and
 panel `j` can be composed into tiled-ijk loop geometry with independent ragged
 tails. Adding a {class}`~scorch.RelayoutSpec` for the dense operand stages each
-`j`-panel by `k`-strip into a reusable vector-backed buffer before the parallel
-row loop, then redirects compute reads to that contiguous panel. The initial
-implementation deliberately accepts only a structurally compatible rank-2
-CSR-by-dense contraction with a dense result, matching floating dtypes, an
-outermost affine free-axis tile, and a serial panel surrounding the parallel CSR
-row loop. Unsupported formats and placements fail during schedule validation.
+access into a reusable vector-backed buffer and redirects the selected logical
+read using LLIR tensor-access provenance. Its `scope_var` is a logical loop
+anchor: the panel variable realizes a `Jc × Nc` stage inside each panel, while
+the tiled free variable realizes a `J × Nc` stage once at free-tile entry.
+
+The affine free tile's `accum` field independently selects result lifetime.
+`"direct"` updates the final dense result. `"stack"` retains the existing
+row-local/register-sized workspace. `"heap"` creates a compact tile spanning
+all dense result-prefix positions (`M × Nc` for rank-2 SpMM), initializes it at
+free-tile entry, accumulates through all enclosed reduction panels, and copies it
+to the result once at tile exit. Thus the compiler can express all four useful
+staging/result crosses; for example, the handwritten-equivalent structure is:
+
+```python
+schedule = scorch.Schedule(
+    loop_order=("i", "j", "k"),
+    tiles=(
+        scorch.TileSpec(
+            "k", Nc, placement="outermost", accum="heap", unroll=False
+        ),
+        scorch.TileSpec(
+            "j", Jc, placement="child_of:k_out",
+            kind="panel", accum="direct",
+        ),
+    ),
+    relayout=scorch.RelayoutSpec(
+        operand="B", pack_var="k", strip_width=Nc, scope_var="k"
+    ),
+    parallel_loop="i",
+)
+```
+
+The initial operand-staging lowering deliberately accepts only a structurally
+compatible rank-2 CSR-by-dense contraction with a dense result, matching floating
+dtypes, an outermost affine free-axis tile, and a serial panel surrounding the
+parallel CSR row loop. Heap result tiles are more general and also cover dense
+multi-index contractions such as TTM when the tiled free axis is the trailing
+dense result level. Unsupported formats, access choices, lifetimes, and unsafe
+parallel placements fail during schedule validation, before C++ generation.
 
 The order matters because iteration cost is dominated by *which* variable sits
 innermost and whether a reduction can stream into a small accumulator. Ordering a
@@ -307,8 +340,12 @@ prebuilt tiling selector (the `-O` autotune ladder in `tiling.py`, described in
 SpMM kernels during dispatch, before the compiler is ever reached. The immutable
 schedule API is the handoff boundary a tuner can use to select JIT loop geometry;
 `schedule_from_tuner_choice(("tileijk", (Nc, Jc)), ...)` is an opt-in adapter from
-the existing normalized tuner choice to the packed JIT schedule. It does not
-replace the production selector or change its cache/default policy.
+the existing normalized tuner choice to the packed JIT schedule. The compiler-only
+extended choice `(Nc, Jc, scope_var, accum)` exposes operand staging at either the
+panel or free-axis tile and direct or heap-backed compact-result accumulation.
+`compiler_schedule_search_space(...)` constructs the Cartesian product of those
+four dimensions for an opt-in search. Neither helper replaces the production
+selector nor changes its persistent cache, learned model, or default policy.
 :::
 
 ## Worked example: formats → loop nest
