@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Union, Sequence, Optional, List, Tuple
 
 import torch
+from torch.fx import Proxy
 
 from .compiler import llir
 from .compiler.cin import (
@@ -557,6 +558,17 @@ def matmul(
     >>> torch.allclose(C.to_torch(), A_dense @ A_dense, atol=1e-3, rtol=1e-3)
     True
     """
+
+    # ``scorch.compile`` traces user functions with torch.fx.  Keep the leaf
+    # behavior on the function itself so tracing never has to replace the
+    # public ``scorch.matmul`` binding (or aliases in user globals).  A Proxy
+    # carries its tracer, which can record this exact call without descending
+    # into the eager dispatch below.
+    proxy = a if isinstance(a, Proxy) else b if isinstance(b, Proxy) else None
+    if proxy is not None:
+        return proxy.tracer.create_proxy(
+            "call_function", matmul, (a, b), kwargs
+        )  # type: ignore[return-value]
 
     effective_schedule = _effective_schedule(kwargs)
 
