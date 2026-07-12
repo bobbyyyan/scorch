@@ -1,46 +1,62 @@
 import glob
 import hashlib
 import math
+import os
 import platform
+import time
 from collections import defaultdict, deque
+from importlib import resources
 from itertools import chain
-from pathlib import Path
 from typing import List, Dict, Any, Iterable, Union, Optional
 
 import torch
-from torch.utils.cpp_extension import load_inline, load
+from torch.utils.cpp_extension import load_inline
 
 from .compiler.llir import DataType
 from .format import TensorFormat, LevelFormat, LevelType
 
-PROJECT_ROOT_DIR = Path(__file__)
+_NATIVE_RESOURCES = resources.files("scorch").joinpath("csrc")
+
+
+def native_resource_text(filename: str) -> str:
+    """Read a packaged native source or header as UTF-8 text."""
+    if filename in {"", ".", ".."} or "/" in filename or "\\" in filename:
+        raise ValueError("filename must name a file directly under scorch/csrc")
+    return _NATIVE_RESOURCES.joinpath(filename).read_text(encoding="utf-8")
 
 
 def _policy_header_text() -> str:
-    """Text of the shared parallel-policy header(s), folded into the JIT kernel
-    cache key. csrc/header.cpp (hashed as a kernel source) only ``#include``s
-    csrc/scorch_policy.h, so its own text does NOT reflect the policy constants'
-    values — a Phase 4b autotune that rewrites scorch_policy.h /
-    scorch_policy_tuned.h would otherwise leave cached .so files stale. Reading
-    the included text here makes any retune change the hash and force a recompile.
+    """Return packaged policy text, with optional local tuning overrides first."""
+    base = native_resource_text("scorch_policy.h")
+    tuned = _NATIVE_RESOURCES.joinpath("scorch_policy_tuned.h")
+    tuned_text = tuned.read_text(encoding="utf-8") if tuned.is_file() else ""
+    return tuned_text + base
+
+
+def jit_preamble_text() -> str:
+    """Return the complete packaged C++ preamble used by generated kernels.
+
+    ``load_inline`` writes its source into a separate cache directory, so a quote
+    include in ``header.cpp`` cannot reliably find an adjacent installed header.
+    Expanding the packaged policy header into the template keeps each generated
+    translation unit self-contained and also works for non-filesystem resource
+    loaders.
     """
-    text = ""
-    for name in ("csrc/scorch_policy.h", "csrc/scorch_policy_tuned.h"):
-        try:
-            text += (PROJECT_ROOT_DIR / name).read_text()
-        except OSError:
-            pass  # tuned header is optional; a missing base header just omits it
-    return text
+    template = native_resource_text("header.cpp")
+    include = '#include "scorch_policy.h"'
+    if template.count(include) != 1:
+        raise RuntimeError("packaged header.cpp must include scorch_policy.h once")
+    return template.replace(include, _policy_header_text(), 1)
 
 
 def _kernel_name(*sources: str) -> str:
     """Deterministic name from kernel source so torch's disk cache persists.
 
-    Includes torch version in the hash so a PyTorch upgrade invalidates
-    all cached .so files (they link against libtorch). Also folds in the shared
-    parallel-policy header text so Phase 4b per-host retuning invalidates them.
+    Includes torch version in the hash so a PyTorch upgrade invalidates all
+    cached .so files (they link against libtorch). ``jit_preamble_text`` expands
+    the policy header into the source, so a local policy retune is covered too.
     """
-    keyed = "".join(sources) + _policy_header_text() + torch.__version__
+    keyed = "".join(sources) + torch.__version__
     if os.environ.get("SCORCH_JIT_TUNE_HOOKS"):
         # Instrumented sweep kernels carry extra getenv branches (same text, -D flag),
         # so key them apart from clean kernels to avoid serving one for the other.
@@ -86,8 +102,6 @@ def _load_kernel(name: str, cpp_sources, functions, extra_cflags, extra_ldflags)
     return module
 
 
-import os
-
 def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
     """Get platform-specific extra compiler flags for torch cpp_extension.
 
@@ -120,15 +134,9 @@ def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
         # Linux: standard OpenMP support
         flags.append("-fopenmp")
 
-    # The JIT preamble (csrc/header.cpp) #includes "scorch_policy.h" (the shared
-    # thread-cap / chunk policy, also used by the prebuilt scorch_ops kernels).
-    # The preamble is text-prepended into a build-dir main.cpp, so the quote-
-    # include only resolves with csrc/ on the compiler's search path.
-    flags.append(f"-I{PROJECT_ROOT_DIR / 'csrc'}")
-
     # Install-time autotune: build JIT kernels with the SCORCH_TUNE_HOOKS sweep hooks
-    # so the codegen thread/chunk policy is tunable in-process too (mirrors setup.py's
-    # SCORCH_BUILD_TUNE_HOOKS for the prebuilt kernels). Off in the shipped path.
+    # so the codegen thread/chunk policy is tunable in-process too (mirrors the
+    # native build's SCORCH_BUILD_TUNE_HOOKS mode). Off in the shipped path.
     if os.environ.get("SCORCH_JIT_TUNE_HOOKS"):
         flags.append("-DSCORCH_TUNE_HOOKS")
 
@@ -177,10 +185,6 @@ def get_extra_ldflags() -> List[str]:
             ldflags.append("-fopenmp")
 
     return ldflags
-while not (PROJECT_ROOT_DIR / "setup.py").exists():
-    PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
-
-import time
 
 
 def load_to_kernel_cache(
@@ -197,12 +201,8 @@ def load_to_kernel_cache(
     if kernel_code_filename is None:
         kernel_code_filename = f"{kernel_name}.cpp"
 
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
-
-    with open(PROJECT_ROOT_DIR / f"csrc/{kernel_code_filename}", "r") as f:
-        cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
+    cpp_code = native_resource_text(kernel_code_filename)
 
     # Load special kernels
     start_time = time.time()
@@ -210,9 +210,10 @@ def load_to_kernel_cache(
         name=kernel_name,
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=get_extra_cflags(["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"]),
+        extra_cflags=get_extra_cflags(
+            ["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"]
+        ),
         extra_ldflags=get_extra_ldflags(),
-        build_directory=PROJECT_ROOT_DIR / "build",
     )
     end_time = time.time()
     print(f"Loading {kernel_name} took {end_time - start_time} s")

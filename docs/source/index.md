@@ -16,7 +16,7 @@ sd_hide_title: true
 </div>
 
 ```{code-block} bash
-pip install -e . --no-build-isolation   # from a clone; see the install guide
+pip install -e .   # from a clone; see the install guide
 ```
 
 Scorch is a **sparse tensor compiler** wearing a PyTorch shim. You `import scorch`,

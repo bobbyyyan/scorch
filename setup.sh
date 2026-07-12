@@ -139,7 +139,8 @@ echo "Upgrading pip and setuptools..."
 pip install --upgrade pip setuptools
 
 # Install scorch in editable/develop mode
-# Use --no-build-isolation since setup.py imports torch at the top level
+# Reuse the torch already installed above instead of provisioning it again in an
+# isolated PEP 517 build environment.
 echo
 echo "Installing scorch in develop mode..."
 pip install -e . --no-build-isolation

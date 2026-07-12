@@ -211,7 +211,7 @@ drains it. The outermost call wraps everything into an LLIR function:
 
 ```python
 llir.Function(
-    return_type=llir.DataType.TACO_TENSOR,   # the csrc/header.cpp `Tensor` struct
+    return_type=llir.DataType.TACO_TENSOR,   # src/scorch/csrc/header.cpp `Tensor`
     name="evaluate",
     args=kernel_args,   # result_shape, then per input:
                         #   <name>_shape, <name>_mode_indices, <name>_values
@@ -294,10 +294,13 @@ The full codegen walk, the OpenMP emission variants, and fused-epilogue
 
 ## Stage 6 — JIT compile
 
-The generated `evaluate()` string is prepended with `csrc/header.cpp` — the
+The generated `evaluate()` string is prepended with the packaged
+`src/scorch/csrc/header.cpp` resource — the
 runtime support (`Tensor` / `TensorStorage` structs, `cvector<T>`,
 `coo_workspace<T, dim>`, the parallel-policy header, OpenMP) — and handed to
-`_load_kernel`. Compilation uses `torch.utils.cpp_extension.load_inline` with:
+`_load_kernel`. The resource and parallel-policy header are loaded with
+`importlib.resources`, so installed wheels do not need a repository checkout.
+Compilation uses `torch.utils.cpp_extension.load_inline` with:
 
 ```text
 -O3 -march=native -ffast-math -funroll-loops -fopenmp
@@ -319,9 +322,9 @@ plus platform-specific include/link flags (macOS links PyTorch's bundled
 
 :::{warning}
 Because caching keys on source text, a stale cache can **mask** an edit you just
-made to codegen or a `csrc/` template. When changing the compiler's output, clear
-the torch extensions build dir. The test suite isolates this automatically by
-pointing `TORCH_EXTENSIONS_DIR` at a temp directory.
+made to codegen or a `src/scorch/csrc/` template. When changing the compiler's
+output, clear the torch extensions build dir. The test suite isolates this
+automatically by pointing `TORCH_EXTENSIONS_DIR` at a temp directory.
 :::
 
 You can pre-warm the cache without executing anything via

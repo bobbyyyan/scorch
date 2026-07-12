@@ -1,7 +1,8 @@
 # Building from source
 
 This page covers the developer build in detail: how the editable install works,
-why the native `scorch_ops` extension has to be rebuilt after you touch `csrc/`,
+why the native `scorch_ops` extension has to be rebuilt after you edit
+`src/scorch/csrc/`,
 and how Scorch's two-tier compile cache can quietly mask codegen changes if you
 don't clear it. If you only want to *use* Scorch, the shorter path is on the
 {doc}`installation page </getting_started/installation>`; this page is for people
@@ -10,15 +11,16 @@ hacking on the library itself.
 Scorch has two independently compiled C++ layers, and most build confusion comes
 from not knowing which one you're rebuilding:
 
-1. **The prebuilt `scorch_ops` extension** — hand-optimized kernels in `csrc/`
-   (`ops.cpp`, `spmm.h`, `kernels.h`, …), compiled once at install time by
-   `setup.py`. Rebuilt with `pip install -e .`.
+1. **The prebuilt `scorch_ops` extension** — hand-optimized kernels in
+   `src/scorch/csrc/` (`ops.cpp`, `spmm.h`, `kernels.h`, …), compiled once at
+   install time from `pyproject.toml` with the custom command in `scorch_build.py`.
+   Rebuilt with `pip install -e .`.
 2. **JIT-generated kernels** — the generic sparse path lowers each operation to a
    C++ source string and compiles it at runtime with `load_inline`, caching the
    `.so` under `TORCH_EXTENSIONS_DIR`. See {doc}`/compiler/codegen`.
 
-Editing `csrc/` affects (1); editing the compiler affects (2); they have separate
-build steps and separate caches.
+Editing `src/scorch/csrc/` affects (1); editing the compiler affects (2); they
+have separate build steps and separate caches.
 
 ## Activate the `scorch` conda env first
 
@@ -54,42 +56,43 @@ conda activate scorch
 pip install -e . --no-build-isolation
 ```
 
-### Why `--no-build-isolation` is mandatory
+### Why developer rebuilds disable isolation
 
-`setup.py` imports torch at module top level to configure the extension:
+The PEP 517 build requirements in `pyproject.toml` include torch, so a normal
+isolated build can import `scorch_build.py` and configure the extension. In an
+already configured development environment, `--no-build-isolation` avoids
+installing a second copy of torch into a temporary build environment and compiles
+against the active environment directly. Clean wheel and source-distribution
+installs do not require this flag.
 
-```python
-import torch
-from torch.utils.cpp_extension import BuildExtension, CppExtension
+## Rebuild `scorch_ops` after editing `src/scorch/csrc/`
+
+The declarative extension in `pyproject.toml` compiles exactly one translation
+unit, `src/scorch/csrc/ops.cpp`, and names every header that can invalidate it:
+
+```toml
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[[tool.setuptools.ext-modules]]
+name = "scorch_ops"
+sources = ["src/scorch/csrc/ops.cpp"]
+depends = [
+    "src/scorch/csrc/header.h",
+    "src/scorch/csrc/kernels.h",
+    "src/scorch/csrc/prebuilt_types.h",
+    "src/scorch/csrc/scorch_policy.h",
+    "src/scorch/csrc/spmm.h",
+]
+extra-compile-args = ["-O3", "-march=native", "-ffast-math", "-funroll-loops"]
+language = "c++"
+
+[tool.setuptools.cmdclass]
+build_ext = "scorch_build.ScorchBuildExtension"
 ```
 
-By default, pip builds in an isolated, freshly created virtual environment where
-your project's dependencies are **not** installed. In that clean environment the
-`import torch` at the top of `setup.py` raises `ModuleNotFoundError` and the build
-aborts before it ever compiles a line of C++. `--no-build-isolation` tells pip to
-run the build in your *current* environment — the `scorch` env, where torch is
-already present — so `setup.py` can import it and hand its compiler/linker flags
-to `BuildExtension`.
-
-:::{warning}
-Omitting `--no-build-isolation` is the single most common build failure. The
-error surfaces as a torch import error *during the build*, not at runtime, which
-misleads people into reinstalling torch. The fix is the flag, not the reinstall.
-:::
-
-## Rebuild `scorch_ops` after editing `csrc/`
-
-The extension defined in `setup.py` compiles exactly one translation unit,
-`csrc/ops.cpp`:
-
-```python
-CppExtension(
-    "scorch_ops",
-    ["csrc/ops.cpp"],
-    extra_compile_args=["-O3", "-march=native", "-ffast-math", "-funroll-loops"],
-    extra_link_args=...,   # platform-specific OpenMP, see below
-)
-```
+`ScorchBuildExtension` subclasses torch's `BuildExtension` and adds the PyTorch
+include/library paths plus the platform-specific OpenMP flags.
 
 `ops.cpp` `#include`s the header-only kernels (`spmm.h`, `kernels.h`, `header.*`,
 `scorch_policy.h`). Any change to those headers or to `ops.cpp` requires a rebuild
@@ -99,22 +102,18 @@ before it takes effect:
 pip install -e . --no-build-isolation
 ```
 
-:::{admonition} Header-only edits may not trigger a rebuild
+:::{admonition} Header-only edits trigger a rebuild
 :class: tip
-Because only `csrc/ops.cpp` is a compilation unit, editing a *header* it includes
-(e.g. `spmm.h`) can leave the build system thinking nothing changed. Force a
-recompile by touching the translation unit:
-
-```bash
-touch csrc/ops.cpp
-pip install -e . --no-build-isolation
-```
+The `depends` list above tells setuptools that `spmm.h`, `kernels.h`,
+`scorch_policy.h`, and the other native headers feed the `ops.cpp` compilation
+unit. Editing one and rerunning the editable install is sufficient; do not touch
+`ops.cpp` merely to force a rebuild.
 :::
 
 :::{note}
-`CMakeLists.txt` and `csrc/pybind.cpp` exist in the tree but are **legacy /
+`CMakeLists.txt` and `src/scorch/csrc/pybind.cpp` exist in the tree but are **legacy /
 IDE-indexing only** — they are not the supported build path. Always build through
-`pip` / `setup.py`.
+`pip` using `pyproject.toml` and `scorch_build.py`.
 :::
 
 ## The two-tier JIT cache and `TORCH_EXTENSIONS_DIR`
@@ -165,7 +164,7 @@ manually with the commands above.
 
 Scorch's kernels are OpenMP-parallel, and the trickiest part of the build is
 linking OpenMP *without* introducing two conflicting OpenMP runtimes into the same
-process. `setup.py` handles this per platform, preferring the copy that PyTorch
+process. `scorch_build.py` handles this per platform, preferring the copy that PyTorch
 itself already loaded:
 
 **macOS (Darwin).** Compiled with `-Xpreprocessor -fopenmp` plus a headers-only
@@ -224,13 +223,16 @@ pytest -m "not perf"
 ## Troubleshooting
 
 `ModuleNotFoundError: No module named 'torch'` *during the build*
-: You omitted `--no-build-isolation`. pip is building in an isolated env without
-  torch. Re-run `pip install -e . --no-build-isolation`.
+: A modern pip should install torch from `pyproject.toml`'s build requirements
+  before loading `scorch_build.py`. Upgrade pip and check that the configured
+  package index can provide torch. In a development environment where torch is
+  already installed, `pip install -e . --no-build-isolation` is the direct fallback.
 
-`import scorch` fails after a `csrc/` edit, or your kernel change has no effect
+`import scorch` fails after a `src/scorch/csrc/` edit, or your kernel change has
+no effect
 : The `scorch_ops` extension wasn't rebuilt. Run
-  `pip install -e . --no-build-isolation`. If you only edited a header, first
-  `touch csrc/ops.cpp` to force the recompile.
+  `pip install -e . --no-build-isolation`. Header dependencies are declared in
+  `pyproject.toml`, so the same command handles header-only edits.
 
 A codegen/compiler change appears to do nothing
 : A stale JIT kernel is being served from cache. Clear `TORCH_EXTENSIONS_DIR`

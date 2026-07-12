@@ -1,0 +1,72 @@
+[build-system]
+requires = [
+    "ninja",
+    "setuptools>=77",
+    "torch",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scorch"
+version = "0.0.1"
+description = "Scorch: A library for sparse machine learning"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Bobby Yan", email = "bobbyy@cs.stanford.edu" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Unix",
+]
+dependencies = [
+    "ninja",
+    "torch",
+]
+
+[project.urls]
+Homepage = "https://github.com/bobbyyyan/scorch"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = false
+
+[[tool.setuptools.ext-modules]]
+name = "scorch_ops"
+sources = ["src/scorch/csrc/ops.cpp"]
+depends = [
+    "src/scorch/csrc/header.h",
+    "src/scorch/csrc/kernels.h",
+    "src/scorch/csrc/prebuilt_types.h",
+    "src/scorch/csrc/scorch_policy.h",
+    "src/scorch/csrc/spmm.h",
+]
+extra-compile-args = [
+    "-O3",
+    "-march=native",
+    "-ffast-math",
+    "-funroll-loops",
+]
+language = "c++"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["scorch", "scorch.*"]
+
+[tool.setuptools.package-data]
+scorch = [
+    "csrc/header.cpp",
+    "csrc/header.h",
+    "csrc/kernels.h",
+    "csrc/ops.cpp",
+    "csrc/prebuilt_types.h",
+    "csrc/pybind.cpp",
+    "csrc/scorch_policy.h",
+    "csrc/spmm.h",
+]
+
+[tool.setuptools.cmdclass]
+build_ext = "scorch_build.ScorchBuildExtension"

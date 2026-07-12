@@ -85,7 +85,7 @@ On macOS, activation auto-sets `CC`/`CXX` to the system clang through the hooks
 ## Path 2 — rebuild in an existing environment
 
 Once the environment exists, reinstall Scorch in editable mode to rebuild after
-editing Python source or anything in `csrc/`:
+editing Python source or anything in `src/scorch/csrc/`:
 
 ```bash
 conda activate scorch
@@ -95,15 +95,15 @@ pip install -e . --no-build-isolation
 This rebuilds both the editable Python package **and** the native `scorch_ops`
 extension.
 
-### Why `--no-build-isolation` is required
+### Why developer rebuilds use `--no-build-isolation`
 
-`setup.py` imports `torch` at module top level (it uses
-`torch.utils.cpp_extension.BuildExtension` and `CppExtension` to compile the
-native extension). With pip's default build isolation, the build runs in a fresh
-throwaway environment where PyTorch is *not* installed, so `setup.py`
-crashes on import before it can build anything. `--no-build-isolation` runs the
-build in your current environment, where torch is present. This flag is mandatory
-for every Scorch install and rebuild.
+`pyproject.toml` declares torch as a build requirement, so ordinary isolated pip
+builds are supported. Scorch's `scorch_build.py` command imports torch to supply
+its C++ include paths, libraries, ABI flags, and platform-specific OpenMP settings.
+For an editable rebuild in an established development environment,
+`--no-build-isolation` reuses the torch already installed there instead of
+provisioning another copy in a temporary build environment. It is a build-speed
+optimization, not a requirement for installing a wheel or source distribution.
 
 For the no-conda case, the manual sequence mirrors what `setup.sh` does:
 
@@ -117,11 +117,13 @@ pip install -e . --no-build-isolation
 (#native-extension-and-openmp)=
 ## Native extension and OpenMP
 
-`setup.py` builds one native compilation unit — `csrc/ops.cpp` — into the
-`scorch_ops` pybind extension. This hosts Scorch's hand-written **prebuilt
-kernels** (it is distinct from the JIT **codegen kernels**, which are compiled at
-runtime; see [JIT kernel cache](#jit-kernel-cache-and-rebuilds)). The base
-compile flags are `-O3 -march=native -ffast-math -funroll-loops`.
+`pyproject.toml` declares one native compilation unit —
+`src/scorch/csrc/ops.cpp` — for the `scorch_ops` pybind extension, and
+`scorch_build.py` supplies PyTorch's build settings. This hosts Scorch's
+hand-written **prebuilt kernels** (it is distinct from the JIT **codegen kernels**,
+which are compiled at runtime; see [JIT kernel
+cache](#jit-kernel-cache-and-rebuilds)). The base compile flags are
+`-O3 -march=native -ffast-math -funroll-loops`.
 
 OpenMP is linked differently per platform, deliberately preferring PyTorch's
 bundled runtime so a second copy of OpenMP is never loaded alongside torch's:
@@ -137,9 +139,9 @@ bundled runtime so a second copy of OpenMP is never loaded alongside torch's:
   falling back to plain `-fopenmp` otherwise.
 
 :::{note}
-The repo also contains a `CMakeLists.txt` and `csrc/pybind.cpp`, but these are
-legacy / IDE-indexing only. The supported build path is `pip install -e .`
-(`setup.py` + torch's `BuildExtension`) — do not build via CMake.
+The repo also contains a `CMakeLists.txt` and `src/scorch/csrc/pybind.cpp`, but
+these are legacy / IDE-indexing only. The supported build path is
+`pip install -e .` (`pyproject.toml` + `scorch_build.py`) — do not build via CMake.
 :::
 
 ## Verifying the install
@@ -186,10 +188,11 @@ $ pytest -m "not perf"
 these are the two prefixes `setup.sh` and the build probe. Reinstall Scorch after
 installing libomp so the headers are picked up.
 
-**Changes to `csrc/` don't take effect.** The native extension is only rebuilt
-when you reinstall. After editing anything in `csrc/`, rerun
-`pip install -e . --no-build-isolation`. For header-only edits (e.g. `spmm.h`),
-`touch csrc/ops.cpp` first so the build system sees a changed compilation unit.
+**Changes to `src/scorch/csrc/` don't take effect.** The native extension is only
+rebuilt when you reinstall. After editing a native source or header, rerun
+`pip install -e . --no-build-isolation`. The extension's headers are declared in
+`pyproject.toml` as build dependencies, so a header-only edit automatically
+invalidates the compilation unit; no manual `touch` is needed.
 
 (jit-kernel-cache-and-rebuilds)=
 **A codegen change seems to have no effect (stale JIT cache).** Generic sparse

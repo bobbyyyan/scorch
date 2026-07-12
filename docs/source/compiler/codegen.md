@@ -175,11 +175,12 @@ that {doc}`lowering </compiler/lowering>` generated from A's `"ds"` format.
 
 ## Stage 6 — JIT compile & the two-tier cache
 
-Before compilation, the generated `evaluate(...)` string is prepended with
-`csrc/header.cpp` — the runtime support layer that defines the `Tensor` /
-`TensorStorage` structs, `cvector<T>`, `coo_workspace<T, dim>`, and the
-`#include "scorch_policy.h"` threading policy. The combined source is then handed to
-`_load_kernel(...)` in `utils.py`.
+Before compilation, the generated `evaluate(...)` string is prepended with the
+packaged `src/scorch/csrc/header.cpp` resource — the runtime support layer that
+defines the `Tensor` / `TensorStorage` structs, `cvector<T>`,
+`coo_workspace<T, dim>`, and the `#include "scorch_policy.h"` threading policy.
+`utils.py` reads both files through `importlib.resources` and expands that include
+before handing the self-contained source to `_load_kernel(...)`.
 
 ### Compiler and linker flags
 
@@ -196,8 +197,9 @@ link it:
 - **macOS:** `-Xpreprocessor -fopenmp`, plus a Homebrew `libomp` include path and
   the macOS SDK C++ stdlib include.
 - **Linux:** `-fopenmp`.
-- **Always:** `-I<project>/csrc`, so the preamble's `#include "scorch_policy.h"`
-  resolves.
+
+The policy header is embedded into the generated source, so runtime compilation
+does not depend on a repository-relative include directory.
 
 CLAUDE.md summarizes the effective flag set as
 `-O3 -march=native -ffast-math -funroll-loops -fopenmp`.
@@ -248,9 +250,10 @@ digits (`kernel_<hash>`). Folding those two extra strings into the hash matters:
 **Stale caches can mask codegen edits.** Because compiled kernels are memoized
 aggressively — the in-process module caches in `ops.py` (keyed by `(format_a,
 format_b, format_output)`) *plus* the persistent on-disk `.so` — a change you make
-to codegen or to a `csrc/` template may not take effect until the old cached kernel
-is removed. If you edit codegen and your change appears to do nothing, clear the
-torch extensions build directory (`TORCH_EXTENSIONS_DIR`) before re-running.
+to codegen or to a `src/scorch/csrc/` template may not take effect until the old
+cached kernel is removed. If you edit codegen and your change appears to do
+nothing, clear the torch extensions build directory (`TORCH_EXTENSIONS_DIR`)
+before re-running.
 
 The test suite isolates this automatically: a session fixture in
 `tests/conftest.py` points `TORCH_EXTENSIONS_DIR` at a fresh temp directory, so a

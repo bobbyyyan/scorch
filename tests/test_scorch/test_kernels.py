@@ -21,7 +21,12 @@ from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.ops import matmul, matmul_wksp, lower_and_exec_cin
 from scorch.storage import TensorIndex
-from scorch.utils import PROJECT_ROOT_DIR, parse_format
+from scorch.utils import (
+    get_extra_cflags,
+    get_extra_ldflags,
+    jit_preamble_text,
+    parse_format,
+)
 
 # indent 2 pretty print
 pp = pprint.PrettyPrinter(indent=2)
@@ -525,15 +530,14 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
 
     print(cpp_code)
 
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
+        extra_cflags=get_extra_cflags(["-O3"]),
+        extra_ldflags=get_extra_ldflags(),
     )
 
     tensor_a_torch = torch.Tensor(
@@ -671,14 +675,14 @@ def test_spmm_ds_ds_ds_kij_outer():
     llir_lowerer = LLIRLowerer()
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
+        extra_cflags=get_extra_cflags(["-O3"]),
+        extra_ldflags=get_extra_ldflags(),
     )
 
     tensor_b_torch = torch.Tensor(
@@ -1179,15 +1183,14 @@ def test_spmm_ss_dd_dd_ikj_gustavson():
 
     print(cpp_code)
 
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
+        extra_cflags=get_extra_cflags(["-O3"]),
+        extra_ldflags=get_extra_ldflags(),
     )
 
     tensor_a_torch = torch.Tensor(
@@ -1297,15 +1300,14 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
 
     print(cpp_code)
 
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
+        extra_cflags=get_extra_cflags(["-O3"]),
+        extra_ldflags=get_extra_ldflags(),
     )
 
     tensor_a_torch = torch.Tensor(
@@ -1416,15 +1418,14 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
 
     print(cpp_code)
 
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
+        extra_cflags=get_extra_cflags(["-O3"]),
+        extra_ldflags=get_extra_ldflags(),
     )
 
     tensor_a_torch = torch.rand(dim_n, dim_n)
@@ -1517,15 +1518,14 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
 
     print(cpp_code)
 
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     module = torch.utils.cpp_extension.load_inline(
         name="kernel",
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=["-O3", f"-I{PROJECT_ROOT_DIR / 'csrc'}"],  # find scorch_policy.h (JIT preamble include)
+        extra_cflags=get_extra_cflags(["-O3"]),
+        extra_ldflags=get_extra_ldflags(),
     )
 
     tensor_a_torch = torch.Tensor(

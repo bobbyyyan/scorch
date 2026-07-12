@@ -1,0 +1,113 @@
+name: packaging
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MAX_JOBS: "2"
+
+jobs:
+  build-distributions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ninja-build
+          python -m pip install --upgrade pip setuptools wheel build twine
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build wheel and source distribution
+        run: python -m build --no-isolation
+
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorch-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  smoke-install:
+    name: smoke install (${{ matrix.distribution }})
+    needs: build-distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [wheel, sdist]
+
+    steps:
+      - name: Check out smoke test
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install compiler dependency
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ninja-build
+
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: scorch-distributions
+          path: dist
+
+      - name: Install ${{ matrix.distribution }} in a clean environment
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+        run: |
+          set -euo pipefail
+
+          venv="$RUNNER_TEMP/scorch-$DISTRIBUTION-venv"
+          python -m venv "$venv"
+          "$venv/bin/python" -m pip install --upgrade pip setuptools wheel
+          "$venv/bin/python" -m pip install torch \
+            --index-url https://download.pytorch.org/whl/cpu
+
+          if [[ "$DISTRIBUTION" == "wheel" ]]; then
+            artifact=("$GITHUB_WORKSPACE"/dist/*.whl)
+            "$venv/bin/python" -m pip install --no-index --no-deps "${artifact[@]}"
+          else
+            artifact=("$GITHUB_WORKSPACE"/dist/*.tar.gz)
+            "$venv/bin/python" -m pip install \
+              --no-index --no-deps --no-build-isolation "${artifact[@]}"
+          fi
+
+          smoke_dir="$RUNNER_TEMP/scorch-$DISTRIBUTION-smoke"
+          jit_dir="$RUNNER_TEMP/scorch-$DISTRIBUTION-jit"
+          mkdir -p "$smoke_dir" "$jit_dir"
+          cd "$smoke_dir"
+
+          SCORCH_CHECKOUT="$GITHUB_WORKSPACE" \
+          TORCH_EXTENSIONS_DIR="$jit_dir" \
+          PYTHONPATH= \
+            timeout 10m "$venv/bin/python" -P \
+              "$GITHUB_WORKSPACE/tests/packaging/smoke_install.py"

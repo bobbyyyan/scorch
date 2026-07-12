@@ -93,7 +93,7 @@ class ResultTensorAssembler:
             # Zero the whole dense buffer before the parallel += accumulate. The
             # generated kernel accumulates into C, so it needs the full buffer
             # zeroed (not empty-rows-only like the prebuilt SpMM). scorch_zero_dense
-            # (csrc/header.cpp) parallelizes that zero across cores for large
+            # (scorch/csrc/header.cpp) parallelizes that zero across cores for large
             # outputs — where the serial memset was a big fraction of runtime — and
             # falls back to a single memset below SCORCH_MEMSET_GRAIN_BYTES. Takes
             # the element count; it computes the byte span internally.
@@ -4090,7 +4090,7 @@ class CINLowerer:
 
     # Min work per thread for the SpGEMM 2-phase path, where `work` is the true flop
     # (A_nnz*avg_B_row). Emitted by NAME (not as a literal) so the codegen flop grain
-    # lives in the single tuning surface csrc/scorch_policy.h and picks up the Phase 4b
+    # lives in scorch/csrc/scorch_policy.h and picks up the Phase 4b
     # per-host autotuned value; the header (via header.cpp) is prepended to every
     # generated kernel so the macro resolves. Defaults to 1500 there — larger than the
     # A_nnz default (500) because flop is ~avg_B_row bigger; validated on redwood.
@@ -4101,7 +4101,7 @@ class CINLowerer:
     ):
         """Attach a work-aware thread cap (+ adaptive schedule chunk) to a parallel
         ForLoop. codegen.py emits these as num_threads(scorch_nthreads(work,rows)) and
-        schedule(dynamic, scorch_chunk(rows, work)) (helpers in csrc/header.cpp).
+        schedule(dynamic, scorch_chunk(rows, work)) (helpers in scorch/csrc/header.cpp).
 
         rows = loop trip count; work = the C++ work estimate. When work_expr is
         given it is used verbatim (e.g. the true SpGEMM flop A_nnz*avg_B_row from

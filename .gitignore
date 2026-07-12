@@ -1,3 +1,4 @@
+src/scorch/csrc/scorch_policy_tuned.h
 figures
 examples/**/*.pt**
 sample-kernels-archive/

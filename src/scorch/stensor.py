@@ -9,7 +9,14 @@ from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
 from .format import TensorFormat, LevelFormat, LevelType
 from .storage import TensorStorage, TensorIndex, TensorStorageView
-from .utils import PROJECT_ROOT_DIR, parse_format, get_extra_cflags, get_extra_ldflags, _kernel_name, _load_kernel
+from .utils import (
+    parse_format,
+    get_extra_cflags,
+    get_extra_ldflags,
+    jit_preamble_text,
+    _kernel_name,
+    _load_kernel,
+)
 
 
 class Window(object):
@@ -442,9 +449,7 @@ class STensor:
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
-        # Read header_cpp_code from csrc/header.cpp
-        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-            header_cpp_code = f.read()
+        header_cpp_code = jit_preamble_text()
 
         module = _load_kernel(
             name=_kernel_name(header_cpp_code, cpp_code),
@@ -1008,9 +1013,7 @@ class STensor:
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
-        # Read header_cpp_code from csrc/header.cpp
-        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-            header_cpp_code = f.read()
+        header_cpp_code = jit_preamble_text()
 
         module = _load_kernel(
             name=_kernel_name(header_cpp_code, cpp_code),
@@ -1188,9 +1191,7 @@ class STensor:
 
             # print("to_sparse cpp_code:\n\n", cpp_code)
 
-            # Read header_cpp_code from csrc/header.cpp
-            with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-                header_cpp_code = f.read()
+            header_cpp_code = jit_preamble_text()
 
             module = _load_kernel(
                 name=_kernel_name(header_cpp_code, cpp_code),
@@ -1456,8 +1457,7 @@ class STensor:
         llir_lowerer = LLIRLowerer()
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-            header_cpp_code = f.read()
+        header_cpp_code = jit_preamble_text()
 
         module = _load_kernel(
             name=_kernel_name(header_cpp_code, cpp_code),

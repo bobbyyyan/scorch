@@ -6,14 +6,14 @@
 // work measure and grain:
 //
 //   * JIT codegen (compiler/codegen.py): the generated kernels call these two
-//     helpers. csrc/header.cpp — the text-prepended JIT preamble — #includes this
-//     file, and src/scorch/utils.py get_extra_cflags() adds csrc/ to the JIT
-//     `-I` path so the include resolves at compile time. The codegen flop path
+//     helpers. scorch/csrc/header.cpp — the packaged JIT preamble — includes this
+//     file, and src/scorch/utils.py expands both resources into one self-contained
+//     translation unit. The codegen flop path
 //     passes SCORCH_GRAIN_CODEGEN_SPGEMM; A_nnz sites use the SCORCH_GRAIN_DEFAULT
 //     default arg.
-//   * prebuilt spmspm_csr (csrc/kernels.h): work = A_nnz*avg_B_row (flop),
+//   * prebuilt spmspm_csr (scorch/csrc/kernels.h): work = A_nnz*avg_B_row (flop),
 //     grain = SCORCH_GRAIN_SPMSPM.
-//   * prebuilt spmm_csr_float_v2 (csrc/spmm.h): work = A_nnz*k, grain = SCORCH_GRAIN_SPMM.
+//   * prebuilt spmm_csr_float_v2 (scorch/csrc/spmm.h): work = A_nnz*k, grain = SCORCH_GRAIN_SPMM.
 //
 // WHY (validated on redwood i9-14900K, a hybrid P+E CPU, back-to-back vs the old
 // unconditional-all-cores + coarse-fixed-chunk policy): an unconditional
@@ -34,7 +34,7 @@
 // override any subset WITHOUT editing this file:
 //
 //   * tools/autotune_policy.py measures THIS build host and writes
-//     csrc/scorch_policy_tuned.h (gitignored) with `#define`s for the constants
+//     src/scorch/csrc/scorch_policy_tuned.h (gitignored) with `#define`s for the constants
 //     it retunes. That file is #included FIRST below (when present), so its
 //     defines win over the #ifndef defaults here.
 //   * When the tuned header is absent — CI, cross-compile, `pip install` without
@@ -51,7 +51,7 @@
 #include <omp.h>
 
 // Install-time autotune sweep hooks. Compiled ONLY when tools/autotune_policy.py
-// builds an instrumented scorch_ops with -DSCORCH_TUNE_HOOKS (see setup.py env
+// builds an instrumented scorch_ops with -DSCORCH_TUNE_HOOKS (see scorch_build.py
 // SCORCH_BUILD_TUNE_HOOKS / utils.get_extra_cflags SCORCH_JIT_TUNE_HOOKS). Then a
 // back-to-back threads x chunk sweep can force any cell in-process via env, with
 // NO rebuild per cell. The shipped library defines nothing -> these evaporate and
@@ -97,7 +97,7 @@
 #  define SCORCH_CHUNK_MAX 64L
 #endif
 
-// Dense-output parallel zero-fill threshold (csrc/header.cpp scorch_zero_dense,
+// Dense-output parallel zero-fill threshold (scorch/csrc/header.cpp scorch_zero_dense,
 // called by the JIT dense-output kernels): minimum OUTPUT BYTES at which the zero
 // is parallelized across all cores. Below this a single memset is used — fork/join
 // would exceed the saving. 256 KB keeps >= 2 pages per thread even at 32 threads

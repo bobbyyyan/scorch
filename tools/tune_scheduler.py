@@ -44,7 +44,7 @@ from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, Tenso
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.scheduler import Scheduler, _CostModelConstants
-from scorch.utils import PROJECT_ROOT_DIR, get_extra_cflags, get_extra_ldflags
+from scorch.utils import get_extra_cflags, get_extra_ldflags, jit_preamble_text
 
 
 LOOP_VARS: Tuple[str, str, str] = ("i", "j", "k")
@@ -210,8 +210,7 @@ def _compile_module_from_cin(
     llir_lowerer = LLIRLowerer()
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     module_hash = hashlib.sha1((header_cpp_code + cpp_code).encode()).hexdigest()[:16]
     module_name = f"scheduler_tune_{module_hash}"

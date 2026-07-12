@@ -4,10 +4,10 @@
 Measures THIS build machine across a threads x chunk grid and REPORTS the policy
 constants that best fit its cores. It is **advisory-first**: by default it writes
 nothing and changes no build — you read the report and decide. Pass ``--adopt`` to
-opt in to writing ``csrc/scorch_policy_tuned.h`` (gitignored) and a clean rebuild.
+opt in to writing ``src/scorch/csrc/scorch_policy_tuned.h`` (gitignored) and a clean rebuild.
 When no tuned header is present (CI, cross-compile, plain ``pip install``, or you
 never ran ``--adopt``), the redwood-tuned defaults baked into
-``csrc/scorch_policy.h`` apply and everything still compiles — the tuned header is
+``src/scorch/csrc/scorch_policy.h`` apply and everything still compiles — the tuned header is
 optional and always removable (delete it to revert).
 
 Why measure at all: the policy SHAPE (throttle small products, adaptive chunk) is
@@ -133,8 +133,9 @@ from collections import Counter, defaultdict, namedtuple
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-POLICY_H = REPO / "csrc" / "scorch_policy.h"
-TUNED_H = REPO / "csrc" / "scorch_policy_tuned.h"
+NATIVE_DIR = REPO / "src" / "scorch" / "csrc"
+POLICY_H = NATIVE_DIR / "scorch_policy.h"
+TUNED_H = NATIVE_DIR / "scorch_policy_tuned.h"
 
 # --- SuiteSparse real-matrix panel (Phase 4b "option 1") ----------------------
 # The synthetic panel is a faithful proxy for the chunk/topology knobs but NOT
@@ -158,7 +159,7 @@ _ZPR_BAND_EDGES = (2.0, 4.0, 16.0, 64.0)          # -> 5 bands: <2 .. >64 nnz/ro
 # Matrix object (download); both carry name/rows/nnz/zpr so _stratify is shared.
 Cand = namedtuple("Cand", "name ref rows nnz zpr sym")
 
-# Shipped redwood-tuned defaults (must mirror csrc/scorch_policy.h). The fit is
+# Shipped redwood-tuned defaults (must mirror src/scorch/csrc/scorch_policy.h). The fit is
 # always compared against these; they are also the fallback when tuning is off.
 DEFAULTS = {
     "SCORCH_GRAIN_SPMSPM": 3000,
@@ -471,7 +472,7 @@ def _download_via_mirror(dest, n):
 
 # ------------------------------------------------------------------ policy model
 def predict_nthreads(work, rows, grain, rpt, hw):
-    """Python mirror of scorch_nthreads() in csrc/scorch_policy.h."""
+    """Python mirror of scorch_nthreads() in src/scorch/csrc/scorch_policy.h."""
     n = rows // rpt
     if work >= 0:
         by_work = work // grain
@@ -953,7 +954,7 @@ def fit(measurements, kernels, tune_grains=False, objective="minregret", reg_tol
 
 # ------------------------------------------------------------------ header write
 # Knobs the tuned header may override, in emission order. Mirrors the #ifndef-guarded
-# macros in csrc/scorch_policy.h (and DEFAULTS above).
+# macros in src/scorch/csrc/scorch_policy.h (and DEFAULTS above).
 _WRITABLE_KNOBS = ("SCORCH_GRAIN_SPMSPM", "SCORCH_GRAIN_SPMM", "SCORCH_ROWS_PER_THREAD",
                    "SCORCH_CHUNKS_PER_THREAD", "SCORCH_CHUNK_MIN", "SCORCH_CHUNK_MAX")
 
@@ -989,7 +990,10 @@ def build_scorch_ops(tune_hooks):
         env["SCORCH_BUILD_TUNE_HOOKS"] = "1"
     else:
         env.pop("SCORCH_BUILD_TUNE_HOOKS", None)
-    (REPO / "csrc" / "ops.cpp").touch()  # header edits don't retrigger ops.cpp compile
+    # The generated host-local header is intentionally excluded from distributed
+    # package data and the extension's declared dependency list, so force this
+    # opt-in autotune rebuild to notice it.
+    (NATIVE_DIR / "ops.cpp").touch()
     label = "instrumented (-DSCORCH_TUNE_HOOKS)" if tune_hooks else "clean"
     print(f"[build] scorch_ops {label} ...", flush=True)
     r = subprocess.run(
@@ -1071,7 +1075,7 @@ def main():
     ap.add_argument("--margin", type=float, default=0.02,
                     help="min fractional gain over defaults for --adopt to write the tune")
     ap.add_argument("--adopt", action="store_true",
-                    help="opt in to WRITING csrc/scorch_policy_tuned.h + a clean rebuild. "
+                    help="opt in to WRITING src/scorch/csrc/scorch_policy_tuned.h + a clean rebuild. "
                     "Default is advisory (report only, change nothing). Scoped to the "
                     "machine-intrinsic CHUNK knobs unless --tune-grains is also given.")
     ap.add_argument("--tune-grains", action="store_true",
@@ -1220,7 +1224,7 @@ def main():
                 print("  Re-run with --adopt --tune-grains to write the tune "
                       "(grains + rows/thr included).")
             else:
-                print(f"  Re-run with --adopt to write csrc/{TUNED_H.name} "
+                print(f"  Re-run with --adopt to write {TUNED_H.relative_to(REPO)} "
                       "(CHUNK knobs only) and rebuild.")
         elif gain < args.margin:
             # 4b. keep the shipped defaults — the tune didn't clear the margin

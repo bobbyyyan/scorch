@@ -21,4 +21,16 @@ include_directories(venv/lib/python3.9/site-packages/torch/include/torch/csrc/ap
 include_directories(venv/lib/python3.9/site-packages/torch/include/torch/csrc/api/include)
 
 
-add_executable(scorch csrc/ops.cpp csrc/elem_wise_vector_mul.cpp csrc/elem_wise_vector_mul.h)
+# Legacy IDE-indexing target only. The supported native-extension build is declared
+# in pyproject.toml and customized by scorch_build.py.
+add_custom_target(
+        scorch_sources
+        SOURCES
+        src/scorch/csrc/header.cpp
+        src/scorch/csrc/header.h
+        src/scorch/csrc/kernels.h
+        src/scorch/csrc/ops.cpp
+        src/scorch/csrc/prebuilt_types.h
+        src/scorch/csrc/pybind.cpp
+        src/scorch/csrc/scorch_policy.h
+        src/scorch/csrc/spmm.h)

@@ -137,9 +137,10 @@ LLIR
 
 prebuilt kernel
 : A hand-written, hand-optimized C++ kernel compiled into the native `scorch_ops`
-  extension (`csrc/spmm.h`, `csrc/kernels.h`) and dispatched via
-  `resolve_prebuilt_matmul` before the JIT pipeline is ever reached — e.g.
-  `spmm_csr_float_v2` for CSR × dense SpMM. Contrast with {term}`generated kernel`.
+  extension (`src/scorch/csrc/spmm.h`, `src/scorch/csrc/kernels.h`) and dispatched
+  via `resolve_prebuilt_matmul` before the JIT pipeline is ever reached — e.g.
+  `spmm_csr_float_v2` for CSR × dense SpMM. Contrast with
+  {term}`generated kernel`.
 
 scheduler
 : The compile-time pass (`compiler/scheduler.py`) that chooses loop order

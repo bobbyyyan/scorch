@@ -216,11 +216,15 @@ The GitHub Actions workflow (`.github/workflows/pytest.yml`, named `pytest`) run
 the suite on `ubuntu-latest` with Python 3.11.7 on every pull request to `main`.
 It installs a CPU build of PyTorch, does an editable install (which compiles the
 native `scorch_ops` extension with libgomp), and runs `pytest`, always uploading
-`pytest-report.xml` as an artifact.
+`pytest-report.xml` as an artifact. A separate `packaging` workflow builds the
+wheel and source distribution, installs each in a clean temporary environment
+outside the checkout, and exercises both the packaged native module and a JIT
+kernel.
 
 :::{note}
-CI gates **tests only** — it does not run the lint/format/typecheck stage. Those
-live in `pre-commit.sh` (Black, mypy, flake8) and are run locally. See
+CI gates tests and distribution smoke installs, but it does not run the
+lint/format/typecheck stage. Those live in `pre-commit.sh` (Black, mypy, flake8)
+and are run locally. See
 {doc}`the contributing guide </development/contributing>` for the full local
 check-in workflow. CI also runs on Linux only; macOS is a supported dev platform
 but is not exercised by CI.

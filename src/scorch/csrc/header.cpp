@@ -233,10 +233,10 @@ template<typename T> inline T scorch_gelu(T x) {
 //
 // Work-aware OpenMP thread cap (scorch_nthreads) + adaptive schedule chunk
 // (scorch_chunk) for the JIT-generated kernels emitted by compiler/codegen.py.
-// The single source of truth is csrc/scorch_policy.h (shared with the prebuilt
-// scorch_ops kernels spmspm_csr / spmm_csr_float_v2). This preamble is text-
-// prepended to every generated kernel; src/scorch/utils.py get_extra_cflags()
-// adds csrc/ to the JIT `-I` path so this include resolves at compile time.
+// The single source of truth is scorch/csrc/scorch_policy.h (shared with the
+// prebuilt scorch_ops kernels spmspm_csr / spmm_csr_float_v2). This preamble is
+// packaged with Scorch; src/scorch/utils.py expands the policy resource in place
+// before prepending the result to every generated kernel.
 #include "scorch_policy.h"
 
 // Parallel dense-output zero-fill for the generated dense-output kernels.

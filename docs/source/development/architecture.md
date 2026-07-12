@@ -26,6 +26,7 @@ scorch/
 │   ├── tiling.py          #   runtime autotune selector over prebuilt SpMM
 │   ├── trace.py           #   @scorch.compile (torch.fx fusion decorator)
 │   ├── utils.py           #   JIT compile + .so cache + compiler flags
+│   ├── csrc/              #   packaged native sources, headers, JIT resources
 │   └── compiler/          #   the sparse-tensor compiler (the heart)
 │       ├── cin.py         #     CIN — Compiler Index Notation (highest IR)
 │       ├── scheduler.py   #     loop ordering, workspace insertion, tiling
@@ -34,13 +35,14 @@ scorch/
 │       ├── iter_lattice.py #    merge lattices for sparse co-iteration
 │       ├── llir.py        #     LLIR — Low-Level IR (typed, C++-shaped)
 │       └── codegen.py     #     LLIR → C++ source string
-├── csrc/                  # native scorch_ops extension + prebuilt kernels
 ├── tests/                 # pytest suite, mirrors src/ layout
 ├── examples/              # runnable applications (gcn, autoencoder, transformer)
 ├── bench/                 # reproducible benchmarks
 ├── tools/                 # tuning / benchmark utilities
 ├── docs/                  # this documentation site
-├── setup.py / setup.sh    # native-extension build + environment bootstrap
+├── pyproject.toml         # package metadata + native extension declaration
+├── scorch_build.py        # PyTorch/OpenMP build_ext customization
+├── setup.sh               # development-environment bootstrap
 └── CLAUDE.md / AGENTS.md   # contributor conventions
 ```
 
@@ -182,7 +184,7 @@ examples and an end-to-end trace of `C[i,k] = A[i,j] * B[j,k]` — lives in
 ```{mermaid}
 flowchart TD
     U["scorch.matmul(A, B)<br/>scorch.einsum(...)"] --> D
-    D["Dispatch<br/>ops.py"] -->|prebuilt hit| K["scorch_ops C++ kernel<br/>csrc/"]
+    D["Dispatch<br/>ops.py"] -->|prebuilt hit| K["scorch_ops C++ kernel<br/>src/scorch/csrc/"]
     D -->|generic sparse| C["CIN<br/>compiler/cin.py"]
     C --> S["Scheduler<br/>compiler/scheduler.py"]
     S --> L["CINLowerer<br/>compiler/cin_lowerer.py"]
@@ -200,11 +202,13 @@ path. The **runtime** selector (`tiling.py`) picks among *hand-written prebuilt*
 SpMM kernels during dispatch — it never touches the compiler IRs.
 :::
 
-## The native layer (`csrc`)
+## The native layer (`src/scorch/csrc`)
 
-The `csrc/` directory holds the hand-written C++ that `setup.py` compiles into the
-`scorch_ops` pybind extension — the fast prebuilt kernels — plus the runtime
-support that JIT-generated kernels are compiled against.
+The `src/scorch/csrc/` directory holds the hand-written C++ declared in
+`pyproject.toml` and compiled into the `scorch_ops` pybind extension — the fast
+prebuilt kernels — plus the packaged runtime support that JIT-generated kernels
+are compiled against. Keeping these files inside `scorch` makes both wheels and
+source distributions self-contained.
 
 | File | Role |
 |------|------|
@@ -216,20 +220,24 @@ support that JIT-generated kernels are compiled against.
 | `prebuilt_types.h` | Shared type declarations for the prebuilt kernels. |
 
 :::{warning}
-`csrc/pybind.cpp` and the top-level `CMakeLists.txt` are **legacy / IDE-indexing
-only**. The supported build path is `setup.py` via PyTorch's `BuildExtension`
-(`pip install -e . --no-build-isolation`), not CMake. Do not add production build
-logic to either.
+`src/scorch/csrc/pybind.cpp` and the top-level `CMakeLists.txt` are **legacy /
+IDE-indexing only**. The supported build path is the extension declaration in
+`pyproject.toml` plus the PyTorch `BuildExtension` subclass in `scorch_build.py`
+(`pip install -e . --no-build-isolation` for a fast developer rebuild), not CMake.
+Do not add production build logic to either legacy file.
 :::
 
 Generated kernels (from `codegen.py`) are compiled *separately at runtime* by
-`utils.py`, not from `csrc/` — but they `#include "header.cpp"` and
-`"scorch_policy.h"`, which is why the JIT compile flags add `-I<repo>/csrc`.
+`utils.py`. It reads `header.cpp` and `scorch_policy.h` from the installed package
+with `importlib.resources`, expands the policy include, and passes a self-contained
+source string to PyTorch's JIT compiler. No repository-relative include path is
+required.
 
 :::{tip}
-After editing anything under `csrc/`, rebuild the extension with
-`pip install -e . --no-build-isolation`. For header-only edits, `touch csrc/ops.cpp`
-first so the (unchanged) compilation unit is forced to recompile. And because
+After editing anything under `src/scorch/csrc/`, rebuild the extension with
+`pip install -e . --no-build-isolation`. Native headers are listed as extension
+dependencies in `pyproject.toml`, so header-only changes trigger recompilation
+without touching `ops.cpp`. Because
 compiled JIT kernels are memoized aggressively — in-process module caches keyed by
 format triple *plus* a persistent `.so` cache — clear the torch extensions build
 dir when a codegen or template change seems to have no effect. The test suite
@@ -279,7 +287,8 @@ patterns and add a regression test near the affected subsystem.
   `test_codegen_perf_optimizations.py`.
 
 **A new prebuilt C++ kernel**
-: Implement it in `csrc/kernels.h` (or `csrc/spmm.h` for SpMM variants), register
+: Implement it in `src/scorch/csrc/kernels.h` (or `src/scorch/csrc/spmm.h` for
+  SpMM variants), register
   it in `prebuilt_kernels.py`, and rebuild the extension. Test in
   `test_prebuilt_kernel_registry.py`.
 

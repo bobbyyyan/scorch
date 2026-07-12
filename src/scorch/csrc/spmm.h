@@ -2297,7 +2297,7 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   const int kTile = (tile_size + 15) & ~15;
 
   // Work-aware thread cap + adaptive schedule chunk from the shared policy
-  // (csrc/scorch_policy.h): work = nnz*k, grain = SCORCH_GRAIN_SPMM. A small
+  // (scorch/csrc/scorch_policy.h): work = nnz*k, grain = SCORCH_GRAIN_SPMM. A small
   // A_sparse @ B_dense product (nnz*k below a few million flops) is swamped by
   // OpenMP fork/join across all cores — a 24-row product spent more time in
   // barriers than computing — so scorch_nthreads throttles it; the cap only binds

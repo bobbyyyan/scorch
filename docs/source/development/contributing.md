@@ -73,20 +73,22 @@ max-complexity = 39
   and scheduling functions. Prefer to stay well under it in new code.
 
 :::{note}
-CI runs the **test suite only** (Linux, Python 3.11, CPU PyTorch) — it does *not*
-run Black, mypy, or Flake8. `pre-commit.sh` is a local gate, so run it yourself;
-a lint or type error will not be caught for you on the pull request.
+CI runs the test suite and clean wheel/source-distribution packaging smoke tests
+(Linux, Python 3.11, CPU PyTorch), but it does *not* run Black, mypy, or Flake8.
+`pre-commit.sh` is a local gate, so run it yourself; a lint or type error will not
+be caught for you on the pull request.
 :::
 
-If you edited anything under `csrc/`, rebuild the extension before testing so the
-checks and tests exercise your change:
+If you edited anything under `src/scorch/csrc/`, rebuild the extension before
+testing so the checks and tests exercise your change:
 
 ```bash
 pip install -e . --no-build-isolation
 ```
 
-For header-only edits (`spmm.h`, `kernels.h`, `scorch_policy.h`, …), `touch
-csrc/ops.cpp` first so the single compilation unit is recompiled.
+Header-only edits (`spmm.h`, `kernels.h`, `scorch_policy.h`, …) are covered by the
+extension dependencies declared in `pyproject.toml`; rerunning the install is
+enough to recompile the native module.
 
 ## Testing your change
 

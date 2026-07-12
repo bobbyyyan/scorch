@@ -1,7 +1,6 @@
 import copy
 import os
 import time
-from pathlib import Path
 from typing import Any, Union, Sequence, Optional, List, Tuple
 
 import torch
@@ -41,13 +40,10 @@ from .utils import (
     load_to_kernel_cache,
     get_extra_cflags,
     get_extra_ldflags,
+    jit_preamble_text,
     _kernel_name,
     _load_kernel,
 )
-
-PROJECT_ROOT_DIR = Path(__file__)
-while not (PROJECT_ROOT_DIR / "setup.py").exists():
-    PROJECT_ROOT_DIR = PROJECT_ROOT_DIR.parent
 
 _kernel_cache = {}
 _einsum_dispatch_cache = {}
@@ -156,8 +152,7 @@ _ATPARALLEL_PIPELINE = os.environ.get("SCORCH_ATPARALLEL_PIPELINE", "1") == "1"
 # # Register custom classes
 # load(
 #     name="pybind",
-#     sources=[str(PROJECT_ROOT_DIR / "csrc/pybind.cpp")],
-#     build_directory=PROJECT_ROOT_DIR / "build",
+#     sources=[...],
 # )
 # end_time = time.time()
 # compile_time = end_time - start_time
@@ -258,9 +253,7 @@ def spmv(
     llir_lowerer = LLIRLowerer()
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    # Read header_cpp_code from csrc/header.cpp
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     # start_time = time.time()
     module = _load_kernel(
@@ -420,8 +413,7 @@ def matmul_wksp(
         llir_lowerer = LLIRLowerer()
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-            header_cpp_code = f.read()
+        header_cpp_code = jit_preamble_text()
 
         module = _load_kernel(
             name=_kernel_name(header_cpp_code, cpp_code),
@@ -1839,9 +1831,7 @@ def einsum(
 
         # print("\n\n", cpp_code)
 
-        # Read header_cpp_code from csrc/header.cpp
-        with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-            header_cpp_code = f.read()
+        header_cpp_code = jit_preamble_text()
 
         module = _load_kernel(
             name=_kernel_name(header_cpp_code, cpp_code),
@@ -2008,8 +1998,7 @@ def lower_and_exec_cin(
     llir_lowerer = LLIRLowerer()
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
     # print(cpp_code)
-    with open(PROJECT_ROOT_DIR / "csrc/header.cpp", "r") as f:
-        header_cpp_code = f.read()
+    header_cpp_code = jit_preamble_text()
 
     module = _load_kernel(
         name=_kernel_name(header_cpp_code, cpp_code),

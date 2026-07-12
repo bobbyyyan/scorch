@@ -73,7 +73,7 @@ Tensor spmspm_csr(
   const long avg_B_row = B0_size > 0 ? (B_nnz / B0_size) + 1 : 1;
   const long flop_est = A_nnz * avg_B_row;
   // Work-aware thread cap + adaptive schedule chunk from the shared policy
-  // (csrc/scorch_policy.h): work = flop_est (A_nnz*avg_B_row), grain = SCORCH_GRAIN_SPMSPM.
+  // (scorch/csrc/scorch_policy.h): work = flop_est (A_nnz*avg_B_row), grain = SCORCH_GRAIN_SPMSPM.
   // scorch_nthreads reproduces this kernel's former inline decision exactly —
   // clamp(min(flop_est/3000, A0_size/16), 1, omp_get_num_procs()) — and scorch_chunk the
   // matching clamp(A0_size/(nthreads*7), 4, 64). The dynamic-schedule chunk is the dominant
