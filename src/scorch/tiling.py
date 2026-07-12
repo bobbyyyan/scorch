@@ -64,6 +64,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import math
 import os
 import platform
 import subprocess
@@ -71,6 +72,7 @@ import threading
 import time
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import scorch_ops as _ops
 
@@ -290,19 +292,18 @@ def _eligible(J: int, nnz: int, N: int, C: int) -> bool:
     return deg > max(_DEG_FLOOR, 2.0 * operand / C)
 
 
-def _scattered(a, J: int) -> bool:
-    """Cheap sampled LOCALITY proxy (stands in for the O(nnz) wavefront W*). CSR
-    rows are column-sorted, so a row's column span is crd[last]-crd[first] in O(1);
-    the mean span/J over ~64 sampled rows is ~1 for a scattered matrix (reddit
-    0.95, random 0.99) and ~0 for a well-ordered/banded one (FEM cant 0.008,
-    band 0.001). tile-j's cross-row B-reuse only exists when access is scattered;
-    this keeps FEM/banded matrices (where v2 already streams the band from cache)
-    off the tile-j path. Uses a private RNG so it never perturbs global torch RNG."""
+def _locality_ratio(a, J: int) -> float:
+    """Cheap sampled LOCALITY proxy in [0,1] (stands in for the O(nnz) wavefront W*).
+    CSR rows are column-sorted, so a row's column span is crd[last]-crd[first] in
+    O(1); the mean span/J over ~64 sampled rows is ~1 for a scattered matrix (reddit
+    0.95, random 0.99) and ~0 for a well-ordered/banded one (FEM cant 0.008, band
+    0.001). This is BOTH the analytic gate (_scattered) and a learned-model feature.
+    Uses a private RNG so it never perturbs global torch RNG."""
     idx = a.index.mode_indices
     pos, crd = idx[1][0], idx[1][1]
     M = int(pos.numel()) - 1
     if M <= 0:
-        return False
+        return 0.0
     n = min(_LOC_NSAMP, M)
     g = torch.Generator().manual_seed(0)
     ridx = torch.randint(0, M, (n,), generator=g)
@@ -310,11 +311,18 @@ def _scattered(a, J: int) -> bool:
     e = pos[ridx + 1].to(torch.long)
     nz = e > b
     if not bool(nz.any()):
-        return False
+        return 0.0
     b = b[nz]
     e = e[nz]
     span = (crd[e - 1].to(torch.long) - crd[b].to(torch.long)).float().mean().item()
-    return (span / max(1, J)) > _LOC_MIN
+    return float(span / max(1, J))
+
+
+def _scattered(a, J: int) -> bool:
+    """tile-j's cross-row B-reuse only exists when access is scattered; this keeps
+    FEM/banded matrices (where v2 already streams the band from cache) off the
+    tile-j path. The analytic/balanced/max locality gate; learned relaxes it."""
+    return _locality_ratio(a, J) > _LOC_MIN
 
 
 def is_candidate(a, b, level: Optional[str] = None) -> bool:
@@ -335,7 +343,15 @@ def is_candidate(a, b, level: Optional[str] = None) -> bool:
     J = int(a.shape[1])
     N = int(b.shape[1])
     nnz = int(a.index.mode_indices[1][1].numel())
-    return _eligible(J, nnz, N, query_llc())
+    C = query_llc()
+    # learned widens the gate (operand>C only) ONLY when opted-in (SCORCH_AUTOTUNE_WIDEN=1)
+    # AND a per-machine model is loaded. DEFAULT: learned uses the analytic gate (no
+    # widening) and only improves the within-gate pick. Either way the 99% (operand<=C)
+    # short-circuits to v2 at int-comparison cost.
+    if (level == "learned" and _LEARNED_WIDEN
+            and _load_learned_model() is not None):
+        return _eligible_learned(J, nnz, N, C)
+    return _eligible(J, nnz, N, C)
 
 
 def _tilej_args(a, b, result_shape, Jc, nthreads):
@@ -513,6 +529,271 @@ def _ijk_beats_tilej_bytes(N, M, J, nnz, Jc_tj, Nc, C):
     return ijk < tj
 
 
+# ---------------------------------------------------------------------------
+# Learned level (Phase 2): an offline-trained gradient-boosted cost model predicts
+# each candidate's runtime in O(1); we argmin over the SAME probe candidate set with
+# a v2 floor. Falls back to analytic when no per-machine model is present. See
+# autotune-levels/01-phase2-learned-design.md. The featurize + tree walker here are
+# the CANONICAL definitions; bench/train_autotune_model.py IMPORTS them, so training
+# and inference are byte-identical (no train/serve drift possible).
+# ---------------------------------------------------------------------------
+
+# Feature vector order (a candidate row). All quantities are cheap / inference-
+# computable from CSR metadata + a fixed-size sample; no O(nnz) wavefront.
+_FEATURES = (
+    "f_log_degree", "f_locality", "f_degree_cv", "f_log2_N", "f_thrash",
+    "f_log_nnz", "f_log_M", "f_log_J", "f_log_operand", "f_log_output",
+    "f_is_tilej", "f_is_tileijk", "f_jc_frac", "f_log_P", "f_log_nk",
+    "f_log_cand_bytes", "f_cand_over_output",
+)
+
+_LEARNED_MARGIN = float(os.environ.get("SCORCH_AUTOTUNE_MARGIN", "0.03"))
+_LEARNED_CONFIRM = os.environ.get("SCORCH_AUTOTUNE_CONFIRM", "0") == "1"
+_CV_NSAMP = int(os.environ.get("SCORCH_TILING_CV_NSAMP", "4096"))
+# Gate policy for learned. DEFAULT = WIDEN (operand>C only, relax degree+locality).
+# The data showed keep-gate (analytic gate) is NOT worth it -- it barely beats analytic
+# on M5 (0.917 vs 0.876) and LOSES on redwood (0.873 vs 0.879) -- because analytic's
+# DEG_FLOOR=64 EXCLUDES mid-degree scattered matrices (deg 16-64) where tiling genuinely
+# wins (scatter_deg50: tile-j 1.7x over v2). Widening catches those analytic
+# false-negatives; a tiled pick in the widened-only region (operand>C but analytic gate
+# rejects) is mandatorily CONFIRMED vs v2 (keep the faster) -> provably no-regression
+# there, while the analytic-eligible region trusts the model + v2-floor (measurement-free,
+# like the analytic level itself). Result: 0.972 (M5) / 0.977 (redwood) of oracle vs
+# analytic 0.876/0.879. SCORCH_AUTOTUNE_WIDEN=0 reverts to the analytic gate.
+_LEARNED_WIDEN = os.environ.get("SCORCH_AUTOTUNE_WIDEN", "1") == "1"
+
+
+def _cand_bytes(kind, M, J, nnz, N, Jc, Nc) -> float:
+    """Predicted DRAM bytes for a candidate (mirrors tiling's byte model; a model
+    feature, so the tree can reproduce the analytic decision and learn the residual)."""
+    BN = 4.0 * N
+    Cwr = M * BN
+    A = 8.0 * nnz
+    if kind == "tilej":
+        P = max(1, -(-int(J) // max(1, int(Jc))))
+        return J * BN + P * 2 * Cwr + A + P * M * 4
+    if kind == "tileijk":
+        nk = max(1, -(-int(N) // max(1, int(Nc))))
+        return J * BN + Cwr + A * nk + 2 * J * BN
+    return J * BN + Cwr + A  # v2
+
+
+def _featurize(M, J, nnz, N, C, locality, degree_cv, kind, Jc, Nc):
+    """Canonical feature vector (order == _FEATURES) for one candidate. Pure function
+    of cheap inputs; imported by the offline trainer so train==serve by construction."""
+    Jf = max(1.0, float(J)); Nf = max(1.0, float(N)); Mf = max(1.0, float(M))
+    nnzf = max(1.0, float(nnz))
+    degree = nnzf / Jf
+    operand = Jf * 4.0 * Nf
+    output = Mf * 4.0 * Nf
+    cb = max(1.0, _cand_bytes(kind, Mf, Jf, nnzf, Nf, Jc, Nc))
+    P = max(1, -(-int(J) // max(1, int(Jc)))) if kind == "tilej" else 0
+    nk = max(1, -(-int(N) // max(1, int(Nc)))) if kind == "tileijk" else 0
+    return [
+        math.log(max(1e-6, degree)), float(locality), float(degree_cv), math.log2(Nf),
+        operand / C, math.log(nnzf), math.log(Mf), math.log(Jf),
+        math.log(max(1.0, operand)), math.log(output),
+        float(kind == "tilej"), float(kind == "tileijk"),
+        float(Jc) / Jf, math.log1p(P), math.log1p(nk), math.log(cb), cb / output,
+    ]
+
+
+def _build_stacked(spec: dict) -> dict:
+    """Per-tree JSON -> stacked padded (T, maxnodes) numpy arrays for the fast walker."""
+    trees = spec["trees"]
+    T = len(trees)
+    maxn = max(len(t["feature"]) for t in trees)
+    feat = np.zeros((T, maxn), dtype=np.int64)
+    thr = np.zeros((T, maxn), dtype=np.float64)
+    left = np.zeros((T, maxn), dtype=np.int64)
+    right = np.zeros((T, maxn), dtype=np.int64)
+    val = np.zeros((T, maxn), dtype=np.float64)
+    maxdepth = 0
+    for i, t in enumerate(trees):
+        n = len(t["feature"])
+        feat[i, :n] = t["feature"]; thr[i, :n] = t["threshold"]
+        left[i, :n] = t["left"]; right[i, :n] = t["right"]; val[i, :n] = t["value"]
+        d = 0; stack = [(0, 0)]
+        while stack:
+            node, dd = stack.pop()
+            if t["left"][node] == -1:
+                d = max(d, dd)
+            else:
+                stack.append((t["left"][node], dd + 1))
+                stack.append((t["right"][node], dd + 1))
+        maxdepth = max(maxdepth, d)
+    return dict(T=T, feat=feat, thr=thr, left=left, right=right, val=val,
+                init=float(spec["init"]), lr=float(spec["learning_rate"]),
+                maxdepth=maxdepth, feature_names=list(spec["feature_names"]))
+
+
+def _walker_predict(stacked: dict, X) -> "np.ndarray":
+    """FAST pure-numpy GBT inference (== sklearn.predict). Level-synchronous over a
+    (K candidates x T trees) node-index matrix: only `maxdepth` python iterations,
+    each a few numpy ops on a K*T array (~50-200us for K~7, T~400). Memoized per
+    signature upstream, so this is a first-call-only cost.
+
+    X is cast to float32 BEFORE the threshold compares: sklearn's decision trees store
+    X as float32 internally, so a float64 compare near a split boundary would take a
+    different branch and desync the walker from sklearn.predict (the export we ship)."""
+    X = np.asarray(X, dtype=np.float32)
+    K = X.shape[0]; T = stacked["T"]
+    feat = stacked["feat"]; thr = stacked["thr"]
+    left = stacked["left"]; right = stacked["right"]; val = stacked["val"]
+    trange = np.arange(T)[None, :]
+    krange = np.arange(K)[:, None]
+    state = np.zeros((K, T), dtype=np.int64)
+    for _ in range(stacked["maxdepth"]):
+        nf = feat[trange, state]
+        nthr = thr[trange, state]
+        safe_nf = np.where(nf >= 0, nf, 0)
+        xval = X[krange, safe_nf]
+        goleft = xval <= nthr
+        nxt = np.where(goleft, left[trange, state], right[trange, state])
+        state = np.where(nf < 0, state, nxt)
+    return stacked["init"] + stacked["lr"] * val[trange, state].sum(axis=1)
+
+
+# --- per-machine model loading (lazy, machine-keyed; cache-dir -> models-dir -> None)
+_LEARNED_VERSION = 1
+_learned_loaded = False
+_learned_model: Optional[dict] = None
+
+
+def _user_cache_dir() -> str:
+    if platform.system() == "Windows":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "scorch")
+
+
+def _learned_model_path() -> Optional[str]:
+    env = os.environ.get("SCORCH_AUTOTUNE_MODEL")
+    if env == "0":
+        return None                       # learned disabled -> analytic fallback
+    if env:
+        return env                        # explicit override
+    mid = _machine_id()
+    cand = os.path.join(_user_cache_dir(), f"autotune_model_{mid}.json")
+    if os.path.isfile(cand):
+        return cand
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    cand2 = os.path.join(repo, "autotune-levels", "models", f"model_{mid}.json")
+    if os.path.isfile(cand2):
+        return cand2
+    return None
+
+
+def _load_learned_model() -> Optional[dict]:
+    """The stacked model for THIS machine, or None (-> analytic fallback). Cached.
+    Rejected on version bump, machine mismatch, or feature-schema drift."""
+    global _learned_loaded, _learned_model
+    if _learned_loaded:
+        return _learned_model
+    _learned_loaded = True
+    path = _learned_model_path()
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            spec = json.load(f)
+        if (spec.get("version") != _LEARNED_VERSION
+                or spec.get("machine_id") != _machine_id()
+                or list(spec.get("feature_names", [])) != list(_FEATURES)):
+            return None
+        _learned_model = _build_stacked(spec)
+    except Exception:
+        _learned_model = None            # any error -> silent analytic fallback
+    return _learned_model
+
+
+def _reset_learned_model_cache() -> None:
+    """Force the next _load_learned_model() to re-read from disk (tests / retrain)."""
+    global _learned_loaded, _learned_model
+    _learned_loaded = False
+    _learned_model = None
+
+
+def _degree_cv(a) -> float:
+    """Degree-skew std/mean over ~4096 sampled rows (the discriminator between
+    power-law skewed graphs -- large Jc fine -- and uniform-random -- small Jc).
+    Private RNG; O(sample) from indptr, never O(nnz)."""
+    pos = a.index.mode_indices[1][0]
+    M = int(pos.numel()) - 1
+    if M <= 0:
+        return 0.0
+    n = min(_CV_NSAMP, M)
+    g = torch.Generator().manual_seed(1)
+    ridx = torch.randint(0, M, (n,), generator=g)
+    degs = (pos[ridx + 1].to(torch.long) - pos[ridx].to(torch.long)).float()
+    m = degs.mean().item()
+    if m <= 0:
+        return 0.0
+    return float(degs.std(unbiased=False).item() / m)
+
+
+def _eligible_learned(J: int, nnz: int, N: int, C: int) -> bool:
+    """Widened gate for the learned level: keep ONLY the operand>C prefilter (the
+    physics boundary -- B fits cache => no tiling helps -- and the cost boundary --
+    operand>C => a >=16-36MB B-stream => a matmul big enough to absorb the O(1)
+    prediction). Relax the degree floor + locality pre-exclusion; the model + v2 floor
+    route the newly-admitted products/arxiv/FEM/banded shapes. Every sub-ms GCN-small/
+    AE/attention shape fails operand>C at int-comparison cost => byte-neutral 99%."""
+    if not _HAS_TILEJ:
+        return False
+    return (J * 4 * N) > C
+
+
+def _learned_decide(a, b, M, J, N, nnz, C, model):
+    """Predict each candidate's runtime, argmin with a v2 floor. Returns (kind, param)
+    where param is None | Jc | (Nc, Jc). Measurement-free (the 'analytic cost')."""
+    Jc0 = _panel_width(N, C)
+    loc = _locality_ratio(a, J)
+    dcv = _degree_cv(a)
+    cands = [("v2", 0, 0)]
+    for jc in _jc_ladder(Jc0):
+        cands.append(("tilej", int(jc), 0))
+    if _HAS_TILEIJK and N >= _NIJK_MIN:
+        Nc, Jci = _ijk_params(N, M, J, C)
+        if Nc < N:
+            cands.append(("tileijk", int(Jci), int(Nc)))
+    X = np.array([_featurize(M, J, nnz, N, C, loc, dcv, k, jc, nc)
+                  for (k, jc, nc) in cands], dtype=np.float64)
+    pred = _walker_predict(model, X)          # predicted log-time (lower = faster)
+    v2_pred = float(pred[0])
+    # v2 floor: only leave v2 for a tiled kernel the model predicts BEATS v2 by margin.
+    best = None
+    for i in range(1, len(cands)):
+        if best is None or pred[i] < pred[best]:
+            best = i
+    if best is not None and float(pred[best]) < v2_pred + math.log(max(1e-9, 1.0 - _LEARNED_MARGIN)):
+        k, jc, nc = cands[best]
+        return ("tilej", jc) if k == "tilej" else ("tileijk", (nc, jc))
+    return ("v2", None)
+
+
+def _confirm_vs_v2(a, b, result_shape, kind, param, nt, v2_fn, nthreads):
+    """One-shot v2-confirm (opt-in, SCORCH_AUTOTUNE_CONFIRM=1): time {predicted winner,
+    v2} once each, keep the faster. Guarantees no-regression-vs-v2 at ~1/N-th the full
+    probe cost (only 2 candidates, not the whole ladder)."""
+    if kind == "tilej":
+        win = lambda: _ops.spmm_csr_float_tilej(*_tilej_args(a, b, result_shape, param, nt))
+    else:
+        win = lambda: _ops.spmm_csr_float_tileijk(
+            *_tileijk_args(a, b, result_shape, param[0], param[1], nt))
+
+    def _t(fn):
+        fn()
+        best = float("inf")
+        for _ in range(2):
+            t0 = time.perf_counter(); fn(); best = min(best, time.perf_counter() - t0)
+        return best
+
+    return (kind, param) if _t(win) < _t(lambda: v2_fn(nthreads)) else ("v2", None)
+
+
 def maybe_dispatch(a, b, result_shape, v2_fn, nthreads: Optional[int],
                    time_dict: Optional[dict] = None, level: Optional[str] = None):
     """Return (result_cpp, used_tiled: bool) or None to signal 'use the caller's
@@ -544,7 +825,15 @@ def maybe_dispatch(a, b, result_shape, v2_fn, nthreads: Optional[int],
     idx = a.index.mode_indices
     nnz = int(idx[1][1].numel())
     C = query_llc()
-    if not _eligible(J, nnz, N, C):
+    # learned uses the WIDENED gate (operand>C only) iff opted-in AND a model is loaded;
+    # by default it uses the analytic gate + the _scattered pre-gate below (so
+    # banded/FEM/low-degree -> v2 exactly like analytic). Model-absent -> analytic
+    # branch. Either way the 99% (operand<=C) short-circuits to v2 here.
+    learned_model = _load_learned_model() if level == "learned" else None
+    if learned_model is not None and _LEARNED_WIDEN:
+        if not _eligible_learned(J, nnz, N, C):
+            return None
+    elif not _eligible(J, nnz, N, C):
         return None
 
     nt = nthreads if nthreads is not None else -1
@@ -572,6 +861,35 @@ def maybe_dispatch(a, b, result_shape, v2_fn, nthreads: Optional[int],
         if pc is not None:
             _decision[memo_key] = pc
             return _timed_dispatch(pc[0], pc[1])
+
+    # "learned" (model present): predict every candidate's runtime in O(1) and argmin
+    # with a v2 floor — measurement-free (the 'analytic cost' promise). The gate was
+    # WIDENED above, so this skips the analytic _scattered pre-exclusion; the model +
+    # v2 floor handle the newly-admitted products/arxiv/FEM/banded shapes (they land
+    # on v2 unless the model predicts a real win). Memoized per (sig, level). Optional
+    # one-shot v2-confirm (SCORCH_AUTOTUNE_CONFIRM=1) measures {winner, v2} once.
+    if learned_model is not None:
+        # DEFAULT (not widened): apply the analytic locality gate first so banded/FEM/
+        # low-degree shapes route to v2 exactly like analytic -> the model only decides
+        # in the region where it is reliable (scattered high-degree: reddit/scatter/
+        # power-law -> big wins). No confirm needed for safety here.
+        if not _LEARNED_WIDEN and not _scattered(a, J):
+            _decision[memo_key] = ("v2", None)
+            return None
+        kind, param = _learned_decide(a, b, M, J, N, nnz, C, learned_model)
+        # When WIDENED, a tiled pick in the widened-only region (analytic gate would
+        # reject) extrapolates into v2-territory, so confirm it against v2 once
+        # (guaranteed no-regression; memoized). Data-driven: without this, redwood FEM
+        # regressed to 0.72 of oracle. SCORCH_AUTOTUNE_CONFIRM=1 forces confirm always.
+        if kind != "v2":
+            analytic_ok = _eligible(J, nnz, N, C) and _scattered(a, J)
+            if _LEARNED_CONFIRM or (_LEARNED_WIDEN and not analytic_ok):
+                kind, param = _confirm_vs_v2(
+                    a, b, result_shape, kind, param, nt, v2_fn, nthreads)
+        _decision[memo_key] = (kind, param)
+        if kind == "v2":
+            return None
+        return _timed_dispatch(kind, param)
 
     # Locality gate (first time only, then memoized): well-ordered/banded matrices
     # (FEM) pass the degree filter but have no cross-row B-reuse for the tile path
