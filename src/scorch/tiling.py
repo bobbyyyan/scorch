@@ -76,6 +76,8 @@ import numpy as np
 import torch
 import scorch_ops as _ops
 
+from .compiler.scheduler import RelayoutSpec, Schedule, TileSpec
+
 # ---------------------------------------------------------------------------
 # Autotune level state (thread-local override over a process-global default).
 # Mirrors torch's grad-mode: set_autotune() is the global knob; the `autotune`
@@ -498,6 +500,100 @@ def _tilej_args(a, b, result_shape, Jc, nthreads):
 def _tileijk_args(a, b, result_shape, Nc, Jc, nthreads):
     return ([result_shape, a.shape, a.index.mode_indices, a.values,
              b.shape, b.index.mode_indices, b.values, Nc, Jc, nthreads])
+
+
+def schedule_from_tuner_choice(
+    choice: tuple,
+    *,
+    row_var: str,
+    panel_var: str,
+    free_var: str,
+    packed_operand: str,
+) -> Optional[Schedule]:
+    """Translate a normalized tile-ijk tuner choice into a compiler schedule.
+
+    The structural names are deliberately required: the runtime tuner selects only
+    tile widths, while the compiler owns the mapping from those widths to tensor
+    accesses and index variables. Non-tile-ijk choices have no compiler adapter yet
+    and return ``None``. This helper is opt-in and is not used by production dispatch.
+    """
+    structural_names = {
+        "row_var": row_var,
+        "panel_var": panel_var,
+        "free_var": free_var,
+        "packed_operand": packed_operand,
+    }
+    for field, value in structural_names.items():
+        if not isinstance(value, str):
+            raise TypeError(f"{field} must be a string")
+        if not value:
+            raise ValueError(f"{field} must be a non-empty string")
+
+    if not isinstance(choice, tuple):
+        raise TypeError("tuner choice must be a (kind, parameter) tuple")
+    if len(choice) != 2:
+        raise ValueError("tuner choice must contain exactly (kind, parameter)")
+
+    kind, parameter = choice
+    if not isinstance(kind, str):
+        raise TypeError("tuner choice kind must be a string")
+    if kind not in ("v2", "tilej", "tileijk"):
+        raise ValueError(
+            "unknown tuner choice kind "
+            f"{kind!r}; expected 'v2', 'tilej', or 'tileijk'"
+        )
+
+    def positive_width(name: str, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be a positive integer")
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    if kind == "v2":
+        if parameter is not None:
+            raise ValueError("normalized 'v2' choice must use parameter None")
+        return None
+
+    if kind == "tilej":
+        positive_width("tilej Jc", parameter)
+        return None
+
+    if not isinstance(parameter, tuple):
+        raise TypeError("normalized 'tileijk' parameter must be an (Nc, Jc) tuple")
+    if len(parameter) != 2:
+        raise ValueError(
+            "normalized 'tileijk' parameter must contain exactly (Nc, Jc)"
+        )
+    nc = positive_width("tileijk Nc", parameter[0])
+    jc = positive_width("tileijk Jc", parameter[1])
+
+    return Schedule(
+        loop_order=(row_var, panel_var, free_var),
+        tiles=(
+            TileSpec(
+                free_var,
+                nc,
+                placement="outermost",
+                accum="direct",
+                unroll=False,
+            ),
+            TileSpec(
+                panel_var,
+                jc,
+                placement=f"child_of:{free_var}_out",
+                kind="panel",
+                accum="direct",
+            ),
+        ),
+        relayout=RelayoutSpec(
+            operand=packed_operand,
+            pack_var=free_var,
+            strip_width=nc,
+        ),
+        tag="tuner-tileijk",
+        parallel_loop=row_var,
+    )
 
 
 def _dispatch_decision(a, b, result_shape, kind, param, nt):

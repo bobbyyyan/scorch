@@ -130,9 +130,11 @@ in {doc}`/compiler/index_notation`.
 
 ## Stage 2b — Scheduler
 
-The `Scheduler` decides *how* the format-agnostic CIN should loop. Its two entry
-points are `select_loop_order` (returns the chosen ordering of `IndexVar`s) and
-`auto_schedule` (the full transform). Conceptually:
+The `Scheduler` decides *how* the format-agnostic CIN should loop. Its automatic
+entry points are `select_loop_order` (returns the chosen ordering of `IndexVar`s)
+and `auto_schedule` (the full transform). `apply_schedule` is the explicit tuner
+entry point: it accepts a `Schedule` containing an exact logical loop order and
+per-axis `TileSpec` strip-mining decisions. Conceptually:
 
 ```python
 loop_order = select_loop_order(cin)          # cost-model ranks candidates
@@ -141,6 +143,23 @@ if should_insert_workspace(cin, loop_order):
     cin = insert_workspace(cin)              # add the Where + Workspace
 cin = _apply_tiling_heuristics(cin)          # tile i / k where profitable
 ```
+
+For an explicit schedule, the same rebuild/workspace stages run, followed by the
+listed affine tiles in deterministic order. A tile splits a logical variable
+into `<var>_out + <var>_in`; its placement can be outermost, beneath a named
+loop, or at a loop depth. The complete schedule is included in both JIT caches,
+because the CIN string alone does not encode tile widths or pragma choices.
+An explicit permutation must preserve the parent-before-child order of result
+storage levels; input operands may be physically relaid out to satisfy the
+remaining loop order.
+Dense affine tiles are encoded in CIN directly. Sparse `kind="panel"` tiles are
+finished just after CIN lowering, when the concrete compressed iterator exists:
+the full-row position range becomes a pair of coordinate-window
+`std::lower_bound` expressions, and the panel loop is placed outside the tagged
+parallel row loop. A validated dense-operand relayout is completed in the same
+post-lowering pass: it allocates reusable vector-backed storage, inserts the
+panel/strip pack before the parallel row loop, redirects the operand read and its
+prefetch, and rejects any compute read that remains unpacked.
 
 Loop order is picked by a small **calibrated cost model** that weighs
 per-iteration cost, workspace insert/sort/transpose costs, and an estimated

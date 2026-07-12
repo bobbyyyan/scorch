@@ -3,8 +3,11 @@ import math
 import os
 from collections import defaultdict, deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+import torch
 
 from scorch.compiler.cin import (
     CIN,
@@ -12,6 +15,7 @@ from scorch.compiler.cin import (
     CINVisitorAccept,
     ForAll,
     IndexVar,
+    Operation,
     TensorAccess,
     TensorAssign,
     TileSizeVar,
@@ -20,7 +24,6 @@ from scorch.compiler.cin import (
     WorkspaceAccess,
 )
 from scorch.format import LevelType
-
 
 # Per-call override for the register-block decision. When not None it takes
 # precedence over the SCORCH_REGBLOCK env var. Phase 2b lowers the SAME CIN twice
@@ -96,6 +99,189 @@ class _CostModelConstants:
     c_trans: float = 40.61
     rho: float = 0.0014
     default_dim_size: int = 1024
+
+
+@dataclass(frozen=True)
+class TileSpec:
+    """A tuner-provided strip-mining decision for one logical index variable.
+
+    ``placement`` controls where the outer tile loop is inserted. The inner loop
+    remains at the logical variable's original position, so tiling ``k`` in
+    ``i,j,k`` with ``placement="child_of:i"`` produces ``i,k_out,j,k_in``.
+
+    Affine tiles are represented in CIN. ``panel`` requests a sparse coordinate
+    window such as SpMM tile-j; it is completed after concrete compressed
+    iterators have been lowered to LLIR.
+    """
+
+    index_var: str
+    width: int
+    placement: str = "outermost"
+    parallel: bool = False
+    kind: str = "affine"
+    accum: str = "stack"
+    unroll: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.index_var, str) or not self.index_var:
+            raise ValueError("TileSpec.index_var must be a non-empty string")
+        if isinstance(self.width, bool) or not isinstance(self.width, int):
+            raise TypeError("TileSpec.width must be an integer")
+        if self.width <= 0:
+            raise ValueError("TileSpec.width must be greater than zero")
+        if not isinstance(self.placement, str):
+            raise TypeError("TileSpec.placement must be a string")
+        if not isinstance(self.parallel, bool):
+            raise TypeError("TileSpec.parallel must be a bool")
+        if not isinstance(self.kind, str):
+            raise TypeError("TileSpec.kind must be a string")
+        if self.kind not in ("affine", "panel"):
+            raise ValueError("TileSpec.kind must be 'affine' or 'panel'")
+        if not isinstance(self.accum, str):
+            raise TypeError("TileSpec.accum must be a string")
+        if self.accum not in ("stack", "direct", "heap"):
+            raise ValueError("TileSpec.accum must be 'stack', 'direct', or 'heap'")
+        if not isinstance(self.unroll, bool):
+            raise TypeError("TileSpec.unroll must be a bool")
+        if not (
+            self.placement == "outermost"
+            or self.placement.startswith("child_of:")
+            or self.placement.startswith("at_depth:")
+        ):
+            raise ValueError(
+                "TileSpec.placement must be 'outermost', 'child_of:<var>', "
+                "or 'at_depth:<n>'"
+            )
+        if self.placement.startswith("child_of:"):
+            if not self.placement.split(":", 1)[1]:
+                raise ValueError("child_of placement requires an index variable")
+        elif self.placement.startswith("at_depth:"):
+            depth = self.placement.split(":", 1)[1]
+            try:
+                parsed_depth = int(depth)
+            except ValueError as exc:
+                raise ValueError(
+                    "at_depth placement requires a non-negative integer"
+                ) from exc
+            if parsed_depth < 0:
+                raise ValueError("at_depth placement requires a non-negative integer")
+
+
+@dataclass(frozen=True)
+class RelayoutSpec:
+    """Pack one dense input across a tiled logical variable.
+
+    ``operand`` names the input tensor to stage, ``pack_var`` names its
+    contiguous tiled dimension, and ``strip_width`` is the packed row stride.
+    The current implementation recognizes the structurally compatible
+    CSR-by-dense contraction used by tile-ijk schedules.
+    """
+
+    operand: str
+    pack_var: str
+    strip_width: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operand, str) or not isinstance(self.pack_var, str):
+            raise TypeError("RelayoutSpec operand and pack_var must be strings")
+        if not self.operand or not self.pack_var:
+            raise ValueError("RelayoutSpec operand and pack_var must be non-empty")
+        if isinstance(self.strip_width, bool) or not isinstance(self.strip_width, int):
+            raise TypeError("RelayoutSpec.strip_width must be an integer")
+        if self.strip_width <= 0:
+            raise ValueError("RelayoutSpec.strip_width must be greater than zero")
+
+
+@dataclass(frozen=True)
+class _RelayoutPlan:
+    """CIN-derived metadata consumed by the post-lowering staging pass."""
+
+    operand: str
+    pack_var: str
+    panel_var: str
+    row_var: str
+    operand_panel_level: int
+    operand_pack_level: int
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """A complete, immutable scheduling decision suitable for cache keys.
+
+    ``loop_order`` names the unsplit logical variables. ``tiles`` are applied in
+    tuple order, making placement deterministic for multi-axis tiling.
+    ``parallel_loop`` may name a logical loop or a generated ``*_out``/``*_in``
+    loop. The full representation, rather than the human tag, is the cache key.
+    """
+
+    loop_order: Optional[Tuple[str, ...]] = None
+    tiles: Tuple[TileSpec, ...] = ()
+    relayout: Optional[RelayoutSpec] = None
+    tag: str = ""
+    parallel_loop: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.loop_order is not None:
+            if isinstance(self.loop_order, str):
+                raise TypeError("Schedule.loop_order must be a sequence of names")
+            if not isinstance(self.loop_order, tuple):
+                object.__setattr__(self, "loop_order", tuple(self.loop_order))
+            if any(not isinstance(name, str) or not name for name in self.loop_order):
+                raise ValueError("Schedule.loop_order must contain non-empty strings")
+            if len(self.loop_order) != len(set(self.loop_order)):
+                raise ValueError("Schedule.loop_order contains duplicate variables")
+        if not isinstance(self.tiles, tuple):
+            try:
+                object.__setattr__(self, "tiles", tuple(self.tiles))
+            except TypeError as exc:
+                raise TypeError("Schedule.tiles must be a sequence") from exc
+        if any(not isinstance(tile, TileSpec) for tile in self.tiles):
+            raise TypeError("Schedule.tiles must contain TileSpec instances")
+        if self.relayout is not None and not isinstance(self.relayout, RelayoutSpec):
+            raise TypeError("Schedule.relayout must be a RelayoutSpec or None")
+        tile_names = [tile.index_var for tile in self.tiles]
+        if len(tile_names) != len(set(tile_names)):
+            raise ValueError("Schedule cannot tile the same index variable twice")
+        if sum(tile.parallel for tile in self.tiles) > 1:
+            raise ValueError("Schedule may select at most one parallel tile loop")
+        if self.parallel_loop is not None and any(tile.parallel for tile in self.tiles):
+            raise ValueError(
+                "Use either Schedule.parallel_loop or TileSpec.parallel, not both"
+            )
+        if self.parallel_loop is not None:
+            if not isinstance(self.parallel_loop, str):
+                raise TypeError("Schedule.parallel_loop must be a string or None")
+            if not self.parallel_loop:
+                raise ValueError("Schedule.parallel_loop must be a non-empty string")
+        if not isinstance(self.tag, str):
+            raise TypeError("Schedule.tag must be a string")
+
+    @property
+    def cache_key(self) -> str:
+        """Canonical cache discriminator containing every schedule field."""
+        return repr(self)
+
+
+_SCHEDULE_FORCE: ContextVar[Optional[Schedule]] = ContextVar(
+    "scorch_schedule_force", default=None
+)
+
+
+def get_forced_schedule() -> Optional[Schedule]:
+    """Return the schedule active in this execution context, if any."""
+    return _SCHEDULE_FORCE.get()
+
+
+@contextmanager
+def schedule_force(value: Optional[Schedule]):
+    """Temporarily force a schedule for ``matmul``/``einsum`` in this context."""
+    if value is not None and not isinstance(value, Schedule):
+        raise TypeError("schedule_force expects a Schedule or None")
+    token = _SCHEDULE_FORCE.set(value)
+    try:
+        yield
+    finally:
+        _SCHEDULE_FORCE.reset(token)
 
 
 class Scheduler:
@@ -330,12 +516,18 @@ class Scheduler:
         if len(shape) < len(level_types):
             shape = shape + [costs.default_dim_size] * (len(level_types) - len(shape))
 
-        mode_order = tensor.mode_order if tensor.mode_order else list(range(len(level_types)))
+        mode_order = (
+            tensor.mode_order if tensor.mode_order else list(range(len(level_types)))
+        )
 
         nnz = 1.0
         for level, level_type in enumerate(level_types):
             logical_dim = mode_order[level] if level < len(mode_order) else level
-            dim_size = float(shape[logical_dim]) if logical_dim < len(shape) else float(costs.default_dim_size)
+            dim_size = (
+                float(shape[logical_dim])
+                if logical_dim < len(shape)
+                else float(costs.default_dim_size)
+            )
             density = costs.rho if Scheduler._is_sparse_level(level_type) else 1.0
             nnz *= max(dim_size, 1.0) * density
         return max(nnz, 1.0)
@@ -387,9 +579,14 @@ class Scheduler:
                     if sf not in sparse_filters:
                         continue
                     for ta in rhs_tensor_accesses:
-                        if (ta.has_index_var(sf) and ta.has_index_var(index_var)
-                                and ta.get_parent_index_var(index_var) == sf
-                                and Scheduler._is_sparse_level(ta.level_type_of_index_var(index_var))):
+                        if (
+                            ta.has_index_var(sf)
+                            and ta.has_index_var(index_var)
+                            and ta.get_parent_index_var(index_var) == sf
+                            and Scheduler._is_sparse_level(
+                                ta.level_type_of_index_var(index_var)
+                            )
+                        ):
                             applicable_filter *= index_selectivities[sf]
                             break
             effective_iters = index_extents[index_var] * applicable_filter
@@ -408,7 +605,9 @@ class Scheduler:
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(cin)
 
-        reduction_vars = Scheduler._unique_index_vars(cin_ivar_getter.get_reduction_vars())
+        reduction_vars = Scheduler._unique_index_vars(
+            cin_ivar_getter.get_reduction_vars()
+        )
         free_vars = Scheduler._unique_index_vars(cin_ivar_getter.get_free_vars())
         if not reduction_vars:
             return 0.0
@@ -420,7 +619,9 @@ class Scheduler:
         if not reduction_vars_in_loop:
             return 0.0
 
-        last_reduction_pos = max(loop_pos[index_var] for index_var in reduction_vars_in_loop)
+        last_reduction_pos = max(
+            loop_pos[index_var] for index_var in reduction_vars_in_loop
+        )
         free_after_last_reduction = [
             index_var
             for index_var in free_vars
@@ -469,9 +670,14 @@ class Scheduler:
                     if sf not in sparse_filters:
                         continue
                     for ta in rhs_tensor_accesses:
-                        if (ta.has_index_var(sf) and ta.has_index_var(index_var)
-                                and ta.get_parent_index_var(index_var) == sf
-                                and Scheduler._is_sparse_level(ta.level_type_of_index_var(index_var))):
+                        if (
+                            ta.has_index_var(sf)
+                            and ta.has_index_var(index_var)
+                            and ta.get_parent_index_var(index_var) == sf
+                            and Scheduler._is_sparse_level(
+                                ta.level_type_of_index_var(index_var)
+                            )
+                        ):
                             applicable_filter *= index_selectivities[sf]
                             break
             n_insert *= max(index_extents[index_var] * applicable_filter, 1.0)
@@ -484,10 +690,7 @@ class Scheduler:
 
         insert_term = costs.c_insert * n_insert * dim_workspace
         sort_term = (
-            costs.c_sort
-            * n_entries
-            * dim_workspace
-            * math.log(max(n_entries, 2.0), 2)
+            costs.c_sort * n_entries * dim_workspace * math.log(max(n_entries, 2.0), 2)
         )
         return insert_term + sort_term
 
@@ -529,7 +732,9 @@ class Scheduler:
             )
             tensor = tensor_access.get_tensor()
             tensor_name = tensor.name
-            needs_transpose[tensor_name] = needs_transpose.get(tensor_name, False) or violates
+            needs_transpose[tensor_name] = (
+                needs_transpose.get(tensor_name, False) or violates
+            )
             if tensor_name not in tensor_nnz:
                 tensor_nnz[tensor_name] = Scheduler._estimate_tensor_nnz(tensor, costs)
 
@@ -577,9 +782,7 @@ class Scheduler:
         delta_ws = ws_cost_after - ws_cost_before
         delta_trans = trans_cost_after - trans_cost_before
         return (
-            costs.alpha * delta_comp
-            + costs.beta * delta_ws
-            + costs.gamma * delta_trans
+            costs.alpha * delta_comp + costs.beta * delta_ws + costs.gamma * delta_trans
         )
 
     @staticmethod
@@ -638,8 +841,12 @@ class Scheduler:
         Dict[Tuple[IndexVar, IndexVar], Set[str]],
         Dict[str, float],
     ]:
-        adjacency: Dict[IndexVar, Set[IndexVar]] = {index_var: set() for index_var in index_vars}
-        edge_to_tensor_names: Dict[Tuple[IndexVar, IndexVar], Set[str]] = defaultdict(set)
+        adjacency: Dict[IndexVar, Set[IndexVar]] = {
+            index_var: set() for index_var in index_vars
+        }
+        edge_to_tensor_names: Dict[Tuple[IndexVar, IndexVar], Set[str]] = defaultdict(
+            set
+        )
         tensor_nnz: Dict[str, float] = {}
         allowed_index_vars = set(index_vars)
 
@@ -691,7 +898,9 @@ class Scheduler:
                 if dst in indegree:
                     indegree[dst] += 1
 
-        queue = deque([index_var for index_var in index_vars if indegree[index_var] == 0])
+        queue = deque(
+            [index_var for index_var in index_vars if indegree[index_var] == 0]
+        )
         visited = 0
         while queue:
             node = queue.popleft()
@@ -717,7 +926,9 @@ class Scheduler:
             in_stack.add(node)
             stack.append(node)
 
-            for neighbor in sorted(adjacency.get(node, set()), key=lambda var: var.name):
+            for neighbor in sorted(
+                adjacency.get(node, set()), key=lambda var: var.name
+            ):
                 if neighbor not in visited:
                     cycle_edges = dfs(neighbor)
                     if cycle_edges:
@@ -794,7 +1005,9 @@ class Scheduler:
                     zero_indegree.append(dst)
 
         if len(order) < len(index_vars):
-            remaining = [index_var for index_var in index_vars if index_var not in order]
+            remaining = [
+                index_var for index_var in index_vars if index_var not in order
+            ]
             remaining.sort(
                 key=lambda index_var: (
                     priority.get(index_var, len(priority)),
@@ -832,9 +1045,7 @@ class Scheduler:
                 tensor_nnz=tensor_nnz,
             )
 
-        priority = {
-            index_var: pos for pos, index_var in enumerate(unique_loop_order)
-        }
+        priority = {index_var: pos for pos, index_var in enumerate(unique_loop_order)}
         return Scheduler._topological_sort_with_priority(
             adjacency=adjacency,
             index_vars=unique_loop_order,
@@ -854,7 +1065,9 @@ class Scheduler:
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(cin)
 
-        reduction_vars = Scheduler._unique_index_vars(cin_ivar_getter.get_reduction_vars())
+        reduction_vars = Scheduler._unique_index_vars(
+            cin_ivar_getter.get_reduction_vars()
+        )
         if not reduction_vars:
             return False
 
@@ -869,7 +1082,9 @@ class Scheduler:
         if not reductions_in_loop:
             return False
 
-        last_reduction_pos = max(loop_pos[index_var] for index_var in reductions_in_loop)
+        last_reduction_pos = max(
+            loop_pos[index_var] for index_var in reductions_in_loop
+        )
         free_after_last_reduction = [
             index_var
             for index_var in free_vars
@@ -902,7 +1117,107 @@ class Scheduler:
         )
 
     @staticmethod
-    def add_tile(cin: CIN, index_var: IndexVar, tile_size: int) -> CIN:
+    def _find_index_var_by_name(cin: CIN, name: str) -> IndexVar:
+        matches = [index_var for index_var in cin.index_vars if index_var.name == name]
+        if not matches:
+            raise ValueError(f"Unknown index variable {name!r}")
+        return matches[0]
+
+    @staticmethod
+    def _outer_loop_prefix(cin: CIN) -> List[ForAll]:
+        prefix: List[ForAll] = []
+        current: CIN = cin
+        while isinstance(current, ForAll):
+            prefix.append(current)
+            current = current.stmt
+        return prefix
+
+    @staticmethod
+    def _placement_depth(cin: CIN, placement: str, target_name: str) -> int:
+        prefix = Scheduler._outer_loop_prefix(cin)
+
+        if placement == "outermost":
+            depth = 0
+        elif placement.startswith("child_of:"):
+            parent_name = placement.split(":", 1)[1]
+            if not parent_name:
+                raise ValueError("child_of placement requires an index variable")
+            exact = [
+                pos
+                for pos, loop in enumerate(prefix)
+                if loop.index_var.name == parent_name
+            ]
+            if not exact:
+                raise ValueError(
+                    f"Cannot place tile child of {parent_name!r}; it is not in "
+                    "the common outer loop prefix"
+                )
+            depth = exact[0] + 1
+        elif placement.startswith("at_depth:"):
+            value = placement.split(":", 1)[1]
+            try:
+                depth = int(value)
+            except ValueError as exc:
+                raise ValueError("at_depth placement requires an integer") from exc
+            if depth < 0 or depth > len(prefix):
+                raise ValueError(
+                    f"at_depth:{depth} is outside the common loop-prefix range "
+                    f"0..{len(prefix)}"
+                )
+        else:
+            raise ValueError(f"Unsupported tile placement {placement!r}")
+
+        target_in_prefix = next(
+            (
+                pos
+                for pos, loop in enumerate(prefix)
+                if loop.index_var.name == target_name
+            ),
+            None,
+        )
+        if target_in_prefix is not None and depth > target_in_prefix:
+            raise ValueError(
+                f"Tile outer loop for {target_name!r} must dominate its inner loop"
+            )
+        return depth
+
+    @staticmethod
+    def _insert_loop_at_depth(cin: CIN, loop: ForAll, depth: int) -> CIN:
+        if depth == 0:
+            loop.stmt = cin
+            cin.set_parent(loop)
+            loop.inserted_workspace = cin.inserted_workspace
+            loop.no_tile_list = list(cin.no_tile_list)
+            return loop
+
+        parent: CIN = cin
+        for _ in range(depth - 1):
+            if not isinstance(parent, ForAll):
+                raise ValueError("Tile placement does not name a common loop prefix")
+            parent = parent.stmt
+        if not isinstance(parent, ForAll):
+            raise ValueError("Tile placement does not name a common loop prefix")
+
+        child = parent.stmt
+        loop.stmt = child
+        child.set_parent(loop)
+        parent.stmt = loop
+        loop.set_parent(parent)
+        # ``loop`` starts with the root as a temporary constructor body. Restore
+        # the actual root relationship after inserting it deeper.
+        cin.parent = None
+        return cin
+
+    @staticmethod
+    def add_tile(
+        cin: CIN,
+        index_var: IndexVar,
+        tile_size: int,
+        placement: Optional[str] = None,
+        parallel: bool = False,
+        unroll: bool = True,
+        use_workspace: bool = True,
+    ) -> CIN:
         """
         Tile the index_var of a CIN statement.
         Specifically,
@@ -1007,116 +1322,57 @@ class Scheduler:
 
         """
 
-        if not cin.inserted_workspace:
+        if isinstance(tile_size, bool) or not isinstance(tile_size, int):
+            raise TypeError("tile_size must be an integer")
+        if tile_size <= 0:
+            raise ValueError("tile_size must be greater than zero")
+        if not isinstance(cin, ForAll):
+            raise ValueError("Expected input CIN to be a ForAll statement")
+
+        target_name = index_var.name
+        if (
+            use_workspace
+            and not cin.inserted_workspace
+            and Scheduler._tile_target_needs_workspace(cin, target_name)
+        ):
             loop_order, _ = Scheduler._extract_loop_chain(cin)
             if Scheduler.should_insert_workspace(cin, loop_order):
                 cin = Scheduler.insert_workspace(cin, allow_dense=True)
 
-        # 2) Stripmine the index_var
-        # Create inner and outer index variables, e.g.
-        #   k_out = IndexVar("k_out")
-        #   k_in = IndexVar("k_in")
-        inner_index_var = IndexVar(f"{index_var.name}_in")
-        outer_index_var = IndexVar(f"{index_var.name}_out")
+        # Workspace insertion deep-copies the graph. Resolve the target by name
+        # in the transformed graph instead of retaining the pre-copy identity.
+        index_var = Scheduler._find_index_var_by_name(cin, target_name)
+        if index_var.is_tiled or getattr(index_var, "_expr", None) is not None:
+            raise ValueError(f"Index variable {target_name!r} is already tiled")
 
-        # Create a new index variable that is the sum of the inner and outer index variables
-        # e.g. k = IndexVar("k", k_out + k_in)
+        sparse_accesses = [
+            tensor_access
+            for tensor_access in cin.tensor_accesses
+            if tensor_access.has_index_var(index_var)
+            and tensor_access.level_type_of_index_var(index_var) != LevelType.DENSE
+        ]
+        if sparse_accesses:
+            raise NotImplementedError(
+                f"Affine tiling cannot split sparse index variable {target_name!r}; "
+                "windowed compressed iterators are not supported"
+            )
+
+        if placement is None:
+            if _regblock_enabled():
+                placement = f"child_of:{cin.index_var.name}"
+            else:
+                placement = "outermost"
+        insertion_depth = Scheduler._placement_depth(cin, placement, target_name)
+
+        inner_index_var = IndexVar(f"{target_name}_in")
+        outer_index_var = IndexVar(f"{target_name}_out")
         index_var.expr = outer_index_var + inner_index_var
-
-        # Create a new tile size variable
-        #
-        # e.g.
-        # k_tile_size = 32
-        # k_tile_var = TileSizeVar(
-        #     outer_index_var=k_out,
-        #     inner_index_var=k_in,
-        #     size=k_tile_size
-        # )
         TileSizeVar(
             outer_index_var=outer_index_var,
             inner_index_var=inner_index_var,
             size=tile_size,
+            unroll=unroll,
         )
-
-        # Now, we want to go from, for example:
-        #
-        # new_cin = ForAll(
-        #     i,
-        #     Where(
-        #         producer=ForAll(
-        #             j,
-        #             ForAll(
-        #                 k,
-        #                 TensorAssign(
-        #                     accum_c[k],
-        #                     A[i, j] * B[j, k],
-        #                     op=Operation.ADD
-        #                 )
-        #             )
-        #         ),
-        #         consumer=ForAll(
-        #             k,
-        #             TensorAssign(
-        #                 C[i, k],
-        #                 accum_c[k],
-        #             )
-        #         )
-        #     )
-        # )
-        #
-        # to a new_cin:
-        #
-        # new_cin = ForAll(
-        #     i,
-        #     ForAll(
-        #         k_out,
-        #         Where(
-        #             producer=ForAll(
-        #                 j,
-        #                 ForAll(
-        #                     k_in,
-        #                     TensorAssign(
-        #                         accum_c[k_in],
-        #                         A[i, j] * B[j, k],
-        #                         op=Operation.ADD,
-        #                     ),
-        #                 ),
-        #             ),
-        #             consumer=ForAll(
-        #                 k_in,
-        #                 TensorAssign(
-        #                     C[i, k],
-        #                     accum_c[k_in],
-        #                 )
-        #             )
-        #         )
-        #     )
-        # )
-        #
-        # This involves several steps:
-        # - Replace the index_var in the Where statement indexing into the workspace with the inner index var
-        # - Add a new ForAll loop outside/before the Where statement
-
-        # Find the Where statement
-        assert isinstance(cin, ForAll), "Expected input CIN to be a ForAll statement."
-        parent_forall = cin
-        while (
-            isinstance(parent_forall, ForAll)
-            and hasattr(parent_forall, "stmt")
-            and not isinstance(parent_forall.stmt, Where)
-        ):
-            parent_forall = parent_forall.stmt
-
-        # Tiling transform currently rewrites around a Where(producer, consumer)
-        # structure. If workspace insertion was not needed/possible and no Where
-        # exists, conservatively skip tiling for this index variable.
-        if not (
-            isinstance(parent_forall, ForAll)
-            and isinstance(parent_forall.stmt, Where)
-        ):
-            return cin
-
-        where_stmt = parent_forall.stmt
 
         class ReplaceIndexVarVisitor(CINVisitorAccept):
             """
@@ -1129,48 +1385,48 @@ class Scheduler:
             def __init__(self, old_index_var: IndexVar, new_index_var: IndexVar):
                 self.old_index_var = old_index_var
                 self.new_index_var = new_index_var
+                self.replacements = 0
 
             def visit_ForAll(self, forall: ForAll):
                 if forall.index_var == self.old_index_var:
                     forall.index_var = self.new_index_var
+                    self.replacements += 1
                 self.visit(forall.stmt)
 
+            def visit_Where(self, where: Where):
+                self.visit(where.producer)
+                self.visit(where.consumer)
+
+            def visit_TensorAssign(self, tensor_assign: TensorAssign):
+                self.visit(tensor_assign.lhs)
+                self.visit(tensor_assign.rhs)
+
             def visit_WorkspaceAccess(self, workspace_access: WorkspaceAccess):
-                if (
-                    workspace_access.indices
-                    and workspace_access.indices[-1] == self.old_index_var
-                ):
-                    workspace_access.indices[-1] = self.new_index_var
-                    workspace_access.update_indices(workspace_access.indices)
+                if not workspace_access.indices:
+                    return
+                indices = [
+                    self.new_index_var if index == self.old_index_var else index
+                    for index in workspace_access.indices
+                ]
+                workspace_access.indices = indices
+                workspace_access.update_indices(indices)
 
         replace_index_var_visitor = ReplaceIndexVarVisitor(
             old_index_var=index_var,
             new_index_var=inner_index_var,
         )
-        replace_index_var_visitor.visit(where_stmt)
+        replace_index_var_visitor.visit(cin)
+        if replace_index_var_visitor.replacements == 0:
+            raise ValueError(
+                f"Cannot tile {target_name!r}: no matching ForAll binder was found"
+            )
 
-        # REGBLOCK: keep the original outermost (row) loop on top so it remains the
-        # parallel loop and the thread policy stays row-based; insert k_out as its
-        # child -> nest [i, k_out, ..., k_in]. This matches add_tile's own docstring
-        # (i outside k_out). The default path below instead wraps k_out outermost;
-        # it is preserved byte-identical when regblock is off. Naively wrapping k_out
-        # outermost here would parallelize over the few free-dim tiles (serial for
-        # narrow N) and mis-size the thread policy — see codegen-parity doc 03.
-        if _regblock_enabled() and isinstance(cin, ForAll):
-            kout_forall = ForAll(index_var=outer_index_var, stmt=cin.stmt)
-            cin.stmt = kout_forall
-            return cin
-
-        # Wrap the new_cin in a new ForAll loop, with the outer index var.
-        # Preserve scheduler metadata carried on the root CIN node.
-        wrapped = ForAll(
+        outer_forall = ForAll(
             index_var=outer_index_var,
             stmt=cin,
+            parallel=True if parallel else None,
         )
-        wrapped.inserted_workspace = cin.inserted_workspace
-        wrapped.no_tile_list = list(cin.no_tile_list)
-
-        return wrapped
+        return Scheduler._insert_loop_at_depth(cin, outer_forall, insertion_depth)
 
     @staticmethod
     def insert_workspace(cin: CIN, allow_dense=False) -> CIN:
@@ -1207,7 +1463,9 @@ class Scheduler:
         if len(reduction_vars) == 0:
             return cin
 
-        reduction_vars_todo = [var for var in reduction_vars if var in index_vars_ordered]
+        reduction_vars_todo = [
+            var for var in reduction_vars if var in index_vars_ordered
+        ]
 
         if len(reduction_vars_todo) == 0:
             return cin
@@ -1309,7 +1567,9 @@ class Scheduler:
         """
 
         reduction_forall = (
-            parent_forall if parent_forall.index_var == next_reduction_var else parent_forall.stmt
+            parent_forall
+            if parent_forall.index_var == next_reduction_var
+            else parent_forall.stmt
         )
 
         # If we have already inserted a workspace, then we should not insert another one.
@@ -1323,7 +1583,9 @@ class Scheduler:
 
         # Iterate until the TensorAssign statement
         while not isinstance(producer_forall_tensor_access_parent.stmt, TensorAssign):
-            producer_forall_tensor_access_parent = producer_forall_tensor_access_parent.stmt
+            producer_forall_tensor_access_parent = (
+                producer_forall_tensor_access_parent.stmt
+            )
 
         # Replace the TensorAssign's lhs with the workspace
         producer_forall_tensor_access_parent.stmt.lhs = workspace_access
@@ -1334,7 +1596,9 @@ class Scheduler:
         consumer_forall_tensor_access_parent = consumer_forall
         # Iterate until the TensorAssign statement
         while not isinstance(consumer_forall_tensor_access_parent.stmt, TensorAssign):
-            consumer_forall_tensor_access_parent = consumer_forall_tensor_access_parent.stmt
+            consumer_forall_tensor_access_parent = (
+                consumer_forall_tensor_access_parent.stmt
+            )
 
         # Replace the TensorAssign's rhs with the workspace
         consumer_forall_tensor_access_parent.stmt.rhs = workspace_access
@@ -1350,7 +1614,10 @@ class Scheduler:
             new_cin.no_tile_list.append(producer_forall.index_var)
 
         # Replace the reduction forall with the Where statement
-        if isinstance(parent_forall.stmt, ForAll) and parent_forall.stmt.index_var == next_reduction_var:
+        if (
+            isinstance(parent_forall.stmt, ForAll)
+            and parent_forall.stmt.index_var == next_reduction_var
+        ):
             parent_forall.stmt = where_stmt
         else:
             new_cin = where_stmt
@@ -1397,12 +1664,11 @@ class Scheduler:
             _needs_forced_reorder = True
             _result_accesses = cin.get_result_tensor_accesses()
             if _result_accesses:
-                _non_ws = [a for a in _result_accesses
-                           if not isinstance(a.tensor, Workspace)]
+                _non_ws = [
+                    a for a in _result_accesses if not isinstance(a.tensor, Workspace)
+                ]
                 if _non_ws:
-                    _result_ivs = set(
-                        iv.name for iv in _non_ws[0].get_index_vars()
-                    )
+                    _result_ivs = set(iv.name for iv in _non_ws[0].get_index_vars())
                     _all_coo = all(
                         lt == LevelType.COORDINATE
                         for lt in _non_ws[0].get_tensor().get_level_types()
@@ -1410,14 +1676,12 @@ class Scheduler:
                     # Check if an input tensor mirrors the output sparsity
                     if _all_coo:
                         _rhs_accesses = [
-                            a for a in cin.tensor_accesses
-                            if a not in _result_accesses
-                               and not a.is_workspace()
+                            a
+                            for a in cin.tensor_accesses
+                            if a not in _result_accesses and not a.is_workspace()
                         ]
                         for _rhs in _rhs_accesses:
-                            _rhs_ivs = set(
-                                iv.name for iv in _rhs.get_index_vars()
-                            )
+                            _rhs_ivs = set(iv.name for iv in _rhs.get_index_vars())
                             if _rhs_ivs == _result_ivs:
                                 _needs_forced_reorder = False
                                 break
@@ -1431,23 +1695,592 @@ class Scheduler:
                 if reduction_vars:
                     reductions_in_loop = [v for v in loop_order if v in reduction_vars]
                     if reductions_in_loop:
-                        last_red_pos = max(loop_order.index(v) for v in reductions_in_loop)
+                        last_red_pos = max(
+                            loop_order.index(v) for v in reductions_in_loop
+                        )
                         free_after = [
-                            v for v in loop_order[last_red_pos + 1:]
+                            v
+                            for v in loop_order[last_red_pos + 1 :]
                             if v not in reduction_vars
                         ]
                         if not free_after:
-                            free_vars = [v for v in loop_order if v not in reduction_vars]
+                            free_vars = [
+                                v for v in loop_order if v not in reduction_vars
+                            ]
                             if free_vars:
                                 last_free = free_vars[-1]
                                 idx = loop_order.index(last_free)
                                 loop_order = (
                                     loop_order[:idx]
-                                    + loop_order[idx + 1:]
+                                    + loop_order[idx + 1 :]
                                     + [last_free]
                                 )
 
         return loop_order
+
+    @staticmethod
+    def resolve_loop_order(
+        cin: CIN,
+        loop_order: Sequence[str],
+    ) -> List[IndexVar]:
+        """Resolve and validate a tuner-provided logical loop permutation."""
+        requested = list(loop_order)
+        if any(not isinstance(name, str) or not name for name in requested):
+            raise ValueError("Schedule.loop_order must contain non-empty names")
+        if len(requested) != len(set(requested)):
+            raise ValueError("Schedule.loop_order contains duplicate variables")
+
+        available_vars = Scheduler.get_index_variables(cin)
+        by_name = {index_var.name: index_var for index_var in available_vars}
+        unknown = [name for name in requested if name not in by_name]
+        missing = [name for name in by_name if name not in requested]
+        if unknown or missing:
+            details = []
+            if unknown:
+                details.append(f"unknown={unknown}")
+            if missing:
+                details.append(f"missing={missing}")
+            raise ValueError(
+                "Schedule.loop_order must be a complete permutation ("
+                + ", ".join(details)
+                + ")"
+            )
+
+        positions = {name: index for index, name in enumerate(requested)}
+        for result_access in cin.get_result_tensor_accesses():
+            if isinstance(result_access.tensor, Workspace):
+                continue
+            result_order = [
+                index_var.name for index_var in result_access.get_sorted_index_vars()
+            ]
+            for parent, child in zip(result_order, result_order[1:]):
+                if positions[parent] > positions[child]:
+                    raise ValueError(
+                        "Schedule.loop_order violates result storage order: "
+                        f"{parent!r} must precede {child!r}"
+                    )
+        return [by_name[name] for name in requested]
+
+    @staticmethod
+    def _tile_target_needs_workspace(cin: CIN, target_name: str) -> bool:
+        """Whether a stack tile targets the trailing free accumulator domain."""
+        loop_order, _ = Scheduler._extract_loop_chain(cin)
+        if not loop_order or not Scheduler.should_insert_workspace(cin, loop_order):
+            return False
+
+        getter = CINIndexVariablesGetter()
+        getter.visit(cin)
+        reduction_names = {var.name for var in getter.get_reduction_vars()}
+        free_names = {var.name for var in getter.get_free_vars()}
+        positions = {var.name: pos for pos, var in enumerate(loop_order)}
+        reductions = [positions[name] for name in reduction_names if name in positions]
+        return bool(
+            target_name in free_names
+            and target_name in positions
+            and reductions
+            and positions[target_name] > max(reductions)
+        )
+
+    @staticmethod
+    def _set_explicit_parallel_loop(cin: CIN, loop_name: str) -> None:
+        matches: List[ForAll] = []
+
+        class LoopFinder(CINVisitorAccept):
+            def visit_ForAll(self, forall: ForAll):
+                if forall.index_var.name == loop_name:
+                    matches.append(forall)
+                self.visit(forall.stmt)
+
+            def visit_Where(self, where: Where):
+                self.visit(where.producer)
+                self.visit(where.consumer)
+
+            def visit_TensorAssign(self, tensor_assign: TensorAssign):
+                return
+
+        LoopFinder().visit(cin)
+        if len(matches) != 1:
+            raise ValueError(
+                f"Schedule.parallel_loop {loop_name!r} must identify exactly one "
+                f"ForAll loop; found {len(matches)}"
+            )
+        matches[0].parallel = True
+
+    @staticmethod
+    def _validate_relayout(
+        cin: CIN,
+        schedule: Schedule,
+        panel_tiles: List[TileSpec],
+        reduction_names: Set[str],
+    ) -> Optional[_RelayoutPlan]:
+        """Recognize the supported packed tile-ijk contraction by structure.
+
+        This intentionally validates before any CIN transform.  Names enter only
+        through the user's ``RelayoutSpec``; eligibility comes from tensor
+        accesses, level formats, free/reduction roles, and tile placement.
+        """
+        relayout = schedule.relayout
+        if relayout is None:
+            return None
+
+        assignment: CIN = cin
+        while isinstance(assignment, ForAll):
+            assignment = assignment.stmt
+        if not isinstance(assignment, TensorAssign) or assignment.op not in (
+            None,
+            Operation.ADD,
+        ):
+            raise NotImplementedError(
+                "Packed relayout requires one additive contraction assignment"
+            )
+
+        rhs_accesses = cin.get_rhs_tensor_accesses()
+        packed_accesses = [
+            access for access in rhs_accesses if access.tensor.name == relayout.operand
+        ]
+        if len(packed_accesses) != 1:
+            raise ValueError(
+                "RelayoutSpec.operand must name exactly one input tensor access; "
+                f"found {len(packed_accesses)} for {relayout.operand!r}"
+            )
+        packed_access = packed_accesses[0]
+        packed_names = [
+            index_var.name for index_var in packed_access.get_sorted_index_vars()
+        ]
+        if relayout.pack_var not in packed_names:
+            raise ValueError(
+                f"Relayout pack_var {relayout.pack_var!r} does not index operand "
+                f"{relayout.operand!r}"
+            )
+        if not packed_access.is_dense() or packed_access.num_levels != 2:
+            raise NotImplementedError(
+                "Packed relayout requires a rank-2 dense input operand"
+            )
+        if packed_names[-1] != relayout.pack_var:
+            raise NotImplementedError(
+                "Packed relayout requires pack_var to be the operand's contiguous "
+                "last storage level"
+            )
+        panel_var = packed_names[0]
+
+        if len(panel_tiles) != 1 or panel_tiles[0].index_var != panel_var:
+            raise ValueError(
+                "Packed relayout requires exactly one sparse panel tile on the "
+                f"other operand index {panel_var!r}"
+            )
+        panel_tile = panel_tiles[0]
+        affine_tiles = [tile for tile in schedule.tiles if tile.kind == "affine"]
+        pack_tiles = [
+            tile for tile in affine_tiles if tile.index_var == relayout.pack_var
+        ]
+        if len(pack_tiles) != 1:
+            raise ValueError(
+                "Packed relayout requires exactly one affine tile for pack_var "
+                f"{relayout.pack_var!r}"
+            )
+        pack_tile = pack_tiles[0]
+        if len(schedule.tiles) != 2 or len(affine_tiles) != 1:
+            raise NotImplementedError(
+                "Packed relayout currently supports only one affine pack tile "
+                "and one sparse panel tile"
+            )
+        if pack_tile.width != relayout.strip_width:
+            raise ValueError(
+                "Relayout strip_width must match the affine pack tile width "
+                f"({relayout.strip_width} != {pack_tile.width})"
+            )
+        if pack_tile.accum != "direct":
+            raise NotImplementedError(
+                "Packed relayout currently requires direct output accumulation"
+            )
+        expected_panel_placement = f"child_of:{relayout.pack_var}_out"
+        if (
+            pack_tile.placement != "outermost"
+            or panel_tile.placement != expected_panel_placement
+        ):
+            raise ValueError(
+                "Packed relayout requires an outermost pack tile followed by a "
+                f"panel placed at {expected_panel_placement!r}"
+            )
+
+        sparse_rhs = [access for access in rhs_accesses if not access.is_dense()]
+        compressed_rhs = [
+            access
+            for access in sparse_rhs
+            if LevelType.COMPRESSED in access.level_types()
+        ]
+        if len(rhs_accesses) != 2 or len(sparse_rhs) != 1 or len(compressed_rhs) != 1:
+            raise NotImplementedError(
+                "Packed relayout requires exactly one CSR input and one dense "
+                "input tensor access"
+            )
+        compressed_access = compressed_rhs[0]
+        if (
+            compressed_access.level_types()
+            != [
+                LevelType.DENSE,
+                LevelType.COMPRESSED,
+            ]
+            or compressed_access.num_levels != 2
+        ):
+            raise NotImplementedError(
+                "Packed relayout requires a rank-2 CSR input with a dense parent"
+            )
+        compressed_names = [
+            index_var.name for index_var in compressed_access.get_sorted_index_vars()
+        ]
+        row_var, compressed_panel_var = compressed_names
+        if compressed_panel_var != panel_var:
+            raise NotImplementedError(
+                "The CSR compressed coordinate must be the packed operand's "
+                f"panel index {panel_var!r}"
+            )
+
+        result_accesses = cin.get_result_tensor_accesses()
+        if len(result_accesses) != 1 or not result_accesses[0].is_dense():
+            raise NotImplementedError(
+                "Packed relayout requires exactly one dense result tensor"
+            )
+        result_access = result_accesses[0]
+        result_names = [
+            index_var.name for index_var in result_access.get_sorted_index_vars()
+        ]
+        if result_names != [row_var, relayout.pack_var]:
+            raise NotImplementedError(
+                "Packed relayout requires the dense result to be indexed by the "
+                "CSR row followed by pack_var"
+            )
+        if panel_var not in reduction_names or relayout.pack_var in reduction_names:
+            raise NotImplementedError(
+                "Packed relayout requires panel_var to be a reduction and "
+                "pack_var to be a free result axis"
+            )
+
+        expected_order = (row_var, panel_var, relayout.pack_var)
+        if schedule.loop_order != expected_order:
+            raise ValueError(
+                "Packed relayout requires loop_order to match the structural "
+                f"(row, panel, pack) order {expected_order!r}"
+            )
+        if schedule.parallel_loop != row_var:
+            raise ValueError(
+                "Packed relayout requires the CSR row loop to be selected for "
+                "parallel execution"
+            )
+
+        tensors = [access.tensor for access in rhs_accesses] + [result_access.tensor]
+        dtypes = {tensor.dtype for tensor in tensors}
+        if len(dtypes) != 1 or packed_access.tensor.dtype not in (
+            torch.float32,
+            torch.float64,
+        ):
+            raise NotImplementedError(
+                "Packed relayout supports matching float32 or float64 operand "
+                "and result dtypes"
+            )
+
+        return _RelayoutPlan(
+            operand=relayout.operand,
+            pack_var=relayout.pack_var,
+            panel_var=panel_var,
+            row_var=row_var,
+            operand_panel_level=packed_access.level_of_index_var(
+                Scheduler._find_index_var_by_name(cin, panel_var)
+            ),
+            operand_pack_level=packed_access.level_of_index_var(
+                Scheduler._find_index_var_by_name(cin, relayout.pack_var)
+            ),
+        )
+
+    @staticmethod
+    def apply_schedule(
+        cin: CIN,
+        schedule: Schedule,
+        costs: _CostModelConstants = _DEFAULT_COSTS,
+    ) -> CIN:
+        """Apply an explicit tuner schedule to a CIN loop nest.
+
+        An empty schedule delegates to :meth:`auto_schedule`, preserving the
+        existing scheduler. A non-empty schedule owns loop order and tiling: no
+        implicit tile heuristic is added on top of it.
+        """
+        if not isinstance(schedule, Schedule):
+            raise TypeError("apply_schedule expects a Schedule")
+        if not isinstance(cin, ForAll):
+            if (
+                schedule.loop_order is not None
+                or schedule.tiles
+                or schedule.relayout is not None
+                or schedule.parallel_loop is not None
+            ):
+                raise NotImplementedError(
+                    "Non-empty schedules require a ForAll CIN statement"
+                )
+            return cin
+        panel_tiles = [tile for tile in schedule.tiles if tile.kind == "panel"]
+        if len(panel_tiles) > 1:
+            raise NotImplementedError("Only one sparse panel tile is supported")
+        if panel_tiles and schedule.tiles[-1].kind != "panel":
+            raise ValueError(
+                "A sparse panel tile must follow all affine tiles in Schedule.tiles"
+            )
+        if panel_tiles and not Scheduler._has_dense_output(cin):
+            raise NotImplementedError(
+                "Sparse panel tiling currently requires a dense result tensor"
+            )
+        if panel_tiles and panel_tiles[0].parallel:
+            raise ValueError(
+                "Sparse panel outer loops must be serial; select the row loop "
+                "with Schedule.parallel_loop"
+            )
+        for tile in schedule.tiles:
+            if tile.accum == "heap":
+                raise NotImplementedError(
+                    "Heap-backed tiled accumulators are not implemented"
+                )
+            if tile.kind == "panel" and tile.accum != "direct":
+                raise NotImplementedError(
+                    "Sparse panel tiles currently require accum='direct'"
+                )
+
+        logical_names = {index_var.name for index_var in cin.index_vars}
+        unknown_tiles = [
+            tile.index_var
+            for tile in schedule.tiles
+            if tile.index_var not in logical_names
+        ]
+        if unknown_tiles:
+            raise ValueError(
+                f"Schedule tiles refer to unknown index variables {unknown_tiles}"
+            )
+
+        index_var_getter = CINIndexVariablesGetter()
+        index_var_getter.visit(cin)
+        reduction_names = {
+            index_var.name for index_var in index_var_getter.get_reduction_vars()
+        }
+        affine_reductions = [
+            tile.index_var
+            for tile in schedule.tiles
+            if tile.kind == "affine" and tile.index_var in reduction_names
+        ]
+        if affine_reductions:
+            raise NotImplementedError(
+                "Affine reduction tiling requires an accumulator spanning outer "
+                f"tiles; unsupported reduction variables: {affine_reductions}"
+            )
+        if any(tile.kind == "affine" for tile in schedule.tiles) and not (
+            Scheduler._has_dense_output(cin)
+        ):
+            raise NotImplementedError(
+                "Explicit affine tiling currently requires a dense result tensor; "
+                "tiled sparse-output assembly is unsupported"
+            )
+
+        parallel_names = [tile.index_var for tile in schedule.tiles if tile.parallel]
+        if schedule.parallel_loop is not None:
+            parallel_names.append(schedule.parallel_loop)
+        if parallel_names and not Scheduler._has_dense_output(cin):
+            raise NotImplementedError(
+                "Explicit parallel-loop selection currently requires a dense "
+                "result tensor"
+            )
+        tiled_inner_loops = {
+            f"{tile.index_var}_in" for tile in schedule.tiles if tile.kind == "affine"
+        }
+        parallel_inner_loops = [
+            name for name in parallel_names if name in tiled_inner_loops
+        ]
+        if parallel_inner_loops:
+            raise ValueError(
+                "Tiled inner loops contain a ragged-tail break and cannot be "
+                f"parallelized: {parallel_inner_loops}"
+            )
+        parallel_reductions = []
+        for parallel_name in parallel_names:
+            logical_name = parallel_name
+            for tile in schedule.tiles:
+                if tile.kind != "affine":
+                    continue
+                if parallel_name in (
+                    tile.index_var,
+                    f"{tile.index_var}_out",
+                    f"{tile.index_var}_in",
+                ):
+                    logical_name = tile.index_var
+                    break
+            if logical_name in reduction_names:
+                parallel_reductions.append(parallel_name)
+        if parallel_reductions:
+            raise ValueError(
+                "Reduction loops cannot be selected for parallel execution: "
+                f"{parallel_reductions}"
+            )
+
+        for tile in panel_tiles:
+            target = Scheduler._find_index_var_by_name(cin, tile.index_var)
+            compressed_accesses = [
+                access
+                for access in cin.tensor_accesses
+                if access.has_index_var(target)
+                and access.level_type_of_index_var(target) == LevelType.COMPRESSED
+            ]
+            if len(compressed_accesses) != 1:
+                raise NotImplementedError(
+                    f"Panel index {tile.index_var!r} must have exactly one "
+                    "compressed tensor access"
+                )
+            compressed_access = compressed_accesses[0]
+            parent = compressed_access.get_parent_index_var(target)
+            if (
+                parent is None
+                or compressed_access.level_type_of_index_var(parent) != LevelType.DENSE
+            ):
+                raise NotImplementedError(
+                    "Sparse panel tiling currently requires a CSR-style "
+                    "compressed level with a dense parent"
+                )
+            if schedule.parallel_loop != parent.name:
+                raise ValueError(
+                    "Sparse panel tiling requires its CSR dense-parent row loop "
+                    f"{parent.name!r} as Schedule.parallel_loop"
+                )
+            if schedule.loop_order is None:
+                panel_logical_order = [
+                    index_var.name
+                    for index_var in Scheduler.select_loop_order(cin, costs=costs)
+                ]
+            else:
+                panel_logical_order = list(schedule.loop_order)
+            if (
+                parent.name in panel_logical_order
+                and target.name in panel_logical_order
+                and panel_logical_order.index(parent.name)
+                > panel_logical_order.index(target.name)
+            ):
+                raise ValueError(
+                    "Sparse panel tiling requires the CSR row loop to precede "
+                    "the compressed panel coordinate in logical loop_order"
+                )
+            if tile.placement.startswith("at_depth:"):
+                raise NotImplementedError(
+                    "Sparse panel tiles do not support at_depth placement"
+                )
+            if tile.placement.startswith("child_of:"):
+                placement_parent = tile.placement.split(":", 1)[1]
+                if placement_parent in (
+                    parent.name,
+                    f"{parent.name}_out",
+                    f"{parent.name}_in",
+                ):
+                    raise ValueError(
+                        "A sparse panel loop must be placed outside its parallel "
+                        "CSR row loop"
+                    )
+                affine_parent = next(
+                    (
+                        affine_tile
+                        for affine_tile in schedule.tiles
+                        if affine_tile.kind == "affine"
+                        and f"{affine_tile.index_var}_out" == placement_parent
+                    ),
+                    None,
+                )
+                if affine_parent is None or affine_parent.placement != "outermost":
+                    raise ValueError(
+                        "A child_of sparse panel placement must name an "
+                        "outermost affine tile loop"
+                    )
+
+        relayout_plan = Scheduler._validate_relayout(
+            cin,
+            schedule,
+            panel_tiles,
+            reduction_names,
+        )
+
+        is_identity = (
+            schedule.loop_order is None
+            and not schedule.tiles
+            and schedule.relayout is None
+            and schedule.parallel_loop is None
+        )
+        if is_identity:
+            return Scheduler.auto_schedule(cin, costs=costs)
+
+        if schedule.loop_order is None:
+            logical_order = Scheduler.select_loop_order(cin, costs=costs)
+        else:
+            logical_order = Scheduler.resolve_loop_order(cin, schedule.loop_order)
+        cin = Scheduler._rebuild_loop_nest(cin, logical_order)
+
+        loop_order, _ = Scheduler._extract_loop_chain(cin)
+        stack_tiles = [
+            tile
+            for tile in schedule.tiles
+            if tile.kind == "affine" and tile.accum == "stack"
+        ]
+        unsupported_stack_tiles = [
+            tile.index_var
+            for tile in stack_tiles
+            if not Scheduler._tile_target_needs_workspace(cin, tile.index_var)
+        ]
+        if unsupported_stack_tiles:
+            raise NotImplementedError(
+                "Stack accumulation is only supported for a trailing dense free "
+                f"dimension after a reduction: {unsupported_stack_tiles}"
+            )
+        stack_targets = {tile.index_var for tile in stack_tiles}
+        if Scheduler.should_insert_workspace(cin, loop_order) and (
+            not Scheduler._has_dense_output(cin) or stack_targets
+        ):
+            cin = Scheduler.insert_workspace(cin, allow_dense=True)
+
+        generated_outer_names: Dict[str, str] = {}
+        for tile in schedule.tiles:
+            if tile.kind == "panel":
+                continue
+            target = Scheduler._find_index_var_by_name(cin, tile.index_var)
+            cin = Scheduler.add_tile(
+                cin=cin,
+                index_var=target,
+                tile_size=tile.width,
+                placement=tile.placement,
+                parallel=tile.parallel,
+                unroll=tile.unroll,
+                use_workspace=False,
+            )
+            generated_outer_names[tile.index_var] = f"{tile.index_var}_out"
+
+        if schedule.parallel_loop is not None:
+            parallel_name = generated_outer_names.get(
+                schedule.parallel_loop, schedule.parallel_loop
+            )
+            Scheduler._set_explicit_parallel_loop(cin, parallel_name)
+
+        panel_bounds: Dict[str, str] = {}
+        for tile in panel_tiles:
+            target = Scheduler._find_index_var_by_name(cin, tile.index_var)
+            dense_accesses = [
+                access
+                for access in cin.tensor_accesses
+                if access.has_index_var(target)
+                and access.level_type_of_index_var(target) == LevelType.DENSE
+            ]
+            if not dense_accesses:
+                raise NotImplementedError(
+                    f"Panel index {tile.index_var!r} has no dense dimension bound"
+                )
+            access = dense_accesses[0]
+            level = access.level_of_index_var(target)
+            panel_bounds[tile.index_var] = f"{access.tensor.name}{level}_size"
+
+        # The CIN lowerer consumes panel tiles after concrete sparse iterators are
+        # available in LLIR. Affine tiles above remain ordinary CIN transforms.
+        cin.explicit_schedule = schedule
+        cin.panel_bounds = panel_bounds
+        cin.relayout_plan = relayout_plan
+        return cin
 
     @staticmethod
     def _select_index_vars_to_tile(cin: CIN) -> List[IndexVar]:
@@ -1514,6 +2347,7 @@ class Scheduler:
         # round-trip). So skip this guard when regblock is on. Byte-identical when off.
         loop_order = cin.loop_order
         if loop_order and not _regblock_enabled():
+
             def _causes_sparse_retraversal(iv: IndexVar) -> bool:
                 if iv not in loop_order:
                     return False
@@ -1527,8 +2361,7 @@ class Scheduler:
                 return False
 
             index_vars_to_tile = [
-                iv for iv in index_vars_to_tile
-                if not _causes_sparse_retraversal(iv)
+                iv for iv in index_vars_to_tile if not _causes_sparse_retraversal(iv)
             ]
 
         return index_vars_to_tile
@@ -1536,6 +2369,13 @@ class Scheduler:
     @staticmethod
     def _apply_tiling_heuristics(cin: CIN) -> CIN:
         if not isinstance(cin, ForAll):
+            return cin
+        # Preserve the legacy auto-scheduler's scope: before ``add_tile`` grew
+        # into a general strip-mining transform it only changed loop nests that
+        # had a workspace/Where region.  Direct affine tiling is intentionally
+        # available through ``Schedule``, but must not silently change default
+        # schedules such as reduction-innermost SDDMM.
+        if not cin.inserted_workspace:
             return cin
         tile_width = _regblock_tile_width() if _regblock_enabled() else 32
         for index_var in Scheduler._select_index_vars_to_tile(cin):

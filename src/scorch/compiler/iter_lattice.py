@@ -1101,10 +1101,29 @@ class IterationLattice:
     def _mark_simd_on_reduction_loops(stmts: list) -> None:
         """Mark dense reduction loops inside scalar accumulation for SIMD."""
         from .cin_lowerer import CINLowerer
+
+        def contains_break(body: list) -> bool:
+            for child in body:
+                if isinstance(child, llir.Break):
+                    return True
+                if isinstance(child, (llir.ForLoop, llir.WhileLoop)):
+                    if contains_break(child.body):
+                        return True
+                elif isinstance(child, llir.IfThenElse):
+                    branches = [child.then_body, child.else_body]
+                    branches.extend(child.then_body_list or [])
+                    if any(branch and contains_break(branch) for branch in branches):
+                        return True
+            return False
+
         for stmt in stmts:
             if isinstance(stmt, llir.ForLoop):
-                if (not CINLowerer._has_sparse_inner_loop(stmt.body)
-                        and not stmt.omp_parallel_for):
+                if (
+                    not CINLowerer._has_sparse_inner_loop(stmt.body)
+                    and not stmt.omp_parallel_for
+                    and not stmt.unroll
+                    and not contains_break(stmt.body)
+                ):
                     stmt.simd = True
 
     def get_lattice_loops(self) -> List[llir.Stmt]:
@@ -1247,7 +1266,14 @@ class IterationLattice:
 
             index_var = lattice_point.get_index_var()
             should_unroll_loop = bool(
-                index_var.tile_size_var and index_var.is_inner
+                index_var.tile_size_var
+                and index_var.is_inner
+                and index_var.tile_size_var.unroll
+            )
+            # Tiled loops bind i_in/k_in while accesses retain the original
+            # logical i/k. Result-index generation must use that parent.
+            logical_index_var = (
+                index_var.parent if index_var.has_parent else index_var
             )
 
             tiled_index_var_resolve_stmts: List[llir.Stmt] = []
@@ -1295,11 +1321,14 @@ class IterationLattice:
 
             if (
                 not result_tensor_access.is_workspace()
-                and result_tensor_access.has_index_var(index_var)
+                and not (index_var.tile_size_var and index_var.is_outer)
+                and result_tensor_access.has_index_var(logical_index_var)
                 and not result_already_in_lattice
             ):
-                level = result_tensor_access.level_of_index_var(index_var)
-                level_type = result_tensor_access.level_type_of_index_var(index_var)
+                level = result_tensor_access.level_of_index_var(logical_index_var)
+                level_type = result_tensor_access.level_type_of_index_var(
+                    logical_index_var
+                )
 
                 result_value_index_stmts: List[llir.Stmt] = []
                 # Index into result value array: p<result tensor var name><_level>
@@ -1318,7 +1347,7 @@ class IterationLattice:
                             llir.VarInit(
                                 var=result_index_var,
                                 value=llir.Var(
-                                    name=index_var.name,
+                                    name=logical_index_var.name,
                                     type=llir.DataType.INT,
                                 ),
                             )
@@ -1342,7 +1371,7 @@ class IterationLattice:
                                         ),
                                     ),
                                     right=llir.Var(
-                                        name=index_var.name,
+                                        name=logical_index_var.name,
                                         type=llir.DataType.INT,
                                     ),
                                 ),

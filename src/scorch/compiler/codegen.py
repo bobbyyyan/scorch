@@ -93,6 +93,9 @@ class LLIRLowerer:
         elif isinstance(ir, llir.Break):
             return self.lower_llir("break;", indent_level)
 
+        elif isinstance(ir, llir.Continue):
+            return self.lower_llir("continue;", indent_level)
+
         elif isinstance(ir, llir.Increment):
             if no_semicolon:
                 return self.lower_llir(f"{ir.var.name}++", indent_level)

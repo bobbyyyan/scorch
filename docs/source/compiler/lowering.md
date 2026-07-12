@@ -197,7 +197,7 @@ Iterator analysis tells you *how* to walk a given loop order. The **`Scheduler`*
 and whether to insert a workspace or tile a loop — all before the `CINLowerer`
 runs. A CIN `ForAll` deliberately carries no order; the Scheduler supplies it.
 
-Two entry points:
+Three entry points:
 
 `select_loop_order(cin)`
 : Chooses the ordered `List[IndexVar]`. It seeds an initial order, runs a
@@ -219,6 +219,51 @@ if should_insert_workspace(cin, loop_order):
 cin = _apply_tiling_heuristics(cin)            # tile-i / tile-k / ...
 return cin
 ```
+
+`apply_schedule(cin, schedule)`
+: Applies an immutable, tuner-provided {class}`~scorch.Schedule`. An empty
+  schedule delegates to `auto_schedule` exactly; otherwise `loop_order` is an
+  exact logical permutation and the listed {class}`~scorch.TileSpec` objects
+  replace implicit tiling. Tile width, outer-loop placement, unrolling,
+  accumulator policy, and the selected parallel loop are all part of the
+  schedule's cache identity.
+
+For example, this emits the register-block geometry
+`i -> k_out -> j -> k_in`, with a four-element stack accumulator and guarded
+ragged tail:
+
+```python
+schedule = scorch.Schedule(
+    loop_order=("i", "j", "k"),
+    tiles=(
+        scorch.TileSpec(
+            "k",
+            4,
+            placement="child_of:i",
+            accum="stack",
+        ),
+    ),
+    tag="spmm-k4",
+)
+C = scorch.matmul(A, B, schedule=schedule)
+```
+
+An explicit schedule forces the generic JIT path, so it cannot be silently
+ignored by a matching prebuilt kernel. Affine tiling supports dense domains such
+as the SpMM row `i` and free dimension `k`; affine reduction tiling is rejected
+until an accumulator can span outer reduction tiles. A sparse contraction tile
+with `kind="panel", accum="direct"` lowers after iterator construction: it emits
+a serial coordinate panel, two `std::lower_bound` calls per CSR row, and a fresh
+parallel row loop per panel. This tile-j form requires sorted compressed
+coordinates, matching the prebuilt kernel's requirement. Affine `i`/`k` tiles and
+panel `j` can be composed into tiled-ijk loop geometry with independent ragged
+tails. Adding a {class}`~scorch.RelayoutSpec` for the dense operand stages each
+`j`-panel by `k`-strip into a reusable vector-backed buffer before the parallel
+row loop, then redirects compute reads to that contiguous panel. The initial
+implementation deliberately accepts only a structurally compatible rank-2
+CSR-by-dense contraction with a dense result, matching floating dtypes, an
+outermost affine free-axis tile, and a serial panel surrounding the parallel CSR
+row loop. Unsupported formats and placements fail during schedule validation.
 
 The order matters because iteration cost is dominated by *which* variable sits
 innermost and whether a reduction can stream into a small accumulator. Ordering a
@@ -259,7 +304,11 @@ This compile-time `Scheduler` is a **different mechanism** from the runtime
 prebuilt tiling selector (the `-O` autotune ladder in `tiling.py`, described in
 {doc}`autotuning </user_guide/autotuning>`). The Scheduler orders and tiles the
 *generic JIT* loop nest; the tiling selector picks among *hand-written* prebuilt
-SpMM kernels during dispatch, before the compiler is ever reached.
+SpMM kernels during dispatch, before the compiler is ever reached. The immutable
+schedule API is the handoff boundary a tuner can use to select JIT loop geometry;
+`schedule_from_tuner_choice(("tileijk", (Nc, Jc)), ...)` is an opt-in adapter from
+the existing normalized tuner choice to the packed JIT schedule. It does not
+replace the production selector or change its cache/default policy.
 :::
 
 ## Worked example: formats → loop nest

@@ -12,11 +12,13 @@ from .ops import (
 )
 from .stensor import STensor
 from .format import TensorFormat
+from .compiler.scheduler import RelayoutSpec, Schedule, TileSpec, schedule_force
 from .trace import compile
 from .tiling import (
     autotune,
     clear_autotune_cache,
     get_autotune,
+    schedule_from_tuner_choice,
     set_autotune,
 )
 
@@ -39,6 +41,9 @@ __version__ = "0.0.1"
 __all__ = [
     "STensor",
     "TensorFormat",
+    "RelayoutSpec",
+    "Schedule",
+    "TileSpec",
     "autotune",
     "clear_autotune_cache",
     "compile",
@@ -49,6 +54,8 @@ __all__ = [
     "get_autotune",
     "matmul",
     "matmul_wksp",
+    "schedule_force",
+    "schedule_from_tuner_choice",
     "set_autotune",
     "sparse_attention",
     "sparse_linear",

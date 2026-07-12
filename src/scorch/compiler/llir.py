@@ -147,6 +147,7 @@ class DataType(Enum):
     PTR_INT_32 = "int32_t*"
     PTR_INT_64 = "int64_t*"
     PTR_FLOAT32 = "float*"
+    PTR_FLOAT64 = "double*"
     PTR_TORCH_FLOAT32 = "torch::kFloat32*"
     PTR_TORCH_FLOAT64 = "torch::kFloat64*"
     PTR_TORCH_INT32 = "torch::kInt32*"
@@ -471,7 +472,7 @@ class ForLoop(Stmt):
         self,
         init: Optional[Union[VarInit, VarDecl]],
         cond: Expr,
-        update: Union[Increment, VarInit, FunctionCall],
+        update: Union[Increment, VarInit, FunctionCall, Assign],
         body: List[Stmt],
         omp_parallel_for: bool = False,
         omp_schedule: Optional[str] = None,
@@ -496,6 +497,8 @@ class ForLoop(Stmt):
         #   schedule becomes "dynamic, <omp_chunk_expr>" overriding omp_schedule's chunk.
         self.omp_num_threads = omp_num_threads
         self.omp_chunk_expr = omp_chunk_expr
+        # Stable logical-loop identity used by post-CIN schedule lowering.
+        self.scorch_index_var: Optional[str] = None
         # Stmts placed inside #pragma omp parallel but before/after the for loop.
         # When set, codegen splits "parallel for" into "parallel { pre; for; post }".
         self.pre_parallel_body = pre_parallel_body
@@ -518,6 +521,7 @@ class WhileLoop(Stmt):
     def __init__(self, cond: Expr, body: List[Stmt]):
         self.cond = cond
         self.body = body
+        self.scorch_index_var: Optional[str] = None
 
 
 @dataclass(frozen=False)

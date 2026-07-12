@@ -20,9 +20,11 @@ from .compiler.cin import (
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
 from .compiler.scheduler import (
+    Schedule,
     Scheduler,
     _regblock_enabled,
     _regblock_max_n,
+    get_forced_schedule,
     regblock_force,
 )
 from .format import TensorFormat, LevelFormat, LevelType
@@ -32,7 +34,15 @@ from .tiling import is_candidate as _tiling_is_candidate
 from .tiling import _current_level as _tiling_current_level
 from .storage import TensorIndex
 from .stensor import STensor
-from .utils import parse_format, topo_sort_characters, load_to_kernel_cache, get_extra_cflags, get_extra_ldflags, _kernel_name, _load_kernel
+from .utils import (
+    parse_format,
+    topo_sort_characters,
+    load_to_kernel_cache,
+    get_extra_cflags,
+    get_extra_ldflags,
+    _kernel_name,
+    _load_kernel,
+)
 
 PROJECT_ROOT_DIR = Path(__file__)
 while not (PROJECT_ROOT_DIR / "setup.py").exists():
@@ -40,6 +50,81 @@ while not (PROJECT_ROOT_DIR / "setup.py").exists():
 
 _kernel_cache = {}
 _einsum_dispatch_cache = {}
+
+
+def _effective_schedule(kwargs: dict) -> Optional[Schedule]:
+    """Resolve an explicit or context-forced compiler schedule."""
+    public = kwargs.get("schedule")
+    internal = kwargs.get("_schedule")
+    if public is not None and internal is not None and public != internal:
+        raise ValueError("schedule and _schedule specify different schedules")
+    schedule = public if public is not None else internal
+    if schedule is None:
+        schedule = get_forced_schedule()
+    if schedule is not None and not isinstance(schedule, Schedule):
+        raise TypeError("schedule must be a scorch.compiler.scheduler.Schedule")
+    return schedule
+
+
+def _schedule_cache_key(schedule: Optional[Schedule]) -> Optional[str]:
+    return schedule.cache_key if schedule is not None else None
+
+
+def _einsum_cache_key(
+    expression: str,
+    tensors: Sequence[Any],
+    output_format: Any,
+    output_mode_order: Any,
+    schedule: Optional[Schedule],
+) -> tuple:
+    """Build the early dispatch key, including every scheduling decision."""
+    return (
+        expression,
+        tuple(str(t.format) for t in tensors),
+        tuple(t.dtype for t in tensors),
+        str(output_format) if output_format is not None else None,
+        tuple(output_mode_order) if output_mode_order else None,
+        _schedule_cache_key(schedule),
+    )
+
+
+def _codegen_kernel_cache_key(
+    cin: IndexStmt,
+    post_ops: Any,
+    schedule: Optional[Schedule],
+) -> str:
+    """Cache a lowered CIN without allowing dtype/schedule fields to alias."""
+    tensor_dtypes = tuple(
+        sorted(
+            {
+                (access.tensor.name, str(access.tensor.dtype))
+                for access in cin.tensor_accesses
+            }
+        )
+    )
+    key = str(cin) + f"|dtypes:{tensor_dtypes!r}"
+    if post_ops:
+        key += f"|post_ops:{post_ops}"
+    if schedule is not None:
+        key += f"|schedule:{schedule.cache_key}"
+    return key
+
+
+def _logical_index_sizes(
+    input_index_strs: Sequence[Sequence[str]],
+    tensors: Sequence[Any],
+) -> dict:
+    """Map logical einsum indices to sizes after physical mode reordering."""
+    index_to_size = {}
+    for index_strs, tensor in zip(input_index_strs, tensors):
+        mode_order = tensor.storage.index.mode_order or list(range(tensor.dim()))
+        for logical_axis, index_str in enumerate(index_strs):
+            if index_str in index_to_size:
+                continue
+            physical_axis = mode_order.index(logical_axis)
+            index_to_size[index_str] = tensor.shape[physical_axis]
+    return index_to_size
+
 
 # Composition thread-count matching for the drop-in CSR-SpMM (spmm_csr_float_v2).
 # When a scorch SpMM is used as a torch op inside a host pipeline (e.g. a GCN
@@ -284,7 +369,7 @@ def matmul_wksp(
 
     # ── Module cache: skip CIN→LLIR→codegen on repeat calls ──────────
     _cache_key = (str(a.format), str(b.format), str(output_format))
-    if not hasattr(matmul_wksp, '_module_cache'):
+    if not hasattr(matmul_wksp, "_module_cache"):
         matmul_wksp._module_cache = {}
 
     module = matmul_wksp._module_cache.get(_cache_key)
@@ -421,6 +506,9 @@ def matmul(
             When ``True``, allow the prebuilt-kernel fast path and the adaptive
             tiling selector. ``False`` forces the generic ``einsum`` path (used by
             the compiler gap tests).
+        schedule : Schedule, optional
+            Explicit JIT loop order and affine tiling decisions. Supplying one
+            forces the generic compiler path even when a prebuilt kernel matches.
         time_dict : dict, optional
             If given, ``time_dict["eval_time"]`` is set to the kernel wall-clock
             time in seconds.
@@ -470,14 +558,25 @@ def matmul(
     True
     """
 
+    effective_schedule = _effective_schedule(kwargs)
+
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        if a.is_sparse and b.is_sparse and a.layout == torch.sparse_coo and b.layout == torch.sparse_coo:
+        if (
+            a.is_sparse
+            and b.is_sparse
+            and a.layout == torch.sparse_coo
+            and b.layout == torch.sparse_coo
+        ):
             a = a.to_sparse_csr()
             b = b.to_sparse_csr()
         if a.is_sparse or a.is_sparse_csr or b.is_sparse or b.is_sparse_csr:
             a = STensor.from_torch(a)
             b = STensor.from_torch(b)
         else:
+            if effective_schedule is not None:
+                raise NotImplementedError(
+                    "Explicit compiler schedules currently require a sparse operand"
+                )
             return torch.matmul(a, b)
 
     if isinstance(a, torch.Tensor):
@@ -489,6 +588,10 @@ def matmul(
     # This is both faster and more reliable than lowering through sparse
     # scheduling paths for fully dense operands.
     if a.format.is_dense() and b.format.is_dense():
+        if effective_schedule is not None:
+            raise NotImplementedError(
+                "Explicit compiler schedules currently require a sparse operand"
+            )
         start_time = time.time()
         result_torch = torch.matmul(
             a.to_torch(in_place=False),
@@ -510,13 +613,23 @@ def matmul(
 
         return STensor.from_torch(result_torch).to_sparse(output_format)
 
-    use_cache = kwargs.get("use_cache", True)
+    # Never silently swallow a codegen schedule in a prebuilt dispatch.
+    use_cache = kwargs.get("use_cache", True) and effective_schedule is None
     time_dict = kwargs.get("time_dict", None)
     requested_output_format = kwargs.get("format", kwargs.get("output_format", None))
+    einsum_kwargs = dict(kwargs)
+    if "output_format" in einsum_kwargs and "format" not in einsum_kwargs:
+        einsum_kwargs["format"] = einsum_kwargs.pop("output_format")
 
     if a.dim() == 2 and b.dim() == 1:
+        if effective_schedule is not None:
+            raise NotImplementedError(
+                "Explicit schedules are not yet threaded through the SpMV compiler"
+            )
         default_mode_order = [0, 1]
-        if (not a.format.is_dense()) and a.storage.index.mode_order != default_mode_order:
+        if (
+            not a.format.is_dense()
+        ) and a.storage.index.mode_order != default_mode_order:
             a = a.copy()
             a.change_mode_order(default_mode_order)
 
@@ -564,9 +677,7 @@ def matmul(
                 b.change_mode_order(default_mode_order)
 
     if use_cache:
-        resolved = resolve_prebuilt_matmul(
-            a, b, output_format=requested_output_format
-        )
+        resolved = resolve_prebuilt_matmul(a, b, output_format=requested_output_format)
         if resolved is not None:
             nthreads = None
             atparallel = False
@@ -593,18 +704,23 @@ def matmul(
 
                     def _v2_fn(nt):
                         rc, _ = execute_prebuilt_binary_kernel(
-                            resolved.fn, a, b, nthreads=nt, atparallel=atparallel)
+                            resolved.fn, a, b, nthreads=nt, atparallel=atparallel
+                        )
                         return rc
 
                     disp = _tiling_maybe_dispatch(
-                        a, b, _rshape, _v2_fn, nthreads,
-                        time_dict=time_dict, level=_lvl)
+                        a, b, _rshape, _v2_fn, nthreads, time_dict=time_dict, level=_lvl
+                    )
                     if disp is not None:
                         result_cpp, _ = disp
                         result_shape = tuple(_rshape)
             if result_cpp is None:
                 result_cpp, result_shape = execute_prebuilt_binary_kernel(
-                    resolved.fn, a, b, time_dict=time_dict, nthreads=nthreads,
+                    resolved.fn,
+                    a,
+                    b,
+                    time_dict=time_dict,
+                    nthreads=nthreads,
                     atparallel=atparallel,
                 )
             # Fast path: a dense output kernel already produced a contiguous
@@ -624,9 +740,9 @@ def matmul(
                 value=result_cpp.storage.value,
             )
         else:
-            result = einsum("ij,jk->ik", a, b, **kwargs)
+            result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
     else:
-        result = einsum("ij,jk->ik", a, b, **kwargs)
+        result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
 
     if isinstance(result, STensor) and result.format.is_dense():
         result = result.to_torch()
@@ -1124,6 +1240,7 @@ def _regblock_free_size_expr(row_loop: llir.ForLoop) -> Optional[llir.Expr]:
     (e.g. `B1_size`). Using it avoids hard-coding a variable name. Returns None if no
     `*_out` tile loop is found.
     """
+
     def _walk(stmts: List[llir.Stmt]) -> Optional[llir.Expr]:
         for s in stmts:
             if isinstance(s, llir.ForLoop):
@@ -1183,6 +1300,9 @@ def _build_regblock_dual_path(
     or None when the register-block path doesn't apply (schedules identical) or the
     stitch can't be formed safely — the caller then falls back to the baseline path.
     """
+    if not Scheduler._has_dense_output(cin_unscheduled):
+        return None
+
     # auto_schedule mutates the CIN in place, so schedule each arm from a pristine copy.
     with regblock_force(False):
         cin_base = Scheduler.auto_schedule(copy.deepcopy(cin_unscheduled))
@@ -1203,7 +1323,7 @@ def _build_regblock_dual_path(
     stitched = _stitch_regblock_dual_path(fn_rb, fn_base, _regblock_max_n())
     if stitched is None:
         return None
-    return stitched, str(cin_rb) + "|rbdual"
+    return stitched, _codegen_kernel_cache_key(cin_rb, post_ops, None) + "|rbdual"
 
 
 def einsum(
@@ -1241,6 +1361,9 @@ def einsum(
             per-level (see Notes).
         output_mode_order : list of int, optional
             Permutation applied to the output modes.
+        schedule : Schedule, optional
+            Exact loop order and affine tiling plan for the JIT scheduler. The
+            complete plan participates in both compiler cache keys.
         time_dict : dict, optional
             If given, ``time_dict["eval_time"]`` is set to the kernel wall-clock
             time in seconds.
@@ -1315,26 +1438,37 @@ def einsum(
     tensors = tuple(
         STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors
     )
+    effective_schedule = _effective_schedule(kwargs)
 
     # ── Prebuilt SDDMM dispatch ────────────────────────────────────────
     # Pattern: 'ij,ik,jk->ij' with S(COO), A(dense), B(dense)
-    if (not compile_only
-            and expression == "ij,ik,jk->ij"
-            and len(tensors) == 3
-            and tensors[0].values.dtype == torch.float32
-            and str(tensors[0].format) == "o,o"
-            and str(tensors[1].format) == "d,d"
-            and str(tensors[2].format) == "d,d"):
+    if (
+        effective_schedule is None
+        and not compile_only
+        and expression == "ij,ik,jk->ij"
+        and len(tensors) == 3
+        and tensors[0].values.dtype == torch.float32
+        and str(tensors[0].format) == "o,o"
+        and str(tensors[1].format) == "d,d"
+        and str(tensors[2].format) == "d,d"
+    ):
         import scorch_ops as _ops
+
         _sddmm_fn = getattr(_ops, "sddmm_coo_float_prebuilt", None)
         if _sddmm_fn is not None:
             S, A, B = tensors
             result_shape = S.shape
             result_cpp = _sddmm_fn(
                 result_shape,
-                S.shape, S.index.mode_indices, S.values,
-                A.shape, A.index.mode_indices, A.values,
-                B.shape, B.index.mode_indices, B.values,
+                S.shape,
+                S.index.mode_indices,
+                S.values,
+                A.shape,
+                A.index.mode_indices,
+                A.values,
+                B.shape,
+                B.index.mode_indices,
+                B.values,
             )
             return STensor(
                 shape=result_shape,
@@ -1350,12 +1484,12 @@ def einsum(
     # + auto_schedule) which dominates wall-clock time for cached kernels.
     _dispatch_key = None
     if not compile_only and "_post_ops" not in kwargs:
-        _dispatch_key = (
+        _dispatch_key = _einsum_cache_key(
             expression,
-            tuple(str(t.format) for t in tensors),
-            tuple(t.dtype for t in tensors),
+            tensors,
             kwargs.get("format", None),
-            tuple(kwargs.get("output_mode_order", ())) if kwargs.get("output_mode_order") else None,
+            kwargs.get("output_mode_order"),
+            effective_schedule,
         )
         _cached = _einsum_dispatch_cache.get(_dispatch_key)
         if _cached is not None:
@@ -1373,11 +1507,7 @@ def einsum(
                     _t.change_mode_order(_mo)
 
             # Compute result shape from expression + current tensor shapes
-            _idx_to_size: dict = {}
-            for _idxs, _t in zip(_input_idx_strs, tensors):
-                for _i, _s in enumerate(_idxs):
-                    if _s not in _idx_to_size:
-                        _idx_to_size[_s] = _t.shape[_i]
+            _idx_to_size = _logical_index_sizes(_input_idx_strs, tensors)
             _result_shape = tuple(_idx_to_size[_s] for _s in _result_idx_strs)
 
             # Build args and evaluate
@@ -1433,10 +1563,9 @@ def einsum(
     )
 
     # Build concatenated substrings for topo_sort_characters
-    index_strs_concat = (
-        ["".join(s) for s in input_index_strs_sorted]
-        + ["".join(result_index_strs_sorted)]
-    )
+    index_strs_concat = ["".join(s) for s in input_index_strs_sorted] + [
+        "".join(result_index_strs_sorted)
+    ]
     index_strs_by_schedule = topo_sort_characters(index_strs_concat, tensors)
 
     # Create a list of IndexVar objects, and a dict mapping index strings
@@ -1605,7 +1734,9 @@ def einsum(
     rhs_expr = None
     for i, tensor_var in enumerate(tensor_vars):
         indices = [index_var_dict[s] for s in input_index_strs[i]]
-        access = tensor_var[indices[0]] if len(indices) == 1 else tensor_var[tuple(indices)]
+        access = (
+            tensor_var[indices[0]] if len(indices) == 1 else tensor_var[tuple(indices)]
+        )
         rhs_expr = access if rhs_expr is None else rhs_expr * access
 
     # Build LHS access and create assignment
@@ -1624,13 +1755,22 @@ def einsum(
     # Align input tensor mode orders with the selected loop order to keep
     # parent-child level traversal valid during lowering for non-canonical
     # schedules.
-    selected_loop_order = Scheduler.select_loop_order(cin_stmt)
+    if effective_schedule is not None and effective_schedule.loop_order is not None:
+        selected_loop_order = Scheduler.resolve_loop_order(
+            cin_stmt, effective_schedule.loop_order
+        )
+    else:
+        selected_loop_order = Scheduler.select_loop_order(cin_stmt)
     selected_loop_order_names = [index_var.name for index_var in selected_loop_order]
     for tensor_index, input_index_str in enumerate(input_index_strs):
         desired_index_strs = [
-            index_str for index_str in selected_loop_order_names if index_str in input_index_str
+            index_str
+            for index_str in selected_loop_order_names
+            if index_str in input_index_str
         ]
-        desired_mode_order = [input_index_str.index(index_str) for index_str in desired_index_strs]
+        desired_mode_order = [
+            input_index_str.index(index_str) for index_str in desired_index_strs
+        ]
         if tensors[tensor_index].storage.index.mode_order != desired_mode_order:
             tensors[tensor_index].change_mode_order(desired_mode_order)
         if tensor_vars[tensor_index].mode_order != desired_mode_order:
@@ -1648,22 +1788,26 @@ def einsum(
     # When the pattern doesn't qualify, `_build_regblock_dual_path` returns None and
     # the else-branch below emits the byte-identical baseline (unchanged from before).
     _dual_llir: Optional[llir.Function] = None
-    if _regblock_dual_active() and _post_ops is None:
+    if effective_schedule is None and _regblock_dual_active() and _post_ops is None:
         _dual = _build_regblock_dual_path(cin_stmt, _post_ops)
         if _dual is not None:
             _dual_llir, _kernel_cache_key = _dual
             _kernel_cache_key = _kernel_cache_key + _cache_key_suffix
 
     if _dual_llir is None:
+        if effective_schedule is not None:
+            cin_stmt = Scheduler.apply_schedule(cin_stmt, effective_schedule)
         # Default single path. When regblock is on but the dual-path wasn't
         # applicable, force it OFF here so we never ship the wide-k-regressing
         # single-path tiled kernel as a silent fallback.
-        if _regblock_enabled():
+        elif _regblock_enabled():
             with regblock_force(False):
                 cin_stmt = Scheduler.auto_schedule(cin_stmt)
         else:
             cin_stmt = Scheduler.auto_schedule(cin_stmt)
-        _kernel_cache_key = str(cin_stmt) + _cache_key_suffix
+        _kernel_cache_key = _codegen_kernel_cache_key(
+            cin_stmt, _post_ops, effective_schedule
+        )
 
     # print("Auto-scheduled CIN:\n", cin_stmt)
 
@@ -1714,12 +1858,7 @@ def einsum(
 
     # Create a mapping from each index string to the size of the dimension
     # it indexes
-    index_str_to_size = {}
-    for index_strs, tensor in zip(input_index_strs, tensors):
-        assert isinstance(tensor, STensor)
-        for i, index_str in enumerate(index_strs):
-            if index_str not in index_str_to_size:
-                index_str_to_size[index_str] = tensor.shape[i]
+    index_str_to_size = _logical_index_sizes(input_index_strs, tensors)
 
     # Get the result shape from the expression, using index_str_to_size
     result_shape = tuple(
@@ -1765,9 +1904,7 @@ def einsum(
     return result
 
 
-def _align_mode_orders_to_loop_order(
-    cin_stmt: IndexStmt, args: tuple
-) -> None:
+def _align_mode_orders_to_loop_order(cin_stmt: IndexStmt, args: tuple) -> None:
     """Align input tensor mode orders to the CIN loop order.
 
     The lowerer requires parent physical levels to be iterated before child
@@ -1814,7 +1951,10 @@ def _align_mode_orders_to_loop_order(
         lhs_names = [iv.name for iv in curr.lhs.get_index_vars()]
         desired_names = [n for n in loop_order_names if n in lhs_names]
         desired_mode_order = [lhs_names.index(n) for n in desired_names]
-        if len(desired_mode_order) == len(lhs_tv.mode_order) and list(lhs_tv.mode_order) != desired_mode_order:
+        if (
+            len(desired_mode_order) == len(lhs_tv.mode_order)
+            and list(lhs_tv.mode_order) != desired_mode_order
+        ):
             lhs_tv.mode_order = desired_mode_order
 
 

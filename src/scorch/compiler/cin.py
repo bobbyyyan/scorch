@@ -444,6 +444,7 @@ class TileSizeVar(IndexExpr):
     size: int
     _name: Optional[str] = None
     _index_var: Optional[IndexVar] = None
+    unroll: bool = True
 
     @property
     def name(self) -> str:
@@ -1008,10 +1009,18 @@ class ForAll(IndexStmt):
     e.g. forall_(i) A[i] = B[i] * C[i]
     """
 
-    def __init__(self, index_var: IndexVar, stmt: IndexStmt):
+    def __init__(
+        self,
+        index_var: IndexVar,
+        stmt: IndexStmt,
+        parallel: Optional[bool] = None,
+    ):
         super(ForAll, self).__init__(None, None)
         self.index_var = index_var
         self.stmt = stmt
+        # None preserves automatic outer-loop parallelization. Explicit
+        # schedules can select a particular (including nested) loop with True.
+        self.parallel = parallel
         self.stmt.set_parent(self)
 
     def get_index_var(self) -> IndexVar:

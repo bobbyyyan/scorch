@@ -10,6 +10,7 @@ every level must match the same torch reference (CLAUDE.md correctness conventio
 """
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -87,6 +88,138 @@ def test_set_autotune_rejects_non_string():
 def test_autotune_rejects_unknown_level():
     with pytest.raises(ValueError):
         scorch.autotune("nope")
+
+
+def test_schedule_from_tuner_choice_maps_tileijk_with_explicit_names():
+    schedule = scorch.schedule_from_tuner_choice(
+        ("tileijk", (32, 17)),
+        row_var="row",
+        panel_var="reduction",
+        free_var="column",
+        packed_operand="DenseRhs",
+    )
+
+    assert schedule == scorch.Schedule(
+        loop_order=("row", "reduction", "column"),
+        tiles=(
+            scorch.TileSpec(
+                "column",
+                32,
+                placement="outermost",
+                accum="direct",
+                unroll=False,
+            ),
+            scorch.TileSpec(
+                "reduction",
+                17,
+                placement="child_of:column_out",
+                kind="panel",
+                accum="direct",
+            ),
+        ),
+        relayout=scorch.RelayoutSpec(
+            operand="DenseRhs",
+            pack_var="column",
+            strip_width=32,
+        ),
+        tag="tuner-tileijk",
+        parallel_loop="row",
+    )
+    assert T.schedule_from_tuner_choice is scorch.schedule_from_tuner_choice
+
+
+@pytest.mark.parametrize("choice", [("v2", None), ("tilej", 17)])
+def test_schedule_from_tuner_choice_returns_none_for_other_valid_choices(choice):
+    assert (
+        scorch.schedule_from_tuner_choice(
+            choice,
+            row_var="row",
+            panel_var="reduction",
+            free_var="column",
+            packed_operand="DenseRhs",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("choice", "error", "message"),
+    [
+        (["tileijk", (8, 4)], TypeError, "choice must be"),
+        (("tileijk",), ValueError, "exactly"),
+        ((1, (8, 4)), TypeError, "kind must be"),
+        (("unknown", None), ValueError, "unknown tuner choice"),
+        (("v2", 1), ValueError, "parameter None"),
+        (("tilej", True), TypeError, "positive integer"),
+        (("tilej", 0), ValueError, "positive integer"),
+        (("tileijk", [8, 4]), TypeError, r"\(Nc, Jc\) tuple"),
+        (("tileijk", (8,)), ValueError, r"exactly \(Nc, Jc\)"),
+        (("tileijk", (True, 4)), TypeError, "Nc must be"),
+        (("tileijk", (8, 0)), ValueError, "Jc must be"),
+    ],
+)
+def test_schedule_from_tuner_choice_rejects_non_normalized_choices(
+    choice, error, message
+):
+    with pytest.raises(error, match=message):
+        scorch.schedule_from_tuner_choice(
+            choice,
+            row_var="row",
+            panel_var="reduction",
+            free_var="column",
+            packed_operand="DenseRhs",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("row_var", "", ValueError),
+        ("panel_var", None, TypeError),
+        ("free_var", "", ValueError),
+        ("packed_operand", None, TypeError),
+    ],
+)
+def test_schedule_from_tuner_choice_requires_structural_names(field, value, error):
+    names = {
+        "row_var": "row",
+        "panel_var": "reduction",
+        "free_var": "column",
+        "packed_operand": "DenseRhs",
+    }
+    names[field] = value
+
+    with pytest.raises(error, match=field):
+        scorch.schedule_from_tuner_choice(("tileijk", (8, 4)), **names)
+
+
+def test_schedule_adapter_does_not_replace_native_tuner_dispatch(monkeypatch):
+    native_result = object()
+    calls = []
+
+    def native_tileijk(*args):
+        calls.append(args)
+        return native_result
+
+    monkeypatch.setattr(
+        T,
+        "_ops",
+        SimpleNamespace(spmm_csr_float_tileijk=native_tileijk),
+    )
+    monkeypatch.setattr(T, "_tileijk_args", lambda *args: ["native-arguments"])
+
+    schedule = scorch.schedule_from_tuner_choice(
+        ("tileijk", (8, 4)),
+        row_var="row",
+        panel_var="reduction",
+        free_var="column",
+        packed_operand="DenseRhs",
+    )
+    dispatched = T._dispatch_decision(None, None, None, "tileijk", (8, 4), -1)
+
+    assert schedule is not None
+    assert dispatched == (native_result, True)
+    assert calls == [("native-arguments",)]
 
 
 # --------------------------------------------------------------------------- #
