@@ -1,0 +1,213 @@
+/* ==========================================================================
+   Scorch documentation — custom theme layer on top of pydata-sphinx-theme.
+   Brand: a flame. Primary is the PyTorch-adjacent flame red-orange (#ee4c2c),
+   warmed with an amber secondary. Tuned for both light and dark modes.
+   ========================================================================== */
+
+:root {
+  --scorch-flame: #ee4c2c;
+  --scorch-flame-bright: #ff6a3d;
+  --scorch-amber: #f9973b;
+  --scorch-ember: #c9331b;
+  --scorch-ink: #1b1f24;
+}
+
+/* ---- Theme color variables ---------------------------------------------- */
+
+html[data-theme="light"] {
+  --pst-color-primary: #d8391c;
+  --pst-color-primary-highlight: #b52c14;
+  --pst-color-secondary: #b8410f;
+  --pst-color-link: #c0330f;
+  --pst-color-link-hover: #8f2409;
+  --pst-color-inline-code: #b52c14;
+  --pst-color-accent: var(--scorch-amber);
+  --scorch-hero-glow: rgba(238, 76, 44, 0.10);
+  --scorch-card-border: rgba(27, 31, 36, 0.08);
+}
+
+html[data-theme="dark"] {
+  --pst-color-primary: #ff7a52;
+  --pst-color-primary-highlight: #ff946f;
+  --pst-color-secondary: #ffa05a;
+  --pst-color-link: #ff8a63;
+  --pst-color-link-hover: #ffb08f;
+  --pst-color-inline-code: #ff9d78;
+  --pst-color-accent: var(--scorch-amber);
+  --scorch-hero-glow: rgba(255, 122, 82, 0.12);
+  --scorch-card-border: rgba(255, 255, 255, 0.10);
+}
+
+/* ---- Announcement bar: subtle warm gradient ----------------------------- */
+
+.bd-header-announcement,
+.pst-announcement,
+aside.bd-header-announcement {
+  background: linear-gradient(90deg, var(--scorch-ember), var(--scorch-flame) 55%, var(--scorch-amber));
+  color: #fff;
+  font-weight: 500;
+}
+.bd-header-announcement a { color: #fff; text-decoration: underline; }
+
+/* ---- Logo sizing -------------------------------------------------------- */
+
+.navbar-brand img { height: 2rem; }
+
+/* ==========================================================================
+   Landing page hero
+   ========================================================================== */
+
+.scorch-hero {
+  text-align: center;
+  padding: 3.5rem 1rem 1.5rem;
+  margin: -1rem 0 1.5rem;
+  border-radius: 1rem;
+  background:
+    radial-gradient(60% 120% at 50% 0%, var(--scorch-hero-glow), transparent 70%);
+}
+
+.scorch-hero .scorch-hero-flame {
+  font-size: 3.25rem;
+  line-height: 1;
+  filter: drop-shadow(0 6px 18px var(--scorch-hero-glow));
+}
+
+.scorch-hero h1 {
+  font-size: clamp(2.4rem, 6vw, 3.6rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  margin: 0.5rem 0 0.25rem;
+  border: none;
+}
+
+.scorch-hero .scorch-gradient-text {
+  background: linear-gradient(100deg, var(--scorch-ember), var(--scorch-flame) 45%, var(--scorch-amber));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+.scorch-hero .scorch-tagline {
+  font-size: clamp(1.05rem, 2.4vw, 1.4rem);
+  font-weight: 400;
+  max-width: 46ch;
+  margin: 0.5rem auto 1.25rem;
+  color: var(--pst-color-text-muted);
+}
+
+.scorch-cta {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+
+.scorch-cta .scorch-btn {
+  display: inline-block;
+  padding: 0.6rem 1.4rem;
+  border-radius: 0.6rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: transform 0.08s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+.scorch-cta .scorch-btn:hover { transform: translateY(-1px); text-decoration: none; }
+
+.scorch-cta .scorch-btn-primary {
+  background: linear-gradient(100deg, var(--scorch-ember), var(--scorch-flame));
+  color: #fff;
+  box-shadow: 0 6px 16px var(--scorch-hero-glow);
+}
+.scorch-cta .scorch-btn-primary:hover { color: #fff; box-shadow: 0 8px 22px var(--scorch-hero-glow); }
+
+.scorch-cta .scorch-btn-secondary {
+  background: transparent;
+  color: var(--pst-color-primary);
+  border: 1.5px solid var(--pst-color-primary);
+}
+.scorch-cta .scorch-btn-secondary:hover { background: var(--scorch-hero-glow); }
+
+/* install one-liner pill under the hero */
+.scorch-install {
+  display: inline-block;
+  margin: 0.5rem auto 0;
+  font-family: var(--pst-font-family-monospace);
+  font-size: 0.95rem;
+}
+
+/* ==========================================================================
+   Feature cards (sphinx-design)
+   ========================================================================== */
+
+.bd-content .sd-card {
+  border: 1px solid var(--scorch-card-border);
+  border-radius: 0.8rem;
+  transition: transform 0.1s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+.bd-content .sd-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.08);
+  border-color: var(--pst-color-primary);
+}
+.bd-content .sd-card .sd-card-title {
+  font-weight: 700;
+  color: var(--pst-color-primary);
+}
+/* emoji/icon lead on cards */
+.scorch-card-icon { font-size: 1.6rem; line-height: 1; }
+
+/* Cards used as big navigation buttons on the landing page */
+a.scorch-nav-card,
+a.scorch-nav-card:hover { text-decoration: none; }
+
+/* ==========================================================================
+   Prose polish
+   ========================================================================== */
+
+/* Give the format-notation inline codes a touch more presence */
+code.literal { font-weight: 600; }
+
+/* Nicer horizontal rule between big sections */
+.bd-content hr {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--scorch-card-border), transparent);
+  margin: 2rem 0;
+}
+
+/* Tables: a hint of warmth in the header row */
+.bd-content table.table thead th {
+  border-bottom: 2px solid var(--pst-color-primary);
+}
+
+/* Admonitions: align the "note/tip" accent with the brand where sensible */
+.bd-content div.admonition.tip,
+.bd-content div.admonition.hint {
+  border-color: var(--scorch-amber);
+}
+.bd-content div.admonition.tip > .admonition-title,
+.bd-content div.admonition.hint > .admonition-title {
+  background-color: rgba(249, 151, 59, 0.12);
+}
+
+/* Keep wide code / tables from breaking the page layout */
+.bd-content div.highlight pre { overflow-x: auto; }
+
+/* Compact the API signature blocks a touch */
+dl.py dt.sig {
+  background: var(--pst-color-surface);
+  border-left: 3px solid var(--pst-color-primary);
+  padding: 0.4rem 0.6rem;
+  border-radius: 0 0.3rem 0.3rem 0;
+}
+
+/* "Key" / kbd styling for keyboard hints */
+kbd, .kbd {
+  border: 1px solid var(--scorch-card-border);
+  border-bottom-width: 2px;
+  border-radius: 0.3rem;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.85em;
+}

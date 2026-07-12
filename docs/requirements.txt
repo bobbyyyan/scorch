@@ -1,0 +1,24 @@
+# Documentation build dependencies for the Scorch docs site.
+#
+# The API reference is generated from source docstrings via autodoc, so the
+# build imports the `scorch` package. It does NOT require the compiled
+# `scorch_ops` extension (that is mocked in conf.py) or a C++ toolchain, but it
+# does need `torch` (CPU is fine) plus the `scorch` sources on the path
+# (conf.py adds ../../src automatically — no install/compile step needed).
+#
+# In the local `scorch` conda env `torch` is already present, so
+# `pip install -r requirements.txt && make html` works out of the box.
+#
+# `torch` is intentionally NOT pinned here: on PyPI the default wheel is a large
+# CUDA build. The local env already provides it, and CI / ReadTheDocs install a
+# CPU-only wheel explicitly (see .github/workflows/docs.yml and
+# .readthedocs.yaml). If you are in a bare environment, first run:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+sphinx>=7.2,<9
+pydata-sphinx-theme>=0.15
+myst-parser>=2.0
+sphinx-design>=0.5
+sphinx-copybutton>=0.5
+sphinxext-opengraph>=0.9
+sphinxcontrib-mermaid>=0.9
+linkify-it-py>=2.0
