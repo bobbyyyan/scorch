@@ -1,13 +1,13 @@
-"""Minimal typed runners for the four extracted current-LLIR passes.
+"""Minimal typed runners for the five extracted current-LLIR passes.
 
 The production pass graph is intentionally not represented as one linear
 pipeline.  Dynamic-vector rewriting is a top-level step over the assembled
 function body.  Compressed ``Where`` lowering is a top-level step during outer
 loop lowering, and it internally runs independent result-write ``count`` and
 ``fill`` transformations over the same original work body.  Sparse prefetching
-accepts only the recursively lowered statement list before the remaining inline
-optimizations.  Dedicated runner methods preserve those different contracts and
-make unsupported composition unrepresentable.
+and dense-pointer hoisting accept only the recursively lowered statement list
+before the remaining inline optimizations.  Dedicated runner methods preserve
+those different contracts and make unsupported composition unrepresentable.
 
 The configuration and artifact carriers are frozen, but the legacy LLIR
 payloads remain mutable.  Every non-empty pass returns a detached tree through
@@ -29,6 +29,10 @@ from .dynamic_vector_access_pass import (
     DynamicVectorAccessConfig,
     DynamicVectorAccessContext,
     rewrite_dynamic_vector_accesses,
+)
+from .dense_pointer_hoist_pass import (
+    DensePointerHoistContext,
+    hoist_dense_pointers,
 )
 from .llir_traversal import (
     LLIRRewriter,
@@ -66,6 +70,7 @@ class LLIRPassContextType(Enum):
     RESULT_WRITE = "result_write_context"
     COMPRESSED_WHERE_OPENMP = "compressed_where_openmp_context"
     SPARSE_PREFETCH = "sparse_prefetch_context"
+    DENSE_POINTER_HOIST = "dense_pointer_hoist_context"
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,14 @@ SPARSE_PREFETCH_PASS = LLIRPassDescriptor(
     context_type=LLIRPassContextType.SPARSE_PREFETCH,
 )
 
+DENSE_POINTER_HOIST_PASS = LLIRPassDescriptor(
+    name="hoist_dense_pointers",
+    version=1,
+    input_artifact=LLIRPassArtifactType.STATEMENT_LIST,
+    output_artifact=LLIRPassArtifactType.STATEMENT_LIST,
+    context_type=LLIRPassContextType.DENSE_POINTER_HOIST,
+)
+
 
 @dataclass(frozen=True)
 class DynamicVectorAccessPassSpec:
@@ -142,6 +155,14 @@ class SparsePrefetchPassSpec:
 
     context: SparsePrefetchContext = SPARSE_PREFETCH_CONTEXT
     descriptor: LLIRPassDescriptor = SPARSE_PREFETCH_PASS
+
+
+@dataclass(frozen=True)
+class DensePointerHoistPassSpec:
+    """One immutable dense-pointer-hoist configuration snapshot."""
+
+    context: DensePointerHoistContext
+    descriptor: LLIRPassDescriptor = DENSE_POINTER_HOIST_PASS
 
 
 @dataclass(frozen=True)
@@ -361,6 +382,61 @@ def _validate_sparse_prefetch_context(context: object) -> SparsePrefetchContext:
     return typed_context
 
 
+def _validate_dense_pointer_hoist_context(
+    context: object,
+) -> DensePointerHoistContext:
+    if type(context) is not DensePointerHoistContext:
+        _raise_manager_error(
+            code="invalid_pass_context",
+            message="dense-pointer runner requires DensePointerHoistContext",
+            sequence_index=0,
+            descriptor=DENSE_POINTER_HOIST_PASS,
+        )
+    typed_context = cast(DensePointerHoistContext, context)
+    _validate_traversal_context(
+        typed_context.traversal,
+        descriptor=DENSE_POINTER_HOIST_PASS,
+    )
+    entries = cast(object, typed_context.value_array_ctypes)
+    if type(entries) is not tuple:
+        _raise_manager_error(
+            code="invalid_pass_context",
+            message="dense-pointer C-type mapping must be an immutable tuple",
+            sequence_index=0,
+            descriptor=DENSE_POINTER_HOIST_PASS,
+        )
+    seen_names: set[str] = set()
+    for entry in cast(Tuple[object, ...], entries):
+        if type(entry) is not tuple or len(entry) != 2:
+            _raise_manager_error(
+                code="invalid_pass_context",
+                message="dense-pointer C-type mapping entries must be exact pairs",
+                sequence_index=0,
+                descriptor=DENSE_POINTER_HOIST_PASS,
+            )
+        name, c_type = cast(Tuple[object, object], entry)
+        if type(name) is not str or not name or type(c_type) is not str or not c_type:
+            _raise_manager_error(
+                code="invalid_pass_context",
+                message=(
+                    "dense-pointer C-type mapping names and types must be "
+                    "non-empty strings"
+                ),
+                sequence_index=0,
+                descriptor=DENSE_POINTER_HOIST_PASS,
+            )
+        typed_name = cast(str, name)
+        if typed_name in seen_names:
+            _raise_manager_error(
+                code="invalid_pass_context",
+                message="dense-pointer C-type mapping names must be unique",
+                sequence_index=0,
+                descriptor=DENSE_POINTER_HOIST_PASS,
+            )
+        seen_names.add(typed_name)
+    return typed_context
+
+
 def _record(
     *,
     descriptor: LLIRPassDescriptor,
@@ -468,6 +544,49 @@ class LLIRPassManager:
             descriptor=SPARSE_PREFETCH_PASS,
             traversal=traversal,
             configuration_name="sparse_prefetch",
+            options=self.options,
+            started_ns=started_ns,
+        )
+        return LLIRStatementListPassResult(
+            LLIRStatementListArtifact(output),
+            (record,),
+        )
+
+    def run_dense_pointer_hoist(
+        self,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: DensePointerHoistPassSpec,
+    ) -> LLIRStatementListPassResult:
+        """Run dense-pointer hoisting over an exact statement-list root."""
+
+        self._validate_options()
+        if type(artifact) is not LLIRStatementListArtifact:
+            _raise_manager_error(
+                code="invalid_pass_artifact",
+                message="dense-pointer runner requires LLIRStatementListArtifact",
+                sequence_index=0,
+                descriptor=DENSE_POINTER_HOIST_PASS,
+            )
+        if type(pass_spec) is not DensePointerHoistPassSpec:
+            _raise_manager_error(
+                code="unknown_pass_spec",
+                message="dense-pointer runner requires its exact pass specification",
+                sequence_index=0,
+                descriptor=DENSE_POINTER_HOIST_PASS,
+            )
+        _validate_descriptor(pass_spec.descriptor, DENSE_POINTER_HOIST_PASS)
+        context = _validate_dense_pointer_hoist_context(pass_spec.context)
+        traversal = context.traversal
+        started_ns = perf_counter_ns() if self.options.record_timing else None
+        if self.options.verify_before_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, artifact.statements))
+        output = hoist_dense_pointers(artifact.statements, context)
+        if self.options.verify_after_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, output))
+        record = _record(
+            descriptor=DENSE_POINTER_HOIST_PASS,
+            traversal=traversal,
+            configuration_name="dense_pointer_hoist",
             options=self.options,
             started_ns=started_ns,
         )

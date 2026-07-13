@@ -18,14 +18,20 @@ from scorch.compiler.dynamic_vector_access_pass import (
     DynamicVectorAccessContext,
     rewrite_dynamic_vector_accesses,
 )
+from scorch.compiler.dense_pointer_hoist_pass import (
+    DensePointerHoistContext,
+    hoist_dense_pointers,
+)
 from scorch.compiler.llir_pass_manager import (
     COMPRESSED_WHERE_OPENMP_PASS,
     DEBUG_LLIR_PASS_OPTIONS,
+    DENSE_POINTER_HOIST_PASS,
     DYNAMIC_VECTOR_ACCESS_PASS,
     PRODUCTION_LLIR_PASS_OPTIONS,
     RESULT_WRITE_PASS,
     SPARSE_PREFETCH_PASS,
     CompressedWhereOpenMPPassSpec,
+    DensePointerHoistPassSpec,
     DynamicVectorAccessPassSpec,
     LLIRPassArtifactType,
     LLIRPassContextType,
@@ -75,6 +81,10 @@ def _compressed_context() -> CompressedWhereOpenMPContext:
         workspace_name="wksp",
         workspace_ctype="float",
     )
+
+
+def _dense_context() -> DensePointerHoistContext:
+    return DensePointerHoistContext((("Input_val", "float"),))
 
 
 def _compatible_loop(body: List[llir.Stmt]) -> llir.ForLoop:
@@ -162,6 +172,8 @@ def test_all_manager_configuration_artifact_and_result_carriers_are_frozen() -> 
     result_spec = ResultWritePassSpec(_result_context())
     compressed_spec = CompressedWhereOpenMPPassSpec(_compressed_context())
     sparse_prefetch_spec = SparsePrefetchPassSpec()
+    dense_context = _dense_context()
+    dense_spec = DensePointerHoistPassSpec(dense_context)
     rewrite_artifact = LLIRRewriteArtifact([llir.BlankLine()])
     statement_artifact = LLIRStatementListArtifact([llir.BlankLine()])
     record = _record(1)
@@ -180,6 +192,8 @@ def test_all_manager_configuration_artifact_and_result_carriers_are_frozen() -> 
         (result_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (compressed_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (sparse_prefetch_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
+        (dense_context, "value_array_ctypes", ()),
+        (dense_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (rewrite_artifact, "value", []),
         (statement_artifact, "statements", []),
         (record, "duration_ns", 2),
@@ -221,6 +235,13 @@ def test_stable_descriptors_expose_exact_artifact_and_context_types() -> None:
         LLIRPassArtifactType.STATEMENT_LIST,
         LLIRPassArtifactType.STATEMENT_LIST,
         LLIRPassContextType.SPARSE_PREFETCH,
+    )
+    assert DENSE_POINTER_HOIST_PASS == LLIRPassDescriptor(
+        "hoist_dense_pointers",
+        1,
+        LLIRPassArtifactType.STATEMENT_LIST,
+        LLIRPassArtifactType.STATEMENT_LIST,
+        LLIRPassContextType.DENSE_POINTER_HOIST,
     )
 
 
@@ -472,6 +493,16 @@ def test_each_runner_preserves_its_original_structured_diagnostic() -> None:
         )
     assert managed_compressed.value.diagnostic == direct_compressed.value.diagnostic
 
+    dense_context = _dense_context()
+    with pytest.raises(LLIRTraversalError) as direct_dense:
+        hoist_dense_pointers(source, dense_context)
+    with pytest.raises(LLIRTraversalError) as managed_dense:
+        manager.run_dense_pointer_hoist(
+            LLIRStatementListArtifact(source),
+            DensePointerHoistPassSpec(dense_context),
+        )
+    assert managed_dense.value.diagnostic == direct_dense.value.diagnostic
+
 
 def test_unknown_descriptor_artifact_spec_and_context_combinations_fail_closed() -> (
     None
@@ -515,6 +546,18 @@ def test_unknown_descriptor_artifact_spec_and_context_combinations_fail_closed()
             statement_artifact,
             SparsePrefetchPassSpec(context=cast(SparsePrefetchContext, object())),
         ),
+        lambda: manager.run_dense_pointer_hoist(
+            cast(LLIRStatementListArtifact, rewrite_artifact),
+            DensePointerHoistPassSpec(_dense_context()),
+        ),
+        lambda: manager.run_dense_pointer_hoist(
+            statement_artifact,
+            cast(DensePointerHoistPassSpec, object()),
+        ),
+        lambda: manager.run_dense_pointer_hoist(
+            statement_artifact,
+            DensePointerHoistPassSpec(context=cast(DensePointerHoistContext, object())),
+        ),
     )
     for invalid in invalid_calls:
         with pytest.raises(LLIRPassManagerError):
@@ -536,11 +579,15 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
     result_spec = ResultWritePassSpec(_result_context())
     compressed_artifact = LLIRStatementListArtifact([llir.BlankLine()])
     compressed_spec = CompressedWhereOpenMPPassSpec(_compressed_context())
+    dense_spec = DensePointerHoistPassSpec(_dense_context())
 
     production = LLIRPassManager(PRODUCTION_LLIR_PASS_OPTIONS)
     production_dynamic = production.run_dynamic_vector_access(rewrite_artifact)
     production_result = production.run_result_write(rewrite_artifact, result_spec)
     production_sparse_prefetch = production.run_sparse_prefetch(compressed_artifact)
+    production_dense = production.run_dense_pointer_hoist(
+        compressed_artifact, dense_spec
+    )
     production_compressed = production.run_compressed_where_openmp(
         compressed_artifact, compressed_spec
     )
@@ -551,6 +598,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
             *production_dynamic.run_records,
             *production_result.run_records,
             *production_sparse_prefetch.run_records,
+            *production_dense.run_records,
             *production_compressed.run_records,
         )
     )
@@ -559,6 +607,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
     debug_dynamic = debug.run_dynamic_vector_access(rewrite_artifact)
     debug_result = debug.run_result_write(rewrite_artifact, result_spec)
     debug_sparse_prefetch = debug.run_sparse_prefetch(compressed_artifact)
+    debug_dense = debug.run_dense_pointer_hoist(compressed_artifact, dense_spec)
     debug_compressed = debug.run_compressed_where_openmp(
         compressed_artifact, compressed_spec
     )
@@ -569,6 +618,8 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
         ("LLIR rewrite", "rewrite_result_writes"),
         ("LLIR transformation", "insert_sparse_prefetch"),
         ("LLIR transformation", "insert_sparse_prefetch"),
+        ("LLIR transformation", "hoist_dense_pointers"),
+        ("LLIR transformation", "hoist_dense_pointers"),
         ("LLIR transformation", "transform_compressed_where_for_openmp"),
         ("LLIR transformation", "transform_compressed_where_for_openmp"),
     ]
@@ -578,6 +629,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
             *debug_dynamic.run_records,
             *debug_result.run_records,
             *debug_sparse_prefetch.run_records,
+            *debug_dense.run_records,
             *debug_compressed.run_records,
         )
     )
