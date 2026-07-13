@@ -33,8 +33,6 @@ from .llir_traversal import (
     LLIRTraversalContext,
     LLIRTraversalDiagnostic,
     LLIRTraversalError,
-    LLIRValue,
-    LLIRWalker,
 )
 
 SPARSE_PREFETCH_TRAVERSAL_CONTEXT = LLIRTraversalContext(
@@ -151,7 +149,6 @@ def _validate_root(
                 path=("root", f"[{index}]"),
                 value=statement,
             )
-    LLIRWalker(context.traversal).walk(cast(LLIRValue, typed_statements))
     return typed_statements
 
 
@@ -447,5 +444,4 @@ def insert_sparse_prefetch(
         LLIRRewriter(checked_context.traversal).rewrite(checked_statements),
     )
     _insert_in_for_loop_bodies(detached, checked_context, ("root",))
-    LLIRWalker(checked_context.traversal).walk(cast(LLIRValue, detached))
     return cast(List[llir.Stmt], detached)
