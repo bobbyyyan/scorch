@@ -32,6 +32,7 @@ from .dynamic_vector_access_pass import (
     DYNAMIC_VECTOR_ACCESS_CONTEXT,
     rewrite_dynamic_vector_accesses,
 )
+from .result_write_pass import ResultWriteContext, rewrite_result_writes
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -2702,304 +2703,6 @@ class CINLowerer:
         )
         return has_sparse_input
 
-    @staticmethod
-    def _transform_result_writes(
-        stmts: List[llir.Stmt],
-        result_name: str,
-        compressed_levels: List[int],
-        mode: str,
-    ) -> List[llir.Stmt]:
-        """Recursively walk LLIR statements and transform result-tensor writes.
-
-        *mode* is ``'count'`` (Phase 1 – replace writes with counter increments)
-        or ``'fill'`` (Phase 3 – replace writes with raw-pointer array stores).
-
-        *compressed_levels* is a sorted list of compressed level numbers,
-        e.g. ``[1]`` for 2-D ``ds`` or ``[1, 2]`` for 3-D ``dss``.
-        """
-        from .codegen import LLIRLowerer
-
-        _cg = LLIRLowerer()
-
-        leaf = compressed_levels[-1]
-        new: List[llir.Stmt] = []
-
-        for stmt in stmts:
-            # ── Assign to result arrays ────────────────────────────────
-            if isinstance(stmt, llir.Assign):
-                vname = getattr(getattr(stmt, "var", None), "name", "")
-
-                # C_values[pCl] = val
-                if f"{result_name}_values[" in vname:
-                    if mode == "count":
-                        continue
-                    val = _cg.lower_llir(stmt.value)
-                    new.append(
-                        llir.RawStmt(
-                            code=f"{result_name}_values_data[_base{leaf} + _pos{leaf}] = {val}"
-                        )
-                    )
-                    continue
-
-                # C{l}_crd[pCl] = coord
-                matched = None
-                for l in compressed_levels:
-                    if f"{result_name}{l}_crd[" in vname:
-                        matched = l
-                        break
-                if matched is not None:
-                    if mode == "count":
-                        new.append(llir.RawStmt(code=f"_cnt{matched}++"))
-                    else:
-                        val = _cg.lower_llir(stmt.value)
-                        new.append(
-                            llir.RawStmt(
-                                code=f"{result_name}{matched}_crd_data"
-                                f"[_base{matched} + _pos{matched}] = {val}"
-                            )
-                        )
-                    continue
-
-                # C{l}_pos[...] = C{l}_crd.size()  (pos boundary update)
-                skip = False
-                for l in compressed_levels:
-                    if f"{result_name}{l}_pos[" in vname:
-                        skip = True
-                        break
-                if skip:
-                    continue  # handled by IfThenElse transform
-
-                new.append(stmt)
-                continue
-
-            # ── Increment pC{l} ────────────────────────────────────────
-            if isinstance(stmt, llir.Increment):
-                vname = getattr(getattr(stmt, "var", None), "name", "")
-                handled = False
-                for l in compressed_levels:
-                    if vname == f"p{result_name}{l}":
-                        if mode == "fill":
-                            new.append(llir.RawStmt(code=f"_pos{l}++"))
-                        # count → remove
-                        handled = True
-                        break
-                if not handled:
-                    new.append(stmt)
-                continue
-
-            # ── FunctionCallStmt ───────────────────────────────────────
-            if isinstance(stmt, llir.FunctionCallStmt):
-                fname = getattr(stmt, "name", "")
-
-                # C{l}_crd.push_back(coord)
-                push_matched = None
-                for l in compressed_levels:
-                    if fname == f"{result_name}{l}_crd.push_back":
-                        push_matched = l
-                        break
-                if push_matched is not None:
-                    l = push_matched
-                    if mode == "count":
-                        new.append(llir.RawStmt(code=f"_cnt{l}++"))
-                    else:
-                        arg = _cg.lower_llir(stmt.args[0]) if stmt.args else "0"
-                        new.append(
-                            llir.RawStmt(
-                                code=f"{result_name}{l}_crd_data"
-                                f"[_base{l} + _pos{l}] = {arg}"
-                            )
-                        )
-                        new.append(llir.RawStmt(code=f"_pos{l}++"))
-                        # pos boundary for next compressed level
-                        idx = compressed_levels.index(l)
-                        if idx + 1 < len(compressed_levels):
-                            nl = compressed_levels[idx + 1]
-                            new.append(
-                                llir.RawStmt(
-                                    code=f"{result_name}{nl}_pos_data"
-                                    f"[_base{l} + _pos{l}] = "
-                                    f"_base{nl} + _pos{nl}"
-                                )
-                            )
-                    continue
-
-                # C_values.push_back(val)
-                if fname == f"{result_name}_values.push_back":
-                    if mode == "fill":
-                        arg = _cg.lower_llir(stmt.args[0]) if stmt.args else "0"
-                        new.append(
-                            llir.RawStmt(
-                                code=f"{result_name}_values_data"
-                                f"[_base{leaf} + _pos{leaf}] = {arg}"
-                            )
-                        )
-                    continue
-
-                # wksp.sort()
-                if ".sort" in fname:
-                    if mode == "fill":
-                        new.append(stmt)
-                    continue  # count → skip
-
-                # everything else
-                new.append(stmt)
-                continue
-
-            # ── VarInit for pC{l} ──────────────────────────────────────
-            if isinstance(stmt, llir.VarInit):
-                vname = getattr(getattr(stmt, "var", None), "name", "")
-                skip = False
-                for l in compressed_levels:
-                    if vname == f"p{result_name}{l}":
-                        skip = True
-                        break
-                if skip:
-                    continue
-                new.append(stmt)
-                continue
-
-            # ── IfThenElse: C{l}_pos.back() < pC{l}  ──────────────────
-            if isinstance(stmt, llir.IfThenElse):
-                cond = stmt.cond
-                matched = None
-                if (
-                    isinstance(cond, llir.BinOp)
-                    and cond.op == "<"
-                    and isinstance(cond.left, llir.FunctionCall)
-                ):
-                    for l in compressed_levels:
-                        if cond.left.name == f"{result_name}{l}_pos.back":
-                            matched = l
-                            break
-                if matched is not None:
-                    l = matched
-                    # parent compressed level (if any)
-                    idx = compressed_levels.index(l)
-                    parent_l = compressed_levels[idx - 1] if idx > 0 else None
-
-                    if mode == "count":
-                        cnt_var = f"_cnt{l}"
-                        prev_var = f"_prev{l}"
-                        then = []
-                        if parent_l is not None:
-                            then.append(llir.RawStmt(code=f"_cnt{parent_l}++"))
-                        then.append(llir.RawStmt(code=f"{prev_var} = {cnt_var}"))
-                        new.append(
-                            llir.IfThenElse(
-                                cond=llir.BinOp(
-                                    op=">",
-                                    left=llir.Var(
-                                        name=cnt_var, type=llir.DataType.INT64
-                                    ),
-                                    right=llir.Var(
-                                        name=prev_var, type=llir.DataType.INT64
-                                    ),
-                                ),
-                                then_body=then,
-                            )
-                        )
-                    else:  # fill
-                        pos_var = f"_pos{l}"
-                        prev_var = f"_prev{l}"
-                        then = []
-                        # extract coord from push_back in serial then_body
-                        coord = None
-                        if stmt.then_body:
-                            for tb in stmt.then_body:
-                                if (
-                                    isinstance(tb, llir.FunctionCallStmt)
-                                    and ".push_back" in tb.name
-                                    and tb.args
-                                ):
-                                    coord = _cg.lower_llir(tb.args[0])
-                                    break
-                        if parent_l is not None and coord is not None:
-                            then.append(
-                                llir.RawStmt(
-                                    code=f"{result_name}{parent_l}_crd_data"
-                                    f"[_base{parent_l} + _pos{parent_l}] = "
-                                    f"{coord}"
-                                )
-                            )
-                            then.append(llir.RawStmt(code=f"_pos{parent_l}++"))
-                            then.append(
-                                llir.RawStmt(
-                                    code=f"{result_name}{l}_pos_data"
-                                    f"[_base{parent_l} + _pos{parent_l}] = "
-                                    f"_base{l} + {pos_var}"
-                                )
-                            )
-                        then.append(llir.RawStmt(code=f"{prev_var} = {pos_var}"))
-                        new.append(
-                            llir.IfThenElse(
-                                cond=llir.BinOp(
-                                    op=">",
-                                    left=llir.Var(
-                                        name=pos_var, type=llir.DataType.INT64
-                                    ),
-                                    right=llir.Var(
-                                        name=prev_var, type=llir.DataType.INT64
-                                    ),
-                                ),
-                                then_body=then,
-                            )
-                        )
-                    continue
-                else:
-                    # Not a result assembly if-block – recurse into bodies
-                    if stmt.then_body:
-                        stmt.then_body = CINLowerer._transform_result_writes(
-                            stmt.then_body, result_name, compressed_levels, mode
-                        )
-                    if stmt.else_body:
-                        stmt.else_body = CINLowerer._transform_result_writes(
-                            stmt.else_body, result_name, compressed_levels, mode
-                        )
-                    if stmt.then_body_list:
-                        stmt.then_body_list = [
-                            CINLowerer._transform_result_writes(
-                                b, result_name, compressed_levels, mode
-                            )
-                            for b in stmt.then_body_list
-                        ]
-                    new.append(stmt)
-                    continue
-
-            # ── Recurse into loops ─────────────────────────────────────
-            if isinstance(stmt, llir.ForLoop):
-                stmt.body = CINLowerer._transform_result_writes(
-                    stmt.body, result_name, compressed_levels, mode
-                )
-                if stmt.pre_parallel_body:
-                    stmt.pre_parallel_body = CINLowerer._transform_result_writes(
-                        stmt.pre_parallel_body, result_name, compressed_levels, mode
-                    )
-                if stmt.post_parallel_body:
-                    stmt.post_parallel_body = CINLowerer._transform_result_writes(
-                        stmt.post_parallel_body, result_name, compressed_levels, mode
-                    )
-                new.append(stmt)
-                continue
-
-            if isinstance(stmt, llir.ForLoopAuto):
-                stmt.body = CINLowerer._transform_result_writes(
-                    stmt.body, result_name, compressed_levels, mode
-                )
-                new.append(stmt)
-                continue
-
-            if isinstance(stmt, llir.WhileLoop):
-                stmt.body = CINLowerer._transform_result_writes(
-                    stmt.body, result_name, compressed_levels, mode
-                )
-                new.append(stmt)
-                continue
-
-            # ── Default: keep ──────────────────────────────────────────
-            new.append(stmt)
-
-        return new
-
     def _transform_compressed_where_for_openmp(
         self, stmts: List[llir.Stmt]
     ) -> List[llir.Stmt]:
@@ -3110,9 +2813,13 @@ class CINLowerer:
         for l in compressed_levels[1:]:
             phase1_body.append(llir.RawStmt(code=f"int _prev{l} = 0"))
 
-        p1_work = copy.deepcopy(work_body)
-        p1_work = self._transform_result_writes(
-            p1_work, result_name, compressed_levels, "count"
+        p1_work = rewrite_result_writes(
+            work_body,
+            ResultWriteContext(
+                result_name=result_name,
+                compressed_levels=tuple(compressed_levels),
+                mode="count",
+            ),
         )
         phase1_body.extend(p1_work)
 
@@ -3151,9 +2858,13 @@ class CINLowerer:
         for l in compressed_levels[1:]:
             phase3_body.append(llir.RawStmt(code=f"int _prev{l} = 0"))
 
-        p3_work = copy.deepcopy(work_body)
-        p3_work = self._transform_result_writes(
-            p3_work, result_name, compressed_levels, "fill"
+        p3_work = rewrite_result_writes(
+            work_body,
+            ResultWriteContext(
+                result_name=result_name,
+                compressed_levels=tuple(compressed_levels),
+                mode="fill",
+            ),
         )
         phase3_body.extend(p3_work)
 
