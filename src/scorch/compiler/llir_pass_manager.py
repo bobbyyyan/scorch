@@ -169,7 +169,11 @@ class LLIRRewriteArtifact(Generic[LLIRRewriteValueT]):
 
 @dataclass(frozen=True)
 class LLIRStatementListArtifact:
-    """Frozen owner label for the compressed pass's exact statement-list root."""
+    """Frozen owner label for an exact current-LLIR statement-list root.
+
+    Legacy payloads may contain nested list/tuple statement sequences even
+    though the outer artifact category remains exactly a list.
+    """
 
     statements: list[llir.Stmt]
 

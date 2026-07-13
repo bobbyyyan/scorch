@@ -12,9 +12,11 @@ The common LLIR boundary validates and detaches the complete input tree.  The
 semantic scan remains deliberately narrower: it follows only chains of direct
 ``ForLoop.body`` children, processes nested loops before their containing loop,
 and does not enter conditionals, switches, functions, or auxiliary parallel
-regions.  A legal structural miss is a detached no-op.  Reapplying the complete
-pass inserts another identical group of prefetch statements, matching the
-characterized non-idempotent legacy behavior.
+regions.  The root must be an exact list; nested list/tuple members admitted by
+the current LLIR statement-sequence contract are validated and detached but are
+also semantically omitted.  A legal structural miss is a detached no-op.
+Reapplying the complete pass inserts another identical group of prefetch
+statements, matching the characterized non-idempotent legacy behavior.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from . import llir
 from .llir_traversal import (
     LLIRPath,
     LLIRRewriter,
+    LLIRStatementValue,
     LLIRTraversalContext,
     LLIRTraversalDiagnostic,
     LLIRTraversalError,
@@ -121,7 +124,7 @@ def _validate_context(context: object) -> SparsePrefetchContext:
 
 def _validate_root(
     statements: object, context: SparsePrefetchContext
-) -> List[llir.Stmt]:
+) -> List[LLIRStatementValue]:
     if type(statements) is not list:
         _raise_sparse_prefetch_error(
             context,
@@ -131,13 +134,20 @@ def _validate_root(
             value=statements,
         )
 
-    typed_statements = cast(List[llir.Stmt], statements)
+    typed_statements = cast(List[LLIRStatementValue], statements)
     for index, statement in enumerate(typed_statements):
-        if not isinstance(statement, llir.Stmt):
+        if (
+            not isinstance(statement, llir.Stmt)
+            and type(statement) is not list
+            and type(statement) is not tuple
+        ):
             _raise_sparse_prefetch_error(
                 context,
                 code="invalid_sparse_prefetch_root_member",
-                message="the top-level list may contain only LLIR statements",
+                message=(
+                    "the top-level list may contain only LLIR statements or "
+                    "nested statement lists/tuples"
+                ),
                 path=("root", f"[{index}]"),
                 value=statement,
             )
@@ -433,9 +443,9 @@ def insert_sparse_prefetch(
     checked_context = _validate_context(context)
     checked_statements = _validate_root(statements, checked_context)
     detached = cast(
-        List[llir.Stmt],
+        List[LLIRStatementValue],
         LLIRRewriter(checked_context.traversal).rewrite(checked_statements),
     )
     _insert_in_for_loop_bodies(detached, checked_context, ("root",))
     LLIRWalker(checked_context.traversal).walk(cast(LLIRValue, detached))
-    return detached
+    return cast(List[llir.Stmt], detached)

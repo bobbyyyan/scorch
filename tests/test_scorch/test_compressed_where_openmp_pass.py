@@ -859,12 +859,14 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
         "transform_compressed_where_for_openmp",
         "rewrite_result_writes",
         "rewrite_result_writes",
+        "insert_sparse_prefetch",
         "rewrite_dynamic_vector_accesses",
     ]
     assert [record.configuration_name for record in lowerer.llir_pass_run_records] == [
         "compressed_where_openmp",
         "count",
         "fill",
+        "sparse_prefetch",
         "dynamic_vector_access",
     ]
     assert [record.sequence_index for record in lowerer.llir_pass_run_records] == [
@@ -872,6 +874,7 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
         1,
         2,
         3,
+        4,
     ]
     assert all(
         not record.verified_before and not record.verified_after
@@ -933,5 +936,6 @@ def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
         "compressed_where_openmp",
         "count",
         "fill",
+        "sparse_prefetch",
         "dynamic_vector_access",
     ]

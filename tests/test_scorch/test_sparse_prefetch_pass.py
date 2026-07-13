@@ -1,34 +1,42 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+import hashlib
 from time import perf_counter_ns
-from typing import Callable, List, Set, Tuple, cast
+from typing import Callable, List, NoReturn, Set, Tuple, cast
 
 import pytest
 
 from scorch.compiler import llir
 import scorch.compiler.llir_pass_manager as pass_manager_module
+from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
+from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.llir_pass_manager import (
     DEBUG_LLIR_PASS_OPTIONS,
     PRODUCTION_LLIR_PASS_OPTIONS,
     SPARSE_PREFETCH_PASS,
+    DynamicVectorAccessPassSpec,
     LLIRPassArtifactType,
     LLIRPassContextType,
     LLIRPassDescriptor,
     LLIRPassManager,
     LLIRPassManagerError,
     LLIRPassOptions,
+    LLIRRewriteArtifact,
+    LLIRRewritePassResult,
     LLIRStatementListArtifact,
     LLIRStatementListPassResult,
     SparsePrefetchPassSpec,
 )
 from scorch.compiler.llir_traversal import (
     LLIRTraversalContext,
+    LLIRTraversalDiagnostic,
     LLIRTraversalError,
     LLIRValue,
     LLIRWalker,
 )
+from scorch.compiler.scheduler import Scheduler
 from scorch.compiler.sparse_prefetch_pass import (
     SPARSE_PREFETCH_CONTEXT,
     SPARSE_PREFETCH_TRAVERSAL_CONTEXT,
@@ -409,6 +417,10 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
     return [
         ("empty", []),
         ("non-loop", [llir.BlankLine()]),
+        (
+            "nested root statement sequence is semantically omitted",
+            cast(List[llir.Stmt], [[_sparse_loop()]]),
+        ),
         ("non-sparse init spelling", [non_sparse]),
         ("non-binary condition", [wrong_condition]),
         ("unnamed condition rhs", [unnamed_end]),
@@ -750,3 +762,253 @@ def test_sparse_prefetch_incremental_manager_plumbing_p95_is_below_one_ms() -> N
         incremental_ns.append(managed_elapsed - direct_elapsed)
 
     assert _p95(incremental_ns) <= 1_000_000
+
+
+def _build_activating_spmm_cin() -> ForAll:
+    row, reduction, column = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    result = TensorVar("C", fmt="dd")
+    left = TensorVar("A", fmt="ds")
+    right = TensorVar("B", fmt="dd")
+    assignment = TensorAssign(
+        result[row, column],
+        left[row, reduction] * right[reduction, column],
+        op=Operation.ADD,
+    )
+    return cast(
+        ForAll,
+        Scheduler.auto_schedule(
+            ForAll(row, ForAll(reduction, ForAll(column, assignment)))
+        ),
+    )
+
+
+def _build_compressed_ds_cin() -> ForAll:
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("SparseProduct", fmt="ds")
+    left = TensorVar("SparseLeft", fmt="ds")
+    right = TensorVar("SparseRight", fmt="ds")
+    assignment = TensorAssign(
+        result[row, column],
+        left[row, reduction] * right[reduction, column],
+        op=Operation.ADD,
+    )
+    return cast(
+        ForAll,
+        Scheduler.auto_schedule(
+            ForAll(row, ForAll(reduction, ForAll(column, assignment)))
+        ),
+    )
+
+
+def _all_raw_codes(value: object) -> List[str]:
+    codes: List[str] = []
+    if type(value) is llir.RawStmt:
+        codes.append(cast(llir.RawStmt, value).code)
+    elif isinstance(value, llir.Node):
+        for child in vars(value).values():
+            codes.extend(_all_raw_codes(child))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            codes.extend(_all_raw_codes(child))
+    return codes
+
+
+def test_production_routes_the_detached_list_at_the_original_optimization_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: List[str] = []
+    detached_sparse_output: List[List[llir.Stmt]] = []
+    original_sparse = LLIRPassManager.run_sparse_prefetch
+    original_dynamic = LLIRPassManager.run_dynamic_vector_access
+    original_dense = CINLowerer._hoist_dense_pointers
+    original_single = CINLowerer._eliminate_single_iteration_loops
+    original_factor = CINLowerer._hoist_loop_invariant_factors
+    dense_depth = 0
+    single_depth = 0
+    factor_depth = 0
+
+    def record_sparse(
+        manager: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SparsePrefetchPassSpec = SparsePrefetchPassSpec(),
+    ) -> LLIRStatementListPassResult:
+        events.append("sparse_prefetch")
+        assert not any(
+            "validate_jit_tensor" in code
+            for code in _all_raw_codes(artifact.statements)
+        )
+        result = original_sparse(manager, artifact, pass_spec)
+        assert _mutable_ir_ids(artifact.statements).isdisjoint(
+            _mutable_ir_ids(result.artifact.statements)
+        )
+        detached_sparse_output.append(result.artifact.statements)
+        return result
+
+    def record_dense(lowerer: CINLowerer, statements: List[llir.Stmt]) -> None:
+        nonlocal dense_depth
+        if dense_depth == 0:
+            events.append("dense_pointer")
+            assert statements is detached_sparse_output[0]
+        dense_depth += 1
+        try:
+            original_dense(lowerer, statements)
+        finally:
+            dense_depth -= 1
+
+    def record_single(statements: List[llir.Stmt]) -> None:
+        nonlocal single_depth
+        if single_depth == 0:
+            events.append("single_iteration")
+        single_depth += 1
+        try:
+            original_single(statements)
+        finally:
+            single_depth -= 1
+
+    def record_factor(statements: List[llir.Stmt]) -> None:
+        nonlocal factor_depth
+        if factor_depth == 0:
+            events.append("factor_hoist")
+        factor_depth += 1
+        try:
+            original_factor(statements)
+        finally:
+            factor_depth -= 1
+
+    def record_dynamic(
+        manager: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[List[llir.Stmt]],
+        pass_spec: DynamicVectorAccessPassSpec = DynamicVectorAccessPassSpec(),
+    ) -> LLIRRewritePassResult[List[llir.Stmt]]:
+        events.append("dynamic_vector")
+        assert any(
+            "validate_jit_tensor" in code for code in _all_raw_codes(artifact.value)
+        )
+        return original_dynamic(manager, artifact, pass_spec)
+
+    monkeypatch.setattr(LLIRPassManager, "run_sparse_prefetch", record_sparse)
+    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
+    monkeypatch.setattr(CINLowerer, "_hoist_dense_pointers", record_dense)
+    monkeypatch.setattr(
+        CINLowerer,
+        "_eliminate_single_iteration_loops",
+        staticmethod(record_single),
+    )
+    monkeypatch.setattr(
+        CINLowerer,
+        "_hoist_loop_invariant_factors",
+        staticmethod(record_factor),
+    )
+
+    lowerer = CINLowerer()
+    cpp = LLIRLowerer().lower_llir(
+        lowerer.lower_IndexStmt(_build_activating_spmm_cin())
+    )
+
+    assert events == [
+        "sparse_prefetch",
+        "dense_pointer",
+        "single_iteration",
+        "factor_hoist",
+        "dynamic_vector",
+    ]
+    assert len(cpp) == 2505
+    assert hashlib.sha256(cpp.encode()).hexdigest() == (
+        "36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151"
+    )
+    assert _expected_prefetch() + ";" in cpp
+    assert [record.pass_name for record in lowerer.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.sequence_index for record in lowerer.llir_pass_run_records] == [
+        0,
+        1,
+    ]
+
+
+def test_sparse_prefetch_failure_stops_remaining_optimizations_and_managed_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: List[str] = []
+    failure = LLIRTraversalError(
+        LLIRTraversalDiagnostic(
+            code="synthetic_sparse_prefetch_failure",
+            message="sparse prefetch failed",
+            path=("root",),
+            node_type="ForLoop",
+            stage="LLIR transformation",
+            pass_name="insert_sparse_prefetch",
+        )
+    )
+
+    def fail_sparse(
+        manager: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SparsePrefetchPassSpec = SparsePrefetchPassSpec(),
+    ) -> NoReturn:
+        events.append("sparse_prefetch")
+        raise failure
+
+    def record_dense(lowerer: CINLowerer, statements: List[llir.Stmt]) -> None:
+        events.append("dense_pointer")
+
+    def record_single(statements: List[llir.Stmt]) -> None:
+        events.append("single_iteration")
+
+    def record_factor(statements: List[llir.Stmt]) -> None:
+        events.append("factor_hoist")
+
+    def record_dynamic(
+        manager: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[List[llir.Stmt]],
+        pass_spec: DynamicVectorAccessPassSpec = DynamicVectorAccessPassSpec(),
+    ) -> LLIRRewritePassResult[List[llir.Stmt]]:
+        events.append("dynamic_vector")
+        raise AssertionError("dynamic-vector pass must not run after failure")
+
+    monkeypatch.setattr(LLIRPassManager, "run_sparse_prefetch", fail_sparse)
+    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
+    monkeypatch.setattr(CINLowerer, "_hoist_dense_pointers", record_dense)
+    monkeypatch.setattr(
+        CINLowerer,
+        "_eliminate_single_iteration_loops",
+        staticmethod(record_single),
+    )
+    monkeypatch.setattr(
+        CINLowerer,
+        "_hoist_loop_invariant_factors",
+        staticmethod(record_factor),
+    )
+
+    lowerer = CINLowerer()
+    with pytest.raises(LLIRTraversalError) as raised:
+        lowerer.lower_IndexStmt(_build_activating_spmm_cin())
+
+    assert raised.value is failure
+    assert events == ["sparse_prefetch"]
+    assert lowerer.llir_pass_run_records == ()
+
+
+def test_applied_compressed_production_records_sparse_before_dynamic_vector() -> None:
+    lowerer = CINLowerer()
+
+    LLIRLowerer().lower_llir(lowerer.lower_IndexStmt(_build_compressed_ds_cin()))
+
+    assert [
+        (record.pass_name, record.configuration_name)
+        for record in lowerer.llir_pass_run_records
+    ] == [
+        ("transform_compressed_where_for_openmp", "compressed_where_openmp"),
+        ("rewrite_result_writes", "count"),
+        ("rewrite_result_writes", "fill"),
+        ("insert_sparse_prefetch", "sparse_prefetch"),
+        ("rewrite_dynamic_vector_accesses", "dynamic_vector_access"),
+    ]
+    assert [record.sequence_index for record in lowerer.llir_pass_run_records] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+    ]

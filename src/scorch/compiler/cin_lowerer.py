@@ -43,6 +43,7 @@ from .llir_pass_manager import (
     LLIRPassRunRecord,
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
+    SparsePrefetchPassSpec,
 )
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
 
 
 _DYNAMIC_VECTOR_ACCESS_PASS_SPEC = DynamicVectorAccessPassSpec()
+_SPARSE_PREFETCH_PASS_SPEC = SparsePrefetchPassSpec()
 
 
 class ResultTensorAssembler:
@@ -2540,7 +2542,12 @@ class CINLowerer:
             compressed_output_parallel = recurse_result.applied
 
             # Post-lowering optimizations on the LLIR
-            self._insert_sparse_prefetch(recurse_stmts)
+            sparse_prefetch_result = self._llir_pass_manager.run_sparse_prefetch(
+                LLIRStatementListArtifact(recurse_stmts),
+                _SPARSE_PREFETCH_PASS_SPEC,
+            )
+            self._record_llir_pass_runs(sparse_prefetch_result.run_records)
+            recurse_stmts = sparse_prefetch_result.artifact.statements
             self._hoist_dense_pointers(recurse_stmts)
             self._eliminate_single_iteration_loops(recurse_stmts)
             self._hoist_loop_invariant_factors(recurse_stmts)
@@ -2797,139 +2804,6 @@ class CINLowerer:
                     return True
         return False
 
-    @staticmethod
-    def _insert_sparse_prefetch(stmts: List[llir.Stmt]) -> None:
-        """Walk the LLIR tree and insert software prefetch hints in sparse loops.
-
-        When a sparse ForLoop (iterating pA1 from A1_pos[...] to pA1_end)
-        contains a dense inner loop that accesses another tensor's values via
-        ``B_val[coord * stride + ...]``, insert a prefetch for the *next*
-        sparse element's corresponding row:
-
-            if (pA1 + 1 < pA1_end)
-              __builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1);
-
-        This hides the latency of indirect B-row loads which dominate SpMM.
-        """
-        import re
-
-        for stmt in stmts:
-            if not isinstance(stmt, llir.ForLoop):
-                continue
-            # Recurse into all ForLoop bodies first
-            CINLowerer._insert_sparse_prefetch(stmt.body)
-
-            # Detect sparse loop: init value contains _pos[
-            if not (
-                isinstance(stmt.init, llir.VarInit)
-                and isinstance(stmt.init.value, llir.Var)
-                and "_pos[" in stmt.init.value.name
-            ):
-                continue
-
-            # Extract iter var name (e.g. "pA1")
-            iter_var = stmt.init.var.name  # e.g. "pA1"
-
-            # Find the end variable from cond (e.g. "pA1_end")
-            if not (
-                isinstance(stmt.cond, llir.BinOp)
-                and isinstance(stmt.cond.right, llir.Var)
-            ):
-                continue
-            end_var = stmt.cond.right.name  # e.g. "pA1_end"
-
-            # Find coordinate array in body: VarInit like k = A1_crd[pA1]
-            crd_array = None
-            for body_stmt in stmt.body:
-                if isinstance(body_stmt, llir.VarInit) and isinstance(
-                    body_stmt.value, llir.Var
-                ):
-                    val_name = body_stmt.value.name
-                    m = re.match(
-                        r"^(\w+_crd)\[" + re.escape(iter_var) + r"\]$", val_name
-                    )
-                    if m:
-                        crd_array = m.group(1)
-                        break
-            if not crd_array:
-                continue
-
-            # Find ALL dense values arrays and their strides by inspecting
-            # the inner dense ForLoop.  We look for:
-            #   VarInit pB1 = Add(Mul(pB0, B1_size), j)  → stride = B1_size
-            #   Assign  C[pC1] += BinOp(*, A_val[pA1], B_val[pB1])
-            #                                              → dense_val = B_val
-            # Collect all (val_array, stride) pairs for multi-prefetch.
-            dense_arrays_found: List[tuple] = []  # [(val_array, stride), ...]
-            for body_stmt in stmt.body:
-                if not isinstance(body_stmt, llir.ForLoop):
-                    continue
-                # Collect position vars and their strides from VarInit nodes
-                pos_to_stride: Dict[str, str] = {}
-                for inner_stmt in body_stmt.body:
-                    if isinstance(inner_stmt, llir.VarInit) and isinstance(
-                        inner_stmt.value, llir.Add
-                    ):
-                        add = inner_stmt.value
-                        # Pattern: Mul(base, stride) + offset
-                        if (
-                            isinstance(add.left, llir.BinOp)
-                            and add.left.op == "*"
-                            and isinstance(add.left.right, llir.Var)
-                        ):
-                            pos_to_stride[inner_stmt.var.name] = add.left.right.name
-                # Find ALL Assign nodes that use _val arrays indexed by those pos vars
-                for inner_stmt in body_stmt.body:
-                    if not isinstance(inner_stmt, llir.Assign):
-                        continue
-                    CINLowerer._find_all_val_array_accesses(
-                        inner_stmt.value, pos_to_stride, dense_arrays_found
-                    )
-
-            if not dense_arrays_found:
-                continue
-
-            # Also check for hoisted pointer accesses (_X_val_ptr patterns)
-            # which reference the sparse coordinate indirectly through the
-            # base pointer computation.  For these, we need to prefetch
-            # using the original val array + coordinate.
-            # The hoisted pointers are: _B_val_ptr = &B_val[pB0 * B1_size]
-            # where pB0 comes from the coordinate.  We detect this by
-            # looking for RawStmt pointer declarations in the loop body.
-            import re as _re
-
-            for body_stmt in stmt.body:
-                if isinstance(body_stmt, llir.RawStmt) and "_ptr" in body_stmt.code:
-                    m = _re.match(
-                        r"const (?:float|double)\* __restrict__ "
-                        r"_(\w+_val)_ptr = &(\w+_val)\[(\w+) \* (\w+)\]",
-                        body_stmt.code,
-                    )
-                    if m:
-                        val_array = m.group(2)
-                        stride = m.group(4)
-                        if (val_array, stride) not in dense_arrays_found:
-                            dense_arrays_found.append((val_array, stride))
-
-            # Insert prefetch for ALL dense arrays accessed via the sparse coordinate
-            prefetch_stmts = []
-            seen = set()
-            for dense_val_array, dense_stride in dense_arrays_found:
-                key = (dense_val_array, dense_stride)
-                if key in seen:
-                    continue
-                seen.add(key)
-                prefetch_code = (
-                    f"if ({iter_var} + 1 < {end_var}) "
-                    f"__builtin_prefetch(&{dense_val_array}["
-                    f"{crd_array}[{iter_var} + 1] * {dense_stride}], 0, 1)"
-                )
-                prefetch_stmts.append(
-                    llir.RawStmt(code=prefetch_code, add_semicolon=True)
-                )
-            for ps in reversed(prefetch_stmts):
-                stmt.body.insert(0, ps)
-
     def _hoist_dense_pointers(self, stmts: List[llir.Stmt]) -> None:
         """Hoist base-pointer computation out of dense inner loops.
 
@@ -3113,37 +2987,6 @@ class CINLowerer:
             expr.array = CINLowerer._rewrite_expr_refs(expr.array, replacements)
             expr.index = CINLowerer._rewrite_expr_refs(expr.index, replacements)
         return expr
-
-    @staticmethod
-    def _find_all_val_array_accesses(
-        expr: llir.Expr,
-        pos_to_stride: Dict[str, str],
-        results: List[tuple],
-    ) -> None:
-        """Like _find_val_array_access but collects ALL matches into results."""
-        import re
-
-        if isinstance(expr, llir.Var):
-            m = re.match(r"^(\w+_val)\[(\w+)\]$", expr.name)
-            if m:
-                arr_name, pos_var = m.group(1), m.group(2)
-                if pos_var in pos_to_stride:
-                    pair = (arr_name, pos_to_stride[pos_var])
-                    if pair not in results:
-                        results.append(pair)
-        if isinstance(expr, llir.BinOp):
-            CINLowerer._find_all_val_array_accesses(expr.left, pos_to_stride, results)
-            CINLowerer._find_all_val_array_accesses(expr.right, pos_to_stride, results)
-        if isinstance(expr, llir.ArrayAccess):
-            if (
-                isinstance(expr.array, llir.Var)
-                and "_val" in expr.array.name
-                and isinstance(expr.index, llir.Var)
-                and expr.index.name in pos_to_stride
-            ):
-                pair = (expr.array.name, pos_to_stride[expr.index.name])
-                if pair not in results:
-                    results.append(pair)
 
     # ------------------------------------------------------------------
     # Optimization pass: eliminate single-iteration loops
