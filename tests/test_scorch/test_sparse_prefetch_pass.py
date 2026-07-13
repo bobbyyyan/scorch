@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 import hashlib
 from time import perf_counter_ns
-from typing import Callable, List, NoReturn, Set, Tuple, cast
+from typing import Callable, List, NoReturn, Sequence, Set, Tuple, cast
 
 import pytest
 
 from scorch.compiler import llir
 import scorch.compiler.llir_pass_manager as pass_manager_module
+import scorch.compiler.sparse_prefetch_pass as sparse_prefetch_module
 from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
@@ -220,7 +221,23 @@ def test_success_and_legal_noop_are_fully_detached_without_input_mutation() -> N
     assert _mutable_ir_ids(noop_source).isdisjoint(_mutable_ir_ids(noop))
 
 
-def test_nested_sparse_loops_are_processed_post_order_through_direct_bodies() -> None:
+def test_nested_sparse_loops_are_processed_post_order_through_direct_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    insertion_order: List[str] = []
+    original_prepend = sparse_prefetch_module._prepend_prefetches
+
+    def record_prepend(
+        loop: llir.ForLoop,
+        iterator: str,
+        end: str,
+        coordinate_array: str,
+        dense_arrays: Sequence[Tuple[str, str]],
+    ) -> None:
+        insertion_order.append(iterator)
+        original_prepend(loop, iterator, end, coordinate_array, dense_arrays)
+
+    monkeypatch.setattr(sparse_prefetch_module, "_prepend_prefetches", record_prepend)
     nested = _sparse_loop(
         iterator="pX1",
         position_array="X1_pos[pX0]",
@@ -239,6 +256,7 @@ def test_nested_sparse_loops_are_processed_post_order_through_direct_bodies() ->
 
     output = insert_sparse_prefetch([outer], SPARSE_PREFETCH_CONTEXT)
 
+    assert insertion_order == ["pX1", "pA1"]
     output_outer = cast(llir.ForLoop, output[0])
     assert cast(llir.RawStmt, output_outer.body[0]).code == _expected_prefetch()
     output_nested = next(
@@ -300,7 +318,11 @@ def test_raw_hoisted_pointer_augments_assignment_discovery_in_body_order() -> No
         "const double* __restrict__ _E_val_ptr = &E_val[pE0 * E1_size]",
         add_semicolon=False,
     )
-    source = [_sparse_loop(tail=[raw_pointer, _string_dense_loop()])]
+    raw_decoys = [
+        llir.RawStmt("use_E_val_ptr_without_a_declaration"),
+        llir.RawStmt("const int* __restrict__ _F_val_ptr = &F_val[pF0 * F1_size]"),
+    ]
+    source = [_sparse_loop(tail=[raw_pointer, *raw_decoys, _string_dense_loop()])]
 
     output = insert_sparse_prefetch(source, SPARSE_PREFETCH_CONTEXT)
 
@@ -324,6 +346,12 @@ def test_sparse_gate_is_name_based_and_uses_the_condition_right_hand_var() -> No
 
 
 def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
+    missing_init = _sparse_loop()
+    missing_init.init = None
+
+    non_var_init_value = _sparse_loop()
+    cast(llir.VarInit, non_var_init_value.init).value = llir.Literal(0)
+
     non_sparse = _sparse_loop(position_array="A1_begin")
 
     wrong_condition = _sparse_loop()
@@ -353,6 +381,54 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
                     llir.VarInit(
                         _var("pB1"),
                         llir.BinOp("-", _var("pB0"), _var("B1_size")),
+                    ),
+                    llir.Assign(_var("out"), _var("B_val[pB1]")),
+                ]
+            )
+        ]
+    )
+
+    non_binary_position_left = _sparse_loop(
+        tail=[
+            _inner_loop(
+                [
+                    llir.VarInit(
+                        _var("pB1"),
+                        llir.Add(llir.Literal(0), _var("j")),
+                    ),
+                    llir.Assign(_var("out"), _var("B_val[pB1]")),
+                ]
+            )
+        ]
+    )
+
+    non_multiply_position = _sparse_loop(
+        tail=[
+            _inner_loop(
+                [
+                    llir.VarInit(
+                        _var("pB1"),
+                        llir.Add(
+                            llir.BinOp("+", _var("pB0"), _var("B1_size")),
+                            _var("j"),
+                        ),
+                    ),
+                    llir.Assign(_var("out"), _var("B_val[pB1]")),
+                ]
+            )
+        ]
+    )
+
+    non_var_stride = _sparse_loop(
+        tail=[
+            _inner_loop(
+                [
+                    llir.VarInit(
+                        _var("pB1"),
+                        llir.Add(
+                            llir.Mul(_var("pB0"), llir.Literal(4)),
+                            _var("j"),
+                        ),
                     ),
                     llir.Assign(_var("out"), _var("B_val[pB1]")),
                 ]
@@ -394,6 +470,32 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
         ]
     )
 
+    unmatched_typed_accesses = _sparse_loop(
+        tail=[
+            _inner_loop(
+                [
+                    _position_init("pB1", "pB0", "B1_size"),
+                    llir.Assign(
+                        _var("out0"),
+                        llir.ArrayAccess(llir.Literal(0), _var("pB1")),
+                    ),
+                    llir.Assign(
+                        _var("out1"),
+                        llir.ArrayAccess(_var("B_data"), _var("pB1")),
+                    ),
+                    llir.Assign(
+                        _var("out2"),
+                        llir.ArrayAccess(_var("B_val"), llir.Literal(0)),
+                    ),
+                    llir.Assign(
+                        _var("out3"),
+                        llir.ArrayAccess(_var("B_val"), _var("unknown_position")),
+                    ),
+                ]
+            )
+        ]
+    )
+
     conditional = llir.IfThenElse(
         cond=llir.Literal(True),
         then_body=[_sparse_loop()],
@@ -409,6 +511,12 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
         args=[],
         body=[_sparse_loop()],
     )
+    while_loop = llir.WhileLoop(llir.Literal(True), [_sparse_loop()])
+    automatic_loop = llir.ForLoopAuto(
+        _var("item"),
+        _var("items"),
+        [_sparse_loop()],
+    )
     optional_regions = _inner_loop([llir.BlankLine()])
     optional_regions.before_parallel_body = [_sparse_loop()]
     optional_regions.pre_parallel_body = [_sparse_loop()]
@@ -421,6 +529,8 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
             "nested root statement sequence is semantically omitted",
             cast(List[llir.Stmt], [[_sparse_loop()]]),
         ),
+        ("missing loop init", [missing_init]),
+        ("non-Var sparse init value", [non_var_init_value]),
         ("non-sparse init spelling", [non_sparse]),
         ("non-binary condition", [wrong_condition]),
         ("unnamed condition rhs", [unnamed_end]),
@@ -429,12 +539,18 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
         ("no direct inner loop", [no_inner_loop]),
         ("no direct position init", [no_position]),
         ("wrong position expression", [wrong_position_shape]),
+        ("position Add has non-binary left child", [non_binary_position_left]),
+        ("position Add left child is not multiplication", [non_multiply_position]),
+        ("position multiplication stride is not a Var", [non_var_stride]),
         ("raw pointer without assignment discovery", [no_assign]),
         ("assignment target is not scanned", [target_only_access]),
         ("cast expression is not scanned", [cast_hidden_access]),
+        ("typed access shapes do not match", [unmatched_typed_accesses]),
         ("conditional container is omitted", [conditional]),
         ("switch container is omitted", [switch]),
         ("function container is omitted", [function]),
+        ("while container is omitted", [while_loop]),
+        ("automatic-for container is omitted", [automatic_loop]),
         ("optional loop regions are omitted", [optional_regions]),
     ]
 
@@ -649,10 +765,23 @@ def test_manager_rejects_wrong_descriptor_artifact_spec_and_context() -> None:
     artifact = LLIRStatementListArtifact([llir.BlankLine()])
     bad_descriptor = replace(SPARSE_PREFETCH_PASS, version=2)
 
+    class SpoofedDescriptor:
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            return False
+
     invalid_calls: Tuple[Callable[[], object], ...] = (
         lambda: manager.run_sparse_prefetch(
             artifact,
             SparsePrefetchPassSpec(descriptor=bad_descriptor),
+        ),
+        lambda: manager.run_sparse_prefetch(
+            artifact,
+            SparsePrefetchPassSpec(
+                descriptor=cast(LLIRPassDescriptor, SpoofedDescriptor())
+            ),
         ),
         lambda: manager.run_sparse_prefetch(
             cast(LLIRStatementListArtifact, object()),

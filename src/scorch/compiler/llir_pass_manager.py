@@ -288,7 +288,7 @@ def _validate_descriptor(
     actual: object,
     expected: LLIRPassDescriptor,
 ) -> None:
-    if actual != expected:
+    if type(actual) is not LLIRPassDescriptor or actual != expected:
         _raise_manager_error(
             code="pass_descriptor_mismatch",
             message=f"pass specification requires descriptor {expected.name}@{expected.version}",
