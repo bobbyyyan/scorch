@@ -570,7 +570,7 @@ class STensor:
             cin_stmt = ForAll(index_var, cin_stmt)
 
         lowerer = CINLowerer()
-        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
         llir_lowerer = LLIRLowerer()
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 

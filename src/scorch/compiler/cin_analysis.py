@@ -931,7 +931,7 @@ def analyze_cin(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
         if access_info.kind != AccessKind.READ:
             continue
         assignment = node_objects.get(access_info.scope_id)
-        if not isinstance(assignment, TensorAssign) or assignment.op is None:
+        if not isinstance(assignment, TensorAssign):
             continue
         lhs_ids = tuple(assignment.lhs.index_ids)
         reduction_evidence.update(

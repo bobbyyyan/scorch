@@ -23,6 +23,7 @@ from scorch.compiler.cin_analysis import (
     normalize_cin,
     verify_cin,
 )
+from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.diagnostics import VerificationError
 from scorch.compiler.identity import AccessId, IndexId, NodeId, SymbolId
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
@@ -475,7 +476,9 @@ def test_verifier_reports_duplicate_typed_ids(
     assert expected_code in _assert_structured_diagnostics(error)
 
 
-def test_verifier_rejects_extent_and_reduction_classification_mismatches() -> None:
+def test_verifier_rejects_extent_mismatches_and_classifies_implicit_reductions() -> (
+    None
+):
     i = IndexVar("i")
     k = IndexVar("k")
     result = TensorVar("C", fmt="d", shape=(4,))
@@ -486,15 +489,13 @@ def test_verifier_rejects_extent_and_reduction_classification_mismatches() -> No
         verify_cin(extent_program)
     assert "index_extent_mismatch" in _assert_structured_diagnostics(extent_error)
 
-    missing_reduction = ForAll(
+    implicit_reduction = ForAll(
         i,
         ForAll(k, TensorAssign(TensorVar("D", fmt="d")[i], source[k])),
     )
-    with pytest.raises(VerificationError) as reduction_error:
-        verify_cin(missing_reduction)
-    assert "index_classification_inconsistent" in _assert_structured_diagnostics(
-        reduction_error
-    )
+    implicit_analysis = verify_cin(implicit_reduction)
+    assert implicit_analysis.free_index_ids == (i.index_id,)
+    assert implicit_analysis.reduction_index_ids == (k.index_id,)
 
     unused = ForAll(
         i,
@@ -517,6 +518,33 @@ def test_full_verification_is_explicit_at_debug_compiler_boundary() -> None:
     with full_cin_verification():
         with pytest.raises(VerificationError, match="tensor_access_rank_mismatch"):
             Scheduler.apply_schedule(invalid, Schedule())
+
+
+def test_debug_compiler_boundary_accepts_implicit_reduction() -> None:
+    i = IndexVar("i")
+    k = IndexVar("k")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="dd", shape=(4, 5))
+    program = ForAll(i, ForAll(k, TensorAssign(result[i], source[i, k])))
+
+    with full_cin_verification():
+        scheduled = Scheduler.auto_schedule(program)
+        CINLowerer().lower_IndexStmt(scheduled)
+
+
+def test_public_lowerer_preserves_caller_owned_cin() -> None:
+    i = IndexVar("i")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="d", shape=(4,))
+    program = ForAll(i, TensorAssign(result[i], source[i]))
+    before = canonical_cin_dump(program)
+
+    CINLowerer().lower_IndexStmt(program)
+
+    assert canonical_cin_dump(program) == before
+    assert program.parent is None
+    assert program.stmt.parent is None
+    assert i.tensor_accesses == []
 
 
 def test_verifier_reports_out_of_scope_index_reference() -> None:

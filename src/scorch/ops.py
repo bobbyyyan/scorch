@@ -1386,9 +1386,9 @@ def _build_regblock_dual_path(
         return None
 
     with regblock_force(False):
-        fn_base = CINLowerer(post_ops=post_ops).lower_IndexStmt(cin_base)
+        fn_base = CINLowerer(post_ops=post_ops)._lower_owned_IndexStmt(cin_base)
     with regblock_force(True):
-        fn_rb = CINLowerer(post_ops=post_ops).lower_IndexStmt(cin_rb)
+        fn_rb = CINLowerer(post_ops=post_ops)._lower_owned_IndexStmt(cin_rb)
     if not (isinstance(fn_base, llir.Function) and isinstance(fn_rb, llir.Function)):
         return None
 
@@ -2008,7 +2008,7 @@ def einsum(
             lowered_llir: Union[llir.Stmt, List[llir.Stmt]] = _dual_llir
         else:
             lowerer = CINLowerer(post_ops=_post_ops)
-            lowered_llir = lowerer.lower_IndexStmt(lowering_stmt)
+            lowered_llir = lowerer._lower_owned_IndexStmt(lowering_stmt)
 
         llir_lowerer = LLIRLowerer()
 
@@ -2209,7 +2209,7 @@ def lower_and_exec_cin(
 
     # Lower to LLIR
     lowerer = CINLowerer()
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+    lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
     llir_lowerer = LLIRLowerer()
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
     # print(cpp_code)

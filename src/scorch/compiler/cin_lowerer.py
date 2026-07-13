@@ -23,7 +23,10 @@ from .iter_lattice import IterationLattice
 from .llir import AssignOp, DataType
 from .diagnostics import CompilerInvariantError, UnsupportedFeature
 from .loop_plan import LoopPlan, ScheduledCIN, verify_scheduled_cin
-from .legacy_cin_adapter import legacy_cin_working_copy
+from .legacy_cin_adapter import (
+    claim_legacy_cin_working_tree,
+    legacy_cin_working_copy,
+)
 from .cin_analysis import verify_cin_if_enabled
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
@@ -2071,7 +2074,10 @@ class CINLowerer:
         ]
 
     def _prepare_scheduled_cin(
-        self, stmt: Union[IndexStmt, ScheduledCIN], recurse: bool
+        self,
+        stmt: Union[IndexStmt, ScheduledCIN],
+        recurse: bool,
+        ownership_transferred: bool,
     ) -> IndexStmt:
         if recurse or self.outermost_stmt is not None:
             if isinstance(stmt, ScheduledCIN):
@@ -2092,16 +2098,32 @@ class CINLowerer:
 
         self._validate_index_stmt(stmt)
         verify_cin_if_enabled(stmt)
+        if ownership_transferred:
+            return claim_legacy_cin_working_tree(stmt, plan)
         return legacy_cin_working_copy(stmt, plan)
 
+    def _lower_owned_IndexStmt(
+        self, stmt: Union[IndexStmt, ScheduledCIN]
+    ) -> Union[llir.Stmt, List[llir.Stmt]]:
+        """Lower a detached compiler-local tree after transferring ownership."""
+
+        return self.lower_IndexStmt(stmt, _ownership_transferred=True)
+
     def lower_IndexStmt(
-        self, stmt: Union[IndexStmt, ScheduledCIN], recurse=False
+        self,
+        stmt: Union[IndexStmt, ScheduledCIN],
+        recurse=False,
+        _ownership_transferred: bool = False,
     ) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
         Lower an IndexStmt to LLIR
         """
 
-        stmt = self._prepare_scheduled_cin(stmt, recurse)
+        stmt = self._prepare_scheduled_cin(
+            stmt,
+            recurse,
+            ownership_transferred=_ownership_transferred,
+        )
 
         if not self.outermost_stmt:
             self.outermost_stmt = stmt

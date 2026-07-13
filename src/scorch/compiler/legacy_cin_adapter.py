@@ -38,8 +38,28 @@ def legacy_cin_working_copy(
 ) -> IndexStmt:
     """Return a private scheduled tree with compatibility backlinks restored."""
 
+    return _prepare_legacy_cin(cin, plan, copy_input=True)
+
+
+def claim_legacy_cin_working_tree(
+    cin: IndexStmt, plan: Optional[LoopPlan] = None
+) -> IndexStmt:
+    """Claim an already detached tree and restore compatibility backlinks.
+
+    This is the ownership-transfer form of :func:`legacy_cin_working_copy`.  It
+    exists solely for compiler frontends that have just received a detached tree
+    from ``Scheduler`` or ``normalize_cin`` and retain no externally visible
+    alias.  Public lowering continues to use the copying form above.
+    """
+
+    return _prepare_legacy_cin(cin, plan, copy_input=False)
+
+
+def _prepare_legacy_cin(
+    cin: IndexStmt, plan: Optional[LoopPlan], *, copy_input: bool
+) -> IndexStmt:
     validate_legacy_cin_display_names(cin)
-    working = copy.deepcopy(cin)
+    working = copy.deepcopy(cin) if copy_input else cin
     if plan is not None:
         # Import lazily to keep CIN ownership independent of scheduling policy.
         from .scheduler import Scheduler, materialize_legacy_schedule
@@ -50,7 +70,9 @@ def legacy_cin_working_copy(
             schedule, _, _, _ = materialize_legacy_schedule(cin, plan)
             replayed = Scheduler._apply_schedule_legacy(working, schedule)
             working = replayed.normalized_cin
-    validate_legacy_cin_display_names(working)
+        # Schedule replay can introduce derived display names, so validate the
+        # resulting private tree as well as its semantic source.
+        validate_legacy_cin_display_names(working)
     _canonicalize_legacy_entities(working)
     _materialize_legacy_backreferences(working)
     return working
