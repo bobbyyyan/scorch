@@ -611,6 +611,19 @@ class LLIRRewriter:
 
         return statements
 
+    def rewrite_statement_sequence_member(
+        self, node: llir.Stmt, path: LLIRPath
+    ) -> Sequence[llir.Stmt]:
+        """Return zero or more statements to rebuild in ``node``'s place.
+
+        Subclasses may delete or expand a statement by returning an exact list
+        or tuple.  Each returned statement is subsequently dispatched through
+        the ordinary exhaustive typed rewriter, so replacement children are
+        validated and detached before they enter the rewritten tree.
+        """
+
+        return (node,)
+
     def rewrite_statement_sequence(
         self, statements: LLIRStatementSequence, path: LLIRPath
     ) -> LLIRStatementSequence:
@@ -619,7 +632,36 @@ class LLIRRewriter:
         for index, statement in enumerate(prepared):
             item_path = path + (f"[{index}]",)
             if isinstance(statement, llir.Stmt):
-                rewritten.append(self._rewrite_stmt(statement, item_path))
+                replacements = self.rewrite_statement_sequence_member(
+                    statement, item_path
+                )
+                if type(replacements) is not list and type(replacements) is not tuple:
+                    _raise_traversal_error(
+                        self.context,
+                        code="invalid_statement_rewrite_sequence",
+                        message=(
+                            "rewrite_statement_sequence_member must return an exact "
+                            "statement list or tuple"
+                        ),
+                        path=item_path,
+                        value=replacements,
+                    )
+                for replacement_index, replacement in enumerate(replacements):
+                    replacement_path = item_path
+                    if len(replacements) != 1:
+                        replacement_path += (f"replacement[{replacement_index}]",)
+                    if not isinstance(replacement, llir.Stmt):
+                        _raise_traversal_error(
+                            self.context,
+                            code="invalid_statement_rewrite_member",
+                            message=(
+                                "rewrite_statement_sequence_member may return only "
+                                "LLIR statements"
+                            ),
+                            path=replacement_path,
+                            value=replacement,
+                        )
+                    rewritten.append(self._rewrite_stmt(replacement, replacement_path))
             elif type(statement) is list or type(statement) is tuple:
                 rewritten.append(
                     self.rewrite_statement_sequence(

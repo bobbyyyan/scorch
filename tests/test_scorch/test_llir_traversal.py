@@ -1,4 +1,4 @@
-from typing import Dict, List, Set, Tuple, Type, cast
+from typing import Dict, List, Sequence, Set, Tuple, Type, cast
 
 import pytest
 
@@ -435,6 +435,107 @@ def test_list_tuple_nesting_and_optional_children_are_preserved() -> None:
     assert rewritten_conditional.then_body_list is not None
     assert type(rewritten_conditional.then_body_list[0]) is tuple
     assert rewritten_conditional.then_body_list[1] == []
+
+
+def test_statement_sequence_member_hook_can_delete_and_expand_statements() -> None:
+    class SplicingRewriter(LLIRRewriter):
+        def rewrite_statement_sequence_member(
+            self, node: llir.Stmt, path: LLIRPath
+        ) -> Sequence[llir.Stmt]:
+            if type(node) is llir.Comment and cast(llir.Comment, node).value == "drop":
+                return []
+            if type(node) is llir.Comment:
+                return [llir.RawStmt("first"), llir.Break()]
+            if type(node) is llir.RawStmt:
+                return (llir.Continue(), llir.RawStmt("second"))
+            return super().rewrite_statement_sequence_member(node, path)
+
+    passthrough = llir.VarDecl(_var("value"))
+    root: List[LLIRStatementValue] = [
+        llir.Comment("expand"),
+        (
+            llir.Comment("drop"),
+            [llir.RawStmt("expand")],
+        ),
+        passthrough,
+    ]
+
+    rewritten = SplicingRewriter(_CONTEXT).rewrite(root)
+
+    assert type(rewritten) is list
+    assert [type(statement) for statement in rewritten[:2]] == [
+        llir.RawStmt,
+        llir.Break,
+    ]
+    assert type(rewritten[2]) is tuple
+    nested_tuple = cast(Tuple[LLIRStatementValue, ...], rewritten[2])
+    assert type(nested_tuple[0]) is list
+    nested_list = cast(List[LLIRStatementValue], nested_tuple[0])
+    assert [type(statement) for statement in nested_list] == [
+        llir.Continue,
+        llir.RawStmt,
+    ]
+    assert type(rewritten[3]) is llir.VarDecl
+    assert rewritten[3] is not passthrough
+    assert cast(llir.VarDecl, rewritten[3]).var is not passthrough.var
+
+    tuple_root = (llir.Comment("expand"), llir.Comment("drop"))
+    rewritten_tuple = SplicingRewriter(_CONTEXT).rewrite(tuple_root)
+    assert type(rewritten_tuple) is tuple
+    assert [type(statement) for statement in rewritten_tuple] == [
+        llir.RawStmt,
+        llir.Break,
+    ]
+
+
+def test_statement_sequence_member_hook_requires_exact_list_or_tuple() -> None:
+    class InvalidContainerRewriter(LLIRRewriter):
+        def rewrite_statement_sequence_member(
+            self, node: llir.Stmt, path: LLIRPath
+        ) -> Sequence[llir.Stmt]:
+            return cast(Sequence[llir.Stmt], iter((node,)))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        InvalidContainerRewriter(_CONTEXT).rewrite([llir.Break()])
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_statement_rewrite_sequence"
+    assert diagnostic.path == ("root", "[0]")
+    assert diagnostic.node_type == "tuple_iterator"
+
+
+def test_statement_sequence_member_hook_rejects_non_statement_members() -> None:
+    class InvalidMemberRewriter(LLIRRewriter):
+        def rewrite_statement_sequence_member(
+            self, node: llir.Stmt, path: LLIRPath
+        ) -> Sequence[llir.Stmt]:
+            return cast(Sequence[llir.Stmt], [llir.Literal(1)])
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        InvalidMemberRewriter(_CONTEXT).rewrite([llir.Break()])
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_statement_rewrite_member"
+    assert diagnostic.path == ("root", "[0]")
+    assert diagnostic.node_type == "Literal"
+
+
+def test_statement_sequence_member_hook_validates_replacement_children() -> None:
+    class MalformedReplacementRewriter(LLIRRewriter):
+        def rewrite_statement_sequence_member(
+            self, node: llir.Stmt, path: LLIRPath
+        ) -> Sequence[llir.Stmt]:
+            declaration = llir.VarDecl(_var("value"))
+            declaration.var = cast(llir.Var, llir.Literal(1))
+            return (declaration,)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        MalformedReplacementRewriter(_CONTEXT).rewrite([llir.Break()])
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_var_child"
+    assert diagnostic.path == ("root", "[0]", "var")
+    assert diagnostic.node_type == "Literal"
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
