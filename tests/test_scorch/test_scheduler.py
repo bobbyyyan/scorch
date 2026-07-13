@@ -6,6 +6,7 @@ from scorch.compiler.cin import (
     TensorVar,
     Where,
 )
+from scorch.compiler.cin_analysis import canonical_cin_dump
 from scorch.compiler.scheduler import Scheduler
 
 
@@ -112,6 +113,8 @@ def test_should_insert_workspace_depends_on_reduction_position():
 
 def test_auto_schedule_spmspm_inserts_workspace():
     stmt = _build_spmm_cin(fmt_c="ds", fmt_a="ds", fmt_b="ds", loop_order="ijk")
+    before = canonical_cin_dump(stmt)
+    original_assignment = stmt.stmt.stmt.stmt
     scheduled = Scheduler.auto_schedule(stmt)
 
     outer_loop_names, body = _loop_names(scheduled)
@@ -123,6 +126,9 @@ def test_auto_schedule_spmspm_inserts_workspace():
     consumer_loop_names, _ = _loop_names(body.consumer)
     assert producer_loop_names == ["j", "k"]
     assert consumer_loop_names == ["j", "k"]
+    assert canonical_cin_dump(stmt) == before
+    assert original_assignment.parent is None
+    assert all(not index_var.tensor_accesses for index_var in stmt.index_vars)
 
 
 def test_auto_schedule_spmm_dense_output_no_workspace():
@@ -134,7 +140,9 @@ def test_auto_schedule_spmm_dense_output_no_workspace():
     assert not scheduled.inserted_workspace
 
 
-def _build_sddmm_cin(fmt_s: str, fmt_m: str, fmt_q: str, fmt_k: str, loop_order: str) -> ForAll:
+def _build_sddmm_cin(
+    fmt_s: str, fmt_m: str, fmt_q: str, fmt_k: str, loop_order: str
+) -> ForAll:
     """Build CIN for SDDMM: S[i,j] = M[i,j] * Q[i,k] * K[j,k]"""
     i = IndexVar("i")
     j = IndexVar("j")
@@ -167,9 +175,11 @@ def test_sddmm_cost_model_prefers_reduction_innermost():
     optimized = Scheduler.optimize_loop_order(stmt, init_order)
     constrained = Scheduler.apply_mode_order_constraints(stmt, optimized)
     names = [v.name for v in constrained]
-    assert names == ["i", "j", "k"], (
-        f"Cost model should prefer [i, j, k] but got {names}"
-    )
+    assert names == [
+        "i",
+        "j",
+        "k",
+    ], f"Cost model should prefer [i, j, k] but got {names}"
 
 
 def test_select_loop_order_sddmm_forced_reorder():

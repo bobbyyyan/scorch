@@ -14,6 +14,7 @@ from scorch.compiler.cin import (
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.loop_plan import ScheduledCIN
+from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
 from scorch.compiler.scheduler import (
     RelayoutSpec,
     Schedule,
@@ -122,7 +123,11 @@ def _lower_to_cpp(stmt: ForAll) -> str:
 
 def _loop_chain(stmt):
     names = []
-    body = stmt.normalized_cin if isinstance(stmt, ScheduledCIN) else stmt
+    body = (
+        legacy_cin_working_copy(stmt.normalized_cin, stmt.verified_loop_plan)
+        if isinstance(stmt, ScheduledCIN)
+        else stmt
+    )
     while isinstance(body, ForAll):
         names.append(body.index_var.name)
         body = body.stmt
@@ -197,7 +202,10 @@ def test_tile_k_width_and_child_placement_reach_generated_cpp():
     assert producer_loop_names == ["j", "k_in"]
     assert isinstance(producer_body, TensorAssign)
 
-    tile_size_vars = scheduled.normalized_cin.get_tile_size_vars()
+    legacy_working = legacy_cin_working_copy(
+        scheduled.normalized_cin, scheduled.verified_loop_plan
+    )
+    tile_size_vars = legacy_working.get_tile_size_vars()
     assert len(tile_size_vars) == 1
     assert tile_size_vars[0].index_var.name == "k"
     assert tile_size_vars[0].size == 4

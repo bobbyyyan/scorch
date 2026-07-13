@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
+from .cin_analysis import analyze_cin
 from .diagnostics import VerificationError
 from .identity import IndexId, SymbolId
 
@@ -99,7 +100,12 @@ class LoopPlan:
 
 @dataclass(frozen=True)
 class ScheduledCIN:
-    """Transitional pair of legacy normalized CIN and its verified LoopPlan."""
+    """Transitional pair of detached normalized CIN and its verified LoopPlan.
+
+    The carrier and plan are frozen. The contained legacy CIN classes are not;
+    consumers must treat them as read-only and use the compatibility adapter
+    before any legacy mutation.
+    """
 
     normalized_cin: IndexStmt
     verified_loop_plan: LoopPlan
@@ -117,33 +123,36 @@ class ScheduledCIN:
 
 
 def _collect_entities(cin: object) -> Tuple[Dict[IndexId, str], Dict[SymbolId, str]]:
-    # Import lazily so CIN does not depend on its transitional carrier.
-    from .cin import BinaryOp, ForAll, TensorAccess, TensorAssign, UnaryOp, Where
+    from .cin import IndexStmt
 
-    indices: Dict[IndexId, str] = {}
-    symbols: Dict[SymbolId, str] = {}
-
-    def visit(node: object) -> None:
-        if isinstance(node, ForAll):
-            indices[node.index_var.index_id] = node.index_var.name
-            visit(node.stmt)
-        elif isinstance(node, Where):
-            visit(node.producer)
-            visit(node.consumer)
-        elif isinstance(node, TensorAssign):
-            visit(node.lhs)
-            visit(node.rhs)
-        elif isinstance(node, TensorAccess):
-            symbols[node.tensor.symbol_id] = node.tensor.name
-            for index_var in node.indices or ():
-                indices[index_var.index_id] = index_var.name
-        elif isinstance(node, BinaryOp):
-            visit(node.left)
-            visit(node.right)
-        elif isinstance(node, UnaryOp):
-            visit(node.expr)
-
-    visit(cin)
+    if not isinstance(cin, IndexStmt):
+        raise VerificationError("normalized CIN must be an IndexStmt")
+    analysis = analyze_cin(cin)
+    reference_errors = tuple(
+        diagnostic
+        for diagnostic in analysis.diagnostics
+        if diagnostic.code.startswith("duplicate_")
+        or diagnostic.code.startswith("dangling_")
+        or diagnostic.code.endswith("_out_of_scope")
+        or diagnostic.code.endswith("_reference_mismatch")
+        or diagnostic.code in ("free_index_not_bound", "missing_node_id")
+    )
+    if reference_errors:
+        first = reference_errors[0]
+        raise VerificationError(
+            f"stage=normalized CIN: {first.code} at "
+            f"{'/'.join(first.path)}: {first.message}",
+            diagnostics=tuple(reference_errors),
+        )
+    indices = {
+        index_id: definition.display_name
+        for index_id, definition in analysis.index_definitions.items()
+        if definition.bindings
+    }
+    symbols = {
+        symbol_id: definition.display_name
+        for symbol_id, definition in analysis.symbol_definitions.items()
+    }
     return indices, symbols
 
 

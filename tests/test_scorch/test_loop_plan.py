@@ -1,8 +1,10 @@
 from dataclasses import FrozenInstanceError, replace
+from unittest.mock import patch
 
 import pytest
 
 from scorch.compiler.cin import ForAll, IndexVar, TensorVar
+from scorch.compiler.cin_analysis import canonical_cin_dump
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.diagnostics import VerificationError
@@ -13,7 +15,13 @@ from scorch.compiler.loop_plan import (
     ScheduledCIN,
     verify_scheduled_cin,
 )
-from scorch.compiler.scheduler import Schedule, Scheduler, TileSpec
+from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
+from scorch.compiler.scheduler import (
+    Schedule,
+    Scheduler,
+    TileSpec,
+    regblock_force,
+)
 
 
 def _build_spmm() -> ForAll:
@@ -56,6 +64,14 @@ def test_schedule_returns_frozen_verified_identity_based_boundary() -> None:
     assert not hasattr(scheduled.normalized_cin, "panel_bounds")
     assert not hasattr(scheduled.normalized_cin, "relayout_plan")
     assert not hasattr(scheduled.normalized_cin, "result_tile_plan")
+    assert all(
+        access.tensor._assignment is None
+        for access in scheduled.normalized_cin.tensor_accesses
+    )
+    assert all(
+        not index_var.tensor_accesses
+        for index_var in scheduled.normalized_cin.index_vars
+    )
 
     with pytest.raises(FrozenInstanceError):
         scheduled.verified_loop_plan.tag = "mutated"  # type: ignore[misc]
@@ -119,6 +135,7 @@ def test_scheduling_is_deterministic_and_does_not_mutate_input() -> None:
 
 def test_one_cin_can_be_scheduled_independently_two_ways() -> None:
     cin = _build_spmm()
+    source_dump = canonical_cin_dump(cin)
     reordered = Scheduler.apply_schedule(
         cin, Schedule(loop_order=("i", "k", "j"), tag="reordered")
     )
@@ -132,6 +149,56 @@ def test_one_cin_can_be_scheduled_independently_two_ways() -> None:
     )
 
     assert reordered.verified_loop_plan != tiled.verified_loop_plan
+    assert canonical_cin_dump(reordered.normalized_cin) == source_dump
+    assert canonical_cin_dump(tiled.normalized_cin) == source_dump
     assert "k_out" not in str(reordered.normalized_cin)
-    assert "k_out" in str(tiled.normalized_cin)
+    assert "k_out" not in str(tiled.normalized_cin)
     assert "k_out" not in str(cin)
+    assert _lower_to_cpp(reordered) != _lower_to_cpp(tiled)
+
+
+def test_auto_plan_replay_does_not_rerun_loop_order_policy() -> None:
+    cin = _build_spmm()
+
+    def select_ikj(working, costs):
+        del costs
+        by_name = {index_var.name: index_var for index_var in working.index_vars}
+        return [by_name["i"], by_name["k"], by_name["j"]]
+
+    with patch.object(Scheduler, "select_loop_order", side_effect=select_ikj):
+        scheduled = Scheduler.apply_schedule(cin, Schedule())
+
+    with patch.object(
+        Scheduler,
+        "select_loop_order",
+        side_effect=AssertionError("auto policy must not run during replay"),
+    ):
+        working = legacy_cin_working_copy(
+            scheduled.normalized_cin,
+            scheduled.verified_loop_plan,
+        )
+
+    replayed_ids = []
+    current = working
+    while isinstance(current, ForAll):
+        replayed_ids.append(current.index_var.index_id)
+        current = current.stmt
+    assert tuple(replayed_ids) == scheduled.verified_loop_plan.loop_order
+
+
+def test_auto_plan_replay_is_independent_of_regblock_context() -> None:
+    with regblock_force(True):
+        direct = Scheduler.auto_schedule(_build_spmm())
+        scheduled = Scheduler.apply_schedule(_build_spmm(), Schedule())
+
+    assert scheduled.verified_loop_plan.tiles
+    with regblock_force(False):
+        working = legacy_cin_working_copy(
+            scheduled.normalized_cin,
+            scheduled.verified_loop_plan,
+        )
+
+    assert str(working) == str(direct)
+    assert tuple(tile.size for tile in working.get_tile_size_vars()) == tuple(
+        tile.width for tile in scheduled.verified_loop_plan.tiles
+    )

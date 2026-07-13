@@ -1,13 +1,22 @@
 from __future__ import annotations
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 
 import torch
 
 from . import llir
-from .identity import IndexId, SymbolId, new_index_id, new_symbol_id
+from .identity import (
+    AccessId,
+    IndexId,
+    NodeId,
+    SymbolId,
+    new_access_id,
+    new_index_id,
+    new_node_id,
+    new_symbol_id,
+)
 from ..format import TensorFormat, LevelType
 from ..utils import parse_format
 
@@ -17,10 +26,12 @@ _BinaryOp = Callable[[Any, Any], Any]
 
 
 class CIN:
-    inserted_workspace: bool = False
-    no_tile_list: List[IndexVar] = []
+    node_id: NodeId
+    inserted_workspace: bool
+    no_tile_list: List[IndexVar]
 
-    def __init__(self):
+    def __init__(self) -> None:
+        self.node_id = new_node_id()
         self.inserted_workspace = False
         self.no_tile_list = []
 
@@ -35,7 +46,14 @@ class CIN:
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(self)
         all_vars = cin_ivar_getter.free_vars + cin_ivar_getter.input_vars
-        return list(set(all_vars))
+        seen = set()
+        ordered = []
+        for index_var in all_vars:
+            if index_var.index_id in seen:
+                continue
+            seen.add(index_var.index_id)
+            ordered.append(index_var)
+        return ordered
 
     @property
     def tensor_accesses(self, omit_workspace=True) -> List[TensorAccess]:
@@ -75,7 +93,8 @@ class CIN:
         """
 
         class TensorAccessGetter(CINVisitorAccept):
-            tensor_accesses: List[TensorAccess] = []
+            def __init__(self) -> None:
+                self.tensor_accesses: List[TensorAccess] = []
 
             def visit_TensorAccess(self, node: TensorAccess) -> None:
                 self.tensor_accesses.append(node)
@@ -104,8 +123,8 @@ class CIN:
         """
 
         class LoopOrderGetter(CINVisitor):
-            index_vars_ordered: List[IndexVar] = []
-            free_vars: List[IndexVar] = []
+            index_vars_ordered: List[IndexVar]
+            free_vars: List[IndexVar]
 
             def __init__(self, stmt: Optional[CIN] = None):
                 self.index_vars_ordered = []
@@ -151,9 +170,10 @@ class IndexStmt(CIN):
     """
 
     def __init__(self, lhs: Optional[IndexExpr], rhs: Optional[IndexExpr]):
+        super().__init__()
         self.lhs = lhs
         self.rhs = rhs
-        self.parent = None
+        self.parent: Optional[IndexStmt] = None
 
     def __str__(self):
         return f"IndexStmt(lhs={self.lhs}, rhs={self.rhs})"
@@ -218,7 +238,8 @@ class IndexStmt(CIN):
 
     def get_rhs_workspaces(self) -> List[Workspace]:
         class WorkspaceGetter(CINVisitorAccept):
-            workspaces: List[Workspace] = []
+            def __init__(self) -> None:
+                self.workspaces: List[Workspace] = []
 
             def visit_Workspace(self, node: Workspace) -> None:
                 self.workspaces.append(node)
@@ -238,7 +259,8 @@ class IndexStmt(CIN):
 
     def get_lhs_workspaces(self) -> List[Workspace]:
         class WorkspaceGetter(CINVisitorAccept):
-            workspaces: List[Workspace] = []
+            def __init__(self) -> None:
+                self.workspaces: List[Workspace] = []
 
             def visit_Workspace(self, node: Workspace) -> None:
                 self.workspaces.append(node)
@@ -258,12 +280,19 @@ class IndexStmt(CIN):
 
     def get_workspaces(self) -> List[Workspace]:
         workspaces = self.get_lhs_workspaces() + self.get_rhs_workspaces()
-        # Remove duplicates
-        return list(set(workspaces))
+        seen = set()
+        unique = []
+        for workspace in workspaces:
+            if workspace.symbol_id in seen:
+                continue
+            seen.add(workspace.symbol_id)
+            unique.append(workspace)
+        return unique
 
     def get_workspace_accesses(self) -> List[WorkspaceAccess]:
         class WorkspaceAccessGetter(CINVisitorAccept):
-            workspace_accesses: List[WorkspaceAccess] = []
+            def __init__(self) -> None:
+                self.workspace_accesses: List[WorkspaceAccess] = []
 
             def visit_WorkspaceAccess(self, node: WorkspaceAccess) -> None:
                 self.workspace_accesses.append(node)
@@ -285,7 +314,8 @@ class IndexStmt(CIN):
 
     def get_index_vars(self) -> List[IndexVar]:
         class IndexVarCollector(CINVisitorAccept):
-            index_vars: List[IndexVar] = []
+            def __init__(self) -> None:
+                self.index_vars: List[IndexVar] = []
 
             def visit_IndexVar(self, node: IndexVar) -> None:
                 if node not in self.index_vars:
@@ -317,11 +347,11 @@ class IndexVar(IndexExpr):
     An index variable is bound to a set of coordinates by a forall statement.
     """
 
-    is_tiled: bool = False
-    is_outer: bool = False
-    is_inner: bool = False
-    tile_size_var: Optional[TileSizeVar] = None
-    tensor_accesses: List[TensorAccess] = []
+    is_tiled: bool
+    is_outer: bool
+    is_inner: bool
+    tile_size_var: Optional[TileSizeVar]
+    _legacy_tensor_accesses: List[TensorAccess]
 
     def __init__(
         self,
@@ -334,7 +364,11 @@ class IndexVar(IndexExpr):
         self._name = name
         self._expr = expr
         self._parent = parent
-        self.tensor_accesses = []
+        self.is_tiled = False
+        self.is_outer = False
+        self.is_inner = False
+        self.tile_size_var = None
+        self._legacy_tensor_accesses = []
         # if expr, then set parent of expr to self
         if expr:
             expr.set_parent(self)
@@ -400,6 +434,15 @@ class IndexVar(IndexExpr):
             self.tensor_accesses.append(tensor_access)
 
     @property
+    def tensor_accesses(self, omit_workspace: bool = True) -> List[TensorAccess]:
+        del omit_workspace
+        return self._legacy_tensor_accesses
+
+    @tensor_accesses.setter
+    def tensor_accesses(self, accesses: List[TensorAccess]) -> None:
+        self._legacy_tensor_accesses = accesses
+
+    @property
     def size_llir_var(self) -> llir.Var:
         # Get the size of the index variable from the dense tensor accesses
         dense_tensor_accesses = [
@@ -423,7 +466,7 @@ class IndexVar(IndexExpr):
 
     def __eq__(self, other):
         if isinstance(other, IndexVar):
-            return self.name == other.name
+            return self.index_id == other.index_id
         return False
 
     def __copy__(self):
@@ -433,7 +476,7 @@ class IndexVar(IndexExpr):
         return
 
     def __hash__(self):
-        return hash(self.name)
+        return hash(self.index_id)
 
     def __add__(self, other) -> IndexVarExpr:
         return IndexVarAdd(self, other)
@@ -478,6 +521,7 @@ class TileSizeVar(IndexExpr):
         return llir.VarInit(var=self.llir_var, value=llir.Literal(self.size))
 
     def __post_init__(self):
+        CIN.__init__(self)
         # if _name is not given, set it to f"kTile_{index_var.name}"
         if self._name is None:
             self._name = f"kTile_{self.index_var.name}"
@@ -541,11 +585,12 @@ class TensorVar(IndexExpr):
     e.g. A, B, C, ...
     """
 
-    _name: Optional[str] = None
-    shape: Optional[Tuple[int, ...]] = None
-    format: Optional[TensorFormat] = None
-    dtype: torch.dtype = torch.float32
-    mode_order: Optional[List[int]] = None
+    _name: Optional[str]
+    _format: Optional[TensorFormat]
+    _assignment: Optional[TensorAssign]
+    shape: Optional[Tuple[int, ...]]
+    dtype: torch.dtype
+    mode_order: Optional[List[int]]
 
     def __init__(
         self,
@@ -558,21 +603,31 @@ class TensorVar(IndexExpr):
         super().__init__()
         self.symbol_id: SymbolId = new_symbol_id()
         self._name = name
-        self.shape = shape
+        self._format = None
+        self._assignment = None
+        self.shape = tuple(shape) if shape is not None else None
 
         if fmt:
-            self.format = parse_format(fmt)
+            self._format = parse_format(fmt)
 
         self.dtype = dtype
 
         if mode_order:
-            self.mode_order = mode_order
+            self.mode_order = list(mode_order)
         elif self.shape:
             self.mode_order = list(range(len(self.shape)))
         elif self.format:
             self.mode_order = list(range(self.format.get_order()))
         else:
             self.mode_order = None
+
+    @property
+    def format(self) -> Optional[TensorFormat]:
+        return self._format
+
+    @format.setter
+    def format(self, value: Optional[TensorFormat]) -> None:
+        self._format = value
 
     @property
     def name(self) -> str:
@@ -588,8 +643,9 @@ class TensorVar(IndexExpr):
         return self.name
 
     def get_format(self) -> TensorFormat:
-        assert self.format is not None, "TensorVar format is None"
-        return self.format
+        tensor_format = self.format
+        assert tensor_format is not None, "TensorVar format is None"
+        return tensor_format
 
     def get_mode_order(self) -> Optional[List[int]]:
         return self.mode_order
@@ -611,10 +667,19 @@ class TensorVar(IndexExpr):
         return TensorAccess(self, item)
 
     def __setitem__(self, key, value) -> None:
-        """
-        Set self._assignment to the processed node.
+        """Compatibility-only assignment DSL.
+
+        Finalized compiler paths construct :class:`TensorAssign` directly. This
+        mutating shim remains temporarily for existing internal/test callers and
+        is stripped by ``normalize_cin``.
         """
         self._assignment = TensorAssign(TensorAccess(self, key), value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TensorVar) and self.symbol_id == other.symbol_id
+
+    def __hash__(self) -> int:
+        return hash(self.symbol_id)
 
     def __str__(self):
         return f"{self.name}:{self.format}"
@@ -629,9 +694,8 @@ class TensorVar(IndexExpr):
 
 
 class Workspace(TensorVar):
-    name: Optional[str] = None
     dim: int
-    workspace_accesses: List[WorkspaceAccess] = []
+    workspace_accesses: List[WorkspaceAccess]
 
     def __init__(
         self,
@@ -650,11 +714,11 @@ class Workspace(TensorVar):
 
         super().__init__()
 
-        self.name = name
+        self._name = name
         self.dtype = dtype
         self._tile_size_var = tile_size_var
         self.workspace_accesses = []
-        self.mode_order = mode_order
+        self.mode_order = list(mode_order) if mode_order is not None else None
 
         if not self.mode_order:
             self.mode_order = [i for i in range(self.dim)]
@@ -687,6 +751,13 @@ class Workspace(TensorVar):
         if self.dense:
             return parse_format(["d"] * self.dim)
         return parse_format(["o"] * self.dim)
+
+    @format.setter
+    def format(self, value: Optional[TensorFormat]) -> None:
+        # Workspace layout is derived from ``dense`` and ``dim``. Keep the
+        # inherited writeable property contract for legacy callers without
+        # making that derived layout authoritative instance state.
+        self._format = value
 
     def add_workspace_access(self, workspace_access: WorkspaceAccess) -> None:
         if workspace_access not in self.workspace_accesses:
@@ -723,19 +794,23 @@ class TensorAccess(IndexExpr):
     def __init__(
         self,
         tensor: TensorVar,
-        indices: Union[IndexVar, List[IndexVar]],
+        indices: Optional[Union[IndexVar, Sequence[IndexVar]]],
     ):
         super(TensorAccess, self).__init__()
 
+        self.access_id: AccessId = new_access_id()
         self.tensor = tensor
+        self.tensor_id = tensor.symbol_id
         if isinstance(indices, IndexVar):
             indices = [indices]
-        self.indices = indices
+        self.indices = list(indices) if indices is not None else []
+        self.index_ids = tuple(index_var.index_id for index_var in self.indices)
 
-        if self.indices:
-            # Add tensor access to index vars
-            for ivar in self.indices:
-                ivar.add_tensor_access(self)
+    def update_indices(self, indices: Sequence[IndexVar]) -> None:
+        """Update legacy working-copy indices and their stable references."""
+
+        self.indices = list(indices)
+        self.index_ids = tuple(index_var.index_id for index_var in self.indices)
 
     def is_dense(self) -> bool:
         return self.tensor.is_dense()
@@ -834,6 +909,12 @@ class TensorAccess(IndexExpr):
     def __getitem__(self, index) -> TensorAccess:
         return TensorAccess(self.tensor, self.indices + [index])
 
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TensorAccess) and self.access_id == other.access_id
+
+    def __hash__(self) -> int:
+        return hash(self.access_id)
+
     def __str__(self):
         return (
             f"{self.tensor}[{', '.join([str(i) for i in self.tensor.mode_order])}]"
@@ -857,28 +938,13 @@ class WorkspaceAccess(TensorAccess):
     ):
         super().__init__(wksp, indices)
         self.wksp: Workspace = wksp
-        wksp.add_workspace_access(self)
-
-        if indices:
-            # If the indices contain an inner index, then we need to set
-            # the tile_size_var of the workspace
-            if isinstance(indices, IndexVar):
-                indices = [indices]
-
-            for index_var in indices:
-                if index_var.is_inner and index_var.tile_size_var:
-                    wksp.tile_size_var = index_var.tile_size_var
 
     def update_indices(self, indices: Union[IndexVar, Sequence[IndexVar]]) -> None:
-        if indices:
-            # If the indices contain an inner index, then we need to set
-            # the tile_size_var of the workspace
-            if isinstance(indices, IndexVar):
-                self.indices = [indices]
-
-            for index_var in indices:
-                if index_var.is_inner and index_var.tile_size_var:
-                    self.wksp.tile_size_var = index_var.tile_size_var
+        normalized = [indices] if isinstance(indices, IndexVar) else list(indices)
+        super().update_indices(normalized)
+        for index_var in normalized:
+            if index_var.is_inner and index_var.tile_size_var:
+                self.wksp.tile_size_var = index_var.tile_size_var
 
     def is_dense(self) -> bool:
         return self.wksp.is_dense()
@@ -918,6 +984,15 @@ class OpExpr(IndexExpr):
     """
 
     op: Operation
+    node_id: NodeId = field(
+        default_factory=new_node_id, init=False, compare=False, repr=False
+    )
+    inserted_workspace: bool = field(
+        default=False, init=False, compare=False, repr=False
+    )
+    no_tile_list: List[IndexVar] = field(
+        default_factory=list, init=False, compare=False, repr=False
+    )
 
 
 @dataclass(frozen=True)
@@ -967,7 +1042,7 @@ class TensorAssign(IndexStmt):
 
     lhs: TensorAccess
     rhs: IndexExpr
-    op: Optional[Operation] = None
+    op: Optional[Operation]
 
     def __init__(
         self,
@@ -1026,7 +1101,6 @@ class ForAll(IndexStmt):
         # None preserves automatic outer-loop parallelization. Explicit
         # schedules can select a particular (including nested) loop with True.
         self.parallel = parallel
-        self.stmt.set_parent(self)
 
     def get_index_var(self) -> IndexVar:
         return self.index_var
@@ -1054,8 +1128,7 @@ class Where(IndexStmt):
     consumer: IndexStmt
 
     def __post_init__(self):
-        self.producer.set_parent(self)
-        self.consumer.set_parent(self)
+        IndexStmt.__init__(self, None, None)
 
     def __str__(self):
         return f"Where(\n\tproducer={self.producer}, \n\tconsumer={self.consumer}\n)"
@@ -1069,7 +1142,8 @@ class Where(IndexStmt):
 
     def get_workspaces(self) -> List[Workspace]:
         class WorkspaceGetter(CINVisitorAccept):
-            workspaces: List[Workspace] = []
+            def __init__(self) -> None:
+                self.workspaces: List[Workspace] = []
 
             def visit_Workspace(self, node: Workspace) -> None:
                 self.workspaces.append(node)
@@ -1104,9 +1178,9 @@ class CINVisitorAccept(CINVisitor):
 
 class CINIndexVariablesGetter(CINVisitorAccept):
     # free variables are index variables of the result tensor
-    free_vars: List[IndexVar] = []
+    free_vars: List[IndexVar]
     # input variables are index variables of the input tensors
-    input_vars: List[IndexVar] = []
+    input_vars: List[IndexVar]
 
     def __init__(self, stmt: Optional[IndexStmt] = None):
         self.free_vars = []
@@ -1174,8 +1248,8 @@ class PostOps:
 
 
 class LoopOrderGetter(CINVisitor):
-    index_vars_ordered: List[IndexVar] = []
-    free_vars: List[IndexVar] = []
+    index_vars_ordered: List[IndexVar]
+    free_vars: List[IndexVar]
 
     def __init__(self, stmt: Optional[CIN] = None):
         self.index_vars_ordered = []

@@ -26,8 +26,10 @@ from scorch.compiler.cin import (
     Workspace,
     WorkspaceAccess,
 )
+from .cin_analysis import normalize_cin
 from .identity import IndexId
 from .diagnostics import CompilerInvariantError, VerificationError
+from .legacy_cin_adapter import validate_legacy_cin_display_names
 from .loop_plan import (
     LoopPart,
     LoopPlacement,
@@ -489,6 +491,17 @@ def _render_loop_ref(loop: LoopRef, index_names: Dict[IndexId, str]) -> str:
     return name
 
 
+def _loop_ref_from_legacy_index_var(index_var: IndexVar) -> LoopRef:
+    """Recover the logical loop reference represented by a legacy tile part."""
+
+    if index_var.has_parent:
+        if index_var.is_outer:
+            return LoopRef(index_var.parent.index_id, LoopPart.OUTER)
+        if index_var.is_inner:
+            return LoopRef(index_var.parent.index_id, LoopPart.INNER)
+    return LoopRef(index_var.index_id)
+
+
 def _render_placement(
     placement: LoopPlacement,
     index_names: Dict[IndexId, str],
@@ -620,12 +633,12 @@ class Scheduler:
 
     @staticmethod
     def _unique_index_vars(index_vars: List[IndexVar]) -> List[IndexVar]:
-        seen: Set[str] = set()
+        seen: Set[IndexId] = set()
         unique: List[IndexVar] = []
         for index_var in index_vars:
-            if index_var.name in seen:
+            if index_var.index_id in seen:
                 continue
-            seen.add(index_var.name)
+            seen.add(index_var.index_id)
             unique.append(index_var)
         return unique
 
@@ -1444,6 +1457,15 @@ class Scheduler:
         return matches[0]
 
     @staticmethod
+    def _find_index_var_by_id(cin: CIN, index_id: IndexId) -> IndexVar:
+        matches = [
+            index_var for index_var in cin.index_vars if index_var.index_id == index_id
+        ]
+        if not matches:
+            raise ValueError(f"Unknown IndexId {index_id.value}")
+        return matches[0]
+
+    @staticmethod
     def _outer_loop_prefix(cin: CIN) -> List[ForAll]:
         prefix: List[ForAll] = []
         current: CIN = cin
@@ -1505,7 +1527,6 @@ class Scheduler:
     def _insert_loop_at_depth(cin: CIN, loop: ForAll, depth: int) -> CIN:
         if depth == 0:
             loop.stmt = cin
-            cin.set_parent(loop)
             loop.inserted_workspace = cin.inserted_workspace
             loop.no_tile_list = list(cin.no_tile_list)
             return loop
@@ -1520,12 +1541,7 @@ class Scheduler:
 
         child = parent.stmt
         loop.stmt = child
-        child.set_parent(loop)
         parent.stmt = loop
-        loop.set_parent(parent)
-        # ``loop`` starts with the root as a temporary constructor body. Restore
-        # the actual root relationship after inserting it deeper.
-        cin.parent = None
         return cin
 
     @staticmethod
@@ -1650,6 +1666,7 @@ class Scheduler:
             raise ValueError("Expected input CIN to be a ForAll statement")
 
         target_name = index_var.name
+        target_id = index_var.index_id
         if (
             use_workspace
             and not cin.inserted_workspace
@@ -1661,7 +1678,7 @@ class Scheduler:
 
         # Workspace insertion deep-copies the graph. Resolve the target by name
         # in the transformed graph instead of retaining the pre-copy identity.
-        index_var = Scheduler._find_index_var_by_name(cin, target_name)
+        index_var = Scheduler._find_index_var_by_id(cin, target_id)
         if index_var.is_tiled or getattr(index_var, "_expr", None) is not None:
             raise ValueError(f"Index variable {target_name!r} is already tiled")
 
@@ -1728,7 +1745,6 @@ class Scheduler:
                     self.new_index_var if index == self.old_index_var else index
                     for index in workspace_access.indices
                 ]
-                workspace_access.indices = indices
                 workspace_access.update_indices(indices)
 
         replace_index_var_visitor = ReplaceIndexVarVisitor(
@@ -1825,6 +1841,13 @@ class Scheduler:
             return cin
 
         new_cin = copy.deepcopy(cin)
+        copied_indices = {
+            index_var.index_id: index_var for index_var in new_cin.index_vars
+        }
+        workspace_indices = [
+            copied_indices[index_var.index_id]
+            for index_var in free_vars_after_last_reduction
+        ]
 
         workspace = Workspace(
             name="wksp", dim=dim_workspace, dense=are_all_dense_levels
@@ -1832,7 +1855,7 @@ class Scheduler:
 
         workspace_access = WorkspaceAccess(
             wksp=workspace,
-            indices=free_vars_after_last_reduction,
+            indices=workspace_indices,
         )
 
         # Note: parent_forall not necessarily ForAll statement at the end
@@ -2501,7 +2524,7 @@ class Scheduler:
         )
 
     @staticmethod
-    def apply_schedule(
+    def _apply_schedule_legacy(
         cin: IndexStmt,
         schedule: Schedule,
         costs: _CostModelConstants = _DEFAULT_COSTS,
@@ -2725,15 +2748,20 @@ class Scheduler:
         )
         if is_identity:
             logical_order = Scheduler.select_loop_order(cin, costs=costs)
-            scheduled_cin = Scheduler.auto_schedule(cin, costs=costs)
-            plan = _build_loop_plan(
-                source_cin,
-                schedule,
+            auto_tiles: List[LoopTile] = []
+            scheduled_cin = Scheduler._apply_auto_order_owned(
+                cin,
                 logical_order,
-                panel_bounds=(),
-                relayout_plan=None,
-                result_tile_plan=None,
-                provenance="auto",
+                plan_tiles=auto_tiles,
+            )
+            plan = verify_loop_plan(
+                source_cin,
+                LoopPlan(
+                    loop_order=tuple(index_var.index_id for index_var in logical_order),
+                    tiles=tuple(auto_tiles),
+                    provenance="auto",
+                    tag=schedule.tag,
+                ),
             )
             return ScheduledCIN(scheduled_cin, plan)
 
@@ -2822,6 +2850,28 @@ class Scheduler:
         return ScheduledCIN(cin, plan)
 
     @staticmethod
+    def apply_schedule(
+        cin: IndexStmt,
+        schedule: Schedule,
+        costs: _CostModelConstants = _DEFAULT_COSTS,
+    ) -> ScheduledCIN:
+        """Pair detached semantic CIN with a verified stable-ID schedule.
+
+        The legacy validator still performs private tree surgery. Its mutable
+        result is discarded here and replayed only inside the lowering adapter.
+        """
+
+        validate_legacy_cin_display_names(cin)
+        normalized_cin = normalize_cin(cin)
+        legacy_scheduled = Scheduler._apply_schedule_legacy(
+            normalized_cin, schedule, costs=costs
+        )
+        return ScheduledCIN(
+            normalized_cin,
+            legacy_scheduled.verified_loop_plan,
+        )
+
+    @staticmethod
     def _select_index_vars_to_tile(cin: CIN) -> List[IndexVar]:
         all_index_vars = cin.index_vars
         tensor_accesses = cin.tensor_accesses
@@ -2906,7 +2956,10 @@ class Scheduler:
         return index_vars_to_tile
 
     @staticmethod
-    def _apply_tiling_heuristics(cin: CIN) -> CIN:
+    def _apply_tiling_heuristics(
+        cin: CIN,
+        plan_tiles: Optional[List[LoopTile]] = None,
+    ) -> CIN:
         if not isinstance(cin, ForAll):
             return cin
         # Preserve the legacy auto-scheduler's scope: before ``add_tile`` grew
@@ -2918,18 +2971,47 @@ class Scheduler:
             return cin
         tile_width = _regblock_tile_width() if _regblock_enabled() else 32
         for index_var in Scheduler._select_index_vars_to_tile(cin):
-            cin = Scheduler.add_tile(cin, index_var, tile_width)
+            if _regblock_enabled():
+                parent_ref = _loop_ref_from_legacy_index_var(cin.index_var)
+                placement = f"child_of:{cin.index_var.name}"
+                loop_placement = LoopPlacement(
+                    PlacementKind.CHILD_OF,
+                    parent=parent_ref,
+                )
+            else:
+                placement = "outermost"
+                loop_placement = LoopPlacement(PlacementKind.OUTERMOST)
+            cin = Scheduler.add_tile(
+                cin,
+                index_var,
+                tile_width,
+                placement=placement,
+            )
+            if plan_tiles is not None:
+                plan_tiles.append(
+                    LoopTile(
+                        loop=LoopRef(index_var.index_id),
+                        width=tile_width,
+                        placement=loop_placement,
+                        parallel=False,
+                        kind="affine",
+                        accumulation="direct",
+                        unroll=True,
+                    )
+                )
         return cin
 
     @staticmethod
-    def auto_schedule(
+    def _apply_auto_order_owned(
         cin: CIN,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
+        loop_order: List[IndexVar],
+        plan_tiles: Optional[List[LoopTile]] = None,
     ) -> CIN:
+        """Apply selected auto decisions on a CIN owned by the scheduler."""
+
         if not isinstance(cin, ForAll):
             return cin
 
-        loop_order = Scheduler.select_loop_order(cin, costs=costs)
         cin = Scheduler._rebuild_loop_nest(cin, loop_order)
 
         if Scheduler.should_insert_workspace(cin, loop_order):
@@ -2943,5 +3025,91 @@ class Scheduler:
         if not isinstance(cin, ForAll):
             return cin
 
-        cin = Scheduler._apply_tiling_heuristics(cin)
+        cin = Scheduler._apply_tiling_heuristics(cin, plan_tiles=plan_tiles)
         return cin
+
+    @staticmethod
+    def _auto_schedule_owned(
+        cin: CIN,
+        costs: _CostModelConstants = _DEFAULT_COSTS,
+        plan_tiles: Optional[List[LoopTile]] = None,
+    ) -> CIN:
+        """Select policy once, then mutate only scheduler-owned CIN."""
+
+        if not isinstance(cin, ForAll):
+            return cin
+        loop_order = Scheduler.select_loop_order(cin, costs=costs)
+        return Scheduler._apply_auto_order_owned(
+            cin,
+            loop_order,
+            plan_tiles=plan_tiles,
+        )
+
+    @staticmethod
+    def _replay_auto_plan_owned(cin: IndexStmt, plan: LoopPlan) -> IndexStmt:
+        """Replay recorded auto decisions without rerunning scheduling policy."""
+
+        verify_loop_plan(cin, plan)
+        if not isinstance(cin, ForAll):
+            if plan.loop_order or plan.tiles:
+                raise VerificationError(
+                    "stage=legacy auto replay: non-loop CIN has loop decisions"
+                )
+            return cin
+        if (
+            plan.panel_bounds
+            or plan.relayout is not None
+            or plan.result_tile is not None
+            or plan.parallel_loop is not None
+        ):
+            raise VerificationError(
+                "stage=legacy auto replay: auto LoopPlan contains explicit-only "
+                "decisions"
+            )
+
+        index_names, _ = entity_display_names(cin)
+        logical_order = [
+            Scheduler._find_index_var_by_id(cin, index_id)
+            for index_id in plan.loop_order
+        ]
+        cin = Scheduler._rebuild_loop_nest(cin, logical_order)
+
+        loop_order, _ = Scheduler._extract_loop_chain(cin)
+        if Scheduler.should_insert_workspace(cin, loop_order) and (
+            not Scheduler._has_dense_output(cin) or bool(plan.tiles)
+        ):
+            cin = Scheduler.insert_workspace(cin, allow_dense=True)
+
+        for tile in plan.tiles:
+            if tile.loop.part != LoopPart.LOGICAL or tile.kind != "affine":
+                raise VerificationError(
+                    "stage=legacy auto replay: unsupported recorded auto tile"
+                )
+            target = Scheduler._find_index_var_by_id(cin, tile.loop.index_id)
+            cin = Scheduler.add_tile(
+                cin=cin,
+                index_var=target,
+                tile_size=tile.width,
+                placement=_render_placement(tile.placement, index_names),
+                parallel=tile.parallel,
+                unroll=tile.unroll,
+                use_workspace=False,
+            )
+        return cin
+
+    @staticmethod
+    def auto_schedule(
+        cin: CIN,
+        costs: _CostModelConstants = _DEFAULT_COSTS,
+    ) -> CIN:
+        """Auto-schedule without mutating caller-owned CIN state."""
+
+        if isinstance(cin, IndexStmt):
+            validate_legacy_cin_display_names(cin)
+        working = (
+            normalize_cin(cin) if isinstance(cin, IndexStmt) else copy.deepcopy(cin)
+        )
+        scheduled = Scheduler._auto_schedule_owned(working, costs=costs)
+        if isinstance(scheduled, IndexStmt):
+            validate_legacy_cin_display_names(scheduled)
+        return scheduled

@@ -23,6 +23,8 @@ from .iter_lattice import IterationLattice
 from .llir import AssignOp, DataType
 from .diagnostics import CompilerInvariantError, UnsupportedFeature
 from .loop_plan import LoopPlan, ScheduledCIN, verify_scheduled_cin
+from .legacy_cin_adapter import legacy_cin_working_copy
+from .cin_analysis import verify_cin_if_enabled
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -508,6 +510,7 @@ class CINLowerer:
         self.outermost_stmt: Optional[IndexStmt] = None
         self.has_explicit_parallel_loop = False
         self.loop_plan: Optional[LoopPlan] = None
+        self.normalized_cin: Optional[IndexStmt] = None
 
         self.result_value_array_sparse_index_llir = None
         self._scalar_accum_mode = False
@@ -1455,15 +1458,16 @@ class CINLowerer:
         # Build conversion CIN: result[i,j,...] = T[i,j,...]
         # then wrap in ForAll loops in mode_order and recursively lower
         sorted_result_index_vars = result_tensor_access.get_sorted_index_vars()
-
-        lhs = f'result_tensor[{", ".join(["result_index_vars[{i}]".format(i=i) for i in range(len(result_index_vars))])}]'
-        rhs = f'intermediate_tensor_var[{", ".join(["result_index_vars[{i}]".format(i=i) for i in range(len(result_index_vars))])}]'
-        exec(f"{lhs} = {rhs}")
-
-        cin_rhs = "result_tensor._assignment"
-        for i in range(len(sorted_result_index_vars) - 1, -1, -1):
-            cin_rhs = f"ForAll(sorted_result_index_vars[{i}], {cin_rhs})"
-        cin_stmt = eval(cin_rhs)
+        access_key = (
+            result_index_vars[0]
+            if len(result_index_vars) == 1
+            else tuple(result_index_vars)
+        )
+        rhs_access = intermediate_tensor_var[access_key]
+        lhs_access = result_tensor[access_key]
+        cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
+        for index_var in reversed(sorted_result_index_vars):
+            cin_stmt = ForAll(index_var, cin_stmt)
 
         # Recursively lower the conversion CIN
         result_conversion_stmts = self.lower_IndexStmt(cin_stmt)
@@ -2069,17 +2073,26 @@ class CINLowerer:
     def _prepare_scheduled_cin(
         self, stmt: Union[IndexStmt, ScheduledCIN], recurse: bool
     ) -> IndexStmt:
-        if not isinstance(stmt, ScheduledCIN):
+        if recurse or self.outermost_stmt is not None:
+            if isinstance(stmt, ScheduledCIN):
+                raise CompilerInvariantError(
+                    "stage=CIN lowering: ScheduledCIN is valid only at the "
+                    "outer scheduling boundary"
+                )
             self._validate_index_stmt(stmt)
             return stmt
-        if recurse or self.outermost_stmt is not None:
-            raise CompilerInvariantError(
-                "stage=CIN lowering: ScheduledCIN is valid only at the "
-                "outer scheduling boundary"
-            )
-        verify_scheduled_cin(stmt)
-        self.loop_plan = stmt.verified_loop_plan
-        return stmt.normalized_cin
+
+        plan = None
+        if isinstance(stmt, ScheduledCIN):
+            verify_scheduled_cin(stmt)
+            self.loop_plan = stmt.verified_loop_plan
+            plan = stmt.verified_loop_plan
+            stmt = stmt.normalized_cin
+            self.normalized_cin = stmt
+
+        self._validate_index_stmt(stmt)
+        verify_cin_if_enabled(stmt)
+        return legacy_cin_working_copy(stmt, plan)
 
     def lower_IndexStmt(
         self, stmt: Union[IndexStmt, ScheduledCIN], recurse=False
@@ -2573,7 +2586,9 @@ class CINLowerer:
                     panel_bounds,
                     relayout_plan,
                     result_tile_plan,
-                ) = materialize_legacy_schedule(stmt, self.loop_plan)
+                ) = materialize_legacy_schedule(
+                    self.normalized_cin or stmt, self.loop_plan
+                )
                 self._apply_explicit_parallel_schedule(function, legacy_schedule)
                 from .schedule_lowerer import apply_schedule_to_llir
 

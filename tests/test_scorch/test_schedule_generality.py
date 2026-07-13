@@ -13,6 +13,7 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
 from scorch.compiler.scheduler import (
     Schedule,
     Scheduler,
@@ -523,7 +524,11 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
     _, auto_body = Scheduler._extract_loop_chain(auto_scheduled)
     assert auto_scheduled.inserted_workspace
     assert isinstance(auto_body, Where)
-    assert str(empty_scheduled) == str(auto_scheduled)
+    empty_working = legacy_cin_working_copy(
+        empty_scheduled.normalized_cin,
+        empty_scheduled.verified_loop_plan,
+    )
+    assert str(empty_working) == str(auto_scheduled)
     assert empty_cpp == auto_cpp
     assert "std::vector<linked_list_workspace_1d" in auto_cpp
     assert auto_cpp.count("].make_view()") == 2
@@ -577,7 +582,11 @@ def test_spmv_and_dense_matmul_empty_schedule_preserve_default_codegen(
         auto_cpp = _lower_to_cpp(auto_scheduled)
         empty_cpp = _lower_to_cpp(empty_scheduled)
 
-    assert str(empty_scheduled) == str(auto_scheduled)
+    empty_working = legacy_cin_working_copy(
+        empty_scheduled.normalized_cin,
+        empty_scheduled.verified_loop_plan,
+    )
+    assert str(empty_working) == str(auto_scheduled)
     assert empty_cpp == auto_cpp
     assert "packed_" not in auto_cpp
 

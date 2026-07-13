@@ -21,6 +21,10 @@ class InvalidSchedule(CompilerError):
 class VerificationError(CompilerError):
     """An artifact violates an invariant at a compiler stage boundary."""
 
+    def __init__(self, message: str, *, diagnostics: tuple[object, ...] = ()) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
 
 class CompilerInvariantError(CompilerError):
     """An internal compiler invariant was violated."""

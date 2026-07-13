@@ -19,8 +19,24 @@ class IndexId:
     value: int
 
 
+@dataclass(frozen=True, order=True)
+class NodeId:
+    """Identity of one CIN node within a compiler artifact."""
+
+    value: int
+
+
+@dataclass(frozen=True, order=True)
+class AccessId:
+    """Identity of one logical tensor access within a CIN artifact."""
+
+    value: int
+
+
 _symbol_ids = count()
 _index_ids = count()
+_node_ids = count()
+_access_ids = count()
 _id_lock = Lock()
 
 
@@ -36,3 +52,17 @@ def new_index_id() -> IndexId:
 
     with _id_lock:
         return IndexId(next(_index_ids))
+
+
+def new_node_id() -> NodeId:
+    """Allocate a stable identity for one CIN node."""
+
+    with _id_lock:
+        return NodeId(next(_node_ids))
+
+
+def new_access_id() -> AccessId:
+    """Allocate a stable identity for one tensor-access occurrence."""
+
+    with _id_lock:
+        return AccessId(next(_access_ids))
