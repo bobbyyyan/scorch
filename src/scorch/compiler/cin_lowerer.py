@@ -28,6 +28,10 @@ from .legacy_cin_adapter import (
     legacy_cin_working_copy,
 )
 from .cin_analysis import verify_cin_if_enabled
+from .dynamic_vector_access_pass import (
+    DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    rewrite_dynamic_vector_accesses,
+)
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -2592,7 +2596,10 @@ class CINLowerer:
                 )
                 body_stmts.extend(final_assembler.emit_final_assembly())
 
-            self._rewrite_dynamic_vector_accesses(body_stmts)
+            body_stmts = rewrite_dynamic_vector_accesses(
+                body_stmts,
+                DYNAMIC_VECTOR_ACCESS_CONTEXT,
+            )
 
             function = llir.Function(
                 return_type=llir.DataType.TACO_TENSOR,
@@ -2624,166 +2631,6 @@ class CINLowerer:
             return function
 
         return []
-
-    @classmethod
-    def _rewrite_dynamic_vector_accesses(cls, stmts: List[llir.Stmt]) -> None:
-        """Make generated ``std::vector`` construction checked and append-aware.
-
-        Vectors declared without an initial size replace the legacy ``cvector``
-        builders. Coordinate and value leaves are emitted at a monotonic output
-        cursor, so those stores become ``emplace_back`` calls with no indexable
-        out-of-range surface. Position-array stores use ``scorch_vector_set`` so
-        only an existing slot or the next append position is legal; reads use
-        ``at``. Pre-sized schedule storage is declared with ``VarInit`` and is
-        intentionally left on its raw-pointer/indexed hot path.
-        """
-        import re
-
-        vector_names: set[str] = set()
-
-        def collect(body: List[llir.Stmt]) -> None:
-            for node in body:
-                if isinstance(node, llir.VarDecl):
-                    type_name = getattr(node.var.type, "value", "")
-                    if type_name.startswith("std::vector<"):
-                        vector_names.add(node.var.name)
-                elif isinstance(node, (llir.ForLoop, llir.ForLoopAuto, llir.WhileLoop)):
-                    collect(node.body)
-                    if isinstance(node, llir.ForLoop):
-                        collect(node.pre_parallel_body or [])
-                        collect(node.post_parallel_body or [])
-                elif isinstance(node, llir.IfThenElse):
-                    collect(node.then_body or [])
-                    collect(node.else_body or [])
-                    for branch in node.then_body_list or []:
-                        collect(branch)
-
-        collect(stmts)
-        if not vector_names:
-            return
-
-        def rewrite_expr(expr):
-            if isinstance(expr, llir.Var):
-                for vector_name in vector_names:
-                    expr.name = re.sub(
-                        rf"\b{re.escape(vector_name)}\[([^\[\]]+)\]",
-                        rf"{vector_name}.at(\1)",
-                        expr.name,
-                    )
-            elif isinstance(expr, llir.BinOp):
-                rewrite_expr(expr.left)
-                rewrite_expr(expr.right)
-            elif isinstance(expr, llir.UnaryOp):
-                rewrite_expr(expr.operand)
-            elif isinstance(expr, llir.FunctionCall):
-                for arg in expr.args:
-                    rewrite_expr(arg)
-            elif isinstance(expr, llir.Array):
-                for value in expr.values:
-                    rewrite_expr(value)
-            elif isinstance(expr, llir.ArrayAccess):
-                rewrite_expr(expr.array)
-                rewrite_expr(expr.index)
-            elif isinstance(expr, llir.Cast):
-                rewrite_expr(expr.expr)
-
-        def transform(body: List[llir.Stmt]) -> None:
-            # Recursive coordinate assembly can publish the same leaf slot more
-            # than once along mixed mode-order tail paths. The legacy container
-            # silently overwrote those duplicates; an append-only std::vector
-            # must instead remove the redundant stores before lowering them to
-            # emplace_back, or its coordinate/value lengths diverge.
-            deduplicated: List[llir.Stmt] = []
-            for candidate in body:
-                target = getattr(getattr(candidate, "var", None), "name", "")
-                target_vector = next(
-                    (
-                        vector_name
-                        for vector_name in vector_names
-                        if re.fullmatch(rf"{re.escape(vector_name)}\[(.+)\]", target)
-                    ),
-                    None,
-                )
-                if (
-                    isinstance(candidate, llir.Assign)
-                    and candidate.op == AssignOp.ASSIGN
-                    and target_vector is not None
-                    and target_vector.endswith("_crd")
-                    and deduplicated
-                    and isinstance(deduplicated[-1], llir.Assign)
-                    and candidate == deduplicated[-1]
-                ):
-                    continue
-                deduplicated.append(candidate)
-            body[:] = deduplicated
-
-            for index, node in enumerate(body):
-                if isinstance(node, llir.Assign):
-                    target = getattr(node.var, "name", "")
-                    matched = None
-                    for vector_name in vector_names:
-                        match = re.fullmatch(
-                            rf"{re.escape(vector_name)}\[(.+)\]", target
-                        )
-                        if match:
-                            matched = (vector_name, match.group(1))
-                            break
-                    rewrite_expr(node.value)
-                    if matched and node.op == AssignOp.ASSIGN:
-                        vector_name, position = matched
-                        if vector_name.endswith(("_crd", "_values")):
-                            body[index] = llir.FunctionCallStmt(
-                                name=f"{vector_name}.emplace_back",
-                                args=[node.value],
-                            )
-                        else:
-                            body[index] = llir.FunctionCallStmt(
-                                name="scorch_vector_set",
-                                args=[
-                                    llir.Var(
-                                        name=vector_name,
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=position,
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    node.value,
-                                ],
-                            )
-                    else:
-                        rewrite_expr(node.var)
-                elif isinstance(node, llir.VarInit):
-                    rewrite_expr(node.value)
-                elif isinstance(node, llir.FunctionCallStmt):
-                    for arg in node.args:
-                        rewrite_expr(arg)
-                elif isinstance(node, llir.ForLoop):
-                    if isinstance(node.init, llir.VarInit):
-                        rewrite_expr(node.init.value)
-                    rewrite_expr(node.cond)
-                    if isinstance(node.update, llir.Assign):
-                        rewrite_expr(node.update.var)
-                        rewrite_expr(node.update.value)
-                    transform(node.body)
-                    transform(node.pre_parallel_body or [])
-                    transform(node.post_parallel_body or [])
-                elif isinstance(node, (llir.ForLoopAuto, llir.WhileLoop)):
-                    if isinstance(node, llir.WhileLoop):
-                        rewrite_expr(node.cond)
-                    transform(node.body)
-                elif isinstance(node, llir.IfThenElse):
-                    rewrite_expr(node.cond)
-                    for condition in node.cond_list or []:
-                        rewrite_expr(condition)
-                    transform(node.then_body or [])
-                    transform(node.else_body or [])
-                    for branch in node.then_body_list or []:
-                        transform(branch)
-                elif isinstance(node, llir.Return):
-                    rewrite_expr(node.value)
-
-        transform(stmts)
 
     @staticmethod
     def _contains_explicit_parallel(stmt: IndexStmt) -> bool:
