@@ -786,6 +786,7 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f"
     )
+    assert not hasattr(lowerer, "_compressed_output_parallel")
 
 
 def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:

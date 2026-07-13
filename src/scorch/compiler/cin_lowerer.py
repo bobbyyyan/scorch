@@ -32,7 +32,12 @@ from .dynamic_vector_access_pass import (
     DYNAMIC_VECTOR_ACCESS_CONTEXT,
     rewrite_dynamic_vector_accesses,
 )
-from .result_write_pass import ResultWriteContext, rewrite_result_writes
+from .compressed_where_openmp_pass import (
+    CompressedWhereOpenMPContext,
+    CompressedWhereOpenMPPolicy,
+    CompressedWhereOpenMPResult,
+    transform_compressed_where_for_openmp,
+)
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -534,8 +539,6 @@ class CINLowerer:
         self._where_workspace_name: Optional[str] = None
         self._where_workspace_ctype: Optional[str] = None
         self._where_workspace_dim: Optional[int] = None
-        self._compressed_output_parallel: bool = False
-
         self.result_tensor_var: Optional[TensorVar] = None
         self.result_tensor_access: Optional[TensorAccess] = None
         self.result_tensor_value_index_var_dict: Dict[IndexVar, llir.Expr] = {}
@@ -2114,6 +2117,19 @@ class CINLowerer:
 
         return self.lower_IndexStmt(stmt, _ownership_transferred=True)
 
+    def _lower_outer_body(self, stmt: IndexStmt) -> CompressedWhereOpenMPResult:
+        """Lower the already-validated outer body and retain pass ownership data."""
+
+        if isinstance(stmt, ForAll):
+            return self.lower_ForAll(stmt)
+        if isinstance(stmt, Where):
+            lowered = self.lower_Where(stmt)
+            statements = lowered if isinstance(lowered, list) else [lowered]
+            return CompressedWhereOpenMPResult(statements, False)
+        raise CompilerInvariantError(
+            "stage=CIN lowering: outer function body must be ForAll or Where"
+        )
+
     def lower_IndexStmt(
         self,
         stmt: Union[IndexStmt, ScheduledCIN],
@@ -2187,7 +2203,7 @@ class CINLowerer:
 
         if recurse or stmt != self.outermost_stmt:
             if isinstance(stmt, ForAll):
-                return self.lower_ForAll(stmt)
+                return self.lower_ForAll(stmt).statements
             if isinstance(stmt, Where):
                 return self.lower_Where(stmt)
 
@@ -2486,9 +2502,9 @@ class CINLowerer:
                         )
                     )
 
-            recurse_stmts = self.lower_IndexStmt(stmt, recurse=True)
-            if not isinstance(recurse_stmts, list):
-                recurse_stmts = [recurse_stmts]
+            recurse_result = self._lower_outer_body(stmt)
+            recurse_stmts = recurse_result.statements
+            compressed_output_parallel = recurse_result.applied
 
             # Post-lowering optimizations on the LLIR
             self._insert_sparse_prefetch(recurse_stmts)
@@ -2551,7 +2567,7 @@ class CINLowerer:
                             *result_level_indices_init_stmts,
                         ]
 
-            if self._compressed_output_parallel:
+            if compressed_output_parallel:
                 # Two-phase parallel transform already emitted Torch-owned
                 # output storage, fill loops, and final assembly.
                 # Only emit tensor level arrays (input pointers) and recurse.
@@ -2702,397 +2718,6 @@ class CINLowerer:
             if tv != self.final_result_tensor_var and not isinstance(tv, Workspace)
         )
         return has_sparse_input
-
-    def _transform_compressed_where_for_openmp(
-        self, stmts: List[llir.Stmt]
-    ) -> List[llir.Stmt]:
-        """Transform a serial ForLoop with workspace-based compressed output into
-        a two-phase parallel assembly:
-          Phase 1: Count nnz per level in parallel
-          Phase 2: Prefix sum + allocate output arrays
-          Phase 3: Fill values in parallel
-
-        Generalised to any 'd,s,s,...,s' output (one dense outer level followed
-        by M compressed levels)."""
-        import copy
-
-        # Find the outer ForLoop
-        for_loop = None
-        for_loop_idx = None
-        for idx, stmt in enumerate(stmts):
-            if isinstance(stmt, llir.ForLoop) and not isinstance(
-                stmt, llir.ForLoopAuto
-            ):
-                if self._is_openmp_compatible_for_loop(stmt):
-                    for_loop = stmt
-                    for_loop_idx = idx
-                    break
-
-        if for_loop is None:
-            return stmts
-
-        loop_var = for_loop.init.var.name
-        loop_bound = self._extract_loop_bound(for_loop)
-        if not loop_bound:
-            return stmts
-
-        wksp_name = self._where_workspace_name
-        wksp_ctype = self._where_workspace_ctype
-        result_name = self.final_result_tensor_var.get_name()
-        level_types = self.final_result_tensor_var.get_level_types()
-        compressed_levels = [
-            i for i, lt in enumerate(level_types) if lt == LevelType.COMPRESSED
-        ]
-        leaf = compressed_levels[-1]
-        first_cl = compressed_levels[0]
-
-        # ── Extract work_body ──────────────────────────────────────────
-        # Keep everything in the outer loop body EXCEPT top-level
-        # compressed-level-1 assembly stmts (pos_index loops, pos
-        # assignments) and the top-level workspace VarInit (hoisted
-        # to pre_parallel_body).  Everything else — including nested
-        # consumer code — stays; the recursive transformer handles it.
-        body = for_loop.body
-        work_body: List[llir.Stmt] = []
-        pos_index_name = f"{result_name}{first_cl}_pos_index"
-        wksp_hoisted = False
-
-        for stmt in body:
-            if isinstance(stmt, llir.ForLoop):
-                cond = getattr(stmt, "cond", None)
-                if (
-                    isinstance(cond, llir.BinOp)
-                    and isinstance(cond.left, llir.Var)
-                    and pos_index_name in cond.left.name
-                ):
-                    continue  # C1_pos_index assembly loop
-                init = getattr(stmt, "init", None)
-                if (
-                    isinstance(init, llir.VarInit)
-                    and hasattr(init, "var")
-                    and getattr(init.var, "name", "").startswith(f"p{result_name}")
-                ):
-                    continue  # pos init loop
-                work_body.append(stmt)
-            elif isinstance(stmt, llir.VarInit):
-                vname = getattr(getattr(stmt, "var", None), "name", "")
-                if vname == wksp_name:
-                    wksp_hoisted = True
-                    continue  # hoisted to pre_parallel_body
-                work_body.append(stmt)
-            elif isinstance(stmt, llir.Assign):
-                vname = getattr(getattr(stmt, "var", None), "name", "")
-                if f"{result_name}{first_cl}_pos[" in vname:
-                    continue  # top-level pos assembly
-                work_body.append(stmt)
-            else:
-                work_body.append(stmt)
-
-        if wksp_hoisted:
-            self._rewrite_val_refs(
-                work_body,
-                {f"{wksp_name}.insert": (f"{wksp_name}.insert_unchecked")},
-            )
-
-        # ── Workspace hoisting ─────────────────────────────────────────
-        wksp_alloc: List[llir.Stmt] = []
-        if wksp_hoisted:
-            wksp_alloc = [
-                llir.RawStmt(
-                    code=(
-                        f"auto {wksp_name} = {wksp_name}_pool["
-                        "(size_t)omp_get_thread_num()].make_view()"
-                    )
-                )
-            ]
-
-        # ── Phase 1: count nnz per level ───────────────────────────────
-        phase1_body: List[llir.Stmt] = []
-        for l in compressed_levels:
-            phase1_body.append(llir.RawStmt(code=f"int _cnt{l} = 0"))
-        for l in compressed_levels[1:]:
-            phase1_body.append(llir.RawStmt(code=f"int _prev{l} = 0"))
-
-        p1_work = rewrite_result_writes(
-            work_body,
-            ResultWriteContext(
-                result_name=result_name,
-                compressed_levels=tuple(compressed_levels),
-                mode="count",
-            ),
-        )
-        phase1_body.extend(p1_work)
-
-        for l in compressed_levels:
-            phase1_body.append(llir.RawStmt(code=f"_count{l}[{loop_var}] = _cnt{l}"))
-        if wksp_hoisted:
-            phase1_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
-
-        phase1_loop = llir.ForLoop(
-            init=copy.deepcopy(for_loop.init),
-            cond=copy.deepcopy(for_loop.cond),
-            update=copy.deepcopy(for_loop.update),
-            body=phase1_body,
-        )
-        phase1_loop.omp_parallel_for = True
-        phase1_loop.omp_schedule = "dynamic, 64"
-        # Both operands are known here, so drive the thread cap by true SpGEMM flop
-        # (A_nnz*avg_B_row) rather than A_nnz alone; falls back to A_nnz when the
-        # B-side pos array can't be found (dense B, self-product, exotic format).
-        flop_work = self._spgemm_flop_work_expr(phase1_body, loop_bound)
-        self._apply_parallel_policy(
-            phase1_loop,
-            body=phase1_body,
-            work_expr=flop_work,
-            grain=self._CG_FLOP_GRAIN if flop_work else None,
-        )
-        if wksp_alloc:
-            phase1_loop.pre_parallel_body = list(wksp_alloc)
-        # ── Phase 3: fill values ───────────────────────────────────────
-        phase3_body: List[llir.Stmt] = []
-        for l in compressed_levels:
-            phase3_body.append(
-                llir.RawStmt(code=f"int64_t _base{l} = _offset{l}[{loop_var}]")
-            )
-            phase3_body.append(llir.RawStmt(code=f"int _pos{l} = 0"))
-        for l in compressed_levels[1:]:
-            phase3_body.append(llir.RawStmt(code=f"int _prev{l} = 0"))
-
-        p3_work = rewrite_result_writes(
-            work_body,
-            ResultWriteContext(
-                result_name=result_name,
-                compressed_levels=tuple(compressed_levels),
-                mode="fill",
-            ),
-        )
-        phase3_body.extend(p3_work)
-
-        if wksp_hoisted:
-            phase3_body.append(llir.RawStmt(code=f"{wksp_name}.clear()"))
-
-        phase3_loop = llir.ForLoop(
-            init=copy.deepcopy(for_loop.init),
-            cond=copy.deepcopy(for_loop.cond),
-            update=copy.deepcopy(for_loop.update),
-            body=phase3_body,
-        )
-        phase3_loop.omp_parallel_for = True
-        phase3_loop.omp_schedule = "dynamic, 64"
-        flop_work3 = self._spgemm_flop_work_expr(phase3_body, loop_bound)
-        self._apply_parallel_policy(
-            phase3_loop,
-            body=phase3_body,
-            work_expr=flop_work3,
-            grain=self._CG_FLOP_GRAIN if flop_work3 else None,
-        )
-        if wksp_alloc:
-            phase3_loop.pre_parallel_body = list(wksp_alloc)
-        # ── Strip pre-loop result tensor declarations ──────────────────
-        result: List[llir.Stmt] = []
-        for stmt in stmts[:for_loop_idx]:
-            if isinstance(stmt, llir.VarDecl) and hasattr(stmt, "var"):
-                vname = getattr(stmt.var, "name", "")
-                if vname.startswith(f"{result_name}_values"):
-                    continue
-                skip = False
-                for l in compressed_levels:
-                    if vname.startswith(f"{result_name}{l}_pos") or vname.startswith(
-                        f"{result_name}{l}_crd"
-                    ):
-                        skip = True
-                        break
-                if skip:
-                    continue
-            if isinstance(stmt, llir.VarInit) and hasattr(stmt, "var"):
-                vname = getattr(stmt.var, "name", "")
-                skip = False
-                for l in compressed_levels:
-                    if vname in (f"p{result_name}{l}", f"{result_name}{l}_pos_index"):
-                        skip = True
-                        break
-                if skip:
-                    continue
-            if isinstance(stmt, llir.Assign):
-                vname = getattr(getattr(stmt, "var", None), "name", "")
-                skip = False
-                for l in compressed_levels:
-                    if f"{result_name}{l}_pos[" in vname:
-                        skip = True
-                        break
-                if skip:
-                    continue
-            if isinstance(stmt, llir.ForLoop):
-                init_var = getattr(getattr(stmt, "init", None), "var", None)
-                if init_var and getattr(init_var, "name", "").startswith(
-                    f"p{result_name}"
-                ):
-                    continue
-            result.append(stmt)
-
-        c_dtype = wksp_ctype or "float"
-
-        # ── Phase 1: RAII count arrays + loop ──────────────────────────
-        if wksp_hoisted:
-            phase1_threads = phase1_loop.omp_num_threads or "omp_get_max_threads()"
-            phase3_threads = phase3_loop.omp_num_threads or "omp_get_max_threads()"
-            thread_count_expr = (
-                phase1_threads
-                if phase1_threads == phase3_threads
-                else f"std::max({phase1_threads}, {phase3_threads})"
-            )
-            result.append(
-                llir.RawStmt(
-                    code=(
-                        f"int {wksp_name}_thread_count = {thread_count_expr};\n"
-                        f"std::vector<linked_list_workspace_1d<{wksp_ctype}>> "
-                        f"{wksp_name}_pool;\n"
-                        f"{wksp_name}_pool.reserve((size_t)"
-                        f"{wksp_name}_thread_count);\n"
-                        f"for (int _worker = 0; _worker < "
-                        f"{wksp_name}_thread_count; _worker++) {{\n"
-                        f"  {wksp_name}_pool.emplace_back("
-                        f"result_shape[{first_cl}], true);\n"
-                        "}"
-                    ),
-                    add_semicolon=False,
-                )
-            )
-        for l in compressed_levels:
-            result.append(
-                llir.RawStmt(
-                    code=(f"std::vector<int> _count{l}((size_t){loop_bound}, 0)")
-                )
-            )
-        result.append(phase1_loop)
-
-        # ── Phase 2: prefix sums + allocate ────────────────────────────
-        for l in compressed_levels:
-            result.append(
-                llir.RawStmt(
-                    code=(
-                        f"std::vector<int64_t> _offset{l}(" f"(size_t){loop_bound} + 1)"
-                    )
-                )
-            )
-            result.append(llir.RawStmt(code=f"_offset{l}[0] = 0"))
-            result.append(
-                llir.RawStmt(
-                    code=f"for (int _i = 0; _i < {loop_bound}; _i++) "
-                    f"_offset{l}[_i + 1] = _offset{l}[_i] + _count{l}[_i];",
-                    add_semicolon=False,
-                )
-            )
-        for l in compressed_levels:
-            result.append(
-                llir.RawStmt(code=f"int64_t _total{l} = _offset{l}[{loop_bound}]")
-            )
-        # Exact-size output buffers are move-only until the fill completes,
-        # then their ownership is transferred into Torch storage contexts.
-        result.append(
-            llir.RawStmt(
-                code=(
-                    f"torch::Tensor {result_name}{first_cl}_pos_torch = "
-                    f"torch::empty({{(long long)({loop_bound} + 1)}}, "
-                    f"torch::kInt);\n"
-                    f"  int* {result_name}{first_cl}_pos_data = "
-                    f"{result_name}{first_cl}_pos_torch.data_ptr<int>();"
-                ),
-                add_semicolon=False,
-            )
-        )
-        result.append(
-            llir.RawStmt(
-                code=f"for (int _i = 0; _i <= {loop_bound}; _i++) "
-                f"{result_name}{first_cl}_pos_data[_i] = "
-                f"(int)_offset{first_cl}[_i];",
-                add_semicolon=False,
-            )
-        )
-
-        for l in compressed_levels:
-            result.append(
-                llir.RawStmt(
-                    code=(
-                        f"torch::Tensor {result_name}{l}_crd_torch = "
-                        f"torch::empty({{(long long)_total{l}}}, torch::kInt);\n"
-                        f"  int* {result_name}{l}_crd_data = "
-                        f"{result_name}{l}_crd_torch.data_ptr<int>();"
-                    ),
-                    add_semicolon=False,
-                )
-            )
-
-        for i, l in enumerate(compressed_levels[:-1]):
-            nl = compressed_levels[i + 1]
-            result.append(
-                llir.RawStmt(
-                    code=(
-                        f"torch::Tensor {result_name}{nl}_pos_torch = "
-                        f"torch::empty({{(long long)(_total{l} + 1)}}, "
-                        f"torch::kInt);\n"
-                        f"  int* {result_name}{nl}_pos_data = "
-                        f"{result_name}{nl}_pos_torch.data_ptr<int>();"
-                    ),
-                    add_semicolon=False,
-                )
-            )
-            # The first boundary has no parent to publish it.  Every later
-            # boundary is the terminal boundary of exactly one parent and is
-            # written by the outer-loop iteration that emits that parent.
-            # Initializing starts inside phase 3 would make adjacent dynamic
-            # iterations write the same boundary concurrently.
-            result.append(llir.RawStmt(code=f"{result_name}{nl}_pos_data[0] = 0"))
-
-        _CTYPE_TO_TORCH = {
-            "float": "torch::kFloat32",
-            "double": "torch::kFloat64",
-            "int": "torch::kInt32",
-            "int32_t": "torch::kInt32",
-            "long long": "torch::kInt64",
-            "int64_t": "torch::kInt64",
-        }
-        torch_dtype = _CTYPE_TO_TORCH.get(c_dtype, "torch::kFloat32")
-        result.append(
-            llir.RawStmt(
-                code=(
-                    f"torch::Tensor {result_name}_values_torch = "
-                    f"torch::empty({{(long long)_total{leaf}}}, {torch_dtype});\n"
-                    f"  {c_dtype}* {result_name}_values_data = "
-                    f"{result_name}_values_torch.data_ptr<{c_dtype}>();"
-                ),
-                add_semicolon=False,
-            )
-        )
-
-        # ── Phase 3: fill values ───────────────────────────────────────
-        result.append(phase3_loop)
-
-        # mode_indices: {{}, {pos,crd}, {pos,crd}, ...}
-        mi_parts = []
-        for i in range(len(level_types)):
-            if i == 0:
-                mi_parts.append("{}")
-            else:
-                mi_parts.append(
-                    f"{{{result_name}{i}_pos_torch, " f"{result_name}{i}_crd_torch}}"
-                )
-        mi_str = ", ".join(mi_parts)
-
-        result.append(
-            llir.RawStmt(
-                code=f"Tensor {result_name};\n"
-                f"  {result_name}.storage.index.mode_indices = "
-                f"{{{mi_str}}};\n"
-                f"  {result_name}.storage.value = "
-                f"{result_name}_values_torch;\n"
-                f"  return {result_name};",
-                add_semicolon=False,
-            )
-        )
-
-        self._compressed_output_parallel = True
-        return result
 
     @staticmethod
     def _is_openmp_compatible_for_loop(for_loop: llir.ForLoop) -> bool:
@@ -4561,7 +4186,7 @@ class CINLowerer:
 
         return result
 
-    def lower_ForAll(self, stmt: ForAll) -> List[llir.Stmt]:
+    def lower_ForAll(self, stmt: ForAll) -> CompressedWhereOpenMPResult:
         """
         Lower a ForAll to LLIR
         parent_index_var is the index var of the parent ForAll, if any
@@ -4640,9 +4265,38 @@ class CINLowerer:
             and not self.has_explicit_parallel_loop
             and self._should_parallelize_compressed_where(index_var)
         ):
-            stmts = self._transform_compressed_where_for_openmp(stmts)
+            result_tensor = self.final_result_tensor_var
+            workspace_name = self._where_workspace_name
+            workspace_ctype = self._where_workspace_ctype
+            if (
+                result_tensor is None
+                or workspace_name is None
+                or workspace_ctype is None
+            ):
+                raise CompilerInvariantError(
+                    "stage=CIN lowering pass=compressed Where/OpenMP: "
+                    "parallelization gate did not establish result/workspace metadata"
+                )
+            compressed_levels = tuple(
+                level
+                for level, level_type in enumerate(result_tensor.get_level_types())
+                if level_type == LevelType.COMPRESSED
+            )
+            return transform_compressed_where_for_openmp(
+                stmts,
+                CompressedWhereOpenMPContext(
+                    result_name=result_tensor.get_name(),
+                    compressed_levels=compressed_levels,
+                    workspace_name=workspace_name,
+                    workspace_ctype=workspace_ctype,
+                    policy=CompressedWhereOpenMPPolicy(
+                        omp_schedule="dynamic, 64",
+                        flop_grain=self._CG_FLOP_GRAIN,
+                    ),
+                ),
+            )
 
-        return stmts
+        return CompressedWhereOpenMPResult(statements=stmts, applied=False)
 
     @staticmethod
     def lower_TensorVar(tensor_var: TensorVar) -> llir.Expr:
