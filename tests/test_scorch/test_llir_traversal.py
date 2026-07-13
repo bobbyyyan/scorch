@@ -1,0 +1,513 @@
+from typing import Dict, List, Set, Tuple, Type, cast
+
+import pytest
+
+from scorch.compiler import llir
+from scorch.compiler.llir_traversal import (
+    LLIRPath,
+    LLIRRewriter,
+    LLIRStatementValue,
+    LLIRTraversalContext,
+    LLIRTraversalError,
+    LLIRValue,
+    LLIRWalker,
+    SUPPORTED_LLIR_NODE_TYPES,
+)
+
+_CONTEXT = LLIRTraversalContext(stage="LLIR test", pass_name="identity")
+
+
+def _var(name: str, data_type: llir.DataType = llir.DataType.INT) -> llir.Var:
+    return llir.Var(name=name, type=data_type)
+
+
+class _RecordingWalker(LLIRWalker):
+    def __init__(self) -> None:
+        super().__init__(_CONTEXT)
+        self.events: List[str] = []
+
+    def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
+        label = type(node).__name__
+        if type(node) is llir.Var:
+            label += f":{cast(llir.Var, node).name}"
+        elif type(node) is llir.Literal:
+            label += f":{cast(llir.Literal, node).value}"
+        self.events.append(label)
+
+
+def _record(value: object) -> List[str]:
+    walker = _RecordingWalker()
+    walker.walk(cast(LLIRValue, value))
+    return walker.events
+
+
+def _structural_snapshot(value: object) -> object:
+    if isinstance(value, llir.Node):
+        return (
+            type(value).__name__,
+            tuple(
+                (name, _structural_snapshot(child))
+                for name, child in sorted(vars(value).items())
+            ),
+        )
+    if isinstance(value, list):
+        return ("list", tuple(_structural_snapshot(child) for child in value))
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_structural_snapshot(child) for child in value))
+    return value
+
+
+def _mutable_ir_ids(value: object) -> Set[int]:
+    mutable_ids: Set[int] = set()
+    if isinstance(value, llir.Node):
+        mutable_ids.add(id(value))
+        for child in vars(value).values():
+            mutable_ids.update(_mutable_ir_ids(child))
+    elif isinstance(value, list):
+        mutable_ids.add(id(value))
+        for child in value:
+            mutable_ids.update(_mutable_ir_ids(child))
+    elif isinstance(value, tuple):
+        for child in value:
+            mutable_ids.update(_mutable_ir_ids(child))
+    return mutable_ids
+
+
+def _declared_node_types() -> Set[Type[llir.Node]]:
+    declared: Set[Type[llir.Node]] = set()
+    pending: List[Type[llir.Node]] = [llir.Node]
+    while pending:
+        parent = pending.pop()
+        for child in parent.__subclasses__():
+            pending.append(child)
+            if child.__module__ == llir.__name__ and child not in (
+                llir.Expr,
+                llir.Stmt,
+            ):
+                declared.add(child)
+    return declared
+
+
+def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
+    value = _var("value")
+    index = _var("index")
+    literal = llir.Literal(1)
+    return {
+        llir.GetTensorProperty: llir.GetTensorProperty(
+            tensor=value,
+            tensor_property=llir.TensorProperty.VALUES,
+        ),
+        llir.Var: value,
+        llir.UnaryOp: llir.UnaryOp("-", value),
+        llir.BinOp: llir.BinOp("+", value, literal),
+        llir.Add: llir.Add(value, literal),
+        llir.Mul: llir.Mul(value, literal),
+        llir.Literal: literal,
+        llir.Increment: llir.Increment(index),
+        llir.Return: llir.Return(value),
+        llir.VarDecl: llir.VarDecl(value),
+        llir.VarInit: llir.VarInit(value, literal),
+        llir.Assign: llir.Assign(value, literal),
+        llir.Allocate: llir.Allocate(value, literal),
+        llir.Free: llir.Free(value),
+        llir.Print: llir.Print(value),
+        llir.Comment: llir.Comment("comment"),
+        llir.BlankLine: llir.BlankLine(),
+        llir.RawStmt: llir.RawStmt("raw"),
+        llir.Continue: llir.Continue(),
+        llir.Break: llir.Break(),
+        llir.Function: llir.Function(
+            return_type=llir.DataType.VOID,
+            name="function",
+            args=[value],
+            body=[llir.Return(value)],
+        ),
+        llir.FunctionCall: llir.FunctionCall("call", [value]),
+        llir.FunctionCallStmt: llir.FunctionCallStmt("call", [value]),
+        llir.Array: llir.Array([value, literal], llir.DataType.INT),
+        llir.ArrayAccess: llir.ArrayAccess(value, index),
+        llir.ForLoop: llir.ForLoop(
+            init=None,
+            cond=value,
+            update=llir.Increment(index),
+            body=[llir.Break()],
+        ),
+        llir.ForLoopAuto: llir.ForLoopAuto(
+            var=index,
+            array=value,
+            body=[llir.Break()],
+        ),
+        llir.WhileLoop: llir.WhileLoop(value, [llir.Break()]),
+        llir.IfThenElse: llir.IfThenElse(
+            cond=value,
+            then_body=[llir.Break()],
+            else_body=[llir.Continue()],
+        ),
+        llir.Case: llir.Case(value, [llir.Break()]),
+        llir.Switch: llir.Switch(
+            cond=value,
+            cases=[llir.Case(literal, [llir.Break()])],
+            default=[llir.Continue()],
+        ),
+        llir.Cast: llir.Cast(value, llir.DataType.INT64),
+        llir.Sizeof: llir.Sizeof(llir.DataType.INT64),
+    }
+
+
+def test_walker_has_deterministic_preorder() -> None:
+    index = _var("i")
+    output = _var("out")
+    function = llir.Function(
+        return_type=llir.DataType.INT,
+        name="ordered",
+        args=[_var("arg0"), _var("arg1")],
+        body=[
+            llir.ForLoop(
+                init=llir.VarInit(index, llir.Literal(0)),
+                cond=llir.BinOp("<", index, _var("n")),
+                update=llir.Increment(index),
+                body=[
+                    llir.IfThenElse(
+                        cond_list=[_var("cond0"), _var("cond1")],
+                        then_body_list=[
+                            [llir.Assign(output, _var("value"))],
+                            [llir.Break()],
+                        ],
+                        else_body=[llir.Continue()],
+                    )
+                ],
+                before_parallel_body=[llir.Comment("before")],
+                pre_parallel_body=[llir.RawStmt("pre")],
+                post_parallel_body=[llir.Return(output)],
+            )
+        ],
+    )
+
+    expected = [
+        "Function",
+        "Var:arg0",
+        "Var:arg1",
+        "ForLoop",
+        "Comment",
+        "VarInit",
+        "Var:i",
+        "Literal:0",
+        "BinOp",
+        "Var:i",
+        "Var:n",
+        "Increment",
+        "Var:i",
+        "RawStmt",
+        "IfThenElse",
+        "Var:cond0",
+        "Var:cond1",
+        "Assign",
+        "Var:out",
+        "Var:value",
+        "Break",
+        "Continue",
+        "Return",
+        "Var:out",
+    ]
+    assert _record(function) == expected
+    assert _record(function) == expected
+
+
+def test_walker_and_rewriter_cover_every_declared_node() -> None:
+    samples = _node_samples()
+    assert set(SUPPORTED_LLIR_NODE_TYPES) == _declared_node_types()
+    assert set(samples) == set(SUPPORTED_LLIR_NODE_TYPES)
+
+    walker = LLIRWalker(_CONTEXT)
+    rewriter = LLIRRewriter(_CONTEXT)
+    for node_type in SUPPORTED_LLIR_NODE_TYPES:
+        sample = samples[node_type]
+        walker.walk(sample)
+        rewritten = rewriter.rewrite(sample)
+        assert type(rewritten) is node_type
+        assert _structural_snapshot(rewritten) == _structural_snapshot(sample)
+        assert _mutable_ir_ids(rewritten).isdisjoint(_mutable_ir_ids(sample))
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_statement_fails_with_structured_stage_diagnostic(
+    operation: str,
+) -> None:
+    class UnknownStmt(llir.Stmt):
+        pass
+
+    unknown = UnknownStmt()
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "unknown_llir_node"
+    assert diagnostic.stage == "LLIR test"
+    assert diagnostic.pass_name == "identity"
+    assert diagnostic.node_type == "UnknownStmt"
+    assert diagnostic.path == ("root",)
+    assert "stage=LLIR test pass=identity" in str(raised.value)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_subclass_of_supported_expression_fails_closed(
+    operation: str,
+) -> None:
+    class UnknownBinOp(llir.BinOp):
+        pass
+
+    unknown = UnknownBinOp("+", _var("left"), _var("right"))
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownBinOp"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_subclass_of_supported_statement_fails_closed(
+    operation: str,
+) -> None:
+    class UnknownBreak(llir.Break):
+        pass
+
+    unknown = UnknownBreak()
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownBreak"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_nested_unknown_node_reports_the_same_exact_path(operation: str) -> None:
+    class UnknownStmt(llir.Stmt):
+        pass
+
+    root: List[LLIRStatementValue] = [[UnknownStmt()]]
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(root)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(root)
+
+    assert raised.value.diagnostic.path == ("root", "[0]", "[0]")
+    assert raised.value.diagnostic.node_type == "UnknownStmt"
+
+
+def test_identity_rewriter_is_detached_and_structurally_idempotent() -> None:
+    metadata = llir.TensorAccessMetadata(
+        tensor_name="Input",
+        index_vars=("i",),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    access = llir.Var(
+        name="Input_values[pInput]",
+        type=llir.DataType.FLOAT32,
+        tensor_access=metadata,
+    )
+    cast_init = llir.VarInit(_var("converted"), llir.Literal(1), cast=True)
+    cast_assign = llir.Assign(_var("assigned"), llir.Literal(2), cast=True)
+    loop = llir.ForLoop(
+        init=llir.VarInit(_var("i"), llir.Literal(0)),
+        cond=llir.BinOp("<", _var("i"), _var("n")),
+        update=llir.Increment(_var("i")),
+        body=[llir.Assign(_var("out"), access)],
+        omp_parallel_for=True,
+        omp_schedule="dynamic, 8",
+        unroll=True,
+        simd=True,
+        before_parallel_body=[llir.Comment("before")],
+        pre_parallel_body=[],
+        post_parallel_body=[llir.RawStmt("post")],
+        omp_num_threads="threads",
+        omp_chunk_expr="chunk_size",
+    )
+    loop.scorch_index_var = "i"
+    setattr(loop, "_use_atomic_scheduling", True)
+    setattr(loop, "_atomic_chunk_var", "chunk")
+    setattr(loop, "_atomic_counter_var", "counter")
+    setattr(loop, "_loop_bound", "n")
+    setattr(loop, "_hoisted_ptr_decls", [llir.RawStmt("hoisted")])
+    while_loop = llir.WhileLoop(_var("keep_going"), [llir.Break()])
+    while_loop.scorch_index_var = "while_index"
+
+    root: List[LLIRStatementValue] = [
+        llir.VarDecl(access),
+        (cast_init, [cast_assign, loop]),
+        while_loop,
+    ]
+    rewriter = LLIRRewriter(_CONTEXT)
+    first = rewriter.rewrite(root)
+    second = rewriter.rewrite(first)
+
+    assert _record(root) == _record(first) == _record(second)
+    assert _structural_snapshot(root) == _structural_snapshot(first)
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert _mutable_ir_ids(root).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    assert first is not root
+    assert type(first[1]) is tuple
+    first_nested = cast(Tuple[object, ...], first[1])
+    second_nested = cast(Tuple[object, ...], second[1])
+    first_cast_init = cast(llir.VarInit, first_nested[0])
+    second_cast_init = cast(llir.VarInit, second_nested[0])
+    assert first_cast_init.cast is True
+    assert type(first_cast_init.value) is llir.Cast
+    assert type(cast(llir.Cast, first_cast_init.value).expr) is llir.Literal
+    assert type(second_cast_init.value) is llir.Cast
+    assert type(cast(llir.Cast, second_cast_init.value).expr) is llir.Literal
+    first_nested_body = cast(List[LLIRStatementValue], first_nested[1])
+    second_nested_body = cast(List[LLIRStatementValue], second_nested[1])
+    first_cast_assign = cast(llir.Assign, first_nested_body[0])
+    second_cast_assign = cast(llir.Assign, second_nested_body[0])
+    assert type(first_cast_assign.value) is llir.Cast
+    assert type(cast(llir.Cast, first_cast_assign.value).expr) is llir.Literal
+    assert type(second_cast_assign.value) is llir.Cast
+    assert type(cast(llir.Cast, second_cast_assign.value).expr) is llir.Literal
+
+    first_decl = cast(llir.VarDecl, first[0])
+    assert first_decl.var.tensor_access is metadata
+    first_loop = cast(llir.ForLoop, first_nested_body[1])
+    assert first_loop.scorch_index_var == "i"
+    assert first_loop.omp_parallel_for is True
+    assert first_loop.omp_schedule == "dynamic, 8"
+    assert first_loop.unroll is True
+    assert first_loop.simd is True
+    assert first_loop.omp_num_threads == "threads"
+    assert first_loop.omp_chunk_expr == "chunk_size"
+    assert first_loop.before_parallel_body is not None
+    assert type(first_loop.before_parallel_body[0]) is llir.Comment
+    assert getattr(first_loop, "_use_atomic_scheduling") is True
+    assert getattr(first_loop, "_atomic_chunk_var") == "chunk"
+    assert getattr(first_loop, "_atomic_counter_var") == "counter"
+    assert getattr(first_loop, "_loop_bound") == "n"
+    assert first_loop.pre_parallel_body == []
+    assert type(getattr(first_loop, "_hoisted_ptr_decls")[0]) is llir.RawStmt
+    first_while = cast(llir.WhileLoop, first[2])
+    assert first_while.scorch_index_var == "while_index"
+
+    first_decl.var.name = "changed"
+    first_loop.body.append(llir.Break())
+    assert cast(llir.VarDecl, root[0]).var.name == "Input_values[pInput]"
+    original_nested = cast(Tuple[object, ...], root[1])
+    original_body = cast(List[LLIRStatementValue], original_nested[1])
+    original_loop = cast(llir.ForLoop, original_body[1])
+    assert len(original_loop.body) == 1
+
+
+def test_list_tuple_nesting_and_optional_children_are_preserved() -> None:
+    conditional = llir.IfThenElse(
+        cond=None,
+        then_body=[],
+        else_body=None,
+        cond_list=[_var("first"), _var("second")],
+        then_body_list=[[llir.Break()], [llir.Continue()]],
+    )
+    conditional.then_body_list = cast(
+        List[List[llir.Stmt]],
+        [(llir.Break(),), []],
+    )
+    root: List[LLIRStatementValue] = [
+        [conditional],
+        (llir.RawStmt("tail"),),
+    ]
+
+    rewritten = LLIRRewriter(_CONTEXT).rewrite(root)
+    assert type(rewritten) is list
+    assert type(rewritten[0]) is list
+    assert type(rewritten[1]) is tuple
+    rewritten_conditional = cast(llir.IfThenElse, cast(List[object], rewritten[0])[0])
+    assert rewritten_conditional.cond is None
+    assert rewritten_conditional.then_body == []
+    assert rewritten_conditional.else_body is None
+    assert rewritten_conditional.cond_list is not None
+    assert len(rewritten_conditional.cond_list) == 2
+    assert rewritten_conditional.then_body_list is not None
+    assert type(rewritten_conditional.then_body_list[0]) is tuple
+    assert rewritten_conditional.then_body_list[1] == []
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("node", "field"),
+    [
+        (
+            llir.Function(llir.DataType.VOID, "function", [], []),
+            "body",
+        ),
+        (
+            llir.ForLoop(None, _var("cond"), llir.Increment(_var("i")), []),
+            "body",
+        ),
+        (llir.ForLoopAuto(_var("i"), _var("array"), []), "body"),
+        (llir.WhileLoop(_var("cond"), []), "body"),
+        (llir.Case(_var("cond"), []), "body"),
+        (llir.Switch(_var("cond"), [], []), "cases"),
+        (llir.Switch(_var("cond"), [], []), "default"),
+    ],
+)
+def test_required_statement_children_reject_none(
+    operation: str,
+    node: llir.Stmt,
+    field: str,
+) -> None:
+    setattr(node, field, None)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(node)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(node)
+
+    assert raised.value.diagnostic.code == "invalid_statement_sequence"
+    assert raised.value.diagnostic.path == ("root", field)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "diagnostic_code"),
+    [
+        ("init", llir.Break(), "invalid_for_loop_init"),
+        ("update", [llir.Increment(_var("i"))], "invalid_for_loop_update"),
+    ],
+)
+def test_for_loop_header_children_are_scalar_and_typed(
+    operation: str,
+    field: str,
+    invalid_value: object,
+    diagnostic_code: str,
+) -> None:
+    loop = llir.ForLoop(
+        init=None,
+        cond=_var("cond"),
+        update=llir.Increment(_var("i")),
+        body=[],
+    )
+    setattr(loop, field, invalid_value)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(loop)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(loop)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == ("root", field)
+
+
+def test_function_call_default_arguments_are_not_shared() -> None:
+    first = llir.FunctionCall("first")
+    second = llir.FunctionCall("second")
+    first.args.append(_var("arg"))
+
+    assert second.args == []

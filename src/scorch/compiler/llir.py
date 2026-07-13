@@ -464,9 +464,9 @@ class Function(Stmt):
 class FunctionCall(Expr):
     """A function call expression."""
 
-    def __init__(self, name: str, args: List[Expr] = []):
+    def __init__(self, name: str, args: Optional[List[Expr]] = None):
         self.name = name
-        self.args = args
+        self.args = [] if args is None else args
 
 
 class FunctionCallStmt(Stmt):
