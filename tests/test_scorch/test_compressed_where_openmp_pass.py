@@ -164,7 +164,7 @@ def test_policy_context_and_result_are_frozen() -> None:
 
 
 def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
-    source = [_compatible_loop(_ds_work_body())]
+    source: List[llir.Stmt] = [_compatible_loop(_ds_work_body())]
 
     result = transform_compressed_where_for_openmp(source, _context())
 
@@ -600,7 +600,7 @@ def test_workspace_ctype_explicitly_controls_value_allocation(
 
 
 def test_transform_does_not_mutate_or_alias_caller_owned_llir() -> None:
-    source = [_compatible_loop(_ds_work_body())]
+    source: List[llir.Stmt] = [_compatible_loop(_ds_work_body())]
     snapshot = _structural_snapshot(source)
 
     result = transform_compressed_where_for_openmp(source, _context())
@@ -775,8 +775,11 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
         left[row, reduction] * right[reduction, column],
         op=Operation.ADD,
     )
-    cin = Scheduler.auto_schedule(
-        ForAll(row, ForAll(reduction, ForAll(column, assignment)))
+    cin = cast(
+        ForAll,
+        Scheduler.auto_schedule(
+            ForAll(row, ForAll(reduction, ForAll(column, assignment)))
+        ),
     )
 
     lowerer = CINLowerer()
@@ -802,11 +805,16 @@ def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
     result[batch, row, column] = (
         left[batch, row, reduction] * right[batch, reduction, column]
     )
-    cin = Scheduler.auto_schedule(
-        ForAll(
-            batch,
-            ForAll(row, ForAll(reduction, ForAll(column, result._assignment))),
-        )
+    assignment = result._assignment
+    assert assignment is not None
+    cin = cast(
+        ForAll,
+        Scheduler.auto_schedule(
+            ForAll(
+                batch,
+                ForAll(row, ForAll(reduction, ForAll(column, assignment))),
+            )
+        ),
     )
 
     cpp = LLIRLowerer().lower_llir(CINLowerer().lower_IndexStmt(cin))
