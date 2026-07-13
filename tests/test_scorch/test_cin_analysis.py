@@ -11,8 +11,10 @@ from scorch.compiler.cin import (
     TensorAccess,
     TensorAssign,
     TensorVar,
+    TileSizeVar,
     Where,
     Workspace,
+    WorkspaceAccess,
 )
 from scorch.compiler.cin_analysis import (
     CINAnalysis,
@@ -171,6 +173,22 @@ def test_access_construction_has_no_backreference_side_effects() -> None:
     assert result._assignment is None
     assert source._assignment is None
     assert workspace_access not in workspace.workspace_accesses
+
+
+def test_workspace_index_rewrite_does_not_materialize_tile_backlink() -> None:
+    logical = IndexVar("i")
+    outer = IndexVar("i_out")
+    inner = IndexVar("i_in")
+    logical.expr = outer + inner
+    TileSizeVar(outer, inner, size=4)
+    workspace = Workspace("tmp", dim=1, dense=True)
+    access = WorkspaceAccess(workspace, logical)
+
+    access.update_indices([inner])
+
+    assert access.indices == [inner]
+    assert access.index_ids == (inner.index_id,)
+    assert not workspace.is_tiled
 
 
 def test_analysis_is_pure_id_keyed_and_tracks_access_order() -> None:

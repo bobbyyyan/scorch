@@ -942,9 +942,6 @@ class WorkspaceAccess(TensorAccess):
     def update_indices(self, indices: Union[IndexVar, Sequence[IndexVar]]) -> None:
         normalized = [indices] if isinstance(indices, IndexVar) else list(indices)
         super().update_indices(normalized)
-        for index_var in normalized:
-            if index_var.is_inner and index_var.tile_size_var:
-                self.wksp.tile_size_var = index_var.tile_size_var
 
     def is_dense(self) -> bool:
         return self.wksp.is_dense()
