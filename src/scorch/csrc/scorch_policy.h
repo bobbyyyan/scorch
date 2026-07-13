@@ -6,7 +6,7 @@
 // work measure and grain:
 //
 //   * JIT codegen (compiler/codegen.py): the generated kernels call these two
-//     helpers. scorch/csrc/header.cpp — the packaged JIT preamble — includes this
+//     helpers. scorch/csrc/header.h — the packaged JIT preamble — includes this
 //     file, and src/scorch/utils.py expands both resources into one self-contained
 //     translation unit. The codegen flop path
 //     passes SCORCH_GRAIN_CODEGEN_SPGEMM; A_nnz sites use the SCORCH_GRAIN_DEFAULT
@@ -97,7 +97,7 @@
 #  define SCORCH_CHUNK_MAX 64L
 #endif
 
-// Dense-output parallel zero-fill threshold (scorch/csrc/header.cpp scorch_zero_dense,
+// Dense-output parallel zero-fill threshold (scorch/csrc/header.h scorch_zero_dense,
 // called by the JIT dense-output kernels): minimum OUTPUT BYTES at which the zero
 // is parallelized across all cores. Below this a single memset is used — fork/join
 // would exceed the saving. 256 KB keeps >= 2 pages per thread even at 32 threads

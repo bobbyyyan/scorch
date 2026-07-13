@@ -8,9 +8,6 @@
 
 #include <vector>
 
-#include "header.h"
-#include "cvector.h"
-
 int cmp(const void* a, const void* b) {
   return *((const int*)a) - *((const int*)b);
 }
@@ -35,21 +32,19 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
   int* SCORCH_RESTRICT B1_crd = B_mode_indices[1][1].data_ptr<int>();
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
-  cvector<int> C1_pos;
-  cvector<int> C1_crd;
-  C1_pos[0] = 0;
+  std::vector<int> C1_pos(C0_size + 1, 0);
+  std::vector<int> C1_crd;
   int pC1 = 0;
 
   for (int pC1 = 1; pC1 < (C0_size + 1); pC1++) {
     C1_pos[pC1] = 0;
   }
 
-  // Initialize result value array
-  cvector<float> C_values;
+  std::vector<float> C_values;
 
-  float* SCORCH_RESTRICT w = (float*)malloc(sizeof(float) * B1_size);
-  int* SCORCH_RESTRICT w_index_list = (int*)malloc(sizeof(int) * B1_size);
-  bool* SCORCH_RESTRICT w_already_set = (bool*)calloc(B1_size, sizeof(bool));
+  std::vector<float> w(B1_size);
+  std::vector<int> w_index_list(B1_size);
+  std::vector<uint8_t> w_already_set(B1_size, 0);
 
   for (int i = 0; i < A0_size; i++) {
     int w_index_list_size = 0;
@@ -67,24 +62,20 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
         }
       }
     }
-    qsort(w_index_list, w_index_list_size, sizeof(int), cmp);
+    qsort(w_index_list.data(), w_index_list_size, sizeof(int), cmp);
     int pC1_begin = pC1;
 
     for (int w_idx = 0; w_idx < w_index_list_size; w_idx++) {
       int k = w_index_list[w_idx];
 
-      C_values[pC1] = w[k];
-      C1_crd[pC1] = k;
+      C_values.push_back(w[k]);
+      C1_crd.push_back(k);
       pC1++;
       w_already_set[k] = 0;
     }
 
     C1_pos[i + 1] = pC1 - pC1_begin;
   }
-
-  free(w_index_list);
-  free(w_already_set);
-  free(w);
 
   int csC1 = 0;
   for (int pC10 = 1; pC10 < (C0_size + 1); pC10++) {
@@ -94,14 +85,13 @@ Tensor evaluate(std::vector<int> result_shape, std::vector<int> A_shape,
 
   // Assemble final result
   Tensor C;
-  torch::Tensor C1_pos_torch = torch::from_blob(
-      C1_pos.data(), {C1_pos.size()}, C1_pos.get_deleter(), torch::kInt);
-  torch::Tensor C1_crd_torch = torch::from_blob(
-      C1_crd.data(), {C1_crd.size()}, C1_crd.get_deleter(), torch::kInt);
+  torch::Tensor C1_pos_torch =
+      scorch_tensor_from_vector(std::move(C1_pos), torch::kInt);
+  torch::Tensor C1_crd_torch =
+      scorch_tensor_from_vector(std::move(C1_crd), torch::kInt);
   torch::Tensor C_values_torch =
-      torch::from_blob(C_values.data(), {C_values.size()},
-                       C_values.get_deleter(), torch::kFloat32);
-  C._storage._index.mode_indices = {{}, {C1_pos_torch, C1_crd_torch}};
-  C._storage._value = C_values_torch;
+      scorch_tensor_from_vector(std::move(C_values), torch::kFloat32);
+  C.storage.index.mode_indices = {{}, {C1_pos_torch, C1_crd_torch}};
+  C.storage.value = C_values_torch;
   return C;
 }

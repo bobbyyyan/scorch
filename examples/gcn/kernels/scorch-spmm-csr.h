@@ -32,10 +32,8 @@ Tensor evaluate(std::vector<int> result_shape,
 
   // Use Torch API to create output
   auto options = torch::TensorOptions().dtype(A_values.scalar_type()).device(A_values.device());
-  auto C_values = torch::empty({C0_size, C1_size}, options);
+  auto C_values = torch::empty({C_capacity}, options);
   float* SCORCH_RESTRICT C_val = C_values.data_ptr<float>();
-
-  // float* SCORCH_RESTRICT C_val = (float*)malloc(sizeof(float) * C_capacity);
 
   constexpr int kTileN = 512;
 
@@ -48,7 +46,7 @@ Tensor evaluate(std::vector<int> result_shape,
 
     for (int outer_j = 0; outer_j < B1_size; outer_j += kTileN) {
       float accumulator[kTileN] = {};
-      // float* SCORCH_RESTRICT accumulator = new float[kTileN]();
+      const int tile_width = std::min(kTileN, B1_size - outer_j);
 
       for (int pA1 = pA1_start; pA1 < pA1_end; pA1++) {
         // Resolve coordinates
@@ -56,7 +54,7 @@ Tensor evaluate(std::vector<int> result_shape,
 
         // Unroll the inner loop
         SCORCH_PRAGMA_UNROLL
-        for (int inner_j = 0; inner_j < kTileN; inner_j++) {
+        for (int inner_j = 0; inner_j < tile_width; inner_j++) {
           int j = outer_j + inner_j;
           int pB1 = k * B1_size + j;
           accumulator[inner_j] += A_val[pA1] * B_val[pB1];
@@ -64,23 +62,17 @@ Tensor evaluate(std::vector<int> result_shape,
       }
 
       // Flush the accumulator
-      for (int inner_j = 0; inner_j < kTileN; inner_j++) {
+      for (int inner_j = 0; inner_j < tile_width; inner_j++) {
         int j = outer_j + inner_j;
         int pC1 = pC0 * C1_size + j;
         C_val[pC1] = accumulator[inner_j];
       }
-
-      // Deallocate memory to prevent memory leak
-      // delete[] accumulator;
     }
   }
 
   // Assemble final result
   Tensor C;
-  // auto C_values_deleter = [](void* ptr) { free(ptr); };
-  // torch::Tensor C_values =
-  //     torch::from_blob(C_val, {C_capacity}, C_values_deleter, torch::kFloat32);
-  C._storage._index.mode_indices = {{}, {}};
-  C._storage._value = C_values;
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = C_values;
   return C;
 }

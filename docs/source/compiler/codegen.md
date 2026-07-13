@@ -35,8 +35,8 @@ Every LLIR node is a `Node`, split into `Expr` (expressions) and `Stmt`
 Types are the `DataType` enum — a set of concrete C++ type *strings*: scalars
 (`INT64 = "int64_t"`, `FLOAT32 = "float"`), the torch/runtime structs
 (`TORCH_TENSOR = "torch::Tensor"`, `TACO_TENSOR = "Tensor"`), pointer families
-(`PTR_FLOAT32 = "float*"`), and the custom container types `cvector<T>` and
-`coo_workspace<T, dim>` that back Scorch's {doc}`workspaces </compiler/workspaces>`.
+(`PTR_FLOAT32 = "float*"`), standard vectors used by sparse builders, and
+`coo_workspace<T, dim>` that backs Scorch's {doc}`workspaces </compiler/workspaces>`.
 Because a `DataType` *is* its C++ spelling, codegen never has to translate types —
 it prints them verbatim.
 
@@ -176,8 +176,8 @@ that {doc}`lowering </compiler/lowering>` generated from A's `"ds"` format.
 ## Stage 6 — JIT compile & the two-tier cache
 
 Before compilation, the generated `evaluate(...)` string is prepended with the
-packaged `src/scorch/csrc/header.cpp` resource — the runtime support layer that
-defines the `Tensor` / `TensorStorage` structs, `cvector<T>`,
+packaged `src/scorch/csrc/header.h` resource — the runtime support layer that
+defines the `Tensor` / `TensorStorage` structs, RAII vector-to-tensor transfer,
 `coo_workspace<T, dim>`, and the `#include "scorch_policy.h"` threading policy.
 `utils.py` reads both files through `importlib.resources` and expands that include
 before handing the self-contained source to `_load_kernel(...)`.

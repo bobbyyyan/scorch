@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -17,7 +19,7 @@
 #endif
 
 #include "prebuilt_types.h"
-#include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.cpp)
+#include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.h)
 #include <ATen/Parallel.h>  // at::parallel_for (pipeline-pool composition A/B)
 #include <cstdlib>          // std::getenv / std::atol (runtime A/B flag)
 
@@ -52,8 +54,10 @@ Tensor spmm_csr_bias_act(std::vector<int> result_shape, std::vector<int> A_shape
   scalar_t* SCORCH_RESTRICT bias_val = bias_values.data_ptr<scalar_t>();
 
   int C_capacity = C0_size * C1_size;
+  torch::Tensor C_values_torch = torch::empty(
+      {(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
   scalar_t* SCORCH_RESTRICT C_values =
-      (scalar_t *)malloc(sizeof(scalar_t) * C_capacity);
+      C_values_torch.data_ptr<scalar_t>();
 
   // Work-escalated thread cap, FLOORED at the platform default (omp_get_max_threads
   // = torch's per-platform thread count, i.e. the P-core count on a hybrid P+E CPU).
@@ -108,9 +112,6 @@ Tensor spmm_csr_bias_act(std::vector<int> result_shape, std::vector<int> A_shape
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {C_capacity}, C_values_deleter, scorch_torch_dtype<scalar_t>());
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -139,8 +140,10 @@ Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
+  torch::Tensor C_values_torch = torch::empty(
+      {(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
   scalar_t* SCORCH_RESTRICT C_values =
-      (scalar_t *)malloc(sizeof(scalar_t) * C_capacity);
+      C_values_torch.data_ptr<scalar_t>();
   memset(C_values, 0, sizeof(scalar_t) * C_capacity);
 
   // Row-parallel loop: i (rows) -> j (sparse) -> k (dense columns).
@@ -167,11 +170,6 @@ Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
 
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void *ptr) {
-    { free(ptr); }
-  };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {C_capacity}, C_values_deleter, scorch_torch_dtype<scalar_t>());
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -231,7 +229,9 @@ Tensor spmm_csr_float_untiled(std::vector<int> result_shape, std::vector<int> A_
 
   // Initialize result value array - use size_t to avoid integer overflow
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   #pragma omp parallel for
@@ -262,11 +262,6 @@ Tensor spmm_csr_float_untiled(std::vector<int> result_shape, std::vector<int> A_
 
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void *ptr) {
-    { free(ptr); }
-  };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -297,7 +292,9 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
-  float* C_values = (float*) malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Initialize tile sizes
@@ -324,8 +321,6 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
       int pC0 = i;
 
       float wksp[kTile_k] = {};
-      // Initialize workspaces
-      // float* wksp = new float[kTile_k]();
 
       for (int pA1 = pA0; pA1 < pA1_end; pA1++) {
         // Resolve coordinates
@@ -349,8 +344,6 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
         int pC1 = pC0 * C1_size + k;
         C_values[pC1] += wksp[k_in];
       }
-
-      // delete[] wksp;
     }
   }
 
@@ -373,7 +366,7 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
         // Resolve index into dense level of values array
         int pC0 = i;
         // Initialize workspaces
-        float* wksp = new float[1]();
+        float wksp = 0.0f;
 
         for (int pA1 = pA0; pA1 < pA1_end; pA1++) {
           // Resolve coordinates
@@ -382,19 +375,17 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
           // Resolve dense coordinates
           int pB0 = j;
           int pB1 = pB0 * B1_size + k;
-          wksp[0] += A_val[pA1] * B_val[pB1];
+          wksp += A_val[pA1] * B_val[pB1];
         }
 
         // Lower consumer CIN
         int pC1 = pC0 * C1_size + k;
-        C_values[pC1] += wksp[0];
+        C_values[pC1] += wksp;
       }
     }
   }
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void* ptr) {{ free(ptr); }};
-  torch::Tensor C_values_torch = torch::from_blob(C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -422,7 +413,9 @@ Tensor spmm_csr_float_optimized(std::vector<int> result_shape, std::vector<int> 
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Use the tile size parameter with a reasonable default
@@ -432,11 +425,16 @@ Tensor spmm_csr_float_optimized(std::vector<int> result_shape, std::vector<int> 
   int num_tiles = static_cast<int>(
       (static_cast<int64_t>(B1_size) + kTile_k - 1) / kTile_k);
 
+  const size_t workspace_stride =
+      ((static_cast<size_t>(kTile_k) + 15) / 16) * 16;
+  auto thread_workspaces = scorch_make_aligned_buffer_pool<float>(
+      static_cast<size_t>(omp_get_max_threads()), workspace_stride);
+
   #pragma omp parallel
   {
-    // Pre-allocate thread-local workspace to avoid repeated allocations
-    // This is a significant optimization - only allocate once per thread
-    float* thread_workspace = new float[kTile_k]();
+    float* SCORCH_RESTRICT thread_workspace =
+        thread_workspaces.get() +
+        static_cast<size_t>(omp_get_thread_num()) * workspace_stride;
 
     #pragma omp for
     for (int i = 0; i < A0_size; i++) {
@@ -490,18 +488,10 @@ Tensor spmm_csr_float_optimized(std::vector<int> result_shape, std::vector<int> 
         }
       }
     }
-
-    // Clean up thread-local storage
-    delete[] thread_workspace;
   }
 
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void *ptr) {
-    { free(ptr); }
-  };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -529,7 +519,9 @@ Tensor spmm_csr_float_turbo(std::vector<int> result_shape, std::vector<int> A_sh
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Calculate optimal tile size for the current matrix
@@ -551,6 +543,11 @@ Tensor spmm_csr_float_turbo(std::vector<int> result_shape, std::vector<int> A_sh
 
   int kTile_k = optimal_tile_size;
 
+  const size_t workspace_stride =
+      ((static_cast<size_t>(kTile_k) + 15) / 16) * 16;
+  auto thread_workspaces = scorch_make_aligned_buffer_pool<float>(
+      static_cast<size_t>(omp_get_max_threads()), workspace_stride);
+
   #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < A0_size; i++) {
     int pC0 = i;
@@ -561,9 +558,9 @@ Tensor spmm_csr_float_turbo(std::vector<int> result_shape, std::vector<int> A_sh
     // Skip rows with no non-zeros
     if (SCORCH_UNLIKELY(nnz_in_row == 0)) continue;
 
-    // Allocate thread-local workspace once per row
-    // This avoids repeated allocation/deallocation inside the tile loop
-    float* accum_c = new float[kTile_k]();
+    float* SCORCH_RESTRICT accum_c =
+        thread_workspaces.get() +
+        static_cast<size_t>(omp_get_thread_num()) * workspace_stride;
 
     // Process each row in tiles
     for (int k_out = 0; k_out < B1_size; k_out += kTile_k) {
@@ -616,18 +613,10 @@ Tensor spmm_csr_float_turbo(std::vector<int> result_shape, std::vector<int> A_sh
         C_values[pC1] = accum_c[k_in];
       }
     }
-
-    // Free thread-local workspace
-    delete[] accum_c;
   }
 
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void *ptr) {
-    { free(ptr); }
-  };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -669,13 +658,9 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
     throw std::runtime_error(ss.str());
   }
 
-  float* SCORCH_RESTRICT C_values = (float *)malloc(allocation_size);
-  if (!C_values) {
-    std::stringstream ss;
-    ss << "Failed to allocate " << (allocation_size / (1024.0 * 1024.0))
-       << " MB for dense output matrix (" << C0_size << " x " << C1_size << ")";
-    throw std::runtime_error(ss.str());
-  }
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, allocation_size);
 
   // Calculate statistics for adaptive tiling
@@ -715,38 +700,22 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
   }
   omp_set_num_threads(num_threads);
 
+  // Allocate all worker scratch before entering OpenMP so allocation failures
+  // unwind normally instead of escaping a parallel structured block.
+  const size_t aligned_tile_size =
+      ((static_cast<size_t>(default_tile_size) + 15) / 16) * 16;
+  auto thread_workspaces = scorch_make_aligned_buffer_pool<float>(
+      static_cast<size_t>(num_threads), aligned_tile_size);
+
   // Process all rows in a single parallel region with dynamic scheduling
   #pragma omp parallel
   {
-    // Ensure allocation size is a multiple of the alignment (64 bytes)
-    // Each float is 4 bytes, so we need to align to 16 floats (64/4)
-    size_t aligned_tile_size = ((default_tile_size + 15) / 16) * 16;
-    size_t aligned_bytes = aligned_tile_size * sizeof(float);
+    float* SCORCH_RESTRICT thread_workspace =
+        thread_workspaces.get() +
+        static_cast<size_t>(omp_get_thread_num()) * aligned_tile_size;
 
-    // Each thread allocates its own workspace aligned to cache line (64 bytes)
-    float* SCORCH_RESTRICT thread_workspace = nullptr;
-
-    #if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200112L)
-    // Use posix_memalign which has better error handling
-    if (posix_memalign((void**)&thread_workspace, 64, aligned_bytes) != 0) {
-      thread_workspace = nullptr; // Ensure it's null on failure
-    }
-    #else
-    // Fallback to aligned_alloc
-    thread_workspace = (float*)aligned_alloc(64, aligned_bytes);
-    #endif
-
-    // Check if allocation succeeded
-    if (thread_workspace == nullptr) {
-      // Handle allocation failure gracefully
-      #pragma omp critical
-      {
-        fprintf(stderr, "Failed to allocate thread workspace memory\n");
-      }
-      // Skip computation in this thread, others can continue
-    } else {
-      #pragma omp for schedule(dynamic, 16)
-      for (int i = 0; i < A0_size; i++) {
+    #pragma omp for schedule(dynamic, 16)
+    for (int i = 0; i < A0_size; i++) {
         int pC0 = i;
         int pA1_begin = A1_pos[i];
         int pA1_end = A1_pos[i + 1];
@@ -873,14 +842,6 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
             C_values[pC1_base + k_in] = thread_workspace[k_in];
           }
         }
-      }
-
-      // Clean up thread-local workspace safely
-      #if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200112L)
-      free(thread_workspace);
-      #else
-      free(thread_workspace);
-      #endif
     }
   }
 
@@ -889,11 +850,6 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
 
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void *ptr) {
-    { free(ptr); }
-  };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -921,7 +877,9 @@ Tensor spmm_csr_float_apex(std::vector<int> result_shape, std::vector<int> A_sha
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Calculate statistics for adaptive tiling
@@ -961,12 +919,17 @@ Tensor spmm_csr_float_apex(std::vector<int> result_shape, std::vector<int> A_sha
   }
   omp_set_num_threads(num_threads);
 
+  auto thread_workspaces = scorch_make_aligned_buffer_pool<float>(
+      static_cast<size_t>(num_threads),
+      static_cast<size_t>(default_tile_size));
+
   // Process all rows in a single parallel region with dynamic scheduling
   #pragma omp parallel
   {
-    // Each thread allocates its own workspace aligned to cache line (64 bytes)
     float* SCORCH_RESTRICT thread_workspace =
-        (float*)aligned_alloc(64, sizeof(float) * default_tile_size);
+        thread_workspaces.get() +
+        static_cast<size_t>(omp_get_thread_num()) *
+            static_cast<size_t>(default_tile_size);
 
     #pragma omp for schedule(dynamic, 16)
     for (int i = 0; i < A0_size; i++) {
@@ -1089,9 +1052,6 @@ Tensor spmm_csr_float_apex(std::vector<int> result_shape, std::vector<int> A_sha
         }
       }
     }
-
-    // Clean up thread-local workspace
-    free(thread_workspace);
   }
 
   // Restore default thread count
@@ -1099,11 +1059,6 @@ Tensor spmm_csr_float_apex(std::vector<int> result_shape, std::vector<int> A_sha
 
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void *ptr) {
-    { free(ptr); }
-  };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -1131,7 +1086,9 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
 
   // Initialize result value array - use size_t to avoid integer overflow
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Use the tile size parameters
@@ -1142,12 +1099,21 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
       (static_cast<int64_t>(A0_size) + kTile_i - 1) / kTile_i);
   int residual_k_start = (B1_size / kTile_k) * kTile_k;
 
+  const size_t workspace_stride =
+      ((static_cast<size_t>(kTile_k) + 15) / 16) * 16;
+  auto thread_workspaces = scorch_make_aligned_buffer_pool<float>(
+      static_cast<size_t>(omp_get_max_threads()), workspace_stride);
+
   #pragma omp parallel for
   for (int i_tile = 0; i_tile < num_i_tiles; i_tile++) {
     // Calculate the start and end of this i-tile
     int i_start = i_tile * kTile_i;
     int i_end = static_cast<int>(std::min<int64_t>(
         static_cast<int64_t>(i_start) + kTile_i, A0_size));
+
+    float* SCORCH_RESTRICT accum_c =
+        thread_workspaces.get() +
+        static_cast<size_t>(omp_get_thread_num()) * workspace_stride;
 
     for (int k_out = 0; k_out < residual_k_start; k_out += kTile_k) {
       // For each i-tile and k-tile, process the computation
@@ -1156,8 +1122,7 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
         // Resolve index into dense level of values array
         int pC0 = i;
 
-        // Initialize workspaces
-        float *accum_c = new float[kTile_k]();
+        memset(accum_c, 0, sizeof(float) * static_cast<size_t>(kTile_k));
 
         // Initialize iterators
         int pA1_end = A1_pos[i + 1];
@@ -1182,8 +1147,6 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
           size_t pC1 = (size_t)pC0 * (size_t)C1_size + (size_t)k;
           C_values[pC1] += accum_c[k_in];
         }
-
-        delete[] accum_c;
       }
     }
   }
@@ -1197,10 +1160,15 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
       int i_start = i_tile * kTile_i;
       int i_end = std::min(i_start + kTile_i, A0_size);
 
+      float* SCORCH_RESTRICT accum_c =
+          thread_workspaces.get() +
+          static_cast<size_t>(omp_get_thread_num()) * workspace_stride;
+
       for (int i = i_start; i < i_end; i++) {
         int pC0 = i;
 
-        float *accum_c = new float[tile_k_width]();
+        memset(accum_c, 0,
+               sizeof(float) * static_cast<size_t>(tile_k_width));
         int pA1_end = A1_pos[i + 1];
 
         for (int pA1 = A1_pos[i]; pA1 < pA1_end; pA1++) {
@@ -1218,17 +1186,11 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
           size_t pC1 = (size_t)pC0 * (size_t)C1_size + (size_t)k;
           C_values[pC1] += accum_c[k - residual_k_start];
         }
-        delete[] accum_c;
       }
     }
   }
   // Assemble final result
   Tensor C;
-  auto C_values_deleter = [](void *ptr) {
-    { free(ptr); }
-  };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -1258,7 +1220,9 @@ Tensor spmm_csr_float_direct(std::vector<int> result_shape, std::vector<int> A_s
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   #pragma omp parallel for schedule(dynamic, 16)
@@ -1306,9 +1270,6 @@ Tensor spmm_csr_float_direct(std::vector<int> result_shape, std::vector<int> A_s
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -1334,7 +1295,9 @@ Tensor spmm_csr_float_neon(std::vector<int> result_shape, std::vector<int> A_sha
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   #pragma omp parallel for schedule(dynamic, 16)
@@ -1417,9 +1380,6 @@ Tensor spmm_csr_float_neon(std::vector<int> result_shape, std::vector<int> A_sha
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -1445,7 +1405,9 @@ Tensor spmm_csr_float_row_panel(std::vector<int> result_shape, std::vector<int> 
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   constexpr int PANEL_SIZE = 8;
@@ -1457,10 +1419,23 @@ Tensor spmm_csr_float_row_panel(std::vector<int> result_shape, std::vector<int> 
     float val;
   };
 
+  size_t max_panel_nnz = 0;
+  for (int panel = 0; panel < num_panels; ++panel) {
+    const int i_start = panel * PANEL_SIZE;
+    const int i_end = std::min(i_start + PANEL_SIZE, A0_size);
+    const size_t panel_nnz = static_cast<size_t>(
+        A1_pos[i_end] - A1_pos[i_start]);
+    max_panel_nnz = std::max(max_panel_nnz, panel_nnz);
+  }
+  const size_t entries_stride = ((max_panel_nnz + 15) / 16) * 16;
+  auto entries_by_thread = scorch_make_unique_array_pool<PanelEntry>(
+      static_cast<size_t>(omp_get_max_threads()), entries_stride);
+
   #pragma omp parallel
   {
-    // Thread-local entry buffer to avoid repeated allocation
-    std::vector<PanelEntry> entries;
+    PanelEntry* SCORCH_RESTRICT entries =
+        entries_by_thread.get() +
+        static_cast<size_t>(omp_get_thread_num()) * entries_stride;
 
     #pragma omp for schedule(dynamic)
     for (int panel = 0; panel < num_panels; panel++) {
@@ -1476,25 +1451,22 @@ Tensor spmm_csr_float_row_panel(std::vector<int> result_shape, std::vector<int> 
 
       if (total_nnz == 0) continue;
 
-      entries.clear();
-      entries.reserve(total_nnz);
-
+      int num_entries = 0;
       for (int r = 0; r < panel_rows; r++) {
         int i = i_start + r;
         for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
-          entries.push_back({A1_crd[pA1], r, A_val[pA1]});
+          entries[num_entries++] = {A1_crd[pA1], r, A_val[pA1]};
         }
       }
 
       // Sort by column for B-row reuse
-      std::sort(entries.begin(), entries.end(),
+      std::sort(entries, entries + num_entries,
                 [](const PanelEntry& a, const PanelEntry& b) {
                   return a.col < b.col;
                 });
 
       // Process sorted entries - B row stays in cache across entries with same col
       int idx = 0;
-      int num_entries = (int)entries.size();
       while (idx < num_entries) {
         int j = entries[idx].col;
         const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size;
@@ -1542,9 +1514,6 @@ Tensor spmm_csr_float_row_panel(std::vector<int> result_shape, std::vector<int> 
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -1571,7 +1540,9 @@ Tensor spmm_csr_float_k_parallel(std::vector<int> result_shape, std::vector<int>
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Tile size = 32 floats = 128 bytes = 1 Apple Silicon cache line
@@ -1613,9 +1584,6 @@ Tensor spmm_csr_float_k_parallel(std::vector<int> result_shape, std::vector<int>
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -1641,7 +1609,9 @@ Tensor spmm_csr_float_sorted_rows(std::vector<int> result_shape, std::vector<int
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   // Sort row indices by nnz count (descending)
@@ -1731,9 +1701,6 @@ Tensor spmm_csr_float_sorted_rows(std::vector<int> result_shape, std::vector<int
   // Empty rows: skip entirely (C is already zeroed)
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -1764,7 +1731,9 @@ Tensor spmm_csr_float_neon2(std::vector<int> result_shape, std::vector<int> A_sh
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   #pragma omp parallel for schedule(dynamic, 16)
@@ -1876,9 +1845,6 @@ Tensor spmm_csr_float_neon2(std::vector<int> result_shape, std::vector<int> A_sh
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -1905,7 +1871,9 @@ Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_sh
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   #pragma omp parallel for schedule(dynamic, 16)
@@ -2013,9 +1981,6 @@ Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_sh
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -2270,21 +2235,16 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   // the zeroing is a single O(rows) index scan. Correctness is identical: a
   // non-empty row is fully overwritten by the kernel; an empty row is zeroed
   // here.
-  torch::Tensor C_values_torch;
-  float* SCORCH_RESTRICT C_values;
-  bool torch_alloc = true, zero_empty_only = true;
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
+  bool zero_empty_only = true;
 #ifdef SCORCH_TUNE_HOOKS
-  // A/B hook: SCORCH_SPMM_ALLOC bit0=torch_alloc, bit1=zero_empty_only.
-  // 0 = malloc + full memset (legacy); 3 = torch::empty + empty-only (default).
+  // A/B hook retained for the zeroing policy. Output storage is always owned by
+  // Torch; bit1 selects empty-row-only zeroing versus a full memset.
   { const char* e = std::getenv("SCORCH_SPMM_ALLOC");
-    if (e && *e) { long v = std::atol(e); torch_alloc = v & 1; zero_empty_only = v & 2; } }
+    if (e && *e) { long v = std::atol(e); zero_empty_only = v & 2; } }
 #endif
-  if (torch_alloc) {
-    C_values_torch = torch::empty({(long long)C_capacity}, torch::kFloat32);
-    C_values = C_values_torch.data_ptr<float>();
-  } else {
-    C_values = (float*)malloc(sizeof(float) * C_capacity);
-  }
   if (zero_empty_only) {
     for (int i = 0; i < A0_size; i++)
       if (A1_pos[i] == A1_pos[i + 1])
@@ -2376,6 +2336,12 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
     g_scorch_regtile_base = (e && *e && std::atol(e) != 0) ? 1 : 0; }
 #endif
 
+  scorch_unique_buffer<float> worker_workspaces;
+#if !defined(__AVX2__) || !defined(__FMA__) || defined(SCORCH_TUNE_HOOKS)
+  worker_workspaces = scorch_make_aligned_buffer_pool<float>(
+      static_cast<size_t>(nthreads), static_cast<size_t>(kTile));
+#endif
+
   // The per-worker body (atomic row work-stealing). Factored into a lambda so it
   // can be launched EITHER through a private libgomp team (#pragma omp, default)
   // OR through torch's own intra-op pool (at::parallel_for). The latter shares
@@ -2383,15 +2349,17 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
   // cross-runtime thread-team reformation at each op boundary — the drop-in-
   // pipeline "same thread pool" composition. Work distribution is byte-identical
   // (same next_row atomic, same regblock/regtile kernels); only the launch differs.
-  auto scorch_spmm_worker = [&]() {
+  auto scorch_spmm_worker = [&](int worker_id) {
     // Per-thread workspace for the fallback path (cache-line aligned, lives in
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
-    // row, so the shipped build never touches it (nullptr; free(nullptr) is a
-    // no-op). Allocated only for the non-AVX2 fallback or the force_workspace hook.
-#if defined(__AVX2__) && defined(__FMA__) && !defined(SCORCH_TUNE_HOOKS)
+    // row, so the shipped build never touches it. Allocated only for the non-AVX2
+    // fallback or the force_workspace hook.
     float* SCORCH_RESTRICT ws = nullptr;
+#if !defined(__AVX2__) || !defined(__FMA__) || defined(SCORCH_TUNE_HOOKS)
+    ws = worker_workspaces.get() +
+        static_cast<size_t>(worker_id) * static_cast<size_t>(kTile);
 #else
-    float* SCORCH_RESTRICT ws = (float*)aligned_alloc(64, kTile * sizeof(float));
+    (void)worker_id;
 #endif
 
     // Atomic work-stealing loop with adaptive chunk size
@@ -2455,8 +2423,6 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
         }
       }
     }
-
-    free(ws);
   };
 
   // Launch. Default: private libgomp team (#pragma omp) — byte-identical to the
@@ -2496,26 +2462,22 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
     if (nthreads >= 2 * atpool) {
       #pragma omp parallel num_threads(nthreads)
       {
-        scorch_spmm_worker();
+        scorch_spmm_worker(omp_get_thread_num());
       }
     } else {
       at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
-        for (int64_t w = wbeg; w < wend; ++w) scorch_spmm_worker();
+        for (int64_t w = wbeg; w < wend; ++w)
+          scorch_spmm_worker(static_cast<int>(w));
       });
     }
   } else {
     #pragma omp parallel num_threads(nthreads)
     {
-      scorch_spmm_worker();
+      scorch_spmm_worker(omp_get_thread_num());
     }
   }
 
   Tensor C;
-  if (!torch_alloc) {
-    auto C_values_deleter = [](void* ptr) { free(ptr); };
-    C_values_torch = torch::from_blob(
-        C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
-  }
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;
@@ -2975,14 +2937,22 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
     if (*_nr) use_neon_regtile = (std::atol(_nr) != 0);
 #endif
 
+  scorch_unique_buffer<float> worker_workspaces;
+#if !defined(__AVX2__) || !defined(__FMA__)
+  worker_workspaces = scorch_make_aligned_buffer_pool<float>(
+      static_cast<size_t>(nthreads), static_cast<size_t>(kTile));
+#endif
+
   // Per-worker body: atomic row work-stealing, byte-identical distribution to v2.
   // Computes each output row via the AVX2 regblock/regtile kernels (or the non-
   // AVX2 workspace fallback), then folds bias+act into the SAME parallel region.
-  auto worker = [&]() {
-#if defined(__AVX2__) && defined(__FMA__)
+  auto worker = [&](int worker_id) {
     float* SCORCH_RESTRICT ws = nullptr;
+#if !defined(__AVX2__) || !defined(__FMA__)
+    ws = worker_workspaces.get() +
+        static_cast<size_t>(worker_id) * static_cast<size_t>(kTile);
 #else
-    float* SCORCH_RESTRICT ws = (float*)aligned_alloc(64, kTile * sizeof(float));
+    (void)worker_id;
 #endif
     while (true) {
       const int start = next_row.fetch_add(chunk, std::memory_order_relaxed);
@@ -3051,7 +3021,6 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
         scorch_apply_row_bias_act(C_row, C1_size, bo, act);
       }
     }
-    free(ws);
   };
 
   // Launch. Unlike v2 (which gates at::parallel_for on work>=grain AND a row-
@@ -3090,17 +3059,18 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
     if (nthreads >= 2 * atpool) {
       #pragma omp parallel num_threads(nthreads)
       {
-        worker();
+        worker(omp_get_thread_num());
       }
     } else {
       at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
-        for (int64_t w = wbeg; w < wend; ++w) worker();
+        for (int64_t w = wbeg; w < wend; ++w)
+          worker(static_cast<int>(w));
       });
     }
   } else {
     #pragma omp parallel num_threads(nthreads)
     {
-      worker();
+      worker(omp_get_thread_num());
     }
   }
 
@@ -3407,11 +3377,20 @@ torch::Tensor scorch_sparse_attention_csr_float(torch::Tensor crow_indices,
     if (len > max_len) max_len = len;
   }
 
-  auto do_rows = [&](int64_t r0, int64_t r1) {
-    // One allocation per parallel task: [max_len score buffer | D-wide V accum].
-    std::vector<float> scratch(max_len + D);
-    float* SCORCH_RESTRICT scores = scratch.data();
-    float* SCORCH_RESTRICT acc = scratch.data() + max_len;
+  TORCH_CHECK(D <= std::numeric_limits<int64_t>::max() - max_len,
+              "sparse-attention scratch size overflow");
+  const size_t scratch_elements = static_cast<size_t>(max_len + D);
+  const size_t scratch_stride = (scratch_elements + 15) & ~size_t{15};
+  const int scratch_workers = std::max(1, at::get_num_threads());
+  auto scratch_by_worker = scorch_make_aligned_buffer_pool<float>(
+      static_cast<size_t>(scratch_workers), scratch_stride);
+
+  auto do_rows = [&](int64_t r0, int64_t r1, int worker_id) {
+    // One serially allocated slice per pool worker: [scores | D-wide V accum].
+    float* SCORCH_RESTRICT scratch =
+        scratch_by_worker.get() + static_cast<size_t>(worker_id) * scratch_stride;
+    float* SCORCH_RESTRICT scores = scratch;
+    float* SCORCH_RESTRICT acc = scratch + max_len;
     for (int64_t i = r0; i < r1; ++i) {
       const int64_t s = rp[i], e = rp[i + 1];
       float* SCORCH_RESTRICT out_i = Op + i * HD;
@@ -3469,9 +3448,11 @@ torch::Tensor scorch_sparse_attention_csr_float(torch::Tensor crow_indices,
   // is heavy (H * len * D), so a few rows per task already amortizes task overhead
   // and keeps the lone heavy global row from stalling the join barrier.
   if (nthreads_override > 0 && S > 1) {
-    at::parallel_for(0, S, 8, [&](int64_t r0, int64_t r1) { do_rows(r0, r1); });
+    at::parallel_for(0, S, 8, [&](int64_t r0, int64_t r1) {
+      do_rows(r0, r1, at::get_thread_num());
+    });
   } else {
-    do_rows(0, S);
+    do_rows(0, S, 0);
   }
   return out;
 }
@@ -3497,7 +3478,9 @@ Tensor spmm_csr_float_tiled_neon(std::vector<int> result_shape, std::vector<int>
   float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-  float* SCORCH_RESTRICT C_values = (float *)malloc(sizeof(float) * C_capacity);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C_capacity}, torch::kFloat32);
+  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
   constexpr int kTile = 128;
@@ -3563,9 +3546,6 @@ Tensor spmm_csr_float_tiled_neon(std::vector<int> result_shape, std::vector<int>
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {(long long)C_capacity}, C_values_deleter, torch::kFloat32);
   C.storage.index.mode_indices = {{}, {}};
   C.storage.value = C_values_torch;
   return C;

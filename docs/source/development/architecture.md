@@ -215,7 +215,7 @@ source distributions self-contained.
 | `ops.cpp` | The single compilation unit for `scorch_ops`; hosts the prebuilt kernel entry points. |
 | `spmm.h` | Hand-optimized SpMM kernels (the tiling variants, thread policy). |
 | `kernels.h` | Other prebuilt kernels (SpMV, SDDMM, fused neural ops). |
-| `header.cpp` / `header.h` | Runtime support prepended to every JIT kernel: the `Tensor` / `TensorStorage` structs, `cvector<T>`, `coo_workspace<T, dim>`. |
+| `header.h` | Canonical runtime prepended to every JIT kernel: tensor result types, checked `std::vector` assembly, and move-only workspaces. |
 | `scorch_policy.h` | The parallel thread-policy header shared by prebuilt and JIT paths. |
 | `prebuilt_types.h` | Shared type declarations for the prebuilt kernels. |
 
@@ -228,7 +228,7 @@ Do not add production build logic to either legacy file.
 :::
 
 Generated kernels (from `codegen.py`) are compiled *separately at runtime* by
-`utils.py`. It reads `header.cpp` and `scorch_policy.h` from the installed package
+`utils.py`. It reads `header.h` and `scorch_policy.h` from the installed package
 with `importlib.resources`, expands the policy include, and passes a self-contained
 source string to PyTorch's JIT compiler. No repository-relative include path is
 required.

@@ -11,9 +11,9 @@ import os
 import scorch
 from scorch import Tensor
 from scorch.storage import TensorIndex
+from scorch.utils import jit_preamble_text
 
-with open("kernels/header.h", "r", encoding="utf-8") as f:
-    header_cpp_code = f.read()
+header_cpp_code = jit_preamble_text()
 
 with open("kernels/scorch-spmm-csr.h", "r", encoding="utf-8") as f:
     spmm_cpp_code = f.read()
@@ -23,7 +23,7 @@ with open("kernels/scorch-spmspm-csr-original.h", "r", encoding="utf-8") as f:
 
 
 spmm = load_inline(
-    name="kernel",
+    name="scorch_example_spmm",
     cpp_sources=[header_cpp_code, spmm_cpp_code],
     functions=["evaluate"],
     extra_cflags=[
@@ -36,9 +36,8 @@ spmm = load_inline(
 )
 
 spmspm = load_inline(
-    name="kernel",
-    cpp_sources=[spmspm_cpp_code],
-    extra_include_paths=["kernels/"],
+    name="scorch_example_spmspm",
+    cpp_sources=[header_cpp_code, spmspm_cpp_code],
     functions=["evaluate"],
     extra_cflags=[
         "-O3",

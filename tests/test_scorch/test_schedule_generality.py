@@ -474,6 +474,9 @@ def test_sddmm_default_scalar_accumulator_and_simd_are_unchanged():
     assert "#pragma omp simd" in cpp
     assert "wksp" not in cpp
     assert "packed_" not in cpp
+    assert "int64_t _known_nnz = Mask_values.size(0);" in cpp
+    assert "torch::Tensor Sampled0_crd_torch = torch::empty" in cpp
+    assert "std::vector<float> Sampled_values" not in cpp
 
     torch.manual_seed(102)
     mask = torch.randn(5, 7)
@@ -522,7 +525,13 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
     assert isinstance(auto_body, Where)
     assert str(empty_scheduled) == str(auto_scheduled)
     assert empty_cpp == auto_cpp
-    assert "linked_list_workspace_1d" in auto_cpp
+    assert "std::vector<linked_list_workspace_1d" in auto_cpp
+    assert auto_cpp.count("].make_view()") == 2
+    assert ", true);" in auto_cpp
+    assert "std::current_exception()" not in auto_cpp
+    assert "for (int _worker = 0" in auto_cpp
+    assert ".insert_unchecked(" in auto_cpp
+    assert "torch::Tensor SparseProduct1_crd_torch = torch::empty" in auto_cpp
     assert "SparseProduct1_pos_data" in auto_cpp
     assert "packed_" not in auto_cpp
 

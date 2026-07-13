@@ -117,12 +117,6 @@ class DataType(Enum):
     TORCH_UINT8 = "torch::kUInt8"
     TACO_TENSOR = "Tensor"
     NO_TYPE = "NO_TYPE"
-    CVECTOR_INT = "cvector<int>"
-    CVECTOR_INT32 = "cvector<int32_t>"
-    CVECTOR_INT64 = "cvector<int64_t>"
-    CVECTOR_FLOAT32 = "cvector<float>"
-    CVECTOR_TORCH_FLOAT32 = "cvector<torch::kFloat32>"
-
     COO_WORKSPACE_INT = "coo_workspace<int>"
     COO_WORKSPACE_FLOAT32 = "coo_workspace<float>"
     COO_WORKSPACE_TORCH_FLOAT32 = "coo_workspace<torch::kFloat32>"
@@ -139,6 +133,12 @@ class DataType(Enum):
     COO_WORKSPACE_FLOAT32_5 = "coo_workspace<float, 5>"
 
     STD_VECTOR_INT = "std::vector<int64_t>"
+    STD_VECTOR_C_INT = "std::vector<int>"
+    STD_VECTOR_INT32 = "std::vector<int32_t>"
+    STD_VECTOR_FLOAT32 = "std::vector<float>"
+    STD_VECTOR_FLOAT64 = "std::vector<double>"
+    STD_VECTOR_INT8 = "std::vector<int8_t>"
+    STD_VECTOR_UINT8 = "std::vector<uint8_t>"
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
     ARRAY_INT = "int[]"
 
@@ -164,11 +164,11 @@ class DataType(Enum):
     CONST_AUTO_REF = "const auto&"
 
     @classmethod
-    def cvector_type(cls, dtype: DataType) -> DataType:
+    def std_vector_type(cls, dtype: DataType) -> DataType:
         """
-        A custom vector type for C++.
+        A standard-library vector with the requested C++ element type.
         """
-        return DataType(f"cvector<{dtype.value}>")
+        return DataType(f"std::vector<{dtype.value}>")
 
     @classmethod
     def coo_workspace_type(cls, dtype: DataType) -> DataType:
@@ -508,6 +508,7 @@ class ForLoop(Stmt):
         post_parallel_body: Optional[List[Stmt]] = None,
         omp_num_threads: Optional[str] = None,
         omp_chunk_expr: Optional[str] = None,
+        before_parallel_body: Optional[List[Stmt]] = None,
     ):
         self.init = init
         self.cond = cond
@@ -525,8 +526,10 @@ class ForLoop(Stmt):
         self.omp_chunk_expr = omp_chunk_expr
         # Stable logical-loop identity used by post-CIN schedule lowering.
         self.scorch_index_var: Optional[str] = None
-        # Stmts placed inside #pragma omp parallel but before/after the for loop.
-        # When set, codegen splits "parallel for" into "parallel { pre; for; post }".
+        # Stmts placed before the OpenMP region, or inside it before/after the
+        # work loop. Serial pre-region construction lets RAII allocations throw
+        # normally instead of terminating while unwinding across OpenMP.
+        self.before_parallel_body = before_parallel_body
         self.pre_parallel_body = pre_parallel_body
         self.post_parallel_body = post_parallel_body
 

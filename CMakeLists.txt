@@ -26,7 +26,6 @@ include_directories(venv/lib/python3.9/site-packages/torch/include/torch/csrc/ap
 add_custom_target(
         scorch_sources
         SOURCES
-        src/scorch/csrc/header.cpp
         src/scorch/csrc/header.h
         src/scorch/csrc/kernels.h
         src/scorch/csrc/native_abi.h

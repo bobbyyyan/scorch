@@ -788,6 +788,7 @@ def test_dense_matmul():
     else:
         raise ValueError(f"Unexpected result type: {type(scorch_result)}")
 
+
 def test_matmul_ds_dd_dd():
     n = 1024
     tensor_b_torch = torch.randint(0, 1000, (n, n))
@@ -1054,7 +1055,9 @@ def test_matmul_time(use_cache):
     tensor_b_scorch = STensor.from_torch(random_tensor_b, "B").to_sparse()
 
     start_time = time.time()
-    scorch_result = matmul(tensor_a_scorch, tensor_b_scorch, format="ds", use_cache=use_cache)
+    scorch_result = matmul(
+        tensor_a_scorch, tensor_b_scorch, format="ds", use_cache=use_cache
+    )
     scorch_time = time.time() - start_time
 
     print(f"torch time: {torch_time}")
@@ -1091,6 +1094,19 @@ def test_matmul_ds_ds_ds(use_cache):
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
 
     assert torch.allclose(result.to_torch(), result_torch)
+
+
+def test_matmul_ds_ds_ds_zero_output_columns():
+    left_torch = torch.tensor([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]], dtype=torch.float32)
+    right_torch = torch.empty((2, 0), dtype=torch.float32)
+    left = STensor.from_torch(left_torch, "ZeroColumnLeft").to_sparse("ds")
+    right = STensor.from_torch(right_torch, "ZeroColumnRight").to_sparse("ds")
+
+    result = matmul(left, right, output_format="ds", use_cache=False)
+
+    assert tuple(result.shape) == (3, 0)
+    assert result.values.numel() == 0
+    assert torch.equal(result.to_torch(in_place=False), left_torch @ right_torch)
 
 
 def test_spmm_ds_ds_ds_random():

@@ -36,21 +36,21 @@ def _policy_header_text() -> str:
 def jit_preamble_text() -> str:
     """Return the complete packaged C++ preamble used by generated kernels.
 
-    ``load_inline`` writes its source into a separate cache directory, so a quote
-    include in ``header.cpp`` cannot reliably find an adjacent installed header.
+    ``load_inline`` writes its source into a separate cache directory, so quote
+    includes in ``header.h`` cannot reliably find adjacent installed headers.
     Expanding the packaged policy header into the template keeps each generated
     translation unit self-contained and also works for non-filesystem resource
     loaders.
     """
-    template = native_resource_text("header.cpp")
+    template = native_resource_text("header.h")
     abi_include = '#include "native_abi.h"'
     if template.count(abi_include) != 1:
-        raise RuntimeError("packaged header.cpp must include native_abi.h once")
+        raise RuntimeError("packaged header.h must include native_abi.h once")
     template = template.replace(abi_include, native_resource_text("native_abi.h"), 1)
 
     include = '#include "scorch_policy.h"'
     if template.count(include) != 1:
-        raise RuntimeError("packaged header.cpp must include scorch_policy.h once")
+        raise RuntimeError("packaged header.h must include scorch_policy.h once")
     return template.replace(include, _policy_header_text(), 1)
 
 
@@ -131,7 +131,10 @@ def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
         flags.extend(["-Xpreprocessor", "-fopenmp"])
 
         # Add OpenMP header path from Homebrew (headers only)
-        for header_path in ["/opt/homebrew/opt/libomp/include", "/usr/local/opt/libomp/include"]:
+        for header_path in [
+            "/opt/homebrew/opt/libomp/include",
+            "/usr/local/opt/libomp/include",
+        ]:
             if os.path.exists(header_path):
                 flags.append(f"-I{header_path}")
                 break
@@ -171,7 +174,10 @@ def get_extra_ldflags() -> List[str]:
             ldflags.append(f"-Wl,-rpath,{torch_lib_path}")
         else:
             # Fall back to Homebrew's libomp
-            for lib_path in ["/opt/homebrew/opt/libomp/lib", "/usr/local/opt/libomp/lib"]:
+            for lib_path in [
+                "/opt/homebrew/opt/libomp/lib",
+                "/usr/local/opt/libomp/lib",
+            ]:
                 if os.path.exists(lib_path):
                     ldflags.extend(["-lomp", f"-L{lib_path}"])
                     break
@@ -298,7 +304,10 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
                 elif neighbor in in_stack:
                     # Cycle found, collect the cycle edges
                     cycle_start = stack.index(neighbor)
-                    edges = [(stack[i], stack[i + 1]) for i in range(cycle_start, len(stack) - 1)]
+                    edges = [
+                        (stack[i], stack[i + 1])
+                        for i in range(cycle_start, len(stack) - 1)
+                    ]
                     edges.append((stack[-1], neighbor))
                     return edges
 
@@ -321,9 +330,14 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
         # Find edge associated with the smallest tensor, tiebreaker goes to result tensor. Represents cost as a tuple.
         def edge_cost(edge):
             edge_tensor_indices = edges_to_tensor_indices[edge]
-            return (0, -(max(edge_tensor_indices))) \
-                if set(edge_tensor_indices).issubset(set(inverted_tensor_indices)) \
-                else (sum(tensor_index_to_size[index] for index in edge_tensor_indices), -max(edge_tensor_indices))
+            return (
+                (0, -(max(edge_tensor_indices)))
+                if set(edge_tensor_indices).issubset(set(inverted_tensor_indices))
+                else (
+                    sum(tensor_index_to_size[index] for index in edge_tensor_indices),
+                    -max(edge_tensor_indices),
+                )
+            )
 
         min_cost_edge = min(edges, key=edge_cost)
         min_cost_tensor_indices = edges_to_tensor_indices[min_cost_edge]
@@ -335,7 +349,9 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
     # Build dictionary from edges (tuples) in graph to indices of tensors they appear in
     for tensor_index, substring in enumerate(substrings):
         for i in range(len(substring) - 1):
-            edges_to_tensor_indices[(substring[i], substring[i + 1])].append(tensor_index)
+            edges_to_tensor_indices[(substring[i], substring[i + 1])].append(
+                tensor_index
+            )
 
     # Build dictionary from tensor index to size using tensor shapes for operands and result
     tensor_index_to_size = {}

@@ -1,0 +1,80 @@
+name: sanitizers
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/scorch/csrc/**"
+      - "src/scorch/compiler/**"
+      - "src/scorch/utils.py"
+      - "scorch_build.py"
+      - "pyproject.toml"
+      - "tests/sanitizers/**"
+      - ".github/workflows/sanitizers.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/scorch/csrc/**"
+      - "src/scorch/compiler/**"
+      - "src/scorch/utils.py"
+      - "scorch_build.py"
+      - "pyproject.toml"
+      - "tests/sanitizers/**"
+      - ".github/workflows/sanitizers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-ownership:
+    name: native ownership (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    env:
+      MAX_JOBS: "2"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ninja-build
+
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: brew list libomp >/dev/null 2>&1 || brew install libomp
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install ninja pytest torch
+
+      - name: Run ASan and UBSan ownership checks
+        env:
+          SCORCH_SANITIZER_CXX: ${{ runner.os == 'macOS' && '/usr/bin/clang++' || '/usr/bin/g++' }}
+          SCORCH_SANITIZER_LOG: ${{ runner.temp }}/scorch-sanitizer-cxx.log
+        run: bash tests/sanitizers/run_sanitizers.sh
+
+      - name: Upload compiler log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-compiler-log-${{ matrix.os }}
+          path: ${{ runner.temp }}/scorch-sanitizer-cxx.log
+          if-no-files-found: warn
+          retention-days: 3

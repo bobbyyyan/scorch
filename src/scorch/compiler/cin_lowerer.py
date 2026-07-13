@@ -28,16 +28,32 @@ from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 class ResultTensorAssembler:
     """Assembles LLIR statements for result tensor initialization and final construction."""
 
-    def __init__(self, tensor_var: TensorVar, known_nnz_var: Optional[str] = None):
+    def __init__(
+        self,
+        tensor_var: TensorVar,
+        known_nnz_var: Optional[str] = None,
+        exact_dense_parent_positions: bool = False,
+        reserve_hint_var: Optional[str] = None,
+    ):
         self.tensor_var = tensor_var
         self.name = tensor_var.get_name()
         self.level_types = tensor_var.get_level_types()
         self.is_dense = tensor_var.is_dense()
         self.dtype = tensor_var.dtype
         self.known_nnz_var = known_nnz_var
+        self.exact_dense_parent_positions = exact_dense_parent_positions
+        self.reserve_hint_var = reserve_hint_var
+
+    def _has_fixed_position_count(self, level: int) -> bool:
+        """A compressed level below a dense parent has parent_size + 1 slots."""
+        return (
+            self.exact_dense_parent_positions
+            and level > 0
+            and self.level_types[level - 1] == LevelType.DENSE
+        )
 
     def emit_value_array_init(self) -> List[llir.Stmt]:
-        """Emit value array initialization: dense malloc+memset or sparse cvector decl."""
+        """Emit Torch-owned known-size storage or a dynamic ``std::vector``."""
         stmts: List[llir.Stmt] = []
         if self.is_dense:
             # capacity = product of all dimension sizes
@@ -64,36 +80,53 @@ class ResultTensorAssembler:
                 )
             )
 
-            # malloc + cast
             c_datatype = dtype_to_c_datatype(self.dtype)
-            sizeof_expr = llir.Sizeof(c_datatype)
             res_capacity_var = llir.Var(
                 name=f"{self.name}_capacity",
                 type=llir.DataType.INT64,
             )
-            malloc = llir.FunctionCall(
-                name="malloc",
-                args=[llir.BinOp(left=sizeof_expr, op="*", right=res_capacity_var)],
-            )
-            malloc = llir.Cast(
-                expr=malloc,
-                data_type=llir.DataType.ptr_type(c_datatype),
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.name}_values_torch",
+                        type=llir.DataType.TORCH_TENSOR,
+                    ),
+                    value=llir.FunctionCall(
+                        name="torch::empty",
+                        args=[
+                            llir.Var(
+                                name=f"{{{self.name}_capacity}}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=get_pytorch_c_dtype_str(self.dtype),
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                        ],
+                    ),
+                )
             )
             stmts.append(
                 llir.VarInit(
                     var=llir.Var(
                         name=f"{self.name}_values",
-                        type=llir.DataType.ptr_type(self.dtype),
+                        type=llir.DataType.ptr_type(c_datatype),
                         is_restrict=True,
                     ),
-                    value=malloc,
+                    value=llir.Var(
+                        name=(
+                            f"{self.name}_values_torch."
+                            f"data_ptr<{c_datatype.value}>()"
+                        ),
+                        type=llir.DataType.ptr_type(c_datatype),
+                    ),
                 )
             )
 
             # Zero the whole dense buffer before the parallel += accumulate. The
             # generated kernel accumulates into C, so it needs the full buffer
             # zeroed (not empty-rows-only like the prebuilt SpMM). scorch_zero_dense
-            # (scorch/csrc/header.cpp) parallelizes that zero across cores for large
+            # (scorch/csrc/header.h) parallelizes that zero across cores for large
             # outputs — where the serial memset was a big fraction of runtime — and
             # falls back to a single memset below SCORCH_MEMSET_GRAIN_BYTES. Takes
             # the element count; it computes the byte span internally.
@@ -110,17 +143,27 @@ class ResultTensorAssembler:
                 )
             )
         elif self.known_nnz_var:
-            # Known-nnz path: raw malloc instead of cvector
             c_datatype = dtype_to_c_datatype(self.dtype)
-            sizeof_expr = llir.Sizeof(c_datatype)
-            nnz_var = llir.Var(name=self.known_nnz_var, type=llir.DataType.INT64)
-            malloc = llir.FunctionCall(
-                name="malloc",
-                args=[llir.BinOp(left=sizeof_expr, op="*", right=nnz_var)],
-            )
-            malloc = llir.Cast(
-                expr=malloc,
-                data_type=llir.DataType.ptr_type(c_datatype),
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.name}_values_torch",
+                        type=llir.DataType.TORCH_TENSOR,
+                    ),
+                    value=llir.FunctionCall(
+                        name="torch::empty",
+                        args=[
+                            llir.Var(
+                                name=f"{{{self.known_nnz_var}}}",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.Var(
+                                name=get_pytorch_c_dtype_str(self.dtype),
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                        ],
+                    ),
+                )
             )
             stmts.append(
                 llir.VarInit(
@@ -128,7 +171,13 @@ class ResultTensorAssembler:
                         name=f"{self.name}_values",
                         type=llir.DataType.ptr_type(c_datatype),
                     ),
-                    value=malloc,
+                    value=llir.Var(
+                        name=(
+                            f"{self.name}_values_torch."
+                            f"data_ptr<{c_datatype.value}>()"
+                        ),
+                        type=llir.DataType.ptr_type(c_datatype),
+                    ),
                 )
             )
         else:
@@ -136,12 +185,24 @@ class ResultTensorAssembler:
                 llir.VarDecl(
                     llir.Var(
                         name=f"{self.name}_values",
-                        type=llir.DataType.cvector_type(
+                        type=llir.DataType.std_vector_type(
                             dtype_to_c_datatype(self.dtype)
                         ),
                     )
                 )
             )
+            if self.reserve_hint_var:
+                stmts.append(
+                    llir.FunctionCallStmt(
+                        name=f"{self.name}_values.reserve",
+                        args=[
+                            llir.Var(
+                                name=self.reserve_hint_var,
+                                type=llir.DataType.INT64,
+                            )
+                        ],
+                    )
+                )
         return stmts
 
     def emit_level_indices_init(self) -> List[llir.Stmt]:
@@ -149,33 +210,60 @@ class ResultTensorAssembler:
         stmts: List[llir.Stmt] = []
         for i, level_type in enumerate(self.level_types):
             if level_type == LevelType.COMPRESSED:
-                # cvector<int> pos and crd
-                stmts.append(
-                    llir.VarDecl(
-                        llir.Var(
-                            name=f"{self.name}{i}_pos",
-                            type=llir.DataType.CVECTOR_INT,
+                if self._has_fixed_position_count(i):
+                    # A dense parent fixes the exact position-array length.
+                    # Size a standard vector once, then transfer it to Torch
+                    # without a copy. Parent coordinates are ABI-validated
+                    # against this same extent before the generated loop.
+                    stmts.append(
+                        llir.RawStmt(
+                            code=(
+                                f"std::vector<int> {self.name}{i}_pos("
+                                f"(size_t){self.name}{i - 1}_size + 1, 0)"
+                            ),
                         )
                     )
-                )
+                else:
+                    # Sparse parents have a dynamically assembled fiber count.
+                    stmts.append(
+                        llir.VarDecl(
+                            llir.Var(
+                                name=f"{self.name}{i}_pos",
+                                type=llir.DataType.STD_VECTOR_C_INT,
+                            )
+                        )
+                    )
                 stmts.append(
                     llir.VarDecl(
                         llir.Var(
                             name=f"{self.name}{i}_crd",
-                            type=llir.DataType.CVECTOR_INT,
+                            type=llir.DataType.STD_VECTOR_C_INT,
                         )
                     )
                 )
-                # pos[0] = 0
-                stmts.append(
-                    llir.Assign(
-                        var=llir.Var(
-                            name=f"{self.name}{i}_pos[0]",
-                            type=llir.DataType.INT64,
-                        ),
-                        value=llir.Literal(0),
+                if self.reserve_hint_var:
+                    stmts.append(
+                        llir.FunctionCallStmt(
+                            name=f"{self.name}{i}_crd.reserve",
+                            args=[
+                                llir.Var(
+                                    name=self.reserve_hint_var,
+                                    type=llir.DataType.INT64,
+                                )
+                            ],
+                        )
                     )
-                )
+                if not self._has_fixed_position_count(i):
+                    # pos[0] = 0 for the append-built position vector.
+                    stmts.append(
+                        llir.Assign(
+                            var=llir.Var(
+                                name=f"{self.name}{i}_pos[0]",
+                                type=llir.DataType.INT64,
+                            ),
+                            value=llir.Literal(0),
+                        )
+                    )
                 # int p<name><i> = 0
                 stmts.append(
                     llir.VarInit(
@@ -198,60 +286,41 @@ class ResultTensorAssembler:
                 )
                 stmts.append(llir.BlankLine())
 
-                # Dense-parent pos init loop
-                if i > 0 and self.level_types[i - 1] == LevelType.DENSE:
-                    loop_var_name = f"p{self.name}{i}"
-                    loop_var = llir.Var(
-                        name=loop_var_name,
-                        type=llir.DataType.INT64,
-                    )
-                    loop = llir.ForLoop(
-                        init=llir.VarInit(
-                            var=loop_var,
-                            value=llir.Literal(1),
-                        ),
-                        cond=llir.BinOp(
-                            left=loop_var,
-                            op="<=",
-                            right=llir.Var(
-                                name=f"{self.name}{i - 1}_size",
-                                type=llir.DataType.INT64,
-                            ),
-                        ),
-                        update=llir.Increment(
-                            var=loop_var,
-                        ),
-                        body=[
-                            llir.Assign(
-                                var=llir.Var(
-                                    name=f"{self.name}{i}_pos[{loop_var_name}]",
-                                    type=llir.DataType.INT64,
-                                ),
-                                value=llir.Literal(0),
-                            )
-                        ],
-                    )
-                    stmts.append(loop)
-
             elif level_type == LevelType.COORDINATE:
                 if self.known_nnz_var:
-                    # Known-nnz path: raw malloc instead of cvector
+                    # Known-size coordinate arrays are Torch-owned from creation.
                     stmts.append(
                         llir.RawStmt(
-                            code=f"int* {self.name}{i}_crd = (int*)malloc(sizeof(int) * {self.known_nnz_var})",
-                            add_semicolon=True,
+                            code=(
+                                f"torch::Tensor {self.name}{i}_crd_torch = "
+                                f"torch::empty({{{self.known_nnz_var}}}, torch::kInt);\n"
+                                f"  int* {self.name}{i}_crd = "
+                                f"{self.name}{i}_crd_torch.data_ptr<int>();"
+                            ),
+                            add_semicolon=False,
                         )
                     )
                 else:
-                    # cvector<int> crd
                     stmts.append(
                         llir.VarDecl(
                             llir.Var(
                                 name=f"{self.name}{i}_crd",
-                                type=llir.DataType.CVECTOR_INT,
+                                type=llir.DataType.STD_VECTOR_C_INT,
                             )
                         )
                     )
+                    if self.reserve_hint_var:
+                        stmts.append(
+                            llir.FunctionCallStmt(
+                                name=f"{self.name}{i}_crd.reserve",
+                                args=[
+                                    llir.Var(
+                                        name=self.reserve_hint_var,
+                                        type=llir.DataType.INT64,
+                                    )
+                                ],
+                            )
+                        )
                 # int p<name><i> = 0
                 stmts.append(
                     llir.VarInit(
@@ -277,7 +346,7 @@ class ResultTensorAssembler:
             return f"{{{tensor_level_name}_crd_torch}}"
 
     def emit_final_assembly(self) -> List[llir.Stmt]:
-        """Emit TacoTensor decl, from_blob conversions, index/value assignment, and return."""
+        """Move dynamic buffers to Torch, assign indices/values, and return."""
         stmts: List[llir.Stmt] = []
 
         # TacoTensor decl
@@ -293,22 +362,13 @@ class ResultTensorAssembler:
             ]
         )
 
-        # Emit shared free deleter if using known-nnz raw malloc path
-        if self.known_nnz_var and not self.is_dense:
-            stmts.append(
-                llir.RawStmt(
-                    code="auto _free_deleter = [](void* p){ free(p); }",
-                    add_semicolon=True,
-                )
-            )
-
-        # Per-level from_blob for pos/crd
+        # Move dynamic index vectors into Torch storage contexts. Known-size
+        # coordinate tensors were allocated before the compute loop.
         for i, level_type in enumerate(self.level_types):
             tensor_level_name = f"{self.name}{i}"
 
             if level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
                 if level_type == LevelType.COMPRESSED:
-                    # pos_torch
                     stmts.append(
                         llir.VarInit(
                             var=llir.Var(
@@ -316,18 +376,10 @@ class ResultTensorAssembler:
                                 type=llir.DataType.TORCH_TENSOR,
                             ),
                             value=llir.FunctionCall(
-                                name="torch::from_blob",
+                                name="scorch_tensor_from_vector",
                                 args=[
                                     llir.Var(
-                                        name=f"{tensor_level_name}_pos.data()",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{{{tensor_level_name}_pos.size()}}",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{tensor_level_name}_pos.get_deleter()",
+                                        name=("std::move(" f"{tensor_level_name}_pos)"),
                                         type=llir.DataType.NO_TYPE,
                                     ),
                                     llir.Var(
@@ -339,38 +391,8 @@ class ResultTensorAssembler:
                         )
                     )
 
-                # crd_torch
                 if self.known_nnz_var and level_type == LevelType.COORDINATE:
-                    # Raw pointer path: use pointer directly with known nnz size
-                    stmts.append(
-                        llir.VarInit(
-                            var=llir.Var(
-                                name=f"{tensor_level_name}_crd_torch",
-                                type=llir.DataType.TORCH_TENSOR,
-                            ),
-                            value=llir.FunctionCall(
-                                name="torch::from_blob",
-                                args=[
-                                    llir.Var(
-                                        name=f"{tensor_level_name}_crd",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{{{self.known_nnz_var}}}",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name="_free_deleter",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name="torch::kInt",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                ],
-                            ),
-                        )
-                    )
+                    continue
                 else:
                     stmts.append(
                         llir.VarInit(
@@ -379,18 +401,10 @@ class ResultTensorAssembler:
                                 type=llir.DataType.TORCH_TENSOR,
                             ),
                             value=llir.FunctionCall(
-                                name="torch::from_blob",
+                                name="scorch_tensor_from_vector",
                                 args=[
                                     llir.Var(
-                                        name=f"{tensor_level_name}_crd.data()",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{{{tensor_level_name}_crd.size()}}",
-                                        type=llir.DataType.NO_TYPE,
-                                    ),
-                                    llir.Var(
-                                        name=f"{tensor_level_name}_crd.get_deleter()",
+                                        name=f"std::move({tensor_level_name}_crd)",
                                         type=llir.DataType.NO_TYPE,
                                     ),
                                     llir.Var(
@@ -402,97 +416,18 @@ class ResultTensorAssembler:
                         )
                     )
 
-        # Values from_blob
-        res_values_torch_var = llir.Var(
-            name=f"{self.name}_values_torch",
-            type=llir.DataType.TORCH_TENSOR,
-        )
-        if self.is_dense:
-            # Lambda deleter + from_blob with capacity
+        if not self.is_dense and not self.known_nnz_var:
             stmts.append(
                 llir.VarInit(
                     var=llir.Var(
-                        name=f"{self.name}_values_deleter",
-                        type=llir.DataType.AUTO,
+                        name=f"{self.name}_values_torch",
+                        type=llir.DataType.TORCH_TENSOR,
                     ),
-                    value=llir.Var(
-                        name="[](void* ptr) {{ free(ptr); }}",
-                        type=llir.DataType.AUTO,
-                    ),
-                )
-            )
-            stmts.append(
-                llir.VarInit(
-                    var=res_values_torch_var,
                     value=llir.FunctionCall(
-                        name="torch::from_blob",
+                        name="scorch_tensor_from_vector",
                         args=[
                             llir.Var(
-                                name=f"{self.name}_values",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=f"{{{self.name}_capacity}}",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=f"{self.name}_values_deleter",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=get_pytorch_c_dtype_str(self.dtype),
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                        ],
-                    ),
-                )
-            )
-        elif self.known_nnz_var:
-            # Raw pointer path: use pointer directly with known nnz size
-            stmts.append(
-                llir.VarInit(
-                    var=res_values_torch_var,
-                    value=llir.FunctionCall(
-                        name="torch::from_blob",
-                        args=[
-                            llir.Var(
-                                name=f"{self.name}_values",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=f"{{{self.known_nnz_var}}}",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name="_free_deleter",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=get_pytorch_c_dtype_str(self.dtype),
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                        ],
-                    ),
-                )
-            )
-        else:
-            # from_blob with cvector data/size/deleter
-            stmts.append(
-                llir.VarInit(
-                    var=res_values_torch_var,
-                    value=llir.FunctionCall(
-                        name="torch::from_blob",
-                        args=[
-                            llir.Var(
-                                name=f"{self.name}_values.data()",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=f"{{{self.name}_values.size()}}",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=f"{self.name}_values.get_deleter()",
+                                name=f"std::move({self.name}_values)",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
@@ -508,7 +443,7 @@ class ResultTensorAssembler:
         stmts.append(
             llir.Assign(
                 var=llir.Var(
-                    name=f"{self.name}._storage._index.mode_indices",
+                    name=f"{self.name}.storage.index.mode_indices",
                     type=llir.DataType.NO_TYPE,
                 ),
                 value=llir.Var(
@@ -522,7 +457,7 @@ class ResultTensorAssembler:
         stmts.append(
             llir.Assign(
                 var=llir.Var(
-                    name=f"{self.name}._storage._value",
+                    name=f"{self.name}.storage.value",
                     type=llir.DataType.NO_TYPE,
                 ),
                 value=llir.Var(
@@ -742,7 +677,7 @@ class CINLowerer:
         return llir.VarInit(
             var=llir.Var(name=f"{tensor.name}_values", type=llir.DataType.TORCH_TENSOR),
             value=llir.Var(
-                name=f"{tensor.name}._storage._value",
+                name=f"{tensor.name}.storage.value",
                 type=llir.DataType.TORCH_TENSOR,
             ),
         )
@@ -1066,9 +1001,11 @@ class CINLowerer:
             llir.Comment("Initialize workspaces"),
         ]
         workspace_cleanup_stmts: List[llir.Stmt] = []
-        # Per-thread workspace allocation (hoisted outside the for loop but
-        # inside the OMP parallel region) and per-iteration memset.
+        # Per-thread workspace ownership is constructed serially before OpenMP;
+        # each worker selects a disjoint slice inside the region. This keeps
+        # allocation failures unwindable through pybind instead of OpenMP.
         self._workspace_alloc_stmts: List[llir.Stmt] = []
+        self._workspace_pool_specs: List[tuple[str, str, str]] = []
         self._workspace_free_stmts: List[llir.Stmt] = []
         self._workspace_memset_stmts: List[llir.Stmt] = []
         for wksp in workspaces:
@@ -1134,7 +1071,7 @@ class CINLowerer:
 
                         ctype = wksp_ctype.value
                         wname = wksp.get_name()
-                        aligned_size = f"(((size_t){actual_size} + 15) & ~15)"
+                        self._workspace_pool_specs.append((wname, ctype, actual_size))
                         self._workspace_alloc_stmts.extend(
                             [
                                 llir.RawStmt(
@@ -1143,13 +1080,12 @@ class CINLowerer:
                                 llir.RawStmt(
                                     code=(
                                         f"{ctype}* __restrict__ {wname} = "
-                                        f"({ctype}*)aligned_alloc(64, {aligned_size} * sizeof({ctype}))"
+                                        f"{wname}_pool_owner.get() + "
+                                        f"(size_t)omp_get_thread_num() * "
+                                        f"(size_t){actual_size}"
                                     ),
                                 ),
                             ]
-                        )
-                        self._workspace_free_stmts.append(
-                            llir.RawStmt(code=f"free({wname})")
                         )
                         self._workspace_memset_stmts.append(
                             llir.RawStmt(
@@ -1230,7 +1166,7 @@ class CINLowerer:
         - result_is_coord: all result levels are COORDINATE, so we directly
           assign sorted workspace entries to the result tensor arrays.
         - Otherwise: build an intermediate COO tensor from workspace entries,
-          assemble torch tensors via from_blob, then recursively lower a
+          move their vectors into Torch storage, then recursively lower a
           conversion CIN to produce the final result format.
         """
         workspaces = stmt.get_workspaces()
@@ -1269,11 +1205,11 @@ class CINLowerer:
             type=llir.DataType.INT64,
         )
 
-        # Build intermediate cvector declarations (only for non-coord path)
+        # Build intermediate standard vectors (only for non-coordinate path).
         intermediate_crd_vecs = []
         intermediate_val_vec = llir.Var(
             name=f"{intermediate_tensor_var.get_name()}_val_vec",
-            type=llir.DataType.cvector_type(
+            type=llir.DataType.std_vector_type(
                 dtype_to_c_datatype(intermediate_tensor_var.dtype)
             ),
         )
@@ -1283,7 +1219,7 @@ class CINLowerer:
             for level in range(len(wksp_index_vars)):
                 crd_vec = llir.Var(
                     name=f"{intermediate_tensor_var.get_name()}{level}_crd_vec",
-                    type=llir.DataType.CVECTOR_INT,
+                    type=llir.DataType.STD_VECTOR_C_INT,
                 )
                 intermediate_crd_vecs.append(crd_vec)
                 vec_decl_stmts.append(llir.VarDecl(crd_vec))
@@ -1347,7 +1283,7 @@ class CINLowerer:
                     )
                 )
         else:
-            # Fill intermediate cvectors: T0_crd_vec[pT] = it.first[0]; etc.
+            # Fill intermediate vectors: T0_crd_vec[pT] = it.first[0]; etc.
             for i in range(len(wksp_index_vars)):
                 loop_body.append(
                     llir.Assign(
@@ -1394,7 +1330,7 @@ class CINLowerer:
                 loop_stmt,
             ]
 
-        # Non-coord path: assemble intermediate torch tensors from cvectors
+        # Move intermediate vectors into Torch storage contexts.
         assembly_stmts = []
         intermediate_crd_tensors = []
 
@@ -1405,23 +1341,14 @@ class CINLowerer:
             )
             intermediate_crd_tensors.append(crd_tensor)
 
-            # torch::Tensor T0_crd_tensor = torch::from_blob(...)
             assembly_stmts.append(
                 llir.VarInit(
                     var=crd_tensor,
                     value=llir.FunctionCall(
-                        name="torch::from_blob",
+                        name="scorch_tensor_from_vector",
                         args=[
                             llir.Var(
-                                name=f"{intermediate_crd_vecs[i].name}.data()",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=f"{{{intermediate_crd_vecs[i].name}.size()}}",
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            llir.Var(
-                                name=f"{intermediate_crd_vecs[i].name}.get_deleter()",
+                                name=f"std::move({intermediate_crd_vecs[i].name})",
                                 type=llir.DataType.NO_TYPE,
                             ),
                             llir.Var(
@@ -1447,7 +1374,6 @@ class CINLowerer:
                 )
             )
 
-        # torch::Tensor T_val_tensor = torch::from_blob(...)
         val_tensor = llir.Var(
             name=f"{intermediate_tensor_var.get_name()}_val_tensor",
             type=llir.DataType.TORCH_TENSOR,
@@ -1456,18 +1382,10 @@ class CINLowerer:
             llir.VarInit(
                 var=val_tensor,
                 value=llir.FunctionCall(
-                    name="torch::from_blob",
+                    name="scorch_tensor_from_vector",
                     args=[
                         llir.Var(
-                            name=f"{intermediate_val_vec.name}.data()",
-                            type=llir.DataType.NO_TYPE,
-                        ),
-                        llir.Var(
-                            name=f"{{{intermediate_val_vec.name}.size()}}",
-                            type=llir.DataType.NO_TYPE,
-                        ),
-                        llir.Var(
-                            name=f"{intermediate_val_vec.name}.get_deleter()",
+                            name=f"std::move({intermediate_val_vec.name})",
                             type=llir.DataType.NO_TYPE,
                         ),
                         llir.Var(
@@ -2183,12 +2101,44 @@ class CINLowerer:
 
         tensor_value_array_init_stmts: List[llir.Stmt] = []
         result_level_indices_init_stmts: List[llir.Stmt] = []
+        # A compressed level below a dense result parent always has one
+        # position slot per parent coordinate plus the sentinel. Sparse-driven
+        # conversions benefit from sizing it exactly at every shape. For dense
+        # scans, doing so is reserved for large tensors: it relieves enough
+        # inner-loop register pressure to matter there, while append-built
+        # positions remain faster for small dense conversions.
+        result_shape = (
+            self.final_result_tensor_var.shape
+            if self.final_result_tensor_var is not None
+            else None
+        )
+        result_cells = 0
+        if result_shape:
+            result_cells = 1
+            for extent in result_shape:
+                result_cells *= extent
+        exact_dense_parent_positions = len(rhs_tensor_vars) == 1 and (
+            not rhs_tensor_vars[0].is_dense() or result_cells >= 1024 * 1024
+        )
+        reserve_hint_var = None
+        if (
+            len(rhs_tensor_vars) == 1
+            and rhs_tensor_vars[0].is_dense()
+            and self.final_result_tensor_var is not None
+            and not self.final_result_tensor_var.is_dense()
+            and self.final_result_tensor_var.levels == 2
+        ):
+            reserve_hint_var = "_dynamic_reserve"
 
         for result_tensor_var in non_workspace_result_tensor_vars:
             self.tensor_var_to_llir[result_tensor_var] = self.lower_TensorVar(
                 result_tensor_var
             )
-            assembler = ResultTensorAssembler(result_tensor_var)
+            assembler = ResultTensorAssembler(
+                result_tensor_var,
+                exact_dense_parent_positions=exact_dense_parent_positions,
+                reserve_hint_var=reserve_hint_var,
+            )
             tensor_value_array_init_stmts.extend(assembler.emit_value_array_init())
             result_level_indices_init_stmts.extend(assembler.emit_level_indices_init())
 
@@ -2225,6 +2175,18 @@ class CINLowerer:
                         ),
                     )
                 )
+
+        if reserve_hint_var:
+            result_tensor_level_sizes.append(
+                llir.RawStmt(
+                    code=(
+                        f"int64_t {reserve_hint_var} = std::min<int64_t>("
+                        "scorch_native::checked_product("
+                        'result_shape, "evaluate", "result_shape", true), '
+                        "2048)"
+                    )
+                )
+            )
 
         if result_tensor_level_sizes:
             result_tensor_level_sizes = [
@@ -2442,29 +2404,35 @@ class CINLowerer:
             self._eliminate_single_iteration_loops(recurse_stmts)
             self._hoist_loop_invariant_factors(recurse_stmts)
 
-            # Known-nnz detection: if scalar accum was used and output is sparse,
-            # we know nnz_out == nnz_in. Re-emit init stmts with raw malloc.
+            # Known-nnz detection: if scalar accumulation was used and output is
+            # sparse, nnz_out == nnz_in. Re-emit init with Torch-owned storage.
             known_nnz_init_stmts: List[llir.Stmt] = []
             if (
                 self._used_scalar_accum
                 and self.final_result_tensor_var
                 and not self.final_result_tensor_var.is_dense()
             ):
-                # Find a COO input tensor to get nnz from
-                coo_crd_tensor = None
+                # Scalar accumulation preserves the driving sparse leaf. Its
+                # value tensor has the exact output cardinality for either COO
+                # or a compressed-leaf format such as CSR.
+                sparse_values_tensor = None
                 for tensor in rhs_tensor_vars:
-                    for lvl, lt in enumerate(tensor.get_level_types()):
-                        if lt == LevelType.COORDINATE:
-                            coo_crd_tensor = f"{tensor.get_name()}{lvl}_crd_tensor"
-                            break
-                    if coo_crd_tensor:
+                    level_types = tensor.get_level_types()
+                    if level_types and level_types[-1] in (
+                        LevelType.COMPRESSED,
+                        LevelType.COORDINATE,
+                    ):
+                        sparse_values_tensor = f"{tensor.get_name()}_values"
                         break
 
-                if coo_crd_tensor:
+                if sparse_values_tensor:
                     self._known_nnz_var = "_known_nnz"
                     known_nnz_init_stmts.append(
                         llir.RawStmt(
-                            code=f"int _known_nnz = {coo_crd_tensor}.size(0)",
+                            code=(
+                                "int64_t _known_nnz = "
+                                f"{sparse_values_tensor}.size(0)"
+                            ),
                             add_semicolon=True,
                         )
                     )
@@ -2474,7 +2442,10 @@ class CINLowerer:
                     result_level_indices_init_stmts = []
                     for result_tensor_var in non_workspace_result_tensor_vars:
                         assembler = ResultTensorAssembler(
-                            result_tensor_var, known_nnz_var=self._known_nnz_var
+                            result_tensor_var,
+                            known_nnz_var=self._known_nnz_var,
+                            exact_dense_parent_positions=(exact_dense_parent_positions),
+                            reserve_hint_var=reserve_hint_var,
                         )
                         tensor_value_array_init_stmts.extend(
                             assembler.emit_value_array_init()
@@ -2489,8 +2460,8 @@ class CINLowerer:
                         ]
 
             if self._compressed_output_parallel:
-                # Two-phase parallel transform already emitted output init,
-                # fill loops, and final assembly (from_blob + return).
+                # Two-phase parallel transform already emitted Torch-owned
+                # output storage, fill loops, and final assembly.
                 # Only emit tensor level arrays (input pointers) and recurse.
                 body_stmts.extend(
                     [
@@ -2529,8 +2500,12 @@ class CINLowerer:
                 final_assembler = ResultTensorAssembler(
                     self.final_result_tensor_var,
                     known_nnz_var=self._known_nnz_var,
+                    exact_dense_parent_positions=exact_dense_parent_positions,
+                    reserve_hint_var=reserve_hint_var,
                 )
                 body_stmts.extend(final_assembler.emit_final_assembly())
+
+            self._rewrite_dynamic_vector_accesses(body_stmts)
 
             function = llir.Function(
                 return_type=llir.DataType.TACO_TENSOR,
@@ -2552,6 +2527,166 @@ class CINLowerer:
             return function
 
         return []
+
+    @classmethod
+    def _rewrite_dynamic_vector_accesses(cls, stmts: List[llir.Stmt]) -> None:
+        """Make generated ``std::vector`` construction checked and append-aware.
+
+        Vectors declared without an initial size replace the legacy ``cvector``
+        builders. Coordinate and value leaves are emitted at a monotonic output
+        cursor, so those stores become ``emplace_back`` calls with no indexable
+        out-of-range surface. Position-array stores use ``scorch_vector_set`` so
+        only an existing slot or the next append position is legal; reads use
+        ``at``. Pre-sized schedule storage is declared with ``VarInit`` and is
+        intentionally left on its raw-pointer/indexed hot path.
+        """
+        import re
+
+        vector_names: set[str] = set()
+
+        def collect(body: List[llir.Stmt]) -> None:
+            for node in body:
+                if isinstance(node, llir.VarDecl):
+                    type_name = getattr(node.var.type, "value", "")
+                    if type_name.startswith("std::vector<"):
+                        vector_names.add(node.var.name)
+                elif isinstance(node, (llir.ForLoop, llir.ForLoopAuto, llir.WhileLoop)):
+                    collect(node.body)
+                    if isinstance(node, llir.ForLoop):
+                        collect(node.pre_parallel_body or [])
+                        collect(node.post_parallel_body or [])
+                elif isinstance(node, llir.IfThenElse):
+                    collect(node.then_body or [])
+                    collect(node.else_body or [])
+                    for branch in node.then_body_list or []:
+                        collect(branch)
+
+        collect(stmts)
+        if not vector_names:
+            return
+
+        def rewrite_expr(expr):
+            if isinstance(expr, llir.Var):
+                for vector_name in vector_names:
+                    expr.name = re.sub(
+                        rf"\b{re.escape(vector_name)}\[([^\[\]]+)\]",
+                        rf"{vector_name}.at(\1)",
+                        expr.name,
+                    )
+            elif isinstance(expr, llir.BinOp):
+                rewrite_expr(expr.left)
+                rewrite_expr(expr.right)
+            elif isinstance(expr, llir.UnaryOp):
+                rewrite_expr(expr.operand)
+            elif isinstance(expr, llir.FunctionCall):
+                for arg in expr.args:
+                    rewrite_expr(arg)
+            elif isinstance(expr, llir.Array):
+                for value in expr.values:
+                    rewrite_expr(value)
+            elif isinstance(expr, llir.ArrayAccess):
+                rewrite_expr(expr.array)
+                rewrite_expr(expr.index)
+            elif isinstance(expr, llir.Cast):
+                rewrite_expr(expr.expr)
+
+        def transform(body: List[llir.Stmt]) -> None:
+            # Recursive coordinate assembly can publish the same leaf slot more
+            # than once along mixed mode-order tail paths. The legacy container
+            # silently overwrote those duplicates; an append-only std::vector
+            # must instead remove the redundant stores before lowering them to
+            # emplace_back, or its coordinate/value lengths diverge.
+            deduplicated: List[llir.Stmt] = []
+            for candidate in body:
+                target = getattr(getattr(candidate, "var", None), "name", "")
+                target_vector = next(
+                    (
+                        vector_name
+                        for vector_name in vector_names
+                        if re.fullmatch(rf"{re.escape(vector_name)}\[(.+)\]", target)
+                    ),
+                    None,
+                )
+                if (
+                    isinstance(candidate, llir.Assign)
+                    and candidate.op == AssignOp.ASSIGN
+                    and target_vector is not None
+                    and target_vector.endswith("_crd")
+                    and deduplicated
+                    and isinstance(deduplicated[-1], llir.Assign)
+                    and candidate == deduplicated[-1]
+                ):
+                    continue
+                deduplicated.append(candidate)
+            body[:] = deduplicated
+
+            for index, node in enumerate(body):
+                if isinstance(node, llir.Assign):
+                    target = getattr(node.var, "name", "")
+                    matched = None
+                    for vector_name in vector_names:
+                        match = re.fullmatch(
+                            rf"{re.escape(vector_name)}\[(.+)\]", target
+                        )
+                        if match:
+                            matched = (vector_name, match.group(1))
+                            break
+                    rewrite_expr(node.value)
+                    if matched and node.op == AssignOp.ASSIGN:
+                        vector_name, position = matched
+                        if vector_name.endswith(("_crd", "_values")):
+                            body[index] = llir.FunctionCallStmt(
+                                name=f"{vector_name}.emplace_back",
+                                args=[node.value],
+                            )
+                        else:
+                            body[index] = llir.FunctionCallStmt(
+                                name="scorch_vector_set",
+                                args=[
+                                    llir.Var(
+                                        name=vector_name,
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    llir.Var(
+                                        name=position,
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    node.value,
+                                ],
+                            )
+                    else:
+                        rewrite_expr(node.var)
+                elif isinstance(node, llir.VarInit):
+                    rewrite_expr(node.value)
+                elif isinstance(node, llir.FunctionCallStmt):
+                    for arg in node.args:
+                        rewrite_expr(arg)
+                elif isinstance(node, llir.ForLoop):
+                    if isinstance(node.init, llir.VarInit):
+                        rewrite_expr(node.init.value)
+                    rewrite_expr(node.cond)
+                    if isinstance(node.update, llir.Assign):
+                        rewrite_expr(node.update.var)
+                        rewrite_expr(node.update.value)
+                    transform(node.body)
+                    transform(node.pre_parallel_body or [])
+                    transform(node.post_parallel_body or [])
+                elif isinstance(node, (llir.ForLoopAuto, llir.WhileLoop)):
+                    if isinstance(node, llir.WhileLoop):
+                        rewrite_expr(node.cond)
+                    transform(node.body)
+                elif isinstance(node, llir.IfThenElse):
+                    rewrite_expr(node.cond)
+                    for condition in node.cond_list or []:
+                        rewrite_expr(condition)
+                    transform(node.then_body or [])
+                    transform(node.else_body or [])
+                    for branch in node.then_body_list or []:
+                        transform(branch)
+                elif isinstance(node, llir.Return):
+                    rewrite_expr(node.value)
+
+        transform(stmts)
 
     @staticmethod
     def _contains_explicit_parallel(stmt: IndexStmt) -> bool:
@@ -3006,14 +3141,21 @@ class CINLowerer:
             else:
                 work_body.append(stmt)
 
+        if wksp_hoisted:
+            self._rewrite_val_refs(
+                work_body,
+                {f"{wksp_name}.insert": (f"{wksp_name}.insert_unchecked")},
+            )
+
         # ── Workspace hoisting ─────────────────────────────────────────
         wksp_alloc: List[llir.Stmt] = []
         if wksp_hoisted:
-            wksp_type_str = f"linked_list_workspace_1d<{wksp_ctype}>"
             wksp_alloc = [
                 llir.RawStmt(
-                    code=f"auto {wksp_name} = {wksp_type_str}"
-                    f"(result_shape[{first_cl}])"
+                    code=(
+                        f"auto {wksp_name} = {wksp_name}_pool["
+                        "(size_t)omp_get_thread_num()].make_view()"
+                    )
                 )
             ]
 
@@ -3055,7 +3197,6 @@ class CINLowerer:
         )
         if wksp_alloc:
             phase1_loop.pre_parallel_body = list(wksp_alloc)
-
         # ── Phase 3: fill values ───────────────────────────────────────
         phase3_body: List[llir.Stmt] = []
         for l in compressed_levels:
@@ -3065,15 +3206,6 @@ class CINLowerer:
             phase3_body.append(llir.RawStmt(code=f"int _pos{l} = 0"))
         for l in compressed_levels[1:]:
             phase3_body.append(llir.RawStmt(code=f"int _prev{l} = 0"))
-        # start pos boundaries for non-first compressed levels
-        for l in compressed_levels[1:]:
-            parent_l = compressed_levels[compressed_levels.index(l) - 1]
-            phase3_body.append(
-                llir.RawStmt(
-                    code=f"{result_name}{l}_pos_data[_base{parent_l}] = "
-                    f"(int)_base{l}"
-                )
-            )
 
         p3_work = copy.deepcopy(work_body)
         p3_work = self._transform_result_writes(
@@ -3101,7 +3233,6 @@ class CINLowerer:
         )
         if wksp_alloc:
             phase3_loop.pre_parallel_body = list(wksp_alloc)
-
         # ── Strip pre-loop result tensor declarations ──────────────────
         result: List[llir.Stmt] = []
         for stmt in stmts[:for_loop_idx]:
@@ -3145,13 +3276,37 @@ class CINLowerer:
             result.append(stmt)
 
         c_dtype = wksp_ctype or "float"
-        sizeof_val = f"sizeof({c_dtype})"
 
-        # ── Phase 1: count arrays + loop ───────────────────────────────
+        # ── Phase 1: RAII count arrays + loop ──────────────────────────
+        if wksp_hoisted:
+            phase1_threads = phase1_loop.omp_num_threads or "omp_get_max_threads()"
+            phase3_threads = phase3_loop.omp_num_threads or "omp_get_max_threads()"
+            thread_count_expr = (
+                phase1_threads
+                if phase1_threads == phase3_threads
+                else f"std::max({phase1_threads}, {phase3_threads})"
+            )
+            result.append(
+                llir.RawStmt(
+                    code=(
+                        f"int {wksp_name}_thread_count = {thread_count_expr};\n"
+                        f"std::vector<linked_list_workspace_1d<{wksp_ctype}>> "
+                        f"{wksp_name}_pool;\n"
+                        f"{wksp_name}_pool.reserve((size_t)"
+                        f"{wksp_name}_thread_count);\n"
+                        f"for (int _worker = 0; _worker < "
+                        f"{wksp_name}_thread_count; _worker++) {{\n"
+                        f"  {wksp_name}_pool.emplace_back("
+                        f"result_shape[{first_cl}], true);\n"
+                        "}"
+                    ),
+                    add_semicolon=False,
+                )
+            )
         for l in compressed_levels:
             result.append(
                 llir.RawStmt(
-                    code=f"int* _count{l} = (int*)calloc({loop_bound}, sizeof(int))"
+                    code=(f"std::vector<int> _count{l}((size_t){loop_bound}, 0)")
                 )
             )
         result.append(phase1_loop)
@@ -3160,8 +3315,9 @@ class CINLowerer:
         for l in compressed_levels:
             result.append(
                 llir.RawStmt(
-                    code=f"int64_t* _offset{l} = (int64_t*)malloc("
-                    f"({loop_bound} + 1) * sizeof(int64_t))"
+                    code=(
+                        f"std::vector<int64_t> _offset{l}(" f"(size_t){loop_bound} + 1)"
+                    )
                 )
             )
             result.append(llir.RawStmt(code=f"_offset{l}[0] = 0"))
@@ -3176,14 +3332,18 @@ class CINLowerer:
             result.append(
                 llir.RawStmt(code=f"int64_t _total{l} = _offset{l}[{loop_bound}]")
             )
-        for l in compressed_levels:
-            result.append(llir.RawStmt(code=f"free(_count{l})"))
-
-        # C{first_cl}_pos_data: size B+1, copied from _offset{first_cl}
+        # Exact-size output buffers are move-only until the fill completes,
+        # then their ownership is transferred into Torch storage contexts.
         result.append(
             llir.RawStmt(
-                code=f"int* {result_name}{first_cl}_pos_data = "
-                f"(int*)malloc(({loop_bound} + 1) * sizeof(int))"
+                code=(
+                    f"torch::Tensor {result_name}{first_cl}_pos_torch = "
+                    f"torch::empty({{(long long)({loop_bound} + 1)}}, "
+                    f"torch::kInt);\n"
+                    f"  int* {result_name}{first_cl}_pos_data = "
+                    f"{result_name}{first_cl}_pos_torch.data_ptr<int>();"
+                ),
+                add_semicolon=False,
             )
         )
         result.append(
@@ -3195,41 +3355,40 @@ class CINLowerer:
             )
         )
 
-        # crd arrays
         for l in compressed_levels:
             result.append(
                 llir.RawStmt(
-                    code=f"int* {result_name}{l}_crd_data = "
-                    f"(int*)malloc(_total{l} * sizeof(int))"
+                    code=(
+                        f"torch::Tensor {result_name}{l}_crd_torch = "
+                        f"torch::empty({{(long long)_total{l}}}, torch::kInt);\n"
+                        f"  int* {result_name}{l}_crd_data = "
+                        f"{result_name}{l}_crd_torch.data_ptr<int>();"
+                    ),
+                    add_semicolon=False,
                 )
             )
 
-        # pos arrays for non-first compressed levels
         for i, l in enumerate(compressed_levels[:-1]):
             nl = compressed_levels[i + 1]
             result.append(
                 llir.RawStmt(
-                    code=f"int* {result_name}{nl}_pos_data = "
-                    f"(int*)malloc((_total{l} + 1) * sizeof(int))"
+                    code=(
+                        f"torch::Tensor {result_name}{nl}_pos_torch = "
+                        f"torch::empty({{(long long)(_total{l} + 1)}}, "
+                        f"torch::kInt);\n"
+                        f"  int* {result_name}{nl}_pos_data = "
+                        f"{result_name}{nl}_pos_torch.data_ptr<int>();"
+                    ),
+                    add_semicolon=False,
                 )
             )
+            # The first boundary has no parent to publish it.  Every later
+            # boundary is the terminal boundary of exactly one parent and is
+            # written by the outer-loop iteration that emits that parent.
+            # Initializing starts inside phase 3 would make adjacent dynamic
+            # iterations write the same boundary concurrently.
+            result.append(llir.RawStmt(code=f"{result_name}{nl}_pos_data[0] = 0"))
 
-        # values array (sized by leaf-level total)
-        result.append(
-            llir.RawStmt(
-                code=f"{c_dtype}* {result_name}_values_data = "
-                f"({c_dtype}*)malloc(_total{leaf} * {sizeof_val})"
-            )
-        )
-
-        # ── Phase 3: fill values ───────────────────────────────────────
-        result.append(phase3_loop)
-
-        # free offset arrays (no longer needed)
-        for l in compressed_levels:
-            result.append(llir.RawStmt(code=f"free(_offset{l})"))
-
-        # ── Final assembly: from_blob ──────────────────────────────────
         _CTYPE_TO_TORCH = {
             "float": "torch::kFloat32",
             "double": "torch::kFloat64",
@@ -3240,37 +3399,19 @@ class CINLowerer:
         }
         torch_dtype = _CTYPE_TO_TORCH.get(c_dtype, "torch::kFloat32")
         result.append(
-            llir.RawStmt(code="auto _free_deleter = [](void* p) { free(p); }")
-        )
-
-        for l in compressed_levels:
-            if l == first_cl:
-                pos_size = f"(long long)({loop_bound} + 1)"
-            else:
-                parent_l = compressed_levels[compressed_levels.index(l) - 1]
-                pos_size = f"(long long)(_total{parent_l} + 1)"
-            result.append(
-                llir.RawStmt(
-                    code=f"torch::Tensor {result_name}{l}_pos_torch = "
-                    f"torch::from_blob({result_name}{l}_pos_data, "
-                    f"{{{pos_size}}}, _free_deleter, torch::kInt)"
-                )
-            )
-            result.append(
-                llir.RawStmt(
-                    code=f"torch::Tensor {result_name}{l}_crd_torch = "
-                    f"torch::from_blob({result_name}{l}_crd_data, "
-                    f"{{(long long)_total{l}}}, _free_deleter, torch::kInt)"
-                )
-            )
-
-        result.append(
             llir.RawStmt(
-                code=f"torch::Tensor {result_name}_values_torch = "
-                f"torch::from_blob({result_name}_values_data, "
-                f"{{(long long)_total{leaf}}}, _free_deleter, {torch_dtype})"
+                code=(
+                    f"torch::Tensor {result_name}_values_torch = "
+                    f"torch::empty({{(long long)_total{leaf}}}, {torch_dtype});\n"
+                    f"  {c_dtype}* {result_name}_values_data = "
+                    f"{result_name}_values_torch.data_ptr<{c_dtype}>();"
+                ),
+                add_semicolon=False,
             )
         )
+
+        # ── Phase 3: fill values ───────────────────────────────────────
+        result.append(phase3_loop)
 
         # mode_indices: {{}, {pos,crd}, {pos,crd}, ...}
         mi_parts = []
@@ -3286,9 +3427,9 @@ class CINLowerer:
         result.append(
             llir.RawStmt(
                 code=f"Tensor {result_name};\n"
-                f"  {result_name}._storage._index.mode_indices = "
+                f"  {result_name}.storage.index.mode_indices = "
                 f"{{{mi_str}}};\n"
-                f"  {result_name}._storage._value = "
+                f"  {result_name}.storage.value = "
                 f"{result_name}_values_torch;\n"
                 f"  return {result_name};",
                 add_semicolon=False,
@@ -3615,6 +3756,13 @@ class CINLowerer:
                 stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
             elif isinstance(stmt, llir.VarInit):
                 stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
+            elif isinstance(stmt, llir.FunctionCallStmt):
+                for old, new in replacements.items():
+                    stmt.name = stmt.name.replace(old, new)
+                stmt.args = [
+                    CINLowerer._rewrite_expr_refs(arg, replacements)
+                    for arg in stmt.args
+                ]
             elif isinstance(stmt, llir.ForLoop):
                 CINLowerer._rewrite_val_refs(stmt.body, replacements)
             elif isinstance(stmt, llir.IfThenElse):
@@ -4062,7 +4210,35 @@ class CINLowerer:
                         llir_stmt.pre_parallel_body = alloc or None
                         llir_stmt.post_parallel_body = free or None
                     self._apply_parallel_policy(llir_stmt)
+                self._attach_serial_workspace_pools(llir_stmt)
                 return
+
+    def _attach_serial_workspace_pools(self, loop: llir.ForLoop) -> None:
+        """Allocate per-worker dense workspaces before entering OpenMP."""
+        specs = getattr(self, "_workspace_pool_specs", [])
+        if not specs:
+            return
+
+        thread_expr = loop.omp_num_threads or "omp_get_max_threads()"
+        before: List[llir.Stmt] = []
+        for workspace_name, ctype, extent in specs:
+            before.extend(
+                [
+                    llir.RawStmt(
+                        code=(f"int {workspace_name}_thread_count = " f"{thread_expr}")
+                    ),
+                    llir.RawStmt(
+                        code=(
+                            f"auto {workspace_name}_pool_owner = "
+                            f"scorch_make_aligned_buffer<{ctype}>("
+                            "scorch_checked_size_product("
+                            f"(size_t){workspace_name}_thread_count, "
+                            f"(size_t){extent}))"
+                        )
+                    ),
+                ]
+            )
+        loop.before_parallel_body = before
 
     @staticmethod
     def _tag_first_loop(stmts: List[llir.Stmt], index_var: IndexVar) -> None:
@@ -4167,7 +4343,7 @@ class CINLowerer:
     # Min work per thread for the SpGEMM 2-phase path, where `work` is the true flop
     # (A_nnz*avg_B_row). Emitted by NAME (not as a literal) so the codegen flop grain
     # lives in scorch/csrc/scorch_policy.h and picks up the Phase 4b
-    # per-host autotuned value; the header (via header.cpp) is prepended to every
+    # per-host autotuned value; the header is prepended to every
     # generated kernel so the macro resolves. Defaults to 1500 there — larger than the
     # A_nnz default (500) because flop is ~avg_B_row bigger; validated on redwood.
     _CG_FLOP_GRAIN = "SCORCH_GRAIN_CODEGEN_SPGEMM"
@@ -4177,7 +4353,7 @@ class CINLowerer:
     ):
         """Attach a work-aware thread cap (+ adaptive schedule chunk) to a parallel
         ForLoop. codegen.py emits these as num_threads(scorch_nthreads(work,rows)) and
-        schedule(dynamic, scorch_chunk(rows, work)) (helpers in scorch/csrc/header.cpp).
+        schedule(dynamic, scorch_chunk(rows, work)) (helpers in scorch/csrc/header.h).
 
         rows = loop trip count; work = the C++ work estimate. When work_expr is
         given it is used verbatim (e.g. the true SpGEMM flop A_nnz*avg_B_row from
@@ -4518,7 +4694,10 @@ class CINLowerer:
             pre_scan_stmts: List[llir.Stmt] = [
                 llir.Comment("Pre-compute row group boundaries for OpenMP"),
                 llir.VarDecl(
-                    llir.Var(name="_group_starts", type=llir.DataType.CVECTOR_INT)
+                    llir.Var(
+                        name="_group_starts",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    )
                 ),
                 llir.Assign(
                     var=llir.Var(name="_group_starts[0]", type=llir.DataType.INT64),
@@ -4526,7 +4705,10 @@ class CINLowerer:
                 ),
                 llir.VarInit(
                     var=llir.Var(name="_n_groups", type=llir.DataType.INT64),
-                    value=llir.Literal(1),
+                    value=llir.Var(
+                        name=f"{outer_end_var} > 0 ? 1 : 0",
+                        type=llir.DataType.INT64,
+                    ),
                 ),
                 # Scan loop
                 llir.ForLoop(
@@ -4633,8 +4815,8 @@ class CINLowerer:
 
             # ── Optimization: flat parallel loop when each nonzero is
             # independent (scalar accumulator mode). Skips the serial
-            # group-boundary scan entirely. Also replaces cvector with
-            # raw malloc for zero-overhead array access. ─────────────
+            # group-boundary scan entirely. Known-size outputs use Torch
+            # storage for zero-overhead array access. ─────────────────
             if self._used_scalar_accum:
                 # Detect known-nnz: sparse output + scalar accum → nnz_out == nnz_in
                 if (
@@ -4680,7 +4862,7 @@ class CINLowerer:
                     )
                 )
                 if not self._known_nnz_var:
-                    # Rewrite output array accesses to bypass cvector bounds checks:
+                    # Rewrite output array accesses to use pre-sized storage directly:
                     # arr[idx] → arr.data()[idx] for pre-allocated arrays.
                     for arr_name in output_arrays:
                         CINLowerer._rewrite_val_refs(

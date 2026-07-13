@@ -211,7 +211,7 @@ drains it. The outermost call wraps everything into an LLIR function:
 
 ```python
 llir.Function(
-    return_type=llir.DataType.TACO_TENSOR,   # src/scorch/csrc/header.cpp `Tensor`
+    return_type=llir.DataType.TACO_TENSOR,   # src/scorch/csrc/header.h `Tensor`
     name="evaluate",
     args=kernel_args,   # result_shape, then per input:
                         #   <name>_shape, <name>_mode_indices, <name>_values
@@ -235,8 +235,8 @@ Every node is an `Expr` or a `Stmt`. Expressions include `Var`, `Literal`,
 `BinOp` / `Add` / `Mul`, `Cast`, `FunctionCall`, and `ArrayAccess`. Statements
 include `VarInit`, `Assign` (with `+=`, `*=`, …), `ForLoop`, `WhileLoop`,
 `IfThenElse`, and `Function`. Types are concrete C++ strings carried by a
-`DataType` enum (`"int64_t"`, `"float"`, `"float*"`, `torch::Tensor`, the custom
-`cvector<T>` and `coo_workspace<T, dim>` families, …).
+`DataType` enum (`"int64_t"`, `"float"`, `"float*"`, `torch::Tensor`,
+`std::vector<T>`, and the move-only `coo_workspace<T, dim>` family, …).
 
 The SpMM inner assignment is, in LLIR:
 
@@ -295,8 +295,8 @@ The full codegen walk, the OpenMP emission variants, and fused-epilogue
 ## Stage 6 — JIT compile
 
 The generated `evaluate()` string is prepended with the packaged
-`src/scorch/csrc/header.cpp` resource — the
-runtime support (`Tensor` / `TensorStorage` structs, `cvector<T>`,
+`src/scorch/csrc/header.h` resource — the
+runtime support (`Tensor` / `TensorStorage` structs, checked standard vectors,
 `coo_workspace<T, dim>`, the parallel-policy header, OpenMP) — and handed to
 `_load_kernel`. The resource and parallel-policy header are loaded with
 `importlib.resources`, so installed wheels do not need a repository checkout.
@@ -364,7 +364,7 @@ $C_{ik} = \sum_j A_{ij} B_{jk}$ with `A` in CSR and `B` dense:
 | **3. CINLowerer** | Iterator analysis emits `A`'s compressed-row pos/crd loops; `Where` → producer fills `accum_c`, consumer copies to `C`; assemble `evaluate` LLIR function. |
 | **4. LLIR** | Typed nodes: `ForLoop` (with OpenMP policy), `Assign(accum_c[k], Mul(A_val, B_val), +=)`. |
 | **5. Codegen** | Emit the C++ string with `#pragma omp parallel for` over rows. |
-| **6. JIT** | Prepend `header.cpp`; key `kernel_<md5>`; load cached `.so` or `load_inline` with `-O3 -march=native …`. |
+| **6. JIT** | Prepend `header.h`; key `kernel_<md5>`; load cached `.so` or `load_inline` with `-O3 -march=native …`. |
 | **7. Execute** | `module.evaluate(result_shape, A.shape, A.index.mode_indices, A.values, …)` → `Tensor` → wrap into `STensor("dd")`. |
 
 And here is the same op driven end-to-end from Python, verified against a PyTorch

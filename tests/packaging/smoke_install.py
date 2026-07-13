@@ -18,7 +18,6 @@ import scorch
 import scorch_ops
 
 EXPECTED_NATIVE_RESOURCES = (
-    "header.cpp",
     "header.h",
     "kernels.h",
     "ops.cpp",
@@ -64,6 +63,9 @@ def _assert_packaged_native_resources() -> None:
             raise AssertionError(f"installed distribution is missing csrc/{filename}")
         if not resource.read_bytes():
             raise AssertionError(f"installed csrc/{filename} is empty")
+
+    if native_root.joinpath("header.cpp").is_file():
+        raise AssertionError("distribution contains the removed divergent header.cpp")
 
     if native_root.joinpath("scorch_policy_tuned.h").is_file():
         raise AssertionError("distribution contains a host-specific tuned policy")

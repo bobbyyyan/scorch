@@ -59,7 +59,6 @@ include = ["scorch", "scorch.*"]
 
 [tool.setuptools.package-data]
 scorch = [
-    "csrc/header.cpp",
     "csrc/header.h",
     "csrc/kernels.h",
     "csrc/native_abi.h",

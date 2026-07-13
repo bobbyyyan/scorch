@@ -8,7 +8,7 @@
 #include <numeric>
 
 #include "prebuilt_types.h"
-#include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.cpp)
+#include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.h)
 
 template <typename scalar_t>
 Tensor spmv_csr(
@@ -28,7 +28,9 @@ Tensor spmv_csr(
   scalar_t* B_val = B_values.data_ptr<scalar_t>();
 
   int C0_size = result_shape[0];
-  scalar_t* C_values = (scalar_t*)malloc(sizeof(scalar_t) * C0_size);
+  torch::Tensor C_values_torch =
+      torch::empty({C0_size}, scorch_torch_dtype<scalar_t>());
+  scalar_t* C_values = C_values_torch.data_ptr<scalar_t>();
 
   #pragma omp parallel for schedule(static)
   for (int i = 0; i < C0_size; i++) {
@@ -41,9 +43,6 @@ Tensor spmv_csr(
   }
 
   Tensor C;
-  auto C_values_deleter = [](void *ptr) { free(ptr); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values, {C0_size}, C_values_deleter, scorch_torch_dtype<scalar_t>());
   C.storage.index.mode_indices = {{}};
   C.storage.value = C_values_torch;
   return C;
@@ -81,14 +80,39 @@ Tensor spmspm_csr(
   // slowest cores (e.g. a hybrid Intel P+E CPU's E-cores, a 4-7x cliff).
   const int nthreads = scorch_nthreads(flop_est, A0_size, SCORCH_GRAIN_SPMSPM);
   const int chunk = scorch_chunk(A0_size, flop_est, SCORCH_GRAIN_SPMSPM);
+  const size_t column_count = static_cast<size_t>(C1_size);
+  const auto cache_line_stride = [nthreads](size_t count, size_t element_size) {
+    if (count == 0) return size_t{0};
+    if (nthreads == 1) return count;
+    const size_t elements_per_line = std::max<size_t>(1, 64 / element_size);
+    const size_t padded =
+        ((count + elements_per_line - 1) / elements_per_line) *
+        elements_per_line;
+    // Keep an unused cache line between unaligned new[]-backed worker slices.
+    return padded + elements_per_line;
+  };
+  const size_t next_stride = cache_line_stride(column_count, sizeof(int));
+  auto next_by_worker = scorch_make_unique_array_pool<int>(
+      static_cast<size_t>(nthreads), next_stride);
+  std::fill_n(next_by_worker.get(),
+              scorch_checked_size_product(static_cast<size_t>(nthreads),
+                                          next_stride),
+              -1);
 
-  // Phase 1: Count nnz per row in parallel
-  int* row_nnz = (int*)calloc(A0_size, sizeof(int));
+  // Phase 1: Count nnz directly into the eventual position owner. Keeping the
+  // counts in slots [1, rows] lets Phase 2 prefix them in place, avoiding a
+  // second temporary allocation and copy while ownership remains move-only.
+  auto C1_pos_owner = scorch_make_unique_array_pool<int>(
+      1, static_cast<size_t>(A0_size) + 1);
+  int* C1_pos_data = C1_pos_owner.get();
+  C1_pos_data[0] = 0;
 
   #pragma omp parallel num_threads(nthreads)
   {
-    // Thread-local linked-list workspace for counting
-    std::vector<int> next(C1_size, -1);
+    // Thread-local linked-list slice from the serially allocated workspace pool.
+    int* SCORCH_RESTRICT next =
+        next_by_worker.get() +
+        static_cast<size_t>(omp_get_thread_num()) * next_stride;
 
     #pragma omp for schedule(dynamic, chunk)
     for (int i = 0; i < A0_size; i++) {
@@ -107,7 +131,7 @@ Tensor spmspm_csr(
         }
       }
 
-      row_nnz[i] = length;
+      C1_pos_data[i + 1] = length;
 
       // Reset linked list
       while (head >= 0) {
@@ -119,22 +143,55 @@ Tensor spmspm_csr(
   }
 
   // Phase 2: Prefix sum to compute row pointers
-  int* C1_pos_data = (int*)malloc((A0_size + 1) * sizeof(int));
-  C1_pos_data[0] = 0;
+  int max_row_nnz = 0;
   for (int i = 0; i < A0_size; i++) {
-    C1_pos_data[i + 1] = C1_pos_data[i] + row_nnz[i];
+    const int count = C1_pos_data[i + 1];
+    max_row_nnz = std::max(max_row_nnz, count);
+    if (count > std::numeric_limits<int>::max() - C1_pos_data[i]) {
+      throw std::length_error("CSR SpGEMM output exceeds int32 index capacity");
+    }
+    C1_pos_data[i + 1] = C1_pos_data[i] + count;
   }
   int total_nnz = C1_pos_data[A0_size];
-  free(row_nnz);
 
   // Phase 3: Numeric multiply in parallel - each row writes to its own slice
-  int* C1_crd_data = (int*)malloc(total_nnz * sizeof(int));
-  scalar_t* C_values_data = (scalar_t*)malloc(total_nnz * sizeof(scalar_t));
+  auto C1_crd_owner = scorch_make_unique_array_pool<int>(
+      1, static_cast<size_t>(total_nnz));
+  auto C_values_owner = scorch_make_unique_array_pool<scalar_t>(
+      1, static_cast<size_t>(total_nnz));
+  int* C1_crd_data = C1_crd_owner.get();
+  scalar_t* C_values_data = C_values_owner.get();
+
+  struct SortEntry {
+    int coordinate;
+    scalar_t value;
+  };
+  const size_t sums_stride = cache_line_stride(column_count, sizeof(scalar_t));
+  const size_t entries_stride = max_row_nnz > 32
+      ? cache_line_stride(static_cast<size_t>(max_row_nnz), sizeof(SortEntry))
+      : 0;
+  auto sums_by_worker = scorch_make_unique_array_pool<scalar_t>(
+      static_cast<size_t>(nthreads), sums_stride);
+  std::unique_ptr<SortEntry[]> entries_by_worker;
+  if (entries_stride != 0) {
+    entries_by_worker = scorch_make_unique_array_pool<SortEntry>(
+        static_cast<size_t>(nthreads), entries_stride);
+  }
+  std::fill_n(sums_by_worker.get(),
+              scorch_checked_size_product(static_cast<size_t>(nthreads),
+                                          sums_stride),
+              static_cast<scalar_t>(0));
 
   #pragma omp parallel num_threads(nthreads)
   {
-    std::vector<int> next(C1_size, -1);
-    std::vector<scalar_t> sums(C1_size, 0);
+    const size_t worker = static_cast<size_t>(omp_get_thread_num());
+    int* SCORCH_RESTRICT next =
+        next_by_worker.get() + worker * next_stride;
+    scalar_t* SCORCH_RESTRICT sums =
+        sums_by_worker.get() + worker * sums_stride;
+    SortEntry* SCORCH_RESTRICT entries = entries_stride != 0
+        ? entries_by_worker.get() + worker * entries_stride
+        : nullptr;
 
     #pragma omp for schedule(dynamic, chunk)
     for (int i = 0; i < A0_size; i++) {
@@ -184,35 +241,34 @@ Tensor spmspm_csr(
           C_values_data[base + b + 1] = key_v;
         }
       } else {
-        // Build index array and sort
-        std::vector<int> idx(length);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::sort(idx.begin(), idx.end(), [&](int a, int b) {
-          return C1_crd_data[base + a] < C1_crd_data[base + b];
-        });
-        std::vector<int> tmp_crd(length);
-        std::vector<scalar_t> tmp_val(length);
+        // Sort a worker-local coordinate/value copy so the parallel region never
+        // allocates, then copy the ordered row back to its output slice.
         for (int jj = 0; jj < length; jj++) {
-          tmp_crd[jj] = C1_crd_data[base + idx[jj]];
-          tmp_val[jj] = C_values_data[base + idx[jj]];
+          entries[jj] =
+              SortEntry{C1_crd_data[base + jj], C_values_data[base + jj]};
         }
-        memcpy(C1_crd_data + base, tmp_crd.data(), length * sizeof(int));
-        memcpy(C_values_data + base, tmp_val.data(), length * sizeof(scalar_t));
+        std::sort(entries, entries + length, [](const SortEntry& left,
+                                                const SortEntry& right) {
+          return left.coordinate < right.coordinate;
+        });
+        for (int jj = 0; jj < length; jj++) {
+          C1_crd_data[base + jj] = entries[jj].coordinate;
+          C_values_data[base + jj] = entries[jj].value;
+        }
       }
     }
   }
 
   // Assemble final result
-  Tensor C;
-  auto int_deleter = [](void* p) { free(p); };
-  torch::Tensor C1_pos_torch = torch::from_blob(C1_pos_data, {(long long)(A0_size + 1)}, int_deleter, torch::kInt);
-  torch::Tensor C1_crd_torch = torch::from_blob(C1_crd_data, {(long long)total_nnz}, int_deleter, torch::kInt);
-  auto val_deleter = [](void* p) { free(p); };
-  torch::Tensor C_values_torch = torch::from_blob(
-      C_values_data,
-      {(long long)total_nnz},
-      val_deleter,
+  torch::Tensor C1_pos_torch = scorch_tensor_from_unique_array(
+      std::move(C1_pos_owner), static_cast<int64_t>(A0_size) + 1, torch::kInt);
+  torch::Tensor C1_crd_torch = scorch_tensor_from_unique_array(
+      std::move(C1_crd_owner), static_cast<int64_t>(total_nnz), torch::kInt);
+  torch::Tensor C_values_torch = scorch_tensor_from_unique_array(
+      std::move(C_values_owner),
+      static_cast<int64_t>(total_nnz),
       scorch_torch_dtype<scalar_t>());
+  Tensor C;
   C.storage.index.mode_indices = {{}, {C1_pos_torch, C1_crd_torch}};
   C.storage.value = C_values_torch;
   return C;
@@ -235,23 +291,23 @@ Tensor spmspm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
   float* B_val = B_values.data_ptr<float>();
 
   // Init result level indices
-  cvector<int> C1_pos;
-  cvector<int> C1_crd;
-  C1_pos[0] = 0;
+  std::vector<int> C1_pos;
+  std::vector<int> C1_crd;
+  scorch_vector_set(C1_pos, 0, 0);
   int pC1 = 0;
   int C1_pos_index = 0;
 
   for (int pC1 = 1; pC1 <= C0_size; pC1++) {
-    C1_pos[pC1] = 0;
+    scorch_vector_set(C1_pos, pC1, 0);
   }
   // Initialize result value array
-  cvector<float> C_values;
+  std::vector<float> C_values;
 
 
   for (int i = 0; i < A0_size; i++) {
     // Assemble COMPRESSED level
     for (; C1_pos_index < i; C1_pos_index++) {
-      C1_pos[C1_pos_index + 1] = C1_crd.size();
+      scorch_vector_set(C1_pos, C1_pos_index + 1, C1_crd.size());
     }
     // Resolve dense coordinates
     int pA0 = i;
@@ -285,20 +341,23 @@ Tensor spmspm_csr_float(std::vector<int> result_shape, std::vector<int> A_shape,
       int64_t k = it.first;
       float wksp_value = it.second;
 
-      C_values[pC1] = wksp_value;
-      C1_crd[pC1] = k;
+      scorch_vector_set(C_values, pC1, wksp_value);
+      scorch_vector_set(C1_crd, pC1, k);
       pC1++;
     }
 
 
     // Assembly compressed _level indices
-    C1_pos[C1_pos_index + 1] = C1_crd.size();
+    scorch_vector_set(C1_pos, C1_pos_index + 1, C1_crd.size());
   }
   // Assemble final result (Do not change this part of the code)
   Tensor C;
-  torch::Tensor C1_pos_torch = torch::from_blob(C1_pos.data(), {C1_pos.size()}, C1_pos.get_deleter(), torch::kInt);
-  torch::Tensor C1_crd_torch = torch::from_blob(C1_crd.data(), {C1_crd.size()}, C1_crd.get_deleter(), torch::kInt);
-  torch::Tensor C_values_torch = torch::from_blob(C_values.data(), {C_values.size()}, C_values.get_deleter(), torch::kFloat32);
+  torch::Tensor C1_pos_torch =
+      scorch_tensor_from_vector(std::move(C1_pos), torch::kInt);
+  torch::Tensor C1_crd_torch =
+      scorch_tensor_from_vector(std::move(C1_crd), torch::kInt);
+  torch::Tensor C_values_torch =
+      scorch_tensor_from_vector(std::move(C_values), torch::kFloat32);
   C.storage.index.mode_indices = {{}, {C1_pos_torch, C1_crd_torch}};
   C.storage.value = C_values_torch;
   return C;
@@ -328,14 +387,14 @@ Tensor spmspm_coo_float(
   float* B_val = B_values.data_ptr<float>();
 
   // Init result level indices
-  cvector<int> C0_crd;
+  std::vector<int> C0_crd;
   int pC0 = 0;
 
-  cvector<int> C1_crd;
+  std::vector<int> C1_crd;
   int pC1 = 0;
 
   // Initialize result value array
-  cvector<float> C_values;
+  std::vector<float> C_values;
 
   // Initialize iterators
   int pA0_end = A0_crd_tensor.size(0);
@@ -395,17 +454,21 @@ Tensor spmspm_coo_float(
       int64_t j = it.first;
       float wksp_value = it.second;
 
-      C_values[pC1] = wksp_value;
-      C1_crd[pC1] = j;
+      scorch_vector_set(C0_crd, pC1, i);
+      scorch_vector_set(C_values, pC1, wksp_value);
+      scorch_vector_set(C1_crd, pC1, j);
       pC1++;
     }
 
   }
   // Assemble final result
   Tensor C;
-  torch::Tensor C0_crd_torch = torch::from_blob(C0_crd.data(), {C0_crd.size()}, C0_crd.get_deleter(), torch::kInt);
-  torch::Tensor C1_crd_torch = torch::from_blob(C1_crd.data(), {C1_crd.size()}, C1_crd.get_deleter(), torch::kInt);
-  torch::Tensor C_values_torch = torch::from_blob(C_values.data(), {C_values.size()}, C_values.get_deleter(), torch::kFloat32);
+  torch::Tensor C0_crd_torch =
+      scorch_tensor_from_vector(std::move(C0_crd), torch::kInt);
+  torch::Tensor C1_crd_torch =
+      scorch_tensor_from_vector(std::move(C1_crd), torch::kInt);
+  torch::Tensor C_values_torch =
+      scorch_tensor_from_vector(std::move(C_values), torch::kFloat32);
   C.storage.index.mode_indices = {{C0_crd_torch}, {C1_crd_torch}};
   C.storage.value = C_values_torch;
   return C;
@@ -435,9 +498,9 @@ Tensor spmspm_coo_float_opt(
   float* B_val = B_values.data_ptr<float>();
 
   // Init result level indices
-  cvector<int> C0_crd;
-  cvector<int> C1_crd;
-  cvector<float> C_values;
+  std::vector<int> C0_crd;
+  std::vector<int> C1_crd;
+  std::vector<float> C_values;
 
   // Initialize iterators
   int pA0_end = A0_crd_tensor.size(0);
@@ -494,24 +557,27 @@ Tensor spmspm_coo_float_opt(
     std::vector<std::pair<int, float>> col_val_pairs;
     col_val_pairs.reserve(length);
     for (int jj = 0; jj < length; jj++) {
-      int idx = C_values.size() - length + jj;
-      col_val_pairs.emplace_back(C1_crd[idx], C_values[idx]);
+      const size_t idx = C_values.size() - length + jj;
+      col_val_pairs.emplace_back(C1_crd.at(idx), C_values.at(idx));
     }
     std::sort(col_val_pairs.begin(), col_val_pairs.end(), [](const auto& a, const auto& b) {
       return a.first < b.first;
     });
     for (int jj = 0; jj < length; jj++) {
-      int idx = C_values.size() - length + jj;
-      C1_crd[idx] = col_val_pairs[jj].first;
-      C_values[idx] = col_val_pairs[jj].second;
+      const size_t idx = C_values.size() - length + jj;
+      C1_crd.at(idx) = col_val_pairs[jj].first;
+      C_values.at(idx) = col_val_pairs[jj].second;
     }
   }
 
   // Assemble final result
   Tensor C;
-  torch::Tensor C0_crd_torch = torch::from_blob(C0_crd.data(), {C0_crd.size()}, C0_crd.get_deleter(), torch::kInt);
-  torch::Tensor C1_crd_torch = torch::from_blob(C1_crd.data(), {C1_crd.size()}, C1_crd.get_deleter(), torch::kInt);
-  torch::Tensor C_values_torch = torch::from_blob(C_values.data(), {C_values.size()}, C_values.get_deleter(), torch::kFloat32);
+  torch::Tensor C0_crd_torch =
+      scorch_tensor_from_vector(std::move(C0_crd), torch::kInt);
+  torch::Tensor C1_crd_torch =
+      scorch_tensor_from_vector(std::move(C1_crd), torch::kInt);
+  torch::Tensor C_values_torch =
+      scorch_tensor_from_vector(std::move(C_values), torch::kFloat32);
   C.storage.index.mode_indices = {{C0_crd_torch}, {C1_crd_torch}};
   C.storage.value = C_values_torch;
   return C;
@@ -543,7 +609,9 @@ Tensor sddmm_coo_float_prebuilt(
   const float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
   const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
 
-  float* SCORCH_RESTRICT D_val = (float*)malloc(sizeof(float) * nnz);
+  torch::Tensor D_values_torch =
+      torch::empty({static_cast<long long>(nnz)}, torch::kFloat32);
+  float* SCORCH_RESTRICT D_val = D_values_torch.data_ptr<float>();
 
   const int nthreads = omp_get_max_threads();
   const int chunk = std::max(16, std::min(256, nnz / (nthreads * 128)));
@@ -578,9 +646,6 @@ Tensor sddmm_coo_float_prebuilt(
   }
 
   Tensor D;
-  auto deleter = [](void* ptr) { free(ptr); };
-  torch::Tensor D_values_torch = torch::from_blob(
-      D_val, {(long long)nnz}, deleter, torch::kFloat32);
   D.storage.index.mode_indices = S_mode_indices;
   D.storage.value = D_values_torch;
   return D;
