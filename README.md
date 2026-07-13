@@ -1,4 +1,4 @@
-# 🔥 Scorch
+# <img src="docs/source/_static/img/scorch-icon-pixel.svg" alt="" width="42" height="42"> Scorch
 
 **A CPU sparse-tensor compiler for PyTorch.**
 
