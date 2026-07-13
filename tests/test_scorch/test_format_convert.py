@@ -223,3 +223,15 @@ def test_2d_ss_dd():
     assert matrix.index.mode_indices[1][1].tolist() == [0, 1, 2, 3, 4, 3, 4, 4]
 
     assert matrix.values.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_rectangular_transposed_sparse_to_dense() -> None:
+    source = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+    source[source.remainder(3) == 0] = 0
+    sparse = STensor.from_torch(source, mode_order=[1, 0]).to_sparse("ds")
+    sparse_mode_order = sparse.mode_order
+
+    dense = sparse.to_dense()
+
+    assert torch.allclose(dense.to_torch(), source)
+    assert sparse.mode_order == sparse_mode_order

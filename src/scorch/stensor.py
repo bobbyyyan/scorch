@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Union, List
 import torch
 
 from .compiler.cin import (
+    IndexStmt,
     TensorVar,
     ForAll,
     IndexVar,
@@ -533,8 +534,8 @@ class STensor:
 
         # Perform element-wise addition
         # TODO: support broadcasting
-        a_index_vars = [IndexVar(f"i{i}") for i in self.storage.index.mode_order]
         index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+        ordered_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
         # TODO: output format inferred from input formats
         output_format = self.format
         result_shape = self.shape
@@ -561,20 +562,12 @@ class STensor:
             mode_order=other.storage.index.mode_order,
         )
 
-        # Generate the python code for the element-wise addition
-        # e.g. A[i0, i1, ...] = B[i0, i1, ...] + C[i0, i1, ...]
-        lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs += f' + C[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        code = f"{lhs} = {rhs}"
-        exec(code)
-
-        # Generate the python code for constructing the ForAll's and execute it
-        # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
-        rhs = "A._assignment"
-        for i in range(len(self.shape))[::-1]:
-            rhs = f"ForAll(a_index_vars[{i}], {rhs})"
-        cin_stmt = eval(rhs)
+        access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
+        rhs_expr = B[access_key] + C[access_key]
+        lhs_access = A[access_key]
+        cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_expr)
+        for index_var in reversed(ordered_index_vars):
+            cin_stmt = ForAll(index_var, cin_stmt)
 
         lowerer = CINLowerer()
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -1213,18 +1206,12 @@ class STensor:
             dtype=self.dtype,
         )
 
-        # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
-        lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        code = f"{lhs} = {rhs}"
-        exec(code)
-
-        # Generate the python code for constructing the ForAll's and execute it
-        # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
-        rhs = "A._assignment"
-        for i in range(len(self.shape))[::-1]:
-            rhs = f"ForAll(index_vars[{i}], {rhs})"
-        cin_stmt = eval(rhs)
+        access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
+        rhs_access = B[access_key]
+        lhs_access = A[access_key]
+        cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
+        for index_var in reversed(index_vars):
+            cin_stmt = ForAll(index_var, cin_stmt)
 
         lowerer = CINLowerer(filter_zeros=True)
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
@@ -1392,18 +1379,12 @@ class STensor:
                 mode_order=self.storage.index.mode_order,
             )
 
-            # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
-            lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-            rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-            code = f"{lhs} = {rhs}"
-            exec(code)
-
-            # Generate the python code for constructing the ForAll's and execute it
-            # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
-            rhs = "A._assignment"
-            for i in range(len(self.shape))[::-1]:
-                rhs = f"ForAll(ordered_index_vars[{i}], {rhs})"
-            cin_stmt = eval(rhs)
+            access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
+            rhs_access = B[access_key]
+            lhs_access = A[access_key]
+            cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
+            for index_var in reversed(ordered_index_vars):
+                cin_stmt = ForAll(index_var, cin_stmt)
 
             # print("\n\ncin_stmt: ", cin_stmt)
 

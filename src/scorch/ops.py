@@ -1,4 +1,3 @@
-import copy
 import os
 import time
 from typing import Any, List, Optional, Sequence, Tuple, Union, cast
@@ -8,6 +7,7 @@ from torch.fx import Proxy
 
 from .compiler import llir
 from .compiler.cin import (
+    IndexExpr,
     IndexVar,
     TensorVar,
     ForAll,
@@ -18,6 +18,7 @@ from .compiler.cin import (
     IndexStmt,
 )
 from .compiler.cin_lowerer import CINLowerer
+from .compiler.cin_analysis import normalize_cin
 from .compiler.codegen import LLIRLowerer
 from .compiler.loop_plan import ScheduledCIN
 from .compiler.scheduler import (
@@ -1375,11 +1376,10 @@ def _build_regblock_dual_path(
     if not Scheduler._has_dense_output(cin_unscheduled):
         return None
 
-    # auto_schedule mutates the CIN in place, so schedule each arm from a pristine copy.
     with regblock_force(False):
-        cin_base = Scheduler.auto_schedule(copy.deepcopy(cin_unscheduled))
+        cin_base = Scheduler.auto_schedule(cin_unscheduled)
     with regblock_force(True):
-        cin_rb = Scheduler.auto_schedule(copy.deepcopy(cin_unscheduled))
+        cin_rb = Scheduler.auto_schedule(cin_unscheduled)
     if str(cin_base) == str(cin_rb):
         # Register-block didn't change the schedule (pattern doesn't qualify) ->
         # nothing to branch on; let the caller use the plain baseline path.
@@ -1927,10 +1927,10 @@ def einsum(
     # Build LHS access and create assignment
     lhs_indices = [index_var_dict[s] for s in result_index_strs]
     lhs_key = lhs_indices[0] if len(lhs_indices) == 1 else tuple(lhs_indices)
-    result_tensor_var[lhs_key] = rhs_expr
+    lhs_access = result_tensor_var[lhs_key]
+    cin_stmt: IndexStmt = TensorAssign(lhs_access, cast(IndexExpr, rhs_expr))
 
     # Wrap in nested ForAll loops (outermost first in schedule, built inside-out)
-    cin_stmt = result_tensor_var._assignment
     for index_str in reversed(index_strs_by_schedule):
         cin_stmt = ForAll(index_var_dict[index_str], cin_stmt)
 
@@ -2092,7 +2092,10 @@ def einsum(
     return result
 
 
-def _align_mode_orders_to_loop_order(cin_stmt: IndexStmt, args: tuple) -> None:
+def _align_mode_orders_to_loop_order(
+    cin_stmt: IndexStmt,
+    args: tuple,
+) -> tuple:
     """Align input tensor mode orders to the CIN loop order.
 
     The lowerer requires parent physical levels to be iterated before child
@@ -2100,8 +2103,8 @@ def _align_mode_orders_to_loop_order(cin_stmt: IndexStmt, args: tuple) -> None:
     generated code references coordinate variables before they are defined.
     This mirrors the alignment that ``einsum`` performs (ops.py L581-591).
 
-    Mutates TensorVar.mode_order in *cin_stmt* and calls
-    ``STensor.change_mode_order`` on the corresponding *args* entries.
+    Mutates only the private ``cin_stmt`` and returns replacement runtime tensors
+    when a physical relayout is required. Caller-owned tensors are preserved.
     """
     # 1. Extract loop order
     loop_order_names: List[str] = []
@@ -2111,14 +2114,15 @@ def _align_mode_orders_to_loop_order(cin_stmt: IndexStmt, args: tuple) -> None:
         curr = curr.stmt
 
     if not loop_order_names:
-        return
+        return args
 
     # 2. Get RHS tensor accesses (left-to-right order matches *args*)
     rhs_accesses = cin_stmt.get_rhs_tensor_accesses()
     if len(rhs_accesses) != len(args):
-        return  # can't align if we don't have a 1:1 mapping
+        return args  # can't align if we don't have a 1:1 mapping
 
-    for ta, stensor in zip(rhs_accesses, args):
+    aligned_args = list(args)
+    for position, (ta, stensor) in enumerate(zip(rhs_accesses, args)):
         tv = ta.get_tensor()
         index_var_names = [iv.name for iv in ta.get_index_vars()]
         # Filter loop order to vars present in this tensor
@@ -2131,7 +2135,9 @@ def _align_mode_orders_to_loop_order(cin_stmt: IndexStmt, args: tuple) -> None:
         if list(tv.mode_order) != desired_mode_order:
             tv.mode_order = desired_mode_order
             if stensor.has_index and stensor.shape is not None:
-                stensor.change_mode_order(desired_mode_order)
+                aligned = stensor.copy()
+                aligned.change_mode_order(desired_mode_order)
+                aligned_args[position] = aligned
 
     # 3. Also align the output tensor
     if isinstance(curr, TensorAssign):
@@ -2144,6 +2150,7 @@ def _align_mode_orders_to_loop_order(cin_stmt: IndexStmt, args: tuple) -> None:
             and list(lhs_tv.mode_order) != desired_mode_order
         ):
             lhs_tv.mode_order = desired_mode_order
+    return tuple(aligned_args)
 
 
 def lower_and_exec_cin(
@@ -2176,7 +2183,8 @@ def lower_and_exec_cin(
     STensor
         Output tensor. The output format is hard-coded to ``"dd"`` (dense).
     """
-    _align_mode_orders_to_loop_order(cin_stmt, args)
+    cin_stmt = normalize_cin(cin_stmt)
+    args = _align_mode_orders_to_loop_order(cin_stmt, args)
 
     rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
     if len(rhs_tensor_vars) != len(args):
