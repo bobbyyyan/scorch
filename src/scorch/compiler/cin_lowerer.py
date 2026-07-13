@@ -2502,6 +2502,10 @@ class CINLowerer:
                         )
                     )
 
+            # The former ``lower_IndexStmt(..., recurse=True)`` path repeated
+            # this bookkeeping before descending.  Keep that observable
+            # instance state stable while returning pass ownership explicitly.
+            self.need_compute.extend(result_tensor_vars)
             recurse_result = self._lower_outer_body(stmt)
             recurse_stmts = recurse_result.statements
             compressed_output_parallel = recurse_result.applied

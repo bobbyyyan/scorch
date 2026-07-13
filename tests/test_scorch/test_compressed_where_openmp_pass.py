@@ -855,6 +855,16 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
         "d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f"
     )
     assert not hasattr(lowerer, "_compressed_output_parallel")
+    assert [tensor.get_name() for tensor in lowerer.need_compute] == [
+        "SparseProduct",
+        "wksp",
+        "SparseProduct",
+        "wksp",
+        "SparseProduct",
+        "wksp",
+        "wksp",
+        "wksp",
+    ]
 
 
 def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
