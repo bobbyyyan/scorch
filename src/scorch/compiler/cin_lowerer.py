@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
+from dataclasses import replace
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import llir
 from .cin import (
@@ -28,21 +29,29 @@ from .legacy_cin_adapter import (
     legacy_cin_working_copy,
 )
 from .cin_analysis import verify_cin_if_enabled
-from .dynamic_vector_access_pass import (
-    DYNAMIC_VECTOR_ACCESS_CONTEXT,
-    rewrite_dynamic_vector_accesses,
-)
 from .compressed_where_openmp_pass import (
     CompressedWhereOpenMPContext,
     CompressedWhereOpenMPPolicy,
     CompressedWhereOpenMPResult,
-    transform_compressed_where_for_openmp,
+)
+from .llir_pass_manager import (
+    PRODUCTION_LLIR_PASS_OPTIONS,
+    CompressedWhereOpenMPPassSpec,
+    DynamicVectorAccessPassSpec,
+    LLIRPassManager,
+    LLIRPassOptions,
+    LLIRPassRunRecord,
+    LLIRRewriteArtifact,
+    LLIRStatementListArtifact,
 )
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
 if TYPE_CHECKING:
     from .scheduler import Schedule
+
+
+_DYNAMIC_VECTOR_ACCESS_PASS_SPEC = DynamicVectorAccessPassSpec()
 
 
 class ResultTensorAssembler:
@@ -509,9 +518,15 @@ class CINLowerer:
         {"add", "mul", "relu", "gelu", "tanh", "sigmoid"}
     )
 
-    def __init__(self, filter_zeros=False, post_ops: Optional[PostOps] = None):
+    def __init__(
+        self,
+        filter_zeros=False,
+        post_ops: Optional[PostOps] = None,
+        llir_pass_options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS,
+    ):
         self.filter_zeros: bool = filter_zeros
         self.post_ops: Optional[PostOps] = post_ops
+        self._llir_pass_manager = LLIRPassManager(llir_pass_options)
         self._validate_post_ops()
         self.defined_index_vars: List[IndexVar] = []
 
@@ -550,6 +565,20 @@ class CINLowerer:
         self.need_compute: List[TensorVar] = []
         self.tensor_var_to_llir: Dict[TensorVar, llir.Expr] = {}
         self._value_array_ctypes: Dict[str, str] = {}
+        self._llir_pass_run_records: Tuple[LLIRPassRunRecord, ...] = ()
+
+    @property
+    def llir_pass_run_records(self) -> Tuple[LLIRPassRunRecord, ...]:
+        """Completed managed LLIR passes in exact production execution order."""
+
+        return self._llir_pass_run_records
+
+    def _record_llir_pass_runs(self, records: Tuple[LLIRPassRunRecord, ...]) -> None:
+        start = len(self._llir_pass_run_records)
+        self._llir_pass_run_records += tuple(
+            replace(record, sequence_index=start + offset)
+            for offset, record in enumerate(records)
+        )
 
     def _validate_post_ops(self) -> None:
         """Reject post-ops that this lowering stage cannot represent."""
@@ -2617,10 +2646,12 @@ class CINLowerer:
                 )
                 body_stmts.extend(final_assembler.emit_final_assembly())
 
-            body_stmts = rewrite_dynamic_vector_accesses(
-                body_stmts,
-                DYNAMIC_VECTOR_ACCESS_CONTEXT,
+            dynamic_vector_result = self._llir_pass_manager.run_dynamic_vector_access(
+                LLIRRewriteArtifact(body_stmts),
+                _DYNAMIC_VECTOR_ACCESS_PASS_SPEC,
             )
+            self._record_llir_pass_runs(dynamic_vector_result.run_records)
+            body_stmts = dynamic_vector_result.artifact.value
 
             function = llir.Function(
                 return_type=llir.DataType.TACO_TENSOR,
@@ -4286,19 +4317,25 @@ class CINLowerer:
                 for level, level_type in enumerate(result_tensor.get_level_types())
                 if level_type == LevelType.COMPRESSED
             )
-            return transform_compressed_where_for_openmp(
-                stmts,
-                CompressedWhereOpenMPContext(
-                    result_name=result_tensor.get_name(),
-                    compressed_levels=compressed_levels,
-                    workspace_name=workspace_name,
-                    workspace_ctype=workspace_ctype,
-                    policy=CompressedWhereOpenMPPolicy(
-                        omp_schedule="dynamic, 64",
-                        flop_grain=self._CG_FLOP_GRAIN,
+            compressed_where_result = (
+                self._llir_pass_manager.run_compressed_where_openmp(
+                    LLIRStatementListArtifact(stmts),
+                    CompressedWhereOpenMPPassSpec(
+                        CompressedWhereOpenMPContext(
+                            result_name=result_tensor.get_name(),
+                            compressed_levels=compressed_levels,
+                            workspace_name=workspace_name,
+                            workspace_ctype=workspace_ctype,
+                            policy=CompressedWhereOpenMPPolicy(
+                                omp_schedule="dynamic, 64",
+                                flop_grain=self._CG_FLOP_GRAIN,
+                            ),
+                        )
                     ),
-                ),
+                )
             )
+            self._record_llir_pass_runs(compressed_where_result.run_records)
+            return compressed_where_result.result
 
         return CompressedWhereOpenMPResult(statements=stmts, applied=False)
 

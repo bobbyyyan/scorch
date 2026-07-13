@@ -44,7 +44,15 @@ from .llir_traversal import (
     LLIRValue,
     LLIRWalker,
 )
-from .result_write_pass import ResultWriteContext, rewrite_result_writes
+from .llir_pass_manager import (
+    PRODUCTION_LLIR_PASS_OPTIONS,
+    LLIRPassManager,
+    LLIRPassOptions,
+    LLIRPassRunRecord,
+    LLIRRewriteArtifact,
+    ResultWritePassSpec,
+)
+from .result_write_pass import ResultWriteContext
 
 COMPRESSED_WHERE_OPENMP_TRAVERSAL_CONTEXT = LLIRTraversalContext(
     stage="LLIR transformation",
@@ -90,6 +98,14 @@ class CompressedWhereOpenMPResult:
 
     statements: List[llir.Stmt]
     applied: bool
+
+
+@dataclass(frozen=True)
+class _ManagedCompressedWhereOpenMPExecution:
+    """Exact result plus the two independent result-write run records."""
+
+    result: CompressedWhereOpenMPResult
+    nested_run_records: Tuple[LLIRPassRunRecord, ...]
 
 
 @dataclass(frozen=True)
@@ -684,30 +700,32 @@ def _build_count_body(
     *,
     loop_var: str,
     workspace_hoisted: bool,
-) -> List[llir.Stmt]:
+    pass_options: LLIRPassOptions,
+) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
     levels = context.compressed_levels
     body: List[llir.Stmt] = [
         llir.RawStmt(code=f"int _cnt{level} = 0") for level in levels
     ]
     body.extend(llir.RawStmt(code=f"int _prev{level} = 0") for level in levels[1:])
-    body.extend(
-        rewrite_result_writes(
-            work_body,
+    result_write = LLIRPassManager(pass_options).run_result_write(
+        LLIRRewriteArtifact(work_body),
+        ResultWritePassSpec(
             ResultWriteContext(
                 result_name=context.result_name,
                 compressed_levels=levels,
                 mode="count",
                 traversal=context.traversal,
-            ),
-        )
+            )
+        ),
     )
+    body.extend(cast(List[llir.Stmt], result_write.artifact.value))
     body.extend(
         llir.RawStmt(code=f"_count{level}[{loop_var}] = _cnt{level}")
         for level in levels
     )
     if workspace_hoisted:
         body.append(llir.RawStmt(code=f"{context.workspace_name}.clear()"))
-    return body
+    return body, result_write.run_records
 
 
 def _build_fill_body(
@@ -716,7 +734,8 @@ def _build_fill_body(
     *,
     loop_var: str,
     workspace_hoisted: bool,
-) -> List[llir.Stmt]:
+    pass_options: LLIRPassOptions,
+) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
     levels = context.compressed_levels
     body: List[llir.Stmt] = []
     for level in levels:
@@ -727,20 +746,21 @@ def _build_fill_body(
             ]
         )
     body.extend(llir.RawStmt(code=f"int _prev{level} = 0") for level in levels[1:])
-    body.extend(
-        rewrite_result_writes(
-            work_body,
+    result_write = LLIRPassManager(pass_options).run_result_write(
+        LLIRRewriteArtifact(work_body),
+        ResultWritePassSpec(
             ResultWriteContext(
                 result_name=context.result_name,
                 compressed_levels=levels,
                 mode="fill",
                 traversal=context.traversal,
-            ),
-        )
+            )
+        ),
     )
+    body.extend(cast(List[llir.Stmt], result_write.artifact.value))
     if workspace_hoisted:
         body.append(llir.RawStmt(code=f"{context.workspace_name}.clear()"))
-    return body
+    return body, result_write.run_records
 
 
 def _should_drop_prefix_statement(
@@ -967,20 +987,23 @@ def _build_transformed_statements(
     for_loop: llir.ForLoop,
     loop_bound: str,
     context: CompressedWhereOpenMPContext,
-) -> List[llir.Stmt]:
+    pass_options: LLIRPassOptions,
+) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
     loop_var = cast(llir.VarInit, for_loop.init).var.name
     work_body, workspace_hoisted = _extract_work_body(for_loop, context)
-    count_body = _build_count_body(
+    count_body, count_records = _build_count_body(
         work_body,
         context,
         loop_var=loop_var,
         workspace_hoisted=workspace_hoisted,
+        pass_options=pass_options,
     )
-    fill_body = _build_fill_body(
+    fill_body, fill_records = _build_fill_body(
         work_body,
         context,
         loop_var=loop_var,
         workspace_hoisted=workspace_hoisted,
+        pass_options=pass_options,
     )
     count_loop = _build_phase_loop(
         for_loop,
@@ -1007,14 +1030,15 @@ def _build_transformed_statements(
     result.append(_value_allocation(context))
     result.append(fill_loop)
     result.append(_final_assembly(context))
-    return result
+    return result, (*count_records, *fill_records)
 
 
-def transform_compressed_where_for_openmp(
+def _transform_compressed_where_for_openmp_managed(
     statements: List[llir.Stmt],
     context: CompressedWhereOpenMPContext,
-) -> CompressedWhereOpenMPResult:
-    """Return a detached two-phase compressed-output transformation result.
+    pass_options: LLIRPassOptions,
+) -> _ManagedCompressedWhereOpenMPExecution:
+    """Run the transform and retain managed internal composition records.
 
     Legal no-ops are an input with no compatible top-level plain ``ForLoop`` or
     one whose first compatible loop has no extractable ``< bound_var`` bound.
@@ -1038,17 +1062,45 @@ def transform_compressed_where_for_openmp(
     )
     loop_index, for_loop = _find_outer_loop(detached)
     if loop_index is None or for_loop is None:
-        return CompressedWhereOpenMPResult(detached, False)
+        return _ManagedCompressedWhereOpenMPExecution(
+            CompressedWhereOpenMPResult(detached, False),
+            (),
+        )
     loop_bound = _extract_loop_bound(for_loop)
     if loop_bound is None:
-        return CompressedWhereOpenMPResult(detached, False)
+        return _ManagedCompressedWhereOpenMPExecution(
+            CompressedWhereOpenMPResult(detached, False),
+            (),
+        )
 
-    transformed = _build_transformed_statements(
+    transformed, nested_run_records = _build_transformed_statements(
         detached,
         loop_index,
         for_loop,
         loop_bound,
         checked_context,
+        pass_options,
     )
     LLIRWalker(checked_context.traversal).walk(cast(LLIRValue, transformed))
-    return CompressedWhereOpenMPResult(transformed, True)
+    return _ManagedCompressedWhereOpenMPExecution(
+        CompressedWhereOpenMPResult(transformed, True),
+        nested_run_records,
+    )
+
+
+def transform_compressed_where_for_openmp(
+    statements: List[llir.Stmt],
+    context: CompressedWhereOpenMPContext,
+) -> CompressedWhereOpenMPResult:
+    """Return the exact detached compressed-Where semantic result.
+
+    This public typed pass keeps its proven return type.  Its internal count and
+    fill result-write calls route through the production runner configuration;
+    manager-only run information is retained only by the managed entry point.
+    """
+
+    return _transform_compressed_where_for_openmp_managed(
+        statements,
+        context,
+        PRODUCTION_LLIR_PASS_OPTIONS,
+    ).result

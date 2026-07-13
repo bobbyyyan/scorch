@@ -19,6 +19,7 @@ from scorch.compiler.llir_traversal import (
     LLIRTraversalContext,
     LLIRTraversalError,
 )
+from scorch.compiler.llir_pass_manager import DEBUG_LLIR_PASS_OPTIONS
 from scorch.compiler.scheduler import Scheduler
 
 
@@ -854,6 +855,35 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f"
     )
+    assert [record.pass_name for record in lowerer.llir_pass_run_records] == [
+        "transform_compressed_where_for_openmp",
+        "rewrite_result_writes",
+        "rewrite_result_writes",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.configuration_name for record in lowerer.llir_pass_run_records] == [
+        "compressed_where_openmp",
+        "count",
+        "fill",
+        "dynamic_vector_access",
+    ]
+    assert [record.sequence_index for record in lowerer.llir_pass_run_records] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert all(
+        not record.verified_before and not record.verified_after
+        for record in lowerer.llir_pass_run_records
+    )
+    debug_lowerer = CINLowerer(llir_pass_options=DEBUG_LLIR_PASS_OPTIONS)
+    debug_cpp = LLIRLowerer().lower_llir(debug_lowerer.lower_IndexStmt(cin))
+    assert debug_cpp == cpp
+    assert all(
+        record.verified_before and record.verified_after
+        for record in debug_lowerer.llir_pass_run_records
+    )
     assert not hasattr(lowerer, "_compressed_output_parallel")
     assert [tensor.get_name() for tensor in lowerer.need_compute] == [
         "SparseProduct",
@@ -892,9 +922,16 @@ def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
         ),
     )
 
-    cpp = LLIRLowerer().lower_llir(CINLowerer().lower_IndexStmt(cin))
+    lowerer = CINLowerer()
+    cpp = LLIRLowerer().lower_llir(lowerer.lower_IndexStmt(cin))
 
     assert len(cpp) == 8660
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e"
     )
+    assert [record.configuration_name for record in lowerer.llir_pass_run_records] == [
+        "compressed_where_openmp",
+        "count",
+        "fill",
+        "dynamic_vector_access",
+    ]

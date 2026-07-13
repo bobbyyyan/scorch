@@ -16,7 +16,7 @@ empty-manager plumbing validates and detaches its mutable payload.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from time import perf_counter_ns
 from typing import TYPE_CHECKING, Generic, NoReturn, Optional, Tuple, cast
@@ -466,7 +466,7 @@ class LLIRPassManager:
 
         from .compressed_where_openmp_pass import (
             CompressedWhereOpenMPContext,
-            transform_compressed_where_for_openmp,
+            _transform_compressed_where_for_openmp_managed,
         )
 
         self._validate_options()
@@ -499,17 +499,44 @@ class LLIRPassManager:
         started_ns = perf_counter_ns() if self.options.record_timing else None
         if self.options.verify_before_pass:
             LLIRWalker(traversal).walk(cast(LLIRValue, artifact.statements))
-        result = transform_compressed_where_for_openmp(
+        execution = _transform_compressed_where_for_openmp_managed(
             artifact.statements,
             pass_spec.context,
+            self.options,
         )
+        result = execution.result
         if self.options.verify_after_pass:
             LLIRWalker(traversal).walk(cast(LLIRValue, result.statements))
-        record = _record(
+        parent_record = _record(
             descriptor=COMPRESSED_WHERE_OPENMP_PASS,
             traversal=traversal,
             configuration_name="compressed_where_openmp",
             options=self.options,
             started_ns=started_ns,
         )
-        return ManagedCompressedWhereOpenMPResult(result, (record,))
+        expected_nested = ("count", "fill") if result.applied else ()
+        actual_nested = tuple(
+            record.configuration_name for record in execution.nested_run_records
+        )
+        if actual_nested != expected_nested or any(
+            record.pass_name != RESULT_WRITE_PASS.name
+            or record.pass_version != RESULT_WRITE_PASS.version
+            for record in execution.nested_run_records
+        ):
+            _raise_manager_error(
+                code="invalid_nested_pass_records",
+                message=(
+                    "compressed-Where composition must run independent count and "
+                    "fill result-write passes exactly once"
+                ),
+                sequence_index=0,
+                descriptor=COMPRESSED_WHERE_OPENMP_PASS,
+            )
+        nested_records = tuple(
+            replace(record, sequence_index=index)
+            for index, record in enumerate(execution.nested_run_records, start=1)
+        )
+        return ManagedCompressedWhereOpenMPResult(
+            result,
+            (parent_record, *nested_records),
+        )

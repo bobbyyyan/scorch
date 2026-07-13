@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 from time import perf_counter_ns
-from typing import List, Set, Tuple, cast
+from typing import List, NoReturn, Set, Tuple, cast
 
 import pytest
 
@@ -40,6 +40,7 @@ from scorch.compiler.llir_pass_manager import (
     ResultWritePassSpec,
 )
 from scorch.compiler.llir_traversal import (
+    LLIRTraversalDiagnostic,
     LLIRTraversalError,
     LLIRValue,
     LLIRWalker,
@@ -273,16 +274,33 @@ def test_result_count_and_fill_are_independent_not_a_linear_pipeline() -> None:
         LLIRRewriteArtifact(source),
         ResultWritePassSpec(_result_context("fill")),
     )
+    count_again = manager.run_result_write(
+        count.artifact,
+        ResultWritePassSpec(_result_context("count")),
+    )
+    fill_after_count = manager.run_result_write(
+        count.artifact,
+        ResultWritePassSpec(_result_context("fill")),
+    )
 
     assert count.run_records[0].configuration_name == "count"
     assert fill.run_records[0].configuration_name == "fill"
     assert _structural_snapshot(count.artifact.value) != _structural_snapshot(
         fill.artifact.value
     )
+    assert _structural_snapshot(count.artifact.value) == _structural_snapshot(
+        count_again.artifact.value
+    )
+    assert _structural_snapshot(fill_after_count.artifact.value) != (
+        _structural_snapshot(fill.artifact.value)
+    )
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(count.artifact.value))
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(fill.artifact.value))
     assert _mutable_ir_ids(count.artifact.value).isdisjoint(
         _mutable_ir_ids(fill.artifact.value)
+    )
+    assert _mutable_ir_ids(count.artifact.value).isdisjoint(
+        _mutable_ir_ids(count_again.artifact.value)
     )
 
 
@@ -329,6 +347,22 @@ def test_compressed_runner_preserves_exact_applied_result_and_legal_noop() -> No
         _mutable_ir_ids(noop.result.statements)
     )
     assert [record.pass_name for record in applied.run_records] == [
+        "transform_compressed_where_for_openmp",
+        "rewrite_result_writes",
+        "rewrite_result_writes",
+    ]
+    assert [record.configuration_name for record in applied.run_records] == [
+        "compressed_where_openmp",
+        "count",
+        "fill",
+    ]
+    assert [record.sequence_index for record in applied.run_records] == [0, 1, 2]
+    assert [record.diagnostic_pass_name for record in applied.run_records] == [
+        "transform_compressed_where_for_openmp",
+        "transform_compressed_where_for_openmp",
+        "transform_compressed_where_for_openmp",
+    ]
+    assert [record.pass_name for record in noop.run_records] == [
         "transform_compressed_where_for_openmp"
     ]
 
@@ -352,6 +386,41 @@ def test_compressed_runner_preserves_single_use_non_idempotent_contract() -> Non
     assert _mutable_ir_ids(first.result.statements).isdisjoint(
         _mutable_ir_ids(second.result.statements)
     )
+
+
+def test_compressed_count_failure_stops_before_fill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modes: List[str] = []
+    failure = LLIRTraversalError(
+        LLIRTraversalDiagnostic(
+            code="synthetic_count_failure",
+            message="count failed",
+            path=("root",),
+            node_type="RawStmt",
+            stage="LLIR transformation",
+            pass_name="transform_compressed_where_for_openmp",
+        )
+    )
+
+    def fail_count(
+        self: LLIRPassManager,
+        artifact: object,
+        pass_spec: ResultWritePassSpec,
+    ) -> NoReturn:
+        modes.append(pass_spec.context.mode)
+        raise failure
+
+    monkeypatch.setattr(LLIRPassManager, "run_result_write", fail_count)
+
+    with pytest.raises(LLIRTraversalError) as error:
+        LLIRPassManager().run_compressed_where_openmp(
+            LLIRStatementListArtifact(_compressed_source()),
+            CompressedWhereOpenMPPassSpec(_compressed_context()),
+        )
+
+    assert error.value is failure
+    assert modes == ["count"]
 
 
 class _UnknownStatement(llir.Stmt):
