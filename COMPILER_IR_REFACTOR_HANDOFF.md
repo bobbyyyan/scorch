@@ -367,6 +367,27 @@ seam is accepted on correctness, generality, byte identity, and isolated timing;
 a quiet-host latency rerun is useful monitoring, not a reason to specialize or
 weaken the pass.
 
+The dense-pointer Phase 2 seam is implemented by `ce5adad` and routed in
+production by `81b847a`. The version-1 `hoist_dense_pointers` pass takes an exact
+statement-list artifact plus a frozen tuple snapshot of the lowerer's current
+value-array/C-type mapping, validates and detaches the complete LLIR tree through
+the common traversal boundary, and preserves the characterized narrower legacy
+analysis and rewrite scopes. Production order is sparse prefetch, managed dense
+pointer hoisting, inline single-iteration elimination, inline invariant-factor
+hoisting, result/ABI assembly, and managed dynamic-vector rewriting. The focused
+common suite is 317 tests and the schedule/codegen matrix remains 82 tests. The
+CSR-by-dense, DS, and DSS anchors remain byte-identical at 2,505, 7,117, and 8,660
+bytes with their recorded hashes; all 42 M5 and all 42 redwood grid build inputs
+are byte-identical to the `c8af101` references, so compiled-kernel A/B comparison
+is waived while structural activation remains covered. In a clean committed
+worktree, empty-manager p95 was 1.542 microseconds and dense one-pass incremental
+manager overhead was 1.958 microseconds. The unchanged `14b110b` latency
+preflight again missed its archive (small-dense p95 1.108x and reduction p95
+1.170x), so no candidate end-to-end sample was taken from that invalid host
+comparison. The remaining sequential inline optimizations are
+`_eliminate_single_iteration_loops` and `_hoist_loop_invariant_factors`; extract
+only the former next.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
