@@ -1,12 +1,13 @@
-"""Minimal typed runners for the three extracted current-LLIR passes.
+"""Minimal typed runners for the four extracted current-LLIR passes.
 
 The production pass graph is intentionally not represented as one linear
 pipeline.  Dynamic-vector rewriting is a top-level step over the assembled
 function body.  Compressed ``Where`` lowering is a top-level step during outer
 loop lowering, and it internally runs independent result-write ``count`` and
-``fill`` transformations over the same original work body.  Dedicated runner
-methods preserve those different contracts and make unsupported composition
-unrepresentable.
+``fill`` transformations over the same original work body.  Sparse prefetching
+accepts only the recursively lowered statement list before the remaining inline
+optimizations.  Dedicated runner methods preserve those different contracts and
+make unsupported composition unrepresentable.
 
 The configuration and artifact carriers are frozen, but the legacy LLIR
 payloads remain mutable.  Every non-empty pass returns a detached tree through
@@ -37,6 +38,11 @@ from .llir_traversal import (
     LLIRWalker,
 )
 from .result_write_pass import ResultWriteContext, rewrite_result_writes
+from .sparse_prefetch_pass import (
+    SPARSE_PREFETCH_CONTEXT,
+    SparsePrefetchContext,
+    insert_sparse_prefetch,
+)
 
 if TYPE_CHECKING:
     from .compressed_where_openmp_pass import (
@@ -59,6 +65,7 @@ class LLIRPassContextType(Enum):
     DYNAMIC_VECTOR_ACCESS = "dynamic_vector_access_context"
     RESULT_WRITE = "result_write_context"
     COMPRESSED_WHERE_OPENMP = "compressed_where_openmp_context"
+    SPARSE_PREFETCH = "sparse_prefetch_context"
 
 
 @dataclass(frozen=True)
@@ -96,6 +103,14 @@ COMPRESSED_WHERE_OPENMP_PASS = LLIRPassDescriptor(
     context_type=LLIRPassContextType.COMPRESSED_WHERE_OPENMP,
 )
 
+SPARSE_PREFETCH_PASS = LLIRPassDescriptor(
+    name="insert_sparse_prefetch",
+    version=1,
+    input_artifact=LLIRPassArtifactType.STATEMENT_LIST,
+    output_artifact=LLIRPassArtifactType.STATEMENT_LIST,
+    context_type=LLIRPassContextType.SPARSE_PREFETCH,
+)
+
 
 @dataclass(frozen=True)
 class DynamicVectorAccessPassSpec:
@@ -119,6 +134,14 @@ class CompressedWhereOpenMPPassSpec:
 
     context: CompressedWhereOpenMPContext
     descriptor: LLIRPassDescriptor = COMPRESSED_WHERE_OPENMP_PASS
+
+
+@dataclass(frozen=True)
+class SparsePrefetchPassSpec:
+    """One immutable sparse-prefetch pass configuration snapshot."""
+
+    context: SparsePrefetchContext = SPARSE_PREFETCH_CONTEXT
+    descriptor: LLIRPassDescriptor = SPARSE_PREFETCH_PASS
 
 
 @dataclass(frozen=True)
@@ -174,6 +197,14 @@ class LLIRRewritePassResult(Generic[LLIRRewriteValueT]):
     """Exact root-preserving output plus non-semantic run information."""
 
     artifact: LLIRRewriteArtifact[LLIRRewriteValueT]
+    run_records: Tuple[LLIRPassRunRecord, ...] = field(compare=False)
+
+
+@dataclass(frozen=True)
+class LLIRStatementListPassResult:
+    """Exact statement-list output plus non-semantic run information."""
+
+    artifact: LLIRStatementListArtifact
     run_records: Tuple[LLIRPassRunRecord, ...] = field(compare=False)
 
 
@@ -310,6 +341,22 @@ def _validate_dynamic_context(context: object) -> DynamicVectorAccessContext:
     return typed_context
 
 
+def _validate_sparse_prefetch_context(context: object) -> SparsePrefetchContext:
+    if type(context) is not SparsePrefetchContext:
+        _raise_manager_error(
+            code="invalid_pass_context",
+            message="sparse-prefetch runner requires SparsePrefetchContext",
+            sequence_index=0,
+            descriptor=SPARSE_PREFETCH_PASS,
+        )
+    typed_context = cast(SparsePrefetchContext, context)
+    _validate_traversal_context(
+        typed_context.traversal,
+        descriptor=SPARSE_PREFETCH_PASS,
+    )
+    return typed_context
+
+
 def _record(
     *,
     descriptor: LLIRPassDescriptor,
@@ -379,6 +426,51 @@ class LLIRPassManager:
         )
         detached = LLIRRewriter(traversal).rewrite(artifact.value)
         return LLIRRewritePassResult(LLIRRewriteArtifact(detached), ())
+
+    def run_sparse_prefetch(
+        self,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SparsePrefetchPassSpec = SparsePrefetchPassSpec(),
+    ) -> LLIRStatementListPassResult:
+        """Run sparse-prefetch insertion over an exact statement-list root."""
+
+        self._validate_options()
+        if type(artifact) is not LLIRStatementListArtifact:
+            _raise_manager_error(
+                code="invalid_pass_artifact",
+                message=("sparse-prefetch runner requires LLIRStatementListArtifact"),
+                sequence_index=0,
+                descriptor=SPARSE_PREFETCH_PASS,
+            )
+        if type(pass_spec) is not SparsePrefetchPassSpec:
+            _raise_manager_error(
+                code="unknown_pass_spec",
+                message=(
+                    "sparse-prefetch runner requires its exact pass specification"
+                ),
+                sequence_index=0,
+                descriptor=SPARSE_PREFETCH_PASS,
+            )
+        _validate_descriptor(pass_spec.descriptor, SPARSE_PREFETCH_PASS)
+        context = _validate_sparse_prefetch_context(pass_spec.context)
+        traversal = context.traversal
+        started_ns = perf_counter_ns() if self.options.record_timing else None
+        if self.options.verify_before_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, artifact.statements))
+        output = insert_sparse_prefetch(artifact.statements, context)
+        if self.options.verify_after_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, output))
+        record = _record(
+            descriptor=SPARSE_PREFETCH_PASS,
+            traversal=traversal,
+            configuration_name="sparse_prefetch",
+            options=self.options,
+            started_ns=started_ns,
+        )
+        return LLIRStatementListPassResult(
+            LLIRStatementListArtifact(output),
+            (record,),
+        )
 
     def run_dynamic_vector_access(
         self,

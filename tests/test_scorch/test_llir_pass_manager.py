@@ -24,6 +24,7 @@ from scorch.compiler.llir_pass_manager import (
     DYNAMIC_VECTOR_ACCESS_PASS,
     PRODUCTION_LLIR_PASS_OPTIONS,
     RESULT_WRITE_PASS,
+    SPARSE_PREFETCH_PASS,
     CompressedWhereOpenMPPassSpec,
     DynamicVectorAccessPassSpec,
     LLIRPassArtifactType,
@@ -36,8 +37,10 @@ from scorch.compiler.llir_pass_manager import (
     LLIRRewriteArtifact,
     LLIRRewritePassResult,
     LLIRStatementListArtifact,
+    LLIRStatementListPassResult,
     ManagedCompressedWhereOpenMPResult,
     ResultWritePassSpec,
+    SparsePrefetchPassSpec,
 )
 from scorch.compiler.llir_traversal import (
     LLIRTraversalDiagnostic,
@@ -50,6 +53,7 @@ from scorch.compiler.result_write_pass import (
     ResultWriteMode,
     rewrite_result_writes,
 )
+from scorch.compiler.sparse_prefetch_pass import SparsePrefetchContext
 
 
 def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Var:
@@ -157,10 +161,12 @@ def test_all_manager_configuration_artifact_and_result_carriers_are_frozen() -> 
     dynamic_spec = DynamicVectorAccessPassSpec()
     result_spec = ResultWritePassSpec(_result_context())
     compressed_spec = CompressedWhereOpenMPPassSpec(_compressed_context())
+    sparse_prefetch_spec = SparsePrefetchPassSpec()
     rewrite_artifact = LLIRRewriteArtifact([llir.BlankLine()])
     statement_artifact = LLIRStatementListArtifact([llir.BlankLine()])
     record = _record(1)
     rewrite_result = LLIRRewritePassResult(rewrite_artifact, (record,))
+    statement_result = LLIRStatementListPassResult(statement_artifact, (record,))
     compressed_result = ManagedCompressedWhereOpenMPResult(
         CompressedWhereOpenMPResult([], False),
         (record,),
@@ -173,10 +179,12 @@ def test_all_manager_configuration_artifact_and_result_carriers_are_frozen() -> 
         (dynamic_spec, "context", DYNAMIC_VECTOR_ACCESS_CONTEXT),
         (result_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (compressed_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
+        (sparse_prefetch_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (rewrite_artifact, "value", []),
         (statement_artifact, "statements", []),
         (record, "duration_ns", 2),
         (rewrite_result, "run_records", ()),
+        (statement_result, "run_records", ()),
         (compressed_result, "run_records", ()),
         (manager, "options", DEBUG_LLIR_PASS_OPTIONS),
     )
@@ -206,6 +214,13 @@ def test_stable_descriptors_expose_exact_artifact_and_context_types() -> None:
         LLIRPassArtifactType.STATEMENT_LIST,
         LLIRPassArtifactType.COMPRESSED_WHERE_RESULT,
         LLIRPassContextType.COMPRESSED_WHERE_OPENMP,
+    )
+    assert SPARSE_PREFETCH_PASS == LLIRPassDescriptor(
+        "insert_sparse_prefetch",
+        1,
+        LLIRPassArtifactType.STATEMENT_LIST,
+        LLIRPassArtifactType.STATEMENT_LIST,
+        LLIRPassContextType.SPARSE_PREFETCH,
     )
 
 
@@ -488,6 +503,18 @@ def test_unknown_descriptor_artifact_spec_and_context_combinations_fail_closed()
             cast(LLIRStatementListArtifact, rewrite_artifact),
             CompressedWhereOpenMPPassSpec(_compressed_context()),
         ),
+        lambda: manager.run_sparse_prefetch(
+            cast(LLIRStatementListArtifact, rewrite_artifact),
+            SparsePrefetchPassSpec(),
+        ),
+        lambda: manager.run_sparse_prefetch(
+            statement_artifact,
+            cast(SparsePrefetchPassSpec, object()),
+        ),
+        lambda: manager.run_sparse_prefetch(
+            statement_artifact,
+            SparsePrefetchPassSpec(context=cast(SparsePrefetchContext, object())),
+        ),
     )
     for invalid in invalid_calls:
         with pytest.raises(LLIRPassManagerError):
@@ -513,6 +540,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
     production = LLIRPassManager(PRODUCTION_LLIR_PASS_OPTIONS)
     production_dynamic = production.run_dynamic_vector_access(rewrite_artifact)
     production_result = production.run_result_write(rewrite_artifact, result_spec)
+    production_sparse_prefetch = production.run_sparse_prefetch(compressed_artifact)
     production_compressed = production.run_compressed_where_openmp(
         compressed_artifact, compressed_spec
     )
@@ -522,6 +550,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
         for record in (
             *production_dynamic.run_records,
             *production_result.run_records,
+            *production_sparse_prefetch.run_records,
             *production_compressed.run_records,
         )
     )
@@ -529,6 +558,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
     debug = LLIRPassManager(DEBUG_LLIR_PASS_OPTIONS)
     debug_dynamic = debug.run_dynamic_vector_access(rewrite_artifact)
     debug_result = debug.run_result_write(rewrite_artifact, result_spec)
+    debug_sparse_prefetch = debug.run_sparse_prefetch(compressed_artifact)
     debug_compressed = debug.run_compressed_where_openmp(
         compressed_artifact, compressed_spec
     )
@@ -537,6 +567,8 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
         ("LLIR rewrite", "rewrite_dynamic_vector_accesses"),
         ("LLIR rewrite", "rewrite_result_writes"),
         ("LLIR rewrite", "rewrite_result_writes"),
+        ("LLIR transformation", "insert_sparse_prefetch"),
+        ("LLIR transformation", "insert_sparse_prefetch"),
         ("LLIR transformation", "transform_compressed_where_for_openmp"),
         ("LLIR transformation", "transform_compressed_where_for_openmp"),
     ]
@@ -545,6 +577,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
         for record in (
             *debug_dynamic.run_records,
             *debug_result.run_records,
+            *debug_sparse_prefetch.run_records,
             *debug_compressed.run_records,
         )
     )
