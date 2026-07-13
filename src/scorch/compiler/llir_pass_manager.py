@@ -1,22 +1,17 @@
-"""Minimal typed orchestration for the extracted current-LLIR passes.
+"""Minimal typed runners for the three extracted current-LLIR passes.
 
-The current production pass graph is not one linear pipeline.  Dynamic-vector
-rewriting is a top-level step over the assembled function body, compressed
-``Where`` lowering is a top-level step during outer-loop lowering, and
-result-write rewriting is composed internally by the compressed ``Where``
-transform.  This module preserves those distinct call points while making each
-managed invocation, its configuration, and its run information explicit.
+The production pass graph is intentionally not represented as one linear
+pipeline.  Dynamic-vector rewriting is a top-level step over the assembled
+function body.  Compressed ``Where`` lowering is a top-level step during outer
+loop lowering, and it internally runs independent result-write ``count`` and
+``fill`` transformations over the same original work body.  Dedicated runner
+methods preserve those different contracts and make unsupported composition
+unrepresentable.
 
-Only the dynamic-vector and result-write passes share the root-preserving
-``LLIRRewriteValueT -> LLIRRewriteValueT`` contract, so only those passes may be
-placed in :class:`LLIRRewritePipeline`.  Compressed ``Where`` has a separate
-typed runner method because it accepts an exact statement-list root and returns
-the secondary ``applied`` result in :class:`CompressedWhereOpenMPResult`.
-
-Artifacts and configuration carriers are frozen, but the legacy LLIR payload
-is mutable.  Every non-empty managed execution relies on the underlying typed
-pass contract to return a fully detached tree.  An empty pipeline performs only
-artifact/configuration plumbing and intentionally does not clone its payload.
+The configuration and artifact carriers are frozen, but the legacy LLIR
+payloads remain mutable.  Every non-empty pass returns a detached tree through
+its proven typed API.  ``run_empty`` uses the common identity rewriter so even
+empty-manager plumbing validates and detaches its mutable payload.
 """
 
 from __future__ import annotations
@@ -24,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, Generic, NoReturn, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Generic, NoReturn, Optional, Tuple, cast
 
 from . import llir
 from .diagnostics import CompilerInvariantError
@@ -35,6 +30,7 @@ from .dynamic_vector_access_pass import (
     rewrite_dynamic_vector_accesses,
 )
 from .llir_traversal import (
+    LLIRRewriter,
     LLIRRewriteValueT,
     LLIRTraversalContext,
     LLIRValue,
@@ -50,7 +46,7 @@ if TYPE_CHECKING:
 
 
 class LLIRPassArtifactType(Enum):
-    """Stable artifact categories used by current-LLIR pass descriptors."""
+    """Stable artifact categories named by pass descriptors and run records."""
 
     REWRITE_VALUE = "llir_rewrite_value"
     STATEMENT_LIST = "llir_statement_list"
@@ -58,7 +54,7 @@ class LLIRPassArtifactType(Enum):
 
 
 class LLIRPassContextType(Enum):
-    """Stable explicit configuration categories for managed LLIR passes."""
+    """Stable explicit configuration categories for managed passes."""
 
     DYNAMIC_VECTOR_ACCESS = "dynamic_vector_access_context"
     RESULT_WRITE = "result_write_context"
@@ -67,7 +63,7 @@ class LLIRPassContextType(Enum):
 
 @dataclass(frozen=True)
 class LLIRPassDescriptor:
-    """Stable identity and typed boundary of one managed pass."""
+    """Stable identity and exact artifact/configuration boundary of a pass."""
 
     name: str
     version: int
@@ -103,7 +99,7 @@ COMPRESSED_WHERE_OPENMP_PASS = LLIRPassDescriptor(
 
 @dataclass(frozen=True)
 class DynamicVectorAccessPassSpec:
-    """One configured dynamic-vector pass invocation."""
+    """One immutable dynamic-vector pass configuration snapshot."""
 
     context: DynamicVectorAccessContext = DYNAMIC_VECTOR_ACCESS_CONTEXT
     descriptor: LLIRPassDescriptor = DYNAMIC_VECTOR_ACCESS_PASS
@@ -111,7 +107,7 @@ class DynamicVectorAccessPassSpec:
 
 @dataclass(frozen=True)
 class ResultWritePassSpec:
-    """One configured count or fill result-write invocation."""
+    """One immutable result-write count or fill configuration snapshot."""
 
     context: ResultWriteContext
     descriptor: LLIRPassDescriptor = RESULT_WRITE_PASS
@@ -119,24 +115,15 @@ class ResultWritePassSpec:
 
 @dataclass(frozen=True)
 class CompressedWhereOpenMPPassSpec:
-    """One configured compressed-Where/OpenMP invocation."""
+    """One immutable compressed-Where/OpenMP configuration snapshot."""
 
     context: CompressedWhereOpenMPContext
     descriptor: LLIRPassDescriptor = COMPRESSED_WHERE_OPENMP_PASS
 
 
-LLIRRewritePassSpec = Union[DynamicVectorAccessPassSpec, ResultWritePassSpec]
-
-
 @dataclass(frozen=True)
 class LLIRPassOptions:
-    """Immutable verification and instrumentation policy snapshot.
-
-    Production records boundary timing but does not add extra full-tree walks;
-    the typed passes retain their own always-on validation.  Tests and debug
-    callers may request explicit full structural walks before and after every
-    managed pass.
-    """
+    """Immutable verification and instrumentation policy snapshot."""
 
     verify_before_pass: bool = False
     verify_after_pass: bool = False
@@ -151,17 +138,17 @@ DEBUG_LLIR_PASS_OPTIONS = LLIRPassOptions(
 
 
 @dataclass(frozen=True)
-class LLIRPassArtifact(Generic[LLIRRewriteValueT]):
-    """Frozen owner label around a legacy mutable LLIR payload."""
+class LLIRRewriteArtifact(Generic[LLIRRewriteValueT]):
+    """Frozen owner label around a root-preserving legacy LLIR payload."""
 
     value: LLIRRewriteValueT
 
 
 @dataclass(frozen=True)
-class LLIRRewritePipeline:
-    """Ordered root-preserving pass configuration for one boundary."""
+class LLIRStatementListArtifact:
+    """Frozen owner label for the compressed pass's exact statement-list root."""
 
-    passes: Tuple[LLIRRewritePassSpec, ...] = ()
+    statements: list[llir.Stmt]
 
 
 @dataclass(frozen=True)
@@ -183,10 +170,10 @@ class LLIRPassRunRecord:
 
 
 @dataclass(frozen=True)
-class LLIRPassPipelineResult(Generic[LLIRRewriteValueT]):
-    """Typed rewrite artifact plus non-semantic ordered run information."""
+class LLIRRewritePassResult(Generic[LLIRRewriteValueT]):
+    """Exact root-preserving output plus non-semantic run information."""
 
-    artifact: LLIRPassArtifact[LLIRRewriteValueT]
+    artifact: LLIRRewriteArtifact[LLIRRewriteValueT]
     run_records: Tuple[LLIRPassRunRecord, ...] = field(compare=False)
 
 
@@ -200,7 +187,7 @@ class ManagedCompressedWhereOpenMPResult:
 
 @dataclass(frozen=True)
 class LLIRPassManagerDiagnostic:
-    """Structured failure owned by pass configuration/dispatch."""
+    """Structured failure owned by runner configuration or typed dispatch."""
 
     code: str
     message: str
@@ -210,7 +197,7 @@ class LLIRPassManagerDiagnostic:
 
 
 class LLIRPassManagerError(CompilerInvariantError):
-    """An unknown or mismatched managed-pass configuration failed closed."""
+    """An unknown or mismatched runner configuration failed closed."""
 
     def __init__(self, diagnostic: LLIRPassManagerDiagnostic) -> None:
         self.diagnostic = diagnostic
@@ -244,7 +231,6 @@ def _raise_manager_error(
 def _validate_traversal_context(
     traversal: object,
     *,
-    sequence_index: int,
     descriptor: LLIRPassDescriptor,
 ) -> LLIRTraversalContext:
     if (
@@ -257,38 +243,49 @@ def _validate_traversal_context(
         _raise_manager_error(
             code="invalid_pass_traversal_context",
             message="pass traversal stage and name must be non-empty strings",
-            sequence_index=sequence_index,
+            sequence_index=0,
             descriptor=descriptor,
         )
     return cast(LLIRTraversalContext, traversal)
 
 
-def _validate_dynamic_context(
-    context: object,
-    *,
-    sequence_index: int,
-    descriptor: LLIRPassDescriptor,
-) -> DynamicVectorAccessContext:
+def _validate_descriptor(
+    actual: object,
+    expected: LLIRPassDescriptor,
+) -> None:
+    if actual != expected:
+        _raise_manager_error(
+            code="pass_descriptor_mismatch",
+            message=f"pass specification requires descriptor {expected.name}@{expected.version}",
+            sequence_index=0,
+            descriptor=(
+                cast(LLIRPassDescriptor, actual)
+                if type(actual) is LLIRPassDescriptor
+                else expected
+            ),
+        )
+
+
+def _validate_dynamic_context(context: object) -> DynamicVectorAccessContext:
     if type(context) is not DynamicVectorAccessContext:
         _raise_manager_error(
             code="invalid_pass_context",
-            message="dynamic-vector pass requires DynamicVectorAccessContext",
-            sequence_index=sequence_index,
-            descriptor=descriptor,
+            message="dynamic-vector runner requires DynamicVectorAccessContext",
+            sequence_index=0,
+            descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
         )
     typed_context = cast(DynamicVectorAccessContext, context)
     _validate_traversal_context(
         typed_context.traversal,
-        sequence_index=sequence_index,
-        descriptor=descriptor,
+        descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
     )
     config = typed_context.config
     if type(config) is not DynamicVectorAccessConfig:
         _raise_manager_error(
             code="invalid_pass_context",
-            message="dynamic-vector pass requires DynamicVectorAccessConfig",
-            sequence_index=sequence_index,
-            descriptor=descriptor,
+            message="dynamic-vector runner requires DynamicVectorAccessConfig",
+            sequence_index=0,
+            descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
         )
     if (
         type(config.vector_type_prefix) is not str
@@ -307,87 +304,14 @@ def _validate_dynamic_context(
         _raise_manager_error(
             code="invalid_pass_context",
             message="dynamic-vector configuration has malformed policy fields",
-            sequence_index=sequence_index,
-            descriptor=descriptor,
+            sequence_index=0,
+            descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
         )
     return typed_context
 
 
-def _validate_rewrite_pass(
-    pass_spec: object, sequence_index: int
-) -> LLIRRewritePassSpec:
-    if type(pass_spec) is DynamicVectorAccessPassSpec:
-        dynamic_spec = cast(DynamicVectorAccessPassSpec, pass_spec)
-        if dynamic_spec.descriptor != DYNAMIC_VECTOR_ACCESS_PASS:
-            _raise_manager_error(
-                code="pass_descriptor_mismatch",
-                message="dynamic-vector pass descriptor does not match its runner",
-                sequence_index=sequence_index,
-                descriptor=dynamic_spec.descriptor,
-            )
-        _validate_dynamic_context(
-            dynamic_spec.context,
-            sequence_index=sequence_index,
-            descriptor=dynamic_spec.descriptor,
-        )
-        return dynamic_spec
-
-    if type(pass_spec) is ResultWritePassSpec:
-        result_spec = cast(ResultWritePassSpec, pass_spec)
-        if result_spec.descriptor != RESULT_WRITE_PASS:
-            _raise_manager_error(
-                code="pass_descriptor_mismatch",
-                message="result-write pass descriptor does not match its runner",
-                sequence_index=sequence_index,
-                descriptor=result_spec.descriptor,
-            )
-        if type(result_spec.context) is not ResultWriteContext:
-            _raise_manager_error(
-                code="invalid_pass_context",
-                message="result-write pass requires ResultWriteContext",
-                sequence_index=sequence_index,
-                descriptor=result_spec.descriptor,
-            )
-        _validate_traversal_context(
-            result_spec.context.traversal,
-            sequence_index=sequence_index,
-            descriptor=result_spec.descriptor,
-        )
-        return result_spec
-
-    _raise_manager_error(
-        code="unknown_pass_spec",
-        message="rewrite pipeline contains an unknown pass specification",
-        sequence_index=sequence_index,
-    )
-
-
-def _pass_traversal(pass_spec: LLIRRewritePassSpec) -> LLIRTraversalContext:
-    if type(pass_spec) is DynamicVectorAccessPassSpec:
-        return cast(DynamicVectorAccessPassSpec, pass_spec).context.traversal
-    return cast(ResultWritePassSpec, pass_spec).context.traversal
-
-
-def _configuration_name(pass_spec: LLIRRewritePassSpec) -> str:
-    if type(pass_spec) is DynamicVectorAccessPassSpec:
-        return "dynamic_vector_access"
-    return cast(ResultWritePassSpec, pass_spec).context.mode
-
-
-def _run_rewrite_pass(
-    value: LLIRRewriteValueT,
-    pass_spec: LLIRRewritePassSpec,
-) -> LLIRRewriteValueT:
-    if type(pass_spec) is DynamicVectorAccessPassSpec:
-        dynamic_spec = cast(DynamicVectorAccessPassSpec, pass_spec)
-        return rewrite_dynamic_vector_accesses(value, dynamic_spec.context)
-    result_spec = cast(ResultWritePassSpec, pass_spec)
-    return rewrite_result_writes(value, result_spec.context)
-
-
 def _record(
     *,
-    sequence_index: int,
     descriptor: LLIRPassDescriptor,
     traversal: LLIRTraversalContext,
     configuration_name: str,
@@ -396,7 +320,7 @@ def _record(
 ) -> LLIRPassRunRecord:
     duration_ns = perf_counter_ns() - started_ns if started_ns is not None else None
     return LLIRPassRunRecord(
-        sequence_index=sequence_index,
+        sequence_index=0,
         pass_name=descriptor.name,
         pass_version=descriptor.version,
         input_artifact=descriptor.input_artifact,
@@ -413,7 +337,7 @@ def _record(
 
 @dataclass(frozen=True)
 class LLIRPassManager:
-    """Typed, fail-closed runner for the current extracted LLIR passes."""
+    """Dedicated, fail-closed runner methods for current extracted passes."""
 
     options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS
 
@@ -432,67 +356,113 @@ class LLIRPassManager:
                 sequence_index=-1,
             )
 
-    def run(
-        self,
-        artifact: LLIRPassArtifact[LLIRRewriteValueT],
-        pipeline: LLIRRewritePipeline,
-    ) -> LLIRPassPipelineResult[LLIRRewriteValueT]:
-        """Run an explicit root-preserving pipeline and stop on first failure."""
-
-        self._validate_options()
-        if type(artifact) is not LLIRPassArtifact:
+    @staticmethod
+    def _validate_rewrite_artifact(artifact: object) -> None:
+        if type(artifact) is not LLIRRewriteArtifact:
             _raise_manager_error(
                 code="invalid_pass_artifact",
-                message="rewrite runner requires LLIRPassArtifact",
-                sequence_index=-1,
+                message="root-preserving runner requires LLIRRewriteArtifact",
+                sequence_index=0,
             )
-        if (
-            type(pipeline) is not LLIRRewritePipeline
-            or type(pipeline.passes) is not tuple
-        ):
+
+    def run_empty(
+        self,
+        artifact: LLIRRewriteArtifact[LLIRRewriteValueT],
+    ) -> LLIRRewritePassResult[LLIRRewriteValueT]:
+        """Validate and detach an artifact without recording a semantic pass."""
+
+        self._validate_options()
+        self._validate_rewrite_artifact(artifact)
+        traversal = LLIRTraversalContext(
+            stage="LLIR pass manager",
+            pass_name="empty_pipeline",
+        )
+        detached = LLIRRewriter(traversal).rewrite(artifact.value)
+        return LLIRRewritePassResult(LLIRRewriteArtifact(detached), ())
+
+    def run_dynamic_vector_access(
+        self,
+        artifact: LLIRRewriteArtifact[LLIRRewriteValueT],
+        pass_spec: DynamicVectorAccessPassSpec = DynamicVectorAccessPassSpec(),
+    ) -> LLIRRewritePassResult[LLIRRewriteValueT]:
+        """Run the root-preserving dynamic-vector rewrite."""
+
+        self._validate_options()
+        self._validate_rewrite_artifact(artifact)
+        if type(pass_spec) is not DynamicVectorAccessPassSpec:
             _raise_manager_error(
-                code="invalid_pass_pipeline",
-                message="rewrite pipeline must be a frozen tuple-backed configuration",
-                sequence_index=-1,
+                code="unknown_pass_spec",
+                message="dynamic-vector runner requires its exact pass specification",
+                sequence_index=0,
+                descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
             )
-
-        checked_passes = tuple(
-            _validate_rewrite_pass(pass_spec, index)
-            for index, pass_spec in enumerate(pipeline.passes)
+        _validate_descriptor(pass_spec.descriptor, DYNAMIC_VECTOR_ACCESS_PASS)
+        context = _validate_dynamic_context(pass_spec.context)
+        traversal = context.traversal
+        started_ns = perf_counter_ns() if self.options.record_timing else None
+        if self.options.verify_before_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, artifact.value))
+        output = rewrite_dynamic_vector_accesses(artifact.value, context)
+        if self.options.verify_after_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, output))
+        record = _record(
+            descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
+            traversal=traversal,
+            configuration_name="dynamic_vector_access",
+            options=self.options,
+            started_ns=started_ns,
         )
-        current = artifact.value
-        records = []
-        for index, pass_spec in enumerate(checked_passes):
-            descriptor = pass_spec.descriptor
-            traversal = _pass_traversal(pass_spec)
-            started_ns = perf_counter_ns() if self.options.record_timing else None
-            if self.options.verify_before_pass:
-                LLIRWalker(traversal).walk(cast(LLIRValue, current))
-            current = _run_rewrite_pass(current, pass_spec)
-            if self.options.verify_after_pass:
-                LLIRWalker(traversal).walk(cast(LLIRValue, current))
-            records.append(
-                _record(
-                    sequence_index=index,
-                    descriptor=descriptor,
-                    traversal=traversal,
-                    configuration_name=_configuration_name(pass_spec),
-                    options=self.options,
-                    started_ns=started_ns,
-                )
+        return LLIRRewritePassResult(LLIRRewriteArtifact(output), (record,))
+
+    def run_result_write(
+        self,
+        artifact: LLIRRewriteArtifact[LLIRRewriteValueT],
+        pass_spec: ResultWritePassSpec,
+    ) -> LLIRRewritePassResult[LLIRRewriteValueT]:
+        """Run one independent root-preserving result-write mode."""
+
+        self._validate_options()
+        self._validate_rewrite_artifact(artifact)
+        if type(pass_spec) is not ResultWritePassSpec:
+            _raise_manager_error(
+                code="unknown_pass_spec",
+                message="result-write runner requires its exact pass specification",
+                sequence_index=0,
+                descriptor=RESULT_WRITE_PASS,
             )
-
-        return LLIRPassPipelineResult(
-            artifact=LLIRPassArtifact(current),
-            run_records=tuple(records),
+        _validate_descriptor(pass_spec.descriptor, RESULT_WRITE_PASS)
+        if type(pass_spec.context) is not ResultWriteContext:
+            _raise_manager_error(
+                code="invalid_pass_context",
+                message="result-write runner requires ResultWriteContext",
+                sequence_index=0,
+                descriptor=RESULT_WRITE_PASS,
+            )
+        traversal = _validate_traversal_context(
+            pass_spec.context.traversal,
+            descriptor=RESULT_WRITE_PASS,
         )
+        started_ns = perf_counter_ns() if self.options.record_timing else None
+        if self.options.verify_before_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, artifact.value))
+        output = rewrite_result_writes(artifact.value, pass_spec.context)
+        if self.options.verify_after_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, output))
+        record = _record(
+            descriptor=RESULT_WRITE_PASS,
+            traversal=traversal,
+            configuration_name=pass_spec.context.mode,
+            options=self.options,
+            started_ns=started_ns,
+        )
+        return LLIRRewritePassResult(LLIRRewriteArtifact(output), (record,))
 
     def run_compressed_where_openmp(
         self,
-        artifact: LLIRPassArtifact[list[llir.Stmt]],
+        artifact: LLIRStatementListArtifact,
         pass_spec: CompressedWhereOpenMPPassSpec,
     ) -> ManagedCompressedWhereOpenMPResult:
-        """Run the non-root-preserving compressed-Where pass without erasure."""
+        """Run compressed-Where without erasing its exact secondary result."""
 
         from .compressed_where_openmp_pass import (
             CompressedWhereOpenMPContext,
@@ -500,10 +470,10 @@ class LLIRPassManager:
         )
 
         self._validate_options()
-        if type(artifact) is not LLIRPassArtifact:
+        if type(artifact) is not LLIRStatementListArtifact:
             _raise_manager_error(
                 code="invalid_pass_artifact",
-                message="compressed-Where runner requires LLIRPassArtifact",
+                message="compressed-Where runner requires LLIRStatementListArtifact",
                 sequence_index=0,
                 descriptor=COMPRESSED_WHERE_OPENMP_PASS,
             )
@@ -514,38 +484,29 @@ class LLIRPassManager:
                 sequence_index=0,
                 descriptor=COMPRESSED_WHERE_OPENMP_PASS,
             )
-        if pass_spec.descriptor != COMPRESSED_WHERE_OPENMP_PASS:
-            _raise_manager_error(
-                code="pass_descriptor_mismatch",
-                message="compressed-Where descriptor does not match its runner",
-                sequence_index=0,
-                descriptor=pass_spec.descriptor,
-            )
+        _validate_descriptor(pass_spec.descriptor, COMPRESSED_WHERE_OPENMP_PASS)
         if type(pass_spec.context) is not CompressedWhereOpenMPContext:
             _raise_manager_error(
                 code="invalid_pass_context",
-                message="compressed-Where pass requires CompressedWhereOpenMPContext",
+                message="compressed-Where runner requires CompressedWhereOpenMPContext",
                 sequence_index=0,
-                descriptor=pass_spec.descriptor,
+                descriptor=COMPRESSED_WHERE_OPENMP_PASS,
             )
         traversal = _validate_traversal_context(
             pass_spec.context.traversal,
-            sequence_index=0,
-            descriptor=pass_spec.descriptor,
+            descriptor=COMPRESSED_WHERE_OPENMP_PASS,
         )
-
         started_ns = perf_counter_ns() if self.options.record_timing else None
         if self.options.verify_before_pass:
-            LLIRWalker(traversal).walk(cast(LLIRValue, artifact.value))
+            LLIRWalker(traversal).walk(cast(LLIRValue, artifact.statements))
         result = transform_compressed_where_for_openmp(
-            artifact.value,
+            artifact.statements,
             pass_spec.context,
         )
         if self.options.verify_after_pass:
             LLIRWalker(traversal).walk(cast(LLIRValue, result.statements))
         record = _record(
-            sequence_index=0,
-            descriptor=pass_spec.descriptor,
+            descriptor=COMPRESSED_WHERE_OPENMP_PASS,
             traversal=traversal,
             configuration_name="compressed_where_openmp",
             options=self.options,
