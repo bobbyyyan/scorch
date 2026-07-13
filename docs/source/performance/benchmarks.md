@@ -10,7 +10,7 @@ inventory of every harness so you can rerun the numbers on your own machine.
 ## Headline result
 
 In the benchmarks reported in the [Scorch CGO 2026
-paper](https://fredrikbk.com/cgo26scorch.html), Scorch achieved
+paper](https://ieeexplore.ieee.org/abstract/document/11394842), Scorch achieved
 **1.05–5.80× speedups over PyTorch Sparse** across sparse-matrix and graph
 neural network workloads.
 

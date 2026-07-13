@@ -11,7 +11,7 @@ compiler and kernel set evolve.
 
 ## 0.0.1
 
-Initial research release accompanying the [CGO 2026 paper](https://fredrikbk.com/cgo26scorch.html).
+Initial research release accompanying the [CGO 2026 paper](https://ieeexplore.ieee.org/abstract/document/11394842).
 
 Highlights:
 
