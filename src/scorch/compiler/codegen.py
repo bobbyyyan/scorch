@@ -1,6 +1,7 @@
-from typing import Union, List, TypeVar, cast
+from typing import List, TypeVar, Union, cast
 
 from . import llir
+from .diagnostics import CodegenError
 
 LLIR_NODE = TypeVar("LLIR_NODE", bound=llir.Node)
 
@@ -13,6 +14,34 @@ class LLIRLowerer:
     indent_str = "  "
     indent_level = 0
     no_comments = False
+
+    # Higher values bind more tightly.  The table intentionally contains only
+    # operators represented by the current LLIR; accepting arbitrary spelling
+    # here would let malformed IR bypass the codegen boundary.
+    _BINARY_PRECEDENCE = {
+        "||": 1,
+        "&&": 2,
+        "|": 3,
+        "^": 4,
+        "&": 5,
+        "==": 6,
+        "!=": 6,
+        "<": 7,
+        "<=": 7,
+        ">": 7,
+        ">=": 7,
+        "<<": 8,
+        ">>": 8,
+        "+": 9,
+        "-": 9,
+        "*": 10,
+        "/": 10,
+        "%": 10,
+    }
+    _UNARY_PRECEDENCE = 11
+    _POSTFIX_PRECEDENCE = 12
+    _PRIMARY_PRECEDENCE = 13
+    _UNARY_OPERATORS = {"+", "-", "!", "~", "*", "&", "++", "--"}
 
     @staticmethod
     def _lower_typed_var(var: llir.Var) -> str:
@@ -47,40 +76,32 @@ class LLIRLowerer:
 
         elif isinstance(ir, llir.VarInit):
             return self.lower_llir(
-                f"{self._lower_typed_var(ir.var)} {ir.op} {self.lower_llir(ir.value)};",
+                f"{self._lower_typed_var(ir.var)} {ir.op} {self._render_expression(ir.value)};",
                 indent_level,
             )
 
         elif isinstance(ir, llir.Assign):
-            assert isinstance(ir.var, llir.Var), f"Invalid var: {ir.var}"
+            if not isinstance(ir.var, llir.Var):
+                raise CodegenError(
+                    "LLIR codegen requires Assign.var to be Var, got "
+                    f"{type(ir.var).__name__}"
+                )
             if no_semicolon:
                 return self.lower_llir(
-                    f"{ir.var.name} {ir.op.value} {self.lower_llir(ir.value)}",
+                    f"{ir.var.name} {ir.op.value} {self._render_expression(ir.value)}",
                     indent_level,
                 )
             return self.lower_llir(
-                f"{ir.var.name} {ir.op.value} {self.lower_llir(ir.value)};",
+                f"{ir.var.name} {ir.op.value} {self._render_expression(ir.value)};",
                 indent_level,
             )
 
-        elif isinstance(
-            ir,
-            (
-                llir.Literal,
-                llir.Cast,
-                llir.Sizeof,
-                llir.BinOp,
-                llir.UnaryOp,
-                llir.FunctionCall,
-                llir.Array,
-                llir.ArrayAccess,
-            ),
-        ):
+        elif isinstance(ir, llir.Expr):
             return self.lower_expression(ir, indent_level)
 
         elif isinstance(ir, llir.FunctionCallStmt):
             return self.lower_llir(
-                f"{ir.name}({', '.join([self.lower_llir(arg) for arg in ir.args])});",
+                f"{ir.name}({', '.join(self._render_expression(arg) for arg in ir.args)});",
                 indent_level,
             )
 
@@ -89,9 +110,6 @@ class LLIRLowerer:
 
         elif isinstance(ir, llir.IfThenElse):
             return self.lower_conditional(ir, indent_level)
-
-        elif isinstance(ir, llir.Var):
-            return ir.name
 
         elif isinstance(ir, llir.VarDecl):
             return self.lower_llir(f"{self._lower_typed_var(ir.var)};", indent_level)
@@ -115,68 +133,131 @@ class LLIRLowerer:
             return self.lower_function_definition(ir, indent_level)
 
         elif isinstance(ir, llir.Return):
-            return self.lower_llir(f"return {self.lower_llir(ir.value)};", indent_level)
+            return self.lower_llir(
+                f"return {self._render_expression(ir.value)};", indent_level
+            )
 
-        return self.lower_llir(
-            f"No code gen implemented for node type: {ir.__class__.__name__}",
-            indent_level,
+        raise CodegenError(
+            f"No C++ codegen implemented for LLIR node type: {type(ir).__name__}"
         )
 
     def lower_expression(
         self,
-        ir: Union[
-            llir.Literal,
-            llir.Cast,
-            llir.Sizeof,
-            llir.BinOp,
-            llir.UnaryOp,
-            llir.FunctionCall,
-            llir.Array,
-            llir.ArrayAccess,
-        ],
+        ir: llir.Expr,
         indent_level: int = 0,
     ) -> str:
+        return self.lower_llir(self._render_expression(ir), indent_level)
+
+    def _render_expression(self, ir: llir.Expr) -> str:
+        """Render an expression while preserving the LLIR expression tree.
+
+        Parentheses are emitted only when C++ would otherwise parse a different
+        tree.  In particular, a right child at the same precedence must remain
+        parenthesized because all currently supported binary operators are
+        left-associative and floating-point reassociation is not semantics
+        preserving.
+        """
         if isinstance(ir, llir.Literal):
-            return self.lower_llir(str(ir.value), indent_level)
+            return str(ir.value)
 
-        elif isinstance(ir, llir.Cast):
-            return self.lower_llir(
-                f"({ir.data_type.value}) {self.lower_llir(ir.expr)}", indent_level
+        if isinstance(ir, llir.Var):
+            return ir.name
+
+        if isinstance(ir, llir.Cast):
+            operand = self._render_operand(
+                ir.expr,
+                parent_precedence=self._UNARY_PRECEDENCE,
+                is_right_child=True,
+            )
+            return f"({ir.data_type.value}) {operand}"
+
+        if isinstance(ir, llir.Sizeof):
+            return f"sizeof({ir.data_type.value})"
+
+        if isinstance(ir, llir.BinOp):
+            precedence = self._binary_precedence(ir.op)
+            left = self._render_operand(
+                ir.left,
+                parent_precedence=precedence,
+                is_right_child=False,
+            )
+            right = self._render_operand(
+                ir.right,
+                parent_precedence=precedence,
+                is_right_child=True,
+            )
+            return f"{left} {ir.op} {right}"
+
+        if isinstance(ir, llir.UnaryOp):
+            if ir.op not in self._UNARY_OPERATORS:
+                raise CodegenError(f"Unsupported LLIR unary operator: {ir.op!r}")
+            operand = self._render_operand(
+                ir.operand,
+                parent_precedence=self._UNARY_PRECEDENCE,
+                is_right_child=True,
+            )
+            return f"{ir.op} {operand}"
+
+        if isinstance(ir, llir.FunctionCall):
+            return (
+                f"{ir.name}"
+                f"({', '.join(self._render_expression(arg) for arg in ir.args)})"
             )
 
-        elif isinstance(ir, llir.Sizeof):
-            return self.lower_llir(f"sizeof({ir.data_type.value})", indent_level)
+        if isinstance(ir, llir.Array):
+            return "{" + ", ".join(self._render_expression(v) for v in ir.values) + "}"
 
-        elif isinstance(ir, llir.BinOp):
-            return self.lower_llir(
-                f"{self.lower_llir(ir.left)} {ir.op} {self.lower_llir(ir.right)}",
-                indent_level,
+        if isinstance(ir, llir.ArrayAccess):
+            array = self._render_operand(
+                ir.array,
+                parent_precedence=self._POSTFIX_PRECEDENCE,
+                is_right_child=False,
             )
+            return f"{array}[{self._render_expression(ir.index)}]"
 
-        elif isinstance(ir, llir.UnaryOp):
-            return self.lower_llir(
-                f"{ir.op} {self.lower_llir(ir.operand)}", indent_level
-            )
+        raise CodegenError(
+            f"No C++ codegen implemented for LLIR expression type: {type(ir).__name__}"
+        )
 
-        elif isinstance(ir, llir.FunctionCall):
-            return self.lower_llir(
-                f"{ir.name}({', '.join([self.lower_llir(arg) for arg in ir.args])})",
-                indent_level,
-            )
+    def _render_operand(
+        self,
+        ir: llir.Expr,
+        *,
+        parent_precedence: int,
+        is_right_child: bool,
+    ) -> str:
+        rendered = self._render_expression(ir)
+        child_precedence = self._expression_precedence(ir)
+        needs_parentheses = child_precedence < parent_precedence
 
-        elif isinstance(ir, llir.Array):
-            return self.lower_llir(
-                f"{{{', '.join([self.lower_llir(v) for v in ir.values])}}}",
-                indent_level,
-            )
+        if isinstance(ir, llir.BinOp) and child_precedence == parent_precedence:
+            # The left child naturally parses first for left-associative binary
+            # operators.  The right child does not, regardless of whether its
+            # operator spelling matches the parent.
+            needs_parentheses = is_right_child
 
-        elif isinstance(ir, llir.ArrayAccess):
-            return self.lower_llir(
-                f"{self.lower_llir(ir.array)}[{self.lower_llir(ir.index)}]",
-                indent_level,
-            )
+        if needs_parentheses:
+            return f"({rendered})"
+        return rendered
 
-        raise ValueError(f"Unknown expression type: {type(ir)}")
+    def _expression_precedence(self, ir: llir.Expr) -> int:
+        if isinstance(ir, llir.BinOp):
+            return self._binary_precedence(ir.op)
+        if isinstance(ir, (llir.Cast, llir.UnaryOp, llir.Sizeof)):
+            return self._UNARY_PRECEDENCE
+        if isinstance(ir, (llir.FunctionCall, llir.ArrayAccess)):
+            return self._POSTFIX_PRECEDENCE
+        if isinstance(ir, (llir.Literal, llir.Var, llir.Array)):
+            return self._PRIMARY_PRECEDENCE
+        raise CodegenError(
+            f"No C++ precedence defined for LLIR expression type: {type(ir).__name__}"
+        )
+
+    def _binary_precedence(self, op: str) -> int:
+        try:
+            return self._BINARY_PRECEDENCE[op]
+        except KeyError as exc:
+            raise CodegenError(f"Unsupported LLIR binary operator: {op!r}") from exc
 
     @staticmethod
     def _omp_num_threads_clause(ir: "llir.ForLoop") -> str:
@@ -351,10 +432,14 @@ class LLIRLowerer:
     def lower_conditional(self, ir: llir.IfThenElse, indent_level: int = 0) -> str:
         result = ""
         if ir.cond_list:
-            assert ir.then_body_list, "then_body_list must be provided"
-            assert len(ir.cond_list) == len(
-                ir.then_body_list
-            ), "Number of conditions and then_body's must be the same"
+            if not ir.then_body_list:
+                raise CodegenError(
+                    "LLIR IfThenElse with cond_list requires then_body_list"
+                )
+            if len(ir.cond_list) != len(ir.then_body_list):
+                raise CodegenError(
+                    "LLIR IfThenElse condition and body counts must match"
+                )
 
             total_num_conds = len(ir.cond_list) + (1 if ir.else_body else 0)
 
@@ -385,8 +470,10 @@ class LLIRLowerer:
                         + "\n"
                     )
         else:
-            assert ir.cond, "If condition must be provided"
-            assert ir.then_body, "If then body must be provided"
+            if ir.cond is None:
+                raise CodegenError("LLIR IfThenElse requires a condition")
+            if not ir.then_body:
+                raise CodegenError("LLIR IfThenElse requires a then body")
             result += (
                 self.lower_llir(f"if ({self.lower_llir(ir.cond)}) {{", indent_level)
                 + "\n"
@@ -408,12 +495,17 @@ class LLIRLowerer:
     def lower_function_definition(
         self, ir: llir.Function, indent_level: int = 0
     ) -> str:
-        if ir.args:
-            assert [
-                isinstance(arg, llir.Var) for arg in ir.args
-            ], "Args must be llir.Var's"
+        if not all(isinstance(arg, llir.Var) for arg in ir.args):
+            invalid_types = [
+                type(arg).__name__ for arg in ir.args if not isinstance(arg, llir.Var)
+            ]
+            raise CodegenError(
+                "LLIR Function arguments must be Var nodes; got "
+                + ", ".join(invalid_types)
+            )
         args = cast(List[llir.Var], ir.args)
-        assert all([arg.type for arg in args]), "All args must have types"
+        if not all(arg.type for arg in args):
+            raise CodegenError("All LLIR Function arguments must have types")
         header = (
             f"{ir.return_type.value} {ir.name}"
             + f"({', '.join([self._lower_typed_var(arg) for arg in args])}) {{"
