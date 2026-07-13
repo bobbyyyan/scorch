@@ -245,3 +245,24 @@ def test_pass_unknown_node_reports_its_own_stage_and_name() -> None:
     assert diagnostic.stage == "LLIR rewrite"
     assert diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
     assert diagnostic.node_type == "UnknownBreak"
+
+
+def test_malformed_vector_declaration_fails_through_structured_diagnostic() -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    declaration = llir.VarDecl(_var("values", llir.DataType.STD_VECTOR_FLOAT32))
+    declaration.var = cast(llir.Var, UnknownExpr())
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        rewrite_dynamic_vector_accesses(
+            [declaration],
+            DYNAMIC_VECTOR_ACCESS_CONTEXT,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "unknown_llir_node"
+    assert diagnostic.stage == "LLIR rewrite"
+    assert diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert diagnostic.node_type == "UnknownExpr"
+    assert diagnostic.path == ("root", "[0]", "var")

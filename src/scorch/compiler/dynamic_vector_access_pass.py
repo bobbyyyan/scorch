@@ -65,13 +65,15 @@ class _DynamicVectorDeclarationCollector(LLIRWalker):
         return tuple(self._names)
 
     def visit_var_decl(self, node: llir.VarDecl, path: LLIRPath) -> None:
+        # Validate and walk the typed child before using declaration metadata so
+        # malformed nodes fail through the shared structured diagnostic path.
+        super().visit_var_decl(node, path)
         if (
             node.var.type.value.startswith(self._config.vector_type_prefix)
             and node.var.name not in self._seen
         ):
             self._seen.add(node.var.name)
             self._names.append(node.var.name)
-        super().visit_var_decl(node, path)
 
 
 class _DynamicVectorAccessRewriter(LLIRRewriter):
@@ -82,25 +84,37 @@ class _DynamicVectorAccessRewriter(LLIRRewriter):
     ) -> None:
         super().__init__(context.traversal)
         self._config = context.config
-        self._vector_names = vector_names
+        self._store_prefixes = tuple(
+            (vector_name, f"{vector_name}[") for vector_name in vector_names
+        )
+        self._read_patterns = tuple(
+            (
+                vector_name,
+                re.compile(rf"\b{re.escape(vector_name)}\[([^\[\]]+)\]"),
+                rf"{vector_name}.at(\1)",
+            )
+            for vector_name in vector_names
+        )
 
     def _match_store(self, expression: llir.Expr) -> Optional[Tuple[str, str]]:
         if type(expression) is not llir.Var:
             return None
         target = cast(llir.Var, expression).name
-        for vector_name in self._vector_names:
-            match = re.fullmatch(rf"{re.escape(vector_name)}\[(.+)\]", target)
-            if match:
-                return vector_name, match.group(1)
+        if "[" not in target or not target.endswith("]"):
+            return None
+        for vector_name, prefix in self._store_prefixes:
+            if target.startswith(prefix):
+                position = target[len(prefix) : -1]
+                if position:
+                    return vector_name, position
         return None
 
     def _rewrite_name(self, name: str) -> str:
-        for vector_name in self._vector_names:
-            name = re.sub(
-                rf"\b{re.escape(vector_name)}\[([^\[\]]+)\]",
-                rf"{vector_name}.at(\1)",
-                name,
-            )
+        if "[" not in name:
+            return name
+        for vector_name, pattern, replacement in self._read_patterns:
+            if vector_name in name:
+                name = pattern.sub(replacement, name)
         return name
 
     def prepare_statement_sequence(
@@ -178,4 +192,7 @@ def rewrite_dynamic_vector_accesses(
     collector = _DynamicVectorDeclarationCollector(context)
     llir_value = cast(LLIRValue, value)
     collector.walk(llir_value)
-    return _DynamicVectorAccessRewriter(context, collector.names).rewrite(value)
+    vector_names = collector.names
+    if not vector_names:
+        return LLIRRewriter(context.traversal).rewrite(value)
+    return _DynamicVectorAccessRewriter(context, vector_names).rewrite(value)

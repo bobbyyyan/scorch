@@ -293,6 +293,25 @@ class LLIRWalker:
                 )
             self._walk_expr(expression, item_path)
 
+    def _walk_var_child(self, value: object, path: LLIRPath) -> None:
+        if not isinstance(value, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_var_child",
+                message="expected an LLIR Var",
+                path=path,
+                value=value,
+            )
+        self._walk_expr(value, path)
+        if type(value) is not llir.Var:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_var_child",
+                message="expected an LLIR Var",
+                path=path,
+                value=value,
+            )
+
     def _walk_branches(self, branches: object, path: LLIRPath) -> None:
         if type(branches) is not list and type(branches) is not tuple:
             _raise_traversal_error(
@@ -454,16 +473,16 @@ class LLIRWalker:
         pass
 
     def visit_increment(self, node: llir.Increment, path: LLIRPath) -> None:
-        self._walk_expr(node.var, path + ("var",))
+        self._walk_var_child(node.var, path + ("var",))
 
     def visit_return(self, node: llir.Return, path: LLIRPath) -> None:
         self._walk_expr(node.value, path + ("value",))
 
     def visit_var_decl(self, node: llir.VarDecl, path: LLIRPath) -> None:
-        self._walk_expr(node.var, path + ("var",))
+        self._walk_var_child(node.var, path + ("var",))
 
     def visit_var_init(self, node: llir.VarInit, path: LLIRPath) -> None:
-        self._walk_expr(node.var, path + ("var",))
+        self._walk_var_child(node.var, path + ("var",))
         self._walk_expr(node.value, path + ("value",))
 
     def visit_assign(self, node: llir.Assign, path: LLIRPath) -> None:
@@ -526,7 +545,7 @@ class LLIRWalker:
             )
 
     def visit_for_loop_auto(self, node: llir.ForLoopAuto, path: LLIRPath) -> None:
-        self._walk_expr(node.var, path + ("var",))
+        self._walk_var_child(node.var, path + ("var",))
         self._walk_expr(node.array, path + ("array",))
         self._walk_statements(node.body, path + ("body",))
 
@@ -738,6 +757,26 @@ class LLIRRewriter:
             return tuple(rewritten)
         return rewritten
 
+    def _rewrite_var_child(self, value: object, path: LLIRPath) -> llir.Var:
+        if not isinstance(value, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_var_child",
+                message="expected an LLIR Var",
+                path=path,
+                value=value,
+            )
+        rewritten = self._rewrite_expr(value, path)
+        if type(rewritten) is not llir.Var:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_var_child",
+                message="expected an LLIR Var",
+                path=path,
+                value=rewritten,
+            )
+        return cast(llir.Var, rewritten)
+
     def _rewrite_branches(
         self,
         branches: object,
@@ -941,21 +980,17 @@ class LLIRRewriter:
         return llir.Sizeof(data_type=node.data_type)
 
     def rewrite_increment(self, node: llir.Increment, path: LLIRPath) -> llir.Increment:
-        return llir.Increment(
-            cast(llir.Var, self._rewrite_expr(node.var, path + ("var",)))
-        )
+        return llir.Increment(self._rewrite_var_child(node.var, path + ("var",)))
 
     def rewrite_return(self, node: llir.Return, path: LLIRPath) -> llir.Return:
         return llir.Return(self._rewrite_expr(node.value, path + ("value",)))
 
     def rewrite_var_decl(self, node: llir.VarDecl, path: LLIRPath) -> llir.VarDecl:
-        return llir.VarDecl(
-            cast(llir.Var, self._rewrite_expr(node.var, path + ("var",)))
-        )
+        return llir.VarDecl(self._rewrite_var_child(node.var, path + ("var",)))
 
     def rewrite_var_init(self, node: llir.VarInit, path: LLIRPath) -> llir.VarInit:
         rewritten = llir.VarInit(
-            var=cast(llir.Var, self._rewrite_expr(node.var, path + ("var",))),
+            var=self._rewrite_var_child(node.var, path + ("var",)),
             value=self._rewrite_expr(node.value, path + ("value",)),
             op=node.op,
             cast=False,
@@ -1084,7 +1119,7 @@ class LLIRRewriter:
     def rewrite_for_loop_auto(
         self, node: llir.ForLoopAuto, path: LLIRPath
     ) -> llir.ForLoopAuto:
-        var = cast(llir.Var, self._rewrite_expr(node.var, path + ("var",)))
+        var = self._rewrite_var_child(node.var, path + ("var",))
         array = self._rewrite_expr(node.array, path + ("array",))
         body = self._rewrite_statements(node.body, path + ("body",))
         return llir.ForLoopAuto(

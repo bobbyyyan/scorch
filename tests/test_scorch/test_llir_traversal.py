@@ -505,6 +505,24 @@ def test_for_loop_header_children_are_scalar_and_typed(
     assert raised.value.diagnostic.path == ("root", field)
 
 
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_typed_var_children_reject_other_supported_expressions(
+    operation: str,
+) -> None:
+    declaration = llir.VarDecl(_var("value"))
+    declaration.var = cast(llir.Var, llir.Literal(1))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(declaration)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(declaration)
+
+    assert raised.value.diagnostic.code == "invalid_var_child"
+    assert raised.value.diagnostic.node_type == "Literal"
+    assert raised.value.diagnostic.path == ("root", "var")
+
+
 def test_function_call_default_arguments_are_not_shared() -> None:
     first = llir.FunctionCall("first")
     second = llir.FunctionCall("second")
