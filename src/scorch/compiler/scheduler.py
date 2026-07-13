@@ -15,14 +15,32 @@ from scorch.compiler.cin import (
     CINIndexVariablesGetter,
     CINVisitorAccept,
     ForAll,
+    IndexStmt,
     IndexVar,
     Operation,
     TensorAccess,
     TensorAssign,
+    TensorVar,
     TileSizeVar,
     Where,
     Workspace,
     WorkspaceAccess,
+)
+from .identity import IndexId
+from .diagnostics import CompilerInvariantError, VerificationError
+from .loop_plan import (
+    LoopPart,
+    LoopPlacement,
+    LoopPlan,
+    LoopRef,
+    LoopTile,
+    OperandRelayout,
+    PanelBound,
+    PlacementKind,
+    ResultTile,
+    ScheduledCIN,
+    entity_display_names,
+    verify_loop_plan,
 )
 from scorch.format import LevelType
 
@@ -308,6 +326,260 @@ class Schedule:
     def cache_key(self) -> str:
         """Canonical cache discriminator containing every schedule field."""
         return repr(self)
+
+
+def _entity_ids_by_name(
+    cin: CIN,
+) -> Tuple[Dict[str, IndexVar], Dict[str, TensorVar]]:
+    """Resolve public display names once at the Schedule-to-LoopPlan boundary."""
+
+    index_names, symbol_names = entity_display_names(cin)
+    index_vars = {
+        index_var.index_id: index_var
+        for index_var in Scheduler.get_index_variables(cin)
+    }
+    for access in cin.tensor_accesses:
+        for index_var in access.indices or ():
+            index_vars.setdefault(index_var.index_id, index_var)
+
+    indices_by_name: Dict[str, IndexVar] = {}
+    for index_id, name in index_names.items():
+        index_var = index_vars[index_id]
+        previous = indices_by_name.get(name)
+        if previous is not None and previous.index_id != index_id:
+            raise ValueError(
+                f"Schedule name {name!r} is ambiguous between distinct IndexId values"
+            )
+        indices_by_name[name] = index_var
+
+    symbols_by_name: Dict[str, TensorVar] = {}
+    symbol_objects = {
+        access.tensor.symbol_id: access.tensor for access in cin.tensor_accesses
+    }
+    for symbol_id, name in symbol_names.items():
+        symbol = symbol_objects[symbol_id]
+        previous = symbols_by_name.get(name)
+        if previous is not None and previous.symbol_id != symbol_id:
+            raise ValueError(
+                f"Schedule name {name!r} is ambiguous between distinct SymbolId values"
+            )
+        symbols_by_name[name] = symbol
+    return indices_by_name, symbols_by_name
+
+
+def _loop_ref_from_name(
+    name: str,
+    indices_by_name: Dict[str, IndexVar],
+) -> LoopRef:
+    index_var = indices_by_name.get(name)
+    if index_var is not None:
+        return LoopRef(index_var.index_id)
+    for suffix, part in (("_out", LoopPart.OUTER), ("_in", LoopPart.INNER)):
+        if name.endswith(suffix):
+            index_var = indices_by_name.get(name[: -len(suffix)])
+            if index_var is not None:
+                return LoopRef(index_var.index_id, part)
+    raise ValueError(f"Schedule references unknown logical loop {name!r}")
+
+
+def _loop_placement_from_public(
+    placement: str,
+    indices_by_name: Dict[str, IndexVar],
+) -> LoopPlacement:
+    if placement == "outermost":
+        return LoopPlacement(PlacementKind.OUTERMOST)
+    if placement.startswith("child_of:"):
+        return LoopPlacement(
+            PlacementKind.CHILD_OF,
+            parent=_loop_ref_from_name(placement.split(":", 1)[1], indices_by_name),
+        )
+    if placement.startswith("at_depth:"):
+        return LoopPlacement(
+            PlacementKind.AT_DEPTH,
+            depth=int(placement.split(":", 1)[1]),
+        )
+    raise ValueError(f"Unsupported loop placement {placement!r}")
+
+
+def _build_loop_plan(
+    cin: CIN,
+    schedule: Schedule,
+    logical_order: Sequence[IndexVar],
+    panel_bounds: Sequence[PanelBound],
+    relayout_plan: Optional[_RelayoutPlan],
+    result_tile_plan: Optional[_ResultTilePlan],
+    provenance: str,
+) -> LoopPlan:
+    indices_by_name, symbols_by_name = _entity_ids_by_name(cin)
+
+    tiles = tuple(
+        LoopTile(
+            loop=_loop_ref_from_name(tile.index_var, indices_by_name),
+            width=tile.width,
+            placement=_loop_placement_from_public(tile.placement, indices_by_name),
+            parallel=tile.parallel,
+            kind=tile.kind,
+            accumulation=tile.accum,
+            unroll=tile.unroll,
+        )
+        for tile in schedule.tiles
+    )
+
+    relayout = None
+    if relayout_plan is not None:
+        if schedule.relayout is None:
+            raise CompilerInvariantError(
+                "validated relayout metadata has no public relayout decision"
+            )
+        relayout = OperandRelayout(
+            operand_id=symbols_by_name[relayout_plan.operand].symbol_id,
+            pack_loop=_loop_ref_from_name(relayout_plan.pack_var, indices_by_name),
+            panel_loop=_loop_ref_from_name(relayout_plan.panel_var, indices_by_name),
+            scope_loop=_loop_ref_from_name(relayout_plan.scope_var, indices_by_name),
+            row_loop=_loop_ref_from_name(relayout_plan.row_var, indices_by_name),
+            strip_width=schedule.relayout.strip_width,
+            access_indices=tuple(
+                indices_by_name[name].index_id
+                for name in relayout_plan.access_index_vars
+            ),
+            operand_panel_level=relayout_plan.operand_panel_level,
+            operand_pack_level=relayout_plan.operand_pack_level,
+        )
+
+    result_tile = None
+    if result_tile_plan is not None:
+        result_tile = ResultTile(
+            result_id=symbols_by_name[result_tile_plan.result].symbol_id,
+            tile_loop=_loop_ref_from_name(result_tile_plan.tile_var, indices_by_name),
+            result_level=result_tile_plan.result_level,
+            result_prefix=tuple(
+                indices_by_name[name].index_id
+                for name in result_tile_plan.result_prefix_vars
+            ),
+            access_indices=tuple(
+                indices_by_name[name].index_id
+                for name in result_tile_plan.access_index_vars
+            ),
+        )
+
+    parallel_loop = (
+        _loop_ref_from_name(schedule.parallel_loop, indices_by_name)
+        if schedule.parallel_loop is not None
+        else None
+    )
+    plan = LoopPlan(
+        loop_order=tuple(index_var.index_id for index_var in logical_order),
+        tiles=tiles,
+        panel_bounds=tuple(panel_bounds),
+        relayout=relayout,
+        result_tile=result_tile,
+        parallel_loop=parallel_loop,
+        provenance=provenance,
+        tag=schedule.tag,
+    )
+    return verify_loop_plan(cin, plan)
+
+
+def _render_loop_ref(loop: LoopRef, index_names: Dict[IndexId, str]) -> str:
+    name = index_names[loop.index_id]
+    if loop.part == LoopPart.OUTER:
+        return f"{name}_out"
+    if loop.part == LoopPart.INNER:
+        return f"{name}_in"
+    return name
+
+
+def _render_placement(
+    placement: LoopPlacement,
+    index_names: Dict[IndexId, str],
+) -> str:
+    if placement.kind == PlacementKind.OUTERMOST:
+        return "outermost"
+    if placement.kind == PlacementKind.CHILD_OF:
+        if placement.parent is None:
+            raise VerificationError("child placement has no parent loop")
+        return f"child_of:{_render_loop_ref(placement.parent, index_names)}"
+    if placement.depth is None:
+        raise VerificationError("depth placement has no depth")
+    return f"at_depth:{placement.depth}"
+
+
+def materialize_legacy_schedule(
+    cin: CIN,
+    plan: LoopPlan,
+) -> Tuple[
+    Schedule,
+    Dict[str, str],
+    Optional[_RelayoutPlan],
+    Optional[_ResultTilePlan],
+]:
+    """Translate a verified LoopPlan only at the legacy LLIR compatibility seam."""
+
+    verify_loop_plan(cin, plan)
+    index_names, symbol_names = entity_display_names(cin)
+    tiles = tuple(
+        TileSpec(
+            index_var=_render_loop_ref(tile.loop, index_names),
+            width=tile.width,
+            placement=_render_placement(tile.placement, index_names),
+            parallel=tile.parallel,
+            kind=tile.kind,
+            accum=tile.accumulation,
+            unroll=tile.unroll,
+        )
+        for tile in plan.tiles
+    )
+
+    relayout_spec = None
+    relayout_plan = None
+    if plan.relayout is not None:
+        relayout = plan.relayout
+        relayout_spec = RelayoutSpec(
+            operand=symbol_names[relayout.operand_id],
+            pack_var=_render_loop_ref(relayout.pack_loop, index_names),
+            strip_width=relayout.strip_width,
+            scope_var=_render_loop_ref(relayout.scope_loop, index_names),
+        )
+        relayout_plan = _RelayoutPlan(
+            operand=symbol_names[relayout.operand_id],
+            pack_var=_render_loop_ref(relayout.pack_loop, index_names),
+            panel_var=_render_loop_ref(relayout.panel_loop, index_names),
+            scope_var=_render_loop_ref(relayout.scope_loop, index_names),
+            row_var=_render_loop_ref(relayout.row_loop, index_names),
+            access_index_vars=tuple(index_names[i] for i in relayout.access_indices),
+            operand_panel_level=relayout.operand_panel_level,
+            operand_pack_level=relayout.operand_pack_level,
+        )
+
+    result_tile_plan = None
+    if plan.result_tile is not None:
+        result_tile = plan.result_tile
+        result_tile_plan = _ResultTilePlan(
+            result=symbol_names[result_tile.result_id],
+            tile_var=_render_loop_ref(result_tile.tile_loop, index_names),
+            result_level=result_tile.result_level,
+            result_prefix_vars=tuple(index_names[i] for i in result_tile.result_prefix),
+            access_index_vars=tuple(index_names[i] for i in result_tile.access_indices),
+        )
+
+    schedule = Schedule(
+        loop_order=tuple(index_names[index_id] for index_id in plan.loop_order),
+        tiles=tiles,
+        relayout=relayout_spec,
+        tag=plan.tag,
+        parallel_loop=(
+            _render_loop_ref(plan.parallel_loop, index_names)
+            if plan.parallel_loop is not None
+            else None
+        ),
+    )
+    rendered_panel_bounds = {
+        _render_loop_ref(bound.loop, index_names): (
+            f"{symbol_names[bound.tensor_id]}{bound.level}_size"
+        )
+        for bound in plan.panel_bounds
+    }
+    return schedule, rendered_panel_bounds, relayout_plan, result_tile_plan
 
 
 _SCHEDULE_FORCE: ContextVar[Optional[Schedule]] = ContextVar(
@@ -2230,10 +2502,10 @@ class Scheduler:
 
     @staticmethod
     def apply_schedule(
-        cin: CIN,
+        cin: IndexStmt,
         schedule: Schedule,
         costs: _CostModelConstants = _DEFAULT_COSTS,
-    ) -> CIN:
+    ) -> ScheduledCIN:
         """Apply an explicit tuner schedule to a CIN loop nest.
 
         An empty schedule delegates to :meth:`auto_schedule`, preserving the
@@ -2242,6 +2514,10 @@ class Scheduler:
         """
         if not isinstance(schedule, Schedule):
             raise TypeError("apply_schedule expects a Schedule")
+        source_cin = cin
+        # Legacy scheduling still uses local tree surgery.  Keep that mutation
+        # behind this boundary by applying it only to a private working copy.
+        cin = copy.deepcopy(cin)
         if not isinstance(cin, ForAll):
             if (
                 schedule.loop_order is not None
@@ -2252,7 +2528,11 @@ class Scheduler:
                 raise NotImplementedError(
                     "Non-empty schedules require a ForAll CIN statement"
                 )
-            return cin
+            plan = verify_loop_plan(
+                source_cin,
+                LoopPlan(loop_order=(), provenance="auto", tag=schedule.tag),
+            )
+            return ScheduledCIN(cin, plan)
         panel_tiles = [tile for tile in schedule.tiles if tile.kind == "panel"]
         if len(panel_tiles) > 1:
             raise NotImplementedError("Only one sparse panel tile is supported")
@@ -2444,7 +2724,18 @@ class Scheduler:
             and schedule.parallel_loop is None
         )
         if is_identity:
-            return Scheduler.auto_schedule(cin, costs=costs)
+            logical_order = Scheduler.select_loop_order(cin, costs=costs)
+            scheduled_cin = Scheduler.auto_schedule(cin, costs=costs)
+            plan = _build_loop_plan(
+                source_cin,
+                schedule,
+                logical_order,
+                panel_bounds=(),
+                relayout_plan=None,
+                result_tile_plan=None,
+                provenance="auto",
+            )
+            return ScheduledCIN(scheduled_cin, plan)
 
         if schedule.loop_order is None:
             logical_order = Scheduler.select_loop_order(cin, costs=costs)
@@ -2496,7 +2787,7 @@ class Scheduler:
             )
             Scheduler._set_explicit_parallel_loop(cin, parallel_name)
 
-        panel_bounds: Dict[str, str] = {}
+        panel_bounds: List[PanelBound] = []
         for tile in panel_tiles:
             target = Scheduler._find_index_var_by_name(cin, tile.index_var)
             dense_accesses = [
@@ -2511,15 +2802,24 @@ class Scheduler:
                 )
             access = dense_accesses[0]
             level = access.level_of_index_var(target)
-            panel_bounds[tile.index_var] = f"{access.tensor.name}{level}_size"
+            panel_bounds.append(
+                PanelBound(
+                    loop=LoopRef(target.index_id),
+                    tensor_id=access.tensor.symbol_id,
+                    level=level,
+                )
+            )
 
-        # The CIN lowerer consumes panel tiles after concrete sparse iterators are
-        # available in LLIR. Affine tiles above remain ordinary CIN transforms.
-        cin.explicit_schedule = schedule
-        cin.panel_bounds = panel_bounds
-        cin.relayout_plan = relayout_plan
-        cin.result_tile_plan = result_tile_plan
-        return cin
+        plan = _build_loop_plan(
+            source_cin,
+            schedule,
+            logical_order,
+            panel_bounds=panel_bounds,
+            relayout_plan=relayout_plan,
+            result_tile_plan=result_tile_plan,
+            provenance="explicit",
+        )
+        return ScheduledCIN(cin, plan)
 
     @staticmethod
     def _select_index_vars_to_tile(cin: CIN) -> List[IndexVar]:

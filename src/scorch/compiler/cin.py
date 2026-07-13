@@ -7,6 +7,7 @@ from typing import List, Optional, Any, Tuple, Callable, Union, Sequence
 import torch
 
 from . import llir
+from .identity import IndexId, SymbolId, new_index_id, new_symbol_id
 from ..format import TensorFormat, LevelType
 from ..utils import parse_format
 
@@ -329,6 +330,7 @@ class IndexVar(IndexExpr):
         parent: Optional[IndexVar] = None,
     ):
         super().__init__()
+        self.index_id: IndexId = new_index_id()
         self._name = name
         self._expr = expr
         self._parent = parent
@@ -551,9 +553,10 @@ class TensorVar(IndexExpr):
         shape: Optional[Tuple[int, ...]] = None,
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
         dtype: torch.dtype = torch.float32,
-        mode_order: Optional[List[int]] = None
+        mode_order: Optional[List[int]] = None,
     ):
         super().__init__()
+        self.symbol_id: SymbolId = new_symbol_id()
         self._name = name
         self.shape = shape
 
@@ -821,7 +824,9 @@ class TensorAccess(IndexExpr):
                                     type=llir.DataType.INT64,
                                 ),
                             ),
-                            right=llir.Var(name=index_var.name, type=llir.DataType.INT64),
+                            right=llir.Var(
+                                name=index_var.name, type=llir.DataType.INT64
+                            ),
                         ),
                     )
                 ]
@@ -1141,6 +1146,7 @@ class CINIndexVariablesGetter(CINVisitorAccept):
 @dataclass
 class PostOp:
     """A single post-operation to fuse after a contraction."""
+
     kind: str  # "add", "mul", "relu", "gelu", "tanh", "sigmoid"
     tensor_name: Optional[str] = None  # for "add"/"mul": name of extra tensor arg
 
@@ -1148,6 +1154,7 @@ class PostOp:
 @dataclass
 class PostOps:
     """Sequence of post-operations with metadata about extra tensor arguments."""
+
     ops: List[PostOp]
     extra_tensors: List[str]  # tensor names needing extra kernel args
 

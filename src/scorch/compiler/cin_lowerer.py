@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Union, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 from . import llir
 from .cin import (
@@ -21,8 +21,13 @@ from .cin import (
 )
 from .iter_lattice import IterationLattice
 from .llir import AssignOp, DataType
+from .diagnostics import CompilerInvariantError, UnsupportedFeature
+from .loop_plan import LoopPlan, ScheduledCIN, verify_scheduled_cin
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
+
+if TYPE_CHECKING:
+    from .scheduler import Schedule
 
 
 class ResultTensorAssembler:
@@ -485,9 +490,14 @@ class CINLowerer:
     This is a class to lower a CIN to LLIR
     """
 
+    _SUPPORTED_POST_OP_KINDS = frozenset(
+        {"add", "mul", "relu", "gelu", "tanh", "sigmoid"}
+    )
+
     def __init__(self, filter_zeros=False, post_ops: Optional[PostOps] = None):
         self.filter_zeros: bool = filter_zeros
         self.post_ops: Optional[PostOps] = post_ops
+        self._validate_post_ops()
         self.defined_index_vars: List[IndexVar] = []
 
         self.dense_coord_resolve_stmt_to_dep_index_vars: Dict[
@@ -497,10 +507,7 @@ class CINLowerer:
         self.seen_outermost_forall = False
         self.outermost_stmt: Optional[IndexStmt] = None
         self.has_explicit_parallel_loop = False
-        self.explicit_schedule = None
-        self.panel_bounds: Dict[str, str] = {}
-        self.relayout_plan = None
-        self.result_tile_plan = None
+        self.loop_plan: Optional[LoopPlan] = None
 
         self.result_value_array_sparse_index_llir = None
         self._scalar_accum_mode = False
@@ -530,8 +537,34 @@ class CINLowerer:
         self.tensor_var_to_llir: Dict[TensorVar, llir.Expr] = {}
         self._value_array_ctypes: Dict[str, str] = {}
 
+    def _validate_post_ops(self) -> None:
+        """Reject post-ops that this lowering stage cannot represent."""
+        if self.post_ops is None:
+            return
+        for op in self.post_ops.ops:
+            if not isinstance(op, PostOp):
+                descriptor_type = type(op).__qualname__
+                raise CompilerInvariantError(
+                    f"stage=CIN lowering: unknown post-op descriptor type "
+                    f"'{descriptor_type}'"
+                )
+            if op.kind not in self._SUPPORTED_POST_OP_KINDS:
+                raise UnsupportedFeature(
+                    f"stage=CIN lowering: unsupported post-op kind '{op.kind}'"
+                )
+
+    @staticmethod
+    def _validate_index_stmt(stmt: IndexStmt) -> None:
+        """Reject statement nodes with no CIN-to-LLIR lowering rule."""
+        if not isinstance(stmt, (TensorAssign, ForAll, Where)):
+            node_type = type(stmt).__qualname__
+            raise CompilerInvariantError(
+                f"stage=CIN lowering: unknown IndexStmt node type '{node_type}'"
+            )
+
     def _emit_post_ops(self, output_var_name: str, index_expr: str) -> List[llir.Stmt]:
         """Emit LLIR statements for post-ops on output_var_name[index_expr]."""
+        self._validate_post_ops()
         if not self.post_ops or not self.post_ops.ops:
             return []
         stmts: List[llir.Stmt] = []
@@ -740,7 +773,10 @@ class CINLowerer:
             return self.lower_BinaryOp(index_expr)
         elif isinstance(index_expr, TensorAccess):
             return self.lower_TensorAccess(index_expr)
-        raise NotImplementedError
+        raise CompilerInvariantError(
+            "stage=CIN lowering: unknown IndexExpr node type "
+            f"'{type(index_expr).__qualname__}'"
+        )
 
     @staticmethod
     def _tensor_access_metadata(
@@ -763,7 +799,10 @@ class CINLowerer:
             return self.lower_IndexStmt(cin)
         elif isinstance(cin, IndexExpr):
             return self.lower_IndexExpr(cin)
-        return []
+        node_type = type(cin).__qualname__
+        raise CompilerInvariantError(
+            f"stage=CIN lowering: unknown CIN node type '{node_type}'"
+        )
 
     def lower_TensorAssign(self, stmt: TensorAssign) -> List[llir.Stmt]:
         """
@@ -2027,20 +2066,33 @@ class CINLowerer:
             *assembly_stmts,
         ]
 
+    def _prepare_scheduled_cin(
+        self, stmt: Union[IndexStmt, ScheduledCIN], recurse: bool
+    ) -> IndexStmt:
+        if not isinstance(stmt, ScheduledCIN):
+            self._validate_index_stmt(stmt)
+            return stmt
+        if recurse or self.outermost_stmt is not None:
+            raise CompilerInvariantError(
+                "stage=CIN lowering: ScheduledCIN is valid only at the "
+                "outer scheduling boundary"
+            )
+        verify_scheduled_cin(stmt)
+        self.loop_plan = stmt.verified_loop_plan
+        return stmt.normalized_cin
+
     def lower_IndexStmt(
-        self, stmt: IndexStmt, recurse=False
+        self, stmt: Union[IndexStmt, ScheduledCIN], recurse=False
     ) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
         Lower an IndexStmt to LLIR
         """
 
+        stmt = self._prepare_scheduled_cin(stmt, recurse)
+
         if not self.outermost_stmt:
             self.outermost_stmt = stmt
             self.has_explicit_parallel_loop = self._contains_explicit_parallel(stmt)
-            self.explicit_schedule = getattr(stmt, "explicit_schedule", None)
-            self.panel_bounds = getattr(stmt, "panel_bounds", {})
-            self.relayout_plan = getattr(stmt, "relayout_plan", None)
-            self.result_tile_plan = getattr(stmt, "result_tile_plan", None)
 
         if isinstance(stmt, TensorAssign):
             return self.lower_TensorAssign(stmt)
@@ -2513,16 +2565,24 @@ class CINLowerer:
                 args=kernel_args,
                 body=body_stmts,
             )
-            if self.explicit_schedule is not None:
-                self._apply_explicit_parallel_schedule(function)
+            if self.loop_plan is not None:
+                from .scheduler import materialize_legacy_schedule
+
+                (
+                    legacy_schedule,
+                    panel_bounds,
+                    relayout_plan,
+                    result_tile_plan,
+                ) = materialize_legacy_schedule(stmt, self.loop_plan)
+                self._apply_explicit_parallel_schedule(function, legacy_schedule)
                 from .schedule_lowerer import apply_schedule_to_llir
 
                 function = apply_schedule_to_llir(
                     function,
-                    self.explicit_schedule,
-                    self.panel_bounds,
-                    self.relayout_plan,
-                    self.result_tile_plan,
+                    legacy_schedule,
+                    panel_bounds,
+                    relayout_plan,
+                    result_tile_plan,
                 )
             return function
 
@@ -4277,8 +4337,9 @@ class CINLowerer:
                         return nested
         return None
 
-    def _apply_explicit_parallel_schedule(self, function: llir.Function) -> None:
-        schedule = self.explicit_schedule
+    def _apply_explicit_parallel_schedule(
+        self, function: llir.Function, schedule: "Schedule"
+    ) -> None:
         loop_name = schedule.parallel_loop
         if loop_name is None:
             parallel_tiles = [tile for tile in schedule.tiles if tile.parallel]

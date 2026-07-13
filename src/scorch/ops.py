@@ -1,7 +1,7 @@
 import copy
 import os
 import time
-from typing import Any, Union, Sequence, Optional, List, Tuple
+from typing import Any, List, Optional, Sequence, Tuple, Union, cast
 
 import torch
 from torch.fx import Proxy
@@ -19,6 +19,7 @@ from .compiler.cin import (
 )
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.codegen import LLIRLowerer
+from .compiler.loop_plan import ScheduledCIN
 from .compiler.scheduler import (
     Schedule,
     Scheduler,
@@ -108,11 +109,12 @@ def _einsum_cache_key(
 
 
 def _codegen_kernel_cache_key(
-    cin: IndexStmt,
+    cin: Union[IndexStmt, ScheduledCIN],
     post_ops: Any,
     schedule: Optional[Schedule],
 ) -> str:
     """Cache a lowered CIN without allowing dtype/schedule fields to alias."""
+    normalized_cin = cin.normalized_cin if isinstance(cin, ScheduledCIN) else cin
     tensor_contracts = tuple(
         sorted(
             {
@@ -123,11 +125,11 @@ def _codegen_kernel_cache_key(
                     str(access.tensor.format),
                     tuple(access.tensor.mode_order or ()),
                 )
-                for access in cin.tensor_accesses
+                for access in normalized_cin.tensor_accesses
             }
         )
     )
-    key = str(cin) + f"|contracts:{tensor_contracts!r}"
+    key = str(normalized_cin) + f"|contracts:{tensor_contracts!r}"
     if post_ops:
         key += f"|post_ops:{post_ops}"
     if schedule is not None:
@@ -1966,6 +1968,7 @@ def einsum(
     _post_ops = kwargs.get("_post_ops", None)
     _post_ops_tensors = kwargs.get("_post_ops_tensors", None)
     _cache_key_suffix = str(_post_ops) if _post_ops else ""
+    lowering_stmt: Union[IndexStmt, ScheduledCIN] = cin_stmt
 
     # Phase 2b (codegen-parity): emit ONE kernel that branches at runtime on the
     # free-dim size — register-block for small N (single tile, no re-traversal), the
@@ -1982,20 +1985,20 @@ def einsum(
 
     if _dual_llir is None:
         if effective_schedule is not None:
-            cin_stmt = Scheduler.apply_schedule(cin_stmt, effective_schedule)
+            lowering_stmt = Scheduler.apply_schedule(cin_stmt, effective_schedule)
         # Default single path. When regblock is on but the dual-path wasn't
         # applicable, force it OFF here so we never ship the wide-k-regressing
         # single-path tiled kernel as a silent fallback.
         elif _regblock_enabled():
             with regblock_force(False):
-                cin_stmt = Scheduler.auto_schedule(cin_stmt)
+                lowering_stmt = cast(IndexStmt, Scheduler.auto_schedule(cin_stmt))
         else:
-            cin_stmt = Scheduler.auto_schedule(cin_stmt)
+            lowering_stmt = cast(IndexStmt, Scheduler.auto_schedule(cin_stmt))
         _kernel_cache_key = _codegen_kernel_cache_key(
-            cin_stmt, _post_ops, effective_schedule
+            lowering_stmt, _post_ops, effective_schedule
         )
 
-    # print("Auto-scheduled CIN:\n", cin_stmt)
+    # print("Auto-scheduled CIN:\n", lowering_stmt)
 
     if _kernel_cache_key in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
@@ -2005,7 +2008,7 @@ def einsum(
             lowered_llir: Union[llir.Stmt, List[llir.Stmt]] = _dual_llir
         else:
             lowerer = CINLowerer(post_ops=_post_ops)
-            lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+            lowered_llir = lowerer.lower_IndexStmt(lowering_stmt)
 
         llir_lowerer = LLIRLowerer()
 
