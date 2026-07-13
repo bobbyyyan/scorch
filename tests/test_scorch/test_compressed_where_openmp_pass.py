@@ -282,6 +282,9 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
 
 
 def test_first_top_level_compatible_loop_is_selected_and_suffix_is_discarded() -> None:
+    auto_prefix = llir.ForLoopAuto(
+        _var("item"), _var("items"), [llir.RawStmt("keep_auto_prefix")]
+    )
     incompatible = _compatible_loop(
         [llir.RawStmt("keep_incompatible")],
         bound="Ignored0_size",
@@ -289,7 +292,13 @@ def test_first_top_level_compatible_loop_is_selected_and_suffix_is_discarded() -
     cast(llir.VarInit, incompatible.init).var.name = "other"
     first = _compatible_loop([llir.RawStmt("first_work")], bound="First0_size")
     second = _compatible_loop([llir.RawStmt("second_work")], bound="Second0_size")
-    source = [incompatible, first, second, llir.RawStmt("suffix")]
+    source: List[llir.Stmt] = [
+        auto_prefix,
+        incompatible,
+        first,
+        second,
+        llir.RawStmt("suffix"),
+    ]
 
     result = transform_compressed_where_for_openmp(source, _context())
 
@@ -301,6 +310,7 @@ def test_first_top_level_compatible_loop_is_selected_and_suffix_is_discarded() -
         "First0_size"
     )
     codes = _raw_codes(result.statements)
+    assert "keep_auto_prefix" in codes
     assert "keep_incompatible" in codes
     assert codes.count("first_work") == 2
     assert "second_work" not in codes
@@ -435,6 +445,61 @@ def test_nested_control_flow_and_statement_containers_follow_legacy_scopes() -> 
     # not ForLoopAuto, WhileLoop, or bare nested statement containers.
     assert calls.count("wksp.insert_unchecked") == 4
     assert calls.count("wksp.insert") == 4
+
+
+def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
+    assignment = llir.Assign(
+        llir.ArrayAccess(_var("wksp.insert_targets"), _var("wksp.insert_target_index")),
+        llir.BinOp(
+            "+",
+            _var("wksp.insert_value"),
+            llir.ArrayAccess(
+                _var("wksp.insert_values"), _var("wksp.insert_value_index")
+            ),
+        ),
+    )
+    initialization = llir.VarInit(
+        _var("initialized"), _var("wksp.insert_initial_value")
+    )
+    raw = llir.RawStmt("wksp.insert(raw_value)")
+    source: List[llir.Stmt] = [
+        _compatible_loop([_workspace_init(), assignment, initialization, raw])
+    ]
+    snapshot = _structural_snapshot(source)
+
+    result = transform_compressed_where_for_openmp(source, _context())
+
+    count_loop, _ = _phase_loops(result)
+    rewritten_assignment = cast(
+        llir.Assign,
+        next(
+            statement for statement in count_loop.body if type(statement) is llir.Assign
+        ),
+    )
+    target = cast(llir.ArrayAccess, rewritten_assignment.var)
+    value = cast(llir.BinOp, rewritten_assignment.value)
+    value_access = cast(llir.ArrayAccess, value.right)
+    rewritten_initialization = cast(
+        llir.VarInit,
+        next(
+            statement
+            for statement in count_loop.body
+            if type(statement) is llir.VarInit
+        ),
+    )
+
+    assert cast(llir.Var, target.array).name == "wksp.insert_unchecked_targets"
+    assert cast(llir.Var, target.index).name == "wksp.insert_unchecked_target_index"
+    assert cast(llir.Var, value.left).name == "wksp.insert_unchecked_value"
+    assert cast(llir.Var, value_access.array).name == "wksp.insert_unchecked_values"
+    assert cast(llir.Var, value_access.index).name == (
+        "wksp.insert_unchecked_value_index"
+    )
+    assert cast(llir.Var, rewritten_initialization.value).name == (
+        "wksp.insert_unchecked_initial_value"
+    )
+    assert "wksp.insert_unchecked(raw_value)" in _raw_codes(count_loop.body)
+    assert _structural_snapshot(source) == snapshot
 
 
 def test_retained_metadata_is_preserved_but_selected_loop_policy_is_reset() -> None:
