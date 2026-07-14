@@ -1,12 +1,13 @@
-"""Minimal typed runners for the six extracted current-LLIR passes.
+"""Minimal typed runners for the seven extracted current-LLIR passes.
 
 The production pass graph is intentionally not represented as one linear
 pipeline.  Dynamic-vector rewriting is a top-level step over the assembled
 function body.  Compressed ``Where`` lowering is a top-level step during outer
 loop lowering, and it internally runs independent result-write ``count`` and
-``fill`` transformations over the same original work body.  Sparse prefetching
-and dense-pointer hoisting and single-iteration-loop elimination accept only the
-recursively lowered statement list before the remaining inline optimization.
+``fill`` transformations over the same original work body.  Sparse prefetching,
+dense-pointer hoisting, single-iteration-loop elimination, and loop-invariant
+factor hoisting accept only the recursively lowered statement list before ABI
+and result assembly.
 Dedicated runner methods preserve those different contracts and make
 unsupported composition unrepresentable.
 
@@ -41,6 +42,11 @@ from .llir_traversal import (
     LLIRTraversalContext,
     LLIRValue,
     LLIRWalker,
+)
+from .loop_invariant_factor_pass import (
+    LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    LoopInvariantFactorHoistContext,
+    hoist_loop_invariant_factors,
 )
 from .result_write_pass import ResultWriteContext, rewrite_result_writes
 from .single_iteration_loop_pass import (
@@ -78,6 +84,7 @@ class LLIRPassContextType(Enum):
     SPARSE_PREFETCH = "sparse_prefetch_context"
     DENSE_POINTER_HOIST = "dense_pointer_hoist_context"
     SINGLE_ITERATION_LOOP_ELIMINATION = "single_iteration_loop_elimination_context"
+    LOOP_INVARIANT_FACTOR_HOIST = "loop_invariant_factor_hoist_context"
 
 
 @dataclass(frozen=True)
@@ -139,6 +146,14 @@ SINGLE_ITERATION_LOOP_ELIMINATION_PASS = LLIRPassDescriptor(
     context_type=LLIRPassContextType.SINGLE_ITERATION_LOOP_ELIMINATION,
 )
 
+LOOP_INVARIANT_FACTOR_HOIST_PASS = LLIRPassDescriptor(
+    name="hoist_loop_invariant_factors",
+    version=1,
+    input_artifact=LLIRPassArtifactType.STATEMENT_LIST,
+    output_artifact=LLIRPassArtifactType.STATEMENT_LIST,
+    context_type=LLIRPassContextType.LOOP_INVARIANT_FACTOR_HOIST,
+)
+
 
 @dataclass(frozen=True)
 class DynamicVectorAccessPassSpec:
@@ -188,6 +203,14 @@ class SingleIterationLoopEliminationPassSpec:
         SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT
     )
     descriptor: LLIRPassDescriptor = SINGLE_ITERATION_LOOP_ELIMINATION_PASS
+
+
+@dataclass(frozen=True)
+class LoopInvariantFactorHoistPassSpec:
+    """One immutable loop-invariant-factor configuration snapshot."""
+
+    context: LoopInvariantFactorHoistContext = LOOP_INVARIANT_FACTOR_HOIST_CONTEXT
+    descriptor: LLIRPassDescriptor = LOOP_INVARIANT_FACTOR_HOIST_PASS
 
 
 @dataclass(frozen=True)
@@ -483,6 +506,27 @@ def _validate_single_iteration_loop_elimination_context(
     return typed_context
 
 
+def _validate_loop_invariant_factor_hoist_context(
+    context: object,
+) -> LoopInvariantFactorHoistContext:
+    if type(context) is not LoopInvariantFactorHoistContext:
+        _raise_manager_error(
+            code="invalid_pass_context",
+            message=(
+                "loop-invariant-factor runner requires "
+                "LoopInvariantFactorHoistContext"
+            ),
+            sequence_index=0,
+            descriptor=LOOP_INVARIANT_FACTOR_HOIST_PASS,
+        )
+    typed_context = cast(LoopInvariantFactorHoistContext, context)
+    _validate_traversal_context(
+        typed_context.traversal,
+        descriptor=LOOP_INVARIANT_FACTOR_HOIST_PASS,
+    )
+    return typed_context
+
+
 def _record(
     *,
     descriptor: LLIRPassDescriptor,
@@ -686,6 +730,59 @@ class LLIRPassManager:
             descriptor=SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
             traversal=traversal,
             configuration_name="single_iteration_loop_elimination",
+            options=self.options,
+            started_ns=started_ns,
+        )
+        return LLIRStatementListPassResult(
+            LLIRStatementListArtifact(output),
+            (record,),
+        )
+
+    def run_loop_invariant_factor_hoist(
+        self,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: LoopInvariantFactorHoistPassSpec = (
+            LoopInvariantFactorHoistPassSpec()
+        ),
+    ) -> LLIRStatementListPassResult:
+        """Hoist loop-invariant factors over an exact statement-list root."""
+
+        self._validate_options()
+        if type(artifact) is not LLIRStatementListArtifact:
+            _raise_manager_error(
+                code="invalid_pass_artifact",
+                message=(
+                    "loop-invariant-factor runner requires " "LLIRStatementListArtifact"
+                ),
+                sequence_index=0,
+                descriptor=LOOP_INVARIANT_FACTOR_HOIST_PASS,
+            )
+        if type(pass_spec) is not LoopInvariantFactorHoistPassSpec:
+            _raise_manager_error(
+                code="unknown_pass_spec",
+                message=(
+                    "loop-invariant-factor runner requires its exact pass "
+                    "specification"
+                ),
+                sequence_index=0,
+                descriptor=LOOP_INVARIANT_FACTOR_HOIST_PASS,
+            )
+        _validate_descriptor(
+            pass_spec.descriptor,
+            LOOP_INVARIANT_FACTOR_HOIST_PASS,
+        )
+        context = _validate_loop_invariant_factor_hoist_context(pass_spec.context)
+        traversal = context.traversal
+        started_ns = perf_counter_ns() if self.options.record_timing else None
+        if self.options.verify_before_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, artifact.statements))
+        output = hoist_loop_invariant_factors(artifact.statements, context)
+        if self.options.verify_after_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, output))
+        record = _record(
+            descriptor=LOOP_INVARIANT_FACTOR_HOIST_PASS,
+            traversal=traversal,
+            configuration_name="loop_invariant_factor_hoist",
             options=self.options,
             started_ns=started_ns,
         )

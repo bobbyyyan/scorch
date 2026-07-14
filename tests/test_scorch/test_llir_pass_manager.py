@@ -27,6 +27,7 @@ from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     DEBUG_LLIR_PASS_OPTIONS,
     DENSE_POINTER_HOIST_PASS,
     DYNAMIC_VECTOR_ACCESS_PASS,
+    LOOP_INVARIANT_FACTOR_HOIST_PASS,
     PRODUCTION_LLIR_PASS_OPTIONS,
     RESULT_WRITE_PASS,
     SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
@@ -45,6 +46,7 @@ from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     LLIRRewritePassResult,
     LLIRStatementListArtifact,
     LLIRStatementListPassResult,
+    LoopInvariantFactorHoistPassSpec,
     ManagedCompressedWhereOpenMPResult,
     ResultWritePassSpec,
     SingleIterationLoopEliminationPassSpec,
@@ -55,6 +57,11 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRTraversalError,
     LLIRValue,
     LLIRWalker,
+)
+from scorch.compiler.loop_invariant_factor_pass import (  # type: ignore[import-untyped]
+    LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    LoopInvariantFactorHoistContext,
+    hoist_loop_invariant_factors,
 )
 from scorch.compiler.result_write_pass import (  # type: ignore[import-untyped]
     ResultWriteContext,
@@ -185,6 +192,8 @@ def test_all_manager_configuration_artifact_and_result_carriers_are_frozen() -> 
     dense_spec = DensePointerHoistPassSpec(dense_context)
     single_context = SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT
     single_spec = SingleIterationLoopEliminationPassSpec(single_context)
+    factor_context = LOOP_INVARIANT_FACTOR_HOIST_CONTEXT
+    factor_spec = LoopInvariantFactorHoistPassSpec(factor_context)
     rewrite_artifact = LLIRRewriteArtifact([llir.BlankLine()])
     statement_artifact = LLIRStatementListArtifact([llir.BlankLine()])
     record = _record(1)
@@ -207,6 +216,8 @@ def test_all_manager_configuration_artifact_and_result_carriers_are_frozen() -> 
         (dense_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (single_context, "traversal", object()),
         (single_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
+        (factor_context, "traversal", object()),
+        (factor_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (rewrite_artifact, "value", []),
         (statement_artifact, "statements", []),
         (record, "duration_ns", 2),
@@ -262,6 +273,13 @@ def test_stable_descriptors_expose_exact_artifact_and_context_types() -> None:
         LLIRPassArtifactType.STATEMENT_LIST,
         LLIRPassArtifactType.STATEMENT_LIST,
         LLIRPassContextType.SINGLE_ITERATION_LOOP_ELIMINATION,
+    )
+    assert LOOP_INVARIANT_FACTOR_HOIST_PASS == LLIRPassDescriptor(
+        "hoist_loop_invariant_factors",
+        1,
+        LLIRPassArtifactType.STATEMENT_LIST,
+        LLIRPassArtifactType.STATEMENT_LIST,
+        LLIRPassContextType.LOOP_INVARIANT_FACTOR_HOIST,
     )
 
 
@@ -533,6 +551,16 @@ def test_each_runner_preserves_its_original_structured_diagnostic() -> None:
         )
     assert managed_single.value.diagnostic == direct_single.value.diagnostic
 
+    factor_context = LOOP_INVARIANT_FACTOR_HOIST_CONTEXT
+    with pytest.raises(LLIRTraversalError) as direct_factor:
+        hoist_loop_invariant_factors(source, factor_context)
+    with pytest.raises(LLIRTraversalError) as managed_factor:
+        manager.run_loop_invariant_factor_hoist(
+            LLIRStatementListArtifact(source),
+            LoopInvariantFactorHoistPassSpec(factor_context),
+        )
+    assert managed_factor.value.diagnostic == direct_factor.value.diagnostic
+
 
 def test_unknown_descriptor_artifact_spec_and_context_combinations_fail_closed() -> (
     None
@@ -602,6 +630,26 @@ def test_unknown_descriptor_artifact_spec_and_context_combinations_fail_closed()
                 context=cast(SingleIterationLoopEliminationContext, object())
             ),
         ),
+        lambda: manager.run_loop_invariant_factor_hoist(
+            cast(LLIRStatementListArtifact, rewrite_artifact),
+            LoopInvariantFactorHoistPassSpec(),
+        ),
+        lambda: manager.run_loop_invariant_factor_hoist(
+            statement_artifact,
+            cast(LoopInvariantFactorHoistPassSpec, object()),
+        ),
+        lambda: manager.run_loop_invariant_factor_hoist(
+            statement_artifact,
+            LoopInvariantFactorHoistPassSpec(
+                context=cast(LoopInvariantFactorHoistContext, object())
+            ),
+        ),
+        lambda: manager.run_loop_invariant_factor_hoist(
+            statement_artifact,
+            LoopInvariantFactorHoistPassSpec(
+                descriptor=replace(LOOP_INVARIANT_FACTOR_HOIST_PASS, version=2)
+            ),
+        ),
     )
     for invalid in invalid_calls:
         with pytest.raises(LLIRPassManagerError):
@@ -635,6 +683,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
     production_single = production.run_single_iteration_loop_elimination(
         compressed_artifact
     )
+    production_factor = production.run_loop_invariant_factor_hoist(compressed_artifact)
     production_compressed = production.run_compressed_where_openmp(
         compressed_artifact, compressed_spec
     )
@@ -647,6 +696,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
             *production_sparse_prefetch.run_records,
             *production_dense.run_records,
             *production_single.run_records,
+            *production_factor.run_records,
             *production_compressed.run_records,
         )
     )
@@ -657,6 +707,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
     debug_sparse_prefetch = debug.run_sparse_prefetch(compressed_artifact)
     debug_dense = debug.run_dense_pointer_hoist(compressed_artifact, dense_spec)
     debug_single = debug.run_single_iteration_loop_elimination(compressed_artifact)
+    debug_factor = debug.run_loop_invariant_factor_hoist(compressed_artifact)
     debug_compressed = debug.run_compressed_where_openmp(
         compressed_artifact, compressed_spec
     )
@@ -671,6 +722,8 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
         ("LLIR transformation", "hoist_dense_pointers"),
         ("LLIR transformation", "eliminate_single_iteration_loops"),
         ("LLIR transformation", "eliminate_single_iteration_loops"),
+        ("LLIR transformation", "hoist_loop_invariant_factors"),
+        ("LLIR transformation", "hoist_loop_invariant_factors"),
         ("LLIR transformation", "transform_compressed_where_for_openmp"),
         ("LLIR transformation", "transform_compressed_where_for_openmp"),
     ]
@@ -682,6 +735,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
             *debug_sparse_prefetch.run_records,
             *debug_dense.run_records,
             *debug_single.run_records,
+            *debug_factor.run_records,
             *debug_compressed.run_records,
         )
     )
