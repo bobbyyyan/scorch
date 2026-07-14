@@ -424,9 +424,59 @@ Direct production-record timing attributes 22.980-68.541 microseconds p50 and
 24.000-71.500 microseconds p95 to the new pass across the corpus. This is a
 modest absolute, measured exception accepted for the general fail-closed
 detachment and ownership boundary; no validation was weakened and no corpus-
-specific shortcut was introduced. The only remaining sequential inline
-optimization is `_hoist_loop_invariant_factors`; extract it next without
-combining it with other optimizations.
+specific shortcut was introduced.
+
+The loop-invariant-factor Phase 2 seam is implemented by `112a9b7` and routed
+in production by `f2bca1b`. The version-1
+`hoist_loop_invariant_factors` pass takes an exact statement-list artifact and a
+frozen context containing only its common-traversal identity. It validates and
+detaches the complete LLIR tree before applying the characterized legacy
+post-order transform and its distinct whole-loop defined-variable analysis.
+Legal misses return fully detached output; unknown subclasses, malformed typed
+children (including children in semantically omitted containers), wrong roots,
+and mismatched artifacts, descriptors, contexts, or specifications fail closed.
+The transform preserves raw substring classification, factor and partition
+order, left-associated rebuilding, current-sequence-index `_inv_{i}` naming
+without collision checks, first-success-only behavior per loop and invocation,
+and the non-idempotent multiple-accumulation repeated-application case.
+
+Production order is now managed sparse prefetch, managed dense-pointer
+hoisting, managed single-iteration elimination, managed invariant-factor
+hoisting, result/ABI assembly, and managed dynamic-vector rewriting. Applied
+compressed output still precedes those passes with compressed-Where/OpenMP plus
+independent count and fill result-write records. An invariant-factor failure
+preserves the earlier ordered records, adds no factor record, and stops result/
+ABI assembly, dynamic-vector rewriting, function construction, scheduling, and
+code generation.
+
+The focused common suite is now 455 tests and the schedule/codegen matrix
+remains 82 tests. CSR-by-dense, DS, DSS, and the structurally activating all-COO
+SDDMM remain byte-identical at 2,505, 7,117, 8,660, and 3,543 bytes with the
+same four recorded SHA-256 digests. The all-COO kernel emits exactly
+`float _inv_17 = Mask_val[pMask0];`, keeps only
+`_Query_val_ptr[q] * _Key_val_ptr[q]` in the q-loop accumulation, and emits
+`_accum *= _inv_17;` immediately after that loop. It also retains the managed
+single-iteration result: no `pMask1_end` declaration or inner `pMask1` loop,
+and direct use of `Mask1_crd[pMask0]` and `Mask_val[pMask0]`. All 42 M5 and all
+42 redwood grid build inputs are byte-identical to the `265123a` references, so
+compiled-kernel candidate-versus-predecessor comparison is waived on both
+machines while structural activation remains required and covered.
+
+In a clean committed worktree, empty-manager p95 was 1.625 microseconds and
+invariant-factor single-pass incremental manager overhead was 1.916
+microseconds. Direct pass and complete managed-call p95 were 2.083 and 3.917
+microseconds, respectively. A fresh unchanged `14b110b` preflight missed its
+own same-commit archive: small-dense, reduction, CSR-intersection, and sparse-
+union p50/p95 ratios were 1.068/1.136, 1.088/1.155, 1.050/1.074, and
+1.057/1.108. Per the settled policy, the control was not rerun
+opportunistically and the candidate was not sampled, so there is no valid new
+end-to-end compiler-latency result to attribute to this seam.
+
+The four sequential Phase 2 LLIR optimizations are now extracted behind the
+typed pass infrastructure with their seam-local ownership, failure, structural,
+ordering, timing, and two-machine generated-input gates satisfied. Run the
+design-canonical Phase 2 exit audit next before declaring the full phase closed;
+after that audit, proceed sequentially to the Phase 3 structured-CxxIR/ABI work.
 
 ## Incremental Migration Plan
 
