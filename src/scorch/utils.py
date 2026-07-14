@@ -1,19 +1,33 @@
-import glob
 import hashlib
+import importlib.util
 import math
 import os
-import platform
+import pickle
+import shutil
+import subprocess
+import sys
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from importlib import resources
 from itertools import chain
-from typing import List, Dict, Any, Iterable, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch
-from torch.utils.cpp_extension import load_inline
-
 from .compiler.llir import DataType
 from .format import parse_format  # noqa: F401 - compatibility re-export
+
+if TYPE_CHECKING:
+    from .compiler.compile_options import CompileOptions, KernelBuildOptions
 
 _NATIVE_RESOURCES = resources.files("scorch").joinpath("csrc")
 
@@ -54,15 +68,32 @@ def jit_preamble_text() -> str:
     return template.replace(include, _policy_header_text(), 1)
 
 
-def _kernel_name(*sources: str) -> str:
+def _resolve_compile_options(
+    compile_options: Optional["CompileOptions"] = None,
+) -> "CompileOptions":
+    """Resolve one typed snapshot at a direct utility compilation boundary."""
+
+    from .compiler.compile_options import CompileOptions
+
+    if compile_options is None:
+        return CompileOptions.from_environment()
+    if type(compile_options) is not CompileOptions:
+        raise TypeError("compile_options must be a CompileOptions instance")
+    return compile_options
+
+
+def _kernel_name(
+    *sources: str, compile_options: Optional["CompileOptions"] = None
+) -> str:
     """Deterministic name from kernel source so torch's disk cache persists.
 
     Includes torch version in the hash so a PyTorch upgrade invalidates all
     cached .so files (they link against libtorch). ``jit_preamble_text`` expands
     the policy header into the source, so a local policy retune is covered too.
     """
-    keyed = "".join(sources) + torch.__version__
-    if os.environ.get("SCORCH_JIT_TUNE_HOOKS"):
+    options = _resolve_compile_options(compile_options)
+    keyed = "".join(sources) + options.build.torch_version
+    if options.build.jit_tune_hooks:
         # Instrumented sweep kernels carry extra getenv branches (same text, -D flag),
         # so key them apart from clean kernels to avoid serving one for the other.
         keyed += "|scorch_tune_hooks"
@@ -70,44 +101,347 @@ def _kernel_name(*sources: str) -> str:
     return f"kernel_{h}"
 
 
-_so_cache: dict = {}
+_so_cache: Dict[tuple[str, tuple[object, ...]], Any] = {}
 
 
-def _load_kernel(name: str, cpp_sources, functions, extra_cflags, extra_ldflags):
+@dataclass(frozen=True)
+class _JITBuildRequest:
+    """Detached, typed payload for one out-of-process Torch extension build."""
+
+    name: str
+    cpp_sources: Tuple[str, ...]
+    functions: Tuple[str, ...]
+    extra_cflags: Tuple[str, ...]
+    extra_ldflags: Tuple[str, ...]
+    build_directory: str
+    build_options: "KernelBuildOptions"
+
+
+def _validate_jit_build_request(request: object) -> _JITBuildRequest:
+    from .compiler.compile_options import KernelBuildOptions
+
+    if type(request) is not _JITBuildRequest:
+        raise TypeError("JIT build payload must be an exact _JITBuildRequest")
+    typed_request = request
+    if type(typed_request.build_options) is not KernelBuildOptions:
+        raise TypeError("JIT build payload must own exact KernelBuildOptions")
+    string_fields = (
+        ("name", typed_request.name),
+        ("build_directory", typed_request.build_directory),
+    )
+    for field_name, string_value in string_fields:
+        if type(string_value) is not str or not string_value:
+            raise TypeError(f"JIT build {field_name} must be a non-empty string")
+    sequence_fields = (
+        ("cpp_sources", typed_request.cpp_sources),
+        ("functions", typed_request.functions),
+        ("extra_cflags", typed_request.extra_cflags),
+        ("extra_ldflags", typed_request.extra_ldflags),
+    )
+    for field_name, sequence_value in sequence_fields:
+        if type(sequence_value) is not tuple or any(
+            type(item) is not str or not item for item in sequence_value
+        ):
+            raise TypeError(f"JIT build {field_name} must be an exact tuple of strings")
+    if not typed_request.cpp_sources or not typed_request.functions:
+        raise ValueError("JIT build sources and functions must be non-empty")
+    if typed_request.extra_cflags not in (
+        typed_request.build_options.extra_cflags,
+        typed_request.build_options.special_kernel_cflags,
+    ):
+        raise ValueError("JIT build compiler flags disagree with KernelBuildOptions")
+    if typed_request.extra_ldflags != typed_request.build_options.extra_ldflags:
+        raise ValueError("JIT build linker flags disagree with KernelBuildOptions")
+    if not os.path.isabs(typed_request.build_directory):
+        raise ValueError("JIT build directory must be absolute")
+    return typed_request
+
+
+def _verify_snapshotted_build_runtime(request: _JITBuildRequest) -> None:
+    """Fail closed if the build child does not match its frozen ABI snapshot."""
+
+    import platform
+    import sysconfig
+
+    from .compiler.compile_options import CompilerWrapperPolicy
+
+    options = request.build_options
+    current_torch_path = torch.__file__
+    current_torch_root = os.path.dirname(current_torch_path)
+    current_torch_include = os.path.join(current_torch_root, "include")
+    current_torch_include_paths = (
+        current_torch_include,
+        os.path.join(current_torch_include, "torch", "csrc", "api", "include"),
+    )
+    current_torch_library_path = os.path.join(current_torch_root, "lib")
+    current_cache_tag = sys.implementation.cache_tag
+    current_python_include = sysconfig.get_path("include", scheme="posix_prefix")
+    observed = (
+        ("torch_version", str(torch.__version__), options.torch_version),
+        ("torch_path", current_torch_path, options.torch_path),
+        (
+            "torch_include_paths",
+            current_torch_include_paths,
+            options.torch_include_paths,
+        ),
+        (
+            "torch_library_path",
+            current_torch_library_path,
+            options.torch_library_path,
+        ),
+        (
+            "torch_cxx11_abi",
+            bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+            options.torch_cxx11_abi,
+        ),
+        ("python_executable", sys.executable, options.python_executable),
+        ("python_version", platform.python_version(), options.python_version),
+        ("python_cache_tag", current_cache_tag, options.python_cache_tag),
+        (
+            "python_include_path",
+            current_python_include,
+            options.python_include_path,
+        ),
+    )
+    mismatches = [name for name, current, expected in observed if current != expected]
+
+    wrapper_disabled = bool(os.environ.get("TORCH_NO_COMPILER_WRAPPER"))
+    if options.compiler_wrapper_policy is CompilerWrapperPolicy.DISABLED:
+        if not wrapper_disabled:
+            mismatches.append("compiler_wrapper_policy")
+    else:
+        if wrapper_disabled:
+            mismatches.append("compiler_wrapper_policy")
+        observed_wrapper_name: Optional[str] = None
+        observed_wrapper_path: Optional[str] = None
+        for wrapper_name in ("ccache", "sccache"):
+            resolved_wrapper = shutil.which(wrapper_name)
+            if resolved_wrapper is not None:
+                observed_wrapper_name = wrapper_name
+                observed_wrapper_path = os.path.abspath(resolved_wrapper)
+                break
+        if observed_wrapper_name != options.compiler_wrapper_name:
+            mismatches.append("compiler_wrapper_name")
+        if observed_wrapper_path != options.compiler_wrapper_path:
+            mismatches.append("compiler_wrapper_path")
+    if mismatches:
+        raise RuntimeError(
+            "JIT build runtime differs from CompileOptions snapshot: "
+            + ", ".join(mismatches)
+        )
+
+
+def _run_jit_build_request() -> None:
+    """Child-process entry point; build without mutating the parent environment."""
+
+    from torch.utils.cpp_extension import load_inline
+
+    request = _validate_jit_build_request(pickle.load(sys.stdin.buffer))
+    _verify_snapshotted_build_runtime(request)
+    load_inline(
+        name=request.name,
+        cpp_sources=list(request.cpp_sources),
+        functions=list(request.functions),
+        extra_cflags=list(request.extra_cflags),
+        extra_ldflags=list(request.extra_ldflags),
+        build_directory=request.build_directory,
+    )
+
+
+def _request_cache_key(request: _JITBuildRequest) -> tuple[object, ...]:
+    from .compiler.compile_options import canonical_cache_digest
+
+    content_digest = canonical_cache_digest(
+        (
+            request.cpp_sources,
+            request.functions,
+            request.extra_cflags,
+            request.extra_ldflags,
+        )
+    )
+    return request.build_options.cache_key + (content_digest,)
+
+
+def _build_identity_digest(
+    cpp_sources: Sequence[str],
+    functions: Sequence[str],
+    extra_cflags: Sequence[str],
+    extra_ldflags: Sequence[str],
+    build_options: "KernelBuildOptions",
+) -> str:
+    from .compiler.compile_options import canonical_cache_digest
+
+    return canonical_cache_digest(
+        (
+            tuple(cpp_sources),
+            tuple(functions),
+            tuple(extra_cflags),
+            tuple(extra_ldflags),
+            build_options.cache_key,
+        )
+    )
+
+
+def _load_extension_file(name: str, so_path: str) -> Any:
+    spec = importlib.util.spec_from_file_location(name, so_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load compiled extension {so_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _build_and_load_extension(request: _JITBuildRequest) -> Any:
+    """Compile in a child with frozen process state, then import the result."""
+
+    request = _validate_jit_build_request(request)
+    os.makedirs(request.build_directory, exist_ok=True)
+    toolchain_directory = _prepare_compiler_toolchain(request)
+    so_path = os.path.join(request.build_directory, f"{request.name}.so")
+    if not os.path.isfile(so_path):
+        subprocess.run(
+            [
+                request.build_options.python_executable,
+                "-P",
+                "-c",
+                "from scorch.utils import _run_jit_build_request; "
+                "_run_jit_build_request()",
+            ],
+            input=pickle.dumps(request),
+            env=_jit_build_environment_from_request(
+                request,
+                toolchain_directory=toolchain_directory,
+            ),
+            check=True,
+        )
+    if not os.path.isfile(so_path):
+        raise RuntimeError(f"JIT build did not produce expected extension {so_path}")
+    return _load_extension_file(request.name, so_path)
+
+
+def _prepare_compiler_toolchain(request: _JITBuildRequest) -> Optional[str]:
+    """Pin a bare compiler spelling to the snapshotted absolute executable."""
+
+    build_options = request.build_options
+    if os.path.isabs(build_options.cxx_compiler):
+        return None
+    toolchain_directory = os.path.join(
+        request.build_directory,
+        ".scorch-toolchain",
+    )
+    os.makedirs(toolchain_directory, exist_ok=True)
+    launcher = os.path.join(toolchain_directory, build_options.cxx_compiler)
+    if not os.path.lexists(launcher):
+        try:
+            os.symlink(build_options.cxx_compiler_path, launcher)
+        except FileExistsError:
+            # A concurrent identical build may have installed the same launcher.
+            pass
+    if not os.path.islink(launcher) or os.readlink(launcher) != (
+        build_options.cxx_compiler_path
+    ):
+        raise RuntimeError(
+            "JIT compiler launcher conflicts with the CompileOptions snapshot"
+        )
+    return toolchain_directory
+
+
+def _jit_build_environment_from_request(
+    request: _JITBuildRequest,
+    *,
+    toolchain_directory: Optional[str],
+) -> Dict[str, str]:
+    """Build a child environment without requiring a second option snapshot."""
+
+    build_options = request.build_options
+    search_path = build_options.executable_search_path
+    if toolchain_directory is not None:
+        search_path = toolchain_directory + os.pathsep + search_path
+    environment = {
+        "PATH": search_path,
+        "PYTHONPATH": build_options.scorch_python_path,
+    }
+    from .compiler.compile_options import CompilerWrapperPolicy
+
+    if build_options.compiler_wrapper_policy is CompilerWrapperPolicy.DISABLED:
+        environment["TORCH_NO_COMPILER_WRAPPER"] = "1"
+    if build_options.cxx_compiler_from_environment:
+        environment["CXX"] = build_options.cxx_compiler
+    darwin_toolchain = build_options.darwin_toolchain
+    if darwin_toolchain is not None:
+        environment["DEVELOPER_DIR"] = darwin_toolchain.developer_dir
+        environment["SDKROOT"] = darwin_toolchain.sdk_root
+        if darwin_toolchain.deployment_target is not None:
+            environment["MACOSX_DEPLOYMENT_TARGET"] = darwin_toolchain.deployment_target
+    return environment
+
+
+def _load_kernel(
+    name: str,
+    cpp_sources: Sequence[str],
+    functions: Sequence[str],
+    extra_cflags: Sequence[str],
+    extra_ldflags: Sequence[str],
+    *,
+    compile_options: Optional["CompileOptions"] = None,
+) -> Any:
     """Load a compiled kernel, using a persistent .so cache when possible.
 
     PyTorch's JIT_EXTENSION_VERSIONER is in-memory only, so load_inline
     always recompiles on the first call in each process (~7s).  We bypass
     it by checking if the .so already exists on disk and loading it directly.
     """
-    if name in _so_cache:
-        return _so_cache[name]
+    options = _resolve_compile_options(compile_options)
+    cpp_sources_snapshot = tuple(cpp_sources)
+    functions_snapshot = tuple(functions)
+    cflags_snapshot = tuple(extra_cflags)
+    ldflags_snapshot = tuple(extra_ldflags)
+    if cflags_snapshot != options.build.extra_cflags:
+        raise ValueError("extra_cflags must match the CompileOptions snapshot")
+    if ldflags_snapshot != options.build.extra_ldflags:
+        raise ValueError("extra_ldflags must match the CompileOptions snapshot")
 
-    import importlib.util
-    from torch.utils.cpp_extension import _get_build_directory, load_inline
+    from torch.utils.cpp_extension import _get_build_directory
 
-    build_dir = _get_build_directory(name, verbose=False)
+    build_root = _get_build_directory(name, verbose=False)
+    build_digest = _build_identity_digest(
+        cpp_sources_snapshot,
+        functions_snapshot,
+        cflags_snapshot,
+        ldflags_snapshot,
+        options.build,
+    )
+    build_dir = os.path.join(build_root, f"scorch_{build_digest}")
     so_path = os.path.join(build_dir, f"{name}.so")
+    request = _validate_jit_build_request(
+        _JITBuildRequest(
+            name=name,
+            cpp_sources=cpp_sources_snapshot,
+            functions=functions_snapshot,
+            extra_cflags=cflags_snapshot,
+            extra_ldflags=ldflags_snapshot,
+            build_directory=build_dir,
+            build_options=options.build,
+        )
+    )
+    cache_key = (name, _request_cache_key(request))
+    if cache_key in _so_cache:
+        return _so_cache[cache_key]
 
     if os.path.isfile(so_path):
-        # .so exists — load directly without invoking ninja
-        spec = importlib.util.spec_from_file_location(name, so_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = _load_extension_file(name, so_path)
     else:
-        module = load_inline(
-            name=name,
-            cpp_sources=cpp_sources,
-            functions=functions,
-            extra_cflags=extra_cflags,
-            extra_ldflags=extra_ldflags,
-        )
+        module = _build_and_load_extension(request)
 
-    _so_cache[name] = module
+    _so_cache[cache_key] = module
     return module
 
 
-def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
+def get_extra_cflags(
+    base_flags: Optional[List[str]] = None,
+    *,
+    compile_options: Optional["CompileOptions"] = None,
+) -> List[str]:
     """Get platform-specific extra compiler flags for torch cpp_extension.
 
     On macOS, adds the C++ standard library include path needed for compilation.
@@ -118,40 +452,19 @@ def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
     Returns:
         List of compiler flags including platform-specific additions.
     """
+    options = _resolve_compile_options(compile_options)
+    default_base = ("-O3", "-march=native", "-ffast-math", "-funroll-loops")
     if base_flags is None:
-        base_flags = ["-O3", "-march=native", "-ffast-math", "-funroll-loops"]
-    flags = list(base_flags)
+        return list(options.build.extra_cflags)
 
-    if platform.system() == "Darwin":
-        # macOS needs explicit C++ stdlib include path for torch JIT compilation
-        sdk_path = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
-        flags.append(f"-isystem{sdk_path}/usr/include/c++/v1")
-
-        # OpenMP flags for macOS - use PyTorch's bundled libomp to avoid runtime conflicts
-        flags.extend(["-Xpreprocessor", "-fopenmp"])
-
-        # Add OpenMP header path from Homebrew (headers only)
-        for header_path in [
-            "/opt/homebrew/opt/libomp/include",
-            "/usr/local/opt/libomp/include",
-        ]:
-            if os.path.exists(header_path):
-                flags.append(f"-I{header_path}")
-                break
-    else:
-        # Linux: standard OpenMP support
-        flags.append("-fopenmp")
-
-    # Install-time autotune: build JIT kernels with the SCORCH_TUNE_HOOKS sweep hooks
-    # so the codegen thread/chunk policy is tunable in-process too (mirrors the
-    # native build's SCORCH_BUILD_TUNE_HOOKS mode). Off in the shipped path.
-    if os.environ.get("SCORCH_JIT_TUNE_HOOKS"):
-        flags.append("-DSCORCH_TUNE_HOOKS")
-
-    return flags
+    # Compatibility callers may replace only the optimization prefix. Target,
+    # OpenMP, and instrumentation flags still come from the same snapshot.
+    return list(base_flags) + list(options.build.extra_cflags[len(default_base) :])
 
 
-def get_extra_ldflags() -> List[str]:
+def get_extra_ldflags(
+    *, compile_options: Optional["CompileOptions"] = None
+) -> List[str]:
     """Get platform-specific extra linker flags for torch cpp_extension.
 
     On macOS, links against PyTorch's bundled libomp to avoid runtime conflicts
@@ -160,46 +473,16 @@ def get_extra_ldflags() -> List[str]:
     Returns:
         List of linker flags.
     """
-    ldflags = []
-
-    if platform.system() == "Darwin":
-        # Link against PyTorch's bundled libomp to avoid runtime conflicts
-        torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
-        torch_omp = os.path.join(torch_lib_path, "libomp.dylib")
-
-        if os.path.exists(torch_omp):
-            # Use full path to avoid linker finding Homebrew's libomp
-            ldflags.append(torch_omp)
-            # Add rpath so it finds the right library at runtime
-            ldflags.append(f"-Wl,-rpath,{torch_lib_path}")
-        else:
-            # Fall back to Homebrew's libomp
-            for lib_path in [
-                "/opt/homebrew/opt/libomp/lib",
-                "/usr/local/opt/libomp/lib",
-            ]:
-                if os.path.exists(lib_path):
-                    ldflags.extend(["-lomp", f"-L{lib_path}"])
-                    break
-            else:
-                ldflags.append("-lomp")
-    else:
-        # Linux: link against PyTorch's bundled libgomp to avoid
-        # dual-runtime conflicts (PyTorch's copy vs system copy)
-        torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
-        gomp_libs = glob.glob(os.path.join(torch_lib_path, "libgomp*.so*"))
-
-        if gomp_libs:
-            ldflags.extend([gomp_libs[0], f"-Wl,-rpath,{torch_lib_path}"])
-        else:
-            # Fallback: use system OpenMP (no bundled libgomp = no conflict)
-            ldflags.append("-fopenmp")
-
-    return ldflags
+    options = _resolve_compile_options(compile_options)
+    return list(options.build.extra_ldflags)
 
 
 def load_to_kernel_cache(
-    kernel_name: str, kernel_cache: Dict, kernel_code_filename: Optional[str]
+    kernel_name: str,
+    kernel_cache: Dict,
+    kernel_code_filename: Optional[str],
+    *,
+    compile_options: Optional["CompileOptions"] = None,
 ) -> None:
     """Load a kernel to the kernel cache.
 
@@ -212,20 +495,41 @@ def load_to_kernel_cache(
     if kernel_code_filename is None:
         kernel_code_filename = f"{kernel_name}.cpp"
 
-    header_cpp_code = jit_preamble_text()
+    options = _resolve_compile_options(compile_options)
+    header_cpp_code = options.build.preamble_source
     cpp_code = native_resource_text(kernel_code_filename)
+    build_name = kernel_name
 
-    # Load special kernels
+    # Load special kernels. Their historical no-signed-zeros policy is distinct
+    # from generated kernels and therefore has its own frozen flag tuple.
     start_time = time.time()
-    module = load_inline(
-        name=kernel_name,
-        cpp_sources=[header_cpp_code, cpp_code],
-        functions=["evaluate"],
-        extra_cflags=get_extra_cflags(
-            ["-O3", "-march=native", "-ffast-math", "-fno-signed-zeros"]
-        ),
-        extra_ldflags=get_extra_ldflags(),
+    from torch.utils.cpp_extension import _get_build_directory
+
+    build_root = _get_build_directory(build_name, verbose=False)
+    build_digest = _build_identity_digest(
+        (header_cpp_code, cpp_code),
+        ("evaluate",),
+        options.build.special_kernel_cflags,
+        options.build.extra_ldflags,
+        options.build,
     )
+    request = _validate_jit_build_request(
+        _JITBuildRequest(
+            name=build_name,
+            cpp_sources=(header_cpp_code, cpp_code),
+            functions=("evaluate",),
+            extra_cflags=options.build.special_kernel_cflags,
+            extra_ldflags=options.build.extra_ldflags,
+            build_directory=os.path.join(build_root, f"scorch_{build_digest}"),
+            build_options=options.build,
+        )
+    )
+    cache_key = (build_name, _request_cache_key(request))
+    if cache_key in _so_cache:
+        module = _so_cache[cache_key]
+    else:
+        module = _build_and_load_extension(request)
+        _so_cache[cache_key] = module
     end_time = time.time()
     print(f"Loading {kernel_name} took {end_time - start_time} s")
 

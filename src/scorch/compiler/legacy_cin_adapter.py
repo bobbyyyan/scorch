@@ -30,19 +30,29 @@ from .diagnostics import VerificationError
 from .identity import AccessId, IndexId, SymbolId
 
 if TYPE_CHECKING:
+    from .compile_options import CompileOptions
     from .loop_plan import LoopPlan
 
 
 def legacy_cin_working_copy(
-    cin: IndexStmt, plan: Optional[LoopPlan] = None
+    cin: IndexStmt,
+    plan: Optional[LoopPlan] = None,
+    compile_options: Optional[CompileOptions] = None,
 ) -> IndexStmt:
     """Return a private scheduled tree with compatibility backlinks restored."""
 
-    return _prepare_legacy_cin(cin, plan, copy_input=True)
+    return _prepare_legacy_cin(
+        cin,
+        plan,
+        copy_input=True,
+        compile_options=compile_options,
+    )
 
 
 def claim_legacy_cin_working_tree(
-    cin: IndexStmt, plan: Optional[LoopPlan] = None
+    cin: IndexStmt,
+    plan: Optional[LoopPlan] = None,
+    compile_options: Optional[CompileOptions] = None,
 ) -> IndexStmt:
     """Claim an already detached tree and restore compatibility backlinks.
 
@@ -52,23 +62,46 @@ def claim_legacy_cin_working_tree(
     alias.  Public lowering continues to use the copying form above.
     """
 
-    return _prepare_legacy_cin(cin, plan, copy_input=False)
+    return _prepare_legacy_cin(
+        cin,
+        plan,
+        copy_input=False,
+        compile_options=compile_options,
+    )
 
 
 def _prepare_legacy_cin(
-    cin: IndexStmt, plan: Optional[LoopPlan], *, copy_input: bool
+    cin: IndexStmt,
+    plan: Optional[LoopPlan],
+    *,
+    copy_input: bool,
+    compile_options: Optional[CompileOptions],
 ) -> IndexStmt:
     validate_legacy_cin_display_names(cin)
     working = copy.deepcopy(cin) if copy_input else cin
     if plan is not None:
         # Import lazily to keep CIN ownership independent of scheduling policy.
+        from .compile_options import CompileOptions
         from .scheduler import Scheduler, materialize_legacy_schedule
 
+        if compile_options is None:
+            compile_options = CompileOptions.from_environment()
+        elif type(compile_options) is not CompileOptions:
+            raise TypeError("compile_options must be a CompileOptions instance")
+
         if plan.provenance == "auto":
-            working = Scheduler._replay_auto_plan_owned(working, plan)
+            working = Scheduler._replay_auto_plan_owned(
+                working,
+                plan,
+                compile_options=compile_options,
+            )
         else:
             schedule, _, _, _ = materialize_legacy_schedule(cin, plan)
-            replayed = Scheduler._apply_schedule_legacy(working, schedule)
+            replayed = Scheduler._apply_schedule_legacy(
+                working,
+                schedule,
+                compile_options=compile_options,
+            )
             working = replayed.normalized_cin
         # Schedule replay can introduce derived display names, so validate the
         # resulting private tree as well as its semantic source.

@@ -1,6 +1,5 @@
 import copy
 import math
-import os
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -26,9 +25,15 @@ from scorch.compiler.cin import (
     Workspace,
     WorkspaceAccess,
 )
-from .cin_analysis import normalize_cin
+from .cin_analysis import _compile_options_at_cin_boundary, normalize_cin
+from .compile_options import CompileOptions, SchedulerCostModel, SchedulerPolicy
 from .identity import IndexId
-from .diagnostics import CompilerInvariantError, VerificationError
+from .diagnostics import (
+    CompileOptionsDiagnostic,
+    CompileOptionsError,
+    CompilerInvariantError,
+    VerificationError,
+)
 from .legacy_cin_adapter import validate_legacy_cin_display_names
 from .loop_plan import (
     LoopPart,
@@ -46,80 +51,142 @@ from .loop_plan import (
 )
 from scorch.format import LevelType
 
-# Per-call override for the register-block decision. When not None it takes
-# precedence over the SCORCH_REGBLOCK env var. Phase 2b lowers the SAME CIN twice
-# (regblock forced OFF -> baseline nest, forced ON -> tiled nest) and stitches a
-# runtime free-dim branch (see ops._build_regblock_dual_path); the two lowerings
-# must be able to select their path independently of the process-wide env.
-_REGBLOCK_FORCE: Optional[bool] = None
+# Compatibility override read only while constructing a snapshot at a direct
+# scheduler boundary. Compiler stages receive the resulting immutable options
+# explicitly and never consult mutable process or context state.
+_REGBLOCK_FORCE: ContextVar[Optional[bool]] = ContextVar(
+    "scorch_regblock_force", default=None
+)
 
 
-def _regblock_enabled() -> bool:
-    """SCORCH_REGBLOCK=1 opts into the free-dim register-block tiling (Phase 2 of
-    the codegen-parity work): tile the dense free/output dim of a sparse contraction
-    so the output tile accumulates in a stack-local buffer across the reduction
-    (register-eligible) instead of round-tripping memory per nonzero.
+def get_forced_regblock() -> Optional[bool]:
+    """Return the register-block compatibility override for this context."""
 
-    A per-call `regblock_force(...)` override wins over the env var when set.
+    value = _REGBLOCK_FORCE.get()
+    if value is not None and type(value) is not bool:
+        raise TypeError("register-block override must be a bool or None")
+    return value
 
-    Default OFF -> codegen is byte-identical to before. See codegen-parity notes.
-    """
-    if _REGBLOCK_FORCE is not None:
-        return _REGBLOCK_FORCE
-    return os.environ.get("SCORCH_REGBLOCK", "0") == "1"
+
+def _compile_options_at_scheduler_boundary(
+    compile_options: Optional[CompileOptions] = None,
+) -> CompileOptions:
+    """Resolve one immutable snapshot at a direct scheduler boundary."""
+
+    if compile_options is not None:
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("compile_options must be a CompileOptions snapshot")
+        return compile_options
+
+    return _compile_options_at_cin_boundary()
+
+
+def _regblock_enabled(
+    compile_options: Optional[CompileOptions] = None,
+) -> bool:
+    """Return the snapshotted register-block scheduling decision."""
+
+    return _compile_options_at_scheduler_boundary(
+        compile_options
+    ).scheduler.regblock_enabled
 
 
 @contextmanager
 def regblock_force(value: Optional[bool]):
-    """Temporarily force `_regblock_enabled()` to `value` (or restore env-driven
-    behavior with None). Used by the Phase 2b dual-path builder to lower the baseline
-    and register-block nests from one CIN. Nestable and exception-safe."""
-    global _REGBLOCK_FORCE
-    prev = _REGBLOCK_FORCE
-    _REGBLOCK_FORCE = value
+    """Temporarily override register blocking at direct scheduler boundaries."""
+
+    if value is not None and type(value) is not bool:
+        raise TypeError("regblock_force expects a bool or None")
+    token = _REGBLOCK_FORCE.set(value)
     try:
         yield
     finally:
-        _REGBLOCK_FORCE = prev
+        _REGBLOCK_FORCE.reset(token)
 
 
-def _regblock_max_n() -> int:
-    """Runtime free-dim cutoff for the dual-path branch (SCORCH_REGBLOCK_MAX_N,
-    default 8): the register-block arm runs only when the free/output dim size is
-    <= this. It is ALSO used as the tile width so the regblock arm is always a
-    single tile (no sparse re-traversal, no ragged tail). Data (doc 04): N<=3 wins,
-    N>=16 regresses; 8 places the threshold between them (tune with N in {4,8})."""
-    try:
-        n = int(os.environ.get("SCORCH_REGBLOCK_MAX_N", "8"))
-    except ValueError:
-        return 8
-    return n if n > 0 else 8
+def _regblock_max_n(
+    compile_options: Optional[CompileOptions] = None,
+) -> int:
+    """Return the snapshotted runtime free-dimension cutoff."""
+
+    return _compile_options_at_scheduler_boundary(
+        compile_options
+    ).scheduler.regblock_max_n
 
 
-def _regblock_tile_width() -> int:
-    """Free-dim tile width for the register-block path. Defaults to REGBLOCK_MAX_N so
-    the regblock arm is single-tile; SCORCH_REGBLOCK_T overrides for experiments."""
-    env = os.environ.get("SCORCH_REGBLOCK_T")
-    if env is not None:
-        try:
-            t = int(env)
-            if t > 0:
-                return t
-        except ValueError:
-            pass
-    return _regblock_max_n()
+def _regblock_tile_width(
+    compile_options: Optional[CompileOptions] = None,
+) -> int:
+    """Return the snapshotted register-block tile width."""
+
+    return _compile_options_at_scheduler_boundary(
+        compile_options
+    ).scheduler.regblock_tile_width
 
 
-@dataclass(frozen=True)
-class _CostModelConstants:
-    alpha: float = 2.975
-    beta: float = 0.1005
-    gamma: float = 43.55
-    c_insert: float = 85.34
-    c_sort: float = 1.741
-    c_trans: float = 40.61
-    rho: float = 0.0014
-    default_dim_size: int = 1024
+def _scheduler_costs_at_boundary(
+    costs: Optional[SchedulerCostModel],
+    compile_options: Optional[CompileOptions],
+) -> Tuple[CompileOptions, SchedulerCostModel]:
+    """Resolve a snapshot and its effective immutable cost model once."""
+
+    options = _compile_options_at_scheduler_boundary(compile_options)
+    if costs is None:
+        costs = options.scheduler.cost_model
+    elif type(costs) is not SchedulerCostModel:
+        raise CompileOptionsError(
+            (
+                CompileOptionsDiagnostic(
+                    code="invalid_type",
+                    field="scheduler.cost_model",
+                    message="expected an exact SchedulerCostModel",
+                ),
+            )
+        )
+    elif compile_options is not None and costs != options.scheduler.cost_model:
+        raise CompileOptionsError(
+            (
+                CompileOptionsDiagnostic(
+                    code="conflicting_scheduler_cost_model",
+                    field="scheduler.cost_model",
+                    message=("the explicit cost model disagrees with CompileOptions"),
+                ),
+            )
+        )
+    elif costs != options.scheduler.cost_model:
+        options = replace(
+            options,
+            scheduler=replace(options.scheduler, cost_model=costs),
+        )
+    return options, costs
+
+
+def _validate_requested_schedule(
+    options: CompileOptions,
+    schedule: Optional["Schedule"],
+    *,
+    exact: bool = False,
+) -> None:
+    """Keep legacy schedule arguments consistent with the owned snapshot."""
+
+    requested = options.requested_schedule
+    if (exact and requested != schedule) or (
+        not exact and requested is not None and requested != schedule
+    ):
+        raise CompileOptionsError(
+            (
+                CompileOptionsDiagnostic(
+                    code="conflicting_schedule",
+                    field="requested_schedule",
+                    message=("the scheduler argument disagrees with CompileOptions"),
+                ),
+            )
+        )
+
+
+# Preserve the existing private spelling for downstream tests and extensions
+# while making the immutable policy type part of CompileOptions.
+_CostModelConstants = SchedulerCostModel
 
 
 @dataclass(frozen=True)
@@ -1553,6 +1620,7 @@ class Scheduler:
         parallel: bool = False,
         unroll: bool = True,
         use_workspace: bool = True,
+        compile_options: Optional[CompileOptions] = None,
     ) -> CIN:
         """
         Tile the index_var of a CIN statement.
@@ -1664,6 +1732,8 @@ class Scheduler:
             raise ValueError("tile_size must be greater than zero")
         if not isinstance(cin, ForAll):
             raise ValueError("Expected input CIN to be a ForAll statement")
+        if compile_options is not None:
+            _compile_options_at_scheduler_boundary(compile_options)
 
         target_name = index_var.name
         target_id = index_var.index_id
@@ -1695,7 +1765,8 @@ class Scheduler:
             )
 
         if placement is None:
-            if _regblock_enabled():
+            options = _compile_options_at_scheduler_boundary(compile_options)
+            if _regblock_enabled(options):
                 placement = f"child_of:{cin.index_var.name}"
             else:
                 placement = "outermost"
@@ -1972,8 +2043,23 @@ class Scheduler:
     @staticmethod
     def select_loop_order(
         cin: CIN,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
     ) -> List[IndexVar]:
+        if costs is None:
+            _, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        elif compile_options is not None:
+            _, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        elif type(costs) is not SchedulerCostModel:
+            raise CompileOptionsError(
+                (
+                    CompileOptionsDiagnostic(
+                        code="invalid_type",
+                        field="scheduler.cost_model",
+                        message="expected an exact SchedulerCostModel",
+                    ),
+                )
+            )
         loop_order = Scheduler.init_loop_order(cin, costs=costs)
         loop_order = Scheduler.optimize_loop_order(cin, loop_order, costs=costs)
         loop_order = Scheduler.apply_mode_order_constraints(
@@ -2527,7 +2613,8 @@ class Scheduler:
     def _apply_schedule_legacy(
         cin: IndexStmt,
         schedule: Schedule,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
     ) -> ScheduledCIN:
         """Apply an explicit tuner schedule to a CIN loop nest.
 
@@ -2537,6 +2624,8 @@ class Scheduler:
         """
         if not isinstance(schedule, Schedule):
             raise TypeError("apply_schedule expects a Schedule")
+        options, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        _validate_requested_schedule(options, schedule)
         source_cin = cin
         # Legacy scheduling still uses local tree surgery.  Keep that mutation
         # behind this boundary by applying it only to a private working copy.
@@ -2689,7 +2778,10 @@ class Scheduler:
             if schedule.loop_order is None:
                 panel_logical_order = [
                     index_var.name
-                    for index_var in Scheduler.select_loop_order(cin, costs=costs)
+                    for index_var in Scheduler.select_loop_order(
+                        cin,
+                        costs=costs,
+                    )
                 ]
             else:
                 panel_logical_order = list(schedule.loop_order)
@@ -2747,12 +2839,16 @@ class Scheduler:
             and schedule.parallel_loop is None
         )
         if is_identity:
-            logical_order = Scheduler.select_loop_order(cin, costs=costs)
+            logical_order = Scheduler.select_loop_order(
+                cin,
+                costs=costs,
+            )
             auto_tiles: List[LoopTile] = []
             scheduled_cin = Scheduler._apply_auto_order_owned(
                 cin,
                 logical_order,
                 plan_tiles=auto_tiles,
+                compile_options=options,
             )
             plan = verify_loop_plan(
                 source_cin,
@@ -2766,7 +2862,10 @@ class Scheduler:
             return ScheduledCIN(scheduled_cin, plan)
 
         if schedule.loop_order is None:
-            logical_order = Scheduler.select_loop_order(cin, costs=costs)
+            logical_order = Scheduler.select_loop_order(
+                cin,
+                costs=costs,
+            )
         else:
             logical_order = Scheduler.resolve_loop_order(cin, schedule.loop_order)
         cin = Scheduler._rebuild_loop_nest(cin, logical_order)
@@ -2806,6 +2905,7 @@ class Scheduler:
                 parallel=tile.parallel,
                 unroll=tile.unroll,
                 use_workspace=False,
+                compile_options=options,
             )
             generated_outer_names[tile.index_var] = f"{tile.index_var}_out"
 
@@ -2853,7 +2953,8 @@ class Scheduler:
     def apply_schedule(
         cin: IndexStmt,
         schedule: Schedule,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
     ) -> ScheduledCIN:
         """Pair detached semantic CIN with a verified stable-ID schedule.
 
@@ -2861,10 +2962,17 @@ class Scheduler:
         result is discarded here and replayed only inside the lowering adapter.
         """
 
+        options, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        if compile_options is None and options.requested_schedule is None:
+            options = replace(options, requested_schedule=schedule)
+        _validate_requested_schedule(options, schedule, exact=True)
         validate_legacy_cin_display_names(cin)
-        normalized_cin = normalize_cin(cin)
+        normalized_cin = normalize_cin(cin, compile_options=options)
         legacy_scheduled = Scheduler._apply_schedule_legacy(
-            normalized_cin, schedule, costs=costs
+            normalized_cin,
+            schedule,
+            costs=costs,
+            compile_options=options,
         )
         return ScheduledCIN(
             normalized_cin,
@@ -2872,7 +2980,10 @@ class Scheduler:
         )
 
     @staticmethod
-    def _select_index_vars_to_tile(cin: CIN) -> List[IndexVar]:
+    def _select_index_vars_to_tile(
+        cin: CIN,
+        scheduler_policy: SchedulerPolicy,
+    ) -> List[IndexVar]:
         all_index_vars = cin.index_vars
         tensor_accesses = cin.tensor_accesses
 
@@ -2935,7 +3046,7 @@ class Scheduler:
         # and holding the accumulator in registers removes the per-nonzero output
         # round-trip). So skip this guard when regblock is on. Byte-identical when off.
         loop_order = cin.loop_order
-        if loop_order and not _regblock_enabled():
+        if loop_order and not scheduler_policy.regblock_enabled:
 
             def _causes_sparse_retraversal(iv: IndexVar) -> bool:
                 if iv not in loop_order:
@@ -2958,6 +3069,8 @@ class Scheduler:
     @staticmethod
     def _apply_tiling_heuristics(
         cin: CIN,
+        compile_options: CompileOptions,
+        scheduler_policy: SchedulerPolicy,
         plan_tiles: Optional[List[LoopTile]] = None,
     ) -> CIN:
         if not isinstance(cin, ForAll):
@@ -2969,9 +3082,14 @@ class Scheduler:
         # schedules such as reduction-innermost SDDMM.
         if not cin.inserted_workspace:
             return cin
-        tile_width = _regblock_tile_width() if _regblock_enabled() else 32
-        for index_var in Scheduler._select_index_vars_to_tile(cin):
-            if _regblock_enabled():
+        regblock_enabled = scheduler_policy.regblock_enabled
+        tile_width = (
+            scheduler_policy.regblock_tile_width
+            if regblock_enabled
+            else scheduler_policy.auto_tile_width
+        )
+        for index_var in Scheduler._select_index_vars_to_tile(cin, scheduler_policy):
+            if regblock_enabled:
                 parent_ref = _loop_ref_from_legacy_index_var(cin.index_var)
                 placement = f"child_of:{cin.index_var.name}"
                 loop_placement = LoopPlacement(
@@ -2986,6 +3104,7 @@ class Scheduler:
                 index_var,
                 tile_width,
                 placement=placement,
+                compile_options=compile_options,
             )
             if plan_tiles is not None:
                 plan_tiles.append(
@@ -3005,12 +3124,16 @@ class Scheduler:
     def _apply_auto_order_owned(
         cin: CIN,
         loop_order: List[IndexVar],
+        compile_options: CompileOptions,
+        scheduler_policy: Optional[SchedulerPolicy] = None,
         plan_tiles: Optional[List[LoopTile]] = None,
     ) -> CIN:
         """Apply selected auto decisions on a CIN owned by the scheduler."""
 
         if not isinstance(cin, ForAll):
             return cin
+        if scheduler_policy is None:
+            scheduler_policy = compile_options.scheduler
 
         cin = Scheduler._rebuild_loop_nest(cin, loop_order)
 
@@ -3018,37 +3141,60 @@ class Scheduler:
             # For dense outputs the workspace only exists to support tiling.
             # If nothing will be tiled, the workspace is pure overhead
             # (extra memset + copy-back per iteration).
-            will_tile = len(Scheduler._select_index_vars_to_tile(cin)) > 0
+            will_tile = (
+                len(Scheduler._select_index_vars_to_tile(cin, scheduler_policy)) > 0
+            )
             if not Scheduler._has_dense_output(cin) or will_tile:
                 cin = Scheduler.insert_workspace(cin, allow_dense=True)
 
         if not isinstance(cin, ForAll):
             return cin
 
-        cin = Scheduler._apply_tiling_heuristics(cin, plan_tiles=plan_tiles)
+        cin = Scheduler._apply_tiling_heuristics(
+            cin,
+            compile_options,
+            scheduler_policy,
+            plan_tiles=plan_tiles,
+        )
         return cin
 
     @staticmethod
     def _auto_schedule_owned(
         cin: CIN,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
+        compile_options: CompileOptions,
+        costs: Optional[_CostModelConstants] = None,
+        scheduler_policy: Optional[SchedulerPolicy] = None,
         plan_tiles: Optional[List[LoopTile]] = None,
     ) -> CIN:
         """Select policy once, then mutate only scheduler-owned CIN."""
 
         if not isinstance(cin, ForAll):
             return cin
-        loop_order = Scheduler.select_loop_order(cin, costs=costs)
+        if scheduler_policy is None:
+            scheduler_policy = compile_options.scheduler
+        if costs is None:
+            costs = scheduler_policy.cost_model
+        loop_order = Scheduler.select_loop_order(
+            cin,
+            costs=costs,
+        )
         return Scheduler._apply_auto_order_owned(
             cin,
             loop_order,
+            compile_options,
+            scheduler_policy=scheduler_policy,
             plan_tiles=plan_tiles,
         )
 
     @staticmethod
-    def _replay_auto_plan_owned(cin: IndexStmt, plan: LoopPlan) -> IndexStmt:
+    def _replay_auto_plan_owned(
+        cin: IndexStmt,
+        plan: LoopPlan,
+        compile_options: Optional[CompileOptions] = None,
+    ) -> IndexStmt:
         """Replay recorded auto decisions without rerunning scheduling policy."""
 
+        options = _compile_options_at_scheduler_boundary(compile_options)
         verify_loop_plan(cin, plan)
         if not isinstance(cin, ForAll):
             if plan.loop_order or plan.tiles:
@@ -3094,22 +3240,74 @@ class Scheduler:
                 parallel=tile.parallel,
                 unroll=tile.unroll,
                 use_workspace=False,
+                compile_options=options,
             )
         return cin
 
     @staticmethod
     def auto_schedule(
         cin: CIN,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
     ) -> CIN:
         """Auto-schedule without mutating caller-owned CIN state."""
+
+        options, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        _validate_requested_schedule(options, None)
+        return Scheduler._auto_schedule_boundary_owned(
+            cin,
+            options,
+            costs,
+            options.scheduler,
+        )
+
+    @staticmethod
+    def _auto_schedule_regblock_arm(
+        cin: CIN,
+        *,
+        enabled: bool,
+        compile_options: CompileOptions,
+    ) -> CIN:
+        """Run one deterministic arm of the internal dual-path algorithm."""
+
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be an exact bool")
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("compile_options must be an exact CompileOptions")
+        _validate_requested_schedule(compile_options, None)
+        scheduler_policy = replace(
+            compile_options.scheduler,
+            regblock_enabled=enabled,
+        )
+        return Scheduler._auto_schedule_boundary_owned(
+            cin,
+            compile_options,
+            scheduler_policy.cost_model,
+            scheduler_policy,
+        )
+
+    @staticmethod
+    def _auto_schedule_boundary_owned(
+        cin: CIN,
+        options: CompileOptions,
+        costs: _CostModelConstants,
+        scheduler_policy: SchedulerPolicy,
+    ) -> CIN:
+        """Shared owned implementation after the public boundary is resolved."""
 
         if isinstance(cin, IndexStmt):
             validate_legacy_cin_display_names(cin)
         working = (
-            normalize_cin(cin) if isinstance(cin, IndexStmt) else copy.deepcopy(cin)
+            normalize_cin(cin, compile_options=options)
+            if isinstance(cin, IndexStmt)
+            else copy.deepcopy(cin)
         )
-        scheduled = Scheduler._auto_schedule_owned(working, costs=costs)
+        scheduled = Scheduler._auto_schedule_owned(
+            working,
+            options,
+            costs=costs,
+            scheduler_policy=scheduler_policy,
+        )
         if isinstance(scheduled, IndexStmt):
             validate_legacy_cin_display_names(scheduled)
         return scheduled

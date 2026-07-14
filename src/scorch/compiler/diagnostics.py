@@ -5,9 +5,40 @@ callers provide the compact node or schedule context in the error message until 
 later structured diagnostic artifact is introduced.
 """
 
+from dataclasses import dataclass
+
 
 class CompilerError(Exception):
     """Base class for failures owned by the Scorch compiler pipeline."""
+
+
+@dataclass(frozen=True)
+class CompileOptionsDiagnostic:
+    """One immutable failure while snapshotting compiler configuration."""
+
+    code: str
+    field: str
+    message: str
+
+
+class CompileOptionsError(CompilerError):
+    """Compiler configuration was malformed or internally inconsistent."""
+
+    def __init__(self, diagnostics: tuple[CompileOptionsDiagnostic, ...]) -> None:
+        if type(diagnostics) is not tuple or not diagnostics:
+            raise TypeError("CompileOptionsError requires immutable diagnostics")
+        if any(
+            type(diagnostic) is not CompileOptionsDiagnostic
+            for diagnostic in diagnostics
+        ):
+            raise TypeError(
+                "CompileOptionsError requires CompileOptionsDiagnostic values"
+            )
+        self.diagnostics = diagnostics
+        first = diagnostics[0]
+        super().__init__(
+            "stage=compile options: " f"{first.code} for {first.field}: {first.message}"
+        )
 
 
 class UnsupportedFeature(CompilerError):

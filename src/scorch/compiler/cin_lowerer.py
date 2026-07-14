@@ -29,6 +29,7 @@ from .legacy_cin_adapter import (
     legacy_cin_working_copy,
 )
 from .cin_analysis import verify_cin_if_enabled
+from .compile_options import CompileOptions
 from .compressed_where_openmp_pass import (
     CompressedWhereOpenMPContext,
     CompressedWhereOpenMPPolicy,
@@ -531,11 +532,29 @@ class CINLowerer:
         self,
         filter_zeros=False,
         post_ops: Optional[PostOps] = None,
-        llir_pass_options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS,
+        llir_pass_options: Optional[LLIRPassOptions] = None,
+        compile_options: Optional[CompileOptions] = None,
     ):
+        if compile_options is None:
+            compile_options = CompileOptions.from_environment(
+                llir_pass_options=(
+                    llir_pass_options
+                    if llir_pass_options is not None
+                    else PRODUCTION_LLIR_PASS_OPTIONS
+                )
+            )
+        elif type(compile_options) is not CompileOptions:
+            raise TypeError("compile_options must be a CompileOptions instance")
+        elif llir_pass_options is not None:
+            raise TypeError(
+                "llir_pass_options and compile_options cannot both be provided"
+            )
+        self.compile_options = compile_options
         self.filter_zeros: bool = filter_zeros
         self.post_ops: Optional[PostOps] = post_ops
-        self._llir_pass_manager = LLIRPassManager(llir_pass_options)
+        self._llir_pass_manager = LLIRPassManager(
+            compile_options.verification.llir_pass_options
+        )
         self._validate_post_ops()
         self.defined_index_vars: List[IndexVar] = []
 
@@ -2143,10 +2162,21 @@ class CINLowerer:
             self.normalized_cin = stmt
 
         self._validate_index_stmt(stmt)
-        verify_cin_if_enabled(stmt)
+        verify_cin_if_enabled(
+            stmt,
+            enabled=self.compile_options.verification.verify_cin,
+        )
         if ownership_transferred:
-            return claim_legacy_cin_working_tree(stmt, plan)
-        return legacy_cin_working_copy(stmt, plan)
+            return claim_legacy_cin_working_tree(
+                stmt,
+                plan,
+                compile_options=self.compile_options,
+            )
+        return legacy_cin_working_copy(
+            stmt,
+            plan,
+            compile_options=self.compile_options,
+        )
 
     def _lower_owned_IndexStmt(
         self, stmt: Union[IndexStmt, ScheduledCIN]
@@ -3214,7 +3244,9 @@ class CINLowerer:
         try:
             from .codegen import LLIRLowerer
 
-            text = LLIRLowerer().lower_llir(list(body))
+            text = LLIRLowerer(compile_options=self.compile_options).lower_llir(
+                list(body)
+            )
         except Exception:
             return []
         found: List[str] = []

@@ -16,6 +16,7 @@ from .compiler.cin import (
     TensorAssign,
 )
 from .compiler.cin_lowerer import CINLowerer
+from .compiler.compile_options import CompileOptions
 from .compiler.codegen import LLIRLowerer
 from .exceptions import (
     TensorIndexError,
@@ -29,9 +30,6 @@ from .layout import TensorLayout, TensorMetadata
 from .storage import SparseStorage, TensorIndex
 from .utils import (
     parse_format,
-    get_extra_cflags,
-    get_extra_ldflags,
-    jit_preamble_text,
     _kernel_name,
     _load_kernel,
 )
@@ -527,10 +525,15 @@ class STensor:
                 f"addition requires equal logical shapes, got "
                 f"{self.logical_shape} and {other.logical_shape}"
             )
+        compile_options = CompileOptions.from_environment()
+
         # Scheduling must not mutate the caller's right-hand operand.
         if self.storage.index.mode_order != other.storage.index.mode_order:
             other = other.copy()
-            other.change_mode_order(self.storage.index.mode_order)
+            other.change_mode_order(
+                self.storage.index.mode_order,
+                _compile_options=compile_options,
+            )
 
         # Perform element-wise addition
         # TODO: support broadcasting
@@ -569,21 +572,26 @@ class STensor:
         for index_var in reversed(ordered_index_vars):
             cin_stmt = ForAll(index_var, cin_stmt)
 
-        lowerer = CINLowerer()
+        lowerer = CINLowerer(compile_options=compile_options)
         lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
-        llir_lowerer = LLIRLowerer()
+        llir_lowerer = LLIRLowerer(compile_options=compile_options)
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
-        header_cpp_code = jit_preamble_text()
+        header_cpp_code = compile_options.build.preamble_source
 
         module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
+            name=_kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            ),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+            extra_cflags=list(compile_options.build.extra_cflags),
+            extra_ldflags=list(compile_options.build.extra_ldflags),
+            compile_options=compile_options,
         )
 
         result_cpp = module.evaluate(
@@ -1111,6 +1119,8 @@ class STensor:
         self,
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
         in_place: bool = False,
+        *,
+        _compile_options: Optional[CompileOptions] = None,
     ) -> STensor:
         """Densify to an all-dense ``STensor`` (stays within Scorch).
 
@@ -1152,6 +1162,14 @@ class STensor:
                 return self
             else:
                 return self.copy()
+
+        compile_options = (
+            CompileOptions.from_environment()
+            if _compile_options is None
+            else _compile_options
+        )
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("_compile_options must be a CompileOptions instance")
 
         default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
 
@@ -1213,21 +1231,29 @@ class STensor:
         for index_var in reversed(index_vars):
             cin_stmt = ForAll(index_var, cin_stmt)
 
-        lowerer = CINLowerer(filter_zeros=True)
+        lowerer = CINLowerer(
+            filter_zeros=True,
+            compile_options=compile_options,
+        )
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-        llir_lowerer = LLIRLowerer()
+        llir_lowerer = LLIRLowerer(compile_options=compile_options)
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
-        header_cpp_code = jit_preamble_text()
+        header_cpp_code = compile_options.build.preamble_source
 
         module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
+            name=_kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            ),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+            extra_cflags=list(compile_options.build.extra_cflags),
+            extra_ldflags=list(compile_options.build.extra_ldflags),
+            compile_options=compile_options,
         )
 
         result_cpp = module.evaluate(
@@ -1257,7 +1283,10 @@ class STensor:
         return new_tensor
 
     def to_sparse(
-        self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None
+        self,
+        fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
+        *,
+        _compile_options: Optional[CompileOptions] = None,
     ) -> STensor:
         """Compress to a sparse ``STensor``, mutating in place.
 
@@ -1326,6 +1355,13 @@ class STensor:
             )
             self._set_state(new_tensor.metadata, new_tensor.storage)
         else:
+            compile_options = (
+                CompileOptions.from_environment()
+                if _compile_options is None
+                else _compile_options
+            )
+            if type(compile_options) is not CompileOptions:
+                raise TypeError("_compile_options must be a CompileOptions instance")
             default_index_vars = [
                 IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
             ]
@@ -1388,21 +1424,29 @@ class STensor:
 
             # print("\n\ncin_stmt: ", cin_stmt)
 
-            lowerer = CINLowerer(filter_zeros=True)
+            lowerer = CINLowerer(
+                filter_zeros=True,
+                compile_options=compile_options,
+            )
             lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-            llir_lowerer = LLIRLowerer()
+            llir_lowerer = LLIRLowerer(compile_options=compile_options)
             cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
             # print("to_sparse cpp_code:\n\n", cpp_code)
 
-            header_cpp_code = jit_preamble_text()
+            header_cpp_code = compile_options.build.preamble_source
 
             module = _load_kernel(
-                name=_kernel_name(header_cpp_code, cpp_code),
+                name=_kernel_name(
+                    header_cpp_code,
+                    cpp_code,
+                    compile_options=compile_options,
+                ),
                 cpp_sources=[header_cpp_code, cpp_code],
                 functions=["evaluate"],
-                extra_cflags=get_extra_cflags(),
-                extra_ldflags=get_extra_ldflags(),
+                extra_cflags=list(compile_options.build.extra_cflags),
+                extra_ldflags=list(compile_options.build.extra_ldflags),
+                compile_options=compile_options,
             )
 
             result_cpp = module.evaluate(
@@ -1428,7 +1472,12 @@ class STensor:
 
         return self
 
-    def change_mode_order(self, mode_order: List[int]) -> STensor:
+    def change_mode_order(
+        self,
+        mode_order: List[int],
+        *,
+        _compile_options: Optional[CompileOptions] = None,
+    ) -> STensor:
         """Relay out the tensor into a new logical mode order (transpose).
 
         Permutes the tensor's modes, updating storage and shape in place. A
@@ -1622,6 +1671,13 @@ class STensor:
             self._set_state(new_tensor.metadata, new_tensor.storage)
             return self
 
+        compile_options = (
+            CompileOptions.from_environment()
+            if _compile_options is None
+            else _compile_options
+        )
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("_compile_options must be a CompileOptions instance")
         default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
         if dim > len(default_index_vars):
             index_vars = [IndexVar(f"i{i}") for i in range(dim)]
@@ -1674,19 +1730,27 @@ class STensor:
             consumer=consumer_stmt,
         )
 
-        lowerer = CINLowerer(filter_zeros=True)
+        lowerer = CINLowerer(
+            filter_zeros=True,
+            compile_options=compile_options,
+        )
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-        llir_lowerer = LLIRLowerer()
+        llir_lowerer = LLIRLowerer(compile_options=compile_options)
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        header_cpp_code = jit_preamble_text()
+        header_cpp_code = compile_options.build.preamble_source
 
         module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
+            name=_kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            ),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+            extra_cflags=list(compile_options.build.extra_cflags),
+            extra_ldflags=list(compile_options.build.extra_ldflags),
+            compile_options=compile_options,
         )
 
         result_cpp = module.evaluate(

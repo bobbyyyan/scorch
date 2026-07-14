@@ -9,7 +9,6 @@ stored on CIN nodes.
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -35,6 +34,7 @@ from .cin import (
 )
 from .diagnostics import VerificationError
 from .identity import AccessId, IndexId, NodeId, SymbolId
+from .compile_options import CompileOptions
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -1045,17 +1045,27 @@ def verify_cin(cin: IndexStmt) -> CINAnalysis:
     return analysis
 
 
-_VERIFY_CIN_BY_DEFAULT = os.environ.get("SCORCH_VERIFY_CIN", "0") == "1"
 _VERIFY_CIN_CONTEXT: ContextVar[bool] = ContextVar(
     "scorch_verify_normalized_cin",
     default=False,
 )
 
 
+def get_full_cin_verification() -> bool:
+    """Return the debug verification override at the public boundary."""
+
+    enabled = _VERIFY_CIN_CONTEXT.get()
+    if type(enabled) is not bool:
+        raise TypeError("full CIN verification override must be a bool")
+    return enabled
+
+
 @contextmanager
 def full_cin_verification(enabled: bool = True) -> Iterator[None]:
     """Enable full CIN verification at compiler boundaries for tests/debug."""
 
+    if type(enabled) is not bool:
+        raise TypeError("full_cin_verification expects a bool")
     token = _VERIFY_CIN_CONTEXT.set(enabled)
     try:
         yield
@@ -1063,10 +1073,33 @@ def full_cin_verification(enabled: bool = True) -> Iterator[None]:
         _VERIFY_CIN_CONTEXT.reset(token)
 
 
-def verify_cin_if_enabled(cin: IndexStmt) -> Optional[CINAnalysis]:
+def _compile_options_at_cin_boundary(
+    compile_options: Optional[CompileOptions] = None,
+) -> CompileOptions:
+    """Snapshot process/debug policy once at a direct CIN boundary.
+
+    An explicit snapshot is already owned by an outer compilation and therefore
+    must not be combined with mutable context state again.
+    """
+
+    if compile_options is not None:
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("compile_options must be a CompileOptions snapshot")
+        return compile_options
+
+    return CompileOptions.from_environment()
+
+
+def verify_cin_if_enabled(
+    cin: IndexStmt, enabled: Optional[bool] = None
+) -> Optional[CINAnalysis]:
     """Verify only in explicit test/debug mode; production JIT stays cheap."""
 
-    if _VERIFY_CIN_BY_DEFAULT or _VERIFY_CIN_CONTEXT.get():
+    if enabled is None:
+        enabled = _compile_options_at_cin_boundary().verification.verify_cin
+    if type(enabled) is not bool:
+        raise TypeError("CIN verification policy must be a bool")
+    if enabled:
         return verify_cin(cin)
     return None
 
@@ -1077,7 +1110,9 @@ def _initialize_cin_clone(clone: object, node_id: NodeId) -> None:
     object.__setattr__(clone, "no_tile_list", [])
 
 
-def normalize_cin(cin: IndexStmt) -> IndexStmt:
+def normalize_cin(
+    cin: IndexStmt, compile_options: Optional[CompileOptions] = None
+) -> IndexStmt:
     """Detach authoritative CIN structure while preserving all stable IDs.
 
     The returned graph is still a mutable legacy CIN graph; only its ownership is
@@ -1087,7 +1122,8 @@ def normalize_cin(cin: IndexStmt) -> IndexStmt:
 
     if not isinstance(cin, IndexStmt):
         raise TypeError("normalize_cin expects an IndexStmt")
-    verify_cin_if_enabled(cin)
+    options = _compile_options_at_cin_boundary(compile_options)
+    verify_cin_if_enabled(cin, options.verification.verify_cin)
 
     index_memo: Dict[int, IndexVar] = {}
     tensor_memo: Dict[int, TensorVar] = {}

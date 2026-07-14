@@ -1,7 +1,10 @@
-from typing import List, TypeVar, Union, cast
+from typing import TYPE_CHECKING, List, Optional, TypeVar, Union, cast
 
 from . import llir
 from .diagnostics import CodegenError
+
+if TYPE_CHECKING:
+    from .compile_options import CompileOptions
 
 LLIR_NODE = TypeVar("LLIR_NODE", bound=llir.Node)
 
@@ -43,6 +46,23 @@ class LLIRLowerer:
     _PRIMARY_PRECEDENCE = 13
     _UNARY_OPERATORS = {"+", "-", "!", "~", "*", "&", "++", "--"}
 
+    def __init__(self, compile_options: Optional["CompileOptions"] = None) -> None:
+        """Bind code emission to the compilation's immutable options snapshot.
+
+        Standalone LLIR rendering remains available without constructing compiler
+        options. Production compilation paths pass the snapshot explicitly.
+        """
+
+        if compile_options is not None:
+            from .compile_options import CompileOptions
+
+            if type(compile_options) is not CompileOptions:
+                raise TypeError("compile_options must be a CompileOptions instance")
+        self.compile_options = compile_options
+        self.no_comments = (
+            not compile_options.emit_comments if compile_options is not None else False
+        )
+
     @staticmethod
     def _lower_typed_var(var: llir.Var) -> str:
         qualifier = "__restrict__ " if var.is_restrict else ""
@@ -56,6 +76,24 @@ class LLIRLowerer:
         no_comments: bool = False,
     ) -> str:
         if no_comments:
+            if self.compile_options is not None and self.compile_options.emit_comments:
+                from .diagnostics import (
+                    CompileOptionsDiagnostic,
+                    CompileOptionsError,
+                )
+
+                raise CompileOptionsError(
+                    (
+                        CompileOptionsDiagnostic(
+                            code="conflicting_emission_policy",
+                            field="no_comments",
+                            message=(
+                                "an explicit CompileOptions snapshot requires "
+                                "comment emission"
+                            ),
+                        ),
+                    )
+                )
             self.no_comments = True
 
         if isinstance(ir, str):

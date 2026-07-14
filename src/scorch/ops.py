@@ -19,15 +19,14 @@ from .compiler.cin import (
 )
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.cin_analysis import normalize_cin
+from .compiler.compile_options import CompileOptions
 from .compiler.codegen import LLIRLowerer
+from .compiler.diagnostics import CompileOptionsDiagnostic, CompileOptionsError
 from .compiler.loop_plan import ScheduledCIN
 from .compiler.scheduler import (
     Schedule,
     Scheduler,
-    _regblock_enabled,
-    _regblock_max_n,
     get_forced_schedule,
-    regblock_force,
 )
 from .exceptions import CompileSpecError, TensorTypeError, TensorValidationError
 from .format import TensorFormat, LevelFormat, LevelType
@@ -41,9 +40,6 @@ from .stensor import STensor, _finalize_generated_mode_indices
 from .utils import (
     parse_format,
     topo_sort_characters,
-    get_extra_cflags,
-    get_extra_ldflags,
-    jit_preamble_text,
     _kernel_name,
     _load_kernel,
 )
@@ -52,22 +48,114 @@ _kernel_cache = {}
 _einsum_dispatch_cache = {}
 
 
-def _effective_schedule(kwargs: dict) -> Optional[Schedule]:
-    """Resolve an explicit or context-forced compiler schedule."""
+def _requested_schedule(kwargs: dict) -> Optional[Schedule]:
+    """Resolve only the explicit public/internal schedule spelling."""
+
     public = kwargs.get("schedule")
     internal = kwargs.get("_schedule")
     if public is not None and internal is not None and public != internal:
         raise ValueError("schedule and _schedule specify different schedules")
     schedule = public if public is not None else internal
-    if schedule is None:
-        schedule = get_forced_schedule()
     if schedule is not None and not isinstance(schedule, Schedule):
         raise TypeError("schedule must be a scorch.compiler.scheduler.Schedule")
     return schedule
 
 
+def _effective_schedule(kwargs: dict) -> Optional[Schedule]:
+    """Resolve an explicit or context-forced compiler schedule."""
+
+    schedule = _requested_schedule(kwargs)
+    return schedule if schedule is not None else get_forced_schedule()
+
+
+_UNRESOLVED_SCHEDULE = object()
+
+
+def _compile_options_from_kwargs(
+    kwargs: dict,
+    *,
+    resolved_schedule: object = _UNRESOLVED_SCHEDULE,
+) -> CompileOptions:
+    """Create or validate the one snapshot owned by a public compile call."""
+
+    provided = kwargs.get("_compile_options")
+    requested = _requested_schedule(kwargs)
+    if provided is not None:
+        if type(provided) is not CompileOptions:
+            raise TypeError("_compile_options must be a CompileOptions instance")
+        expected = (
+            requested
+            if resolved_schedule is _UNRESOLVED_SCHEDULE
+            else resolved_schedule
+        )
+        if expected is not None and provided.requested_schedule != expected:
+            raise CompileOptionsError(
+                (
+                    CompileOptionsDiagnostic(
+                        code="conflicting_schedule",
+                        field="requested_schedule",
+                        message=(
+                            "_compile_options and the requested schedule disagree"
+                        ),
+                    ),
+                )
+            )
+        return provided
+
+    if resolved_schedule is _UNRESOLVED_SCHEDULE:
+        return CompileOptions.from_environment(requested_schedule=requested)
+    return CompileOptions.from_environment(
+        requested_schedule=cast(Optional[Schedule], resolved_schedule),
+        forced_schedule=None,
+    )
+
+
+def _matmul_compile_policy(
+    kwargs: dict,
+) -> Tuple[Optional[CompileOptions], Optional[Schedule]]:
+    """Resolve an existing snapshot or defer creation until compilation starts."""
+
+    if kwargs.get("_compile_options") is None:
+        return None, _effective_schedule(kwargs)
+    options = _compile_options_from_kwargs(kwargs)
+    return options, options.requested_schedule
+
+
+def _ensure_compile_options(
+    kwargs: dict,
+    effective_schedule: Optional[Schedule],
+    compile_options: Optional[CompileOptions],
+) -> CompileOptions:
+    """Create the one deferred matmul snapshot at its first compiler boundary."""
+
+    if compile_options is not None:
+        return compile_options
+    return _compile_options_from_kwargs(
+        kwargs,
+        resolved_schedule=effective_schedule,
+    )
+
+
 def _schedule_cache_key(schedule: Optional[Schedule]) -> Optional[str]:
     return schedule.cache_key if schedule is not None else None
+
+
+def _reject_unsupported_requested_schedule(
+    compile_options: CompileOptions,
+    boundary: str,
+) -> None:
+    """Fail closed when a compile entry cannot apply a requested schedule."""
+
+    if compile_options.requested_schedule is not None:
+        raise CompileOptionsError(
+            (
+                CompileOptionsDiagnostic(
+                    code="unsupported_requested_schedule",
+                    field="requested_schedule",
+                    message=f"{boundary} does not support explicit scheduling",
+                ),
+            )
+        )
 
 
 def _einsum_cache_key(
@@ -76,6 +164,7 @@ def _einsum_cache_key(
     output_format: Any,
     output_mode_order: Any,
     schedule: Optional[Schedule],
+    compile_options: Optional[CompileOptions] = None,
 ) -> tuple:
     """Build the early dispatch key, including every scheduling decision."""
 
@@ -106,6 +195,7 @@ def _einsum_cache_key(
         str(output_format) if output_format is not None else None,
         tuple(output_mode_order) if output_mode_order else None,
         _schedule_cache_key(schedule),
+        compile_options.cache_key if compile_options is not None else None,
     )
 
 
@@ -113,6 +203,7 @@ def _codegen_kernel_cache_key(
     cin: Union[IndexStmt, ScheduledCIN],
     post_ops: Any,
     schedule: Optional[Schedule],
+    compile_options: Optional[CompileOptions] = None,
 ) -> str:
     """Cache a lowered CIN without allowing dtype/schedule fields to alias."""
     normalized_cin = cin.normalized_cin if isinstance(cin, ScheduledCIN) else cin
@@ -135,6 +226,8 @@ def _codegen_kernel_cache_key(
         key += f"|post_ops:{post_ops}"
     if schedule is not None:
         key += f"|schedule:{schedule.cache_key}"
+    if compile_options is not None:
+        key += f"|compile_options:{compile_options.cache_fingerprint}"
     return key
 
 
@@ -165,13 +258,18 @@ def _logical_index_sizes(
 
 
 def _with_compiler_mode_order(
-    tensor: Union[STensor, TensorSpec], mode_order: Sequence[int]
+    tensor: Union[STensor, TensorSpec],
+    mode_order: Sequence[int],
+    compile_options: CompileOptions,
 ) -> Union[STensor, TensorSpec]:
     """Relayout a runtime tensor or functionally update a compile-only spec."""
     if isinstance(tensor, TensorSpec):
         return tensor.with_mode_order(mode_order)
     result = tensor.copy()
-    result.change_mode_order(list(mode_order))
+    result.change_mode_order(
+        list(mode_order),
+        _compile_options=compile_options,
+    )
     return result
 
 
@@ -267,6 +365,8 @@ def spmv(
     >>> torch.allclose(y, A.to_torch() @ x, atol=1e-3, rtol=1e-3)
     True
     """
+    compile_options = _compile_options_from_kwargs(kwargs)
+    _reject_unsupported_requested_schedule(compile_options, "spmv")
     if output_format is None:
         output_format = parse_format("d")
     elif not isinstance(output_format, TensorFormat):
@@ -301,20 +401,25 @@ def spmv(
         ),
     )
 
-    lowerer = CINLowerer()
+    lowerer = CINLowerer(compile_options=compile_options)
     lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-    llir_lowerer = LLIRLowerer()
+    llir_lowerer = LLIRLowerer(compile_options=compile_options)
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-    header_cpp_code = jit_preamble_text()
+    header_cpp_code = compile_options.build.preamble_source
 
     # start_time = time.time()
     module = _load_kernel(
-        name=_kernel_name(header_cpp_code, cpp_code),
+        name=_kernel_name(
+            header_cpp_code,
+            cpp_code,
+            compile_options=compile_options,
+        ),
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=get_extra_cflags(),
-        extra_ldflags=get_extra_ldflags(),
+        extra_cflags=list(compile_options.build.extra_cflags),
+        extra_ldflags=list(compile_options.build.extra_ldflags),
+        compile_options=compile_options,
     )
     # end_time = time.time()
 
@@ -405,10 +510,16 @@ def matmul_wksp(
     >>> torch.allclose(C.to_torch(), A.to_torch() @ B.to_torch(), atol=1e-3, rtol=1e-3)
     True
     """
+    compile_options = _compile_options_from_kwargs(kwargs)
+    _reject_unsupported_requested_schedule(compile_options, "matmul_wksp")
     if isinstance(a, torch.Tensor):
-        a = STensor.from_torch(a).to_sparse()
+        a = STensor.from_torch(a).to_sparse(
+            _compile_options=compile_options,
+        )
     if isinstance(b, torch.Tensor):
-        b = STensor.from_torch(b).to_sparse()
+        b = STensor.from_torch(b).to_sparse(
+            _compile_options=compile_options,
+        )
 
     if output_format is None:
         output_format = parse_format("ds")
@@ -424,6 +535,7 @@ def matmul_wksp(
         str(b.dtype),
         str(output_format),
         result_shape,
+        compile_options.cache_key,
     )
     if not hasattr(matmul_wksp, "_module_cache"):
         matmul_wksp._module_cache = {}
@@ -470,19 +582,24 @@ def matmul_wksp(
             ),
         )
 
-        lowerer = CINLowerer()
+        lowerer = CINLowerer(compile_options=compile_options)
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-        llir_lowerer = LLIRLowerer()
+        llir_lowerer = LLIRLowerer(compile_options=compile_options)
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
-        header_cpp_code = jit_preamble_text()
+        header_cpp_code = compile_options.build.preamble_source
 
         module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
+            name=_kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            ),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+            extra_cflags=list(compile_options.build.extra_cflags),
+            extra_ldflags=list(compile_options.build.extra_ldflags),
+            compile_options=compile_options,
         )
         matmul_wksp._module_cache[_cache_key] = module
 
@@ -625,7 +742,7 @@ def matmul(
             "call_function", matmul, (a, b), kwargs
         )  # type: ignore[return-value]
 
-    effective_schedule = _effective_schedule(kwargs)
+    compile_options, effective_schedule = _matmul_compile_policy(kwargs)
 
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         if (
@@ -678,7 +795,15 @@ def matmul(
         if output_format.is_dense():
             return result_torch
 
-        return STensor.from_torch(result_torch).to_sparse(output_format)
+        compile_options = _ensure_compile_options(
+            kwargs,
+            effective_schedule,
+            compile_options,
+        )
+        return STensor.from_torch(result_torch).to_sparse(
+            output_format,
+            _compile_options=compile_options,
+        )
 
     # Never silently swallow a codegen schedule in a prebuilt dispatch.
     use_cache = kwargs.get("use_cache", True) and effective_schedule is None
@@ -698,7 +823,15 @@ def matmul(
             not a.format.is_dense()
         ) and a.storage.index.mode_order != default_mode_order:
             a = a.copy()
-            a.change_mode_order(default_mode_order)
+            compile_options = _ensure_compile_options(
+                kwargs,
+                effective_schedule,
+                compile_options,
+            )
+            a.change_mode_order(
+                default_mode_order,
+                _compile_options=compile_options,
+            )
 
         if use_cache:
             resolved = resolve_prebuilt_matmul(
@@ -726,6 +859,12 @@ def matmul(
         spmv_kwargs = dict(kwargs)
         if "format" in spmv_kwargs and "output_format" not in spmv_kwargs:
             spmv_kwargs["output_format"] = spmv_kwargs.pop("format")
+        compile_options = _ensure_compile_options(
+            kwargs,
+            effective_schedule,
+            compile_options,
+        )
+        spmv_kwargs["_compile_options"] = compile_options
         return spmv(a, b, **spmv_kwargs)
 
     # Normalize sparse 2D operands to canonical mode order before dispatch.
@@ -741,10 +880,26 @@ def matmul(
         if has_non_default_mode_order and has_sparse_input:
             if a.storage.index.mode_order != default_mode_order:
                 a = a.copy()
-                a.change_mode_order(default_mode_order)
+                compile_options = _ensure_compile_options(
+                    kwargs,
+                    effective_schedule,
+                    compile_options,
+                )
+                a.change_mode_order(
+                    default_mode_order,
+                    _compile_options=compile_options,
+                )
             if b.storage.index.mode_order != default_mode_order:
                 b = b.copy()
-                b.change_mode_order(default_mode_order)
+                compile_options = _ensure_compile_options(
+                    kwargs,
+                    effective_schedule,
+                    compile_options,
+                )
+                b.change_mode_order(
+                    default_mode_order,
+                    _compile_options=compile_options,
+                )
 
     if use_cache:
         resolved = resolve_prebuilt_matmul(a, b, output_format=requested_output_format)
@@ -813,8 +968,20 @@ def matmul(
                 value=result_cpp.storage.value,
             )
         else:
+            compile_options = _ensure_compile_options(
+                kwargs,
+                effective_schedule,
+                compile_options,
+            )
+            einsum_kwargs["_compile_options"] = compile_options
             result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
     else:
+        compile_options = _ensure_compile_options(
+            kwargs,
+            effective_schedule,
+            compile_options,
+        )
+        einsum_kwargs["_compile_options"] = compile_options
         result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
 
     if isinstance(result, STensor) and result.format.is_dense():
@@ -1264,25 +1431,25 @@ def sparse_linear(
 # geomean 0.89), wide-k byte-identical else-arm PARITY. This is DECOUPLED from the
 # scheduler's `SCORCH_REGBLOCK` env (which stays default OFF, so a direct
 # `Scheduler.auto_schedule` caller — and the two schedule-shape tests — is unchanged):
-# `_build_regblock_dual_path` forces the tiling LOCALLY via `regblock_force`, so it
+# `_build_regblock_dual_path` derives two LOCAL immutable option snapshots, so it
 # needs nothing from the global env. Escape hatch: `SCORCH_REGBLOCK_DUAL=0` restores
 # the pre-flip single baseline path (also byte-identical to before the whole feature).
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _regblock_dual_active() -> bool:
+def _regblock_dual_active(compile_options: CompileOptions) -> bool:
     """Whether `einsum` emits the register-block dual-path kernel for the qualifying
     pattern (dense output, sparse contraction, a tileable free dim).
 
     Default TRUE post-validation (see the module comment above). Set
     ``SCORCH_REGBLOCK_DUAL=0`` to restore the pre-flip single baseline path. This is
-    intentionally SEPARATE from the scheduler's ``SCORCH_REGBLOCK`` / ``_regblock_enabled()``
-    (default OFF): the dual builder forces its two lowerings locally, so flipping the
+    intentionally SEPARATE from the scheduler's ``SCORCH_REGBLOCK`` policy
+    (default OFF): the dual builder configures its two lowerings explicitly, so flipping the
     per-op default here leaves every direct ``auto_schedule`` caller untouched. When the
     dual-path does not apply (non-qualifying pattern → `_build_regblock_dual_path`
     returns None), einsum falls back to the byte-identical baseline single path.
     """
-    return os.environ.get("SCORCH_REGBLOCK_DUAL", "1") != "0"
+    return compile_options.regblock_dual
 
 
 def _find_top_compute_loop(
@@ -1364,7 +1531,9 @@ def _stitch_regblock_dual_path(
 
 
 def _build_regblock_dual_path(
-    cin_unscheduled: IndexStmt, post_ops: Any
+    cin_unscheduled: IndexStmt,
+    post_ops: Any,
+    compile_options: Optional[CompileOptions] = None,
 ) -> Optional[Tuple[llir.Function, str]]:
     """Build the Phase 2b dual-path kernel from an unscheduled CIN.
 
@@ -1373,29 +1542,57 @@ def _build_regblock_dual_path(
     or None when the register-block path doesn't apply (schedules identical) or the
     stitch can't be formed safely — the caller then falls back to the baseline path.
     """
+    if compile_options is None:
+        compile_options = CompileOptions.from_environment()
+    elif type(compile_options) is not CompileOptions:
+        raise TypeError("compile_options must be a CompileOptions instance")
+
     if not Scheduler._has_dense_output(cin_unscheduled):
         return None
 
-    with regblock_force(False):
-        cin_base = Scheduler.auto_schedule(cin_unscheduled)
-    with regblock_force(True):
-        cin_rb = Scheduler.auto_schedule(cin_unscheduled)
+    cin_base = Scheduler._auto_schedule_regblock_arm(
+        cin_unscheduled,
+        enabled=False,
+        compile_options=compile_options,
+    )
+    cin_rb = Scheduler._auto_schedule_regblock_arm(
+        cin_unscheduled,
+        enabled=True,
+        compile_options=compile_options,
+    )
     if str(cin_base) == str(cin_rb):
         # Register-block didn't change the schedule (pattern doesn't qualify) ->
         # nothing to branch on; let the caller use the plain baseline path.
         return None
 
-    with regblock_force(False):
-        fn_base = CINLowerer(post_ops=post_ops)._lower_owned_IndexStmt(cin_base)
-    with regblock_force(True):
-        fn_rb = CINLowerer(post_ops=post_ops)._lower_owned_IndexStmt(cin_rb)
+    fn_base = CINLowerer(
+        post_ops=post_ops,
+        compile_options=compile_options,
+    )._lower_owned_IndexStmt(cin_base)
+    fn_rb = CINLowerer(
+        post_ops=post_ops,
+        compile_options=compile_options,
+    )._lower_owned_IndexStmt(cin_rb)
     if not (isinstance(fn_base, llir.Function) and isinstance(fn_rb, llir.Function)):
         return None
 
-    stitched = _stitch_regblock_dual_path(fn_rb, fn_base, _regblock_max_n())
+    stitched = _stitch_regblock_dual_path(
+        fn_rb,
+        fn_base,
+        compile_options.scheduler.regblock_max_n,
+    )
     if stitched is None:
         return None
-    return stitched, _codegen_kernel_cache_key(cin_rb, post_ops, None) + "|rbdual"
+    return (
+        stitched,
+        _codegen_kernel_cache_key(
+            cin_rb,
+            post_ops,
+            None,
+            compile_options=compile_options,
+        )
+        + "|rbdual",
+    )
 
 
 def einsum(
@@ -1506,6 +1703,8 @@ def einsum(
     #     if tensor_name_counts[tensor.name] > 1:
     #         tensor.name = tensor.name + str(i)
 
+    compile_options = _compile_options_from_kwargs(kwargs)
+
     # Convert all torch.Tensor inputs to STensor early
     tensors = tuple(
         STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors
@@ -1596,7 +1795,7 @@ def einsum(
         raise CompileSpecError(
             "TensorSpec has no runtime payload; pass compile_only=True or use STensor"
         )
-    effective_schedule = _effective_schedule(kwargs)
+    effective_schedule = compile_options.requested_schedule
 
     # ── Prebuilt SDDMM dispatch ────────────────────────────────────────
     # Pattern: 'ij,ik,jk->ij' with S(COO), A(dense), B(dense)
@@ -1654,6 +1853,7 @@ def einsum(
             kwargs.get("format", None),
             output_mode_order,
             effective_schedule,
+            compile_options,
         )
         _cached = _einsum_dispatch_cache.get(_dispatch_key)
         if _cached is not None:
@@ -1669,7 +1869,11 @@ def einsum(
             cached_tensors = list(tensors)
             for _index, (_t, _mo) in enumerate(zip(cached_tensors, _input_mos)):
                 if list(_t.mode_order) != _mo:
-                    cached_tensors[_index] = _with_compiler_mode_order(_t, _mo)
+                    cached_tensors[_index] = _with_compiler_mode_order(
+                        _t,
+                        _mo,
+                        compile_options,
+                    )
             tensors = tuple(cached_tensors)
 
             # Compute result shape from expression + current tensor shapes
@@ -1708,7 +1912,10 @@ def einsum(
                 kwargs["time_dict"]["eval_time"] = _eval_time
 
             if _temp_mo:
-                _result.change_mode_order(_final_mo)
+                _result.change_mode_order(
+                    _final_mo,
+                    _compile_options=compile_options,
+                )
 
             return _result
     # ── End fast dispatch ────────────────────────────────────────────────
@@ -1760,7 +1967,9 @@ def einsum(
             if s in str_to_mode:
                 new_mode_order.append(str_to_mode[s])
         tensors[tensor_index] = _with_compiler_mode_order(
-            tensors[tensor_index], new_mode_order
+            tensors[tensor_index],
+            new_mode_order,
+            compile_options,
         )
     tensors = tuple(tensors)
 
@@ -1944,7 +2153,10 @@ def einsum(
             cin_stmt, effective_schedule.loop_order
         )
     else:
-        selected_loop_order = Scheduler.select_loop_order(cin_stmt)
+        selected_loop_order = Scheduler.select_loop_order(
+            cin_stmt,
+            costs=compile_options.scheduler.cost_model,
+        )
     selected_loop_order_names = [index_var.name for index_var in selected_loop_order]
     for tensor_index, input_index_str in enumerate(input_index_strs):
         desired_index_strs = [
@@ -1957,7 +2169,9 @@ def einsum(
         ]
         if list(tensors[tensor_index].mode_order) != desired_mode_order:
             tensors[tensor_index] = _with_compiler_mode_order(
-                tensors[tensor_index], desired_mode_order
+                tensors[tensor_index],
+                desired_mode_order,
+                compile_options,
             )
         tensor_vars[tensor_index].shape = tensors[tensor_index].shape
         if tensor_vars[tensor_index].mode_order != desired_mode_order:
@@ -1977,25 +2191,52 @@ def einsum(
     # When the pattern doesn't qualify, `_build_regblock_dual_path` returns None and
     # the else-branch below emits the byte-identical baseline (unchanged from before).
     _dual_llir: Optional[llir.Function] = None
-    if effective_schedule is None and _regblock_dual_active() and _post_ops is None:
-        _dual = _build_regblock_dual_path(cin_stmt, _post_ops)
+    if (
+        effective_schedule is None
+        and _regblock_dual_active(compile_options)
+        and _post_ops is None
+    ):
+        _dual = _build_regblock_dual_path(
+            cin_stmt,
+            _post_ops,
+            compile_options=compile_options,
+        )
         if _dual is not None:
             _dual_llir, _kernel_cache_key = _dual
             _kernel_cache_key = _kernel_cache_key + _cache_key_suffix
 
     if _dual_llir is None:
         if effective_schedule is not None:
-            lowering_stmt = Scheduler.apply_schedule(cin_stmt, effective_schedule)
+            lowering_stmt = Scheduler.apply_schedule(
+                cin_stmt,
+                effective_schedule,
+                compile_options=compile_options,
+            )
         # Default single path. When regblock is on but the dual-path wasn't
         # applicable, force it OFF here so we never ship the wide-k-regressing
         # single-path tiled kernel as a silent fallback.
-        elif _regblock_enabled():
-            with regblock_force(False):
-                lowering_stmt = cast(IndexStmt, Scheduler.auto_schedule(cin_stmt))
+        elif compile_options.scheduler.regblock_enabled:
+            lowering_stmt = cast(
+                IndexStmt,
+                Scheduler._auto_schedule_regblock_arm(
+                    cin_stmt,
+                    enabled=False,
+                    compile_options=compile_options,
+                ),
+            )
         else:
-            lowering_stmt = cast(IndexStmt, Scheduler.auto_schedule(cin_stmt))
+            lowering_stmt = cast(
+                IndexStmt,
+                Scheduler.auto_schedule(
+                    cin_stmt,
+                    compile_options=compile_options,
+                ),
+            )
         _kernel_cache_key = _codegen_kernel_cache_key(
-            lowering_stmt, _post_ops, effective_schedule
+            lowering_stmt,
+            _post_ops,
+            effective_schedule,
+            compile_options=compile_options,
         )
 
     # print("Auto-scheduled CIN:\n", lowering_stmt)
@@ -2007,23 +2248,31 @@ def einsum(
         if _dual_llir is not None:
             lowered_llir: Union[llir.Stmt, List[llir.Stmt]] = _dual_llir
         else:
-            lowerer = CINLowerer(post_ops=_post_ops)
+            lowerer = CINLowerer(
+                post_ops=_post_ops,
+                compile_options=compile_options,
+            )
             lowered_llir = lowerer._lower_owned_IndexStmt(lowering_stmt)
 
-        llir_lowerer = LLIRLowerer()
+        llir_lowerer = LLIRLowerer(compile_options=compile_options)
 
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
 
         # print("\n\n", cpp_code)
 
-        header_cpp_code = jit_preamble_text()
+        header_cpp_code = compile_options.build.preamble_source
 
         module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
+            name=_kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            ),
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+            extra_cflags=list(compile_options.build.extra_cflags),
+            extra_ldflags=list(compile_options.build.extra_ldflags),
+            compile_options=compile_options,
         )
 
         _kernel_cache[_kernel_cache_key] = module
@@ -2087,7 +2336,10 @@ def einsum(
 
     # Convert to final mode order if it differs from temporary mode order
     if temp_mode_order:
-        result.change_mode_order(final_mode_order)
+        result.change_mode_order(
+            final_mode_order,
+            _compile_options=compile_options,
+        )
 
     return result
 
@@ -2095,6 +2347,7 @@ def einsum(
 def _align_mode_orders_to_loop_order(
     cin_stmt: IndexStmt,
     args: tuple,
+    compile_options: CompileOptions,
 ) -> tuple:
     """Align input tensor mode orders to the CIN loop order.
 
@@ -2136,7 +2389,10 @@ def _align_mode_orders_to_loop_order(
             tv.mode_order = desired_mode_order
             if stensor.has_index and stensor.shape is not None:
                 aligned = stensor.copy()
-                aligned.change_mode_order(desired_mode_order)
+                aligned.change_mode_order(
+                    desired_mode_order,
+                    _compile_options=compile_options,
+                )
                 aligned_args[position] = aligned
 
     # 3. Also align the output tensor
@@ -2183,8 +2439,14 @@ def lower_and_exec_cin(
     STensor
         Output tensor. The output format is hard-coded to ``"dd"`` (dense).
     """
-    cin_stmt = normalize_cin(cin_stmt)
-    args = _align_mode_orders_to_loop_order(cin_stmt, args)
+    compile_options = _compile_options_from_kwargs(kwargs)
+    _reject_unsupported_requested_schedule(compile_options, "lower_and_exec_cin")
+    cin_stmt = normalize_cin(cin_stmt, compile_options=compile_options)
+    args = _align_mode_orders_to_loop_order(
+        cin_stmt,
+        args,
+        compile_options,
+    )
 
     rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
     if len(rhs_tensor_vars) != len(args):
@@ -2208,19 +2470,24 @@ def lower_and_exec_cin(
             tensor_var.dtype = output_dtype
 
     # Lower to LLIR
-    lowerer = CINLowerer()
+    lowerer = CINLowerer(compile_options=compile_options)
     lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
-    llir_lowerer = LLIRLowerer()
+    llir_lowerer = LLIRLowerer(compile_options=compile_options)
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
     # print(cpp_code)
-    header_cpp_code = jit_preamble_text()
+    header_cpp_code = compile_options.build.preamble_source
 
     module = _load_kernel(
-        name=_kernel_name(header_cpp_code, cpp_code),
+        name=_kernel_name(
+            header_cpp_code,
+            cpp_code,
+            compile_options=compile_options,
+        ),
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
-        extra_cflags=get_extra_cflags(),
-        extra_ldflags=get_extra_ldflags(),
+        extra_cflags=list(compile_options.build.extra_cflags),
+        extra_ldflags=list(compile_options.build.extra_ldflags),
+        compile_options=compile_options,
     )
 
     module_args: List[Any] = [result_shape]
