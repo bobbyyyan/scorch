@@ -35,6 +35,7 @@ from .cin import (
 from .diagnostics import VerificationError
 from .identity import AccessId, IndexId, NodeId, SymbolId
 from .compile_options import CompileOptions
+from .stage_timing import CompilerStageId, CompilerStageTiming
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -1119,7 +1120,9 @@ def _initialize_cin_clone(clone: object, node_id: NodeId) -> None:
 
 
 def normalize_cin(
-    cin: IndexStmt, compile_options: Optional[CompileOptions] = None
+    cin: IndexStmt,
+    compile_options: Optional[CompileOptions] = None,
+    stage_timing: Optional[CompilerStageTiming] = None,
 ) -> IndexStmt:
     """Detach authoritative CIN structure while preserving all stable IDs.
 
@@ -1131,6 +1134,14 @@ def normalize_cin(
     if not isinstance(cin, IndexStmt):
         raise TypeError("normalize_cin expects an IndexStmt")
     options = _compile_options_at_cin_boundary(compile_options)
+    stage_token = (
+        stage_timing.begin(
+            CompilerStageId.CIN_NORMALIZATION,
+            compile_options=options,
+        )
+        if stage_timing is not None
+        else None
+    )
     verify_cin_if_enabled(cin, options.verification.verify_cin)
 
     index_memo: Dict[int, IndexVar] = {}
@@ -1274,7 +1285,10 @@ def normalize_cin(
             return assign_clone
         raise TypeError(f"unsupported CIN statement {type(stmt).__name__}")
 
-    return clone_stmt(cin)
+    normalized = clone_stmt(cin)
+    if stage_token is not None and stage_timing is not None:
+        stage_timing.commit(stage_token)
+    return normalized
 
 
 def canonical_cin_dump(cin: IndexStmt) -> str:

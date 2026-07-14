@@ -18,6 +18,7 @@ from .compiler.cin import (
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.compile_options import CompileOptions
 from .compiler.codegen import LLIRLowerer
+from .compiler.stage_timing import CompilerStageId, CompilerStageTiming
 from .exceptions import (
     TensorIndexError,
     TensorLayoutError,
@@ -33,6 +34,24 @@ from .utils import (
     _kernel_name,
     _load_kernel,
 )
+
+
+def _stage_timing_at_boundary(
+    stage_timing: Optional[CompilerStageTiming],
+    compile_options: CompileOptions,
+) -> CompilerStageTiming:
+    """Create or validate the one timing owner paired with the one snapshot."""
+
+    if stage_timing is not None:
+        if type(stage_timing) is not CompilerStageTiming:
+            raise TypeError("_stage_timing must be a CompilerStageTiming instance")
+        if stage_timing.compile_options is not compile_options:
+            raise TypeError(
+                "_stage_timing must retain this compilation's exact "
+                "CompileOptions snapshot"
+            )
+        return stage_timing
+    return CompilerStageTiming(compile_options=compile_options)
 
 
 def _finalize_generated_mode_indices(
@@ -526,6 +545,11 @@ class STensor:
                 f"{self.logical_shape} and {other.logical_shape}"
             )
         compile_options = CompileOptions.from_environment()
+        stage_timing = CompilerStageTiming(compile_options=compile_options)
+        frontend_token = stage_timing.begin(
+            CompilerStageId.FRONTEND_CONSTRUCTION,
+            compile_options=compile_options,
+        )
 
         # Scheduling must not mutate the caller's right-hand operand.
         if self.storage.index.mode_order != other.storage.index.mode_order:
@@ -572,21 +596,36 @@ class STensor:
         for index_var in reversed(ordered_index_vars):
             cin_stmt = ForAll(index_var, cin_stmt)
 
-        lowerer = CINLowerer(compile_options=compile_options)
+        stage_timing.commit(frontend_token)
+        lowerer = CINLowerer(
+            compile_options=compile_options,
+            stage_timing=stage_timing,
+        )
         lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
         llir_lowerer = LLIRLowerer(compile_options=compile_options)
+        cpp_token = stage_timing.begin(
+            CompilerStageId.CPP_GENERATION,
+            compile_options=compile_options,
+        )
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        stage_timing.commit(cpp_token)
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
         header_cpp_code = compile_options.build.preamble_source
 
+        kernel_name_token = stage_timing.begin(
+            CompilerStageId.KERNEL_NAME_ASSEMBLY,
+            compile_options=compile_options,
+        )
+        kernel_name = _kernel_name(
+            header_cpp_code,
+            cpp_code,
+            compile_options=compile_options,
+        )
+        stage_timing.commit(kernel_name_token)
         module = _load_kernel(
-            name=_kernel_name(
-                header_cpp_code,
-                cpp_code,
-                compile_options=compile_options,
-            ),
+            name=kernel_name,
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=list(compile_options.build.extra_cflags),
@@ -1121,6 +1160,7 @@ class STensor:
         in_place: bool = False,
         *,
         _compile_options: Optional[CompileOptions] = None,
+        _stage_timing: Optional[CompilerStageTiming] = None,
     ) -> STensor:
         """Densify to an all-dense ``STensor`` (stays within Scorch).
 
@@ -1170,6 +1210,11 @@ class STensor:
         )
         if type(compile_options) is not CompileOptions:
             raise TypeError("_compile_options must be a CompileOptions instance")
+        stage_timing = _stage_timing_at_boundary(_stage_timing, compile_options)
+        frontend_token = stage_timing.begin(
+            CompilerStageId.FRONTEND_CONSTRUCTION,
+            compile_options=compile_options,
+        )
 
         default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
 
@@ -1231,24 +1276,37 @@ class STensor:
         for index_var in reversed(index_vars):
             cin_stmt = ForAll(index_var, cin_stmt)
 
+        stage_timing.commit(frontend_token)
         lowerer = CINLowerer(
             filter_zeros=True,
             compile_options=compile_options,
+            stage_timing=stage_timing,
         )
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
         llir_lowerer = LLIRLowerer(compile_options=compile_options)
+        cpp_token = stage_timing.begin(
+            CompilerStageId.CPP_GENERATION,
+            compile_options=compile_options,
+        )
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        stage_timing.commit(cpp_token)
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
         header_cpp_code = compile_options.build.preamble_source
 
+        kernel_name_token = stage_timing.begin(
+            CompilerStageId.KERNEL_NAME_ASSEMBLY,
+            compile_options=compile_options,
+        )
+        kernel_name = _kernel_name(
+            header_cpp_code,
+            cpp_code,
+            compile_options=compile_options,
+        )
+        stage_timing.commit(kernel_name_token)
         module = _load_kernel(
-            name=_kernel_name(
-                header_cpp_code,
-                cpp_code,
-                compile_options=compile_options,
-            ),
+            name=kernel_name,
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=list(compile_options.build.extra_cflags),
@@ -1287,6 +1345,7 @@ class STensor:
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
         *,
         _compile_options: Optional[CompileOptions] = None,
+        _stage_timing: Optional[CompilerStageTiming] = None,
     ) -> STensor:
         """Compress to a sparse ``STensor``, mutating in place.
 
@@ -1362,6 +1421,11 @@ class STensor:
             )
             if type(compile_options) is not CompileOptions:
                 raise TypeError("_compile_options must be a CompileOptions instance")
+            stage_timing = _stage_timing_at_boundary(_stage_timing, compile_options)
+            frontend_token = stage_timing.begin(
+                CompilerStageId.FRONTEND_CONSTRUCTION,
+                compile_options=compile_options,
+            )
             default_index_vars = [
                 IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
             ]
@@ -1424,24 +1488,37 @@ class STensor:
 
             # print("\n\ncin_stmt: ", cin_stmt)
 
+            stage_timing.commit(frontend_token)
             lowerer = CINLowerer(
                 filter_zeros=True,
                 compile_options=compile_options,
+                stage_timing=stage_timing,
             )
             lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
             llir_lowerer = LLIRLowerer(compile_options=compile_options)
+            cpp_token = stage_timing.begin(
+                CompilerStageId.CPP_GENERATION,
+                compile_options=compile_options,
+            )
             cpp_code = llir_lowerer.lower_llir(lowered_llir)
+            stage_timing.commit(cpp_token)
 
             # print("to_sparse cpp_code:\n\n", cpp_code)
 
             header_cpp_code = compile_options.build.preamble_source
 
+            kernel_name_token = stage_timing.begin(
+                CompilerStageId.KERNEL_NAME_ASSEMBLY,
+                compile_options=compile_options,
+            )
+            kernel_name = _kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            )
+            stage_timing.commit(kernel_name_token)
             module = _load_kernel(
-                name=_kernel_name(
-                    header_cpp_code,
-                    cpp_code,
-                    compile_options=compile_options,
-                ),
+                name=kernel_name,
                 cpp_sources=[header_cpp_code, cpp_code],
                 functions=["evaluate"],
                 extra_cflags=list(compile_options.build.extra_cflags),
@@ -1477,6 +1554,7 @@ class STensor:
         mode_order: List[int],
         *,
         _compile_options: Optional[CompileOptions] = None,
+        _stage_timing: Optional[CompilerStageTiming] = None,
     ) -> STensor:
         """Relay out the tensor into a new logical mode order (transpose).
 
@@ -1678,6 +1756,11 @@ class STensor:
         )
         if type(compile_options) is not CompileOptions:
             raise TypeError("_compile_options must be a CompileOptions instance")
+        stage_timing = _stage_timing_at_boundary(_stage_timing, compile_options)
+        frontend_token = stage_timing.begin(
+            CompilerStageId.FRONTEND_CONSTRUCTION,
+            compile_options=compile_options,
+        )
         default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
         if dim > len(default_index_vars):
             index_vars = [IndexVar(f"i{i}") for i in range(dim)]
@@ -1730,22 +1813,35 @@ class STensor:
             consumer=consumer_stmt,
         )
 
+        stage_timing.commit(frontend_token)
         lowerer = CINLowerer(
             filter_zeros=True,
             compile_options=compile_options,
+            stage_timing=stage_timing,
         )
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
         llir_lowerer = LLIRLowerer(compile_options=compile_options)
+        cpp_token = stage_timing.begin(
+            CompilerStageId.CPP_GENERATION,
+            compile_options=compile_options,
+        )
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        stage_timing.commit(cpp_token)
 
         header_cpp_code = compile_options.build.preamble_source
 
+        kernel_name_token = stage_timing.begin(
+            CompilerStageId.KERNEL_NAME_ASSEMBLY,
+            compile_options=compile_options,
+        )
+        kernel_name = _kernel_name(
+            header_cpp_code,
+            cpp_code,
+            compile_options=compile_options,
+        )
+        stage_timing.commit(kernel_name_token)
         module = _load_kernel(
-            name=_kernel_name(
-                header_cpp_code,
-                cpp_code,
-                compile_options=compile_options,
-            ),
+            name=kernel_name,
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=list(compile_options.build.extra_cflags),

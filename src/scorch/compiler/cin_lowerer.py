@@ -52,6 +52,7 @@ from .llir_pass_manager import (
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
 )
+from .stage_timing import CompilerStageId, CompilerStageTiming
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -537,6 +538,7 @@ class CINLowerer:
         post_ops: Optional[PostOps] = None,
         llir_pass_options: Optional[LLIRPassOptions] = None,
         compile_options: Optional[CompileOptions] = None,
+        stage_timing: Optional[CompilerStageTiming] = None,
     ):
         if compile_options is None:
             compile_options = CompileOptions.from_environment(
@@ -552,6 +554,15 @@ class CINLowerer:
             raise TypeError(
                 "llir_pass_options and compile_options cannot both be provided"
             )
+        if stage_timing is not None:
+            if type(stage_timing) is not CompilerStageTiming:
+                raise TypeError("stage_timing must be a CompilerStageTiming instance")
+            if stage_timing.compile_options is not compile_options:
+                raise TypeError(
+                    "stage_timing must retain this lowering's exact "
+                    "CompileOptions snapshot"
+                )
+        self._stage_timing = stage_timing
         self.compile_options = compile_options
         self.filter_zeros: bool = filter_zeros
         self.post_ops: Optional[PostOps] = post_ops
@@ -2233,6 +2244,31 @@ class CINLowerer:
         Lower an IndexStmt to LLIR
         """
 
+        stage_timing = self._stage_timing
+        if stage_timing is None or recurse or self.outermost_stmt is not None:
+            return self._lower_index_stmt_untimed(
+                stmt,
+                recurse,
+                _ownership_transferred,
+            )
+        stage_token = stage_timing.begin(
+            CompilerStageId.CIN_LOWERING,
+            compile_options=self.compile_options,
+        )
+        lowered = self._lower_index_stmt_untimed(
+            stmt,
+            recurse,
+            _ownership_transferred,
+        )
+        stage_timing.commit(stage_token)
+        return lowered
+
+    def _lower_index_stmt_untimed(
+        self,
+        stmt: Union[IndexStmt, ScheduledCIN],
+        recurse: bool,
+        _ownership_transferred: bool,
+    ) -> Union[llir.Stmt, List[llir.Stmt]]:
         stmt = self._prepare_scheduled_cin(
             stmt,
             recurse,
@@ -2713,6 +2749,29 @@ class CINLowerer:
 
                 return LLIRRewriteArtifact(body_stmts)
 
+            body_assembler = assemble_body
+            stage_timing = self._stage_timing
+            if stage_timing is not None:
+
+                def timed_assemble_body(
+                    transformed_body: LLIRStatementListArtifact,
+                    compressed_output_parallel: bool,
+                ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+                    # Same one-shot result/ABI continuation at the same lazy
+                    # barrier position; timing brackets only its execution.
+                    assembly_token = stage_timing.begin(
+                        CompilerStageId.RESULT_ABI_ASSEMBLY,
+                        compile_options=self.compile_options,
+                    )
+                    assembled = assemble_body(
+                        transformed_body,
+                        compressed_output_parallel,
+                    )
+                    stage_timing.commit(assembly_token)
+                    return assembled
+
+                body_assembler = timed_assemble_body
+
             try:
                 pipeline_result = self._llir_pass_manager.run_production_pipeline(
                     LLIRStatementListArtifact(recurse_result.statements),
@@ -2724,7 +2783,7 @@ class CINLowerer:
                             value_array_ctypes=tuple(self._value_array_ctypes.items())
                         )
                     ),
-                    body_assembler=assemble_body,
+                    body_assembler=body_assembler,
                 )
             except LLIRPassPartialFailure as failure:
                 self._record_llir_pass_runs(failure.completed_run_records)
@@ -2739,6 +2798,14 @@ class CINLowerer:
                 body=body_stmts,
             )
             if self.loop_plan is not None:
+                schedule_lowering_token = (
+                    stage_timing.begin(
+                        CompilerStageId.SCHEDULE_LOWERING,
+                        compile_options=self.compile_options,
+                    )
+                    if stage_timing is not None
+                    else None
+                )
                 from .scheduler import materialize_legacy_schedule
 
                 (
@@ -2759,6 +2826,8 @@ class CINLowerer:
                     relayout_plan,
                     result_tile_plan,
                 )
+                if schedule_lowering_token is not None and stage_timing is not None:
+                    stage_timing.commit(schedule_lowering_token)
             return function
 
         return []

@@ -28,6 +28,7 @@ from .compiler.scheduler import (
     Scheduler,
     get_forced_schedule,
 )
+from .compiler.stage_timing import CompilerStageId, CompilerStageTiming
 from .exceptions import CompileSpecError, TensorTypeError, TensorValidationError
 from .format import TensorFormat, LevelFormat, LevelType
 from .layout import TensorSpec
@@ -36,7 +37,11 @@ from .tiling import maybe_dispatch as _tiling_maybe_dispatch
 from .tiling import is_candidate as _tiling_is_candidate
 from .tiling import _current_level as _tiling_current_level
 from .storage import TensorIndex
-from .stensor import STensor, _finalize_generated_mode_indices
+from .stensor import (
+    STensor,
+    _finalize_generated_mode_indices,
+    _stage_timing_at_boundary,
+)
 from .utils import (
     parse_format,
     topo_sort_characters,
@@ -108,6 +113,15 @@ def _compile_options_from_kwargs(
         requested_schedule=cast(Optional[Schedule], resolved_schedule),
         forced_schedule=None,
     )
+
+
+def _stage_timing_from_kwargs(
+    kwargs: dict,
+    compile_options: CompileOptions,
+) -> CompilerStageTiming:
+    """Create or validate the one timing owner paired with the one snapshot."""
+
+    return _stage_timing_at_boundary(kwargs.get("_stage_timing"), compile_options)
 
 
 def _matmul_compile_policy(
@@ -367,6 +381,11 @@ def spmv(
     """
     compile_options = _compile_options_from_kwargs(kwargs)
     _reject_unsupported_requested_schedule(compile_options, "spmv")
+    stage_timing = _stage_timing_from_kwargs(kwargs, compile_options)
+    frontend_token = stage_timing.begin(
+        CompilerStageId.FRONTEND_CONSTRUCTION,
+        compile_options=compile_options,
+    )
     if output_format is None:
         output_format = parse_format("d")
     elif not isinstance(output_format, TensorFormat):
@@ -401,20 +420,35 @@ def spmv(
         ),
     )
 
-    lowerer = CINLowerer(compile_options=compile_options)
+    stage_timing.commit(frontend_token)
+    lowerer = CINLowerer(
+        compile_options=compile_options,
+        stage_timing=stage_timing,
+    )
     lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
     llir_lowerer = LLIRLowerer(compile_options=compile_options)
+    cpp_token = stage_timing.begin(
+        CompilerStageId.CPP_GENERATION,
+        compile_options=compile_options,
+    )
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
+    stage_timing.commit(cpp_token)
 
     header_cpp_code = compile_options.build.preamble_source
 
+    kernel_name_token = stage_timing.begin(
+        CompilerStageId.KERNEL_NAME_ASSEMBLY,
+        compile_options=compile_options,
+    )
+    kernel_name = _kernel_name(
+        header_cpp_code,
+        cpp_code,
+        compile_options=compile_options,
+    )
+    stage_timing.commit(kernel_name_token)
     # start_time = time.time()
     module = _load_kernel(
-        name=_kernel_name(
-            header_cpp_code,
-            cpp_code,
-            compile_options=compile_options,
-        ),
+        name=kernel_name,
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=list(compile_options.build.extra_cflags),
@@ -512,6 +546,7 @@ def matmul_wksp(
     """
     compile_options = _compile_options_from_kwargs(kwargs)
     _reject_unsupported_requested_schedule(compile_options, "matmul_wksp")
+    stage_timing = _stage_timing_from_kwargs(kwargs, compile_options)
     if isinstance(a, torch.Tensor):
         a = STensor.from_torch(a).to_sparse(
             _compile_options=compile_options,
@@ -542,6 +577,10 @@ def matmul_wksp(
 
     module = matmul_wksp._module_cache.get(_cache_key)
     if module is None:
+        frontend_token = stage_timing.begin(
+            CompilerStageId.FRONTEND_CONSTRUCTION,
+            compile_options=compile_options,
+        )
         C = TensorVar("C", shape=result_shape, fmt=output_format, dtype=a.dtype)
         A = TensorVar("A", shape=a.shape, fmt=a.format, dtype=a.dtype)
         B = TensorVar("B", shape=b.shape, fmt=b.format, dtype=b.dtype)
@@ -582,19 +621,34 @@ def matmul_wksp(
             ),
         )
 
-        lowerer = CINLowerer(compile_options=compile_options)
+        stage_timing.commit(frontend_token)
+        lowerer = CINLowerer(
+            compile_options=compile_options,
+            stage_timing=stage_timing,
+        )
         lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
         llir_lowerer = LLIRLowerer(compile_options=compile_options)
+        cpp_token = stage_timing.begin(
+            CompilerStageId.CPP_GENERATION,
+            compile_options=compile_options,
+        )
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        stage_timing.commit(cpp_token)
 
         header_cpp_code = compile_options.build.preamble_source
 
+        kernel_name_token = stage_timing.begin(
+            CompilerStageId.KERNEL_NAME_ASSEMBLY,
+            compile_options=compile_options,
+        )
+        kernel_name = _kernel_name(
+            header_cpp_code,
+            cpp_code,
+            compile_options=compile_options,
+        )
+        stage_timing.commit(kernel_name_token)
         module = _load_kernel(
-            name=_kernel_name(
-                header_cpp_code,
-                cpp_code,
-                compile_options=compile_options,
-            ),
+            name=kernel_name,
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=list(compile_options.build.extra_cflags),
@@ -1534,6 +1588,7 @@ def _build_regblock_dual_path(
     cin_unscheduled: IndexStmt,
     post_ops: Any,
     compile_options: Optional[CompileOptions] = None,
+    stage_timing: Optional[CompilerStageTiming] = None,
 ) -> Optional[Tuple[llir.Function, str]]:
     """Build the Phase 2b dual-path kernel from an unscheduled CIN.
 
@@ -1554,11 +1609,13 @@ def _build_regblock_dual_path(
         cin_unscheduled,
         enabled=False,
         compile_options=compile_options,
+        stage_timing=stage_timing,
     )
     cin_rb = Scheduler._auto_schedule_regblock_arm(
         cin_unscheduled,
         enabled=True,
         compile_options=compile_options,
+        stage_timing=stage_timing,
     )
     if str(cin_base) == str(cin_rb):
         # Register-block didn't change the schedule (pattern doesn't qualify) ->
@@ -1568,10 +1625,12 @@ def _build_regblock_dual_path(
     fn_base = CINLowerer(
         post_ops=post_ops,
         compile_options=compile_options,
+        stage_timing=stage_timing,
     )._lower_owned_IndexStmt(cin_base)
     fn_rb = CINLowerer(
         post_ops=post_ops,
         compile_options=compile_options,
+        stage_timing=stage_timing,
     )._lower_owned_IndexStmt(cin_rb)
     if not (isinstance(fn_base, llir.Function) and isinstance(fn_rb, llir.Function)):
         return None
@@ -1704,6 +1763,7 @@ def einsum(
     #         tensor.name = tensor.name + str(i)
 
     compile_options = _compile_options_from_kwargs(kwargs)
+    stage_timing = _stage_timing_from_kwargs(kwargs, compile_options)
 
     # Convert all torch.Tensor inputs to STensor early
     tensors = tuple(
@@ -1920,6 +1980,10 @@ def einsum(
             return _result
     # ── End fast dispatch ────────────────────────────────────────────────
 
+    frontend_token = stage_timing.begin(
+        CompilerStageId.FRONTEND_CONSTRUCTION,
+        compile_options=compile_options,
+    )
     # unique_index_strs should be a list of unique index strings
     # e.g. ["i", "j", "k"]
     unique_index_strs = list("".join(input_groups) + result_expression)
@@ -2177,6 +2241,7 @@ def einsum(
         if tensor_vars[tensor_index].mode_order != desired_mode_order:
             tensor_vars[tensor_index].mode_order = desired_mode_order
     tensors = tuple(tensors)
+    stage_timing.commit(frontend_token)
 
     # Extract PostOps for fused kernel compilation
     _post_ops = kwargs.get("_post_ops", None)
@@ -2200,6 +2265,7 @@ def einsum(
             cin_stmt,
             _post_ops,
             compile_options=compile_options,
+            stage_timing=stage_timing,
         )
         if _dual is not None:
             _dual_llir, _kernel_cache_key = _dual
@@ -2211,6 +2277,7 @@ def einsum(
                 cin_stmt,
                 effective_schedule,
                 compile_options=compile_options,
+                stage_timing=stage_timing,
             )
         # Default single path. When regblock is on but the dual-path wasn't
         # applicable, force it OFF here so we never ship the wide-k-regressing
@@ -2222,6 +2289,7 @@ def einsum(
                     cin_stmt,
                     enabled=False,
                     compile_options=compile_options,
+                    stage_timing=stage_timing,
                 ),
             )
         else:
@@ -2230,6 +2298,7 @@ def einsum(
                 Scheduler.auto_schedule(
                     cin_stmt,
                     compile_options=compile_options,
+                    stage_timing=stage_timing,
                 ),
             )
         _kernel_cache_key = _codegen_kernel_cache_key(
@@ -2251,23 +2320,35 @@ def einsum(
             lowerer = CINLowerer(
                 post_ops=_post_ops,
                 compile_options=compile_options,
+                stage_timing=stage_timing,
             )
             lowered_llir = lowerer._lower_owned_IndexStmt(lowering_stmt)
 
         llir_lowerer = LLIRLowerer(compile_options=compile_options)
 
+        cpp_token = stage_timing.begin(
+            CompilerStageId.CPP_GENERATION,
+            compile_options=compile_options,
+        )
         cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        stage_timing.commit(cpp_token)
 
         # print("\n\n", cpp_code)
 
         header_cpp_code = compile_options.build.preamble_source
 
+        kernel_name_token = stage_timing.begin(
+            CompilerStageId.KERNEL_NAME_ASSEMBLY,
+            compile_options=compile_options,
+        )
+        kernel_name = _kernel_name(
+            header_cpp_code,
+            cpp_code,
+            compile_options=compile_options,
+        )
+        stage_timing.commit(kernel_name_token)
         module = _load_kernel(
-            name=_kernel_name(
-                header_cpp_code,
-                cpp_code,
-                compile_options=compile_options,
-            ),
+            name=kernel_name,
             cpp_sources=[header_cpp_code, cpp_code],
             functions=["evaluate"],
             extra_cflags=list(compile_options.build.extra_cflags),
@@ -2441,7 +2522,12 @@ def lower_and_exec_cin(
     """
     compile_options = _compile_options_from_kwargs(kwargs)
     _reject_unsupported_requested_schedule(compile_options, "lower_and_exec_cin")
-    cin_stmt = normalize_cin(cin_stmt, compile_options=compile_options)
+    stage_timing = _stage_timing_from_kwargs(kwargs, compile_options)
+    cin_stmt = normalize_cin(
+        cin_stmt,
+        compile_options=compile_options,
+        stage_timing=stage_timing,
+    )
     args = _align_mode_orders_to_loop_order(
         cin_stmt,
         args,
@@ -2470,19 +2556,33 @@ def lower_and_exec_cin(
             tensor_var.dtype = output_dtype
 
     # Lower to LLIR
-    lowerer = CINLowerer(compile_options=compile_options)
+    lowerer = CINLowerer(
+        compile_options=compile_options,
+        stage_timing=stage_timing,
+    )
     lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
     llir_lowerer = LLIRLowerer(compile_options=compile_options)
+    cpp_token = stage_timing.begin(
+        CompilerStageId.CPP_GENERATION,
+        compile_options=compile_options,
+    )
     cpp_code = llir_lowerer.lower_llir(lowered_llir)
+    stage_timing.commit(cpp_token)
     # print(cpp_code)
     header_cpp_code = compile_options.build.preamble_source
 
+    kernel_name_token = stage_timing.begin(
+        CompilerStageId.KERNEL_NAME_ASSEMBLY,
+        compile_options=compile_options,
+    )
+    kernel_name = _kernel_name(
+        header_cpp_code,
+        cpp_code,
+        compile_options=compile_options,
+    )
+    stage_timing.commit(kernel_name_token)
     module = _load_kernel(
-        name=_kernel_name(
-            header_cpp_code,
-            cpp_code,
-            compile_options=compile_options,
-        ),
+        name=kernel_name,
         cpp_sources=[header_cpp_code, cpp_code],
         functions=["evaluate"],
         extra_cflags=list(compile_options.build.extra_cflags),
