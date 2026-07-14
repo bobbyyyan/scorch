@@ -742,6 +742,105 @@ in-flight or completed first compilation. Plain CIN lowering now fails closed
 instead of ignoring a requested schedule; the verified `ScheduledCIN` route
 continues to accept the same snapshot.
 
+#### Manager-owned pipeline and common analysis-runner closure (2026-07-14)
+
+Commits `8e89822` and `cdb12bc` close the isolated canonical manager-owned
+pipeline/common analysis-runner blocker without changing a pass implementation,
+pass order, result/ABI assembly, scheduling, generated syntax, or optimization
+policy. `LLIRPassPipeline.from_compile_options` constructs one exact frozen
+`LLIRPassPipeline(compile_options, pass_ids, pass_descriptors, options)` and
+`LLIRPassManager.from_compile_options` retains that pipeline plus the identical
+`VerificationPolicy.llir_pass_options` object. `CINLowerer` now has one
+`run_production_pipeline` call and no individual manager `run_*` call. The
+manager spells out the heterogeneous production composition explicitly; it
+does not use generic dispatch, reflection, signature inspection, a pass
+registry, or a dictionary-of-`Any` configuration.
+
+The complete pre-implementation orchestration inventory was:
+
+- `CINLowerer.lower_ForAll` called `run_compressed_where_openmp` when the
+  compressed-output parallel gate selected the transform. The pass itself ran
+  `run_result_write` independently in `count` and `fill` modes over the same
+  original work-body list; result write was not a direct `CINLowerer` call.
+- `CINLowerer.lower_IndexStmt` then called `run_sparse_prefetch`,
+  `run_dense_pointer_hoist`, `run_single_iteration_loop_elimination`, and
+  `run_loop_invariant_factor_hoist` over the recursively lowered statement
+  list, assembled known-nnz/result storage, ABI validation, prologue, and final
+  result statements, and finally called `run_dynamic_vector_access` over that
+  assembled body. These six lowerer calls were the complete production
+  `LLIRPassManager.run_*` inventory.
+- The exact stable seven-identity tuple was, and remains,
+  `COMPRESSED_WHERE_OPENMP`, `RESULT_WRITE`, `SPARSE_PREFETCH`,
+  `DENSE_POINTER_HOIST`, `SINGLE_ITERATION_LOOP_ELIMINATION`,
+  `LOOP_INVARIANT_FACTOR_HOIST`, and `DYNAMIC_VECTOR_ACCESS`. Ordinary
+  compilations realize records in sparse, dense, single-iteration,
+  invariant-factor, dynamic-vector order. An applied compressed compilation
+  realizes compressed parent, count, fill, sparse, dense, single-iteration,
+  invariant-factor, dynamic-vector records. Result/ABI assembly remains the
+  typed lazy barrier between invariant-factor and dynamic-vector rewriting; it
+  is not a new pass.
+- A count failure completed no nested record and suppressed fill and all later
+  work. A fill failure retained only count. Failure while building or verifying
+  the compressed parent retained count and fill but no parent. Each later pass
+  failure retained all previously completed top-level and nested records and
+  suppressed every later pass, assembly step, function construction, schedule
+  lowering, and code generation. The new pipeline globally reindexes the same
+  completed records and also transports them across an unexpected ordinary
+  Python exception from the legacy assembly barrier; `CINLowerer` then raises
+  the exact original exception.
+- Production `LLIRPassOptions(False, False, True)` still disables full
+  before/after walking and records duration. Debug
+  `LLIRPassOptions(True, True, True)` still verifies before and after and records
+  duration. `CompileOptions` accepts only those two policies; direct managers
+  retain their supported custom-policy compatibility. Cheap artifact,
+  descriptor, context, root, nested-record, and snapshot-identity validation
+  remains fail closed in every mode.
+- Before this closure, `CompileOptions.enabled_llir_passes` was frozen,
+  validated, and included in semantic/build cache identity but was not consumed
+  for production orchestration. It now supplies the exact tuple retained by
+  `LLIRPassPipeline`; the manager also retains the matching ordered descriptor
+  tuple and rejects a missing, reordered, malformed, or detached production
+  pipeline before work. An applied compressed spec must retain the pipeline's
+  exact `CompileOptions` object, while standalone compressed/result-write and
+  other direct pass APIs retain their existing compatibility behavior.
+
+The complete analysis inventory and classification is:
+
+| Current computation | Input, output, consumer, and recomputation | Canonical classification |
+| --- | --- | --- |
+| Normalized-CIN ownership/use/access analysis | `IndexStmt` -> fresh frozen `CINAnalysis(root_id, parents, node_scopes, scope_parents, symbol_definitions, symbol_uses, index_definitions, index_uses, accesses, access_occurrences, tensor_accesses, access_order, free_index_ids, reduction_index_ids, diagnostics)`. Consumed by `verify_cin`, `LoopPlan` entity collection/verification, scheduler ID-boundary checks, and diagnostic/display-name lookup. It is recomputed on every request and retains no mutable IR reference. | The sole current **canonical common analysis-runner** computation. `AnalysisRunner.analyze_cin` is explicit and typed; the compatibility `cin_analysis.analyze_cin` entry delegates to the zero-field frozen `COMMON_ANALYSIS_RUNNER`. |
+| Dynamic-vector declaration names; dense-pointer `_LoopAnalysis`; single-step bounds and `_LoopMatch`; invariant-factor defined-variable/factor partitions; sparse-prefetch value/coordinate/dense-access facts; result-write target/coordinate matches; compressed-Where loop, bound, sparse-position, work, and parallel-policy facts | Each scan is derived from the exact LLIR artifact/configuration consumed by one transform and is used only while producing that pass's detached result. Normal repeated calls rescan their input. Current mutable LLIR has no stable node-ID side-table boundary. | **Pass-local derived facts**. They deliberately remain inside their pass and are not promoted into the common runner. |
+| Schedule-lowerer loop discovery; `Scheduler` cost/selectivity/mode graph and planning; `IterationLattice`/`ModeIterator`; legacy CIN collectors/backlinks and adapter state; `CINLowerer` tensor/workspace/result/ABI state; normalization, verification, traversal, and canonical serialization | These computations either construct/validate an artifact, encode program or lowering state, or depend on mutable legacy ownership and generated spelling. Consumers are the corresponding scheduler, lattice, adapter, lowerer, verifier, or serializer stage. | **Program/lowering state outside the common analysis runner**, not reusable immutable analysis side tables. |
+
+No current LLIR computation satisfies the common-runner contract, so no LLIR
+analysis API was invented. No analysis cache is required: current CIN is small,
+the typed result is immutable and cheap to recompute, and caching mutable legacy
+IR would require the explicitly prohibited fingerprint cache plus
+preserve/invalidate protocol. Existing caches remain unchanged: `CompileOptions`
+semantic/build/cache keys, `Schedule.cache_key`, operation dispatch and kernel
+caches, matmul module caches, and `utils._so_cache` cache configuration or build
+artifacts rather than analysis results.
+
+Ownership remains caller-safe. Normalization detaches CIN before private legacy
+mutation; `ScheduledCIN` carries only detached CIN plus `LoopPlan`; the legacy
+adapter claims or copies private state; `CINAnalysis` contains frozen IDs,
+scalars, tuples, and `FrozenMap` tables rather than mutable CIN/LLIR nodes; and
+every managed LLIR output, including no-ops, is detached. The pipeline owns only
+frozen configuration and typed artifact carriers around caller-independent
+payloads. A first compilation/result remains independent of later caller
+mutation and of a second distinct `CompileOptions` snapshot.
+
+The clean latency artifacts are
+`/tmp/scorch-phase2-manager-pipeline-final/latency-af16e792aa1-m5.json`
+(`382a04de605b50e2280362b26a71060dd89c0e26c21c1e42a7519d4dd4f99a7d`)
+and
+`/tmp/scorch-phase2-manager-pipeline-final/latency-cdb12bc8402-m5.json`
+(`1f859021940efff5d3b48c51e01d5280949591b47c1d0ec8fadc5c55c3e60572`).
+Both metadata records have empty git status and exact detached revisions. The
+retained `14b110b` control remains invalid against its own archive and was not
+rerun or reclassified; this closure used the single fresh current-predecessor
+pair recorded below.
+
 #### Canonical deliverable matrix
 
 | Phase 2 deliverable | Status | Exact evidence or impact |
@@ -751,7 +850,7 @@ continues to accept the same snapshot.
 | Frozen `ScheduledCIN(cin, plan)` transitional carrier | **MET** | `loop_plan.ScheduledCIN` is an exact frozen two-field dataclass containing only detached normalized CIN and a `LoopPlan` accepted by the current structural verifier; it owns no analysis bundle and adds no CIN node schema. Exact carrier and field behavior is covered in `test_loop_plan.py`; the incomplete semantic legality verifier is a separate blocker below. |
 | Internal `LoopPlan` translation from public `Schedule` | **MET** | `scheduler._build_loop_plan` translates public name-bearing schedule decisions to stable IDs, and `Scheduler.apply_schedule` returns `ScheduledCIN`. Public scheduling compatibility and translation are covered by `test_loop_plan.py`, `test_schedule_api.py`, and `test_schedule_generality.py`. A separate semantic-verifier blocker is recorded below. |
 | Removal of dynamic schedule attributes | **MET** | Public scheduling decisions are carried by `LoopPlan`; tests in `test_loop_plan.py` and `test_schedule_api.py` assert the old scheduling attributes are absent from normalized CIN and that scheduling leaves the input unchanged. Legacy scheduling mutation occurs only on a private copy. |
-| Initial pass manager and pure analysis runner; no cache or preserve/invalidate machinery | **GAP** | `llir_pass_manager.py` has exact frozen descriptors/specs/artifacts, seven typed runners, optional verification/timing, and no cache or preserve/invalidate protocol. `cin_analysis.analyze_cin` is a pure recomputed immutable side-table analysis. However, the manager does not own an explicit pipeline assembled from `CompileOptions`; required order remains a sequence of calls inside `CINLowerer`, and there is no explicit common analysis-runner service. The implemented typed seams are sound, but the canonical orchestration deliverable is incomplete. |
+| Initial pass manager and pure analysis runner; no cache or preserve/invalidate machinery | **MET** | `8e89822` adds the exact frozen `LLIRPassPipeline` assembled from and retaining one `CompileOptions` snapshot, and one explicit manager-owned heterogeneous production entry. `CINLowerer` delegates once; ordered ordinary and compressed records, same-source count/fill siblings, production/debug policy, partial failures, later-work suppression, trust-boundary validation, and direct pass compatibility are executable. `cdb12bc` adds the zero-field frozen `AnalysisRunner`; every typed CIN request recomputes a fresh immutable `CINAnalysis`. No analysis cache, dependency graph, callback registry, reflection, or preserve/invalidate protocol was introduced. |
 | Common current-LLIR walker/rewriter | **MET** | `llir_traversal.py` provides exhaustive exact-type walking and detached rewriting for the current LLIR. `test_llir_traversal.py` covers declared-node completeness, deterministic traversal, nested container shape, detachment, malformed children, replacement validation, and unknown-subclass rejection. Commit `14c1f27`. |
 | Four existing sequential LLIR optimizations extracted into passes | **MET** | Sparse prefetch (`325547d` implementation, `2bb1ce6` routing, `cfec7c5` traversal cleanup, `c8af101` descriptor/test hardening), dense-pointer hoisting (`ce5adad`, `81b847a`), single-iteration elimination (`0d31882`, `265123a`), and invariant-factor hoisting (`112a9b7`, `f2bca1b`) are typed, production-routed passes with focused structural, ownership, failure, timing, and activation tests. Dynamic-vector, result-write, and compressed-Where are also managed, for seven managed pass descriptors total. |
 | Per-stage latency instrumentation in production and debug configurations | **GAP** | `LLIRPassRunRecord.duration_ns` measures individual managed passes when enabled, but there are no production/debug records for frontend construction, normalization/verification, scheduling/`LoopPlan`, CIN lowering, result/ABI assembly, schedule lowering, or final code generation. Pass-local timing cannot provide the canonical end-to-end stage attribution. |
@@ -762,12 +861,12 @@ continues to accept the same snapshot.
 | Phase 2 exit criterion | Status | Exact evidence or impact |
 | --- | --- | --- |
 | One CIN can be compiled independently under two schedules | **MET** | `test_loop_plan.py` and `test_schedule_api.py` compile the same normalized CIN with distinct schedules, observe distinct scheduled/codegen results, and verify the input and first result remain unchanged. `apply_schedule` normalizes/detaches before legacy scheduling mutation. |
-| Pass order is explicit and observable | **GAP** | Ordered run records and production tests make the current order observable. Ordinary order is sparse prefetch, dense-pointer hoist, single-iteration elimination, invariant-factor hoist, then dynamic-vector access after ABI/result assembly. Applied-compressed order prefixes compressed-Where, count, and fill. But canonical required order is still hidden as straight-line `CINLowerer` calls instead of an explicit manager pipeline assembled from options, which the design expressly forbids as the sole representation of order. |
+| Pass order is explicit and observable | **MET** | `LLIRPassPipeline` retains the exact seven option-supplied identities and matching descriptors. `LLIRPassManager.run_production_pipeline` explicitly realizes ordinary sparse, dense, single-iteration, invariant-factor, assembly barrier, dynamic-vector order, and applied compressed parent, count, fill before that sequence. `CINLowerer` contains one production orchestration call and no individual manager `run_*` call. Behavioral tests observe exact record order/indices and inject failures at nested, pre-assembly, assembly, and post-assembly positions. |
 | Every extracted pass has focused structural tests | **MET** | The seven pass suites cover positive/no-op structure, exact descriptors/specs/contexts/artifacts/roots, malformed/unknown nodes, detachment, ordering, verification modes, failures, and pass-specific repeated-application semantics: `test_dynamic_vector_access_pass.py`, `test_result_write_pass.py`, `test_compressed_where_openmp_pass.py`, `test_sparse_prefetch_pass.py`, `test_dense_pointer_hoist_pass.py`, `test_single_iteration_loop_pass.py`, and `test_loop_invariant_factor_pass.py`. |
 | No schedule metadata is dynamically attached to CIN nodes | **MET** | Schedule decisions reside in frozen `LoopPlan`; source search and `test_loop_plan.py` show no dynamic schedule fields on normalized CIN. Compatibility backlinks are a separate legacy concern described below. |
 | Empty and incremental plumbing p95 remain below 1 ms | **MET** | Clean committed measurements are 1.625 and 1.916 microseconds respectively, over 500 times below the ceiling. Focused tests retain the executable 1 ms assertion. |
-| Production compiler latency is measured or handled under the settled policy | **MET** | Sparse and dense routing were not assigned candidate results after unchanged `14b110b` controls missed their own clean archive: sparse preflight ratios were 1.054/1.154, 1.093/1.182, 1.121/1.204, and 1.046/1.092; dense preflight ratios were 1.048/1.108, 1.087/1.170, 1.035/1.033, and 1.027/1.017. The single-iteration candidate was validly measured against Phase 0 at 1.127/1.017, 1.108/1.116, 1.132/1.070, and 1.130/1.192. Direct pass attribution was 22.980-68.541 microseconds p50 and 24.000-71.500 microseconds p95; the modest ownership/validation exception was explicitly accepted. For invariant-factor routing, unchanged-control ratios were 1.068/1.136, 1.088/1.155, 1.050/1.074, and 1.057/1.108. It was not rerun opportunistically and no candidate sample was taken; this is not a valid candidate latency result. `64a5f1e` labels 1.10 crossings `INVESTIGATE`, retains a nonzero result, and prints the attribution requirement instead of treating crossings as automatic rejection. |
-| Every emission-affecting extraction satisfied its phase-local two-machine gate | **MET** | The retained clean archives were inspected directly. On both M5 and Redwood every archive has 42/42 correct cells, and sorted per-cell build inputs are byte-identical through the full chain: sparse `cfec7c5` versus `14b110b`, sparse hardening `c8af101` versus `cfec7c5`, dense `81b847a` versus `c8af101`, single `265123a` versus `81b847a`, and factor `f2bca1b` versus `265123a`. Runtime comparison was therefore correctly waived at each byte-identical seam. Audit fixes `72b8a59`, `74c7a96`, and `64a5f1e` do not change valid emitted kernels. The CompileOptions diagnostic grids and current-toolchain replacement control are recorded below; final `d8ae9ed`/`d4a4cb3` restore predecessor-identical production build inputs and preserve all source anchors, so the binding policy again waives a ceremonial identical-binary rerun. |
+| Production compiler latency is measured or handled under the settled policy | **MET** | Sparse and dense routing were not assigned candidate results after unchanged `14b110b` controls missed their own clean archive: sparse preflight ratios were 1.054/1.154, 1.093/1.182, 1.121/1.204, and 1.046/1.092; dense preflight ratios were 1.048/1.108, 1.087/1.170, 1.035/1.033, and 1.027/1.017. The single-iteration candidate was validly measured against Phase 0 at 1.127/1.017, 1.108/1.116, 1.132/1.070, and 1.130/1.192. Direct pass attribution was 22.980-68.541 microseconds p50 and 24.000-71.500 microseconds p95; the modest ownership/validation exception was explicitly accepted. For invariant-factor routing, unchanged-control ratios were 1.068/1.136, 1.088/1.155, 1.050/1.074, and 1.057/1.108. It was not rerun opportunistically and no candidate sample was taken; this is not a valid candidate latency result. `64a5f1e` labels 1.10 crossings `INVESTIGATE`, retains a nonzero result, and prints the attribution requirement instead of treating crossings as automatic rejection. The manager closure used one fresh clean committed `af16e79`/`cdb12bc` pair rather than rerunning the invalid control. Baseline -> candidate p50/p95 milliseconds and ratios were: small dense 1.454/1.718 -> 1.475/1.713 (1.014/0.998), reduction 1.337/1.507 -> 1.354/1.551 (1.012/1.029), CSR intersection 1.432/1.540 -> 1.427/1.516 (0.996/0.984), and sparse union 1.356/1.475 -> 1.362/1.464 (1.004/0.993). Every cell is below 1.10, so no exception is required. |
+| Every emission-affecting extraction satisfied its phase-local two-machine gate | **MET** | The retained clean archives were inspected directly. On both M5 and Redwood every archive has 42/42 correct cells, and sorted per-cell build inputs are byte-identical through the full chain: sparse `cfec7c5` versus `14b110b`, sparse hardening `c8af101` versus `cfec7c5`, dense `81b847a` versus `c8af101`, single `265123a` versus `81b847a`, and factor `f2bca1b` versus `265123a`. Runtime comparison was therefore correctly waived at each byte-identical seam. Audit fixes `72b8a59`, `74c7a96`, and `64a5f1e` do not change valid emitted kernels. The CompileOptions diagnostic grids and current-toolchain replacement control are recorded below; final `d8ae9ed`/`d4a4cb3` restore predecessor-identical production build inputs and preserve all source anchors, so the binding policy again waives a ceremonial identical-binary rerun. The clean committed manager candidate retains all four source sizes/hashes, and its production C++ flags, linker flags, kernel name, and preamble digest JSON is byte-identical to `af16e79`; both hash to `4342e155548e81f8524b69a84c6e1d1b114f71de10ad6832b49a23e39257023a`. No emitted production build input changed, so the retained M5/Redwood 42-cell archives remain the applicable runtime evidence and no ceremonial two-machine rerun was performed. |
 
 #### Supplemental ownership, verification, and failure audit
 
@@ -1013,19 +1112,42 @@ benchmark output, generated extension, plot, cache, or unrelated file changed;
 the user-owned `.gitignore` modification and untracked research/benchmark
 material remain untouched.
 
-The canonical `CompileOptions` Phase-2 blocker is **closed**. Canonical Phase 2
-is still **not formally exited**. Blocking Phase 2 work remains:
+The manager/analysis-runner follow-up adds 17 focused executable cases. Its
+final exact focused command passed 523 tests in 1.53 seconds, and the exact
+schedule/codegen matrix passed 82 tests in 397.90 seconds. The final full
+`pytest -q -m "not perf" tests` run completed with 1,032 passed, 14 skipped, 3
+deselected, one warning, and the same sole inherited
+`tests/test_scorch/test_perf.py::test_spmm_dd_ds_dd_tiled_time` failure in
+2,096.81 seconds. The traceback is the baseline `IndexError` in
+`CINLowerer.lower_Where`; this scoped closure did not fix or mark it.
 
-1. make the manager own an explicit options-assembled pipeline and common
-   analysis runner rather than leaving required order only in `CINLowerer`
-   calls;
-2. add production/debug timing for every compiler stage;
-3. complete semantic `LoopPlan` legality verification;
-4. satisfy the required all-COO no-`pMask1_end`-declaration invariant through a
+Black left all nine changed implementation/test Python files unchanged. On the
+exact changed-file set, Flake8 reported five findings at both `af16e79` and
+`cdb12bc`, all in existing `cin_lowerer.py`, for zero new findings; the existing
+`lower_IndexStmt` C901 score changes from 50 to 53 because the manager call's
+typed lazy assembly barrier and partial-failure transport remain visibly inside
+the legacy lowering method rather than beginning the prohibited Phase 3 ABI
+extraction. Mypy reported the same 48 inherited errors in the same two existing
+files at both commits: 40 in `cin_lowerer.py` and eight import-typing findings in
+`test_cin_analysis.py`. The new `analysis_runner.py` and every other changed
+Python file are clean. The broader inherited inventory remains nine Flake8
+findings in four files and 128 mypy errors in five files, exactly matching the
+`af16e79` baseline. `git diff --check` is clean. No `csrc` or design file,
+benchmark output, generated extension, plot, cache, or unrelated file changed;
+the user-owned `.gitignore` modification and untracked research/benchmark
+material remain untouched.
+
+The canonical `CompileOptions` and manager-owned pipeline/common
+analysis-runner Phase-2 blockers are **closed**. Canonical Phase 2 is still
+**not formally exited**. Blocking Phase 2 work remains:
+
+1. add production/debug timing for every compiler stage;
+2. complete semantic `LoopPlan` legality verification;
+3. satisfy the required all-COO no-`pMask1_end`-declaration invariant through a
    separately gated, emission-affecting change.
 
-The next Phase-2 blocker is the explicit manager-owned pipeline and common
-analysis-runner seam. Do not start Phase 3 while these Phase 2 blockers remain.
+The next Phase-2 blocker is production/debug timing for every compiler stage.
+Do not start Phase 3 while these Phase 2 blockers remain.
 
 ## Incremental Migration Plan
 
