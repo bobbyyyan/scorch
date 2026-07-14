@@ -455,11 +455,13 @@ def get_extra_cflags(
     options = _resolve_compile_options(compile_options)
     default_base = ("-O3", "-march=native", "-ffast-math", "-funroll-loops")
     if base_flags is None:
-        return list(options.build.extra_cflags)
+        return list(options.build.direct_extension_cflags)
 
     # Compatibility callers may replace only the optimization prefix. Target,
     # OpenMP, and instrumentation flags still come from the same snapshot.
-    return list(base_flags) + list(options.build.extra_cflags[len(default_base) :])
+    return list(base_flags) + list(
+        options.build.direct_extension_cflags[len(default_base) :]
+    )
 
 
 def get_extra_ldflags(

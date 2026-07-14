@@ -227,6 +227,7 @@ def test_compile_options_and_nested_policies_are_frozen_and_structurally_typed()
     assert type(options.enabled_llir_passes) is tuple
     assert all(type(pass_id) is LLIRPassId for pass_id in options.enabled_llir_passes)
     assert type(options.build.extra_cflags) is tuple
+    assert type(options.build.direct_extension_cflags) is tuple
     assert type(options.build.special_kernel_cflags) is tuple
     assert options.build.special_kernel_cflags[:4] == (
         "-O3",
@@ -260,6 +261,7 @@ def test_compile_options_and_nested_policies_are_frozen_and_structurally_typed()
 def test_compile_options_detaches_mutable_build_pass_and_schedule_inputs() -> None:
     base = _default_options()
     cflags = list(base.build.extra_cflags)
+    direct_cflags = list(base.build.direct_extension_cflags)
     special_cflags = list(base.build.special_kernel_cflags)
     ldflags = list(base.build.extra_ldflags)
     enabled_passes = list(base.enabled_llir_passes)
@@ -269,6 +271,7 @@ def test_compile_options_detaches_mutable_build_pass_and_schedule_inputs() -> No
     build = replace(
         base.build,
         extra_cflags=cflags,
+        direct_extension_cflags=direct_cflags,
         special_kernel_cflags=special_cflags,
         extra_ldflags=ldflags,
     )
@@ -281,6 +284,7 @@ def test_compile_options_detaches_mutable_build_pass_and_schedule_inputs() -> No
     )
 
     cflags.append("-DCHANGED")
+    direct_cflags.append("-DCHANGED")
     special_cflags.append("-DCHANGED")
     ldflags.append("-lchanged")
     enabled_passes.clear()
@@ -288,6 +292,7 @@ def test_compile_options_detaches_mutable_build_pass_and_schedule_inputs() -> No
     tiles.clear()
 
     assert options.build.extra_cflags == base.build.extra_cflags
+    assert options.build.direct_extension_cflags == base.build.direct_extension_cflags
     assert options.build.special_kernel_cflags == base.build.special_kernel_cflags
     assert options.build.extra_ldflags == base.build.extra_ldflags
     assert options.enabled_llir_passes == CURRENT_LLIR_PASSES
@@ -578,6 +583,17 @@ def test_invalid_option_combinations_fail_closed() -> None:
         field="build.special_kernel_cflags",
     )
 
+    with pytest.raises(CompileOptionsError) as direct_flags_error:
+        replace(
+            base.build,
+            direct_extension_cflags=base.build.direct_extension_cflags + ("-O0",),
+        )
+    _assert_compile_options_error(
+        direct_flags_error,
+        code="unsupported_build_flags",
+        field="build.direct_extension_cflags",
+    )
+
     with pytest.raises(CompileOptionsError) as build_path_error:
         replace(base.build, python_include_path="relative/include")
     _assert_compile_options_error(
@@ -717,7 +733,9 @@ def test_explicit_snapshot_prevents_nested_environment_resnapshot(
 
     _, _, _, cpp = _compile_spmm(_build_spmm_source(), options)
     assert cpp
-    assert get_extra_cflags(compile_options=options) == list(options.build.extra_cflags)
+    assert get_extra_cflags(compile_options=options) == list(
+        options.build.direct_extension_cflags
+    )
     assert get_extra_ldflags(compile_options=options) == list(
         options.build.extra_ldflags
     )
@@ -1049,7 +1067,7 @@ def test_build_boundary_snapshots_caller_owned_sequences_once(
     assert request.extra_ldflags == options.build.extra_ldflags
 
 
-def test_darwin_build_flags_compile_without_ambient_target_state(
+def test_darwin_direct_extension_flags_compile_without_ambient_target_state(
     tmp_path: Path,
 ) -> None:
     options = _default_options()
@@ -1084,7 +1102,7 @@ def test_darwin_build_flags_compile_without_ambient_target_state(
         [
             options.build.cxx_compiler,
             "-std=c++20",
-            *options.build.extra_cflags,
+            *options.build.direct_extension_cflags,
             "-fsyntax-only",
             str(source),
         ],
@@ -1095,6 +1113,20 @@ def test_darwin_build_flags_compile_without_ambient_target_state(
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_generated_and_direct_extension_target_flags_are_explicit() -> None:
+    options = _default_options()
+    if options.build.target_os is TargetOS.DARWIN:
+        assert "-isysroot" not in options.build.extra_cflags
+        assert "-isysroot" in options.build.direct_extension_cflags
+        assert options.build.darwin_toolchain is not None
+        sysroot_index = options.build.direct_extension_cflags.index("-isysroot")
+        assert options.build.direct_extension_cflags[sysroot_index + 1] == (
+            options.build.darwin_toolchain.sdk_root
+        )
+    else:
+        assert options.build.direct_extension_cflags == options.build.extra_cflags
 
 
 def test_relative_cxx_path_is_resolved_and_detached(

@@ -469,6 +469,7 @@ class KernelBuildOptions:
     compiler_wrapper_path: Optional[str]
     darwin_toolchain: Optional[DarwinToolchainOptions]
     extra_cflags: Tuple[str, ...]
+    direct_extension_cflags: Tuple[str, ...]
     special_kernel_cflags: Tuple[str, ...]
     extra_ldflags: Tuple[str, ...]
     jit_tune_hooks: bool
@@ -644,6 +645,10 @@ class KernelBuildOptions:
             )
 
         cflags = _snapshot_string_tuple(self.extra_cflags, "build.extra_cflags")
+        direct_extension_cflags = _snapshot_string_tuple(
+            self.direct_extension_cflags,
+            "build.direct_extension_cflags",
+        )
         special_cflags = _snapshot_string_tuple(
             self.special_kernel_cflags,
             "build.special_kernel_cflags",
@@ -654,6 +659,11 @@ class KernelBuildOptions:
             "build.torch_include_paths",
         )
         object.__setattr__(self, "extra_cflags", cflags)
+        object.__setattr__(
+            self,
+            "direct_extension_cflags",
+            direct_extension_cflags,
+        )
         object.__setattr__(self, "special_kernel_cflags", special_cflags)
         object.__setattr__(self, "extra_ldflags", ldflags)
         object.__setattr__(self, "torch_include_paths", torch_include_paths)
@@ -676,13 +686,23 @@ class KernelBuildOptions:
                 "snapshotted Torch include paths must be absolute",
             )
         has_tune_define = "-DSCORCH_TUNE_HOOKS" in cflags
-        if has_tune_define != self.jit_tune_hooks:
+        direct_has_tune_define = "-DSCORCH_TUNE_HOOKS" in direct_extension_cflags
+        if (
+            has_tune_define != self.jit_tune_hooks
+            or direct_has_tune_define != self.jit_tune_hooks
+        ):
             _raise_options_error(
                 "inconsistent_tune_hooks",
                 "build.extra_cflags",
                 "SCORCH_TUNE_HOOKS define must match jit_tune_hooks",
             )
-        _validate_supported_build_flags(self, cflags, special_cflags, ldflags)
+        _validate_supported_build_flags(
+            self,
+            cflags,
+            direct_extension_cflags,
+            special_cflags,
+            ldflags,
+        )
 
     @property
     def cache_key(self) -> tuple[object, ...]:
@@ -708,6 +728,7 @@ class KernelBuildOptions:
             self.compiler_wrapper_path,
             darwin_toolchain_key,
             self.extra_cflags,
+            self.direct_extension_cflags,
             self.special_kernel_cflags,
             self.extra_ldflags,
             self.jit_tune_hooks,
@@ -1035,6 +1056,7 @@ def _parse_environment_bool(
 def _validate_supported_build_flags(
     build: KernelBuildOptions,
     cflags: Tuple[str, ...],
+    direct_extension_cflags: Tuple[str, ...],
     special_cflags: Tuple[str, ...],
     ldflags: Tuple[str, ...],
 ) -> None:
@@ -1042,7 +1064,12 @@ def _validate_supported_build_flags(
 
     tune_suffix = ("-DSCORCH_TUNE_HOOKS",) if build.jit_tune_hooks else ()
     if build.target_os is TargetOS.DARWIN:
-        fixed_tail = (
+        production_tail = (
+            f"-isystem{_DARWIN_CXX_INCLUDE}",
+            "-Xpreprocessor",
+            "-fopenmp",
+        )
+        direct_tail = (
             f"-isystem{_DARWIN_CXX_INCLUDE}",
             "-isysroot",
             _DARWIN_SDK_ROOT,
@@ -1055,16 +1082,27 @@ def _validate_supported_build_flags(
             ("-I/usr/local/opt/libomp/include",),
         )
         supported_cflags = {
-            _BASE_CFLAGS + fixed_tail + include_tail + tune_suffix
+            _BASE_CFLAGS + production_tail + include_tail + tune_suffix
+            for include_tail in include_tails
+        }
+        supported_direct_cflags = {
+            _BASE_CFLAGS + direct_tail + include_tail + tune_suffix
             for include_tail in include_tails
         }
     else:
         supported_cflags = {_BASE_CFLAGS + ("-fopenmp",) + tune_suffix}
+        supported_direct_cflags = supported_cflags
     if cflags not in supported_cflags:
         _raise_options_error(
             "unsupported_build_flags",
             "build.extra_cflags",
             "compiler flags must match one current target policy exactly",
+        )
+    if direct_extension_cflags not in supported_direct_cflags:
+        _raise_options_error(
+            "unsupported_build_flags",
+            "build.direct_extension_cflags",
+            "direct extension flags must match one current target policy exactly",
         )
     supported_special_cflags = {
         _SPECIAL_KERNEL_BASE_CFLAGS + flags[len(_BASE_CFLAGS) :]
@@ -1304,6 +1342,7 @@ def _snapshot_kernel_build_options(
     torch_cxx11_abi = bool(torch._C._GLIBCXX_USE_CXX11_ABI)
 
     cflags = list(_BASE_CFLAGS)
+    direct_extension_cflags = list(_BASE_CFLAGS)
     ldflags: list[str] = []
     if target_os is TargetOS.DARWIN:
         if darwin_toolchain is None:
@@ -1313,8 +1352,17 @@ def _snapshot_kernel_build_options(
                 "Darwin build options require a toolchain snapshot",
             )
         cflags.append(f"-isystem{darwin_toolchain.sdk_root}/usr/include/c++/v1")
-        cflags.extend(
-            ("-isysroot", darwin_toolchain.sdk_root, "-Xpreprocessor", "-fopenmp")
+        direct_extension_cflags.append(
+            f"-isystem{darwin_toolchain.sdk_root}/usr/include/c++/v1"
+        )
+        cflags.extend(("-Xpreprocessor", "-fopenmp"))
+        direct_extension_cflags.extend(
+            (
+                "-isysroot",
+                darwin_toolchain.sdk_root,
+                "-Xpreprocessor",
+                "-fopenmp",
+            )
         )
         for header_path in (
             "/opt/homebrew/opt/libomp/include",
@@ -1322,6 +1370,7 @@ def _snapshot_kernel_build_options(
         ):
             if os.path.exists(header_path):
                 cflags.append(f"-I{header_path}")
+                direct_extension_cflags.append(f"-I{header_path}")
                 break
 
         torch_omp = os.path.join(torch_lib_path, "libomp.dylib")
@@ -1339,6 +1388,7 @@ def _snapshot_kernel_build_options(
                 ldflags.append("-lomp")
     else:
         cflags.append("-fopenmp")
+        direct_extension_cflags.append("-fopenmp")
         gomp_libraries = glob.glob(os.path.join(torch_lib_path, "libgomp*.so*"))
         if gomp_libraries:
             ldflags.extend((gomp_libraries[0], f"-Wl,-rpath,{torch_lib_path}"))
@@ -1347,6 +1397,7 @@ def _snapshot_kernel_build_options(
 
     if jit_tune_hooks:
         cflags.append("-DSCORCH_TUNE_HOOKS")
+        direct_extension_cflags.append("-DSCORCH_TUNE_HOOKS")
 
     special_cflags = list(_SPECIAL_KERNEL_BASE_CFLAGS)
     special_cflags.extend(cflags[len(_BASE_CFLAGS) :])
@@ -1370,6 +1421,7 @@ def _snapshot_kernel_build_options(
         compiler_wrapper_path=compiler_wrapper_path,
         darwin_toolchain=darwin_toolchain,
         extra_cflags=tuple(cflags),
+        direct_extension_cflags=tuple(direct_extension_cflags),
         special_kernel_cflags=tuple(special_cflags),
         extra_ldflags=tuple(ldflags),
         jit_tune_hooks=jit_tune_hooks,
