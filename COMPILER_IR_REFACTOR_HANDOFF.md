@@ -492,11 +492,261 @@ binding design decision. The audit fixes before this record are `72b8a59`
 No canonical Phase 2 deliverable is marked deferred: each item below is
 explicitly assigned to Phase 2 by the design.
 
+#### CompileOptions closure follow-up (2026-07-14)
+
+Commits `7c68ac9`, `d8ae9ed`, and `d4a4cb3` close the isolated canonical
+`CompileOptions` deliverable. `compiler/compile_options.py` now owns one exact
+frozen snapshot for a compilation. Public `ops.py` and `STensor` compilation
+boundaries construct it once when ordinary callers do not provide the internal
+optional value, then route that same object through normalization, scheduling,
+legacy CIN adaptation, CIN/LLIR lowering, nested compressed-output passes, C++
+emission, kernel naming, and the build seam; the detached JIT request carries
+the exact `options.build` subobject. Direct scheduler,
+CIN-analysis, CIN-lowerer, legacy-adapter, and utility entry points retain
+compatibility boundaries that snapshot only when no outer snapshot exists.
+Standalone renderer and pass APIs are non-compilation compatibility calls and
+do not construct a snapshot. A production stage receiving an explicit snapshot
+returns or forwards that exact object and does not reread the corresponding
+environment or `ContextVar`.
+
+The exact typed ownership is:
+
+- `CompileOptions(build, requested_schedule, scheduler, verification,
+  enabled_llir_passes, regblock_dual, emit_comments)`;
+- `SchedulerPolicy(regblock_enabled, regblock_max_n, regblock_tile_width,
+  auto_tile_width, cost_model)` and
+  `SchedulerCostModel(alpha, beta, gamma, c_insert, c_sort, c_trans, rho,
+  default_dim_size)`;
+- `VerificationPolicy(verify_cin, llir_pass_options)`;
+- `KernelBuildOptions(target_os, target_arch, optimization_level, isa_policy,
+  fast_math, unroll_loops, parallel_backend, legacy_parallel_policy,
+  legacy_lowering_policy, index_width, abi_policy,
+  compiler_abi_check_policy, compiler_wrapper_policy, compiler_wrapper_name,
+  compiler_wrapper_path, darwin_toolchain, extra_cflags,
+  direct_extension_cflags, special_kernel_cflags, extra_ldflags,
+  jit_tune_hooks, torch_version, torch_path, torch_include_paths,
+  torch_library_path, torch_cxx11_abi, python_executable, python_version,
+  python_cache_tag, python_include_path, scorch_python_path, cxx_compiler,
+  cxx_compiler_path, cxx_compiler_from_environment,
+  executable_search_path, preamble_source)`; and
+- `DarwinToolchainOptions(developer_dir, sdk_root, deployment_target)`.
+
+All collections crossing the boundary are converted to tuples or exact frozen
+values, including schedules, pass identities, build/link flags, Torch include
+paths, source/function lists in the build request, and scheduler costs.
+Unsupported pass sequences, targets, flags, toolchains, ABI policies, compiler
+commands, unordered carriers, and conflicting legacy arguments fail
+closed with frozen `CompileOptionsDiagnostic` values carried by
+`CompileOptionsError`. The exact current seven-pass tuple is represented,
+validated, and cache-keyed, but this follow-up deliberately does not claim that
+the pass manager now owns an options-assembled pipeline; that remains a
+separate canonical blocker below.
+
+##### Configuration inventory: compiler configuration
+
+Unless a row names a different owner, environment keys in this table are
+declared and read exactly once by `compiler/compile_options.py`; later files in
+the source-location column consume only their frozen typed representation.
+
+| Source/input and source location | Current reader and effect | Frozen typed representation or fail-closed treatment |
+| --- | --- | --- |
+| `SCORCH_REGBLOCK` (`compiler/compile_options.py`; scheduling policy consumed in `compiler/scheduler.py`) | `CompileOptions.from_environment`; scheduling and generated C++ | `scheduler.regblock_enabled: bool`, default `False`, exact `0`/`1` |
+| `SCORCH_REGBLOCK_MAX_N` (`compiler/compile_options.py`; consumed in `compiler/scheduler.py` and `ops.py`) | Same boundary; scheduling and dual-path cutoff | `scheduler.regblock_max_n: int`, default `8`, positive int32 |
+| `SCORCH_REGBLOCK_T` (`compiler/compile_options.py`; consumed in `compiler/scheduler.py`) | Same boundary; register-block tile width | `scheduler.regblock_tile_width: int`, defaulting to the snapshotted max-N value |
+| `_REGBLOCK_FORCE` / `regblock_force` (`compiler/scheduler.py`) | Compatibility `ContextVar`, read only while constructing a direct-boundary snapshot | Folded once into `scheduler.regblock_enabled`; exact bool or `None` |
+| Public `schedule` / internal `_schedule` (`ops.py`) | Public compilation boundary; requested loop order, tiling, relayout, and parallel choice | Detached frozen `requested_schedule: Optional[Schedule]`; conflicts fail closed |
+| `_SCHEDULE_FORCE` / `schedule_force` (`compiler/scheduler.py`) | Compatibility `ContextVar`, read only at the boundary | Folded once into `requested_schedule` |
+| `Scheduler._DEFAULT_COSTS` and direct optional `costs` (`compiler/scheduler.py`) | Auto-scheduling cost policy | Frozen `SchedulerCostModel(alpha=2.975, beta=0.1005, gamma=43.55, c_insert=85.34, c_sort=1.741, c_trans=40.61, rho=0.0014, default_dim_size=1024)`; conflicting direct arguments fail closed |
+| Legacy implicit auto-tile width `32` (`compiler/scheduler.py`) | Auto-scheduling policy | `scheduler.auto_tile_width: int = 32` |
+| `SCORCH_VERIFY_CIN` (`compiler/compile_options.py`; verification consumed in `compiler/cin_analysis.py`) | Snapshot boundary; debug verification | `verification.verify_cin: bool`, default `False`, exact `0`/`1` |
+| `_VERIFY_CIN_CONTEXT` / `full_cin_verification` (`compiler/cin_analysis.py`) | Debug compatibility `ContextVar`, read only at the boundary | ORed once into `verification.verify_cin` |
+| `PRODUCTION_LLIR_PASS_OPTIONS` (`compiler/llir_pass_manager.py`) | Production pass verification/timing policy | `verification.llir_pass_options=(False, False, True)` for before/after/timing |
+| `DEBUG_LLIR_PASS_OPTIONS` and direct `llir_pass_options` | Debug pass verification/timing policy | Exact `(True, True, True)`; only the production and debug frozen values are supported |
+| Seven manager pass descriptors/order | Enabled compiler behavior | `enabled_llir_passes: tuple[LLIRPassId, ...]`; only the current exact seven-pass tuple is supported |
+| `SCORCH_REGBLOCK_DUAL` (`compiler/compile_options.py`; consumed in `ops.py`) | Snapshot boundary; dual-path generated LLIR/C++ | `regblock_dual: bool`, default `True`, exact `0`/`1` |
+| `LLIRLowerer.no_comments` / `lower_llir(no_comments=...)` (`compiler/codegen.py`) | Generated C++ spelling and bytes | `emit_comments: bool = True`; a conflicting explicit `no_comments=True` fails closed |
+| `SCORCH_JIT_TUNE_HOOKS` (`compiler/compile_options.py`; consumed in `utils.py`) | Snapshot boundary; JIT build flags, runtime-hook enablement, and build/name identity | `build.jit_tune_hooks: bool` and exact matching production/direct flag tuples |
+| `CXX` (`compiler/compile_options.py`; build validation in `utils.py`) | Snapshot boundary; compiler identity and build behavior | `cxx_compiler`, absolute `cxx_compiler_path`, and `cxx_compiler_from_environment`; whitespace commands are unsupported |
+| `PATH` (`compiler/compile_options.py`; frozen child environment assembled in `utils.py`) | Snapshot boundary; CXX and wrapper resolution | Detached `executable_search_path`; absent uses `os.defpath`, and the child receives only the frozen path |
+| `TORCH_NO_COMPILER_WRAPPER` (`compiler/compile_options.py`; fail-closed child revalidation in `utils.py`) | Snapshot boundary; PyTorch ccache/sccache policy | `CompilerWrapperPolicy`, optional wrapper name, and absolute wrapper path; any nonempty value disables, matching PyTorch semantics |
+| `shutil.which("ccache")` then `shutil.which("sccache")` | Snapshot boundary; wrapper discovery | First resolved supported wrapper name/path is frozen and build-keyed |
+| `TORCH_DONT_CHECK_COMPILER_ABI` (`compiler/compile_options.py`) | Snapshot boundary; production compiler ABI policy | `CompilerABICheckPolicy.REQUIRED`; absent/`0` is accepted, `1` is rejected, malformed values fail closed |
+| `CPATH` | Snapshot boundary; would change include search | Presence is rejected as `unsupported_compiler_environment` |
+| `CPLUS_INCLUDE_PATH` | Same | Presence is rejected |
+| `C_INCLUDE_PATH` | Same | Presence is rejected |
+| `OBJC_INCLUDE_PATH` | Same | Presence is rejected |
+| `OBJCPLUS_INCLUDE_PATH` | Same | Presence is rejected |
+| `LIBRARY_PATH` | Snapshot boundary; would change link search | Presence is rejected |
+| `COMPILER_PATH` | Snapshot boundary; would change compiler selection | Presence is rejected |
+| `GCC_EXEC_PREFIX` | Snapshot boundary; would change GCC tool lookup | Presence is rejected |
+| `CCC_OVERRIDE_OPTIONS` | Snapshot boundary; would rewrite compiler arguments | Presence is rejected |
+| `SDKROOT` (`compiler/compile_options.py`; frozen child environment assembled in `utils.py`) | Snapshot boundary; Darwin SDK target | `darwin_toolchain.sdk_root`; only the coherent CommandLineTools SDK is accepted |
+| `DEVELOPER_DIR` (`compiler/compile_options.py`; frozen child environment assembled in `utils.py`) | Snapshot boundary; Darwin toolchain root | `darwin_toolchain.developer_dir`; only CommandLineTools is accepted |
+| `MACOSX_DEPLOYMENT_TARGET` (`compiler/compile_options.py`; frozen child environment assembled in `utils.py`) | Snapshot boundary; Darwin deployment/build identity | Validated optional numeric `darwin_toolchain.deployment_target` |
+| `platform.system()` (`compiler/compile_options.py`) | Snapshot boundary; target policy | `target_os: TargetOS`; only Darwin and Linux are supported |
+| `platform.machine()` | Snapshot boundary; target/build identity | `target_arch: str` |
+| `shutil.which(CXX, path=PATH)` | Snapshot boundary; compiler resolution | Absolute `cxx_compiler_path`; a missing compiler fails closed |
+| Fixed `-O3` | Current optimization policy | `optimization_level=3` and exact flag tuples |
+| Fixed `-march=native` | Current ISA policy | `isa_policy=ISAPolicy.NATIVE` and exact flag tuples |
+| Fixed `-ffast-math` | Current numerical policy | `fast_math=True` and exact flag tuples |
+| Fixed `-funroll-loops` | Current optimization policy | `unroll_loops=True` and exact flag tuples |
+| Special-kernel `-fno-signed-zeros` | Special-kernel numerical policy | Exact `special_kernel_cflags: tuple[str, ...]` |
+| Fixed OpenMP target choice | Parallel target policy | `parallel_backend=OPENMP` and exact compile/link tuples |
+| CommandLineTools SDK/libc++ directory existence | Snapshot boundary; Darwin target availability | Frozen `DarwinToolchainOptions`; missing directories fail closed |
+| Torch `libomp.dylib` existence | Snapshot boundary; Darwin OpenMP link selection | Exact `extra_ldflags` and rpath tuple |
+| Homebrew `/opt/homebrew` include/lib probes | Snapshot boundary; Darwin OpenMP fallback | Selected paths are frozen in compile/link tuples |
+| Homebrew `/usr/local` include/lib probes | Same fallback after `/opt/homebrew` | Selected paths are frozen in compile/link tuples |
+| `glob(torch/lib/libgomp*.so*)` | Snapshot boundary; Linux OpenMP link selection | First absolute library/rpath or exact `-fopenmp`, frozen in `extra_ldflags` |
+| `torch.__version__` | Snapshot boundary; generated name/cache/build identity | `torch_version: str` |
+| `torch.__file__` | Snapshot boundary; Torch installation/build identity | `torch_path: str` |
+| Torch include paths derived from `torch.__file__` | Snapshot boundary; build specification | `torch_include_paths: tuple[str, ...]` |
+| Torch library path derived from `torch.__file__` | Snapshot boundary; build/link specification | `torch_library_path: str` |
+| `torch._C._GLIBCXX_USE_CXX11_ABI` | Snapshot boundary; C++ ABI | `torch_cxx11_abi: bool` |
+| `sys.executable` | Snapshot boundary; child interpreter/build identity | `python_executable: absolute str` |
+| `platform.python_version()` | Snapshot boundary; Python ABI identity | `python_version: str` |
+| `sys.implementation.cache_tag` | Snapshot boundary; Python ABI/cache identity | `python_cache_tag: str` |
+| `sysconfig.get_path("include", scheme="posix_prefix")` | Snapshot boundary; Python headers | `python_include_path: absolute str` |
+| Scorch root derived from `compile_options.py.__file__` | Snapshot boundary; child import identity | `scorch_python_path: absolute str`, supplied as the child's `PYTHONPATH` |
+| Packaged `header.h` (`utils.jit_preamble_text`) | Snapshot boundary; generated translation-unit bytes | Included in immutable `preamble_source` |
+| Packaged `native_abi.h` | Same; generated ABI helpers | Included in immutable `preamble_source` |
+| Packaged `scorch_policy.h` | Same; generated target/runtime policy | Included in immutable `preamble_source` |
+| Optional local `scorch_policy_tuned.h` | Same; local policy overrides | Included in immutable `preamble_source` and build identity when present |
+| `SCORCH_GRAIN_DEFAULT=500` source default | Embedded generated-kernel runtime policy | Snapshotted textually in `preamble_source`, not reread from process state |
+| `SCORCH_GRAIN_CODEGEN_SPGEMM=1500` source default | Embedded generated-kernel work policy | Snapshotted in `preamble_source` |
+| `SCORCH_ROWS_PER_THREAD=16` source default | Embedded parallel policy | Snapshotted in `preamble_source` |
+| `SCORCH_CHUNKS_PER_THREAD=7` source default | Embedded parallel policy | Snapshotted in `preamble_source` |
+| `SCORCH_CHUNK_MIN=4` source default | Embedded parallel policy | Snapshotted in `preamble_source` |
+| `SCORCH_CHUNK_MAX=64` source default | Embedded parallel policy | Snapshotted in `preamble_source` |
+| `SCORCH_MEMSET_GRAIN_BYTES=262144` source default | Embedded generated zero-fill policy | Snapshotted in `preamble_source` |
+| Fixed int32 index behavior | Generated LLIR/C++ and ABI | `index_width=IndexWidthPolicy.INT32` |
+| Fixed Torch C++ extension ABI | Wrapper behavior | `abi_policy=ABIPolicy.TORCH_CPP_EXTENSION` |
+| Current legacy lowering behavior | Compiler/output policy | `legacy_lowering_policy=LegacyLoweringPolicy.CURRENT` |
+| Current legacy parallel behavior | Compiler/output policy | `legacy_parallel_policy=LegacyParallelPolicy.CURRENT` |
+| Production versus direct-extension target flags | Build behavior | `extra_cflags` preserves generated-grid inputs; `direct_extension_cflags` separately adds Darwin `-isysroot` for direct legacy `load_inline` callers |
+| PyTorch CPU-extension glue (`-fPIC`, `-std=c++20`, include/lib flags, extension-name macro) | Torch-owned implicit build specification | Not a mutable Scorch input; pinned transitively by the frozen Torch/Python/compiler identities, sources, functions, and name |
+
+The isolated build child rechecks Torch/Python ABI identity,
+`TORCH_NO_COMPILER_WRAPPER`, and wrapper availability in
+`utils._verify_snapshotted_build_runtime`. These are fail-closed trust-boundary
+checks against the minimal environment reconstructed from `KernelBuildOptions`;
+they do not reselect compiler configuration or consult the mutated parent
+environment.
+
+##### Configuration inventory: fixed behavior and program inputs
+
+| Source/input | Classification and reason it is not a separate `CompileOptions` input |
+| --- | --- |
+| `CompressedWhereOpenMPPolicy("dynamic, 64", "SCORCH_GRAIN_CODEGEN_SPGEMM")` | Fixed versioned implementation policy with no mutable reader; current parallel policy is represented by `parallel_backend` and `legacy_parallel_policy` |
+| Other fixed `dynamic, 16`/`static` OpenMP spellings and parallel eligibility predicates | Fixed current lowering implementation, not independently configurable process state |
+| Frozen traversal contexts and pass descriptors/specifications | Fixed pass implementation; enablement/order is in `enabled_llir_passes`, while result names, levels, types, and pointer facts are derived typed artifacts |
+| Fixed preamble macros `SCORCH_RESTRICT`, `SCORCH_FORCE_INLINE`, `SCORCH_LIKELY`, `SCORCH_UNLIKELY`, and `SCORCH_PRAGMA_UNROLL` | Source-level implementation spellings with no process reader; their exact definitions are frozen in `preamble_source` |
+| `SCORCH_TUNE_HOOKS` preprocessor define | Not read from the environment by compiled code; its inclusion is controlled and validated by `build.jit_tune_hooks` |
+| `CINLowerer(filter_zeros=False, post_ops=None)` | Explicit operation/lowering semantic input chosen by entry points; existing post-op ownership is unchanged and is not part of `CompileOptions` |
+| Output format, mode order, dtype, shape, layout, and tensor contents | Validated program semantics destined for OpSpec/CIN ownership, not compiler policy |
+| Result/workspace names, compressed levels, ctypes, and assembly facts | Derived from the verified program/IR, not ambient configuration |
+| `compile_only`, `use_cache`, and timing dictionaries | Frontend execution control or observation, not compiler semantics/output policy |
+| `get_extra_cflags(base_flags=...)` custom prefix | Legacy direct-extension helper input, not used by the production JIT; the snapshotted target/OpenMP tail is still applied and the returned list is detached |
+| Standalone direct pass/`LLIRLowerer` compatibility calls without options | Their own non-production boundary; every nested production renderer now receives the outer snapshot |
+| Compiler ABI/version subprocess probe | Validation of the pinned executable at a trust boundary, not a configuration choice |
+| Debug/stage dumps | No current debug-dump environment variable or mutable dump registry exists, so there is no current input to snapshot |
+
+##### Configuration inventory: explicitly outside compiler configuration
+
+The `SCORCH_AUTOTUNE*`, `SCORCH_TILING*`, cache-location, and host-query rows
+below are read by `tiling.py`; the native runtime-hook rows identify their C++
+header reader explicitly in the first column or exclusion text.
+
+| Source/input and current reader | Concrete exclusion |
+| --- | --- |
+| `SCORCH_MATCH_HOST_THREADS` / `_MATCH_HOST_THREADS` (`ops.py`) | Module-import snapshot selecting a launch argument for already-built CSR-SpMM; never changes generic compiler IR, emitted C++, or JIT build inputs |
+| `SCORCH_ATPARALLEL_PIPELINE` / `_ATPARALLEL_PIPELINE` (`ops.py`) | Module-import snapshot selecting the already-built SpMM's private OpenMP versus Torch-pool launch |
+| `torch.get_num_threads()` (`ops.py`) | Per-call prebuilt launch input only |
+| `SCORCH_AUTOTUNE` (`tiling.py`) | Initial prebuilt SpMM selector level; `tiling.py` documents that it does not touch the general JIT compiler |
+| `SCORCH_TILING` | Legacy mapping to the prebuilt selector's `off`/default level |
+| `SCORCH_TILING_PROBE` | Legacy mapping to prebuilt analytic/balanced selection |
+| `SCORCH_TILING_DEG_FLOOR` | Prebuilt selector eligibility gate only |
+| `SCORCH_TILING_NIJK_MIN` | Prebuilt tile-ijk candidate gate only |
+| `SCORCH_LLC_BYTES` | Prebuilt selector LLC input only |
+| `SCORCH_TILING_LOC_MIN` | Prebuilt selector locality gate only |
+| `SCORCH_AUTOTUNE_MARGIN` | Learned prebuilt selector winner margin |
+| `SCORCH_AUTOTUNE_CONFIRM` | Learned prebuilt selector runtime confirmation policy |
+| `SCORCH_TILING_CV_NSAMP` | Learned prebuilt selector feature-sampling count |
+| `SCORCH_AUTOTUNE_WIDEN` | Learned prebuilt selector gate policy |
+| `SCORCH_AUTOTUNE_CACHE` | Prebuilt selector persistent-cache path/disable switch |
+| `SCORCH_AUTOTUNE_MODEL` | Prebuilt learned-model path/disable switch |
+| `LOCALAPPDATA` (`tiling.py`) | Prebuilt selector cache/model storage only |
+| `XDG_CACHE_HOME` (`tiling.py`) | Prebuilt selector cache/model storage only |
+| `HOME` via `expanduser` (`tiling.py`) | Prebuilt selector cache/model storage fallback only |
+| Tiling `_global_level` | Mutable prebuilt dispatch default only |
+| Tiling thread-local `_tls.level` | Scoped prebuilt dispatch override only |
+| Tiling `_HAS_TILEJ` | Availability of a symbol in already-built `scorch_ops` |
+| Tiling `_HAS_TILEIJK` | Availability of a symbol in already-built `scorch_ops` |
+| Tiling `platform.system()` | Prebuilt LLC/cache/model path and fingerprint only |
+| Tiling `platform.machine()` | Prebuilt machine fingerprint only |
+| Tiling `sysctl`/sysfs `/proc/cpuinfo` queries | Prebuilt LLC and machine fingerprint only |
+| Tiling `os.cpu_count()` | Prebuilt machine fingerprint only |
+| Tiling `_decision` | Prebuilt runtime dispatch memoization only |
+| Tiling `_llc_bytes` | Prebuilt runtime LLC memoization only |
+| Tiling `_machine_id_val` | Prebuilt persistent-cache/model fingerprint only |
+| Tiling `_LEVELS`, `_LOC_NSAMP`, `_FEATURES`, `_CACHE_VERSION`, and `_LEARNED_VERSION` | Fixed prebuilt selector/model implementation constants only |
+| Tiling parsed-policy globals `_DEG_FLOOR`, `_NIJK_MIN`, `_LOC_MIN`, `_LEARNED_MARGIN`, `_LEARNED_CONFIRM`, `_CV_NSAMP`, and `_LEARNED_WIDEN` | Module snapshots of the individually inventoried selector-only environment inputs above; never consumed by the generic compiler |
+| Tiling `_cache_loaded`, `_persist_cache`, `_learned_loaded`, and `_learned_model` globals | Prebuilt selector service state only |
+| `compiler_schedule_search_space` / `schedule_from_tuner_choice` | Opt-in pure helpers; only a returned explicit `Schedule`, if actually passed to compilation, enters `requested_schedule` |
+| `SCORCH_BUILD_TUNE_HOOKS` (`scorch_build.py`) | Install/editable-build configuration for the prebuilt `scorch_ops` extension, outside a per-JIT compilation |
+| `SCORCH_TUNE_THREADS` (`scorch_policy.h`) | Execution-time hook inside already-compiled code, only when hooks were compiled in |
+| `SCORCH_TUNE_CHUNK` (`scorch_policy.h`) | Execution-time hook inside already-compiled code |
+| `SCORCH_CODEGEN_ALLOC` (`header.h`) | Execution-time generated-kernel zero-fill A/B hook; enabling the hook code itself is snapshotted by `jit_tune_hooks` |
+| `SCORCH_SPMM_ALLOC` (`spmm.h`) | Runtime A/B control inside the prebuilt SpMM |
+| `SCORCH_SPMM_WORKSPACE` (`spmm.h`) | Runtime A/B control inside the prebuilt SpMM |
+| `SCORCH_REGTILE_BASE` (`spmm.h`) | Runtime A/B control inside the prebuilt SpMM |
+| `SCORCH_SPMM_ATPARALLEL` (`spmm.h`) | Runtime A/B control inside the prebuilt SpMM |
+| `SCORCH_NEON_REGTILE` (`spmm.h`) | Runtime A/B control inside the prebuilt SpMM |
+| `SCORCH_GRAIN_SPMSPM=3000` source default | Primarily prebuilt runtime policy; its incidental presence in the shared preamble is nevertheless frozen textually |
+| `SCORCH_GRAIN_SPMM=150000` source default | Primarily prebuilt runtime policy; its incidental presence in the shared preamble is frozen textually |
+| `TORCH_EXTENSIONS_DIR` | Extension storage/cache location only, not emitted source, flags, ABI, or semantic build identity |
+| Default Torch cache root derived from HOME/XDG state | Storage only |
+| `TMPDIR`, `TEMP`, and `TMP` | Temporary storage only |
+| `MAX_JOBS` | Native build concurrency only |
+| `NINJA_STATUS` | Native build status presentation only |
+| `CC` | The supported CPU JIT path does not consume it; setup/prebuilt builds are a separate boundary |
+| `CFLAGS` | Not consumed by the isolated CPU Ninja JIT child |
+| `CXXFLAGS` | Not consumed by the isolated CPU Ninja JIT child |
+| `CPPFLAGS` | Not consumed by the isolated CPU Ninja JIT child |
+| `LDFLAGS` | Not consumed by the isolated CPU Ninja JIT child |
+| `ARCHFLAGS` | Not consumed by the isolated CPU Ninja JIT child |
+| Ambient `PYTHONPATH` | Ignored; the child receives the snapshotted Scorch root |
+| `LD_LIBRARY_PATH` | Native loader state, not compiler configuration; link inputs/rpaths are frozen explicitly |
+| `DYLD_LIBRARY_PATH` and other `DYLD_*` loader values | Native loader state only |
+| `OMP_*` | OpenMP runtime execution policy only; no compiler reader |
+| `MKL_*` | Native library execution policy only |
+| `OPENBLAS_*` | Native library execution policy only |
+| `SCORCH_SUITESPARSE` | Benchmark dataset location in tooling only |
+| `SCORCH_SANITIZER_CXX` | Sanitizer-test compiler selection only, outside production compilation |
+| `SCORCH_SANITIZER_LOG` | Sanitizer-test log location only |
+| `SCORCH_SANITIZER_RUN` | Sanitizer-test opt-in only |
+| `SCORCH_CHECKOUT` | Packaging smoke-test checkout location only |
+| Existing `_kernel_cache`, `_einsum_dispatch_cache`, `matmul_wksp._module_cache`, and `utils._so_cache` | Existing execution/build memoization, not configuration; semantic/build keys now include canonical option identity, and no new cache was added |
+| `time.time`, `time.perf_counter`, and `perf_counter_ns` | Observation/instrumentation only; run durations are non-semantic |
+| Prebuilt dispatch specifications, `_ACT_CODES`, and `_EMPTY_MODE_INDICES` (`ops.py`) | Already-built native symbol routing/argument encoding and a fixed empty native-call argument |
+| `_UNRESOLVED_SCHEDULE` (`ops.py`) | Private identity sentinel used only while assembling a boundary snapshot; it is not policy state |
+| Special-kernel source file text | An explicit source artifact snapshotted into `_JITBuildRequest.cpp_sources`, not configuration |
+
+The parent boundary reads each of the 22 audited environment keys exactly once.
+The focused counting-mapping test proves that property. Other tests replace
+`CompileOptions.from_environment` after construction and compile successfully,
+assert that public `einsum` invokes it once, and assert exact object identity at
+the scheduler, lowerer, nested compressed-output renderers, codegen, and build
+seams. Mutation-after-snapshot and two-snapshot tests prove that environment
+changes, caller-list changes, and a second configuration cannot affect an
+in-flight or completed first compilation. Plain CIN lowering now fails closed
+instead of ignoring a requested schedule; the verified `ScheduledCIN` route
+continues to accept the same snapshot.
+
 #### Canonical deliverable matrix
 
 | Phase 2 deliverable | Status | Exact evidence or impact |
 | --- | --- | --- |
-| Immutable `CompileOptions` snapshot | **GAP** | No `CompileOptions` type or boundary snapshot exists in `src/` or `tests/`. Compiler/output policy is still read from process state, including `SCORCH_REGBLOCK*` in `compiler/scheduler.py`, `SCORCH_VERIFY_CIN` in `compiler/cin_analysis.py`, `SCORCH_REGBLOCK_DUAL` and thread/backend flags in `ops.py`, JIT flags in `utils.py`, and tuning/cache/target knobs in `tiling.py`. Passes and compilation therefore do not receive one immutable snapshot of all emission-affecting configuration. |
+| Immutable `CompileOptions` snapshot | **MET** | `7c68ac9` introduces exact frozen compiler, scheduler, verification, build, target, ABI, wrapper, and Darwin-toolchain values; snapshots mutable schedules/flags/pass inputs into tuples; parses the audited environment and compatibility `ContextVar`s once at public boundaries; and routes one object through normalization, scheduling, lowering, emission, naming, and the detached JIT build. `d8ae9ed` separates direct-extension Darwin target flags from predecessor-identical production flags. `d4a4cb3` completes exact identity routing through nested compressed-output/result-write renderers and rejects plain CIN that would ignore a requested schedule. Unsupported values and combinations fail closed with typed diagnostics. Focused executable coverage proves freezing/types, detachment, one-time reads, post-snapshot environment independence, independent snapshots, production/debug verification, public and nested identity, build-child isolation, cache separation, invalid inputs/combinations, ownership, and source anchors. No singleton, mutable registry, callback bag, reflection/signature inspection, `Any` configuration dictionary, new cache, or preserve/invalidate machinery was introduced. |
 | Stable `SymbolId`/`IndexId` references at the `LoopPlan` boundary | **MET** | `identity.py`, `cin.py`, and `cin_analysis.py` assign and verify stable typed IDs. `loop_plan.py` represents every addressable loop/tensor decision with `IndexId`, `SymbolId`, or typed `LoopRef`; `scheduler._build_loop_plan` resolves public names once and emits only IDs. `test_cin_analysis.py` and `test_loop_plan.py` cover stable identity, dangling references, detachment, and caller-list snapshotting. No name or object-identity adapter crosses this boundary. Core commits: `9e3690c`, `9dcd06c`, and audit hardening `72b8a59`. |
 | Frozen `ScheduledCIN(cin, plan)` transitional carrier | **MET** | `loop_plan.ScheduledCIN` is an exact frozen two-field dataclass containing only detached normalized CIN and a `LoopPlan` accepted by the current structural verifier; it owns no analysis bundle and adds no CIN node schema. Exact carrier and field behavior is covered in `test_loop_plan.py`; the incomplete semantic legality verifier is a separate blocker below. |
 | Internal `LoopPlan` translation from public `Schedule` | **MET** | `scheduler._build_loop_plan` translates public name-bearing schedule decisions to stable IDs, and `Scheduler.apply_schedule` returns `ScheduledCIN`. Public scheduling compatibility and translation are covered by `test_loop_plan.py`, `test_schedule_api.py`, and `test_schedule_generality.py`. A separate semantic-verifier blocker is recorded below. |
@@ -517,7 +767,7 @@ explicitly assigned to Phase 2 by the design.
 | No schedule metadata is dynamically attached to CIN nodes | **MET** | Schedule decisions reside in frozen `LoopPlan`; source search and `test_loop_plan.py` show no dynamic schedule fields on normalized CIN. Compatibility backlinks are a separate legacy concern described below. |
 | Empty and incremental plumbing p95 remain below 1 ms | **MET** | Clean committed measurements are 1.625 and 1.916 microseconds respectively, over 500 times below the ceiling. Focused tests retain the executable 1 ms assertion. |
 | Production compiler latency is measured or handled under the settled policy | **MET** | Sparse and dense routing were not assigned candidate results after unchanged `14b110b` controls missed their own clean archive: sparse preflight ratios were 1.054/1.154, 1.093/1.182, 1.121/1.204, and 1.046/1.092; dense preflight ratios were 1.048/1.108, 1.087/1.170, 1.035/1.033, and 1.027/1.017. The single-iteration candidate was validly measured against Phase 0 at 1.127/1.017, 1.108/1.116, 1.132/1.070, and 1.130/1.192. Direct pass attribution was 22.980-68.541 microseconds p50 and 24.000-71.500 microseconds p95; the modest ownership/validation exception was explicitly accepted. For invariant-factor routing, unchanged-control ratios were 1.068/1.136, 1.088/1.155, 1.050/1.074, and 1.057/1.108. It was not rerun opportunistically and no candidate sample was taken; this is not a valid candidate latency result. `64a5f1e` labels 1.10 crossings `INVESTIGATE`, retains a nonzero result, and prints the attribution requirement instead of treating crossings as automatic rejection. |
-| Every emission-affecting extraction satisfied its phase-local two-machine gate | **MET** | The retained clean archives were inspected directly. On both M5 and Redwood every archive has 42/42 correct cells, and sorted per-cell build inputs are byte-identical through the full chain: sparse `cfec7c5` versus `14b110b`, sparse hardening `c8af101` versus `cfec7c5`, dense `81b847a` versus `c8af101`, single `265123a` versus `81b847a`, and factor `f2bca1b` versus `265123a`. Runtime comparison was therefore correctly waived at each byte-identical seam. Audit fixes `72b8a59`, `74c7a96`, and `64a5f1e` do not change valid emitted kernels, so no ceremonial rerun was performed. |
+| Every emission-affecting extraction satisfied its phase-local two-machine gate | **MET** | The retained clean archives were inspected directly. On both M5 and Redwood every archive has 42/42 correct cells, and sorted per-cell build inputs are byte-identical through the full chain: sparse `cfec7c5` versus `14b110b`, sparse hardening `c8af101` versus `cfec7c5`, dense `81b847a` versus `c8af101`, single `265123a` versus `81b847a`, and factor `f2bca1b` versus `265123a`. Runtime comparison was therefore correctly waived at each byte-identical seam. Audit fixes `72b8a59`, `74c7a96`, and `64a5f1e` do not change valid emitted kernels. The CompileOptions diagnostic grids and current-toolchain replacement control are recorded below; final `d8ae9ed`/`d4a4cb3` restore predecessor-identical production build inputs and preserve all source anchors, so the binding policy again waives a ceremonial identical-binary rerun. |
 
 #### Supplemental ownership, verification, and failure audit
 
@@ -610,6 +860,75 @@ is
 `/tmp/scorch-phase2-pass-manager-final/latency-14b110b-m5-final.json`; both are
 clean, same-commit `14b110b` archives with matching corpus configuration.
 
+The CompileOptions implementation preserved all four generated-source anchors
+and kernel names. Initial commit `7c68ac9` added an explicit Darwin `-isysroot`
+to the production generated-kernel flags while diagnosing a concurrent Apple
+Command Line Tools update. That changed one class of M5 build input, so clean
+committed full-grid diagnostics were run. The exact current-toolchain
+`969f3cd` replacement control and `7c68ac9` candidate were both 42/42 correct.
+Their M5 comparison had three individual cell-band crossings, while the
+machine geomean was `0.995`, inside the candidate same-binary band
+`[0.991, 1.009]`. On Redwood, `7c68ac9` was 42/42 correct and all 21 build
+records were exactly predecessor-identical, so runtime comparison was waived.
+The first comparison against the stale retained M5 predecessor archive was
+invalid because the generated build inputs differed across toolchains; its
+diagnostic geomean was `1.015` with 34/42 cells inside their bands, and it was
+not used as an acceptance result.
+
+The Command Line Tools installation recorded in `/var/log/install.log` during
+this session made the older retained M5 predecessor binary archive an invalid
+cross-toolchain control. Exact `969f3cd` reproduced a mixed
+CommandLineTools/Xcode header failure without a coherent target environment;
+the declared replacement control pinned `DEVELOPER_DIR` and `SDKROOT` to the
+current CommandLineTools installation. Final fix `d8ae9ed` keeps explicit
+`-isysroot` only in frozen `direct_extension_cflags` for direct legacy
+`load_inline` callers, while the isolated child receives coherent
+`DEVELOPER_DIR` and `SDKROOT` for production builds. Production flags, linker
+flags, source, functions, and generated names are therefore again
+predecessor-identical on M5, and the `7c68ac9` Redwood records were already
+identical. The Darwin direct-extension helper flags intentionally differ from
+`969f3cd` by that SDK pair: this is the narrow toolchain-compatibility build
+input exception. The identical flag spelling was exercised by the full 42-cell
+M5 grid at `7c68ac9`, and the final committed focused suite compiles a real C++
+syntax probe with `direct_extension_cflags` after removing ambient `SDKROOT` and
+`DEVELOPER_DIR`; Redwood's non-Darwin helper flags did not change. `d4a4cb3`
+only routes the already-owned default policy through
+nested renderers and does not change a supported default output. Under the
+binding byte-identity policy, no final ceremonial runtime rerun was performed.
+As a final committed-candidate check, isolated clean `969f3cd` and `d4a4cb3`
+worktrees produced byte-identical JSON for production C++ flags, linker flags,
+kernel name, and preamble SHA-256; both files hash to
+`4342e155548e81f8524b69a84c6e1d1b114f71de10ad6832b49a23e39257023a`.
+The four anchor tests at clean committed `d4a4cb3` passed in 0.67 seconds and
+left that worktree clean.
+
+The retained diagnostics and SHA-256 digests are:
+
+- `/tmp/scorch-phase2-compile-options-final/kernel-aa-7c68ac9ca037-m5.json`,
+  `4cf3049e34933075a9d0ef57aaa3350d51683bea8e5eabd303061db42255423c`;
+- `/tmp/scorch-phase2-compile-options-final/kernel-aa-7c68ac9ca037-redwood.json`,
+  `120c924a19535f96cf279cd47808d66567ff3c15f79d96798065b3bcd4d4b7d9`;
+- `/tmp/scorch-phase2-compile-options-final/kernel-aa-969f3cdd7cd-m5-current-clt-control.json`,
+  `d10d668b672114a821e81a0b018e697123f6e9a810b25d952471df5d994a207d`;
+- retained predecessor M5
+  `/tmp/scorch-phase2-loop-invariant-final/kernel-aa-candidate-m5.json`,
+  `816430d435d76dbe47277e921228d45c7387fc93d110bc37cc70f173982dfb77`;
+  and
+- retained predecessor Redwood
+  `/tmp/scorch-phase2-loop-invariant-final/kernel-aa-candidate-redwood.json`,
+  `31baca05f50d8f51483aa1d7d5b77f19f93550ebb95e46209d8dcbbd935dbc7e`.
+
+No new candidate compiler-latency sample was assigned. The unchanged clean
+`14b110b` preflight remained invalid against its own retained archive and was
+not rerun merely to seek a passing sample. Archive p50/p95 milliseconds were
+`0.9360005/1.0621401`, `0.8618545/0.95682935`,
+`0.8447505/0.91348385`, and `0.7487705/0.8238083` for small dense,
+reduction, CSR intersection, and sparse union. The unchanged preflight values
+were `0.9995/1.20686265`, `0.9375625/1.10532065`,
+`0.886896/0.9811416`, and `0.791104/0.9131712`, giving p50/p95 ratios
+`1.068/1.136`, `1.088/1.155`, `1.050/1.074`, and `1.057/1.108`.
+This is an invalid control result, not a candidate latency result.
+
 #### Exact remaining unmanaged LLIR traversal inventory
 
 1. `compiler/codegen.py`: `LLIRLowerer` expression/statement/loop/conditional/
@@ -638,7 +957,9 @@ the inventory above.
 
 #### Verification and decision
 
-The initial unmodified audit baseline produced 455 passed tests in the focused
+The following results are the preceding exit audit's historical baseline,
+before the CompileOptions closure follow-up. The initial unmodified audit
+baseline produced 455 passed tests in the focused
 Phase 2/common suite and 82 passed tests in the schedule/codegen matrix. Audit
 fixes have focused coverage for `LoopPlan` structural boundaries, exact manager
 combinations, nested partial failures, later-work suppression, and latency-tool
@@ -658,17 +979,40 @@ both revisions; the new benchmark-policy test and changed benchmark tool are
 clean. `git diff --check` is clean. No `csrc` file was changed, and no test or
 benchmark output was added to the repository.
 
-Canonical Phase 2 is **not formally exited**. Blocking Phase 2 work remains:
+The CompileOptions follow-up adds 42 focused executable cases. Its final exact
+focused command passed 506 tests in 1.30 seconds, and the exact
+schedule/codegen matrix passed 82 tests in 377.87 seconds. The final full
+`pytest -q -m "not perf" tests` run completed with 1,015 passed, 14 skipped, 3
+deselected, one warning, and the same sole inherited
+`tests/test_scorch/test_perf.py::test_spmm_dd_ds_dd_tiled_time` failure in
+2,059.65 seconds. The failure is the already-reproduced `IndexError` from
+`CINLowerer.lower_Where`; this scoped follow-up did not fix or mark it.
 
-1. introduce and route the immutable `CompileOptions` snapshot;
-2. make the manager own an explicit options-assembled pipeline and analysis
-   runner rather than leaving required order only in `CINLowerer` calls;
-3. add production/debug timing for every compiler stage;
-4. complete semantic `LoopPlan` legality verification;
-5. satisfy the required all-COO no-`pMask1_end`-declaration invariant through a
+Black left all 13 implementation/test Python files unchanged. Flake8 reported
+the same nine inherited findings on the corresponding existing files at exact
+`969f3cd` and at `d4a4cb3`, for zero regressions. Mypy reported 128 inherited
+errors in five existing files at `d4a4cb3`, versus 131 errors in six existing
+files at exact `969f3cd`: zero regressions and three inherited `utils.py` errors
+removed. New `compiler/compile_options.py` and
+`tests/test_scorch/test_compile_options.py`, plus the newly changed nested-pass
+files, are clean. `git diff --check` is clean. No `csrc` or design file,
+benchmark output, generated extension, plot, cache, or unrelated file changed;
+the user-owned `.gitignore` modification and untracked research/benchmark
+material remain untouched.
+
+The canonical `CompileOptions` Phase-2 blocker is **closed**. Canonical Phase 2
+is still **not formally exited**. Blocking Phase 2 work remains:
+
+1. make the manager own an explicit options-assembled pipeline and common
+   analysis runner rather than leaving required order only in `CINLowerer`
+   calls;
+2. add production/debug timing for every compiler stage;
+3. complete semantic `LoopPlan` legality verification;
+4. satisfy the required all-COO no-`pMask1_end`-declaration invariant through a
    separately gated, emission-affecting change.
 
-Do not start Phase 3 while these Phase 2 blockers remain.
+The next Phase-2 blocker is the explicit manager-owned pipeline and common
+analysis-runner seam. Do not start Phase 3 while these Phase 2 blockers remain.
 
 ## Incremental Migration Plan
 
