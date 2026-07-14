@@ -23,7 +23,9 @@ from typing import TYPE_CHECKING, NoReturn, Optional, Tuple, cast
 
 from .diagnostics import CompileOptionsDiagnostic, CompileOptionsError
 from .llir_pass_manager import (
+    CURRENT_LLIR_PASSES,
     DEBUG_LLIR_PASS_OPTIONS,
+    LLIRPassId,
     LLIRPassOptions,
     PRODUCTION_LLIR_PASS_OPTIONS,
 )
@@ -87,28 +89,6 @@ class CompilerWrapperPolicy(Enum):
     AUTO = "auto"
     DISABLED = "disabled"
 
-
-class LLIRPassId(Enum):
-    """Stable identities of the seven managed current-LLIR passes."""
-
-    COMPRESSED_WHERE_OPENMP = "transform_compressed_where_for_openmp"
-    RESULT_WRITE = "rewrite_result_writes"
-    SPARSE_PREFETCH = "insert_sparse_prefetch"
-    DENSE_POINTER_HOIST = "hoist_dense_pointers"
-    SINGLE_ITERATION_LOOP_ELIMINATION = "eliminate_single_iteration_loops"
-    LOOP_INVARIANT_FACTOR_HOIST = "hoist_loop_invariant_factors"
-    DYNAMIC_VECTOR_ACCESS = "rewrite_dynamic_vector_accesses"
-
-
-CURRENT_LLIR_PASSES: Tuple[LLIRPassId, ...] = (
-    LLIRPassId.COMPRESSED_WHERE_OPENMP,
-    LLIRPassId.RESULT_WRITE,
-    LLIRPassId.SPARSE_PREFETCH,
-    LLIRPassId.DENSE_POINTER_HOIST,
-    LLIRPassId.SINGLE_ITERATION_LOOP_ELIMINATION,
-    LLIRPassId.LOOP_INVARIANT_FACTOR_HOIST,
-    LLIRPassId.DYNAMIC_VECTOR_ACCESS,
-)
 
 _BASE_CFLAGS = ("-O3", "-march=native", "-ffast-math", "-funroll-loops")
 _SPECIAL_KERNEL_BASE_CFLAGS = (

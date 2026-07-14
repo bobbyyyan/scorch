@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 from time import perf_counter_ns
-from typing import List, NoReturn, Set, Tuple, cast
+from typing import Callable, List, NoReturn, Set, Tuple, cast
 
 import pytest
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
+from scorch.compiler.compile_options import CompileOptions  # type: ignore[import-untyped]
 from scorch.compiler.compressed_where_openmp_pass import (  # type: ignore[import-untyped]
     CompressedWhereOpenMPContext,
     CompressedWhereOpenMPResult,
@@ -24,6 +25,8 @@ from scorch.compiler.dense_pointer_hoist_pass import (  # type: ignore[import-un
 )
 from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     COMPRESSED_WHERE_OPENMP_PASS,
+    CURRENT_LLIR_PASS_DESCRIPTORS,
+    CURRENT_LLIR_PASSES,
     DEBUG_LLIR_PASS_OPTIONS,
     DENSE_POINTER_HOIST_PASS,
     DYNAMIC_VECTOR_ACCESS_PASS,
@@ -38,10 +41,12 @@ from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     LLIRPassArtifactType,
     LLIRPassContextType,
     LLIRPassDescriptor,
+    LLIRPassId,
     LLIRPassManager,
     LLIRPassManagerError,
     LLIRPassOptions,
     LLIRPassPartialFailure,
+    LLIRPassPipeline,
     LLIRPassRunRecord,
     LLIRRewriteArtifact,
     LLIRRewritePassResult,
@@ -102,6 +107,18 @@ def _compressed_context() -> CompressedWhereOpenMPContext:
 
 def _dense_context() -> DensePointerHoistContext:
     return DensePointerHoistContext((("Input_val", "float"),))
+
+
+def _compile_options(
+    pass_options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS,
+) -> CompileOptions:
+    return CompileOptions.from_environment(
+        environ={},
+        forced_schedule=None,
+        regblock_override=None,
+        verify_cin_override=False,
+        llir_pass_options=pass_options,
+    )
 
 
 def _compatible_loop(body: List[llir.Stmt]) -> llir.ForLoop:
@@ -282,6 +299,460 @@ def test_stable_descriptors_expose_exact_artifact_and_context_types() -> None:
         LLIRPassArtifactType.STATEMENT_LIST,
         LLIRPassContextType.LOOP_INVARIANT_FACTOR_HOIST,
     )
+
+
+def test_compile_options_assembles_one_frozen_typed_ordered_pipeline() -> None:
+    compile_options = _compile_options()
+    pipeline = LLIRPassPipeline.from_compile_options(compile_options)
+    manager = LLIRPassManager.from_compile_options(compile_options)
+
+    assert type(pipeline) is LLIRPassPipeline
+    assert pipeline.compile_options is compile_options
+    assert pipeline.pass_ids is compile_options.enabled_llir_passes
+    assert pipeline.options is compile_options.verification.llir_pass_options
+    assert pipeline.pass_ids == CURRENT_LLIR_PASSES
+    assert pipeline.pass_descriptors == CURRENT_LLIR_PASS_DESCRIPTORS
+    assert type(pipeline.pass_ids) is tuple
+    assert type(pipeline.pass_descriptors) is tuple
+    assert all(type(pass_id) is LLIRPassId for pass_id in pipeline.pass_ids)
+    assert all(
+        type(descriptor) is LLIRPassDescriptor
+        for descriptor in pipeline.pass_descriptors
+    )
+    assert tuple(pass_id.value for pass_id in pipeline.pass_ids) == tuple(
+        descriptor.name for descriptor in pipeline.pass_descriptors
+    )
+
+    assert manager.pipeline is not None
+    assert manager.pipeline.compile_options is compile_options
+    assert manager.pipeline.pass_ids is compile_options.enabled_llir_passes
+    assert manager.pipeline.options is compile_options.verification.llir_pass_options
+    assert manager.options is compile_options.verification.llir_pass_options
+
+    with pytest.raises(FrozenInstanceError):
+        pipeline.pass_ids = ()
+    with pytest.raises(FrozenInstanceError):
+        pipeline.compile_options = _compile_options()
+
+
+def test_production_pipeline_runs_ordinary_passes_in_exact_order() -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    source: List[llir.Stmt] = [llir.BlankLine()]
+    assembly_modes: List[bool] = []
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assembly_modes.append(compressed_output_parallel)
+        return LLIRRewriteArtifact(artifact.statements)
+
+    result = manager.run_production_pipeline(
+        LLIRStatementListArtifact(source),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    assert assembly_modes == [False]
+    assert [record.pass_name for record in result.run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.configuration_name for record in result.run_records] == [
+        "sparse_prefetch",
+        "dense_pointer_hoist",
+        "single_iteration_loop_elimination",
+        "loop_invariant_factor_hoist",
+        "dynamic_vector_access",
+    ]
+    assert [record.sequence_index for record in result.run_records] == list(range(5))
+    assert result.compressed_output_parallel is False
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(result.artifact.value))
+
+
+def test_production_pipeline_rejects_a_detached_compressed_options_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager_options = _compile_options()
+    detached_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(manager_options)
+    nested_calls: List[str] = []
+
+    def unexpected_result_write(
+        self: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[object],
+        pass_spec: ResultWritePassSpec,
+    ) -> NoReturn:
+        del self, artifact
+        nested_calls.append(pass_spec.context.mode)
+        raise AssertionError("mixed snapshots reached a nested pass")
+
+    monkeypatch.setattr(
+        LLIRPassManager,
+        "run_result_write",
+        unexpected_result_write,
+    )
+    with pytest.raises(LLIRPassManagerError) as error:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact(_compressed_source()),
+            compressed_where_pass_spec=CompressedWhereOpenMPPassSpec(
+                replace(_compressed_context(), compile_options=detached_options)
+            ),
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=lambda artifact, _: LLIRRewriteArtifact(artifact.statements),
+        )
+
+    assert manager_options == detached_options
+    assert manager_options is not detached_options
+    assert error.value.diagnostic.code == "detached_compile_options"
+    assert error.value.diagnostic.pass_name == COMPRESSED_WHERE_OPENMP_PASS.name
+    assert nested_calls == []
+
+
+def test_production_pipeline_rejects_malformed_compressed_context_before_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = LLIRPassManager.from_compile_options(_compile_options())
+    orchestration_calls: List[str] = []
+
+    def unexpected_compressed_pass(
+        self: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: CompressedWhereOpenMPPassSpec,
+    ) -> NoReturn:
+        del self, artifact, pass_spec
+        orchestration_calls.append("compressed_where_openmp")
+        raise AssertionError("malformed context reached production work")
+
+    monkeypatch.setattr(
+        LLIRPassManager,
+        "run_compressed_where_openmp",
+        unexpected_compressed_pass,
+    )
+    malformed_spec = CompressedWhereOpenMPPassSpec(
+        cast(CompressedWhereOpenMPContext, object())
+    )
+    with pytest.raises(LLIRPassManagerError) as error:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact(_compressed_source()),
+            compressed_where_pass_spec=malformed_spec,
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=lambda artifact, _: LLIRRewriteArtifact(artifact.statements),
+        )
+
+    assert error.value.diagnostic.code == "invalid_pass_context"
+    assert error.value.diagnostic.pass_name == COMPRESSED_WHERE_OPENMP_PASS.name
+    assert orchestration_calls == []
+
+
+@pytest.mark.parametrize(
+    ("pass_options", "verified"),
+    [
+        pytest.param(PRODUCTION_LLIR_PASS_OPTIONS, False, id="production"),
+        pytest.param(DEBUG_LLIR_PASS_OPTIONS, True, id="debug"),
+    ],
+)
+def test_production_pipeline_preserves_applied_compressed_order_and_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    pass_options: LLIRPassOptions,
+    verified: bool,
+) -> None:
+    compile_options = _compile_options(pass_options)
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    nested_managers: List[LLIRPassManager] = []
+    nested_source_ids: List[int] = []
+    nested_modes: List[str] = []
+    assembly_modes: List[bool] = []
+    original_result_write = LLIRPassManager.run_result_write
+
+    def observe_result_write(
+        self: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[object],
+        pass_spec: ResultWritePassSpec,
+    ) -> LLIRRewritePassResult[object]:
+        nested_managers.append(self)
+        nested_source_ids.append(id(artifact.value))
+        nested_modes.append(pass_spec.context.mode)
+        assert pass_spec.context.compile_options is compile_options
+        return original_result_write(self, artifact, pass_spec)
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assembly_modes.append(compressed_output_parallel)
+        return LLIRRewriteArtifact(artifact.statements)
+
+    monkeypatch.setattr(
+        LLIRPassManager,
+        "run_result_write",
+        observe_result_write,
+    )
+    result = manager.run_production_pipeline(
+        LLIRStatementListArtifact(_compressed_source()),
+        compressed_where_pass_spec=CompressedWhereOpenMPPassSpec(
+            replace(_compressed_context(), compile_options=compile_options)
+        ),
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    assert nested_managers == [manager, manager]
+    assert nested_modes == ["count", "fill"]
+    assert len(nested_source_ids) == 2
+    assert nested_source_ids[0] == nested_source_ids[1]
+    assert assembly_modes == [True]
+    assert [record.pass_name for record in result.run_records] == [
+        "transform_compressed_where_for_openmp",
+        "rewrite_result_writes",
+        "rewrite_result_writes",
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.configuration_name for record in result.run_records] == [
+        "compressed_where_openmp",
+        "count",
+        "fill",
+        "sparse_prefetch",
+        "dense_pointer_hoist",
+        "single_iteration_loop_elimination",
+        "loop_invariant_factor_hoist",
+        "dynamic_vector_access",
+    ]
+    assert [record.sequence_index for record in result.run_records] == list(range(8))
+    assert all(record.verified_before is verified for record in result.run_records)
+    assert all(record.verified_after is verified for record in result.run_records)
+    assert all(record.duration_ns is not None for record in result.run_records)
+    assert result.compressed_output_parallel is True
+
+
+def test_production_pipeline_nested_fill_failure_preserves_count_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    nested_managers: List[LLIRPassManager] = []
+    nested_source_ids: List[int] = []
+    nested_modes: List[str] = []
+    later_work: List[str] = []
+    original_result_write = LLIRPassManager.run_result_write
+    failure = LLIRTraversalError(
+        LLIRTraversalDiagnostic(
+            code="synthetic_pipeline_fill_failure",
+            message="fill failed in production orchestration",
+            path=("root",),
+            node_type="RawStmt",
+            stage="LLIR transformation",
+            pass_name="transform_compressed_where_for_openmp",
+        )
+    )
+
+    def fail_fill(
+        self: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[object],
+        pass_spec: ResultWritePassSpec,
+    ) -> LLIRRewritePassResult[object]:
+        nested_managers.append(self)
+        nested_source_ids.append(id(artifact.value))
+        nested_modes.append(pass_spec.context.mode)
+        if pass_spec.context.mode == "fill":
+            raise failure
+        return original_result_write(self, artifact, pass_spec)
+
+    def unexpected_later_transform(source: object, context: object) -> NoReturn:
+        del source, context
+        later_work.append("pass")
+        raise AssertionError("later production pass executed after nested failure")
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        del compressed_output_parallel
+        later_work.append("body_assembler")
+        return LLIRRewriteArtifact(artifact.statements)
+
+    monkeypatch.setattr(LLIRPassManager, "run_result_write", fail_fill)
+    for function_name in (
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ):
+        monkeypatch.setattr(
+            pass_manager_module,
+            function_name,
+            unexpected_later_transform,
+        )
+
+    with pytest.raises(LLIRPassPartialFailure) as error:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact(_compressed_source()),
+            compressed_where_pass_spec=CompressedWhereOpenMPPassSpec(
+                replace(_compressed_context(), compile_options=compile_options)
+            ),
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=assemble_body,
+        )
+
+    assert error.value.failure is failure
+    assert nested_managers == [manager, manager]
+    assert nested_modes == ["count", "fill"]
+    assert len(nested_source_ids) == 2
+    assert nested_source_ids[0] == nested_source_ids[1]
+    assert later_work == []
+    assert [
+        (record.pass_name, record.configuration_name, record.sequence_index)
+        for record in error.value.completed_run_records
+    ] == [("rewrite_result_writes", "count", 0)]
+
+
+@pytest.mark.parametrize(
+    ("failing_stage", "completed_pass_names"),
+    [
+        pytest.param("sparse_prefetch", (), id="sparse-prefetch"),
+        pytest.param(
+            "dense_pointer_hoist",
+            ("insert_sparse_prefetch",),
+            id="dense-pointer-hoist",
+        ),
+        pytest.param(
+            "single_iteration_loop_elimination",
+            ("insert_sparse_prefetch", "hoist_dense_pointers"),
+            id="single-iteration",
+        ),
+        pytest.param(
+            "loop_invariant_factor_hoist",
+            (
+                "insert_sparse_prefetch",
+                "hoist_dense_pointers",
+                "eliminate_single_iteration_loops",
+            ),
+            id="loop-invariant-factor",
+        ),
+        pytest.param(
+            "body_assembler",
+            (
+                "insert_sparse_prefetch",
+                "hoist_dense_pointers",
+                "eliminate_single_iteration_loops",
+                "hoist_loop_invariant_factors",
+            ),
+            id="body-assembler",
+        ),
+        pytest.param(
+            "dynamic_vector_access",
+            (
+                "insert_sparse_prefetch",
+                "hoist_dense_pointers",
+                "eliminate_single_iteration_loops",
+                "hoist_loop_invariant_factors",
+            ),
+            id="dynamic-vector-access",
+        ),
+    ],
+)
+def test_each_production_pipeline_failure_stops_later_positions(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_stage: str,
+    completed_pass_names: Tuple[str, ...],
+) -> None:
+    manager = LLIRPassManager.from_compile_options(_compile_options())
+    calls: List[str] = []
+    failure: Exception
+    if failing_stage == "body_assembler":
+        failure = AssertionError("synthetic body-assembler failure")
+    else:
+        failure = LLIRTraversalError(
+            LLIRTraversalDiagnostic(
+                code=f"synthetic_{failing_stage}_failure",
+                message=f"{failing_stage} failed",
+                path=("root",),
+                node_type="BlankLine",
+                stage="LLIR production pipeline",
+                pass_name=failing_stage,
+            )
+        )
+
+    def instrument_transform(
+        stage: str,
+        implementation: object,
+    ) -> Callable[[List[llir.Stmt], object], List[llir.Stmt]]:
+        typed_implementation = cast(
+            Callable[[List[llir.Stmt], object], List[llir.Stmt]],
+            implementation,
+        )
+
+        def instrumented(source: List[llir.Stmt], context: object) -> List[llir.Stmt]:
+            calls.append(stage)
+            if stage == failing_stage:
+                raise failure
+            return typed_implementation(source, context)
+
+        return instrumented
+
+    for stage, function_name in (
+        ("sparse_prefetch", "insert_sparse_prefetch"),
+        ("dense_pointer_hoist", "hoist_dense_pointers"),
+        (
+            "single_iteration_loop_elimination",
+            "eliminate_single_iteration_loops",
+        ),
+        ("loop_invariant_factor_hoist", "hoist_loop_invariant_factors"),
+        ("dynamic_vector_access", "rewrite_dynamic_vector_accesses"),
+    ):
+        original = getattr(pass_manager_module, function_name)
+        monkeypatch.setattr(
+            pass_manager_module,
+            function_name,
+            instrument_transform(stage, original),
+        )
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        calls.append("body_assembler")
+        if failing_stage == "body_assembler":
+            raise failure
+        return LLIRRewriteArtifact(artifact.statements)
+
+    production_order = (
+        "sparse_prefetch",
+        "dense_pointer_hoist",
+        "single_iteration_loop_elimination",
+        "loop_invariant_factor_hoist",
+        "body_assembler",
+        "dynamic_vector_access",
+    )
+    with pytest.raises(LLIRPassPartialFailure) as error:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact([llir.BlankLine()]),
+            compressed_where_pass_spec=None,
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=assemble_body,
+        )
+
+    failure_index = production_order.index(failing_stage)
+    assert calls == list(production_order[: failure_index + 1])
+    assert error.value.failure is failure
+    assert (
+        tuple(record.pass_name for record in error.value.completed_run_records)
+        == completed_pass_names
+    )
+    assert [
+        record.sequence_index for record in error.value.completed_run_records
+    ] == list(range(len(completed_pass_names)))
 
 
 @pytest.mark.parametrize(

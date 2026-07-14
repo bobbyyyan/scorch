@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import llir
@@ -38,23 +38,19 @@ from .compile_options import CompileOptions
 from .compressed_where_openmp_pass import (
     CompressedWhereOpenMPContext,
     CompressedWhereOpenMPPolicy,
-    CompressedWhereOpenMPResult,
 )
 from .dense_pointer_hoist_pass import DensePointerHoistContext
 from .llir_pass_manager import (
     PRODUCTION_LLIR_PASS_OPTIONS,
     CompressedWhereOpenMPPassSpec,
     DensePointerHoistPassSpec,
-    DynamicVectorAccessPassSpec,
     LLIRPassManager,
     LLIRPassOptions,
+    LLIRPassPipeline,
     LLIRPassPartialFailure,
     LLIRPassRunRecord,
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
-    LoopInvariantFactorHoistPassSpec,
-    SingleIterationLoopEliminationPassSpec,
-    SparsePrefetchPassSpec,
 )
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
@@ -63,10 +59,12 @@ if TYPE_CHECKING:
     from .scheduler import Schedule
 
 
-_DYNAMIC_VECTOR_ACCESS_PASS_SPEC = DynamicVectorAccessPassSpec()
-_SPARSE_PREFETCH_PASS_SPEC = SparsePrefetchPassSpec()
-_SINGLE_ITERATION_LOOP_ELIMINATION_PASS_SPEC = SingleIterationLoopEliminationPassSpec()
-_LOOP_INVARIANT_FACTOR_HOIST_PASS_SPEC = LoopInvariantFactorHoistPassSpec()
+@dataclass(frozen=True)
+class _LoweredOuterBody:
+    """Raw outer-body LLIR plus an optional deferred compressed-Where pass."""
+
+    statements: List[llir.Stmt]
+    compressed_where_pass_spec: Optional[CompressedWhereOpenMPPassSpec] = None
 
 
 class ResultTensorAssembler:
@@ -557,9 +555,7 @@ class CINLowerer:
         self.compile_options = compile_options
         self.filter_zeros: bool = filter_zeros
         self.post_ops: Optional[PostOps] = post_ops
-        self._llir_pass_manager = LLIRPassManager(
-            compile_options.verification.llir_pass_options
-        )
+        self._llir_pass_manager = LLIRPassManager.from_compile_options(compile_options)
         self._validate_post_ops()
         self.defined_index_vars: List[IndexVar] = []
 
@@ -605,6 +601,17 @@ class CINLowerer:
         """Completed managed LLIR passes in exact production execution order."""
 
         return self._llir_pass_run_records
+
+    @property
+    def llir_pass_pipeline(self) -> LLIRPassPipeline:
+        """The exact frozen manager-owned pipeline for this compilation."""
+
+        pipeline = self._llir_pass_manager.pipeline
+        if type(pipeline) is not LLIRPassPipeline:
+            raise CompilerInvariantError(
+                "stage=CIN lowering: production manager has no LLIR pass pipeline"
+            )
+        return pipeline
 
     def _record_llir_pass_runs(self, records: Tuple[LLIRPassRunRecord, ...]) -> None:
         start = len(self._llir_pass_run_records)
@@ -2203,7 +2210,7 @@ class CINLowerer:
 
         return self.lower_IndexStmt(stmt, _ownership_transferred=True)
 
-    def _lower_outer_body(self, stmt: IndexStmt) -> CompressedWhereOpenMPResult:
+    def _lower_outer_body(self, stmt: IndexStmt) -> _LoweredOuterBody:
         """Lower the already-validated outer body and retain pass ownership data."""
 
         if isinstance(stmt, ForAll):
@@ -2211,7 +2218,7 @@ class CINLowerer:
         if isinstance(stmt, Where):
             lowered = self.lower_Where(stmt)
             statements = lowered if isinstance(lowered, list) else [lowered]
-            return CompressedWhereOpenMPResult(statements, False)
+            return _LoweredOuterBody(statements)
         raise CompilerInvariantError(
             "stage=CIN lowering: outer function body must be ForAll or Where"
         )
@@ -2565,8 +2572,6 @@ class CINLowerer:
                         )
                     )
 
-            body_stmts: List[llir.Stmt] = []
-
             # Extract data pointers for PostOps extra tensors
             postop_ptr_stmts: List[llir.Stmt] = []
             if self.post_ops and self.post_ops.extra_tensors:
@@ -2593,150 +2598,139 @@ class CINLowerer:
             # instance state stable while returning pass ownership explicitly.
             self.need_compute.extend(result_tensor_vars)
             recurse_result = self._lower_outer_body(stmt)
-            recurse_stmts = recurse_result.statements
-            compressed_output_parallel = recurse_result.applied
 
-            # Post-lowering optimizations on the LLIR
-            sparse_prefetch_result = self._llir_pass_manager.run_sparse_prefetch(
-                LLIRStatementListArtifact(recurse_stmts),
-                _SPARSE_PREFETCH_PASS_SPEC,
-            )
-            self._record_llir_pass_runs(sparse_prefetch_result.run_records)
-            recurse_stmts = sparse_prefetch_result.artifact.statements
-            dense_pointer_result = self._llir_pass_manager.run_dense_pointer_hoist(
-                LLIRStatementListArtifact(recurse_stmts),
-                DensePointerHoistPassSpec(
-                    DensePointerHoistContext(
-                        value_array_ctypes=tuple(self._value_array_ctypes.items())
-                    )
-                ),
-            )
-            self._record_llir_pass_runs(dense_pointer_result.run_records)
-            recurse_stmts = dense_pointer_result.artifact.statements
-            single_iteration_result = (
-                self._llir_pass_manager.run_single_iteration_loop_elimination(
-                    LLIRStatementListArtifact(recurse_stmts),
-                    _SINGLE_ITERATION_LOOP_ELIMINATION_PASS_SPEC,
-                )
-            )
-            self._record_llir_pass_runs(single_iteration_result.run_records)
-            recurse_stmts = single_iteration_result.artifact.statements
-            loop_invariant_factor_result = (
-                self._llir_pass_manager.run_loop_invariant_factor_hoist(
-                    LLIRStatementListArtifact(recurse_stmts),
-                    _LOOP_INVARIANT_FACTOR_HOIST_PASS_SPEC,
-                )
-            )
-            self._record_llir_pass_runs(loop_invariant_factor_result.run_records)
-            recurse_stmts = loop_invariant_factor_result.artifact.statements
+            def assemble_body(
+                transformed_body: LLIRStatementListArtifact,
+                compressed_output_parallel: bool,
+            ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+                recurse_stmts = transformed_body.statements
+                body_stmts: List[llir.Stmt] = []
+                assembled_value_init_stmts = tensor_value_array_init_stmts
+                assembled_level_indices_stmts = result_level_indices_init_stmts
 
-            # Known-nnz detection: if scalar accumulation was used and output is
-            # sparse, nnz_out == nnz_in. Re-emit init with Torch-owned storage.
-            known_nnz_init_stmts: List[llir.Stmt] = []
-            if (
-                self._used_scalar_accum
-                and self.final_result_tensor_var
-                and not self.final_result_tensor_var.is_dense()
-            ):
-                # Scalar accumulation preserves the driving sparse leaf. Its
-                # value tensor has the exact output cardinality for either COO
-                # or a compressed-leaf format such as CSR.
-                sparse_values_tensor = None
-                for tensor in rhs_tensor_vars:
-                    level_types = tensor.get_level_types()
-                    if level_types and level_types[-1] in (
-                        LevelType.COMPRESSED,
-                        LevelType.COORDINATE,
-                    ):
-                        sparse_values_tensor = f"{tensor.get_name()}_values"
-                        break
+                # Known-nnz detection: if scalar accumulation was used and output is
+                # sparse, nnz_out == nnz_in. Re-emit init with Torch-owned storage.
+                known_nnz_init_stmts: List[llir.Stmt] = []
+                if (
+                    self._used_scalar_accum
+                    and self.final_result_tensor_var
+                    and not self.final_result_tensor_var.is_dense()
+                ):
+                    # Scalar accumulation preserves the driving sparse leaf. Its
+                    # value tensor has the exact output cardinality for either COO
+                    # or a compressed-leaf format such as CSR.
+                    sparse_values_tensor = None
+                    for tensor in rhs_tensor_vars:
+                        level_types = tensor.get_level_types()
+                        if level_types and level_types[-1] in (
+                            LevelType.COMPRESSED,
+                            LevelType.COORDINATE,
+                        ):
+                            sparse_values_tensor = f"{tensor.get_name()}_values"
+                            break
 
-                if sparse_values_tensor:
-                    self._known_nnz_var = "_known_nnz"
-                    known_nnz_init_stmts.append(
-                        llir.RawStmt(
-                            code=(
-                                "int64_t _known_nnz = "
-                                f"{sparse_values_tensor}.size(0)"
-                            ),
-                            add_semicolon=True,
+                    if sparse_values_tensor:
+                        self._known_nnz_var = "_known_nnz"
+                        known_nnz_init_stmts.append(
+                            llir.RawStmt(
+                                code=(
+                                    "int64_t _known_nnz = "
+                                    f"{sparse_values_tensor}.size(0)"
+                                ),
+                                add_semicolon=True,
+                            )
                         )
-                    )
 
-                    # Re-emit init stmts with known_nnz_var
-                    tensor_value_array_init_stmts = []
-                    result_level_indices_init_stmts = []
-                    for result_tensor_var in non_workspace_result_tensor_vars:
-                        assembler = ResultTensorAssembler(
-                            result_tensor_var,
-                            known_nnz_var=self._known_nnz_var,
-                            exact_dense_parent_positions=(exact_dense_parent_positions),
-                            reserve_hint_var=reserve_hint_var,
-                        )
-                        tensor_value_array_init_stmts.extend(
-                            assembler.emit_value_array_init()
-                        )
-                        result_level_indices_init_stmts.extend(
-                            assembler.emit_level_indices_init()
-                        )
-                    if result_level_indices_init_stmts:
-                        result_level_indices_init_stmts = [
-                            llir.Comment("Init result level indices"),
-                            *result_level_indices_init_stmts,
+                        # Re-emit init stmts with known_nnz_var
+                        assembled_value_init_stmts = []
+                        assembled_level_indices_stmts = []
+                        for result_tensor_var in non_workspace_result_tensor_vars:
+                            assembler = ResultTensorAssembler(
+                                result_tensor_var,
+                                known_nnz_var=self._known_nnz_var,
+                                exact_dense_parent_positions=(
+                                    exact_dense_parent_positions
+                                ),
+                                reserve_hint_var=reserve_hint_var,
+                            )
+                            assembled_value_init_stmts.extend(
+                                assembler.emit_value_array_init()
+                            )
+                            assembled_level_indices_stmts.extend(
+                                assembler.emit_level_indices_init()
+                            )
+                        if assembled_level_indices_stmts:
+                            assembled_level_indices_stmts = [
+                                llir.Comment("Init result level indices"),
+                                *assembled_level_indices_stmts,
+                            ]
+
+                if compressed_output_parallel:
+                    # Two-phase parallel transform already emitted Torch-owned
+                    # output storage, fill loops, and final assembly.
+                    # Only emit tensor level arrays (input pointers) and recurse.
+                    body_stmts.extend(
+                        [
+                            *abi_validation_stmts,
+                            *result_tensor_level_sizes,
+                            *tensor_level_array_assign_stmts,
+                            llir.BlankLine(),
+                            *tile_size_vars_init_stmts,
+                            *postop_ptr_stmts,
+                            llir.BlankLine(),
+                            *recurse_stmts,
                         ]
+                    )
+                else:
+                    body_stmts.extend(
+                        [
+                            *abi_validation_stmts,
+                            *result_tensor_level_sizes,
+                            *tensor_level_array_assign_stmts,
+                            llir.BlankLine(),
+                            *known_nnz_init_stmts,
+                            *assembled_level_indices_stmts,
+                            llir.Comment("Initialize result value array"),
+                            *assembled_value_init_stmts,
+                            *tile_size_vars_init_stmts,
+                            *postop_ptr_stmts,
+                            # *result_index_init_stmts,
+                            llir.BlankLine(),
+                            *recurse_stmts,
+                        ]
+                    )
 
-            if compressed_output_parallel:
-                # Two-phase parallel transform already emitted Torch-owned
-                # output storage, fill loops, and final assembly.
-                # Only emit tensor level arrays (input pointers) and recurse.
-                body_stmts.extend(
-                    [
-                        *abi_validation_stmts,
-                        *result_tensor_level_sizes,
-                        *tensor_level_array_assign_stmts,
-                        llir.BlankLine(),
-                        *tile_size_vars_init_stmts,
-                        *postop_ptr_stmts,
-                        llir.BlankLine(),
-                        *recurse_stmts,
-                    ]
-                )
-            else:
-                body_stmts.extend(
-                    [
-                        *abi_validation_stmts,
-                        *result_tensor_level_sizes,
-                        *tensor_level_array_assign_stmts,
-                        llir.BlankLine(),
-                        *known_nnz_init_stmts,
-                        *result_level_indices_init_stmts,
-                        llir.Comment("Initialize result value array"),
-                        *tensor_value_array_init_stmts,
-                        *tile_size_vars_init_stmts,
-                        *postop_ptr_stmts,
-                        # *result_index_init_stmts,
-                        llir.BlankLine(),
-                        *recurse_stmts,
-                    ]
-                )
+                    assert (
+                        self.final_result_tensor_var is not None
+                    ), "No final result tensor"
+                    final_assembler = ResultTensorAssembler(
+                        self.final_result_tensor_var,
+                        known_nnz_var=self._known_nnz_var,
+                        exact_dense_parent_positions=exact_dense_parent_positions,
+                        reserve_hint_var=reserve_hint_var,
+                    )
+                    body_stmts.extend(final_assembler.emit_final_assembly())
 
-                assert (
-                    self.final_result_tensor_var is not None
-                ), "No final result tensor"
-                final_assembler = ResultTensorAssembler(
-                    self.final_result_tensor_var,
-                    known_nnz_var=self._known_nnz_var,
-                    exact_dense_parent_positions=exact_dense_parent_positions,
-                    reserve_hint_var=reserve_hint_var,
-                )
-                body_stmts.extend(final_assembler.emit_final_assembly())
+                return LLIRRewriteArtifact(body_stmts)
 
-            dynamic_vector_result = self._llir_pass_manager.run_dynamic_vector_access(
-                LLIRRewriteArtifact(body_stmts),
-                _DYNAMIC_VECTOR_ACCESS_PASS_SPEC,
-            )
-            self._record_llir_pass_runs(dynamic_vector_result.run_records)
-            body_stmts = dynamic_vector_result.artifact.value
+            try:
+                pipeline_result = self._llir_pass_manager.run_production_pipeline(
+                    LLIRStatementListArtifact(recurse_result.statements),
+                    compressed_where_pass_spec=(
+                        recurse_result.compressed_where_pass_spec
+                    ),
+                    dense_pointer_pass_spec=DensePointerHoistPassSpec(
+                        DensePointerHoistContext(
+                            value_array_ctypes=tuple(self._value_array_ctypes.items())
+                        )
+                    ),
+                    body_assembler=assemble_body,
+                )
+            except LLIRPassPartialFailure as failure:
+                self._record_llir_pass_runs(failure.completed_run_records)
+                raise failure.failure from None
+            self._record_llir_pass_runs(pipeline_result.run_records)
+            body_stmts = pipeline_result.artifact.value
 
             function = llir.Function(
                 return_type=llir.DataType.TACO_TENSOR,
@@ -3766,7 +3760,7 @@ class CINLowerer:
 
         return result
 
-    def lower_ForAll(self, stmt: ForAll) -> CompressedWhereOpenMPResult:
+    def lower_ForAll(self, stmt: ForAll) -> _LoweredOuterBody:
         """
         Lower a ForAll to LLIR
         parent_index_var is the index var of the parent ForAll, if any
@@ -3862,32 +3856,24 @@ class CINLowerer:
                 for level, level_type in enumerate(result_tensor.get_level_types())
                 if level_type == LevelType.COMPRESSED
             )
-            try:
-                compressed_where_result = (
-                    self._llir_pass_manager.run_compressed_where_openmp(
-                        LLIRStatementListArtifact(stmts),
-                        CompressedWhereOpenMPPassSpec(
-                            CompressedWhereOpenMPContext(
-                                result_name=result_tensor.get_name(),
-                                compressed_levels=compressed_levels,
-                                workspace_name=workspace_name,
-                                workspace_ctype=workspace_ctype,
-                                policy=CompressedWhereOpenMPPolicy(
-                                    omp_schedule="dynamic, 64",
-                                    flop_grain=self._CG_FLOP_GRAIN,
-                                ),
-                                compile_options=self.compile_options,
-                            )
+            return _LoweredOuterBody(
+                statements=stmts,
+                compressed_where_pass_spec=CompressedWhereOpenMPPassSpec(
+                    CompressedWhereOpenMPContext(
+                        result_name=result_tensor.get_name(),
+                        compressed_levels=compressed_levels,
+                        workspace_name=workspace_name,
+                        workspace_ctype=workspace_ctype,
+                        policy=CompressedWhereOpenMPPolicy(
+                            omp_schedule="dynamic, 64",
+                            flop_grain=self._CG_FLOP_GRAIN,
                         ),
+                        compile_options=self.compile_options,
                     )
-                )
-            except LLIRPassPartialFailure as failure:
-                self._record_llir_pass_runs(failure.completed_run_records)
-                raise failure.failure from None
-            self._record_llir_pass_runs(compressed_where_result.run_records)
-            return compressed_where_result.result
+                ),
+            )
 
-        return CompressedWhereOpenMPResult(statements=stmts, applied=False)
+        return _LoweredOuterBody(statements=stmts)
 
     @staticmethod
     def lower_TensorVar(tensor_var: TensorVar) -> llir.Expr:

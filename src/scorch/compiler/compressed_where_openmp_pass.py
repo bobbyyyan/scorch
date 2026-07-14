@@ -48,7 +48,6 @@ from .llir_traversal import (
 from .llir_pass_manager import (
     PRODUCTION_LLIR_PASS_OPTIONS,
     LLIRPassManager,
-    LLIRPassOptions,
     LLIRPassPartialFailure,
     LLIRPassRunRecord,
     LLIRRewriteArtifact,
@@ -731,14 +730,14 @@ def _build_count_body(
     *,
     loop_var: str,
     workspace_hoisted: bool,
-    pass_options: LLIRPassOptions,
+    manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
     levels = context.compressed_levels
     body: List[llir.Stmt] = [
         llir.RawStmt(code=f"int _cnt{level} = 0") for level in levels
     ]
     body.extend(llir.RawStmt(code=f"int _prev{level} = 0") for level in levels[1:])
-    result_write = LLIRPassManager(pass_options).run_result_write(
+    result_write = manager.run_result_write(
         LLIRRewriteArtifact(work_body),
         ResultWritePassSpec(
             ResultWriteContext(
@@ -766,7 +765,7 @@ def _build_fill_body(
     *,
     loop_var: str,
     workspace_hoisted: bool,
-    pass_options: LLIRPassOptions,
+    manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
     levels = context.compressed_levels
     body: List[llir.Stmt] = []
@@ -778,7 +777,7 @@ def _build_fill_body(
             ]
         )
     body.extend(llir.RawStmt(code=f"int _prev{level} = 0") for level in levels[1:])
-    result_write = LLIRPassManager(pass_options).run_result_write(
+    result_write = manager.run_result_write(
         LLIRRewriteArtifact(work_body),
         ResultWritePassSpec(
             ResultWriteContext(
@@ -1020,7 +1019,7 @@ def _build_transformed_statements(
     for_loop: llir.ForLoop,
     loop_bound: str,
     context: CompressedWhereOpenMPContext,
-    pass_options: LLIRPassOptions,
+    manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
     loop_var = cast(llir.VarInit, for_loop.init).var.name
     work_body, workspace_hoisted = _extract_work_body(for_loop, context)
@@ -1029,7 +1028,7 @@ def _build_transformed_statements(
         context,
         loop_var=loop_var,
         workspace_hoisted=workspace_hoisted,
-        pass_options=pass_options,
+        manager=manager,
     )
     try:
         fill_body, fill_records = _build_fill_body(
@@ -1037,7 +1036,7 @@ def _build_transformed_statements(
             context,
             loop_var=loop_var,
             workspace_hoisted=workspace_hoisted,
-            pass_options=pass_options,
+            manager=manager,
         )
     except CompilerError as failure:
         raise LLIRPassPartialFailure(failure, count_records) from failure
@@ -1077,7 +1076,7 @@ def _build_transformed_statements(
 def _transform_compressed_where_for_openmp_managed(
     statements: List[llir.Stmt],
     context: CompressedWhereOpenMPContext,
-    pass_options: LLIRPassOptions,
+    manager: LLIRPassManager,
 ) -> _ManagedCompressedWhereOpenMPExecution:
     """Run the transform and retain managed internal composition records.
 
@@ -1120,7 +1119,7 @@ def _transform_compressed_where_for_openmp_managed(
         for_loop,
         loop_bound,
         checked_context,
-        pass_options,
+        manager,
     )
     try:
         LLIRWalker(checked_context.traversal).walk(cast(LLIRValue, transformed))
@@ -1147,7 +1146,7 @@ def transform_compressed_where_for_openmp(
         return _transform_compressed_where_for_openmp_managed(
             statements,
             context,
-            PRODUCTION_LLIR_PASS_OPTIONS,
+            LLIRPassManager(PRODUCTION_LLIR_PASS_OPTIONS),
         ).result
     except LLIRPassPartialFailure as failure:
         raise failure.failure from None

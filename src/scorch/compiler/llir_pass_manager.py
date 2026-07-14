@@ -1,15 +1,14 @@
-"""Minimal typed runners for the seven extracted current-LLIR passes.
+"""Typed manager and production pipeline for current-LLIR passes.
 
-The production pass graph is intentionally not represented as one linear
-pipeline.  Dynamic-vector rewriting is a top-level step over the assembled
-function body.  Compressed ``Where`` lowering is a top-level step during outer
-loop lowering, and it internally runs independent result-write ``count`` and
-``fill`` transformations over the same original work body.  Sparse prefetching,
-dense-pointer hoisting, single-iteration-loop elimination, and loop-invariant
-factor hoisting accept only the recursively lowered statement list before ABI
-and result assembly.
-Dedicated runner methods preserve those different contracts and make
-unsupported composition unrepresentable.
+The manager owns one explicit, immutable production pipeline assembled from an
+exact :class:`CompileOptions` snapshot.  The pipeline retains the seven stable
+pass identities even though their artifact contracts are not one homogeneous
+linear chain: compressed ``Where`` owns independent result-write ``count`` and
+``fill`` branches over the same original work body, four passes transform the
+recursively lowered statement list, result/ABI assembly is a typed lazy barrier,
+and dynamic-vector rewriting consumes the assembled body.  The fixed
+``run_production_pipeline`` entry spells out that composition without generic
+dispatch, reflection, or a callback registry.
 
 The configuration and artifact carriers are frozen, but the legacy LLIR
 payloads remain mutable.  Every non-empty pass returns a detached tree through
@@ -22,7 +21,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, Generic, NoReturn, Optional, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Generic,
+    List,
+    NoReturn,
+    Optional,
+    Tuple,
+    cast,
+)
 
 from . import llir
 from .diagnostics import CompilerError, CompilerInvariantError
@@ -61,10 +69,34 @@ from .sparse_prefetch_pass import (
 )
 
 if TYPE_CHECKING:
+    from .compile_options import CompileOptions
     from .compressed_where_openmp_pass import (
         CompressedWhereOpenMPContext,
         CompressedWhereOpenMPResult,
     )
+
+
+class LLIRPassId(Enum):
+    """Stable identities of the seven managed current-LLIR passes."""
+
+    COMPRESSED_WHERE_OPENMP = "transform_compressed_where_for_openmp"
+    RESULT_WRITE = "rewrite_result_writes"
+    SPARSE_PREFETCH = "insert_sparse_prefetch"
+    DENSE_POINTER_HOIST = "hoist_dense_pointers"
+    SINGLE_ITERATION_LOOP_ELIMINATION = "eliminate_single_iteration_loops"
+    LOOP_INVARIANT_FACTOR_HOIST = "hoist_loop_invariant_factors"
+    DYNAMIC_VECTOR_ACCESS = "rewrite_dynamic_vector_accesses"
+
+
+CURRENT_LLIR_PASSES: Tuple[LLIRPassId, ...] = (
+    LLIRPassId.COMPRESSED_WHERE_OPENMP,
+    LLIRPassId.RESULT_WRITE,
+    LLIRPassId.SPARSE_PREFETCH,
+    LLIRPassId.DENSE_POINTER_HOIST,
+    LLIRPassId.SINGLE_ITERATION_LOOP_ELIMINATION,
+    LLIRPassId.LOOP_INVARIANT_FACTOR_HOIST,
+    LLIRPassId.DYNAMIC_VECTOR_ACCESS,
+)
 
 
 class LLIRPassArtifactType(Enum):
@@ -152,6 +184,17 @@ LOOP_INVARIANT_FACTOR_HOIST_PASS = LLIRPassDescriptor(
     input_artifact=LLIRPassArtifactType.STATEMENT_LIST,
     output_artifact=LLIRPassArtifactType.STATEMENT_LIST,
     context_type=LLIRPassContextType.LOOP_INVARIANT_FACTOR_HOIST,
+)
+
+
+CURRENT_LLIR_PASS_DESCRIPTORS: Tuple[LLIRPassDescriptor, ...] = (
+    COMPRESSED_WHERE_OPENMP_PASS,
+    RESULT_WRITE_PASS,
+    SPARSE_PREFETCH_PASS,
+    DENSE_POINTER_HOIST_PASS,
+    SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
+    LOOP_INVARIANT_FACTOR_HOIST_PASS,
+    DYNAMIC_VECTOR_ACCESS_PASS,
 )
 
 
@@ -290,6 +333,15 @@ class ManagedCompressedWhereOpenMPResult:
 
 
 @dataclass(frozen=True)
+class LLIRProductionPipelineResult:
+    """Final assembled body plus exact ordered records from one pipeline run."""
+
+    artifact: LLIRRewriteArtifact[List[llir.Stmt]]
+    compressed_output_parallel: bool
+    run_records: Tuple[LLIRPassRunRecord, ...] = field(compare=False)
+
+
+@dataclass(frozen=True)
 class LLIRPassManagerDiagnostic:
     """Structured failure owned by runner configuration or typed dispatch."""
 
@@ -319,11 +371,11 @@ class LLIRPassPartialFailure(CompilerInvariantError):
 
     def __init__(
         self,
-        failure: CompilerError,
+        failure: Exception,
         completed_run_records: Tuple[LLIRPassRunRecord, ...],
     ) -> None:
-        if not isinstance(failure, CompilerError):
-            raise TypeError("LLIRPassPartialFailure requires a compiler error")
+        if not isinstance(failure, Exception):
+            raise TypeError("LLIRPassPartialFailure requires an exception")
         if type(completed_run_records) is not tuple or any(
             type(record) is not LLIRPassRunRecord for record in completed_run_records
         ):
@@ -337,7 +389,7 @@ class LLIRPassPartialFailure(CompilerInvariantError):
         )
         super().__init__(
             "stage=LLIR pass manager: managed execution failed after "
-            f"{len(self.completed_run_records)} completed nested pass(es): {failure}"
+            f"{len(self.completed_run_records)} completed pass record(s): {failure}"
         )
 
 
@@ -580,10 +632,98 @@ def _record(
 
 
 @dataclass(frozen=True)
+class LLIRPassPipeline:
+    """One exact immutable production pipeline assembled from CompileOptions."""
+
+    compile_options: "CompileOptions"
+    pass_ids: Tuple[LLIRPassId, ...]
+    pass_descriptors: Tuple[LLIRPassDescriptor, ...]
+    options: LLIRPassOptions
+
+    @classmethod
+    def from_compile_options(
+        cls, compile_options: "CompileOptions"
+    ) -> "LLIRPassPipeline":
+        from .compile_options import CompileOptions
+
+        if type(compile_options) is not CompileOptions:
+            _raise_manager_error(
+                code="invalid_compile_options",
+                message="pipeline assembly requires an exact CompileOptions snapshot",
+                sequence_index=-1,
+            )
+        return cls(
+            compile_options=compile_options,
+            pass_ids=compile_options.enabled_llir_passes,
+            pass_descriptors=CURRENT_LLIR_PASS_DESCRIPTORS,
+            options=compile_options.verification.llir_pass_options,
+        )
+
+    def __post_init__(self) -> None:
+        from .compile_options import CompileOptions
+
+        if type(self.compile_options) is not CompileOptions:
+            _raise_manager_error(
+                code="invalid_compile_options",
+                message="pipeline requires an exact CompileOptions snapshot",
+                sequence_index=-1,
+            )
+        if (
+            type(self.pass_ids) is not tuple
+            or self.pass_ids != CURRENT_LLIR_PASSES
+            or any(type(pass_id) is not LLIRPassId for pass_id in self.pass_ids)
+        ):
+            _raise_manager_error(
+                code="invalid_production_pipeline",
+                message="pipeline pass IDs must be the exact current ordered tuple",
+                sequence_index=-1,
+            )
+        if (
+            type(self.pass_descriptors) is not tuple
+            or self.pass_descriptors != CURRENT_LLIR_PASS_DESCRIPTORS
+            or any(
+                type(descriptor) is not LLIRPassDescriptor
+                for descriptor in self.pass_descriptors
+            )
+        ):
+            _raise_manager_error(
+                code="invalid_production_pipeline",
+                message="pipeline descriptors must match the exact ordered pass IDs",
+                sequence_index=-1,
+            )
+        if self.pass_ids is not self.compile_options.enabled_llir_passes:
+            _raise_manager_error(
+                code="detached_production_pipeline",
+                message="pipeline must retain the CompileOptions pass tuple exactly",
+                sequence_index=-1,
+            )
+        if self.options is not self.compile_options.verification.llir_pass_options:
+            _raise_manager_error(
+                code="detached_production_pipeline",
+                message="pipeline must retain the CompileOptions pass policy exactly",
+                sequence_index=-1,
+            )
+
+
+LLIRBodyAssembler = Callable[
+    [LLIRStatementListArtifact, bool],
+    LLIRRewriteArtifact[List[llir.Stmt]],
+]
+
+
+@dataclass(frozen=True)
 class LLIRPassManager:
     """Dedicated, fail-closed runner methods for current extracted passes."""
 
     options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS
+    pipeline: Optional[LLIRPassPipeline] = None
+
+    @classmethod
+    def from_compile_options(
+        cls, compile_options: "CompileOptions"
+    ) -> "LLIRPassManager":
+        pipeline = LLIRPassPipeline.from_compile_options(compile_options)
+        return cls(options=pipeline.options, pipeline=pipeline)
 
     def _validate_options(self) -> None:
         if type(self.options) is not LLIRPassOptions or any(
@@ -599,6 +739,26 @@ class LLIRPassManager:
                 message="manager options must contain exact boolean policy fields",
                 sequence_index=-1,
             )
+
+    def _validate_production_pipeline(self) -> LLIRPassPipeline:
+        self._validate_options()
+        if type(self.pipeline) is not LLIRPassPipeline:
+            _raise_manager_error(
+                code="missing_production_pipeline",
+                message=(
+                    "production orchestration requires a pipeline assembled from "
+                    "CompileOptions"
+                ),
+                sequence_index=-1,
+            )
+        pipeline = cast(LLIRPassPipeline, self.pipeline)
+        if pipeline.options is not self.options:
+            _raise_manager_error(
+                code="detached_production_pipeline",
+                message="manager and pipeline must share the exact pass policy",
+                sequence_index=-1,
+            )
+        return pipeline
 
     @staticmethod
     def _validate_rewrite_artifact(artifact: object) -> None:
@@ -940,7 +1100,7 @@ class LLIRPassManager:
         execution = _transform_compressed_where_for_openmp_managed(
             artifact.statements,
             pass_spec.context,
-            self.options,
+            self,
         )
         result = execution.result
         expected_nested = ("count", "fill") if result.applied else ()
@@ -983,4 +1143,175 @@ class LLIRPassManager:
         return ManagedCompressedWhereOpenMPResult(
             result,
             (parent_record, *nested_records),
+        )
+
+    def run_production_pipeline(
+        self,
+        artifact: LLIRStatementListArtifact,
+        *,
+        compressed_where_pass_spec: Optional[CompressedWhereOpenMPPassSpec],
+        dense_pointer_pass_spec: DensePointerHoistPassSpec,
+        body_assembler: LLIRBodyAssembler,
+    ) -> LLIRProductionPipelineResult:
+        """Run the exact heterogeneous production pipeline once.
+
+        ``body_assembler`` is the single typed legacy result/ABI barrier.  It is
+        invoked only after every pre-assembly pass succeeds, and its exact body
+        artifact is then consumed by dynamic-vector rewriting.  It is a one-shot
+        continuation, not a registry or dynamically selected pass.
+        """
+
+        pipeline = self._validate_production_pipeline()
+        if type(artifact) is not LLIRStatementListArtifact:
+            _raise_manager_error(
+                code="invalid_pass_artifact",
+                message="production pipeline requires LLIRStatementListArtifact",
+                sequence_index=0,
+            )
+        if (
+            compressed_where_pass_spec is not None
+            and type(compressed_where_pass_spec) is not CompressedWhereOpenMPPassSpec
+        ):
+            _raise_manager_error(
+                code="unknown_pass_spec",
+                message=(
+                    "production pipeline requires an exact optional "
+                    "CompressedWhereOpenMPPassSpec"
+                ),
+                sequence_index=0,
+                descriptor=COMPRESSED_WHERE_OPENMP_PASS,
+            )
+        if compressed_where_pass_spec is not None:
+            from .compressed_where_openmp_pass import CompressedWhereOpenMPContext
+
+            if (
+                type(compressed_where_pass_spec.context)
+                is not CompressedWhereOpenMPContext
+            ):
+                _raise_manager_error(
+                    code="invalid_pass_context",
+                    message=(
+                        "production compressed-Where configuration requires an "
+                        "exact CompressedWhereOpenMPContext"
+                    ),
+                    sequence_index=0,
+                    descriptor=COMPRESSED_WHERE_OPENMP_PASS,
+                )
+            if (
+                compressed_where_pass_spec.context.compile_options
+                is not pipeline.compile_options
+            ):
+                _raise_manager_error(
+                    code="detached_compile_options",
+                    message=(
+                        "production compressed-Where configuration must retain the "
+                        "pipeline CompileOptions snapshot exactly"
+                    ),
+                    sequence_index=0,
+                    descriptor=COMPRESSED_WHERE_OPENMP_PASS,
+                )
+        if type(dense_pointer_pass_spec) is not DensePointerHoistPassSpec:
+            _raise_manager_error(
+                code="unknown_pass_spec",
+                message=(
+                    "production pipeline requires an exact DensePointerHoistPassSpec"
+                ),
+                sequence_index=3,
+                descriptor=DENSE_POINTER_HOIST_PASS,
+            )
+        if not callable(body_assembler):
+            _raise_manager_error(
+                code="invalid_body_assembler",
+                message="production pipeline requires one typed body assembler",
+                sequence_index=6,
+            )
+
+        # Validate the complete frozen order before executing any user program
+        # work.  Heterogeneous artifact contracts remain explicit below; there
+        # is deliberately no generic pass dispatch table.
+        if (
+            pipeline.pass_ids != CURRENT_LLIR_PASSES
+            or pipeline.pass_descriptors != CURRENT_LLIR_PASS_DESCRIPTORS
+        ):
+            _raise_manager_error(
+                code="invalid_production_pipeline",
+                message="production pipeline order changed after assembly",
+                sequence_index=-1,
+            )
+
+        completed: Tuple[LLIRPassRunRecord, ...] = ()
+        statements = artifact.statements
+        compressed_output_parallel = False
+        try:
+            if compressed_where_pass_spec is not None:
+                compressed = self.run_compressed_where_openmp(
+                    LLIRStatementListArtifact(statements),
+                    compressed_where_pass_spec,
+                )
+                completed = (*completed, *compressed.run_records)
+                statements = compressed.result.statements
+                compressed_output_parallel = compressed.result.applied
+
+            sparse = self.run_sparse_prefetch(
+                LLIRStatementListArtifact(statements),
+                SparsePrefetchPassSpec(),
+            )
+            completed = (*completed, *sparse.run_records)
+            statements = sparse.artifact.statements
+
+            dense = self.run_dense_pointer_hoist(
+                LLIRStatementListArtifact(statements),
+                dense_pointer_pass_spec,
+            )
+            completed = (*completed, *dense.run_records)
+            statements = dense.artifact.statements
+
+            single = self.run_single_iteration_loop_elimination(
+                LLIRStatementListArtifact(statements),
+                SingleIterationLoopEliminationPassSpec(),
+            )
+            completed = (*completed, *single.run_records)
+            statements = single.artifact.statements
+
+            factor = self.run_loop_invariant_factor_hoist(
+                LLIRStatementListArtifact(statements),
+                LoopInvariantFactorHoistPassSpec(),
+            )
+            completed = (*completed, *factor.run_records)
+            statements = factor.artifact.statements
+
+            assembled = body_assembler(
+                LLIRStatementListArtifact(statements),
+                compressed_output_parallel,
+            )
+            self._validate_rewrite_artifact(assembled)
+            if type(assembled.value) is not list:
+                _raise_manager_error(
+                    code="invalid_body_assembly_artifact",
+                    message="body assembler must return an exact statement-list value",
+                    sequence_index=6,
+                    descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
+                )
+
+            dynamic = self.run_dynamic_vector_access(
+                assembled,
+                DynamicVectorAccessPassSpec(),
+            )
+            completed = (*completed, *dynamic.run_records)
+        except LLIRPassPartialFailure as failure:
+            raise LLIRPassPartialFailure(
+                failure.failure,
+                (*completed, *failure.completed_run_records),
+            ) from failure
+        except Exception as failure:
+            raise LLIRPassPartialFailure(failure, completed) from failure
+
+        ordered_records = tuple(
+            replace(record, sequence_index=index)
+            for index, record in enumerate(completed)
+        )
+        return LLIRProductionPipelineResult(
+            artifact=cast(LLIRRewriteArtifact[List[llir.Stmt]], dynamic.artifact),
+            compressed_output_parallel=compressed_output_parallel,
+            run_records=ordered_records,
         )

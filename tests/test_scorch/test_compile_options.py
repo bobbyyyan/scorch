@@ -28,6 +28,7 @@ from scorch.compiler.cin import (  # type: ignore[import-untyped]
 )
 from scorch.compiler.cin_analysis import (  # type: ignore[import-untyped]
     canonical_cin_dump,
+    full_cin_verification,
     normalize_cin,
 )
 from scorch.compiler.cin_lowerer import CINLowerer  # type: ignore[import-untyped]
@@ -57,14 +58,24 @@ from scorch.compiler.diagnostics import (  # type: ignore[import-untyped]
     VerificationError,
 )
 from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
+    CURRENT_LLIR_PASS_DESCRIPTORS,
     DEBUG_LLIR_PASS_OPTIONS,
+    DENSE_POINTER_HOIST_PASS,
+    DensePointerHoistPassSpec,
+    LLIRBodyAssembler,
+    LLIRPassManager,
     LLIRPassOptions,
+    LLIRPassPipeline,
+    LLIRProductionPipelineResult,
+    LLIRStatementListArtifact,
     PRODUCTION_LLIR_PASS_OPTIONS,
 )
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Schedule,
     Scheduler,
     TileSpec,
+    regblock_force,
+    schedule_force,
 )
 from scorch.layout import TensorSpec  # type: ignore[import-untyped]
 from scorch.utils import (  # type: ignore[import-untyped]
@@ -761,6 +772,135 @@ def test_explicit_snapshot_prevents_nested_environment_resnapshot(
         options.build.extra_ldflags
     )
     assert _kernel_name("source", compile_options=options).startswith("kernel_")
+
+
+def test_production_lowering_delegates_once_to_each_snapshotted_manager_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    production = _default_options()
+    debug = _default_options(
+        verify_cin=True,
+        llir_pass_options=DEBUG_LLIR_PASS_OPTIONS,
+    )
+    observed_calls: list[
+        tuple[
+            LLIRPassManager,
+            LLIRStatementListArtifact,
+            DensePointerHoistPassSpec,
+            LLIRBodyAssembler,
+            LLIRProductionPipelineResult,
+        ]
+    ] = []
+    original_pipeline_entry = LLIRPassManager.run_production_pipeline
+
+    def record_pipeline_entry(
+        self: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        *,
+        compressed_where_pass_spec: object,
+        dense_pointer_pass_spec: DensePointerHoistPassSpec,
+        body_assembler: LLIRBodyAssembler,
+    ) -> LLIRProductionPipelineResult:
+        assert compressed_where_pass_spec is None
+        result = original_pipeline_entry(
+            self,
+            artifact,
+            compressed_where_pass_spec=None,
+            dense_pointer_pass_spec=dense_pointer_pass_spec,
+            body_assembler=body_assembler,
+        )
+        observed_calls.append(
+            (
+                self,
+                artifact,
+                dense_pointer_pass_spec,
+                body_assembler,
+                result,
+            )
+        )
+        return result
+
+    def fail_resnapshot(
+        cls: type[CompileOptions], *args: object, **kwargs: object
+    ) -> CompileOptions:
+        raise AssertionError("production lowering attempted to resnapshot state")
+
+    monkeypatch.setattr(
+        LLIRPassManager,
+        "run_production_pipeline",
+        record_pipeline_entry,
+    )
+    monkeypatch.setattr(
+        CompileOptions,
+        "from_environment",
+        classmethod(fail_resnapshot),
+    )
+    monkeypatch.setenv("SCORCH_REGBLOCK", "1")
+    monkeypatch.setenv("SCORCH_VERIFY_CIN", "1")
+    conflicting_schedule = Schedule(loop_order=("i", "j", "k"))
+
+    with (
+        regblock_force(True),
+        schedule_force(conflicting_schedule),
+        full_cin_verification(True),
+    ):
+        _, _, production_lowerer, production_cpp = _compile_spmm(
+            _build_spmm_source(), production
+        )
+    with (
+        regblock_force(True),
+        schedule_force(conflicting_schedule),
+        full_cin_verification(False),
+    ):
+        _, _, debug_lowerer, debug_cpp = _compile_spmm(_build_spmm_source(), debug)
+
+    assert len(observed_calls) == 2
+    expected_options = (production, debug)
+    expected_lowerers = (production_lowerer, debug_lowerer)
+    expected_record_names = tuple(pass_id.value for pass_id in CURRENT_LLIR_PASSES[2:])
+    for call, options, lowerer in zip(
+        observed_calls, expected_options, expected_lowerers
+    ):
+        manager, artifact, dense_spec, body_assembler, result = call
+        pipeline = manager.pipeline
+
+        assert type(pipeline) is LLIRPassPipeline
+        assert pipeline is lowerer.llir_pass_pipeline
+        assert pipeline.compile_options is options
+        assert pipeline.pass_ids is options.enabled_llir_passes
+        assert pipeline.pass_ids == CURRENT_LLIR_PASSES
+        assert pipeline.pass_descriptors is CURRENT_LLIR_PASS_DESCRIPTORS
+        assert pipeline.options is options.verification.llir_pass_options
+        assert manager.options is pipeline.options
+        assert type(artifact) is LLIRStatementListArtifact
+        assert type(artifact.statements) is list
+        assert type(dense_spec) is DensePointerHoistPassSpec
+        assert dense_spec.descriptor is DENSE_POINTER_HOIST_PASS
+        assert dense_spec.context.value_array_ctypes == (
+            ("A_val", "float"),
+            ("B_val", "float"),
+        )
+        assert callable(body_assembler)
+        assert type(result) is LLIRProductionPipelineResult
+        assert tuple(record.sequence_index for record in result.run_records) == tuple(
+            range(len(result.run_records))
+        )
+        assert tuple(record.pass_name for record in result.run_records) == (
+            expected_record_names
+        )
+        assert result.run_records == lowerer.llir_pass_run_records
+
+    first_result = observed_calls[0][-1]
+    second_result = observed_calls[1][-1]
+    assert production_lowerer.llir_pass_pipeline is not debug_lowerer.llir_pass_pipeline
+    assert first_result is not second_result
+    assert first_result.artifact is not second_result.artifact
+    assert first_result.artifact.value is not second_result.artifact.value
+    assert production_cpp == debug_cpp
+    assert len(production_cpp) == 2505
+    assert hashlib.sha256(production_cpp.encode()).hexdigest() == (
+        "36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151"
+    )
 
 
 def test_compressed_output_routes_exact_snapshot_through_nested_renderers(
