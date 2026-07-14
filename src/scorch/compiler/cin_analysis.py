@@ -395,7 +395,7 @@ def _tensor_metadata(
     )
 
 
-def analyze_cin(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
+def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
     """Compute immutable ownership/use/access facts without mutating ``cin``."""
 
     # This exhaustive traversal stays local until the next planned seam extracts
@@ -1029,6 +1029,14 @@ def analyze_cin(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
         reduction_index_ids=reduction_index_ids,
         diagnostics=tuple(diagnostics),
     )
+
+
+def analyze_cin(cin: IndexStmt) -> CINAnalysis:
+    """Compatibility entry routed through the canonical pure analysis runner."""
+
+    from .analysis_runner import COMMON_ANALYSIS_RUNNER
+
+    return COMMON_ANALYSIS_RUNNER.analyze_cin(cin)
 
 
 def verify_cin(cin: IndexStmt) -> CINAnalysis:

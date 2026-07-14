@@ -4,8 +4,14 @@ from typing import Any
 
 import pytest
 
+import scorch.compiler.analysis_runner as analysis_runner_module  # type: ignore[import-untyped]
+from scorch.compiler.analysis_runner import (  # type: ignore[import-untyped]
+    AnalysisRunner,
+    COMMON_ANALYSIS_RUNNER,
+)
 from scorch.compiler.cin import (
     ForAll,
+    IndexStmt,
     IndexVar,
     Operation,
     TensorAccess,
@@ -273,6 +279,74 @@ def test_analysis_result_is_deeply_immutable() -> None:
         mutable_analysis.root_id = NodeId(-1)
     with pytest.raises(TypeError):
         mutable_parents[NodeId(-1)] = None
+
+
+def test_common_analysis_runner_is_frozen_stateless_and_typed() -> None:
+    runner = AnalysisRunner()
+    program, _ = _reduction_program()
+
+    assert isinstance(COMMON_ANALYSIS_RUNNER, AnalysisRunner)
+    assert fields(runner) == ()
+    assert vars(runner) == {}
+    assert runner == AnalysisRunner()
+    assert isinstance(runner.analyze_cin(program), CINAnalysis)
+
+    mutable_runner: Any = runner
+    with pytest.raises(FrozenInstanceError):
+        mutable_runner.cache = {}
+
+
+def test_common_analysis_runner_recomputes_equal_distinct_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    program, _ = _reduction_program()
+    before = canonical_cin_dump(program)
+    calls: list[IndexStmt] = []
+    compute = analysis_runner_module._compute_cin_analysis
+
+    def counted_compute(cin: IndexStmt) -> CINAnalysis:
+        calls.append(cin)
+        return compute(cin)
+
+    monkeypatch.setattr(
+        analysis_runner_module,
+        "_compute_cin_analysis",
+        counted_compute,
+    )
+
+    direct = COMMON_ANALYSIS_RUNNER.analyze_cin(program)
+    compatibility = analyze_cin(program)
+
+    assert len(calls) == 2
+    assert all(call is program for call in calls)
+    assert compatibility == direct
+    assert compatibility is not direct
+    assert canonical_cin_dump(program) == before
+
+
+def test_common_analysis_runner_results_are_immutable_and_input_independent() -> None:
+    program, nodes = _reduction_program()
+    before = canonical_cin_dump(program)
+
+    first = COMMON_ANALYSIS_RUNNER.analyze_cin(program)
+
+    assert canonical_cin_dump(program) == before
+    assert program.parent is None
+    assert nodes.assignment.parent is None
+    assert nodes.i.tensor_accesses == []
+    assert nodes.k.tensor_accesses == []
+    _assert_deeply_immutable(first)
+
+    nodes.left.name = "A_changed"
+    changed_input = canonical_cin_dump(program)
+    second = COMMON_ANALYSIS_RUNNER.analyze_cin(program)
+
+    assert canonical_cin_dump(program) == changed_input
+    assert first.symbol_definitions[nodes.left.symbol_id].display_name == "A"
+    assert second.symbol_definitions[nodes.left.symbol_id].display_name == "A_changed"
+    assert first != second
+    assert first is not second
+    _assert_deeply_immutable(second)
 
 
 def test_same_name_nested_bindings_keep_distinct_identity_and_scopes() -> None:
