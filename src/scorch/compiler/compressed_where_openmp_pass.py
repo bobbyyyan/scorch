@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, NoReturn, Optional, Sequence, Tuple, cast
+from typing import TYPE_CHECKING, Dict, List, NoReturn, Optional, Sequence, Tuple, cast
 
 from . import llir
 from .codegen import LLIRLowerer
@@ -55,6 +55,9 @@ from .llir_pass_manager import (
     ResultWritePassSpec,
 )
 from .result_write_pass import ResultWriteContext
+
+if TYPE_CHECKING:
+    from .compile_options import CompileOptions
 
 COMPRESSED_WHERE_OPENMP_TRAVERSAL_CONTEXT = LLIRTraversalContext(
     stage="LLIR transformation",
@@ -83,7 +86,9 @@ class CompressedWhereOpenMPContext:
 
     ``workspace_ctype`` is also the legacy result-value C type used for exact
     output allocation.  Production obtains both workspace fields together from
-    the one-dimensional sparse ``Where`` workspace.
+    the one-dimensional sparse ``Where`` workspace. ``compile_options`` carries
+    the exact outer snapshot through the two nested result-write passes and
+    their spelling-only renderers; standalone pass callers may omit it.
     """
 
     result_name: str
@@ -92,6 +97,7 @@ class CompressedWhereOpenMPContext:
     workspace_ctype: str
     policy: CompressedWhereOpenMPPolicy = COMPRESSED_WHERE_OPENMP_POLICY
     traversal: LLIRTraversalContext = COMPRESSED_WHERE_OPENMP_TRAVERSAL_CONTEXT
+    compile_options: Optional["CompileOptions"] = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +194,18 @@ def _validate_context(context: object) -> CompressedWhereOpenMPContext:
             path=("context", "traversal"),
             value=traversal,
         )
+
+    if typed_context.compile_options is not None:
+        from .compile_options import CompileOptions
+
+        if type(typed_context.compile_options) is not CompileOptions:
+            _raise_compressed_where_error(
+                typed_context,
+                code="invalid_compressed_where_compile_options",
+                message="compile_options must be an exact CompileOptions snapshot",
+                path=("context", "compile_options"),
+                value=typed_context.compile_options,
+            )
 
     _validate_non_empty_string(
         typed_context,
@@ -586,11 +604,14 @@ def _parallel_rows_expr(for_loop: llir.ForLoop, bound: str) -> str:
     return bound
 
 
-def _find_all_sparse_pos_arrays(body: Sequence[llir.Stmt]) -> List[str]:
+def _find_all_sparse_pos_arrays(
+    body: Sequence[llir.Stmt],
+    compile_options: Optional["CompileOptions"],
+) -> List[str]:
     """Recover legacy sparse-array spellings from rendered phase C++."""
 
     try:
-        text = LLIRLowerer().lower_llir(list(body))
+        text = LLIRLowerer(compile_options=compile_options).lower_llir(list(body))
     except Exception:
         # This is the characterized legacy policy fallback.  The input LLIR has
         # already passed exact-type traversal validation; rendering failure only
@@ -610,9 +631,13 @@ def _parse_pos(pos_name: str) -> Optional[Tuple[str, int]]:
     return match.group(1), int(match.group(2))
 
 
-def _spgemm_flop_work_expr(body: Sequence[llir.Stmt], bound: str) -> Optional[str]:
+def _spgemm_flop_work_expr(
+    body: Sequence[llir.Stmt],
+    bound: str,
+    compile_options: Optional["CompileOptions"],
+) -> Optional[str]:
     levels: Dict[str, set[int]] = {}
-    for position_name in _find_all_sparse_pos_arrays(body):
+    for position_name in _find_all_sparse_pos_arrays(body, compile_options):
         parsed = _parse_pos(position_name)
         if parsed is not None:
             levels.setdefault(parsed[0], set()).add(parsed[1])
@@ -673,7 +698,11 @@ def _build_phase_loop(
     loop_bound: str,
 ) -> llir.ForLoop:
     header = _phase_header_copy(source, context)
-    flop_work = _spgemm_flop_work_expr(body, loop_bound)
+    flop_work = _spgemm_flop_work_expr(
+        body,
+        loop_bound,
+        context.compile_options,
+    )
     decision = _parallel_policy_decision(
         header,
         body,
@@ -717,6 +746,7 @@ def _build_count_body(
                 compressed_levels=levels,
                 mode="count",
                 traversal=context.traversal,
+                compile_options=context.compile_options,
             )
         ),
     )
@@ -756,6 +786,7 @@ def _build_fill_body(
                 compressed_levels=levels,
                 mode="fill",
                 traversal=context.traversal,
+                compile_options=context.compile_options,
             )
         ),
     )

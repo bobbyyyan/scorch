@@ -146,6 +146,27 @@ def _build_spmm_source() -> ForAll:
     return ForAll(row, ForAll(reduction, ForAll(column, assignment)))
 
 
+def _build_dss_source() -> ForAll:
+    batch, row, reduction, column = (
+        IndexVar("batch"),
+        IndexVar("row"),
+        IndexVar("reduction"),
+        IndexVar("column"),
+    )
+    result = TensorVar("Result", fmt="dss")
+    left = TensorVar("Left", fmt="dss")
+    right = TensorVar("Right", fmt="dss")
+    result[batch, row, column] = (
+        left[batch, row, reduction] * right[batch, reduction, column]
+    )
+    assignment = result._assignment
+    assert assignment is not None
+    return ForAll(
+        batch,
+        ForAll(row, ForAll(reduction, ForAll(column, assignment))),
+    )
+
+
 def _structural_snapshot(value: object) -> object:
     if isinstance(value, llir.Node):
         return (
@@ -742,6 +763,38 @@ def test_explicit_snapshot_prevents_nested_environment_resnapshot(
     assert _kernel_name("source", compile_options=options).startswith("kernel_")
 
 
+def test_compressed_output_routes_exact_snapshot_through_nested_renderers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = replace(_default_options(), emit_comments=False)
+    observed_options: list[object] = []
+    original_codegen_init = LLIRLowerer.__init__
+
+    def record_codegen_init(
+        self: LLIRLowerer,
+        compile_options: CompileOptions | None = None,
+    ) -> None:
+        observed_options.append(compile_options)
+        original_codegen_init(self, compile_options=compile_options)
+
+    monkeypatch.setattr(LLIRLowerer, "__init__", record_codegen_init)
+
+    scheduled = Scheduler.auto_schedule(
+        _build_dss_source(),
+        compile_options=options,
+    )
+    lowerer = CINLowerer(compile_options=options)
+    lowered = lowerer.lower_IndexStmt(scheduled)
+    cpp = LLIRLowerer(compile_options=options).lower_llir(lowered)
+
+    assert cpp
+    assert len(observed_options) == 5
+    assert all(observed is options for observed in observed_options)
+    assert [
+        record.configuration_name for record in lowerer.llir_pass_run_records[:3]
+    ] == ["compressed_where_openmp", "count", "fill"]
+
+
 def test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1209,3 +1262,25 @@ def test_compile_entry_without_schedule_support_fails_closed() -> None:
         code="unsupported_requested_schedule",
         field="requested_schedule",
     )
+
+
+def test_plain_cin_lowering_cannot_ignore_snapshotted_schedule() -> None:
+    requested = Schedule(loop_order=("i", "k", "j"))
+    options = replace(_default_options(), requested_schedule=requested)
+    source = _build_spmm_source()
+
+    with pytest.raises(CompileOptionsError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(source)
+    _assert_compile_options_error(
+        error,
+        code="unsupported_requested_schedule",
+        field="requested_schedule",
+    )
+
+    scheduled = Scheduler.apply_schedule(
+        source,
+        requested,
+        compile_options=options,
+    )
+    lowered = CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+    assert lowered

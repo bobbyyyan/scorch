@@ -19,7 +19,16 @@ OpenMP transform does not declare ``_prev`` for the first compressed level.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, NoReturn, Optional, Sequence, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    List,
+    Literal,
+    NoReturn,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
 from . import llir
 from .codegen import LLIRLowerer
@@ -36,6 +45,9 @@ from .llir_traversal import (
     LLIRWalker,
 )
 
+if TYPE_CHECKING:
+    from .compile_options import CompileOptions
+
 ResultWriteMode = Literal["count", "fill"]
 
 RESULT_WRITE_TRAVERSAL_CONTEXT = LLIRTraversalContext(
@@ -46,12 +58,18 @@ RESULT_WRITE_TRAVERSAL_CONTEXT = LLIRTraversalContext(
 
 @dataclass(frozen=True)
 class ResultWriteContext:
-    """All explicit state required to rewrite one result's writes."""
+    """All explicit state required to rewrite one result's writes.
+
+    Production carries the outer compilation snapshot so its spelling-only
+    renderer cannot fall back to an independent emission policy. Direct pass
+    callers may omit it because they are their own compatibility boundary.
+    """
 
     result_name: str
     compressed_levels: Tuple[int, ...]
     mode: ResultWriteMode
     traversal: LLIRTraversalContext = RESULT_WRITE_TRAVERSAL_CONTEXT
+    compile_options: Optional["CompileOptions"] = None
 
 
 def _diagnostic_context(context: object) -> LLIRTraversalContext:
@@ -109,6 +127,18 @@ def _validate_context(context: object) -> ResultWriteContext:
             path=("context", "traversal"),
             value=traversal,
         )
+
+    if typed_context.compile_options is not None:
+        from .compile_options import CompileOptions
+
+        if type(typed_context.compile_options) is not CompileOptions:
+            _raise_result_write_error(
+                typed_context,
+                code="invalid_result_write_compile_options",
+                message="compile_options must be an exact CompileOptions snapshot",
+                path=("context", "compile_options"),
+                value=typed_context.compile_options,
+            )
 
     if type(typed_context.result_name) is not str or not typed_context.result_name:
         _raise_result_write_error(
@@ -176,7 +206,7 @@ class _ResultWriteRewriter(LLIRRewriter):
         self._compressed_levels = context.compressed_levels
         self._leaf = context.compressed_levels[-1]
         self._mode = context.mode
-        self._codegen = LLIRLowerer()
+        self._codegen = LLIRLowerer(compile_options=context.compile_options)
         self._identity = LLIRRewriter(context.traversal)
 
     def rewrite_statement_sequence(

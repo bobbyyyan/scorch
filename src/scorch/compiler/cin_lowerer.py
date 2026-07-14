@@ -22,7 +22,12 @@ from .cin import (
 )
 from .iter_lattice import IterationLattice
 from .llir import AssignOp, DataType
-from .diagnostics import CompilerInvariantError, UnsupportedFeature
+from .diagnostics import (
+    CompileOptionsDiagnostic,
+    CompileOptionsError,
+    CompilerInvariantError,
+    UnsupportedFeature,
+)
 from .loop_plan import LoopPlan, ScheduledCIN, verify_scheduled_cin
 from .legacy_cin_adapter import (
     claim_legacy_cin_working_tree,
@@ -2160,6 +2165,19 @@ class CINLowerer:
             plan = stmt.verified_loop_plan
             stmt = stmt.normalized_cin
             self.normalized_cin = stmt
+        elif self.compile_options.requested_schedule is not None:
+            raise CompileOptionsError(
+                (
+                    CompileOptionsDiagnostic(
+                        code="unsupported_requested_schedule",
+                        field="requested_schedule",
+                        message=(
+                            "plain CIN lowering cannot ignore a requested schedule; "
+                            "lower a verified ScheduledCIN"
+                        ),
+                    ),
+                )
+            )
 
         self._validate_index_stmt(stmt)
         verify_cin_if_enabled(
@@ -3858,6 +3876,7 @@ class CINLowerer:
                                     omp_schedule="dynamic, 64",
                                     flop_grain=self._CG_FLOP_GRAIN,
                                 ),
+                                compile_options=self.compile_options,
                             )
                         ),
                     )
