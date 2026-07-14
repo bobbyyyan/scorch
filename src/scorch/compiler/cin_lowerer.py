@@ -45,6 +45,7 @@ from .llir_pass_manager import (
     LLIRPassRunRecord,
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
+    LoopInvariantFactorHoistPassSpec,
     SingleIterationLoopEliminationPassSpec,
     SparsePrefetchPassSpec,
 )
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
 _DYNAMIC_VECTOR_ACCESS_PASS_SPEC = DynamicVectorAccessPassSpec()
 _SPARSE_PREFETCH_PASS_SPEC = SparsePrefetchPassSpec()
 _SINGLE_ITERATION_LOOP_ELIMINATION_PASS_SPEC = SingleIterationLoopEliminationPassSpec()
+_LOOP_INVARIANT_FACTOR_HOIST_PASS_SPEC = LoopInvariantFactorHoistPassSpec()
 
 
 class ResultTensorAssembler:
@@ -2570,7 +2572,14 @@ class CINLowerer:
             )
             self._record_llir_pass_runs(single_iteration_result.run_records)
             recurse_stmts = single_iteration_result.artifact.statements
-            self._hoist_loop_invariant_factors(recurse_stmts)
+            loop_invariant_factor_result = (
+                self._llir_pass_manager.run_loop_invariant_factor_hoist(
+                    LLIRStatementListArtifact(recurse_stmts),
+                    _LOOP_INVARIANT_FACTOR_HOIST_PASS_SPEC,
+                )
+            )
+            self._record_llir_pass_runs(loop_invariant_factor_result.run_records)
+            recurse_stmts = loop_invariant_factor_result.artifact.statements
 
             # Known-nnz detection: if scalar accumulation was used and output is
             # sparse, nnz_out == nnz_in. Re-emit init with Torch-owned storage.
@@ -2875,162 +2884,6 @@ class CINLowerer:
             expr.array = CINLowerer._rewrite_expr_refs(expr.array, replacements)
             expr.index = CINLowerer._rewrite_expr_refs(expr.index, replacements)
         return expr
-
-    # ------------------------------------------------------------------
-    # Optimization pass: hoist loop-invariant multiplicative factors
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _hoist_loop_invariant_factors(stmts: List[llir.Stmt]) -> None:
-        """Hoist loop-invariant factors out of inner accumulation loops.
-
-        Transforms:
-            for (int k = 0; k < K; k++) {
-                _accum += A_val[pA1] * _B_ptr[k] * _C_ptr[k];
-            }
-        Into:
-            float _inv_0 = A_val[pA1];
-            for (int k = 0; k < K; k++) {
-                _accum += _B_ptr[k] * _C_ptr[k];
-            }
-            _accum *= _inv_0;
-
-        This is valid under -ffast-math (FP associativity) and reduces
-        multiplies in the inner loop from N to N+1.
-        """
-        import re
-
-        for s in stmts:
-            if isinstance(s, llir.ForLoop):
-                CINLowerer._hoist_loop_invariant_factors(s.body)
-            elif isinstance(s, llir.IfThenElse):
-                if s.then_body:
-                    CINLowerer._hoist_loop_invariant_factors(s.then_body)
-                if s.else_body:
-                    CINLowerer._hoist_loop_invariant_factors(s.else_body)
-
-        i = 0
-        while i < len(stmts):
-            s = stmts[i]
-            if not isinstance(s, llir.ForLoop):
-                i += 1
-                continue
-
-            # Find the loop variable
-            if not isinstance(s.update, llir.Increment):
-                i += 1
-                continue
-            loop_var = s.update.var.name
-
-            # Collect all variable names defined inside the loop body so
-            # we never hoist a factor that references them.
-            body_defined_vars = set()
-            body_defined_vars.add(loop_var)
-            CINLowerer._collect_defined_vars(s.body, body_defined_vars)
-
-            # Look for accumulation: _accum += expr where expr contains
-            # a factor that doesn't reference loop_var or any _ptr[loop_var]
-            for j, body_s in enumerate(s.body):
-                if not (
-                    isinstance(body_s, llir.Assign)
-                    and body_s.op.value == "+="
-                    and isinstance(body_s.value, llir.BinOp)
-                    and body_s.value.op == "*"
-                ):
-                    continue
-
-                accum_var = body_s.var.name
-                # Only hoist when accumulating into a simple scalar,
-                # not an array element (e.g. C_values[pC1])
-                if "[" in accum_var:
-                    continue
-                # Collect all multiplicative factors
-                factors = []
-                CINLowerer._collect_mul_factors(body_s.value, factors)
-
-                if len(factors) < 2:
-                    continue
-
-                # Find factors that don't reference the loop variable
-                # or any variable defined inside the loop body
-                invariant = []
-                variant = []
-                for f in factors:
-                    name = f.name if isinstance(f, llir.Var) else ""
-                    if "_ptr[" in name:
-                        variant.append(f)
-                    elif any(v in name for v in body_defined_vars):
-                        variant.append(f)
-                    else:
-                        invariant.append(f)
-
-                if not invariant or not variant:
-                    continue
-
-                # Build the hoisted factor expression
-                inv_name = f"_inv_{i}"
-                if len(invariant) == 1:
-                    inv_expr = invariant[0]
-                else:
-                    inv_expr = invariant[0]
-                    for f in invariant[1:]:
-                        inv_expr = llir.BinOp(left=inv_expr, op="*", right=f)
-
-                # Build the reduced inner expression (only variant factors)
-                if len(variant) == 1:
-                    new_inner = variant[0]
-                else:
-                    new_inner = variant[0]
-                    for f in variant[1:]:
-                        new_inner = llir.BinOp(left=new_inner, op="*", right=f)
-
-                # Replace the accumulation
-                s.body[j] = llir.Assign(
-                    var=body_s.var,
-                    value=new_inner,
-                    op=body_s.op,
-                )
-
-                # Insert hoisted var before the loop, multiply after
-                inv_var_init = llir.RawStmt(
-                    code=f"float {inv_name} = {CINLowerer._expr_to_str(inv_expr)}"
-                )
-                post_mul = llir.RawStmt(code=f"{accum_var} *= {inv_name}")
-                stmts.insert(i, inv_var_init)
-                i += 1  # skip past the init we just inserted
-                stmts.insert(i + 1, post_mul)
-                break  # only hoist from first accumulation found
-
-            i += 1
-
-    @staticmethod
-    def _collect_defined_vars(stmts: list, out: set) -> None:
-        """Collect all variable names defined in a statement list (recursively)."""
-        for s in stmts:
-            if isinstance(s, llir.VarInit) and isinstance(s.var, llir.Var):
-                out.add(s.var.name)
-            elif isinstance(s, llir.ForLoop):
-                if isinstance(s.init, llir.VarInit) and isinstance(
-                    s.init.var, llir.Var
-                ):
-                    out.add(s.init.var.name)
-                CINLowerer._collect_defined_vars(s.body, out)
-            elif isinstance(s, llir.WhileLoop):
-                CINLowerer._collect_defined_vars(s.body, out)
-            elif isinstance(s, llir.IfThenElse):
-                if s.then_body:
-                    CINLowerer._collect_defined_vars(s.then_body, out)
-                if s.else_body:
-                    CINLowerer._collect_defined_vars(s.else_body, out)
-
-    @staticmethod
-    def _collect_mul_factors(expr, factors: list) -> None:
-        """Flatten a tree of multiplies into a list of leaf factors."""
-        if isinstance(expr, llir.BinOp) and expr.op == "*":
-            CINLowerer._collect_mul_factors(expr.left, factors)
-            CINLowerer._collect_mul_factors(expr.right, factors)
-        else:
-            factors.append(expr)
 
     @staticmethod
     def _expr_to_str(expr) -> str:
