@@ -33,6 +33,7 @@ from scorch.compiler.llir_pass_manager import (
     LLIRStatementListArtifact,
     LLIRStatementListPassResult,
     LoopInvariantFactorHoistPassSpec,
+    ResultWritePassSpec,
     SingleIterationLoopEliminationPassSpec,
     SparsePrefetchPassSpec,
 )
@@ -1130,11 +1131,19 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
     )
     assert "pMask1_end = pMask0 + 1" not in cpp
     assert "pMask1 = pMask0" not in cpp
+    assert "pMask1 <" not in cpp
+    assert "pMask1++" not in cpp
     assert "Mask1_crd[pMask0]" in cpp
     assert "Mask_val[pMask0]" in cpp
-    assert "    float _inv_17 = Mask_val[pMask0];" in cpp
-    assert "      _accum += _Query_val_ptr[q] * _Key_val_ptr[q];" in cpp
-    assert "    _accum *= _inv_17;" in cpp
+    assert (
+        "    float _inv_17 = Mask_val[pMask0];\n"
+        "    #pragma omp simd\n"
+        "    for (int64_t q = 0; q < Query1_size; q++) {\n"
+        "      // Resolve dense coordinates\n"
+        "      _accum += _Query_val_ptr[q] * _Key_val_ptr[q];\n"
+        "    }\n"
+        "    _accum *= _inv_17;"
+    ) in cpp
     assert [
         (record.pass_name, record.configuration_name)
         for record in lowerer.llir_pass_run_records
@@ -1230,6 +1239,55 @@ def test_sparse_prefetch_failure_stops_remaining_optimizations_and_managed_work(
     assert raised.value is failure
     assert events == ["sparse_prefetch"]
     assert lowerer.llir_pass_run_records == ()
+
+
+def test_compressed_fill_failure_preserves_count_record_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: List[str] = []
+    failure = LLIRTraversalError(
+        LLIRTraversalDiagnostic(
+            code="synthetic_compressed_fill_failure",
+            message="compressed fill failed",
+            path=("root",),
+            node_type="RawStmt",
+            stage="LLIR transformation",
+            pass_name="transform_compressed_where_for_openmp",
+        )
+    )
+    original_result_write = LLIRPassManager.run_result_write
+
+    def fail_fill(
+        manager: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[object],
+        pass_spec: ResultWritePassSpec,
+    ) -> LLIRRewritePassResult[object]:
+        events.append(pass_spec.context.mode)
+        if pass_spec.context.mode == "fill":
+            raise failure
+        return original_result_write(manager, artifact, pass_spec)
+
+    def reject_sparse(
+        manager: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SparsePrefetchPassSpec = SparsePrefetchPassSpec(),
+    ) -> NoReturn:
+        events.append("sparse_prefetch")
+        raise AssertionError("sparse prefetch must not run after fill failure")
+
+    monkeypatch.setattr(LLIRPassManager, "run_result_write", fail_fill)
+    monkeypatch.setattr(LLIRPassManager, "run_sparse_prefetch", reject_sparse)
+
+    lowerer = CINLowerer()
+    with pytest.raises(LLIRTraversalError) as raised:
+        lowerer.lower_IndexStmt(_build_compressed_ds_cin())
+
+    assert raised.value is failure
+    assert events == ["count", "fill"]
+    assert [
+        (record.pass_name, record.configuration_name, record.sequence_index)
+        for record in lowerer.llir_pass_run_records
+    ] == [("rewrite_result_writes", "count", 0)]
 
 
 def test_dense_pointer_failure_preserves_prior_records_and_stops_all_later_work(
@@ -1507,6 +1565,57 @@ def test_factor_failure_preserves_prior_records_and_stops_all_later_work(
         0,
         1,
         2,
+    ]
+
+
+def test_dynamic_vector_failure_preserves_prior_records_and_stops_function_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: List[str] = []
+    failure = LLIRTraversalError(
+        LLIRTraversalDiagnostic(
+            code="synthetic_dynamic_vector_failure",
+            message="dynamic-vector rewriting failed",
+            path=("root",),
+            node_type="ForLoop",
+            stage="LLIR transformation",
+            pass_name="rewrite_dynamic_vector_accesses",
+        )
+    )
+
+    def fail_dynamic(
+        manager: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[List[llir.Stmt]],
+        pass_spec: DynamicVectorAccessPassSpec = DynamicVectorAccessPassSpec(),
+    ) -> NoReturn:
+        events.append("dynamic_vector")
+        raise failure
+
+    def reject_function(*args: object, **kwargs: object) -> NoReturn:
+        events.append("function")
+        raise AssertionError("function construction must not run after pass failure")
+
+    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", fail_dynamic)
+    monkeypatch.setattr(llir, "Function", reject_function)
+
+    lowerer = CINLowerer()
+    with pytest.raises(LLIRTraversalError) as raised:
+        lowerer.lower_IndexStmt(_build_activating_spmm_cin())
+
+    assert raised.value is failure
+    assert events == ["dynamic_vector"]
+    assert [
+        (record.pass_name, record.configuration_name, record.sequence_index)
+        for record in lowerer.llir_pass_run_records
+    ] == [
+        ("insert_sparse_prefetch", "sparse_prefetch", 0),
+        ("hoist_dense_pointers", "dense_pointer_hoist", 1),
+        (
+            "eliminate_single_iteration_loops",
+            "single_iteration_loop_elimination",
+            2,
+        ),
+        ("hoist_loop_invariant_factors", "loop_invariant_factor_hoist", 3),
     ]
 
 

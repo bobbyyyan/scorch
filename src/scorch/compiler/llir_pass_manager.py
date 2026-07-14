@@ -25,7 +25,7 @@ from time import perf_counter_ns
 from typing import TYPE_CHECKING, Generic, NoReturn, Optional, Tuple, cast
 
 from . import llir
-from .diagnostics import CompilerInvariantError
+from .diagnostics import CompilerError, CompilerInvariantError
 from .dynamic_vector_access_pass import (
     DYNAMIC_VECTOR_ACCESS_CONTEXT,
     DynamicVectorAccessConfig,
@@ -311,6 +311,33 @@ class LLIRPassManagerError(CompilerInvariantError):
             f"pass={diagnostic.pass_name}@{diagnostic.pass_version}: "
             f"{diagnostic.code} at sequence[{diagnostic.sequence_index}]: "
             f"{diagnostic.message}"
+        )
+
+
+class LLIRPassPartialFailure(CompilerInvariantError):
+    """Transport completed non-semantic records across one managed failure."""
+
+    def __init__(
+        self,
+        failure: CompilerError,
+        completed_run_records: Tuple[LLIRPassRunRecord, ...],
+    ) -> None:
+        if not isinstance(failure, CompilerError):
+            raise TypeError("LLIRPassPartialFailure requires a compiler error")
+        if type(completed_run_records) is not tuple or any(
+            type(record) is not LLIRPassRunRecord for record in completed_run_records
+        ):
+            raise TypeError(
+                "LLIRPassPartialFailure requires exact completed run records"
+            )
+        self.failure = failure
+        self.completed_run_records = tuple(
+            replace(record, sequence_index=index)
+            for index, record in enumerate(completed_run_records)
+        )
+        super().__init__(
+            "stage=LLIR pass manager: managed execution failed after "
+            f"{len(self.completed_run_records)} completed nested pass(es): {failure}"
         )
 
 
@@ -916,15 +943,6 @@ class LLIRPassManager:
             self.options,
         )
         result = execution.result
-        if self.options.verify_after_pass:
-            LLIRWalker(traversal).walk(cast(LLIRValue, result.statements))
-        parent_record = _record(
-            descriptor=COMPRESSED_WHERE_OPENMP_PASS,
-            traversal=traversal,
-            configuration_name="compressed_where_openmp",
-            options=self.options,
-            started_ns=started_ns,
-        )
         expected_nested = ("count", "fill") if result.applied else ()
         actual_nested = tuple(
             record.configuration_name for record in execution.nested_run_records
@@ -943,6 +961,21 @@ class LLIRPassManager:
                 sequence_index=0,
                 descriptor=COMPRESSED_WHERE_OPENMP_PASS,
             )
+        try:
+            if self.options.verify_after_pass:
+                LLIRWalker(traversal).walk(cast(LLIRValue, result.statements))
+            parent_record = _record(
+                descriptor=COMPRESSED_WHERE_OPENMP_PASS,
+                traversal=traversal,
+                configuration_name="compressed_where_openmp",
+                options=self.options,
+                started_ns=started_ns,
+            )
+        except CompilerError as failure:
+            raise LLIRPassPartialFailure(
+                failure,
+                execution.nested_run_records,
+            ) from failure
         nested_records = tuple(
             replace(record, sequence_index=index)
             for index, record in enumerate(execution.nested_run_records, start=1)

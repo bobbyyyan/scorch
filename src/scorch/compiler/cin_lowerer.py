@@ -42,6 +42,7 @@ from .llir_pass_manager import (
     DynamicVectorAccessPassSpec,
     LLIRPassManager,
     LLIRPassOptions,
+    LLIRPassPartialFailure,
     LLIRPassRunRecord,
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
@@ -3811,23 +3812,27 @@ class CINLowerer:
                 for level, level_type in enumerate(result_tensor.get_level_types())
                 if level_type == LevelType.COMPRESSED
             )
-            compressed_where_result = (
-                self._llir_pass_manager.run_compressed_where_openmp(
-                    LLIRStatementListArtifact(stmts),
-                    CompressedWhereOpenMPPassSpec(
-                        CompressedWhereOpenMPContext(
-                            result_name=result_tensor.get_name(),
-                            compressed_levels=compressed_levels,
-                            workspace_name=workspace_name,
-                            workspace_ctype=workspace_ctype,
-                            policy=CompressedWhereOpenMPPolicy(
-                                omp_schedule="dynamic, 64",
-                                flop_grain=self._CG_FLOP_GRAIN,
-                            ),
-                        )
-                    ),
+            try:
+                compressed_where_result = (
+                    self._llir_pass_manager.run_compressed_where_openmp(
+                        LLIRStatementListArtifact(stmts),
+                        CompressedWhereOpenMPPassSpec(
+                            CompressedWhereOpenMPContext(
+                                result_name=result_tensor.get_name(),
+                                compressed_levels=compressed_levels,
+                                workspace_name=workspace_name,
+                                workspace_ctype=workspace_ctype,
+                                policy=CompressedWhereOpenMPPolicy(
+                                    omp_schedule="dynamic, 64",
+                                    flop_grain=self._CG_FLOP_GRAIN,
+                                ),
+                            )
+                        ),
+                    )
                 )
-            )
+            except LLIRPassPartialFailure as failure:
+                self._record_llir_pass_runs(failure.completed_run_records)
+                raise failure.failure from None
             self._record_llir_pass_runs(compressed_where_result.run_records)
             return compressed_where_result.result
 

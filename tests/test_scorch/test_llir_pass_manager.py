@@ -41,6 +41,7 @@ from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     LLIRPassManager,
     LLIRPassManagerError,
     LLIRPassOptions,
+    LLIRPassPartialFailure,
     LLIRPassRunRecord,
     LLIRRewriteArtifact,
     LLIRRewritePassResult,
@@ -497,6 +498,74 @@ def test_compressed_count_failure_stops_before_fill(
     assert modes == ["count"]
 
 
+def test_compressed_fill_failure_carries_only_completed_count_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modes: List[str] = []
+    failure = LLIRTraversalError(
+        LLIRTraversalDiagnostic(
+            code="synthetic_fill_failure",
+            message="fill failed",
+            path=("root",),
+            node_type="RawStmt",
+            stage="LLIR transformation",
+            pass_name="transform_compressed_where_for_openmp",
+        )
+    )
+    original_result_write = LLIRPassManager.run_result_write
+
+    def fail_fill(
+        self: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[object],
+        pass_spec: ResultWritePassSpec,
+    ) -> LLIRRewritePassResult[object]:
+        modes.append(pass_spec.context.mode)
+        if pass_spec.context.mode == "fill":
+            raise failure
+        return original_result_write(self, artifact, pass_spec)
+
+    monkeypatch.setattr(LLIRPassManager, "run_result_write", fail_fill)
+
+    with pytest.raises(LLIRPassPartialFailure) as error:
+        LLIRPassManager().run_compressed_where_openmp(
+            LLIRStatementListArtifact(_compressed_source()),
+            CompressedWhereOpenMPPassSpec(_compressed_context()),
+        )
+
+    assert error.value.failure is failure
+    assert modes == ["count", "fill"]
+    assert [
+        (record.pass_name, record.configuration_name, record.sequence_index)
+        for record in error.value.completed_run_records
+    ] == [("rewrite_result_writes", "count", 0)]
+
+
+def test_compressed_runner_rejects_malformed_nested_records_without_carrying_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_result_write = LLIRPassManager.run_result_write
+
+    def corrupt_record(
+        self: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[object],
+        pass_spec: ResultWritePassSpec,
+    ) -> LLIRRewritePassResult[object]:
+        result = original_result_write(self, artifact, pass_spec)
+        malformed = replace(result.run_records[0], pass_name="not_result_write")
+        return replace(result, run_records=(malformed,))
+
+    monkeypatch.setattr(LLIRPassManager, "run_result_write", corrupt_record)
+
+    with pytest.raises(LLIRPassManagerError) as error:
+        LLIRPassManager().run_compressed_where_openmp(
+            LLIRStatementListArtifact(_compressed_source()),
+            CompressedWhereOpenMPPassSpec(_compressed_context()),
+        )
+
+    assert error.value.diagnostic.code == "invalid_nested_pass_records"
+    assert not isinstance(error.value, LLIRPassPartialFailure)
+
+
 class _UnknownStatement(llir.Stmt):
     pass
 
@@ -588,9 +657,45 @@ def test_unknown_descriptor_artifact_spec_and_context_combinations_fail_closed()
                 context=cast(DynamicVectorAccessContext, object())
             ),
         ),
+        lambda: manager.run_result_write(
+            cast(LLIRRewriteArtifact[object], statement_artifact),
+            ResultWritePassSpec(_result_context()),
+        ),
+        lambda: manager.run_result_write(
+            rewrite_artifact,
+            cast(ResultWritePassSpec, object()),
+        ),
+        lambda: manager.run_result_write(
+            rewrite_artifact,
+            ResultWritePassSpec(context=cast(ResultWriteContext, object())),
+        ),
+        lambda: manager.run_result_write(
+            rewrite_artifact,
+            ResultWritePassSpec(
+                context=_result_context(),
+                descriptor=replace(RESULT_WRITE_PASS, version=2),
+            ),
+        ),
         lambda: manager.run_compressed_where_openmp(
             cast(LLIRStatementListArtifact, rewrite_artifact),
             CompressedWhereOpenMPPassSpec(_compressed_context()),
+        ),
+        lambda: manager.run_compressed_where_openmp(
+            statement_artifact,
+            cast(CompressedWhereOpenMPPassSpec, object()),
+        ),
+        lambda: manager.run_compressed_where_openmp(
+            statement_artifact,
+            CompressedWhereOpenMPPassSpec(
+                context=cast(CompressedWhereOpenMPContext, object())
+            ),
+        ),
+        lambda: manager.run_compressed_where_openmp(
+            statement_artifact,
+            CompressedWhereOpenMPPassSpec(
+                context=_compressed_context(),
+                descriptor=replace(COMPRESSED_WHERE_OPENMP_PASS, version=2),
+            ),
         ),
         lambda: manager.run_sparse_prefetch(
             cast(LLIRStatementListArtifact, rewrite_artifact),

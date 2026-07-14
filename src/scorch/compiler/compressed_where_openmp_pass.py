@@ -33,6 +33,7 @@ from typing import Dict, List, NoReturn, Optional, Sequence, Tuple, cast
 
 from . import llir
 from .codegen import LLIRLowerer
+from .diagnostics import CompilerError
 from .llir_traversal import (
     LLIRPath,
     LLIRRewriter,
@@ -48,6 +49,7 @@ from .llir_pass_manager import (
     PRODUCTION_LLIR_PASS_OPTIONS,
     LLIRPassManager,
     LLIRPassOptions,
+    LLIRPassPartialFailure,
     LLIRPassRunRecord,
     LLIRRewriteArtifact,
     ResultWritePassSpec,
@@ -998,39 +1000,47 @@ def _build_transformed_statements(
         workspace_hoisted=workspace_hoisted,
         pass_options=pass_options,
     )
-    fill_body, fill_records = _build_fill_body(
-        work_body,
-        context,
-        loop_var=loop_var,
-        workspace_hoisted=workspace_hoisted,
-        pass_options=pass_options,
-    )
-    count_loop = _build_phase_loop(
-        for_loop,
-        count_body,
-        context,
-        workspace_hoisted=workspace_hoisted,
-        loop_bound=loop_bound,
-    )
-    fill_loop = _build_phase_loop(
-        for_loop,
-        fill_body,
-        context,
-        workspace_hoisted=workspace_hoisted,
-        loop_bound=loop_bound,
-    )
+    try:
+        fill_body, fill_records = _build_fill_body(
+            work_body,
+            context,
+            loop_var=loop_var,
+            workspace_hoisted=workspace_hoisted,
+            pass_options=pass_options,
+        )
+    except CompilerError as failure:
+        raise LLIRPassPartialFailure(failure, count_records) from failure
 
-    result = _filtered_prefix(statements, loop_index, context)
-    if workspace_hoisted:
-        result.append(_workspace_pool_statement(context, count_loop, fill_loop))
-    result.extend(_count_and_offset_statements(context, loop_bound))
-    result.append(count_loop)
-    result.extend(_prefix_sum_statements(context, loop_bound))
-    result.extend(_position_and_coordinate_allocations(context, loop_bound))
-    result.append(_value_allocation(context))
-    result.append(fill_loop)
-    result.append(_final_assembly(context))
-    return result, (*count_records, *fill_records)
+    nested_run_records = (*count_records, *fill_records)
+    try:
+        count_loop = _build_phase_loop(
+            for_loop,
+            count_body,
+            context,
+            workspace_hoisted=workspace_hoisted,
+            loop_bound=loop_bound,
+        )
+        fill_loop = _build_phase_loop(
+            for_loop,
+            fill_body,
+            context,
+            workspace_hoisted=workspace_hoisted,
+            loop_bound=loop_bound,
+        )
+
+        result = _filtered_prefix(statements, loop_index, context)
+        if workspace_hoisted:
+            result.append(_workspace_pool_statement(context, count_loop, fill_loop))
+        result.extend(_count_and_offset_statements(context, loop_bound))
+        result.append(count_loop)
+        result.extend(_prefix_sum_statements(context, loop_bound))
+        result.extend(_position_and_coordinate_allocations(context, loop_bound))
+        result.append(_value_allocation(context))
+        result.append(fill_loop)
+        result.append(_final_assembly(context))
+    except CompilerError as failure:
+        raise LLIRPassPartialFailure(failure, nested_run_records) from failure
+    return result, nested_run_records
 
 
 def _transform_compressed_where_for_openmp_managed(
@@ -1081,7 +1091,10 @@ def _transform_compressed_where_for_openmp_managed(
         checked_context,
         pass_options,
     )
-    LLIRWalker(checked_context.traversal).walk(cast(LLIRValue, transformed))
+    try:
+        LLIRWalker(checked_context.traversal).walk(cast(LLIRValue, transformed))
+    except CompilerError as failure:
+        raise LLIRPassPartialFailure(failure, nested_run_records) from failure
     return _ManagedCompressedWhereOpenMPExecution(
         CompressedWhereOpenMPResult(transformed, True),
         nested_run_records,
@@ -1099,8 +1112,11 @@ def transform_compressed_where_for_openmp(
     manager-only run information is retained only by the managed entry point.
     """
 
-    return _transform_compressed_where_for_openmp_managed(
-        statements,
-        context,
-        PRODUCTION_LLIR_PASS_OPTIONS,
-    ).result
+    try:
+        return _transform_compressed_where_for_openmp_managed(
+            statements,
+            context,
+            PRODUCTION_LLIR_PASS_OPTIONS,
+        ).result
+    except LLIRPassPartialFailure as failure:
+        raise failure.failure from None
