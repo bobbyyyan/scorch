@@ -861,6 +861,7 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
         "rewrite_result_writes",
         "insert_sparse_prefetch",
         "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
         "rewrite_dynamic_vector_accesses",
     ]
     assert [record.configuration_name for record in lowerer.llir_pass_run_records] == [
@@ -869,6 +870,7 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
         "fill",
         "sparse_prefetch",
         "dense_pointer_hoist",
+        "single_iteration_loop_elimination",
         "dynamic_vector_access",
     ]
     assert [record.sequence_index for record in lowerer.llir_pass_run_records] == [
@@ -878,6 +880,7 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
         3,
         4,
         5,
+        6,
     ]
     assert all(
         not record.verified_before and not record.verified_after
@@ -941,5 +944,6 @@ def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
         "fill",
         "sparse_prefetch",
         "dense_pointer_hoist",
+        "single_iteration_loop_elimination",
         "dynamic_vector_access",
     ]

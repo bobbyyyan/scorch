@@ -9,13 +9,15 @@ import pytest
 
 from scorch.compiler import llir
 import scorch.compiler.llir_pass_manager as pass_manager_module
+import scorch.compiler.schedule_lowerer as schedule_lowerer_module
 import scorch.compiler.sparse_prefetch_pass as sparse_prefetch_module
 from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
-from scorch.compiler.cin_lowerer import CINLowerer
+from scorch.compiler.cin_lowerer import CINLowerer, ResultTensorAssembler
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.llir_pass_manager import (
     DEBUG_LLIR_PASS_OPTIONS,
     PRODUCTION_LLIR_PASS_OPTIONS,
+    SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
     SPARSE_PREFETCH_PASS,
     DensePointerHoistPassSpec,
     DynamicVectorAccessPassSpec,
@@ -29,6 +31,7 @@ from scorch.compiler.llir_pass_manager import (
     LLIRRewritePassResult,
     LLIRStatementListArtifact,
     LLIRStatementListPassResult,
+    SingleIterationLoopEliminationPassSpec,
     SparsePrefetchPassSpec,
 )
 from scorch.compiler.llir_traversal import (
@@ -38,7 +41,7 @@ from scorch.compiler.llir_traversal import (
     LLIRValue,
     LLIRWalker,
 )
-from scorch.compiler.scheduler import Scheduler
+from scorch.compiler.scheduler import Schedule, Scheduler, regblock_force
 from scorch.compiler.sparse_prefetch_pass import (
     SPARSE_PREFETCH_CONTEXT,
     SPARSE_PREFETCH_TRAVERSAL_CONTEXT,
@@ -894,7 +897,7 @@ def test_sparse_prefetch_incremental_manager_plumbing_p95_is_below_one_ms() -> N
     assert _p95(incremental_ns) <= 1_000_000
 
 
-def _build_activating_spmm_cin() -> ForAll:
+def _build_activating_spmm_source() -> ForAll:
     row, reduction, column = IndexVar("i"), IndexVar("k"), IndexVar("j")
     result = TensorVar("C", fmt="dd")
     left = TensorVar("A", fmt="ds")
@@ -904,10 +907,31 @@ def _build_activating_spmm_cin() -> ForAll:
         left[row, reduction] * right[reduction, column],
         op=Operation.ADD,
     )
+    return ForAll(row, ForAll(reduction, ForAll(column, assignment)))
+
+
+def _build_activating_spmm_cin() -> ForAll:
+    return cast(
+        ForAll,
+        Scheduler.auto_schedule(_build_activating_spmm_source()),
+    )
+
+
+def _build_activating_all_coo_sddmm_cin() -> ForAll:
+    row, column, reduction = IndexVar("r"), IndexVar("c"), IndexVar("q")
+    result = TensorVar("Sampled", fmt="oo")
+    mask = TensorVar("Mask", fmt="oo")
+    query = TensorVar("Query", fmt="dd")
+    key = TensorVar("Key", fmt="dd")
+    assignment = TensorAssign(
+        result[row, column],
+        mask[row, column] * query[row, reduction] * key[column, reduction],
+        op=Operation.ADD,
+    )
     return cast(
         ForAll,
         Scheduler.auto_schedule(
-            ForAll(row, ForAll(reduction, ForAll(column, assignment)))
+            ForAll(row, ForAll(column, ForAll(reduction, assignment)))
         ),
     )
 
@@ -949,12 +973,12 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     events: List[str] = []
     detached_sparse_output: List[List[llir.Stmt]] = []
     detached_dense_output: List[List[llir.Stmt]] = []
+    detached_single_output: List[List[llir.Stmt]] = []
     original_sparse = LLIRPassManager.run_sparse_prefetch
     original_dense = LLIRPassManager.run_dense_pointer_hoist
+    original_single = LLIRPassManager.run_single_iteration_loop_elimination
     original_dynamic = LLIRPassManager.run_dynamic_vector_access
-    original_single = CINLowerer._eliminate_single_iteration_loops
     original_factor = CINLowerer._hoist_loop_invariant_factors
-    single_depth = 0
     factor_depth = 0
 
     def record_sparse(
@@ -992,21 +1016,27 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
         detached_dense_output.append(result.artifact.statements)
         return result
 
-    def record_single(statements: List[llir.Stmt]) -> None:
-        nonlocal single_depth
-        if single_depth == 0:
-            events.append("single_iteration")
-            assert statements is detached_dense_output[0]
-        single_depth += 1
-        try:
-            original_single(statements)
-        finally:
-            single_depth -= 1
+    def record_single(
+        manager: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SingleIterationLoopEliminationPassSpec = (
+            SingleIterationLoopEliminationPassSpec()
+        ),
+    ) -> LLIRStatementListPassResult:
+        events.append("single_iteration")
+        assert artifact.statements is detached_dense_output[0]
+        result = original_single(manager, artifact, pass_spec)
+        assert _mutable_ir_ids(artifact.statements).isdisjoint(
+            _mutable_ir_ids(result.artifact.statements)
+        )
+        detached_single_output.append(result.artifact.statements)
+        return result
 
     def record_factor(statements: List[llir.Stmt]) -> None:
         nonlocal factor_depth
         if factor_depth == 0:
             events.append("factor_hoist")
+            assert statements is detached_single_output[0]
         factor_depth += 1
         try:
             original_factor(statements)
@@ -1026,12 +1056,12 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
 
     monkeypatch.setattr(LLIRPassManager, "run_sparse_prefetch", record_sparse)
     monkeypatch.setattr(LLIRPassManager, "run_dense_pointer_hoist", record_dense)
-    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
     monkeypatch.setattr(
-        CINLowerer,
-        "_eliminate_single_iteration_loops",
-        staticmethod(record_single),
+        LLIRPassManager,
+        "run_single_iteration_loop_elimination",
+        record_single,
     )
+    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
     monkeypatch.setattr(
         CINLowerer,
         "_hoist_loop_invariant_factors",
@@ -1059,12 +1089,43 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     assert [record.pass_name for record in lowerer.llir_pass_run_records] == [
         "insert_sparse_prefetch",
         "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
         "rewrite_dynamic_vector_accesses",
     ]
     assert [record.sequence_index for record in lowerer.llir_pass_run_records] == [
         0,
         1,
         2,
+        3,
+    ]
+
+
+def test_production_all_coo_sddmm_activates_single_iteration_elimination() -> None:
+    with regblock_force(False):
+        lowerer = CINLowerer()
+        cpp = LLIRLowerer().lower_llir(
+            lowerer.lower_IndexStmt(_build_activating_all_coo_sddmm_cin())
+        )
+
+    assert len(cpp) == 3543
+    assert hashlib.sha256(cpp.encode()).hexdigest() == (
+        "de94b08752077a621c5e411ce0dcbb40e8bcbeacb9bce3824dd6019e2d2bd29d"
+    )
+    assert "pMask1_end = pMask0 + 1" not in cpp
+    assert "pMask1 = pMask0" not in cpp
+    assert "Mask1_crd[pMask0]" in cpp
+    assert "Mask_val[pMask0]" in cpp
+    assert [
+        (record.pass_name, record.configuration_name)
+        for record in lowerer.llir_pass_run_records
+    ] == [
+        ("insert_sparse_prefetch", "sparse_prefetch"),
+        ("hoist_dense_pointers", "dense_pointer_hoist"),
+        (
+            "eliminate_single_iteration_loops",
+            "single_iteration_loop_elimination",
+        ),
+        ("rewrite_dynamic_vector_accesses", "dynamic_vector_access"),
     ]
 
 
@@ -1099,8 +1160,15 @@ def test_sparse_prefetch_failure_stops_remaining_optimizations_and_managed_work(
         events.append("dense_pointer")
         raise AssertionError("dense-pointer pass must not run after failure")
 
-    def record_single(statements: List[llir.Stmt]) -> None:
+    def record_single(
+        manager: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SingleIterationLoopEliminationPassSpec = (
+            SingleIterationLoopEliminationPassSpec()
+        ),
+    ) -> NoReturn:
         events.append("single_iteration")
+        raise AssertionError("single-iteration pass must not run after failure")
 
     def record_factor(statements: List[llir.Stmt]) -> None:
         events.append("factor_hoist")
@@ -1115,12 +1183,12 @@ def test_sparse_prefetch_failure_stops_remaining_optimizations_and_managed_work(
 
     monkeypatch.setattr(LLIRPassManager, "run_sparse_prefetch", fail_sparse)
     monkeypatch.setattr(LLIRPassManager, "run_dense_pointer_hoist", record_dense)
-    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
     monkeypatch.setattr(
-        CINLowerer,
-        "_eliminate_single_iteration_loops",
-        staticmethod(record_single),
+        LLIRPassManager,
+        "run_single_iteration_loop_elimination",
+        record_single,
     )
+    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
     monkeypatch.setattr(
         CINLowerer,
         "_hoist_loop_invariant_factors",
@@ -1159,8 +1227,15 @@ def test_dense_pointer_failure_preserves_prior_records_and_stops_all_later_work(
         events.append("dense_pointer")
         raise failure
 
-    def record_single(statements: List[llir.Stmt]) -> None:
+    def record_single(
+        manager: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SingleIterationLoopEliminationPassSpec = (
+            SingleIterationLoopEliminationPassSpec()
+        ),
+    ) -> NoReturn:
         events.append("single_iteration")
+        raise AssertionError("single-iteration pass must not run after failure")
 
     def record_factor(statements: List[llir.Stmt]) -> None:
         events.append("factor_hoist")
@@ -1174,12 +1249,12 @@ def test_dense_pointer_failure_preserves_prior_records_and_stops_all_later_work(
         raise AssertionError("dynamic-vector pass must not run after failure")
 
     monkeypatch.setattr(LLIRPassManager, "run_dense_pointer_hoist", fail_dense)
-    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
     monkeypatch.setattr(
-        CINLowerer,
-        "_eliminate_single_iteration_loops",
-        staticmethod(record_single),
+        LLIRPassManager,
+        "run_single_iteration_loop_elimination",
+        record_single,
     )
+    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
     monkeypatch.setattr(
         CINLowerer,
         "_hoist_loop_invariant_factors",
@@ -1209,6 +1284,98 @@ def test_dense_pointer_failure_preserves_prior_records_and_stops_all_later_work(
     ]
 
 
+def test_single_iteration_failure_preserves_prior_records_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: List[str] = []
+    failure = LLIRTraversalError(
+        LLIRTraversalDiagnostic(
+            code="synthetic_single_iteration_failure",
+            message="single-iteration elimination failed",
+            path=("root",),
+            node_type="ForLoop",
+            stage="LLIR transformation",
+            pass_name=SINGLE_ITERATION_LOOP_ELIMINATION_PASS.name,
+        )
+    )
+
+    def fail_single(
+        manager: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SingleIterationLoopEliminationPassSpec = (
+            SingleIterationLoopEliminationPassSpec()
+        ),
+    ) -> NoReturn:
+        events.append("single_iteration")
+        raise failure
+
+    def record_factor(statements: List[llir.Stmt]) -> NoReturn:
+        events.append("factor_hoist")
+        raise AssertionError("factor hoisting must not run after failure")
+
+    def record_assembly(assembler: ResultTensorAssembler) -> NoReturn:
+        events.append("assembly")
+        raise AssertionError("result assembly must not run after failure")
+
+    def record_dynamic(
+        manager: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[List[llir.Stmt]],
+        pass_spec: DynamicVectorAccessPassSpec = DynamicVectorAccessPassSpec(),
+    ) -> NoReturn:
+        events.append("dynamic_vector")
+        raise AssertionError("dynamic-vector pass must not run after failure")
+
+    def record_schedule(*args: object, **kwargs: object) -> NoReturn:
+        events.append("schedule_lowering")
+        raise AssertionError("schedule lowering must not run after failure")
+
+    def record_codegen(*args: object, **kwargs: object) -> NoReturn:
+        events.append("codegen")
+        raise AssertionError("code generation must not run after failure")
+
+    monkeypatch.setattr(
+        LLIRPassManager,
+        "run_single_iteration_loop_elimination",
+        fail_single,
+    )
+    monkeypatch.setattr(
+        CINLowerer,
+        "_hoist_loop_invariant_factors",
+        staticmethod(record_factor),
+    )
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_final_assembly",
+        record_assembly,
+    )
+    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
+    monkeypatch.setattr(
+        schedule_lowerer_module,
+        "apply_schedule_to_llir",
+        record_schedule,
+    )
+    monkeypatch.setattr(LLIRLowerer, "lower_llir", record_codegen)
+
+    scheduled = Scheduler.apply_schedule(_build_activating_spmm_source(), Schedule())
+    lowerer = CINLowerer()
+    with pytest.raises(LLIRTraversalError) as raised:
+        LLIRLowerer().lower_llir(lowerer.lower_IndexStmt(scheduled))
+
+    assert raised.value is failure
+    assert events == ["single_iteration"]
+    assert [
+        (record.pass_name, record.configuration_name)
+        for record in lowerer.llir_pass_run_records
+    ] == [
+        ("insert_sparse_prefetch", "sparse_prefetch"),
+        ("hoist_dense_pointers", "dense_pointer_hoist"),
+    ]
+    assert [record.sequence_index for record in lowerer.llir_pass_run_records] == [
+        0,
+        1,
+    ]
+
+
 def test_applied_compressed_production_records_sparse_before_dynamic_vector() -> None:
     lowerer = CINLowerer()
 
@@ -1223,6 +1390,10 @@ def test_applied_compressed_production_records_sparse_before_dynamic_vector() ->
         ("rewrite_result_writes", "fill"),
         ("insert_sparse_prefetch", "sparse_prefetch"),
         ("hoist_dense_pointers", "dense_pointer_hoist"),
+        (
+            "eliminate_single_iteration_loops",
+            "single_iteration_loop_elimination",
+        ),
         ("rewrite_dynamic_vector_accesses", "dynamic_vector_access"),
     ]
     assert [record.sequence_index for record in lowerer.llir_pass_run_records] == [
@@ -1232,4 +1403,5 @@ def test_applied_compressed_production_records_sparse_before_dynamic_vector() ->
         3,
         4,
         5,
+        6,
     ]
