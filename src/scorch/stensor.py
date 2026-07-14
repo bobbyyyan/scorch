@@ -16,9 +16,10 @@ from .compiler.cin import (
     TensorAssign,
 )
 from .compiler.cin_lowerer import CINLowerer
+from .compiler.cin_analysis import normalize_cin
 from .compiler.compile_options import CompileOptions
 from .compiler.codegen import LLIRLowerer
-from .compiler.stage_timing import CompilerStageId, CompilerStageTiming
+from .compiler.compilation_context import CompilerStageId, CompilationContext
 from .exceptions import (
     TensorIndexError,
     TensorLayoutError,
@@ -32,26 +33,29 @@ from .storage import SparseStorage, TensorIndex
 from .utils import (
     parse_format,
     _kernel_name,
-    _load_kernel,
+    _load_validated_prepared_kernel,
+    _prepare_jit_build,
 )
 
 
-def _stage_timing_at_boundary(
-    stage_timing: Optional[CompilerStageTiming],
+def _compilation_context_at_boundary(
+    compilation_context: Optional[CompilationContext],
     compile_options: CompileOptions,
-) -> CompilerStageTiming:
+) -> CompilationContext:
     """Create or validate the one timing owner paired with the one snapshot."""
 
-    if stage_timing is not None:
-        if type(stage_timing) is not CompilerStageTiming:
-            raise TypeError("_stage_timing must be a CompilerStageTiming instance")
-        if stage_timing.compile_options is not compile_options:
+    if compilation_context is not None:
+        if type(compilation_context) is not CompilationContext:
             raise TypeError(
-                "_stage_timing must retain this compilation's exact "
+                "_compilation_context must be a CompilationContext instance"
+            )
+        if compilation_context.compile_options is not compile_options:
+            raise TypeError(
+                "_compilation_context must retain this compilation's exact "
                 "CompileOptions snapshot"
             )
-        return stage_timing
-    return CompilerStageTiming(compile_options=compile_options)
+        return compilation_context
+    return CompilationContext(compile_options=compile_options)
 
 
 def _finalize_generated_mode_indices(
@@ -545,11 +549,7 @@ class STensor:
                 f"{self.logical_shape} and {other.logical_shape}"
             )
         compile_options = CompileOptions.from_environment()
-        stage_timing = CompilerStageTiming(compile_options=compile_options)
-        frontend_token = stage_timing.begin(
-            CompilerStageId.FRONTEND_CONSTRUCTION,
-            compile_options=compile_options,
-        )
+        compilation_context = CompilationContext(compile_options=compile_options)
 
         # Scheduling must not mutate the caller's right-hand operand.
         if self.storage.index.mode_order != other.storage.index.mode_order:
@@ -557,81 +557,105 @@ class STensor:
             other.change_mode_order(
                 self.storage.index.mode_order,
                 _compile_options=compile_options,
+                _compilation_context=compilation_context,
             )
 
-        # Perform element-wise addition
-        # TODO: support broadcasting
-        index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
-        ordered_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
-        # TODO: output format inferred from input formats
-        output_format = self.format
-        result_shape = self.shape
-
-        A = TensorVar(
-            name="A",
-            fmt=output_format,
-            shape=result_shape,
-            dtype=self.dtype,
-            mode_order=self.storage.index.mode_order,
-        )
-        B = TensorVar(
-            name="B",
-            fmt=self.format,
-            shape=self.shape,
-            dtype=self.dtype,
-            mode_order=self.storage.index.mode_order,
-        )
-        C = TensorVar(
-            name="C",
-            fmt=other.format,
-            shape=other.shape,
-            dtype=other.dtype,
-            mode_order=other.storage.index.mode_order,
+        frontend_token = compilation_context.begin_stage(
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+            compile_options=compile_options,
         )
 
-        access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
-        rhs_expr = B[access_key] + C[access_key]
-        lhs_access = A[access_key]
-        cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_expr)
-        for index_var in reversed(ordered_index_vars):
-            cin_stmt = ForAll(index_var, cin_stmt)
+        try:
+            # Perform element-wise addition
+            # TODO: support broadcasting
+            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+            ordered_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+            # TODO: output format inferred from input formats
+            output_format = self.format
+            result_shape = self.shape
 
-        stage_timing.commit(frontend_token)
+            A = TensorVar(
+                name="A",
+                fmt=output_format,
+                shape=result_shape,
+                dtype=self.dtype,
+                mode_order=self.storage.index.mode_order,
+            )
+            B = TensorVar(
+                name="B",
+                fmt=self.format,
+                shape=self.shape,
+                dtype=self.dtype,
+                mode_order=self.storage.index.mode_order,
+            )
+            C = TensorVar(
+                name="C",
+                fmt=other.format,
+                shape=other.shape,
+                dtype=other.dtype,
+                mode_order=other.storage.index.mode_order,
+            )
+
+            access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
+            rhs_expr = B[access_key] + C[access_key]
+            lhs_access = A[access_key]
+            cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_expr)
+            for index_var in reversed(ordered_index_vars):
+                cin_stmt = ForAll(index_var, cin_stmt)
+        except Exception:
+            compilation_context.fail_stage(frontend_token)
+            raise
+
+        compilation_context.complete_stage(frontend_token)
+        cin_stmt = normalize_cin(
+            cin_stmt,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
+        )
         lowerer = CINLowerer(
             compile_options=compile_options,
-            stage_timing=stage_timing,
+            compilation_context=compilation_context,
         )
         lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
         llir_lowerer = LLIRLowerer(compile_options=compile_options)
-        cpp_token = stage_timing.begin(
-            CompilerStageId.CPP_GENERATION,
+        cpp_token = compilation_context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
             compile_options=compile_options,
         )
-        cpp_code = llir_lowerer.lower_llir(lowered_llir)
-        stage_timing.commit(cpp_token)
+        try:
+            cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        except Exception:
+            compilation_context.fail_stage(cpp_token)
+            raise
+        compilation_context.complete_stage(cpp_token)
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
         header_cpp_code = compile_options.build.preamble_source
 
-        kernel_name_token = stage_timing.begin(
-            CompilerStageId.KERNEL_NAME_ASSEMBLY,
+        kernel_name_token = compilation_context.begin_stage(
+            CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
             compile_options=compile_options,
         )
-        kernel_name = _kernel_name(
-            header_cpp_code,
-            cpp_code,
-            compile_options=compile_options,
-        )
-        stage_timing.commit(kernel_name_token)
-        module = _load_kernel(
-            name=kernel_name,
-            cpp_sources=[header_cpp_code, cpp_code],
-            functions=["evaluate"],
-            extra_cflags=list(compile_options.build.extra_cflags),
-            extra_ldflags=list(compile_options.build.extra_ldflags),
-            compile_options=compile_options,
-        )
+        try:
+            kernel_name = _kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            )
+            prepared_build = _prepare_jit_build(
+                name=kernel_name,
+                cpp_sources=[header_cpp_code, cpp_code],
+                functions=["evaluate"],
+                extra_cflags=list(compile_options.build.extra_cflags),
+                extra_ldflags=list(compile_options.build.extra_ldflags),
+                compile_options=compile_options,
+            )
+        except Exception:
+            compilation_context.fail_stage(kernel_name_token)
+            raise
+        compilation_context.complete_stage(kernel_name_token)
+        module = _load_validated_prepared_kernel(prepared_build)
 
         result_cpp = module.evaluate(
             result_shape,
@@ -1160,7 +1184,7 @@ class STensor:
         in_place: bool = False,
         *,
         _compile_options: Optional[CompileOptions] = None,
-        _stage_timing: Optional[CompilerStageTiming] = None,
+        _compilation_context: Optional[CompilationContext] = None,
     ) -> STensor:
         """Densify to an all-dense ``STensor`` (stays within Scorch).
 
@@ -1210,109 +1234,132 @@ class STensor:
         )
         if type(compile_options) is not CompileOptions:
             raise TypeError("_compile_options must be a CompileOptions instance")
-        stage_timing = _stage_timing_at_boundary(_stage_timing, compile_options)
-        frontend_token = stage_timing.begin(
-            CompilerStageId.FRONTEND_CONSTRUCTION,
+        compilation_context = _compilation_context_at_boundary(
+            _compilation_context, compile_options
+        )
+        frontend_token = compilation_context.begin_stage(
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
             compile_options=compile_options,
         )
 
-        default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
+        try:
+            default_index_vars = [
+                IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+            ]
 
-        if len(self.shape) > len(default_index_vars):
-            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
-        else:
-            index_vars = default_index_vars[: len(self.shape)]
+            if len(self.shape) > len(default_index_vars):
+                index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+            else:
+                index_vars = default_index_vars[: len(self.shape)]
 
-        # Permute index_vars by mode_order so ForAll nesting matches
-        # the physical level order. Don't pass mode_order to TensorVars
-        # because the permuted index_vars already reflect physical order;
-        # get_sorted_index_vars() with identity mode_order will then
-        # correctly map subscript position k to physical level k.
-        if self.storage.index.mode_order:
-            index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+            # Permute index_vars by mode_order so ForAll nesting matches
+            # the physical level order. Don't pass mode_order to TensorVars
+            # because the permuted index_vars already reflect physical order;
+            # get_sorted_index_vars() with identity mode_order will then
+            # correctly map subscript position k to physical level k.
+            if self.storage.index.mode_order:
+                index_vars = [index_vars[i] for i in self.storage.index.mode_order]
 
-        if self.has_index:
-            B = TensorVar(
-                name="B",
-                fmt=self.format,
-                shape=self.shape,
-                dtype=self.dtype,
-            )
-        else:
-            B = TensorVar(
-                name="B",
-                fmt=TensorFormat(
+            if self.has_index:
+                B = TensorVar(
+                    name="B",
+                    fmt=self.format,
+                    shape=self.shape,
+                    dtype=self.dtype,
+                )
+            else:
+                B = TensorVar(
+                    name="B",
+                    fmt=TensorFormat(
+                        level_formats=[
+                            LevelFormat(mode=LevelType.DENSE)
+                            for _ in range(len(self.shape))
+                        ]
+                    ),
+                    shape=self.shape,
+                    dtype=self.dtype,
+                )
+
+            if fmt is None:
+                # TODO: infer output format from input format
+                # For now, make every level COMPRESSED
+                output_format = TensorFormat(
                     level_formats=[
                         LevelFormat(mode=LevelType.DENSE)
                         for _ in range(len(self.shape))
                     ]
-                ),
+                )
+            else:
+                output_format = parse_format(fmt)
+
+            A = TensorVar(
+                name="A",
+                fmt=output_format,
                 shape=self.shape,
                 dtype=self.dtype,
             )
 
-        if fmt is None:
-            # TODO: infer output format from input format
-            # For now, make every level COMPRESSED
-            output_format = TensorFormat(
-                level_formats=[
-                    LevelFormat(mode=LevelType.DENSE) for _ in range(len(self.shape))
-                ]
-            )
-        else:
-            output_format = parse_format(fmt)
+            access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
+            rhs_access = B[access_key]
+            lhs_access = A[access_key]
+            cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
+            for index_var in reversed(index_vars):
+                cin_stmt = ForAll(index_var, cin_stmt)
+        except Exception:
+            compilation_context.fail_stage(frontend_token)
+            raise
 
-        A = TensorVar(
-            name="A",
-            fmt=output_format,
-            shape=self.shape,
-            dtype=self.dtype,
+        compilation_context.complete_stage(frontend_token)
+        cin_stmt = normalize_cin(
+            cin_stmt,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
         )
-
-        access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
-        rhs_access = B[access_key]
-        lhs_access = A[access_key]
-        cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
-        for index_var in reversed(index_vars):
-            cin_stmt = ForAll(index_var, cin_stmt)
-
-        stage_timing.commit(frontend_token)
         lowerer = CINLowerer(
             filter_zeros=True,
             compile_options=compile_options,
-            stage_timing=stage_timing,
+            compilation_context=compilation_context,
         )
-        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
         llir_lowerer = LLIRLowerer(compile_options=compile_options)
-        cpp_token = stage_timing.begin(
-            CompilerStageId.CPP_GENERATION,
+        cpp_token = compilation_context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
             compile_options=compile_options,
         )
-        cpp_code = llir_lowerer.lower_llir(lowered_llir)
-        stage_timing.commit(cpp_token)
+        try:
+            cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        except Exception:
+            compilation_context.fail_stage(cpp_token)
+            raise
+        compilation_context.complete_stage(cpp_token)
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
         header_cpp_code = compile_options.build.preamble_source
 
-        kernel_name_token = stage_timing.begin(
-            CompilerStageId.KERNEL_NAME_ASSEMBLY,
+        kernel_name_token = compilation_context.begin_stage(
+            CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
             compile_options=compile_options,
         )
-        kernel_name = _kernel_name(
-            header_cpp_code,
-            cpp_code,
-            compile_options=compile_options,
-        )
-        stage_timing.commit(kernel_name_token)
-        module = _load_kernel(
-            name=kernel_name,
-            cpp_sources=[header_cpp_code, cpp_code],
-            functions=["evaluate"],
-            extra_cflags=list(compile_options.build.extra_cflags),
-            extra_ldflags=list(compile_options.build.extra_ldflags),
-            compile_options=compile_options,
-        )
+        try:
+            kernel_name = _kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            )
+            prepared_build = _prepare_jit_build(
+                name=kernel_name,
+                cpp_sources=[header_cpp_code, cpp_code],
+                functions=["evaluate"],
+                extra_cflags=list(compile_options.build.extra_cflags),
+                extra_ldflags=list(compile_options.build.extra_ldflags),
+                compile_options=compile_options,
+            )
+        except Exception:
+            compilation_context.fail_stage(kernel_name_token)
+            raise
+        compilation_context.complete_stage(kernel_name_token)
+        module = _load_validated_prepared_kernel(prepared_build)
 
         result_cpp = module.evaluate(
             self.shape,
@@ -1345,7 +1392,7 @@ class STensor:
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
         *,
         _compile_options: Optional[CompileOptions] = None,
-        _stage_timing: Optional[CompilerStageTiming] = None,
+        _compilation_context: Optional[CompilationContext] = None,
     ) -> STensor:
         """Compress to a sparse ``STensor``, mutating in place.
 
@@ -1421,110 +1468,134 @@ class STensor:
             )
             if type(compile_options) is not CompileOptions:
                 raise TypeError("_compile_options must be a CompileOptions instance")
-            stage_timing = _stage_timing_at_boundary(_stage_timing, compile_options)
-            frontend_token = stage_timing.begin(
-                CompilerStageId.FRONTEND_CONSTRUCTION,
+            compilation_context = _compilation_context_at_boundary(
+                _compilation_context, compile_options
+            )
+            frontend_token = compilation_context.begin_stage(
+                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
                 compile_options=compile_options,
             )
-            default_index_vars = [
-                IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
-            ]
-            if len(self.shape) > len(default_index_vars):
-                index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
-            else:
-                index_vars = default_index_vars[: len(self.shape)]
+            try:
+                default_index_vars = [
+                    IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+                ]
+                if len(self.shape) > len(default_index_vars):
+                    index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+                else:
+                    index_vars = default_index_vars[: len(self.shape)]
 
-            # Permute index_vars by mode_order for ForAll construction
-            ordered_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+                # Permute index_vars by mode_order for ForAll construction
+                ordered_index_vars = [
+                    index_vars[i] for i in self.storage.index.mode_order
+                ]
 
-            if self.has_index:
-                B = TensorVar(
-                    name="B",
-                    fmt=self.format,
-                    shape=self.shape,
-                    dtype=self.dtype,
-                    mode_order=self.storage.index.mode_order,
-                )
-            else:
-                B = TensorVar(
-                    name="B",
-                    fmt=TensorFormat(
+                if self.has_index:
+                    B = TensorVar(
+                        name="B",
+                        fmt=self.format,
+                        shape=self.shape,
+                        dtype=self.dtype,
+                        mode_order=self.storage.index.mode_order,
+                    )
+                else:
+                    B = TensorVar(
+                        name="B",
+                        fmt=TensorFormat(
+                            level_formats=[
+                                LevelFormat(mode=LevelType.DENSE)
+                                for _ in range(len(self.shape))
+                            ]
+                        ),
+                        shape=self.shape,
+                        dtype=self.dtype,
+                        mode_order=self.storage.index.mode_order,
+                    )
+
+                if fmt is None:
+                    # TODO: infer output format from input format
+                    # For now, make every level COMPRESSED
+                    output_format = TensorFormat(
                         level_formats=[
-                            LevelFormat(mode=LevelType.DENSE)
+                            LevelFormat(mode=LevelType.COMPRESSED)
                             for _ in range(len(self.shape))
                         ]
-                    ),
+                    )
+                else:
+                    output_format = parse_format(fmt)
+
+                A = TensorVar(
+                    name="A",
+                    fmt=output_format,
                     shape=self.shape,
                     dtype=self.dtype,
                     mode_order=self.storage.index.mode_order,
                 )
 
-            if fmt is None:
-                # TODO: infer output format from input format
-                # For now, make every level COMPRESSED
-                output_format = TensorFormat(
-                    level_formats=[
-                        LevelFormat(mode=LevelType.COMPRESSED)
-                        for _ in range(len(self.shape))
-                    ]
+                access_key = (
+                    index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
                 )
-            else:
-                output_format = parse_format(fmt)
+                rhs_access = B[access_key]
+                lhs_access = A[access_key]
+                cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
+                for index_var in reversed(ordered_index_vars):
+                    cin_stmt = ForAll(index_var, cin_stmt)
 
-            A = TensorVar(
-                name="A",
-                fmt=output_format,
-                shape=self.shape,
-                dtype=self.dtype,
-                mode_order=self.storage.index.mode_order,
+                # print("\n\ncin_stmt: ", cin_stmt)
+            except Exception:
+                compilation_context.fail_stage(frontend_token)
+                raise
+
+            compilation_context.complete_stage(frontend_token)
+            cin_stmt = normalize_cin(
+                cin_stmt,
+                compile_options=compile_options,
+                compilation_context=compilation_context,
             )
-
-            access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
-            rhs_access = B[access_key]
-            lhs_access = A[access_key]
-            cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
-            for index_var in reversed(ordered_index_vars):
-                cin_stmt = ForAll(index_var, cin_stmt)
-
-            # print("\n\ncin_stmt: ", cin_stmt)
-
-            stage_timing.commit(frontend_token)
             lowerer = CINLowerer(
                 filter_zeros=True,
                 compile_options=compile_options,
-                stage_timing=stage_timing,
+                compilation_context=compilation_context,
             )
-            lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+            lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
             llir_lowerer = LLIRLowerer(compile_options=compile_options)
-            cpp_token = stage_timing.begin(
-                CompilerStageId.CPP_GENERATION,
+            cpp_token = compilation_context.begin_stage(
+                CompilerStageId.LLIR_TO_CPP_GENERATION,
                 compile_options=compile_options,
             )
-            cpp_code = llir_lowerer.lower_llir(lowered_llir)
-            stage_timing.commit(cpp_token)
+            try:
+                cpp_code = llir_lowerer.lower_llir(lowered_llir)
+            except Exception:
+                compilation_context.fail_stage(cpp_token)
+                raise
+            compilation_context.complete_stage(cpp_token)
 
             # print("to_sparse cpp_code:\n\n", cpp_code)
 
             header_cpp_code = compile_options.build.preamble_source
 
-            kernel_name_token = stage_timing.begin(
-                CompilerStageId.KERNEL_NAME_ASSEMBLY,
+            kernel_name_token = compilation_context.begin_stage(
+                CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
                 compile_options=compile_options,
             )
-            kernel_name = _kernel_name(
-                header_cpp_code,
-                cpp_code,
-                compile_options=compile_options,
-            )
-            stage_timing.commit(kernel_name_token)
-            module = _load_kernel(
-                name=kernel_name,
-                cpp_sources=[header_cpp_code, cpp_code],
-                functions=["evaluate"],
-                extra_cflags=list(compile_options.build.extra_cflags),
-                extra_ldflags=list(compile_options.build.extra_ldflags),
-                compile_options=compile_options,
-            )
+            try:
+                kernel_name = _kernel_name(
+                    header_cpp_code,
+                    cpp_code,
+                    compile_options=compile_options,
+                )
+                prepared_build = _prepare_jit_build(
+                    name=kernel_name,
+                    cpp_sources=[header_cpp_code, cpp_code],
+                    functions=["evaluate"],
+                    extra_cflags=list(compile_options.build.extra_cflags),
+                    extra_ldflags=list(compile_options.build.extra_ldflags),
+                    compile_options=compile_options,
+                )
+            except Exception:
+                compilation_context.fail_stage(kernel_name_token)
+                raise
+            compilation_context.complete_stage(kernel_name_token)
+            module = _load_validated_prepared_kernel(prepared_build)
 
             result_cpp = module.evaluate(
                 self.shape,
@@ -1554,7 +1625,7 @@ class STensor:
         mode_order: List[int],
         *,
         _compile_options: Optional[CompileOptions] = None,
-        _stage_timing: Optional[CompilerStageTiming] = None,
+        _compilation_context: Optional[CompilationContext] = None,
     ) -> STensor:
         """Relay out the tensor into a new logical mode order (transpose).
 
@@ -1756,98 +1827,120 @@ class STensor:
         )
         if type(compile_options) is not CompileOptions:
             raise TypeError("_compile_options must be a CompileOptions instance")
-        stage_timing = _stage_timing_at_boundary(_stage_timing, compile_options)
-        frontend_token = stage_timing.begin(
-            CompilerStageId.FRONTEND_CONSTRUCTION,
+        compilation_context = _compilation_context_at_boundary(
+            _compilation_context, compile_options
+        )
+        frontend_token = compilation_context.begin_stage(
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
             compile_options=compile_options,
         )
-        default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
-        if dim > len(default_index_vars):
-            index_vars = [IndexVar(f"i{i}") for i in range(dim)]
-        else:
-            index_vars = default_index_vars[:dim]
+        try:
+            default_index_vars = [
+                IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+            ]
+            if dim > len(default_index_vars):
+                index_vars = [IndexVar(f"i{i}") for i in range(dim)]
+            else:
+                index_vars = default_index_vars[:dim]
 
-        b_index_vars = [index_vars[i] for i in old_mode_order]
-        a_index_vars = [index_vars[i] for i in mode_order]
+            b_index_vars = [index_vars[i] for i in old_mode_order]
+            a_index_vars = [index_vars[i] for i in mode_order]
 
-        B = TensorVar(
-            name="B",
-            fmt=self.format,
-            shape=self.shape,
-            dtype=self.dtype,
-            mode_order=old_mode_order[:],
+            B = TensorVar(
+                name="B",
+                fmt=self.format,
+                shape=self.shape,
+                dtype=self.dtype,
+                mode_order=old_mode_order[:],
+            )
+
+            A = TensorVar(
+                name="A",
+                fmt=self.format,
+                shape=result_shape,
+                dtype=self.dtype,
+                mode_order=mode_order[:],
+            )
+
+            workspace = Workspace(
+                name="wksp",
+                dim=len(self.shape),
+                mode_order=mode_order[:],
+            )
+
+            producer_stmt = TensorAssign(
+                workspace[tuple(index_vars)],
+                B[tuple(index_vars)],
+            )
+
+            for index_var in b_index_vars[::-1]:
+                producer_stmt = ForAll(index_var, producer_stmt)
+
+            consumer_stmt = TensorAssign(
+                A[tuple(index_vars)],
+                workspace[tuple(index_vars)],
+            )
+
+            for index_var in a_index_vars[::-1]:
+                consumer_stmt = ForAll(index_var, consumer_stmt)
+
+            cin_stmt: IndexStmt = Where(
+                producer=producer_stmt,
+                consumer=consumer_stmt,
+            )
+        except Exception:
+            compilation_context.fail_stage(frontend_token)
+            raise
+
+        compilation_context.complete_stage(frontend_token)
+        cin_stmt = normalize_cin(
+            cin_stmt,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
         )
-
-        A = TensorVar(
-            name="A",
-            fmt=self.format,
-            shape=result_shape,
-            dtype=self.dtype,
-            mode_order=mode_order[:],
-        )
-
-        workspace = Workspace(
-            name="wksp",
-            dim=len(self.shape),
-            mode_order=mode_order[:],
-        )
-
-        producer_stmt = TensorAssign(
-            workspace[tuple(index_vars)],
-            B[tuple(index_vars)],
-        )
-
-        for index_var in b_index_vars[::-1]:
-            producer_stmt = ForAll(index_var, producer_stmt)
-
-        consumer_stmt = TensorAssign(
-            A[tuple(index_vars)],
-            workspace[tuple(index_vars)],
-        )
-
-        for index_var in a_index_vars[::-1]:
-            consumer_stmt = ForAll(index_var, consumer_stmt)
-
-        cin_stmt = Where(
-            producer=producer_stmt,
-            consumer=consumer_stmt,
-        )
-
-        stage_timing.commit(frontend_token)
         lowerer = CINLowerer(
             filter_zeros=True,
             compile_options=compile_options,
-            stage_timing=stage_timing,
+            compilation_context=compilation_context,
         )
-        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+        lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
         llir_lowerer = LLIRLowerer(compile_options=compile_options)
-        cpp_token = stage_timing.begin(
-            CompilerStageId.CPP_GENERATION,
+        cpp_token = compilation_context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
             compile_options=compile_options,
         )
-        cpp_code = llir_lowerer.lower_llir(lowered_llir)
-        stage_timing.commit(cpp_token)
+        try:
+            cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        except Exception:
+            compilation_context.fail_stage(cpp_token)
+            raise
+        compilation_context.complete_stage(cpp_token)
 
         header_cpp_code = compile_options.build.preamble_source
 
-        kernel_name_token = stage_timing.begin(
-            CompilerStageId.KERNEL_NAME_ASSEMBLY,
+        kernel_name_token = compilation_context.begin_stage(
+            CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
             compile_options=compile_options,
         )
-        kernel_name = _kernel_name(
-            header_cpp_code,
-            cpp_code,
-            compile_options=compile_options,
-        )
-        stage_timing.commit(kernel_name_token)
-        module = _load_kernel(
-            name=kernel_name,
-            cpp_sources=[header_cpp_code, cpp_code],
-            functions=["evaluate"],
-            extra_cflags=list(compile_options.build.extra_cflags),
-            extra_ldflags=list(compile_options.build.extra_ldflags),
-            compile_options=compile_options,
-        )
+        try:
+            kernel_name = _kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            )
+            prepared_build = _prepare_jit_build(
+                name=kernel_name,
+                cpp_sources=[header_cpp_code, cpp_code],
+                functions=["evaluate"],
+                extra_cflags=list(compile_options.build.extra_cflags),
+                extra_ldflags=list(compile_options.build.extra_ldflags),
+                compile_options=compile_options,
+            )
+        except Exception:
+            compilation_context.fail_stage(kernel_name_token)
+            raise
+        compilation_context.complete_stage(kernel_name_token)
+        module = _load_validated_prepared_kernel(prepared_build)
 
         result_cpp = module.evaluate(
             result_shape,

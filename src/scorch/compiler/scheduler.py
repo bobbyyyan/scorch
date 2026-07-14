@@ -26,7 +26,7 @@ from scorch.compiler.cin import (
     WorkspaceAccess,
 )
 from .cin_analysis import _compile_options_at_cin_boundary, normalize_cin
-from .stage_timing import CompilerStageId, CompilerStageTiming
+from .compilation_context import CompilerStageId, CompilationContext
 from .compile_options import CompileOptions, SchedulerCostModel, SchedulerPolicy
 from .identity import IndexId
 from .diagnostics import (
@@ -2956,7 +2956,7 @@ class Scheduler:
         schedule: Schedule,
         costs: Optional[_CostModelConstants] = None,
         compile_options: Optional[CompileOptions] = None,
-        stage_timing: Optional[CompilerStageTiming] = None,
+        compilation_context: Optional[CompilationContext] = None,
     ) -> ScheduledCIN:
         """Pair detached semantic CIN with a verified stable-ID schedule.
 
@@ -2968,32 +2968,37 @@ class Scheduler:
         if compile_options is None and options.requested_schedule is None:
             options = replace(options, requested_schedule=schedule)
         _validate_requested_schedule(options, schedule, exact=True)
-        stage_token = (
-            stage_timing.begin(
-                CompilerStageId.SCHEDULING,
-                compile_options=options,
-            )
-            if stage_timing is not None
-            else None
-        )
         validate_legacy_cin_display_names(cin)
         normalized_cin = normalize_cin(
             cin,
             compile_options=options,
-            stage_timing=stage_timing,
+            compilation_context=compilation_context,
         )
-        legacy_scheduled = Scheduler._apply_schedule_legacy(
-            normalized_cin,
-            schedule,
-            costs=costs,
-            compile_options=options,
+        stage_token = (
+            compilation_context.begin_stage(
+                CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+                compile_options=options,
+            )
+            if compilation_context is not None
+            else None
         )
-        scheduled = ScheduledCIN(
-            normalized_cin,
-            legacy_scheduled.verified_loop_plan,
-        )
-        if stage_token is not None and stage_timing is not None:
-            stage_timing.commit(stage_token)
+        try:
+            legacy_scheduled = Scheduler._apply_schedule_legacy(
+                normalized_cin,
+                schedule,
+                costs=costs,
+                compile_options=options,
+            )
+            scheduled = ScheduledCIN(
+                normalized_cin,
+                legacy_scheduled.verified_loop_plan,
+            )
+        except Exception:
+            if stage_token is not None and compilation_context is not None:
+                compilation_context.fail_stage(stage_token)
+            raise
+        if stage_token is not None and compilation_context is not None:
+            compilation_context.complete_stage(stage_token)
         return scheduled
 
     @staticmethod
@@ -3266,7 +3271,7 @@ class Scheduler:
         cin: CIN,
         costs: Optional[_CostModelConstants] = None,
         compile_options: Optional[CompileOptions] = None,
-        stage_timing: Optional[CompilerStageTiming] = None,
+        compilation_context: Optional[CompilationContext] = None,
     ) -> CIN:
         """Auto-schedule without mutating caller-owned CIN state."""
 
@@ -3277,7 +3282,7 @@ class Scheduler:
             options,
             costs,
             options.scheduler,
-            stage_timing=stage_timing,
+            compilation_context=compilation_context,
         )
 
     @staticmethod
@@ -3286,7 +3291,7 @@ class Scheduler:
         *,
         enabled: bool,
         compile_options: CompileOptions,
-        stage_timing: Optional[CompilerStageTiming] = None,
+        compilation_context: Optional[CompilationContext] = None,
     ) -> CIN:
         """Run one deterministic arm of the internal dual-path algorithm."""
 
@@ -3304,7 +3309,7 @@ class Scheduler:
             compile_options,
             scheduler_policy.cost_model,
             scheduler_policy,
-            stage_timing=stage_timing,
+            compilation_context=compilation_context,
         )
 
     @staticmethod
@@ -3313,37 +3318,42 @@ class Scheduler:
         options: CompileOptions,
         costs: _CostModelConstants,
         scheduler_policy: SchedulerPolicy,
-        stage_timing: Optional[CompilerStageTiming] = None,
+        compilation_context: Optional[CompilationContext] = None,
     ) -> CIN:
         """Shared owned implementation after the public boundary is resolved."""
 
-        stage_token = (
-            stage_timing.begin(
-                CompilerStageId.SCHEDULING,
-                compile_options=options,
-            )
-            if stage_timing is not None
-            else None
-        )
         if isinstance(cin, IndexStmt):
             validate_legacy_cin_display_names(cin)
         working = (
             normalize_cin(
                 cin,
                 compile_options=options,
-                stage_timing=stage_timing,
+                compilation_context=compilation_context,
             )
             if isinstance(cin, IndexStmt)
             else copy.deepcopy(cin)
         )
-        scheduled = Scheduler._auto_schedule_owned(
-            working,
-            options,
-            costs=costs,
-            scheduler_policy=scheduler_policy,
+        stage_token = (
+            compilation_context.begin_stage(
+                CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+                compile_options=options,
+            )
+            if compilation_context is not None
+            else None
         )
-        if isinstance(scheduled, IndexStmt):
-            validate_legacy_cin_display_names(scheduled)
-        if stage_token is not None and stage_timing is not None:
-            stage_timing.commit(stage_token)
+        try:
+            scheduled = Scheduler._auto_schedule_owned(
+                working,
+                options,
+                costs=costs,
+                scheduler_policy=scheduler_policy,
+            )
+            if isinstance(scheduled, IndexStmt):
+                validate_legacy_cin_display_names(scheduled)
+        except Exception:
+            if stage_token is not None and compilation_context is not None:
+                compilation_context.fail_stage(stage_token)
+            raise
+        if stage_token is not None and compilation_context is not None:
+            compilation_context.complete_stage(stage_token)
         return scheduled

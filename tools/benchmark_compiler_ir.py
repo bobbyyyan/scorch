@@ -2,8 +2,10 @@
 """Phase 0 compiler-IR latency corpus and generated-kernel noise control.
 
 The latency command measures the production Python compiler path from the public,
-validated operation boundary through emitted C++ and build arguments.  It intercepts
-the native build call, so external C++ compilation and kernel execution are excluded.
+validated operation boundary through the frozen JIT build request and cache identity.
+It records the predecessor-compatible marker before request assembly and intercepts
+the pre-native loader, so native cache lookup, C++ compilation, dynamic loading, and
+kernel execution are excluded.
 
 The kernel-aa command measures the legacy generated SpMM kernel twice in alternating
 lanes.  Both lanes call the same loaded module; their ratios are the per-machine A/A
@@ -34,8 +36,12 @@ import torch
 
 import scorch  # type: ignore[import-untyped]
 from scorch import ops
+from scorch.compiler.compilation_context import (  # type: ignore[import-untyped]
+    CompilationContext,
+)
 from scorch.layout import TensorSpec  # type: ignore[import-untyped]
 from scorch.stensor import STensor  # type: ignore[import-untyped]
+from scorch.utils import _PreparedJITBuild  # type: ignore[import-untyped]
 
 SCHEMA_VERSION = 1
 LATENCY_CORPUS_VERSION = "phase0-v1"
@@ -53,10 +59,16 @@ QUICK_DENSITIES = (0.05,)
 class _CompilationCaptured(Exception):
     """Internal sentinel raised exactly where the native build would begin."""
 
-    def __init__(self, boundary_ns: int, load_kwargs: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        boundary_ns: int,
+        legacy_boundary_ns: int,
+        prepared: _PreparedJITBuild,
+    ) -> None:
         super().__init__("native build boundary reached")
         self.boundary_ns = boundary_ns
-        self.load_kwargs = load_kwargs
+        self.legacy_boundary_ns = legacy_boundary_ns
+        self.prepared = prepared
 
 
 @dataclass(frozen=True)
@@ -88,8 +100,24 @@ def _metadata() -> Dict[str, Any]:
         "python": platform.python_version(),
         "torch": torch.__version__,
         "scorch": getattr(scorch, "__version__", "unknown"),
+        "scorch_source_root": str(Path(scorch.__file__).resolve().parent),
         "torch_threads": torch.get_num_threads(),
     }
+
+
+def _require_imported_scorch_from_worktree() -> None:
+    """Fail closed if Git metadata and imported compiler source can disagree."""
+
+    worktree = _git_value("rev-parse", "--show-toplevel")
+    if worktree == "unknown":
+        raise RuntimeError("compiler benchmark requires a Git worktree")
+    expected = (Path(worktree) / "src" / "scorch").resolve()
+    actual = Path(scorch.__file__).resolve().parent
+    if actual != expected:
+        raise RuntimeError(
+            "compiler benchmark imported Scorch from a different worktree: "
+            f"expected {expected}, got {actual}"
+        )
 
 
 def _percentile(samples: Sequence[float], fraction: float) -> float:
@@ -116,6 +144,19 @@ def _source_summary(load_kwargs: Mapping[str, Any]) -> Dict[str, Any]:
         "extra_cflags": list(load_kwargs.get("extra_cflags", ())),
         "extra_ldflags": list(load_kwargs.get("extra_ldflags", ())),
     }
+
+
+def _prepared_source_summary(prepared: _PreparedJITBuild) -> Dict[str, Any]:
+    request = prepared.request
+    return _source_summary(
+        {
+            "name": request.name,
+            "cpp_sources": request.cpp_sources,
+            "functions": request.functions,
+            "extra_cflags": request.extra_cflags,
+            "extra_ldflags": request.extra_ldflags,
+        }
+    )
 
 
 def _write_result(result: Mapping[str, Any], output: Optional[Path]) -> None:
@@ -218,25 +259,56 @@ def _build_latency_cases() -> List[LatencyCase]:
 
 @contextmanager
 def _intercept_native_builds(
-    captures: List[Dict[str, Any]], *, stop_before_build: bool
+    captures: List[Dict[str, Any]],
+    legacy_boundaries: List[int],
+    compilation_contexts: List[CompilationContext],
+    *,
+    stop_before_build: bool,
 ) -> Iterator[None]:
     stensor_module = importlib.import_module("scorch.stensor")
-    original_ops_load = ops._load_kernel
-    original_stensor_load = getattr(stensor_module, "_load_kernel")
+    original_ops_prepare = ops._prepare_jit_build
+    original_stensor_prepare = getattr(stensor_module, "_prepare_jit_build")
+    original_ops_load = ops._load_validated_prepared_kernel
+    original_stensor_load = getattr(stensor_module, "_load_validated_prepared_kernel")
+    original_context_post_init = CompilationContext.__post_init__
 
-    def intercept(**kwargs: Any) -> object:
+    def intercept_prepare(*args: Any, **kwargs: Any) -> _PreparedJITBuild:
+        legacy_boundaries.append(time.perf_counter_ns())
+        return original_ops_prepare(*args, **kwargs)
+
+    def intercept_load(prepared: _PreparedJITBuild) -> object:
         if stop_before_build:
-            raise _CompilationCaptured(time.perf_counter_ns(), kwargs)
-        captures.append(_source_summary(kwargs))
-        return original_ops_load(**kwargs)
+            if len(legacy_boundaries) != 1:
+                raise RuntimeError("compilation reached an ambiguous legacy boundary")
+            raise _CompilationCaptured(
+                time.perf_counter_ns(),
+                legacy_boundaries[0],
+                prepared,
+            )
+        captures.append(_prepared_source_summary(prepared))
+        return original_ops_load(prepared)
 
-    ops._load_kernel = intercept
-    setattr(stensor_module, "_load_kernel", intercept)
+    def intercept_context_post_init(context: CompilationContext) -> None:
+        original_context_post_init(context)
+        compilation_contexts.append(context)
+
+    ops._prepare_jit_build = intercept_prepare
+    setattr(stensor_module, "_prepare_jit_build", intercept_prepare)
+    ops._load_validated_prepared_kernel = intercept_load
+    setattr(stensor_module, "_load_validated_prepared_kernel", intercept_load)
+    CompilationContext.__post_init__ = intercept_context_post_init
     try:
         yield
     finally:
-        ops._load_kernel = original_ops_load
-        setattr(stensor_module, "_load_kernel", original_stensor_load)
+        ops._prepare_jit_build = original_ops_prepare
+        setattr(stensor_module, "_prepare_jit_build", original_stensor_prepare)
+        ops._load_validated_prepared_kernel = original_ops_load
+        setattr(
+            stensor_module,
+            "_load_validated_prepared_kernel",
+            original_stensor_load,
+        )
+        CompilationContext.__post_init__ = original_context_post_init
 
 
 def _clear_compiler_caches() -> None:
@@ -244,24 +316,82 @@ def _clear_compiler_caches() -> None:
     ops._einsum_dispatch_cache.clear()
 
 
-def _time_captured_compilation(case: LatencyCase) -> tuple[float, Dict[str, Any]]:
+def _time_captured_compilation(
+    case: LatencyCase,
+) -> tuple[float, float, Dict[str, Any], List[Dict[str, Any]]]:
     _clear_compiler_caches()
     captures: List[Dict[str, Any]] = []
-    with _intercept_native_builds(captures, stop_before_build=True):
+    legacy_boundaries: List[int] = []
+    compilation_contexts: List[CompilationContext] = []
+    with _intercept_native_builds(
+        captures,
+        legacy_boundaries,
+        compilation_contexts,
+        stop_before_build=True,
+    ):
         start = time.perf_counter_ns()
         try:
             case.invoke()
         except _CompilationCaptured as captured:
-            elapsed_ms = (captured.boundary_ns - start) / 1_000_000.0
-            build = _source_summary(captured.load_kwargs)
+            compatible_elapsed_ms = (captured.legacy_boundary_ns - start) / 1_000_000.0
+            canonical_elapsed_ms = (captured.boundary_ns - start) / 1_000_000.0
+            build = _prepared_source_summary(captured.prepared)
         else:
             raise RuntimeError(f"{case.name} did not reach the native build boundary")
     if captures:
         raise RuntimeError(f"{case.name} unexpectedly entered the native build")
-    return elapsed_ms, build
+    if len(compilation_contexts) != 1:
+        raise RuntimeError(
+            f"{case.name} must publish exactly one compilation timing owner; "
+            f"observed {len(compilation_contexts)}"
+        )
+    if not compilation_contexts[0].stage_run_records:
+        raise RuntimeError(f"{case.name} published no compiler-stage records")
+    stage_runs = [
+        {
+            "sequence_index": record.sequence_index,
+            "stage_id": record.stage_id.value,
+            "duration_ns": record.duration_ns,
+            "nested_within": (
+                record.nested_within.value if record.nested_within is not None else None
+            ),
+        }
+        for context in compilation_contexts
+        for record in context.stage_run_records
+    ]
+    return compatible_elapsed_ms, canonical_elapsed_ms, build, stage_runs
+
+
+def _stage_timing_summary(
+    samples: Sequence[Sequence[Mapping[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    stage_ids = sorted({str(run["stage_id"]) for sample in samples for run in sample})
+    summary: Dict[str, Dict[str, Any]] = {}
+    for stage_id in stage_ids:
+        durations_ms: List[float] = []
+        runs_per_sample: List[int] = []
+        nested_within: set[Optional[str]] = set()
+        for sample in samples:
+            matching = [run for run in sample if run["stage_id"] == stage_id]
+            runs_per_sample.append(len(matching))
+            durations_ms.append(
+                sum(float(run["duration_ns"]) for run in matching) / 1_000_000.0
+            )
+            nested_within.update(run["nested_within"] for run in matching)
+        summary[stage_id] = {
+            "samples_ms": durations_ms,
+            "p50_ms": _percentile(durations_ms, 0.50),
+            "p95_ms": _percentile(durations_ms, 0.95),
+            "runs_per_sample": runs_per_sample,
+            "nested_within": sorted(
+                value for value in nested_within if value is not None
+            ),
+        }
+    return summary
 
 
 def run_latency(args: argparse.Namespace) -> int:
+    _require_imported_scorch_from_worktree()
     if args.warmup < 0 or args.samples < 1:
         raise ValueError("warmup must be nonnegative and samples must be positive")
     cases = _build_latency_cases()
@@ -269,23 +399,40 @@ def run_latency(args: argparse.Namespace) -> int:
 
     print("Phase 0 Python compiler latency (native build and execution excluded)")
     print(f"warmup={args.warmup} samples={args.samples}")
-    print(f"{'case':<20} {'p50_ms':>10} {'p95_ms':>10} {'source_sha256':>16}")
+    print(
+        f"{'case':<20} {'compat50':>10} {'compat95':>10} "
+        f"{'canon50':>10} {'canon95':>10} {'source_sha256':>16}"
+    )
     for case in cases:
         for _ in range(args.warmup):
             _time_captured_compilation(case)
         samples: List[float] = []
+        canonical_samples: List[float] = []
         builds: List[Dict[str, Any]] = []
+        stage_samples: List[List[Dict[str, Any]]] = []
         for _ in range(args.samples):
-            elapsed_ms, build = _time_captured_compilation(case)
-            samples.append(elapsed_ms)
+            compatible_ms, canonical_ms, build, stage_runs = _time_captured_compilation(
+                case
+            )
+            samples.append(compatible_ms)
+            canonical_samples.append(canonical_ms)
             builds.append(build)
-        source_digests = {build["source_sha256"] for build in builds}
-        if len(source_digests) != 1:
-            raise RuntimeError(f"{case.name} emitted nondeterministic C++")
+            stage_samples.append(stage_runs)
+        if any(build != builds[0] for build in builds[1:]):
+            raise RuntimeError(
+                f"{case.name} emitted nondeterministic compiler build inputs"
+            )
         p50_ms = _percentile(samples, 0.50)
         p95_ms = _percentile(samples, 0.95)
+        canonical_p50_ms = _percentile(canonical_samples, 0.50)
+        canonical_p95_ms = _percentile(canonical_samples, 0.95)
+        endpoint_extension_samples = [
+            canonical - compatible
+            for compatible, canonical in zip(samples, canonical_samples)
+        ]
         print(
             f"{case.name:<20} {p50_ms:10.3f} {p95_ms:10.3f} "
+            f"{canonical_p50_ms:10.3f} {canonical_p95_ms:10.3f} "
             f"{builds[0]['source_sha256'][:16]:>16}"
         )
         case_results.append(
@@ -297,6 +444,17 @@ def run_latency(args: argparse.Namespace) -> int:
                 "samples_ms": samples,
                 "p50_ms": p50_ms,
                 "p95_ms": p95_ms,
+                "canonical_samples_ms": canonical_samples,
+                "canonical_p50_ms": canonical_p50_ms,
+                "canonical_p95_ms": canonical_p95_ms,
+                "canonical_endpoint_extension_samples_ms": endpoint_extension_samples,
+                "canonical_endpoint_extension_p50_ms": _percentile(
+                    endpoint_extension_samples, 0.50
+                ),
+                "canonical_endpoint_extension_p95_ms": _percentile(
+                    endpoint_extension_samples, 0.95
+                ),
+                "stage_timing": _stage_timing_summary(stage_samples),
                 "build": builds[0],
             }
         )
@@ -397,6 +555,7 @@ def _geomean(values: Sequence[float]) -> float:
 
 
 def run_kernel_aa(args: argparse.Namespace) -> int:
+    _require_imported_scorch_from_worktree()
     if args.warmup < 0 or args.rounds < 2 or args.calls < 1:
         raise ValueError("warmup must be nonnegative, rounds >= 2, and calls positive")
     if args.threads:
@@ -416,7 +575,12 @@ def run_kernel_aa(args: argparse.Namespace) -> int:
     )
     print(f"{'M':>7} {'N':>5} {'density':>8} {'median_ms':>11} {'band':>19}")
 
-    with _intercept_native_builds(build_captures, stop_before_build=False):
+    with _intercept_native_builds(
+        build_captures,
+        [],
+        [],
+        stop_before_build=False,
+    ):
         for rows in rows_grid:
             cols = rows
             for density in density_grid:

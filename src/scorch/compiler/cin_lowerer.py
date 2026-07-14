@@ -44,6 +44,7 @@ from .llir_pass_manager import (
     PRODUCTION_LLIR_PASS_OPTIONS,
     CompressedWhereOpenMPPassSpec,
     DensePointerHoistPassSpec,
+    LLIRBodyAssembler,
     LLIRPassManager,
     LLIRPassOptions,
     LLIRPassPipeline,
@@ -52,7 +53,7 @@ from .llir_pass_manager import (
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
 )
-from .stage_timing import CompilerStageId, CompilerStageTiming
+from .compilation_context import CompilerStageId, CompilationContext
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
@@ -538,7 +539,7 @@ class CINLowerer:
         post_ops: Optional[PostOps] = None,
         llir_pass_options: Optional[LLIRPassOptions] = None,
         compile_options: Optional[CompileOptions] = None,
-        stage_timing: Optional[CompilerStageTiming] = None,
+        compilation_context: Optional[CompilationContext] = None,
     ):
         if compile_options is None:
             compile_options = CompileOptions.from_environment(
@@ -554,15 +555,17 @@ class CINLowerer:
             raise TypeError(
                 "llir_pass_options and compile_options cannot both be provided"
             )
-        if stage_timing is not None:
-            if type(stage_timing) is not CompilerStageTiming:
-                raise TypeError("stage_timing must be a CompilerStageTiming instance")
-            if stage_timing.compile_options is not compile_options:
+        if compilation_context is not None:
+            if type(compilation_context) is not CompilationContext:
                 raise TypeError(
-                    "stage_timing must retain this lowering's exact "
+                    "compilation_context must be a CompilationContext instance"
+                )
+            if compilation_context.compile_options is not compile_options:
+                raise TypeError(
+                    "compilation_context must retain this lowering's exact "
                     "CompileOptions snapshot"
                 )
-        self._stage_timing = stage_timing
+        self._compilation_context = compilation_context
         self.compile_options = compile_options
         self.filter_zeros: bool = filter_zeros
         self.post_ops: Optional[PostOps] = post_ops
@@ -626,10 +629,51 @@ class CINLowerer:
 
     def _record_llir_pass_runs(self, records: Tuple[LLIRPassRunRecord, ...]) -> None:
         start = len(self._llir_pass_run_records)
-        self._llir_pass_run_records += tuple(
+        owned_records = tuple(
             replace(record, sequence_index=start + offset)
             for offset, record in enumerate(records)
         )
+        self._llir_pass_run_records += owned_records
+        if self._compilation_context is not None:
+            self._compilation_context.record_llir_pass_runs(
+                owned_records,
+                compile_options=self.compile_options,
+            )
+
+    def _instrument_body_assembler(
+        self,
+        body_assembler: LLIRBodyAssembler,
+    ) -> LLIRBodyAssembler:
+        """Time the existing one-shot result/ABI continuation when owned."""
+
+        compilation_context = self._compilation_context
+        if compilation_context is None:
+            return body_assembler
+
+        def timed_body_assembler(
+            transformed_body: LLIRStatementListArtifact,
+            compressed_output_parallel: bool,
+        ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+            assembly_token = compilation_context.begin_stage(
+                CompilerStageId.RESULT_ABI_ASSEMBLY,
+                compile_options=self.compile_options,
+                nested_within=CompilerStageId.CIN_LOWERING,
+            )
+            try:
+                assembled = body_assembler(
+                    transformed_body,
+                    compressed_output_parallel,
+                )
+                assembled = self._llir_pass_manager.validate_body_assembly_artifact(
+                    assembled
+                )
+            except Exception:
+                compilation_context.fail_stage(assembly_token)
+                raise
+            compilation_context.complete_stage(assembly_token)
+            return assembled
+
+        return timed_body_assembler
 
     def _validate_post_ops(self) -> None:
         """Reject post-ops that this lowering stage cannot represent."""
@@ -2244,24 +2288,38 @@ class CINLowerer:
         Lower an IndexStmt to LLIR
         """
 
-        stage_timing = self._stage_timing
-        if stage_timing is None or recurse or self.outermost_stmt is not None:
+        compilation_context = self._compilation_context
+        if compilation_context is None or recurse or self.outermost_stmt is not None:
             return self._lower_index_stmt_untimed(
                 stmt,
                 recurse,
                 _ownership_transferred,
             )
-        stage_token = stage_timing.begin(
+        adapter_token = compilation_context.begin_stage(
+            CompilerStageId.LEGACY_CIN_ADAPTATION,
+            compile_options=self.compile_options,
+        )
+        try:
+            prepared_stmt = self._prepare_scheduled_cin(
+                stmt,
+                recurse,
+                ownership_transferred=_ownership_transferred,
+            )
+        except Exception:
+            compilation_context.fail_stage(adapter_token)
+            raise
+        compilation_context.complete_stage(adapter_token)
+        lowering_token = compilation_context.begin_stage(
             CompilerStageId.CIN_LOWERING,
             compile_options=self.compile_options,
         )
-        lowered = self._lower_index_stmt_untimed(
-            stmt,
-            recurse,
-            _ownership_transferred,
-        )
-        stage_timing.commit(stage_token)
-        return lowered
+        try:
+            lowered = self._lower_prepared_index_stmt(prepared_stmt, recurse)
+        except Exception:
+            compilation_context.fail_stage(lowering_token)
+            raise
+        compilation_context.complete_stage(lowering_token)
+        return self._apply_schedule_lowering(lowered, prepared_stmt)
 
     def _lower_index_stmt_untimed(
         self,
@@ -2269,11 +2327,23 @@ class CINLowerer:
         recurse: bool,
         _ownership_transferred: bool,
     ) -> Union[llir.Stmt, List[llir.Stmt]]:
+        apply_schedule_lowering = not recurse and self.outermost_stmt is None
         stmt = self._prepare_scheduled_cin(
             stmt,
             recurse,
             ownership_transferred=_ownership_transferred,
         )
+        lowered = self._lower_prepared_index_stmt(stmt, recurse)
+        if apply_schedule_lowering:
+            return self._apply_schedule_lowering(lowered, stmt)
+        return lowered
+
+    def _lower_prepared_index_stmt(
+        self,
+        stmt: IndexStmt,
+        recurse: bool,
+    ) -> Union[llir.Stmt, List[llir.Stmt]]:
+        """Lower one already adapted compiler-owned CIN tree to current LLIR."""
 
         if not self.outermost_stmt:
             self.outermost_stmt = stmt
@@ -2749,28 +2819,9 @@ class CINLowerer:
 
                 return LLIRRewriteArtifact(body_stmts)
 
-            body_assembler = assemble_body
-            stage_timing = self._stage_timing
-            if stage_timing is not None:
-
-                def timed_assemble_body(
-                    transformed_body: LLIRStatementListArtifact,
-                    compressed_output_parallel: bool,
-                ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
-                    # Same one-shot result/ABI continuation at the same lazy
-                    # barrier position; timing brackets only its execution.
-                    assembly_token = stage_timing.begin(
-                        CompilerStageId.RESULT_ABI_ASSEMBLY,
-                        compile_options=self.compile_options,
-                    )
-                    assembled = assemble_body(
-                        transformed_body,
-                        compressed_output_parallel,
-                    )
-                    stage_timing.commit(assembly_token)
-                    return assembled
-
-                body_assembler = timed_assemble_body
+            # Same one-shot continuation at the same lazy barrier position;
+            # instrumentation only brackets its existing execution.
+            body_assembler = self._instrument_body_assembler(assemble_body)
 
             try:
                 pipeline_result = self._llir_pass_manager.run_production_pipeline(
@@ -2797,40 +2848,54 @@ class CINLowerer:
                 args=kernel_args,
                 body=body_stmts,
             )
-            if self.loop_plan is not None:
-                schedule_lowering_token = (
-                    stage_timing.begin(
-                        CompilerStageId.SCHEDULE_LOWERING,
-                        compile_options=self.compile_options,
-                    )
-                    if stage_timing is not None
-                    else None
-                )
-                from .scheduler import materialize_legacy_schedule
-
-                (
-                    legacy_schedule,
-                    panel_bounds,
-                    relayout_plan,
-                    result_tile_plan,
-                ) = materialize_legacy_schedule(
-                    self.normalized_cin or stmt, self.loop_plan
-                )
-                self._apply_explicit_parallel_schedule(function, legacy_schedule)
-                from .schedule_lowerer import apply_schedule_to_llir
-
-                function = apply_schedule_to_llir(
-                    function,
-                    legacy_schedule,
-                    panel_bounds,
-                    relayout_plan,
-                    result_tile_plan,
-                )
-                if schedule_lowering_token is not None and stage_timing is not None:
-                    stage_timing.commit(schedule_lowering_token)
             return function
 
         return []
+
+    def _apply_schedule_lowering(
+        self,
+        lowered: Union[llir.Stmt, List[llir.Stmt]],
+        stmt: IndexStmt,
+    ) -> Union[llir.Stmt, List[llir.Stmt]]:
+        """Apply an existing LoopPlan after CIN lowering has completed."""
+
+        if self.loop_plan is None or not isinstance(lowered, llir.Function):
+            return lowered
+        compilation_context = self._compilation_context
+        schedule_lowering_token = (
+            compilation_context.begin_stage(
+                CompilerStageId.SCHEDULE_LOWERING,
+                compile_options=self.compile_options,
+            )
+            if compilation_context is not None
+            else None
+        )
+        try:
+            from .scheduler import materialize_legacy_schedule
+
+            (
+                legacy_schedule,
+                panel_bounds,
+                relayout_plan,
+                result_tile_plan,
+            ) = materialize_legacy_schedule(self.normalized_cin or stmt, self.loop_plan)
+            self._apply_explicit_parallel_schedule(lowered, legacy_schedule)
+            from .schedule_lowerer import apply_schedule_to_llir
+
+            scheduled = apply_schedule_to_llir(
+                lowered,
+                legacy_schedule,
+                panel_bounds,
+                relayout_plan,
+                result_tile_plan,
+            )
+        except Exception:
+            if schedule_lowering_token is not None and compilation_context is not None:
+                compilation_context.fail_stage(schedule_lowering_token)
+            raise
+        if schedule_lowering_token is not None and compilation_context is not None:
+            compilation_context.complete_stage(schedule_lowering_token)
+        return scheduled
 
     @staticmethod
     def _contains_explicit_parallel(stmt: IndexStmt) -> bool:

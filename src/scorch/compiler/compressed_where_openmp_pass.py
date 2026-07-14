@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, Dict, List, NoReturn, Optional, Sequence, Tupl
 
 from . import llir
 from .codegen import LLIRLowerer
-from .diagnostics import CompilerError
 from .llir_traversal import (
     LLIRPath,
     LLIRRewriter,
@@ -1038,7 +1037,7 @@ def _build_transformed_statements(
             workspace_hoisted=workspace_hoisted,
             manager=manager,
         )
-    except CompilerError as failure:
+    except Exception as failure:
         raise LLIRPassPartialFailure(failure, count_records) from failure
 
     nested_run_records = (*count_records, *fill_records)
@@ -1068,7 +1067,7 @@ def _build_transformed_statements(
         result.append(_value_allocation(context))
         result.append(fill_loop)
         result.append(_final_assembly(context))
-    except CompilerError as failure:
+    except Exception as failure:
         raise LLIRPassPartialFailure(failure, nested_run_records) from failure
     return result, nested_run_records
 
@@ -1123,7 +1122,7 @@ def _transform_compressed_where_for_openmp_managed(
     )
     try:
         LLIRWalker(checked_context.traversal).walk(cast(LLIRValue, transformed))
-    except CompilerError as failure:
+    except Exception as failure:
         raise LLIRPassPartialFailure(failure, nested_run_records) from failure
     return _ManagedCompressedWhereOpenMPExecution(
         CompressedWhereOpenMPResult(transformed, True),

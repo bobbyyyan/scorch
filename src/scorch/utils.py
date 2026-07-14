@@ -117,6 +117,34 @@ class _JITBuildRequest:
     build_options: "KernelBuildOptions"
 
 
+@dataclass(frozen=True)
+class _PreparedJITBuild:
+    """Validated build request and identities at the pre-native boundary."""
+
+    request: _JITBuildRequest
+    cache_key: tuple[str, tuple[object, ...]]
+    so_path: str
+
+
+def _validate_prepared_jit_build(prepared: object) -> _PreparedJITBuild:
+    """Validate that one pre-native carrier has a coherent frozen identity."""
+
+    if type(prepared) is not _PreparedJITBuild:
+        raise TypeError("prepared JIT build must be an exact _PreparedJITBuild")
+    typed_prepared = prepared
+    request = _validate_jit_build_request(typed_prepared.request)
+    expected_cache_key = (request.name, _request_cache_key(request))
+    if typed_prepared.cache_key != expected_cache_key:
+        raise ValueError("prepared JIT cache key disagrees with its build request")
+    expected_so_path = os.path.join(
+        request.build_directory,
+        f"{request.name}.so",
+    )
+    if typed_prepared.so_path != expected_so_path:
+        raise ValueError("prepared JIT path disagrees with its build request")
+    return typed_prepared
+
+
 def _validate_jit_build_request(request: object) -> _JITBuildRequest:
     from .compiler.compile_options import KernelBuildOptions
 
@@ -376,7 +404,7 @@ def _jit_build_environment_from_request(
     return environment
 
 
-def _load_kernel(
+def _prepare_jit_build(
     name: str,
     cpp_sources: Sequence[str],
     functions: Sequence[str],
@@ -384,13 +412,9 @@ def _load_kernel(
     extra_ldflags: Sequence[str],
     *,
     compile_options: Optional["CompileOptions"] = None,
-) -> Any:
-    """Load a compiled kernel, using a persistent .so cache when possible.
+) -> _PreparedJITBuild:
+    """Assemble one frozen request and cache identity before native work."""
 
-    PyTorch's JIT_EXTENSION_VERSIONER is in-memory only, so load_inline
-    always recompiles on the first call in each process (~7s).  We bypass
-    it by checking if the .so already exists on disk and loading it directly.
-    """
     options = _resolve_compile_options(compile_options)
     cpp_sources_snapshot = tuple(cpp_sources)
     functions_snapshot = tuple(functions)
@@ -425,16 +449,64 @@ def _load_kernel(
         )
     )
     cache_key = (name, _request_cache_key(request))
+    return _validate_prepared_jit_build(
+        _PreparedJITBuild(
+            request=request,
+            cache_key=cache_key,
+            so_path=so_path,
+        )
+    )
+
+
+def _load_validated_prepared_kernel(prepared: _PreparedJITBuild) -> Any:
+    """Begin cache/native work from a production-validated frozen request."""
+
+    request = prepared.request
+    cache_key = prepared.cache_key
     if cache_key in _so_cache:
         return _so_cache[cache_key]
 
-    if os.path.isfile(so_path):
-        module = _load_extension_file(name, so_path)
+    if os.path.isfile(prepared.so_path):
+        module = _load_extension_file(request.name, prepared.so_path)
     else:
         module = _build_and_load_extension(request)
 
     _so_cache[cache_key] = module
     return module
+
+
+def _load_prepared_kernel(prepared: _PreparedJITBuild) -> Any:
+    """Compatibility boundary validating a detached pre-native carrier."""
+
+    return _load_validated_prepared_kernel(_validate_prepared_jit_build(prepared))
+
+
+def _load_kernel(
+    name: str,
+    cpp_sources: Sequence[str],
+    functions: Sequence[str],
+    extra_cflags: Sequence[str],
+    extra_ldflags: Sequence[str],
+    *,
+    compile_options: Optional["CompileOptions"] = None,
+) -> Any:
+    """Compatibility boundary that prepares, caches, and loads one kernel.
+
+    PyTorch's JIT_EXTENSION_VERSIONER is in-memory only, so load_inline
+    always recompiles on the first call in each process (~7s).  We bypass
+    it by checking if the .so already exists on disk and loading it directly.
+    """
+
+    return _load_validated_prepared_kernel(
+        _prepare_jit_build(
+            name,
+            cpp_sources,
+            functions,
+            extra_cflags,
+            extra_ldflags,
+            compile_options=compile_options,
+        )
+    )
 
 
 def get_extra_cflags(

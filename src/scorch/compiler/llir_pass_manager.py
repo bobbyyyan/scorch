@@ -33,7 +33,7 @@ from typing import (
 )
 
 from . import llir
-from .diagnostics import CompilerError, CompilerInvariantError
+from .diagnostics import CompilerInvariantError
 from .dynamic_vector_access_pass import (
     DYNAMIC_VECTOR_ACCESS_CONTEXT,
     DynamicVectorAccessConfig,
@@ -1055,6 +1055,23 @@ class LLIRPassManager:
         )
         return LLIRRewritePassResult(LLIRRewriteArtifact(output), (record,))
 
+    def validate_body_assembly_artifact(
+        self,
+        artifact: object,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        """Validate the exact typed result of the lazy result/ABI barrier."""
+
+        self._validate_rewrite_artifact(artifact)
+        typed_artifact = cast(LLIRRewriteArtifact[List[llir.Stmt]], artifact)
+        if type(typed_artifact.value) is not list:
+            _raise_manager_error(
+                code="invalid_body_assembly_artifact",
+                message="body assembler must return an exact statement-list value",
+                sequence_index=6,
+                descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
+            )
+        return typed_artifact
+
     def run_compressed_where_openmp(
         self,
         artifact: LLIRStatementListArtifact,
@@ -1131,7 +1148,7 @@ class LLIRPassManager:
                 options=self.options,
                 started_ns=started_ns,
             )
-        except CompilerError as failure:
+        except Exception as failure:
             raise LLIRPassPartialFailure(
                 failure,
                 execution.nested_run_records,
@@ -1284,14 +1301,7 @@ class LLIRPassManager:
                 LLIRStatementListArtifact(statements),
                 compressed_output_parallel,
             )
-            self._validate_rewrite_artifact(assembled)
-            if type(assembled.value) is not list:
-                _raise_manager_error(
-                    code="invalid_body_assembly_artifact",
-                    message="body assembler must return an exact statement-list value",
-                    sequence_index=6,
-                    descriptor=DYNAMIC_VECTOR_ACCESS_PASS,
-                )
+            assembled = self.validate_body_assembly_artifact(assembled)
 
             dynamic = self.run_dynamic_vector_access(
                 assembled,

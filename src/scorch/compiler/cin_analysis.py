@@ -35,7 +35,7 @@ from .cin import (
 from .diagnostics import VerificationError
 from .identity import AccessId, IndexId, NodeId, SymbolId
 from .compile_options import CompileOptions
-from .stage_timing import CompilerStageId, CompilerStageTiming
+from .compilation_context import CompilerStageId, CompilationContext
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -1122,7 +1122,7 @@ def _initialize_cin_clone(clone: object, node_id: NodeId) -> None:
 def normalize_cin(
     cin: IndexStmt,
     compile_options: Optional[CompileOptions] = None,
-    stage_timing: Optional[CompilerStageTiming] = None,
+    compilation_context: Optional[CompilationContext] = None,
 ) -> IndexStmt:
     """Detach authoritative CIN structure while preserving all stable IDs.
 
@@ -1134,14 +1134,24 @@ def normalize_cin(
     if not isinstance(cin, IndexStmt):
         raise TypeError("normalize_cin expects an IndexStmt")
     options = _compile_options_at_cin_boundary(compile_options)
-    stage_token = (
-        stage_timing.begin(
-            CompilerStageId.CIN_NORMALIZATION,
-            compile_options=options,
-        )
-        if stage_timing is not None
-        else None
+    if compilation_context is None:
+        return _normalize_cin_owned(cin, options)
+    stage_token = compilation_context.begin_stage(
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+        compile_options=options,
     )
+    try:
+        normalized = _normalize_cin_owned(cin, options)
+    except Exception:
+        compilation_context.fail_stage(stage_token)
+        raise
+    compilation_context.complete_stage(stage_token)
+    return normalized
+
+
+def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
+    """Normalize after the public boundary resolved one exact options snapshot."""
+
     verify_cin_if_enabled(cin, options.verification.verify_cin)
 
     index_memo: Dict[int, IndexVar] = {}
@@ -1285,10 +1295,7 @@ def normalize_cin(
             return assign_clone
         raise TypeError(f"unsupported CIN statement {type(stmt).__name__}")
 
-    normalized = clone_stmt(cin)
-    if stage_token is not None and stage_timing is not None:
-        stage_timing.commit(stage_token)
-    return normalized
+    return clone_stmt(cin)
 
 
 def canonical_cin_dump(cin: IndexStmt) -> str:
