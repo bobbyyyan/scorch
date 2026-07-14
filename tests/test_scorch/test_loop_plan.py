@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError, replace
+from typing import Tuple, cast
 from unittest.mock import patch
 
 import pytest
@@ -10,7 +11,11 @@ from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.diagnostics import VerificationError
 from scorch.compiler.identity import IndexId, SymbolId
 from scorch.compiler.loop_plan import (
+    LoopPlan,
     LoopRef,
+    LoopTile,
+    OperandRelayout,
+    PanelBound,
     ResultTile,
     ScheduledCIN,
     verify_scheduled_cin,
@@ -100,6 +105,125 @@ def test_loop_plan_verifier_rejects_dangling_symbol_reference() -> None:
 
     with pytest.raises(VerificationError, match="unknown SymbolId"):
         verify_scheduled_cin(invalid)
+
+
+def test_loop_plan_verifier_requires_complete_loop_order() -> None:
+    scheduled = Scheduler.apply_schedule(_build_spmm(), Schedule())
+    incomplete_plan = replace(
+        scheduled.verified_loop_plan,
+        loop_order=scheduled.verified_loop_plan.loop_order[:-1],
+    )
+
+    with pytest.raises(
+        VerificationError,
+        match="loop_order must contain every bound IndexId exactly once",
+    ):
+        verify_scheduled_cin(ScheduledCIN(scheduled.normalized_cin, incomplete_plan))
+
+
+def test_loop_plan_rejects_unordered_loop_order_input() -> None:
+    scheduled = Scheduler.apply_schedule(_build_spmm(), Schedule())
+
+    with pytest.raises(TypeError, match="must be a tuple or list"):
+        LoopPlan(
+            loop_order=cast(
+                Tuple[IndexId, ...],
+                set(scheduled.verified_loop_plan.loop_order),
+            )
+        )
+
+
+def test_loop_plan_verifier_fails_closed_on_malformed_panel_bound() -> None:
+    scheduled = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("j", 32, kind="panel", accum="direct"),),
+            parallel_loop="i",
+        ),
+    )
+    plan = scheduled.verified_loop_plan
+    malformed_bound = replace(
+        plan.panel_bounds[0],
+        loop=cast(LoopRef, object()),
+    )
+    malformed_plan = replace(plan, panel_bounds=(malformed_bound,))
+
+    with pytest.raises(
+        VerificationError,
+        match=r"panel_bounds\[0\]\.loop must be a LoopRef",
+    ):
+        verify_scheduled_cin(ScheduledCIN(scheduled.normalized_cin, malformed_plan))
+
+
+def test_tuple_valued_loop_plan_inputs_are_detached_from_mutable_callers() -> None:
+    scheduled = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("j", 32, kind="panel", accum="direct"),),
+            parallel_loop="i",
+        ),
+    )
+    source = scheduled.verified_loop_plan
+    loop_order = list(source.loop_order)
+    tiles = list(source.tiles)
+    panel_bounds = list(source.panel_bounds)
+    plan = LoopPlan(
+        loop_order=cast(Tuple[IndexId, ...], loop_order),
+        tiles=cast(Tuple[LoopTile, ...], tiles),
+        panel_bounds=cast(Tuple[PanelBound, ...], panel_bounds),
+        relayout=source.relayout,
+        result_tile=source.result_tile,
+        parallel_loop=source.parallel_loop,
+        provenance=source.provenance,
+        tag=source.tag,
+    )
+
+    loop_order.reverse()
+    tiles.clear()
+    panel_bounds.clear()
+
+    assert plan.loop_order == source.loop_order
+    assert plan.tiles == source.tiles
+    assert plan.panel_bounds == source.panel_bounds
+    replay = ScheduledCIN(scheduled.normalized_cin, plan)
+    assert verify_scheduled_cin(replay) is replay
+
+
+def test_nested_loop_plan_sequences_are_detached_from_mutable_callers() -> None:
+    scheduled = Scheduler.apply_schedule(_build_spmm(), Schedule())
+    loop_order = scheduled.verified_loop_plan.loop_order
+    relayout_indices = list(loop_order)
+    result_prefix = list(loop_order[:1])
+    result_indices = list(loop_order)
+
+    relayout = OperandRelayout(
+        operand_id=SymbolId(1),
+        pack_loop=LoopRef(loop_order[0]),
+        panel_loop=LoopRef(loop_order[1]),
+        scope_loop=LoopRef(loop_order[0]),
+        row_loop=LoopRef(loop_order[0]),
+        strip_width=4,
+        access_indices=cast(Tuple[IndexId, ...], relayout_indices),
+        operand_panel_level=0,
+        operand_pack_level=1,
+    )
+    result_tile = ResultTile(
+        result_id=SymbolId(2),
+        tile_loop=LoopRef(loop_order[0]),
+        result_level=0,
+        result_prefix=cast(Tuple[IndexId, ...], result_prefix),
+        access_indices=cast(Tuple[IndexId, ...], result_indices),
+    )
+
+    relayout_indices.clear()
+    result_prefix.clear()
+    result_indices.clear()
+
+    assert relayout.access_indices == loop_order
+    assert result_tile.result_prefix == loop_order[:1]
+    assert result_tile.access_indices == loop_order
 
 
 def test_scheduling_is_deterministic_and_does_not_mutate_input() -> None:
