@@ -868,8 +868,21 @@ committed full-grid diagnostics were run. The exact current-toolchain
 `969f3cd` replacement control and `7c68ac9` candidate were both 42/42 correct.
 Their M5 comparison had three individual cell-band crossings, while the
 machine geomean was `0.995`, inside the candidate same-binary band
-`[0.991, 1.009]`. On Redwood, `7c68ac9` was 42/42 correct and all 21 build
-records were exactly predecessor-identical, so runtime comparison was waived.
+`[0.991, 1.009]`; the comparison therefore retained its nonzero diagnostic
+status. The exact crossings were: `M=512,N=64,density=0.1`,
+`0.1500845 -> 0.1384020` ms, ratio `0.922160` versus
+`[0.936667,1.067616]`; `M=20000,N=16,density=0.02`,
+`10.0975037 -> 9.9070072` ms, ratio `0.981134` versus
+`[0.987261,1.012903]`; and `M=20000,N=8,density=0.1`,
+`45.0789928 -> 45.6268787` ms, ratio `1.012154` versus
+`[0.990457,1.009635]`. The first two crossings are faster, and the sole slower
+cell is a 1.215% increase only 0.252 percentage points above its band. The
+source, optimization/ISA flags, and full-grid geomean exclude a systematic
+code-generation regression; the changed pair only pins header/SDK selection,
+so these three noisy cell crossings are accepted for the narrow direct-helper
+toolchain exception rather than hidden by a rerun. On Redwood, `7c68ac9` was
+42/42 correct and all 21 build records were exactly predecessor-identical, so
+runtime comparison was waived.
 The first comparison against the stale retained M5 predecessor archive was
 invalid because the generated build inputs differed across toolchains; its
 diagnostic geomean was `1.015` with 34/42 cells inside their bands, and it was
