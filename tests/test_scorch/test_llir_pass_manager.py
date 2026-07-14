@@ -6,29 +6,30 @@ from typing import List, NoReturn, Set, Tuple, cast
 
 import pytest
 
-from scorch.compiler import llir
-import scorch.compiler.llir_pass_manager as pass_manager_module
-from scorch.compiler.compressed_where_openmp_pass import (
+from scorch.compiler import llir  # type: ignore[import-untyped]
+import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
+from scorch.compiler.compressed_where_openmp_pass import (  # type: ignore[import-untyped]
     CompressedWhereOpenMPContext,
     CompressedWhereOpenMPResult,
     transform_compressed_where_for_openmp,
 )
-from scorch.compiler.dynamic_vector_access_pass import (
+from scorch.compiler.dynamic_vector_access_pass import (  # type: ignore[import-untyped]
     DYNAMIC_VECTOR_ACCESS_CONTEXT,
     DynamicVectorAccessContext,
     rewrite_dynamic_vector_accesses,
 )
-from scorch.compiler.dense_pointer_hoist_pass import (
+from scorch.compiler.dense_pointer_hoist_pass import (  # type: ignore[import-untyped]
     DensePointerHoistContext,
     hoist_dense_pointers,
 )
-from scorch.compiler.llir_pass_manager import (
+from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     COMPRESSED_WHERE_OPENMP_PASS,
     DEBUG_LLIR_PASS_OPTIONS,
     DENSE_POINTER_HOIST_PASS,
     DYNAMIC_VECTOR_ACCESS_PASS,
     PRODUCTION_LLIR_PASS_OPTIONS,
     RESULT_WRITE_PASS,
+    SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
     SPARSE_PREFETCH_PASS,
     CompressedWhereOpenMPPassSpec,
     DensePointerHoistPassSpec,
@@ -46,20 +47,28 @@ from scorch.compiler.llir_pass_manager import (
     LLIRStatementListPassResult,
     ManagedCompressedWhereOpenMPResult,
     ResultWritePassSpec,
+    SingleIterationLoopEliminationPassSpec,
     SparsePrefetchPassSpec,
 )
-from scorch.compiler.llir_traversal import (
+from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRTraversalDiagnostic,
     LLIRTraversalError,
     LLIRValue,
     LLIRWalker,
 )
-from scorch.compiler.result_write_pass import (
+from scorch.compiler.result_write_pass import (  # type: ignore[import-untyped]
     ResultWriteContext,
     ResultWriteMode,
     rewrite_result_writes,
 )
-from scorch.compiler.sparse_prefetch_pass import SparsePrefetchContext
+from scorch.compiler.single_iteration_loop_pass import (  # type: ignore[import-untyped]
+    SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    SingleIterationLoopEliminationContext,
+    eliminate_single_iteration_loops,
+)
+from scorch.compiler.sparse_prefetch_pass import (  # type: ignore[import-untyped]
+    SparsePrefetchContext,
+)
 
 
 def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Var:
@@ -174,6 +183,8 @@ def test_all_manager_configuration_artifact_and_result_carriers_are_frozen() -> 
     sparse_prefetch_spec = SparsePrefetchPassSpec()
     dense_context = _dense_context()
     dense_spec = DensePointerHoistPassSpec(dense_context)
+    single_context = SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT
+    single_spec = SingleIterationLoopEliminationPassSpec(single_context)
     rewrite_artifact = LLIRRewriteArtifact([llir.BlankLine()])
     statement_artifact = LLIRStatementListArtifact([llir.BlankLine()])
     record = _record(1)
@@ -194,6 +205,8 @@ def test_all_manager_configuration_artifact_and_result_carriers_are_frozen() -> 
         (sparse_prefetch_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (dense_context, "value_array_ctypes", ()),
         (dense_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
+        (single_context, "traversal", object()),
+        (single_spec, "descriptor", DYNAMIC_VECTOR_ACCESS_PASS),
         (rewrite_artifact, "value", []),
         (statement_artifact, "statements", []),
         (record, "duration_ns", 2),
@@ -242,6 +255,13 @@ def test_stable_descriptors_expose_exact_artifact_and_context_types() -> None:
         LLIRPassArtifactType.STATEMENT_LIST,
         LLIRPassArtifactType.STATEMENT_LIST,
         LLIRPassContextType.DENSE_POINTER_HOIST,
+    )
+    assert SINGLE_ITERATION_LOOP_ELIMINATION_PASS == LLIRPassDescriptor(
+        "eliminate_single_iteration_loops",
+        1,
+        LLIRPassArtifactType.STATEMENT_LIST,
+        LLIRPassArtifactType.STATEMENT_LIST,
+        LLIRPassContextType.SINGLE_ITERATION_LOOP_ELIMINATION,
     )
 
 
@@ -503,6 +523,16 @@ def test_each_runner_preserves_its_original_structured_diagnostic() -> None:
         )
     assert managed_dense.value.diagnostic == direct_dense.value.diagnostic
 
+    single_context = SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT
+    with pytest.raises(LLIRTraversalError) as direct_single:
+        eliminate_single_iteration_loops(source, single_context)
+    with pytest.raises(LLIRTraversalError) as managed_single:
+        manager.run_single_iteration_loop_elimination(
+            LLIRStatementListArtifact(source),
+            SingleIterationLoopEliminationPassSpec(single_context),
+        )
+    assert managed_single.value.diagnostic == direct_single.value.diagnostic
+
 
 def test_unknown_descriptor_artifact_spec_and_context_combinations_fail_closed() -> (
     None
@@ -558,6 +588,20 @@ def test_unknown_descriptor_artifact_spec_and_context_combinations_fail_closed()
             statement_artifact,
             DensePointerHoistPassSpec(context=cast(DensePointerHoistContext, object())),
         ),
+        lambda: manager.run_single_iteration_loop_elimination(
+            cast(LLIRStatementListArtifact, rewrite_artifact),
+            SingleIterationLoopEliminationPassSpec(),
+        ),
+        lambda: manager.run_single_iteration_loop_elimination(
+            statement_artifact,
+            cast(SingleIterationLoopEliminationPassSpec, object()),
+        ),
+        lambda: manager.run_single_iteration_loop_elimination(
+            statement_artifact,
+            SingleIterationLoopEliminationPassSpec(
+                context=cast(SingleIterationLoopEliminationContext, object())
+            ),
+        ),
     )
     for invalid in invalid_calls:
         with pytest.raises(LLIRPassManagerError):
@@ -588,6 +632,9 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
     production_dense = production.run_dense_pointer_hoist(
         compressed_artifact, dense_spec
     )
+    production_single = production.run_single_iteration_loop_elimination(
+        compressed_artifact
+    )
     production_compressed = production.run_compressed_where_openmp(
         compressed_artifact, compressed_spec
     )
@@ -599,6 +646,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
             *production_result.run_records,
             *production_sparse_prefetch.run_records,
             *production_dense.run_records,
+            *production_single.run_records,
             *production_compressed.run_records,
         )
     )
@@ -608,6 +656,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
     debug_result = debug.run_result_write(rewrite_artifact, result_spec)
     debug_sparse_prefetch = debug.run_sparse_prefetch(compressed_artifact)
     debug_dense = debug.run_dense_pointer_hoist(compressed_artifact, dense_spec)
+    debug_single = debug.run_single_iteration_loop_elimination(compressed_artifact)
     debug_compressed = debug.run_compressed_where_openmp(
         compressed_artifact, compressed_spec
     )
@@ -620,6 +669,8 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
         ("LLIR transformation", "insert_sparse_prefetch"),
         ("LLIR transformation", "hoist_dense_pointers"),
         ("LLIR transformation", "hoist_dense_pointers"),
+        ("LLIR transformation", "eliminate_single_iteration_loops"),
+        ("LLIR transformation", "eliminate_single_iteration_loops"),
         ("LLIR transformation", "transform_compressed_where_for_openmp"),
         ("LLIR transformation", "transform_compressed_where_for_openmp"),
     ]
@@ -630,6 +681,7 @@ def test_production_skips_extra_verification_and_debug_checks_all_boundaries(
             *debug_result.run_records,
             *debug_sparse_prefetch.run_records,
             *debug_dense.run_records,
+            *debug_single.run_records,
             *debug_compressed.run_records,
         )
     )

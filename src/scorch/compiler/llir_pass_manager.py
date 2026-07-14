@@ -1,13 +1,14 @@
-"""Minimal typed runners for the five extracted current-LLIR passes.
+"""Minimal typed runners for the six extracted current-LLIR passes.
 
 The production pass graph is intentionally not represented as one linear
 pipeline.  Dynamic-vector rewriting is a top-level step over the assembled
 function body.  Compressed ``Where`` lowering is a top-level step during outer
 loop lowering, and it internally runs independent result-write ``count`` and
 ``fill`` transformations over the same original work body.  Sparse prefetching
-and dense-pointer hoisting accept only the recursively lowered statement list
-before the remaining inline optimizations.  Dedicated runner methods preserve
-those different contracts and make unsupported composition unrepresentable.
+and dense-pointer hoisting and single-iteration-loop elimination accept only the
+recursively lowered statement list before the remaining inline optimization.
+Dedicated runner methods preserve those different contracts and make
+unsupported composition unrepresentable.
 
 The configuration and artifact carriers are frozen, but the legacy LLIR
 payloads remain mutable.  Every non-empty pass returns a detached tree through
@@ -42,6 +43,11 @@ from .llir_traversal import (
     LLIRWalker,
 )
 from .result_write_pass import ResultWriteContext, rewrite_result_writes
+from .single_iteration_loop_pass import (
+    SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    SingleIterationLoopEliminationContext,
+    eliminate_single_iteration_loops,
+)
 from .sparse_prefetch_pass import (
     SPARSE_PREFETCH_CONTEXT,
     SparsePrefetchContext,
@@ -71,6 +77,7 @@ class LLIRPassContextType(Enum):
     COMPRESSED_WHERE_OPENMP = "compressed_where_openmp_context"
     SPARSE_PREFETCH = "sparse_prefetch_context"
     DENSE_POINTER_HOIST = "dense_pointer_hoist_context"
+    SINGLE_ITERATION_LOOP_ELIMINATION = "single_iteration_loop_elimination_context"
 
 
 @dataclass(frozen=True)
@@ -124,6 +131,14 @@ DENSE_POINTER_HOIST_PASS = LLIRPassDescriptor(
     context_type=LLIRPassContextType.DENSE_POINTER_HOIST,
 )
 
+SINGLE_ITERATION_LOOP_ELIMINATION_PASS = LLIRPassDescriptor(
+    name="eliminate_single_iteration_loops",
+    version=1,
+    input_artifact=LLIRPassArtifactType.STATEMENT_LIST,
+    output_artifact=LLIRPassArtifactType.STATEMENT_LIST,
+    context_type=LLIRPassContextType.SINGLE_ITERATION_LOOP_ELIMINATION,
+)
+
 
 @dataclass(frozen=True)
 class DynamicVectorAccessPassSpec:
@@ -163,6 +178,16 @@ class DensePointerHoistPassSpec:
 
     context: DensePointerHoistContext
     descriptor: LLIRPassDescriptor = DENSE_POINTER_HOIST_PASS
+
+
+@dataclass(frozen=True)
+class SingleIterationLoopEliminationPassSpec:
+    """One immutable single-iteration-loop configuration snapshot."""
+
+    context: SingleIterationLoopEliminationContext = (
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT
+    )
+    descriptor: LLIRPassDescriptor = SINGLE_ITERATION_LOOP_ELIMINATION_PASS
 
 
 @dataclass(frozen=True)
@@ -437,6 +462,27 @@ def _validate_dense_pointer_hoist_context(
     return typed_context
 
 
+def _validate_single_iteration_loop_elimination_context(
+    context: object,
+) -> SingleIterationLoopEliminationContext:
+    if type(context) is not SingleIterationLoopEliminationContext:
+        _raise_manager_error(
+            code="invalid_pass_context",
+            message=(
+                "single-iteration-loop runner requires "
+                "SingleIterationLoopEliminationContext"
+            ),
+            sequence_index=0,
+            descriptor=SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
+        )
+    typed_context = cast(SingleIterationLoopEliminationContext, context)
+    _validate_traversal_context(
+        typed_context.traversal,
+        descriptor=SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
+    )
+    return typed_context
+
+
 def _record(
     *,
     descriptor: LLIRPassDescriptor,
@@ -587,6 +633,59 @@ class LLIRPassManager:
             descriptor=DENSE_POINTER_HOIST_PASS,
             traversal=traversal,
             configuration_name="dense_pointer_hoist",
+            options=self.options,
+            started_ns=started_ns,
+        )
+        return LLIRStatementListPassResult(
+            LLIRStatementListArtifact(output),
+            (record,),
+        )
+
+    def run_single_iteration_loop_elimination(
+        self,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: SingleIterationLoopEliminationPassSpec = (
+            SingleIterationLoopEliminationPassSpec()
+        ),
+    ) -> LLIRStatementListPassResult:
+        """Eliminate single-iteration loops over an exact statement-list root."""
+
+        self._validate_options()
+        if type(artifact) is not LLIRStatementListArtifact:
+            _raise_manager_error(
+                code="invalid_pass_artifact",
+                message=(
+                    "single-iteration-loop runner requires " "LLIRStatementListArtifact"
+                ),
+                sequence_index=0,
+                descriptor=SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
+            )
+        if type(pass_spec) is not SingleIterationLoopEliminationPassSpec:
+            _raise_manager_error(
+                code="unknown_pass_spec",
+                message=(
+                    "single-iteration-loop runner requires its exact pass "
+                    "specification"
+                ),
+                sequence_index=0,
+                descriptor=SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
+            )
+        _validate_descriptor(
+            pass_spec.descriptor,
+            SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
+        )
+        context = _validate_single_iteration_loop_elimination_context(pass_spec.context)
+        traversal = context.traversal
+        started_ns = perf_counter_ns() if self.options.record_timing else None
+        if self.options.verify_before_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, artifact.statements))
+        output = eliminate_single_iteration_loops(artifact.statements, context)
+        if self.options.verify_after_pass:
+            LLIRWalker(traversal).walk(cast(LLIRValue, output))
+        record = _record(
+            descriptor=SINGLE_ITERATION_LOOP_ELIMINATION_PASS,
+            traversal=traversal,
+            configuration_name="single_iteration_loop_elimination",
             options=self.options,
             started_ns=started_ns,
         )
