@@ -338,21 +338,27 @@ def run_compare_latency(args: argparse.Namespace) -> int:
         raise ValueError("baseline and candidate latency cases differ")
 
     print("Python compiler latency comparison")
-    print(f"{'case':<20} {'p50 new/old':>13} {'p95 new/old':>13} {'status':>8}")
-    failed = False
+    print(f"{'case':<20} {'p50 new/old':>13} {'p95 new/old':>13} {'status':>12}")
+    investigation_required = False
     for name in baseline_cases:
         old = baseline_cases[name]
         new = candidate_cases[name]
         p50_ratio = new["p50_ms"] / old["p50_ms"]
         p95_ratio = new["p95_ms"] / old["p95_ms"]
-        passed = p50_ratio <= LATENCY_MAX_RATIO and p95_ratio <= LATENCY_MAX_RATIO
-        failed = failed or not passed
+        within_target = (
+            p50_ratio <= LATENCY_MAX_RATIO and p95_ratio <= LATENCY_MAX_RATIO
+        )
+        investigation_required = investigation_required or not within_target
         print(
             f"{name:<20} {p50_ratio:13.3f} {p95_ratio:13.3f} "
-            f"{'PASS' if passed else 'FAIL':>8}"
+            f"{'TARGET' if within_target else 'INVESTIGATE':>12}"
         )
-    print(f"limit: {LATENCY_MAX_RATIO:.2f}x for both p50 and p95 in every category")
-    return 1 if failed else 0
+    print(f"target: {LATENCY_MAX_RATIO:.2f}x for both p50 and p95 in every category")
+    print(
+        "A crossing requires attribution under the compiler-latency policy; "
+        "it is not an automatic rejection."
+    )
+    return 1 if investigation_required else 0
 
 
 def _build_csr(
@@ -620,7 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
     latency.set_defaults(handler=run_latency)
 
     compare_latency = subparsers.add_parser(
-        "compare-latency", help="compare latency results to the Phase 0 budget"
+        "compare-latency", help="compare latency results to the Phase 0 target"
     )
     compare_latency.add_argument("baseline", type=Path)
     compare_latency.add_argument("candidate", type=Path)

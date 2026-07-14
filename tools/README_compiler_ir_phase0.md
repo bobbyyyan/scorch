@@ -36,14 +36,20 @@ commit, and dirty status. Repeated samples must emit the same source digest. Ful
 debug-verifier and stage-dump measurements are separate and do not replace this
 production baseline.
 
-Repeat the same command after a migration step, then enforce the design's 1.10x
-per-category p50 and p95 budget:
+Repeat the same command after a migration step, then compare against the design's
+1.10x per-category p50 and p95 target:
 
 ```bash
 python tools/benchmark_compiler_ir.py compare-latency \
   /tmp/scorch-phase0/latency-legacy-m5.json \
   /tmp/scorch-phase0/latency-candidate-m5.json
 ```
+
+A ratio above 1.10 is an investigation threshold, not an automatic rejection. The
+comparison labels such cells `INVESTIGATE` and exits nonzero so the crossing cannot be
+overlooked. A modest exception may be accepted only with the absolute and relative
+measurements, stage attribution, and design tradeoff recorded; material, unexplained,
+or compounding regression remains a failure.
 
 ## Generated-kernel baseline and A/A control
 
