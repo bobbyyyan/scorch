@@ -943,7 +943,7 @@ def test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(
     scheduler_options: list[object] = []
     cin_lowerer_options: list[object] = []
     codegen_options: list[object] = []
-    build_calls: list[dict[str, object]] = []
+    build_calls: list[utils._PreparedJITBuild] = []
     original_auto_schedule = Scheduler.auto_schedule
     original_regblock_arm = Scheduler._auto_schedule_regblock_arm
     original_cin_init = CINLowerer.__init__
@@ -971,8 +971,8 @@ def test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(
         codegen_options.append(kwargs.get("compile_options"))
         original_codegen_init(self, *args, **kwargs)
 
-    def record_build(**kwargs: object) -> object:
-        build_calls.append(kwargs)
+    def record_build(prepared: utils._PreparedJITBuild) -> object:
+        build_calls.append(prepared)
         return object()
 
     monkeypatch.setattr(
@@ -988,7 +988,7 @@ def test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(
     )
     monkeypatch.setattr(CINLowerer, "__init__", record_cin_init)
     monkeypatch.setattr(LLIRLowerer, "__init__", record_codegen_init)
-    monkeypatch.setattr(ops, "_load_kernel", record_build)
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record_build)
     monkeypatch.setattr(ops, "_kernel_cache", {})
     monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
 
@@ -1008,9 +1008,11 @@ def test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(
     )
     assert codegen_options and all(value is snapshot for value in codegen_options)
     assert len(build_calls) == 1
-    assert build_calls[0]["cpp_sources"][0] == snapshot.build.preamble_source  # type: ignore[index]
-    assert build_calls[0]["extra_cflags"] == list(snapshot.build.extra_cflags)
-    assert build_calls[0]["extra_ldflags"] == list(snapshot.build.extra_ldflags)
+    request = build_calls[0].request
+    assert request.cpp_sources[0] == snapshot.build.preamble_source
+    assert request.extra_cflags == snapshot.build.extra_cflags
+    assert request.extra_ldflags == snapshot.build.extra_ldflags
+    assert request.build_options is snapshot.build
 
 
 def test_build_and_emission_variants_are_explicit_and_cache_independent() -> None:

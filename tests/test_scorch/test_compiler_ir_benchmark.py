@@ -6,6 +6,7 @@ from typing import Dict, List, Union
 import pytest
 
 from tools import benchmark_compiler_ir
+from scorch.layout import TensorSpec  # type: ignore[import-untyped]
 
 JsonValue = Union[str, float, List[Dict[str, object]], Dict[str, object]]
 
@@ -61,3 +62,40 @@ def test_latency_comparison_treats_target_crossing_as_investigation(
     assert expected_status in output
     assert "not an automatic rejection" in output
     assert "FAIL" not in output
+
+
+def test_latency_capture_stops_at_one_nonempty_canonical_timing_owner() -> None:
+    case = benchmark_compiler_ir.LatencyCase(
+        name="capture_test",
+        operation="ij,ij->ij",
+        formats=("dd", "dd"),
+        output_format="dd",
+        invoke=lambda: benchmark_compiler_ir.ops.einsum(
+            "ij,ij->ij",
+            TensorSpec("dd", (2, 2), name="A"),
+            TensorSpec("dd", (2, 2), name="B"),
+            compile_only=True,
+            format="dd",
+        ),
+    )
+
+    compatible_ms, canonical_ms, build, stage_runs = (
+        benchmark_compiler_ir._time_captured_compilation(case)
+    )
+
+    assert canonical_ms >= compatible_ms
+    assert build["source_bytes"] > 0
+    assert stage_runs
+    assert [run["sequence_index"] for run in stage_runs] == list(range(len(stage_runs)))
+    assert stage_runs[-1]["stage_id"] == "kernel_name_and_build_request_assembly"
+
+
+def test_benchmark_rejects_an_import_from_a_different_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        benchmark_compiler_ir.scorch, "__file__", "/tmp/other/scorch.py"
+    )
+
+    with pytest.raises(RuntimeError, match="different worktree"):
+        benchmark_compiler_ir._require_imported_scorch_from_worktree()

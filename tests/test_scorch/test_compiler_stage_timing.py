@@ -1,0 +1,2333 @@
+"""Behavioral coverage for compilation-local compiler-stage timing.
+
+The compiler-stage records in this file stop at the frozen native build
+request.  Cache lookup, native compilation/loading, and kernel execution are
+deliberately outside the seam.  Managed LLIR pass records remain a separate,
+nested observation owned by the same ``CompilationContext``.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import FrozenInstanceError, fields, replace
+from pathlib import Path
+from time import perf_counter_ns
+from types import SimpleNamespace
+from typing import Callable, Optional, Tuple
+
+import pytest
+import torch
+
+import scorch  # type: ignore[import-untyped]
+import scorch.compiler.cin_analysis as cin_analysis  # type: ignore[import-untyped]
+import scorch.compiler.cin_lowerer as cin_lowerer_module  # type: ignore[import-untyped]
+import scorch.compiler.compilation_context as context_module  # type: ignore[import-untyped]
+import scorch.compiler.llir_pass_manager as llir_pass_manager  # type: ignore[import-untyped]
+import scorch.compiler.schedule_lowerer as schedule_lowerer  # type: ignore[import-untyped]
+import scorch.compiler.scheduler as scheduler_module  # type: ignore[import-untyped]
+import scorch.ops as ops  # type: ignore[import-untyped]
+import scorch.stensor as stensor_module  # type: ignore[import-untyped]
+import scorch.utils as utils  # type: ignore[import-untyped]
+from scorch.compiler.cin import (  # type: ignore[import-untyped]
+    ForAll,
+    IndexVar,
+    Operation,
+    TensorAssign,
+    TensorVar,
+)
+from scorch.compiler.cin_analysis import (  # type: ignore[import-untyped]
+    canonical_cin_dump,
+    normalize_cin,
+)
+from scorch.compiler.cin_lowerer import (  # type: ignore[import-untyped]
+    CINLowerer,
+    ResultTensorAssembler,
+)
+from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
+from scorch.compiler.compilation_context import (  # type: ignore[import-untyped]
+    CANONICAL_COMPILER_STAGES,
+    CompilationContext,
+    CompilationContextError,
+    CompilerStageId,
+    CompilerStageRunRecord,
+    CompilerStageToken,
+)
+from scorch.compiler.compile_options import (  # type: ignore[import-untyped]
+    CompileOptions,
+    canonical_cache_digest,
+)
+from scorch.compiler.diagnostics import VerificationError  # type: ignore[import-untyped]
+from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
+    DEBUG_LLIR_PASS_OPTIONS,
+    LLIRPassOptions,
+    PRODUCTION_LLIR_PASS_OPTIONS,
+)
+from scorch.compiler.scheduler import Schedule, Scheduler  # type: ignore[import-untyped]
+from scorch.format import parse_format  # type: ignore[import-untyped]
+from scorch.layout import TensorSpec  # type: ignore[import-untyped]
+from scorch.stensor import STensor  # type: ignore[import-untyped]
+
+_FULL_STAGE_SEQUENCE = [stage.value for stage in CANONICAL_COMPILER_STAGES]
+_MANUAL_STAGE_SEQUENCE = [
+    CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+    CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+    CompilerStageId.LEGACY_CIN_ADAPTATION.value,
+    CompilerStageId.CIN_LOWERING.value,
+    CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    CompilerStageId.LLIR_TO_CPP_GENERATION.value,
+    CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY.value,
+]
+_AUTO_STAGE_SEQUENCE = [
+    CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+    CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+    CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+    CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+    CompilerStageId.LEGACY_CIN_ADAPTATION.value,
+    CompilerStageId.CIN_LOWERING.value,
+    CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    CompilerStageId.LLIR_TO_CPP_GENERATION.value,
+    CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY.value,
+]
+_EXPLICIT_STAGE_SEQUENCE = [
+    CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+    CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+    CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+    CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+    CompilerStageId.LEGACY_CIN_ADAPTATION.value,
+    CompilerStageId.CIN_LOWERING.value,
+    CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    CompilerStageId.SCHEDULE_LOWERING.value,
+    CompilerStageId.LLIR_TO_CPP_GENERATION.value,
+    CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY.value,
+]
+_EINSUM_PREFIX_THROUGH_ADAPTER = _EXPLICIT_STAGE_SEQUENCE[:5]
+_DIRECT_CIN_STAGE_SEQUENCE = [
+    CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+    CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+    CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+    CompilerStageId.LEGACY_CIN_ADAPTATION.value,
+    CompilerStageId.CIN_LOWERING.value,
+    CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    CompilerStageId.LLIR_TO_CPP_GENERATION.value,
+    CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY.value,
+]
+
+
+def _default_options(
+    *,
+    verify_cin: bool = False,
+    llir_pass_options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS,
+    requested_schedule: Optional[Schedule] = None,
+    regblock_dual: bool = False,
+) -> CompileOptions:
+    environ = {} if regblock_dual else {"SCORCH_REGBLOCK_DUAL": "0"}
+    return CompileOptions.from_environment(
+        environ=environ,
+        requested_schedule=requested_schedule,
+        forced_schedule=None,
+        regblock_override=None,
+        verify_cin_override=verify_cin,
+        llir_pass_options=llir_pass_options,
+    )
+
+
+def _explicit_options(
+    *,
+    verify_cin: bool = False,
+    llir_pass_options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS,
+) -> CompileOptions:
+    return _default_options(
+        verify_cin=verify_cin,
+        llir_pass_options=llir_pass_options,
+        requested_schedule=Schedule(loop_order=("i", "k", "j")),
+    )
+
+
+def _spmm_specs() -> Tuple[TensorSpec, TensorSpec]:
+    return (
+        TensorSpec("ds", (2, 3), name="A"),
+        TensorSpec("dd", (3, 4), name="B"),
+    )
+
+
+def _build_spmm_cin() -> ForAll:
+    row, reduction, column = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    result = TensorVar("C", fmt="dd")
+    left = TensorVar("A", fmt="ds")
+    right = TensorVar("B", fmt="dd")
+    assignment = TensorAssign(
+        result[row, column],
+        left[row, reduction] * right[reduction, column],
+        op=Operation.ADD,
+    )
+    return ForAll(row, ForAll(reduction, ForAll(column, assignment)))
+
+
+def _stage_values(context: CompilationContext) -> list[str]:
+    return [record.stage_id.value for record in context.stage_run_records]
+
+
+def _isolate_compiler_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ops, "_kernel_cache", {})
+    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+
+
+def _compile_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    options: CompileOptions,
+    context: CompilationContext,
+    *,
+    prepared_builds: Optional[list[object]] = None,
+) -> TensorSpec:
+    _isolate_compiler_caches(monkeypatch)
+
+    def stop_before_native(prepared: object) -> object:
+        if prepared_builds is not None:
+            prepared_builds.append(prepared)
+        return object()
+
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", stop_before_native)
+    result = ops.einsum(
+        "ik,kj->ij",
+        *_spmm_specs(),
+        compile_only=True,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=context,
+    )
+    assert isinstance(result, TensorSpec)
+    return result
+
+
+def _direct_lower(
+    options: CompileOptions,
+    context: Optional[CompilationContext],
+) -> tuple[CINLowerer, object, str]:
+    source = _build_spmm_cin()
+    scheduled = Scheduler.apply_schedule(
+        source,
+        Schedule(loop_order=("i", "k", "j")),
+        compile_options=options,
+        compilation_context=context,
+    )
+    lowerer = CINLowerer(
+        compile_options=options,
+        compilation_context=context,
+    )
+    lowered = lowerer._lower_owned_IndexStmt(scheduled)
+    cpp = LLIRLowerer(compile_options=options).lower_llir(lowered)
+    return lowerer, lowered, cpp
+
+
+def test_stage_identities_records_and_owner_are_typed_frozen_and_stable() -> None:
+    assert CANONICAL_COMPILER_STAGES == (
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+        CompilerStageId.LEGACY_CIN_ADAPTATION,
+        CompilerStageId.CIN_LOWERING,
+        CompilerStageId.RESULT_ABI_ASSEMBLY,
+        CompilerStageId.SCHEDULE_LOWERING,
+        CompilerStageId.LLIR_TO_CPP_GENERATION,
+        CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
+    )
+    assert _FULL_STAGE_SEQUENCE == [
+        "frontend_validated_operation_construction",
+        "cin_normalization_and_verification",
+        "scheduling_and_loop_plan_construction",
+        "legacy_cin_adaptation",
+        "cin_lowering",
+        "result_abi_assembly",
+        "schedule_lowering",
+        "llir_to_cpp_generation",
+        "kernel_name_and_build_request_assembly",
+    ]
+
+    record = CompilerStageRunRecord(
+        sequence_index=0,
+        stage_id=CompilerStageId.CIN_LOWERING,
+        nested_within=None,
+        duration_ns=17,
+    )
+    assert record == replace(record, duration_ns=999_999)
+    assert record != replace(record, sequence_index=1)
+    with pytest.raises(FrozenInstanceError):
+        record.stage_id = CompilerStageId.SCHEDULE_LOWERING  # type: ignore[misc]
+
+    options = _default_options()
+    context = CompilationContext(options)
+    with pytest.raises(FrozenInstanceError):
+        context.compile_options = options  # type: ignore[misc]
+    token = context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=options,
+    )
+    assert type(token) is CompilerStageToken
+    with pytest.raises(FrozenInstanceError):
+        token.stage_id = CompilerStageId.CIN_LOWERING  # type: ignore[misc]
+    context.complete_stage(token)
+    assert type(context.stage_run_records) is tuple
+    assert context.stage_run_records[0].sequence_index == 0
+
+
+def test_context_validation_rejects_foreign_options_tokens_and_nesting() -> None:
+    options = _default_options()
+    other = _default_options(verify_cin=True)
+    with pytest.raises(CompilationContextError) as invalid_owner:
+        CompilationContext("options")  # type: ignore[arg-type]
+    assert invalid_owner.value.diagnostic.code == "invalid_compile_options"
+
+    context = CompilationContext(options)
+    with pytest.raises(CompilationContextError) as invalid_stage:
+        context.begin_stage("cin_lowering", compile_options=options)  # type: ignore[arg-type]
+    assert invalid_stage.value.diagnostic.code == "invalid_stage_id"
+    with pytest.raises(CompilationContextError) as detached_options:
+        context.begin_stage(
+            CompilerStageId.CIN_LOWERING,
+            compile_options=other,
+        )
+    assert detached_options.value.diagnostic.code == "detached_compile_options"
+    with pytest.raises(CompilationContextError) as invalid_nesting:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+            nested_within=CompilerStageId.CIN_LOWERING,
+        )
+    assert invalid_nesting.value.diagnostic.code == "invalid_stage_nesting"
+    with pytest.raises(CompilationContextError) as inactive_parent:
+        context.begin_stage(
+            CompilerStageId.RESULT_ABI_ASSEMBLY,
+            compile_options=options,
+            nested_within=CompilerStageId.CIN_LOWERING,
+        )
+    assert inactive_parent.value.diagnostic.code == "inactive_parent_stage"
+
+    token = context.begin_stage(
+        CompilerStageId.CIN_LOWERING,
+        compile_options=options,
+    )
+    foreign = CompilationContext(options)
+    with pytest.raises(CompilationContextError) as detached_token:
+        foreign.complete_stage(token)
+    assert detached_token.value.diagnostic.code == "detached_stage_token"
+    context.complete_stage(token)
+    with pytest.raises(CompilationContextError) as duplicate:
+        context.complete_stage(token)
+    assert duplicate.value.diagnostic.code == "completed_stage_token"
+
+
+def test_context_enforces_strict_lifo_nesting_and_exact_token_identity() -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    frontend = context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=options,
+    )
+    with pytest.raises(CompilationContextError) as overlap:
+        context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=options,
+        )
+    assert overlap.value.diagnostic.code == "overlapping_stage"
+    context.complete_stage(frontend)
+
+    lowering = context.begin_stage(
+        CompilerStageId.CIN_LOWERING,
+        compile_options=options,
+    )
+    assembly = context.begin_stage(
+        CompilerStageId.RESULT_ABI_ASSEMBLY,
+        compile_options=options,
+        nested_within=CompilerStageId.CIN_LOWERING,
+    )
+    with pytest.raises(CompilationContextError) as parent_first:
+        context.complete_stage(lowering)
+    assert parent_first.value.diagnostic.code == "unbalanced_stage_stack"
+
+    forged = replace(
+        assembly,
+        stage_id=CompilerStageId.LLIR_TO_CPP_GENERATION,
+        started_ns=0,
+    )
+    with pytest.raises(CompilationContextError) as forged_token:
+        context.complete_stage(forged)
+    assert forged_token.value.diagnostic.code == "inactive_stage_token"
+    assert context.is_stage_active(assembly)
+    context.complete_stage(assembly)
+    context.complete_stage(lowering)
+
+
+def test_deterministic_clock_failure_retains_child_and_makes_owner_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter(range(0, 10_000, 100))
+    monkeypatch.setattr(context_module, "perf_counter_ns", lambda: next(ticks))
+    options = _default_options()
+    context = CompilationContext(options)
+    lowering = context.begin_stage(
+        CompilerStageId.CIN_LOWERING,
+        compile_options=options,
+    )
+    assembly = context.begin_stage(
+        CompilerStageId.RESULT_ABI_ASSEMBLY,
+        compile_options=options,
+        nested_within=CompilerStageId.CIN_LOWERING,
+    )
+    context.complete_stage(assembly)
+    context.fail_stage(lowering)
+
+    records = context.stage_run_records
+    assert [record.sequence_index for record in records] == [0]
+    assert [record.stage_id for record in records] == [
+        CompilerStageId.RESULT_ABI_ASSEMBLY
+    ]
+    assert [record.duration_ns for record in records] == [100]
+    assert records[0].nested_within is CompilerStageId.CIN_LOWERING
+    with pytest.raises(CompilationContextError) as later_work:
+        context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=options,
+        )
+    assert later_work.value.diagnostic.code == "failed_compilation"
+
+
+def test_cancelled_optional_stage_publishes_nothing_and_owner_remains_usable() -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    cancelled = context.begin_stage(
+        CompilerStageId.CIN_LOWERING,
+        compile_options=options,
+    )
+    context.cancel_stage(cancelled)
+    assert context.stage_run_records == ()
+    with pytest.raises(CompilationContextError) as retired:
+        context.complete_stage(cancelled)
+    assert retired.value.diagnostic.code == "retired_stage_token"
+
+    cpp = context.begin_stage(
+        CompilerStageId.LLIR_TO_CPP_GENERATION,
+        compile_options=options,
+    )
+    context.complete_stage(cpp)
+    assert _stage_values(context) == [CompilerStageId.LLIR_TO_CPP_GENERATION.value]
+
+
+def test_context_accepts_managed_pass_records_only_during_active_lowering() -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    with pytest.raises(CompilationContextError) as inactive:
+        context.record_llir_pass_runs((), compile_options=options)
+    assert inactive.value.diagnostic.code == "inactive_cin_lowering"
+
+    lowering = context.begin_stage(
+        CompilerStageId.CIN_LOWERING,
+        compile_options=options,
+    )
+    context.record_llir_pass_runs((), compile_options=options)
+    context.complete_stage(lowering)
+
+
+@pytest.mark.parametrize(
+    ("verify_cin", "pass_options"),
+    [
+        (False, PRODUCTION_LLIR_PASS_OPTIONS),
+        (True, DEBUG_LLIR_PASS_OPTIONS),
+    ],
+    ids=("production", "debug"),
+)
+def test_production_and_debug_record_the_exact_complete_stage_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    verify_cin: bool,
+    pass_options: LLIRPassOptions,
+) -> None:
+    options = _explicit_options(
+        verify_cin=verify_cin,
+        llir_pass_options=pass_options,
+    )
+    context = CompilationContext(options)
+    _compile_explicit(monkeypatch, options, context)
+
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(len(_EXPLICIT_STAGE_SEQUENCE))
+    )
+    assert all(
+        type(record.duration_ns) is int and record.duration_ns >= 0
+        for record in context.stage_run_records
+    )
+    assert [record.nested_within for record in context.stage_run_records] == [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        CompilerStageId.CIN_LOWERING,
+        None,
+        None,
+        None,
+    ]
+
+
+def test_regblock_dual_path_records_both_schedule_and_lowering_arms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options(regblock_dual=True)
+    context = CompilationContext(options)
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    result = ops.einsum(
+        "ik,kj->ij",
+        *_spmm_specs(),
+        compile_only=True,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=context,
+    )
+
+    assert isinstance(result, TensorSpec)
+    assert _stage_values(context) == [
+        _FULL_STAGE_SEQUENCE[0],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[1],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[1],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[3],
+        _FULL_STAGE_SEQUENCE[4],
+        _FULL_STAGE_SEQUENCE[5],
+        _FULL_STAGE_SEQUENCE[3],
+        _FULL_STAGE_SEQUENCE[4],
+        _FULL_STAGE_SEQUENCE[5],
+        _FULL_STAGE_SEQUENCE[4],
+        _FULL_STAGE_SEQUENCE[7],
+        _FULL_STAGE_SEQUENCE[8],
+    ]
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ] * 2
+
+
+def test_regblock_dual_second_arm_failure_keeps_first_arm_and_suppresses_codegen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options(regblock_dual=True)
+    context = CompilationContext(options)
+    error = RuntimeError("injected second dual-arm failure")
+    calls = 0
+    original_factor = llir_pass_manager.hoist_loop_invariant_factors
+
+    def fail_second_factor(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise error
+        return original_factor(*args, **kwargs)
+
+    monkeypatch.setattr(
+        llir_pass_manager,
+        "hoist_loop_invariant_factors",
+        fail_second_factor,
+    )
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == [
+        _FULL_STAGE_SEQUENCE[0],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[1],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[1],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[3],
+        _FULL_STAGE_SEQUENCE[4],
+        _FULL_STAGE_SEQUENCE[5],
+        _FULL_STAGE_SEQUENCE[3],
+    ]
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+    ]
+
+
+def test_regblock_dual_stitch_failure_has_failed_cin_stage_and_suppresses_codegen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options(regblock_dual=True)
+    context = CompilationContext(options)
+    error = RuntimeError("injected dual-path stitch failure")
+    monkeypatch.setattr(ops, "_stitch_regblock_dual_path", _raise_same(error))
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == [
+        _FULL_STAGE_SEQUENCE[0],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[1],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[1],
+        _FULL_STAGE_SEQUENCE[2],
+        _FULL_STAGE_SEQUENCE[3],
+        _FULL_STAGE_SEQUENCE[4],
+        _FULL_STAGE_SEQUENCE[5],
+        _FULL_STAGE_SEQUENCE[3],
+        _FULL_STAGE_SEQUENCE[4],
+        _FULL_STAGE_SEQUENCE[5],
+    ]
+    assert len(context.llir_pass_run_records) == 10
+
+
+def test_regblock_dual_declined_stitch_records_only_artifact_producing_lowerings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options(regblock_dual=True)
+    context = CompilationContext(options)
+    monkeypatch.setattr(ops, "_stitch_regblock_dual_path", lambda *args: None)
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    result = ops.einsum(
+        "ik,kj->ij",
+        *_spmm_specs(),
+        compile_only=True,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=context,
+    )
+
+    assert isinstance(result, TensorSpec)
+    assert _stage_values(context) == [
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+        CompilerStageId.LEGACY_CIN_ADAPTATION.value,
+        CompilerStageId.CIN_LOWERING.value,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+        CompilerStageId.LEGACY_CIN_ADAPTATION.value,
+        CompilerStageId.CIN_LOWERING.value,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+        CompilerStageId.LEGACY_CIN_ADAPTATION.value,
+        CompilerStageId.CIN_LOWERING.value,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+        CompilerStageId.LLIR_TO_CPP_GENERATION.value,
+        CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY.value,
+    ]
+    assert (
+        sum(
+            record.stage_id is CompilerStageId.CIN_LOWERING
+            for record in context.stage_run_records
+        )
+        == 3
+    )
+
+
+def test_debug_verification_policy_is_not_enabled_by_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verification_calls: list[object] = []
+    original_verify = cin_analysis.verify_cin
+
+    def counting_verify(cin: object) -> None:
+        verification_calls.append(cin)
+        original_verify(cin)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cin_analysis, "verify_cin", counting_verify)
+    production = _default_options()
+    normalize_cin(
+        _build_spmm_cin(),
+        compile_options=production,
+        compilation_context=CompilationContext(production),
+    )
+    assert verification_calls == []
+
+    debug = _default_options(
+        verify_cin=True,
+        llir_pass_options=DEBUG_LLIR_PASS_OPTIONS,
+    )
+    normalize_cin(
+        _build_spmm_cin(),
+        compile_options=debug,
+        compilation_context=CompilationContext(debug),
+    )
+    assert len(verification_calls) == 1
+
+
+def test_one_options_snapshot_routes_through_one_owner_without_rereads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    routed_options: list[CompileOptions] = []
+    original_begin = CompilationContext.begin_stage
+    original_prepare = ops._prepare_jit_build
+
+    def recording_begin(
+        self: CompilationContext,
+        stage_id: CompilerStageId,
+        *,
+        compile_options: CompileOptions,
+        nested_within: Optional[CompilerStageId] = None,
+    ) -> CompilerStageToken:
+        routed_options.append(compile_options)
+        return original_begin(
+            self,
+            stage_id,
+            compile_options=compile_options,
+            nested_within=nested_within,
+        )
+
+    def recording_prepare(*args: object, **kwargs: object) -> object:
+        routed_options.append(kwargs["compile_options"])  # type: ignore[arg-type]
+        return original_prepare(*args, **kwargs)
+
+    def forbidden_snapshot(*args: object, **kwargs: object) -> CompileOptions:
+        raise AssertionError("a compiler stage resnapshotted process state")
+
+    environment_reads: list[str] = []
+    context_reads: list[str] = []
+    verification_calls: list[object] = []
+    snapshotted_environment_keys = {
+        "CXX",
+        "DEVELOPER_DIR",
+        "MACOSX_DEPLOYMENT_TARGET",
+        "PATH",
+        "SCORCH_JIT_TUNE_HOOKS",
+        "SCORCH_REGBLOCK",
+        "SCORCH_REGBLOCK_DUAL",
+        "SCORCH_REGBLOCK_MAX_N",
+        "SCORCH_REGBLOCK_T",
+        "SCORCH_VERIFY_CIN",
+        "SDKROOT",
+        "TORCH_DONT_CHECK_COMPILER_ABI",
+        "TORCH_NO_COMPILER_WRAPPER",
+    }
+    environment_type = type(os.environ)
+    original_environment_get = environment_type.get
+    original_environment_getitem = environment_type.__getitem__
+
+    def recording_environment_get(
+        self: object, key: str, default: object = None
+    ) -> object:
+        if key in snapshotted_environment_keys:
+            environment_reads.append(key)
+        return original_environment_get(  # type: ignore[arg-type, call-overload]
+            self, key, default
+        )
+
+    def recording_environment_getitem(self: object, key: str) -> str:
+        if key in snapshotted_environment_keys:
+            environment_reads.append(key)
+        return original_environment_getitem(self, key)  # type: ignore[arg-type]
+
+    class RecordingContextVar:
+        def __init__(self, name: str, variable: object) -> None:
+            self._name = name
+            self._variable = variable
+
+        def get(self, *args: object) -> object:
+            context_reads.append(self._name)
+            return self._variable.get(*args)  # type: ignore[attr-defined, no-any-return]
+
+        def set(self, value: object) -> object:
+            return self._variable.set(value)  # type: ignore[attr-defined, no-any-return]
+
+        def reset(self, token: object) -> None:
+            self._variable.reset(token)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(CompilationContext, "begin_stage", recording_begin)
+    monkeypatch.setattr(ops, "_prepare_jit_build", recording_prepare)
+    monkeypatch.setattr(
+        CompileOptions,
+        "from_environment",
+        classmethod(forbidden_snapshot),
+    )
+    monkeypatch.setattr(
+        cin_analysis,
+        "verify_cin",
+        lambda cin: verification_calls.append(cin),
+    )
+    monkeypatch.setenv("SCORCH_VERIFY_CIN", "1")
+    monkeypatch.setenv("SCORCH_REGBLOCK", "1")
+    monkeypatch.setenv("SCORCH_REGBLOCK_DUAL", "1")
+    with (
+        cin_analysis.full_cin_verification(True),
+        scheduler_module.regblock_force(True),
+        scheduler_module.schedule_force(Schedule(loop_order=("k", "i", "j"))),
+    ):
+        monkeypatch.setattr(environment_type, "get", recording_environment_get)
+        monkeypatch.setattr(
+            environment_type,
+            "__getitem__",
+            recording_environment_getitem,
+        )
+        monkeypatch.setattr(
+            cin_analysis,
+            "_VERIFY_CIN_CONTEXT",
+            RecordingContextVar(
+                "verify_cin",
+                cin_analysis._VERIFY_CIN_CONTEXT,
+            ),
+        )
+        monkeypatch.setattr(
+            scheduler_module,
+            "_REGBLOCK_FORCE",
+            RecordingContextVar(
+                "regblock",
+                scheduler_module._REGBLOCK_FORCE,
+            ),
+        )
+        monkeypatch.setattr(
+            scheduler_module,
+            "_SCHEDULE_FORCE",
+            RecordingContextVar(
+                "schedule",
+                scheduler_module._SCHEDULE_FORCE,
+            ),
+        )
+        _compile_explicit(monkeypatch, options, context)
+
+    assert routed_options
+    assert all(routed is options for routed in routed_options)
+    assert environment_reads == []
+    assert context_reads == []
+    assert verification_calls == []
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE
+
+
+def test_existing_llir_pass_records_are_context_owned_ordered_and_unchanged() -> None:
+    options = _explicit_options()
+    untimed_lowerer, _, untimed_cpp = _direct_lower(options, None)
+    context = CompilationContext(options)
+    timed_lowerer, _, timed_cpp = _direct_lower(options, context)
+
+    expected_names = [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert timed_lowerer.llir_pass_run_records == untimed_lowerer.llir_pass_run_records
+    assert context.llir_pass_run_records == timed_lowerer.llir_pass_run_records
+    assert [
+        record.pass_name for record in context.llir_pass_run_records
+    ] == expected_names
+    assert [record.sequence_index for record in context.llir_pass_run_records] == list(
+        range(len(expected_names))
+    )
+    assert timed_cpp == untimed_cpp
+
+    cin_record = next(
+        record
+        for record in context.stage_run_records
+        if record.stage_id is CompilerStageId.CIN_LOWERING
+    )
+    pass_duration = sum(
+        record.duration_ns or 0 for record in context.llir_pass_run_records
+    )
+    assert cin_record.duration_ns >= pass_duration
+
+
+def test_result_abi_barrier_remains_between_invariant_and_dynamic_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+    original_factor = llir_pass_manager.LLIRPassManager.run_loop_invariant_factor_hoist
+    original_dynamic = llir_pass_manager.LLIRPassManager.run_dynamic_vector_access
+    original_begin = CompilationContext.begin_stage
+    original_complete = CompilationContext.complete_stage
+
+    def recording_factor(self: object, *args: object, **kwargs: object) -> object:
+        events.append(("pass", "hoist_loop_invariant_factors"))
+        return original_factor(self, *args, **kwargs)
+
+    def recording_dynamic(self: object, *args: object, **kwargs: object) -> object:
+        events.append(("pass", "rewrite_dynamic_vector_accesses"))
+        return original_dynamic(self, *args, **kwargs)
+
+    def recording_begin(
+        self: CompilationContext,
+        stage_id: CompilerStageId,
+        **kwargs: object,
+    ) -> CompilerStageToken:
+        events.append(("begin", stage_id))
+        return original_begin(self, stage_id, **kwargs)  # type: ignore[arg-type]
+
+    def recording_complete(
+        self: CompilationContext,
+        token: CompilerStageToken,
+    ) -> None:
+        events.append(("complete", token.stage_id))
+        original_complete(self, token)
+
+    monkeypatch.setattr(
+        llir_pass_manager.LLIRPassManager,
+        "run_loop_invariant_factor_hoist",
+        recording_factor,
+    )
+    monkeypatch.setattr(
+        llir_pass_manager.LLIRPassManager,
+        "run_dynamic_vector_access",
+        recording_dynamic,
+    )
+    monkeypatch.setattr(CompilationContext, "begin_stage", recording_begin)
+    monkeypatch.setattr(CompilationContext, "complete_stage", recording_complete)
+
+    options = _explicit_options()
+    context = CompilationContext(options)
+    _direct_lower(options, context)
+    factor = events.index(("pass", "hoist_loop_invariant_factors"))
+    begin = events.index(("begin", CompilerStageId.RESULT_ABI_ASSEMBLY))
+    complete = events.index(("complete", CompilerStageId.RESULT_ABI_ASSEMBLY))
+    dynamic = events.index(("pass", "rewrite_dynamic_vector_accesses"))
+    assert factor < begin < complete < dynamic
+    record = next(
+        record
+        for record in context.stage_run_records
+        if record.stage_id is CompilerStageId.RESULT_ABI_ASSEMBLY
+    )
+    assert record.nested_within is CompilerStageId.CIN_LOWERING
+
+
+def test_result_abi_record_is_not_published_before_barrier_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected result/ABI artifact validation failure")
+    monkeypatch.setattr(
+        llir_pass_manager.LLIRPassManager,
+        "validate_body_assembly_artifact",
+        _raise_same(error),
+    )
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+
+
+def test_einsum_frontend_completes_before_a_nested_runtime_relayout_native_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("stop nested relayout before native work")
+    observed_at_native: list[list[str]] = []
+
+    def stop_nested_relayout(prepared: object) -> object:
+        observed_at_native.append(_stage_values(context))
+        raise error
+
+    monkeypatch.setattr(
+        stensor_module, "_load_validated_prepared_kernel", stop_nested_relayout
+    )
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", stop_nested_relayout)
+    _isolate_compiler_caches(monkeypatch)
+    transposed = scorch.STensor.from_torch(
+        torch.ones(3, 2, 4),
+        mode_order=[1, 0, 2],
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ijk,ijk->ijk",
+            transposed,
+            TensorSpec("ddd", (3, 2, 4), name="B"),
+            compile_only=True,
+            format="ddd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert len(observed_at_native) == 1
+    assert observed_at_native[0] == [
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+        *_MANUAL_STAGE_SEQUENCE,
+    ]
+    assert _stage_values(context) == observed_at_native[0]
+
+
+def test_einsum_preserves_topological_then_selected_operand_relayout_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options(
+        requested_schedule=Schedule(loop_order=("i", "j", "l", "k"))
+    )
+    context = CompilationContext(options)
+    original_relayout = ops._with_compiler_mode_order
+    requested_orders: list[tuple[str, tuple[int, ...]]] = []
+
+    def recording_relayout(
+        tensor: object,
+        mode_order: object,
+        compile_options: CompileOptions,
+        compilation_context: Optional[CompilationContext] = None,
+    ) -> object:
+        requested_orders.append(
+            (tensor.name, tuple(mode_order))  # type: ignore[attr-defined, arg-type]
+        )
+        return original_relayout(
+            tensor,  # type: ignore[arg-type]
+            mode_order,  # type: ignore[arg-type]
+            compile_options,
+            compilation_context,
+        )
+
+    monkeypatch.setattr(ops, "_with_compiler_mode_order", recording_relayout)
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+    left = TensorSpec("ddd", (2, 3, 4), name="A", mode_order=(0, 2, 1))
+    right = TensorSpec("dd", (4, 5), name="B", mode_order=(1, 0))
+
+    result = ops.einsum(
+        "ijk,kl->ijl",
+        left,
+        right,
+        compile_only=True,
+        format="ddd",
+        _compile_options=options,
+        _compilation_context=context,
+    )
+
+    assert isinstance(result, TensorSpec)
+    assert [order for name, order in requested_orders if name == "B"] == [
+        (0, 1),
+        (1, 0),
+    ]
+    assert left.mode_order == (0, 2, 1)
+    assert right.mode_order == (1, 0)
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE
+
+
+def test_timing_is_excluded_from_source_name_request_and_cache_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stepped_clock(step: int) -> Callable[[], int]:
+        current = 0
+
+        def now() -> int:
+            nonlocal current
+            current += step
+            return current
+
+        return now
+
+    options = _explicit_options()
+    first_context = CompilationContext(options)
+    first_builds: list[object] = []
+    monkeypatch.setattr(context_module, "perf_counter_ns", stepped_clock(7))
+    first_result = _compile_explicit(
+        monkeypatch,
+        options,
+        first_context,
+        prepared_builds=first_builds,
+    )
+    first_records = first_context.stage_run_records
+    monkeypatch.undo()
+
+    second_context = CompilationContext(options)
+    second_builds: list[object] = []
+    monkeypatch.setattr(context_module, "perf_counter_ns", stepped_clock(701))
+    second_result = _compile_explicit(
+        monkeypatch,
+        options,
+        second_context,
+        prepared_builds=second_builds,
+    )
+    assert first_result == second_result
+    assert len(first_builds) == len(second_builds) == 1
+    assert first_builds[0] == second_builds[0]
+    first_prepared = first_builds[0]
+    second_prepared = second_builds[0]
+    assert isinstance(first_prepared, utils._PreparedJITBuild)
+    assert isinstance(second_prepared, utils._PreparedJITBuild)
+    assert tuple(field.name for field in fields(type(first_prepared))) == (
+        "request",
+        "cache_key",
+        "so_path",
+    )
+    assert tuple(field.name for field in fields(type(first_prepared.request))) == (  # type: ignore[attr-defined]
+        "name",
+        "cpp_sources",
+        "functions",
+        "extra_cflags",
+        "extra_ldflags",
+        "build_directory",
+        "build_options",
+    )
+    assert first_prepared.request.name == second_prepared.request.name  # type: ignore[attr-defined]
+    assert first_prepared.request.cpp_sources == second_prepared.request.cpp_sources  # type: ignore[attr-defined]
+    assert first_prepared.cache_key == second_prepared.cache_key  # type: ignore[attr-defined]
+    assert first_prepared.request.build_options is options.build  # type: ignore[attr-defined]
+    assert second_prepared.request.build_options is options.build  # type: ignore[attr-defined]
+    assert first_context.compile_options is options
+    assert second_context.compile_options is options
+
+    canonical_cache_digest(options.cache_key)
+    canonical_cache_digest(options.semantic_cache_key)
+    with pytest.raises(TypeError):
+        canonical_cache_digest((first_records[0],))
+    with pytest.raises(TypeError):
+        canonical_cache_digest((first_context,))
+    assert tuple(replace(record, duration_ns=0) for record in first_records) == tuple(
+        replace(record, duration_ns=0) for record in second_context.stage_run_records
+    )
+    assert [record.duration_ns for record in first_records] != [
+        record.duration_ns for record in second_context.stage_run_records
+    ]
+
+
+def test_two_options_snapshots_have_independent_records_results_and_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    production = _explicit_options()
+    debug = _explicit_options(
+        verify_cin=True,
+        llir_pass_options=DEBUG_LLIR_PASS_OPTIONS,
+    )
+    assert production is not debug
+    assert production.cache_key != debug.cache_key
+    production_context = CompilationContext(production)
+    production_builds: list[object] = []
+    first_result = _compile_explicit(
+        monkeypatch,
+        production,
+        production_context,
+        prepared_builds=production_builds,
+    )
+    first_stage_snapshot = production_context.stage_run_records
+    first_pass_snapshot = production_context.llir_pass_run_records
+    monkeypatch.undo()
+
+    debug_context = CompilationContext(debug)
+    debug_builds: list[object] = []
+    second_result = _compile_explicit(
+        monkeypatch,
+        debug,
+        debug_context,
+        prepared_builds=debug_builds,
+    )
+    assert first_result == second_result
+    assert first_result is not second_result
+    assert production_context.compile_options is production
+    assert debug_context.compile_options is debug
+    assert production_context.stage_run_records == first_stage_snapshot
+    assert production_context.llir_pass_run_records == first_pass_snapshot
+    assert production_context.stage_run_records is not debug_context.stage_run_records
+    assert all(
+        first_record is not second_record
+        for first_record, second_record in zip(
+            production_context.stage_run_records,
+            debug_context.stage_run_records,
+        )
+    )
+    assert production_builds[0].request.cpp_sources == debug_builds[0].request.cpp_sources  # type: ignore[attr-defined]
+    assert all(
+        not record.verified_before and not record.verified_after
+        for record in first_pass_snapshot
+    )
+    assert all(
+        record.verified_before and record.verified_after
+        for record in debug_context.llir_pass_run_records
+    )
+
+
+def test_caller_owned_cin_llir_and_first_result_are_not_mutated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    source = _build_spmm_cin()
+    source_before = canonical_cin_dump(source)
+    context = CompilationContext(options)
+    scheduled = Scheduler.apply_schedule(
+        source,
+        Schedule(loop_order=("i", "k", "j")),
+        compile_options=options,
+        compilation_context=context,
+    )
+    assert canonical_cin_dump(source) == source_before
+    lowerer = CINLowerer(compile_options=options, compilation_context=context)
+    lowered = lowerer._lower_owned_IndexStmt(scheduled)
+    lowered_before = repr(lowered)
+    LLIRLowerer(compile_options=options).lower_llir(lowered)
+    assert repr(lowered) == lowered_before
+    assert canonical_cin_dump(source) == source_before
+
+    first_context = CompilationContext(options)
+    first = _compile_explicit(monkeypatch, options, first_context)
+    first_snapshot = first.metadata
+    monkeypatch.undo()
+    second_context = CompilationContext(options)
+    _compile_explicit(monkeypatch, options, second_context)
+    assert first.metadata == first_snapshot
+    assert first_context.stage_run_records
+
+
+def _raise_same(error: BaseException) -> Callable[..., object]:
+    def failing(*args: object, **kwargs: object) -> object:
+        raise error
+
+    return failing
+
+
+@pytest.mark.parametrize(
+    ("failure_site", "expected_prefix"),
+    [
+        ("normalization", _EXPLICIT_STAGE_SEQUENCE[:2]),
+        ("scheduling", _EXPLICIT_STAGE_SEQUENCE[:3]),
+        ("adapter", _EXPLICIT_STAGE_SEQUENCE[:4]),
+        ("cin_pass", _EINSUM_PREFIX_THROUGH_ADAPTER),
+        ("abi", _EINSUM_PREFIX_THROUGH_ADAPTER),
+        ("schedule_lowering", _EXPLICIT_STAGE_SEQUENCE[:7]),
+        ("cpp", _EXPLICIT_STAGE_SEQUENCE[:8]),
+        ("request", _EXPLICIT_STAGE_SEQUENCE[:9]),
+    ],
+)
+def test_stage_failures_raise_original_error_and_suppress_all_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+    expected_prefix: list[str],
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    error = RuntimeError(f"injected {failure_site} failure")
+    if failure_site == "normalization":
+        monkeypatch.setattr(
+            cin_analysis,
+            "verify_cin_if_enabled",
+            _raise_same(error),
+        )
+    elif failure_site == "scheduling":
+        monkeypatch.setattr(
+            Scheduler,
+            "_apply_schedule_legacy",
+            staticmethod(_raise_same(error)),
+        )
+    elif failure_site == "adapter":
+        monkeypatch.setattr(
+            cin_lowerer_module,
+            "claim_legacy_cin_working_tree",
+            _raise_same(error),
+        )
+    elif failure_site == "cin_pass":
+        monkeypatch.setattr(
+            llir_pass_manager,
+            "hoist_loop_invariant_factors",
+            _raise_same(error),
+        )
+    elif failure_site == "abi":
+        monkeypatch.setattr(
+            ResultTensorAssembler,
+            "emit_final_assembly",
+            _raise_same(error),
+        )
+    elif failure_site == "schedule_lowering":
+        monkeypatch.setattr(
+            schedule_lowerer,
+            "apply_schedule_to_llir",
+            _raise_same(error),
+        )
+    elif failure_site == "cpp":
+        monkeypatch.setattr(LLIRLowerer, "lower_llir", _raise_same(error))
+    elif failure_site == "request":
+        monkeypatch.setattr(ops, "_prepare_jit_build", _raise_same(error))
+    else:  # pragma: no cover - the parameter list is exhaustive
+        raise AssertionError(failure_site)
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+    assert failure.value is error
+    assert _stage_values(context) == expected_prefix
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(len(expected_prefix))
+    )
+
+    if failure_site == "cin_pass":
+        assert [record.pass_name for record in context.llir_pass_run_records] == [
+            "insert_sparse_prefetch",
+            "hoist_dense_pointers",
+            "eliminate_single_iteration_loops",
+        ]
+    elif failure_site == "abi":
+        assert [record.pass_name for record in context.llir_pass_run_records] == [
+            "insert_sparse_prefetch",
+            "hoist_dense_pointers",
+            "eliminate_single_iteration_loops",
+            "hoist_loop_invariant_factors",
+        ]
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_frontend_failure_records_nothing_and_never_enters_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    normalization_calls: list[object] = []
+
+    def forbidden_normalization(*args: object, **kwargs: object) -> object:
+        normalization_calls.append(args)
+        raise AssertionError("normalization ran after frontend failure")
+
+    monkeypatch.setattr(ops, "normalize_cin", forbidden_normalization)
+    with pytest.raises(Exception) as failure:
+        ops.einsum(
+            "invalid",
+            *_spmm_specs(),
+            compile_only=True,
+            _compile_options=options,
+            _compilation_context=context,
+        )
+    assert type(failure.value).__name__ == "CompileSpecError"
+    assert context.stage_run_records == ()
+    assert context.llir_pass_run_records == ()
+    assert normalization_calls == []
+
+
+def test_frontend_stage_failure_preserves_exact_error_and_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected frontend construction failure")
+    normalization_calls: list[object] = []
+    monkeypatch.setattr(STensor, "from_torch", _raise_same(error))
+    monkeypatch.setattr(
+        ops,
+        "normalize_cin",
+        lambda *args, **kwargs: normalization_calls.append(args),
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            torch.ones(2, 3),
+            TensorSpec("dd", (3, 4), name="B"),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert context.stage_run_records == ()
+    assert context.llir_pass_run_records == ()
+    assert normalization_calls == []
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+@pytest.mark.parametrize("failure_site", ("selection", "binding"))
+def test_prealignment_scheduling_failure_keeps_only_completed_frontend(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    error = RuntimeError(f"injected prealignment {failure_site} failure")
+    if failure_site == "selection":
+        monkeypatch.setattr(
+            Scheduler,
+            "resolve_loop_order",
+            staticmethod(_raise_same(error)),
+        )
+    else:
+        monkeypatch.setattr(
+            ops,
+            "_bind_frontend_operand_mode_orders",
+            _raise_same(error),
+        )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == [
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value
+    ]
+    assert context.llir_pass_run_records == ()
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_native_load_failure_is_outside_the_completed_compiler_stage_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected native/cache failure")
+    prepared_builds: list[utils._PreparedJITBuild] = []
+
+    def fail_at_native_boundary(prepared: utils._PreparedJITBuild) -> object:
+        assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE
+        assert utils._validate_prepared_jit_build(prepared) is prepared
+        prepared_builds.append(prepared)
+        raise error
+
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", fail_at_native_boundary)
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+    assert failure.value is error
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE
+    assert len(prepared_builds) == 1
+    prepared = prepared_builds[0]
+    request = prepared.request
+    assert request.build_options is options.build
+    assert prepared.cache_key == (request.name, utils._request_cache_key(request))
+    assert prepared.so_path == str(Path(request.build_directory) / f"{request.name}.so")
+    assert type(request.cpp_sources) is tuple
+    assert type(request.functions) is tuple
+    with pytest.raises(FrozenInstanceError):
+        prepared.so_path = "detached.so"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        request.name = "detached"  # type: ignore[misc]
+
+
+def test_prepared_build_validation_failure_is_owned_by_kernel_request_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected prepared-build validation failure")
+    loader_calls: list[object] = []
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(utils, "_validate_prepared_jit_build", _raise_same(error))
+    monkeypatch.setattr(
+        ops,
+        "_load_validated_prepared_kernel",
+        lambda prepared: loader_calls.append(prepared),
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE[:-1]
+    assert loader_calls == []
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_prepared_build_rejects_detached_request_cache_and_path_before_native_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    prepared = utils._prepare_jit_build(
+        "kernel_timing_carrier",
+        ["int timing_carrier;"],
+        ["evaluate"],
+        options.build.extra_cflags,
+        options.build.extra_ldflags,
+        compile_options=options,
+    )
+    monkeypatch.setattr(utils, "_so_cache", {})
+    monkeypatch.setattr(
+        utils,
+        "_build_and_load_extension",
+        lambda request: (_ for _ in ()).throw(
+            AssertionError("invalid carrier reached native compilation")
+        ),
+    )
+    monkeypatch.setattr(
+        utils,
+        "_load_extension_file",
+        lambda name, path: (_ for _ in ()).throw(
+            AssertionError("invalid carrier reached native loading")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="cache key"):
+        utils._load_prepared_kernel(
+            replace(prepared, cache_key=("detached", prepared.cache_key[1]))
+        )
+    with pytest.raises(ValueError, match="path"):
+        utils._load_prepared_kernel(replace(prepared, so_path="/tmp/detached.so"))
+    with pytest.raises(TypeError, match="build payload"):
+        utils._load_prepared_kernel(
+            replace(prepared, request=object())  # type: ignore[arg-type]
+        )
+
+
+def test_dynamic_failure_after_abi_keeps_assembly_and_preceding_pass_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected dynamic-vector failure")
+    monkeypatch.setattr(
+        llir_pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        _raise_same(error),
+    )
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == [
+        *_EINSUM_PREFIX_THROUGH_ADAPTER,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    ]
+    assert context.stage_run_records[-1].nested_within is CompilerStageId.CIN_LOWERING
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failed_mode", "expected_configurations"),
+    [("count", []), ("fill", ["count"])],
+)
+def test_compressed_where_partial_failures_preserve_exact_nested_pass_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_mode: str,
+    expected_configurations: list[str],
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = VerificationError(f"injected compressed {failed_mode} failure")
+    original_rewrite = llir_pass_manager.rewrite_result_writes
+
+    def fail_selected_mode(value: object, pass_context: object) -> object:
+        if getattr(pass_context, "mode", None) == failed_mode:
+            raise error
+        return original_rewrite(value, pass_context)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        llir_pass_manager,
+        "rewrite_result_writes",
+        fail_selected_mode,
+    )
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+    with pytest.raises(VerificationError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            TensorSpec("ds", (2, 3), name="A"),
+            TensorSpec("ds", (3, 4), name="B"),
+            compile_only=True,
+            format="ds",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+    assert failure.value is error
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [
+        record.configuration_name for record in context.llir_pass_run_records
+    ] == expected_configurations
+    assert all(
+        record.pass_name == "rewrite_result_writes"
+        for record in context.llir_pass_run_records
+    )
+
+
+def test_compressed_where_ordinary_fill_failure_preserves_completed_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected ordinary compressed fill failure")
+    original_rewrite = llir_pass_manager.rewrite_result_writes
+
+    def fail_fill(value: object, pass_context: object) -> object:
+        if getattr(pass_context, "mode", None) == "fill":
+            raise error
+        return original_rewrite(value, pass_context)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(llir_pass_manager, "rewrite_result_writes", fail_fill)
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            TensorSpec("ds", (2, 3), name="A"),
+            TensorSpec("ds", (3, 4), name="B"),
+            compile_only=True,
+            format="ds",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [
+        (record.pass_name, record.configuration_name)
+        for record in context.llir_pass_run_records
+    ] == [("rewrite_result_writes", "count")]
+
+
+def test_compressed_where_ordinary_parent_failure_preserves_count_and_fill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected ordinary compressed parent failure")
+    original_record = llir_pass_manager._record
+
+    def fail_parent_record(*args: object, **kwargs: object) -> object:
+        descriptor = kwargs.get("descriptor")
+        if descriptor is llir_pass_manager.COMPRESSED_WHERE_OPENMP_PASS:
+            raise error
+        return original_record(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(llir_pass_manager, "_record", fail_parent_record)
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            TensorSpec("ds", (2, 3), name="A"),
+            TensorSpec("ds", (3, 4), name="B"),
+            compile_only=True,
+            format="ds",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [
+        (record.pass_name, record.configuration_name)
+        for record in context.llir_pass_run_records
+    ] == [
+        ("rewrite_result_writes", "count"),
+        ("rewrite_result_writes", "fill"),
+    ]
+
+
+def test_compressed_where_success_retains_count_fill_and_all_seven_pass_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+    result = ops.einsum(
+        "ik,kj->ij",
+        TensorSpec("ds", (2, 3), name="A"),
+        TensorSpec("ds", (3, 4), name="B"),
+        compile_only=True,
+        format="ds",
+        _compile_options=options,
+        _compilation_context=context,
+    )
+    assert isinstance(result, TensorSpec)
+    assert [record.configuration_name for record in context.llir_pass_run_records] == [
+        "compressed_where_openmp",
+        "count",
+        "fill",
+        "sparse_prefetch",
+        "dense_pointer_hoist",
+        "single_iteration_loop_elimination",
+        "loop_invariant_factor_hoist",
+        "dynamic_vector_access",
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == list(
+        range(8)
+    )
+
+
+def _runtime_compiler_inputs() -> tuple[STensor, STensor, STensor]:
+    sparse = scorch.STensor.from_torch(
+        torch.tensor(
+            [
+                [1.0, 0.0, 2.0],
+                [0.0, 3.0, 0.0],
+            ]
+        ).to_sparse_csr(),
+        "A",
+    )
+    dense = scorch.STensor.from_torch(torch.ones(3, 4), "B")
+    vector = scorch.STensor.from_torch(torch.ones(3), "v")
+    return sparse, dense, vector
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "spmv",
+        "matmul_wksp",
+        "lower_and_exec_cin",
+        "to_dense",
+        "to_sparse",
+        "change_mode_order",
+    ),
+)
+def test_manual_generated_boundaries_record_only_the_stages_they_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError(f"stop {boundary} at native boundary")
+    sparse, dense, vector = _runtime_compiler_inputs()
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", _raise_same(error))
+    monkeypatch.setattr(
+        stensor_module, "_load_validated_prepared_kernel", _raise_same(error)
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        if boundary == "spmv":
+            ops.spmv(
+                sparse,
+                vector,
+                _compile_options=options,
+                _compilation_context=context,
+            )
+        elif boundary == "matmul_wksp":
+            monkeypatch.setattr(ops.matmul_wksp, "_module_cache", {}, raising=False)
+            ops.matmul_wksp(
+                sparse,
+                dense,
+                output_format="dd",
+                _compile_options=options,
+                _compilation_context=context,
+            )
+        elif boundary == "lower_and_exec_cin":
+            ops.lower_and_exec_cin(
+                _build_spmm_cin(),
+                (2, 4),
+                sparse,
+                dense,
+                _compile_options=options,
+                _compilation_context=context,
+            )
+        elif boundary == "to_dense":
+            sparse.to_dense(
+                _compile_options=options,
+                _compilation_context=context,
+            )
+        elif boundary == "to_sparse":
+            dense.copy().to_sparse(
+                "ds",
+                _compile_options=options,
+                _compilation_context=context,
+            )
+        elif boundary == "change_mode_order":
+            scorch.STensor.from_torch(torch.ones(2, 3, 4)).change_mode_order(
+                [1, 0, 2],
+                _compile_options=options,
+                _compilation_context=context,
+            )
+        else:  # pragma: no cover - the parameter list is exhaustive
+            raise AssertionError(boundary)
+
+    assert failure.value is error
+    expected = (
+        _DIRECT_CIN_STAGE_SEQUENCE
+        if boundary == "lower_and_exec_cin"
+        else _MANUAL_STAGE_SEQUENCE
+    )
+    assert _stage_values(context) == expected
+
+
+def test_direct_cin_runtime_binding_failure_suppresses_legacy_lowering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected direct-CIN binding failure")
+    sparse, dense, _ = _runtime_compiler_inputs()
+    monkeypatch.setattr(ops, "_apply_mode_order_alignment", _raise_same(error))
+    monkeypatch.setattr(
+        ops,
+        "_load_validated_prepared_kernel",
+        lambda prepared: (_ for _ in ()).throw(
+            AssertionError("lowering continued after direct-CIN binding failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.lower_and_exec_cin(
+            _build_spmm_cin(),
+            (2, 4),
+            sparse,
+            dense,
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == [
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+    ]
+    assert context.llir_pass_run_records == ()
+
+
+def test_direct_cin_runtime_binding_plan_failure_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected direct-CIN binding-plan failure")
+    sparse, dense, _ = _runtime_compiler_inputs()
+    relayout_calls: list[object] = []
+    monkeypatch.setattr(ops, "_plan_mode_orders_to_loop_order", _raise_same(error))
+    monkeypatch.setattr(
+        ops,
+        "_relayout_mode_order_args",
+        lambda *args, **kwargs: relayout_calls.append(args),
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.lower_and_exec_cin(
+            _build_spmm_cin(),
+            (2, 4),
+            sparse,
+            dense,
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == [
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value
+    ]
+    assert relayout_calls == []
+    assert context.llir_pass_run_records == ()
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.LEGACY_CIN_ADAPTATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_direct_cin_actual_legacy_adapter_failure_keeps_frontend_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected direct-CIN legacy adapter failure")
+    sparse, dense, _ = _runtime_compiler_inputs()
+    monkeypatch.setattr(
+        cin_lowerer_module,
+        "claim_legacy_cin_working_tree",
+        _raise_same(error),
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.lower_and_exec_cin(
+            _build_spmm_cin(),
+            (2, 4),
+            sparse,
+            dense,
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == [
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+    ]
+    assert context.llir_pass_run_records == ()
+
+
+def test_direct_cin_normalization_completes_before_nested_relayout_native_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    result_var = TensorVar("C", fmt="ddd")
+    input_var = TensorVar("B", fmt="ddd")
+    cin = ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(k, TensorAssign(result_var[i, j, k], input_var[i, j, k])),
+        ),
+    )
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("stop direct-CIN nested relayout")
+    observed_at_native: list[list[str]] = []
+
+    def stop_nested_relayout(prepared: object) -> object:
+        observed_at_native.append(_stage_values(context))
+        raise error
+
+    monkeypatch.setattr(
+        stensor_module, "_load_validated_prepared_kernel", stop_nested_relayout
+    )
+    runtime = scorch.STensor.from_torch(
+        torch.ones(3, 2, 4),
+        mode_order=[1, 0, 2],
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.lower_and_exec_cin(
+            cin,
+            (3, 2, 4),
+            runtime,
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert observed_at_native == [
+        [
+            CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION.value,
+            *_MANUAL_STAGE_SEQUENCE,
+        ]
+    ]
+    assert _stage_values(context) == observed_at_native[0]
+
+
+def test_stensor_add_constructs_one_owner_and_routes_one_options_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    contexts: list[CompilationContext] = []
+    snapshot_calls: list[object] = []
+    error = RuntimeError("stop STensor.__add__ at native boundary")
+    original_post_init = CompilationContext.__post_init__
+
+    def capture_context(context: CompilationContext) -> None:
+        original_post_init(context)
+        contexts.append(context)
+
+    def snapshot_once(
+        cls: type[CompileOptions], *args: object, **kwargs: object
+    ) -> CompileOptions:
+        snapshot_calls.append((args, kwargs))
+        return options
+
+    monkeypatch.setattr(CompilationContext, "__post_init__", capture_context)
+    monkeypatch.setattr(
+        CompileOptions,
+        "from_environment",
+        classmethod(snapshot_once),
+    )
+    monkeypatch.setattr(
+        stensor_module, "_load_validated_prepared_kernel", _raise_same(error)
+    )
+    left = scorch.STensor.from_torch(torch.ones(2, 2), "left")
+    right = scorch.STensor.from_torch(torch.ones(2, 2), "right")
+
+    with pytest.raises(RuntimeError) as failure:
+        left + right
+
+    assert failure.value is error
+    assert len(snapshot_calls) == 1
+    assert len(contexts) == 1
+    assert contexts[0].compile_options is options
+    assert _stage_values(contexts[0]) == _MANUAL_STAGE_SEQUENCE
+
+
+def test_matmul_routes_one_owner_through_the_auto_einsum_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("stop nested matmul compiler path")
+    sparse, dense, _ = _runtime_compiler_inputs()
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", _raise_same(error))
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.matmul(
+            sparse,
+            dense,
+            format="dd",
+            use_cache=False,
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert context.compile_options is options
+    assert _stage_values(context) == _AUTO_STAGE_SEQUENCE
+
+
+def test_dispatch_and_workspace_module_cache_hits_record_no_compiler_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    sparse, dense, _ = _runtime_compiler_inputs()
+    fake_result = SimpleNamespace(
+        storage=SimpleNamespace(
+            index=SimpleNamespace(mode_indices=[[], []]),
+            value=torch.ones(8),
+        )
+    )
+    fake_module = SimpleNamespace(evaluate=lambda *args: fake_result)
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: fake_module
+    )
+
+    first_context = CompilationContext(options)
+    first = ops.einsum(
+        "ik,kj->ij",
+        sparse,
+        dense,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=first_context,
+    )
+    assert isinstance(first, STensor)
+    assert _stage_values(first_context) == _AUTO_STAGE_SEQUENCE
+
+    dispatch_hit_context = CompilationContext(options)
+    second = ops.einsum(
+        "ik,kj->ij",
+        sparse,
+        dense,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=dispatch_hit_context,
+    )
+    assert isinstance(second, STensor)
+    assert dispatch_hit_context.stage_run_records == ()
+    assert dispatch_hit_context.llir_pass_run_records == ()
+
+    monkeypatch.setattr(ops.matmul_wksp, "_module_cache", {}, raising=False)
+    first_wksp_context = CompilationContext(options)
+    ops.matmul_wksp(
+        sparse,
+        dense,
+        output_format="dd",
+        _compile_options=options,
+        _compilation_context=first_wksp_context,
+    )
+    assert _stage_values(first_wksp_context) == _MANUAL_STAGE_SEQUENCE
+
+    wksp_hit_context = CompilationContext(options)
+    ops.matmul_wksp(
+        sparse,
+        dense,
+        output_format="dd",
+        _compile_options=options,
+        _compilation_context=wksp_hit_context,
+    )
+    assert wksp_hit_context.stage_run_records == ()
+    assert wksp_hit_context.llir_pass_run_records == ()
+
+
+def test_prebuilt_sddmm_rank_one_sparse_and_mode_order_noops_record_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scorch_ops  # type: ignore[import-not-found]
+
+    options = _default_options()
+    mask = scorch.STensor.from_torch(torch.eye(2).to_sparse_coo(), "S")
+    left = scorch.STensor.from_torch(torch.ones(2, 2), "A")
+    right = scorch.STensor.from_torch(torch.ones(2, 2), "B")
+    fake_sddmm_result = SimpleNamespace(
+        storage=SimpleNamespace(
+            index=SimpleNamespace(mode_indices=mask._native_mode_indices()),
+            value=torch.ones_like(mask.values),
+        )
+    )
+    monkeypatch.setattr(
+        scorch_ops,
+        "sddmm_coo_float_prebuilt",
+        lambda *args: fake_sddmm_result,
+    )
+    prebuilt_context = CompilationContext(options)
+
+    result = ops.einsum(
+        "ij,ik,jk->ij",
+        mask,
+        left,
+        right,
+        _compile_options=options,
+        _compilation_context=prebuilt_context,
+    )
+
+    assert isinstance(result, STensor)
+    assert prebuilt_context.stage_run_records == ()
+
+    rank_one_context = CompilationContext(options)
+    vector = scorch.STensor.from_torch(torch.tensor([0.0, 1.0, 0.0]))
+    vector.to_sparse(
+        _compile_options=options,
+        _compilation_context=rank_one_context,
+    )
+    assert rank_one_context.stage_run_records == ()
+
+    mode_noop_context = CompilationContext(options)
+    dense = scorch.STensor.from_torch(torch.ones(2, 2))
+    dense.change_mode_order(
+        [0, 1],
+        _compile_options=options,
+        _compilation_context=mode_noop_context,
+    )
+    dense.change_mode_order(
+        [1, 0],
+        _compile_options=options,
+        _compilation_context=mode_noop_context,
+    )
+    assert mode_noop_context.stage_run_records == ()
+
+
+def test_kernel_cache_prebuilt_and_noop_paths_do_not_fabricate_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    first_context = CompilationContext(options)
+    first = ops.einsum(
+        "ik,kj->ij",
+        *_spmm_specs(),
+        compile_only=True,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=first_context,
+    )
+    assert isinstance(first, TensorSpec)
+    assert _stage_values(first_context) == _EXPLICIT_STAGE_SEQUENCE
+
+    kernel_hit_context = CompilationContext(options)
+    second = ops.einsum(
+        "ik,kj->ij",
+        *_spmm_specs(),
+        compile_only=True,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=kernel_hit_context,
+    )
+    assert isinstance(second, TensorSpec)
+    assert _stage_values(kernel_hit_context) == _EXPLICIT_STAGE_SEQUENCE[:4]
+    assert kernel_hit_context.llir_pass_run_records == ()
+
+    sparse = scorch.STensor.from_torch(torch.eye(2).to_sparse_csr())
+    dense = scorch.STensor.from_torch(torch.ones(2, 2))
+    fake_result = SimpleNamespace(
+        storage=SimpleNamespace(value=torch.arange(4, dtype=torch.float32))
+    )
+    resolved = SimpleNamespace(
+        fn=object(),
+        output_format=parse_format("dd"),
+        symbol_name="test_prebuilt",
+    )
+    monkeypatch.setattr(
+        ops,
+        "resolve_prebuilt_matmul",
+        lambda *args, **kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        ops,
+        "execute_prebuilt_binary_kernel",
+        lambda *args, **kwargs: (fake_result, (2, 2)),
+    )
+    prebuilt_options = _default_options()
+    prebuilt_context = CompilationContext(prebuilt_options)
+    output = ops.matmul(
+        sparse,
+        dense,
+        _compile_options=prebuilt_options,
+        _compilation_context=prebuilt_context,
+    )
+    assert tuple(output.shape) == (2, 2)
+    assert prebuilt_context.stage_run_records == ()
+
+    dense_tensor = scorch.STensor.from_torch(torch.ones(2, 2))
+    noop_context = CompilationContext(options)
+    copy = dense_tensor.to_dense(
+        _compile_options=options,
+        _compilation_context=noop_context,
+    )
+    assert copy is not dense_tensor
+    assert noop_context.stage_run_records == ()
+
+
+def test_direct_analysis_scheduler_lowerer_renderer_and_loader_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    source = _build_spmm_cin()
+    source_before = canonical_cin_dump(source)
+    normalized = normalize_cin(source, compile_options=options)
+    scheduled = Scheduler.auto_schedule(source, compile_options=options)
+    lowerer = CINLowerer(compile_options=options)
+    lowered = lowerer.lower_IndexStmt(scheduled)
+    cpp = LLIRLowerer(compile_options=options).lower_llir(lowered)
+    assert canonical_cin_dump(source) == source_before
+    assert normalized is not source
+    assert lowerer.llir_pass_run_records
+    assert cpp == LLIRLowerer().lower_llir(lowered)
+
+    loaded = object()
+    prepared: list[object] = []
+
+    def standalone_load(request: object) -> object:
+        prepared.append(request)
+        return loaded
+
+    monkeypatch.setattr(utils, "_load_validated_prepared_kernel", standalone_load)
+    module = utils._load_kernel(
+        "kernel_direct_compatibility",
+        ["int direct_compatibility;"],
+        ["evaluate"],
+        list(options.build.extra_cflags),
+        list(options.build.extra_ldflags),
+        compile_options=options,
+    )
+    assert module is loaded
+    assert len(prepared) == 1
+
+
+def test_isolated_compilation_context_plumbing_p95_is_below_one_millisecond() -> None:
+    options = _default_options()
+    samples: list[int] = []
+    for _ in range(300):
+        context = CompilationContext(options)
+        started = perf_counter_ns()
+        token = context.begin_stage(
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+            compile_options=options,
+        )
+        context.complete_stage(token)
+        assert context.stage_run_records[0].duration_ns >= 0
+        samples.append(perf_counter_ns() - started)
+    samples.sort()
+    p95 = samples[int((len(samples) - 1) * 0.95)]
+    assert p95 < 1_000_000
