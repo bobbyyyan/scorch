@@ -384,9 +384,49 @@ worktree, empty-manager p95 was 1.542 microseconds and dense one-pass incrementa
 manager overhead was 1.958 microseconds. The unchanged `14b110b` latency
 preflight again missed its archive (small-dense p95 1.108x and reduction p95
 1.170x), so no candidate end-to-end sample was taken from that invalid host
-comparison. The remaining sequential inline optimizations are
-`_eliminate_single_iteration_loops` and `_hoist_loop_invariant_factors`; extract
-only the former next.
+comparison. At that point, the remaining sequential inline optimizations were
+`_eliminate_single_iteration_loops` and `_hoist_loop_invariant_factors`.
+
+The single-iteration Phase 2 seam is implemented by `0d31882` and routed in
+production by `265123a`. The version-1 `eliminate_single_iteration_loops` pass
+takes an exact statement-list artifact and a frozen context containing only its
+common-traversal identity. It validates and detaches the complete LLIR tree
+before applying the characterized post-order analysis and its distinct legacy
+generated-string rewrite scope. Legal misses and normal repeated application
+return fully detached output; unknown subclasses, malformed typed children,
+wrong roots, and mismatched artifacts, descriptors, contexts, or specifications
+fail closed. Production order is managed sparse prefetch, managed dense-pointer
+hoisting, managed single-iteration elimination, inline invariant-factor
+hoisting, result/ABI assembly, and managed dynamic-vector rewriting. Applied
+compressed output still precedes those passes with compressed-Where/OpenMP plus
+independent count and fill result-write records.
+
+The focused common suite is now 380 tests and the schedule/codegen matrix remains
+82 tests. CSR-by-dense, DS, DSS, and the structurally activating all-COO SDDMM
+remain byte-identical at 2,505, 7,117, 8,660, and 3,543 bytes with SHA-256
+digests `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151`,
+`d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f`,
+`1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e`,
+and `de94b08752077a621c5e411ce0dcbb40e8bcbeacb9bce3824dd6019e2d2bd29d`.
+All 42 M5 and all 42 redwood grid build inputs are byte-identical to the
+`81b847a` references, so compiled-kernel A/B comparison is waived while the
+all-COO activation remains structurally covered.
+
+In a clean committed worktree, empty-manager p95 was 1.542 microseconds and
+single-pass incremental manager overhead was 1.917 microseconds. A fresh
+unchanged `14b110b` preflight passed its archived same-commit control before the
+candidate was sampled. Against the Phase 0 archive, candidate p50/p95 values in
+milliseconds were 1.029/1.129 for small dense, 0.954/1.021 for reduction,
+1.009/1.087 for CSR intersection, and 0.974/1.073 for sparse union. Their
+respective Phase 0 p50/p95 ratios were 1.127/1.017, 1.108/1.116, 1.132/1.070,
+and 1.130/1.192, crossing the 1.10 investigation target in several categories.
+Direct production-record timing attributes 22.980-68.541 microseconds p50 and
+24.000-71.500 microseconds p95 to the new pass across the corpus. This is a
+modest absolute, measured exception accepted for the general fail-closed
+detachment and ownership boundary; no validation was weakened and no corpus-
+specific shortcut was introduced. The only remaining sequential inline
+optimization is `_hoist_loop_invariant_factors`; extract it next without
+combining it with other optimizations.
 
 ## Incremental Migration Plan
 
