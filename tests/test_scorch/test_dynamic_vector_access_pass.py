@@ -238,6 +238,41 @@ def test_dynamic_vector_pass_no_vector_declaration_is_detached_no_op() -> None:
     )
 
 
+def test_dynamic_vector_pass_detaches_and_preserves_shape_extent_reads() -> None:
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_values", llir.DataType.STD_VECTOR_FLOAT32)),
+        llir.VarInit(
+            _var("Input0_size", llir.DataType.INT64),
+            llir.ArrayAccess(
+                array=_var("Input_shape", llir.DataType.STD_VECTOR_INT),
+                index=llir.Literal(0, data_type=llir.DataType.INT64),
+            ),
+        ),
+    ]
+    source_snapshot = _structural_snapshot(source)
+
+    once = rewrite_dynamic_vector_accesses(source, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+    twice = rewrite_dynamic_vector_accesses(once, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+
+    assert _structural_snapshot(source) == source_snapshot
+    assert _structural_snapshot(once) == _structural_snapshot(twice)
+    assert _cpp(once) == _cpp(twice)
+    assert _cpp(once) == (
+        "std::vector<float> out_values;\n"
+        "int64_t Input0_size = Input_shape[0];"
+    )
+    first_access = cast(llir.ArrayAccess, cast(llir.VarInit, once[1]).value)
+    repeated_access = cast(llir.ArrayAccess, cast(llir.VarInit, twice[1]).value)
+    source_access = cast(llir.ArrayAccess, cast(llir.VarInit, source[1]).value)
+    assert first_access is not source_access
+    assert repeated_access is not first_access
+    assert first_access.array is not source_access.array
+    assert first_access.index is not source_access.index
+    cast(llir.Var, first_access.array).name = "changed"
+    assert cast(llir.Var, source_access.array).name == "Input_shape"
+    assert cast(llir.Var, repeated_access.array).name == "Input_shape"
+
+
 def test_pass_preserves_nested_list_and_tuple_statement_containers() -> None:
     nested: List[LLIRStatementValue] = [
         llir.VarDecl(_var("values", llir.DataType.STD_VECTOR_FLOAT32)),

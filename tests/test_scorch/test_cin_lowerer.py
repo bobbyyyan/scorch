@@ -1,3 +1,4 @@
+from dataclasses import FrozenInstanceError
 from typing import cast
 
 import pytest
@@ -234,6 +235,55 @@ def test_nonworkspace_tensor_reads_lower_to_frozen_structured_accesses(
     assert LLIRLowerer().lower_llir(structured) == f"Input_val[{expected_index}]"
     assert tuple(access.indices) == original_indices
     assert access.tensor is tensor
+
+
+def test_dense_level_shape_reads_use_frozen_structured_array_accesses() -> None:
+    row, column = IndexVar("row"), IndexVar("column")
+    result = TensorVar("Result", shape=(3, 5), fmt="dd")
+    operand = TensorVar("Input", shape=(3, 5), fmt="dd")
+    statement = ForAll(
+        row,
+        ForAll(
+            column,
+            TensorAssign(result[row, column], operand[row, column]),
+        ),
+    )
+
+    lowered = CINLowerer().lower_IndexStmt(statement)
+
+    assert type(lowered) is llir.Function
+    function = cast(llir.Function, lowered)
+    initializers = {
+        node.var.name: cast(llir.VarInit, node)
+        for node in function.body
+        if type(node) is llir.VarInit
+    }
+    expected = {
+        "Result0_size": ("result_shape", 0),
+        "Result1_size": ("result_shape", 1),
+        "Input0_size": ("Input_shape", 0),
+        "Input1_size": ("Input_shape", 1),
+    }
+    for initializer_name, (shape_name, level) in expected.items():
+        initializer = initializers[initializer_name]
+        assert type(initializer.value) is llir.ArrayAccess
+        access = cast(llir.ArrayAccess, initializer.value)
+        assert access == llir.ArrayAccess(
+            array=llir.Var(shape_name, llir.DataType.STD_VECTOR_INT),
+            index=llir.Literal(level, data_type=llir.DataType.INT64),
+        )
+        assert type(access.array) is llir.Var
+        assert cast(llir.Var, access.array).type is llir.DataType.STD_VECTOR_INT
+        assert type(access.index) is llir.Literal
+        assert cast(llir.Literal, access.index).data_type is llir.DataType.INT64
+        assert access.tensor_access is None
+        assert LLIRLowerer().lower_llir(initializer) == (
+            f"int64_t {initializer_name} = {shape_name}[{level}];"
+        )
+
+    result_access = cast(llir.ArrayAccess, initializers["Result0_size"].value)
+    with pytest.raises(FrozenInstanceError):
+        result_access.index = llir.Literal(1)
 
 
 def test_cin_reference_rewrite_rebuilds_frozen_access_and_preserves_metadata() -> None:
