@@ -808,10 +808,15 @@ def _apply_heap_result_tile(
                         llir.Var(copy_logical, llir.DataType.INT64),
                     ),
                 ),
-                value=llir.Var(
-                    f"{compact_name}[{copy_prefix} * {tile_size_name} + "
-                    f"{copy_inner}]",
-                    scalar_type,
+                value=llir.ArrayAccess(
+                    array=llir.Var(compact_name, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(copy_prefix, llir.DataType.INT64),
+                            llir.Var(tile_size_name, llir.DataType.INT64),
+                        ),
+                        llir.Var(copy_inner, llir.DataType.INT64),
+                    ),
                 ),
             ),
         ],
