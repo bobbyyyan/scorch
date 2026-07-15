@@ -847,8 +847,8 @@ pair recorded below.
 | --- | --- | --- |
 | Immutable `CompileOptions` snapshot | **MET** | `7c68ac9` introduces exact frozen compiler, scheduler, verification, build, target, ABI, wrapper, and Darwin-toolchain values; snapshots mutable schedules/flags/pass inputs into tuples; parses the audited environment and compatibility `ContextVar`s once at public boundaries; and routes one object through normalization, scheduling, lowering, emission, naming, and the detached JIT build. `d8ae9ed` separates direct-extension Darwin target flags from predecessor-identical production flags. `d4a4cb3` completes exact identity routing through nested compressed-output/result-write renderers and rejects plain CIN that would ignore a requested schedule. Unsupported values and combinations fail closed with typed diagnostics. Focused executable coverage proves freezing/types, detachment, one-time reads, post-snapshot environment independence, independent snapshots, production/debug verification, public and nested identity, build-child isolation, cache separation, invalid inputs/combinations, ownership, and source anchors. No singleton, mutable registry, callback bag, reflection/signature inspection, `Any` configuration dictionary, new cache, or preserve/invalidate machinery was introduced. |
 | Stable `SymbolId`/`IndexId` references at the `LoopPlan` boundary | **MET** | `identity.py`, `cin.py`, and `cin_analysis.py` assign and verify stable typed IDs. `loop_plan.py` represents every addressable loop/tensor decision with `IndexId`, `SymbolId`, or typed `LoopRef`; `scheduler._build_loop_plan` resolves public names once and emits only IDs. `test_cin_analysis.py` and `test_loop_plan.py` cover stable identity, dangling references, detachment, and caller-list snapshotting. No name or object-identity adapter crosses this boundary. Core commits: `9e3690c`, `9dcd06c`, and audit hardening `72b8a59`. |
-| Frozen `ScheduledCIN(cin, plan)` transitional carrier | **MET** | `loop_plan.ScheduledCIN` is an exact frozen two-field dataclass containing only detached normalized CIN and a `LoopPlan` accepted by the current structural verifier; it owns no analysis bundle and adds no CIN node schema. Exact carrier and field behavior is covered in `test_loop_plan.py`; the incomplete semantic legality verifier is a separate blocker below. |
-| Internal `LoopPlan` translation from public `Schedule` | **MET** | `scheduler._build_loop_plan` translates public name-bearing schedule decisions to stable IDs, and `Scheduler.apply_schedule` returns `ScheduledCIN`. Public scheduling compatibility and translation are covered by `test_loop_plan.py`, `test_schedule_api.py`, and `test_schedule_generality.py`. A separate semantic-verifier blocker is recorded below. |
+| Frozen `ScheduledCIN(cin, plan)` transitional carrier | **MET** | `loop_plan.ScheduledCIN` remains an exact frozen two-field dataclass containing only detached normalized CIN and a `LoopPlan`; it owns no analysis bundle and adds no CIN node schema. Its constructor deliberately remains a carrier, while semantic acceptance is enforced at `verify_scheduled_cin` and lowering trust boundaries. Exact carrier, field, structural, and semantic-boundary behavior is covered in `test_loop_plan.py` and the legality closure below. |
+| Internal `LoopPlan` translation from public `Schedule` | **MET** | `scheduler._build_loop_plan` translates public name-bearing schedule decisions to stable IDs, and `Scheduler.apply_schedule` returns `ScheduledCIN`. Public scheduling compatibility, translation, and convergence with direct artifact legality are covered by `test_loop_plan.py`, `test_schedule_api.py`, and `test_schedule_generality.py`; the semantic verifier closure is recorded below. |
 | Removal of dynamic schedule attributes | **MET** | Public scheduling decisions are carried by `LoopPlan`; tests in `test_loop_plan.py` and `test_schedule_api.py` assert the old scheduling attributes are absent from normalized CIN and that scheduling leaves the input unchanged. Legacy scheduling mutation occurs only on a private copy. |
 | Initial pass manager and pure analysis runner; no cache or preserve/invalidate machinery | **MET** | `8e89822` adds the exact frozen `LLIRPassPipeline` assembled from and retaining one `CompileOptions` snapshot, and one explicit manager-owned heterogeneous production entry. `CINLowerer` delegates once; ordered ordinary and compressed records, same-source count/fill siblings, production/debug policy, partial failures, later-work suppression, trust-boundary validation, and direct pass compatibility are executable. `cdb12bc` adds the zero-field frozen `AnalysisRunner`; every typed CIN request recomputes a fresh immutable `CINAnalysis`. No analysis cache, dependency graph, callback registry, reflection, or preserve/invalidate protocol was introduced. |
 | Common current-LLIR walker/rewriter | **MET** | `llir_traversal.py` provides exhaustive exact-type walking and detached rewriting for the current LLIR. `test_llir_traversal.py` covers declared-node completeness, deterministic traversal, nested container shape, detachment, malformed children, replacement validation, and unknown-subclass rejection. Commit `14c1f27`. |
@@ -884,15 +884,14 @@ pair recorded below.
   exact nested structures and well-formed IDs; requires a complete loop order;
   and rejects duplicate panel bounds, malformed structured values, and conflicting
   parallel selections with structured `VerificationError`s.
-- Canonical semantic `LoopPlan` legality remains a **GAP**. A direct audit probe
-  built normalized SpMM CIN, replaced the verified plan, and called
-  `verify_scheduled_cin`; it accepted result order `k,i,j`, CSR child-before-parent
-  order `j,i,k`, and parallel reduction loop `j`. The public `Schedule` route has
-  some corresponding checks, but the artifact verifier does not itself enforce
-  result/storage ordering, sparse-parent dominance, reduction race legality,
-  relayout/access compatibility, or full scheduling scope/ownership. Closing
-  this correctly requires a broader legality-analysis seam, not another local
-  structural predicate.
+- Canonical semantic `LoopPlan` legality is **CLOSED** by `f63f8c5`,
+  `f2e693f`, and the audit completions through `fd0ff9a`/`87014ac`. The same
+  direct forged SpMM artifacts now fail at both
+  `verify_loop_plan` and `verify_scheduled_cin`: result order `k,i,j` reports
+  `result_storage_order`, CSR child-before-parent `j,i,k` reports
+  `sparse_parent_dominance`, and parallel reduction `j` reports
+  `parallel_reduction`. The closure uses immutable canonical `CINAnalysis`
+  facts and is recorded in detail below.
 - All manager outputs, including legal no-ops and `run_empty`, are detached from
   caller-owned mutable LLIR. Production disables full before/after verification;
   debug enables both, while exact public/trust-boundary validation remains on.
@@ -1397,9 +1396,12 @@ The public API test proves that the old name is absent from the package,
 
 Focused API/timing/scheduler/direct-workspace verification reports 88 passed in
 192.28 seconds. The full `pytest -q -m "not perf" tests` command reports 1,089
-passed, 14 skipped, three deselected, one warning, and only the inherited
-`test_spmm_dd_ds_dd_tiled_time` failure in 2,047.62 seconds. All four generated
-source anchors remain exact. Black is clean on the five changed Python files;
+passed, 14 skipped, three deselected, one warning, and one
+`test_spmm_dd_ds_dd_tiled_time` failure in 2,047.62 seconds. That failure was
+subsequently proven to be a compiler-refactor test-migration regression, not an
+inherited baseline failure; its audit and correction are recorded immediately
+below. All four generated source anchors remain exact. Black is clean on the
+five changed Python files;
 comparable Flake8 runs improve from 14 to 11 inherited findings and comparable
 mypy runs improve from 85 to 82 inherited errors, with no new diagnostic. A
 strict Sphinx build has the same 23 inherited unresolved-reference warnings as
@@ -1407,17 +1409,281 @@ pre-removal `697cb9c` and no removal-related warning. No compiler latency or
 runtime gate was rerun because no remaining production compiler path, emitted
 source, build input, or native code changed.
 
+#### Tiled SpMM regression correction (2026-07-14)
+
+Commit `a969d65` corrects the omitted repository-caller migration behind
+`test_spmm_dd_ds_dd_tiled_time`; the test remains in the ordinary non-performance
+suite and is not hidden or reclassified. A source-isolated history audit proves
+that this was not an inherited failure and was not introduced by semantic
+`LoopPlan` verification. Exact `9dcd06c` passes the full-size test, while its
+child `6d199fe` (`refactor(frontend): construct CIN assignments explicitly`) is
+the first failing revision. That commit began normalizing/detaching
+`lower_and_exec_cin` input before lowering. Exact `9b952d7` and `d7680f4`, both
+descendants of `6d199fe`, reproduce the same `CINLowerer.lower_Where`
+`IndexError` when their own `src` trees are forced onto `PYTHONPATH`; a historical
+pass attributed to `9b952d7` is therefore not reproducible under source-isolated
+execution. Editable-install resolution to a different worktree was independently
+observed as a concrete hazard during this phase.
+
+The 2024-era test embedded an execution schedule directly in mutable CIN by
+constructing `k = k_out + k_in` and relying on `TileSizeVar` side effects on
+`k_out`, `k_in`, and the workspace. Canonical normalization correctly removes
+those legacy schedule backlinks. The lowerer consequently treated
+`accum_c[k_in]` as an untiled workspace and attempted to infer its extent from
+a dense access directly indexed by `k_in`; no such access exists because the
+dense operand and result use derived `k`, producing the empty-list lookup.
+Preserving the backlinks in normalized semantic CIN would violate the canonical
+no-schedule-metadata ownership boundary, and guessing an extent in
+`lower_Where` would not restore the tile lifetime.
+
+The corrected test expresses the same decision through
+`Schedule(loop_order=("i", "j", "k"), tiles=(TileSpec("k", 4096,
+placement="child_of:i", accum="stack"),))` and calls supported production
+`matmul`. Direct comparison of legacy-manual and canonical-plan lowering shows
+the same loop nesting, bounds, stack zero initialization, CSR traversal, derived
+coordinate and ragged guards, accumulation, output copy, and OpenMP placement;
+only the scheduler-owned workspace spelling changes from `accum_c` to `wksp`.
+The exact 4,096 by 4,096 workload passes, including the original `torch.allclose`
+check and native timing observation. This is a test-only correction: no
+production source, emitted-source anchor, build input, latency result, or
+runtime archive changed.
+
+#### Semantic LoopPlan legality closure (2026-07-14)
+
+Commits `f63f8c5`, `f2e693f`, `aaa293b`, `77bad30`, `72f5711`, `138642e`,
+`b57c899`, `87014ac`, and `fd0ff9a` close the design-canonical semantic
+`LoopPlan` trust-boundary blocker. `verify_loop_plan` and
+`verify_scheduled_cin` now prove legality from detached normalized CIN, one
+fresh immutable canonical analysis result, and the exact frozen plan. Passing
+through the public `Schedule` adapter is no longer part of the correctness
+argument.
+
+The pre-implementation audit covered every `LoopPlan`, nested plan-value, and
+`ScheduledCIN` constructor; both artifact verifiers; the public
+`Schedule`/`TileSpec`/`RelayoutSpec` adapter; auto, explicit, tuned, forced,
+fallback, direct, and standalone scheduler entries; plan replay in
+`legacy_cin_adapter`; CIN-lowering and code-generation entry points; compiler
+stage S/A ownership and failure propagation; schedule/dispatch/kernel/build
+cache consumers; and direct callers that retain or replace CIN, plans,
+analyses, schedules, or prior results. It also traced the legacy checks in
+`scheduler.py`, the structural checks in `loop_plan.py`, all result and operand
+formats/mode orders, free/reduction discovery, affine and panel tiling,
+workspace insertion, operand packing, result tiling, explicit and implicit
+parallel selection, ragged placement, and the compatibility paths that lower
+already-built `ScheduledCIN` values.
+
+The audit found additional direct-artifact bypasses beyond the three recorded
+in the prior handoff. An explicit affine tile could split a sparse operand
+coordinate, and a child panel could be placed under the affine outer tile of
+its own parallel CSR row; these now reject as `sparse_affine_tile` and
+`panel_parallel_scope`. Stack accumulation and no-tile sparse-output workspace
+replay accepted non-additive reductions even though current workspace lowering
+zero-initializes and emits additive updates; these now reject as
+`stack_reduction_operator`, `workspace_reduction_operator`, or
+`auto_reduction_operator` as appropriate.
+
+Adversarial replay review also found unsupported scope/provenance shapes:
+existing-workspace CIN accepted non-auto or explicit decisions,
+multi-assignment terminal `Where` programs accepted decisions or derived
+workspace lifetimes that replay could not represent, loop-free scalar CIN
+accepted non-auto provenance, and a root reduction could insert a root
+`Where` before applying a tile. These now fail closed as
+`workspace_plan_provenance`, `multi_assignment_schedule`,
+`scalar_plan_provenance`, and `root_workspace_tiling`. Supported
+no-decision auto workspace/scalar paths remain replayable. Canonical additive
+auto reduction tiling remains accepted: its derived workspace spans the inner
+reduction tile and replay succeeds. Independent review exercised 20,880
+dense/SpMM affine combinations (884 accepted, with no replay mismatch), then
+rechecked all later counterexamples on `fd0ff9a`; no concrete semantic bypass
+or supported-scheduler false rejection remains.
+
+`CINAnalysis` gained only the missing typed immutable facts, through the
+existing zero-field frozen `AnalysisRunner`:
+
+- `AccessLayoutInfo` records stable access/tensor IDs, logical and physical
+  storage `IndexId` order, typed level kinds, physical extents, lexical scope,
+  access role, and workspace role;
+- `AssignmentInfo` records stable assignment/LHS/RHS IDs, update operation,
+  result indices, assignment-local reductions, and exact multiplicative-access
+  provenance; and
+- immutable access-layout/assignment side tables and deterministic order tuples
+  are returned with the existing analysis. No fact is attached to CIN or a
+  plan, and every verifier call recomputes its analysis.
+
+The semantic proof enforces these rules:
+
+- bound loops are exactly the disjoint free/reduction union, appear exactly
+  once in the plan, and form the single root scheduling prefix supported by the
+  transitional replay seam; loop-free CIN admits only no-decision auto
+  provenance;
+- result levels follow physical storage/mode order for dense, compressed, and
+  coordinate outputs; every physical sparse parent dominates its dependent
+  child, including non-default mode orders and nested sparse levels; singleton
+  levels fail as an explicit unsupported feature;
+- affine targets must be dense in every compatible access, explicit reduction
+  tiling is unsupported without a spanning accumulator, and auto reduction
+  tiling is accepted only with the existing additive derived-workspace
+  lifetime; stack accumulation requires the sole trailing dense free axis and
+  an additive reduction operator; sparse and auto derived workspaces likewise
+  require additive reductions;
+- sequential placement simulation admits only existing logical or already
+  derived parents, rejects self/future/out-of-scope/depth violations, and
+  accounts for the workspace-truncated common prefix and ragged inner loops;
+- explicit parallelism selects a free result-partitioning loop, never a
+  reduction or ragged inner, partitions every result write, and has private or
+  partitioned workspace ownership; invalid post-reduction derived-workspace
+  placement is rejected;
+- existing-workspace CIN supports only its no-decision auto compatibility path;
+  derived workspace, tiling, or parallel decisions on multi-assignment CIN fail
+  closed; and tile replay cannot follow workspace insertion at the loop root;
+- one canonical panel must target exactly one compatible compressed access
+  with a dense parent, use the exact dense read bound, remain outside its
+  parallel row, have legal placement/policy, and consume exactly one matching
+  panel bound;
+- relayout identifies one exact rank-two dense RHS access and physical axes,
+  one compatible CSR contraction partner, the exact multiplicative assignment,
+  pack/panel/scope/row loops, tile geometry/placement, matching dtype, result
+  axes, and explicit row ownership; and
+- heap accumulation and `ResultTile` are a bijection. The metadata must exactly
+  describe the unique dense result access, physical prefix, trailing tile,
+  additive reduction, outermost serial lifetime, and safe parallel prefix.
+  All panel, relayout, result-tile, and parallel decisions are either consumed
+  by these checks or rejected.
+
+Malformed CIN, IDs, or typed plan structure still fails as
+`VerificationError`. An illegal scheduling choice fails as `InvalidSchedule`;
+a well-formed request that current lowering cannot represent fails as
+`UnsupportedFeature`. The latter two retain `ValueError` and
+`NotImplementedError` compatibility respectively. The public scheduler maps
+its pre-existing built-in validation failures to those domain types inside the
+same S-stage timing scope, while existing domain and verification exceptions
+are re-raised unchanged.
+
+Direct forged `ScheduledCIN` values can no longer bypass the adapter. Both
+artifact entry points reject result order `k,i,j` with
+`result_storage_order`, CSR child-before-parent `j,i,k` with
+`sparse_parent_dominance`, and parallel reduction `j` with
+`parallel_reduction`. Direct tests additionally cover dense and `ds`/`do`
+sparse result ordering, `dss`/`doo` nested sparse dominance, complete loop
+classification, valid auto reduction tiling, invalid explicit reduction
+tiling, valid/invalid stack and auto accumulator lifetime, non-additive stack
+and derived-workspace rejection, ambiguous/non-prefix/multi-assignment/scalar
+scheduling scopes, existing and root workspace replay, result/workspace
+ownership, duplicate/conflicting panels, direct/heap relayout axes, and heap
+result-tile lifetime. Representative
+auto, explicit, tile-j, tile-ijk, stack, heap, direct, relayout, tuned,
+regblock, and fallback plans remain accepted.
+
+Scheduling verification failures preserve stage ownership. A public invalid
+schedule fails its active S stage; a forged carrier passed directly to lowering
+fails its active A stage. In each case all earlier completed records remain
+exactly once, the failed stage publishes no record, all lowering/codegen/native
+stages are suppressed, the owner becomes terminal, and the original domain
+exception is re-raised. Tests also prove that verification does not reread
+environment or `ContextVar` state, does not mutate caller-owned CIN, analysis,
+plan, schedule, options, or completed results, and shares no state between two
+independent plans/snapshots.
+
+Legality diagnostics and local derived facts are non-semantic: they do not
+enter plan equality/hash, option fingerprints, dispatch/kernel/build cache
+keys, generated names/source, or build requests. No analysis cache,
+preserve/invalidate protocol, dependency graph, callback or dynamic-dispatch
+registry, reflection, signature inspection, global singleton, mutable
+registry, dictionary-of-`Any` configuration, new IR, dynamic CIN metadata, or
+new carrier field was introduced. `ScheduledCIN(cin, plan)` remains the exact
+frozen two-field transitional carrier.
+
+The exact canonical 18-file Phase-2/common suite reports 619 passed in 1.55
+seconds. The final required 11-file scheduler/CIN/codegen matrix reports 295
+passed in 370.98 seconds. The final LoopPlan file collects 45 tests. The four
+source-anchor tests from the clean committed `fd0ff9a` production worktree
+report four passed in 0.60 seconds and retain all recorded byte counts and
+SHA-256 digests. After the tiled-SpMM caller correction, the final
+`pytest -q -m "not perf" tests` run reports 1,127 passed, 14 skipped, three
+deselected, and one warning in 2,088.23 seconds. It has no failure; the
+full-size tiled SpMM remains unmarked and executes in that run.
+
+Black reports all nine changed Python files unchanged. Exact `d7680f4`
+comparison improves four Flake8 diagnostics to two: the inherited
+`Scheduler._apply_schedule_legacy` C901 complexity-41 finding (line 2614 at
+baseline, 2676 at candidate) and the unrelated pre-existing
+`test_perf.py` unused local remain, while the stale tiled-test local and unused
+import are removed. Mypy improves from 22 to 21 inherited `import-untyped`
+diagnostics in four files because the migrated test has one fewer internal
+module import; the new `loop_plan_legality.py` is clean. Strict Sphinx 8.2.3
+builds at baseline and candidate both finish with exactly 23 inherited
+unresolved Python-reference warnings (18 class, two exception, two attribute,
+one function) and no new category.
+
+The earlier measured `f2e693f`, `77bad30`, and `b57c899` candidates were each
+superseded by later audit fixes or the final typed-helper extraction and are not
+used for closure. Their retained artifacts are not reclassified. The first
+`b57c899` harness launch correctly stopped before warmups or samples because the
+editable import still resolved to the main worktree; prepending that detached
+worktree's `src` fixed the preflight defect. It was not a measurement run.
+
+Exactly one five-warmup, 30-sample run of final production candidate `fd0ff9a`
+was taken from its detached clean worktree. Its artifact is
+`/tmp/scorch-phase2-loop-plan-legality-final/latency-fd0ff9a-m5.json`, SHA-256
+`ccf5caa742b753248aac0de49fe1f28dae573cb1ba57453c160ae61644c29f28`;
+metadata records exact revision `fd0ff9aac4c119a09b96a19ff0fbbcb0b55eec60`,
+empty status, and the isolated source root. The retained `141cbc5` predecessor
+was never rerun and still matches SHA-256
+`c611ff9f7be622db04b1ddc16bb13368b6b3bf38aa7bba2344922e4ccb502a05`.
+
+Predecessor -> candidate compatibility p50/p95 milliseconds and ratios are:
+
+| Case | Predecessor | Candidate | p50/p95 ratio |
+| --- | --- | --- | --- |
+| small dense | 1.417 / 1.666 | 1.505 / 1.667 | 1.062 / 1.000 |
+| reduction | 1.325 / 1.413 | 1.390 / 1.545 | 1.049 / 1.094 |
+| CSR intersection | 1.400 / 1.493 | 1.474 / 1.544 | 1.052 / 1.034 |
+| sparse union | 1.329 / 1.393 | 1.414 / 1.566 | 1.064 / 1.124 |
+
+The sole 1.10 crossing, sparse-union p95 at 1.124, is investigated rather than
+treated as automatic rejection. Sparse union has no scheduling/LoopPlan stage,
+so that tail cannot be verifier overhead. Within the scheduling stage,
+predecessor -> candidate p50/p95 milliseconds are 0.240/0.281 -> 0.253/0.282
+for small dense, 0.227/0.231 -> 0.234/0.247 for reduction, and 0.141/0.148 ->
+0.149/0.156 for CSR intersection. The observed S-stage deltas associated with
+the semantic proof are 7.5-13.0 microseconds p50 and 0.2-16.5 microseconds p95.
+This single-run attribution is not an isolated verifier-cost measurement.
+At the direct lowering trust boundary, legacy-CIN adaptation p50/p95 deltas are
+1.3/1.0 microseconds for small dense, 0.7/0.4 for reduction, and 0.6/0.9 for
+CSR intersection. Sparse union performs no plan verification yet its adapter
+stage moves by 2.6/9.3 microseconds, providing an ambient-tail control.
+CIN-lowering itself moves by 11.4-39.8 microseconds p50 and 22.2-65.3
+microseconds p95, including the no-scheduling sparse-union case. The small
+observed scheduling increment is accepted as the correctness tradeoff; the
+candidate and retained control were not repeated.
+
+The candidate latency build summaries are exactly equal to the predecessor's.
+The standalone production-input JSON was first retained at `77bad30`; the
+same payload was recomputed from the clean final `fd0ff9a` worktree as 493
+bytes including its newline. Its C++ flags, linker flags, source-derived name,
+and preamble digest are byte-identical and retain SHA-256
+`4342e155548e81f8524b69a84c6e1d1b114f71de10ad6832b49a23e39257023a`.
+Because valid emitted build inputs are unchanged, the two-machine runtime gate
+is waived. The retained M5 and Redwood archives each still contain 42/42
+correct cells and match SHA-256
+`816430d435d76dbe47277e921228d45c7387fc93d110bc37cc70f173982dfb77`
+and `31baca05f50d8f51483aa1d7d5b77f19f93550ebb95e46209d8dcbbd935dbc7e`.
+
+No `csrc`, design, generated output, native extension, benchmark result,
+plot, cache, or unrelated repository file is part of these commits. The
+all-COO `pMask1_end` declaration remains unchanged. The user-owned
+`.gitignore` modification and untracked research/benchmark material remain
+untouched and uncommitted.
+
 The canonical `CompileOptions`, manager-owned pipeline/common
-analysis-runner, and production/debug compiler-stage timing Phase-2 blockers
-are **closed**. Canonical Phase 2 is still **not formally exited**. Blocking
-Phase 2 work remains:
+analysis-runner, production/debug compiler-stage timing, and semantic
+`LoopPlan` legality-verification Phase-2 blockers are **closed**. Canonical
+Phase 2 is still **not formally exited**. The remaining blocker is the required
+all-COO no-`pMask1_end`-declaration invariant, which requires a separately
+gated emission-affecting change.
 
-1. complete semantic `LoopPlan` legality verification;
-2. satisfy the required all-COO no-`pMask1_end`-declaration invariant through a
-   separately gated, emission-affecting change.
-
-The next Phase-2 blocker is semantic `LoopPlan` legality verification.
-Do not start Phase 3 while these Phase 2 blockers remain.
+The next Phase-2 blocker is the all-COO `pMask1_end` declaration.
+Do not start Phase 3 while this Phase-2 blocker remains.
 
 ## Incremental Migration Plan
 
