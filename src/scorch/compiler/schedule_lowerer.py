@@ -7,11 +7,16 @@ position/coordinate iterators exist in LLIR.
 """
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 from . import llir
 from .identity import IndexId, SymbolId
-from .llir_traversal import LLIRRewriter, LLIRTraversalContext, LLIRWalker
+from .llir_traversal import (
+    LLIRRewriter,
+    LLIRTraversalContext,
+    LLIRValue,
+    LLIRWalker,
+)
 from .scheduler import Schedule, TileSpec, _RelayoutPlan, _ResultTilePlan
 
 LoopLocation = Tuple[List[llir.Stmt], int, llir.ForLoop]
@@ -372,7 +377,7 @@ def _rewrite_stmt_accesses(
 ) -> int:
     """Rewrite matching tensor accesses without parsing rendered C++ names."""
     if not _validated:
-        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(stmts)
+        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(cast(LLIRValue, stmts))
     count = 0
     for stmt in stmts:
         if isinstance(stmt, llir.VarInit):
@@ -491,7 +496,7 @@ def _contains_tensor_access(
                 self.found = True
 
     walker = _TensorAccessMatchWalker()
-    walker.walk(stmts)
+    walker.walk(cast(LLIRValue, stmts))
     return walker.found
 
 
