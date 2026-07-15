@@ -438,6 +438,21 @@ def _verify_tiling_capabilities(
                 ("tiles", str(position)),
                 index_id=tile.loop.index_id,
             )
+    if stack_tiles:
+        reduction_assignments = tuple(
+            assignment
+            for assignment in facts.assignments
+            if assignment.reduction_index_ids
+        )
+        if not reduction_assignments or any(
+            not _assignment_is_additive(assignment)
+            for assignment in reduction_assignments
+        ):
+            _unsupported(
+                "stack_reduction_operator",
+                "stack accumulation supports additive reductions only",
+                ("tiles",),
+            )
     return bool(stack_tiles)
 
 

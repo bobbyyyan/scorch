@@ -8,6 +8,7 @@ from scorch.compiler.cin import (
     ForAll,
     IndexStmt,
     IndexVar,
+    Operation,
     TensorAssign,
     TensorVar,
     Where,
@@ -61,6 +62,19 @@ def _build_dense_matmul() -> ForAll:
     right = TensorVar("B", fmt="dd")
     result[i, k] = left[i, j] * right[j, k]
     return ForAll(i, ForAll(j, ForAll(k, result._assignment)))
+
+
+def _build_nonadditive_dense_matmul() -> ForAll:
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    result = TensorVar("C", fmt="dd")
+    left = TensorVar("A", fmt="dd")
+    right = TensorVar("B", fmt="dd")
+    assignment = TensorAssign(
+        result[i, k],
+        left[i, j] * right[j, k],
+        op=Operation.MUL,
+    )
+    return ForAll(i, ForAll(j, ForAll(k, assignment)))
 
 
 def _build_nondefault_dense_result() -> ForAll:
@@ -801,6 +815,48 @@ def test_parallel_post_reduction_workspace_scope_is_rejected() -> None:
         forged,
         InvalidSchedule,
         "parallel_workspace_scope",
+    )
+
+
+def test_stack_accumulation_rejects_nonadditive_reductions() -> None:
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec(
+                "k",
+                4,
+                placement="child_of:i",
+                accum="stack",
+            ),
+        ),
+    )
+    with pytest.raises(UnsupportedFeature, match="stack_reduction_operator"):
+        Scheduler.apply_schedule(_build_nonadditive_dense_matmul(), schedule)
+
+    scheduled = Scheduler.apply_schedule(
+        _build_nonadditive_dense_matmul(),
+        Schedule(loop_order=("i", "j", "k")),
+    )
+    cin = scheduled.normalized_cin
+    ids = _index_ids_by_name(cin)
+    forged = replace(
+        scheduled.verified_loop_plan,
+        tiles=(
+            _affine_tile(
+                ids["k"],
+                LoopPlacement(
+                    PlacementKind.CHILD_OF,
+                    parent=LoopRef(ids["i"]),
+                ),
+                accumulation="stack",
+            ),
+        ),
+    )
+    _assert_plan_rejected(
+        cin,
+        forged,
+        UnsupportedFeature,
+        "stack_reduction_operator",
     )
 
 
