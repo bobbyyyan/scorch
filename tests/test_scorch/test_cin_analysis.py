@@ -23,6 +23,9 @@ from scorch.compiler.cin import (
     WorkspaceAccess,
 )
 from scorch.compiler.cin_analysis import (
+    AccessKind,
+    AccessLayoutInfo,
+    AssignmentInfo,
     CINAnalysis,
     FrozenMap,
     analyze_cin,
@@ -36,7 +39,7 @@ from scorch.compiler.diagnostics import VerificationError
 from scorch.compiler.identity import AccessId, IndexId, NodeId, SymbolId
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
 from scorch.compiler.scheduler import Schedule, Scheduler
-from scorch.format import LevelFormat, TensorFormat
+from scorch.format import LevelFormat, LevelType, TensorFormat
 
 
 @dataclass(frozen=True)
@@ -222,6 +225,8 @@ def test_analysis_is_pure_id_keyed_and_tracks_access_order() -> None:
     assert all(isinstance(key, IndexId) for key in analysis.index_definitions)
     assert all(isinstance(key, IndexId) for key in analysis.index_uses)
     assert all(isinstance(key, AccessId) for key in analysis.accesses)
+    assert all(isinstance(key, AccessId) for key in analysis.access_layouts)
+    assert all(isinstance(key, NodeId) for key in analysis.assignments)
     assert all(isinstance(key, SymbolId) for key in analysis.tensor_accesses)
     assert analysis.accesses[nodes.left_access.access_id].tensor_id == (
         nodes.left.symbol_id
@@ -238,6 +243,40 @@ def test_analysis_is_pure_id_keyed_and_tracks_access_order() -> None:
         nodes.left_access.access_id,
         nodes.right_access.access_id,
     )
+    left_layout = analysis.access_layouts[nodes.left_access.access_id]
+    assert isinstance(left_layout, AccessLayoutInfo)
+    assert left_layout.access_id == nodes.left_access.access_id
+    assert left_layout.tensor_id == nodes.left.symbol_id
+    assert left_layout.logical_index_ids == (
+        nodes.i.index_id,
+        nodes.k.index_id,
+    )
+    assert left_layout.storage_index_ids == (
+        nodes.i.index_id,
+        nodes.k.index_id,
+    )
+    assert left_layout.level_types == (LevelType.DENSE, LevelType.DENSE)
+    assert left_layout.physical_extents == (None, None)
+    assert left_layout.scope_id == assignment.node_id
+    assert left_layout.kind == AccessKind.READ
+    assert not left_layout.is_workspace
+
+    assignment_info = analysis.assignments[assignment.node_id]
+    assert isinstance(assignment_info, AssignmentInfo)
+    assert assignment_info.assignment_id == assignment.node_id
+    assert assignment_info.lhs_access_id == nodes.result_access.access_id
+    assert assignment_info.rhs_access_ids == (
+        nodes.left_access.access_id,
+        nodes.right_access.access_id,
+    )
+    assert assignment_info.update_op == Operation.ADD
+    assert assignment_info.lhs_index_ids == (nodes.i.index_id,)
+    assert assignment_info.reduction_index_ids == (nodes.k.index_id,)
+    assert assignment_info.multiplicative_access_ids == (
+        nodes.left_access.access_id,
+        nodes.right_access.access_id,
+    )
+    assert analysis.assignment_order == (assignment.node_id,)
 
     repeated = analyze_cin(program)
     assert repeated == analysis
@@ -256,11 +295,14 @@ def test_analysis_result_is_deeply_immutable() -> None:
         "index_definitions",
         "index_uses",
         "accesses",
+        "access_layouts",
+        "assignments",
         "tensor_accesses",
     )
     tuple_fields = (
         "access_occurrences",
         "access_order",
+        "assignment_order",
         "free_index_ids",
         "reduction_index_ids",
         "diagnostics",
@@ -279,6 +321,33 @@ def test_analysis_result_is_deeply_immutable() -> None:
         mutable_analysis.root_id = NodeId(-1)
     with pytest.raises(TypeError):
         mutable_parents[NodeId(-1)] = None
+
+
+def test_analysis_tracks_typed_nondefault_storage_layout() -> None:
+    i = IndexVar("i")
+    k = IndexVar("k")
+    result = TensorVar("C", shape=(5,), fmt="d")
+    source = TensorVar(
+        "A",
+        shape=(7, 5),
+        fmt="ds",
+        mode_order=[1, 0],
+    )
+    result_access = result[i]
+    source_access = source[i, k]
+    assignment = TensorAssign(result_access, source_access, op=Operation.ADD)
+
+    analysis = verify_cin(ForAll(i, ForAll(k, assignment)))
+
+    layout = analysis.access_layouts[source_access.access_id]
+    assert layout.logical_index_ids == (i.index_id, k.index_id)
+    assert layout.storage_index_ids == (k.index_id, i.index_id)
+    assert layout.level_types == (LevelType.DENSE, LevelType.COMPRESSED)
+    assert layout.physical_extents == (7, 5)
+    assert not layout.is_workspace
+    assert analysis.assignments[assignment.node_id].multiplicative_access_ids == (
+        source_access.access_id,
+    )
 
 
 def test_common_analysis_runner_is_frozen_stateless_and_typed() -> None:
@@ -447,6 +516,19 @@ def test_workspace_normalization_is_idempotent_and_strips_backreferences() -> No
     assert all(not index_var.tensor_accesses for index_var in first.index_vars)
     assert all(
         not workspace_var.workspace_accesses for workspace_var in first.get_workspaces()
+    )
+    analysis = analyze_cin(first)
+    workspace_ids = tuple(
+        symbol_id
+        for symbol_id, definition in analysis.symbol_definitions.items()
+        if definition.is_workspace
+    )
+    assert len(workspace_ids) == 1
+    workspace_access_ids = analysis.tensor_accesses[workspace_ids[0]]
+    assert workspace_access_ids
+    assert all(
+        analysis.access_layouts[access_id].is_workspace
+        for access_id in workspace_access_ids
     )
 
 

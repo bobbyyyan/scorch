@@ -56,13 +56,25 @@ from scorch.compiler.compile_options import (  # type: ignore[import-untyped]
     CompileOptions,
     canonical_cache_digest,
 )
-from scorch.compiler.diagnostics import VerificationError  # type: ignore[import-untyped]
+from scorch.compiler.diagnostics import (  # type: ignore[import-untyped]
+    InvalidSchedule,
+    VerificationError,
+)
+from scorch.compiler.loop_plan import (  # type: ignore[import-untyped]
+    LoopRef,
+    ScheduledCIN,
+    verify_scheduled_cin,
+)
 from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     DEBUG_LLIR_PASS_OPTIONS,
     LLIRPassOptions,
     PRODUCTION_LLIR_PASS_OPTIONS,
 )
-from scorch.compiler.scheduler import Schedule, Scheduler  # type: ignore[import-untyped]
+from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
+    Schedule,
+    Scheduler,
+    TileSpec,
+)
 from scorch.format import parse_format  # type: ignore[import-untyped]
 from scorch.layout import TensorSpec  # type: ignore[import-untyped]
 from scorch.stensor import STensor  # type: ignore[import-untyped]
@@ -165,6 +177,15 @@ def _build_spmm_cin() -> ForAll:
 
 def _stage_values(context: CompilationContext) -> list[str]:
     return [record.stage_id.value for record in context.stage_run_records]
+
+
+def _exact_stage_record_values(
+    context: CompilationContext,
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        tuple(getattr(record, field.name) for field in fields(type(record)))
+        for record in context.stage_run_records
+    )
 
 
 def _isolate_compiler_caches(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1236,6 +1257,402 @@ def _raise_same(error: BaseException) -> Callable[..., object]:
         raise error
 
     return failing
+
+
+def _forbid_later_work(calls: list[str], name: str) -> Callable[..., object]:
+    def forbidden(*args: object, **kwargs: object) -> object:
+        calls.append(name)
+        raise AssertionError(f"{name} ran after schedule verification failed")
+
+    return forbidden
+
+
+def _forbid_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[str],
+    boundaries: tuple[tuple[object, str, str], ...],
+) -> None:
+    for owner, attribute, name in boundaries:
+        monkeypatch.setattr(
+            owner,
+            attribute,
+            _forbid_later_work(calls, name),
+        )
+
+
+def _legality_identity(
+    scheduled: ScheduledCIN,
+    schedule: Schedule,
+    options: CompileOptions,
+    specs: Tuple[TensorSpec, TensorSpec],
+) -> tuple[object, ...]:
+    plan = scheduled.verified_loop_plan
+    return (
+        schedule.cache_key,
+        hash(schedule),
+        hash(plan),
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+        canonical_cache_digest(options.cache_key),
+        ops._einsum_cache_key(
+            "ik,kj->ij",
+            specs,
+            "dd",
+            None,
+            schedule,
+            options,
+        ),
+        ops._codegen_kernel_cache_key(
+            scheduled,
+            None,
+            schedule,
+            options,
+        ),
+    )
+
+
+def test_public_invalid_schedule_fails_its_stage_and_suppresses_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = Schedule(
+        loop_order=("i", "k", "j"),
+        parallel_loop="k",
+        tag="invalid-parallel-reduction",
+    )
+    schedule_snapshot = replace(schedule)
+    schedule_cache_key = schedule.cache_key
+    options = _default_options(requested_schedule=schedule)
+    options_fingerprint = options.cache_fingerprint
+    context = CompilationContext(options)
+    later_calls: list[str] = []
+
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (CINLowerer, "_lower_owned_IndexStmt", "cin_lowering"),
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_codegen_kernel_cache_key", "codegen_cache_key"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(InvalidSchedule) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert type(failure.value) is InvalidSchedule
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE[:3]
+    assert [record.sequence_index for record in context.stage_run_records] == [
+        0,
+        1,
+        2,
+    ]
+    assert all(
+        _stage_values(context).count(stage) == 1
+        for stage in _EXPLICIT_STAGE_SEQUENCE[:3]
+    )
+    assert context.llir_pass_run_records == ()
+    assert later_calls == []
+    assert schedule == schedule_snapshot
+    assert schedule.cache_key == schedule_cache_key
+    assert context.compile_options is options
+    assert options.cache_fingerprint == options_fingerprint
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.LEGACY_CIN_ADAPTATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+    assert CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value in str(
+        suppressed.value
+    )
+
+
+def test_forged_scheduled_cin_fails_adapter_with_exact_prior_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = Schedule(loop_order=("i", "k", "j"), tag="direct-valid")
+    options = _default_options(requested_schedule=schedule)
+    context = CompilationContext(options)
+    source = _build_spmm_cin()
+    source_snapshot = canonical_cin_dump(source)
+    scheduled = Scheduler.apply_schedule(
+        source,
+        schedule,
+        compile_options=options,
+        compilation_context=context,
+    )
+    plan = scheduled.verified_loop_plan
+    plan_snapshot = replace(plan)
+    plan_hash = hash(plan)
+    normalized_snapshot = canonical_cin_dump(scheduled.normalized_cin)
+    prior_records = context.stage_run_records
+    prior_record_values = _exact_stage_record_values(context)
+    assert _stage_values(context) == [
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION.value,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION.value,
+    ]
+
+    analysis = cin_analysis.analyze_cin(scheduled.normalized_cin)
+    assert len(analysis.reduction_index_ids) == 1
+    forged_plan = replace(
+        plan,
+        parallel_loop=LoopRef(analysis.reduction_index_ids[0]),
+    )
+    forged = ScheduledCIN(scheduled.normalized_cin, forged_plan)
+    with pytest.raises(InvalidSchedule) as direct_failure:
+        verify_scheduled_cin(forged)
+    assert direct_failure.value.diagnostics[0].code == "parallel_reduction"
+
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (CINLowerer, "_lower_prepared_index_stmt", "cin_lowering"),
+            (ResultTensorAssembler, "emit_final_assembly", "result_abi"),
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+
+    lowerer = CINLowerer(
+        compile_options=options,
+        compilation_context=context,
+    )
+    with pytest.raises(InvalidSchedule) as timed_failure:
+        lowered = lowerer._lower_owned_IndexStmt(forged)
+        cpp = LLIRLowerer(compile_options=options).lower_llir(lowered)
+        ops._prepare_generated_kernel_build(  # pragma: no cover
+            options.build.preamble_source,
+            cpp,
+            options,
+            context,
+        )
+
+    assert type(timed_failure.value) is type(direct_failure.value)
+    assert timed_failure.value.args == direct_failure.value.args
+    assert timed_failure.value.diagnostics == direct_failure.value.diagnostics
+    assert timed_failure.value.__cause__ is direct_failure.value.__cause__ is None
+    assert context.stage_run_records == prior_records
+    assert _exact_stage_record_values(context) == prior_record_values
+    assert [record.sequence_index for record in context.stage_run_records] == [0, 1]
+    assert context.llir_pass_run_records == ()
+    assert later_calls == []
+    assert canonical_cin_dump(source) == source_snapshot
+    assert canonical_cin_dump(scheduled.normalized_cin) == normalized_snapshot
+    assert scheduled.verified_loop_plan is plan
+    assert plan == plan_snapshot
+    assert hash(plan) == plan_hash
+    assert schedule is options.requested_schedule
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.CIN_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+    assert CompilerStageId.LEGACY_CIN_ADAPTATION.value in str(suppressed.value)
+
+
+def test_artifact_verification_does_not_read_environment_or_contextvars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = Schedule(loop_order=("i", "k", "j"), tag="exact-options")
+    options = _default_options(requested_schedule=schedule)
+    scheduled = Scheduler.apply_schedule(
+        _build_spmm_cin(),
+        schedule,
+        compile_options=options,
+    )
+    analysis = cin_analysis.analyze_cin(scheduled.normalized_cin)
+    forged = ScheduledCIN(
+        scheduled.normalized_cin,
+        replace(
+            scheduled.verified_loop_plan,
+            parallel_loop=LoopRef(analysis.reduction_index_ids[0]),
+        ),
+    )
+    snapshotted_environment_keys = {
+        "SCORCH_REGBLOCK",
+        "SCORCH_REGBLOCK_DUAL",
+        "SCORCH_VERIFY_CIN",
+    }
+    environment_type = type(os.environ)
+    original_environment_get = environment_type.get
+
+    def forbidden_environment_get(
+        self: object, key: str, default: object = None
+    ) -> object:
+        if key in snapshotted_environment_keys:
+            raise AssertionError(f"artifact verification read environment key {key}")
+        return original_environment_get(  # type: ignore[arg-type, call-overload]
+            self, key, default
+        )
+
+    def forbidden_snapshot(*args: object, **kwargs: object) -> CompileOptions:
+        raise AssertionError("artifact verification resnapshotted process state")
+
+    class ForbiddenContextVar:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def get(self, *args: object) -> object:
+            raise AssertionError(f"artifact verification read {self._name} ContextVar")
+
+    monkeypatch.setenv("SCORCH_VERIFY_CIN", "1")
+    monkeypatch.setenv("SCORCH_REGBLOCK", "1")
+    monkeypatch.setenv("SCORCH_REGBLOCK_DUAL", "1")
+    with (
+        cin_analysis.full_cin_verification(True),
+        scheduler_module.regblock_force(True),
+        scheduler_module.schedule_force(
+            Schedule(loop_order=("k", "i", "j"), tag="ignored-context")
+        ),
+    ):
+        with monkeypatch.context() as verifier_patch:
+            verifier_patch.setattr(
+                CompileOptions,
+                "from_environment",
+                classmethod(forbidden_snapshot),
+            )
+            verifier_patch.setattr(
+                environment_type,
+                "get",
+                forbidden_environment_get,
+            )
+            verifier_patch.setattr(
+                cin_analysis,
+                "_VERIFY_CIN_CONTEXT",
+                ForbiddenContextVar("verify_cin"),
+            )
+            verifier_patch.setattr(
+                scheduler_module,
+                "_REGBLOCK_FORCE",
+                ForbiddenContextVar("regblock"),
+            )
+            verifier_patch.setattr(
+                scheduler_module,
+                "_SCHEDULE_FORCE",
+                ForbiddenContextVar("schedule"),
+            )
+
+            assert verify_scheduled_cin(scheduled) is scheduled
+            lowerer = CINLowerer(compile_options=options)
+            assert lowerer.compile_options is options
+            with pytest.raises(InvalidSchedule):
+                lowerer._prepare_scheduled_cin(
+                    forged,
+                    recurse=False,
+                    ownership_transferred=False,
+                )
+
+
+def test_legality_verification_is_nonsemantic_and_plans_are_independent() -> None:
+    source = _build_spmm_cin()
+    source_snapshot = canonical_cin_dump(source)
+    first_schedule = Schedule(
+        loop_order=("i", "k", "j"),
+        tiles=(TileSpec("j", 4, accum="direct", unroll=False),),
+        tag="independent-width-four",
+    )
+    second_schedule = replace(
+        first_schedule,
+        tiles=(TileSpec("j", 8, accum="direct", unroll=False),),
+        tag="independent-width-eight",
+    )
+    first_options = _default_options(requested_schedule=first_schedule)
+    second_options = _default_options(requested_schedule=second_schedule)
+    first_context = CompilationContext(first_options)
+    second_context = CompilationContext(second_options)
+    first = Scheduler.apply_schedule(
+        source,
+        first_schedule,
+        compile_options=first_options,
+        compilation_context=first_context,
+    )
+    second = Scheduler.apply_schedule(
+        source,
+        second_schedule,
+        compile_options=second_options,
+        compilation_context=second_context,
+    )
+    first_plan = first.verified_loop_plan
+    second_plan = second.verified_loop_plan
+    first_plan_snapshot = replace(first_plan)
+    second_plan_snapshot = replace(second_plan)
+    first_records = first_context.stage_run_records
+    second_records = second_context.stage_run_records
+    first_record_values = _exact_stage_record_values(first_context)
+    second_record_values = _exact_stage_record_values(second_context)
+    specs = _spmm_specs()
+
+    first_identity = _legality_identity(
+        first,
+        first_schedule,
+        first_options,
+        specs,
+    )
+    second_identity = _legality_identity(
+        second,
+        second_schedule,
+        second_options,
+        specs,
+    )
+
+    assert verify_scheduled_cin(first) is first
+    analysis = cin_analysis.analyze_cin(first.normalized_cin)
+    forged = ScheduledCIN(
+        first.normalized_cin,
+        replace(
+            first_plan,
+            parallel_loop=LoopRef(analysis.reduction_index_ids[0]),
+        ),
+    )
+    with pytest.raises(InvalidSchedule):
+        verify_scheduled_cin(forged)
+    assert verify_scheduled_cin(second) is second
+
+    assert canonical_cin_dump(source) == source_snapshot
+    assert first.verified_loop_plan is first_plan
+    assert second.verified_loop_plan is second_plan
+    assert first_plan == first_plan_snapshot
+    assert second_plan == second_plan_snapshot
+    assert first_plan != second_plan
+    assert first_plan is not second_plan
+    assert first_plan.tiles is not second_plan.tiles
+    assert first_plan.tiles[0] is not second_plan.tiles[0]
+    assert first_context.compile_options is first_options
+    assert second_context.compile_options is second_options
+    assert first_context.stage_run_records == first_records
+    assert second_context.stage_run_records == second_records
+    assert _exact_stage_record_values(first_context) == first_record_values
+    assert _exact_stage_record_values(second_context) == second_record_values
+
+    assert first_identity == _legality_identity(
+        first,
+        first_schedule,
+        first_options,
+        specs,
+    )
+    assert second_identity == _legality_identity(
+        second,
+        second_schedule,
+        second_options,
+        specs,
+    )
 
 
 @pytest.mark.parametrize(
