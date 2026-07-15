@@ -248,12 +248,11 @@ digits (`kernel_<hash>`). Folding those two extra strings into the hash matters:
 
 :::{warning}
 **Stale caches can mask codegen edits.** Because compiled kernels are memoized
-aggressively — the in-process module caches in `ops.py` (keyed by `(format_a,
-format_b, format_output)`) *plus* the persistent on-disk `.so` — a change you make
-to codegen or to a `src/scorch/csrc/` template may not take effect until the old
-cached kernel is removed. If you edit codegen and your change appears to do
-nothing, clear the torch extensions build directory (`TORCH_EXTENSIONS_DIR`)
-before re-running.
+aggressively — the typed operation and generated-kernel caches in `ops.py` plus
+the persistent on-disk `.so` cache — a change you make to codegen or to a
+`src/scorch/csrc/` template may not take effect until the old cached kernel is
+removed. If you edit codegen and your change appears to do nothing, clear the
+torch extensions build directory (`TORCH_EXTENSIONS_DIR`) before re-running.
 
 The test suite isolates this automatically: a session fixture in
 `tests/conftest.py` points `TORCH_EXTENSIONS_DIR` at a fresh temp directory, so a

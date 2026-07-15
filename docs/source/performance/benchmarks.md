@@ -104,7 +104,7 @@ datasets, framework dependencies, and any per-framework setup gotchas.
 | `bench_spmv.py` | SpMV `A_sparse @ v_dense`. | `python bench/bench_spmv.py` |
 | `bench_spmspm.py` | SpMSpM `A_sparse @ A_sparseᵀ` (CSR, OpenMP-parallel). | `python bench/bench_spmspm.py` |
 | `bench_sddmm.py` | SDDMM `S ⊙ (A_dense @ B_dense)`. | `python bench/bench_sddmm.py` |
-| `bench_spmm_variants.py` | All SpMM kernel variants (tiled / untiled / direct) + PyTorch MKL across SuiteSparse; each matrix in a subprocess for crash isolation. | `python bench/bench_spmm_variants.py` |
+| `bench_spmm_variants.py` | Native SpMM kernel variants (tiled / untiled / direct) + PyTorch MKL across SuiteSparse; each matrix in a subprocess for crash isolation. | `python bench/bench_spmm_variants.py` |
 
 ### Tiling & autotune studies
 

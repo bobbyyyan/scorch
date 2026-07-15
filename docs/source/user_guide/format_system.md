@@ -226,7 +226,7 @@ out into the requested format; defaults to a compressed form when `fmt` is
 ## Requesting output formats in ops
 
 The generic ops let you pin the format of the result. `matmul` honors a `format=`
-or `output_format=` keyword; `spmv` and `matmul_wksp` take `output_format=`
+or `output_format=` keyword; the internal `spmv` boundary takes `output_format=`
 directly. Anything that is not already a `TensorFormat` is run through
 `parse_format`, so a string (`"ds"`), a list (`["dense", "compressed"]`), or a
 `TensorFormat` all work.

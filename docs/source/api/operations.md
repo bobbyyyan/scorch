@@ -11,8 +11,6 @@ explanations and worked examples.
 
 ```{eval-rst}
 .. autofunction:: scorch.matmul
-
-.. autofunction:: scorch.matmul_wksp
 ```
 
 ## Einstein summation

@@ -725,7 +725,7 @@ header reader explicitly in the first column or exclusion text.
 | `SCORCH_SANITIZER_LOG` | Sanitizer-test log location only |
 | `SCORCH_SANITIZER_RUN` | Sanitizer-test opt-in only |
 | `SCORCH_CHECKOUT` | Packaging smoke-test checkout location only |
-| Existing `_kernel_cache`, `_einsum_dispatch_cache`, `matmul_wksp._module_cache`, and `utils._so_cache` | Existing execution/build memoization, not configuration; semantic/build keys now include canonical option identity, and no new cache was added |
+| Existing `_kernel_cache`, `_einsum_dispatch_cache`, and `utils._so_cache` | Existing execution/build memoization, not configuration; semantic/build keys now include canonical option identity, and no new cache was added |
 | `time.time`, `time.perf_counter`, and `perf_counter_ns` | Observation/instrumentation only; run durations are non-semantic |
 | Prebuilt dispatch specifications, `_ACT_CODES`, and `_EMPTY_MODE_INDICES` (`ops.py`) | Already-built native symbol routing/argument encoding and a fixed empty native-call argument |
 | `_UNRESOLVED_SCHEDULE` (`ops.py`) | Private identity sentinel used only while assembling a boundary snapshot; it is not policy state |
@@ -818,7 +818,7 @@ the typed result is immutable and cheap to recompute, and caching mutable legacy
 IR would require the explicitly prohibited fingerprint cache plus
 preserve/invalidate protocol. Existing caches remain unchanged: `CompileOptions`
 semantic/build/cache keys, `Schedule.cache_key`, operation dispatch and kernel
-caches, matmul module caches, and `utils._so_cache` cache configuration or build
+caches and `utils._so_cache` cache configuration or build
 artifacts rather than analysis results.
 
 Ownership remains caller-safe. Normalization detaches CIN before private legacy
@@ -1199,7 +1199,7 @@ The audited production boundaries and orchestration are:
 | `einsum` auto path | F; optional full nested relayout compilation(s); prealignment S; N/S for each real scheduled arm; A/L(R) for each real lowered arm; optional L stitch; C; K. A simple non-dual path is F,S,N,S,A,L,R,C,K. |
 | `einsum` explicit schedule | F,S,N,S,A,L,R,SL,C,K, with the same genuine nested relayout behavior. The original topological relayout and later selected-order relayout both remain. |
 | `lower_and_exec_cin` | N; F for runtime-binding planning; optional full nested relayout compilation(s); F for applying/validating the binding; A,L,R,C,K. The caller's CIN and runtime tensors remain detached/owned as before. |
-| `spmv`, `matmul_wksp` miss, `STensor.__add__`, compiled `to_dense`, `to_sparse`, and `change_mode_order` | F,N,A,L,R,C,K. Nested prerequisite conversions or relayouts run the same complete manual sequence on the same owner. |
+| `spmv`, `STensor.__add__`, compiled `to_dense`, `to_sparse`, and `change_mode_order` | F,N,A,L,R,C,K. Nested prerequisite conversions or relayouts run the same complete manual sequence on the same owner. |
 | `matmul` and wrappers | Dense/prebuilt routes execute no generated compiler stage; generated routes delegate to `einsum` or `spmv` with the same snapshot/context. Dense-to-sparse result conversion, sparse `to_torch`, unsupported sparse-linear fallbacks, and eager-equivalent compile fallbacks reach the existing generated conversion/matmul boundaries. |
 | `precompile_kernels` | Five independent compile-only public `einsum` compilations, each with its own snapshot and owner. |
 
@@ -1207,11 +1207,15 @@ Prebuilt SDDMM/matmul, dense delegates, rank-one sparse conversion, dense
 to-dense, mode-order no-ops, core-format fast relayout, and special kernels do
 not fabricate records. A dispatch-cache hit cancels the speculative outer F
 and records only any genuine input/output relayout compilation. A
-`matmul_wksp` module-cache hit records no main compiler work, although raw
-tensor prerequisite conversions still record their real work. A single-path
-kernel-cache hit retains the frontend/normalization/scheduling work that
-actually reruns and skips A/L/C/K. `_so_cache` and on-disk extension hits occur
-after K and therefore retain all compiler records.
+single-path kernel-cache hit retains the frontend/normalization/scheduling work
+that actually reruns and skips A/L/C/K. `_so_cache` and on-disk extension hits
+occur after K and therefore retain all compiler records.
+
+At the time of the timing audit, the subsequently removed prototype
+`matmul_wksp` boundary also recorded F,N,A,L,R,C,K on a private module-cache
+miss and no main compiler work on a hit. Its later removal deleted that public
+boundary and private cache without changing any stage identity, timing rule, or
+remaining production path.
 
 K includes source-derived kernel naming and assembly plus validation of the
 exact frozen `_PreparedJITBuild(request, cache_key, so_path)` carrier. The
@@ -1371,6 +1375,37 @@ Flake8-clean.
 No `csrc` or design file, benchmark output, generated extension, plot, cache,
 or unrelated repository file changed. The user-owned `.gitignore` modification
 and untracked research/benchmark material remain untouched and uncommitted.
+
+#### Legacy workspace-matmul prototype removal (2026-07-14)
+
+Commit `a37371c` removes the 2023 research-prototype `matmul_wksp` boundary,
+its top-level export, and its function-owned module cache. No production source
+called that boundary: tuned `matmul` already delegates compiler misses to
+`einsum`, while workspace insertion and accumulation policy belong to the
+scheduler. The removal therefore deletes duplicate public orchestration rather
+than a compiler capability.
+
+Workspace CIN (`Workspace`/`Where`), scheduler insertion, legacy adaptation,
+CIN/LLIR lowering, compressed-output passes, generated C++, and native
+workspace types remain unchanged. Prototype-only runtime/timing tests and the
+obsolete compiler lane in the legacy native-variant benchmark were deleted.
+Useful sparse-output and nine-pair input-format matrices now execute through
+the supported production `einsum` path; direct scheduler, CIN, codegen, and
+compressed-Where tests continue to force and inspect exact workspace shapes.
+The public API test proves that the old name is absent from the package,
+`__all__`, and `scorch.ops`.
+
+Focused API/timing/scheduler/direct-workspace verification reports 88 passed in
+192.28 seconds. The full `pytest -q -m "not perf" tests` command reports 1,089
+passed, 14 skipped, three deselected, one warning, and only the inherited
+`test_spmm_dd_ds_dd_tiled_time` failure in 2,047.62 seconds. All four generated
+source anchors remain exact. Black is clean on the five changed Python files;
+comparable Flake8 runs improve from 14 to 11 inherited findings and comparable
+mypy runs improve from 85 to 82 inherited errors, with no new diagnostic. A
+strict Sphinx build has the same 23 inherited unresolved-reference warnings as
+pre-removal `697cb9c` and no removal-related warning. No compiler latency or
+runtime gate was rerun because no remaining production compiler path, emitted
+source, build input, or native code changed.
 
 The canonical `CompileOptions`, manager-owned pipeline/common
 analysis-runner, and production/debug compiler-stage timing Phase-2 blockers

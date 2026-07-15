@@ -238,11 +238,11 @@ After editing anything under `src/scorch/csrc/`, rebuild the extension with
 `pip install -e . --no-build-isolation`. Native headers are listed as extension
 dependencies in `pyproject.toml`, so header-only changes trigger recompilation
 without touching `ops.cpp`. Because
-compiled JIT kernels are memoized aggressively — in-process module caches keyed by
-format triple *plus* a persistent `.so` cache — clear the torch extensions build
-dir when a codegen or template change seems to have no effect. The test suite
-sidesteps this by isolating `TORCH_EXTENSIONS_DIR` to a tmp dir per session
-(`tests/conftest.py`).
+compiled JIT kernels are memoized aggressively — in-process operation and
+generated-kernel caches keyed by canonical identity *plus* a persistent `.so`
+cache — clear the torch extensions build dir when a codegen or template change
+seems to have no effect. The test suite sidesteps this by isolating
+`TORCH_EXTENSIONS_DIR` to a tmp dir per session (`tests/conftest.py`).
 :::
 
 ## Supporting directories

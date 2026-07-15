@@ -123,9 +123,9 @@ Operations that don't hit a prebuilt kernel go through the compiler pipeline
 runtime with `torch.utils.cpp_extension.load_inline`. To avoid recompiling on
 every call, results are memoized at two levels:
 
-Module cache (in-memory)
-: Keyed by the format triple `(format_a, format_b, format_output)` in `ops.py`.
-  Lives only for the process.
+Operation and kernel caches (in-memory)
+: Keyed by canonical operation, layout, dtype, output-format, schedule, and build
+  identity in `ops.py`. They live only for the process.
 
 On-disk `.so` cache
 : torch writes the compiled shared objects under `TORCH_EXTENSIONS_DIR` (default
