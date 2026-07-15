@@ -708,6 +708,64 @@ def test_incomplete_free_reduction_classification_is_a_verification_error() -> N
     )
 
 
+def test_direct_artifacts_require_one_unambiguous_root_scheduling_scope() -> None:
+    shared = IndexVar("i")
+    first_result = TensorVar("C", fmt="d")
+    first_source = TensorVar("A", fmt="d")
+    second_result = TensorVar("D", fmt="d")
+    second_source = TensorVar("B", fmt="d")
+    ambiguous = normalize_cin(
+        Where(
+            producer=ForAll(
+                shared,
+                TensorAssign(first_result[shared], first_source[shared]),
+            ),
+            consumer=ForAll(
+                shared,
+                TensorAssign(second_result[shared], second_source[shared]),
+            ),
+        )
+    )
+    ambiguous_ids = _index_ids_by_name(ambiguous)
+    _assert_plan_rejected(
+        ambiguous,
+        LoopPlan(
+            loop_order=(ambiguous_ids["i"],),
+            provenance="explicit",
+        ),
+        UnsupportedFeature,
+        "ambiguous_scheduling_scope",
+    )
+
+    i, k = IndexVar("i"), IndexVar("k")
+    left_result = TensorVar("Left", fmt="d")
+    left_source = TensorVar("LeftSource", fmt="d")
+    right_result = TensorVar("Right", fmt="d")
+    right_source = TensorVar("RightSource", fmt="d")
+    non_prefix = normalize_cin(
+        Where(
+            producer=ForAll(
+                i,
+                TensorAssign(left_result[i], left_source[i]),
+            ),
+            consumer=ForAll(
+                k,
+                TensorAssign(right_result[k], right_source[k]),
+            ),
+        )
+    )
+    non_prefix_ids = _index_ids_by_name(non_prefix)
+    _assert_plan_rejected(
+        non_prefix,
+        LoopPlan(
+            loop_order=(non_prefix_ids["i"], non_prefix_ids["k"]),
+            provenance="explicit",
+        ),
+        UnsupportedFeature,
+        "non_prefix_scheduling_scope",
+    )
+
+
 def test_reduction_tiles_and_accumulator_lifetimes_are_artifact_verified() -> None:
     scheduled = Scheduler.apply_schedule(
         _build_dense_matmul(), Schedule(loop_order=("i", "j", "k"))
