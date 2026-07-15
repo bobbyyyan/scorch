@@ -2437,6 +2437,270 @@ the 28 characterized subscript strings, three raw compound indexed stores, and
 the independently gated member/call/allocation/statement families. Phase 3
 remains in progress. Phase 3.5 and LoopIR have not begun.
 
+### Phase-3 compact-result copy-read slice complete (2026-07-15)
+
+The third Phase-3 slice starts exactly at documentation commit `5339f56` and is
+implemented by `81850b3` with tests in `6c35b03`. It migrates only the
+schedule-local read from a compact heap-result tile during copy-out. The branch
+is `refactor/compiler-ir-phase3-compact-result-read`. No earlier Phase-2,
+structured-read, or structured-store seam was reopened.
+
+#### Complete pre-implementation audit and seam selection
+
+The locked starting budget contained 371 `llir.Var` constructors, 56 direct
+expression strings, 315 other constructor arguments (including nine known
+indirect sinks/clones), ten generic string-rewrite sites, and 52 `RawStmt`
+calls / 51 producers. The 56 direct expressions were exactly 28 subscripts, 13
+calls, 7 members, 3 initializers, 3 qualified names, 1 ternary, and 1
+arithmetic expression. No direct indexed `Assign` target remained opaque.
+
+All 28 subscript constructors were audited before selection:
+
+| Classification | Count | Exact inherited sites |
+|---|---:|---|
+| logical tensor values | 2 | `cin_lowerer.py:736,747`, post-op `<tensor>_val[index]` reads |
+| physical positions | 4 | `iterator.py:281,292,306,316`, sparse `*_pos[...]` bounds/positions |
+| coordinates | 6 | `iterator.py:300,326`; `cin_lowerer.py:3896,3899,3957,4010`, sparse/all-COO `*_crd[...]` reads |
+| shapes/extents | 2 | `cin_lowerer.py:784,2611`, `<tensor>_shape[level]` and `result_shape[i]` |
+| workspaces | 6 | `cin_lowerer.py:900,1482,1535,1939,2030,2107`, metadata-free value fallback, `it.first[i]`, and dense/tiled workspace reads |
+| mode-index containers | 4 | `cin_lowerer.py:798,812,825,838`, nested `mode_indices[level][slot]` with and without `data_ptr<int>()` |
+| schedule/group compatibility | 3 | `cin_lowerer.py:3947,3951`, all-COO `_group_starts[...]`; `schedule_lowerer.py:811`, compact-result copy read |
+| declaration | 1 | `cin_lowerer.py:1254`, fixed workspace `wksp[tile_size]` |
+
+This is 27 reads plus the one declaration. The six workspace-family reads are
+deliberately counted by workspace ownership, not as ordinary sparse tensor
+value/coordinate-array reads. The remaining call/member audit was also
+complete:
+
+- the 13 calls were six tensor/value `data_ptr<T>()` spellings
+  (`cin_lowerer.py:160,218,855,1617,1656,2827`), five `std::move(...)`
+  spellings (`:428,453,476,1597,1634`), and two schedule-storage `.data()`
+  spellings (`schedule_lowerer.py:869,1151`);
+- the seven members were the two result-storage lvalues
+  (`cin_lowerer.py:492,506`), the input `storage.value` compatibility read
+  (`:868`), and four workspace-pair reads (`:1504,1554,2093,2120`);
+- the rest were three initializer spellings (`cin_lowerer.py:141,200,496`),
+  three `torch::kInt` names (`:432,457,1601`), the all-COO ternary at `:3873`,
+  and the all-COO arithmetic spelling at `:4037`.
+
+The physical iterator family is shared by sparse-prefetch, compressed-Where,
+nested sparse, panel, and all-COO consumers. The mode-index family requires a
+postfix member/call hierarchy. Workspace pair reads require member structure,
+and post-op, shape, and all-COO reads have different provenance and rewrite
+ownership. Migrating any of those together would conflate independently gated
+families. The single remaining schedule read was instead a complete producer
+family: one scope-local physical buffer, one already-typed pointer, one affine
+index, and one existing precedence-aware consumer.
+
+#### Minimum coherent representation and production trace
+
+`_apply_heap_result_tile` already derives the result pointer type from the
+generated result-value initialization, accepts only `float*` or `double*`,
+creates the compact storage and its structured write targets, and owns the
+three typed `INT64` index components. The former opaque RHS
+
+`tiled_C[C_tile_copy * kTile_k + k_tile_copy]`
+
+is now an existing frozen `ArrayAccess(Var(pointer_type), Add(Mul(INT64,
+INT64), INT64))`. No new node, widened field, parser, lvalue hierarchy, logical
+metadata, or fallback was needed. This physical temporary has no cross-pass
+semantic identity, so adding `AccessId`/`SymbolId` provenance would be false
+precision.
+
+The path is explicit `Schedule` -> verified `LoopPlan` -> ordinary CIN/managed
+LLIR production -> result/ABI assembly -> function construction -> schedule
+lowering -> `_apply_heap_result_tile` -> existing `ArrayAccess` codegen. The
+managed production pipeline and result/ABI assembly finish before schedule
+lowering; this new node therefore does **not** traverse managed LLIR passes.
+Relayout runs subsequently for packed schedules but rewrites only its selected
+row-loop operand subtree; it does not traverse the compact copy-out loop. There
+is no regex or string consumer for the compact RHS. Existing exact-type common
+traversal validates, walks, rebuilds, and fails closed for `ArrayAccess`;
+codegen owns postfix precedence and emits its typed arithmetic index
+byte-for-byte.
+
+Malformed heap schedules still fail at the owning schedule stage for a missing
+tile/plan, unsupported placement, missing result write, or unsupported pointer
+type. Unknown LLIR nodes/children still fail in common traversal/codegen.
+Legal no-ops, repeated scheduling/rewrite application, replacement preflight,
+detachment, failure propagation, managed-pass records, and later-stage
+suppression are unchanged and remain covered by the inherited manager and
+schedule suites. In particular, no latency cost is attributed to managed
+passes for this late-created node.
+
+Focused tests lock the exact frozen tree, pointer and index child types,
+float32/float64 behavior, precedence-correct expression spelling, the complete
+copy statement, and detached ownership across two independent lowerings of the
+same frozen `ScheduledCIN`. Existing `ArrayAccess` tests retain exact
+construction, type hints, equality, malformed-child validation, freezing,
+common walk/rewrite, detachment, and unknown-subclass/unknown-child failure.
+The activating packed heap-result native matrix covers both panel and full
+relayout scopes, ragged panels, empty rows, zero-sized domains, and float64;
+generic TTM heap copy-out is also structurally covered.
+
+#### Locked post-slice compatibility budget
+
+The precise budget is now:
+
+- 374 total `Var` constructors: replacing one opaque `Var` with the
+  `ArrayAccess` base plus three index `Var` children is a net increase of three;
+- 55 direct expression strings: 27 subscript, 13 call, 7 member, 3 initializer,
+  3 qualified, 1 ternary, and 1 arithmetic;
+- 319 other constructor arguments, including the unchanged nine known indirect
+  sinks/clones;
+- ten generic string-rewrite compatibility sites;
+- 52 `RawStmt` calls / 51 producers, unchanged.
+
+The remaining 27 direct subscripts are exactly 21 in `cin_lowerer.py` and 6 in
+`iterator.py`; `schedule_lowerer.py` has none. They are 26 reads plus the one
+fixed-workspace declaration. The three characterized raw indexed stores remain
+the dense-workspace `memcpy` destination and the two compressed-Where compound
+prefix-sum/position-copy loops. No direct production `Assign` target is a
+string-encoded expression.
+
+#### Exact source, cache, request, ABI, flags, and build identity
+
+Clean same-root captures compare `5339f56` with committed code/test candidate
+`6c35b03`. The canonical four-anchor manifest and the 42-cell SpMM grid are
+byte-identical on both sides and exactly reproduce the inherited structured-
+store/`28dcca5` findings:
+
+- anchor manifest SHA-256:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- 42-cell grid SHA-256:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+- preamble: 68,671 bytes,
+  `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`.
+
+| Canonical path | Bytes | SHA-256 |
+|---|---:|---|
+| CSR-by-dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO SDDMM | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+
+Because the canonical corpus auto-schedules and does not activate the explicit
+heap seam, a separate no-build capture used both panel-scoped and full-axis
+packed heap schedules. Its `28dcca5`/`5339f56`/candidate manifest is
+byte-identical with
+SHA-256 `4d1620ec67fc38d4403c18b2e3a6b2cd8e57aa593fa99c4db7893eb157abd130`.
+Panel heap source is 5,414 bytes with SHA-256
+`5f2f59ebcd245c79746129fd50554e24698ccadc1fc30ad879d8503ce6ae02bc`
+and kernel name `kernel_d0e556f1c6e6`; full heap source is 5,334 bytes with
+SHA-256 `4e65ab9737251480abe63687cc898adc924a1e435d9a2a629c02914662b3a476`
+and kernel name `kernel_07f39c22f1ac`. Their build-identity digests are
+`3c0bb0b3b440a8e27f389e34214d6383c6c4d57fe153afb6eff737408b6aa71f`
+and `e61becb739622cc5b4aed36e592a3c2d36f0641a11f86187f04eb553bd514274`.
+The capture script SHA-256 is
+`27d5ab5c291d047084689e41a10e1cebda8df51d51fbf69dbd54defdb30205c0`.
+
+Across both captures the generated source, exact `evaluate` signature,
+preamble, source-derived kernel name, codegen/semantic/build/full cache keys,
+request fields, compiler/linker flags, ABI and index policies, build-option and
+request keys, build identity, prepared cache key, build directory, and `.so`
+path are identical. Exact `CompileOptions` identity reaches the lowerer.
+
+The existing canonical byte-identical runtime waiver therefore applies; no new
+M5 or Redwood runtime grid is required. Retained artifacts re-hash to:
+
+- M5:
+  `3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+- Redwood:
+  `c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+
+#### Compiler latency and attribution
+
+The valid run used committed `6c35b03` in its clean detached worktree, five
+warmups, 30 samples, and no overlapping pytest, native compilation/execution,
+or benchmark process. Artifact:
+
+`/tmp/scorch-phase3-compact-read-results/latency-6c35b03-control-m5.json`
+
+SHA-256:
+`0076729e891440100dc524ee36b539fa0918dacb9cb6a5c04beb5189e2e36f1e`.
+The required `d437174` predecessor re-hashes to
+`b65c724ea39f83fea7dbb277396724a16474041632bba4d28ebe7f59cda1d9f5`.
+
+| Case | Candidate p50/p95 ms | New/old p50 | New/old p95 | Decision |
+|---|---:|---:|---:|---|
+| small dense | 1.635 / 1.816 | 1.066 | 1.051 | target |
+| reduction | 1.460 / 1.642 | 1.030 | 1.054 | target |
+| CSR intersection | 1.653 / 1.784 | 0.994 | 0.989 | target |
+| sparse union | 1.670 / 1.826 | 1.016 | 0.947 | target |
+
+No case crosses 1.10. Absolute p50/p95 changes are +0.102/+0.089 ms,
++0.043/+0.085 ms, -0.009/-0.020 ms, and +0.026/-0.103 ms respectively.
+The largest recorded stage change is small-dense CIN lowering at
++0.031/+0.097 ms; reduction CIN lowering is +0.007/+0.025 ms and kernel/request
+assembly is +0.007/+0.017 ms. Intersection CIN lowering is -0.012/+0.043 ms,
+while union CIN lowering is +0.003/-0.034 ms. The canonical endpoint extension
+changes only +0.005/-0.014, +0.003/+0.014, -0.003/-0.021, and
+-0.003/+0.006 ms. The latency corpus does not request heap schedules and cannot
+execute the new construction, so these small bidirectional stage changes are
+measurement variation, not managed-pass or compact-read cost.
+
+One earlier sample taken immediately after the 35-minute native full suite is
+retained but rejected as contended:
+`/tmp/scorch-phase3-compact-read-results/latency-6c35b03-m5.json`, SHA-256
+`c118b0311e57857853304614d4c6c8a384c87a24619f2ebc0980d67c62efe701`.
+It crossed 1.10 broadly in unrelated non-activating stages; an immediate host
+check showed high CPU in `syspolicyd`, `peopled`, `WindowServer`, `trustd`, and
+CallHistory synchronization. A fresh same-host `5339f56` control (SHA-256
+`ee57b6ad9278e433389fd671891845d2c8f14952a20f55cdc16ae8255724c701`)
+followed by the valid candidate produced p50/p95 ratios of 1.014/0.981,
+1.000/1.038, 0.991/1.012, and 1.029/1.056. This paired control confirms the
+rejected crossing was host noise and that every candidate case is within the
+policy target.
+
+#### Verification record
+
+Every Python, pytest, documentation, capture, and benchmark command activated
+the `scorch` conda environment first. On committed `6c35b03` in a clean
+detached worktree:
+
+- exact compact structure/budget focus: 6 passed in 1.17 s;
+- focused schedule/traversal/codegen/budget/native set: 264 passed in 332.43 s;
+- canonical 18-file Phase-2/common suite: 720 passed in 2.76 s (the inherited
+  719 plus one new schedule regression);
+- required 11-file scheduler/CIN/codegen matrix: 309 passed in 375.22 s (the
+  inherited 308 plus that regression);
+- `pytest -q -m "not perf" tests`: 1,238 passed, 14 skipped, 3 deselected, and
+  the one inherited PyTorch sparse-invariant warning in 2,100.49 s;
+- Black on all three changed Python files: clean, with only the existing Python
+  3.11-versus-target-3.15 safety warning;
+- Flake8 on all three changed Python files: clean at both base and candidate;
+- mypy on the production file: clean at both base and candidate; all three
+  changed files report the exact same nine inherited missing-`py.typed` test
+  import diagnostics at base and candidate, with no candidate-only error;
+- strict Sphinx completes HTML generation and reproduces the exact normalized
+  base failure: 23 unresolved-reference warnings under `-W`, no new warning;
+- `git diff --check`: clean; an independent implementation/requirements audit
+  found no release blocker.
+
+The canonical suites retain caller-owned CIN/LLIR, access metadata, analyses,
+plans, schedules, exact `CompileOptions`, prior results, and independent-
+compilation ownership. They also retain exact stage identity/order, timing
+ownership, managed-pass/failure records, cache identity, and failure
+short-circuit/later-stage suppression. `ScheduledCIN(cin, plan)` remains the
+exact frozen carrier.
+
+No parser, generalized member/call/lvalue/allocation hierarchy, broad ABI
+rewrite, generalized DCE, reflection, signature inspection, dynamic metadata,
+dictionary-of-`Any` configuration, callback, mutable registry/global singleton,
+analysis cache/invalidation protocol, dependency graph, forcing API, parallel
+zero-fill extraction, TorchCppABI extraction, generalized allocation migration,
+complete CxxIR, generated tracked output, benchmark artifact, `csrc` change,
+design-document change, or unrelated tracked file was introduced. The
+user-owned `.gitignore` modification and untracked `autotune-levels/`, `bench/`,
+`bench/bench_results/`, and `scratchpad/` material remain untouched and
+uncommitted.
+
+This closes only the narrow Phase-3 **structured schedule-local compact-result
+copy read** slice. Remaining low-level structural debt is the 27 characterized
+subscript strings, three raw compound indexed stores, and the independently
+gated member/call/initializer/qualified/ternary/arithmetic/allocation/statement
+families. Phase 3 remains in progress. Phase 3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
