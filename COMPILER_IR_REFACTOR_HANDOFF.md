@@ -853,7 +853,7 @@ pair recorded below.
 | Initial pass manager and pure analysis runner; no cache or preserve/invalidate machinery | **MET** | `8e89822` adds the exact frozen `LLIRPassPipeline` assembled from and retaining one `CompileOptions` snapshot, and one explicit manager-owned heterogeneous production entry. `CINLowerer` delegates once; ordered ordinary and compressed records, same-source count/fill siblings, production/debug policy, partial failures, later-work suppression, trust-boundary validation, and direct pass compatibility are executable. `cdb12bc` adds the zero-field frozen `AnalysisRunner`; every typed CIN request recomputes a fresh immutable `CINAnalysis`. No analysis cache, dependency graph, callback registry, reflection, or preserve/invalidate protocol was introduced. |
 | Common current-LLIR walker/rewriter | **MET** | `llir_traversal.py` provides exhaustive exact-type walking and detached rewriting for the current LLIR. `test_llir_traversal.py` covers declared-node completeness, deterministic traversal, nested container shape, detachment, malformed children, replacement validation, and unknown-subclass rejection. Commit `14c1f27`. |
 | Four existing sequential LLIR optimizations extracted into passes | **MET** | Sparse prefetch (`325547d` implementation, `2bb1ce6` routing, `cfec7c5` traversal cleanup, `c8af101` descriptor/test hardening), dense-pointer hoisting (`ce5adad`, `81b847a`), single-iteration elimination (`0d31882`, `265123a`), and invariant-factor hoisting (`112a9b7`, `f2bca1b`) are typed, production-routed passes with focused structural, ownership, failure, timing, and activation tests. Dynamic-vector, result-write, and compressed-Where are also managed, for seven managed pass descriptors total. |
-| Per-stage latency instrumentation in production and debug configurations | **GAP** | `LLIRPassRunRecord.duration_ns` measures individual managed passes when enabled, but there are no production/debug records for frontend construction, normalization/verification, scheduling/`LoopPlan`, CIN lowering, result/ABI assembly, schedule lowering, or final code generation. Pass-local timing cannot provide the canonical end-to-end stage attribution. |
+| Per-stage latency instrumentation in production and debug configurations | **MET** | `8b3b910`/`d985f74`, corrected and completed by `e14dfbf`/`141cbc5`, add one frozen identity-owned `CompilationContext` per compilation. It retains the exact `CompileOptions` object and immutable `CompilerStageRunRecord`/existing `LLIRPassRunRecord` snapshots. Nine stable `CompilerStageId` values cover validated frontend construction, CIN normalization/optional verification, scheduling/`LoopPlan`, distinct legacy adaptation, CIN lowering, the nested result/ABI barrier, schedule lowering, LLIR-to-C++, and validated kernel-name/build-request assembly ending immediately before cache/native loading. Production and debug execute the same complete stage inventory; only the snapshotted verifier policy differs. Failed stages publish no record, make the owner terminal, preserve earlier stage/pass records, and re-raise the exact original exception. See the closure below. |
 | Isolated pass/artifact plumbing latency benchmark | **MET** | Focused executable plumbing tests enforce the 1 ms ceiling. The prior clean committed measurement recorded above reports empty-manager p95 1.625 microseconds, incremental manager p95 1.916 microseconds, direct-pass p95 2.083 microseconds, and complete managed-call p95 3.917 microseconds. |
 
 #### Canonical exit-criterion matrix
@@ -1137,16 +1137,251 @@ benchmark output, generated extension, plot, cache, or unrelated file changed;
 the user-owned `.gitignore` modification and untracked research/benchmark
 material remain untouched.
 
-The canonical `CompileOptions` and manager-owned pipeline/common
-analysis-runner Phase-2 blockers are **closed**. Canonical Phase 2 is still
-**not formally exited**. Blocking Phase 2 work remains:
+#### Compiler-stage timing closure (2026-07-14)
 
-1. add production/debug timing for every compiler stage;
-2. complete semantic `LoopPlan` legality verification;
-3. satisfy the required all-COO no-`pMask1_end`-declaration invariant through a
+Commits `8b3b910`/`d985f74`, followed by corrective implementation and test
+commits `e14dfbf`/`141cbc5`, close only the canonical production/debug
+compiler-stage timing blocker. They do not change pass order, scheduling,
+result/ABI semantics, emitted syntax, kernel names, native flags, or the
+all-COO `pMask1_end` declaration.
+
+The pre-implementation audit found four distinct timing classes:
+
+1. There was no canonical compiler-stage record. The only in-compiler records
+   were the existing `LLIRPassRunRecord` values, created with
+   `perf_counter_ns` for the seven managed pass descriptors (with applied
+   compressed-Where count/fill siblings).
+2. `time_dict["eval_time"]` used `time.time` at the existing production
+   execution sites. It measures native kernel execution and remains a legacy
+   compatibility contract outside the compiler-stage seam.
+3. `tiling.py` used `time.perf_counter` for native selector calibration and
+   execution, while `utils.load_to_kernel_cache` used `time.time` for a
+   special/native build. Both remain outside this seam. Commented build timers
+   remain inert.
+4. The Phase-0 tool timed the public operation through the former
+   `_load_kernel` call but had no typed per-stage attribution. It now retains a
+   predecessor-compatible marker and also measures the canonical endpoint.
+
+The exact owner is frozen, identity-equality `CompilationContext`, containing
+one exact `CompileOptions` object and immutable tuple snapshots of completed
+stage and managed-pass records. `CompilerStageRunRecord(sequence_index,
+stage_id, nested_within, duration_ns)` is frozen; `duration_ns` is
+`field(compare=False)` and comes from `perf_counter_ns`. Opaque frozen
+`CompilerStageToken` values enforce exact owner/token identity, serial root
+stages, strict LIFO completion, and terminal suppression after the first
+failure. The nine stable `CompilerStageId` values, in
+`CANONICAL_COMPILER_STAGES` order, are:
+
+1. `frontend_validated_operation_construction`;
+2. `cin_normalization_and_verification`;
+3. `scheduling_and_loop_plan_construction`;
+4. `legacy_cin_adaptation`;
+5. `cin_lowering`;
+6. `result_abi_assembly`;
+7. `schedule_lowering`;
+8. `llir_to_cpp_generation`;
+9. `kernel_name_and_build_request_assembly`.
+
+Only result/ABI assembly is a nested canonical stage, directly inside CIN
+lowering. CIN-lowering duration therefore includes the manager-owned pass
+pipeline and the lazy result/ABI continuation. The barrier remains after
+invariant-factor hoisting and before dynamic-vector rewriting; the assembled
+artifact is validated inside the R record and again at the unchanged manager
+trust boundary. Schedule lowering is a root stage after L. Existing managed
+pass records remain a distinct nested observation: their seven descriptor
+identities and order are unchanged, they are appended to the same context only
+while L is active, and compressed-Where parent/count/fill ordering is unchanged.
+
+The audited production boundaries and orchestration are:
+
+| Boundary/path | Actual compiler work and timing behavior |
+| --- | --- |
+| `einsum` auto path | F; optional full nested relayout compilation(s); prealignment S; N/S for each real scheduled arm; A/L(R) for each real lowered arm; optional L stitch; C; K. A simple non-dual path is F,S,N,S,A,L,R,C,K. |
+| `einsum` explicit schedule | F,S,N,S,A,L,R,SL,C,K, with the same genuine nested relayout behavior. The original topological relayout and later selected-order relayout both remain. |
+| `lower_and_exec_cin` | N; F for runtime-binding planning; optional full nested relayout compilation(s); F for applying/validating the binding; A,L,R,C,K. The caller's CIN and runtime tensors remain detached/owned as before. |
+| `spmv`, `matmul_wksp` miss, `STensor.__add__`, compiled `to_dense`, `to_sparse`, and `change_mode_order` | F,N,A,L,R,C,K. Nested prerequisite conversions or relayouts run the same complete manual sequence on the same owner. |
+| `matmul` and wrappers | Dense/prebuilt routes execute no generated compiler stage; generated routes delegate to `einsum` or `spmv` with the same snapshot/context. Dense-to-sparse result conversion, sparse `to_torch`, unsupported sparse-linear fallbacks, and eager-equivalent compile fallbacks reach the existing generated conversion/matmul boundaries. |
+| `precompile_kernels` | Five independent compile-only public `einsum` compilations, each with its own snapshot and owner. |
+
+Prebuilt SDDMM/matmul, dense delegates, rank-one sparse conversion, dense
+to-dense, mode-order no-ops, core-format fast relayout, and special kernels do
+not fabricate records. A dispatch-cache hit cancels the speculative outer F
+and records only any genuine input/output relayout compilation. A
+`matmul_wksp` module-cache hit records no main compiler work, although raw
+tensor prerequisite conversions still record their real work. A single-path
+kernel-cache hit retains the frontend/normalization/scheduling work that
+actually reruns and skips A/L/C/K. `_so_cache` and on-disk extension hits occur
+after K and therefore retain all compiler records.
+
+K includes source-derived kernel naming and assembly plus validation of the
+exact frozen `_PreparedJITBuild(request, cache_key, so_path)` carrier. The
+request contains only name, C++ source tuple, function tuple, flag tuples,
+build directory, and the snapshotted build options. K completes immediately
+before `_load_validated_prepared_kernel`; `_so_cache` lookup, extension import,
+subprocess/native compilation, cache insertion, module execution, and result
+wrapping are excluded. Torch's `TORCH_EXTENSIONS_DIR` lookup remains the
+previously classified non-semantic storage/cache-location boundary; it is not
+compiler policy or emitted/build identity.
+
+Production and debug use the same complete stage inventory. Only the exact
+snapshotted `verification.verify_cin` and managed-pass verification policy
+differs; timing never enables verification. Every timed stage and nested pass
+receives the context's identical `CompileOptions` object. Behavioral spies
+prove that corresponding environment values and the CIN/schedule/regblock
+`ContextVar`s are not read after snapshot construction.
+
+A failed canonical stage publishes no failed-stage record, preserves all
+earlier completed records once in deterministic start order, marks the owner
+terminal, suppresses every later stage, and re-raises the exact original
+exception. Completed R remains if a later dynamic-vector pass fails. Ordinary
+compressed-Where failures retain the same partial pass policy: count failure
+retains no nested sibling, fill failure retains count, and later parent work
+retains count/fill. Unexpected ordinary Python exceptions are transported
+without erasing completed records; `BaseException` behavior is unchanged.
+Native/cache failures happen after completed K and do not retroactively create
+a failed compiler stage.
+
+Timing is non-semantic. The context and records are absent from
+`CompileOptions` equality/fingerprints, operation/dispatch/module/kernel/native
+cache keys, emitted names/source/flags, build carriers, and public results;
+canonical cache serialization rejects them. Deterministically different clock
+observations produce identical results, generated source, names, cache
+identity, and exact build-request schemas. Two distinct snapshots have
+independent owners, records, requests, and result objects; caller-owned CIN,
+LLIR, analyses, schedules, tensors, and prior results remain unchanged. Direct
+normalizer, scheduler, lowerer, renderer, manager/pass, and legacy loader APIs
+retain their supported standalone behavior; passing a context opts the allowed
+compatibility seams into the same typed ownership.
+
+Existing public callers and `time_dict` continue to receive only the native
+`eval_time` contract. Canonical compiler records are observed by a caller that
+holds and routes a `CompilationContext` through the supported internal
+compatibility kwarg; they are not attached to public results, `time_dict`, or
+native requests. Internally constructed owners remain compilation-local, and
+the benchmark observes them only with a temporary test/tool interception.
+
+No stage/timing/analysis cache, invalidation or preservation protocol,
+dependency graph, callback registry, dynamic-dispatch bag, reflection,
+signature inspection, global singleton, mutable registry, dictionary-of-Any
+configuration, dumping, generalized tracing, or telemetry was introduced.
+
+The final focused Phase-2/common command reports 583 passed in 1.42 seconds;
+`test_compiler_stage_timing.py` contributes 60 executable cases. The changed
+benchmark/value-boundary command additionally reports 40 passed in 12.08
+seconds. The required
+schedule/codegen matrix reports 82 passed in 354.74 seconds. The four exact
+source-anchor tests report 4 passed in 0.49 seconds and preserve:
+
+- CSR-by-dense: 2,505 bytes,
+  `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151`;
+- DS: 7,117 bytes,
+  `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f`;
+- DSS: 8,660 bytes,
+  `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e`;
+- all-COO SDDMM: 3,543 bytes,
+  `de94b08752077a621c5e411ce0dcbb40e8bcbeacb9bce3824dd6019e2d2bd29d`.
+
+The production C++ flags, linker flags, source-derived name, and preamble
+digest JSON is byte-identical to the clean `cdb12bc` predecessor; both files
+hash to
+`4342e155548e81f8524b69a84c6e1d1b114f71de10ad6832b49a23e39257023a`.
+No emitted production input changed, so the binding policy waives a ceremonial
+42-input runtime rerun. The retained clean M5 and Redwood archives remain the
+applicable evidence and match their required SHA-256 values exactly:
+`816430d435d76dbe47277e921228d45c7387fc93d110bc37cc70f173982dfb77`
+and
+`31baca05f50d8f51483aa1d7d5b77f19f93550ebb95e46209d8dcbbd935dbc7e`.
+The all-COO declaration is unchanged and remains a separate Phase-2 blocker.
+
+The full `pytest -q -m "not perf" tests` command reports 1,094 passed, 14
+skipped, three deselected, one warning, and one inherited failure in 1,914.16
+seconds. The only failure is
+`tests/test_scorch/test_perf.py::test_spmm_dd_ds_dd_tiled_time`, the same
+pre-existing `IndexError` in `CINLowerer.lower_Where`; it is not fixed or
+marked by this work. There are no new full-suite failures.
+
+The accepted compiler-latency comparison used exactly one final committed
+candidate run from detached clean worktree `141cbc5` and the retained control.
+The candidate artifact is
+`/tmp/scorch-phase2-stage-timing-final/latency-141cbc5-m5.json`, SHA-256
+`c611ff9f7be622db04b1ddc16bb13368b6b3bf38aa7bba2344922e4ccb502a05`;
+its metadata records exact revision `141cbc59b8104aeb2b66fcdcfdda38088a47dd3b`,
+empty status, and the isolated source root. The retained `cdb12bc` predecessor
+matched SHA-256
+`1f859021940efff5d3b48c51e01d5280949591b47c1d0ec8fadc5c55c3e60572`
+and the exact 5-warmup/30-sample configuration. An earlier provisional agent
+violated the gate policy before the corrective work: it unnecessarily created
+`latency-a3ee6a3-m5-fresh.json` (SHA-256
+`9b126c5a3ed4fe64adfd164bb9846c41159153caefd3f4b0f59c437778a72133`)
+even though `cdb12bc` and `a3ee6a3` differ only by documentation, then ran the
+unchanged superseded `d985f74` candidate twice (`latency-d985f74-m5.json`,
+SHA-256
+`2ddb9efc87dfba5f561988e9981d01bd836547618271a707902c03bcc28c8b21`,
+and `latency-d985f74-m5-quiet.json`, SHA-256
+`efb3bcb8ef6dfcf3825fe0ea5bee8fccfbfdddb083c7080106e8be12a80bfbe3`).
+All three have clean 5/30 metadata, but the redundant control and repeated
+unchanged candidate violate the settled run policy and are invalid/unused for
+this closure; they were not reclassified. The corrective final candidate did
+not rerun any control and ran `141cbc5` once. The old `14b110b` control also
+remains invalid, unused, and unreclassified.
+
+Predecessor -> candidate compatibility p50/p95 milliseconds and candidate
+ratios are:
+
+| Case | Predecessor | Candidate | p50/p95 ratio |
+| --- | --- | --- | --- |
+| small dense | 1.475 / 1.713 | 1.417 / 1.666 | 0.961 / 0.972 |
+| reduction | 1.354 / 1.551 | 1.325 / 1.413 | 0.979 / 0.911 |
+| CSR intersection | 1.427 / 1.516 | 1.400 / 1.493 | 0.981 / 0.985 |
+| sparse union | 1.362 / 1.464 | 1.329 / 1.393 | 0.976 / 0.952 |
+
+Every ratio is below 1.10, so there is no accepted exception. Extending the
+legacy marker through validated K produces canonical p50/p95 values of
+1.710/1.966, 1.617/1.703, 1.693/1.786, and 1.627/1.688 milliseconds. The
+corresponding endpoint-extension p50/p95 values are 0.291/0.324,
+0.294/0.306, 0.289/0.310, and 0.292/0.314 milliseconds.
+
+The predecessor-compatible marker is recorded at entry to
+`_prepare_jit_build`, after K has begun and after source-derived naming; the
+0.289-0.294 ms p50 endpoint extension is therefore the request/carrier suffix
+of K, while the K record covers the whole stage. Across the four cases, total
+canonical per-compilation stage p50 ranges are F 0.013-0.033 ms, N
+0.007-0.020 ms,
+S 0.141-0.240 ms where scheduling runs, A 0.023-0.026 ms, L 0.396-0.770 ms,
+nested R 0.007-0.010 ms, C 0.028-0.063 ms, and K 0.387-0.394 ms. The auto
+corpus has no explicit SL stage. Small dense/reduction genuinely execute three
+N and four S runs because the dual-path arms are retained; CSR intersection
+executes one N and two S runs; sparse union is the manual path. These totals
+include real repeated work and do not merge or reinterpret pass records. The
+isolated timing-owner/context plumbing assertion remains below the
+1 ms ceiling. A preliminary dirty-worktree microprobe was discarded; the
+5,000-sample rerun from a detached clean `141cbc5` worktree measured 2.583
+microseconds p50, 2.708 microseconds p95, and 46.708 microseconds maximum for
+context construction, begin, complete, and immutable record access.
+
+All 14 changed Python files are Black-clean. Exact `a3ee6a3` comparison gives
+eight Flake8 findings at both revisions and zero regressions: CIN-lowerer C901
+moves 53 -> 52, einsum 72 -> 70, and scheduler remains 41; the remaining
+F841/F401 findings are inherited. Comparable mypy runs report 124 errors in
+five current files versus 128 in five baseline files, with zero added
+diagnostics and four inherited `ops.py` diagnostics removed. The new timing
+owner, timing test file, and benchmark tool are individually mypy- and
+Flake8-clean.
+
+No `csrc` or design file, benchmark output, generated extension, plot, cache,
+or unrelated repository file changed. The user-owned `.gitignore` modification
+and untracked research/benchmark material remain untouched and uncommitted.
+
+The canonical `CompileOptions`, manager-owned pipeline/common
+analysis-runner, and production/debug compiler-stage timing Phase-2 blockers
+are **closed**. Canonical Phase 2 is still **not formally exited**. Blocking
+Phase 2 work remains:
+
+1. complete semantic `LoopPlan` legality verification;
+2. satisfy the required all-COO no-`pMask1_end`-declaration invariant through a
    separately gated, emission-affecting change.
 
-The next Phase-2 blocker is production/debug timing for every compiler stage.
+The next Phase-2 blocker is semantic `LoopPlan` legality verification.
 Do not start Phase 3 while these Phase 2 blockers remain.
 
 ## Incremental Migration Plan
