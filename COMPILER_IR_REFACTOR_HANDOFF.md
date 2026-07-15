@@ -1892,6 +1892,286 @@ With the full-suite and two-machine results above passing, the final all-COO
 declaration blocker is **CLOSED** and canonical Phase 2 is formally
 **COMPLETE**. Phase 3 has not begun.
 
+### First narrow Phase-3 structured-access slice (2026-07-15)
+
+This is the first shippable **Phase 3** slice, not completion of Phase 3. It
+starts exactly from `28dcca51144c7f84008d1e39bb4050c4fb9909f0` on
+`refactor/compiler-ir-phase3-structured-access`. Phase 3.5, LoopIR, parallel
+zero-fill extraction, Torch/C++ ABI extraction, generalized allocation
+migration, and unrelated optimization work have not begun.
+
+The committed compiler candidate is `2e2a30d666d2272afe7174d7ea5f999e167a6cd1`:
+
+- `09acd48` — `refactor(compiler): add typed low-level access structure`;
+- `1fec8f8` — `test(compiler): cover structured access migration`;
+- `2e2a30d` — `fix(compiler): type schedule traversal roots`.
+
+#### Pre-implementation inventory and seam selection
+
+The audit considered every current low-level producer, structural consumer,
+manager pass, schedule transform, result/ABI path, and C++ emitter before
+selecting a seam. At the base revision there were 315 syntactic `llir.Var`
+construction sites. A conservative direct-fragment classifier identified 90
+expression-shaped `Var.name` producers:
+
+| Direct base category | Count |
+|---|---:|
+| subscript | 62 |
+| call | 13 |
+| member | 7 |
+| initializer | 3 |
+| qualified name | 3 |
+| ternary | 1 |
+| arithmetic | 1 |
+| **Total** | **90** |
+
+Those sites were concentrated in `cin_lowerer.py` (70),
+`iter_lattice.py` (5), `iterator.py` (6), and `schedule_lowerer.py` (9).
+The audit separately followed indirect expression strings, generic rewrite
+sinks, and traversal clones so a local variable could not hide from the
+budget.
+
+There were 62 `RawStmt` construction calls: 61 semantic producers and the one
+common traversal clone. Their exact base/current distribution is unchanged:
+
+| File | Calls | Classification |
+|---|---:|---|
+| `cin_lowerer.py` | 17 | ABI/prologue, allocation, parallel, and compatibility output |
+| `compressed_where_openmp_pass.py` | 22 | characterized count/fill and workspace compatibility output |
+| `result_write_pass.py` | 15 | characterized sparse-result assembly/writes |
+| `schedule_lowerer.py` | 3 | reusable vector allocation compatibility output |
+| `loop_invariant_factor_pass.py` | 2 | generated invariant declaration/update output |
+| `dense_pointer_hoist_pass.py` | 1 | generated pointer declaration output |
+| `sparse_prefetch_pass.py` | 1 | generated prefetch output |
+| `llir_traversal.py` | 1 | detached clone, not a producer |
+
+The audited expression consumers were sparse prefetch, dense-pointer hoisting,
+single-iteration elimination, invariant-factor hoisting, dynamic-vector
+rewriting, result writes, compressed-Where, schedule access redirection, packed
+relayout construction, and final C++ emission. Coordinate/position accesses,
+indexed result writes, workspace accesses, member/call/allocation expressions,
+and pointer/declaration strings share some consumers but require additional
+typed provenance or a typed lvalue seam. Migrating them together would have
+expanded this slice into a generalized expression parser or a broad CxxIR.
+
+The selected end-to-end seam is therefore **non-workspace logical tensor value
+reads produced centrally by `CINLowerer.lower_TensorAccess`**. This is the
+smallest seam that removes a real string-encoded C++ subscript from production,
+survives the manager-owned LLIR pipeline, activates existing optimizations, is
+consumed by schedule relayout, and reaches the emitter as one representation.
+It includes synthetic packed and dense-hoisted reads so the migrated production
+path does not fall back to a parallel string representation.
+
+One narrow dependency was required: the existing `TensorAccessMetadata` and
+private relayout/result-tile carriers could not keep display names as semantic
+identity. They now carry the already-canonical `AccessId`, `SymbolId`, and
+`IndexId` values. Occurrence identity is retained by `AccessId`; schedule
+selection intentionally matches the logical `SymbolId`/ordered `IndexId` tuple
+and role. Display spellings remain separate and byte-identical. No new identity
+allocator or registry was introduced.
+
+#### Implemented structural contract
+
+- Existing `llir.ArrayAccess(array, index, tensor_access=None)` is now a frozen
+  dataclass with typed expression children and exact construction validation.
+- `TensorAccessMetadata(access_id, tensor_id, index_ids, role)` is frozen and
+  validates every typed identity field. Common walking and rewriting revalidate
+  exact metadata fields on both `ArrayAccess` and the transitional
+  metadata-bearing `Var` result-write form, including forged objects.
+- Non-workspace value reads lower to
+  `ArrayAccess(Var("<tensor>_val"), Var("<physical-position>"), metadata)`.
+  Workspace value reads remain the characterized flat compatibility form.
+- The common exact-type walker/rewriter owns traversal and detachment. Unknown
+  access subclasses, unknown children, invalid metadata, and malformed roots
+  fail at the owning traversal/codegen/schedule stage.
+- C++ emission owns postfix precedence and renders the new structure with the
+  exact prior spelling and whitespace. Provenance is non-emitting. Structural
+  expression equality intentionally excludes provenance, as the prior `Var`
+  contract did; semantic consumers compare typed IDs explicitly.
+- Dense-pointer hoisting maps structured value reads to structured pointer
+  reads while retaining its direct legacy compatibility input. It never shares
+  mutable replacement children.
+- Single-iteration elimination rewrites exact typed access-index symbols rather
+  than parsing the whole subscript. Invariant-factor hoisting determines
+  dependence from structured pointer/index children. Compressed-Where and the
+  common rewriter rebuild frozen accesses and preserve provenance.
+- Schedule relayout/result selection uses stable IDs. Access rewriting now uses
+  the common exact traversal, is detached and repeatable, clones each
+  replacement, and fails closed for unknown children. Packed reads and relayout
+  source loads are structured `ArrayAccess` plus typed arithmetic; packed
+  destination and result stores remain the explicit indexed-lvalue debt.
+- Sparse prefetch already understood `ArrayAccess`; result writes already render
+  structured right-hand sides; dynamic-vector rewriting does not own this input
+  read seam. No compatibility shim or second production representation was
+  added for migrated non-workspace reads.
+
+This is the minimum coherent typed structure: one existing access node, typed
+children, and stable provenance. Adding member, call, allocation, pointer, or
+indexed-store nodes is neither necessary for this seam nor justified in the
+same change.
+
+#### Remaining measured compatibility budget
+
+`tests/test_scorch/test_llir_string_budget.py` locks every current `Var`
+constructor, direct category, known indirect sink, generic rewrite sink, and
+`RawStmt` producer. After the slice:
+
+- 326 total `Var` constructor calls are inventoried;
+- 87 are directly provable expression strings: 59 subscript, 13 call, 7 member,
+  3 initializer, 3 qualified, 1 ternary, and 1 arithmetic;
+- all remaining 239 constructor arguments are separately counted by file; the
+  manual audit identifies eight indirect expression/compatibility sinks plus
+  the one common traversal clone among them;
+- 11 generic string-rewrite compatibility sites are explicitly locked across
+  `cin_lowerer`, compressed-Where, dense-pointer, single-iteration, and
+  dynamic-vector rewriting;
+- `RawStmt` remains 62 calls / 61 producers with the file budget above.
+
+The direct expression-string budget therefore falls from 90 to 87. The larger
+constructor count reflects the intended replacement of one opaque value-read
+`Var` with an `ArrayAccess` and typed `Var` children; it is not new generated-C++
+string debt. Coordinates/positions, result/workspace lvalues, member/call and
+allocation forms, result assembly, raw prefetch/pointer declarations, and
+schedule-only stores remain future measured slices.
+
+#### Correctness, ownership, and failure evidence
+
+Focused tests cover exact construction, freezing, type hints, structural and
+semantic equality, metadata validation, precedence, byte-exact emission,
+common traversal, unknown subclasses/children, forged metadata, detached
+rewrites, no-ops, repeated application, replacement non-sharing, and stable-ID
+schedule matching. Production regressions cover CSR-by-dense, DS, DSS,
+all-COO, sparse intersection/union, compressed-Where, nested sparse levels,
+non-default mode order, panel/relayout, and register-blocked paths.
+
+Caller-owned CIN/access objects and source LLIR remain unchanged; each manager
+pass works on a detached tree. Existing canonical tests prove plans, analyses,
+`CompileOptions`, prior results, and independent compilations retain their
+ownership. Two replacements in one schedule rewrite are distinct objects.
+Compiler-stage identities/order, exact options identity, timing ownership,
+managed-pass records, failure propagation, and later-stage suppression remain
+covered by the canonical matrices and full suite.
+
+Exact generated-source anchors remain:
+
+| Path | Bytes | SHA-256 |
+|---|---:|---|
+| CSR-by-dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO SDDMM | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+
+Native PyTorch-comparison evidence is included in the scheduler/codegen matrix
+and full non-performance suite. The full run covers structurally activating
+CSR-by-dense, DS/DSS, sparse intersection, sparse union, compressed-Where,
+nested sparse, all-COO, non-default mode-order, relayout/panel, and
+register-blocked paths.
+
+#### Exact source/build identity and runtime waiver
+
+A deterministic same-path pre-native capture compared `28dcca5` with the
+committed compiler candidate `2e2a30d`. The raw C++ files, 68,671-byte preamble,
+evaluate signatures, source-derived kernel names, codegen keys, semantic/build/
+full `CompileOptions` keys, request fields, compiler/linker flags, ABI/index
+policies, build-option keys, request keys, build identity, prepared cache key,
+build directory, and `.so` path are byte-for-byte identical for the four anchor
+families. `CompileOptions` identity reaching the lowerer is exact.
+
+- preamble SHA-256:
+  `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`;
+- complete anchor manifest SHA-256:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`.
+
+The full 42-cell generated-SpMM corpus was then captured without entering
+native compilation. Every cell matches the retained Phase-2 M5 build summary
+for source digest/bytes, function list, exact compiler/linker flags, and kernel
+name. The richer same-path base/candidate grid capture, including per-source and
+request/prepared/build identities, is byte-identical with SHA-256
+`204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`.
+The retained M5 and Redwood archives have identical source digest/byte fields in
+all cells; their source-derived names differ only by the retained platform/Torch
+build identity as expected.
+
+Because every corpus source and build input is unchanged, the canonical
+byte-identical runtime waiver applies. No new M5 or Redwood runtime grid was
+run. The retained artifacts were re-hashed without reclassification:
+
+- latency predecessor: `ccf5caa742b753248aac0de49fe1f28dae573cb1ba57453c160ae61644c29f28`;
+- M5 kernel predecessor: `3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+- Redwood kernel predecessor: `c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`;
+- final Phase-2 manifest: `f9509f16f44ec61373b71e24494c066ee60017892b9e807f8a43cb215cdf0460`.
+
+#### Compiler latency and attribution
+
+The valid uncontended production run used the clean committed
+`2e2a30d666d2272afe7174d7ea5f999e167a6cd1` worktree, five warmups, and 30
+samples. Native build/execution was excluded. Artifact:
+
+`/tmp/scorch-phase3-structured-access-results/latency-2e2a30d-m5.json`
+
+SHA-256:
+`2dac0b53298ba2215f92d6e1a500af369869825700127aa8bcf0db7ef5d5288b`.
+
+| Case | Candidate p50/p95 ms | New/old p50 | New/old p95 | Decision |
+|---|---:|---:|---:|---|
+| small dense | 1.588 / 1.933 | 1.055 | 1.160 | investigate p95 |
+| reduction | 1.457 / 1.589 | 1.049 | 1.028 | target |
+| CSR intersection | 1.556 / 1.714 | 1.056 | 1.110 | investigate p95 |
+| sparse union | 1.580 / 1.864 | 1.118 | 1.190 | investigate p50/p95 |
+
+The 1.10 threshold is an investigation trigger, not automatic rejection. The
+crossings are explained primarily by CIN lowering, where one opaque value-read
+node becomes an access plus typed children and each managed detached rewrite
+must visit, validate, and rebuild that structure. CIN-lowering p50/p95 absolute
+deltas are +0.031/+0.059 ms (small dense), +0.033/+0.053 ms (reduction),
++0.069/+0.082 ms (intersection), and +0.105/+0.193 ms (union). LLIR-to-C++
+generation changes are only +0.001 to +0.005 ms at p50. Kernel-name/build-request
+assembly p50 improves in all four cases, and the canonical endpoint extension
+also improves, so the regression is neither source/cache/build-request work nor
+an unexplained downstream effect. The worst total absolute p95 increase is
+0.298 ms, with every candidate p95 still below 1.94 ms. This is recorded as a
+modest, attributed structural-cost exception for the first typed access slice;
+future Phase-3 slices must not allow it to compound without review.
+
+#### Verification record
+
+All Python/test/tool commands activated the `scorch` conda environment first.
+
+- changed-file focused suite: **376 passed** in 118.11 s;
+- canonical 18-file Phase-2/common suite: **661 passed** in 1.88 s;
+- required 11-file scheduler/CIN/codegen matrix: **303 passed** in 388.34 s;
+- `pytest -q -m "not perf" tests`: **1,176 passed, 14 skipped, 3 deselected**
+  with one inherited PyTorch sparse-invariant warning in 2,059.22 s;
+- exact four-source anchor check after final structural code: **4 passed**;
+- Black on all 20 changed Python files: clean (the repository targets Python
+  3.15 while the required environment is Python 3.11, so Black reports its
+  existing target-version safety-check warning);
+- Flake8 on every changed test/new file: clean. Changed production files report
+  the exact same seven normalized findings as `28dcca5` (two F841, two F401,
+  two C901, and one F541), with only shifted line numbers;
+- mypy on changed production files: the same 45 normalized inherited findings
+  as `28dcca5`; the nine existing changed tests have the same 33 `py.typed`/
+  import-stub findings as the base; the new budget test is clean;
+- strict Sphinx command completed and reproduced the exact base failure: both
+  base and candidate report the same 23 unresolved-reference warnings under
+  `-W`; there is no new warning;
+- source/build capture and the valid latency run used clean detached committed
+  worktrees and `/tmp` outputs only.
+
+No analysis cache, preservation/invalidation protocol, dependency graph,
+generalized DCE, reflection, signature inspection, callback/dynamic registry,
+dictionary-of-`Any` configuration, mutable global singleton, forcing API,
+complete CxxIR, LoopIR, Phase-3.5 interpreter, `csrc` change, design-document
+change, generated tracked output, benchmark artifact, or unrelated tracked file
+was introduced. `ScheduledCIN(cin, plan)` remains the exact frozen two-field
+carrier and `matmul_wksp` remains removed. The user-owned `.gitignore` change
+and all untracked research/benchmark material remain untouched and uncommitted.
+
+This closes only the first narrow Phase-3 **structured non-workspace tensor
+value-read access** slice. The measured budgets above identify the remaining
+string/`RawStmt` families for later independently gated slices. Phase 3 remains
+in progress; Phase 3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
