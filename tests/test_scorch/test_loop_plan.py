@@ -12,6 +12,7 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorVar,
     Where,
+    Workspace,
 )
 from scorch.compiler.cin_analysis import analyze_cin, canonical_cin_dump, normalize_cin
 from scorch.compiler.cin_lowerer import CINLowerer
@@ -75,6 +76,71 @@ def _build_nonadditive_dense_matmul() -> ForAll:
         op=Operation.MUL,
     )
     return ForAll(i, ForAll(j, ForAll(k, assignment)))
+
+
+def _build_sparse_output_reduction(*, op: Operation | None = None) -> ForAll:
+    i, j = IndexVar("i"), IndexVar("j")
+    result = TensorVar("C", fmt="s")
+    source = TensorVar("A", fmt="dd")
+    assignment = TensorAssign(result[i], source[j, i], op=op)
+    return ForAll(j, ForAll(i, assignment))
+
+
+def _build_existing_workspace() -> ForAll:
+    i = IndexVar("i")
+    result = TensorVar("C", fmt="d")
+    source = TensorVar("A", fmt="d")
+    workspace = Workspace("tmp", dim=1, dense=True)
+    return ForAll(
+        i,
+        Where(
+            producer=TensorAssign(workspace[i], source[i]),
+            consumer=TensorAssign(result[i], workspace[i]),
+        ),
+    )
+
+
+def _build_multi_assignment_where() -> ForAll:
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    first_result = TensorVar("C", fmt="dd")
+    second_result = TensorVar("D", fmt="dd")
+    first_source = TensorVar("A", fmt="ddd")
+    second_source = TensorVar("B", fmt="ddd")
+    return ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(
+                k,
+                Where(
+                    producer=TensorAssign(
+                        first_result[i, k],
+                        first_source[i, j, k],
+                        op=Operation.ADD,
+                    ),
+                    consumer=TensorAssign(
+                        second_result[i, k],
+                        second_source[i, j, k],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _build_scalar_assignment() -> TensorAssign:
+    result = TensorVar("C", shape=())
+    source = TensorVar("A", shape=())
+    return TensorAssign(result[[]], source[[]])
+
+
+def _build_root_reduction() -> ForAll:
+    j, k = IndexVar("j"), IndexVar("k")
+    result = TensorVar("C", fmt="d")
+    source = TensorVar("A", fmt="dd")
+    assignment = TensorAssign(result[k], source[j, k], op=Operation.ADD)
+    return ForAll(j, ForAll(k, assignment))
 
 
 def _build_nondefault_dense_result() -> ForAll:
@@ -532,7 +598,7 @@ def test_forged_parallel_reduction_fails_both_artifact_verifiers() -> None:
     )
 
 
-def test_parallel_loop_must_partition_every_result_write() -> None:
+def test_parallel_multi_result_writes_fail_closed() -> None:
     i, k = IndexVar("i"), IndexVar("k")
     first_result = TensorVar("C", fmt="d")
     second_result = TensorVar("D", fmt="d")
@@ -559,8 +625,8 @@ def test_parallel_loop_must_partition_every_result_write() -> None:
     _assert_plan_rejected(
         cin,
         plan,
-        InvalidSchedule,
-        "parallel_result_race",
+        UnsupportedFeature,
+        "multi_assignment_schedule",
     )
 
 
@@ -848,6 +914,10 @@ def test_reduction_tiles_and_accumulator_lifetimes_are_artifact_verified() -> No
         for tile in valid_auto.verified_loop_plan.tiles
     )
     assert verify_scheduled_cin(valid_auto) is valid_auto
+    assert legacy_cin_working_copy(
+        valid_auto.normalized_cin,
+        valid_auto.verified_loop_plan,
+    ).inserted_workspace
 
 
 def test_parallel_post_reduction_workspace_scope_is_rejected() -> None:
@@ -916,6 +986,240 @@ def test_stack_accumulation_rejects_nonadditive_reductions() -> None:
         UnsupportedFeature,
         "stack_reduction_operator",
     )
+
+
+def test_derived_sparse_workspace_rejects_nonadditive_reductions() -> None:
+    explicit = Schedule(loop_order=("j", "i"))
+    valid = Scheduler.apply_schedule(_build_sparse_output_reduction(), explicit)
+    assert verify_scheduled_cin(valid) is valid
+    assert legacy_cin_working_copy(
+        valid.normalized_cin,
+        valid.verified_loop_plan,
+    ).inserted_workspace
+    valid_auto = Scheduler.apply_schedule(_build_sparse_output_reduction(), Schedule())
+    assert verify_scheduled_cin(valid_auto) is valid_auto
+    assert legacy_cin_working_copy(
+        valid_auto.normalized_cin,
+        valid_auto.verified_loop_plan,
+    ).inserted_workspace
+
+    with pytest.raises(UnsupportedFeature, match="workspace_reduction_operator"):
+        Scheduler.apply_schedule(
+            _build_sparse_output_reduction(op=Operation.MUL),
+            explicit,
+        )
+    with pytest.raises(UnsupportedFeature, match="auto_reduction_operator"):
+        Scheduler.apply_schedule(
+            _build_sparse_output_reduction(op=Operation.MUL),
+            Schedule(),
+        )
+
+    cin = normalize_cin(_build_sparse_output_reduction(op=Operation.MUL))
+    ids = _index_ids_by_name(cin)
+    forged_explicit = LoopPlan(
+        loop_order=(ids["j"], ids["i"]),
+        provenance="explicit",
+    )
+    _assert_plan_rejected(
+        cin,
+        forged_explicit,
+        UnsupportedFeature,
+        "workspace_reduction_operator",
+    )
+    forged_auto = replace(forged_explicit, provenance="auto")
+    _assert_plan_rejected(
+        cin,
+        forged_auto,
+        UnsupportedFeature,
+        "auto_reduction_operator",
+    )
+
+
+def test_existing_workspace_rejects_unsupported_replay_decisions() -> None:
+    auto = Scheduler.apply_schedule(_build_existing_workspace(), Schedule())
+    assert verify_scheduled_cin(auto) is auto
+
+    explicit_requests = (
+        Schedule(loop_order=("i",)),
+        Schedule(
+            loop_order=("i",),
+            tiles=(TileSpec("i", 4, accum="direct"),),
+        ),
+        Schedule(loop_order=("i",), parallel_loop="i"),
+    )
+    for schedule in explicit_requests:
+        with pytest.raises(UnsupportedFeature, match="existing workspace"):
+            Scheduler.apply_schedule(_build_existing_workspace(), schedule)
+
+    cin = auto.normalized_cin
+    ids = _index_ids_by_name(cin)
+    for provenance in ("explicit", "tuned", "fallback", "direct"):
+        forged = replace(auto.verified_loop_plan, provenance=provenance)
+        _assert_plan_rejected(
+            cin,
+            forged,
+            UnsupportedFeature,
+            "workspace_plan_provenance",
+        )
+
+    forged_tile = replace(
+        auto.verified_loop_plan,
+        tiles=(
+            _affine_tile(
+                ids["i"],
+                LoopPlacement(PlacementKind.OUTERMOST),
+            ),
+        ),
+    )
+    _assert_plan_rejected(
+        cin,
+        forged_tile,
+        UnsupportedFeature,
+        "multi_assignment_schedule",
+    )
+
+    forged_parallel = replace(
+        auto.verified_loop_plan,
+        parallel_loop=LoopRef(ids["i"]),
+    )
+    _assert_plan_rejected(
+        cin,
+        forged_parallel,
+        UnsupportedFeature,
+        "multi_assignment_schedule",
+    )
+
+
+def test_multi_assignment_scope_rejects_tile_and_parallel_decisions() -> None:
+    with pytest.raises(UnsupportedFeature, match="Derived workspace"):
+        Scheduler.apply_schedule(_build_multi_assignment_where(), Schedule())
+
+    explicit_requests = (
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("k", 4, accum="direct"),),
+        ),
+        Schedule(loop_order=("i", "j", "k"), parallel_loop="i"),
+    )
+    for schedule in explicit_requests:
+        with pytest.raises(UnsupportedFeature):
+            Scheduler.apply_schedule(_build_multi_assignment_where(), schedule)
+
+    cin = normalize_cin(_build_multi_assignment_where())
+    ids = _index_ids_by_name(cin)
+    base = LoopPlan(
+        loop_order=(ids["i"], ids["j"], ids["k"]),
+        provenance="auto",
+    )
+    _assert_plan_rejected(
+        cin,
+        base,
+        UnsupportedFeature,
+        "multi_assignment_schedule",
+    )
+    _assert_plan_rejected(
+        cin,
+        replace(base, provenance="explicit"),
+        UnsupportedFeature,
+        "multi_assignment_schedule",
+    )
+    forged_tile = replace(
+        base,
+        tiles=(
+            _affine_tile(
+                ids["k"],
+                LoopPlacement(PlacementKind.OUTERMOST),
+            ),
+        ),
+    )
+    _assert_plan_rejected(
+        cin,
+        forged_tile,
+        UnsupportedFeature,
+        "multi_assignment_schedule",
+    )
+    forged_parallel = replace(
+        base,
+        parallel_loop=LoopRef(ids["i"]),
+        provenance="explicit",
+    )
+    _assert_plan_rejected(
+        cin,
+        forged_parallel,
+        UnsupportedFeature,
+        "multi_assignment_schedule",
+    )
+
+
+def test_loop_free_cin_supports_only_auto_plan_provenance() -> None:
+    auto = Scheduler.apply_schedule(_build_scalar_assignment(), Schedule())
+    assert verify_scheduled_cin(auto) is auto
+
+    with pytest.raises(UnsupportedFeature):
+        Scheduler.apply_schedule(
+            _build_scalar_assignment(),
+            Schedule(loop_order=()),
+        )
+
+    for provenance in ("explicit", "tuned", "fallback", "direct"):
+        forged = replace(auto.verified_loop_plan, provenance=provenance)
+        _assert_plan_rejected(
+            auto.normalized_cin,
+            forged,
+            UnsupportedFeature,
+            "scalar_plan_provenance",
+        )
+
+
+def test_root_workspace_scope_rejects_tiling_replay() -> None:
+    auto = Scheduler.apply_schedule(_build_root_reduction(), Schedule())
+    assert verify_scheduled_cin(auto) is auto
+    assert not legacy_cin_working_copy(
+        auto.normalized_cin,
+        auto.verified_loop_plan,
+    ).inserted_workspace
+
+    with pytest.raises(UnsupportedFeature, match="workspace inserted at the root"):
+        Scheduler.apply_schedule(
+            _build_root_reduction(),
+            Schedule(
+                loop_order=("j", "k"),
+                tiles=(TileSpec("k", 4, accum="stack"),),
+            ),
+        )
+
+    cin = normalize_cin(_build_root_reduction())
+    ids = _index_ids_by_name(cin)
+    base = LoopPlan(
+        loop_order=(ids["j"], ids["k"]),
+        tiles=(
+            _affine_tile(
+                ids["k"],
+                LoopPlacement(PlacementKind.OUTERMOST),
+            ),
+        ),
+        provenance="auto",
+    )
+    _assert_plan_rejected(
+        cin,
+        base,
+        UnsupportedFeature,
+        "root_workspace_tiling",
+    )
+    _assert_plan_rejected(
+        cin,
+        replace(
+            base,
+            tiles=(replace(base.tiles[0], accumulation="stack"),),
+            provenance="explicit",
+        ),
+        UnsupportedFeature,
+        "root_workspace_tiling",
+    )
+
+    direct = replace(base, tiles=())
+    assert verify_loop_plan(cin, direct) is direct
+    assert not legacy_cin_working_copy(cin, direct).inserted_workspace
 
 
 def test_affine_placement_rejects_self_future_and_out_of_range_parents() -> None:
@@ -1053,6 +1357,27 @@ def test_panel_plan_checks_bound_parallelism_and_placement() -> None:
     symbols = _symbol_ids_by_name(cin)
     plan = scheduled.verified_loop_plan
     bound = plan.panel_bounds[0]
+    panel_tile = plan.tiles[0]
+
+    duplicated_bound = replace(plan, panel_bounds=(bound, bound))
+    _assert_plan_rejected(
+        cin,
+        duplicated_bound,
+        VerificationError,
+        "unique loops",
+    )
+
+    multiple_panels = replace(
+        plan,
+        tiles=(panel_tile, replace(panel_tile, loop=LoopRef(ids["k"]))),
+        panel_bounds=(bound, replace(bound, loop=LoopRef(ids["k"]))),
+    )
+    _assert_plan_rejected(
+        cin,
+        multiple_panels,
+        UnsupportedFeature,
+        "multiple_panel_tiles",
+    )
 
     wrong_tensor = replace(
         plan,
@@ -1084,7 +1409,6 @@ def test_panel_plan_checks_bound_parallelism_and_placement() -> None:
         "panel_parallel_parent",
     )
 
-    panel_tile = plan.tiles[0]
     wrong_placement = replace(
         plan,
         tiles=(
@@ -1183,6 +1507,26 @@ def test_heap_result_tile_pairing_and_access_metadata() -> None:
         )
 
     ids = _index_ids_by_name(cin)
+    heap_tile = plan.tiles[0]
+    invalid_lifetime = replace(
+        plan,
+        tiles=(
+            replace(
+                heap_tile,
+                placement=LoopPlacement(
+                    PlacementKind.CHILD_OF,
+                    parent=LoopRef(ids["i"]),
+                ),
+            ),
+        ),
+    )
+    _assert_plan_rejected(
+        cin,
+        invalid_lifetime,
+        InvalidSchedule,
+        "heap_tile_lifetime",
+    )
+
     wrong_parallel_owner = replace(plan, parallel_loop=LoopRef(ids["k"]))
     _assert_plan_rejected(
         cin,
@@ -1264,6 +1608,28 @@ def test_relayout_plan_checks_operand_access_levels_and_scope() -> None:
         wrong_scope,
         InvalidSchedule,
         "relayout_scope",
+    )
+
+    wrong_pack = replace(
+        plan,
+        relayout=replace(relayout, pack_loop=LoopRef(ids["i"])),
+    )
+    _assert_plan_rejected(
+        cin,
+        wrong_pack,
+        InvalidSchedule,
+        "relayout_storage_axes",
+    )
+
+    wrong_row = replace(
+        plan,
+        relayout=replace(relayout, row_loop=LoopRef(ids["k"])),
+    )
+    _assert_plan_rejected(
+        cin,
+        wrong_row,
+        InvalidSchedule,
+        "relayout_sparse_axes",
     )
 
 
