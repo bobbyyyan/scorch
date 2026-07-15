@@ -322,9 +322,13 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
             rewritten.left = self._rewrite_legacy_expr(rewritten.left)
             rewritten.right = self._rewrite_legacy_expr(rewritten.right)
             return rewritten
-        if isinstance(rewritten, llir.ArrayAccess):
-            rewritten.array = self._rewrite_legacy_expr(rewritten.array)
-            rewritten.index = self._rewrite_legacy_expr(rewritten.index)
+        if type(rewritten) is llir.ArrayAccess:
+            access = cast(llir.ArrayAccess, rewritten)
+            return llir.ArrayAccess(
+                array=self._rewrite_legacy_expr(access.array),
+                index=self._rewrite_legacy_expr(access.index),
+                tensor_access=access.tensor_access,
+            )
         return rewritten
 
     def _rewrite_for_loop(self, node: llir.ForLoop) -> llir.ForLoop:

@@ -56,6 +56,12 @@ class _LoopMatch:
     base: str
 
 
+@dataclass(frozen=True)
+class _ReferenceReplacements:
+    generated_strings: Tuple[Tuple[str, str], ...]
+    structured_indices: Tuple[Tuple[str, str], ...]
+
+
 _SINGLE_STEP_BOUND = re.compile(r"^(\w+) \+ 1$")
 _BINOP_FAMILY = (llir.BinOp, llir.Add, llir.Mul)
 
@@ -296,15 +302,22 @@ def _match_loop(
 
 def _rewrite_expression_references(
     expression: llir.Expr,
-    replacements: Sequence[Tuple[str, str]],
+    replacements: _ReferenceReplacements,
     context: SingleIterationLoopEliminationContext,
     path: LLIRPath,
+    *,
+    in_array_index: bool = False,
 ) -> llir.Expr:
     if type(expression) is llir.Var:
         variable = cast(llir.Var, expression)
         name = _checked_var_name(variable, context, path)
         changed = False
-        for old, new in replacements:
+        if in_array_index:
+            for old, new in replacements.structured_indices:
+                if name == old:
+                    name = new
+                    changed = True
+        for old, new in replacements.generated_strings:
             if name == old or old in name:
                 name = name.replace(old, new)
                 changed = True
@@ -325,33 +338,39 @@ def _rewrite_expression_references(
             replacements,
             context,
             path + ("left",),
+            in_array_index=in_array_index,
         )
         binary.right = _rewrite_expression_references(
             binary.right,
             replacements,
             context,
             path + ("right",),
+            in_array_index=in_array_index,
         )
     if type(expression) is llir.ArrayAccess:
         access = cast(llir.ArrayAccess, expression)
-        access.array = _rewrite_expression_references(
-            access.array,
-            replacements,
-            context,
-            path + ("array",),
-        )
-        access.index = _rewrite_expression_references(
-            access.index,
-            replacements,
-            context,
-            path + ("index",),
+        return llir.ArrayAccess(
+            array=_rewrite_expression_references(
+                access.array,
+                replacements,
+                context,
+                path + ("array",),
+            ),
+            index=_rewrite_expression_references(
+                access.index,
+                replacements,
+                context,
+                path + ("index",),
+                in_array_index=True,
+            ),
+            tensor_access=access.tensor_access,
         )
     return expression
 
 
 def _rewrite_expression_sequence(
     expressions: Sequence[llir.Expr],
-    replacements: Sequence[Tuple[str, str]],
+    replacements: _ReferenceReplacements,
     context: SingleIterationLoopEliminationContext,
     path: LLIRPath,
 ) -> Sequence[llir.Expr]:
@@ -371,7 +390,7 @@ def _rewrite_expression_sequence(
 
 def _rewrite_statement_references(
     statements: Sequence[LLIRStatementValue],
-    replacements: Sequence[Tuple[str, str]],
+    replacements: _ReferenceReplacements,
     context: SingleIterationLoopEliminationContext,
     path: LLIRPath,
 ) -> None:
@@ -410,7 +429,7 @@ def _rewrite_statement_references(
         elif type(statement) is llir.FunctionCallStmt:
             call = cast(llir.FunctionCallStmt, statement)
             name = _checked_function_name(call, context, statement_path)
-            for old, new in replacements:
+            for old, new in replacements.generated_strings:
                 name = name.replace(old, new)
             call.name = name
             call.args = cast(
@@ -457,7 +476,7 @@ def _rewrite_statement_references(
         elif type(statement) is llir.RawStmt:
             raw_statement = cast(llir.RawStmt, statement)
             code = _checked_raw_code(raw_statement, context, statement_path)
-            for old, new in replacements:
+            for old, new in replacements.generated_strings:
                 code = code.replace(old, new)
             raw_statement.code = code
 
@@ -537,10 +556,13 @@ def _eliminate_in_sequence(
         inlined: List[LLIRStatementValue] = list(
             cast(Sequence[LLIRStatementValue], loop.body)
         )
-        replacements = (
-            (f"{match.loop_variable}]", f"{match.base}]"),
-            (f"[{match.loop_variable}]", f"[{match.base}]"),
-            (f"{match.loop_variable} ", f"{match.base} "),
+        replacements = _ReferenceReplacements(
+            generated_strings=(
+                (f"{match.loop_variable}]", f"{match.base}]"),
+                (f"[{match.loop_variable}]", f"[{match.base}]"),
+                (f"{match.loop_variable} ", f"{match.base} "),
+            ),
+            structured_indices=((match.loop_variable, match.base),),
         )
         _rewrite_statement_references(
             inlined,

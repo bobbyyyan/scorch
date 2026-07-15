@@ -245,7 +245,7 @@ class LLIRLowerer:
         if isinstance(ir, llir.Array):
             return "{" + ", ".join(self._render_expression(v) for v in ir.values) + "}"
 
-        if isinstance(ir, llir.ArrayAccess):
+        if type(ir) is llir.ArrayAccess:
             array = self._render_operand(
                 ir.array,
                 parent_precedence=self._POSTFIX_PRECEDENCE,
@@ -283,7 +283,7 @@ class LLIRLowerer:
             return self._binary_precedence(ir.op)
         if isinstance(ir, (llir.Cast, llir.UnaryOp, llir.Sizeof)):
             return self._UNARY_PRECEDENCE
-        if isinstance(ir, (llir.FunctionCall, llir.ArrayAccess)):
+        if isinstance(ir, llir.FunctionCall) or type(ir) is llir.ArrayAccess:
             return self._POSTFIX_PRECEDENCE
         if isinstance(ir, (llir.Literal, llir.Var, llir.Array)):
             return self._PRIMARY_PRECEDENCE

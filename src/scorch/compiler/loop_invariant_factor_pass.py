@@ -303,18 +303,46 @@ def _partition_factors(
     invariant: List[_Factor] = []
     variant: List[_Factor] = []
     for factor, path in factors:
-        name = (
-            _checked_var_name(cast(llir.Var, factor), context, path)
-            if type(factor) is llir.Var
-            else ""
-        )
-        if "_ptr[" in name:
-            variant.append((factor, path))
-        elif any(defined_name in name for defined_name in body_defined_vars):
+        if _factor_is_variant(factor, body_defined_vars, context, path):
             variant.append((factor, path))
         else:
             invariant.append((factor, path))
     return invariant, variant
+
+
+def _factor_is_variant(
+    expression: llir.Expr,
+    body_defined_vars: set[str],
+    context: LoopInvariantFactorHoistContext,
+    path: LLIRPath,
+) -> bool:
+    if type(expression) is llir.Var:
+        name = _checked_var_name(cast(llir.Var, expression), context, path)
+        return "_ptr[" in name or any(
+            defined_name in name for defined_name in body_defined_vars
+        )
+    if type(expression) is llir.ArrayAccess:
+        access = cast(llir.ArrayAccess, expression)
+        if type(access.array) is llir.Var:
+            array_name = _checked_var_name(
+                cast(llir.Var, access.array),
+                context,
+                path + ("array",),
+            )
+            if array_name.endswith("_ptr"):
+                return True
+        return _factor_is_variant(
+            access.array,
+            body_defined_vars,
+            context,
+            path + ("array",),
+        ) or _factor_is_variant(
+            access.index,
+            body_defined_vars,
+            context,
+            path + ("index",),
+        )
+    return False
 
 
 def _rebuild_product(factors: Sequence[_Factor]) -> llir.Expr:
@@ -342,6 +370,12 @@ def _render_expression(
             f"({_render_expression(binary.left, context, path + ('left',))} "
             f"{operator} "
             f"{_render_expression(binary.right, context, path + ('right',))})"
+        )
+    if type(expression) is llir.ArrayAccess:
+        access = cast(llir.ArrayAccess, expression)
+        return (
+            f"{_render_expression(access.array, context, path + ('array',))}"
+            f"[{_render_expression(access.index, context, path + ('index',))}]"
         )
     return str(expression)
 

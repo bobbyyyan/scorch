@@ -10,9 +10,16 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from . import llir
+from .identity import IndexId, SymbolId
+from .llir_traversal import LLIRRewriter, LLIRTraversalContext, LLIRWalker
 from .scheduler import Schedule, TileSpec, _RelayoutPlan, _ResultTilePlan
 
 LoopLocation = Tuple[List[llir.Stmt], int, llir.ForLoop]
+
+_ACCESS_REWRITE_CONTEXT = LLIRTraversalContext(
+    stage="schedule lowering",
+    pass_name="redirect_tensor_access",
+)
 
 
 def _nested_bodies(stmt: llir.Stmt) -> List[List[llir.Stmt]]:
@@ -280,143 +287,180 @@ def _unique_name(base: str, used: set[str]) -> str:
 
 def _matches_tensor_access(
     expr: llir.Expr,
-    tensor_name: str,
-    index_vars: Tuple[str, ...],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
 ) -> bool:
-    if not isinstance(expr, llir.Var) or expr.tensor_access is None:
+    if type(expr) is llir.Var:
+        metadata = expr.tensor_access
+    elif type(expr) is llir.ArrayAccess:
+        metadata = expr.tensor_access
+    else:
         return False
-    metadata = expr.tensor_access
+    if type(metadata) is not llir.TensorAccessMetadata:
+        return False
     return (
-        metadata.tensor_name == tensor_name
-        and metadata.index_vars == index_vars
+        metadata.tensor_id == tensor_id
+        and metadata.index_ids == index_ids
         and metadata.role == role
     )
 
 
+class _TensorAccessRewriter(LLIRRewriter):
+    """Detach an expression while replacing selected logical accesses."""
+
+    def __init__(
+        self,
+        tensor_id: SymbolId,
+        index_ids: Tuple[IndexId, ...],
+        role: llir.TensorAccessRole,
+        replacement: llir.Expr,
+    ) -> None:
+        super().__init__(_ACCESS_REWRITE_CONTEXT)
+        self.tensor_id = tensor_id
+        self.index_ids = index_ids
+        self.role = role
+        self.replacement = replacement
+        self.rewrite_count = 0
+
+    def _rewrite_expr(self, node: llir.Expr, path: Tuple[str, ...]) -> llir.Expr:
+        rewritten = super()._rewrite_expr(node, path)
+        if _matches_tensor_access(
+            rewritten,
+            self.tensor_id,
+            self.index_ids,
+            self.role,
+        ):
+            self.rewrite_count += 1
+            cloned = LLIRRewriter(self.context).rewrite(self.replacement)
+            if not isinstance(cloned, llir.Expr):
+                raise AssertionError(
+                    "an expression replacement must remain an expression"
+                )
+            return cloned
+        return rewritten
+
+
 def _rewrite_expr_access(
     expr: llir.Expr,
-    tensor_name: str,
-    index_vars: Tuple[str, ...],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
-    replacement: llir.Var,
+    replacement: llir.Expr,
 ) -> Tuple[llir.Expr, int]:
-    """Redirect one CIN tensor access in a structured LLIR expression tree."""
-    if isinstance(expr, llir.Var):
-        if _matches_tensor_access(expr, tensor_name, index_vars, role):
-            return replacement, 1
-        return expr, 0
-    if isinstance(expr, llir.BinOp):
-        expr.left, left_count = _rewrite_expr_access(
-            expr.left, tensor_name, index_vars, role, replacement
-        )
-        expr.right, right_count = _rewrite_expr_access(
-            expr.right, tensor_name, index_vars, role, replacement
-        )
-        return expr, left_count + right_count
-    if isinstance(expr, llir.UnaryOp):
-        expr.operand, count = _rewrite_expr_access(
-            expr.operand, tensor_name, index_vars, role, replacement
-        )
-        return expr, count
-    if isinstance(expr, llir.FunctionCall):
-        count = 0
-        rewritten_args = []
-        for arg in expr.args:
-            new_arg, arg_count = _rewrite_expr_access(
-                arg, tensor_name, index_vars, role, replacement
-            )
-            rewritten_args.append(new_arg)
-            count += arg_count
-        expr.args = rewritten_args
-        return expr, count
-    if isinstance(expr, llir.ArrayAccess):
-        expr.array, array_count = _rewrite_expr_access(
-            expr.array, tensor_name, index_vars, role, replacement
-        )
-        expr.index, index_count = _rewrite_expr_access(
-            expr.index, tensor_name, index_vars, role, replacement
-        )
-        return expr, array_count + index_count
-    if isinstance(expr, llir.Cast):
-        rewritten_expr, count = _rewrite_expr_access(
-            expr.expr, tensor_name, index_vars, role, replacement
-        )
-        return llir.Cast(rewritten_expr, expr.data_type), count
-    return expr, 0
+    """Redirect one CIN tensor access in a detached expression tree."""
+    rewriter = _TensorAccessRewriter(
+        tensor_id,
+        index_ids,
+        role,
+        replacement,
+    )
+    rewritten = rewriter.rewrite(expr)
+    if not isinstance(rewritten, llir.Expr):
+        raise AssertionError("an expression rewrite must remain an expression")
+    return rewritten, rewriter.rewrite_count
 
 
 def _rewrite_stmt_accesses(
     stmts: List[llir.Stmt],
-    tensor_name: str,
-    index_vars: Tuple[str, ...],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
-    replacement: llir.Var,
+    replacement: llir.Expr,
+    *,
+    _validated: bool = False,
 ) -> int:
     """Rewrite matching tensor accesses without parsing rendered C++ names."""
+    if not _validated:
+        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(stmts)
     count = 0
     for stmt in stmts:
         if isinstance(stmt, llir.VarInit):
             stmt.value, rewritten = _rewrite_expr_access(
-                stmt.value, tensor_name, index_vars, role, replacement
+                stmt.value, tensor_id, index_ids, role, replacement
             )
             count += rewritten
         elif isinstance(stmt, llir.Assign):
             stmt.var, lhs_count = _rewrite_expr_access(
-                stmt.var, tensor_name, index_vars, role, replacement
+                stmt.var, tensor_id, index_ids, role, replacement
             )
             stmt.value, rhs_count = _rewrite_expr_access(
-                stmt.value, tensor_name, index_vars, role, replacement
+                stmt.value, tensor_id, index_ids, role, replacement
             )
             count += lhs_count + rhs_count
         elif isinstance(stmt, llir.ForLoop):
             if stmt.init is not None:
                 count += _rewrite_stmt_accesses(
-                    [stmt.init], tensor_name, index_vars, role, replacement
+                    [stmt.init],
+                    tensor_id,
+                    index_ids,
+                    role,
+                    replacement,
+                    _validated=True,
                 )
             stmt.cond, cond_count = _rewrite_expr_access(
-                stmt.cond, tensor_name, index_vars, role, replacement
+                stmt.cond, tensor_id, index_ids, role, replacement
             )
             count += cond_count
             if isinstance(stmt.update, llir.Assign):
                 count += _rewrite_stmt_accesses(
-                    [stmt.update], tensor_name, index_vars, role, replacement
+                    [stmt.update],
+                    tensor_id,
+                    index_ids,
+                    role,
+                    replacement,
+                    _validated=True,
                 )
             count += _rewrite_stmt_accesses(
-                stmt.body, tensor_name, index_vars, role, replacement
+                stmt.body,
+                tensor_id,
+                index_ids,
+                role,
+                replacement,
+                _validated=True,
             )
         elif isinstance(stmt, llir.WhileLoop):
             stmt.cond, cond_count = _rewrite_expr_access(
-                stmt.cond, tensor_name, index_vars, role, replacement
+                stmt.cond, tensor_id, index_ids, role, replacement
             )
             count += cond_count
             count += _rewrite_stmt_accesses(
-                stmt.body, tensor_name, index_vars, role, replacement
+                stmt.body,
+                tensor_id,
+                index_ids,
+                role,
+                replacement,
+                _validated=True,
             )
         elif isinstance(stmt, llir.IfThenElse):
             if stmt.cond is not None:
                 stmt.cond, cond_count = _rewrite_expr_access(
-                    stmt.cond, tensor_name, index_vars, role, replacement
+                    stmt.cond, tensor_id, index_ids, role, replacement
                 )
                 count += cond_count
             if stmt.cond_list:
                 rewritten_conditions = []
                 for condition in stmt.cond_list:
                     condition, cond_count = _rewrite_expr_access(
-                        condition, tensor_name, index_vars, role, replacement
+                        condition, tensor_id, index_ids, role, replacement
                     )
                     rewritten_conditions.append(condition)
                     count += cond_count
                 stmt.cond_list = rewritten_conditions
             for body in _nested_bodies(stmt):
                 count += _rewrite_stmt_accesses(
-                    body, tensor_name, index_vars, role, replacement
+                    body,
+                    tensor_id,
+                    index_ids,
+                    role,
+                    replacement,
+                    _validated=True,
                 )
         elif isinstance(stmt, llir.FunctionCallStmt):
             rewritten_args = []
             for arg in stmt.args:
                 arg, arg_count = _rewrite_expr_access(
-                    arg, tensor_name, index_vars, role, replacement
+                    arg, tensor_id, index_ids, role, replacement
                 )
                 rewritten_args.append(arg)
                 count += arg_count
@@ -426,46 +470,29 @@ def _rewrite_stmt_accesses(
 
 def _contains_tensor_access(
     stmts: List[llir.Stmt],
-    tensor_name: str,
-    index_vars: Tuple[str, ...],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
 ) -> bool:
     """Whether structured LLIR still contains a selected logical access."""
-    for stmt in stmts:
-        expressions: List[llir.Expr] = []
-        if isinstance(stmt, llir.VarInit):
-            expressions.append(stmt.value)
-        elif isinstance(stmt, llir.Assign):
-            expressions.extend([stmt.var, stmt.value])
-        elif isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
-            expressions.append(stmt.cond)
-        elif isinstance(stmt, llir.IfThenElse):
-            if stmt.cond is not None:
-                expressions.append(stmt.cond)
-            expressions.extend(stmt.cond_list or [])
-        elif isinstance(stmt, llir.FunctionCallStmt):
-            expressions.extend(stmt.args)
 
-        pending = list(expressions)
-        while pending:
-            expr = pending.pop()
-            if _matches_tensor_access(expr, tensor_name, index_vars, role):
-                return True
-            if isinstance(expr, llir.BinOp):
-                pending.extend([expr.left, expr.right])
-            elif isinstance(expr, llir.UnaryOp):
-                pending.append(expr.operand)
-            elif isinstance(expr, llir.FunctionCall):
-                pending.extend(expr.args)
-            elif isinstance(expr, llir.ArrayAccess):
-                pending.extend([expr.array, expr.index])
-            elif isinstance(expr, llir.Cast):
-                pending.append(expr.expr)
+    class _TensorAccessMatchWalker(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(_ACCESS_REWRITE_CONTEXT)
+            self.found = False
 
-        for body in _nested_bodies(stmt):
-            if _contains_tensor_access(body, tensor_name, index_vars, role):
-                return True
-    return False
+        def enter_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if isinstance(node, llir.Expr) and _matches_tensor_access(
+                node,
+                tensor_id,
+                index_ids,
+                role,
+            ):
+                self.found = True
+
+    walker = _TensorAccessMatchWalker()
+    walker.walk(stmts)
+    return walker.found
 
 
 def _redirect_sparse_prefetch(
@@ -610,8 +637,8 @@ def _apply_heap_result_tile(
     )
     rewritten = _rewrite_stmt_accesses(
         tile_loop.body,
-        plan.result,
-        plan.access_index_vars,
+        plan.result_id,
+        plan.access_index_ids,
         llir.TensorAccessRole.RESULT_WRITE,
         compact_access,
     )
@@ -621,8 +648,8 @@ def _apply_heap_result_tile(
         )
     if _contains_tensor_access(
         tile_loop.body,
-        plan.result,
-        plan.access_index_vars,
+        plan.result_id,
+        plan.access_index_ids,
         llir.TensorAccessRole.RESULT_WRITE,
     ):
         raise NotImplementedError(
@@ -845,20 +872,29 @@ def _apply_relayout(
     panel_axis_bound = f"{plan.operand}{plan.operand_panel_level}_size"
     panel_scoped = plan.scope_var == plan.panel_var
     stage_row_origin = panel_outer_name if panel_scoped else None
-    staged_read_row = (
-        f"({plan.panel_var} - {panel_outer_name})" if panel_scoped else plan.panel_var
+    staged_read_row: llir.Expr = (
+        llir.BinOp(
+            op="-",
+            left=llir.Var(plan.panel_var, llir.DataType.INT64),
+            right=llir.Var(panel_outer_name, llir.DataType.INT64),
+        )
+        if panel_scoped
+        else llir.Var(plan.panel_var, llir.DataType.INT64)
     )
-    packed_read = llir.Var(
-        name=(
-            f"{packed_name}[{staged_read_row} * "
-            f"{pack_tile_var} + {pack_inner_name}]"
+    packed_read = llir.ArrayAccess(
+        array=llir.Var(packed_name, pointer_type),
+        index=llir.Add(
+            llir.Mul(
+                staged_read_row,
+                llir.Var(pack_tile_var, llir.DataType.INT64),
+            ),
+            llir.Var(pack_inner_name, llir.DataType.INT64),
         ),
-        type=scalar_type,
     )
     rewritten = _rewrite_stmt_accesses(
         row_loop.body,
-        plan.operand,
-        plan.access_index_vars,
+        plan.operand_id,
+        plan.access_index_ids,
         llir.TensorAccessRole.INPUT_READ,
         packed_read,
     )
@@ -908,8 +944,8 @@ def _apply_relayout(
     )
     if _contains_tensor_access(
         row_loop.body,
-        plan.operand,
-        plan.access_index_vars,
+        plan.operand_id,
+        plan.access_index_ids,
         llir.TensorAccessRole.INPUT_READ,
     ):
         raise NotImplementedError(
@@ -919,7 +955,6 @@ def _apply_relayout(
     pack_row = _unique_name(f"{plan.panel_var}_pack", used_names)
     pack_col = _unique_name(f"{plan.pack_var}_pack", used_names)
     logical_pack_col = _unique_name(f"{plan.pack_var}_packed", used_names)
-    source_index = f"{pack_row} * {pack_axis_bound} + {logical_pack_col}"
     destination_row = f"({pack_row} - {panel_outer_name})" if panel_scoped else pack_row
     destination_index = f"{destination_row} * {pack_tile_var} + {pack_col}"
     pack_inner = llir.ForLoop(
@@ -951,7 +986,16 @@ def _apply_relayout(
             ),
             llir.Assign(
                 var=llir.Var(f"{packed_name}[{destination_index}]", scalar_type),
-                value=llir.Var(f"{operand_value_array}[{source_index}]", scalar_type),
+                value=llir.ArrayAccess(
+                    array=llir.Var(operand_value_array, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(pack_row, llir.DataType.INT64),
+                            llir.Var(pack_axis_bound, llir.DataType.INT64),
+                        ),
+                        llir.Var(logical_pack_col, llir.DataType.INT64),
+                    ),
+                ),
             ),
         ],
     )

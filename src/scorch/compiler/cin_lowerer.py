@@ -871,30 +871,27 @@ class CINLowerer:
         )
 
         if len(tensor_access.indices) == 1 and level_type == LevelType.DENSE:
-            return llir.Var(
-                name=f"{tensor_access.tensor.name}_val[{last_index_var.name}]",
-                type=llir.DataType.NO_TYPE,
-                tensor_access=tensor_access_metadata,
+            physical_index = last_index_var.name
+        else:
+            physical_index = (
+                f"p{tensor_access.tensor.get_name()}"
+                f"{tensor_access.level_of_index_var(last_index_var)}"
             )
 
-        return llir.Var(
-            name=f"{tensor_access.tensor.name}_val"
-            + f"[p{tensor_access.tensor.get_name()}{tensor_access.level_of_index_var(last_index_var)}]",
-            type=llir.DataType.NO_TYPE,
+        if tensor_access_metadata is None:
+            return llir.Var(
+                name=f"{tensor_access.tensor.name}_val[{physical_index}]",
+                type=llir.DataType.NO_TYPE,
+            )
+
+        return llir.ArrayAccess(
+            array=llir.Var(
+                name=f"{tensor_access.tensor.name}_val",
+                type=llir.DataType.ptr_type(tensor_access.tensor.dtype),
+            ),
+            index=llir.Var(name=physical_index, type=llir.DataType.INT),
             tensor_access=tensor_access_metadata,
         )
-
-        # if level_type == LevelType.DENSE:
-        #     return llir.Var(
-        #         name=f"{tensor_access.tensor.name}_values[{last_index_var.name}]",
-        #         type=llir.DataType.NO_TYPE,
-        #     )
-        # elif level_type == LevelType.COMPRESSED:
-        #     return llir.Var(
-        #         name=f"{tensor_access.tensor.name}_values[{last_index_var.name}_{tensor_access.tensor.name}]",
-        #         type=llir.DataType.NO_TYPE,
-        #     )
-        raise NotImplementedError(f"Level type {level_type} not implemented")
 
     def lower_BinaryOp(self, bin_op: BinaryOp) -> llir.Expr:
         """
@@ -925,10 +922,9 @@ class CINLowerer:
         if tensor_access.is_workspace():
             return None
         return llir.TensorAccessMetadata(
-            tensor_name=tensor_access.tensor.name,
-            index_vars=tuple(
-                index_var.name for index_var in (tensor_access.indices or [])
-            ),
+            access_id=tensor_access.access_id,
+            tensor_id=tensor_access.tensor_id,
+            index_ids=tuple(tensor_access.index_ids),
             role=role,
         )
 
@@ -3057,9 +3053,12 @@ class CINLowerer:
         if isinstance(expr, llir.BinOp):
             expr.left = CINLowerer._rewrite_expr_refs(expr.left, replacements)
             expr.right = CINLowerer._rewrite_expr_refs(expr.right, replacements)
-        if isinstance(expr, llir.ArrayAccess):
-            expr.array = CINLowerer._rewrite_expr_refs(expr.array, replacements)
-            expr.index = CINLowerer._rewrite_expr_refs(expr.index, replacements)
+        if type(expr) is llir.ArrayAccess:
+            return llir.ArrayAccess(
+                array=CINLowerer._rewrite_expr_refs(expr.array, replacements),
+                index=CINLowerer._rewrite_expr_refs(expr.index, replacements),
+                tensor_access=expr.tensor_access,
+            )
         return expr
 
     @staticmethod

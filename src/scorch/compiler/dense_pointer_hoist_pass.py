@@ -1,12 +1,13 @@
 """Typed dense-pointer hoisting over a detached LLIR statement list.
 
-Version 1 intentionally preserves the legacy string-encoded optimization.  A
+Version 1 preserves the characterized optimization while structurally owning
+typed tensor-value reads.  A
 candidate is discovered only in a direct ``ForLoop.body`` and only when its
 position initializer has the exact affine shape used by ``CINLowerer``.  Value
-arrays are associated with positions only through string-encoded
-``<name>_val[<position>]`` variables found in direct assignments.  In
-particular, a structured ``ArrayAccess(Var("B_val"), Var("pB1"))`` remains a
-legal miss.
+arrays are associated with positions through
+``ArrayAccess(Var("B_val"), Var("pB1"))`` expressions found in direct
+assignments.  The preexisting flat ``<name>_val[<position>]`` compatibility
+form remains accepted while legacy producers are retired.
 
 The common LLIR rewriter first validates and detaches the complete input tree.
 Semantic analysis is intentionally narrower: it follows only direct
@@ -63,7 +64,22 @@ class _LoopAnalysis:
     position_to_value_array: Tuple[Tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class _StructuredAccessReplacement:
+    value_array: str
+    position: str
+    pointer: str
+    loop_variable: str
+
+
+@dataclass(frozen=True)
+class _ReferenceReplacements:
+    generated_strings: Tuple[Tuple[str, str], ...]
+    structured_accesses: Tuple[_StructuredAccessReplacement, ...]
+
+
 _STRING_VALUE_ACCESS = re.compile(r"^(\w+_val)\[(\w+)\]$")
+_STRUCTURED_VALUE_ARRAY = re.compile(r"^\w+_val$")
 
 
 class _DensePointerDetacher(LLIRRewriter):
@@ -266,7 +282,7 @@ def _collect_value_array_references(
     context: DensePointerHoistContext,
     path: LLIRPath,
 ) -> None:
-    """Collect exact string accesses with the legacy expression recursion."""
+    """Collect exact structured and legacy value-array accesses."""
 
     if type(expression) is llir.Var:
         variable = cast(llir.Var, expression)
@@ -289,6 +305,20 @@ def _collect_value_array_references(
         )
     if type(expression) is llir.ArrayAccess:
         access = cast(llir.ArrayAccess, expression)
+        if type(access.array) is llir.Var and type(access.index) is llir.Var:
+            array_name = _checked_var_name(
+                cast(llir.Var, access.array),
+                context,
+                path + ("array",),
+            )
+            position = _checked_var_name(
+                cast(llir.Var, access.index),
+                context,
+                path + ("index",),
+            )
+            if _STRUCTURED_VALUE_ARRAY.match(array_name):
+                position_to_value_array[position] = array_name
+                return
         _collect_value_array_references(
             access.array,
             position_to_value_array,
@@ -407,7 +437,7 @@ def _analyze_loop(
 
 def _rewrite_expression_references(
     expression: llir.Expr,
-    replacements: Sequence[Tuple[str, str]],
+    replacements: _ReferenceReplacements,
     context: DensePointerHoistContext,
     path: LLIRPath,
 ) -> llir.Expr:
@@ -415,7 +445,7 @@ def _rewrite_expression_references(
         variable = cast(llir.Var, expression)
         name = _checked_var_name(variable, context, path)
         rewritten: llir.Expr = variable
-        for old, new in replacements:
+        for old, new in replacements.generated_strings:
             if name == old or old in name:
                 name = name.replace(old, new)
                 rewritten = llir.Var(
@@ -442,24 +472,50 @@ def _rewrite_expression_references(
         )
     if type(expression) is llir.ArrayAccess:
         access = cast(llir.ArrayAccess, expression)
-        access.array = _rewrite_expression_references(
-            access.array,
-            replacements,
-            context,
-            path + ("array",),
-        )
-        access.index = _rewrite_expression_references(
-            access.index,
-            replacements,
-            context,
-            path + ("index",),
+        if type(access.array) is llir.Var and type(access.index) is llir.Var:
+            array = cast(llir.Var, access.array)
+            index = cast(llir.Var, access.index)
+            array_name = _checked_var_name(array, context, path + ("array",))
+            index_name = _checked_var_name(index, context, path + ("index",))
+            for replacement in replacements.structured_accesses:
+                if (
+                    array_name == replacement.value_array
+                    and index_name == replacement.position
+                ):
+                    return llir.ArrayAccess(
+                        array=llir.Var(
+                            name=replacement.pointer,
+                            type=array.type,
+                            is_ptr=True,
+                            is_restrict=True,
+                        ),
+                        index=llir.Var(
+                            name=replacement.loop_variable,
+                            type=index.type,
+                        ),
+                        tensor_access=access.tensor_access,
+                    )
+        return llir.ArrayAccess(
+            array=_rewrite_expression_references(
+                access.array,
+                replacements,
+                context,
+                path + ("array",),
+            ),
+            index=_rewrite_expression_references(
+                access.index,
+                replacements,
+                context,
+                path + ("index",),
+            ),
+            tensor_access=access.tensor_access,
         )
     return expression
 
 
 def _rewrite_expression_sequence(
     expressions: Sequence[llir.Expr],
-    replacements: Sequence[Tuple[str, str]],
+    replacements: _ReferenceReplacements,
     context: DensePointerHoistContext,
     path: LLIRPath,
 ) -> Sequence[llir.Expr]:
@@ -511,7 +567,7 @@ def _checked_raw_code(
 
 def _rewrite_statement_references(
     statements: Sequence[LLIRStatementValue],
-    replacements: Sequence[Tuple[str, str]],
+    replacements: _ReferenceReplacements,
     context: DensePointerHoistContext,
     path: LLIRPath,
 ) -> None:
@@ -550,7 +606,7 @@ def _rewrite_statement_references(
         elif type(statement) is llir.FunctionCallStmt:
             call = cast(llir.FunctionCallStmt, statement)
             name = _checked_function_name(call, context, statement_path)
-            for old, new in replacements:
+            for old, new in replacements.generated_strings:
                 name = name.replace(old, new)
             call.name = name
             call.args = cast(
@@ -597,7 +653,7 @@ def _rewrite_statement_references(
         elif type(statement) is llir.RawStmt:
             raw_statement = cast(llir.RawStmt, statement)
             code = _checked_raw_code(raw_statement, context, statement_path)
-            for old, new in replacements:
+            for old, new in replacements.generated_strings:
                 code = code.replace(old, new)
             raw_statement.code = code
 
@@ -613,6 +669,7 @@ def _apply_loop_analysis(
     declarations: List[llir.Stmt] = []
     indices_to_remove: set[int] = set()
     replacements: Dict[str, str] = {}
+    structured_replacements: List[_StructuredAccessReplacement] = []
 
     for candidate in analysis.candidates:
         value_array = position_to_value_array.get(candidate.position)
@@ -633,6 +690,14 @@ def _apply_loop_analysis(
         replacements[f"{value_array}[{candidate.position}]"] = (
             f"{pointer_name}[{analysis.loop_variable}]"
         )
+        structured_replacements.append(
+            _StructuredAccessReplacement(
+                value_array=value_array,
+                position=candidate.position,
+                pointer=pointer_name,
+                loop_variable=analysis.loop_variable,
+            )
+        )
         indices_to_remove.add(candidate.body_index)
 
     if not declarations:
@@ -652,7 +717,10 @@ def _apply_loop_analysis(
         loop.body = cast(List[llir.Stmt], retained)
     _rewrite_statement_references(
         loop.body,
-        tuple(replacements.items()),
+        _ReferenceReplacements(
+            generated_strings=tuple(replacements.items()),
+            structured_accesses=tuple(structured_replacements),
+        ),
         context,
         path + ("body",),
     )

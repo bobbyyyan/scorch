@@ -1,10 +1,11 @@
 """Exhaustive typed traversal and rebuilding for the current LLIR.
 
-The current LLIR is mutable, so :class:`LLIRRewriter` rebuilds every node and
-child collection.  A rewritten value is therefore a detached working tree even
-when a subclass makes no semantic change.  Dispatch is deliberately explicit
-and exact-type based: adding an LLIR node requires adding its child order here,
-and an unknown subclass cannot be mistaken for a supported parent node.
+The current LLIR is predominantly mutable, while newer structural nodes may be
+frozen.  :class:`LLIRRewriter` rebuilds every node and child collection, so a
+rewritten value is a detached working tree even when a subclass makes no
+semantic change.  Dispatch is deliberately explicit and exact-type based:
+adding an LLIR node requires adding its child order here, and an unknown
+subclass cannot be mistaken for a supported parent node.
 
 Traversal is deterministic pre-order.  Scalar fields are visited in their
 emission-oriented order.  In particular, a ``ForLoop`` visits its optional
@@ -30,6 +31,7 @@ from typing import (
 
 from . import llir
 from .diagnostics import CompilerInvariantError
+from .identity import AccessId, IndexId, SymbolId
 
 LLIRPath = Tuple[str, ...]
 LLIRStatementValue = Union[
@@ -149,6 +151,60 @@ def _raise_traversal_error(
             pass_name=context.pass_name,
         )
     )
+
+
+def _validate_tensor_access_metadata(
+    metadata: object,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if metadata is None:
+        return
+    if type(metadata) is not llir.TensorAccessMetadata:
+        _raise_traversal_error(
+            context,
+            code="invalid_tensor_access_metadata",
+            message="tensor_access must be TensorAccessMetadata or None",
+            path=path,
+            value=metadata,
+        )
+    typed_metadata = cast(llir.TensorAccessMetadata, metadata)
+    fields = (
+        ("access_id", typed_metadata.access_id, AccessId),
+        ("tensor_id", typed_metadata.tensor_id, SymbolId),
+        ("role", typed_metadata.role, llir.TensorAccessRole),
+    )
+    for field_name, value, expected_type in fields:
+        if type(value) is not expected_type:
+            _raise_traversal_error(
+                context,
+                code="invalid_tensor_access_metadata",
+                message=(
+                    f"TensorAccessMetadata.{field_name} must be "
+                    f"{expected_type.__name__}"
+                ),
+                path=path + (field_name,),
+                value=value,
+            )
+    if type(typed_metadata.index_ids) is not tuple:
+        _raise_traversal_error(
+            context,
+            code="invalid_tensor_access_metadata",
+            message="TensorAccessMetadata.index_ids must be a tuple of IndexId values",
+            path=path + ("index_ids",),
+            value=typed_metadata.index_ids,
+        )
+    for index, index_id in enumerate(typed_metadata.index_ids):
+        if type(index_id) is not IndexId:
+            _raise_traversal_error(
+                context,
+                code="invalid_tensor_access_metadata",
+                message=(
+                    "TensorAccessMetadata.index_ids must contain only IndexId values"
+                ),
+                path=path + ("index_ids", f"[{index}]"),
+                value=index_id,
+            )
 
 
 class LLIRWalker:
@@ -438,7 +494,11 @@ class LLIRWalker:
         self._walk_expr(node.tensor, path + ("tensor",))
 
     def visit_var(self, node: llir.Var, path: LLIRPath) -> None:
-        pass
+        _validate_tensor_access_metadata(
+            node.tensor_access,
+            self.context,
+            path + ("tensor_access",),
+        )
 
     def visit_unary_op(self, node: llir.UnaryOp, path: LLIRPath) -> None:
         self._walk_expr(node.operand, path + ("operand",))
@@ -463,6 +523,11 @@ class LLIRWalker:
         self._walk_expr_sequence(node.values, path + ("values",))
 
     def visit_array_access(self, node: llir.ArrayAccess, path: LLIRPath) -> None:
+        _validate_tensor_access_metadata(
+            node.tensor_access,
+            self.context,
+            path + ("tensor_access",),
+        )
         self._walk_expr(node.array, path + ("array",))
         self._walk_expr(node.index, path + ("index",))
 
@@ -942,6 +1007,11 @@ class LLIRRewriter:
         )
 
     def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+        _validate_tensor_access_metadata(
+            node.tensor_access,
+            self.context,
+            path + ("tensor_access",),
+        )
         return llir.Var(
             name=node.name,
             type=node.type,
@@ -1007,9 +1077,15 @@ class LLIRRewriter:
     def rewrite_array_access(
         self, node: llir.ArrayAccess, path: LLIRPath
     ) -> llir.ArrayAccess:
+        _validate_tensor_access_metadata(
+            node.tensor_access,
+            self.context,
+            path + ("tensor_access",),
+        )
         return llir.ArrayAccess(
             array=self._rewrite_expr(node.array, path + ("array",)),
             index=self._rewrite_expr(node.index, path + ("index",)),
+            tensor_access=node.tensor_access,
         )
 
     def rewrite_cast(self, node: llir.Cast, path: LLIRPath) -> llir.Cast:

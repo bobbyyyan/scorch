@@ -28,7 +28,7 @@ from scorch.compiler.cin import (
 from .cin_analysis import _compile_options_at_cin_boundary, normalize_cin
 from .compilation_context import CompilerStageId, CompilationContext
 from .compile_options import CompileOptions, SchedulerCostModel, SchedulerPolicy
-from .identity import IndexId
+from .identity import IndexId, SymbolId
 from .diagnostics import (
     CompileOptionsDiagnostic,
     CompileOptionsError,
@@ -308,11 +308,13 @@ class _RelayoutPlan:
     """CIN-derived metadata consumed by the post-lowering staging pass."""
 
     operand: str
+    operand_id: SymbolId
     pack_var: str
     panel_var: str
     scope_var: str
     row_var: str
     access_index_vars: Tuple[str, ...]
+    access_index_ids: Tuple[IndexId, ...]
     operand_panel_level: int
     operand_pack_level: int
 
@@ -328,10 +330,12 @@ class _ResultTilePlan:
     """
 
     result: str
+    result_id: SymbolId
     tile_var: str
     result_level: int
     result_prefix_vars: Tuple[str, ...]
     access_index_vars: Tuple[str, ...]
+    access_index_ids: Tuple[IndexId, ...]
 
 
 @dataclass(frozen=True)
@@ -504,16 +508,13 @@ def _build_loop_plan(
                 "validated relayout metadata has no public relayout decision"
             )
         relayout = OperandRelayout(
-            operand_id=symbols_by_name[relayout_plan.operand].symbol_id,
+            operand_id=relayout_plan.operand_id,
             pack_loop=_loop_ref_from_name(relayout_plan.pack_var, indices_by_name),
             panel_loop=_loop_ref_from_name(relayout_plan.panel_var, indices_by_name),
             scope_loop=_loop_ref_from_name(relayout_plan.scope_var, indices_by_name),
             row_loop=_loop_ref_from_name(relayout_plan.row_var, indices_by_name),
             strip_width=schedule.relayout.strip_width,
-            access_indices=tuple(
-                indices_by_name[name].index_id
-                for name in relayout_plan.access_index_vars
-            ),
+            access_indices=relayout_plan.access_index_ids,
             operand_panel_level=relayout_plan.operand_panel_level,
             operand_pack_level=relayout_plan.operand_pack_level,
         )
@@ -521,17 +522,14 @@ def _build_loop_plan(
     result_tile = None
     if result_tile_plan is not None:
         result_tile = ResultTile(
-            result_id=symbols_by_name[result_tile_plan.result].symbol_id,
+            result_id=result_tile_plan.result_id,
             tile_loop=_loop_ref_from_name(result_tile_plan.tile_var, indices_by_name),
             result_level=result_tile_plan.result_level,
             result_prefix=tuple(
                 indices_by_name[name].index_id
                 for name in result_tile_plan.result_prefix_vars
             ),
-            access_indices=tuple(
-                indices_by_name[name].index_id
-                for name in result_tile_plan.access_index_vars
-            ),
+            access_indices=result_tile_plan.access_index_ids,
         )
 
     parallel_loop = (
@@ -625,11 +623,13 @@ def materialize_legacy_schedule(
         )
         relayout_plan = _RelayoutPlan(
             operand=symbol_names[relayout.operand_id],
+            operand_id=relayout.operand_id,
             pack_var=_render_loop_ref(relayout.pack_loop, index_names),
             panel_var=_render_loop_ref(relayout.panel_loop, index_names),
             scope_var=_render_loop_ref(relayout.scope_loop, index_names),
             row_var=_render_loop_ref(relayout.row_loop, index_names),
             access_index_vars=tuple(index_names[i] for i in relayout.access_indices),
+            access_index_ids=tuple(relayout.access_indices),
             operand_panel_level=relayout.operand_panel_level,
             operand_pack_level=relayout.operand_pack_level,
         )
@@ -639,10 +639,12 @@ def materialize_legacy_schedule(
         result_tile = plan.result_tile
         result_tile_plan = _ResultTilePlan(
             result=symbol_names[result_tile.result_id],
+            result_id=result_tile.result_id,
             tile_var=_render_loop_ref(result_tile.tile_loop, index_names),
             result_level=result_tile.result_level,
             result_prefix_vars=tuple(index_names[i] for i in result_tile.result_prefix),
             access_index_vars=tuple(index_names[i] for i in result_tile.access_indices),
+            access_index_ids=tuple(result_tile.access_indices),
         )
 
     schedule = Schedule(
@@ -2382,12 +2384,14 @@ class Scheduler:
 
         return _ResultTilePlan(
             result=result_access.tensor.name,
+            result_id=result_access.tensor_id,
             tile_var=tile.index_var,
             result_level=result_level,
             result_prefix_vars=result_names[:-1],
             access_index_vars=tuple(
                 index_var.name for index_var in result_access.indices
             ),
+            access_index_ids=tuple(result_access.index_ids),
         )
 
     @staticmethod
@@ -2597,6 +2601,7 @@ class Scheduler:
 
         return _RelayoutPlan(
             operand=relayout.operand,
+            operand_id=packed_access.tensor_id,
             pack_var=relayout.pack_var,
             panel_var=panel_var,
             scope_var=scope_var,
@@ -2604,6 +2609,7 @@ class Scheduler:
             access_index_vars=tuple(
                 index_var.name for index_var in packed_access.indices
             ),
+            access_index_ids=tuple(packed_access.index_ids),
             operand_panel_level=packed_access.level_of_index_var(
                 Scheduler._find_index_var_by_name(cin, panel_var)
             ),

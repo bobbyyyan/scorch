@@ -5,6 +5,8 @@ from typing import List, Optional, Any, Union, TypeVar, Sequence, Tuple
 
 import torch
 
+from .identity import AccessId, IndexId, SymbolId
+
 """
 TODO: maybe need this, maybe not
 Enum class for different IRNode types.
@@ -240,14 +242,30 @@ class TensorAccessRole(Enum):
 class TensorAccessMetadata:
     """Immutable CIN provenance for a generated tensor value access.
 
-    ``index_vars`` preserves the logical access order from CIN, independently of
-    the physical position expression stored in :class:`Var.name`. Schedule passes
-    can therefore identify an access without parsing generated C++ fragments.
+    Stable IDs preserve the logical access independently of generated C++
+    spelling.  ``access_id`` records occurrence provenance; transformations that
+    select every access to a logical tensor/index tuple match ``tensor_id`` and
+    ``index_ids`` instead.
     """
 
-    tensor_name: str
-    index_vars: Tuple[str, ...]
+    access_id: AccessId
+    tensor_id: SymbolId
+    index_ids: Tuple[IndexId, ...]
     role: TensorAccessRole
+
+    def __post_init__(self) -> None:
+        if type(self.access_id) is not AccessId:
+            raise TypeError("TensorAccessMetadata.access_id must be an AccessId")
+        if type(self.tensor_id) is not SymbolId:
+            raise TypeError("TensorAccessMetadata.tensor_id must be a SymbolId")
+        if type(self.index_ids) is not tuple or any(
+            type(index_id) is not IndexId for index_id in self.index_ids
+        ):
+            raise TypeError(
+                "TensorAccessMetadata.index_ids must be a tuple of IndexId values"
+            )
+        if type(self.role) is not TensorAccessRole:
+            raise TypeError("TensorAccessMetadata.role must be a TensorAccessRole")
 
 
 """
@@ -483,12 +501,35 @@ class Array(Expr):
         self.data_type = data_type
 
 
-@dataclass(frozen=False)
+@dataclass(frozen=True)
 class ArrayAccess(Expr):
-    """An array access expression."""
+    """An immutable typed array/subscript access expression.
+
+    Structural equality describes emitted expression shape.  Optional logical
+    provenance is deliberately excluded, as it is for :class:`Var`; consumers
+    that need semantic identity must compare its stable typed IDs explicitly.
+    """
 
     array: Expr
     index: Expr
+    tensor_access: Optional[TensorAccessMetadata] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.array, Expr):
+            raise TypeError("ArrayAccess.array must be an LLIR Expr")
+        if not isinstance(self.index, Expr):
+            raise TypeError("ArrayAccess.index must be an LLIR Expr")
+        if (
+            self.tensor_access is not None
+            and type(self.tensor_access) is not TensorAccessMetadata
+        ):
+            raise TypeError(
+                "ArrayAccess.tensor_access must be TensorAccessMetadata or None"
+            )
 
 
 class ForLoop(Stmt):
