@@ -2613,6 +2613,66 @@ class Scheduler:
         )
 
     @staticmethod
+    def _validate_legacy_replay_scope(
+        cin: ForAll,
+        schedule: Schedule,
+        costs: _CostModelConstants,
+    ) -> bool:
+        """Validate public decisions that transitional replay can represent."""
+
+        is_identity = (
+            schedule.loop_order is None
+            and not schedule.tiles
+            and schedule.relayout is None
+            and schedule.parallel_loop is None
+        )
+        if not is_identity and cin.get_workspace_accesses():
+            raise NotImplementedError(
+                "CIN with an existing workspace supports only an empty auto Schedule"
+            )
+        if len(cin.get_result_tensor_accesses()) == 1:
+            return is_identity
+        if (
+            schedule.tiles
+            or schedule.relayout is not None
+            or schedule.parallel_loop is not None
+        ):
+            raise NotImplementedError(
+                "Tiling, relayout, and explicit parallel scheduling require "
+                "one assignment"
+            )
+        prospective_order = (
+            Scheduler.select_loop_order(cin, costs=costs)
+            if schedule.loop_order is None
+            else Scheduler.resolve_loop_order(cin, schedule.loop_order)
+        )
+        if Scheduler.should_insert_workspace(cin, prospective_order):
+            raise NotImplementedError(
+                "Derived workspace scheduling requires one assignment"
+            )
+        return is_identity
+
+    @staticmethod
+    def _validate_stack_workspace_scope(
+        loop_order: Sequence[IndexVar],
+        reduction_names: Set[str],
+        stack_targets: Set[str],
+    ) -> None:
+        """Reject a stack workspace that would replace the replay root."""
+
+        if not stack_targets:
+            return
+        reduction_positions = [
+            position
+            for position, index_var in enumerate(loop_order)
+            if index_var.name in reduction_names
+        ]
+        if reduction_positions and max(reduction_positions) == 0:
+            raise NotImplementedError(
+                "Stack tiling cannot wrap a workspace inserted at the root scope"
+            )
+
+    @staticmethod
     def _apply_schedule_legacy(
         cin: IndexStmt,
         schedule: Schedule,
@@ -2648,36 +2708,7 @@ class Scheduler:
                 LoopPlan(loop_order=(), provenance="auto", tag=schedule.tag),
             )
             return ScheduledCIN(cin, plan)
-        is_identity = (
-            schedule.loop_order is None
-            and not schedule.tiles
-            and schedule.relayout is None
-            and schedule.parallel_loop is None
-        )
-        if not is_identity and cin.get_workspace_accesses():
-            raise NotImplementedError(
-                "CIN with an existing workspace supports only an empty auto " "Schedule"
-            )
-        result_accesses = cin.get_result_tensor_accesses()
-        if len(result_accesses) != 1:
-            if (
-                schedule.tiles
-                or schedule.relayout is not None
-                or schedule.parallel_loop
-            ):
-                raise NotImplementedError(
-                    "Tiling, relayout, and explicit parallel scheduling require "
-                    "one assignment"
-                )
-            prospective_order = (
-                Scheduler.select_loop_order(cin, costs=costs)
-                if schedule.loop_order is None
-                else Scheduler.resolve_loop_order(cin, schedule.loop_order)
-            )
-            if Scheduler.should_insert_workspace(cin, prospective_order):
-                raise NotImplementedError(
-                    "Derived workspace scheduling requires one assignment"
-                )
+        is_identity = Scheduler._validate_legacy_replay_scope(cin, schedule, costs)
         panel_tiles = [tile for tile in schedule.tiles if tile.kind == "panel"]
         if len(panel_tiles) > 1:
             raise NotImplementedError("Only one sparse panel tile is supported")
@@ -2914,16 +2945,11 @@ class Scheduler:
                 f"dimension after a reduction: {unsupported_stack_tiles}"
             )
         stack_targets = {tile.index_var for tile in stack_tiles}
-        if stack_targets:
-            reduction_positions = [
-                position
-                for position, index_var in enumerate(loop_order)
-                if index_var.name in reduction_names
-            ]
-            if reduction_positions and max(reduction_positions) == 0:
-                raise NotImplementedError(
-                    "Stack tiling cannot wrap a workspace inserted at the root scope"
-                )
+        Scheduler._validate_stack_workspace_scope(
+            loop_order,
+            reduction_names,
+            stack_targets,
+        )
         if Scheduler.should_insert_workspace(cin, loop_order) and (
             not Scheduler._has_dense_output(cin) or stack_targets
         ):
