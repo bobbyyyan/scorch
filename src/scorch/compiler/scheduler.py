@@ -2914,6 +2914,16 @@ class Scheduler:
                 f"dimension after a reduction: {unsupported_stack_tiles}"
             )
         stack_targets = {tile.index_var for tile in stack_tiles}
+        if stack_targets:
+            reduction_positions = [
+                position
+                for position, index_var in enumerate(loop_order)
+                if index_var.name in reduction_names
+            ]
+            if reduction_positions and max(reduction_positions) == 0:
+                raise NotImplementedError(
+                    "Stack tiling cannot wrap a workspace inserted at the root scope"
+                )
         if Scheduler.should_insert_workspace(cin, loop_order) and (
             not Scheduler._has_dense_output(cin) or stack_targets
         ):

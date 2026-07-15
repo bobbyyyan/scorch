@@ -515,6 +515,24 @@ def _initial_placement_state(
     return _PlacementState(tuple(LoopRef(index_id) for index_id in prefix_ids))
 
 
+def _verify_workspace_replay_shape(
+    facts: LoopPlanLegalityFacts,
+    plan: LoopPlan,
+    workspace_inserted: bool,
+) -> None:
+    if not workspace_inserted or not plan.tiles:
+        return
+    last_reduction = max(
+        facts.loop_positions[index_id] for index_id in facts.reduction_index_ids
+    )
+    if last_reduction == 0:
+        _unsupported(
+            "root_workspace_tiling",
+            "tiling cannot wrap a workspace inserted at the root scope",
+            ("tiles",),
+        )
+
+
 def _placement_depth(
     state: _PlacementState,
     placement: LoopPlacement,
@@ -1221,6 +1239,7 @@ def verify_loop_plan_semantics(analysis: CINAnalysis, plan: LoopPlan) -> None:
     _verify_schedulable_scope(facts, plan)
     _verify_storage_order(facts)
     workspace_inserted = _verify_tiling_capabilities(facts, plan)
+    _verify_workspace_replay_shape(facts, plan, workspace_inserted)
     state = _apply_affine_placements(facts, plan, workspace_inserted)
     parallel = _verify_parallel_legality(facts, plan, workspace_inserted)
     _verify_panel(facts, plan, state, parallel)
