@@ -3,17 +3,7 @@ import time
 import torch
 
 from scorch import STensor, matmul, einsum
-from scorch.compiler.cin import (
-    TensorAssign,
-    ForAll,
-    Operation,
-    Where,
-    Workspace,
-    TensorVar,
-    IndexVar,
-    TileSizeVar,
-)
-from scorch.ops import spmv, lower_and_exec_cin
+from scorch.compiler.scheduler import Schedule, TileSpec
 
 
 def test_spmm_dd_ds_dd_tiled_time():
@@ -36,63 +26,34 @@ def test_spmm_dd_ds_dd_tiled_time():
     tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("ds")
     tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
-    i = IndexVar("i")
-    j = IndexVar("j")
-    k_out = IndexVar("k_out")
-    k_in = IndexVar("k_in")
-    k = IndexVar("k", k_out + k_in)
-
     k_tile_size = 4096
-    k_tile_var = TileSizeVar(
-        outer_index_var=k_out, inner_index_var=k_in, size=k_tile_size
-    )
-
-    C = TensorVar("C", fmt="dd")
-    A = TensorVar("A", fmt="ds")
-    B = TensorVar("B", fmt="dd")
-
-    # accum_c = TensorVar("accum_c", fmt="d")
-    accum_c = Workspace("accum_c", dim=1, dense=True)
-
-    cin_stmt = ForAll(
-        i,
-        ForAll(
-            k_out,
-            Where(
-                producer=ForAll(
-                    j,
-                    ForAll(
-                        k_in,
-                        TensorAssign(
-                            accum_c[k_in],
-                            A[i, j] * B[j, k],
-                            op=Operation.ADD,
-                        ),
-                    ),
-                ),
-                consumer=ForAll(
-                    k_in,
-                    TensorAssign(
-                        C[i, k],
-                        accum_c[k_in],
-                    ),
-                ),
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec(
+                "k",
+                k_tile_size,
+                placement="child_of:i",
+                accum="stack",
             ),
         ),
+        tag="spmm-full-width-k-tile",
     )
-
-    result_shape = (n, n)
 
     time_dict = {}
     start_time = time.time()
-    scorch_result = lower_and_exec_cin(
-        cin_stmt, result_shape, tensor_a_scorch, tensor_b_scorch, time_dict=time_dict
+    scorch_result = matmul(
+        tensor_a_scorch,
+        tensor_b_scorch,
+        format="dd",
+        schedule=schedule,
+        time_dict=time_dict,
     )
     scorch_total_time = time.time() - start_time
     scorch_eval_time = time_dict["eval_time"]
 
     # Assert that the results are the same
-    assert torch.allclose(torch_result, scorch_result.to_torch())
+    assert torch.allclose(torch_result, scorch_result)
 
     print(f"torch time: {torch_time}")
     print(f"scorch total time: {scorch_total_time}")
