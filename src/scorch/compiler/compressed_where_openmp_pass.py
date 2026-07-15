@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Dict, List, NoReturn, Optional, Sequence, Tupl
 
 from . import llir
 from .codegen import LLIRLowerer
+from .identity import SymbolId
 from .llir_traversal import (
     LLIRPath,
     LLIRRewriter,
@@ -85,11 +86,12 @@ class CompressedWhereOpenMPContext:
     ``workspace_ctype`` is also the legacy result-value C type used for exact
     output allocation.  Production obtains both workspace fields together from
     the one-dimensional sparse ``Where`` workspace. ``compile_options`` carries
-    the exact outer snapshot through the two nested result-write passes and
-    their spelling-only renderers; standalone pass callers may omit it.
+    the exact outer snapshot through the two nested result-write passes and the
+    remaining output-assembly renderer; standalone pass callers may omit it.
     """
 
     result_name: str
+    result_id: SymbolId
     compressed_levels: Tuple[int, ...]
     workspace_name: str
     workspace_ctype: str
@@ -118,6 +120,24 @@ class _ManagedCompressedWhereOpenMPExecution:
 class _ParallelPolicyDecision:
     num_threads: Optional[str]
     chunk_expr: Optional[str]
+
+
+def _value_pointer_type(workspace_ctype: str) -> llir.DataType:
+    """Map production scalar spellings to their exact LLIR pointer type."""
+
+    if workspace_ctype == "float":
+        return llir.DataType.PTR_FLOAT32
+    if workspace_ctype == "double":
+        return llir.DataType.PTR_FLOAT64
+    if workspace_ctype == "int":
+        return llir.DataType.PTR_INT
+    if workspace_ctype == "int32_t":
+        return llir.DataType.PTR_INT_32
+    if workspace_ctype == "int64_t":
+        return llir.DataType.PTR_INT_64
+    # Preserve direct-pass compatibility for free-form legacy C type spellings
+    # without pretending that they have a precise DataType member.
+    return llir.DataType.NO_TYPE
 
 
 def _diagnostic_context(context: object) -> LLIRTraversalContext:
@@ -211,6 +231,14 @@ def _validate_context(context: object) -> CompressedWhereOpenMPContext:
         code="invalid_compressed_where_result_name",
         field="result_name",
     )
+    if type(typed_context.result_id) is not SymbolId:
+        _raise_compressed_where_error(
+            typed_context,
+            code="invalid_compressed_where_result_id",
+            message="result_id must be an exact SymbolId",
+            path=("context", "result_id"),
+            value=typed_context.result_id,
+        )
     _validate_non_empty_string(
         typed_context,
         typed_context.workspace_name,
@@ -376,7 +404,9 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
         if type(node) is llir.Assign:
             assign = cast(llir.Assign, node)
             rewritten_assign = cast(llir.Assign, self._identity.rewrite(assign))
-            rewritten_assign.var = self._rewrite_legacy_expr(assign.var)
+            rewritten_target = self._rewrite_legacy_expr(assign.var)
+            llir._validate_assignment_target(rewritten_target)
+            rewritten_assign.var = cast(llir.AssignmentTarget, rewritten_target)
             rewritten_assign.value = self._rewrite_legacy_expr(assign.value)
             return rewritten_assign
         if type(node) is llir.VarInit:
@@ -475,6 +505,15 @@ def _find_outer_loop(
     return None, None
 
 
+def _assignment_array_name(target: llir.AssignmentTarget) -> Optional[str]:
+    if type(target) is not llir.ArrayAccess:
+        return None
+    array = cast(llir.ArrayAccess, target).array
+    if type(array) is not llir.Var:
+        return None
+    return cast(llir.Var, array).name
+
+
 def _extract_loop_bound(for_loop: llir.ForLoop) -> Optional[str]:
     if type(for_loop.cond) is llir.BinOp and for_loop.cond.op == "<":
         right = for_loop.cond.right
@@ -506,8 +545,8 @@ def _should_drop_work_statement(
         if statement.var.name == workspace_name:
             return True, True
     elif type(statement) is llir.Assign:
-        target_name = getattr(statement.var, "name", "")
-        if f"{result_name}{first_compressed_level}_pos[" in target_name:
+        target_name = _assignment_array_name(statement.var)
+        if target_name == f"{result_name}{first_compressed_level}_pos":
             return True, False
     return False, False
 
@@ -745,8 +784,10 @@ def _build_count_body(
         ResultWritePassSpec(
             ResultWriteContext(
                 result_name=context.result_name,
+                result_id=context.result_id,
                 compressed_levels=levels,
                 mode="count",
+                value_pointer_type=_value_pointer_type(context.workspace_ctype),
                 traversal=context.traversal,
                 compile_options=context.compile_options,
             )
@@ -754,7 +795,16 @@ def _build_count_body(
     )
     body.extend(cast(List[llir.Stmt], result_write.artifact.value))
     body.extend(
-        llir.RawStmt(code=f"_count{level}[{loop_var}] = _cnt{level}")
+        llir.Assign(
+            var=llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"_count{level}",
+                    type=llir.DataType.STD_VECTOR_C_INT,
+                ),
+                index=llir.Var(name=loop_var, type=llir.DataType.INT64),
+            ),
+            value=llir.Var(name=f"_cnt{level}", type=llir.DataType.INT),
+        )
         for level in levels
     )
     if workspace_hoisted:
@@ -785,8 +835,10 @@ def _build_fill_body(
         ResultWritePassSpec(
             ResultWriteContext(
                 result_name=context.result_name,
+                result_id=context.result_id,
                 compressed_levels=levels,
                 mode="fill",
+                value_pointer_type=_value_pointer_type(context.workspace_ctype),
                 traversal=context.traversal,
                 compile_options=context.compile_options,
             )
@@ -819,8 +871,8 @@ def _should_drop_prefix_statement(
             for level in levels
         )
     if type(statement) is llir.Assign:
-        name = getattr(statement.var, "name", "")
-        return any(f"{result_name}{level}_pos[" in name for level in levels)
+        array_name = _assignment_array_name(statement.var)
+        return any(array_name == f"{result_name}{level}_pos" for level in levels)
     if type(statement) is llir.ForLoop:
         init = statement.init
         return bool(
@@ -896,7 +948,16 @@ def _prefix_sum_statements(
                         f"(size_t){loop_bound} + 1)"
                     )
                 ),
-                llir.RawStmt(code=f"_offset{level}[0] = 0"),
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"_offset{level}",
+                            type=llir.DataType.STD_VECTOR_INT,
+                        ),
+                        index=llir.Literal(0),
+                    ),
+                    value=llir.Literal(0),
+                ),
                 llir.RawStmt(
                     code=(
                         f"for (int _i = 0; _i < {loop_bound}; _i++) "
@@ -964,7 +1025,16 @@ def _position_and_coordinate_allocations(
                     ),
                     add_semicolon=False,
                 ),
-                llir.RawStmt(code=f"{result_name}{level}_pos_data[0] = 0"),
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_name}{level}_pos_data",
+                            type=llir.DataType.PTR_INT,
+                        ),
+                        index=llir.Literal(0),
+                    ),
+                    value=llir.Literal(0),
+                ),
             ]
         )
     return statements

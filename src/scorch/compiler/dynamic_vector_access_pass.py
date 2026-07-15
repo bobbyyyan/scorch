@@ -21,7 +21,7 @@ from .llir_traversal import (
 
 @dataclass(frozen=True)
 class DynamicVectorAccessConfig:
-    """Immutable policy for the legacy string-encoded vector representation."""
+    """Immutable policy for generated dynamic-vector access rewriting."""
 
     vector_type_prefix: str
     append_suffixes: Tuple[str, ...]
@@ -84,9 +84,7 @@ class _DynamicVectorAccessRewriter(LLIRRewriter):
     ) -> None:
         super().__init__(context.traversal)
         self._config = context.config
-        self._store_prefixes = tuple(
-            (vector_name, f"{vector_name}[") for vector_name in vector_names
-        )
+        self._vector_names = frozenset(vector_names)
         self._read_patterns = tuple(
             (
                 vector_name,
@@ -96,18 +94,16 @@ class _DynamicVectorAccessRewriter(LLIRRewriter):
             for vector_name in vector_names
         )
 
-    def _match_store(self, expression: llir.Expr) -> Optional[Tuple[str, str]]:
-        if type(expression) is not llir.Var:
+    def _match_store(self, expression: llir.Expr) -> Optional[Tuple[str, llir.Expr]]:
+        if type(expression) is not llir.ArrayAccess:
             return None
-        target = cast(llir.Var, expression).name
-        if "[" not in target or not target.endswith("]"):
+        access = cast(llir.ArrayAccess, expression)
+        if type(access.array) is not llir.Var:
             return None
-        for vector_name, prefix in self._store_prefixes:
-            if target.startswith(prefix):
-                position = target[len(prefix) : -1]
-                if position:
-                    return vector_name, position
-        return None
+        vector_name = cast(llir.Var, access.array).name
+        if vector_name not in self._vector_names:
+            return None
+        return vector_name, access.index
 
     def _rewrite_name(self, name: str) -> str:
         if "[" not in name:
@@ -165,13 +161,13 @@ class _DynamicVectorAccessRewriter(LLIRRewriter):
                 name=self._config.checked_set_function,
                 args=[
                     llir.Var(name=vector_name, type=llir.DataType.NO_TYPE),
-                    llir.Var(name=position, type=llir.DataType.NO_TYPE),
+                    self._rewrite_expr(position, path + ("var", "index")),
                     value,
                 ],
             )
 
         rewritten = llir.Assign(
-            var=self._rewrite_expr(node.var, path + ("var",)),
+            var=self._rewrite_assignment_target(node.var, path + ("var",)),
             value=value,
             op=node.op,
             cast=False,

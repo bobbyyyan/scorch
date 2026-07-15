@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 from . import llir
 from .cin import (
@@ -301,9 +301,12 @@ class ResultTensorAssembler:
                     # pos[0] = 0 for the append-built position vector.
                     stmts.append(
                         llir.Assign(
-                            var=llir.Var(
-                                name=f"{self.name}{i}_pos[0]",
-                                type=llir.DataType.INT64,
+                            var=llir.ArrayAccess(
+                                array=llir.Var(
+                                    name=f"{self.name}{i}_pos",
+                                    type=llir.DataType.STD_VECTOR_C_INT,
+                                ),
+                                index=llir.Literal(0),
                             ),
                             value=llir.Literal(0),
                         )
@@ -700,21 +703,36 @@ class CINLowerer:
                 f"stage=CIN lowering: unknown IndexStmt node type '{node_type}'"
             )
 
-    def _emit_post_ops(self, output_var_name: str, index_expr: str) -> List[llir.Stmt]:
+    def _emit_post_ops(
+        self,
+        output_var_name: str,
+        index_expr: str,
+        tensor_access: Optional[llir.TensorAccessMetadata] = None,
+    ) -> List[llir.Stmt]:
         """Emit LLIR statements for post-ops on output_var_name[index_expr]."""
         self._validate_post_ops()
         if not self.post_ops or not self.post_ops.ops:
             return []
         stmts: List[llir.Stmt] = []
-        target = llir.Var(
-            name=f"{output_var_name}[{index_expr}]",
-            type=llir.DataType.NO_TYPE,
-        )
+
+        def target() -> llir.ArrayAccess:
+            return llir.ArrayAccess(
+                array=llir.Var(
+                    name=output_var_name,
+                    type=llir.DataType.NO_TYPE,
+                ),
+                index=llir.Var(
+                    name=index_expr,
+                    type=llir.DataType.INT64,
+                ),
+                tensor_access=tensor_access,
+            )
+
         for op in self.post_ops.ops:
             if op.kind == "add":
                 stmts.append(
                     llir.Assign(
-                        var=target,
+                        var=target(),
                         value=llir.Var(
                             name=f"{op.tensor_name}_val[{index_expr}]",
                             type=llir.DataType.NO_TYPE,
@@ -725,7 +743,7 @@ class CINLowerer:
             elif op.kind == "mul":
                 stmts.append(
                     llir.Assign(
-                        var=target,
+                        var=target(),
                         value=llir.Var(
                             name=f"{op.tensor_name}_val[{index_expr}]",
                             type=llir.DataType.NO_TYPE,
@@ -736,10 +754,10 @@ class CINLowerer:
             elif op.kind in ("relu", "gelu", "tanh", "sigmoid"):
                 stmts.append(
                     llir.Assign(
-                        var=target,
+                        var=target(),
                         value=llir.FunctionCall(
                             name=f"scorch_{op.kind}",
-                            args=[target],
+                            args=[target()],
                         ),
                         op=AssignOp.ASSIGN,
                     )
@@ -967,7 +985,7 @@ class CINLowerer:
                 self.result_tensor_access,
                 llir.TensorAccessRole.RESULT_WRITE,
             )
-            if not is_workspace and self.result_tensor_access.is_dense()
+            if not is_workspace
             else None
         )
         index_vars = self.result_tensor_access.get_index_vars()
@@ -992,18 +1010,27 @@ class CINLowerer:
                     values_llir_name = f"{values_llir_name}_values"
 
                 if self.result_value_array_sparse_index_llir:
-                    tensor_access_llir = llir.Var(
-                        name=f"{values_llir_name}[{self.result_value_array_sparse_index_llir.name}]",
-                        type=llir.DataType.NO_TYPE,
+                    tensor_access_llir = llir.ArrayAccess(
+                        array=llir.Var(
+                            name=values_llir_name,
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=self.result_value_array_sparse_index_llir,
                         tensor_access=result_access_metadata,
                     )
                 else:
                     level = self.result_tensor_access.level_of_index_var(
                         sorted_index_vars[-1]
                     )
-                    tensor_access_llir = llir.Var(
-                        name=f"{values_llir_name}[p{self.result_tensor_var.name}{level}]",
-                        type=llir.DataType.NO_TYPE,
+                    tensor_access_llir = llir.ArrayAccess(
+                        array=llir.Var(
+                            name=values_llir_name,
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=llir.Var(
+                            name=f"p{self.result_tensor_var.name}{level}",
+                            type=llir.DataType.INT64,
+                        ),
                         tensor_access=result_access_metadata,
                     )
                     # tensor_access_llir = llir.Var(
@@ -1028,9 +1055,15 @@ class CINLowerer:
                         wksp_index_var = sorted_wksp_index_vars[0]
                         llir_stmts.append(
                             llir.Assign(
-                                var=llir.Var(
-                                    name=f"{self.result_tensor_var.name}[{wksp_index_var.name}]",
-                                    type=llir.DataType.NO_TYPE,
+                                var=llir.ArrayAccess(
+                                    array=llir.Var(
+                                        name=self.result_tensor_var.name,
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    index=llir.Var(
+                                        name=wksp_index_var.name,
+                                        type=llir.DataType.INT64,
+                                    ),
                                 ),
                                 value=rhs_llir,
                                 op=AssignOp.ADD_ASSIGN,
@@ -1099,10 +1132,15 @@ class CINLowerer:
 
                     llir_stmts.append(
                         llir.Assign(
-                            var=llir.Var(
-                                name=f"{result_tensor_name}{level}_crd"
-                                + f"[{result_index_name}]",
-                                type=llir.DataType.NO_TYPE,
+                            var=llir.ArrayAccess(
+                                array=llir.Var(
+                                    name=f"{result_tensor_name}{level}_crd",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                index=llir.Var(
+                                    name=result_index_name,
+                                    type=llir.DataType.INT64,
+                                ),
                             ),
                             value=llir.Var(
                                 name=last_ivar.name,
@@ -1126,10 +1164,15 @@ class CINLowerer:
                             if level_type == LevelType.COORDINATE:
                                 llir_stmts.append(
                                     llir.Assign(
-                                        var=llir.Var(
-                                            name=f"{result_tensor_name}{level}_crd"
-                                            + f"[{result_index_name}]",
-                                            type=llir.DataType.NO_TYPE,
+                                        var=llir.ArrayAccess(
+                                            array=llir.Var(
+                                                name=f"{result_tensor_name}{level}_crd",
+                                                type=llir.DataType.NO_TYPE,
+                                            ),
+                                            index=llir.Var(
+                                                name=result_index_name,
+                                                type=llir.DataType.INT64,
+                                            ),
                                         ),
                                         value=llir.Var(
                                             name=defined_ivar.name,
@@ -1353,6 +1396,10 @@ class CINLowerer:
         result_tensor = result_tensor_access.get_tensor()
         result_index_vars = result_tensor_access.get_index_vars()
         result_tensor_name = result_tensor.get_name()
+        result_value_metadata = self._tensor_access_metadata(
+            result_tensor_access,
+            llir.TensorAccessRole.RESULT_WRITE,
+        )
 
         # Check if result is all-coordinate (fast path: direct assignment)
         result_is_coord = all(
@@ -1422,9 +1469,15 @@ class CINLowerer:
             for i in range(len(wksp_index_vars)):
                 loop_body.append(
                     llir.Assign(
-                        var=llir.Var(
-                            name=f"{result_tensor_name}{i}_crd[p{result_tensor_name}{i}]",
-                            type=llir.DataType.INT64,
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{result_tensor_name}{i}_crd",
+                                type=llir.DataType.STD_VECTOR_C_INT,
+                            ),
+                            index=llir.Var(
+                                name=f"p{result_tensor_name}{i}",
+                                type=llir.DataType.INT64,
+                            ),
                         ),
                         value=llir.Var(
                             name=f"{loop_var.name}.first[{i}]",
@@ -1435,9 +1488,18 @@ class CINLowerer:
             # A_values[pA0] = it.second;
             loop_body.append(
                 llir.Assign(
-                    var=llir.Var(
-                        name=f"{result_tensor_name}_values[p{result_tensor_name}0]",
-                        type=llir.DataType.INT64,
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_tensor_name}_values",
+                            type=llir.DataType.std_vector_type(
+                                dtype_to_c_datatype(result_tensor.dtype)
+                            ),
+                        ),
+                        index=llir.Var(
+                            name=f"p{result_tensor_name}0",
+                            type=llir.DataType.INT64,
+                        ),
+                        tensor_access=result_value_metadata,
                     ),
                     value=llir.Var(
                         name=f"{loop_var.name}.second",
@@ -1460,9 +1522,15 @@ class CINLowerer:
             for i in range(len(wksp_index_vars)):
                 loop_body.append(
                     llir.Assign(
-                        var=llir.Var(
-                            name=f"{intermediate_crd_vecs[i].name}[{intermediate_tensor_iterator.name}]",
-                            type=llir.DataType.INT64,
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=intermediate_crd_vecs[i].name,
+                                type=llir.DataType.STD_VECTOR_C_INT,
+                            ),
+                            index=llir.Var(
+                                name=intermediate_tensor_iterator.name,
+                                type=llir.DataType.INT64,
+                            ),
                         ),
                         value=llir.Var(
                             name=f"{loop_var.name}.first[{i}]",
@@ -1473,9 +1541,15 @@ class CINLowerer:
             # T_val_vec[pT] = it.second;
             loop_body.append(
                 llir.Assign(
-                    var=llir.Var(
-                        name=f"{intermediate_val_vec.name}[{intermediate_tensor_iterator.name}]",
-                        type=llir.DataType.INT64,
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=intermediate_val_vec.name,
+                            type=intermediate_val_vec.type,
+                        ),
+                        index=llir.Var(
+                            name=intermediate_tensor_iterator.name,
+                            type=llir.DataType.INT64,
+                        ),
                     ),
                     value=llir.Var(
                         name=f"{loop_var.name}.second",
@@ -1634,6 +1708,10 @@ class CINLowerer:
         result_tensor_accesses = stmt.get_result_tensor_accesses()
         result_tensor_access: TensorAccess = result_tensor_accesses[0]
         result_tensor_name = result_tensor_access.get_tensor().get_name()
+        result_value_metadata = self._tensor_access_metadata(
+            result_tensor_access,
+            llir.TensorAccessRole.RESULT_WRITE,
+        )
 
         # If the wksp_index_var is None, that means we just have a scalar
         # workspace
@@ -1660,9 +1738,16 @@ class CINLowerer:
                         ),
                         then_body=[
                             llir.Assign(
-                                var=llir.Var(
-                                    name=f"{result_tensor_name}_values[p{result_tensor_name}{level}]",
-                                    type=llir.DataType.NO_TYPE,
+                                var=llir.ArrayAccess(
+                                    array=llir.Var(
+                                        name=f"{result_tensor_name}_values",
+                                        type=llir.DataType.NO_TYPE,
+                                    ),
+                                    index=llir.Var(
+                                        name=f"p{result_tensor_name}{level}",
+                                        type=llir.DataType.INT64,
+                                    ),
+                                    tensor_access=result_value_metadata,
                                 ),
                                 value=wksp_var,
                             ),
@@ -1840,9 +1925,16 @@ class CINLowerer:
 
                 loop_body.append(
                     llir.Assign(
-                        var=llir.Var(
-                            name=f"{result_tensor_name}_values[{result_level_iterator_name}]",
-                            type=llir.DataType.NO_TYPE,
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{result_tensor_name}_values",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            index=llir.Var(
+                                name=result_level_iterator_name,
+                                type=llir.DataType.INT64,
+                            ),
+                            tensor_access=result_value_metadata,
                         ),
                         value=llir.Var(
                             name=f"{wksp.get_name()}[{loop_var.name}]",
@@ -1857,6 +1949,7 @@ class CINLowerer:
                     self._emit_post_ops(
                         f"{result_tensor_name}_values",
                         result_level_iterator_name,
+                        result_value_metadata,
                     )
                 )
 
@@ -1923,9 +2016,16 @@ class CINLowerer:
 
             loop_body.append(
                 llir.Assign(
-                    var=llir.Var(
-                        name=f"{result_tensor_name}_values[{result_level_iterator_name}]",
-                        type=llir.DataType.NO_TYPE,
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_tensor_name}_values",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=llir.Var(
+                            name=result_level_iterator_name,
+                            type=llir.DataType.INT64,
+                        ),
+                        tensor_access=result_value_metadata,
                     ),
                     value=llir.Var(
                         name=f"{wksp.get_name()}[{loop_var.name}]",
@@ -2030,9 +2130,16 @@ class CINLowerer:
         # <result tensor name>_values[<result level iterator>] = <wksp's name>_value;
         loop_body.append(
             llir.Assign(
-                var=llir.Var(
-                    name=f"{result_tensor_name}_values[{result_level_iterator_name}]",
-                    type=llir.DataType.NO_TYPE,
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_tensor_name}_values",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=llir.Var(
+                        name=result_level_iterator_name,
+                        type=llir.DataType.INT64,
+                    ),
+                    tensor_access=result_value_metadata,
                 ),
                 value=llir.Var(
                     name=f"{wksp.get_name()}_value",
@@ -2045,9 +2152,15 @@ class CINLowerer:
         # <result tensor name><level>_crd[<result level iterator>] = <wksp_access's first index var's name>;
         loop_body.append(
             llir.Assign(
-                var=llir.Var(
-                    name=f"{result_tensor_name}{level}_crd[{result_level_iterator_name}]",
-                    type=llir.DataType.NO_TYPE,
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_tensor_name}{level}_crd",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=llir.Var(
+                        name=result_level_iterator_name,
+                        type=llir.DataType.INT64,
+                    ),
                 ),
                 value=llir.Var(
                     name=f"{wksp_access.get_index_vars()[0].name}",
@@ -2060,9 +2173,15 @@ class CINLowerer:
         if parent_level_type == LevelType.COORDINATE:
             loop_body.append(
                 llir.Assign(
-                    var=llir.Var(
-                        name=f"{result_tensor_name}{level - 1}_crd[{result_level_iterator_name}]",
-                        type=llir.DataType.NO_TYPE,
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_tensor_name}{level - 1}_crd",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=llir.Var(
+                            name=result_level_iterator_name,
+                            type=llir.DataType.INT64,
+                        ),
                     ),
                     value=llir.Var(
                         name=f"{parent_index_var.name}",
@@ -2139,9 +2258,17 @@ class CINLowerer:
                     # A1_pos[A0_crd.size()] = A1_crd.size()
                     assembly_stmts.append(
                         llir.Assign(
-                            var=llir.Var(
-                                name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level - 1}_crd.size()]",
-                                type=llir.DataType.INT64,
+                            var=llir.ArrayAccess(
+                                array=llir.Var(
+                                    name=f"{result_tensor_name}{level}_pos",
+                                    type=llir.DataType.STD_VECTOR_C_INT,
+                                ),
+                                index=llir.FunctionCall(
+                                    name=(
+                                        f"{result_tensor_name}" f"{level - 1}_crd.size"
+                                    ),
+                                    args=[],
+                                ),
                             ),
                             value=llir.FunctionCall(
                                 name=f"{result_tensor_name}{level}_crd.size",
@@ -2168,9 +2295,18 @@ class CINLowerer:
                 # e.g. A1_pos[A1_pos_index + 1] = A1_crd.size()
                 assembly_stmts.append(
                     llir.Assign(
-                        var=llir.Var(
-                            name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level}_pos_index + 1]",
-                            type=llir.DataType.INT64,
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{result_tensor_name}{level}_pos",
+                                type=llir.DataType.STD_VECTOR_C_INT,
+                            ),
+                            index=llir.Add(
+                                llir.Var(
+                                    name=f"{result_tensor_name}{level}_pos_index",
+                                    type=llir.DataType.INT64,
+                                ),
+                                llir.Literal(1),
+                            ),
                         ),
                         value=llir.FunctionCall(
                             name=f"{result_tensor_name}{level}_crd.size",
@@ -2975,6 +3111,8 @@ class CINLowerer:
             if for_loop.update.var.name != loop_var.name:
                 return False
         elif isinstance(for_loop.update, llir.Assign):
+            if type(for_loop.update.var) is not llir.Var:
+                return False
             if for_loop.update.var.name != loop_var.name:
                 return False
             if for_loop.update.op not in (AssignOp.ADD_ASSIGN, AssignOp.SUB_ASSIGN):
@@ -3011,7 +3149,9 @@ class CINLowerer:
         """Rewrite _val[pos] → _ptr[loop_var] in LLIR statement trees."""
         for i, stmt in enumerate(stmts):
             if isinstance(stmt, llir.Assign):
-                stmt.var = CINLowerer._rewrite_expr_refs(stmt.var, replacements)
+                rewritten_target = CINLowerer._rewrite_expr_refs(stmt.var, replacements)
+                llir._validate_assignment_target(rewritten_target)
+                stmt.var = cast(llir.AssignmentTarget, rewritten_target)
                 stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
             elif isinstance(stmt, llir.VarInit):
                 stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
@@ -3039,6 +3179,30 @@ class CINLowerer:
     @staticmethod
     def _rewrite_expr_refs(expr, replacements: dict):
         """Rewrite variable references in an expression."""
+        if type(expr) is llir.ArrayAccess:
+            access = cast(llir.ArrayAccess, expr)
+            rewritten_array = CINLowerer._rewrite_expr_refs(access.array, replacements)
+            if type(rewritten_array) is llir.Var:
+                array = cast(llir.Var, rewritten_array)
+                for old, new in replacements.items():
+                    if (
+                        old.endswith("[")
+                        and new.endswith("[")
+                        and array.name == old[:-1]
+                    ):
+                        array = llir.Var(
+                            name=new[:-1],
+                            type=array.type,
+                            is_ptr=array.is_ptr,
+                            is_restrict=array.is_restrict,
+                            tensor_access=array.tensor_access,
+                        )
+                rewritten_array = array
+            return llir.ArrayAccess(
+                array=rewritten_array,
+                index=CINLowerer._rewrite_expr_refs(access.index, replacements),
+                tensor_access=access.tensor_access,
+            )
         if isinstance(expr, llir.Var):
             for old, new in replacements.items():
                 if expr.name == old or old in expr.name:
@@ -3053,12 +3217,6 @@ class CINLowerer:
         if isinstance(expr, llir.BinOp):
             expr.left = CINLowerer._rewrite_expr_refs(expr.left, replacements)
             expr.right = CINLowerer._rewrite_expr_refs(expr.right, replacements)
-        if type(expr) is llir.ArrayAccess:
-            return llir.ArrayAccess(
-                array=CINLowerer._rewrite_expr_refs(expr.array, replacements),
-                index=CINLowerer._rewrite_expr_refs(expr.index, replacements),
-                tensor_access=expr.tensor_access,
-            )
         return expr
 
     @staticmethod
@@ -3452,10 +3610,12 @@ class CINLowerer:
         import re
 
         for stmt in stmts:
-            if isinstance(stmt, llir.Assign) and isinstance(stmt.var, llir.Var):
-                m = re.match(r"^(\w+)\[", stmt.var.name)
-                if m:
-                    arr_name = m.group(1)
+            if isinstance(stmt, llir.Assign) and type(stmt.var) is llir.ArrayAccess:
+                array = cast(llir.ArrayAccess, stmt.var).array
+                if type(array) is llir.Var:
+                    arr_name = cast(llir.Var, array).name
+                    if not re.match(r"^\w+$", arr_name):
+                        continue
                     if arr_name not in output_arrays:
                         output_arrays.append(arr_name)
             elif isinstance(stmt, llir.ForLoop):
@@ -3511,14 +3671,25 @@ class CINLowerer:
 
         to_remove = []
         for i, stmt in enumerate(stmts):
-            if isinstance(stmt, llir.Assign) and isinstance(stmt.var, llir.Var):
-                # Replace pD<N> in array index: D_values[pD1] -> D_values[pA1]
-                m = re.match(r"^(.+)\[p([A-Z])\d+\]$", stmt.var.name)
-                if m and m.group(1).startswith(m.group(2)):
-                    # This is an output array write like D_values[pD1] or D0_crd[pD1]
-                    stmt.var.name = re.sub(
-                        r"\[p[A-Z]\d+\]", f"[{input_pos_var}]", stmt.var.name
-                    )
+            if isinstance(stmt, llir.Assign) and type(stmt.var) is llir.ArrayAccess:
+                # Replace pD<N> in a typed output index with the input position.
+                target = cast(llir.ArrayAccess, stmt.var)
+                if type(target.array) is llir.Var and type(target.index) is llir.Var:
+                    array = cast(llir.Var, target.array)
+                    index = cast(llir.Var, target.index)
+                    match = re.match(r"^p([A-Z])\d+$", index.name)
+                    if match and array.name.startswith(match.group(1)):
+                        stmt.var = llir.ArrayAccess(
+                            array=array,
+                            index=llir.Var(
+                                name=input_pos_var,
+                                type=index.type,
+                                is_ptr=index.is_ptr,
+                                is_restrict=index.is_restrict,
+                                tensor_access=index.tensor_access,
+                            ),
+                            tensor_access=target.tensor_access,
+                        )
             elif isinstance(stmt, llir.Increment) and isinstance(stmt.var, llir.Var):
                 # Remove pD1++ (no longer needed, position is input-derived)
                 if re.match(r"^p[A-Z]\d+$", stmt.var.name):
@@ -3688,7 +3859,13 @@ class CINLowerer:
                     )
                 ),
                 llir.Assign(
-                    var=llir.Var(name="_group_starts[0]", type=llir.DataType.INT64),
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name="_group_starts",
+                            type=llir.DataType.STD_VECTOR_C_INT,
+                        ),
+                        index=llir.Literal(0),
+                    ),
                     value=llir.Literal(0),
                 ),
                 llir.VarInit(
@@ -3726,9 +3903,15 @@ class CINLowerer:
                             ),
                             then_body=[
                                 llir.Assign(
-                                    var=llir.Var(
-                                        name="_group_starts[_n_groups]",
-                                        type=llir.DataType.INT64,
+                                    var=llir.ArrayAccess(
+                                        array=llir.Var(
+                                            name="_group_starts",
+                                            type=llir.DataType.STD_VECTOR_C_INT,
+                                        ),
+                                        index=llir.Var(
+                                            name="_n_groups",
+                                            type=llir.DataType.INT64,
+                                        ),
                                     ),
                                     value=llir.Var(name="_p", type=llir.DataType.INT64),
                                 ),
@@ -3742,8 +3925,15 @@ class CINLowerer:
                     ],
                 ),
                 llir.Assign(
-                    var=llir.Var(
-                        name="_group_starts[_n_groups]", type=llir.DataType.INT64
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name="_group_starts",
+                            type=llir.DataType.STD_VECTOR_C_INT,
+                        ),
+                        index=llir.Var(
+                            name="_n_groups",
+                            type=llir.DataType.INT64,
+                        ),
                     ),
                     value=llir.Var(name=outer_end_var, type=llir.DataType.INT64),
                 ),
@@ -3990,10 +4180,12 @@ class CINLowerer:
             and self._should_parallelize_compressed_where(index_var)
         ):
             result_tensor = self.final_result_tensor_var
+            result_access = self.final_result_tensor_access
             workspace_name = self._where_workspace_name
             workspace_ctype = self._where_workspace_ctype
             if (
                 result_tensor is None
+                or result_access is None
                 or workspace_name is None
                 or workspace_ctype is None
             ):
@@ -4011,6 +4203,7 @@ class CINLowerer:
                 compressed_where_pass_spec=CompressedWhereOpenMPPassSpec(
                     CompressedWhereOpenMPContext(
                         result_name=result_tensor.get_name(),
+                        result_id=result_access.tensor_id,
                         compressed_levels=compressed_levels,
                         workspace_name=workspace_name,
                         workspace_ctype=workspace_ctype,

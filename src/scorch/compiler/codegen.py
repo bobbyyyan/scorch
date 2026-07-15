@@ -2,11 +2,17 @@ from typing import TYPE_CHECKING, List, Optional, TypeVar, Union, cast
 
 from . import llir
 from .diagnostics import CodegenError
+from .llir_traversal import LLIRTraversalContext, LLIRTraversalError, LLIRWalker
 
 if TYPE_CHECKING:
     from .compile_options import CompileOptions
 
 LLIR_NODE = TypeVar("LLIR_NODE", bound=llir.Node)
+
+_ASSIGNMENT_CODEGEN_CONTEXT = LLIRTraversalContext(
+    stage="C++ code generation",
+    pass_name="emit_assignment",
+)
 
 
 class LLIRLowerer:
@@ -118,19 +124,33 @@ class LLIRLowerer:
                 indent_level,
             )
 
-        elif isinstance(ir, llir.Assign):
-            if not isinstance(ir.var, llir.Var):
+        elif type(ir) is llir.Assign:
+            assignment = cast(llir.Assign, ir)
+            try:
+                LLIRWalker(_ASSIGNMENT_CODEGEN_CONTEXT).walk(assignment.var)
+                llir._validate_assignment_target(assignment.var)
+            except (TypeError, LLIRTraversalError) as error:
                 raise CodegenError(
-                    "LLIR codegen requires Assign.var to be Var, got "
-                    f"{type(ir.var).__name__}"
-                )
+                    f"Invalid LLIR assignment target: {error}"
+                ) from error
+            if type(assignment.op) is not llir.AssignOp:
+                raise CodegenError("LLIR Assign.op must be an AssignOp")
+            if type(assignment.cast) is not bool:
+                raise CodegenError("LLIR Assign.cast must be a bool")
+            if assignment.cast and type(assignment.var) is not llir.Var:
+                raise CodegenError("LLIR Assign.cast requires an exact Var target")
+            if not isinstance(assignment.value, llir.Expr):
+                raise CodegenError("LLIR Assign.value must be an expression")
+            target = self._render_expression(assignment.var)
             if no_semicolon:
                 return self.lower_llir(
-                    f"{ir.var.name} {ir.op.value} {self._render_expression(ir.value)}",
+                    f"{target} {assignment.op.value} "
+                    f"{self._render_expression(assignment.value)}",
                     indent_level,
                 )
             return self.lower_llir(
-                f"{ir.var.name} {ir.op.value} {self._render_expression(ir.value)};",
+                f"{target} {assignment.op.value} "
+                f"{self._render_expression(assignment.value)};",
                 indent_level,
             )
 

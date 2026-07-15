@@ -420,9 +420,9 @@ def _analyze_loop(
             context,
             assignment_path + ("value",),
         )
-        if type(assignment.var) is llir.Var:
+        if type(assignment.var) in (llir.Var, llir.ArrayAccess):
             _collect_value_array_references(
-                cast(llir.Var, assignment.var),
+                assignment.var,
                 position_to_value_array,
                 context,
                 assignment_path + ("var",),
@@ -583,12 +583,14 @@ def _rewrite_statement_references(
         statement_path = path + (f"[{index}]",)
         if type(statement) is llir.Assign:
             assignment = cast(llir.Assign, statement)
-            assignment.var = _rewrite_expression_references(
+            rewritten_target = _rewrite_expression_references(
                 assignment.var,
                 replacements,
                 context,
                 statement_path + ("var",),
             )
+            llir._validate_assignment_target(rewritten_target)
+            assignment.var = cast(llir.AssignmentTarget, rewritten_target)
             assignment.value = _rewrite_expression_references(
                 assignment.value,
                 replacements,

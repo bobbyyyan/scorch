@@ -406,12 +406,14 @@ def _rewrite_statement_references(
         statement_path = path + (f"[{index}]",)
         if type(statement) is llir.Assign:
             assignment = cast(llir.Assign, statement)
-            assignment.var = _rewrite_expression_references(
+            rewritten_target = _rewrite_expression_references(
                 assignment.var,
                 replacements,
                 context,
                 statement_path + ("var",),
             )
+            llir._validate_assignment_target(rewritten_target)
+            assignment.var = cast(llir.AssignmentTarget, rewritten_target)
             assignment.value = _rewrite_expression_references(
                 assignment.value,
                 replacements,

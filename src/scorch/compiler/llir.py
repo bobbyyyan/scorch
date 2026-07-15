@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Any, Union, TypeVar, Sequence, Tuple
+from typing import List, Optional, Any, Union, TypeVar, Sequence, Tuple, cast
 
 import torch
 
@@ -381,16 +381,24 @@ class VarInit(Stmt):
 
 @dataclass(frozen=False)
 class Assign(Stmt):
-    """A variable assignment statement."""
+    """An assignment to a scalar/member variable or structured subscript."""
 
-    var: Union[Var, Expr]
+    var: "AssignmentTarget"
     value: Expr
     op: AssignOp = AssignOp.ASSIGN
-    cast: Optional[bool] = False
+    cast: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        _validate_assignment_target(self.var)
+        if not isinstance(self.value, Expr):
+            raise TypeError("Assign.value must be an LLIR Expr")
+        if type(self.op) is not AssignOp:
+            raise TypeError("Assign.op must be an AssignOp")
+        if type(self.cast) is not bool:
+            raise TypeError("Assign.cast must be a bool")
         if self.cast:
-            assert isinstance(self.var, Var)
+            if type(self.var) is not Var:
+                raise TypeError("Assign.cast requires an exact Var target")
             self.value = Cast(self.value, self.var.type)
 
 
@@ -530,6 +538,155 @@ class ArrayAccess(Expr):
             raise TypeError(
                 "ArrayAccess.tensor_access must be TensorAccessMetadata or None"
             )
+
+
+AssignmentTarget = Union[Var, ArrayAccess]
+
+
+def _is_assignment_name(name: object, *, allow_member: bool) -> bool:
+    """Whether ``name`` is in the narrow identifier/member lvalue grammar."""
+
+    if type(name) is not str or not name:
+        return False
+    components = name.split(".") if allow_member else (name,)
+    return all(component.isidentifier() for component in components)
+
+
+def _validate_assignment_metadata(
+    metadata: object,
+    *,
+    expected_role: TensorAccessRole,
+    owner: str,
+) -> None:
+    if type(metadata) is not TensorAccessMetadata:
+        raise TypeError(f"{owner} metadata must be TensorAccessMetadata")
+    typed_metadata = cast(TensorAccessMetadata, metadata)
+    if typed_metadata.role is not expected_role:
+        raise TypeError(f"{owner} metadata must have the {expected_role.name} role")
+    if type(typed_metadata.access_id) is not AccessId:
+        raise TypeError(f"{owner} metadata access_id must be an AccessId")
+    if type(typed_metadata.tensor_id) is not SymbolId:
+        raise TypeError(f"{owner} metadata tensor_id must be a SymbolId")
+    if type(typed_metadata.index_ids) is not tuple or any(
+        type(index_id) is not IndexId for index_id in typed_metadata.index_ids
+    ):
+        raise TypeError(f"{owner} metadata index_ids must be a tuple of IndexId values")
+
+
+def _validate_assignment_index(expression: object) -> None:
+    """Validate the typed expression subset admitted as a subscript index."""
+
+    expression_type = type(expression)
+    if expression_type is Var:
+        var = cast(Var, expression)
+        if not _is_assignment_name(var.name, allow_member=True):
+            raise TypeError(
+                "assignment index Var names must be identifiers or member paths"
+            )
+        if type(var.type) is not DataType:
+            raise TypeError("assignment index Var.type must be a DataType")
+        if var.tensor_access is not None:
+            raise TypeError("assignment index Vars cannot carry tensor access metadata")
+        return
+    if expression_type is Literal:
+        literal = cast(Literal, expression)
+        if type(literal.value) is not int:
+            raise TypeError("assignment index Literal.value must be an int")
+        if type(literal.data_type) is not DataType:
+            raise TypeError("assignment index Literal.data_type must be a DataType")
+        return
+    if expression_type is Sizeof:
+        if type(cast(Sizeof, expression).data_type) is not DataType:
+            raise TypeError("assignment index Sizeof.data_type must be a DataType")
+        return
+    if expression_type in (BinOp, Add, Mul):
+        binary = cast(BinOp, expression)
+        if type(binary.op) is not str or binary.op not in ("+", "-", "*", "/", "%"):
+            raise TypeError(
+                "assignment index BinOp.op must be a supported arithmetic operator"
+            )
+        _validate_assignment_index(binary.left)
+        _validate_assignment_index(binary.right)
+        return
+    if expression_type is UnaryOp:
+        unary = cast(UnaryOp, expression)
+        if type(unary.op) is not str or unary.op not in ("+", "-"):
+            raise TypeError("assignment index UnaryOp.op must be '+' or '-'")
+        _validate_assignment_index(unary.operand)
+        return
+    if expression_type is Cast:
+        typed_cast = cast(Cast, expression)
+        if type(typed_cast.data_type) is not DataType:
+            raise TypeError("assignment index Cast.data_type must be a DataType")
+        _validate_assignment_index(typed_cast.expr)
+        return
+    if expression_type is FunctionCall:
+        call = cast(FunctionCall, expression)
+        if not _is_assignment_name(call.name, allow_member=True):
+            raise TypeError(
+                "assignment index FunctionCall.name must be an identifier or "
+                "member path"
+            )
+        if type(call.args) is not list:
+            raise TypeError("assignment index FunctionCall.args must be a list")
+        for argument in call.args:
+            _validate_assignment_index(argument)
+        return
+    if expression_type is ArrayAccess:
+        access = cast(ArrayAccess, expression)
+        if access.tensor_access is not None:
+            _validate_assignment_metadata(
+                access.tensor_access,
+                expected_role=TensorAccessRole.INPUT_READ,
+                owner="assignment index ArrayAccess",
+            )
+        _validate_assignment_index(access.array)
+        _validate_assignment_index(access.index)
+        return
+    raise TypeError(
+        "assignment ArrayAccess.index contains an unsupported LLIR expression"
+    )
+
+
+def _validate_assignment_target(target: object) -> None:
+    """Validate the deliberately small lvalue subset owned by ``Assign``."""
+
+    if type(target) is Var:
+        var = target
+        if not _is_assignment_name(var.name, allow_member=True):
+            raise TypeError("assignment Var.name must be an identifier or member path")
+        if type(var.type) is not DataType:
+            raise TypeError("assignment Var.type must be a DataType")
+        if var.tensor_access is not None:
+            raise TypeError(
+                "scalar/member Assign targets cannot carry tensor access metadata"
+            )
+        return
+    if type(target) is not ArrayAccess:
+        raise TypeError("Assign.var must be an exact Var or ArrayAccess")
+
+    access = target
+    if type(access.array) is not Var:
+        raise TypeError("assignment ArrayAccess.array must be an exact Var")
+    array = access.array
+    if not _is_assignment_name(array.name, allow_member=True):
+        raise TypeError(
+            "assignment ArrayAccess.array name must be an identifier or member path"
+        )
+    if type(array.type) is not DataType:
+        raise TypeError("assignment ArrayAccess.array type must be a DataType")
+    if array.tensor_access is not None:
+        raise TypeError(
+            "assignment ArrayAccess.array cannot carry tensor access metadata"
+        )
+    _validate_assignment_index(access.index)
+    metadata = access.tensor_access
+    if metadata is not None:
+        _validate_assignment_metadata(
+            metadata,
+            expected_role=TensorAccessRole.RESULT_WRITE,
+            owner="assignment ArrayAccess",
+        )
 
 
 class ForLoop(Stmt):

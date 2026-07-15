@@ -207,6 +207,37 @@ def _validate_tensor_access_metadata(
             )
 
 
+def _validate_assign_fields(
+    node: llir.Assign,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if type(node.op) is not llir.AssignOp:
+        _raise_traversal_error(
+            context,
+            code="invalid_assign_op",
+            message="Assign.op must be an AssignOp",
+            path=path + ("op",),
+            value=node.op,
+        )
+    if type(node.cast) is not bool:
+        _raise_traversal_error(
+            context,
+            code="invalid_assign_cast",
+            message="Assign.cast must be a bool",
+            path=path + ("cast",),
+            value=node.cast,
+        )
+    if node.cast and type(node.var) is not llir.Var:
+        _raise_traversal_error(
+            context,
+            code="invalid_assign_cast_target",
+            message="Assign.cast requires an exact Var target",
+            path=path + ("var",),
+            value=node.var,
+        )
+
+
 class LLIRWalker:
     """A stateless, exhaustive walker with one typed hook per LLIR node."""
 
@@ -364,6 +395,27 @@ class LLIRWalker:
                 self.context,
                 code="invalid_var_child",
                 message="expected an LLIR Var",
+                path=path,
+                value=value,
+            )
+
+    def _walk_assignment_target(self, value: object, path: LLIRPath) -> None:
+        if not isinstance(value, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message="expected an exact LLIR Var or ArrayAccess",
+                path=path,
+                value=value,
+            )
+        self._walk_expr(value, path)
+        try:
+            llir._validate_assignment_target(value)
+        except TypeError as error:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message=str(error),
                 path=path,
                 value=value,
             )
@@ -551,7 +603,16 @@ class LLIRWalker:
         self._walk_expr(node.value, path + ("value",))
 
     def visit_assign(self, node: llir.Assign, path: LLIRPath) -> None:
-        self._walk_expr(node.var, path + ("var",))
+        _validate_assign_fields(node, self.context, path)
+        self._walk_assignment_target(node.var, path + ("var",))
+        if not isinstance(node.value, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assign_value",
+                message="Assign.value must be an LLIR Expr",
+                path=path + ("value",),
+                value=node.value,
+            )
         self._walk_expr(node.value, path + ("value",))
 
     def visit_allocate(self, node: llir.Allocate, path: LLIRPath) -> None:
@@ -884,6 +945,30 @@ class LLIRRewriter:
             )
         return cast(llir.Var, rewritten)
 
+    def _rewrite_assignment_target(
+        self, value: object, path: LLIRPath
+    ) -> llir.AssignmentTarget:
+        if not isinstance(value, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message="expected an exact LLIR Var or ArrayAccess",
+                path=path,
+                value=value,
+            )
+        rewritten = self._rewrite_expr(value, path)
+        try:
+            llir._validate_assignment_target(rewritten)
+        except TypeError as error:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message=str(error),
+                path=path,
+                value=rewritten,
+            )
+        return cast(llir.AssignmentTarget, rewritten)
+
     def _rewrite_branches(
         self,
         branches: object,
@@ -1117,8 +1202,17 @@ class LLIRRewriter:
         return rewritten
 
     def rewrite_assign(self, node: llir.Assign, path: LLIRPath) -> llir.Stmt:
+        _validate_assign_fields(node, self.context, path)
+        if not isinstance(node.value, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assign_value",
+                message="Assign.value must be an LLIR Expr",
+                path=path + ("value",),
+                value=node.value,
+            )
         rewritten = llir.Assign(
-            var=self._rewrite_expr(node.var, path + ("var",)),
+            var=self._rewrite_assignment_target(node.var, path + ("var",)),
             value=self._rewrite_expr(node.value, path + ("value",)),
             op=node.op,
             cast=False,

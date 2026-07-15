@@ -450,6 +450,11 @@ def _try_hoist_from_loop(
         ):
             continue
 
+        if type(assignment.var) is llir.ArrayAccess:
+            # Indexed accumulations are legal stores, but this scalar factor
+            # hoist does not own their storage or aliasing semantics.
+            continue
+
         target = _checked_target(
             assignment.var,
             context,
@@ -460,9 +465,6 @@ def _try_hoist_from_loop(
             context,
             assignment_path + ("var",),
         )
-        if "[" in accumulator_name:
-            continue
-
         factors: List[_Factor] = []
         _collect_mul_factors(
             assignment.value,

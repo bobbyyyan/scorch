@@ -1,12 +1,9 @@
-"""Typed rewriting of legacy compressed-result writes.
+"""Typed rewriting of compressed-result writes.
 
 This pass preserves the current compressed-output/OpenMP transformation while
 moving its LLIR rewrite behind the common detached ownership boundary.  The
-legacy LLIR still encodes result accesses and vector operations in ``Var.name``
-and ``FunctionCallStmt.name`` strings, and fill mode must render expressions
-back to C++ before placing them in ``RawStmt`` nodes.  Those spelling
-dependencies are intentionally contained here until structured access nodes
-replace them; this extraction does not broaden that migration seam.
+vector operations remain in ``FunctionCallStmt.name`` strings, while indexed
+assignment targets and the fill stores produced here stay structured.
 
 Count and fill are independent transformations.  Production applies each mode
 once to the same original work body.  Applying one mode to the output of the
@@ -31,8 +28,7 @@ from typing import (
 )
 
 from . import llir
-from .codegen import LLIRLowerer
-from .diagnostics import CodegenError
+from .identity import SymbolId
 from .llir_traversal import (
     LLIRPath,
     LLIRRewriteValueT,
@@ -60,14 +56,16 @@ RESULT_WRITE_TRAVERSAL_CONTEXT = LLIRTraversalContext(
 class ResultWriteContext:
     """All explicit state required to rewrite one result's writes.
 
-    Production carries the outer compilation snapshot so its spelling-only
-    renderer cannot fall back to an independent emission policy. Direct pass
-    callers may omit it because they are their own compatibility boundary.
+    ``result_id`` is the stable logical identity used to recognize value writes;
+    generated storage names are used only for scoped physical coordinate and
+    position arrays. Production carries the exact outer compilation snapshot.
     """
 
     result_name: str
+    result_id: SymbolId
     compressed_levels: Tuple[int, ...]
     mode: ResultWriteMode
+    value_pointer_type: llir.DataType
     traversal: LLIRTraversalContext = RESULT_WRITE_TRAVERSAL_CONTEXT
     compile_options: Optional["CompileOptions"] = None
 
@@ -148,6 +146,14 @@ def _validate_context(context: object) -> ResultWriteContext:
             path=("context", "result_name"),
             value=typed_context.result_name,
         )
+    if type(typed_context.result_id) is not SymbolId:
+        _raise_result_write_error(
+            typed_context,
+            code="invalid_result_write_id",
+            message="result_id must be an exact SymbolId",
+            path=("context", "result_id"),
+            value=typed_context.result_id,
+        )
 
     levels = typed_context.compressed_levels
     if type(levels) is not tuple or not levels:
@@ -186,6 +192,32 @@ def _validate_context(context: object) -> ResultWriteContext:
             path=("context", "mode"),
             value=typed_context.mode,
         )
+    if type(
+        typed_context.value_pointer_type
+    ) is not llir.DataType or typed_context.value_pointer_type not in {
+        llir.DataType.NO_TYPE,
+        llir.DataType.PTR_INT,
+        llir.DataType.PTR_INT_32,
+        llir.DataType.PTR_INT_64,
+        llir.DataType.PTR_FLOAT32,
+        llir.DataType.PTR_FLOAT64,
+        llir.DataType.PTR_TORCH_FLOAT32,
+        llir.DataType.PTR_TORCH_FLOAT64,
+        llir.DataType.PTR_TORCH_INT32,
+        llir.DataType.PTR_TORCH_INT64,
+        llir.DataType.PTR_TORCH_INT8,
+        llir.DataType.PTR_TORCH_UINT8,
+        llir.DataType.PTR_TORCH_TENSOR,
+        llir.DataType.PTR_TENSOR,
+        llir.DataType.PTR_VOID,
+    }:
+        _raise_result_write_error(
+            typed_context,
+            code="invalid_result_write_value_pointer_type",
+            message="value_pointer_type must be an exact pointer DataType or NO_TYPE",
+            path=("context", "value_pointer_type"),
+            value=typed_context.value_pointer_type,
+        )
     return typed_context
 
 
@@ -201,12 +233,12 @@ class _ResultWriteRewriter(LLIRRewriter):
 
     def __init__(self, context: ResultWriteContext) -> None:
         super().__init__(context.traversal)
-        self._pass_context = context
         self._result_name = context.result_name
+        self._result_id = context.result_id
         self._compressed_levels = context.compressed_levels
         self._leaf = context.compressed_levels[-1]
         self._mode = context.mode
-        self._codegen = LLIRLowerer(compile_options=context.compile_options)
+        self._value_pointer_type = context.value_pointer_type
         self._identity = LLIRRewriter(context.traversal)
 
     def rewrite_statement_sequence(
@@ -234,52 +266,81 @@ class _ResultWriteRewriter(LLIRRewriter):
             return self._rewrite_if_statement(cast(llir.IfThenElse, node), path)
         return super().rewrite_statement_sequence_member(node, path)
 
-    def _render_expression(self, expression: llir.Expr, path: LLIRPath) -> str:
-        try:
-            return self._codegen.lower_llir(expression)
-        except CodegenError as error:
-            _raise_result_write_error(
-                self._pass_context,
-                code="result_write_expression_render_failed",
-                message=str(error),
-                path=path,
-                value=expression,
-            )
+    @staticmethod
+    def _array_name(target: llir.AssignmentTarget) -> Optional[str]:
+        if type(target) is not llir.ArrayAccess:
+            return None
+        array = cast(llir.ArrayAccess, target).array
+        if type(array) is not llir.Var:
+            return None
+        return cast(llir.Var, array).name
+
+    @staticmethod
+    def _phase_index(level: int) -> llir.Add:
+        return llir.Add(
+            llir.Var(name=f"_base{level}", type=llir.DataType.INT64),
+            llir.Var(name=f"_pos{level}", type=llir.DataType.INT64),
+        )
+
+    @classmethod
+    def _store(
+        cls,
+        array_name: str,
+        index: llir.Expr,
+        value: llir.Expr,
+        *,
+        array_type: llir.DataType = llir.DataType.NO_TYPE,
+    ) -> llir.Assign:
+        return llir.Assign(
+            var=llir.ArrayAccess(
+                array=llir.Var(name=array_name, type=array_type),
+                index=index,
+            ),
+            value=value,
+        )
+
+    def _is_result_value_target(self, target: llir.AssignmentTarget) -> bool:
+        if type(target) is not llir.ArrayAccess:
+            return False
+        metadata = cast(llir.ArrayAccess, target).tensor_access
+        return bool(
+            type(metadata) is llir.TensorAccessMetadata
+            and metadata.tensor_id == self._result_id
+            and metadata.role is llir.TensorAccessRole.RESULT_WRITE
+        )
 
     def _rewrite_assign_statement(
         self, node: llir.Assign, path: LLIRPath
     ) -> Sequence[llir.Stmt]:
-        target_name = getattr(node.var, "name", "")
+        target_name = self._array_name(node.var)
 
-        if f"{self._result_name}_values[" in target_name:
+        if self._is_result_value_target(node.var):
             if self._mode == "count":
                 return ()
-            value = self._render_expression(node.value, path + ("value",))
             return (
-                llir.RawStmt(
-                    code=(
-                        f"{self._result_name}_values_data"
-                        f"[_base{self._leaf} + _pos{self._leaf}] = {value}"
-                    )
+                self._store(
+                    f"{self._result_name}_values_data",
+                    self._phase_index(self._leaf),
+                    node.value,
+                    array_type=self._value_pointer_type,
                 ),
             )
 
         for level in self._compressed_levels:
-            if f"{self._result_name}{level}_crd[" in target_name:
+            if target_name == f"{self._result_name}{level}_crd":
                 if self._mode == "count":
                     return (llir.RawStmt(code=f"_cnt{level}++"),)
-                value = self._render_expression(node.value, path + ("value",))
                 return (
-                    llir.RawStmt(
-                        code=(
-                            f"{self._result_name}{level}_crd_data"
-                            f"[_base{level} + _pos{level}] = {value}"
-                        )
+                    self._store(
+                        f"{self._result_name}{level}_crd_data",
+                        self._phase_index(level),
+                        node.value,
+                        array_type=llir.DataType.PTR_INT,
                     ),
                 )
 
         if any(
-            f"{self._result_name}{level}_pos[" in target_name
+            target_name == f"{self._result_name}{level}_pos"
             for level in self._compressed_levels
         ):
             return ()
@@ -304,29 +365,24 @@ class _ResultWriteRewriter(LLIRRewriter):
             if self._mode == "count":
                 return (llir.RawStmt(code=f"_cnt{level}++"),)
 
-            coordinate = (
-                self._render_expression(node.args[0], path + ("args", "[0]"))
-                if node.args
-                else "0"
-            )
+            coordinate = node.args[0] if node.args else llir.Literal(0)
             replacements = [
-                llir.RawStmt(
-                    code=(
-                        f"{self._result_name}{level}_crd_data"
-                        f"[_base{level} + _pos{level}] = {coordinate}"
-                    )
+                self._store(
+                    f"{self._result_name}{level}_crd_data",
+                    self._phase_index(level),
+                    coordinate,
+                    array_type=llir.DataType.PTR_INT,
                 ),
                 llir.RawStmt(code=f"_pos{level}++"),
             ]
             if index + 1 < len(self._compressed_levels):
                 next_level = self._compressed_levels[index + 1]
                 replacements.append(
-                    llir.RawStmt(
-                        code=(
-                            f"{self._result_name}{next_level}_pos_data"
-                            f"[_base{level} + _pos{level}] = "
-                            f"_base{next_level} + _pos{next_level}"
-                        )
+                    self._store(
+                        f"{self._result_name}{next_level}_pos_data",
+                        self._phase_index(level),
+                        self._phase_index(next_level),
+                        array_type=llir.DataType.PTR_INT,
                     )
                 )
             return replacements
@@ -334,17 +390,13 @@ class _ResultWriteRewriter(LLIRRewriter):
         if node.name == f"{self._result_name}_values.push_back":
             if self._mode == "count":
                 return ()
-            value = (
-                self._render_expression(node.args[0], path + ("args", "[0]"))
-                if node.args
-                else "0"
-            )
+            value = node.args[0] if node.args else llir.Literal(0)
             return (
-                llir.RawStmt(
-                    code=(
-                        f"{self._result_name}_values_data"
-                        f"[_base{self._leaf} + _pos{self._leaf}] = {value}"
-                    )
+                self._store(
+                    f"{self._result_name}_values_data",
+                    self._phase_index(self._leaf),
+                    value,
+                    array_type=self._value_pointer_type,
                 ),
             )
 
@@ -400,25 +452,23 @@ class _ResultWriteRewriter(LLIRRewriter):
                 ),
             )
 
-        coordinate = self._find_serial_coordinate(node, path)
+        coordinate = self._find_serial_coordinate(node)
         fill_body: List[llir.Stmt] = []
         if parent_level is not None and coordinate is not None:
             fill_body.extend(
                 [
-                    llir.RawStmt(
-                        code=(
-                            f"{self._result_name}{parent_level}_crd_data"
-                            f"[_base{parent_level} + _pos{parent_level}] = "
-                            f"{coordinate}"
-                        )
+                    self._store(
+                        f"{self._result_name}{parent_level}_crd_data",
+                        self._phase_index(parent_level),
+                        coordinate,
+                        array_type=llir.DataType.PTR_INT,
                     ),
                     llir.RawStmt(code=f"_pos{parent_level}++"),
-                    llir.RawStmt(
-                        code=(
-                            f"{self._result_name}{level}_pos_data"
-                            f"[_base{parent_level} + _pos{parent_level}] = "
-                            f"_base{level} + _pos{level}"
-                        )
+                    self._store(
+                        f"{self._result_name}{level}_pos_data",
+                        self._phase_index(parent_level),
+                        self._phase_index(level),
+                        array_type=llir.DataType.PTR_INT,
                     ),
                 ]
             )
@@ -438,21 +488,16 @@ class _ResultWriteRewriter(LLIRRewriter):
             right=llir.Var(name=f"_prev{level}", type=llir.DataType.INT64),
         )
 
-    def _find_serial_coordinate(
-        self, node: llir.IfThenElse, path: LLIRPath
-    ) -> Optional[str]:
+    def _find_serial_coordinate(self, node: llir.IfThenElse) -> Optional[llir.Expr]:
         if not node.then_body:
             return None
-        for index, statement in enumerate(node.then_body):
+        for statement in node.then_body:
             if (
                 type(statement) is llir.FunctionCallStmt
                 and ".push_back" in statement.name
                 and statement.args
             ):
-                return self._render_expression(
-                    statement.args[0],
-                    path + ("then_body", f"[{index}]", "args", "[0]"),
-                )
+                return statement.args[0]
         return None
 
     def rewrite_function(self, node: llir.Function, path: LLIRPath) -> llir.Function:

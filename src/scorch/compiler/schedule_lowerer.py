@@ -346,6 +346,34 @@ class _TensorAccessRewriter(LLIRRewriter):
         return rewritten
 
 
+class _TensorAccessRewritePreflight(LLIRWalker):
+    """Validate a replacement everywhere it would become an lvalue."""
+
+    def __init__(
+        self,
+        tensor_id: SymbolId,
+        index_ids: Tuple[IndexId, ...],
+        role: llir.TensorAccessRole,
+        replacement: llir.Expr,
+    ) -> None:
+        super().__init__(_ACCESS_REWRITE_CONTEXT)
+        self.tensor_id = tensor_id
+        self.index_ids = index_ids
+        self.role = role
+        self.replacement = replacement
+
+    def visit_assign(self, node: llir.Assign, path: Tuple[str, ...]) -> None:
+        rewritten_target, _ = _rewrite_expr_access(
+            node.var,
+            self.tensor_id,
+            self.index_ids,
+            self.role,
+            self.replacement,
+        )
+        self._walk_assignment_target(rewritten_target, path + ("var",))
+        super().visit_assign(node, path)
+
+
 def _rewrite_expr_access(
     expr: llir.Expr,
     tensor_id: SymbolId,
@@ -377,7 +405,13 @@ def _rewrite_stmt_accesses(
 ) -> int:
     """Rewrite matching tensor accesses without parsing rendered C++ names."""
     if not _validated:
-        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(cast(LLIRValue, stmts))
+        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(replacement)
+        _TensorAccessRewritePreflight(
+            tensor_id,
+            index_ids,
+            role,
+            replacement,
+        ).walk(cast(LLIRValue, stmts))
     count = 0
     for stmt in stmts:
         if isinstance(stmt, llir.VarInit):
@@ -386,9 +420,10 @@ def _rewrite_stmt_accesses(
             )
             count += rewritten
         elif isinstance(stmt, llir.Assign):
-            stmt.var, lhs_count = _rewrite_expr_access(
+            rewritten_target, lhs_count = _rewrite_expr_access(
                 stmt.var, tensor_id, index_ids, role, replacement
             )
+            stmt.var = cast(llir.AssignmentTarget, rewritten_target)
             stmt.value, rhs_count = _rewrite_expr_access(
                 stmt.value, tensor_id, index_ids, role, replacement
             )
@@ -470,6 +505,8 @@ def _rewrite_stmt_accesses(
                 rewritten_args.append(arg)
                 count += arg_count
             stmt.args = rewritten_args
+    if not _validated:
+        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(cast(LLIRValue, stmts))
     return count
 
 
@@ -633,12 +670,21 @@ def _apply_heap_result_tile(
             "Heap accumulation requires at least one dense result prefix level"
         )
 
-    compact_access = llir.Var(
-        name=(
-            f"{compact_name}[p{plan.result}{plan.result_level - 1} * "
-            f"{tile_size_name} + {tile_inner_name}]"
+    compact_access = llir.ArrayAccess(
+        array=llir.Var(
+            name=compact_name,
+            type=pointer_type,
         ),
-        type=scalar_type,
+        index=llir.Add(
+            llir.Mul(
+                llir.Var(
+                    name=f"p{plan.result}{plan.result_level - 1}",
+                    type=llir.DataType.INT64,
+                ),
+                llir.Var(name=tile_size_name, type=llir.DataType.INT64),
+            ),
+            llir.Var(name=tile_inner_name, type=llir.DataType.INT64),
+        ),
     )
     rewritten = _rewrite_stmt_accesses(
         tile_loop.body,
@@ -689,10 +735,15 @@ def _apply_heap_result_tile(
                 then_body=[llir.Break()],
             ),
             llir.Assign(
-                var=llir.Var(
-                    f"{compact_name}[{init_prefix} * {tile_size_name} + "
-                    f"{init_inner}]",
-                    scalar_type,
+                var=llir.ArrayAccess(
+                    array=llir.Var(compact_name, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(init_prefix, llir.DataType.INT64),
+                            llir.Var(tile_size_name, llir.DataType.INT64),
+                        ),
+                        llir.Var(init_inner, llir.DataType.INT64),
+                    ),
                 ),
                 value=llir.Var(zero_value, scalar_type),
             ),
@@ -747,10 +798,15 @@ def _apply_heap_result_tile(
                 then_body=[llir.Break()],
             ),
             llir.Assign(
-                var=llir.Var(
-                    f"{result_values}[{copy_prefix} * {trailing_bound} + "
-                    f"{copy_logical}]",
-                    scalar_type,
+                var=llir.ArrayAccess(
+                    array=llir.Var(result_values, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(copy_prefix, llir.DataType.INT64),
+                            llir.Var(trailing_bound, llir.DataType.INT64),
+                        ),
+                        llir.Var(copy_logical, llir.DataType.INT64),
+                    ),
                 ),
                 value=llir.Var(
                     f"{compact_name}[{copy_prefix} * {tile_size_name} + "
@@ -960,8 +1016,22 @@ def _apply_relayout(
     pack_row = _unique_name(f"{plan.panel_var}_pack", used_names)
     pack_col = _unique_name(f"{plan.pack_var}_pack", used_names)
     logical_pack_col = _unique_name(f"{plan.pack_var}_packed", used_names)
-    destination_row = f"({pack_row} - {panel_outer_name})" if panel_scoped else pack_row
-    destination_index = f"{destination_row} * {pack_tile_var} + {pack_col}"
+    destination_row: llir.Expr = (
+        llir.BinOp(
+            op="-",
+            left=llir.Var(pack_row, llir.DataType.INT64),
+            right=llir.Var(panel_outer_name, llir.DataType.INT64),
+        )
+        if panel_scoped
+        else llir.Var(pack_row, llir.DataType.INT64)
+    )
+    destination_index = llir.Add(
+        llir.Mul(
+            destination_row,
+            llir.Var(pack_tile_var, llir.DataType.INT64),
+        ),
+        llir.Var(pack_col, llir.DataType.INT64),
+    )
     pack_inner = llir.ForLoop(
         init=llir.VarInit(
             var=llir.Var(pack_col, llir.DataType.INT64),
@@ -990,7 +1060,10 @@ def _apply_relayout(
                 then_body=[llir.Break()],
             ),
             llir.Assign(
-                var=llir.Var(f"{packed_name}[{destination_index}]", scalar_type),
+                var=llir.ArrayAccess(
+                    array=llir.Var(packed_name, pointer_type),
+                    index=destination_index,
+                ),
                 value=llir.ArrayAccess(
                     array=llir.Var(operand_value_array, pointer_type),
                     index=llir.Add(

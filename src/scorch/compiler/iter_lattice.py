@@ -27,8 +27,6 @@ from ..format import LevelType
 from .iterator import ModeIterator
 
 
-
-
 @dataclass(frozen=False)
 class LatticePoint:
     """
@@ -621,9 +619,18 @@ class LatticePoint:
                         update=llir.Increment(var=pos_index_var_llir),
                         body=[
                             llir.Assign(
-                                var=llir.Var(
-                                    name=f"{result_tensor_name}{child_level}_pos[{pos_index_var_llir.name} + 1]",
-                                    type=llir.DataType.INT,
+                                var=llir.ArrayAccess(
+                                    array=llir.Var(
+                                        name=f"{result_tensor_name}{child_level}_pos",
+                                        type=llir.DataType.STD_VECTOR_C_INT,
+                                    ),
+                                    index=llir.Add(
+                                        llir.Var(
+                                            name=pos_index_var_llir.name,
+                                            type=llir.DataType.INT,
+                                        ),
+                                        llir.Literal(1),
+                                    ),
                                 ),
                                 value=llir.FunctionCall(
                                     name=f"{result_tensor_name}{child_level}_crd.size",
@@ -1026,8 +1033,10 @@ class IterationLattice:
                 return False
 
         # This must be the last result level
-        if (result_tensor_access.level_of_index_var(index_var)
-                != result_tensor_var.levels - 1):
+        if (
+            result_tensor_access.level_of_index_var(index_var)
+            != result_tensor_var.levels - 1
+        ):
             return False
 
         # Child must be a ForAll with a reduction variable (not in result)
@@ -1049,9 +1058,11 @@ class IterationLattice:
         if use_scalar_accum:
             self.cin_lowerer._scalar_accum_mode = True
 
-        child_subregion = list(lattice_point.get_child_subregion_loops(
-            self.cin_lowerer, self.for_all_stmt.stmt
-        ))
+        child_subregion = list(
+            lattice_point.get_child_subregion_loops(
+                self.cin_lowerer, self.for_all_stmt.stmt
+            )
+        )
 
         if use_scalar_accum:
             self.cin_lowerer._scalar_accum_mode = False
@@ -1069,26 +1080,52 @@ class IterationLattice:
             )
 
             # Post: D_values[pD1] = _accum; D0_crd[pD1] = i; D1_crd[pD1] = j; pD1++;
+            result_metadata = self.cin_lowerer._tensor_access_metadata(
+                result_tensor_access,
+                llir.TensorAccessRole.RESULT_WRITE,
+            )
             post_stmts: list = []
-            post_stmts.append(llir.Assign(
-                var=llir.Var(
-                    name=f"{result_name}_values[{pos_var}]",
-                    type=llir.DataType.NO_TYPE,
-                ),
-                value=llir.Var(name="_accum", type=llir.DataType.NO_TYPE),
-            ))
+            post_stmts.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_name}_values",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=llir.Var(
+                            name=pos_var,
+                            type=llir.DataType.INT64,
+                        ),
+                        tensor_access=result_metadata,
+                    ),
+                    value=llir.Var(name="_accum", type=llir.DataType.NO_TYPE),
+                )
+            )
             sorted_result_ivars = result_tensor_access.get_sorted_index_vars()
             for level_idx, level_iv in enumerate(sorted_result_ivars):
-                post_stmts.append(llir.Assign(
-                    var=llir.Var(
-                        name=f"{result_name}{level_idx}_crd[{pos_var}]",
-                        type=llir.DataType.NO_TYPE,
-                    ),
-                    value=llir.Var(name=level_iv.name, type=llir.DataType.NO_TYPE),
-                ))
-            post_stmts.append(llir.Increment(
-                var=llir.Var(name=pos_var, type=llir.DataType.INT),
-            ))
+                post_stmts.append(
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{result_name}{level_idx}_crd",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            index=llir.Var(
+                                name=pos_var,
+                                type=llir.DataType.INT64,
+                            ),
+                        ),
+                        value=llir.Var(
+                            name=level_iv.name,
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    )
+                )
+            post_stmts.append(
+                llir.Increment(
+                    var=llir.Var(name=pos_var, type=llir.DataType.INT),
+                )
+            )
 
             # Mark SIMD on dense reduction loops inside the child subregion
             self._mark_simd_on_reduction_loops(child_subregion)
@@ -1222,9 +1259,18 @@ class IterationLattice:
                         # A1_pos[A0_crd.size()] = A1_crd.size()
                         stmts.append(
                             llir.Assign(
-                                var=llir.Var(
-                                    name=f"{result_tensor_name}{level}_pos[{result_tensor_var.name}{level - 1}_crd.size()]",
-                                    type=llir.DataType.INT,
+                                var=llir.ArrayAccess(
+                                    array=llir.Var(
+                                        name=f"{result_tensor_name}{level}_pos",
+                                        type=llir.DataType.STD_VECTOR_C_INT,
+                                    ),
+                                    index=llir.FunctionCall(
+                                        name=(
+                                            f"{result_tensor_var.name}"
+                                            f"{level - 1}_crd.size"
+                                        ),
+                                        args=[],
+                                    ),
                                 ),
                                 value=llir.FunctionCall(
                                     name=f"{result_tensor_name}{level}_crd.size",
@@ -1238,9 +1284,18 @@ class IterationLattice:
                     stmts.append(
                         # e.g. A1_pos[A1_pos_index + 1] = A1_crd.size()
                         llir.Assign(
-                            var=llir.Var(
-                                name=f"{result_tensor_name}{level}_pos[{result_tensor_name}{level}_pos_index + 1]",
-                                type=llir.DataType.INT,
+                            var=llir.ArrayAccess(
+                                array=llir.Var(
+                                    name=f"{result_tensor_name}{level}_pos",
+                                    type=llir.DataType.STD_VECTOR_C_INT,
+                                ),
+                                index=llir.Add(
+                                    llir.Var(
+                                        name=f"{result_tensor_name}{level}_pos_index",
+                                        type=llir.DataType.INT,
+                                    ),
+                                    llir.Literal(1),
+                                ),
                             ),
                             value=llir.FunctionCall(
                                 name=f"{result_tensor_name}{level}_crd.size",
@@ -1272,9 +1327,7 @@ class IterationLattice:
             )
             # Tiled loops bind i_in/k_in while accesses retain the original
             # logical i/k. Result-index generation must use that parent.
-            logical_index_var = (
-                index_var.parent if index_var.has_parent else index_var
-            )
+            logical_index_var = index_var.parent if index_var.has_parent else index_var
 
             tiled_index_var_resolve_stmts: List[llir.Stmt] = []
 
@@ -1478,8 +1531,7 @@ class IterationLattice:
                             *tiled_index_var_resolve_stmts,
                             *lattice_point.get_candidate_coordinate_stmts(lattice=self),
                             *result_value_index_stmts,
-                            *self._wrap_child_subregion(lattice_point, index_var
-                            ),
+                            *self._wrap_child_subregion(lattice_point, index_var),
                             *lattice_point.get_iterators_advance_stmts(lattice=self),
                         ],
                     )
@@ -1541,7 +1593,9 @@ class IterationLattice:
         # already covers the full range with if/else sub-branches for each
         # sub-case. Subsequent lattice points are redundant (they would
         # generate duplicate remainder loops).
-        points_to_lower = [lattice_points[0]] if self.dense_index_var_llir else lattice_points
+        points_to_lower = (
+            [lattice_points[0]] if self.dense_index_var_llir else lattice_points
+        )
 
         return (
             flatten_2d_list(
