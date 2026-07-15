@@ -1685,6 +1685,213 @@ gated emission-affecting change.
 The next Phase-2 blocker is the all-COO `pMask1_end` declaration.
 Do not start Phase 3 while this Phase-2 blocker remains.
 
+#### All-COO bound-declaration and canonical Phase 2 closure (2026-07-15)
+
+This section supersedes the immediately preceding status that named
+`pMask1_end` as the remaining blocker. Commits `5740d3c` and `641ec81` close
+that blocker without beginning Phase 3.
+
+The pre-implementation audit traced the declaration through every relevant
+stage. Coordinate-iterator initialization creates `int pMask1_end = 0;` as a
+future-level sentinel. Before flat COO transformation, the outer `pMask0` loop
+advances through that bound, coordinate resolution assigns
+`pMask1_end = pMask0 + 1` and scans the group boundary, and an inner `pMask1`
+loop consumes it. Flat scalar-COO lowering removes the original assignment and
+scan, installs a loop-local `int64_t pMask1_end = pMask0 + 1`, and retains the
+inner loop, but previously copied the zero-initialized outer prefix declaration
+unchanged. Sparse-prefetch and dense-pointer passes preserved all three
+remaining references. Single-iteration elimination then removed the local
+derived declaration and inner loop, rewrote coordinate/value accesses directly
+to `pMask0`, and left the outer zero sentinel because its characterized matcher
+only consumes a direct same-sequence `base + 1` bound. Invariant-factor
+hoisting preserved that now-dead root statement; result/ABI assembly retained
+it in the function body, later dynamic-vector rewriting preserved it, and the
+mechanical C++ emitter emitted it. That unconditional prefix retention was the
+root cause.
+
+The audit also covered generic iterator initialization, iteration-lattice
+assignment and scan generation, `CINLowerer`, all managed-pass routing,
+single-iteration and invariant-factor behavior, result/ABI assembly, final C++
+declaration emission, and scheduler/codegen-created bounds. Every other
+representative `*_end` declaration remains live: `pMask0_end` bounds the
+all-COO outer loop; CSR compressed ends bound traversal and prefetch guards;
+DS and DSS ends bound both compressed-Where count and fill loops; intersection
+ends feed merge conditions; union ends additionally feed one-sided tails; and
+nested coordinate sentinels feed boundary scans, child merges, and parent
+advances. The same proof holds for nested sparse levels and non-default mode
+orders. Panel, relayout, row-window, and atomic-emission bounds are created at
+different seams and remain consumed. Focused tests now lock the live CSR,
+DS/DSS, and non-default COO-intersection cases.
+
+The correction is deliberately local to the successful flat scalar-COO
+lowering branch. After it has constructed the replacement flat loop and its
+loop-local derived bound, it filters only direct accumulated prefix statements
+whose exact node shape is an exact `llir.VarInit` of an exact `llir.Var`, whose
+name equals the transform's detected `end_var`, whose type is exactly
+`DataType.INT`, and whose value is an exact `llir.Literal` wrapping an exact
+Python `int` equal to zero. The generated prefix owns exactly one such
+sentinel. The correction performs no recursive liveness walk, does not inspect
+arbitrary `*_end` names, does not mutate an LLIR node, and cannot match the
+loop-local `INT64` bound. It is lowering-seam lifetime cleanup, not generalized
+dead-declaration elimination.
+
+The complete generated-source change is the 22-byte deletion:
+
+```diff
+   // Initialize iterators
+   int pMask0_end = Mask0_crd_tensor.size(0);
+-  int pMask1_end = 0;
+
+   #pragma omp parallel for num_threads(scorch_nthreads(-1, pMask0_end)) schedule(dynamic, scorch_chunk(pMask0_end, -1))
+```
+
+Reinserting that one line into the candidate source reconstructs the exact
+3,543-byte `211ffef` source and its
+`de94b08752077a621c5e411ce0dcbb40e8bcbeacb9bce3824dd6019e2d2bd29d`
+SHA-256. Candidate `641ec81` is exactly 3,521 bytes with SHA-256
+`53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667`.
+It contains no `pMask1_end` substring, inner `pMask1` loop, or derived-bound
+assignment. It retains direct `Mask1_crd[pMask0]` and `Mask_val[pMask0]`
+access, the exact `float _inv_17 = Mask_val[pMask0];` spelling, only
+`_Query_val_ptr[q] * _Key_val_ptr[q]` inside the SIMD q-loop, and
+`_accum *= _inv_17;` immediately afterward.
+
+The affected source-derived identities change exactly as required:
+
+| Identity | `211ffef` | `641ec81` |
+| --- | --- | --- |
+| Kernel name | `kernel_78191be4a32b` | `kernel_a67e7b1a138e` |
+| Request-content digest | `0add35dde92ce72f1311ccb9ddb4234b356c3218ae72c654dd7db71f1cbf817a` | `f29034b8cc06f9817865082839e73f8b02a4a1ddfd65d2c5bec08b9af5065ed8` |
+| Build-identity digest | `c680956e76a633cc102bc495ea55ddbefd0ab9731cd3c1765f303727eaf769b0` | `bb7414675cbc55384f59065d2cd6223ad55ddfb0cb50b970f8acb3b2743d10fb` |
+
+The exact `CompileOptions` cache fingerprint remains
+`398311f4f3da7e8ac654459d3f214c237e64a56ade4e041971559001a4a01e6e`,
+the build-options cache digest remains
+`76462d4b5e037d39b09e941b2880adac519014e8719658c6ff1f4c446519bc76`,
+and the preamble digest remains
+`db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`.
+Flags, linker flags, function ABI, and every non-source-derived build field are
+equal. Semantic frontend/codegen cache keys remain unchanged; only the affected
+source-derived kernel name, JIT request, build directory, and shared-object
+identity change. The unaffected production build-input comparison retains
+SHA-256
+`4342e155548e81f8524b69a84c6e1d1b114f71de10ad6832b49a23e39257023a`.
+
+The unaffected source anchors remain byte-identical:
+
+| Kernel | Bytes | SHA-256 |
+| --- | ---: | --- |
+| CSR×dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+
+The exact canonical 18-file Phase-2/common suite reports 620 passed in 2.10
+seconds. The required 11-file scheduler/CIN/codegen matrix reports 297 passed
+in 498.80 seconds. `tests/test_scorch/test_loop_plan.py` remains 45 passed in
+0.86 seconds. The explicit M5 all-COO structural and native command reports two
+passed in 26.72 seconds; the native case compiles the committed candidate and
+matches `mask * (query @ key.T)` at `atol=rtol=1e-3`. Its log SHA-256 is
+`e8cd905f71cf32ee30f1988bf15895d12572a9d3b301578c6d76e516e9cf86b0`.
+The full non-performance suite reports
+1,129 passed, 14 skipped, three deselected, and the one inherited sparse-tensor
+invariant warning in 2,419.93 seconds; its log SHA-256 is
+`ac638bd7b6c88de5483aba4f8a9b71a21d6c30a5c6f08d53fb9556c22abcff2d`.
+
+The clean detached M5 gate records exact revision
+`641ec81208780031a9d6c726ac1a6bf44c9237ca`, empty status,
+`macOS-26.4.1-arm64-arm-64bit`, Python 3.11.15, Torch 2.13.0, and six Torch
+threads. Its candidate A/A run reports 42/42 correct cells, 21 unique builds,
+identical per-cell and top-level build inputs, and machine control band
+`[0.9826540709874659, 1.0176521214582699]`. The standard grid remains
+byte-identical to the retained predecessor, so it does not substitute for the
+separately executed changed all-COO structural/native case. Candidate artifact
+`/tmp/scorch-phase2-all-coo-pmask-results/kernel-aa-641ec81-m5.json` has
+SHA-256
+`3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+its log, comparison log, and correctness/build summary have SHA-256
+`3adb0c6b0889f8c7a960e17958d503b2cc16574dcf8d49eba57e82e038be9fcb`,
+`fefddeec80b5ca91efee6e4381400f5a14da40e88081ed5e5650fab1eb92bcc1`,
+and `58a8a998232171363ad79f1ce05d1cbf5fbfe07ac9ef19d98281481d16c292f4`.
+The retained predecessor artifact remains
+`816430d435d76dbe47277e921228d45c7387fc93d110bc37cc70f173982dfb77`.
+
+Exactly one five-warmup, 30-sample candidate compiler-latency run was retained.
+Its artifact is
+`/tmp/scorch-phase2-all-coo-pmask-results/latency-641ec81-m5.json`, SHA-256
+`eb231ae72b6d1ff71406ab49e819a2cf1d8e38907380410a73592ca5d8f9b673`;
+the valid `fd0ff9a` predecessor remains
+`ccf5caa742b753248aac0de49fe1f28dae573cb1ba57453c160ae61644c29f28`.
+
+| Case | Predecessor p50/p95 ms | Candidate p50/p95 ms | Ratio |
+| --- | --- | --- | --- |
+| small dense | 1.505 / 1.667 | 2.093 / 2.492 | 1.391 / 1.495 |
+| reduction | 1.390 / 1.545 | 1.981 / 2.504 | 1.426 / 1.621 |
+| CSR intersection | 1.474 / 1.544 | 2.367 / 3.336 | 1.607 / 2.161 |
+| sparse union | 1.414 / 1.566 | 2.282 / 2.737 | 1.614 / 1.748 |
+
+These crossings are retained and investigated, not treated as automatic
+rejection. None of the four latency cases reaches the changed flat all-COO
+branch, and every candidate latency source byte count and SHA-256 is identical
+to its predecessor. Inflation is stage-wide, including frontend construction,
+normalization, legacy adaptation, C++ generation, and cases with no COO
+scheduling. The full native suite began at 23:52:30 while the latency artifact
+was written at 23:53:01. A same-window contention capture records load averages
+`10.22/9.65/8.63`, an active Clang native build at 98% CPU, and several other
+high-CPU system processes. Its SHA-256 is
+`c51f8c55aa7f45a9008678a10a6d1426edac599b14d2be3645a87c4083bc8698`.
+The evidence attributes the broad movement to concurrent M5 contention, not to
+the inactive one-line emission correction; the single candidate run was not
+repeated.
+
+The clean Redwood candidate records the same exact revision and empty status
+on `Linux-5.15.0-121-generic-x86_64-with-glibc2.35`, Python 3.11.15, Torch
+2.5.1, and 24 Torch threads. Its full gate reports 42/42 correct cells, 21
+unique builds, identical per-cell and top-level build inputs, and machine
+control band `[0.9692050303205669, 1.031773431540329]`; the comparator exits
+zero with the byte-identical runtime waiver. Candidate artifact
+`/tmp/scorch-phase2-all-coo-pmask-results/kernel-aa-641ec81-redwood.json` has
+SHA-256
+`c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`;
+its log, comparison log, and correctness/build summary have SHA-256
+`d782133ae790b2edf08780952c2ac019e3b8880e78c5e321a8ff2036bd91f2f7`,
+`3f9efe57eec1c70084c09d082f64eda06b0a302e91058e4840649b5842e1d5f2`,
+and `c74652c5e055de49770a070915d2d4dc9de1a5af608d0b4d6679d3d62cdb02a1`.
+The retained predecessor remains
+`31baca05f50d8f51483aa1d7d5b77f19f93550ebb95e46209d8dcbbd935dbc7e`.
+The separately executed Redwood all-COO structural/native command reports two
+passed in 28.56 seconds and log SHA-256
+`3b7ad0971e310f769862732039ef981516b47d32ceb086fce6a262534f414157`.
+
+Black leaves all five changed Python files unchanged. Exact `211ffef`
+comparisons show the same five inherited Flake8 findings in
+`cin_lowerer.py` and the same 68 inherited mypy errors across the five checked
+files, with normalized error multisets byte-identical and no new diagnostic.
+`git diff --check` is clean. Strict Sphinx finishes with exactly the same 23
+inherited unresolved-reference warnings and no new category.
+
+No managed LLIR pass changed, so pass identities, order, nesting, repeated
+application, legal no-op behavior, failure records, and later-stage suppression
+remain unchanged. The lowerer works on its private detached LLIR and the new
+code only rebinds a fresh local statement list; caller-owned CIN, plans,
+analyses, options, prior results, and independent compilations retain their
+existing ownership guarantees. Exact `CompileOptions` identity,
+compiler-stage timing ownership, source-derived caching, and failure
+short-circuit behavior remain covered by the canonical suite.
+
+No new IR, structured CxxIR, generalized DCE, analysis cache,
+preserve/invalidate protocol, dependency graph, callback registry, reflection,
+dynamic metadata/configuration, public forcing API, or mutable global state was
+introduced. `ScheduledCIN(cin, plan)` remains the exact frozen two-field
+carrier, and `matmul_wksp` was not restored. There is no `csrc` or design-file
+change, generated output, native artifact, benchmark result, plot, cache, or
+unrelated tracked file in the candidate. The user-owned `.gitignore`
+modification and untracked research/benchmark material remain untouched and
+uncommitted.
+
+With the full-suite and two-machine results above passing, the final all-COO
+declaration blocker is **CLOSED** and canonical Phase 2 is formally
+**COMPLETE**. Phase 3 has not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
