@@ -143,6 +143,24 @@ def _lower_with_assignment_targets(
     return LLIRLowerer().lower_llir(lowered), targets
 
 
+def _lower_with_assignments(stmt: ForAll) -> tuple[str, list[llir.Assign]]:
+    lowered = CINLowerer().lower_IndexStmt(stmt)
+    assignments: list[llir.Assign] = []
+
+    class AssignmentCollector(LLIRWalker):
+        def visit_assign(self, node: llir.Assign, path: tuple[str, ...]) -> None:
+            assignments.append(node)
+            super().visit_assign(node, path)
+
+    AssignmentCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_assignments",
+        )
+    ).walk(lowered)
+    return LLIRLowerer().lower_llir(lowered), assignments
+
+
 def _loop_chain(stmt):
     names = []
     body = (
@@ -630,6 +648,71 @@ def test_full_stage_and_heap_result_are_structural_and_name_independent():
     }
 
 
+def test_heap_result_copy_read_is_frozen_structured_and_independently_owned():
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope="free",
+        accum="heap",
+    )
+    scheduled = Scheduler.apply_schedule(_build_named_spmm(), schedule)
+
+    def compact_copy_read(assignments: list[llir.Assign]) -> llir.ArrayAccess:
+        matches = [
+            node.value
+            for node in assignments
+            if type(node.value) is llir.ArrayAccess
+            and type(node.value.array) is llir.Var
+            and node.value.array.name == "tiled_Output"
+        ]
+        assert len(matches) == 1
+        match = matches[0]
+        assert isinstance(match, llir.ArrayAccess)
+        return match
+
+    first_cpp, first_assignments = _lower_with_assignments(scheduled)
+    second_cpp, second_assignments = _lower_with_assignments(scheduled)
+    first = compact_copy_read(first_assignments)
+    second = compact_copy_read(second_assignments)
+
+    assert first is not second
+    assert first.array is not second.array
+    assert first.index is not second.index
+    assert first.tensor_access is None
+    assert first.array == llir.Var(
+        "tiled_Output",
+        llir.DataType.PTR_FLOAT32,
+    )
+    assert first.array.type is llir.DataType.PTR_FLOAT32
+    assert type(first.index) is llir.Add
+    assert type(first.index.left) is llir.Mul
+    assert first.index.left.left == llir.Var(
+        "Output_tile_copy",
+        llir.DataType.INT64,
+    )
+    assert first.index.left.right == llir.Var(
+        "kTile_free",
+        llir.DataType.INT64,
+    )
+    assert first.index.right == llir.Var(
+        "free_tile_copy",
+        llir.DataType.INT64,
+    )
+    assert LLIRLowerer().lower_llir(first) == (
+        "tiled_Output[Output_tile_copy * kTile_free + free_tile_copy]"
+    )
+    assert first_cpp == second_cpp
+    assert (
+        "Output_values[Output_tile_copy * Output1_size + free_copy_logical] = "
+        "tiled_Output[Output_tile_copy * kTile_free + free_tile_copy];"
+    ) in first_cpp
+
+    with pytest.raises(FrozenInstanceError):
+        first.index = llir.Literal(0)
+
+
 def test_structured_schedule_targets_track_float64_storage_types():
     schedule = _packed_schedule(
         row="row",
@@ -640,12 +723,12 @@ def test_structured_schedule_targets_track_float64_storage_types():
         accum="heap",
     )
 
-    _, targets = _lower_with_assignment_targets(
-        Scheduler.apply_schedule(
-            _build_named_spmm(dtype=torch.float64),
-            schedule,
-        )
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=torch.float64),
+        schedule,
     )
+    _, targets = _lower_with_assignment_targets(scheduled)
+    _, assignments = _lower_with_assignments(scheduled)
 
     storage_types = {
         target.array.name: target.array.type
@@ -659,6 +742,17 @@ def test_structured_schedule_targets_track_float64_storage_types():
         "tiled_Output": llir.DataType.PTR_FLOAT64,
         "Output_values": llir.DataType.PTR_FLOAT64,
     }
+    compact_reads = [
+        node.value
+        for node in assignments
+        if type(node.value) is llir.ArrayAccess
+        and type(node.value.array) is llir.Var
+        and node.value.array.name == "tiled_Output"
+    ]
+    assert len(compact_reads) == 1
+    compact_read = compact_reads[0]
+    assert isinstance(compact_read, llir.ArrayAccess)
+    assert compact_read.array.type is llir.DataType.PTR_FLOAT64
 
 
 def test_packed_relayout_generates_hygienic_staging_names():

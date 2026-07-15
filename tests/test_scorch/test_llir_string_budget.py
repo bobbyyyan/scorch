@@ -1,4 +1,4 @@
-"""Audited compatibility budget after structured indexed-store migration."""
+"""Audited compatibility budget after compact-result read migration."""
 
 import ast
 from collections import Counter
@@ -112,10 +112,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "iterator.py": 19,
         "llir_traversal.py": 1,
         "result_write_pass.py": 5,
-        "schedule_lowerer.py": 93,
+        "schedule_lowerer.py": 96,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(constructor_counts.values()) == 371
+    assert sum(constructor_counts.values()) == 374
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 152,
@@ -126,10 +126,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "iterator.py": 13,
         "llir_traversal.py": 1,
         "result_write_pass.py": 5,
-        "schedule_lowerer.py": 90,
+        "schedule_lowerer.py": 94,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 315
+    assert sum(unclassified_counts.values()) == 319
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -143,7 +143,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 9
 
     assert totals == {
-        "subscript": 28,
+        "subscript": 27,
         "call": 13,
         "member": 7,
         "initializer": 3,
@@ -151,7 +151,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "ternary": 1,
         "arithmetic": 1,
     }
-    assert sum(totals.values()) == 56
+    assert sum(totals.values()) == 55
     assert per_file == {
         ("cin_lowerer.py", "subscript"): 21,
         ("cin_lowerer.py", "call"): 11,
@@ -161,7 +161,6 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("cin_lowerer.py", "ternary"): 1,
         ("cin_lowerer.py", "arithmetic"): 1,
         ("iterator.py", "subscript"): 6,
-        ("schedule_lowerer.py", "subscript"): 1,
         ("schedule_lowerer.py", "call"): 2,
     }
 
