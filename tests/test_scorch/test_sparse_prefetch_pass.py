@@ -1100,6 +1100,9 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151"
     )
+    assert "int pA1_end = A1_pos[pA0 + 1];" in cpp
+    assert "pA1 < pA1_end; pA1++" in cpp
+    assert "pA1 + 1 < pA1_end" in cpp
     assert _expected_prefetch() + ";" in cpp
     assert ("const float* __restrict__ _B_val_ptr = " "&B_val[pB0 * B1_size];") in cpp
     assert [record.pass_name for record in lowerer.llir_pass_run_records] == [
@@ -1125,14 +1128,16 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
             lowerer.lower_IndexStmt(_build_activating_all_coo_sddmm_cin())
         )
 
-    assert len(cpp) == 3543
+    assert len(cpp) == 3521
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "de94b08752077a621c5e411ce0dcbb40e8bcbeacb9bce3824dd6019e2d2bd29d"
+        "53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667"
     )
-    assert "pMask1_end = pMask0 + 1" not in cpp
+    assert "pMask1_end" not in cpp
     assert "pMask1 = pMask0" not in cpp
     assert "pMask1 <" not in cpp
     assert "pMask1++" not in cpp
+    assert "int pMask0_end = Mask0_crd_tensor.size(0);" in cpp
+    assert "pMask0 < pMask0_end; pMask0++" in cpp
     assert "Mask1_crd[pMask0]" in cpp
     assert "Mask_val[pMask0]" in cpp
     assert (

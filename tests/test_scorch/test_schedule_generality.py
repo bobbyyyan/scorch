@@ -496,6 +496,47 @@ def test_sddmm_default_scalar_accumulator_and_simd_are_unchanged():
     assert torch.allclose(result.to_torch(), reference, atol=1e-3, rtol=1e-3)
 
 
+def test_all_coo_sddmm_has_no_redundant_end_and_remains_correct():
+    row, column, reduction = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    out = TensorVar("Sampled", fmt="oo")
+    mask_var = TensorVar("Mask", fmt="oo")
+    query_var = TensorVar("Query", fmt="dd")
+    key_var = TensorVar("Key", fmt="dd")
+    assignment = TensorAssign(
+        out[row, column],
+        mask_var[row, column] * query_var[row, reduction] * key_var[column, reduction],
+        op=Operation.ADD,
+    )
+
+    with regblock_force(False):
+        scheduled = Scheduler.auto_schedule(_nest((row, column, reduction), assignment))
+        cpp = _lower_to_cpp(scheduled)
+
+    assert "pMask1_end" not in cpp
+    assert "Mask1_crd[pMask0]" in cpp
+    assert "Mask_val[pMask0]" in cpp
+
+    torch.manual_seed(103)
+    mask = torch.randn(5, 7)
+    mask *= torch.rand(5, 7) < 0.35
+    query = torch.randn(5, 3)
+    key = torch.randn(7, 3)
+    result = einsum(
+        "ij,ik,jk->ij",
+        _sparse_stensor(mask, "Mask", "oo"),
+        STensor.from_torch(query, "Query"),
+        STensor.from_torch(key, "Key"),
+        format="oo",
+        schedule=Schedule(
+            loop_order=("i", "j", "k"),
+            tag="all-coo-pmask-end-native",
+        ),
+    )
+    reference = mask * (query @ key.T)
+
+    assert torch.allclose(result.to_torch(), reference, atol=1e-3, rtol=1e-3)
+
+
 def test_sddmm_affine_reduction_tile_is_rejected_during_validation():
     schedule = Schedule(
         loop_order=("r", "c", "q"),

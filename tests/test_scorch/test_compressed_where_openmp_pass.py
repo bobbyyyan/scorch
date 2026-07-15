@@ -855,6 +855,12 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f"
     )
+    assert cpp.count("int pSparseLeft1_end = SparseLeft1_pos[pSparseLeft0 + 1];") == 2
+    assert cpp.count("pSparseLeft1 < pSparseLeft1_end; pSparseLeft1++") == 2
+    assert (
+        cpp.count("int pSparseRight1_end = SparseRight1_pos[pSparseRight0 + 1];") == 2
+    )
+    assert cpp.count("pSparseRight1 < pSparseRight1_end; pSparseRight1++") == 2
     assert [record.pass_name for record in lowerer.llir_pass_run_records] == [
         "transform_compressed_where_for_openmp",
         "rewrite_result_writes",
@@ -941,6 +947,13 @@ def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e"
     )
+    assert cpp.count("int pLeft1_end = Left1_pos[pLeft0 + 1];") == 2
+    assert cpp.count("pLeft1 < pLeft1_end; pLeft1++") == 2
+    assert cpp.count("int pLeft2_end = Left2_pos[pLeft1 + 1];") == 2
+    assert cpp.count("pLeft2 < pLeft2_end && pRight1 < pRight1_end") == 2
+    assert cpp.count("int pRight1_end = Right1_pos[pRight0 + 1];") == 2
+    assert cpp.count("int pRight2_end = Right2_pos[pRight1 + 1];") == 2
+    assert cpp.count("pRight2 < pRight2_end; pRight2++") == 2
     assert [record.configuration_name for record in lowerer.llir_pass_run_records] == [
         "compressed_where_openmp",
         "count",
