@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Union, cast
 
+from ..format import LevelType
 from .cin import (
     BinaryOp,
     ForAll,
@@ -140,6 +141,30 @@ class AccessInfo:
 
 
 @dataclass(frozen=True)
+class AccessLayoutInfo:
+    access_id: AccessId
+    tensor_id: SymbolId
+    logical_index_ids: Tuple[IndexId, ...]
+    storage_index_ids: Tuple[IndexId, ...]
+    level_types: Tuple[LevelType, ...]
+    physical_extents: Tuple[Optional[int], ...]
+    scope_id: NodeId
+    kind: AccessKind
+    is_workspace: bool
+
+
+@dataclass(frozen=True)
+class AssignmentInfo:
+    assignment_id: NodeId
+    lhs_access_id: AccessId
+    rhs_access_ids: Tuple[AccessId, ...]
+    update_op: Optional[Operation]
+    lhs_index_ids: Tuple[IndexId, ...]
+    reduction_index_ids: Tuple[IndexId, ...]
+    multiplicative_access_ids: Optional[Tuple[AccessId, ...]]
+
+
+@dataclass(frozen=True)
 class AccessOccurrence:
     access_id: AccessId
     node_id: NodeId
@@ -173,9 +198,12 @@ class CINAnalysis:
     index_definitions: FrozenMap[IndexId, IndexDefinition]
     index_uses: FrozenMap[IndexId, Tuple[IndexUse, ...]]
     accesses: FrozenMap[AccessId, AccessInfo]
+    access_layouts: FrozenMap[AccessId, AccessLayoutInfo]
+    assignments: FrozenMap[NodeId, AssignmentInfo]
     access_occurrences: Tuple[AccessOccurrence, ...]
     tensor_accesses: FrozenMap[SymbolId, Tuple[AccessId, ...]]
     access_order: Tuple[AccessId, ...]
+    assignment_order: Tuple[NodeId, ...]
     free_index_ids: Tuple[IndexId, ...]
     reduction_index_ids: Tuple[IndexId, ...]
     diagnostics: Tuple[CINDiagnostic, ...]
@@ -346,9 +374,12 @@ def _empty_analysis(
         index_definitions=FrozenMap(),
         index_uses=FrozenMap(),
         accesses=FrozenMap(),
+        access_layouts=FrozenMap(),
+        assignments=FrozenMap(),
         access_occurrences=(),
         tensor_accesses=FrozenMap(),
         access_order=(),
+        assignment_order=(),
         free_index_ids=(),
         reduction_index_ids=(),
         diagnostics=diagnostics,
@@ -432,9 +463,12 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
 
     access_objects: Dict[AccessId, TensorAccess] = {}
     accesses: Dict[AccessId, AccessInfo] = {}
+    access_layouts: Dict[AccessId, AccessLayoutInfo] = {}
+    assignments: Dict[NodeId, AssignmentInfo] = {}
     access_occurrences: List[AccessOccurrence] = []
     tensor_accesses: Dict[SymbolId, List[AccessId]] = {}
     access_order: List[AccessId] = []
+    assignment_order: List[NodeId] = []
     free_index_ids: List[IndexId] = []
     diagnostics: List[CINDiagnostic] = []
 
@@ -640,6 +674,36 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
                 kind,
                 order,
             )
+            mode_order = tuple(access.tensor.mode_order or ())
+            if len(mode_order) == len(stable_index_ids) and sorted(mode_order) == list(
+                range(len(stable_index_ids))
+            ):
+                storage_index_ids = tuple(
+                    stable_index_ids[logical_axis] for logical_axis in mode_order
+                )
+            else:
+                storage_index_ids = stable_index_ids
+            level_types = (
+                tuple(access.tensor.format.get_level_types())
+                if access.tensor.format is not None
+                else ()
+            )
+            shape = tuple(access.tensor.shape or ())
+            physical_extents = tuple(
+                shape[level] if level < len(shape) else None
+                for level in range(len(storage_index_ids))
+            )
+            access_layouts[access_id] = AccessLayoutInfo(
+                access_id=access_id,
+                tensor_id=tensor_id,
+                logical_index_ids=stable_index_ids,
+                storage_index_ids=storage_index_ids,
+                level_types=level_types,
+                physical_extents=physical_extents,
+                scope_id=scope_id,
+                kind=kind,
+                is_workspace=isinstance(access.tensor, Workspace),
+            )
 
         symbol_uses.setdefault(tensor_id, []).append(
             SymbolUse(tensor_id, access_id, access.node_id, scope_id, kind)
@@ -668,6 +732,27 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
 
         if not recorded:
             return
+
+    def expression_access_ids(expr: IndexExpr) -> Tuple[AccessId, ...]:
+        if isinstance(expr, TensorAccess):
+            return (expr.access_id,)
+        if isinstance(expr, BinaryOp):
+            return expression_access_ids(expr.left) + expression_access_ids(expr.right)
+        if isinstance(expr, UnaryOp):
+            return expression_access_ids(expr.expr)
+        return ()
+
+    def multiplicative_access_ids(
+        expr: IndexExpr,
+    ) -> Optional[Tuple[AccessId, ...]]:
+        if isinstance(expr, TensorAccess):
+            return (expr.access_id,)
+        if isinstance(expr, BinaryOp) and expr.op == Operation.MUL:
+            left_ids = multiplicative_access_ids(expr.left)
+            right_ids = multiplicative_access_ids(expr.right)
+            if left_ids is not None and right_ids is not None:
+                return left_ids + right_ids
+        return None
 
     def visit_expr(
         expr: IndexExpr,
@@ -810,6 +895,29 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
                 AccessKind.READ,
                 path + ("rhs",),
             )
+            rhs_access_ids = expression_access_ids(stmt.rhs)
+            lhs_index_ids = tuple(stmt.lhs.index_ids)
+            reduction_index_ids: List[IndexId] = []
+            for access_id in rhs_access_ids:
+                access_info = accesses.get(access_id)
+                if access_info is None:
+                    continue
+                for index_id in access_info.index_ids:
+                    if (
+                        index_id not in lhs_index_ids
+                        and index_id not in reduction_index_ids
+                    ):
+                        reduction_index_ids.append(index_id)
+            assignments[stmt.node_id] = AssignmentInfo(
+                assignment_id=stmt.node_id,
+                lhs_access_id=stmt.lhs.access_id,
+                rhs_access_ids=rhs_access_ids,
+                update_op=stmt.op,
+                lhs_index_ids=lhs_index_ids,
+                reduction_index_ids=tuple(reduction_index_ids),
+                multiplicative_access_ids=multiplicative_access_ids(stmt.rhs),
+            )
+            assignment_order.append(stmt.node_id)
             return
         diagnose(
             "unsupported_statement",
@@ -1020,12 +1128,18 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
             for index_id in index_use_order
         ),
         accesses=FrozenMap.from_items(accesses.items()),
+        access_layouts=FrozenMap.from_items(access_layouts.items()),
+        assignments=FrozenMap.from_items(
+            (assignment_id, assignments[assignment_id])
+            for assignment_id in assignment_order
+        ),
         access_occurrences=tuple(access_occurrences),
         tensor_accesses=FrozenMap.from_items(
             (symbol_id, tuple(tensor_accesses.get(symbol_id, ())))
             for symbol_id in tensor_access_order
         ),
         access_order=tuple(access_order),
+        assignment_order=tuple(assignment_order),
         free_index_ids=tuple(free_index_ids),
         reduction_index_ids=reduction_index_ids,
         diagnostics=tuple(diagnostics),

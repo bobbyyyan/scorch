@@ -33,6 +33,8 @@ from .diagnostics import (
     CompileOptionsDiagnostic,
     CompileOptionsError,
     CompilerInvariantError,
+    InvalidSchedule,
+    UnsupportedFeature,
     VerificationError,
 )
 from .legacy_cin_adapter import validate_legacy_cin_display_names
@@ -2983,12 +2985,19 @@ class Scheduler:
             else None
         )
         try:
-            legacy_scheduled = Scheduler._apply_schedule_legacy(
-                normalized_cin,
-                schedule,
-                costs=costs,
-                compile_options=options,
-            )
+            try:
+                legacy_scheduled = Scheduler._apply_schedule_legacy(
+                    normalized_cin,
+                    schedule,
+                    costs=costs,
+                    compile_options=options,
+                )
+            except (InvalidSchedule, UnsupportedFeature, VerificationError):
+                raise
+            except NotImplementedError as exc:
+                raise UnsupportedFeature(str(exc)) from exc
+            except ValueError as exc:
+                raise InvalidSchedule(str(exc)) from exc
             scheduled = ScheduledCIN(
                 normalized_cin,
                 legacy_scheduled.verified_loop_plan,

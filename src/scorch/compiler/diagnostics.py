@@ -41,12 +41,20 @@ class CompileOptionsError(CompilerError):
         )
 
 
-class UnsupportedFeature(CompilerError):
+class UnsupportedFeature(NotImplementedError, CompilerError):
     """A valid program requests a feature the current compiler cannot lower."""
 
+    def __init__(self, message: str, *, diagnostics: tuple[object, ...] = ()) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
-class InvalidSchedule(CompilerError):
+
+class InvalidSchedule(ValueError, CompilerError):
     """A scheduling decision is invalid for the normalized CIN program."""
+
+    def __init__(self, message: str, *, diagnostics: tuple[object, ...] = ()) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 class VerificationError(CompilerError):

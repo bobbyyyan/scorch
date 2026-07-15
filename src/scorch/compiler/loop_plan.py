@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, cast
 
-from .cin_analysis import analyze_cin
+from .cin_analysis import CINAnalysis, analyze_cin
 from .diagnostics import VerificationError
 from .identity import IndexId, SymbolId
 
@@ -215,6 +215,24 @@ def _collect_entities(cin: object) -> Tuple[Dict[IndexId, str], Dict[SymbolId, s
     return indices, symbols
 
 
+def _analyze_loop_plan_cin(cin: object) -> CINAnalysis:
+    """Return trustworthy canonical facts for semantic plan verification."""
+
+    from .cin import IndexStmt
+
+    if not isinstance(cin, IndexStmt):
+        raise VerificationError("normalized CIN must be an IndexStmt")
+    analysis = analyze_cin(cin)
+    if analysis.diagnostics:
+        first = analysis.diagnostics[0]
+        raise VerificationError(
+            f"stage=normalized CIN: {first.code} at "
+            f"{'/'.join(first.path)}: {first.message}",
+            diagnostics=cast(Tuple[object, ...], analysis.diagnostics),
+        )
+    return analysis
+
+
 def entity_display_names(
     cin: object,
 ) -> Tuple[Dict[IndexId, str], Dict[SymbolId, str]]:
@@ -387,13 +405,24 @@ def _verify_complete_loop_order(plan: LoopPlan, indices: Dict[IndexId, str]) -> 
 
 
 def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
-    """Verify stable symbol and loop references at the scheduling boundary."""
+    """Verify structural and semantic legality at the scheduling boundary."""
 
     plan = _validate_loop_plan_structure(plan)
-
-    indices, symbols = _collect_entities(cin)
+    analysis = _analyze_loop_plan_cin(cin)
+    indices = {
+        index_id: definition.display_name
+        for index_id, definition in analysis.index_definitions.items()
+        if definition.bindings
+    }
+    symbols = {
+        symbol_id: definition.display_name
+        for symbol_id, definition in analysis.symbol_definitions.items()
+    }
     if not indices:
         _verify_empty_loop_plan(plan)
+        from .loop_plan_legality import verify_loop_plan_semantics
+
+        verify_loop_plan_semantics(analysis, plan)
         return plan
 
     def check_loop(loop: LoopRef, path: str) -> None:
@@ -411,6 +440,7 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
     _verify_complete_loop_order(plan, indices)
 
     tiled_ids = set()
+    affine_tiled_ids = set()
     for position, tile in enumerate(plan.tiles):
         check_loop(tile.loop, f"tiles[{position}].loop")
         if tile.loop.part != LoopPart.LOGICAL:
@@ -418,6 +448,8 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
         if tile.loop.index_id in tiled_ids:
             raise VerificationError("LoopPlan tiles the same logical loop twice")
         tiled_ids.add(tile.loop.index_id)
+        if tile.kind == "affine":
+            affine_tiled_ids.add(tile.loop.index_id)
         if tile.width <= 0:
             raise VerificationError("LoopPlan tile widths must be positive")
         if tile.placement.kind == PlacementKind.CHILD_OF:
@@ -442,9 +474,9 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
             check_loop(tile.placement.parent, f"tiles[{position}].placement.parent")
 
     def check_derived_loop(loop: LoopRef, path: str) -> None:
-        if loop.part != LoopPart.LOGICAL and loop.index_id not in tiled_ids:
+        if loop.part != LoopPart.LOGICAL and loop.index_id not in affine_tiled_ids:
             raise VerificationError(
-                f"LoopPlan {path} references a split part of an untiled loop"
+                f"LoopPlan {path} references a split part of a non-affine loop"
             )
 
     for position, tile in enumerate(plan.tiles):
@@ -509,6 +541,9 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
             for position, index_id in enumerate(index_ids):
                 check_loop(LoopRef(index_id), f"result_tile.{field}[{position}]")
 
+    from .loop_plan_legality import verify_loop_plan_semantics
+
+    verify_loop_plan_semantics(analysis, plan)
     return plan
 
 
