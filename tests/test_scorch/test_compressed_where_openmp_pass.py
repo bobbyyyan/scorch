@@ -14,6 +14,7 @@ from scorch.compiler.compressed_where_openmp_pass import (
     CompressedWhereOpenMPResult,
     transform_compressed_where_for_openmp,
 )
+from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_traversal import (
     LLIRStatementValue,
     LLIRTraversalContext,
@@ -449,13 +450,21 @@ def test_nested_control_flow_and_statement_containers_follow_legacy_scopes() -> 
 
 
 def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(1),
+        tensor_id=SymbolId(2),
+        index_ids=(IndexId(3),),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
     assignment = llir.Assign(
         llir.ArrayAccess(_var("wksp.insert_targets"), _var("wksp.insert_target_index")),
         llir.BinOp(
             "+",
             _var("wksp.insert_value"),
             llir.ArrayAccess(
-                _var("wksp.insert_values"), _var("wksp.insert_value_index")
+                _var("wksp.insert_values"),
+                _var("wksp.insert_value_index"),
+                tensor_access=metadata,
             ),
         ),
     )
@@ -470,7 +479,7 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
 
     result = transform_compressed_where_for_openmp(source, _context())
 
-    count_loop, _ = _phase_loops(result)
+    count_loop, fill_loop = _phase_loops(result)
     rewritten_assignment = cast(
         llir.Assign,
         next(
@@ -496,6 +505,15 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
     assert cast(llir.Var, value_access.index).name == (
         "wksp.insert_unchecked_value_index"
     )
+    assert value_access.tensor_access is metadata
+    fill_assignment = cast(
+        llir.Assign,
+        next(
+            statement for statement in fill_loop.body if type(statement) is llir.Assign
+        ),
+    )
+    fill_value = cast(llir.BinOp, fill_assignment.value)
+    assert cast(llir.ArrayAccess, fill_value.right).tensor_access is metadata
     assert cast(llir.Var, rewritten_initialization.value).name == (
         "wksp.insert_unchecked_initial_value"
     )

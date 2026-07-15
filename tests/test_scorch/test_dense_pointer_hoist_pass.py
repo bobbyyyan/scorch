@@ -8,6 +8,7 @@ import pytest
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
+from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.dense_pointer_hoist_pass import (  # type: ignore[import-untyped]
     DENSE_POINTER_HOIST_TRAVERSAL_CONTEXT,
     DensePointerHoistContext,
@@ -343,8 +344,9 @@ def test_core_transformation_accepts_arbitrary_names_and_c_type_spellings(
 
 def test_every_legal_noop_is_detached_and_preserves_all_fields_and_metadata() -> None:
     metadata = llir.TensorAccessMetadata(
-        tensor_name="Input",
-        index_vars=("row", "column"),
+        access_id=AccessId(11),
+        tensor_id=SymbolId(12),
+        index_ids=(IndexId(13), IndexId(14)),
         role=llir.TensorAccessRole.INPUT_READ,
     )
     loop = _loop(
@@ -446,8 +448,18 @@ def test_exact_affine_shape_and_increment_update_are_required(
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
-def test_typed_array_access_and_varinit_access_are_actual_legal_misses() -> None:
-    typed_access = llir.ArrayAccess(_var("Input_val"), _var("position"))
+def test_typed_array_access_activates_and_preserves_structured_provenance() -> None:
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(21),
+        tensor_id=SymbolId(22),
+        index_ids=(IndexId(23),),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    typed_access = llir.ArrayAccess(
+        _var("Input_val"),
+        _var("position"),
+        tensor_access=metadata,
+    )
     loop = _loop(
         [
             _position_init(),
@@ -456,6 +468,39 @@ def test_typed_array_access_and_varinit_access_are_actual_legal_misses() -> None
         ]
     )
     source = [loop]
+    before = _snapshot(source)
+
+    output = hoist_dense_pointers(source, _context(("Input_val", "float")))
+
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+    declaration = cast(llir.RawStmt, output[0])
+    assert declaration.code == (
+        "const float* __restrict__ _Input_val_ptr = " "&Input_val[base * stride]"
+    )
+    rewritten_loop = cast(llir.ForLoop, output[1])
+    initializer = cast(llir.VarInit, rewritten_loop.body[0])
+    assert cast(llir.Var, initializer.value).name == "_Input_val_ptr[lane]"
+    assignment = cast(llir.Assign, rewritten_loop.body[1])
+    access = cast(llir.ArrayAccess, assignment.value)
+    assert cast(llir.Var, access.array).name == "_Input_val_ptr"
+    assert cast(llir.Var, access.index).name == "lane"
+    assert access.tensor_access is metadata
+    assert access is not typed_access
+
+
+def test_varinit_only_value_access_remains_a_detached_legal_miss() -> None:
+    source = [
+        _loop(
+            [
+                _position_init(),
+                llir.VarInit(
+                    _var("from_initializer"),
+                    _var("Input_val[position]"),
+                ),
+            ]
+        )
+    ]
     before = _snapshot(source)
 
     output = hoist_dense_pointers(source, _context(("Input_val", "float")))
@@ -620,8 +665,9 @@ def test_missing_type_mapping_keeps_only_that_position_initializer() -> None:
 
 def test_substring_rewrite_preserves_every_var_field_and_tensor_metadata() -> None:
     metadata = llir.TensorAccessMetadata(
-        tensor_name="Arbitrary",
-        index_vars=("lane",),
+        access_id=AccessId(31),
+        tensor_id=SymbolId(32),
+        index_ids=(IndexId(33),),
         role=llir.TensorAccessRole.INPUT_READ,
     )
     decorated = _var(

@@ -14,6 +14,7 @@ import scorch.compiler.sparse_prefetch_pass as sparse_prefetch_module
 from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
 from scorch.compiler.cin_lowerer import CINLowerer, ResultTensorAssembler
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_pass_manager import (
     DEBUG_LLIR_PASS_OPTIONS,
     LOOP_INVARIANT_FACTOR_HOIST_PASS,
@@ -285,6 +286,12 @@ def test_nested_sparse_loops_are_processed_post_order_through_direct_bodies(
 def test_string_and_typed_array_accesses_collect_all_pairs_in_first_seen_order() -> (
     None
 ):
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(1),
+        tensor_id=SymbolId(2),
+        index_ids=(IndexId(3), IndexId(4)),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
     inner = _inner_loop(
         [
             _position_init("pB1", "pB0", "B1_size"),
@@ -294,7 +301,11 @@ def test_string_and_typed_array_accesses_collect_all_pairs_in_first_seen_order()
                 llir.BinOp(
                     "+",
                     _var("B_val[pB1]"),
-                    llir.ArrayAccess(_var("D_val"), _var("pD1")),
+                    llir.ArrayAccess(
+                        _var("D_val"),
+                        _var("pD1"),
+                        tensor_access=metadata,
+                    ),
                 ),
             ),
             llir.Assign(_var("duplicate"), _var("B_val[pB1]")),
@@ -318,6 +329,12 @@ def test_string_and_typed_array_accesses_collect_all_pairs_in_first_seen_order()
         + _expected_prefetch("D_val", "D1_size")
         + ";"
     )
+    rewritten_inner = next(
+        statement for statement in loop.body if type(statement) is llir.ForLoop
+    )
+    assignment = cast(llir.Assign, rewritten_inner.body[2])
+    binary = cast(llir.BinOp, assignment.value)
+    assert cast(llir.ArrayAccess, binary.right).tensor_access is metadata
 
 
 def test_raw_hoisted_pointer_augments_assignment_discovery_in_body_order() -> None:

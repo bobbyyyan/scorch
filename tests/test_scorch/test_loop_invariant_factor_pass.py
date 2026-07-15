@@ -8,6 +8,7 @@ import pytest
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
+from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     DEBUG_LLIR_PASS_OPTIONS,
     LOOP_INVARIANT_FACTOR_HOIST_PASS,
@@ -343,10 +344,75 @@ def test_success_is_fully_detached_and_does_not_mutate_the_input() -> None:
     assert rewritten_assignment.var is not cast(llir.ForLoop, source[0]).body[0].var
 
 
+def test_structured_access_factors_preserve_exact_all_coo_hoist_behavior() -> None:
+    mask_metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(31),
+        tensor_id=SymbolId(32),
+        index_ids=(IndexId(33), IndexId(34)),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    query_metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(35),
+        tensor_id=SymbolId(36),
+        index_ids=(IndexId(33), IndexId(37)),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    key_metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(38),
+        tensor_id=SymbolId(39),
+        index_ids=(IndexId(34), IndexId(37)),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    mask = llir.ArrayAccess(
+        _var("Mask_val", llir.DataType.PTR_FLOAT32),
+        _var("pMask0"),
+        tensor_access=mask_metadata,
+    )
+    query = llir.ArrayAccess(
+        _var("_Query_val_ptr", llir.DataType.PTR_FLOAT32),
+        _var("q"),
+        tensor_access=query_metadata,
+    )
+    key = llir.ArrayAccess(
+        _var("_Key_val_ptr", llir.DataType.PTR_FLOAT32),
+        _var("q"),
+        tensor_access=key_metadata,
+    )
+    source = [_loop([_assignment([mask, query, key])], loop_variable="q")]
+    before = _snapshot(source)
+
+    first = hoist_loop_invariant_factors(
+        source,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    second = hoist_loop_invariant_factors(
+        first,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+
+    assert _snapshot(source) == before
+    assert _snapshot(second) == _snapshot(first)
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    assert _raw_codes(first) == [
+        "float _inv_0 = Mask_val[pMask0]",
+        "_accum *= _inv_0",
+    ]
+    assignment = cast(llir.Assign, cast(llir.ForLoop, first[1]).body[0])
+    product = cast(llir.BinOp, assignment.value)
+    rewritten_query = cast(llir.ArrayAccess, product.left)
+    rewritten_key = cast(llir.ArrayAccess, product.right)
+    assert cast(llir.Var, rewritten_query.index).name == "q"
+    assert cast(llir.Var, rewritten_key.index).name == "q"
+    assert rewritten_query.tensor_access is query_metadata
+    assert rewritten_key.tensor_access is key_metadata
+
+
 def test_legal_noop_preserves_fields_metadata_raw_settings_and_compatibility() -> None:
     metadata = llir.TensorAccessMetadata(
-        tensor_name="Input",
-        index_vars=("row", "column"),
+        access_id=AccessId(11),
+        tensor_id=SymbolId(12),
+        index_ids=(IndexId(13), IndexId(14)),
         role=llir.TensorAccessRole.INPUT_READ,
     )
     decorated = _var(
@@ -1183,13 +1249,15 @@ def test_multiple_accumulations_transform_one_per_application() -> None:
 
 def test_successful_replacement_preserves_target_factor_metadata_op_and_cast() -> None:
     target_metadata = llir.TensorAccessMetadata(
-        tensor_name="Accumulator",
-        index_vars=(),
+        access_id=AccessId(21),
+        tensor_id=SymbolId(22),
+        index_ids=(),
         role=llir.TensorAccessRole.RESULT_WRITE,
     )
     factor_metadata = llir.TensorAccessMetadata(
-        tensor_name="Input",
-        index_vars=("k",),
+        access_id=AccessId(23),
+        tensor_id=SymbolId(24),
+        index_ids=(IndexId(25),),
         role=llir.TensorAccessRole.INPUT_READ,
     )
     target = _var(

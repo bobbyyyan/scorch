@@ -8,6 +8,7 @@ import pytest
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
+from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     DEBUG_LLIR_PASS_OPTIONS,
     LLIRPassArtifactType,
@@ -307,8 +308,9 @@ def test_nested_root_sequences_are_detached_and_semantically_omitted() -> None:
 
 def test_every_legal_noop_is_detached_with_fields_metadata_and_raw_code() -> None:
     metadata = llir.TensorAccessMetadata(
-        tensor_name="Input",
-        index_vars=("row", "column"),
+        access_id=AccessId(11),
+        tensor_id=SymbolId(12),
+        index_ids=(IndexId(13), IndexId(14)),
         role=llir.TensorAccessRole.INPUT_READ,
     )
     loop = _loop(
@@ -577,8 +579,9 @@ def test_bound_snapshot_eliminates_multiple_loops_and_preserves_body_order() -> 
 
 def test_exact_substring_rewrite_order_and_positive_scope() -> None:
     metadata = llir.TensorAccessMetadata(
-        tensor_name="Input",
-        index_vars=("ix",),
+        access_id=AccessId(21),
+        tensor_id=SymbolId(22),
+        index_ids=(IndexId(23),),
         role=llir.TensorAccessRole.INPUT_READ,
     )
     decorated = _var(
@@ -674,6 +677,45 @@ def test_exact_substring_rewrite_order_and_positive_scope() -> None:
     branch_call = cast(llir.FunctionCallStmt, branches[1][0])
     assert branch_call.name == "branch_root]_[root]_root call"
     assert cast(llir.Var, branch_call.args[0]).name == "Arg[root]"
+
+
+def test_exact_structured_access_index_is_rewritten_and_reapplication_is_noop() -> None:
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(31),
+        tensor_id=SymbolId(32),
+        index_ids=(IndexId(33), IndexId(34)),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    access = llir.ArrayAccess(
+        array=_var("Mask_val", llir.DataType.PTR_FLOAT32),
+        index=_var("pMask1", llir.DataType.INT64),
+        tensor_access=metadata,
+    )
+    source = _program(
+        [llir.Assign(_var("out"), access)],
+        loop_variable="pMask1",
+        base="pMask0",
+    )
+    before = _snapshot(source)
+
+    first = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+    second = eliminate_single_iteration_loops(
+        first,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert _snapshot(source) == before
+    assert _snapshot(second) == _snapshot(first)
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    rewritten = cast(llir.ArrayAccess, cast(llir.Assign, first[0]).value)
+    assert cast(llir.Var, rewritten.array).name == "Mask_val"
+    assert cast(llir.Var, rewritten.index).name == "pMask0"
+    assert rewritten.tensor_access is metadata
+    assert rewritten is not access
 
 
 def test_rewrite_omits_headers_parallel_regions_and_legacy_containers() -> None:

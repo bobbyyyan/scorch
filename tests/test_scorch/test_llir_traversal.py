@@ -3,6 +3,7 @@ from typing import Dict, List, Sequence, Set, Tuple, Type, cast
 import pytest
 
 from scorch.compiler import llir
+from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_traversal import (
     LLIRPath,
     LLIRRewriter,
@@ -271,6 +272,105 @@ def test_unknown_subclass_of_supported_expression_fails_closed(
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_array_access_subclass_fails_closed(operation: str) -> None:
+    class UnknownArrayAccess(llir.ArrayAccess):
+        pass
+
+    unknown = UnknownArrayAccess(_var("array"), _var("index"))
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownArrayAccess"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_array_access_unknown_child_reports_exact_path(operation: str) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    access = llir.ArrayAccess(UnknownExpr(), _var("index"))
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(access)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(access)
+
+    assert raised.value.diagnostic.node_type == "UnknownExpr"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", "array")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_forged_array_access_metadata_fails_at_traversal_boundary(
+    operation: str,
+) -> None:
+    access = object.__new__(llir.ArrayAccess)
+    object.__setattr__(access, "array", _var("array"))
+    object.__setattr__(access, "index", _var("index"))
+    object.__setattr__(access, "tensor_access", "invalid")
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(access)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(access)
+
+    assert raised.value.diagnostic.code == "invalid_tensor_access_metadata"
+    assert raised.value.diagnostic.path == ("root", "tensor_access")
+    assert raised.value.diagnostic.node_type == "str"
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize("owner", ["var", "array_access"])
+@pytest.mark.parametrize(
+    ("field", "invalid", "expected_path"),
+    (
+        ("access_id", 1, ("access_id",)),
+        ("tensor_id", "tensor", ("tensor_id",)),
+        ("index_ids", [IndexId(3)], ("index_ids",)),
+        ("index_ids", (3,), ("index_ids", "[0]")),
+        ("role", "input_read", ("role",)),
+    ),
+)
+def test_forged_exact_metadata_fields_fail_at_common_traversal_boundary(
+    operation: str,
+    owner: str,
+    field: str,
+    invalid: object,
+    expected_path: Tuple[str, ...],
+) -> None:
+    metadata = object.__new__(llir.TensorAccessMetadata)
+    object.__setattr__(metadata, "access_id", AccessId(1))
+    object.__setattr__(metadata, "tensor_id", SymbolId(2))
+    object.__setattr__(metadata, "index_ids", (IndexId(3),))
+    object.__setattr__(metadata, "role", llir.TensorAccessRole.INPUT_READ)
+    object.__setattr__(metadata, field, invalid)
+    node: llir.Expr
+    if owner == "var":
+        node = llir.Var("value", llir.DataType.FLOAT32, tensor_access=metadata)
+    else:
+        node = llir.ArrayAccess(_var("array"), _var("index"), metadata)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(node)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(node)
+
+    assert raised.value.diagnostic.code == "invalid_tensor_access_metadata"
+    assert raised.value.diagnostic.path == (
+        "root",
+        "tensor_access",
+        *expected_path,
+    )
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_unknown_subclass_of_supported_statement_fails_closed(
     operation: str,
 ) -> None:
@@ -306,13 +406,19 @@ def test_nested_unknown_node_reports_the_same_exact_path(operation: str) -> None
 
 def test_identity_rewriter_is_detached_and_structurally_idempotent() -> None:
     metadata = llir.TensorAccessMetadata(
-        tensor_name="Input",
-        index_vars=("i",),
+        access_id=AccessId(11),
+        tensor_id=SymbolId(12),
+        index_ids=(IndexId(13),),
         role=llir.TensorAccessRole.INPUT_READ,
     )
-    access = llir.Var(
+    tagged_var = llir.Var(
         name="Input_values[pInput]",
         type=llir.DataType.FLOAT32,
+        tensor_access=metadata,
+    )
+    access = llir.ArrayAccess(
+        array=_var("Input_values", llir.DataType.PTR_FLOAT32),
+        index=_var("pInput"),
         tensor_access=metadata,
     )
     cast_init = llir.VarInit(_var("converted"), llir.Literal(1), cast=True)
@@ -342,7 +448,7 @@ def test_identity_rewriter_is_detached_and_structurally_idempotent() -> None:
     while_loop.scorch_index_var = "while_index"
 
     root: List[LLIRStatementValue] = [
-        llir.VarDecl(access),
+        llir.VarDecl(tagged_var),
         (cast_init, [cast_assign, loop]),
         while_loop,
     ]
@@ -378,6 +484,10 @@ def test_identity_rewriter_is_detached_and_structurally_idempotent() -> None:
     first_decl = cast(llir.VarDecl, first[0])
     assert first_decl.var.tensor_access is metadata
     first_loop = cast(llir.ForLoop, first_nested_body[1])
+    first_assignment = cast(llir.Assign, first_loop.body[0])
+    first_access = cast(llir.ArrayAccess, first_assignment.value)
+    assert first_access.tensor_access is metadata
+    assert first_access is not access
     assert first_loop.scorch_index_var == "i"
     assert first_loop.omp_parallel_for is True
     assert first_loop.omp_schedule == "dynamic, 8"

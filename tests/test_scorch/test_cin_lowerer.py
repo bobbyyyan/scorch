@@ -2,6 +2,7 @@ from typing import cast
 
 import pytest
 
+from scorch.compiler import llir  # type: ignore[import-untyped]
 from scorch.compiler.cin import (
     CIN,
     ForAll,
@@ -83,6 +84,71 @@ def test_mutated_unknown_post_op_cannot_be_silently_skipped():
         match=r"stage=CIN lowering: unsupported post-op kind 'clip'",
     ):
         lowerer._emit_post_ops("output", "i")
+
+
+@pytest.mark.parametrize(
+    ("fmt", "indices", "expected_index"),
+    (
+        ("d", ("i",), "i"),
+        ("ds", ("i", "j"), "pInput1"),
+    ),
+)
+def test_nonworkspace_tensor_reads_lower_to_frozen_structured_accesses(
+    fmt: str,
+    indices: tuple[str, ...],
+    expected_index: str,
+) -> None:
+    index_vars = tuple(IndexVar(name) for name in indices)
+    tensor = TensorVar("Input", fmt=fmt)
+    access = tensor[index_vars[0] if len(index_vars) == 1 else index_vars]
+    original_indices = tuple(access.indices)
+
+    lowered = CINLowerer().lower_TensorAccess(access)
+
+    assert type(lowered) is llir.ArrayAccess
+    structured = cast(llir.ArrayAccess, lowered)
+    assert cast(llir.Var, structured.array).name == "Input_val"
+    assert cast(llir.Var, structured.array).type is llir.DataType.PTR_FLOAT32
+    assert cast(llir.Var, structured.index).name == expected_index
+    assert cast(llir.Var, structured.index).type is llir.DataType.INT
+    assert structured.tensor_access == llir.TensorAccessMetadata(
+        access_id=access.access_id,
+        tensor_id=access.tensor_id,
+        index_ids=access.index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    assert LLIRLowerer().lower_llir(structured) == f"Input_val[{expected_index}]"
+    assert tuple(access.indices) == original_indices
+    assert access.tensor is tensor
+
+
+def test_cin_reference_rewrite_rebuilds_frozen_access_and_preserves_metadata() -> None:
+    index = IndexVar("ix")
+    tensor = TensorVar("Input", fmt="d")
+    logical_access = tensor[index]
+    metadata = llir.TensorAccessMetadata(
+        access_id=logical_access.access_id,
+        tensor_id=logical_access.tensor_id,
+        index_ids=logical_access.index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    source = llir.ArrayAccess(
+        array=llir.Var("Array[ix]", llir.DataType.PTR_FLOAT32),
+        index=llir.Var("ix offset", llir.DataType.INT),
+        tensor_access=metadata,
+    )
+
+    rewritten = CINLowerer._rewrite_expr_refs(source, {"ix": "root"})
+    repeated = CINLowerer._rewrite_expr_refs(rewritten, {"ix": "root"})
+
+    assert type(rewritten) is llir.ArrayAccess
+    assert cast(llir.Var, rewritten.array).name == "Array[root]"
+    assert cast(llir.Var, rewritten.index).name == "root offset"
+    assert rewritten.tensor_access is metadata
+    assert repeated == rewritten
+    assert repeated is not rewritten
+    assert cast(llir.Var, source.array).name == "Array[ix]"
+    assert cast(llir.Var, source.index).name == "ix offset"
 
 
 def test_nondefault_coo_intersection_keeps_live_coordinate_end_bounds():

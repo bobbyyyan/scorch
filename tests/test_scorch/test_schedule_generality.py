@@ -13,7 +13,15 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
+from scorch.compiler.llir_traversal import LLIRTraversalError  # type: ignore[import-untyped]
+from scorch.compiler.schedule_lowerer import (  # type: ignore[import-untyped]
+    _contains_tensor_access,
+    _matches_tensor_access,
+    _rewrite_expr_access,
+    _rewrite_stmt_accesses,
+)
 from scorch.compiler.scheduler import (
     Schedule,
     Scheduler,
@@ -192,20 +200,216 @@ def test_llir_continue_has_a_general_cpp_lowering():
     assert LLIRLowerer().lower_llir(llir.Continue()) == "continue;"
 
 
+def test_schedule_access_matching_uses_typed_identity_not_display_spelling():
+    tensor_id = SymbolId(1)
+    index_ids = (IndexId(2), IndexId(3))
+    access = llir.ArrayAccess(
+        array=llir.Var("SameDisplay_val", llir.DataType.PTR_FLOAT32),
+        index=llir.Var("same_position", llir.DataType.INT),
+        tensor_access=llir.TensorAccessMetadata(
+            access_id=AccessId(4),
+            tensor_id=tensor_id,
+            index_ids=index_ids,
+            role=llir.TensorAccessRole.INPUT_READ,
+        ),
+    )
+
+    assert _matches_tensor_access(
+        access,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+    )
+    assert not _matches_tensor_access(
+        access,
+        SymbolId(99),
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+    )
+    assert not _matches_tensor_access(
+        access,
+        tensor_id,
+        (IndexId(2), IndexId(99)),
+        llir.TensorAccessRole.INPUT_READ,
+    )
+    assert not _matches_tensor_access(
+        access,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.RESULT_WRITE,
+    )
+    same_logical_access = llir.ArrayAccess(
+        array=llir.Var("DifferentDisplay_val", llir.DataType.PTR_FLOAT32),
+        index=llir.Var("different_position", llir.DataType.INT),
+        tensor_access=llir.TensorAccessMetadata(
+            access_id=AccessId(999),
+            tensor_id=tensor_id,
+            index_ids=index_ids,
+            role=llir.TensorAccessRole.INPUT_READ,
+        ),
+    )
+    assert _matches_tensor_access(
+        same_logical_access,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+    )
+
+
+def test_schedule_access_rewrite_is_detached_repeatable_and_fail_closed():
+    tensor_id = SymbolId(11)
+    other_tensor_id = SymbolId(12)
+    index_ids = (IndexId(13),)
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(14),
+        tensor_id=tensor_id,
+        index_ids=index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    other_metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(15),
+        tensor_id=other_tensor_id,
+        index_ids=index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    selected = llir.ArrayAccess(
+        llir.Var("Input_val", llir.DataType.PTR_FLOAT32),
+        llir.Var("pInput", llir.DataType.INT),
+        metadata,
+    )
+    unselected = llir.ArrayAccess(
+        llir.Var("Other_val", llir.DataType.PTR_FLOAT32),
+        llir.Var("pOther", llir.DataType.INT),
+        other_metadata,
+    )
+    source = llir.BinOp("+", selected, unselected)
+    replacement = llir.ArrayAccess(
+        llir.Var("packed_Input", llir.DataType.PTR_FLOAT32),
+        llir.Var("packed_position", llir.DataType.INT),
+    )
+    lowerer = LLIRLowerer()
+    source_cpp = lowerer.lower_llir(source)
+
+    first, first_count = _rewrite_expr_access(
+        source,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+    second, second_count = _rewrite_expr_access(
+        first,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+
+    assert first_count == 1
+    assert second_count == 0
+    assert lowerer.lower_llir(source) == source_cpp
+    assert (
+        lowerer.lower_llir(first) == "packed_Input[packed_position] + Other_val[pOther]"
+    )
+    assert lowerer.lower_llir(second) == lowerer.lower_llir(first)
+    assert first is not source
+    assert second is not first
+    assert first.left is not replacement
+    assert first.right is not unselected
+    assert first.right.tensor_access is other_metadata
+    assert not _contains_tensor_access(
+        [llir.Assign(llir.Var("out", llir.DataType.FLOAT32), first)],
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+    )
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    malformed = llir.ArrayAccess(
+        llir.Var("Input_val", llir.DataType.PTR_FLOAT32),
+        UnknownExpr(),
+    )
+    with pytest.raises(LLIRTraversalError) as raised:
+        _rewrite_expr_access(
+            malformed,
+            tensor_id,
+            index_ids,
+            llir.TensorAccessRole.INPUT_READ,
+            replacement,
+        )
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", "index")
+
+
+def test_schedule_statement_access_rewrite_counts_and_clones_each_replacement():
+    tensor_id = SymbolId(21)
+    index_ids = (IndexId(22),)
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(23),
+        tensor_id=tensor_id,
+        index_ids=index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    access = llir.ArrayAccess(
+        llir.Var("Input_val", llir.DataType.PTR_FLOAT32),
+        llir.Var("pInput", llir.DataType.INT),
+        metadata,
+    )
+    statements = [
+        llir.Assign(llir.Var("left", llir.DataType.FLOAT32), access),
+        llir.Assign(llir.Var("right", llir.DataType.FLOAT32), access),
+    ]
+    replacement = llir.ArrayAccess(
+        llir.Var("packed_Input", llir.DataType.PTR_FLOAT32),
+        llir.Var("packed_position", llir.DataType.INT),
+    )
+
+    first_count = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+    first_values = [statement.value for statement in statements]
+    second_count = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+
+    assert first_count == 2
+    assert second_count == 0
+    assert first_values[0] is not first_values[1]
+    assert first_values[0] is not replacement
+    assert first_values[1] is not replacement
+    assert all(
+        LLIRLowerer().lower_llir(statement.value) == "packed_Input[packed_position]"
+        for statement in statements
+    )
+
+
 def test_dense_elementwise_llir_tensor_access_metadata_survives_rewrites():
-    lowered = CINLowerer().lower_IndexStmt(_build_elementwise("dd"))
+    source = _build_elementwise("dd")
+    lowered = CINLowerer().lower_IndexStmt(source)
     assert isinstance(lowered, llir.Function)
 
-    tagged_vars = []
+    tagged_expressions = []
 
     def collect_expr(expr):
         if isinstance(expr, llir.Var):
             if expr.tensor_access is not None:
-                tagged_vars.append(expr)
+                tagged_expressions.append(expr)
         elif isinstance(expr, llir.BinOp):
             collect_expr(expr.left)
             collect_expr(expr.right)
         elif isinstance(expr, llir.ArrayAccess):
+            if expr.tensor_access is not None:
+                tagged_expressions.append(expr)
             collect_expr(expr.array)
             collect_expr(expr.index)
 
@@ -226,36 +430,45 @@ def test_dense_elementwise_llir_tensor_access_metadata_survives_rewrites():
                         collect_stmts(body)
 
     collect_stmts(lowered.body)
-    metadata = {var.tensor_access for var in tagged_vars}
-    assert metadata == {
+    metadata = {expression.tensor_access for expression in tagged_expressions}
+    expected_metadata = {
         llir.TensorAccessMetadata(
-            "ElemLeft",
-            ("r", "c"),
-            llir.TensorAccessRole.INPUT_READ,
-        ),
-        llir.TensorAccessMetadata(
-            "ElemRight",
-            ("r", "c"),
-            llir.TensorAccessRole.INPUT_READ,
-        ),
-        llir.TensorAccessMetadata(
-            "ElemOut",
-            ("r", "c"),
-            llir.TensorAccessRole.RESULT_WRITE,
-        ),
+            access_id=access.access_id,
+            tensor_id=access.tensor_id,
+            index_ids=access.index_ids,
+            role=(
+                llir.TensorAccessRole.RESULT_WRITE
+                if access.tensor.name == "ElemOut"
+                else llir.TensorAccessRole.INPUT_READ
+            ),
+        )
+        for access in source.tensor_accesses
     }
+    assert metadata == expected_metadata
     # Dense pointer hoisting rewrites the physical access spelling, while the
     # logical tensor/index identity remains available to later schedule passes.
-    assert {var.name for var in tagged_vars} == {
+    lowerer = LLIRLowerer()
+    assert {lowerer.lower_llir(expression) for expression in tagged_expressions} == {
         "_ElemLeft_val_ptr[c]",
         "_ElemRight_val_ptr[c]",
         "ElemOut_values[pElemOut1]",
     }
 
-    cpp_with_metadata = LLIRLowerer().lower_llir(lowered)
-    for var in tagged_vars:
-        var.tensor_access = None
-    assert LLIRLowerer().lower_llir(lowered) == cpp_with_metadata
+    for expression in tagged_expressions:
+        if type(expression) is llir.Var:
+            without_metadata = llir.Var(
+                name=expression.name,
+                type=expression.type,
+                is_ptr=expression.is_ptr,
+                is_restrict=expression.is_restrict,
+            )
+        else:
+            assert type(expression) is llir.ArrayAccess
+            without_metadata = llir.ArrayAccess(
+                array=expression.array,
+                index=expression.index,
+            )
+        assert lowerer.lower_llir(expression) == lowerer.lower_llir(without_metadata)
 
 
 def test_ttm_row_and_free_axis_tiles_compose_with_ragged_tails():
