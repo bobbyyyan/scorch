@@ -906,6 +906,25 @@ def test_affine_placement_accepts_logical_and_prior_derived_parents() -> None:
 
 
 def test_panel_plan_checks_bound_parallelism_and_placement() -> None:
+    with pytest.raises(InvalidSchedule, match="outside its parallel"):
+        Scheduler.apply_schedule(
+            _build_spmm(),
+            Schedule(
+                loop_order=("i", "j", "k"),
+                tiles=(
+                    TileSpec("i", 4, placement="outermost", accum="direct"),
+                    TileSpec(
+                        "j",
+                        4,
+                        placement="child_of:i_out",
+                        kind="panel",
+                        accum="direct",
+                    ),
+                ),
+                parallel_loop="i",
+            ),
+        )
+
     scheduled = Scheduler.apply_schedule(
         _build_spmm(),
         Schedule(
