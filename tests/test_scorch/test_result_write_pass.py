@@ -1,15 +1,21 @@
+from dataclasses import FrozenInstanceError
 from typing import List, Literal, Set, Tuple, cast
 
 import pytest
 
-from scorch.compiler import llir
-from scorch.compiler.codegen import LLIRLowerer
-from scorch.compiler.llir_traversal import (
+from scorch.compiler import llir  # type: ignore[import-untyped]
+from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
+from scorch.compiler.identity import (  # type: ignore[import-untyped]
+    AccessId,
+    IndexId,
+    SymbolId,
+)
+from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRStatementValue,
     LLIRTraversalContext,
     LLIRTraversalError,
 )
-from scorch.compiler.result_write_pass import (
+from scorch.compiler.result_write_pass import (  # type: ignore[import-untyped]
     RESULT_WRITE_TRAVERSAL_CONTEXT,
     ResultWriteContext,
     rewrite_result_writes,
@@ -17,9 +23,62 @@ from scorch.compiler.result_write_pass import (
 
 _Mode = Literal["count", "fill"]
 
+_RESULT_ID = SymbolId(700)
+_RESULT_INDEX_ID = IndexId(701)
+
 
 def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Var:
     return llir.Var(name=name, type=data_type)
+
+
+def _access(
+    array_name: str,
+    index: llir.Expr,
+    array_type: llir.DataType = llir.DataType.NO_TYPE,
+    *,
+    tensor_access: llir.TensorAccessMetadata | None = None,
+) -> llir.ArrayAccess:
+    return llir.ArrayAccess(
+        array=_var(array_name, array_type),
+        index=index,
+        tensor_access=tensor_access,
+    )
+
+
+def _result_value_access(
+    index: llir.Expr,
+    *,
+    tensor_id: SymbolId = _RESULT_ID,
+) -> llir.ArrayAccess:
+    return _access(
+        "Result_values",
+        index,
+        tensor_access=llir.TensorAccessMetadata(
+            access_id=AccessId(702),
+            tensor_id=tensor_id,
+            index_ids=(_RESULT_INDEX_ID,),
+            role=llir.TensorAccessRole.RESULT_WRITE,
+        ),
+    )
+
+
+def _phase_index(level: int) -> llir.Add:
+    return llir.Add(
+        _var(f"_base{level}", llir.DataType.INT64),
+        _var(f"_pos{level}", llir.DataType.INT64),
+    )
+
+
+def _fill_store(
+    array_name: str,
+    index: llir.Expr,
+    value: llir.Expr,
+    array_type: llir.DataType = llir.DataType.NO_TYPE,
+) -> llir.Assign:
+    return llir.Assign(
+        _access(array_name, index, array_type),
+        value,
+    )
 
 
 def _context(
@@ -28,9 +87,29 @@ def _context(
 ) -> ResultWriteContext:
     return ResultWriteContext(
         result_name="Result",
+        result_id=_RESULT_ID,
         compressed_levels=compressed_levels,
         mode=mode,
+        value_pointer_type=llir.DataType.PTR_FLOAT32,
     )
+
+
+def test_result_write_context_is_frozen_typed_and_value_equal() -> None:
+    context = _context("fill")
+
+    assert context == _context("fill")
+    assert context != _context("count")
+    assert ResultWriteContext.__annotations__ == {
+        "result_name": "str",
+        "result_id": "SymbolId",
+        "compressed_levels": "Tuple[int, ...]",
+        "mode": "ResultWriteMode",
+        "value_pointer_type": "llir.DataType",
+        "traversal": "LLIRTraversalContext",
+        "compile_options": "Optional['CompileOptions']",
+    }
+    with pytest.raises(FrozenInstanceError):
+        context.value_pointer_type = llir.DataType.PTR_FLOAT64  # type: ignore[misc]
 
 
 def _structural_snapshot(value: object) -> object:
@@ -72,11 +151,17 @@ def _cpp(statements: List[llir.Stmt]) -> str:
 def _single_level_serial_writes() -> List[llir.Stmt]:
     return [
         llir.Assign(
-            _var("Result_values[pResult1]"),
+            _result_value_access(_var("pResult1")),
             llir.BinOp("+", _var("left"), _var("right")),
         ),
-        llir.Assign(_var("Result1_crd[pResult1]"), _var("coordinate")),
-        llir.Assign(_var("Result1_pos[row + 1]"), _var("pResult1")),
+        llir.Assign(
+            _access("Result1_crd", _var("pResult1")),
+            _var("coordinate"),
+        ),
+        llir.Assign(
+            _access("Result1_pos", llir.Add(_var("row"), llir.Literal(1))),
+            _var("pResult1"),
+        ),
         llir.Increment(_var("pResult1", llir.DataType.INT64)),
         llir.FunctionCallStmt(
             "Result1_crd.push_back",
@@ -118,7 +203,10 @@ def _multiple_level_serial_writes() -> List[llir.Stmt]:
         ),
         boundary,
         llir.Assign(
-            _var("Result2_pos[Result1_crd.size()]"),
+            _access(
+                "Result2_pos",
+                llir.FunctionCall("Result1_crd.size", []),
+            ),
             _var("Result2_crd.size()"),
         ),
     ]
@@ -143,12 +231,32 @@ def test_count_rewrite_matches_legacy_single_level_structure() -> None:
 def test_fill_rewrite_matches_legacy_single_level_structure() -> None:
     source = _single_level_serial_writes()
     expected: List[llir.Stmt] = [
-        llir.RawStmt("Result_values_data[_base1 + _pos1] = left + right"),
-        llir.RawStmt("Result1_crd_data[_base1 + _pos1] = coordinate"),
+        _fill_store(
+            "Result_values_data",
+            _phase_index(1),
+            llir.BinOp("+", _var("left"), _var("right")),
+            llir.DataType.PTR_FLOAT32,
+        ),
+        _fill_store(
+            "Result1_crd_data",
+            _phase_index(1),
+            _var("coordinate"),
+            llir.DataType.PTR_INT,
+        ),
         llir.RawStmt("_pos1++"),
-        llir.RawStmt("Result1_crd_data[_base1 + _pos1] = pushed_coordinate"),
+        _fill_store(
+            "Result1_crd_data",
+            _phase_index(1),
+            _var("pushed_coordinate"),
+            llir.DataType.PTR_INT,
+        ),
         llir.RawStmt("_pos1++"),
-        llir.RawStmt("Result_values_data[_base1 + _pos1] = 0"),
+        _fill_store(
+            "Result_values_data",
+            _phase_index(1),
+            llir.Literal(0),
+            llir.DataType.PTR_FLOAT32,
+        ),
         llir.FunctionCallStmt("workspace.sort", []),
         llir.Assign(_var("scratch"), _var("keep")),
     ]
@@ -191,9 +299,19 @@ def test_count_rewrite_matches_legacy_multiple_level_boundary() -> None:
 def test_fill_rewrite_matches_legacy_multiple_level_boundary() -> None:
     source = _multiple_level_serial_writes()
     expected: List[llir.Stmt] = [
-        llir.RawStmt("Result1_crd_data[_base1 + _pos1] = outer_coordinate"),
+        _fill_store(
+            "Result1_crd_data",
+            _phase_index(1),
+            _var("outer_coordinate"),
+            llir.DataType.PTR_INT,
+        ),
         llir.RawStmt("_pos1++"),
-        llir.RawStmt("Result2_pos_data[_base1 + _pos1] = _base2 + _pos2"),
+        _fill_store(
+            "Result2_pos_data",
+            _phase_index(1),
+            _phase_index(2),
+            llir.DataType.PTR_INT,
+        ),
         llir.IfThenElse(
             cond=llir.BinOp(
                 ">",
@@ -201,9 +319,19 @@ def test_fill_rewrite_matches_legacy_multiple_level_boundary() -> None:
                 _var("_prev2", llir.DataType.INT64),
             ),
             then_body=[
-                llir.RawStmt("Result1_crd_data[_base1 + _pos1] = parent_coordinate"),
+                _fill_store(
+                    "Result1_crd_data",
+                    _phase_index(1),
+                    _var("parent_coordinate"),
+                    llir.DataType.PTR_INT,
+                ),
                 llir.RawStmt("_pos1++"),
-                llir.RawStmt("Result2_pos_data[_base1 + _pos1] = _base2 + _pos2"),
+                _fill_store(
+                    "Result2_pos_data",
+                    _phase_index(1),
+                    _phase_index(2),
+                    llir.DataType.PTR_INT,
+                ),
                 llir.RawStmt("_prev2 = _pos2"),
             ],
         ),
@@ -218,7 +346,12 @@ def test_legacy_control_flow_regions_are_transformed_and_detached() -> None:
     auto_loop = llir.ForLoopAuto(
         var=_var("item"),
         array=_var("items"),
-        body=[llir.Assign(_var("Result1_crd[pResult1]"), _var("auto"))],
+        body=[
+            llir.Assign(
+                _access("Result1_crd", _var("pResult1")),
+                _var("auto"),
+            )
+        ],
     )
     while_loop = llir.WhileLoop(
         _var("keep_going"),
@@ -229,7 +362,14 @@ def test_legacy_control_flow_regions_are_transformed_and_detached() -> None:
         then_body=[auto_loop],
         else_body=[while_loop],
         cond_list=[_var("branch_guard")],
-        then_body_list=[[llir.Assign(_var("Result1_crd[pResult1]"), _var("branch"))]],
+        then_body_list=[
+            [
+                llir.Assign(
+                    _access("Result1_crd", _var("pResult1")),
+                    _var("branch"),
+                )
+            ]
+        ],
     )
     loop = llir.ForLoop(
         init=llir.VarInit(
@@ -240,15 +380,33 @@ def test_legacy_control_flow_regions_are_transformed_and_detached() -> None:
         update=llir.Increment(_var("pResult1", llir.DataType.INT64)),
         body=[conditional],
         before_parallel_body=[
-            llir.Assign(_var("Result1_crd[pResult1]"), _var("before"))
+            llir.Assign(
+                _access("Result1_crd", _var("pResult1")),
+                _var("before"),
+            )
         ],
-        pre_parallel_body=[llir.Assign(_var("Result1_crd[pResult1]"), _var("pre"))],
-        post_parallel_body=[llir.Assign(_var("Result1_crd[pResult1]"), _var("post"))],
+        pre_parallel_body=[
+            llir.Assign(
+                _access("Result1_crd", _var("pResult1")),
+                _var("pre"),
+            )
+        ],
+        post_parallel_body=[
+            llir.Assign(
+                _access("Result1_crd", _var("pResult1")),
+                _var("post"),
+            )
+        ],
     )
     setattr(
         loop,
         "_hoisted_ptr_decls",
-        [llir.Assign(_var("Result1_crd[pResult1]"), _var("hoisted"))],
+        [
+            llir.Assign(
+                _access("Result1_crd", _var("pResult1")),
+                _var("hoisted"),
+            )
+        ],
     )
     source: List[llir.Stmt] = [loop]
     source_snapshot = _structural_snapshot(source)
@@ -282,11 +440,16 @@ def test_legacy_control_flow_regions_are_transformed_and_detached() -> None:
 
     assert rewritten_loop.before_parallel_body is not None
     before = cast(llir.Assign, rewritten_loop.before_parallel_body[0])
-    assert cast(llir.Var, before.var).name == "Result1_crd[pResult1]"
+    assert type(before.var) is llir.ArrayAccess
+    assert cast(llir.Var, cast(llir.ArrayAccess, before.var).array).name == (
+        "Result1_crd"
+    )
     hoisted = cast(List[llir.Stmt], getattr(rewritten_loop, "_hoisted_ptr_decls"))
     assert type(hoisted[0]) is llir.Assign
-    assert cast(llir.Var, cast(llir.Assign, hoisted[0]).var).name == (
-        "Result1_crd[pResult1]"
+    hoisted_target = cast(llir.Assign, hoisted[0]).var
+    assert type(hoisted_target) is llir.ArrayAccess
+    assert cast(llir.Var, cast(llir.ArrayAccess, hoisted_target).array).name == (
+        "Result1_crd"
     )
 
     assert _structural_snapshot(source) == source_snapshot
@@ -327,7 +490,10 @@ def test_none_and_empty_optional_loop_regions_preserve_their_shape() -> None:
 
 def test_function_case_and_switch_bodies_are_identity_only_and_detached() -> None:
     def result_write(value: str) -> llir.Assign:
-        return llir.Assign(_var("Result1_crd[pResult1]"), _var(value))
+        return llir.Assign(
+            _access("Result1_crd", _var("pResult1")),
+            _var(value),
+        )
 
     source: List[llir.Stmt] = [
         llir.Function(
@@ -355,7 +521,7 @@ def test_nested_list_and_tuple_roots_preserve_container_shapes() -> None:
         (
             [
                 llir.Assign(
-                    _var("Result1_crd[pResult1]"),
+                    _access("Result1_crd", _var("pResult1")),
                     _var("coordinate"),
                 )
             ],
@@ -377,13 +543,13 @@ def test_nested_list_and_tuple_roots_preserve_container_shapes() -> None:
     first_tuple = cast(Tuple[LLIRStatementValue, ...], rewritten[0])
     assert type(first_tuple[0]) is list
     first_list = cast(List[LLIRStatementValue], first_tuple[0])
-    assert type(first_list[0]) is llir.RawStmt
+    assert type(first_list[0]) is llir.Assign
     assert type(rewritten[1]) is list
     second_list = cast(List[LLIRStatementValue], rewritten[1])
     assert type(second_list[0]) is tuple
     second_tuple = cast(Tuple[LLIRStatementValue, ...], second_list[0])
     assert [type(statement) for statement in second_tuple] == [
-        llir.RawStmt,
+        llir.Assign,
         llir.RawStmt,
     ]
 
@@ -405,7 +571,7 @@ def test_unknown_subclass_fails_with_result_write_stage_diagnostic() -> None:
     class UnknownAssign(llir.Assign):
         pass
 
-    unknown = UnknownAssign(_var("Result_values[pResult1]"), _var("value"))
+    unknown = UnknownAssign(_result_value_access(_var("pResult1")), _var("value"))
     unknown_root: List[llir.Stmt] = [unknown]
 
     with pytest.raises(LLIRTraversalError) as raised:
@@ -428,45 +594,80 @@ def test_unknown_subclass_fails_with_result_write_stage_diagnostic() -> None:
             ("context",),
         ),
         (
-            ResultWriteContext("", (1,), "count"),
+            ResultWriteContext(
+                "", _RESULT_ID, (1,), "count", llir.DataType.PTR_FLOAT32
+            ),
             "invalid_result_write_name",
             ("context", "result_name"),
         ),
         (
-            ResultWriteContext(cast(str, 3), (1,), "count"),
+            ResultWriteContext(
+                cast(str, 3),
+                _RESULT_ID,
+                (1,),
+                "count",
+                llir.DataType.PTR_FLOAT32,
+            ),
             "invalid_result_write_name",
             ("context", "result_name"),
         ),
         (
-            ResultWriteContext("Result", (), "count"),
-            "invalid_compressed_levels",
-            ("context", "compressed_levels"),
+            ResultWriteContext(
+                "Result",
+                cast(SymbolId, 3),
+                (1,),
+                "count",
+                llir.DataType.PTR_FLOAT32,
+            ),
+            "invalid_result_write_id",
+            ("context", "result_id"),
         ),
         (
-            ResultWriteContext("Result", cast(Tuple[int, ...], [1]), "count"),
-            "invalid_compressed_levels",
-            ("context", "compressed_levels"),
-        ),
-        (
-            ResultWriteContext("Result", (-1,), "count"),
-            "invalid_compressed_levels",
-            ("context", "compressed_levels"),
-        ),
-        (
-            ResultWriteContext("Result", (1, 1), "count"),
-            "invalid_compressed_levels",
-            ("context", "compressed_levels"),
-        ),
-        (
-            ResultWriteContext("Result", (2, 1), "count"),
+            ResultWriteContext(
+                "Result", _RESULT_ID, (), "count", llir.DataType.PTR_FLOAT32
+            ),
             "invalid_compressed_levels",
             ("context", "compressed_levels"),
         ),
         (
             ResultWriteContext(
                 "Result",
+                _RESULT_ID,
+                cast(Tuple[int, ...], [1]),
+                "count",
+                llir.DataType.PTR_FLOAT32,
+            ),
+            "invalid_compressed_levels",
+            ("context", "compressed_levels"),
+        ),
+        (
+            ResultWriteContext(
+                "Result", _RESULT_ID, (-1,), "count", llir.DataType.PTR_FLOAT32
+            ),
+            "invalid_compressed_levels",
+            ("context", "compressed_levels"),
+        ),
+        (
+            ResultWriteContext(
+                "Result", _RESULT_ID, (1, 1), "count", llir.DataType.PTR_FLOAT32
+            ),
+            "invalid_compressed_levels",
+            ("context", "compressed_levels"),
+        ),
+        (
+            ResultWriteContext(
+                "Result", _RESULT_ID, (2, 1), "count", llir.DataType.PTR_FLOAT32
+            ),
+            "invalid_compressed_levels",
+            ("context", "compressed_levels"),
+        ),
+        (
+            ResultWriteContext(
+                "Result",
+                _RESULT_ID,
                 (1,),
                 cast(_Mode, "invalid"),
+                llir.DataType.PTR_FLOAT32,
             ),
             "invalid_result_write_mode",
             ("context", "mode"),
@@ -474,8 +675,32 @@ def test_unknown_subclass_fails_with_result_write_stage_diagnostic() -> None:
         (
             ResultWriteContext(
                 "Result",
+                _RESULT_ID,
                 (1,),
                 "count",
+                cast(llir.DataType, "float*"),
+            ),
+            "invalid_result_write_value_pointer_type",
+            ("context", "value_pointer_type"),
+        ),
+        (
+            ResultWriteContext(
+                "Result",
+                _RESULT_ID,
+                (1,),
+                "count",
+                llir.DataType.FLOAT32,
+            ),
+            "invalid_result_write_value_pointer_type",
+            ("context", "value_pointer_type"),
+        ),
+        (
+            ResultWriteContext(
+                "Result",
+                _RESULT_ID,
+                (1,),
+                "count",
+                llir.DataType.PTR_FLOAT32,
                 traversal=LLIRTraversalContext(stage="", pass_name="custom"),
             ),
             "invalid_result_write_traversal_context",
@@ -541,7 +766,7 @@ def test_same_mode_rewrite_is_idempotent_for_generated_shapes(
 
 def test_count_and_fill_are_independent_not_composable() -> None:
     source: List[llir.Stmt] = [
-        llir.Assign(_var("Result_values[pResult1]"), _var("value"))
+        llir.Assign(_result_value_access(_var("pResult1")), _var("value"))
     ]
     counted = rewrite_result_writes(source, _context("count"))
 
@@ -557,7 +782,10 @@ def test_count_and_fill_are_independent_not_composable() -> None:
     ("statement", "context", "replacement_count"),
     [
         (
-            llir.Assign(_var("Result_values[pResult1]"), _var("value")),
+            llir.Assign(
+                _result_value_access(_var("pResult1")),
+                _var("value"),
+            ),
             _context("count"),
             0,
         ),
@@ -589,12 +817,72 @@ def test_scalar_deletion_and_expansion_fail_structurally(
 
 def test_scalar_one_for_one_replacement_preserves_root_category() -> None:
     source = llir.Assign(
-        _var("Result_values[pResult1]"),
+        _result_value_access(_var("pResult1")),
         _var("value"),
     )
 
     rewritten = rewrite_result_writes(source, _context("fill"))
 
-    assert type(rewritten) is llir.RawStmt
-    assert rewritten.code == "Result_values_data[_base1 + _pos1] = value"
+    assert type(rewritten) is llir.Assign
+    assert type(rewritten.var) is llir.ArrayAccess
+    assert cast(llir.Var, rewritten.var.array).name == "Result_values_data"
+    assert cast(llir.Var, rewritten.var.array).type is llir.DataType.PTR_FLOAT32
+    assert _cpp([rewritten]) == "Result_values_data[_base1 + _pos1] = value;"
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(rewritten))
+
+
+def test_result_value_matching_uses_stable_identity_not_rendered_name() -> None:
+    source: List[llir.Stmt] = [
+        llir.Assign(
+            _result_value_access(
+                _var("pResult1"),
+                tensor_id=SymbolId(_RESULT_ID.value + 1),
+            ),
+            _var("value"),
+        )
+    ]
+
+    rewritten = rewrite_result_writes(source, _context("fill"))
+
+    assert _structural_snapshot(rewritten) == _structural_snapshot(source)
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(rewritten))
+    assert _cpp(cast(List[llir.Stmt], rewritten)) == (
+        "Result_values[pResult1] = value;"
+    )
+
+
+def test_result_value_matching_ignores_physical_name_when_identity_matches() -> None:
+    logical_target = _result_value_access(_var("pResult1"))
+    target = llir.ArrayAccess(
+        array=_var("renamed_physical_values", llir.DataType.PTR_FLOAT32),
+        index=logical_target.index,
+        tensor_access=logical_target.tensor_access,
+    )
+    source: List[llir.Stmt] = [llir.Assign(target, _var("value"))]
+
+    rewritten = rewrite_result_writes(source, _context("fill"))
+
+    assignment = cast(llir.Assign, rewritten[0])
+    assert type(assignment.var) is llir.ArrayAccess
+    assert cast(llir.Var, assignment.var.array).name == "Result_values_data"
+    assert cast(llir.Var, assignment.var.array).type is llir.DataType.PTR_FLOAT32
+    assert _cpp(cast(List[llir.Stmt], rewritten)) == (
+        "Result_values_data[_base1 + _pos1] = value;"
+    )
+
+
+def test_malformed_rvalue_assignment_target_fails_at_result_write_boundary() -> None:
+    malformed = llir.Assign(_var("scratch"), _var("value"))
+    malformed.var = cast(
+        llir.AssignmentTarget,
+        llir.FunctionCall("not_an_lvalue", []),
+    )
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        rewrite_result_writes([malformed], _context("fill"))
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_assignment_target"
+    assert diagnostic.path == ("root", "[0]", "var")
+    assert diagnostic.stage == RESULT_WRITE_TRAVERSAL_CONTEXT.stage
+    assert diagnostic.pass_name == RESULT_WRITE_TRAVERSAL_CONTEXT.pass_name

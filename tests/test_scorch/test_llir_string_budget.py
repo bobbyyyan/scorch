@@ -1,4 +1,4 @@
-"""Audited compatibility budget for the first structured-access slice."""
+"""Audited compatibility budget after structured indexed-store migration."""
 
 import ast
 from collections import Counter
@@ -25,6 +25,21 @@ def _var_name_expression(call: ast.Call) -> Optional[ast.expr]:
         if keyword.arg == "name":
             return keyword.value
     return call.args[0] if call.args else None
+
+
+def _assign_target_expression(call: ast.Call) -> Optional[ast.expr]:
+    for keyword in call.keywords:
+        if keyword.arg == "var":
+            return keyword.value
+    return call.args[0] if call.args else None
+
+
+def _is_llir_constructor(expression: ast.expr, constructor: str) -> bool:
+    return bool(
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr == constructor
+    )
 
 
 def _static_string_fragments(expression: ast.expr) -> str:
@@ -89,30 +104,32 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 179,
+        "cin_lowerer.py": 199,
+        "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
-        "dynamic_vector_access_pass.py": 2,
-        "iter_lattice.py": 31,
+        "dynamic_vector_access_pass.py": 1,
+        "iter_lattice.py": 35,
         "iterator.py": 19,
         "llir_traversal.py": 1,
-        "result_write_pass.py": 2,
-        "schedule_lowerer.py": 79,
+        "result_write_pass.py": 5,
+        "schedule_lowerer.py": 93,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(constructor_counts.values()) == 326
+    assert sum(constructor_counts.values()) == 371
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 110,
+        "cin_lowerer.py": 152,
+        "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
-        "dynamic_vector_access_pass.py": 2,
-        "iter_lattice.py": 26,
+        "dynamic_vector_access_pass.py": 1,
+        "iter_lattice.py": 35,
         "iterator.py": 13,
         "llir_traversal.py": 1,
-        "result_write_pass.py": 2,
-        "schedule_lowerer.py": 72,
+        "result_write_pass.py": 5,
+        "schedule_lowerer.py": 90,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 239
+    assert sum(unclassified_counts.values()) == 315
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -126,7 +143,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 9
 
     assert totals == {
-        "subscript": 59,
+        "subscript": 28,
         "call": 13,
         "member": 7,
         "initializer": 3,
@@ -134,18 +151,17 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "ternary": 1,
         "arithmetic": 1,
     }
-    assert sum(totals.values()) == 87
+    assert sum(totals.values()) == 56
     assert per_file == {
-        ("cin_lowerer.py", "subscript"): 43,
+        ("cin_lowerer.py", "subscript"): 21,
         ("cin_lowerer.py", "call"): 11,
         ("cin_lowerer.py", "member"): 7,
         ("cin_lowerer.py", "initializer"): 3,
         ("cin_lowerer.py", "qualified"): 3,
         ("cin_lowerer.py", "ternary"): 1,
         ("cin_lowerer.py", "arithmetic"): 1,
-        ("iter_lattice.py", "subscript"): 5,
         ("iterator.py", "subscript"): 6,
-        ("schedule_lowerer.py", "subscript"): 5,
+        ("schedule_lowerer.py", "subscript"): 1,
         ("schedule_lowerer.py", "call"): 2,
     }
 
@@ -161,22 +177,50 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 17,
-        "compressed_where_openmp_pass.py": 22,
+        "compressed_where_openmp_pass.py": 19,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 2,
-        "result_write_pass.py": 15,
+        "result_write_pass.py": 8,
         "schedule_lowerer.py": 3,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 62
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 61
+    assert sum(counts.values()) == 52
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 51
+
+
+def test_no_direct_assign_target_reintroduces_a_string_expression() -> None:
+    """Keep migrated production lvalues on the one structured representation."""
+
+    violations: list[tuple[str, str, str]] = []
+    allowed_members: list[tuple[str, str]] = []
+    for path in sorted(_COMPILER_ROOT.glob("*.py")):
+        for assign_call in _llir_constructor_calls(path, "Assign"):
+            target = _assign_target_expression(assign_call)
+            if target is None or not _is_llir_constructor(target, "Var"):
+                continue
+            target_call = target
+            assert isinstance(target_call, ast.Call)
+            name_expression = _var_name_expression(target_call)
+            if name_expression is None:
+                continue
+            category = _string_expression_category(name_expression)
+            spelling = ast.unparse(name_expression)
+            if category == "member":
+                allowed_members.append((path.name, spelling))
+            elif category is not None:
+                violations.append((path.name, category, ast.unparse(name_expression)))
+
+    assert violations == []
+    assert allowed_members == [
+        ("cin_lowerer.py", "f'{self.name}.storage.index.mode_indices'"),
+        ("cin_lowerer.py", "f'{self.name}.storage.value'"),
+    ]
 
 
 def test_generic_string_rewrite_compatibility_budget_is_explicit() -> None:
     markers = {
         "cin_lowerer.py": (
-            "stmt.var.name = re.sub(",
             "stmt.name = stmt.name.replace(old, new)",
             "stmt.code = stmt.code.replace(old, new)",
         ),
@@ -202,4 +246,4 @@ def test_generic_string_rewrite_compatibility_budget_is_explicit() -> None:
         source = (_COMPILER_ROOT / filename).read_text()
         for marker in expected_markers:
             assert source.count(marker) == 1
-    assert sum(len(expected_markers) for expected_markers in markers.values()) == 11
+    assert sum(len(expected_markers) for expected_markers in markers.values()) == 10

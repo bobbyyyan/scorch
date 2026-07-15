@@ -1,3 +1,5 @@
+from typing import cast
+
 import pytest
 import torch
 
@@ -393,6 +395,106 @@ def test_schedule_statement_access_rewrite_counts_and_clones_each_replacement():
     )
 
 
+def test_schedule_result_target_rewrite_remains_a_valid_detached_lvalue() -> None:
+    tensor_id = SymbolId(31)
+    index_ids = (IndexId(32), IndexId(33))
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(34),
+        tensor_id=tensor_id,
+        index_ids=index_ids,
+        role=llir.TensorAccessRole.RESULT_WRITE,
+    )
+    target = llir.ArrayAccess(
+        llir.Var("Result_values", llir.DataType.PTR_FLOAT32),
+        llir.Var("pResult", llir.DataType.INT64),
+        metadata,
+    )
+    replacement = llir.ArrayAccess(
+        llir.Var("compact_Result", llir.DataType.PTR_FLOAT32),
+        llir.Add(
+            llir.Mul(llir.Var("row", llir.DataType.INT64), llir.Literal(4)),
+            llir.Var("lane", llir.DataType.INT64),
+        ),
+    )
+    statements = [llir.Assign(target, llir.Var("value", llir.DataType.FLOAT32))]
+
+    count = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.RESULT_WRITE,
+        replacement,
+    )
+    repeated = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.RESULT_WRITE,
+        replacement,
+    )
+
+    rewritten = cast(llir.ArrayAccess, statements[0].var)
+    assert count == 1
+    assert repeated == 0
+    assert rewritten is not replacement
+    assert rewritten.array is not replacement.array
+    assert rewritten.index is not replacement.index
+    assert LLIRLowerer().lower_llir(statements[0]) == (
+        "compact_Result[row * 4 + lane] = value;"
+    )
+    assert LLIRLowerer().lower_llir(target) == "Result_values[pResult]"
+
+    malformed = [llir.Assign(target, llir.Var("value", llir.DataType.FLOAT32))]
+    with pytest.raises(LLIRTraversalError) as raised:
+        _rewrite_stmt_accesses(
+            malformed,
+            tensor_id,
+            index_ids,
+            llir.TensorAccessRole.RESULT_WRITE,
+            llir.BinOp("+", llir.Var("left", llir.DataType.INT64), llir.Literal(1)),
+        )
+    assert raised.value.diagnostic.code == "invalid_assignment_target"
+    assert raised.value.diagnostic.path == ("root", "[0]", "var")
+    assert malformed[0].var is target
+    assert LLIRLowerer().lower_llir(malformed[0]) == ("Result_values[pResult] = value;")
+
+
+def test_schedule_nested_read_replacement_preflights_without_mutating_lvalue() -> None:
+    tensor_id = SymbolId(41)
+    index_ids = (IndexId(42),)
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(43),
+        tensor_id=tensor_id,
+        index_ids=index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    indirect_index = llir.ArrayAccess(
+        llir.Var("indices", llir.DataType.PTR_INT),
+        llir.Var("i", llir.DataType.INT64),
+        metadata,
+    )
+    target = llir.ArrayAccess(
+        llir.Var("output", llir.DataType.PTR_FLOAT32),
+        indirect_index,
+    )
+    statements = [llir.Assign(target, llir.Var("value", llir.DataType.FLOAT32))]
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        _rewrite_stmt_accesses(
+            statements,
+            tensor_id,
+            index_ids,
+            llir.TensorAccessRole.INPUT_READ,
+            llir.Array([llir.Literal(0)], llir.DataType.INT),
+        )
+
+    assert raised.value.diagnostic.code == "invalid_assignment_target"
+    assert raised.value.diagnostic.path == ("root", "[0]", "var")
+    assert statements[0].var is target
+    assert cast(llir.ArrayAccess, statements[0].var).index is indirect_index
+    assert LLIRLowerer().lower_llir(statements[0]) == ("output[indices[i]] = value;")
+
+
 def test_dense_elementwise_llir_tensor_access_metadata_survives_rewrites():
     source = _build_elementwise("dd")
     lowered = CINLowerer().lower_IndexStmt(source)
@@ -445,6 +547,16 @@ def test_dense_elementwise_llir_tensor_access_metadata_survives_rewrites():
         for access in source.tensor_accesses
     }
     assert metadata == expected_metadata
+    assert all(
+        type(expression) is llir.ArrayAccess for expression in tagged_expressions
+    )
+    result_writes = [
+        cast(llir.ArrayAccess, expression)
+        for expression in tagged_expressions
+        if expression.tensor_access.role is llir.TensorAccessRole.RESULT_WRITE
+    ]
+    assert len(result_writes) == 1
+    assert cast(llir.Var, result_writes[0].array).name == "ElemOut_values"
     # Dense pointer hoisting rewrites the physical access spelling, while the
     # logical tensor/index identity remains available to later schedule passes.
     lowerer = LLIRLowerer()

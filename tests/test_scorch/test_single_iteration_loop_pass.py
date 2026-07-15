@@ -56,6 +56,13 @@ def _var(
     )
 
 
+def _access(array: str, index: str) -> llir.ArrayAccess:
+    return llir.ArrayAccess(
+        array=_var(array),
+        index=_var(index, llir.DataType.INT64),
+    )
+
+
 def _bound(
     end_variable: str = "end",
     base: str = "base",
@@ -592,7 +599,7 @@ def test_exact_substring_rewrite_order_and_positive_scope() -> None:
         tensor_access=metadata,
     )
     nested_loop = _loop(
-        [llir.Assign(_var("Nested[ix]"), _var("ix nested"))],
+        [llir.Assign(_access("Nested", "ix"), _var("ix nested"))],
         loop_variable="nested",
         base="nested_base",
         end_variable="nested_end",
@@ -600,7 +607,7 @@ def test_exact_substring_rewrite_order_and_positive_scope() -> None:
     conditional = llir.IfThenElse(
         cond=_var("condition_ix]"),
         then_body=[llir.RawStmt("then(Array[ix])")],
-        else_body=[llir.Assign(_var("Else[ix]"), _var("ix else"))],
+        else_body=[llir.Assign(_access("Else", "ix"), _var("ix else"))],
         cond_list=[_var("branch_ix]")],
         then_body_list=[
             [llir.VarInit(_var("declared_ix]"), _var("Value[ix]"))],
@@ -609,7 +616,7 @@ def test_exact_substring_rewrite_order_and_positive_scope() -> None:
     )
     body: List[llir.Stmt] = [
         llir.Assign(
-            _var("Target[ix]"),
+            _access("Target", "ix"),
             llir.BinOp(
                 "+",
                 llir.ArrayAccess(_var("Array[ix]"), _var("ix offset")),
@@ -633,7 +640,9 @@ def test_exact_substring_rewrite_order_and_positive_scope() -> None:
     )
 
     assignment = cast(llir.Assign, output[0])
-    assert cast(llir.Var, assignment.var).name == "Target[root]"
+    assignment_target = cast(llir.ArrayAccess, assignment.var)
+    assert cast(llir.Var, assignment_target.array).name == "Target"
+    assert cast(llir.Var, assignment_target.index).name == "root"
     binary = cast(llir.BinOp, assignment.value)
     access = cast(llir.ArrayAccess, binary.left)
     assert cast(llir.Var, access.array).name == "Array[root]"
@@ -657,7 +666,9 @@ def test_exact_substring_rewrite_order_and_positive_scope() -> None:
 
     nested = cast(llir.ForLoop, output[4])
     nested_assignment = cast(llir.Assign, nested.body[0])
-    assert cast(llir.Var, nested_assignment.var).name == "Nested[root]"
+    nested_target = cast(llir.ArrayAccess, nested_assignment.var)
+    assert cast(llir.Var, nested_target.array).name == "Nested"
+    assert cast(llir.Var, nested_target.index).name == "root"
     assert cast(llir.Var, nested_assignment.value).name == "root nested"
     rewritten_if = cast(llir.IfThenElse, output[5])
     assert cast(llir.Var, rewritten_if.cond).name == "condition_ix]"
@@ -668,7 +679,9 @@ def test_exact_substring_rewrite_order_and_positive_scope() -> None:
         llir.Assign,
         cast(List[llir.Stmt], rewritten_if.else_body)[0],
     )
-    assert cast(llir.Var, else_assignment.var).name == "Else[root]"
+    else_target = cast(llir.ArrayAccess, else_assignment.var)
+    assert cast(llir.Var, else_target.array).name == "Else"
+    assert cast(llir.Var, else_target.index).name == "root"
     assert cast(llir.Var, else_assignment.value).name == "root else"
     branches = cast(List[List[llir.Stmt]], rewritten_if.then_body_list)
     branch_initializer = cast(llir.VarInit, branches[0][0])
@@ -723,7 +736,7 @@ def test_rewrite_omits_headers_parallel_regions_and_legacy_containers() -> None:
     nested_header = _loop([], loop_variable="nested")
     nested_header.init = llir.VarInit(_var("nested"), _var(old))
     nested_header.cond = llir.BinOp("<", _var(old), _var("limit"))
-    nested_header.update = llir.Assign(_var(old), llir.Literal(1))
+    nested_header.update = llir.Assign(_access("Array", "ix"), llir.Literal(1))
     nested_header.body = [llir.RawStmt(old)]
     nested_header.before_parallel_body = [llir.RawStmt(old)]
     nested_header.pre_parallel_body = [llir.RawStmt(old)]
@@ -779,7 +792,9 @@ def test_rewrite_omits_headers_parallel_regions_and_legacy_containers() -> None:
     header = cast(llir.ForLoop, output[0])
     assert cast(llir.Var, cast(llir.VarInit, header.init).value).name == old
     assert cast(llir.Var, cast(llir.BinOp, header.cond).left).name == old
-    assert cast(llir.Var, cast(llir.Assign, header.update).var).name == old
+    header_target = cast(llir.ArrayAccess, cast(llir.Assign, header.update).var)
+    assert cast(llir.Var, header_target.array).name == "Array"
+    assert cast(llir.Var, header_target.index).name == "ix"
     assert cast(llir.RawStmt, header.body[0]).code == "Array[base]"
     assert cast(llir.RawStmt, header.before_parallel_body[0]).code == old
     assert cast(llir.RawStmt, header.pre_parallel_body[0]).code == old

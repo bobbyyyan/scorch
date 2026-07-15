@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError
-from typing import Optional, Tuple, get_type_hints
+from typing import Optional, Tuple, Union, cast, get_type_hints
 
 import pytest
 
@@ -11,6 +11,15 @@ from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore
 
 def _var(name: str) -> llir.Var:
     return llir.Var(name=name, type=llir.DataType.INT)
+
+
+def _result_metadata(access_id: int = 1) -> llir.TensorAccessMetadata:
+    return llir.TensorAccessMetadata(
+        access_id=AccessId(access_id),
+        tensor_id=SymbolId(2),
+        index_ids=(IndexId(3),),
+        role=llir.TensorAccessRole.RESULT_WRITE,
+    )
 
 
 def test_codegen_rejects_unknown_statement_node() -> None:
@@ -136,6 +145,304 @@ def test_array_access_codegen_is_byte_exact_and_precedence_correct(
     expected: str,
 ) -> None:
     assert LLIRLowerer().lower_llir(expression) == expected
+
+
+def test_indexed_assign_codegen_is_byte_exact_and_precedence_correct() -> None:
+    assignment = llir.Assign(
+        var=llir.ArrayAccess(
+            array=_var("values"),
+            index=llir.Add(
+                _var("i"),
+                llir.Mul(_var("tile"), llir.Add(_var("j"), llir.Literal(1))),
+            ),
+            tensor_access=_result_metadata(),
+        ),
+        value=llir.ArrayAccess(
+            array=_var("source"),
+            index=llir.Add(_var("p"), _var("offset")),
+        ),
+        op=llir.AssignOp.ADD_ASSIGN,
+    )
+
+    assert (
+        LLIRLowerer().lower_llir(assignment)
+        == "values[i + tile * (j + 1)] += source[p + offset];"
+    )
+    assert (
+        LLIRLowerer().lower_llir(assignment, no_semicolon=True)
+        == "values[i + tile * (j + 1)] += source[p + offset]"
+    )
+
+
+def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None:
+    target = llir.ArrayAccess(
+        array=_var("values"),
+        index=_var("i"),
+        tensor_access=_result_metadata(),
+    )
+    assignment = llir.Assign(
+        var=target,
+        value=llir.Literal(2),
+        op=llir.AssignOp.MUL_ASSIGN,
+    )
+    equal_assignment = llir.Assign(
+        var=llir.ArrayAccess(
+            array=_var("values"),
+            index=_var("i"),
+            tensor_access=_result_metadata(access_id=99),
+        ),
+        value=llir.Literal(2),
+        op=llir.AssignOp.MUL_ASSIGN,
+    )
+
+    assert assignment.var is target
+    assert assignment.value == llir.Literal(2)
+    assert assignment.op is llir.AssignOp.MUL_ASSIGN
+    assert assignment.cast is False
+    assert assignment == equal_assignment
+    assert assignment != llir.Assign(target, llir.Literal(3), llir.AssignOp.MUL_ASSIGN)
+    assert get_type_hints(llir.Assign) == {
+        "var": Union[llir.Var, llir.ArrayAccess],
+        "value": llir.Expr,
+        "op": llir.AssignOp,
+        "cast": bool,
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        target.array = _var("other")
+    with pytest.raises(FrozenInstanceError):
+        target.index = _var("j")
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    (
+        (llir.Literal(1), "exact Var or ArrayAccess"),
+        (llir.FunctionCall("target"), "exact Var or ArrayAccess"),
+        (_var("values[i]"), "identifier or member path"),
+        (_var("call()"), "identifier or member path"),
+        (_var("left + right"), "identifier or member path"),
+        (_var("42"), "identifier or member path"),
+        (
+            llir.ArrayAccess(
+                llir.BinOp("+", _var("values"), _var("offset")), _var("i")
+            ),
+            "ArrayAccess.array must be an exact Var",
+        ),
+        (
+            llir.ArrayAccess(_var("values[i]"), _var("j")),
+            "ArrayAccess.array name must be an identifier or member path",
+        ),
+        (
+            llir.ArrayAccess(_var("values"), _var("indices[j]")),
+            "assignment index Var names",
+        ),
+        (
+            llir.ArrayAccess(_var("values"), llir.Literal("i + 1")),
+            "Literal.value must be an int",
+        ),
+        (
+            llir.ArrayAccess(_var("values"), llir.FunctionCall("i + 1")),
+            "FunctionCall.name must be an identifier or member path",
+        ),
+        (
+            llir.ArrayAccess(
+                _var("values"),
+                llir.BinOp("] = 0", _var("i"), llir.Literal(1)),
+            ),
+            "supported arithmetic operator",
+        ),
+        (
+            llir.ArrayAccess(
+                _var("values"),
+                llir.Cast(_var("i"), cast(llir.DataType, "int")),
+            ),
+            "Cast.data_type must be a DataType",
+        ),
+        (
+            llir.ArrayAccess(
+                _var("values"),
+                llir.Sizeof(cast(llir.DataType, "int")),
+            ),
+            "Sizeof.data_type must be a DataType",
+        ),
+        (
+            llir.ArrayAccess(llir.ArrayAccess(_var("values"), _var("i")), _var("j")),
+            "ArrayAccess.array must be an exact Var",
+        ),
+        (
+            llir.ArrayAccess(
+                _var("values"),
+                _var("i"),
+                llir.TensorAccessMetadata(
+                    access_id=AccessId(1),
+                    tensor_id=SymbolId(2),
+                    index_ids=(IndexId(3),),
+                    role=llir.TensorAccessRole.INPUT_READ,
+                ),
+            ),
+            "RESULT_WRITE role",
+        ),
+    ),
+)
+def test_assign_rejects_arbitrary_rvalues_and_malformed_lvalues(
+    target: llir.Expr,
+    message: str,
+) -> None:
+    with pytest.raises(TypeError, match=message):
+        llir.Assign(
+            var=cast(llir.AssignmentTarget, target),
+            value=llir.Literal(1),
+        )
+
+
+def test_assign_rejects_target_subclasses_and_invalid_fields() -> None:
+    class UnknownVar(llir.Var):
+        pass
+
+    class UnknownArrayAccess(llir.ArrayAccess):
+        pass
+
+    with pytest.raises(TypeError, match="exact Var or ArrayAccess"):
+        llir.Assign(UnknownVar("value", llir.DataType.INT), llir.Literal(1))
+    with pytest.raises(TypeError, match="exact Var or ArrayAccess"):
+        llir.Assign(
+            UnknownArrayAccess(_var("values"), _var("i")),
+            llir.Literal(1),
+        )
+    with pytest.raises(TypeError, match="unsupported LLIR expression"):
+        llir.Assign(
+            llir.ArrayAccess(_var("values"), UnknownVar("i", llir.DataType.INT)),
+            llir.Literal(1),
+        )
+    with pytest.raises(TypeError, match="Assign.value"):
+        llir.Assign(_var("value"), "not an expression")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Assign.op"):
+        llir.Assign(
+            _var("value"),
+            llir.Literal(1),
+            op="=",  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="Assign.cast"):
+        llir.Assign(
+            _var("value"),
+            llir.Literal(1),
+            cast=1,  # type: ignore[arg-type]
+        )
+
+
+def test_assign_cast_is_scalar_only_and_emits_the_existing_spelling() -> None:
+    scalar = llir.Assign(
+        _var("value"),
+        llir.Add(llir.Literal(1), llir.Literal(2)),
+        cast=True,
+    )
+    assert LLIRLowerer().lower_llir(scalar) == "value = (int) (1 + 2);"
+
+    with pytest.raises(TypeError, match="cast requires an exact Var target"):
+        llir.Assign(
+            llir.ArrayAccess(_var("values"), _var("i")),
+            llir.Literal(1),
+            cast=True,
+        )
+
+
+def test_indexed_assign_accepts_a_structured_member_call_index() -> None:
+    assignment = llir.Assign(
+        llir.ArrayAccess(
+            _var("values"),
+            llir.FunctionCall("indices.size"),
+        ),
+        llir.Literal(1),
+    )
+
+    assert LLIRLowerer().lower_llir(assignment) == "values[indices.size()] = 1;"
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "rvalue",
+        "subclass",
+        "unknown_child",
+        "unknown_var",
+        "metadata",
+        "cast_type",
+    ],
+)
+def test_codegen_rejects_forged_malformed_assignment_targets(
+    malformation: str,
+) -> None:
+    class UnknownArrayAccess(llir.ArrayAccess):
+        pass
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    class UnknownVar(llir.Var):
+        pass
+
+    assignment = llir.Assign(_var("value"), llir.Literal(1))
+    if malformation == "rvalue":
+        assignment.var = cast(llir.AssignmentTarget, llir.Literal(0))
+        expected = "Invalid LLIR assignment target"
+    elif malformation == "subclass":
+        assignment.var = cast(
+            llir.AssignmentTarget,
+            UnknownArrayAccess(_var("values"), _var("i")),
+        )
+        expected = "Invalid LLIR assignment target"
+    elif malformation == "unknown_child":
+        target = object.__new__(llir.ArrayAccess)
+        object.__setattr__(target, "array", _var("values"))
+        object.__setattr__(target, "index", UnknownExpr())
+        object.__setattr__(target, "tensor_access", None)
+        assignment.var = target
+        expected = "UnknownExpr"
+    elif malformation == "unknown_var":
+        target = object.__new__(llir.ArrayAccess)
+        object.__setattr__(target, "array", _var("values"))
+        object.__setattr__(target, "index", UnknownVar("i", llir.DataType.INT))
+        object.__setattr__(target, "tensor_access", None)
+        assignment.var = target
+        expected = "UnknownVar"
+    elif malformation == "metadata":
+        metadata = object.__new__(llir.TensorAccessMetadata)
+        object.__setattr__(metadata, "access_id", 1)
+        object.__setattr__(metadata, "tensor_id", SymbolId(2))
+        object.__setattr__(metadata, "index_ids", (IndexId(3),))
+        object.__setattr__(metadata, "role", llir.TensorAccessRole.RESULT_WRITE)
+        target = object.__new__(llir.ArrayAccess)
+        object.__setattr__(target, "array", _var("values"))
+        object.__setattr__(target, "index", _var("i"))
+        object.__setattr__(target, "tensor_access", metadata)
+        assignment.var = target
+        expected = "AccessId"
+    else:
+        target = object.__new__(llir.ArrayAccess)
+        object.__setattr__(target, "array", _var("values"))
+        object.__setattr__(
+            target,
+            "index",
+            llir.Cast(_var("i"), cast(llir.DataType, "int")),
+        )
+        object.__setattr__(target, "tensor_access", None)
+        assignment.var = target
+        expected = "Cast.data_type must be a DataType"
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(assignment)
+
+
+def test_codegen_rejects_forged_structured_cast_target() -> None:
+    assignment = llir.Assign(
+        llir.ArrayAccess(_var("values"), _var("i")),
+        llir.Literal(1),
+    )
+    assignment.cast = True
+
+    with pytest.raises(CodegenError, match="cast requires an exact Var target"):
+        LLIRLowerer().lower_llir(assignment)
 
 
 def test_array_access_is_frozen_typed_validated_and_structurally_equal() -> None:

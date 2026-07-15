@@ -58,6 +58,13 @@ def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Va
     return llir.Var(name=name, type=data_type)
 
 
+def _access(array: str, index: str) -> llir.ArrayAccess:
+    return llir.ArrayAccess(
+        array=_var(array),
+        index=_var(index, llir.DataType.INT64),
+    )
+
+
 def _position_init(
     position: str,
     base: str,
@@ -92,7 +99,7 @@ def _string_dense_loop(
     return _inner_loop(
         [
             _position_init(position, base, stride),
-            llir.Assign(_var("C_val[pC1]"), _var(f"{array}[{position}]")),
+            llir.Assign(_access("C_val", "pC1"), _var(f"{array}[{position}]")),
         ]
     )
 
@@ -297,7 +304,7 @@ def test_string_and_typed_array_accesses_collect_all_pairs_in_first_seen_order()
             _position_init("pB1", "pB0", "B1_size"),
             _position_init("pD1", "pD0", "D1_size"),
             llir.Assign(
-                _var("C_val[pC1]"),
+                _access("C_val", "pC1"),
                 llir.BinOp(
                     "+",
                     _var("B_val[pB1]"),
@@ -474,7 +481,7 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
             _inner_loop(
                 [
                     _position_init("pB1", "pB0", "B1_size"),
-                    llir.Assign(_var("B_val[pB1]"), _var("value")),
+                    llir.Assign(_access("B_val", "pB1"), _var("value")),
                 ]
             )
         ]

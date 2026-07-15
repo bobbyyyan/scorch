@@ -8,14 +8,18 @@ from scorch.compiler.cin import (
     ForAll,
     IndexStmt,
     IndexVar,
+    Operation,
     PostOp,
     PostOps,
     TensorAssign,
     TensorVar,
+    Where,
+    Workspace,
 )
-from scorch.compiler.cin_lowerer import CINLowerer
+from scorch.compiler.cin_lowerer import CINLowerer, ResultTensorAssembler
 from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 from scorch.compiler.diagnostics import CompilerInvariantError, UnsupportedFeature
+from scorch.compiler.llir_traversal import LLIRTraversalContext, LLIRWalker
 from scorch.compiler.scheduler import Scheduler  # type: ignore[import-untyped]
 
 
@@ -71,7 +75,117 @@ def test_supported_post_ops_still_lower(kind, tensor_name):
         extra_tensors=extra_tensors,
     )
 
-    assert len(CINLowerer(post_ops=post_ops)._emit_post_ops("output", "i")) == 1
+    statements = CINLowerer(post_ops=post_ops)._emit_post_ops("output", "i")
+
+    assert len(statements) == 1
+    assignment = cast(llir.Assign, statements[0])
+    assert type(assignment.var) is llir.ArrayAccess
+    target = cast(llir.ArrayAccess, assignment.var)
+    assert cast(llir.Var, target.array).name == "output"
+    assert cast(llir.Var, target.index).name == "i"
+    assert LLIRLowerer().lower_llir(assignment).startswith("output[i] ")
+
+
+def test_result_position_initialization_uses_a_frozen_structured_target() -> None:
+    result = TensorVar("Result", fmt="ds")
+
+    statements = ResultTensorAssembler(result).emit_level_indices_init()
+    assignment = next(
+        cast(llir.Assign, statement)
+        for statement in statements
+        if type(statement) is llir.Assign
+    )
+
+    assert type(assignment.var) is llir.ArrayAccess
+    target = cast(llir.ArrayAccess, assignment.var)
+    assert cast(llir.Var, target.array).name == "Result1_pos"
+    assert cast(llir.Literal, target.index).value == 0
+    assert LLIRLowerer().lower_llir(assignment) == "Result1_pos[0] = 0;"
+
+
+def test_all_coo_workspace_assembly_targets_use_storage_types() -> None:
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("Result", fmt="oo")
+    left = TensorVar("Left", fmt="ds", mode_order=[1, 0])
+    right = TensorVar("Right", fmt="ds")
+    workspace = Workspace("wksp", dim=2)
+    statement = Where(
+        producer=ForAll(
+            reduction,
+            ForAll(
+                row,
+                ForAll(
+                    column,
+                    TensorAssign(
+                        workspace[row, column],
+                        left[row, reduction] * right[reduction, column],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+        ),
+        consumer=ForAll(
+            row,
+            ForAll(
+                column,
+                TensorAssign(result[row, column], workspace[row, column]),
+            ),
+        ),
+    )
+    lowerer = CINLowerer()
+    lowerer.outermost_stmt = statement
+    lowerer.result_tensor_var = result
+    lowerer.result_tensor_access = statement.consumer.get_result_tensor_accesses()[0]
+    lowered = lowerer.lower_outer_ConsumerIndexStmt(statement.consumer)
+    workspace_loop = next(
+        cast(llir.ForLoopAuto, node)
+        for node in lowered
+        if type(node) is llir.ForLoopAuto
+    )
+
+    workspace_assignments = [
+        cast(llir.Assign, node)
+        for node in workspace_loop.body
+        if type(node) is llir.Assign
+    ]
+    assert [LLIRLowerer().lower_llir(node) for node in workspace_assignments] == [
+        "Result0_crd[pResult0] = it.first[0];",
+        "Result1_crd[pResult1] = it.first[1];",
+        "Result_values[pResult0] = it.second;",
+    ]
+
+    storage_types = {
+        cast(llir.Var, cast(llir.ArrayAccess, node.var).array)
+        .name: cast(llir.Var, cast(llir.ArrayAccess, node.var).array)
+        .type
+        for node in workspace_assignments
+    }
+    assert storage_types == {
+        "Result0_crd": llir.DataType.STD_VECTOR_C_INT,
+        "Result1_crd": llir.DataType.STD_VECTOR_C_INT,
+        "Result_values": llir.DataType.STD_VECTOR_FLOAT32,
+    }
+
+    lowered_function = CINLowerer().lower_IndexStmt(statement)
+    dynamic_vector_assignments: list[llir.Assign] = []
+
+    class DynamicVectorAssignmentCollector(LLIRWalker):
+        def visit_assign(self, node: llir.Assign, path: tuple[str, ...]) -> None:
+            dynamic_vector_assignments.append(node)
+            super().visit_assign(node, path)
+
+    DynamicVectorAssignmentCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_dynamic_vector_assignments",
+        )
+    ).walk(lowered_function)
+    assert not any(
+        type(node.var) is llir.ArrayAccess
+        and cast(llir.Var, cast(llir.ArrayAccess, node.var).array).name
+        in {"Result0_crd", "Result1_crd", "Result_values"}
+        for node in dynamic_vector_assignments
+    )
 
 
 def test_mutated_unknown_post_op_cannot_be_silently_skipped():

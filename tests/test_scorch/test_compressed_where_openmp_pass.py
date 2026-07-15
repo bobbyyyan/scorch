@@ -32,9 +32,11 @@ def _context(
     compressed_levels: Tuple[int, ...] = (1,),
     *,
     policy: CompressedWhereOpenMPPolicy = CompressedWhereOpenMPPolicy(),
+    result_id: SymbolId = SymbolId(1),
 ) -> CompressedWhereOpenMPContext:
     return CompressedWhereOpenMPContext(
         result_name="Result",
+        result_id=result_id,
         compressed_levels=compressed_levels,
         workspace_name="wksp",
         workspace_ctype="float",
@@ -129,6 +131,26 @@ def _raw_codes(value: object) -> List[str]:
     return codes
 
 
+def _assignments(value: object) -> List[llir.Assign]:
+    assignments: List[llir.Assign] = []
+    if type(value) is llir.Assign:
+        assignments.append(cast(llir.Assign, value))
+    elif isinstance(value, llir.Node):
+        for child in vars(value).values():
+            assignments.extend(_assignments(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            assignments.extend(_assignments(child))
+    return assignments
+
+
+def _assignment_codes(value: object) -> List[str]:
+    return [
+        LLIRLowerer().lower_llir([assignment]).removesuffix(";")
+        for assignment in _assignments(value)
+    ]
+
+
 def _call_names(value: object) -> List[str]:
     names: List[str] = []
     if type(value) is llir.FunctionCallStmt:
@@ -174,6 +196,9 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     count_loop, fill_loop = _phase_loops(result)
     count_codes = _raw_codes(count_loop.body)
     fill_codes = _raw_codes(fill_loop.body)
+    count_assignment_codes = _assignment_codes(count_loop.body)
+    fill_assignment_codes = _assignment_codes(fill_loop.body)
+    all_assignment_codes = _assignment_codes(result.statements)
     top_level_codes = [
         statement.code
         for statement in result.statements
@@ -182,14 +207,23 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
 
     assert "int _cnt1 = 0" in count_codes
     assert "_cnt1++" in count_codes
-    assert "_count1[row] = _cnt1" in count_codes
+    assert "_count1[row] = _cnt1" in count_assignment_codes
+    assert "_count1[row] = _cnt1" not in count_codes
     assert "wksp.clear()" in count_codes
     assert "int64_t _base1 = _offset1[row]" in fill_codes
     assert "int _pos1 = 0" in fill_codes
-    assert "Result1_crd_data[_base1 + _pos1] = column" in fill_codes
+    assert "Result1_crd_data[_base1 + _pos1] = column" in fill_assignment_codes
+    assert "Result1_crd_data[_base1 + _pos1] = column" not in fill_codes
     assert "_pos1++" in fill_codes
-    assert "Result_values_data[_base1 + _pos1] = value" in fill_codes
+    assert "Result_values_data[_base1 + _pos1] = value" in fill_assignment_codes
+    assert "Result_values_data[_base1 + _pos1] = value" not in fill_codes
     assert "wksp.clear()" in fill_codes
+    assert "_offset1[0] = 0" in all_assignment_codes
+    assert "_offset1[0] = 0" not in _raw_codes(result.statements)
+    assert all(
+        type(assignment.var) is llir.ArrayAccess
+        for assignment in _assignments(count_loop.body) + _assignments(fill_loop.body)
+    )
     assert _call_names(count_loop.body).count("wksp.insert_unchecked") == 1
     assert _call_names(fill_loop.body).count("wksp.insert_unchecked") == 1
 
@@ -242,7 +276,6 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
 
     count_loop, fill_loop = _phase_loops(result)
     count_codes = _raw_codes(count_loop.body)
-    fill_codes = _raw_codes(fill_loop.body)
     all_codes = _raw_codes(result.statements)
     count_boundary = cast(
         llir.IfThenElse,
@@ -268,14 +301,19 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
     assert _raw_codes(count_boundary.then_body) == ["_cnt1++", "_prev2 = _cnt2"]
     assert cast(llir.BinOp, fill_boundary.cond).op == ">"
     assert _raw_codes(fill_boundary.then_body) == [
-        "Result1_crd_data[_base1 + _pos1] = parent_coordinate",
         "_pos1++",
-        "Result2_pos_data[_base1 + _pos1] = _base2 + _pos2",
         "_prev2 = _pos2",
     ]
-    assert "Result2_crd_data[_base2 + _pos2] = leaf_coordinate" in fill_codes
-    assert "Result2_pos_data[0] = 0" in all_codes
-    assert sum(code == "Result2_pos_data[0] = 0" for code in all_codes) == 1
+    assert _assignment_codes(fill_boundary.then_body) == [
+        "Result1_crd_data[_base1 + _pos1] = parent_coordinate",
+        "Result2_pos_data[_base1 + _pos1] = _base2 + _pos2",
+    ]
+    assert "Result2_crd_data[_base2 + _pos2] = leaf_coordinate" in _assignment_codes(
+        fill_loop.body
+    )
+    assert "Result2_pos_data[0] = 0" in _assignment_codes(result.statements)
+    assert "Result2_pos_data[0] = 0" not in all_codes
+    assert _assignment_codes(result.statements).count("Result2_pos_data[0] = 0") == 1
     assert any(
         "{{}, {Result1_pos_torch, Result1_crd_torch}, "
         "{Result2_pos_torch, Result2_crd_torch}}" in code
@@ -362,7 +400,10 @@ def test_legacy_prefix_and_work_body_filters_are_top_level_only() -> None:
             _workspace_init(),
             assembly_loop,
             position_loop,
-            llir.Assign(_var("Result1_pos[row]"), _var("pResult1")),
+            llir.Assign(
+                llir.ArrayAccess(_var("Result1_pos"), _var("row")),
+                _var("pResult1"),
+            ),
             llir.RawStmt("keep_work"),
             nested,
         ]
@@ -376,7 +417,10 @@ def test_legacy_prefix_and_work_body_filters_are_top_level_only() -> None:
         llir.VarDecl(_var("Result1_crd")),
         llir.VarInit(_var("pResult1"), llir.Literal(0)),
         llir.VarInit(_var("Result1_pos_index"), llir.Literal(0)),
-        llir.Assign(_var("Result1_pos[0]"), llir.Literal(0)),
+        llir.Assign(
+            llir.ArrayAccess(_var("Result1_pos"), llir.Literal(0)),
+            llir.Literal(0),
+        ),
         prefix_position_loop,
         selected,
         llir.RawStmt("drop_suffix"),
@@ -647,20 +691,24 @@ def test_custom_parallel_policy_is_an_explicit_context_input() -> None:
 
 
 @pytest.mark.parametrize(
-    ("workspace_ctype", "torch_dtype"),
+    ("workspace_ctype", "torch_dtype", "pointer_type"),
     [
-        ("float", "torch::kFloat32"),
-        ("double", "torch::kFloat64"),
-        ("int32_t", "torch::kInt32"),
-        ("int64_t", "torch::kInt64"),
-        ("custom_scalar", "torch::kFloat32"),
+        ("float", "torch::kFloat32", llir.DataType.PTR_FLOAT32),
+        ("double", "torch::kFloat64", llir.DataType.PTR_FLOAT64),
+        ("int", "torch::kInt32", llir.DataType.PTR_INT),
+        ("int32_t", "torch::kInt32", llir.DataType.PTR_INT_32),
+        ("int64_t", "torch::kInt64", llir.DataType.PTR_INT_64),
+        ("custom_scalar", "torch::kFloat32", llir.DataType.NO_TYPE),
     ],
 )
 def test_workspace_ctype_explicitly_controls_value_allocation(
-    workspace_ctype: str, torch_dtype: str
+    workspace_ctype: str,
+    torch_dtype: str,
+    pointer_type: llir.DataType,
 ) -> None:
     context = CompressedWhereOpenMPContext(
         result_name="Result",
+        result_id=SymbolId(1),
         compressed_levels=(1,),
         workspace_name="wksp",
         workspace_ctype=workspace_ctype,
@@ -681,6 +729,18 @@ def test_workspace_ctype_explicitly_controls_value_allocation(
         f"  {workspace_ctype}* Result_values_data = "
         f"Result_values_torch.data_ptr<{workspace_ctype}>();"
     ]
+    value_targets = [
+        cast(llir.ArrayAccess, assignment.var)
+        for assignment in _assignments(result.statements)
+        if type(assignment.var) is llir.ArrayAccess
+        and type(cast(llir.ArrayAccess, assignment.var).array) is llir.Var
+        and cast(llir.Var, cast(llir.ArrayAccess, assignment.var).array).name
+        == "Result_values_data"
+    ]
+    assert value_targets
+    assert all(
+        cast(llir.Var, target.array).type is pointer_type for target in value_targets
+    )
 
 
 def test_transform_does_not_mutate_or_alias_caller_owned_llir() -> None:
@@ -744,36 +804,78 @@ def test_malformed_typed_child_fails_with_pass_specific_diagnostic() -> None:
             ("context",),
         ),
         (
-            CompressedWhereOpenMPContext("", (1,), "wksp", "float"),
+            CompressedWhereOpenMPContext(
+                result_name="",
+                result_id=SymbolId(1),
+                compressed_levels=(1,),
+                workspace_name="wksp",
+                workspace_ctype="float",
+            ),
             "invalid_compressed_where_result_name",
             ("context", "result_name"),
         ),
         (
-            CompressedWhereOpenMPContext("Result", (), "wksp", "float"),
+            CompressedWhereOpenMPContext(
+                result_name="Result",
+                result_id=cast(SymbolId, object()),
+                compressed_levels=(1,),
+                workspace_name="wksp",
+                workspace_ctype="float",
+            ),
+            "invalid_compressed_where_result_id",
+            ("context", "result_id"),
+        ),
+        (
+            CompressedWhereOpenMPContext(
+                result_name="Result",
+                result_id=SymbolId(1),
+                compressed_levels=(),
+                workspace_name="wksp",
+                workspace_ctype="float",
+            ),
             "invalid_compressed_where_levels",
             ("context", "compressed_levels"),
         ),
         (
-            CompressedWhereOpenMPContext("Result", (2,), "wksp", "float"),
+            CompressedWhereOpenMPContext(
+                result_name="Result",
+                result_id=SymbolId(1),
+                compressed_levels=(2,),
+                workspace_name="wksp",
+                workspace_ctype="float",
+            ),
             "unsupported_compressed_where_layout",
             ("context", "compressed_levels"),
         ),
         (
-            CompressedWhereOpenMPContext("Result", (1,), "", "float"),
+            CompressedWhereOpenMPContext(
+                result_name="Result",
+                result_id=SymbolId(1),
+                compressed_levels=(1,),
+                workspace_name="",
+                workspace_ctype="float",
+            ),
             "invalid_compressed_where_workspace_name",
             ("context", "workspace_name"),
         ),
         (
-            CompressedWhereOpenMPContext("Result", (1,), "wksp", ""),
+            CompressedWhereOpenMPContext(
+                result_name="Result",
+                result_id=SymbolId(1),
+                compressed_levels=(1,),
+                workspace_name="wksp",
+                workspace_ctype="",
+            ),
             "invalid_compressed_where_workspace_ctype",
             ("context", "workspace_ctype"),
         ),
         (
             CompressedWhereOpenMPContext(
-                "Result",
-                (1,),
-                "wksp",
-                "float",
+                result_name="Result",
+                result_id=SymbolId(1),
+                compressed_levels=(1,),
+                workspace_name="wksp",
+                workspace_ctype="float",
                 policy=CompressedWhereOpenMPPolicy(omp_schedule="", flop_grain="grain"),
             ),
             "invalid_compressed_where_schedule",
@@ -781,10 +883,11 @@ def test_malformed_typed_child_fails_with_pass_specific_diagnostic() -> None:
         ),
         (
             CompressedWhereOpenMPContext(
-                "Result",
-                (1,),
-                "wksp",
-                "float",
+                result_name="Result",
+                result_id=SymbolId(1),
+                compressed_levels=(1,),
+                workspace_name="wksp",
+                workspace_ctype="float",
                 traversal=LLIRTraversalContext(stage="", pass_name="pass"),
             ),
             "invalid_compressed_where_traversal_context",

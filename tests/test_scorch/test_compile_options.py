@@ -903,7 +903,7 @@ def test_production_lowering_delegates_once_to_each_snapshotted_manager_pipeline
     )
 
 
-def test_compressed_output_routes_exact_snapshot_through_nested_renderers(
+def test_compressed_output_routes_exact_snapshot_through_remaining_renderers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     options = replace(_default_options(), emit_comments=False)
@@ -928,7 +928,9 @@ def test_compressed_output_routes_exact_snapshot_through_nested_renderers(
     cpp = LLIRLowerer(compile_options=options).lower_llir(lowered)
 
     assert cpp
-    assert len(observed_options) == 5
+    # Structured result stores keep their RHS as expressions, so count/fill no
+    # longer instantiate private spelling renderers.
+    assert len(observed_options) == 3
     assert all(observed is options for observed in observed_options)
     assert [
         record.configuration_name for record in lowerer.llir_pass_run_records[:3]

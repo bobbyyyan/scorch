@@ -578,7 +578,7 @@ def _legal_miss_loops() -> Tuple[llir.ForLoop, ...]:
             [
                 _assignment(
                     [_var("scale"), _var("value[k]")],
-                    target=_var("result[index]"),
+                    target=llir.ArrayAccess(_var("result"), _var("index")),
                 )
             ]
         ),
@@ -602,30 +602,7 @@ def test_all_legal_structural_misses_are_detached_noops(loop: llir.ForLoop) -> N
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
-def test_raw_bracket_filter_is_an_exact_substring_check() -> None:
-    for target in ("acc[slot]", "prefix[suffix", "["):
-        source = [
-            _loop(
-                [
-                    _assignment(
-                        [_var("scale"), _var("value[k]")],
-                        target=_var(target),
-                    )
-                ]
-            )
-        ]
-        before = _snapshot(source)
-
-        output = hoist_loop_invariant_factors(
-            source,
-            LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
-        )
-
-        assert _snapshot(output) == before
-        assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
-
-
-def test_non_var_target_fails_only_after_other_candidate_gates_hold() -> None:
+def test_indexed_target_is_a_legal_detached_noop_after_candidate_gates() -> None:
     qualifying = _loop(
         [
             _assignment(
@@ -634,14 +611,13 @@ def test_non_var_target_fails_only_after_other_candidate_gates_hold() -> None:
             )
         ]
     )
-    with pytest.raises(LLIRTraversalError) as raised:
-        hoist_loop_invariant_factors(
-            [qualifying],
-            LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
-        )
-    assert raised.value.diagnostic.code == "invalid_loop_invariant_factor_target"
-    assert raised.value.diagnostic.path == ("root", "[0]", "body", "[0]", "var")
-    assert raised.value.diagnostic.node_type == "ArrayAccess"
+    source = [qualifying]
+    output = hoist_loop_invariant_factors(
+        source,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    assert _snapshot(output) == _snapshot(source)
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
     earlier_miss = _loop(
         [
@@ -657,6 +633,21 @@ def test_non_var_target_fails_only_after_other_candidate_gates_hold() -> None:
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
     assert _snapshot(output) == _snapshot([earlier_miss])
+
+
+def test_arbitrary_rvalue_target_fails_at_the_common_boundary() -> None:
+    assignment = _assignment([_var("scale"), _var("value[k]")])
+    assignment.var = llir.BinOp("+", _var("left"), _var("right"))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        hoist_loop_invariant_factors(
+            [_loop([assignment])],
+            LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+        )
+
+    assert raised.value.diagnostic.code == "invalid_assignment_target"
+    assert raised.value.diagnostic.path == ("root", "[0]", "body", "[0]", "var")
+    assert raised.value.diagnostic.node_type == "BinOp"
 
 
 def test_flatten_partition_and_rebuild_orders_are_exact() -> None:
@@ -1158,7 +1149,7 @@ def test_earlier_accumulation_misses_do_not_hide_first_success() -> None:
     )
     miss_target = _assignment(
         [_var("array_scale"), _var("array_value[k]")],
-        target=_var("array[index]"),
+        target=llir.ArrayAccess(_var("array"), _var("index")),
     )
     first = _assignment(
         [_var("first_scale"), _var("first_value[k]")],
@@ -1247,13 +1238,9 @@ def test_multiple_accumulations_transform_one_per_application() -> None:
     assert _mutable_ir_ids(second).isdisjoint(_mutable_ir_ids(third))
 
 
-def test_successful_replacement_preserves_target_factor_metadata_op_and_cast() -> None:
-    target_metadata = llir.TensorAccessMetadata(
-        access_id=AccessId(21),
-        tensor_id=SymbolId(22),
-        index_ids=(),
-        role=llir.TensorAccessRole.RESULT_WRITE,
-    )
+def test_successful_replacement_preserves_target_fields_factor_metadata_and_cast() -> (
+    None
+):
     factor_metadata = llir.TensorAccessMetadata(
         access_id=AccessId(23),
         tensor_id=SymbolId(24),
@@ -1265,7 +1252,6 @@ def test_successful_replacement_preserves_target_factor_metadata_op_and_cast() -
         llir.DataType.FLOAT64,
         is_ptr=True,
         is_restrict=True,
-        tensor_access=target_metadata,
     )
     variant = _var(
         "Input_val[k]",
@@ -1290,7 +1276,7 @@ def test_successful_replacement_preserves_target_factor_metadata_op_and_cast() -
     assert rewritten_target.type is llir.DataType.FLOAT64
     assert rewritten_target.is_ptr is True
     assert rewritten_target.is_restrict is True
-    assert rewritten_target.tensor_access is target_metadata
+    assert rewritten_target.tensor_access is None
     assert rewritten_variant.tensor_access is factor_metadata
     assert rewritten_target is not target
     assert rewritten_variant is not variant
@@ -1565,13 +1551,13 @@ def _malformed_factor_name() -> List[llir.Stmt]:
         ),
         (
             _malformed_assign_operator,
-            "invalid_loop_invariant_factor_assign_operator",
+            "invalid_assign_op",
             ("root", "[0]", "body", "[0]", "op"),
         ),
         (
             _malformed_target_name,
-            "invalid_loop_invariant_factor_var_name",
-            ("root", "[0]", "body", "[0]", "var", "name"),
+            "invalid_assignment_target",
+            ("root", "[0]", "body", "[0]", "var"),
         ),
         (
             _malformed_factor_name,
@@ -1580,7 +1566,7 @@ def _malformed_factor_name() -> List[llir.Stmt]:
         ),
     ),
 )
-def test_malformed_consumed_scalars_use_pass_owned_diagnostics(
+def test_malformed_consumed_scalars_use_the_owning_boundary_diagnostics(
     factory: Callable[[], List[llir.Stmt]],
     expected_code: str,
     expected_path: Tuple[str, ...],
@@ -1594,7 +1580,7 @@ def test_malformed_consumed_scalars_use_pass_owned_diagnostics(
     diagnostic = raised.value.diagnostic
     assert diagnostic.code == expected_code
     assert diagnostic.path == expected_path
-    assert diagnostic.node_type in {"int", "_AssignOperatorSpoof"}
+    assert diagnostic.node_type in {"int", "Var", "_AssignOperatorSpoof"}
     assert diagnostic.stage == "LLIR transformation"
     assert diagnostic.pass_name == "hoist_loop_invariant_factors"
 

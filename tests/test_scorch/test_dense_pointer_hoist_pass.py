@@ -55,6 +55,13 @@ def _var(
     )
 
 
+def _access(array: str, index: str) -> llir.ArrayAccess:
+    return llir.ArrayAccess(
+        array=_var(array),
+        index=_var(index, llir.DataType.INT64),
+    )
+
+
 def _position_init(
     position: str = "position",
     base: str = "base",
@@ -584,7 +591,7 @@ def test_assign_scan_is_value_then_var_and_later_matches_win() -> None:
                 ),
             ),
             llir.Assign(
-                _var("Target_val[position]"),
+                _access("Target_val", "position"),
                 _var("LastValue_val[position]"),
             ),
         ]
@@ -604,7 +611,9 @@ def test_assign_scan_is_value_then_var_and_later_matches_win() -> None:
     ]
     output_loop = cast(llir.ForLoop, output[1])
     final_assignment = cast(llir.Assign, output_loop.body[1])
-    assert cast(llir.Var, final_assignment.var).name == "_Target_val_ptr[lane]"
+    final_target = cast(llir.ArrayAccess, final_assignment.var)
+    assert cast(llir.Var, final_target.array).name == "_Target_val_ptr"
+    assert cast(llir.Var, final_target.index).name == "lane"
     assert cast(llir.Var, final_assignment.value).name == ("LastValue_val[position]")
 
 
@@ -704,7 +713,7 @@ def test_positive_rewrite_scope_covers_calls_raw_nested_loops_and_all_if_bodies(
 ):
     old = "Input_val[position]"
     nested = _loop(
-        [llir.Assign(_var(old), _var(old))],
+        [llir.Assign(_access("Input_val", "position"), _var(old))],
         loop_variable="nested_lane",
     )
     conditional = llir.IfThenElse(
@@ -748,7 +757,9 @@ def test_positive_rewrite_scope_covers_calls_raw_nested_loops_and_all_if_bodies(
     assert cast(llir.RawStmt, output_loop.body[3]).code == f"raw({rewritten})"
     nested_output = cast(llir.ForLoop, output_loop.body[4])
     nested_assignment = cast(llir.Assign, nested_output.body[0])
-    assert cast(llir.Var, nested_assignment.var).name == rewritten
+    nested_target = cast(llir.ArrayAccess, nested_assignment.var)
+    assert cast(llir.Var, nested_target.array).name == "_Input_val_ptr"
+    assert cast(llir.Var, nested_target.index).name == "lane"
     assert cast(llir.Var, nested_assignment.value).name == rewritten
     output_if = cast(llir.IfThenElse, output_loop.body[5])
     assert (
@@ -775,7 +786,9 @@ def test_legacy_rewrite_omits_headers_parallel_regions_and_unsupported_container
     nested_header = _loop([], loop_variable="nested")
     nested_header.init = llir.VarInit(_var("nested"), _var(old))
     nested_header.cond = llir.BinOp("<", _var(old), _var("limit"))
-    nested_header.update = llir.Assign(_var(old), llir.Literal(1))
+    nested_header.update = llir.Assign(
+        _access("Input_val", "position"), llir.Literal(1)
+    )
     nested_header.before_parallel_body = [llir.RawStmt(old)]
     nested_header.pre_parallel_body = [llir.RawStmt(old)]
     nested_header.post_parallel_body = [llir.RawStmt(old)]
@@ -830,7 +843,9 @@ def test_legacy_rewrite_omits_headers_parallel_regions_and_unsupported_container
     header = cast(llir.ForLoop, output_loop.body[1])
     assert cast(llir.Var, cast(llir.VarInit, header.init).value).name == old
     assert cast(llir.Var, cast(llir.BinOp, header.cond).left).name == old
-    assert cast(llir.Var, cast(llir.Assign, header.update).var).name == old
+    header_target = cast(llir.ArrayAccess, cast(llir.Assign, header.update).var)
+    assert cast(llir.Var, header_target.array).name == "Input_val"
+    assert cast(llir.Var, header_target.index).name == "position"
     assert cast(llir.RawStmt, header.before_parallel_body[0]).code == old
     assert (
         cast(llir.RawStmt, cast(llir.WhileLoop, output_loop.body[2]).body[0]).code

@@ -64,6 +64,11 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRValue,
     LLIRWalker,
 )
+from scorch.compiler.identity import (  # type: ignore[import-untyped]
+    AccessId,
+    IndexId,
+    SymbolId,
+)
 from scorch.compiler.loop_invariant_factor_pass import (  # type: ignore[import-untyped]
     LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     LoopInvariantFactorHoistContext,
@@ -88,17 +93,45 @@ def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Va
     return llir.Var(name=name, type=data_type)
 
 
+_RESULT_ID = SymbolId(41)
+
+
+def _access(
+    array: str,
+    index: str,
+    *,
+    metadata: llir.TensorAccessMetadata | None = None,
+) -> llir.ArrayAccess:
+    return llir.ArrayAccess(
+        array=_var(array),
+        index=_var(index, llir.DataType.INT64),
+        tensor_access=metadata,
+    )
+
+
+def _result_metadata() -> llir.TensorAccessMetadata:
+    return llir.TensorAccessMetadata(
+        access_id=AccessId(43),
+        tensor_id=_RESULT_ID,
+        index_ids=(IndexId(47),),
+        role=llir.TensorAccessRole.RESULT_WRITE,
+    )
+
+
 def _result_context(mode: ResultWriteMode = "count") -> ResultWriteContext:
     return ResultWriteContext(
         result_name="Result",
+        result_id=_RESULT_ID,
         compressed_levels=(1,),
         mode=mode,
+        value_pointer_type=llir.DataType.PTR_FLOAT32,
     )
 
 
 def _compressed_context() -> CompressedWhereOpenMPContext:
     return CompressedWhereOpenMPContext(
         result_name="Result",
+        result_id=_RESULT_ID,
         compressed_levels=(1,),
         workspace_name="wksp",
         workspace_ctype="float",
@@ -786,7 +819,7 @@ def test_empty_manager_rejects_unknown_payload_instead_of_aliasing_it() -> None:
 def test_dynamic_runner_preserves_exact_root_and_detached_idempotence() -> None:
     source: List[llir.Stmt] = [
         llir.VarDecl(_var("out_values", llir.DataType.STD_VECTOR_FLOAT32)),
-        llir.Assign(_var("out_values[p]"), _var("value")),
+        llir.Assign(_access("out_values", "p"), _var("value")),
     ]
     manager = LLIRPassManager()
 
@@ -807,8 +840,15 @@ def test_dynamic_runner_preserves_exact_root_and_detached_idempotence() -> None:
 
 def test_result_count_and_fill_are_independent_not_a_linear_pipeline() -> None:
     source: List[llir.Stmt] = [
-        llir.Assign(_var("Result_values[pResult1]"), _var("value")),
-        llir.Assign(_var("Result1_crd[pResult1]"), _var("coordinate")),
+        llir.Assign(
+            _access(
+                "Result_values",
+                "pResult1",
+                metadata=_result_metadata(),
+            ),
+            _var("value"),
+        ),
+        llir.Assign(_access("Result1_crd", "pResult1"), _var("coordinate")),
     ]
     manager = LLIRPassManager()
 

@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 import torch
 
+from scorch.compiler import llir
 from scorch.compiler.cin import (
     ForAll,
     IndexVar,
@@ -15,6 +16,7 @@ from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.loop_plan import ScheduledCIN
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
+from scorch.compiler.llir_traversal import LLIRTraversalContext, LLIRWalker
 from scorch.compiler.scheduler import (
     RelayoutSpec,
     Schedule,
@@ -119,6 +121,26 @@ def _packed_schedule(
 def _lower_to_cpp(stmt: ForAll) -> str:
     lowered = CINLowerer().lower_IndexStmt(stmt)
     return LLIRLowerer().lower_llir(lowered)
+
+
+def _lower_with_assignment_targets(
+    stmt: ForAll,
+) -> tuple[str, list[llir.AssignmentTarget]]:
+    lowered = CINLowerer().lower_IndexStmt(stmt)
+    targets: list[llir.AssignmentTarget] = []
+
+    class AssignmentTargetCollector(LLIRWalker):
+        def visit_assign(self, node: llir.Assign, path: tuple[str, ...]) -> None:
+            targets.append(node.var)
+            super().visit_assign(node, path)
+
+    AssignmentTargetCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_assignment_targets",
+        )
+    ).walk(lowered)
+    return LLIRLowerer().lower_llir(lowered), targets
 
 
 def _loop_chain(stmt):
@@ -525,7 +547,7 @@ def test_packed_relayout_is_structural_and_name_independent():
     )
 
     scheduled = Scheduler.apply_schedule(_build_named_spmm(), schedule)
-    cpp = _lower_to_cpp(scheduled)
+    cpp, targets = _lower_with_assignment_targets(scheduled)
 
     allocation = "std::vector<float> packed_DenseInput_storage"
     pack_loop = (
@@ -544,6 +566,17 @@ def test_packed_relayout_is_structural_and_name_independent():
     assert cpp.index(pack_loop) < cpp.index(row_loop)
     assert cpp.count("scorch_zero_dense(Output_values, Output_capacity)") == 1
     assert "Output_values[pOutput1] +=" in cpp
+    packed_targets = [
+        target
+        for target in targets
+        if type(target) is llir.ArrayAccess
+        and type(target.array) is llir.Var
+        and target.array.name == "packed_DenseInput"
+    ]
+    assert packed_targets
+    assert all(
+        target.array.type is llir.DataType.PTR_FLOAT32 for target in packed_targets
+    )
 
 
 def test_full_stage_and_heap_result_are_structural_and_name_independent():
@@ -556,7 +589,9 @@ def test_full_stage_and_heap_result_are_structural_and_name_independent():
         accum="heap",
     )
 
-    cpp = _lower_to_cpp(Scheduler.apply_schedule(_build_named_spmm(), schedule))
+    cpp, targets = _lower_with_assignment_targets(
+        Scheduler.apply_schedule(_build_named_spmm(), schedule)
+    )
 
     full_stage = (
         "std::vector<float> packed_DenseInput_storage("
@@ -581,6 +616,49 @@ def test_full_stage_and_heap_result_are_structural_and_name_independent():
     assert "tiled_Output[pOutput0 * kTile_free + free_in] +=" in cpp
     assert "Output_values[pOutput1] +=" not in cpp
     assert "scorch_zero_dense(Output_values, Output_capacity)" not in cpp
+    storage_types = {
+        target.array.name: target.array.type
+        for target in targets
+        if type(target) is llir.ArrayAccess
+        and type(target.array) is llir.Var
+        and target.array.name in {"packed_DenseInput", "tiled_Output", "Output_values"}
+    }
+    assert storage_types == {
+        "packed_DenseInput": llir.DataType.PTR_FLOAT32,
+        "tiled_Output": llir.DataType.PTR_FLOAT32,
+        "Output_values": llir.DataType.PTR_FLOAT32,
+    }
+
+
+def test_structured_schedule_targets_track_float64_storage_types():
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope="free",
+        accum="heap",
+    )
+
+    _, targets = _lower_with_assignment_targets(
+        Scheduler.apply_schedule(
+            _build_named_spmm(dtype=torch.float64),
+            schedule,
+        )
+    )
+
+    storage_types = {
+        target.array.name: target.array.type
+        for target in targets
+        if type(target) is llir.ArrayAccess
+        and type(target.array) is llir.Var
+        and target.array.name in {"packed_DenseInput", "tiled_Output", "Output_values"}
+    }
+    assert storage_types == {
+        "packed_DenseInput": llir.DataType.PTR_FLOAT64,
+        "tiled_Output": llir.DataType.PTR_FLOAT64,
+        "Output_values": llir.DataType.PTR_FLOAT64,
+    }
 
 
 def test_packed_relayout_generates_hygienic_staging_names():

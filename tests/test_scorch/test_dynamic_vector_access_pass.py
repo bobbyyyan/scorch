@@ -18,9 +18,18 @@ def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Va
     return llir.Var(name=name, type=data_type)
 
 
+def _access(
+    array: str,
+    index: str | llir.Expr,
+    data_type: llir.DataType = llir.DataType.NO_TYPE,
+) -> llir.ArrayAccess:
+    index_expr = _var(index) if type(index) is str else index
+    return llir.ArrayAccess(array=_var(array, data_type), index=index_expr)
+
+
 def _legacy_dynamic_vector_fixture() -> List[llir.Stmt]:
     coordinate_store = llir.Assign(
-        var=_var("out_crd[p]"),
+        var=_access("out_crd", "p", llir.DataType.STD_VECTOR_C_INT),
         value=_var("out_pos[q]"),
     )
     return [
@@ -33,23 +42,34 @@ def _legacy_dynamic_vector_fixture() -> List[llir.Stmt]:
         ),
         coordinate_store,
         llir.Assign(
-            var=_var("out_crd[p]"),
+            var=_access("out_crd", "p", llir.DataType.STD_VECTOR_C_INT),
             value=_var("out_pos[q]"),
         ),
         llir.Assign(
-            var=_var("out_values[p]"),
+            var=_access("out_values", "p", llir.DataType.STD_VECTOR_FLOAT32),
             value=_var("out_crd[q]"),
         ),
         llir.Assign(
-            var=_var("out_pos[p + 1]"),
+            var=_access(
+                "out_pos",
+                llir.Add(_var("p"), llir.Literal(1)),
+                llir.DataType.STD_VECTOR_C_INT,
+            ),
             value=_var("out_values[q]"),
         ),
         llir.VarInit(_var("read", llir.DataType.INT), _var("out_pos[p]")),
         llir.Assign(
-            var=_var("scratch[i]"),
+            var=_access("scratch", "i", llir.DataType.STD_VECTOR_FLOAT32),
             value=_var("out_values[q]"),
         ),
     ]
+
+
+def _array_access_parts(access: llir.AssignmentTarget) -> tuple[str, str]:
+    assert type(access) is llir.ArrayAccess
+    assert type(access.array) is llir.Var
+    assert type(access.index) is llir.Var
+    return cast(llir.Var, access.array).name, cast(llir.Var, access.index).name
 
 
 def _cpp(statements: List[llir.Stmt]) -> str:
@@ -107,14 +127,14 @@ def test_dynamic_vector_pass_matches_legacy_transformation_structurally() -> Non
 
     position_store = cast(llir.FunctionCallStmt, rewritten[6])
     assert position_store.name == "scorch_vector_set"
-    assert [cast(llir.Var, arg).name for arg in position_store.args] == [
-        "out_pos",
-        "p + 1",
-        "out_values.at(q)",
-    ]
+    assert cast(llir.Var, position_store.args[0]).name == "out_pos"
+    position = cast(llir.Add, position_store.args[1])
+    assert cast(llir.Var, position.left).name == "p"
+    assert cast(llir.Literal, position.right).value == 1
+    assert cast(llir.Var, position_store.args[2]).name == "out_values.at(q)"
 
     pre_sized_store = cast(llir.Assign, rewritten[8])
-    assert cast(llir.Var, pre_sized_store.var).name == "scratch[i]"
+    assert _array_access_parts(pre_sized_store.var) == ("scratch", "i")
     assert cast(llir.Var, pre_sized_store.value).name == "out_values.at(q)"
 
     expected_cpp = """std::vector<int> out_pos;
@@ -143,7 +163,10 @@ def test_dynamic_vector_pass_does_not_mutate_or_alias_caller_input() -> None:
     rewritten.append(llir.Break())
 
     assert cast(llir.VarDecl, source[0]).var.name == "out_pos"
-    assert cast(llir.Assign, source[4]).var.name == "out_crd[p]"
+    assert _array_access_parts(cast(llir.Assign, source[4]).var) == (
+        "out_crd",
+        "p",
+    )
     assert cast(llir.Assign, source[4]).value.name == "out_pos[q]"
     assert len(source) == 10
 
@@ -165,7 +188,7 @@ def test_dynamic_vector_pass_preserves_compound_store_and_loop_update_shape() ->
         init=llir.VarInit(_var("i", llir.DataType.INT), llir.Literal(0)),
         cond=llir.BinOp("<", _var("i"), _var("n")),
         update=llir.Assign(
-            _var("out_pos[i]"),
+            _access("out_pos", "i", llir.DataType.STD_VECTOR_C_INT),
             _var("out_values[i]"),
             op=llir.AssignOp.ADD_ASSIGN,
         ),
@@ -186,8 +209,33 @@ def test_dynamic_vector_pass_preserves_compound_store_and_loop_update_shape() ->
 
     assert type(update) is llir.Assign
     assert update.op == llir.AssignOp.ADD_ASSIGN
-    assert cast(llir.Var, update.var).name == "out_pos.at(i)"
+    assert _array_access_parts(update.var) == ("out_pos", "i")
     assert cast(llir.Var, update.value).name == "out_values.at(i)"
+
+
+def test_dynamic_vector_pass_no_vector_declaration_is_detached_no_op() -> None:
+    source: List[llir.Stmt] = [
+        llir.Assign(
+            _access("scratch", "i", llir.DataType.PTR_FLOAT32),
+            _var("value"),
+        )
+    ]
+    snapshot = _structural_snapshot(source)
+
+    rewritten = rewrite_dynamic_vector_accesses(
+        source,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+
+    assert rewritten is not source
+    assert _structural_snapshot(rewritten) == snapshot
+    rewritten_store = cast(llir.Assign, rewritten[0])
+    rewritten_access = cast(llir.ArrayAccess, rewritten_store.var)
+    cast(llir.Var, rewritten_access.array).name = "changed"
+    assert _array_access_parts(cast(llir.Assign, source[0]).var) == (
+        "scratch",
+        "i",
+    )
 
 
 def test_pass_preserves_nested_list_and_tuple_statement_containers() -> None:
