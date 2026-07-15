@@ -195,10 +195,19 @@ def _build_facts(analysis: CINAnalysis, plan: LoopPlan) -> LoopPlanLegalityFacts
     )
 
 
-def _verify_schedulable_scope(facts: LoopPlanLegalityFacts) -> None:
+def _verify_schedulable_scope(
+    facts: LoopPlanLegalityFacts,
+    plan: LoopPlan,
+) -> None:
     """Require the single loop chain that the transitional adapter can rebuild."""
 
     if not facts.bound_index_ids:
+        if plan.provenance != "auto":
+            _unsupported(
+                "scalar_plan_provenance",
+                "loop-free CIN supports only no-decision auto replay",
+                ("provenance",),
+            )
         return
     binding_scopes = {}
     for index_id in facts.bound_index_ids:
@@ -346,6 +355,29 @@ def _verify_tiling_capabilities(
 
     affine_tiles = tuple(tile for tile in plan.tiles if tile.kind == "affine")
     panel_tiles = tuple(tile for tile in plan.tiles if tile.kind == "panel")
+    workspace_domain = _workspace_domain(facts, plan)
+    source_has_workspace = any(
+        layout.is_workspace for layout in facts.analysis.access_layouts.values()
+    )
+    if source_has_workspace and plan.provenance != "auto":
+        _unsupported(
+            "workspace_plan_provenance",
+            "CIN with an existing workspace supports only no-decision auto replay",
+            ("provenance",),
+        )
+    has_parallel_decision = plan.parallel_loop is not None or any(
+        tile.parallel for tile in plan.tiles
+    )
+    if len(facts.assignments) != 1 and (
+        plan.tiles or has_parallel_decision or workspace_domain
+    ):
+        _unsupported(
+            "multi_assignment_schedule",
+            "derived workspaces, tiling, and parallel decisions require one assignment",
+            ("analysis", "assignments"),
+        )
+    sparse_workspace = bool(workspace_domain) and not _all_dense_results(facts)
+    sparse_workspace = sparse_workspace and not source_has_workspace
     for tile in affine_tiles:
         layouts = tuple(
             layout
@@ -383,9 +415,8 @@ def _verify_tiling_capabilities(
                     ("tiles", str(position)),
                     index_id=tile.loop.index_id,
                 )
-        if not affine_tiles:
+        if not affine_tiles and not sparse_workspace:
             return False
-        workspace_domain = _workspace_domain(facts, plan)
         if not workspace_domain:
             _invalid(
                 "auto_accumulator_lifetime",
@@ -415,7 +446,6 @@ def _verify_tiling_capabilities(
             ("tiles",),
         )
     reduction_set = set(facts.reduction_index_ids)
-    workspace_domain = _workspace_domain(facts, plan)
     stack_tiles = tuple(tile for tile in affine_tiles if tile.accumulation == "stack")
     if len(stack_tiles) > 1:
         _unsupported(
@@ -453,7 +483,22 @@ def _verify_tiling_capabilities(
                 "stack accumulation supports additive reductions only",
                 ("tiles",),
             )
-    return bool(stack_tiles)
+    if sparse_workspace:
+        reduction_assignments = tuple(
+            assignment
+            for assignment in facts.assignments
+            if assignment.reduction_index_ids
+        )
+        if not reduction_assignments or any(
+            not _assignment_is_additive(assignment)
+            for assignment in reduction_assignments
+        ):
+            _unsupported(
+                "workspace_reduction_operator",
+                "derived sparse workspaces support additive reductions only",
+                ("analysis", "assignments"),
+            )
+    return bool(stack_tiles) or sparse_workspace
 
 
 def _initial_placement_state(
@@ -1173,7 +1218,7 @@ def verify_loop_plan_semantics(analysis: CINAnalysis, plan: LoopPlan) -> None:
     """Prove one structurally valid plan legal for its analyzed normalized CIN."""
 
     facts = _build_facts(analysis, plan)
-    _verify_schedulable_scope(facts)
+    _verify_schedulable_scope(facts, plan)
     _verify_storage_order(facts)
     workspace_inserted = _verify_tiling_capabilities(facts, plan)
     state = _apply_affine_placements(facts, plan, workspace_inserted)

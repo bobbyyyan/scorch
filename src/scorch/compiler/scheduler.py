@@ -2648,6 +2648,36 @@ class Scheduler:
                 LoopPlan(loop_order=(), provenance="auto", tag=schedule.tag),
             )
             return ScheduledCIN(cin, plan)
+        is_identity = (
+            schedule.loop_order is None
+            and not schedule.tiles
+            and schedule.relayout is None
+            and schedule.parallel_loop is None
+        )
+        if not is_identity and cin.get_workspace_accesses():
+            raise NotImplementedError(
+                "CIN with an existing workspace supports only an empty auto " "Schedule"
+            )
+        result_accesses = cin.get_result_tensor_accesses()
+        if len(result_accesses) != 1:
+            if (
+                schedule.tiles
+                or schedule.relayout is not None
+                or schedule.parallel_loop
+            ):
+                raise NotImplementedError(
+                    "Tiling, relayout, and explicit parallel scheduling require "
+                    "one assignment"
+                )
+            prospective_order = (
+                Scheduler.select_loop_order(cin, costs=costs)
+                if schedule.loop_order is None
+                else Scheduler.resolve_loop_order(cin, schedule.loop_order)
+            )
+            if Scheduler.should_insert_workspace(cin, prospective_order):
+                raise NotImplementedError(
+                    "Derived workspace scheduling requires one assignment"
+                )
         panel_tiles = [tile for tile in schedule.tiles if tile.kind == "panel"]
         if len(panel_tiles) > 1:
             raise NotImplementedError("Only one sparse panel tile is supported")
@@ -2835,12 +2865,6 @@ class Scheduler:
             reduction_names,
         )
 
-        is_identity = (
-            schedule.loop_order is None
-            and not schedule.tiles
-            and schedule.relayout is None
-            and schedule.parallel_loop is None
-        )
         if is_identity:
             logical_order = Scheduler.select_loop_order(
                 cin,
