@@ -781,9 +781,15 @@ class CINLowerer:
                             name=f"{tensor.name}{level}_size",
                             type=llir.DataType.INT64,
                         ),
-                        value=llir.Var(
-                            name=f"{tensor.name}_shape[{level}]",
-                            type=llir.DataType.INT64,
+                        value=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{tensor.name}_shape",
+                                type=llir.DataType.STD_VECTOR_INT,
+                            ),
+                            index=llir.Literal(
+                                value=level,
+                                data_type=llir.DataType.INT64,
+                            ),
                         ),
                     )
                 )
@@ -2608,9 +2614,15 @@ class CINLowerer:
                             name=f"{self.result_tensor_var.get_name()}{i}_size",
                             type=llir.DataType.INT64,
                         ),
-                        value=llir.Var(
-                            name=f"result_shape[{i}]",
-                            type=llir.DataType.INT64,
+                        value=llir.ArrayAccess(
+                            array=llir.Var(
+                                name="result_shape",
+                                type=llir.DataType.STD_VECTOR_INT,
+                            ),
+                            index=llir.Literal(
+                                value=i,
+                                data_type=llir.DataType.INT64,
+                            ),
                         ),
                     )
                 )
