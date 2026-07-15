@@ -1786,7 +1786,6 @@ def _runtime_compiler_inputs() -> tuple[STensor, STensor, STensor]:
     "boundary",
     (
         "spmv",
-        "matmul_wksp",
         "lower_and_exec_cin",
         "to_dense",
         "to_sparse",
@@ -1811,15 +1810,6 @@ def test_manual_generated_boundaries_record_only_the_stages_they_execute(
             ops.spmv(
                 sparse,
                 vector,
-                _compile_options=options,
-                _compilation_context=context,
-            )
-        elif boundary == "matmul_wksp":
-            monkeypatch.setattr(ops.matmul_wksp, "_module_cache", {}, raising=False)
-            ops.matmul_wksp(
-                sparse,
-                dense,
-                output_format="dd",
                 _compile_options=options,
                 _compilation_context=context,
             )
@@ -2082,7 +2072,7 @@ def test_matmul_routes_one_owner_through_the_auto_einsum_path(
     assert _stage_values(context) == _AUTO_STAGE_SEQUENCE
 
 
-def test_dispatch_and_workspace_module_cache_hits_record_no_compiler_work(
+def test_dispatch_cache_hit_records_no_compiler_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     options = _default_options()
@@ -2123,28 +2113,6 @@ def test_dispatch_and_workspace_module_cache_hits_record_no_compiler_work(
     assert isinstance(second, STensor)
     assert dispatch_hit_context.stage_run_records == ()
     assert dispatch_hit_context.llir_pass_run_records == ()
-
-    monkeypatch.setattr(ops.matmul_wksp, "_module_cache", {}, raising=False)
-    first_wksp_context = CompilationContext(options)
-    ops.matmul_wksp(
-        sparse,
-        dense,
-        output_format="dd",
-        _compile_options=options,
-        _compilation_context=first_wksp_context,
-    )
-    assert _stage_values(first_wksp_context) == _MANUAL_STAGE_SEQUENCE
-
-    wksp_hit_context = CompilationContext(options)
-    ops.matmul_wksp(
-        sparse,
-        dense,
-        output_format="dd",
-        _compile_options=options,
-        _compilation_context=wksp_hit_context,
-    )
-    assert wksp_hit_context.stage_run_records == ()
-    assert wksp_hit_context.llir_pass_run_records == ()
 
 
 def test_prebuilt_sddmm_rank_one_sparse_and_mode_order_noops_record_nothing(

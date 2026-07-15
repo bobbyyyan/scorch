@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark all SpMM kernel variants on SuiteSparse matrices.
+"""Benchmark native SpMM kernel variants on SuiteSparse matrices.
 
 Compares Scorch kernel variants (tiled, untiled, direct, etc.) and
 PyTorch MKL across a representative sample of matrices at different
@@ -24,34 +24,33 @@ from _utils import (
     suppress_torch_warnings,
 )
 
-
 # Representative matrices spanning small → very large
 _SAMPLE_MATRICES = [
     # Small
-    "494_bus",       # 1.7K nnz
-    "bcspwr09",      # 6.5K
-    "bcsstk08",      # 13K
+    "494_bus",  # 1.7K nnz
+    "bcspwr09",  # 6.5K
+    "bcsstk08",  # 13K
     # Medium
-    "bcsstk14",      # 63K
-    "bcsstk17",      # 429K
-    "crystk02",      # 969K
+    "bcsstk14",  # 63K
+    "bcsstk17",  # 429K
+    "crystk02",  # 969K
     # Large
-    "bcsstk30",      # 2M
-    "ct20stif",      # 2.6M
-    "gupta2",        # 4.2M
-    "pre2",          # 5.8M
-    "pkustk11",      # 5.2M
+    "bcsstk30",  # 2M
+    "ct20stif",  # 2.6M
+    "gupta2",  # 4.2M
+    "pre2",  # 5.8M
+    "pkustk11",  # 5.2M
     # Very large
-    "mouse_gene",    # 29M
+    "mouse_gene",  # 29M
     # Different sparsity patterns
-    "minsurfo",      # 204K - regular grid
-    "mosfet2",       # 1.5M - circuit sim
-    "mixtank_new",   # 2M - CFD
-    "amazon0312",    # 1.2M - graph
-    "ca-CondMat",    # 186K - small graph
-    "cfd2",          # 3M - CFD
-    "parabolic_fem", # 3.7M - FEM
-    "thermal2",      # 8.6M - thermal
+    "minsurfo",  # 204K - regular grid
+    "mosfet2",  # 1.5M - circuit sim
+    "mixtank_new",  # 2M - CFD
+    "amazon0312",  # 1.2M - graph
+    "ca-CondMat",  # 186K - small graph
+    "cfd2",  # 3M - CFD
+    "parabolic_fem",  # 3.7M - FEM
+    "thermal2",  # 8.6M - thermal
 ]
 
 
@@ -171,30 +170,6 @@ def run(params):
         except Exception as e:
             results["variants"][vname] = {"error": str(e)}
 
-    # --- Scorch compiler-generated path ---
-    import scorch
-    a_st = STensor.from_csr(torch_csr, "A")
-    b_st = STensor.from_torch(b_dense, "B")
-    try:
-        for _ in range(warmup):
-            scorch.ops.matmul_wksp(a_st, b_st, output_format="dd", output_mode_order=[0,1], use_cache=True)
-        comp_times = []
-        for _ in range(repeats):
-            t0 = time.perf_counter()
-            scorch.ops.matmul_wksp(a_st, b_st, output_format="dd", output_mode_order=[0,1], use_cache=True)
-            comp_times.append(time.perf_counter() - t0)
-        comp_out = scorch.ops.matmul_wksp(a_st, b_st, output_format="dd", output_mode_order=[0,1], use_cache=True)
-        comp_dense = comp_out if isinstance(comp_out, torch.Tensor) else comp_out.to_torch()
-        correct = torch.allclose(comp_dense, ref, atol=1e-2, rtol=1e-2)
-        results["variants"]["compiler"] = {
-            "median_ms": statistics.median(comp_times) * 1e3,
-            "min_ms": min(comp_times) * 1e3,
-            "times": comp_times,
-            "correct": correct,
-        }
-    except Exception as e:
-        results["variants"]["compiler"] = {"error": str(e)}
-
     print(json.dumps(results))
 
 params = json.loads(sys.argv[1])
@@ -206,7 +181,10 @@ def _run_single(params: dict, timeout: int) -> dict | None:
     cmd = [sys.executable, "-c", _WORKER_SCRIPT, json.dumps(params)]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
             cwd=Path(__file__).parent,
         )
     except subprocess.TimeoutExpired:
@@ -232,11 +210,21 @@ def _run_single(params: dict, timeout: int) -> dict | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark SpMM kernel variants on SuiteSparse")
-    parser.add_argument("--k", type=int, default=128, help="Dense columns (default: 128)")
-    parser.add_argument("--warmup", type=int, default=3, help="Warmup iters (default: 3)")
-    parser.add_argument("--repeats", type=int, default=10, help="Timed iters (default: 10)")
-    parser.add_argument("--timeout", type=int, default=300, help="Per-matrix timeout (default: 300s)")
+    parser = argparse.ArgumentParser(
+        description="Benchmark SpMM kernel variants on SuiteSparse"
+    )
+    parser.add_argument(
+        "--k", type=int, default=128, help="Dense columns (default: 128)"
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=3, help="Warmup iters (default: 3)"
+    )
+    parser.add_argument(
+        "--repeats", type=int, default=10, help="Timed iters (default: 10)"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=300, help="Per-matrix timeout (default: 300s)"
+    )
     parser.add_argument("--output-dir", type=str, default="bench_results")
     args = parser.parse_args()
 
@@ -259,7 +247,9 @@ def main() -> None:
 
     all_rows = []
 
-    print(f"SpMM Variant Benchmark  (k={args.k}, warmup={args.warmup}, repeats={args.repeats})")
+    print(
+        f"SpMM Variant Benchmark  (k={args.k}, warmup={args.warmup}, repeats={args.repeats})"
+    )
     print(f"Matrices: {len(matrices)}")
     print("=" * 100)
 
@@ -267,9 +257,12 @@ def main() -> None:
         print(f"\n[{i}/{len(matrices)}] {name}")
 
         params = {
-            "name": name, "k": args.k,
-            "warmup": args.warmup, "repeats": args.repeats,
-            "cache_dir": str(CACHE_DIR), "on_redwood": _ON_REDWOOD,
+            "name": name,
+            "k": args.k,
+            "warmup": args.warmup,
+            "repeats": args.repeats,
+            "cache_dir": str(CACHE_DIR),
+            "on_redwood": _ON_REDWOOD,
         }
         result = _run_single(params, timeout=args.timeout)
         if result is None:
@@ -284,24 +277,42 @@ def main() -> None:
         print(f"  {'pytorch (MKL)':20s}  median={pt['median_ms']:9.3f} ms")
 
         # Collect rows
-        all_rows.append({
-            "Matrix": name, "Rows": n_rows, "Cols": n_cols, "NNZ": nnz,
-            "Variant": "pytorch", "MedianMs": pt["median_ms"], "MinMs": pt["min_ms"],
-            "Correct": True,
-        })
+        all_rows.append(
+            {
+                "Matrix": name,
+                "Rows": n_rows,
+                "Cols": n_cols,
+                "NNZ": nnz,
+                "Variant": "pytorch",
+                "MedianMs": pt["median_ms"],
+                "MinMs": pt["min_ms"],
+                "Correct": True,
+            }
+        )
 
         for vname, vdata in result["variants"].items():
             if "error" in vdata:
                 print(f"  {vname:20s}  ERROR: {vdata['error']}")
                 continue
             tag = "" if vdata.get("correct", True) else " [WRONG]"
-            speedup = pt["median_ms"] / vdata["median_ms"] if vdata["median_ms"] > 0 else 0
-            print(f"  {vname:20s}  median={vdata['median_ms']:9.3f} ms  ({speedup:.2f}x vs MKL){tag}")
-            all_rows.append({
-                "Matrix": name, "Rows": n_rows, "Cols": n_cols, "NNZ": nnz,
-                "Variant": vname, "MedianMs": vdata["median_ms"], "MinMs": vdata["min_ms"],
-                "Correct": vdata.get("correct", False),
-            })
+            speedup = (
+                pt["median_ms"] / vdata["median_ms"] if vdata["median_ms"] > 0 else 0
+            )
+            print(
+                f"  {vname:20s}  median={vdata['median_ms']:9.3f} ms  ({speedup:.2f}x vs MKL){tag}"
+            )
+            all_rows.append(
+                {
+                    "Matrix": name,
+                    "Rows": n_rows,
+                    "Cols": n_cols,
+                    "NNZ": nnz,
+                    "Variant": vname,
+                    "MedianMs": vdata["median_ms"],
+                    "MinMs": vdata["min_ms"],
+                    "Correct": vdata.get("correct", False),
+                }
+            )
 
     # Save CSV
     df = pd.DataFrame(all_rows)
@@ -321,9 +332,11 @@ def main() -> None:
         pt_row = sub[sub["Variant"] == "pytorch"]
         pt_ms = pt_row["MedianMs"].values[0] if not pt_row.empty else float("inf")
         speedup = pt_ms / best["MedianMs"] if best["MedianMs"] > 0 else 0
-        print(f"  {name:20s}  nnz={int(best['NNZ']):>12,}  "
-              f"best={best['Variant']:20s}  {best['MedianMs']:9.3f} ms  "
-              f"({speedup:.2f}x vs MKL)")
+        print(
+            f"  {name:20s}  nnz={int(best['NNZ']):>12,}  "
+            f"best={best['Variant']:20s}  {best['MedianMs']:9.3f} ms  "
+            f"({speedup:.2f}x vs MKL)"
+        )
 
 
 if __name__ == "__main__":

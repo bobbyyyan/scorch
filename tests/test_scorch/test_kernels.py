@@ -6,6 +6,8 @@ from itertools import product
 import pytest
 import torch
 
+import scorch
+import scorch.ops as scorch_ops
 from scorch import STensor, einsum, utils
 from scorch.compiler.cin import (
     ForAll,
@@ -19,7 +21,7 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
-from scorch.ops import matmul, matmul_wksp, lower_and_exec_cin
+from scorch.ops import lower_and_exec_cin, matmul
 from scorch.storage import TensorIndex
 from scorch.utils import (
     get_extra_cflags,
@@ -30,6 +32,12 @@ from scorch.utils import (
 
 # indent 2 pretty print
 pp = pprint.PrettyPrinter(indent=2)
+
+
+def test_legacy_workspace_matmul_is_not_public() -> None:
+    assert "matmul_wksp" not in vars(scorch)
+    assert "matmul_wksp" not in scorch.__all__
+    assert "matmul_wksp" not in vars(scorch_ops)
 
 
 def test_dense_copy():
@@ -734,46 +742,6 @@ def test_spmm_ds_ds_ds_kij_outer():
     assert result.values.tolist() == expected[expected != 0].tolist()
 
 
-def test_matmul_wksp():
-    print("Testing matmul_wksp")
-    # Random matrix
-    dim_n = 50
-    tensor_a_torch = torch.rand(dim_n, dim_n)
-    tensor_b_torch = torch.rand(dim_n, dim_n)
-
-    # Sparsify to 80% sparsity
-    sparsity_level = 0.8
-    tensor_a_torch = torch.where(
-        torch.rand_like(tensor_a_torch) > sparsity_level,
-        tensor_a_torch,
-        torch.zeros_like(tensor_a_torch),
-    )
-
-    start_time = time.time()
-    torch_result = torch.matmul(tensor_a_torch, tensor_b_torch)
-    end_time = time.time()
-    torch_total_time = end_time - start_time
-
-    time_dict = {}
-
-    start_time = time.time()
-    scorch_result = matmul_wksp(tensor_a_torch, tensor_b_torch, time_dict=time_dict)
-    end_time = time.time()
-
-    scorch_eval_time = time_dict["eval_time"]
-    scorch_total_time = end_time - start_time
-
-    # Assert that the results are the same
-    assert torch.allclose(torch_result, scorch_result.to_torch())
-
-    print(f"Torch total time taken: {torch_total_time}s")
-    print(f"Scorch eval time taken: {scorch_eval_time}s")
-    print(f"Scorch total time taken: {scorch_total_time}s")
-    print(f"Scorch eval time / Torch total time: {scorch_eval_time / torch_total_time}")
-
-    assert torch.allclose(torch_result, scorch_result.to_torch())
-
-
 def test_dense_matmul():
     tensor_a_torch = torch.rand(100, 200)
     tensor_b_torch = torch.rand(200, 300)
@@ -821,33 +789,7 @@ def todo_test_matmul_ds_dd_dd_large():
     assert torch_result.allclose(scorch_result_torch)
 
 
-def todo_test_matmul_wksp_dd_oo_dd_time():
-    n = 100
-    sparsity = 0.9
-    random_tensor_a = torch.rand(n, n)
-    random_tensor_b = torch.rand(n, n)
-
-    # Randomly sparsify each tensor
-    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity)
-    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity)
-
-    start_time = time.time()
-    torch_result = torch.matmul(random_tensor_a, random_tensor_b)
-    torch_time = time.time() - start_time
-
-    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("oo")
-    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
-
-    start_time = time.time()
-    scorch_result = matmul_wksp(tensor_a_scorch, tensor_b_scorch, output_format="dd")
-    scorch_time = time.time() - start_time
-
-    print(f"torch time: {torch_time}")
-    print(f"[matmul_wksp] scorch time: {scorch_time}")
-    print(f"[matmul_wksp] scorch time / torch time: {scorch_time / torch_time}")
-
-
-def test_matmul_wksp_ds_time():
+def test_compiled_spmm_sparse_output():
     n = 100
     sparsity = 0.9
     random_tensor_a = torch.rand(n, n)
@@ -857,133 +799,20 @@ def test_matmul_wksp_ds_time():
     random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity).float()
     random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity).float()
 
-    start_time = time.time()
     torch_result = torch.matmul(random_tensor_a, random_tensor_b)
-    torch_time = time.time() - start_time
-
-    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse()
-    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B").to_sparse()
-
-    start_time = time.time()
-    scorch_result = matmul_wksp(tensor_a_scorch, tensor_b_scorch, output_format="ds")
-    scorch_time = time.time() - start_time
-
-    print(f"torch time: {torch_time}")
-    print(f"[matmul_wksp] scorch time: {scorch_time}")
-    print(f"[matmul_wksp] scorch time / torch time: {scorch_time / torch_time}")
-    assert torch.allclose(torch_result, scorch_result.to_torch())
-
-
-def test_spmm_ds_ds_dd_time():
-    """
-    Compare speed of torch and scorch matmul
-    Use random tensors
-    """
-    n = 100
-    sparsity = 0.9
-    random_tensor_a = torch.rand(n, n)
-    random_tensor_b = torch.rand(n, n)
-
-    # Randomly sparsify each tensor
-    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity).float()
-    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity).float()
-
-    start_time = time.time()
-    torch_result = torch.matmul(random_tensor_a, random_tensor_b)
-    torch_time = time.time() - start_time
 
     tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("ds")
     tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
 
-    time_dict = {}
-    start_time = time.time()
-    scorch_result = matmul_wksp(
-        tensor_a_scorch, tensor_b_scorch, format="ds", time_dict=time_dict
+    scorch_result = einsum(
+        "ik,kj->ij",
+        tensor_a_scorch,
+        tensor_b_scorch,
+        format="ds",
     )
-    scorch_total_time = time.time() - start_time
-    scorch_eval_time = time_dict["eval_time"]
 
-    # Assert that the results are the same
+    assert scorch_result.format == parse_format("ds")
     assert torch.allclose(torch_result, scorch_result.to_torch())
-
-    print(f"torch time: {torch_time}")
-    print(f"scorch total time: {scorch_total_time}")
-    print(f"scorch eval time: {scorch_eval_time}")
-    print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
-
-
-def todo_test_spmm_dd_oo_dd_wksp_time():
-    n = 100
-    sparsity = 0.99
-    random_tensor_a = torch.rand(n, n).float()
-    random_tensor_b = torch.rand(n, n).float()
-
-    # Randomly sparsify each tensor
-    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity)
-    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity)
-
-    random_tensor_a_csr = random_tensor_a.to_sparse_coo()
-    # Convert random_tensor_a to a sparse COO pytorch tensor
-    start_time = time.time()
-    # torch_result = torch.matmul(random_tensor_a, random_tensor_b).to_sparse_coo()
-    torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
-    torch_time = time.time() - start_time
-
-    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("oo")
-    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
-
-    time_dict = {}
-    start_time = time.time()
-    scorch_result = matmul_wksp(
-        tensor_a_scorch, tensor_b_scorch, format="dd", time_dict=time_dict
-    )
-    scorch_total_time = time.time() - start_time
-    scorch_eval_time = time_dict["eval_time"]
-
-    # Assert that the results are the same
-    assert torch.allclose(torch_result, scorch_result.to_torch())
-
-    print(f"torch time: {torch_time}")
-    print(f"scorch total time: {scorch_total_time}")
-    print(f"scorch eval time: {scorch_eval_time}")
-    print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
-
-
-def test_spmm_dd_ds_dd_wksp_time():
-    n = 50
-    sparsity = 0.8
-    random_tensor_a = torch.rand(n, n).float()
-    random_tensor_b = torch.rand(n, n).float()
-
-    # Randomly sparsify each tensor
-    random_tensor_a = random_tensor_a * (torch.rand(n, n) > sparsity)
-    random_tensor_b = random_tensor_b * (torch.rand(n, n) > sparsity)
-
-    random_tensor_a_csr = random_tensor_a.to_sparse_csr()
-    # Convert random_tensor_a to a sparse CSR pytorch tensor
-    start_time = time.time()
-    # torch_result = torch.matmul(random_tensor_a, random_tensor_b).to_sparse_coo()
-    torch_result = torch.sparse.mm(random_tensor_a_csr, random_tensor_b)
-    torch_time = time.time() - start_time
-
-    tensor_a_scorch = STensor.from_torch(random_tensor_a, "A").to_sparse("ds")
-    tensor_b_scorch = STensor.from_torch(random_tensor_b, "B")
-
-    time_dict = {}
-    start_time = time.time()
-    scorch_result = matmul_wksp(
-        tensor_a_scorch, tensor_b_scorch, format="dd", time_dict=time_dict
-    )
-    scorch_total_time = time.time() - start_time
-    scorch_eval_time = time_dict["eval_time"]
-
-    # Assert that the results are the same
-    assert torch.allclose(torch_result, scorch_result.to_torch())
-
-    print(f"torch time: {torch_time}")
-    print(f"scorch total time: {scorch_total_time}")
-    print(f"scorch eval time: {scorch_eval_time}")
-    print(f"scorch eval time / torch time: {scorch_eval_time / torch_time}")
 
 
 def test_spmm_dd_oo_dd_time():
@@ -1107,39 +936,6 @@ def test_matmul_ds_ds_ds_zero_output_columns():
     assert tuple(result.shape) == (3, 0)
     assert result.values.numel() == 0
     assert torch.equal(result.to_torch(in_place=False), left_torch @ right_torch)
-
-
-def test_spmm_ds_ds_ds_random():
-    dim_n = 10
-    sparsity = 0.9
-    tensor_a_torch = torch.rand(dim_n, dim_n)
-    tensor_b_torch = torch.rand(dim_n, dim_n)
-
-    # Randomly sparsify each tensor
-    tensor_a_torch = tensor_a_torch * (torch.rand(dim_n, dim_n) > sparsity).float()
-    tensor_b_torch = tensor_b_torch * (torch.rand(dim_n, dim_n) > sparsity).float()
-
-    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
-
-    result = matmul_wksp(a_sparse, b_sparse, output_format="ds")
-    result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
-
-    result_to_torch = result.to_torch()
-
-    assert torch.allclose(result_to_torch, result_torch)
-
-    if not torch.allclose(result_to_torch, result_torch):
-        print("\n\nresult_torch:")
-        print(result_torch.tolist())
-        print("\n\nresult:")
-        print(result.index.mode_indices[1][0].tolist())
-        print(result.index.mode_indices[1][1].tolist())
-        print(result.values.tolist())
-        print("\n\nresult_to_torch:")
-        print(result_to_torch.tolist())
-        print("\n\nresult_to_torch - result_torch:")
-        print((result_to_torch - result_torch).tolist())
 
 
 def test_spmm_ss_dd_dd_ikj_gustavson():
@@ -1625,71 +1421,6 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
     ]
 
 
-def test_spmm_ss_ds_ds():
-    tensor_a_torch = torch.Tensor(
-        [
-            [1, 0, 0, 0, 0],
-            [0, 2, 0, 0, 0],
-            [0, 0, 3, 0, 0],
-            [0, 0, 0, 4, 0],
-            [0, 0, 0, 0, 5],
-        ]
-    )
-    tensor_b_torch = torch.Tensor(
-        [
-            [1, 2, 3, 4, 5],
-            [2, 2, 0, 0, 0],
-            [3, 0, 3, 0, 0],
-            [4, 0, 0, 4, 0],
-            [5, 0, 0, 0, 5],
-        ]
-    )
-
-    a_sparse = STensor.from_torch(tensor_a_torch, "A").to_sparse("ds")
-    b_sparse = STensor.from_torch(tensor_b_torch, "B").to_sparse("ds")
-
-    # result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
-    result = matmul_wksp(a_sparse, b_sparse, output_format="ss")
-
-    assert result.shape == (5, 5)
-    assert len(result.index.mode_indices) == 2
-
-    assert result.index.mode_indices[0][0].tolist() == [0, 5]
-    assert result.index.mode_indices[0][1].tolist() == [0, 1, 2, 3, 4]
-
-    assert result.index.mode_indices[1][0].tolist() == [0, 5, 7, 9, 11, 13]
-    assert result.index.mode_indices[1][1].tolist() == [
-        0,
-        1,
-        2,
-        3,
-        4,
-        0,
-        1,
-        0,
-        2,
-        0,
-        3,
-        0,
-        4,
-    ]
-    assert result.values.tolist() == [
-        1.0,
-        2.0,
-        3.0,
-        4.0,
-        5.0,
-        4.0,
-        4.0,
-        9.0,
-        9.0,
-        16.0,
-        16.0,
-        25.0,
-        25.0,
-    ]
-
-
 @pytest.mark.parametrize("use_cache", [True, False])
 def test_matmul_dd_ds_dd(use_cache):
     n = 64
@@ -1865,8 +1596,12 @@ def test_spmm_ds_multi_multi():
         a_sparse = tensor_a.to_sparse(format_a)
         b_sparse = tensor_b.to_sparse(format_b)
 
-        # result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ds")
-        result = matmul_wksp(a_sparse, b_sparse, output_format="ds")
+        result = einsum(
+            "ik,kj->ij",
+            a_sparse,
+            b_sparse,
+            format="ds",
+        )
 
         print("Input formats: ", format_a, format_b)
         print("Output format: ", result.format)
@@ -1939,8 +1674,12 @@ def test_spmm_ss_multi_multi():
         a_sparse = tensor_a.to_sparse(format_a)
         b_sparse = tensor_b.to_sparse(format_b)
 
-        # result = einsum("ik,kj->ij", a_sparse, b_sparse, format="ss")
-        result = matmul_wksp(a_sparse, b_sparse, output_format="ss")
+        result = einsum(
+            "ik,kj->ij",
+            a_sparse,
+            b_sparse,
+            format="ss",
+        )
 
         print("Input formats: ", format_a, format_b)
         print("Output format: ", result.format)
