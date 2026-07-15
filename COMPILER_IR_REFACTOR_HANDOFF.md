@@ -2172,6 +2172,271 @@ value-read access** slice. The measured budgets above identify the remaining
 string/`RawStmt` families for later independently gated slices. Phase 3 remains
 in progress; Phase 3.5 and LoopIR have not begun.
 
+### Phase-3 structured indexed-store slice complete (2026-07-15)
+
+The second independently shippable Phase-3 slice is complete. The compiler
+implementation commit is `dd979ef` and the test commit is `d437174`. This slice
+starts from `878dd24`, retains the first structured-read slice unchanged, and
+does not claim that Phase 3 is complete.
+
+#### Complete pre-implementation inventory and seam selection
+
+The locked budget was re-audited from the AST before implementation. All 326
+`llir.Var` constructor sites were accounted for. The 87 directly provable
+expression strings remained exactly 59 subscript, 13 call, 7 member, 3
+initializer, 3 qualified, 1 ternary, and 1 arithmetic. The other 239
+constructors included the eight known indirect compatibility sinks and the one
+common traversal clone. The generic rewrite budget was 11 and `RawStmt` was 62
+calls / 61 producers.
+
+The 59 direct subscript strings split as follows:
+
+| Producer | Indexed lvalue | Read | Declaration | Total |
+|---|---:|---:|---:|---:|
+| `cin_lowerer.py` | 22 | 20 | 1 | 43 |
+| `iter_lattice.py` | 5 | 0 | 0 | 5 |
+| `iterator.py` | 0 | 6 | 0 | 6 |
+| `schedule_lowerer.py` | 4 | 1 | 0 | 5 |
+| **Total** | **31** | **27** | **1** | **59** |
+
+Twenty-seven lvalues were direct `Assign(var=Var(...))` constructors: 19 in
+CIN lowering, 5 in the iteration lattice, and 3 in schedule lowering. The four
+other lvalue constructors flowed through the existing post-op/store helpers: 3
+in CIN lowering and 1 compact schedule target. The one declaration was the
+fixed-size workspace declaration and was not an assignment target.
+
+The 31 lvalues cover logical result-value writes, result coordinate/position
+assembly, dense-workspace element stores, dynamic intermediate vectors,
+all-COO grouping vectors, post-op output stores, iteration-lattice result
+stores, packed-relayout destinations, compact/heap result destinations, and
+the final schedule copy to output storage. DS, DSS, CSR-by-dense, sparse
+intersection/union, nested sparse levels, all-COO SDDMM, non-default mode
+orders, panel/relayout, register-blocked, and atomic-scheduling construction all
+reach one or more of those shared producers; none requires a second indexed
+target family.
+
+The statement audit also found 13 indexed stores embedded in `RawStmt`: one
+dense-workspace `memcpy` destination, five compressed-Where auxiliary/output
+stores, and seven result-write assembly stores. Ten standalone stores were in
+scope: all seven result-write stores plus `_count[row]`, `_offset[0]`, and
+`pos_data[0]` in compressed-Where. Three compound statements remain outside
+this seam: the `memcpy` call destination, the prefix-sum loop body, and the
+position-copy loop body. Structuring those would require a typed call/nested
+statement family rather than an indexed-lvalue node alone.
+
+All regex, string-rewrite, clone, and rendering consumers were traced through
+CIN/iteration-lattice lowering, compressed-Where count/fill construction,
+result-write assembly, dense-pointer, single-iteration, invariant-factor,
+dynamic-vector, schedule relayout/result-tile rewriting, common traversal,
+manager verification, and final code generation. The audit showed that the
+existing frozen `ArrayAccess` is a legal lvalue carrier; a second store node,
+general lvalue hierarchy, expression parser, ABI rewrite, or complete CxxIR was
+not necessary. Indexed stores were therefore selected over member/call access
+as the minimum coherent seam.
+
+#### Implemented structural contract
+
+- `Assign.var` is now the explicit `AssignmentTarget = Var | ArrayAccess`.
+  Exact `Var` targets accept only identifiers or dotted member paths. Exact
+  `ArrayAccess` targets require an identifier/member base plus a deliberately
+  small typed index grammar; arbitrary rvalue expressions, flat subscript
+  strings, malformed children, forged metadata, and unknown subclasses fail
+  closed.
+- The existing frozen `ArrayAccess` is reused for every migrated production
+  indexed target. There is no string fallback for the supported paths and no
+  parallel store representation.
+- Logical result-value targets carry frozen `TensorAccessMetadata` with typed
+  `AccessId`, `SymbolId`, and ordered `IndexId` children and the
+  `RESULT_WRITE` role. Result-write matching uses `SymbolId`, not a rendered
+  array name. Physical coordinate/position and schedule-local arrays remain
+  provenance-free because their scoped storage identity is not logical tensor
+  identity.
+- `ResultWriteContext` now carries the exact result `SymbolId` and result-value
+  pointer `DataType`. Production float, double, C int, int32, and int64 output
+  stores receive exact pointer types. A standalone custom legacy C spelling
+  remains explicitly `NO_TYPE`; the pass never invents a false type.
+- Common traversal validates and detaches assignment targets, recursively walks
+  structured indices (including nested typed input reads), clones replacements,
+  rebuilds frozen accesses, and rejects unknown structure at the owning stage.
+  Codegen validates again and owns precedence-aware lvalue emission.
+- Schedule access rewriting preflights every replacement on a detached target
+  before mutating the statement tree. Both an invalid outer result replacement
+  and an invalid nested read replacement leave caller-owned LLIR unchanged.
+- Dense-pointer, single-iteration, invariant-factor, dynamic-vector,
+  compressed-Where, result-write, and schedule consumers recognize the typed
+  target directly. Coordinate/position, compact, packed, all-COO grouping, and
+  dynamic-vector storage bases retain their exact storage/pointer `DataType`.
+- Count/fill result-write passes remain independent and repeatable in their
+  documented modes. Legal no-ops detach their result; malformed roots,
+  contexts, targets, metadata, replacements, and unknown nodes fail before
+  partial publication. Manager failure records, later-stage suppression, and
+  compiler-stage timing ownership are unchanged.
+
+This is the minimum design because the operation already distinguishes a
+scalar/member lvalue from an indexed lvalue. Allowing every `Expr` as an
+assignment target would weaken typing, while adding `Store`, `LValue`, member,
+call, allocation, and nested-statement families together would exceed this
+slice. Reusing `ArrayAccess` plus a narrow target union expresses exactly the
+production seam and nothing more.
+
+#### Remaining measured compatibility budget
+
+`tests/test_scorch/test_llir_string_budget.py` now locks the complete post-slice
+budget and separately forbids any direct production `Assign` from
+reintroducing a string-encoded expression target. The only direct expression
+`Var` targets allowed by that seam assertion are the two audited dotted member
+paths.
+
+- 371 total `Var` constructor calls;
+- 56 direct expression strings: 28 subscript, 13 call, 7 member, 3 initializer,
+  3 qualified, 1 ternary, and 1 arithmetic;
+- 315 other constructor arguments, including the same nine known indirect
+  sinks/clones;
+- 10 generic string-rewrite compatibility sites;
+- 52 `RawStmt` calls / 51 producers.
+
+The 28 remaining direct subscript strings are exactly 21 in CIN lowering, 6 in
+iterator construction, and 1 schedule read. They contain 27 rvalue reads and
+the one fixed-workspace declaration; none is a direct indexed assignment
+target. The three remaining raw indexed-store statements are the characterized
+`memcpy` destination and two compound compressed-Where loops above. Their
+future migration requires independently justified call/statement structure.
+
+#### Correctness, ownership, and failure evidence
+
+Focused tests lock exact construction, type hints, freezing, equality,
+validation, target/rvalue separation, postfix and arithmetic precedence,
+byte-exact emission, common walking/rewriting, replacement ownership,
+detachment, legal no-ops, repeated application, malformed input, unknown-child
+and subclass failure, stable identity, and exact float32/float64/integer
+storage types. Every migrated producer has a structural regression, including
+the ten formerly raw standalone stores.
+
+Exact CSR-by-dense, DS, DSS, and all-COO source anchors remain unchanged.
+Native PyTorch comparisons in the scheduler/codegen matrix and full suite cover
+the activating CSR-by-dense, DS/DSS, intersection, union, compressed-Where,
+nested-sparse, all-COO, non-default mode-order, relayout/panel,
+register-blocked, workspace, and dynamic-vector paths.
+
+Caller-owned CIN, LLIR, access metadata, analyses, exact `ScheduledCIN(cin,
+plan)`, schedules, plans, `CompileOptions`, and prior pass results remain
+unchanged. Two independent compilations share no mutable state. The canonical
+manager/stage suites retain stage identity/order, exact option identity, timing
+ownership, pass records, failure records, cache identity, and later-stage
+suppression.
+
+#### Exact source/build identity and runtime waiver
+
+Committed candidate `d437174` was captured in a clean detached worktree. A
+same-root comparison against `878dd24` produced byte-identical raw C++,
+preamble, signatures, source-derived kernel names, semantic/codegen/build/full
+cache keys, request fields, compiler/linker flags, ABI/index policies,
+build-option keys, request keys, build identities, prepared cache keys, build
+directories, and `.so` paths. The complete same-root manifest is identical on
+both sides with SHA-256
+`ab6c28584676d963b14713dcb88ec4906aad53fc304730b28d7ce59ae671c169`.
+
+The inherited capture root was then reproduced exactly. The entire candidate
+anchor manifest is byte-identical to the retained `2e2a30d` manifest with
+SHA-256 `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`.
+The preamble remains 68,671 bytes with SHA-256
+`db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`.
+
+| Path | Bytes | SHA-256 |
+|---|---:|---|
+| CSR-by-dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO SDDMM | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+
+The 42-cell base/candidate SpMM source/build corpus is byte-identical in the
+new same-root capture. Reproducing the inherited capture root yields the exact
+retained SHA-256
+`204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`.
+Every cell also matches the retained M5 build summary for source digest/bytes,
+function list, flags, and kernel name.
+
+Because every generated source and build input is unchanged, the canonical
+byte-identical runtime waiver applies. No new M5 or Redwood runtime grid was
+run. The retained artifacts were re-hashed:
+
+- M5 runtime artifact:
+  `3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+- Redwood runtime artifact:
+  `c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+
+#### Compiler latency and attribution
+
+The valid uncontended run used committed `d437174`, five warmups, 30 samples,
+and excluded native build/execution. Artifact:
+
+`/tmp/scorch-phase3-structured-store-results/latency-d437174-m5.json`
+
+SHA-256:
+`b65c724ea39f83fea7dbb277396724a16474041632bba4d28ebe7f59cda1d9f5`.
+
+The predecessor was the retained uncontended `2e2a30d` artifact with SHA-256
+`2dac0b53298ba2215f92d6e1a500af369869825700127aa8bcf0db7ef5d5288b`.
+
+| Case | Candidate p50/p95 ms | New/old p50 | New/old p95 | Decision |
+|---|---:|---:|---:|---|
+| small dense | 1.533 / 1.727 | 0.966 | 0.893 | target |
+| reduction | 1.417 / 1.557 | 0.972 | 0.980 | target |
+| CSR intersection | 1.662 / 1.804 | 1.068 | 1.052 | target |
+| sparse union | 1.644 / 1.929 | 1.040 | 1.035 | target |
+
+No case crosses the 1.10 investigation threshold. Small dense improves by
+0.055/0.206 ms at p50/p95 and reduction by 0.040/0.032 ms. Intersection adds
+0.106/0.090 ms, attributed primarily to CIN lowering (+0.078/+0.050 ms) with
+LLIR emission adding +0.007/+0.010 ms. Union adds 0.063/0.066 ms; CIN lowering
+adds +0.129/+0.117 ms, partly offset by kernel-name/request assembly
+(-0.021/-0.035 ms) and the canonical endpoint extension
+(-0.010/-0.023 ms). This is the expected absolute cost of constructing and
+validating typed lvalue children in the structurally largest sparse cases; it
+does not propagate into source, cache, request, or build work. Every
+compatibility-path candidate p95 remains below 1.93 ms.
+
+#### Verification record
+
+All Python, pytest, lint, documentation, capture, and benchmark commands used
+the `scorch` conda environment. Final results on the committed code/test tree:
+
+- focused pass/traversal/codegen/budget set: **236 passed** in 0.96 s;
+- added budget/identity/type focus: **76 passed** in 0.92 s;
+- canonical 18-file Phase-2/common suite: **719 passed** in 1.64 s;
+- required 11-file scheduler/CIN/codegen matrix: **308 passed** in 377.84 s;
+- `pytest -q -m "not perf" tests`: **1,237 passed, 14 skipped, 3
+  deselected**, with one inherited PyTorch sparse-invariant warning, in
+  1,946.55 s;
+- Black: all 27 changed Python files clean, with only the existing Python
+  3.11-versus-target-3.15 safety warning;
+- Flake8: six inherited implementation findings, exactly matching the same six
+  base findings; the candidate removes the base's two `iter_lattice.py`
+  formatting findings;
+- mypy on all 27 changed files: 103 inherited errors in 11 files versus 105 in
+  12 at the base; production-only: 56 in 3 files versus 57 in 3 at the base;
+  no candidate-only error was introduced;
+- strict Sphinx completed the HTML build and reproduced the exact base failure:
+  23 unresolved-reference warnings under `-W`, with no new warning;
+- `git diff --check`: clean; both independent final reviews found no release
+  blocker.
+
+No analysis cache, preservation/invalidation protocol, dependency graph,
+generalized DCE, parser, reflection, signature inspection, callback, dynamic
+metadata/configuration bag, mutable registry/global singleton, forcing API,
+parallel zero-fill extraction, TorchCppABI extraction, generalized allocation
+migration, complete CxxIR, `csrc` change, design-document change, generated
+tracked output, benchmark artifact, or unrelated tracked file was introduced.
+`ScheduledCIN(cin, plan)` remains the exact frozen carrier and `matmul_wksp`
+remains removed. The user-owned `.gitignore` modification and all untracked
+research/benchmark material remain untouched and uncommitted.
+
+This closes only the second narrow Phase-3 **structured indexed
+assignment/store target** slice. Remaining low-level structural debt includes
+the 28 characterized subscript strings, three raw compound indexed stores, and
+the independently gated member/call/allocation/statement families. Phase 3
+remains in progress. Phase 3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
