@@ -3882,6 +3882,23 @@ class CINLowerer:
                 )
                 self._apply_parallel_policy(flat_loop, body=flat_body)
 
+                # The coordinate lattice declares this zero placeholder outside
+                # the original grouped loop so its update can advance the parent.
+                # Flat COO lowering replaces that update with a loop-local bound,
+                # leaving only this exact generated prefix declaration redundant.
+                result = [
+                    prefix_stmt
+                    for prefix_stmt in result
+                    if not (
+                        type(prefix_stmt) is llir.VarInit
+                        and type(prefix_stmt.var) is llir.Var
+                        and prefix_stmt.var.name == end_var
+                        and prefix_stmt.var.type is llir.DataType.INT
+                        and type(prefix_stmt.value) is llir.Literal
+                        and type(prefix_stmt.value.value) is int
+                        and prefix_stmt.value.value == 0
+                    )
+                ]
                 if not self._known_nnz_var:
                     result.extend(prealloc_stmts)
                 result.append(flat_loop)
