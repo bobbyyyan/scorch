@@ -258,8 +258,7 @@ def test_dynamic_vector_pass_detaches_and_preserves_shape_extent_reads() -> None
     assert _structural_snapshot(once) == _structural_snapshot(twice)
     assert _cpp(once) == _cpp(twice)
     assert _cpp(once) == (
-        "std::vector<float> out_values;\n"
-        "int64_t Input0_size = Input_shape[0];"
+        "std::vector<float> out_values;\n" "int64_t Input0_size = Input_shape[0];"
     )
     first_access = cast(llir.ArrayAccess, cast(llir.VarInit, once[1]).value)
     repeated_access = cast(llir.ArrayAccess, cast(llir.VarInit, twice[1]).value)

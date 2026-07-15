@@ -2701,6 +2701,300 @@ subscript strings, three raw compound indexed stores, and the independently
 gated member/call/initializer/qualified/ternary/arithmetic/allocation/statement
 families. Phase 3 remains in progress. Phase 3.5 and LoopIR have not begun.
 
+### Phase-3 dense-level shape/extent read slice complete (2026-07-15)
+
+The fourth narrow Phase-3 slice starts exactly at `dd278e0`, is implemented by
+`c739c0b`, and has focused tests in `0577492`. The branch is
+`refactor/compiler-ir-phase3-shape-extent-read`. It migrates only the two
+dense-level shape/extent expression producers in CIN lowering. It does not
+reopen the logical tensor-read, structured-store, or compact-result seams.
+
+#### Complete pre-implementation audit and seam selection
+
+The locked starting budget contained 374 `llir.Var` constructors, 55 direct
+expression strings, 319 other constructor arguments (including nine known
+indirect sinks/clones), ten generic string-rewrite sites, and 52 `RawStmt`
+calls / 51 producers. The 55 direct expressions were exactly 27 subscripts, 13
+calls, 7 members, 3 initializers, 3 qualified names, 1 ternary, and 1
+arithmetic expression. No direct indexed `Assign` target remained opaque.
+
+All 27 subscript constructors were re-audited before selection:
+
+| Classification | Count | Exact inherited sites |
+|---|---:|---|
+| logical tensor values | 2 | `cin_lowerer.py:736,747`, post-op `<tensor>_val[index]` reads |
+| physical positions | 4 | `iterator.py:281,292,306,316`, sparse `*_pos[...]` bounds/positions |
+| coordinates | 6 | `iterator.py:300,326`; `cin_lowerer.py:3896,3899,3957,4010`, sparse/all-COO `*_crd[...]` reads |
+| shapes/extents | 2 | `cin_lowerer.py:784,2611`, `<tensor>_shape[level]` and `result_shape[i]` |
+| workspaces | 6 | `cin_lowerer.py:900,1482,1535,1939,2030,2107`, metadata-free value fallback, `it.first[i]`, and dense/tiled workspace reads |
+| mode-index containers | 4 | `cin_lowerer.py:798,812,825,838`, nested `mode_indices[level][slot]` with and without `data_ptr<int>()` |
+| all-COO grouping compatibility | 2 | `cin_lowerer.py:3947,3951`, `_group_starts[...]` reads |
+| fixed-workspace declaration | 1 | `cin_lowerer.py:1254`, `wksp[tile_size]` |
+
+These are 26 reads plus one declaration. The six workspace reads remain
+classified by their physical storage ownership rather than bracket spelling.
+The remaining direct-expression inventory is unchanged:
+
+- the 13 calls are six tensor/value `data_ptr<T>()` spellings
+  (`cin_lowerer.py:160,218,855,1617,1656,2827`), five `std::move(...)`
+  spellings (`:428,453,476,1597,1634`), and two schedule-storage `.data()`
+  spellings (`schedule_lowerer.py:874,1156`);
+- the seven members are two result-storage lvalues (`cin_lowerer.py:492,506`),
+  one input `storage.value` read (`:868`), and four workspace-pair reads
+  (`:1504,1554,2093,2120`);
+- the other eight are three initializer spellings (`cin_lowerer.py:141,200,496`),
+  three `torch::kInt` qualified names (`:432,457,1601`), the all-COO ternary at
+  `:3873`, and the all-COO arithmetic expression at `:4037`.
+
+The raw compressed-Where workspace-pool statement separately contains
+`result_shape[first_level]`. It is not a `Var.name` expression: it lives inside
+a multi-line compound `RawStmt` with allocation, member, and call syntax.
+Migrating it would require a broader statement/member/call or loop hierarchy,
+so it remains intentionally outside this seam and inside the unchanged raw
+statement budget.
+
+The physical position/coordinate, workspace, mode-index, and all-COO families
+have shared sparse/schedule consumers and different rewrite ownership. The
+member family mixes lvalues and physical reads, while the call family requires
+postfix call/member structure. The two dense-level shape sites are the smallest
+complete family: both are physical extent reads from existing by-value ABI
+containers, both feed local `INT64` bound variables, and both already have an
+exact precedence-aware structured representation.
+
+#### Distinct ABI ownership and minimum coherent representation
+
+The two producers are semantically distinct despite their common shape:
+
+- `result_shape` is the first `evaluate` argument and describes the physical
+  output layout. Its dense-level reads initialize `Result<i>_size` locals.
+- `<tensor>_shape` belongs to each input tensor and appears immediately before
+  that tensor's mode-index and values arguments. Its dense-level reads
+  initialize `<tensor><level>_size` iterator bounds after mode-order alignment.
+
+Both ABI values are by-value `std::vector<int64_t>` containers represented by
+the existing `DataType.STD_VECTOR_INT`; neither is a pointer, tensor property,
+logical tensor value, nor schedule-owned workspace. The owning CIN stage emits
+ABI validation for the result and every input before any shape subscript.
+
+Each former opaque `Var("..._shape[...]")` is now the existing frozen
+`ArrayAccess` with a typed `STD_VECTOR_INT` base `Var` and an `INT64` `Literal`
+level index. `GetTensorProperty` would be semantically wrong and is rejected by
+codegen; `FunctionCall` is unrelated. No new node, generalized parser,
+metadata, stable ID, widened field, or compatibility fallback is needed. The
+reads are physical ABI-local data with no cross-pass logical identity, so
+adding tensor-access provenance would be false precision.
+
+The producers construct their prologue statements during CIN lowering, but
+those lists are held outside the initial managed statement artifact. The
+compressed-Where, result-write, sparse-prefetch, dense-pointer,
+single-iteration, and factor-hoist passes run on the compute artifact first.
+The one-shot result/ABI continuation then prepends ABI validation and the shape
+prologue. Only the final dynamic-vector pass traverses the assembled body. It
+validates, detaches, and rebuilds the structured access through the common
+walker/rewriter, but cannot classify either ABI argument as a dynamic vector
+declaration. Exact repeated application is therefore a structural no-op.
+
+Schedule lowering follows CIN lowering. Its metadata/loop-selected rewrites do
+not target these prologue initializers; register-block stitching preserves the
+prologue, and packed relayout rewrites only its selected row-loop operand
+subtree. Existing `ArrayAccess` codegen owns postfix precedence and reproduces
+the old spelling byte-for-byte. The nine non-dynamic compatibility string
+rewrites run only on the pre-assembly compute artifact and cannot observe these
+prologue accesses. The tenth, dynamic-vector's name rewrite, traverses them but
+cannot match: both bases are function arguments rather than names collected
+from body `VarDecl` nodes. Kernel/request/cache/build assembly receives the
+unchanged semantic/codegen key, generated source, and exact `CompileOptions`
+snapshot.
+
+Malformed `ArrayAccess` children, arbitrary field values, unknown subclasses,
+and unknown descendants continue to fail closed in common traversal or
+codegen. ABI rank/shape/type failures occur before the indexed reads. Manager
+pre/post verification, failure propagation, partial run records, later-stage
+suppression, result immutability, timing ownership, and exact option identity
+are unchanged. The migration mutates no caller-owned CIN, LLIR, analysis,
+plan, schedule, options, or prior result.
+
+Focused tests lock both producers with a two-dimensional dense input/result:
+all four initializers have exact frozen `ArrayAccess` roots with structured
+`STD_VECTOR_INT` and `Literal(INT64)` children, no logical metadata, and
+byte-exact C++. A
+dynamic-vector regression locks legal no-op and repeated application,
+structural equality, byte-exact emission, detached children, and replacement
+ownership. Existing `ArrayAccess`, common traversal, pass-manager, and codegen
+tests retain exact construction, type hints, equality, field rejection,
+freezing, precedence, malformed/unknown-child failure, and independent
+rewriting. The budget test forbids either production shape family from
+returning to a direct string-encoded `Var.name`.
+
+#### Locked post-slice compatibility budget
+
+The precise budget is now:
+
+- 374 total `Var` constructors, unchanged because each opaque leaf became one
+  typed base `Var` under `ArrayAccess`;
+- 53 direct expression strings: 25 subscript, 13 call, 7 member, 3 initializer,
+  3 qualified, 1 ternary, and 1 arithmetic;
+- 321 other constructor arguments, including the unchanged nine known indirect
+  sinks/clones;
+- ten generic string-rewrite compatibility sites;
+- 52 `RawStmt` calls / 51 producers, unchanged.
+
+The remaining 25 direct subscripts are exactly 19 in `cin_lowerer.py` and 6 in
+`iterator.py`. They are the two logical-value, four physical-position, six
+coordinate, six workspace, four mode-index, two all-COO grouping, and one
+fixed-workspace-declaration sites above. No direct production `Assign` target
+is string encoded. The three characterized raw indexed stores remain the
+dense-workspace `memcpy` destination and the two compressed-Where compound
+prefix-sum/position-copy loops.
+
+#### Exact source, cache, request, ABI, flags, and build identity
+
+Clean same-root captures compare `28dcca5`, `5339f56`, `dd278e0`, and committed
+candidate `0577492`. Every revision is byte-identical to the retained compact-
+read canonical artifacts:
+
+- anchor manifest SHA-256:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- 42-cell grid SHA-256:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+- preamble: 68,671 bytes,
+  `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`.
+
+| Canonical path | Bytes | SHA-256 | Kernel name |
+|---|---:|---|---|
+| CSR-by-dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` | `kernel_2c75843753b8` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` | `kernel_c13bc3936f95` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` | `kernel_a11206384e14` |
+| all-COO SDDMM | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` | `kernel_a67e7b1a138e` |
+
+The four codegen-key digests are `b3209384718875524e52fdd46fad2600e1ec32b8e864ebd9d04421b81ebd13fc`,
+`ae3a9b4274043115d7593c0af4f35fef7db2299b351b895f8711543680c705a2`,
+`913b063d249a38db27844f6d7738de487f96ebc0190fdc93b6f329662a485150`,
+and `2dc1bfe23a9fcec6a5afd7c3683743422aafb0c29fd7723be7b75b5c3ab7413d`.
+Their request keys are `6d1ccb85f07025f3ee40a893ac08a3dd5735484f59524a375418c14224b75fbe`,
+`4815ccba2bd2b3dd233122d64cff89cb91ad21005641fd59fbb2dc7f911b3fe2`,
+`ccd742d5d588cee6a39ed35f3dd20ea679f9b8d5b3aca7eb3093c6694f85df0f`,
+and `b6d8ea817a97cdabc29862b1509b8bc51c6014426add9666b4be52a4f66c8aa1`.
+Their build identities are `38524f9364e0ad048fc621934d86927aa56e515e73f5841fab879393a3d30d52`,
+`8c74dea0b86dbbff098000dfff86ba06337a11c7d06d7f9d4b0e17605d14edd7`,
+`63b04fe2386dc02f7ca7a5acf1d40cad3dcd2aa55bf3b6cea1a9172c50a139ce`,
+and `7748de4475c85c5a139f3db1749465cca54ef88bf142553e28851a32e49f031e`.
+Prepared keys, build directories, and `.so` paths are also exact.
+
+The semantic, build, and full option/cache digests are respectively
+`4160d8f1c0186b5c12ba462a851bababda8ad71d8d11c94980f1cdd40ee095e9`,
+`946b3609479fe584dde8ef3167543d52e0e793e08309bb2821fb18e381dece6d`,
+and `3b3e0091fe7ebfafbf544790664f2b89528aab11770f7a0393b2e5b2a0929c07`.
+The ABI/index policies remain `torch_cpp_extension_v1` / `int32`, compiler ABI
+checking remains required, and C++11 ABI remains true. Exact compile flags are
+`-O3 -march=native -ffast-math -funroll-loops
+-isystem/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1
+-Xpreprocessor -fopenmp`; linker flags remain Torch's `libomp.dylib` and Torch
+library rpath. Exact `evaluate` signatures, request source/function tuples,
+options, ABI, flags, linker flags, kernel names, cache keys, request keys,
+build identities, prepared keys/directories, and extension paths all match.
+
+The canonical scripts re-hash to
+`605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`
+and `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`.
+Because every source and build input is byte-identical and the canonical corpus
+activates dense input/result shape reads, the existing runtime waiver applies;
+no new M5 or Redwood grid is required. Retained artifacts re-hash to:
+
+- M5:
+  `3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+- Redwood:
+  `c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+
+#### Compiler latency and attribution
+
+The valid run used committed `0577492` in a clean detached worktree, five
+warmups, 30 samples, and no overlapping pytest, native compilation/execution,
+capture, documentation, or benchmark process. Repeated host samples reached
+84-86% idle before the run. Artifact:
+
+`/tmp/scorch-phase3-shape-read-results/latency-0577492-m5.json`
+
+SHA-256:
+`1bd2c7290f971a83f9c2a0416e24bb41650488508d3779df827e6a579e8c99d9`.
+The required `6c35b03` predecessor re-hashes to
+`0076729e891440100dc524ee36b539fa0918dacb9cb6a5c04beb5189e2e36f1e`.
+
+| Case | Candidate p50/p95 ms | New/old p50 | New/old p95 | Absolute delta p50/p95 ms |
+|---|---:|---:|---:|---:|
+| small dense | 1.498 / 1.672 | 0.916 | 0.921 | -0.137 / -0.144 |
+| reduction | 1.380 / 1.495 | 0.945 | 0.911 | -0.080 / -0.146 |
+| CSR intersection | 1.542 / 1.618 | 0.933 | 0.907 | -0.111 / -0.166 |
+| sparse union | 1.558 / 1.599 | 0.933 | 0.876 | -0.112 / -0.227 |
+
+No case crosses 1.10. All four corpus cases activate the seam because each has
+a dense result level and at least one dense input level. Result/ABI assembly
+p50/p95 changes are -0.001/-0.001, -0.001/-0.002, -0.001/-0.002, and
+-0.001/-0.002 ms respectively. CIN-lowering changes are -0.030/-0.108,
+-0.012/-0.070, -0.025/-0.090, and -0.048/-0.096 ms. The canonical endpoint
+extension changes by only +0.004/+0.030, +0.015/+0.016, +0.015/+0.021, and
++0.009/+0.010 ms; kernel/request assembly changes by +0.003/+0.020,
++0.010/+0.005, +0.016/+0.020, and +0.003/+0.001 ms. These small
+bidirectional downstream changes and the broad CIN improvement indicate normal
+same-host variation; there is no measurable cost in the owning result/ABI
+stage and no managed-stage or cache regression.
+
+#### Verification record
+
+Every Python, pytest, documentation, capture, and benchmark command activated
+the `scorch` conda environment first. On the final branch candidate:
+
+- exact shape structure and budget focus: 7 passed in 1.10 s;
+- changed producer/dynamic-vector/budget plus traversal/codegen focus: 162
+  passed in 1.18 s;
+- exact CSR-by-dense, DS, DSS, and all-COO anchors: 4 passed in 0.53 s;
+- canonical 18-file Phase-2/common suite: 722 passed in 2.07 s;
+- required 11-file scheduler/CIN/codegen matrix: 310 passed in 401.17 s;
+- `pytest -q -m "not perf" tests`: 1,241 passed, 14 skipped, 3 deselected,
+  and the one inherited PyTorch sparse-invariant warning in 1,952.24 s;
+- Black on all four changed Python files: clean after its one required
+  expected-string reflow, with only the inherited Python 3.11-versus-target-
+  3.15 safety warning;
+- base/candidate Flake8 comparison: the same five inherited findings (`F841`
+  twice, `C901` once, and `F401` twice), with no new code/message;
+- base/candidate mypy comparison: the same 47 inherited errors in three of four
+  checked files, with no new code/message;
+- strict Sphinx completes HTML generation and reproduces the exact normalized
+  base failure: 23 unresolved-reference warnings under `-W` (18 class, two
+  attribute, two exception, one function), no new warning;
+- `git diff --check`: clean; independent implementation and requirements audits
+  found no compiler-structure release blocker.
+
+The native matrix covers CSR-by-dense, DS, DSS, all-COO, intersection/union,
+compressed-Where, nested sparse levels, non-default mode order, panel/relayout,
+register blocking, workspaces, dynamic vectors, atomics, post-ops, and result
+assembly. Exact source anchors are unchanged and all activating correctness
+cases match PyTorch. The canonical manager/scheduler suites retain legal
+no-ops, repeated application, malformed and unknown-node failure, detachment,
+replacement ownership, caller-owned inputs/results, and two independent
+compilations with no shared mutable state. Stage identities/order, exact timing
+ownership, managed-pass/failure records, cache identity, short-circuiting, and
+later-stage suppression remain unchanged. `ScheduledCIN(cin, plan)` remains the
+exact frozen carrier.
+
+No parser, generalized member/call/lvalue/allocation hierarchy, broad ABI
+rewrite, generalized DCE, reflection, signature inspection, dynamic metadata,
+dictionary-of-`Any` configuration, callback, mutable registry/global singleton,
+analysis cache/invalidation protocol, dependency graph, forcing API, parallel
+zero-fill extraction, TorchCppABI extraction, generalized allocation migration,
+complete CxxIR, generated tracked output, benchmark artifact, `csrc` change,
+design-document change, or unrelated tracked file was introduced. The
+user-owned `.gitignore` modification and untracked `autotune-levels/`, `bench/`,
+`bench/bench_results/`, and `scratchpad/` material remain untouched and
+uncommitted.
+
+This closes only the narrow Phase-3 **structured dense-level shape/extent
+read** slice. Remaining low-level structural debt is the 25 characterized
+direct subscript strings, the raw compound shape access and three raw indexed
+stores, and the independently gated member/call/initializer/qualified/ternary/
+arithmetic/allocation/statement families. Phase 3 remains in progress. Phase
+3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
