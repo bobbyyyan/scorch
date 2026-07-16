@@ -4029,8 +4029,15 @@ class CINLowerer:
                 ),
                 llir.VarInit(
                     var=llir.Var(name=coord_var_name, type=llir.DataType.INT64),
-                    value=llir.Var(
-                        name=f"{crd_array}[{iter_var}]", type=llir.DataType.INT64
+                    value=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=crd_array,
+                            type=llir.DataType.PTR_INT,
+                        ),
+                        index=llir.Var(
+                            name=cast(str, iter_var),
+                            type=llir.DataType.INT64,
+                        ),
                     ),
                 ),
                 *inner_body_filtered,
@@ -4082,9 +4089,15 @@ class CINLowerer:
                 flat_body: List[llir.Stmt] = [
                     llir.VarInit(
                         var=llir.Var(name=coord_var_name, type=llir.DataType.INT64),
-                        value=llir.Var(
-                            name=f"{crd_array}[{iter_var}]",
-                            type=llir.DataType.INT64,
+                        value=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=crd_array,
+                                type=llir.DataType.PTR_INT,
+                            ),
+                            index=llir.Var(
+                                name=cast(str, iter_var),
+                                type=llir.DataType.INT64,
+                            ),
                         ),
                     ),
                 ]
