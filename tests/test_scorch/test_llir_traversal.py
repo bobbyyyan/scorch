@@ -236,6 +236,29 @@ def test_walker_has_deterministic_preorder() -> None:
     assert _record(function) == expected
 
 
+def test_arithmetic_walker_has_deterministic_preorder() -> None:
+    expression = llir.BinOp(
+        "<",
+        llir.Add(
+            llir.Mul(_var("tile"), llir.Literal(4, llir.DataType.INT64)),
+            _var("offset"),
+        ),
+        llir.Literal(32, llir.DataType.INT64),
+    )
+
+    expected = [
+        "BinOp",
+        "Add",
+        "Mul",
+        "Var:tile",
+        "Literal:4",
+        "Var:offset",
+        "Literal:32",
+    ]
+    assert _record(expression) == expected
+    assert _record(expression) == expected
+
+
 def test_member_access_walker_has_deterministic_preorder() -> None:
     expression = llir.ArrayAccess(
         array=llir.MemberAccess(
@@ -326,6 +349,151 @@ def test_unknown_subclass_of_supported_expression_fails_closed(
 
     assert raised.value.diagnostic.node_type == "UnknownBinOp"
     assert raised.value.diagnostic.code == "unknown_llir_node"
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_arithmetic_subclasses_fail_closed(operation: str) -> None:
+    class UnknownAdd(llir.Add):
+        pass
+
+    class UnknownLiteral(llir.Literal):
+        pass
+
+    for unknown in (
+        UnknownAdd(_var("left"), _var("right")),
+        UnknownLiteral(1),
+    ):
+        with pytest.raises(LLIRTraversalError) as raised:
+            if operation == "walk":
+                LLIRWalker(_CONTEXT).walk(unknown)
+            else:
+                LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+        assert raised.value.diagnostic.node_type == type(unknown).__name__
+        assert raised.value.diagnostic.code == "unknown_llir_node"
+        assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("node_type", "field", "invalid", "diagnostic_code", "expected_path"),
+    (
+        (
+            llir.BinOp,
+            "op",
+            "",
+            "invalid_binary_operator",
+            ("root", "op"),
+        ),
+        (
+            llir.Add,
+            "op",
+            "-",
+            "invalid_add_operator",
+            ("root", "op"),
+        ),
+        (
+            llir.Mul,
+            "op",
+            "+",
+            "invalid_mul_operator",
+            ("root", "op"),
+        ),
+        (
+            llir.BinOp,
+            "left",
+            "left",
+            "invalid_binary_child",
+            ("root", "left"),
+        ),
+        (
+            llir.Add,
+            "right",
+            "right",
+            "invalid_binary_child",
+            ("root", "right"),
+        ),
+    ),
+)
+def test_forged_binary_fields_fail_at_traversal_boundary(
+    operation: str,
+    node_type: Type[llir.BinOp],
+    field: str,
+    invalid: object,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    expression = object.__new__(node_type)
+    object.__setattr__(expression, "op", "*" if node_type is llir.Mul else "+")
+    object.__setattr__(expression, "left", _var("left"))
+    object.__setattr__(expression, "right", _var("right"))
+    object.__setattr__(expression, field, invalid)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("field", "invalid", "diagnostic_code", "expected_path"),
+    (
+        (
+            "value",
+            object(),
+            "invalid_literal_value",
+            ("root", "value"),
+        ),
+        (
+            "data_type",
+            None,
+            "invalid_literal_data_type",
+            ("root", "data_type"),
+        ),
+    ),
+)
+def test_forged_literal_fields_fail_at_traversal_boundary(
+    operation: str,
+    field: str,
+    invalid: object,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    literal = object.__new__(llir.Literal)
+    object.__setattr__(literal, "value", 1)
+    object.__setattr__(literal, "data_type", llir.DataType.INT32)
+    object.__setattr__(literal, field, invalid)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(literal)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(literal)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_binary_unknown_child_reports_exact_path(operation: str) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    expression = llir.Add(UnknownExpr(), llir.Literal(1))
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.node_type == "UnknownExpr"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", "left")
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -830,6 +998,61 @@ def test_identity_rewriter_is_detached_and_structurally_idempotent() -> None:
     original_body = cast(List[LLIRStatementValue], original_nested[1])
     original_loop = cast(llir.ForLoop, original_body[1])
     assert len(original_loop.body) == 1
+
+
+def test_arithmetic_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original = llir.BinOp(
+        "<",
+        llir.Add(
+            llir.Mul(_var("scale"), llir.Literal(2, llir.DataType.INT64)),
+            llir.Literal(1, llir.DataType.INT64),
+        ),
+        _var("limit"),
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.BinOp, rewriter.rewrite(original))
+    second = cast(llir.BinOp, rewriter.rewrite(first))
+
+    assert type(first) is llir.BinOp
+    assert type(first.left) is llir.Add
+    assert type(cast(llir.Add, first.left).left) is llir.Mul
+    assert type(second) is llir.BinOp
+    assert type(second.left) is llir.Add
+    assert type(cast(llir.Add, second.left).left) is llir.Mul
+    assert _record(original) == _record(first) == _record(second)
+    assert original == first == second
+    assert hash(original) == hash(first) == hash(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+
+    class ReplaceScale(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "scale":
+                rewritten.name = "replacement"
+            return rewritten
+
+    replacement = cast(llir.BinOp, ReplaceScale(_CONTEXT).rewrite(original))
+    replacement_add = cast(llir.Add, replacement.left)
+    replacement_mul = cast(llir.Mul, replacement_add.left)
+    original_add = cast(llir.Add, original.left)
+    original_mul = cast(llir.Mul, original_add.left)
+    replacement_var = cast(llir.Var, replacement_mul.left)
+    original_var = cast(llir.Var, original_mul.left)
+
+    assert replacement_var.name == "replacement"
+    assert original_var.name == "scale"
+    assert replacement is not original
+    assert replacement.left is not original.left
+    assert replacement_mul is not original_mul
+    assert replacement_var is not original_var
+
+    replacement_var.name = "owned"
+    assert original_var.name == "scale"
+    assert cast(
+        llir.Var, cast(llir.Mul, cast(llir.Add, second.left).left).left
+    ).name == ("scale")
 
 
 def test_member_access_identity_rewrite_is_detached_idempotent_and_owned() -> None:

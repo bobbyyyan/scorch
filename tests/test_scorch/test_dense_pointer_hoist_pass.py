@@ -496,6 +496,71 @@ def test_typed_array_access_activates_and_preserves_structured_provenance() -> N
     assert access is not typed_access
 
 
+def test_add_rewrite_is_rebuilt_detached_repeatable_and_caller_owned() -> None:
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(24),
+        tensor_id=SymbolId(25),
+        index_ids=(IndexId(26),),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    value = llir.Add(
+        _var(
+            "Input_val[position]",
+            llir.DataType.PTR_FLOAT32,
+            is_ptr=True,
+            is_restrict=True,
+            tensor_access=metadata,
+        ),
+        llir.Literal(1, llir.DataType.INT64),
+    )
+    source = [
+        _loop(
+            [
+                _position_init(),
+                llir.Assign(_var("output"), value),
+            ]
+        )
+    ]
+    snapshot = _snapshot(source)
+    context = _context(("Input_val", "float"))
+
+    once = hoist_dense_pointers(source, context)
+    twice = hoist_dense_pointers(once, context)
+
+    assert _snapshot(source) == snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once))
+    assert _mutable_ir_ids(once).isdisjoint(_mutable_ir_ids(twice))
+    assert _snapshot(twice) == _snapshot(once)
+    assert _raw_codes(once) == [
+        "const float* __restrict__ _Input_val_ptr = " "&Input_val[base * stride]"
+    ]
+    rewritten = cast(
+        llir.Add,
+        cast(llir.Assign, cast(llir.ForLoop, once[1]).body[0]).value,
+    )
+    repeated = cast(
+        llir.Add,
+        cast(llir.Assign, cast(llir.ForLoop, twice[1]).body[0]).value,
+    )
+    assert type(rewritten) is llir.Add
+    assert rewritten is not value
+    assert rewritten == llir.Add(
+        _var(
+            "_Input_val_ptr[lane]",
+            llir.DataType.PTR_FLOAT32,
+            is_ptr=True,
+            is_restrict=True,
+            tensor_access=metadata,
+        ),
+        llir.Literal(1, llir.DataType.INT64),
+    )
+    assert cast(llir.Var, rewritten.left).tensor_access is metadata
+    assert repeated == rewritten
+    assert repeated is not rewritten
+    assert repeated.left is not rewritten.left
+    assert repeated.right is not rewritten.right
+
+
 def test_varinit_only_value_access_remains_a_detached_legal_miss() -> None:
     source = [
         _loop(

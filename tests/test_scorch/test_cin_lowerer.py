@@ -22,7 +22,10 @@ from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 from scorch.compiler.diagnostics import CompilerInvariantError, UnsupportedFeature
 from scorch.compiler.iterator import ModeIterator  # type: ignore[import-untyped]
 from scorch.compiler.llir_traversal import LLIRTraversalContext, LLIRWalker
-from scorch.compiler.scheduler import Scheduler  # type: ignore[import-untyped]
+from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
+    Scheduler,
+    regblock_force,
+)
 from scorch.format import LevelType  # type: ignore[import-untyped]
 
 
@@ -83,6 +86,49 @@ def _all_coo_transform_coordinate_read(
     )
     assert type(initializer.value) is llir.ArrayAccess
     return parallel_loop, initializer, cast(llir.ArrayAccess, initializer.value)
+
+
+def _all_coo_transform_end_bound(
+    *, source: llir.ForLoop | None = None
+) -> tuple[llir.ForLoop, llir.VarInit, llir.Add]:
+    lowerer = CINLowerer()
+    lowerer._used_scalar_accum = True
+    transformed = lowerer._transform_coo_loop_for_openmp(
+        [source if source is not None else _build_all_coo_transform_loop()]
+    )
+    parallel_loop = next(
+        cast(llir.ForLoop, statement)
+        for statement in transformed
+        if type(statement) is llir.ForLoop
+        and cast(llir.ForLoop, statement).omp_parallel_for
+    )
+    initializer = next(
+        cast(llir.VarInit, statement)
+        for statement in parallel_loop.body
+        if type(statement) is llir.VarInit
+        and cast(llir.VarInit, statement).var.name == "pMask1_end"
+    )
+    assert type(initializer.value) is llir.Add
+    return parallel_loop, initializer, cast(llir.Add, initializer.value)
+
+
+def _build_activating_all_coo_sddmm() -> ForAll:
+    row, column, reduction = IndexVar("r"), IndexVar("c"), IndexVar("q")
+    result = TensorVar("Sampled", fmt="oo")
+    mask = TensorVar("Mask", fmt="oo")
+    query = TensorVar("Query", fmt="dd")
+    key = TensorVar("Key", fmt="dd")
+    assignment = TensorAssign(
+        result[row, column],
+        mask[row, column] * query[row, reduction] * key[column, reduction],
+        op=Operation.ADD,
+    )
+    return cast(
+        ForAll,
+        Scheduler.auto_schedule(
+            ForAll(row, ForAll(column, ForAll(reduction, assignment)))
+        ),
+    )
 
 
 def _build_outer_workspace_statement(result_format: str) -> tuple[Where, TensorVar]:
@@ -761,6 +807,118 @@ def test_all_coo_transform_coordinate_initializers_are_structured_typed_and_owne
     assert LLIRLowerer().lower_llir(source) == source_cpp
     with pytest.raises(FrozenInstanceError):
         first.index = llir.Var("other", llir.DataType.INT64)
+
+
+def test_all_coo_transform_end_bound_is_structured_typed_owned_and_byte_exact() -> None:
+    source = _build_all_coo_transform_loop()
+    source_cpp = LLIRLowerer().lower_llir(source)
+    first_loop, first_initializer, first = _all_coo_transform_end_bound(source=source)
+    second_loop, second_initializer, second = _all_coo_transform_end_bound()
+
+    expected = llir.Add(
+        llir.Var("pMask0", llir.DataType.INT64),
+        llir.Literal(1, data_type=llir.DataType.INT64),
+    )
+    assert type(first) is llir.Add
+    assert type(second) is llir.Add
+    assert first == expected == second
+    assert hash(first) == hash(expected) == hash(second)
+    assert first != llir.BinOp(
+        "+",
+        llir.Var("pMask0", llir.DataType.INT64),
+        llir.Literal(1, data_type=llir.DataType.INT64),
+    )
+    assert type(first.left) is llir.Var
+    first_left = cast(llir.Var, first.left)
+    assert first_left.name == "pMask0"
+    assert first_left.type is llir.DataType.INT64
+    assert first_left.tensor_access is None
+    assert first_left.is_ptr is False
+    assert first_left.is_restrict is False
+    assert type(first.right) is llir.Literal
+    first_right = cast(llir.Literal, first.right)
+    assert first_right.value == 1
+    assert type(first_right.value) is int
+    assert first_right.data_type is llir.DataType.INT64
+
+    assert first is not second
+    assert first.left is not second.left
+    assert first.right is not second.right
+    assert first.left is not cast(llir.VarInit, first_loop.init).var
+    assert second.left is not cast(llir.VarInit, second_loop.init).var
+    assert first_initializer is not second_initializer
+    assert first_initializer.var is not second_initializer.var
+    assert first_initializer.value is first
+    assert second_initializer.value is second
+    assert first_initializer.var.type is llir.DataType.INT64
+    assert LLIRLowerer().lower_llir(first_initializer) == (
+        "int64_t pMask1_end = pMask0 + 1;"
+    )
+    assert "  int64_t pMask1_end = pMask0 + 1;" in LLIRLowerer().lower_llir(first_loop)
+    assert LLIRLowerer().lower_llir(source) == source_cpp
+
+
+def test_production_all_coo_end_bound_activates_then_is_suppressed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statement = _build_activating_all_coo_sddmm()
+    statement_before = str(statement)
+    original_transform = CINLowerer._transform_coo_loop_for_openmp
+    captured: list[llir.Add] = []
+
+    def record_end_bound(
+        self: CINLowerer,
+        statements: list[llir.Stmt],
+    ) -> list[llir.Stmt]:
+        transformed = original_transform(self, statements)
+
+        def collect(value: object) -> None:
+            if type(value) is llir.VarInit:
+                initializer = cast(llir.VarInit, value)
+                if (
+                    initializer.var.name == "pMask1_end"
+                    and type(initializer.value) is llir.Add
+                ):
+                    captured.append(cast(llir.Add, initializer.value))
+            if isinstance(value, llir.Node):
+                for child in vars(value).values():
+                    collect(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child)
+
+        collect(transformed)
+        return transformed
+
+    monkeypatch.setattr(
+        CINLowerer,
+        "_transform_coo_loop_for_openmp",
+        record_end_bound,
+    )
+    with regblock_force(False):
+        lowerer = CINLowerer()
+        lowered = lowerer.lower_IndexStmt(statement)
+    cpp = LLIRLowerer().lower_llir(lowered)
+
+    assert str(statement) == statement_before
+    assert captured == [
+        llir.Add(
+            llir.Var("pMask0", llir.DataType.INT64),
+            llir.Literal(1, data_type=llir.DataType.INT64),
+        )
+    ]
+    assert "pMask1_end" not in cpp
+    assert "pMask1 = pMask0" not in cpp
+    assert "pMask1 <" not in cpp
+    assert "pMask1++" not in cpp
+    assert "pMask0 < pMask0_end; pMask0++" in cpp
+    assert [record.pass_name for record in lowerer.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
 
 
 def test_mutated_unknown_post_op_cannot_be_silently_skipped():

@@ -448,15 +448,12 @@ def test_bound_regex_and_spacing_are_exact(bound_spelling: str) -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
-@pytest.mark.parametrize("condition_type", (llir.BinOp, llir.Add, llir.Mul))
-def test_supported_binop_family_ignores_condition_left_and_update(
-    condition_type: type[llir.BinOp],
-) -> None:
-    if condition_type is llir.BinOp:
-        condition = llir.BinOp("<", llir.FunctionCall("unrelated", []), _var("end"))
-    else:
-        condition = condition_type(llir.FunctionCall("unrelated", []), _var("end"))
-        condition.op = "<"
+def test_exact_binop_condition_ignores_condition_left_and_update() -> None:
+    condition = llir.BinOp(
+        "<",
+        llir.FunctionCall("unrelated", []),
+        _var("end"),
+    )
     loop = _loop(
         [llir.RawStmt("read(A[lane])")],
         condition=condition,
@@ -472,10 +469,209 @@ def test_supported_binop_family_ignores_condition_left_and_update(
     assert _raw_codes(output) == ["read(A[base])"]
 
 
+def test_structured_add_bound_matches_and_rebuilds_detached_references() -> None:
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(41),
+        tensor_id=SymbolId(42),
+        index_ids=(IndexId(43),),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    bound_value = llir.Add(
+        _var("base", llir.DataType.INT64),
+        llir.Literal(1, llir.DataType.INT64),
+    )
+    body_value = llir.Add(
+        _var(
+            "lane value",
+            llir.DataType.PTR_FLOAT32,
+            is_ptr=True,
+            is_restrict=True,
+            tensor_access=metadata,
+        ),
+        llir.Literal(2, llir.DataType.INT64),
+    )
+    source = _program(
+        [
+            llir.Assign(_var("output"), body_value),
+            llir.RawStmt("read(A[lane])"),
+        ],
+        bound_value=bound_value,
+    )
+    snapshot = _snapshot(source)
+
+    once = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+    twice = eliminate_single_iteration_loops(
+        once,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert _snapshot(source) == snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once))
+    assert _mutable_ir_ids(once).isdisjoint(_mutable_ir_ids(twice))
+    assert _snapshot(twice) == _snapshot(once)
+    assert _raw_codes(once) == ["read(A[base])"]
+    rewritten = cast(llir.Add, cast(llir.Assign, once[0]).value)
+    repeated = cast(llir.Add, cast(llir.Assign, twice[0]).value)
+    assert type(rewritten) is llir.Add
+    assert rewritten is not body_value
+    assert rewritten == llir.Add(
+        _var(
+            "base value",
+            llir.DataType.PTR_FLOAT32,
+            is_ptr=True,
+            is_restrict=True,
+            tensor_access=metadata,
+        ),
+        llir.Literal(2, llir.DataType.INT64),
+    )
+    assert cast(llir.Var, rewritten.left).tensor_access is metadata
+    assert repeated == rewritten
+    assert repeated is not rewritten
+    assert repeated.left is not rewritten.left
+    assert repeated.right is not rewritten.right
+
+
+@pytest.mark.parametrize(
+    "bound_value",
+    (
+        llir.BinOp(
+            "+",
+            _var("base", llir.DataType.INT64),
+            llir.Literal(1, llir.DataType.INT64),
+        ),
+        llir.Mul(
+            _var("base", llir.DataType.INT64),
+            llir.Literal(1, llir.DataType.INT64),
+        ),
+        llir.Add(
+            llir.Literal(1, llir.DataType.INT64),
+            _var("base", llir.DataType.INT64),
+        ),
+        llir.Add(
+            _var("base", llir.DataType.INT64),
+            llir.Literal(2, llir.DataType.INT64),
+        ),
+        llir.Add(
+            _var("base", llir.DataType.INT64),
+            llir.Literal(1, llir.DataType.INT),
+        ),
+        llir.Add(
+            _var("base", llir.DataType.INT),
+            llir.Literal(1, llir.DataType.INT64),
+        ),
+        llir.Add(
+            _var("base", llir.DataType.INT64, is_ptr=True),
+            llir.Literal(1, llir.DataType.INT64),
+        ),
+        llir.Add(
+            _var("base", llir.DataType.INT64, is_restrict=True),
+            llir.Literal(1, llir.DataType.INT64),
+        ),
+        llir.Add(
+            _var(
+                "base",
+                llir.DataType.INT64,
+                tensor_access=llir.TensorAccessMetadata(
+                    access_id=AccessId(51),
+                    tensor_id=SymbolId(52),
+                    index_ids=(IndexId(53),),
+                    role=llir.TensorAccessRole.INPUT_READ,
+                ),
+            ),
+            llir.Literal(1, llir.DataType.INT64),
+        ),
+    ),
+)
+def test_structured_single_step_bound_requires_the_exact_legal_shape(
+    bound_value: llir.Expr,
+) -> None:
+    source = _program(bound_value=bound_value)
+    snapshot = _snapshot(source)
+
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert _snapshot(output) == snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
+def test_structured_single_step_bound_requires_a_word_base_name() -> None:
+    source = _program(
+        base="base-name",
+        bound_value=llir.Add(
+            _var("base-name", llir.DataType.INT64),
+            llir.Literal(1, llir.DataType.INT64),
+        ),
+    )
+    snapshot = _snapshot(source)
+
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert _snapshot(output) == snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
+class _UnknownSingleStepAdd(llir.Add):
+    pass
+
+
+def test_structured_single_step_bound_unknown_subclass_fails_closed() -> None:
+    source = _program(
+        bound_value=_UnknownSingleStepAdd(
+            _var("base", llir.DataType.INT64),
+            llir.Literal(1, llir.DataType.INT64),
+        )
+    )
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        eliminate_single_iteration_loops(
+            source,
+            SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "unknown_llir_node"
+    assert diagnostic.path == ("root", "[0]", "value")
+    assert diagnostic.node_type == "_UnknownSingleStepAdd"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "eliminate_single_iteration_loops"
+
+
+def test_structured_single_step_bound_forged_operator_fails_validation() -> None:
+    value = llir.Add(
+        _var("base", llir.DataType.INT64),
+        llir.Literal(1, llir.DataType.INT64),
+    )
+    object.__setattr__(value, "op", "-")
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        eliminate_single_iteration_loops(
+            _program(bound_value=value),
+            SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_add_operator"
+    assert diagnostic.path == ("root", "[0]", "value", "op")
+    assert diagnostic.node_type == "str"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "eliminate_single_iteration_loops"
+
+
 @pytest.mark.parametrize(
     "loop",
     (
         _loop([], condition=llir.BinOp("<=", _var("lane"), _var("end"))),
+        _loop([], condition=llir.Add(_var("lane"), _var("end"))),
+        _loop([], condition=llir.Mul(_var("lane"), _var("end"))),
         _loop([], condition=llir.BinOp("<", _var("lane"), llir.Literal(1))),
         _loop([], initial_value=llir.FunctionCall("initial", [])),
         _loop([], loop_variable="base"),
@@ -1101,7 +1297,11 @@ def _malformed_bound_name() -> List[llir.Stmt]:
 
 def _malformed_condition_operator() -> List[llir.Stmt]:
     source = _program()
-    cast(llir.BinOp, cast(llir.ForLoop, source[1]).cond).op = cast(str, 7)
+    object.__setattr__(
+        cast(llir.BinOp, cast(llir.ForLoop, source[1]).cond),
+        "op",
+        cast(str, 7),
+    )
     return source
 
 
@@ -1124,11 +1324,6 @@ def _malformed_rewritten_var_name() -> List[llir.Stmt]:
             _malformed_bound_name,
             "invalid_single_iteration_loop_var_name",
             ("root", "[0]", "value", "name"),
-        ),
-        (
-            _malformed_condition_operator,
-            "invalid_single_iteration_loop_binary_operator",
-            ("root", "[1]", "cond", "op"),
         ),
         (
             _malformed_function_name,
@@ -1161,6 +1356,21 @@ def test_malformed_consumed_scalars_use_pass_owned_diagnostics(
     diagnostic = raised.value.diagnostic
     assert diagnostic.code == expected_code
     assert diagnostic.path == expected_path
+    assert diagnostic.node_type == "int"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "eliminate_single_iteration_loops"
+
+
+def test_forged_condition_operator_uses_common_binary_validation() -> None:
+    with pytest.raises(LLIRTraversalError) as raised:
+        eliminate_single_iteration_loops(
+            _malformed_condition_operator(),
+            SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_binary_operator"
+    assert diagnostic.path == ("root", "[1]", "cond", "op")
     assert diagnostic.node_type == "int"
     assert diagnostic.stage == "LLIR transformation"
     assert diagnostic.pass_name == "eliminate_single_iteration_loops"

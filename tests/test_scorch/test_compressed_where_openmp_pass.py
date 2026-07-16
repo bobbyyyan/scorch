@@ -502,8 +502,7 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
     )
     assignment = llir.Assign(
         llir.ArrayAccess(_var("wksp.insert_targets"), _var("wksp.insert_target_index")),
-        llir.BinOp(
-            "+",
+        llir.Add(
             _var("wksp.insert_value"),
             llir.ArrayAccess(
                 _var("wksp.insert_values"),
@@ -531,7 +530,7 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
         ),
     )
     target = cast(llir.ArrayAccess, rewritten_assignment.var)
-    value = cast(llir.BinOp, rewritten_assignment.value)
+    value = cast(llir.Add, rewritten_assignment.value)
     value_access = cast(llir.ArrayAccess, value.right)
     rewritten_initialization = cast(
         llir.VarInit,
@@ -556,13 +555,24 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
             statement for statement in fill_loop.body if type(statement) is llir.Assign
         ),
     )
-    fill_value = cast(llir.BinOp, fill_assignment.value)
+    fill_value = cast(llir.Add, fill_assignment.value)
+    assert type(value) is llir.Add
+    assert type(fill_value) is llir.Add
+    assert value == fill_value
+    assert value is not assignment.value
+    assert fill_value is not assignment.value
+    assert fill_value is not value
+    assert value.left is not cast(llir.Add, assignment.value).left
+    assert value.right is not cast(llir.Add, assignment.value).right
+    assert fill_value.left is not value.left
+    assert fill_value.right is not value.right
     assert cast(llir.ArrayAccess, fill_value.right).tensor_access is metadata
     assert cast(llir.Var, rewritten_initialization.value).name == (
         "wksp.insert_unchecked_initial_value"
     )
     assert "wksp.insert_unchecked(raw_value)" in _raw_codes(count_loop.body)
     assert _structural_snapshot(source) == snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(result.statements))
 
 
 def test_retained_metadata_is_preserved_but_selected_loop_policy_is_reset() -> None:

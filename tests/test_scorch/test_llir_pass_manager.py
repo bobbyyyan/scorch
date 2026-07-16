@@ -617,6 +617,86 @@ def test_all_coo_coordinate_read_survives_repeated_production_pipeline() -> None
     assert once_read.tensor_access is None
 
 
+def test_all_coo_end_bound_survives_repeated_detached_production_pipeline() -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    source_bound = llir.Add(
+        _var("pMask0", llir.DataType.INT64),
+        llir.Literal(1, data_type=llir.DataType.INT64),
+    )
+    source: List[llir.Stmt] = [
+        llir.VarInit(
+            _var("pMask1_end", llir.DataType.INT64),
+            source_bound,
+        )
+    ]
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact(artifact.statements)
+
+    once = manager.run_production_pipeline(
+        LLIRStatementListArtifact(source),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+    twice = manager.run_production_pipeline(
+        LLIRStatementListArtifact(once.artifact.value),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    assert _structural_snapshot(source) == _structural_snapshot(once.artifact.value)
+    assert _structural_snapshot(once.artifact.value) == _structural_snapshot(
+        twice.artifact.value
+    )
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once.artifact.value))
+    assert _mutable_ir_ids(once.artifact.value).isdisjoint(
+        _mutable_ir_ids(twice.artifact.value)
+    )
+    expected_passes = [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    for result in (once, twice):
+        assert [record.pass_name for record in result.run_records] == expected_passes
+        assert [record.sequence_index for record in result.run_records] == list(
+            range(5)
+        )
+        assert all(record.duration_ns is not None for record in result.run_records)
+
+    once_initializer = cast(llir.VarInit, once.artifact.value[0])
+    twice_initializer = cast(llir.VarInit, twice.artifact.value[0])
+    assert once_initializer.value == source_bound
+    assert twice_initializer.value == source_bound
+    assert hash(cast(llir.Add, once_initializer.value)) == hash(source_bound)
+    assert type(once_initializer.value) is llir.Add
+    assert type(twice_initializer.value) is llir.Add
+    once_bound = cast(llir.Add, once_initializer.value)
+    twice_bound = cast(llir.Add, twice_initializer.value)
+    assert type(once_bound.left) is llir.Var
+    assert cast(llir.Var, once_bound.left).name == "pMask0"
+    assert cast(llir.Var, once_bound.left).type is llir.DataType.INT64
+    assert cast(llir.Var, once_bound.left).tensor_access is None
+    assert type(once_bound.right) is llir.Literal
+    assert cast(llir.Literal, once_bound.right).value == 1
+    assert cast(llir.Literal, once_bound.right).data_type is llir.DataType.INT64
+    assert once_bound is not source_bound
+    assert once_bound.left is not source_bound.left
+    assert once_bound.right is not source_bound.right
+    assert twice_bound is not once_bound
+    assert twice_bound.left is not once_bound.left
+    assert twice_bound.right is not once_bound.right
+
+
 def test_mode_iterator_coordinate_read_activates_managed_sparse_prefetch() -> None:
     compile_options = _compile_options()
     manager = LLIRPassManager.from_compile_options(compile_options)

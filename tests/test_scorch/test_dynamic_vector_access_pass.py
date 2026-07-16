@@ -176,6 +176,117 @@ def test_structural_function_call_equality_is_explicit_at_deduplication_seam() -
     assert _structural_snapshot(source) == snapshot
 
 
+def _independent_single_step_add() -> llir.Add:
+    return llir.Add(
+        _var("base", llir.DataType.INT64),
+        llir.Literal(1, llir.DataType.INT64),
+    )
+
+
+def test_structural_add_equality_deduplicates_only_coordinate_appends() -> None:
+    coordinate_values = [_independent_single_step_add() for _ in range(2)]
+    position_values = [_independent_single_step_add() for _ in range(2)]
+    non_coordinate_values = [_independent_single_step_add() for _ in range(2)]
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_crd", llir.DataType.STD_VECTOR_C_INT)),
+        llir.VarDecl(_var("out_pos", llir.DataType.STD_VECTOR_C_INT)),
+        llir.VarDecl(_var("out_values", llir.DataType.STD_VECTOR_FLOAT32)),
+        *[
+            llir.Assign(
+                _access("out_crd", "p", llir.DataType.STD_VECTOR_C_INT),
+                value,
+            )
+            for value in coordinate_values
+        ],
+        *[
+            llir.Assign(
+                _access("out_pos", "p", llir.DataType.STD_VECTOR_C_INT),
+                value,
+            )
+            for value in position_values
+        ],
+        *[
+            llir.Assign(
+                _access("out_values", "p", llir.DataType.STD_VECTOR_FLOAT32),
+                value,
+            )
+            for value in non_coordinate_values
+        ],
+    ]
+    snapshot = _structural_snapshot(source)
+
+    rewritten = rewrite_dynamic_vector_accesses(
+        source,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+
+    assert _structural_snapshot(source) == snapshot
+    calls = [
+        cast(llir.FunctionCallStmt, statement)
+        for statement in rewritten
+        if type(statement) is llir.FunctionCallStmt
+    ]
+    assert [call.name for call in calls] == [
+        "out_crd.emplace_back",
+        "scorch_vector_set",
+        "scorch_vector_set",
+        "out_values.emplace_back",
+        "out_values.emplace_back",
+    ]
+    rewritten_values = [
+        cast(
+            llir.Add, call.args[2] if call.name == "scorch_vector_set" else call.args[0]
+        )
+        for call in calls
+    ]
+    assert all(type(value) is llir.Add for value in rewritten_values)
+    assert all(value == _independent_single_step_add() for value in rewritten_values)
+    for rewritten_value in rewritten_values:
+        assert all(
+            rewritten_value is not source_value
+            for source_value in (
+                *coordinate_values,
+                *position_values,
+                *non_coordinate_values,
+            )
+        )
+    assert _cpp(rewritten).count("out_crd.emplace_back(base + 1);") == 1
+    assert _cpp(rewritten).count("scorch_vector_set(out_pos, p, base + 1);") == 2
+    assert _cpp(rewritten).count("out_values.emplace_back(base + 1);") == 2
+
+
+def test_binary_exact_class_difference_prevents_coordinate_deduplication() -> None:
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_crd", llir.DataType.STD_VECTOR_C_INT)),
+        llir.Assign(
+            _access("out_crd", "p", llir.DataType.STD_VECTOR_C_INT),
+            llir.BinOp(
+                "+",
+                _var("base", llir.DataType.INT64),
+                llir.Literal(1, llir.DataType.INT64),
+            ),
+        ),
+        llir.Assign(
+            _access("out_crd", "p", llir.DataType.STD_VECTOR_C_INT),
+            _independent_single_step_add(),
+        ),
+    ]
+
+    rewritten = rewrite_dynamic_vector_accesses(
+        source,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+
+    calls = [cast(llir.FunctionCallStmt, statement) for statement in rewritten[1:]]
+    assert [call.name for call in calls] == [
+        "out_crd.emplace_back",
+        "out_crd.emplace_back",
+    ]
+    assert type(calls[0].args[0]) is llir.BinOp
+    assert type(calls[1].args[0]) is llir.Add
+    assert _cpp(rewritten).count("out_crd.emplace_back(base + 1);") == 2
+
+
 def test_dynamic_vector_pass_does_not_mutate_or_alias_caller_input() -> None:
     source = _legacy_dynamic_vector_fixture()
     rewritten = rewrite_dynamic_vector_accesses(

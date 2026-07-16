@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError
-from typing import Optional, Tuple, Union, cast, get_type_hints
+from typing import Any, Optional, Tuple, Union, cast, get_type_hints
 
 import pytest
 
@@ -112,6 +112,185 @@ def test_cast_codegen_parenthesizes_lower_precedence_operand() -> None:
     )
 
     assert LLIRLowerer().lower_llir(expression) == "(float) (a + b)"
+
+
+def test_binary_and_literal_nodes_are_frozen_typed_structural_values() -> None:
+    left = _var("i")
+    one = llir.Literal(1, llir.DataType.INT64)
+    add = llir.Add(left, one)
+    equal_add = llir.Add(_var("i"), llir.Literal(1, llir.DataType.INT64))
+    generic_add = llir.BinOp("+", _var("i"), llir.Literal(1, llir.DataType.INT64))
+    multiply = llir.Mul(_var("i"), llir.Literal(1, llir.DataType.INT64))
+
+    assert type(add) is llir.Add
+    assert add.op == "+"
+    assert add.left is left
+    assert add.right is one
+    assert type(multiply) is llir.Mul
+    assert multiply.op == "*"
+    assert llir.Literal(1).data_type is llir.DataType.INT32
+    assert llir.Literal(True).data_type is llir.DataType.BOOL
+    assert llir.Literal(1.0).data_type is llir.DataType.FLOAT32
+    assert llir.Literal("value").data_type is llir.DataType.STRING
+    binary_hints = {
+        "op": str,
+        "left": llir.Expr,
+        "right": llir.Expr,
+    }
+    assert get_type_hints(llir.BinOp) == binary_hints
+    assert get_type_hints(llir.Add) == binary_hints
+    assert get_type_hints(llir.Mul) == binary_hints
+    assert get_type_hints(llir.Literal) == {
+        "value": Any,
+        "data_type": Optional[llir.DataType],
+    }
+
+    assert add == equal_add
+    assert hash(add) == hash(equal_add)
+    assert add != generic_add
+    assert add != multiply
+    assert len({add, equal_add, generic_add, multiply}) == 3
+    assert llir.Literal(1) == llir.Literal(1, llir.DataType.INT32)
+    assert hash(llir.Literal(1)) == hash(llir.Literal(1, llir.DataType.INT32))
+    assert llir.Literal(1) != llir.Literal(1, llir.DataType.INT64)
+    assert llir.Literal(True) != llir.Literal(1)
+
+    with pytest.raises(FrozenInstanceError):
+        add.op = "-"
+    with pytest.raises(FrozenInstanceError):
+        add.left = _var("j")
+    with pytest.raises(FrozenInstanceError):
+        one.value = 2
+    with pytest.raises(FrozenInstanceError):
+        one.data_type = llir.DataType.INT32
+
+
+def test_binary_and_literal_construction_rejects_malformed_fields() -> None:
+    with pytest.raises(TypeError, match="BinOp.op"):
+        llir.BinOp("", _var("left"), _var("right"))
+    with pytest.raises(TypeError, match="BinOp.op"):
+        llir.BinOp(1, _var("left"), _var("right"))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="BinOp.left"):
+        llir.BinOp("+", "left", _var("right"))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="BinOp.right"):
+        llir.Add(_var("left"), "right")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Literal.value"):
+        llir.Literal(object())
+    with pytest.raises(TypeError, match="Literal.data_type"):
+        llir.Literal(1, cast(llir.DataType, "int64_t"))
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
+        (llir.Add(_var("p"), llir.Literal(1)), "p + 1"),
+        (
+            llir.Mul(llir.Add(_var("a"), _var("b")), _var("c")),
+            "(a + b) * c",
+        ),
+        (
+            llir.Add(llir.Mul(_var("a"), _var("b")), _var("c")),
+            "a * b + c",
+        ),
+        (
+            llir.Add(_var("a"), llir.Add(_var("b"), _var("c"))),
+            "a + (b + c)",
+        ),
+        (
+            llir.Mul(_var("a"), llir.Mul(_var("b"), _var("c"))),
+            "a * (b * c)",
+        ),
+    ),
+)
+def test_exact_add_mul_codegen_is_byte_exact_and_precedence_safe(
+    expression: llir.BinOp,
+    expected: str,
+) -> None:
+    assert LLIRLowerer().lower_llir(expression) == expected
+
+
+@pytest.mark.parametrize(
+    "node_type",
+    (llir.BinOp, llir.Add, llir.Mul, llir.Literal),
+)
+def test_codegen_rejects_unknown_arithmetic_subclasses(
+    node_type: type[llir.Expr],
+) -> None:
+    if node_type is llir.Literal:
+
+        class UnknownArithmetic(node_type):  # type: ignore[misc, valid-type]
+            pass
+
+        expression = UnknownArithmetic(1)
+    else:
+
+        class UnknownArithmetic(node_type):  # type: ignore[misc, valid-type, no-redef]
+            pass
+
+        if node_type is llir.BinOp:
+            expression = UnknownArithmetic("+", _var("left"), _var("right"))
+        else:
+            expression = UnknownArithmetic(_var("left"), _var("right"))
+
+    with pytest.raises(CodegenError, match="UnknownArithmetic"):
+        LLIRLowerer().lower_llir(expression)
+
+
+@pytest.mark.parametrize(
+    ("node_type", "field", "invalid", "message"),
+    (
+        (llir.BinOp, "op", "", "non-empty string"),
+        (llir.Add, "op", "-", "Add.op"),
+        (llir.Mul, "op", "+", "Mul.op"),
+        (llir.BinOp, "left", "left", "BinOp.left"),
+        (llir.Add, "right", "right", "BinOp.right"),
+    ),
+)
+def test_codegen_rejects_forged_binary_fields(
+    node_type: type[llir.BinOp],
+    field: str,
+    invalid: object,
+    message: str,
+) -> None:
+    expression = object.__new__(node_type)
+    object.__setattr__(expression, "op", "*" if node_type is llir.Mul else "+")
+    object.__setattr__(expression, "left", _var("left"))
+    object.__setattr__(expression, "right", _var("right"))
+    object.__setattr__(expression, field, invalid)
+
+    with pytest.raises(CodegenError, match=message):
+        LLIRLowerer().lower_llir(expression)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "message"),
+    (
+        ("value", object(), "Literal.value"),
+        ("data_type", None, "Literal.data_type"),
+    ),
+)
+def test_codegen_rejects_forged_literal_fields(
+    field: str,
+    invalid: object,
+    message: str,
+) -> None:
+    literal = object.__new__(llir.Literal)
+    object.__setattr__(literal, "value", 1)
+    object.__setattr__(literal, "data_type", llir.DataType.INT32)
+    object.__setattr__(literal, field, invalid)
+
+    with pytest.raises(CodegenError, match=message):
+        LLIRLowerer().lower_llir(literal)
+
+
+def test_codegen_rejects_unknown_binary_children() -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    expression = llir.Add(UnknownExpr(), llir.Literal(1))
+
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(expression)
 
 
 def test_function_call_is_frozen_typed_owned_and_structurally_equal() -> None:

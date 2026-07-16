@@ -2305,6 +2305,98 @@ def test_malformed_all_coo_coordinate_read_fails_cin_lowering_and_stops_later_wo
     assert suppressed.value.diagnostic.code == "failed_compilation"
 
 
+def test_malformed_all_coo_end_bound_fails_cin_lowering_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    original_transform = CINLowerer._transform_coo_loop_for_openmp
+    injected_bounds: list[llir.Add] = []
+
+    def transform_with_malformed_end_bound(
+        self: CINLowerer,
+        statements: list[llir.Stmt],
+    ) -> list[llir.Stmt]:
+        transformed = original_transform(self, statements)
+
+        def inject(value: object) -> None:
+            if type(value) is llir.VarInit:
+                initializer = cast(llir.VarInit, value)
+                if type(initializer.value) is llir.Add:
+                    arithmetic = cast(llir.Add, initializer.value)
+                    left = arithmetic.left
+                    right = arithmetic.right
+                else:
+                    arithmetic = None
+                    left = None
+                    right = None
+                if (
+                    initializer.var.name.endswith("1_end")
+                    and arithmetic is not None
+                    and type(left) is llir.Var
+                    and cast(llir.Var, left).type is llir.DataType.INT64
+                    and type(right) is llir.Literal
+                    and cast(llir.Literal, right).value == 1
+                    and cast(llir.Literal, right).data_type is llir.DataType.INT64
+                ):
+                    object.__setattr__(arithmetic, "op", "-")
+                    injected_bounds.append(arithmetic)
+                    return
+            if isinstance(value, llir.Node):
+                for child in vars(value).values():
+                    inject(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    inject(child)
+
+        inject(transformed)
+        return transformed
+
+    monkeypatch.setattr(
+        CINLowerer,
+        "_transform_coo_loop_for_openmp",
+        transform_with_malformed_end_bound,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with scheduler_module.regblock_force(False):
+        with pytest.raises(LLIRTraversalError) as failure:
+            ops.einsum(
+                "ij,ik,jk->ij",
+                *_all_coo_sddmm_specs(),
+                compile_only=True,
+                format="oo",
+                _compile_options=options,
+                _compilation_context=context,
+            )
+
+    assert len(injected_bounds) == 1
+    assert failure.value.diagnostic.code == "invalid_add_operator"
+    assert failure.value.diagnostic.stage == "LLIR transformation"
+    assert failure.value.diagnostic.pass_name == "insert_sparse_prefetch"
+    assert context.compile_options is options
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert context.llir_pass_run_records == ()
+    assert later_calls == []
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
 def test_malformed_mode_iterator_coordinate_read_stops_all_later_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

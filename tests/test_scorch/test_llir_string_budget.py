@@ -118,7 +118,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(constructor_counts.values()) == 379
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 172,
+        "cin_lowerer.py": 173,
         "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -129,7 +129,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 94,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 343
+    assert sum(unclassified_counts.values()) == 344
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -149,9 +149,8 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "initializer": 3,
         "qualified": 3,
         "ternary": 1,
-        "arithmetic": 1,
     }
-    assert sum(totals.values()) == 36
+    assert sum(totals.values()) == 35
     assert per_file == {
         ("cin_lowerer.py", "subscript"): 13,
         ("cin_lowerer.py", "call"): 6,
@@ -159,7 +158,6 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("cin_lowerer.py", "initializer"): 3,
         ("cin_lowerer.py", "qualified"): 3,
         ("cin_lowerer.py", "ternary"): 1,
-        ("cin_lowerer.py", "arithmetic"): 1,
         ("iterator.py", "subscript"): 4,
         ("schedule_lowerer.py", "call"): 2,
     }
@@ -236,6 +234,15 @@ def test_all_coo_coordinate_initializers_cannot_return_to_var_names() -> None:
     assert transform.count('name=f"{crd_array}[{iter_var}]"') == 0
     assert transform.count("name=crd_array,") == 2
     assert transform.count("name=cast(str, iter_var),") == 2
+
+
+def test_all_coo_single_element_end_bound_cannot_return_to_a_var_name() -> None:
+    source = (_COMPILER_ROOT / "cin_lowerer.py").read_text()
+    transform = source.split("def _transform_coo_loop_for_openmp", 1)[1].split(
+        "def lower_ForAll", 1
+    )[0]
+
+    assert 'name=f"{iter_var} + 1"' not in transform
 
 
 def test_iterator_coordinate_reads_cannot_return_to_var_names() -> None:

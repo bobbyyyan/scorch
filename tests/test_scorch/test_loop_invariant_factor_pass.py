@@ -534,16 +534,15 @@ def test_loop_identity_comes_only_from_increment_and_init_condition_are_ignored(
     assert _factor_names(assignment.value) == ["value[actual_driver]"]
 
 
-@pytest.mark.parametrize("binary_type", _BINOP_FAMILY)
-def test_every_exact_supported_binop_family_can_be_a_root_multiply(
+@pytest.mark.parametrize("binary_type", (llir.BinOp, llir.Mul))
+def test_every_exact_multiply_node_can_be_a_root_multiply(
     binary_type: type[llir.BinOp],
 ) -> None:
     value = (
         llir.BinOp("*", _var("scale"), _var("value[k]"))
         if binary_type is llir.BinOp
-        else binary_type(_var("scale"), _var("value[k]"))
+        else llir.Mul(_var("scale"), _var("value[k]"))
     )
-    value.op = "*"
     loop = _loop([llir.Assign(_var("acc"), value, llir.AssignOp.ADD_ASSIGN)])
 
     output = hoist_loop_invariant_factors(
@@ -584,6 +583,15 @@ def _legal_miss_loops() -> Tuple[llir.ForLoop, ...]:
         ),
         _loop([_assignment([_var("outside_a"), _var("outside_b")])]),
         _loop([_assignment([_var("value[k]"), _var("other[k]")])]),
+        _loop(
+            [
+                llir.Assign(
+                    _var("acc"),
+                    llir.Add(_var("scale"), _var("value[k]")),
+                    llir.AssignOp.ADD_ASSIGN,
+                )
+            ]
+        ),
         _loop([]),
     )
 
@@ -1505,7 +1513,11 @@ def _malformed_defined_name() -> List[llir.Stmt]:
 
 def _malformed_binary_operator() -> List[llir.Stmt]:
     loop = _activating_loop()
-    cast(llir.BinOp, cast(llir.Assign, loop.body[0]).value).op = cast(str, 7)
+    object.__setattr__(
+        cast(llir.BinOp, cast(llir.Assign, loop.body[0]).value),
+        "op",
+        cast(str, 7),
+    )
     return [loop]
 
 
@@ -1546,7 +1558,7 @@ def _malformed_factor_name() -> List[llir.Stmt]:
         ),
         (
             _malformed_binary_operator,
-            "invalid_loop_invariant_factor_binary_operator",
+            "invalid_binary_operator",
             ("root", "[0]", "body", "[0]", "value", "op"),
         ),
         (
