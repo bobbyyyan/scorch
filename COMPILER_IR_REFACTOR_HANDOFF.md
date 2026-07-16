@@ -3383,6 +3383,334 @@ raw indexed stores, and the independently gated member/call/initializer/
 qualified/ternary/arithmetic/allocation/statement families. Phase 3 remains in
 progress. Phase 3.5 and LoopIR have not begun.
 
+### Phase-3 structured free `std::move` call slice complete (2026-07-15)
+
+This narrow Phase-3 slice starts exactly at `f911366` on branch
+`refactor/compiler-ir-phase3-std-move-call`. Its production implementation is
+`6b3afe5`, focused tests are `0224d3c`, and the preserved-history compatibility
+correction is `0282226`. The originally requested three-commit sequence became
+a four-commit final history with explicit user approval after the canonical
+suite exposed a dataclass-representation regression; no existing commit was
+amended, squashed, reordered, or otherwise rewritten.
+
+The slice migrates only the five free qualified `std::move(...)` producer
+leaves used to transfer ownership from standard-library vectors into result
+tensors. It does not migrate member/template calls, schedule-storage calls,
+input storage, allocation, lvalue, statement, or ABI families.
+
+#### Complete base inventory and seam choice
+
+The exact `f911366` `Var` inventory was:
+
+| Production file | `Var` constructors | Other constructor arguments |
+|---|---:|---:|
+| `cin.py` | 9 | 9 |
+| `cin_lowerer.py` | 199 | 161 |
+| `compressed_where_openmp_pass.py` | 5 | 5 |
+| `dense_pointer_hoist_pass.py` | 3 | 3 |
+| `dynamic_vector_access_pass.py` | 1 | 1 |
+| `iter_lattice.py` | 35 | 35 |
+| `iterator.py` | 19 | 13 |
+| `llir_traversal.py` | 1 | 1 |
+| `result_write_pass.py` | 5 | 5 |
+| `schedule_lowerer.py` | 96 | 94 |
+| `single_iteration_loop_pass.py` | 1 | 1 |
+| **Total** | **374** | **328** |
+
+The 46 direct string expressions were exactly:
+
+| Direct family | Base count | File distribution |
+|---|---:|---|
+| subscript | 22 | 16 `cin_lowerer.py`, six `iterator.py` |
+| call | 13 | 11 `cin_lowerer.py`, two `schedule_lowerer.py` |
+| member | 3 | `cin_lowerer.py` |
+| initializer | 3 | `cin_lowerer.py` |
+| qualified | 3 | `cin_lowerer.py` |
+| ternary | 1 | `cin_lowerer.py` |
+| arithmetic | 1 | `cin_lowerer.py` |
+
+The nine known indirect sinks/clones inside the 328 other arguments were one
+`expr.name.replace(old, new)`, one dense-pointer `name`, one traversal
+`node.name`, schedule-lowerer `lower_expr` and `upper_expr`, two
+`prefix_extent` uses, one `zero_value`, and one single-iteration `name`. The
+other locked compatibility inventories were ten generic string-rewrite sites,
+52 `RawStmt` constructor calls / 51 producers, and no direct production
+`Assign` target encoded as a string.
+
+The 13 direct call spellings split into precisely three families:
+
+- five `std::move(...)` leaves at base `cin_lowerer.py:429,454,477,1622,1659`;
+- six `data_ptr<T>()` leaves in `cin_lowerer.py`;
+- two schedule-storage `.data()` leaves in `schedule_lowerer.py`.
+
+The five selected leaves are one live production ownership-transfer family:
+
+- three in `ResultTensorAssembler.emit_final_assembly`, moving final position,
+  coordinate, and value vectors;
+- two in outer intermediate-coordinate assembly, moving its coordinate and
+  value vector expressions. The coordinate producer is inside a per-level loop,
+  so an activating rank-two generated kernel contains two coordinate call
+  instances from that one producer site.
+
+All five are free qualified unary calls over simple vectors and map exactly to
+`FunctionCall("std::move", ...)`. The six `data_ptr<T>()` expressions were
+rejected because they are member/template calls with distinct tensor-data
+ownership. The two `.data()` expressions were rejected because they are
+schedule-storage member calls. Grouping either rejected family with a free
+call would begin the deliberately deferred member/call hierarchy.
+
+The remaining input `storage.value` read was also rejected. Its only producer,
+`CINLowerer.get_value_array_statement`, has zero callers; activating it would
+require a broader input-ABI rewrite and would redeclare the existing
+`<tensor>_values` argument.
+
+The base had 24 production `FunctionCall` constructors including the traversal
+clone: 14 in `cin_lowerer.py`, six in `iter_lattice.py`, two in `iterator.py`,
+one in `schedule_lowerer.py`, and one in `llir_traversal.py`. No production
+consumer mutates a call expression's `name` or `args`; observed argument-list
+mutation belongs to the separate `FunctionCallStmt`. One test intentionally
+mutated `FunctionCall.args` and was replaced by immutable ownership coverage.
+
+#### Minimum coherent value contract and compatibility correction
+
+Contrary to the earlier working assumption, base `FunctionCall` was mutable,
+aliased a caller-provided argument list, and used identity equality. Freezing
+this existing node was therefore the minimum coherent dependency for moving
+production expressions into it. The implemented contract is:
+
+- a frozen exact `FunctionCall` value with non-empty string `name`;
+- `Tuple[Expr, ...]` ownership, accepting list/tuple inputs and snapshotting
+  lists into tuple ownership;
+- structural equality and exact constructor validation;
+- exact name/tuple/argument validation in common walking and rewriting;
+- detached rewriting with replacement ownership and repeatable no-op behavior;
+- fail-closed codegen for forged fields, unknown children, and subclasses;
+- unchanged postfix precedence for a call used as an indexed base;
+- a fresh accurately typed vector `Var` inside each migrated call.
+
+The first post-commit canonical suite reported 778 passes and one failure:
+`test_supported_non_var_leaves_are_invariant_and_preserve_order`. The frozen
+dataclass's generated structural `repr` had changed inherited identity-based
+`str()` behavior observed by the legacy loop-invariant fallback renderer.
+With explicit approval to preserve history and use a four-commit final
+sequence, correction `0282226` set `repr=False` on the dataclass. This retains
+frozen structural equality while restoring the predecessor representation. The
+failing test plus the frozen-value and detached-rewrite tests then passed three
+of three, and the canonical suite passed 779 of 779. No generalized renderer or
+new expression hierarchy was introduced.
+
+Source spelling, ABI, flags, `data_ptr<T>()`, `.data()`, member lvalues, and all
+unrelated expression families are unchanged.
+
+#### Equality, traversal, pipeline, and ownership audit
+
+The only production whole-node equality consumer is consecutive coordinate-
+assignment deduplication in `dynamic_vector_access_pass.py`. Two separately
+constructed identical call-bearing synthetic `_crd` assignments now compare
+structurally and deduplicate; a focused test locks that consequence. Supported
+production emission is unchanged because production assignments containing
+calls target `_pos` or post-op results, every production `_crd` store is
+call-free, and all five migrated call sites occur inside `VarInit`. Exact source
+captures below confirm the supported-output result. No other production
+equality, hashing, set, or cache consumer depends on whole `FunctionCall`
+identity.
+
+Focused tests cover exact type hints, construction, structural equality,
+freezing, list snapshotting, tuple ownership, malformed name/args/argument
+rejection, forged fields, unknown subclasses/children, deterministic preorder,
+detached rewriting, replacement ownership, legal no-op and repeated
+application, byte-exact nested-call emission, and postfix precedence.
+
+All five producer templates are asserted with exact vector types. Production
+tests activate final-result assembly and outer intermediate-coordinate
+assembly, preserve caller CIN, and prove that two compilations own disjoint
+mutable child nodes while emitting identical source. Managed-pipeline tests
+lock the exact four-pass partial prefix for a malformed assembled call, its
+owning CIN-lowering failure, exact `CompileOptions` identity, terminal failure,
+and suppression of schedule lowering, C++ generation, build-request assembly,
+and native loading.
+
+#### Locked post-slice string compatibility budget
+
+The exact post-slice budget is:
+
+- 374 total `Var` constructors;
+- 41 direct expression strings: 22 subscript, eight call, three member, three
+  initializer, three qualified, one ternary, and one arithmetic;
+- 333 other constructor arguments, including the same nine indirect
+  sinks/clones;
+- ten generic string rewrites;
+- 52 `RawStmt` calls / 51 producers;
+- no `std::move(` in a production `Var.name`;
+- no direct string-expression `Assign` target.
+
+The eight remaining direct calls are exactly six `data_ptr<T>()` spellings and
+two schedule-storage `.data()` spellings. The five new structured constructor
+sites are all in `cin_lowerer.py`.
+
+#### Verification record
+
+Every Python, pytest, capture, Sphinx, and benchmark command activated the
+`scorch` conda environment first. On committed code/test/fix candidate
+`0282226`:
+
+- pre-test implementation focus: 174 passed with the two expected incompatible
+  tests (the mutable-argument test and old five-leaf budget) still failing;
+- final producer/traversal/codegen/pass-manager/timing/budget focus: 316 passed
+  in 1.77 s;
+- native final-intersection, final-union, and outer-intermediate activation:
+  three passed in 70.92 s;
+- exact CSR-by-dense, DS, DSS, and all-COO source anchors: four passed in
+  0.52 s;
+- explicit stage order/timing, exact options, managed failure, cache identity,
+  independent compilation, ownership, and later-suppression focus: 24 passed
+  in 0.72 s;
+- canonical 18-file suite: 779 passed in 1.75 s versus the 748-test predecessor
+  baseline;
+- required 11-file scheduler/CIN/codegen matrix: 319 passed in 433.66 s versus
+  the 316-test predecessor baseline;
+- `pytest -q -m "not perf" tests`: 1,303 passed, 14 skipped, three deselected,
+  and the one inherited PyTorch sparse-invariant warning in 2,060.76 s versus
+  the 1,271-pass predecessor baseline;
+- Black on all 11 changed Python files: clean, with only the inherited Python
+  3.11-versus-target-3.15 safety warning;
+- exact `f911366`/candidate Flake8 comparison: the same six inherited findings
+  (`F841` twice, `C901` once, `F401` twice, and `F541` once), with no normalized
+  code/message change;
+- exact `f911366`/candidate mypy comparison: the same 55 inherited errors in
+  six of 11 files. Two `no-redef` messages refer to line 1,944 at base and line
+  1,971 after the inserted producer code; after normalizing diagnostic and
+  referenced source locations, the code/message multiset is exact;
+- strict `f911366` Sphinx generated HTML and reproduced exactly 23 inherited
+  unresolved-reference warnings under `-W`: 18 class, two attribute, two
+  exception, and one function. The final handoff candidate reproduces that
+  same result with no new warning;
+- `git diff --check` is clean.
+
+#### Exact source, cache, request, ABI, flags, and build identity
+
+The three canonical scripts re-hash exactly:
+
+- `scorch_phase3_capture_inputs.py`:
+  `605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`;
+- `scorch_phase3_capture_spmm_grid.py`:
+  `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`;
+- `scorch_phase3_capture_workspace_pair.py`:
+  `964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`.
+
+The path-stable clean worktree comparison covered candidate `0282226` and
+`f911366`, `fad5322`, `dd278e0`, `5339f56`, and `28dcca5`. All raw C++ files,
+manifests, and grid JSON are byte-identical across all six revisions. The first
+attempt exposed the known macOS `/tmp` versus `/private/tmp` source-root hazard;
+an explicit logical `cd -L /tmp/...` restored the canonical identity before the
+recorded run.
+
+The canonical outputs reproduce the required hashes exactly:
+
+- complete anchor manifest:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- complete 42-cell grid:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+- activating workspace-pair manifest:
+  `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`;
+- 68,671-byte preamble:
+  `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`.
+
+| Canonical source | Bytes | SHA-256 | Kernel name |
+|---|---:|---|---|
+| CSR-by-dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` | `kernel_2c75843753b8` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` | `kernel_c13bc3936f95` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` | `kernel_a11206384e14` |
+| all-COO SDDMM | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` | `kernel_a67e7b1a138e` |
+| outer all-coordinate | 3,528 | `5c69621af52939759ffcbaed3649ef1c4461108522b614df8f8a18c86ec0560a` | `kernel_f8b8c75fbabd` |
+| outer intermediate-coordinate | 5,252 | `b1770961d5f9c9c7fd716bd71cb97f1d5e73c6dcf200ba378b97b65c87fbe5d7` | `kernel_b0409f88e4a2` |
+
+The workspace all-coordinate source contains the three final-result move-call
+instances. The intermediate-coordinate source contains those three plus three
+outer instances: two coordinate vectors emitted by the looped coordinate
+producer and one value vector. Thus the capture corpus activates both selected
+producer families while retaining byte-exact source.
+
+The directory/manifest comparison covers exact evaluate signatures, ABI and
+index policy, compiler/linker flags, kernel names, semantic/codegen/build/full
+keys, request fields and keys, build identities, prepared keys and directories,
+and extension paths. Exact `CompileOptions` identity reaching the lowerer is
+also covered by focused tests and the capture's `options_identity` fields.
+
+Because every source/build input is byte-identical, the canonical runtime
+waiver applies. No new M5 or Redwood runtime grid was run. The retained
+artifacts re-hash exactly:
+
+- M5:
+  `3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+- Redwood:
+  `c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+
+#### Compiler latency and crossing attribution
+
+The final committed code/test/fix candidate was benchmarked alone in clean
+detached `/tmp/scorch-phase3-std-move-latency-wt` at `0282226`, with five
+warmups and 30 samples. No pytest, native compiler, capture, Sphinx, or other
+benchmark process overlapped it. Four preflight host samples reported 68.50% to
+73.86% CPU idle. The candidate artifact is
+`/tmp/scorch-phase3-std-move-results/latency-0282226-m5.json`, SHA-256
+`35de24307bc3574dd1e734c90d39e53e8502c15d75e8d71d6f5ffac5e7257a7c`.
+Its metadata records revision `0282226795f9204f5da0c75018c9066392f600e6`,
+empty git status, five warmups, and 30 samples.
+
+The predecessor
+`/tmp/scorch-phase3-workspace-pair-results/latency-a8edfeb-m5.json` re-hashes to
+`f6ef10caa162701294e81df9bf2427622961499ab3618ac707317038dc106ecf`.
+Candidate and predecessor `.cases[].build` objects are byte-identical.
+
+| Case | Move seam | p50 old/new ms | ratio / delta ms | p95 old/new ms | ratio / delta ms |
+|---|---|---:|---:|---:|---:|
+| small dense | none | 1.538917 / 1.834459 | 1.192 / +0.295542 | 1.721254 / 2.698909 | 1.568 / +0.977654 |
+| reduction | none | 1.404250 / 1.591167 | 1.133 / +0.186917 | 1.479233 / 1.959310 | 1.325 / +0.480077 |
+| CSR intersection | three final calls | 1.559250 / 1.928709 | 1.237 / +0.369458 | 1.662254 / 2.743191 | 1.650 / +1.080937 |
+| sparse union | three final calls | 1.578729 / 1.878750 | 1.190 / +0.300021 | 1.702314 / 2.370960 | 1.393 / +0.668646 |
+
+All four cases cross the 1.10 investigation threshold, including both cases
+that construct no migrated call. The outer-intermediate family is not present
+in this latency corpus. Owning and emission-stage attribution is:
+
+| Case | result ABI p50/p95 delta ms | CIN lowering p50/p95 delta ms | C++ generation p50/p95 delta ms |
+|---|---:|---:|---:|
+| small dense | +0.001479 / +0.004398 | +0.066272 / +0.247125 | +0.004895 / +0.009638 |
+| reduction | +0.001270 / +0.003889 | +0.043793 / +0.205598 | +0.003750 / +0.010345 |
+| CSR intersection | +0.005292 / +0.010948 | +0.133751 / +0.460744 | +0.010458 / +0.021531 |
+| sparse union | +0.005417 / +0.011529 | +0.125479 / +0.506448 | +0.009834 / +0.023106 |
+
+Request-assembly p50/p95 deltas were +0.026375/+0.193119 ms,
++0.022896/+0.056550 ms, +0.042979/+0.146390 ms, and
++0.042021/+0.080246 ms in table order. Canonical-endpoint deltas were
++0.022416/+0.209610 ms, +0.014146/+0.046307 ms,
++0.036917/+0.132355 ms, and +0.036126/+0.019732 ms.
+
+The direct owning-stage absolute p50 change is only 0.0013-0.0054 ms and p95
+change only 0.0039-0.0116 ms. Larger p95 movement is distributed across CIN
+lowering, request assembly, and endpoint timing, also affects both
+non-activating controls, and occurs with byte-identical build objects. The
+crossing is therefore consistent with broad host/run variance plus a small
+upper bound on structured-construction cost, not evidence of a generated-
+source, ABI, cache, or build-identity regression. Under policy, the crossing
+requires this attribution but is not an automatic rejection.
+
+No design-document or `csrc` file changed. No Phase 3.5, LoopIR, TorchCppABI
+extraction, parallel zero-fill extraction, generalized allocation migration,
+member/call hierarchy, generalized parsing, DCE, reflection, signature
+inspection, dynamic metadata, dictionary-of-`Any` configuration, callbacks,
+mutable registries, global singletons, analysis caches/invalidation protocols,
+dependency graphs, compatibility fallbacks, or unrelated optimization work was
+introduced.
+
+The user-owned `.gitignore` modification and untracked `autotune-levels/`,
+`bench/`, `bench/bench_results/`, and `scratchpad/` material remain untouched
+and uncommitted.
+
+This closes only the narrow Phase-3 **structured free `std::move` call** slice.
+Phase 3 remains in progress. Phase 3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
