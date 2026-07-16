@@ -800,6 +800,7 @@ def test_compressed_mode_iterator_position_bounds_are_structured_typed_and_owned
     second_end = second_iterator.get_iterator_var_end_value_llir()
     level = 1 if with_parent else 0
     array_name = f"Input{level}_pos"
+    expected_match: tuple[str, str | None]
     if with_parent:
         expected_begin = llir.ArrayAccess(
             llir.Var(array_name, llir.DataType.PTR_INT),

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from scorch.compiler import llir
-import scorch.compiler.schedule_lowerer as schedule_lowerer_module
+import scorch.compiler.schedule_lowerer as schedule_lowerer_module  # type: ignore[import-untyped]
 from scorch.compiler.cin import (
     ForAll,
     IndexVar,
