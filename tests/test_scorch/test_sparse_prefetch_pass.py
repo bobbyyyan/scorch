@@ -80,6 +80,16 @@ def _position_init(
     )
 
 
+def _mode_position_begin(
+    array: str = "A1_pos",
+    index: str = "pA0",
+) -> llir.ArrayAccess:
+    return llir.ArrayAccess(
+        _var(array, llir.DataType.PTR_INT),
+        _var(index, llir.DataType.INT),
+    )
+
+
 def _inner_loop(body: List[llir.Stmt]) -> llir.ForLoop:
     return llir.ForLoop(
         init=llir.VarInit(_var("j", llir.DataType.INT), llir.Literal(0)),
@@ -107,15 +117,17 @@ def _string_dense_loop(
 def _sparse_loop(
     *,
     iterator: str = "pA1",
-    position_array: str = "A1_pos[pA0]",
+    position_begin: llir.Expr | None = None,
     end: str = "pA1_end",
     coordinate_array: str = "A1_crd",
     tail: List[llir.Stmt] | None = None,
 ) -> llir.ForLoop:
     if tail is None:
         tail = [_string_dense_loop()]
+    if position_begin is None:
+        position_begin = _mode_position_begin()
     return llir.ForLoop(
-        init=llir.VarInit(_var(iterator), _var(position_array)),
+        init=llir.VarInit(_var(iterator), position_begin),
         cond=llir.BinOp("<", _var(iterator), _var(end)),
         update=llir.Increment(_var(iterator)),
         body=[
@@ -261,7 +273,7 @@ def test_nested_sparse_loops_are_processed_post_order_through_direct_bodies(
     monkeypatch.setattr(sparse_prefetch_module, "_prepend_prefetches", record_prepend)
     nested = _sparse_loop(
         iterator="pX1",
-        position_array="X1_pos[pX0]",
+        position_begin=_mode_position_begin("X1_pos", "pX0"),
         end="pX1_end",
         coordinate_array="X1_crd",
         tail=[
@@ -370,8 +382,8 @@ def test_raw_hoisted_pointer_augments_assignment_discovery_in_body_order() -> No
     ]
 
 
-def test_sparse_gate_is_name_based_and_uses_the_condition_right_hand_var() -> None:
-    loop = _sparse_loop(position_array="prefix_A1_pos[pA0] + suffix")
+def test_sparse_gate_is_structural_and_uses_the_condition_right_hand_var() -> None:
+    loop = _sparse_loop()
     loop.cond = llir.Add(llir.Literal(7), _var("named_rhs_end"))
 
     output = insert_sparse_prefetch([loop], SPARSE_PREFETCH_CONTEXT)
@@ -381,6 +393,13 @@ def test_sparse_gate_is_name_based_and_uses_the_condition_right_hand_var() -> No
         _expected_prefetch(end="named_rhs_end")
     ]
 
+    legacy = _sparse_loop(
+        position_begin=_var("prefix_A1_pos[pA0] + suffix", llir.DataType.INT)
+    )
+    legacy_output = insert_sparse_prefetch([legacy], SPARSE_PREFETCH_CONTEXT)
+    assert _prefetches(cast(llir.ForLoop, legacy_output[0]).body) == []
+    assert _mutable_ir_ids([legacy]).isdisjoint(_mutable_ir_ids(legacy_output))
+
 
 def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
     missing_init = _sparse_loop()
@@ -389,7 +408,25 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
     non_var_init_value = _sparse_loop()
     cast(llir.VarInit, non_var_init_value.init).value = llir.Literal(0)
 
-    non_sparse = _sparse_loop(position_array="A1_begin")
+    non_sparse = _sparse_loop(position_begin=_var("A1_begin"))
+
+    legacy_flat_position = _sparse_loop(
+        position_begin=_var("A1_pos[pA0]", llir.DataType.INT)
+    )
+
+    wrong_position_array_type = _sparse_loop(
+        position_begin=llir.ArrayAccess(
+            _var("A1_pos", llir.DataType.STD_VECTOR_C_INT),
+            _var("pA0", llir.DataType.INT),
+        )
+    )
+
+    wrong_position_index_type = _sparse_loop(
+        position_begin=llir.ArrayAccess(
+            _var("A1_pos", llir.DataType.PTR_INT),
+            _var("pA0", llir.DataType.INT64),
+        )
+    )
 
     wrong_condition = _sparse_loop()
     wrong_condition.cond = llir.Literal(True)
@@ -585,6 +622,9 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
         ("missing loop init", [missing_init]),
         ("non-Var sparse init value", [non_var_init_value]),
         ("non-sparse init spelling", [non_sparse]),
+        ("legacy flat position spelling", [legacy_flat_position]),
+        ("position array has the wrong type", [wrong_position_array_type]),
+        ("position index has the wrong type", [wrong_position_index_type]),
         ("non-binary condition", [wrong_condition]),
         ("unnamed condition rhs", [unnamed_end]),
         ("missing coordinate", [missing_coordinate]),

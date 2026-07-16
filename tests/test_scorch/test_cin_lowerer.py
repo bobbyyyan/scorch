@@ -20,8 +20,18 @@ from scorch.compiler.cin import (
 from scorch.compiler.cin_lowerer import CINLowerer, ResultTensorAssembler
 from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 from scorch.compiler.diagnostics import CompilerInvariantError, UnsupportedFeature
-from scorch.compiler.iterator import ModeIterator  # type: ignore[import-untyped]
-from scorch.compiler.llir_traversal import LLIRTraversalContext, LLIRWalker
+from scorch.compiler.iterator import (  # type: ignore[import-untyped]
+    ModeIterator,
+    collect_mode_position_arrays,
+    match_mode_position_access,
+    match_mode_position_begin,
+    match_mode_position_bounds,
+)
+from scorch.compiler.llir_traversal import (
+    LLIRTraversalContext,
+    LLIRTraversalError,
+    LLIRWalker,
+)
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Scheduler,
     regblock_force,
@@ -733,6 +743,401 @@ def test_sparse_mode_iterator_coordinate_reads_are_structured_typed_and_owned(
     )
     assert index_state(index) == index_before
     assert index_state(parent) == parent_before
+
+
+@pytest.mark.parametrize("with_parent", (False, True), ids=("root", "parent"))
+def test_compressed_mode_iterator_position_bounds_are_structured_typed_and_owned(
+    with_parent: bool,
+) -> None:
+    tensor = TensorVar("Input", fmt="ds" if with_parent else "s")
+    index = IndexVar("column")
+    parent = IndexVar("row") if with_parent else None
+    tensor_access = tensor[parent, index] if parent is not None else tensor[index]
+    tensor_state = (
+        tensor.name,
+        tensor.symbol_id,
+        tensor.format,
+        tensor.shape,
+        tensor.dtype,
+        tuple(tensor.mode_order or ()),
+        tensor._assignment,
+    )
+
+    def index_state(value: IndexVar) -> tuple[object, ...]:
+        return (
+            value.name,
+            value.index_id,
+            value._expr,
+            value._parent,
+            value.is_tiled,
+            value.is_outer,
+            value.is_inner,
+            value.tile_size_var,
+            tuple(value.tensor_accesses),
+        )
+
+    index_before = index_state(index)
+    parent_before = index_state(parent) if parent is not None else None
+    access_state = (
+        tensor_access.access_id,
+        tensor_access.tensor,
+        tensor_access.tensor_id,
+        tuple(tensor_access.indices),
+        tensor_access.index_ids,
+    )
+
+    def build() -> ModeIterator:
+        return ModeIterator(
+            tensor_access=tensor_access,
+            index_var=index,
+        )
+
+    first_iterator = build()
+    second_iterator = build()
+    first_begin = first_iterator.get_iterator_var_begin_value_llir()
+    first_end = first_iterator.get_iterator_var_end_value_llir()
+    second_begin = second_iterator.get_iterator_var_begin_value_llir()
+    second_end = second_iterator.get_iterator_var_end_value_llir()
+    level = 1 if with_parent else 0
+    array_name = f"Input{level}_pos"
+    if with_parent:
+        expected_begin = llir.ArrayAccess(
+            llir.Var(array_name, llir.DataType.PTR_INT),
+            llir.Var("pInput0", llir.DataType.INT),
+        )
+        expected_end = llir.ArrayAccess(
+            llir.Var(array_name, llir.DataType.PTR_INT),
+            llir.Add(
+                llir.Var("pInput0", llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        )
+        expected_begin_cpp = "Input1_pos[pInput0]"
+        expected_end_cpp = "Input1_pos[pInput0 + 1]"
+        expected_match = ("Input1_pos", "pInput0")
+    else:
+        expected_begin = llir.ArrayAccess(
+            llir.Var(array_name, llir.DataType.PTR_INT),
+            llir.Literal(0, llir.DataType.INT),
+        )
+        expected_end = llir.ArrayAccess(
+            llir.Var(array_name, llir.DataType.PTR_INT),
+            llir.Literal(1, llir.DataType.INT),
+        )
+        expected_begin_cpp = "Input0_pos[0]"
+        expected_end_cpp = "Input0_pos[1]"
+        expected_match = ("Input0_pos", None)
+
+    assert type(first_begin) is llir.ArrayAccess
+    assert type(first_end) is llir.ArrayAccess
+    assert first_begin == expected_begin == second_begin
+    assert first_end == expected_end == second_end
+    assert hash(first_begin) == hash(expected_begin) == hash(second_begin)
+    assert hash(first_end) == hash(expected_end) == hash(second_end)
+    assert match_mode_position_begin(first_begin) == expected_match
+    assert match_mode_position_access(first_begin) == array_name
+    assert match_mode_position_access(first_end) == array_name
+    assert match_mode_position_bounds(first_begin, first_end) == expected_begin_cpp
+    assert LLIRLowerer().lower_llir(first_begin) == expected_begin_cpp
+    assert LLIRLowerer().lower_llir(first_end) == expected_end_cpp
+
+    accesses = [
+        cast(llir.ArrayAccess, value)
+        for value in (first_begin, first_end, second_begin, second_end)
+    ]
+    assert all(access.tensor_access is None for access in accesses)
+    assert all(type(access.array) is llir.Var for access in accesses)
+    arrays = [cast(llir.Var, access.array) for access in accesses]
+    assert all(array.name == array_name for array in arrays)
+    assert all(array.type is llir.DataType.PTR_INT for array in arrays)
+    assert all(array.is_ptr is False for array in arrays)
+    assert all(array.is_restrict is False for array in arrays)
+    assert all(array.tensor_access is None for array in arrays)
+    assert len({id(access) for access in accesses}) == 4
+    assert len({id(array) for array in arrays}) == 4
+    assert first_begin is not first_end
+    assert first_begin is not second_begin
+    assert first_end is not second_end
+    assert first_begin.array is not first_end.array
+    assert first_begin.index is not first_end.index
+    assert first_begin.index is not first_iterator.iterator_var_llir
+    assert first_end.index is not first_iterator.iterator_var_llir
+    assert second_begin.index is not second_iterator.iterator_var_llir
+    assert second_end.index is not second_iterator.iterator_var_llir
+
+    def owned_children(
+        begin: llir.ArrayAccess,
+        end: llir.ArrayAccess,
+    ) -> list[llir.Expr]:
+        children: list[llir.Expr] = [
+            begin.array,
+            begin.index,
+            end.array,
+            end.index,
+        ]
+        if type(end.index) is llir.Add:
+            add = cast(llir.Add, end.index)
+            children.extend((add.left, add.right))
+        return children
+
+    first_children = owned_children(
+        cast(llir.ArrayAccess, first_begin),
+        cast(llir.ArrayAccess, first_end),
+    )
+    second_children = owned_children(
+        cast(llir.ArrayAccess, second_begin),
+        cast(llir.ArrayAccess, second_end),
+    )
+    assert len({id(child) for child in first_children}) == len(first_children)
+    assert len({id(child) for child in second_children}) == len(second_children)
+    assert {id(child) for child in first_children}.isdisjoint(
+        {id(child) for child in second_children}
+    )
+
+    for access in accesses:
+        if type(access.index) is llir.Var:
+            index_var = cast(llir.Var, access.index)
+            assert index_var.type is llir.DataType.INT
+            assert index_var.is_ptr is False
+            assert index_var.is_restrict is False
+            assert index_var.tensor_access is None
+        elif type(access.index) is llir.Literal:
+            literal = cast(llir.Literal, access.index)
+            assert type(literal.value) is int
+            assert literal.data_type is llir.DataType.INT
+        else:
+            add = cast(llir.Add, access.index)
+            assert type(add.left) is llir.Var
+            assert cast(llir.Var, add.left).type is llir.DataType.INT
+            assert type(add.right) is llir.Literal
+            assert cast(llir.Literal, add.right).value == 1
+            assert cast(llir.Literal, add.right).data_type is llir.DataType.INT
+
+    with pytest.raises(FrozenInstanceError):
+        cast(llir.ArrayAccess, first_begin).index = llir.Literal(2)
+    if with_parent:
+        with pytest.raises(FrozenInstanceError):
+            cast(llir.Add, cast(llir.ArrayAccess, first_end).index).left = llir.Var(
+                "other", llir.DataType.INT
+            )
+
+    assert tensor_state == (
+        tensor.name,
+        tensor.symbol_id,
+        tensor.format,
+        tensor.shape,
+        tensor.dtype,
+        tuple(tensor.mode_order or ()),
+        tensor._assignment,
+    )
+    assert index_state(index) == index_before
+    if parent is not None:
+        assert index_state(parent) == parent_before
+    assert access_state == (
+        tensor_access.access_id,
+        tensor_access.tensor,
+        tensor_access.tensor_id,
+        tuple(tensor_access.indices),
+        tensor_access.index_ids,
+    )
+
+
+def test_mode_position_matching_is_exact_and_collection_is_structural() -> None:
+    parent_begin = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Var("pA0", llir.DataType.INT),
+    )
+    parent_end = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Add(
+            llir.Var("pA0", llir.DataType.INT),
+            llir.Literal(1, llir.DataType.INT),
+        ),
+    )
+    root_begin = llir.ArrayAccess(
+        llir.Var("B0_pos", llir.DataType.PTR_INT),
+        llir.Literal(0, llir.DataType.INT),
+    )
+    raw = llir.RawStmt("use(C1_pos[pC0], A1_pos[pA0])")
+    body: list[llir.Stmt] = [
+        llir.VarInit(llir.Var("pA1_end", llir.DataType.INT), parent_end),
+        llir.ForLoop(
+            init=llir.VarInit(llir.Var("pA1", llir.DataType.INT), parent_begin),
+            cond=llir.BinOp(
+                "<",
+                llir.Var("pA1", llir.DataType.INT),
+                llir.Var("pA1_end", llir.DataType.INT),
+            ),
+            update=llir.Increment(llir.Var("pA1", llir.DataType.INT)),
+            body=[llir.VarInit(llir.Var("pB0", llir.DataType.INT), root_begin), raw],
+        ),
+    ]
+    context = LLIRTraversalContext("test", "collect_mode_position_arrays")
+
+    assert collect_mode_position_arrays(body, context) == [
+        "A1_pos",
+        "B0_pos",
+        "C1_pos",
+    ]
+    assert CINLowerer._has_sparse_inner_loop(body) is True
+    assert CINLowerer._find_sparse_pos_array(body) == "A1_pos"
+    assert (
+        CINLowerer._has_sparse_inner_loop(
+            [
+                llir.ForLoop(
+                    init=llir.VarInit(
+                        llir.Var("pA1", llir.DataType.INT),
+                        llir.Var("A1_pos[pA0]", llir.DataType.INT),
+                    ),
+                    cond=llir.Literal(True),
+                    update=llir.Increment(llir.Var("pA1", llir.DataType.INT)),
+                    body=[],
+                )
+            ]
+        )
+        is False
+    )
+    assert (
+        CINLowerer._find_sparse_pos_array(
+            [
+                llir.VarInit(
+                    llir.Var("pA1", llir.DataType.INT),
+                    llir.Var("A1_pos[pA0]", llir.DataType.INT),
+                )
+            ]
+        )
+        is None
+    )
+    assert CINLowerer._find_sparse_pos_array([llir.RawStmt("A1_pos[pA0]")]) == (
+        "A1_pos"
+    )
+
+    wrong_type = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.STD_VECTOR_C_INT),
+        llir.Var("pA0", llir.DataType.INT),
+    )
+    wrong_index = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Var("pA0", llir.DataType.INT64),
+    )
+    wrong_literal = llir.ArrayAccess(
+        llir.Var("A0_pos", llir.DataType.PTR_INT),
+        llir.Literal(0),
+    )
+    access_metadata = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Var("pA0", llir.DataType.INT),
+    )
+    object.__setattr__(access_metadata, "tensor_access", object())
+    base_metadata = llir.ArrayAccess(
+        llir.Var(
+            "A1_pos",
+            llir.DataType.PTR_INT,
+            tensor_access=cast(llir.TensorAccessMetadata, object()),
+        ),
+        llir.Var("pA0", llir.DataType.INT),
+    )
+    index_metadata = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Var(
+            "pA0",
+            llir.DataType.INT,
+            tensor_access=cast(llir.TensorAccessMetadata, object()),
+        ),
+    )
+    semantic_misses = [
+        wrong_type,
+        wrong_index,
+        wrong_literal,
+        access_metadata,
+        base_metadata,
+        index_metadata,
+        llir.ArrayAccess(
+            llir.Var("A1_pos", llir.DataType.PTR_INT, is_ptr=True),
+            llir.Var("pA0", llir.DataType.INT),
+        ),
+        llir.ArrayAccess(
+            llir.Var("A1_pos", llir.DataType.PTR_INT, is_restrict=True),
+            llir.Var("pA0", llir.DataType.INT),
+        ),
+        llir.ArrayAccess(
+            llir.Var("A1_pos", llir.DataType.PTR_INT),
+            llir.Var("not-an-identifier", llir.DataType.INT),
+        ),
+        llir.ArrayAccess(
+            llir.Var("not-position", llir.DataType.PTR_INT),
+            llir.Var("pA0", llir.DataType.INT),
+        ),
+    ]
+    for value in semantic_misses:
+        assert match_mode_position_begin(value) is None
+        assert match_mode_position_access(value) is None
+
+    forged_end = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Add(
+            llir.Var("pA0", llir.DataType.INT),
+            llir.Literal(1, llir.DataType.INT),
+        ),
+    )
+    object.__setattr__(cast(llir.Add, forged_end.index), "op", "-")
+    invalid_ends = [
+        root_begin,
+        forged_end,
+        llir.ArrayAccess(
+            llir.Var("A1_pos", llir.DataType.PTR_INT),
+            llir.Add(
+                llir.Literal(1, llir.DataType.INT),
+                llir.Var("pA0", llir.DataType.INT),
+            ),
+        ),
+        llir.ArrayAccess(
+            llir.Var("A1_pos", llir.DataType.PTR_INT),
+            llir.Add(
+                llir.Var("pA0", llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT64),
+            ),
+        ),
+    ]
+    assert all(
+        match_mode_position_bounds(parent_begin, end) is None for end in invalid_ends
+    )
+
+    class UnknownPositionAccess(llir.ArrayAccess):
+        pass
+
+    class UnknownPositionAdd(llir.Add):
+        pass
+
+    class UnknownPositionVar(llir.Var):
+        pass
+
+    unknown_access = UnknownPositionAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Var("pA0", llir.DataType.INT),
+    )
+    unknown_base = llir.ArrayAccess(
+        UnknownPositionVar("A1_pos", llir.DataType.PTR_INT),
+        llir.Var("pA0", llir.DataType.INT),
+    )
+    unknown_index = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        UnknownPositionVar("pA0", llir.DataType.INT),
+    )
+    unknown_end = llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        UnknownPositionAdd(
+            llir.Var("pA0", llir.DataType.INT),
+            llir.Literal(1, llir.DataType.INT),
+        ),
+    )
+    for value in (unknown_access, unknown_base, unknown_index, unknown_end):
+        assert match_mode_position_access(value) is None
+    assert match_mode_position_bounds(parent_begin, unknown_end) is None
+    with pytest.raises(LLIRTraversalError, match="unknown_llir_node"):
+        collect_mode_position_arrays(
+            [llir.VarInit(llir.Var("x", llir.DataType.INT), unknown_access)], context
+        )
 
 
 @pytest.mark.parametrize("scalar_accumulator", (False, True))

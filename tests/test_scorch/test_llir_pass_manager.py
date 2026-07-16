@@ -697,9 +697,22 @@ def test_all_coo_end_bound_survives_repeated_detached_production_pipeline() -> N
     assert twice_bound.right is not once_bound.right
 
 
-def test_mode_iterator_coordinate_read_activates_managed_sparse_prefetch() -> None:
+def test_mode_iterator_position_bounds_and_coordinate_read_activate_managed_prefetch() -> (
+    None
+):
     compile_options = _compile_options()
     manager = LLIRPassManager.from_compile_options(compile_options)
+    source_begin = llir.ArrayAccess(
+        _var("A1_pos", llir.DataType.PTR_INT),
+        _var("pA0", llir.DataType.INT),
+    )
+    source_end = llir.ArrayAccess(
+        _var("A1_pos", llir.DataType.PTR_INT),
+        llir.Add(
+            _var("pA0", llir.DataType.INT),
+            llir.Literal(1, llir.DataType.INT),
+        ),
+    )
     source_read = llir.ArrayAccess(
         _var("A1_crd", llir.DataType.PTR_INT),
         _var("pA1", llir.DataType.INT),
@@ -707,7 +720,7 @@ def test_mode_iterator_coordinate_read_activates_managed_sparse_prefetch() -> No
     sparse_loop = llir.ForLoop(
         init=llir.VarInit(
             _var("pA1", llir.DataType.INT),
-            _var("A1_pos[pA0]", llir.DataType.INT),
+            source_begin,
         ),
         cond=llir.BinOp(
             "<",
@@ -747,7 +760,10 @@ def test_mode_iterator_coordinate_read_activates_managed_sparse_prefetch() -> No
             ),
         ],
     )
-    source: List[llir.Stmt] = [sparse_loop]
+    source: List[llir.Stmt] = [
+        llir.VarInit(_var("pA1_end", llir.DataType.INT), source_end),
+        sparse_loop,
+    ]
 
     def assemble_body(
         artifact: LLIRStatementListArtifact,
@@ -787,8 +803,10 @@ def test_mode_iterator_coordinate_read_activates_managed_sparse_prefetch() -> No
         )
         assert all(record.duration_ns is not None for record in result.run_records)
 
-    once_loop = cast(llir.ForLoop, once.artifact.value[0])
-    twice_loop = cast(llir.ForLoop, twice.artifact.value[0])
+    once_end_init = cast(llir.VarInit, once.artifact.value[0])
+    twice_end_init = cast(llir.VarInit, twice.artifact.value[0])
+    once_loop = cast(llir.ForLoop, once.artifact.value[1])
+    twice_loop = cast(llir.ForLoop, twice.artifact.value[1])
     once_prefetches = [
         cast(llir.RawStmt, statement).code
         for statement in once_loop.body
@@ -818,6 +836,32 @@ def test_mode_iterator_coordinate_read_activates_managed_sparse_prefetch() -> No
     assert once_access.index is not source_read.index
     assert twice_access.array is not once_access.array
     assert twice_access.index is not once_access.index
+
+    once_begin = cast(llir.ArrayAccess, cast(llir.VarInit, once_loop.init).value)
+    twice_begin = cast(llir.ArrayAccess, cast(llir.VarInit, twice_loop.init).value)
+    once_end = cast(llir.ArrayAccess, once_end_init.value)
+    twice_end = cast(llir.ArrayAccess, twice_end_init.value)
+    assert once_begin == source_begin == twice_begin
+    assert once_end == source_end == twice_end
+    assert once_begin is not source_begin
+    assert twice_begin is not once_begin
+    assert once_end is not source_end
+    assert twice_end is not once_end
+    assert once_begin.array is not source_begin.array
+    assert once_begin.index is not source_begin.index
+    assert twice_begin.array is not once_begin.array
+    assert twice_begin.index is not once_begin.index
+    assert once_end.array is not source_end.array
+    assert once_end.index is not source_end.index
+    assert twice_end.array is not once_end.array
+    assert twice_end.index is not once_end.index
+    source_add = cast(llir.Add, source_end.index)
+    once_add = cast(llir.Add, once_end.index)
+    twice_add = cast(llir.Add, twice_end.index)
+    assert once_add.left is not source_add.left
+    assert once_add.right is not source_add.right
+    assert twice_add.left is not once_add.left
+    assert twice_add.right is not once_add.right
 
 
 def test_malformed_workspace_pair_read_stops_the_production_pipeline(

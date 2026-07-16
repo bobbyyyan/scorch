@@ -2467,6 +2467,72 @@ def test_malformed_mode_iterator_coordinate_read_stops_all_later_work(
     assert suppressed.value.diagnostic.code == "failed_compilation"
 
 
+def test_malformed_mode_iterator_position_bound_stops_all_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    original_post_init = ModeIterator.__post_init__
+    injected_bounds: list[llir.Add] = []
+
+    def post_init_with_malformed_position_bound(self: ModeIterator) -> None:
+        original_post_init(self)
+        value = self.iterator_var_end_value_llir
+        if (
+            type(value) is llir.ArrayAccess
+            and type(value.array) is llir.Var
+            and value.array.name == "A1_pos"
+            and value.array.type is llir.DataType.PTR_INT
+            and type(value.index) is llir.Add
+        ):
+            malformed = cast(llir.Add, value.index)
+            object.__setattr__(malformed, "op", "-")
+            injected_bounds.append(malformed)
+
+    monkeypatch.setattr(
+        ModeIterator,
+        "__post_init__",
+        post_init_with_malformed_position_bound,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert len(injected_bounds) == 1
+    assert failure.value.diagnostic.code == "invalid_add_operator"
+    assert failure.value.diagnostic.stage == "LLIR transformation"
+    assert failure.value.diagnostic.pass_name == "insert_sparse_prefetch"
+    assert context.compile_options is options
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert context.llir_pass_run_records == ()
+    assert later_calls == []
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
 @pytest.mark.parametrize(
     ("failed_mode", "expected_configurations"),
     [("count", []), ("fill", ["count"])],

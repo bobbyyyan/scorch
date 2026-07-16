@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from scorch.compiler import llir
+import scorch.compiler.schedule_lowerer as schedule_lowerer_module
 from scorch.compiler.cin import (
     ForAll,
     IndexVar,
@@ -389,8 +390,126 @@ def test_panel_tile_lowers_to_windowed_sparse_iteration():
     assert "j_out_end = std::min(j_out + kTile_j, B0_size)" in cpp
     assert cpp.count("std::lower_bound") == 2
     assert "pA1 = pA1_panel_begin" in cpp
+    assert "int pA1_row_end = A1_pos[pA0 + 1];" in cpp
+    assert (
+        "int pA1_panel_begin = (int) (std::lower_bound(A1_crd + "
+        "A1_pos[pA0], A1_crd + pA1_row_end, j_out) - A1_crd);"
+    ) in cpp
+    assert (
+        "int pA1_end = (int) (std::lower_bound(A1_crd + pA1_panel_begin, "
+        "A1_crd + pA1_row_end, j_out_end) - A1_crd);"
+    ) in cpp
     assert cpp.index("j_out = 0") < cpp.index("#pragma omp parallel for")
     assert cpp.index("#pragma omp parallel for") < cpp.index("i = 0")
+
+
+@pytest.mark.parametrize(
+    ("begin", "end"),
+    (
+        pytest.param(
+            llir.Var("A1_pos[pA0]", llir.DataType.INT),
+            llir.Var("A1_pos[pA0 + 1]", llir.DataType.INT),
+            id="legacy-flat",
+        ),
+        pytest.param(
+            llir.ArrayAccess(
+                llir.Var("A1_pos", llir.DataType.PTR_INT),
+                llir.Var("pA0", llir.DataType.INT),
+            ),
+            llir.ArrayAccess(
+                llir.Var("B1_pos", llir.DataType.PTR_INT),
+                llir.Add(
+                    llir.Var("pA0", llir.DataType.INT),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+            ),
+            id="different-array",
+        ),
+        pytest.param(
+            llir.ArrayAccess(
+                llir.Var("A1_pos", llir.DataType.PTR_INT),
+                llir.Var("pA0", llir.DataType.INT),
+            ),
+            llir.ArrayAccess(
+                llir.Var("A1_pos", llir.DataType.PTR_INT),
+                llir.Add(
+                    llir.Var("pOther", llir.DataType.INT),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+            ),
+            id="different-parent",
+        ),
+    ),
+)
+def test_panel_window_rejects_noncanonical_position_bounds_without_mutation(
+    begin: llir.Expr,
+    end: llir.Expr,
+) -> None:
+    def structural_snapshot(value: object) -> object:
+        if isinstance(value, llir.Node):
+            return (
+                type(value).__name__,
+                tuple(
+                    (name, structural_snapshot(child))
+                    for name, child in sorted(vars(value).items())
+                ),
+            )
+        if type(value) is list or type(value) is tuple:
+            return (
+                type(value).__name__,
+                tuple(structural_snapshot(child) for child in value),
+            )
+        return value
+
+    def mutable_ids(value: object) -> set[int]:
+        found: set[int] = set()
+        if isinstance(value, llir.Node) or type(value) is list:
+            found.add(id(value))
+        if isinstance(value, llir.Node):
+            for child in vars(value).values():
+                found.update(mutable_ids(child))
+        elif type(value) is list or type(value) is tuple:
+            for child in value:
+                found.update(mutable_ids(child))
+        return found
+
+    end_init = llir.VarInit(llir.Var("pA1_end", llir.DataType.INT), end)
+    loop = llir.ForLoop(
+        init=llir.VarInit(llir.Var("pA1", llir.DataType.INT), begin),
+        cond=llir.BinOp(
+            "<",
+            llir.Var("pA1", llir.DataType.INT),
+            llir.Var("pA1_end", llir.DataType.INT),
+        ),
+        update=llir.Increment(llir.Var("pA1", llir.DataType.INT)),
+        body=[
+            llir.VarInit(
+                llir.Var("j_A", llir.DataType.INT),
+                llir.ArrayAccess(
+                    llir.Var("A1_crd", llir.DataType.PTR_INT),
+                    llir.Var("pA1", llir.DataType.INT),
+                ),
+            )
+        ],
+    )
+    container: list[llir.Stmt] = [end_init, loop]
+    source = LLIRLowerer().lower_llir(container)
+    snapshot = structural_snapshot(container)
+    source_ids = mutable_ids(container)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="matching structured CSR row bounds",
+    ):
+        schedule_lowerer_module._window_sparse_loop(
+            (container, 1, loop),
+            "j_out",
+            "j_out_end",
+        )
+
+    assert LLIRLowerer().lower_llir(container) == source
+    assert structural_snapshot(container) == snapshot
+    assert mutable_ids(container) == source_ids
 
 
 def test_panel_outermost_placement_hoists_over_affine_tile():

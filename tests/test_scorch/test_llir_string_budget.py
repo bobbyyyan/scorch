@@ -123,13 +123,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
-        "iterator.py": 17,
+        "iterator.py": 19,
         "llir_traversal.py": 1,
         "result_write_pass.py": 5,
         "schedule_lowerer.py": 94,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 344
+    assert sum(unclassified_counts.values()) == 346
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -143,14 +143,14 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 9
 
     assert totals == {
-        "subscript": 17,
+        "subscript": 15,
         "call": 8,
         "member": 3,
         "initializer": 3,
         "qualified": 3,
         "ternary": 1,
     }
-    assert sum(totals.values()) == 35
+    assert sum(totals.values()) == 33
     assert per_file == {
         ("cin_lowerer.py", "subscript"): 13,
         ("cin_lowerer.py", "call"): 6,
@@ -158,7 +158,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("cin_lowerer.py", "initializer"): 3,
         ("cin_lowerer.py", "qualified"): 3,
         ("cin_lowerer.py", "ternary"): 1,
-        ("iterator.py", "subscript"): 4,
+        ("iterator.py", "subscript"): 2,
         ("schedule_lowerer.py", "call"): 2,
     }
 
@@ -257,6 +257,17 @@ def test_iterator_coordinate_reads_cannot_return_to_var_names() -> None:
             violations.append((call.lineno, ast.unparse(name_expression)))
 
     assert violations == []
+
+
+def test_compressed_iterator_position_bounds_cannot_return_to_var_names() -> None:
+    source = (_COMPILER_ROOT / "iterator.py").read_text()
+    compressed = source.split("elif self.level_type == LevelType.COMPRESSED:", 1)[
+        1
+    ].split("elif self.level_type == LevelType.DENSE:", 1)[0]
+
+    assert "_pos[" not in compressed
+    assert "self._compressed_position_access(0)" in compressed
+    assert "self._compressed_position_access(1)" in compressed
 
 
 def test_dense_level_shape_reads_cannot_return_to_var_names() -> None:

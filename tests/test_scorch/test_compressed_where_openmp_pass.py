@@ -86,6 +86,29 @@ def _ds_work_body(
     return body
 
 
+def _structured_ds_work_body() -> List[llir.Stmt]:
+    def end_init(array: str, parent: str, iterator: str) -> llir.VarInit:
+        return llir.VarInit(
+            _var(f"{iterator}_end", llir.DataType.INT),
+            llir.ArrayAccess(
+                _var(array, llir.DataType.PTR_INT),
+                llir.Add(
+                    _var(parent, llir.DataType.INT),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+            ),
+        )
+
+    return [
+        _workspace_init(),
+        end_init("A1_pos", "pA0", "pA1"),
+        end_init("B1_pos", "pB0", "pB1"),
+        llir.FunctionCallStmt("wksp.insert", [_var("value")]),
+        llir.FunctionCallStmt("Result1_crd.push_back", [_var("column")]),
+        llir.FunctionCallStmt("Result_values.push_back", [_var("value")]),
+    ]
+
+
 def _structural_snapshot(value: object) -> object:
     if isinstance(value, llir.Node):
         return (
@@ -245,6 +268,23 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
         assert loop.omp_schedule == "dynamic, 64"
         assert loop.omp_num_threads == (
             f"scorch_nthreads({flop}, A0_size, " "SCORCH_GRAIN_CODEGEN_SPGEMM)"
+        )
+        assert loop.omp_chunk_expr == (
+            f"scorch_chunk(A0_size, {flop}, SCORCH_GRAIN_CODEGEN_SPGEMM)"
+        )
+
+
+def test_structured_position_bounds_drive_the_exact_spgemm_policy() -> None:
+    source: List[llir.Stmt] = [_compatible_loop(_structured_ds_work_body())]
+
+    result = transform_compressed_where_for_openmp(source, _context())
+
+    flop = (
+        "(long)A1_pos[A0_size] * (B0_size > 0 ? " "(B1_pos[B0_size] / B0_size) + 1 : 1)"
+    )
+    for loop in _phase_loops(result):
+        assert loop.omp_num_threads == (
+            f"scorch_nthreads({flop}, A0_size, SCORCH_GRAIN_CODEGEN_SPGEMM)"
         )
         assert loop.omp_chunk_expr == (
             f"scorch_chunk(A0_size, {flop}, SCORCH_GRAIN_CODEGEN_SPGEMM)"
