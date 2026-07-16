@@ -1,4 +1,4 @@
-"""Audited compatibility budget after dense-level shape-read migration."""
+"""Audited compatibility budget after workspace-pair read migration."""
 
 import ast
 from collections import Counter
@@ -118,7 +118,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(constructor_counts.values()) == 374
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 154,
+        "cin_lowerer.py": 161,
         "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -129,7 +129,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 94,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 321
+    assert sum(unclassified_counts.values()) == 328
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -143,19 +143,19 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 9
 
     assert totals == {
-        "subscript": 25,
+        "subscript": 22,
         "call": 13,
-        "member": 7,
+        "member": 3,
         "initializer": 3,
         "qualified": 3,
         "ternary": 1,
         "arithmetic": 1,
     }
-    assert sum(totals.values()) == 53
+    assert sum(totals.values()) == 46
     assert per_file == {
-        ("cin_lowerer.py", "subscript"): 19,
+        ("cin_lowerer.py", "subscript"): 16,
         ("cin_lowerer.py", "call"): 11,
-        ("cin_lowerer.py", "member"): 7,
+        ("cin_lowerer.py", "member"): 3,
         ("cin_lowerer.py", "initializer"): 3,
         ("cin_lowerer.py", "qualified"): 3,
         ("cin_lowerer.py", "ternary"): 1,
@@ -163,6 +163,22 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("iterator.py", "subscript"): 6,
         ("schedule_lowerer.py", "call"): 2,
     }
+
+
+def test_workspace_pair_reads_cannot_return_to_var_names() -> None:
+    violations: list[tuple[str, int, str]] = []
+    for path in sorted(_COMPILER_ROOT.glob("*.py")):
+        for call in _llir_constructor_calls(path, "Var"):
+            name_expression = _var_name_expression(call)
+            if name_expression is None:
+                continue
+            fragments = _static_string_fragments(name_expression)
+            if ".first" in fragments or ".second" in fragments:
+                violations.append(
+                    (path.name, call.lineno, ast.unparse(name_expression))
+                )
+
+    assert violations == []
 
 
 def test_dense_level_shape_reads_cannot_return_to_var_names() -> None:

@@ -408,6 +408,121 @@ def test_production_pipeline_runs_ordinary_passes_in_exact_order() -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(result.artifact.value))
 
 
+def test_workspace_pair_reads_survive_repeated_production_pipeline_noops() -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    source: List[llir.Stmt] = [
+        llir.ForLoopAuto(
+            var=_var("it", llir.DataType.CONST_AUTO_REF),
+            array=_var("workspace", llir.DataType.AUTO),
+            body=[
+                llir.VarInit(
+                    _var("column", llir.DataType.INT64),
+                    llir.ArrayAccess(
+                        llir.MemberAccess(
+                            _var("it", llir.DataType.CONST_AUTO_REF),
+                            "first",
+                        ),
+                        llir.Literal(1, llir.DataType.INT64),
+                    ),
+                ),
+                llir.VarInit(
+                    _var("value", llir.DataType.FLOAT32),
+                    llir.MemberAccess(
+                        _var("it", llir.DataType.CONST_AUTO_REF),
+                        "second",
+                    ),
+                ),
+            ],
+        )
+    ]
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact(artifact.statements)
+
+    once = manager.run_production_pipeline(
+        LLIRStatementListArtifact(source),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+    twice = manager.run_production_pipeline(
+        LLIRStatementListArtifact(once.artifact.value),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    assert _structural_snapshot(source) == _structural_snapshot(once.artifact.value)
+    assert _structural_snapshot(once.artifact.value) == _structural_snapshot(
+        twice.artifact.value
+    )
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once.artifact.value))
+    assert _mutable_ir_ids(once.artifact.value).isdisjoint(
+        _mutable_ir_ids(twice.artifact.value)
+    )
+    expected_passes = [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.pass_name for record in once.run_records] == expected_passes
+    assert [record.pass_name for record in twice.run_records] == expected_passes
+    assert [record.sequence_index for record in once.run_records] == list(range(5))
+    assert all(record.duration_ns is not None for record in once.run_records)
+
+
+def test_malformed_workspace_pair_read_stops_the_production_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malformed = object.__new__(llir.MemberAccess)
+    object.__setattr__(malformed, "base", _var("it"))
+    object.__setattr__(malformed, "member", "first[0]")
+    source = [llir.VarInit(_var("column"), malformed)]
+    later_calls: List[str] = []
+
+    def unexpected_dense_pointer_hoist(
+        statements: List[llir.Stmt], context: DensePointerHoistContext
+    ) -> List[llir.Stmt]:
+        del statements, context
+        later_calls.append("dense_pointer_hoist")
+        raise AssertionError("later pass ran after malformed MemberAccess")
+
+    monkeypatch.setattr(
+        pass_manager_module,
+        "hoist_dense_pointers",
+        unexpected_dense_pointer_hoist,
+    )
+    manager = LLIRPassManager.from_compile_options(_compile_options())
+
+    with pytest.raises(LLIRPassPartialFailure) as raised:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact(source),
+            compressed_where_pass_spec=None,
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=lambda artifact, _: LLIRRewriteArtifact(artifact.statements),
+        )
+
+    assert type(raised.value.failure) is LLIRTraversalError
+    failure = cast(LLIRTraversalError, raised.value.failure)
+    assert failure.diagnostic.code == "invalid_member_access_member"
+    assert failure.diagnostic.path == (
+        "root",
+        "[0]",
+        "value",
+        "member",
+    )
+    assert failure.diagnostic.pass_name == "insert_sparse_prefetch"
+    assert raised.value.completed_run_records == ()
+    assert later_calls == []
+
+
 def test_production_pipeline_rejects_a_detached_compressed_options_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

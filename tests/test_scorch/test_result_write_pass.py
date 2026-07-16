@@ -274,6 +274,42 @@ workspace.sort();
 scratch = keep;"""
 
 
+def test_fill_rewrite_preserves_structured_workspace_pair_reads() -> None:
+    coordinate = llir.ArrayAccess(
+        llir.MemberAccess(
+            _var("it", llir.DataType.CONST_AUTO_REF),
+            "first",
+        ),
+        llir.Literal(1, llir.DataType.INT64),
+    )
+    value = llir.MemberAccess(
+        _var("it", llir.DataType.CONST_AUTO_REF),
+        "second",
+    )
+    source = [
+        llir.Assign(_result_value_access(_var("pResult1")), value),
+        llir.Assign(_access("Result1_crd", _var("pResult1")), coordinate),
+    ]
+    source_snapshot = _structural_snapshot(source)
+
+    rewritten = rewrite_result_writes(source, _context("fill"))
+
+    assert _structural_snapshot(source) == source_snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(rewritten))
+    assert _cpp(rewritten) == """Result_values_data[_base1 + _pos1] = it.second;
+Result1_crd_data[_base1 + _pos1] = it.first[1];"""
+    value_store = cast(llir.Assign, rewritten[0])
+    coordinate_store = cast(llir.Assign, rewritten[1])
+    assert type(value_store.value) is llir.MemberAccess
+    assert type(coordinate_store.value) is llir.ArrayAccess
+    rewritten_coordinate = cast(llir.ArrayAccess, coordinate_store.value)
+    assert type(rewritten_coordinate.array) is llir.MemberAccess
+    original_member = cast(llir.MemberAccess, coordinate.array)
+    assert cast(llir.MemberAccess, rewritten_coordinate.array).base is not (
+        original_member.base
+    )
+
+
 def test_count_rewrite_matches_legacy_multiple_level_boundary() -> None:
     source = _multiple_level_serial_writes()
     expected: List[llir.Stmt] = [

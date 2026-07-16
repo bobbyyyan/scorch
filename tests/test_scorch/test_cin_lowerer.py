@@ -32,6 +32,68 @@ class UnknownIndexStmt(IndexStmt):
     pass
 
 
+def _build_outer_workspace_statement(result_format: str) -> tuple[Where, TensorVar]:
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("Result", fmt=result_format)
+    left = TensorVar("Left", fmt="ds", mode_order=[1, 0])
+    right = TensorVar("Right", fmt="ds")
+    workspace = Workspace("wksp", dim=2)
+    return (
+        Where(
+            producer=ForAll(
+                reduction,
+                ForAll(
+                    row,
+                    ForAll(
+                        column,
+                        TensorAssign(
+                            workspace[row, column],
+                            left[row, reduction] * right[reduction, column],
+                            op=Operation.ADD,
+                        ),
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                row,
+                ForAll(
+                    column,
+                    TensorAssign(result[row, column], workspace[row, column]),
+                ),
+            ),
+        ),
+        result,
+    )
+
+
+def _assert_workspace_pair_read(
+    value: llir.Expr,
+    expected_member: str,
+    expected_index: int | None,
+) -> llir.Var:
+    if expected_index is None:
+        assert type(value) is llir.MemberAccess
+        member_access = cast(llir.MemberAccess, value)
+    else:
+        assert type(value) is llir.ArrayAccess
+        array_access = cast(llir.ArrayAccess, value)
+        assert array_access.tensor_access is None
+        assert type(array_access.index) is llir.Literal
+        literal = cast(llir.Literal, array_access.index)
+        assert literal.value == expected_index
+        assert literal.data_type is llir.DataType.INT64
+        assert type(array_access.array) is llir.MemberAccess
+        member_access = cast(llir.MemberAccess, array_access.array)
+
+    assert member_access.member == expected_member
+    assert type(member_access.base) is llir.Var
+    base = cast(llir.Var, member_access.base)
+    assert base.name == "it"
+    assert base.type is llir.DataType.CONST_AUTO_REF
+    assert base.tensor_access is None
+    return base
+
+
 def test_unknown_cin_node_fails_at_cin_lowering():
     with pytest.raises(
         CompilerInvariantError,
@@ -105,34 +167,7 @@ def test_result_position_initialization_uses_a_frozen_structured_target() -> Non
 
 
 def test_all_coo_workspace_assembly_targets_use_storage_types() -> None:
-    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
-    result = TensorVar("Result", fmt="oo")
-    left = TensorVar("Left", fmt="ds", mode_order=[1, 0])
-    right = TensorVar("Right", fmt="ds")
-    workspace = Workspace("wksp", dim=2)
-    statement = Where(
-        producer=ForAll(
-            reduction,
-            ForAll(
-                row,
-                ForAll(
-                    column,
-                    TensorAssign(
-                        workspace[row, column],
-                        left[row, reduction] * right[reduction, column],
-                        op=Operation.ADD,
-                    ),
-                ),
-            ),
-        ),
-        consumer=ForAll(
-            row,
-            ForAll(
-                column,
-                TensorAssign(result[row, column], workspace[row, column]),
-            ),
-        ),
-    )
+    statement, result = _build_outer_workspace_statement("oo")
     lowerer = CINLowerer()
     lowerer.outermost_stmt = statement
     lowerer.result_tensor_var = result
@@ -154,6 +189,16 @@ def test_all_coo_workspace_assembly_targets_use_storage_types() -> None:
         "Result1_crd[pResult1] = it.first[1];",
         "Result_values[pResult0] = it.second;",
     ]
+    pair_bases = [
+        _assert_workspace_pair_read(node.value, member, index)
+        for node, member, index in zip(
+            workspace_assignments,
+            ("first", "first", "second"),
+            (0, 1, None),
+        )
+    ]
+    assert len({id(base) for base in pair_bases}) == len(pair_bases)
+    assert all(base is not workspace_loop.var for base in pair_bases)
 
     storage_types = {
         cast(llir.Var, cast(llir.ArrayAccess, node.var).array)
@@ -187,6 +232,109 @@ def test_all_coo_workspace_assembly_targets_use_storage_types() -> None:
         in {"Result0_crd", "Result1_crd", "Result_values"}
         for node in dynamic_vector_assignments
     )
+
+
+def test_outer_workspace_intermediate_reads_use_structured_pair_members() -> None:
+    statement, result = _build_outer_workspace_statement("ds")
+    original = str(statement)
+    lowerer = CINLowerer()
+    lowerer.outermost_stmt = statement
+    lowerer.result_tensor_var = result
+    lowerer.result_tensor_access = statement.consumer.get_result_tensor_accesses()[0]
+
+    lowered = lowerer.lower_outer_ConsumerIndexStmt(statement.consumer)
+    workspace_loop = next(
+        cast(llir.ForLoopAuto, node)
+        for node in lowered
+        if type(node) is llir.ForLoopAuto
+    )
+    workspace_assignments = [
+        cast(llir.Assign, node)
+        for node in workspace_loop.body
+        if type(node) is llir.Assign
+    ]
+
+    assert [LLIRLowerer().lower_llir(node) for node in workspace_assignments] == [
+        "T0_crd_vec[pT] = it.first[0];",
+        "T1_crd_vec[pT] = it.first[1];",
+        "T_val_vec[pT] = it.second;",
+    ]
+    pair_bases = [
+        _assert_workspace_pair_read(node.value, member, index)
+        for node, member, index in zip(
+            workspace_assignments,
+            ("first", "first", "second"),
+            (0, 1, None),
+        )
+    ]
+    assert len({id(base) for base in pair_bases}) == len(pair_bases)
+    assert all(base is not workspace_loop.var for base in pair_bases)
+    assert str(statement) == original
+
+
+@pytest.mark.parametrize(
+    ("result_format", "index_names", "expected_initializers"),
+    [
+        pytest.param(
+            "s",
+            ("i",),
+            ("int64_t i = it.first;", "float wksp_value = it.second;"),
+            id="rank-one",
+        ),
+        pytest.param(
+            "oo",
+            ("i", "j"),
+            (
+                "int64_t i = it.first[0];",
+                "int64_t j = it.first[1];",
+                "float wksp_value = it.second;",
+            ),
+            id="rank-two",
+        ),
+    ],
+)
+def test_nested_workspace_reads_use_structured_pair_members(
+    result_format: str,
+    index_names: tuple[str, ...],
+    expected_initializers: tuple[str, ...],
+) -> None:
+    index_vars = tuple(IndexVar(name) for name in index_names)
+    result = TensorVar("Result", fmt=result_format)
+    workspace = Workspace("wksp", dim=len(index_vars))
+    access_key = index_vars[0] if len(index_vars) == 1 else index_vars
+    consumer = TensorAssign(result[access_key], workspace[access_key])
+    original = str(consumer)
+    lowerer = CINLowerer()
+    lowerer.outermost_stmt = ForAll(IndexVar("outer"), consumer)
+
+    lowered = lowerer.lower_ConsumerIndexStmt(consumer)
+    workspace_loop = next(
+        cast(llir.ForLoopAuto, node)
+        for node in lowered
+        if type(node) is llir.ForLoopAuto
+    )
+    initializers = [
+        cast(llir.VarInit, node)
+        for node in workspace_loop.body
+        if type(node) is llir.VarInit
+    ][: len(index_vars) + 1]
+
+    assert [LLIRLowerer().lower_llir(node) for node in initializers] == list(
+        expected_initializers
+    )
+    expected_reads: list[tuple[str, int | None]] = (
+        [("first", None)]
+        if len(index_vars) == 1
+        else [("first", index) for index in range(len(index_vars))]
+    )
+    expected_reads.append(("second", None))
+    pair_bases = [
+        _assert_workspace_pair_read(node.value, member, index)
+        for node, (member, index) in zip(initializers, expected_reads)
+    ]
+    assert len({id(base) for base in pair_bases}) == len(pair_bases)
+    assert all(base is not workspace_loop.var for base in pair_bases)
+    assert str(consumer) == original
 
 
 def test_mutated_unknown_post_op_cannot_be_silently_skipped():

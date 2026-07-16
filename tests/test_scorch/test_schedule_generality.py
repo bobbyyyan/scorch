@@ -102,6 +102,37 @@ def _build_spgemm() -> ForAll:
     return _nest((row, reduction, col), assignment)
 
 
+def _build_outer_workspace_spgemm(result_format: str) -> ForAll:
+    row, reduction, col = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    out = TensorVar("SparseProduct", fmt=result_format)
+    left = TensorVar("SparseLeft", fmt="ds", mode_order=[1, 0])
+    right = TensorVar("SparseRight", fmt="ds")
+    assignment = TensorAssign(
+        out[row, col],
+        left[row, reduction] * right[reduction, col],
+        op=Operation.ADD,
+    )
+    return _nest((reduction, row, col), assignment)
+
+
+def _build_nested_rank_two_workspace() -> ForAll:
+    batch, reduction, row, col = (
+        IndexVar("a"),
+        IndexVar("q"),
+        IndexVar("r"),
+        IndexVar("c"),
+    )
+    out = TensorVar("BatchedProduct", fmt="doo")
+    left = TensorVar("BatchedLeft", fmt="ddd", mode_order=[0, 2, 1])
+    right = TensorVar("BatchedRight", fmt="ddd")
+    assignment = TensorAssign(
+        out[batch, row, col],
+        left[batch, row, reduction] * right[batch, reduction, col],
+        op=Operation.ADD,
+    )
+    return _nest((batch, reduction, row, col), assignment)
+
+
 def _build_spmv() -> ForAll:
     row, reduction = IndexVar("r"), IndexVar("q")
     out = TensorVar("VectorOut", fmt="d")
@@ -905,6 +936,8 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
     assert "torch::Tensor SparseProduct1_crd_torch = torch::empty" in auto_cpp
     assert "SparseProduct1_pos_data" in auto_cpp
     assert "packed_" not in auto_cpp
+    assert auto_cpp.count("int64_t c = it.first;") == 2
+    assert auto_cpp.count("float wksp_value = it.second;") == 2
 
     torch.manual_seed(103)
     left = torch.randn(5, 6)
@@ -919,6 +952,90 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
     )
 
     assert torch.allclose(result.to_torch(), left @ right, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("result_format", "expected_pair_reads"),
+    [
+        pytest.param(
+            "oo",
+            (
+                "SparseProduct0_crd.emplace_back(it.first[0]);",
+                "SparseProduct1_crd.emplace_back(it.first[1]);",
+                "SparseProduct_values.emplace_back(it.second);",
+            ),
+            id="all-coordinate",
+        ),
+        pytest.param(
+            "ds",
+            (
+                "scorch_vector_set(T0_crd_vec, pT, it.first[0]);",
+                "scorch_vector_set(T1_crd_vec, pT, it.first[1]);",
+                "scorch_vector_set(T_val_vec, pT, it.second);",
+            ),
+            id="intermediate-coordinate",
+        ),
+    ],
+)
+def test_outer_workspace_pair_reads_are_stable_and_remain_correct(
+    result_format: str,
+    expected_pair_reads: tuple[str, ...],
+) -> None:
+    schedule = Schedule(
+        loop_order=("q", "r", "c"),
+        tag=f"workspace-pair-outer-{result_format}",
+    )
+    statement = _build_outer_workspace_spgemm(result_format)
+    original = str(statement)
+
+    with regblock_force(False):
+        first_cpp = _lower_to_cpp(Scheduler.apply_schedule(statement, schedule))
+        second_cpp = _lower_to_cpp(Scheduler.apply_schedule(statement, schedule))
+
+    assert str(statement) == original
+    assert second_cpp == first_cpp
+    for anchor in expected_pair_reads:
+        assert anchor in first_cpp
+
+    torch.manual_seed(104)
+    left = torch.randn(4, 5)
+    right = torch.randn(5, 3)
+    left *= torch.rand(4, 5) < 0.45
+    right *= torch.rand(5, 3) < 0.5
+    sparse_left = STensor.from_torch(
+        left,
+        "WorkspacePairLeft",
+        mode_order=[1, 0],
+    ).to_sparse("ds")
+    sparse_right = _sparse_stensor(right, "WorkspacePairRight")
+    result = einsum(
+        "rq,qc->rc",
+        sparse_left,
+        sparse_right,
+        format=result_format,
+        schedule=schedule,
+    )
+
+    assert torch.allclose(result.to_torch(), left @ right, atol=1e-3, rtol=1e-3)
+
+
+def test_nested_rank_two_workspace_pair_reads_are_stable() -> None:
+    schedule = Schedule(
+        loop_order=("a", "q", "r", "c"),
+        tag="workspace-pair-nested-rank-two",
+    )
+    statement = _build_nested_rank_two_workspace()
+    original = str(statement)
+
+    with regblock_force(False):
+        first_cpp = _lower_to_cpp(Scheduler.apply_schedule(statement, schedule))
+        second_cpp = _lower_to_cpp(Scheduler.apply_schedule(statement, schedule))
+
+    assert str(statement) == original
+    assert second_cpp == first_cpp
+    assert "int64_t r = it.first[0];" in first_cpp
+    assert "int64_t c = it.first[1];" in first_cpp
+    assert "float wksp_value = it.second;" in first_cpp
 
 
 def test_spgemm_affine_tile_is_rejected_before_sparse_output_assembly():

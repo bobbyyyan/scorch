@@ -117,6 +117,47 @@ def test_cast_codegen_parenthesizes_lower_precedence_operand() -> None:
 @pytest.mark.parametrize(
     ("expression", "expected"),
     (
+        (llir.MemberAccess(_var("it"), "second"), "it.second"),
+        (
+            llir.ArrayAccess(
+                llir.MemberAccess(_var("it"), "first"),
+                llir.Literal(0, llir.DataType.INT64),
+            ),
+            "it.first[0]",
+        ),
+        (
+            llir.MemberAccess(
+                llir.ArrayAccess(_var("entries"), _var("i")),
+                "second",
+            ),
+            "entries[i].second",
+        ),
+        (
+            llir.MemberAccess(
+                llir.BinOp(op="+", left=_var("entry"), right=_var("offset")),
+                "second",
+            ),
+            "(entry + offset).second",
+        ),
+        (
+            llir.MemberAccess(
+                llir.MemberAccess(_var("entry"), "first"),
+                "value",
+            ),
+            "entry.first.value",
+        ),
+    ),
+)
+def test_member_access_codegen_is_byte_exact_and_precedence_correct(
+    expression: llir.Expr,
+    expected: str,
+) -> None:
+    assert LLIRLowerer().lower_llir(expression) == expected
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
         (
             llir.ArrayAccess(
                 array=llir.BinOp(op="+", left=_var("a"), right=_var("offset")),
@@ -219,6 +260,7 @@ def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None
     (
         (llir.Literal(1), "exact Var or ArrayAccess"),
         (llir.FunctionCall("target"), "exact Var or ArrayAccess"),
+        (llir.MemberAccess(_var("target"), "member"), "exact Var or ArrayAccess"),
         (_var("values[i]"), "identifier or member path"),
         (_var("call()"), "identifier or member path"),
         (_var("left + right"), "identifier or member path"),
@@ -498,6 +540,35 @@ def test_array_access_is_frozen_typed_validated_and_structurally_equal() -> None
         )
 
 
+def test_member_access_is_frozen_typed_validated_and_structurally_equal() -> None:
+    base = _var("it")
+    access = llir.MemberAccess(base=base, member="second")
+
+    assert access.base is base
+    assert access.member == "second"
+    assert access == llir.MemberAccess(_var("it"), "second")
+    assert access != llir.MemberAccess(_var("it"), "first")
+    assert access != llir.MemberAccess(_var("other"), "second")
+    assert get_type_hints(llir.MemberAccess) == {
+        "base": llir.Expr,
+        "member": str,
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        access.base = _var("other")
+    with pytest.raises(FrozenInstanceError):
+        access.member = "first"
+
+    with pytest.raises(TypeError, match="MemberAccess.base"):
+        llir.MemberAccess("it", "second")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="MemberAccess.member"):
+        llir.MemberAccess(_var("it"), "")
+    with pytest.raises(TypeError, match="MemberAccess.member"):
+        llir.MemberAccess(_var("it"), "first.second")
+    with pytest.raises(TypeError, match="MemberAccess.member"):
+        llir.MemberAccess(_var("it"), 1)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     "kwargs",
     (
@@ -551,6 +622,35 @@ def test_codegen_rejects_array_access_subclasses_and_unknown_children() -> None:
         )
     with pytest.raises(CodegenError, match="UnknownExpr"):
         LLIRLowerer().lower_llir(llir.ArrayAccess(array=UnknownExpr(), index=_var("i")))
+
+
+def test_codegen_rejects_member_access_subclasses_and_unknown_children() -> None:
+    class UnknownMemberAccess(llir.MemberAccess):
+        pass
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownMemberAccess"):
+        LLIRLowerer().lower_llir(UnknownMemberAccess(_var("it"), "second"))
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(llir.MemberAccess(UnknownExpr(), "second"))
+
+
+@pytest.mark.parametrize("malformation", ("base", "member"))
+def test_codegen_rejects_forged_member_access_fields(malformation: str) -> None:
+    access = object.__new__(llir.MemberAccess)
+    object.__setattr__(access, "base", _var("it"))
+    object.__setattr__(access, "member", "second")
+    if malformation == "base":
+        object.__setattr__(access, "base", "it")
+        expected = "MemberAccess.base"
+    else:
+        object.__setattr__(access, "member", "first.second")
+        expected = "MemberAccess.member"
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(access)
 
 
 def test_function_codegen_rejects_non_var_argument() -> None:
