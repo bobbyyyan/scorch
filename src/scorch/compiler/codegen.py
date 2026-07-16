@@ -241,9 +241,7 @@ class LLIRLowerer:
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
             binary = cast(llir.BinOp, ir)
             if type(binary.op) is not str or not binary.op:
-                raise CodegenError(
-                    "LLIR binary operator must be a non-empty string"
-                )
+                raise CodegenError("LLIR binary operator must be a non-empty string")
             if type(binary) is llir.Add and binary.op != "+":
                 raise CodegenError("Add.op must remain '+'")
             if type(binary) is llir.Mul and binary.op != "*":

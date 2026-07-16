@@ -349,9 +349,7 @@ def rebuild_binary_expression(
         if expression.op != "*":
             raise TypeError("Mul.op must remain '*'")
         return Mul(left, right)
-    raise TypeError(
-        "binary expression must be an exact BinOp, Add, or Mul instance"
-    )
+    raise TypeError("binary expression must be an exact BinOp, Add, or Mul instance")
 
 
 @dataclass(frozen=True)
