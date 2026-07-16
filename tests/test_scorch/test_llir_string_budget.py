@@ -1,4 +1,4 @@
-"""Audited compatibility budget after workspace-pair read migration."""
+"""Audited compatibility budget after structured free-move call migration."""
 
 import ast
 from collections import Counter
@@ -118,7 +118,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(constructor_counts.values()) == 374
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 161,
+        "cin_lowerer.py": 166,
         "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -129,7 +129,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 94,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 328
+    assert sum(unclassified_counts.values()) == 333
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -144,17 +144,17 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert totals == {
         "subscript": 22,
-        "call": 13,
+        "call": 8,
         "member": 3,
         "initializer": 3,
         "qualified": 3,
         "ternary": 1,
         "arithmetic": 1,
     }
-    assert sum(totals.values()) == 46
+    assert sum(totals.values()) == 41
     assert per_file == {
         ("cin_lowerer.py", "subscript"): 16,
-        ("cin_lowerer.py", "call"): 11,
+        ("cin_lowerer.py", "call"): 6,
         ("cin_lowerer.py", "member"): 3,
         ("cin_lowerer.py", "initializer"): 3,
         ("cin_lowerer.py", "qualified"): 3,
@@ -162,6 +162,44 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("cin_lowerer.py", "arithmetic"): 1,
         ("iterator.py", "subscript"): 6,
         ("schedule_lowerer.py", "call"): 2,
+    }
+
+
+def test_free_move_calls_cannot_return_to_var_names() -> None:
+    violations: list[tuple[str, int, str]] = []
+    structured_moves: Counter[str] = Counter()
+    remaining_opaque_calls: Counter[tuple[str, str]] = Counter()
+    for path in sorted(_COMPILER_ROOT.glob("*.py")):
+        for call in _llir_constructor_calls(path, "Var"):
+            name_expression = _var_name_expression(call)
+            if name_expression is None:
+                continue
+            fragments = _static_string_fragments(name_expression)
+            if "std::move(" in fragments:
+                violations.append(
+                    (path.name, call.lineno, ast.unparse(name_expression))
+                )
+            if _string_expression_category(name_expression) == "call":
+                if "data_ptr<" in fragments:
+                    remaining_opaque_calls[(path.name, "data_ptr")] += 1
+                elif ".data()" in fragments:
+                    remaining_opaque_calls[(path.name, "storage_data")] += 1
+                else:
+                    remaining_opaque_calls[(path.name, "other")] += 1
+
+        for call in _llir_constructor_calls(path, "FunctionCall"):
+            name_expression = _var_name_expression(call)
+            if (
+                isinstance(name_expression, ast.Constant)
+                and name_expression.value == "std::move"
+            ):
+                structured_moves[path.name] += 1
+
+    assert violations == []
+    assert structured_moves == {"cin_lowerer.py": 5}
+    assert remaining_opaque_calls == {
+        ("cin_lowerer.py", "data_ptr"): 6,
+        ("schedule_lowerer.py", "storage_data"): 2,
     }
 
 

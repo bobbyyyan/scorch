@@ -254,6 +254,23 @@ def test_member_access_walker_has_deterministic_preorder() -> None:
     ]
 
 
+def test_function_call_walker_has_deterministic_preorder() -> None:
+    expression = llir.FunctionCall(
+        "scorch_tensor_from_vector",
+        [
+            llir.FunctionCall("std::move", [_var("values")]),
+            _var("dtype"),
+        ],
+    )
+
+    assert _record(expression) == [
+        "FunctionCall",
+        "FunctionCall",
+        "Var:values",
+        "Var:dtype",
+    ]
+
+
 def test_walker_and_rewriter_cover_every_declared_node() -> None:
     samples = _node_samples()
     assert set(SUPPORTED_LLIR_NODE_TYPES) == _declared_node_types()
@@ -346,6 +363,23 @@ def test_unknown_member_access_subclass_fails_closed(operation: str) -> None:
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_function_call_subclass_fails_closed(operation: str) -> None:
+    class UnknownFunctionCall(llir.FunctionCall):
+        pass
+
+    unknown = UnknownFunctionCall("call")
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownFunctionCall"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_unknown_assignment_target_subclass_fails_closed(operation: str) -> None:
     class UnknownArrayAccess(llir.ArrayAccess):
         pass
@@ -399,6 +433,62 @@ def test_member_access_unknown_child_reports_exact_path(operation: str) -> None:
     assert raised.value.diagnostic.node_type == "UnknownExpr"
     assert raised.value.diagnostic.code == "unknown_llir_node"
     assert raised.value.diagnostic.path == ("root", "base")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_function_call_unknown_child_reports_exact_path(operation: str) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    call = llir.FunctionCall("call", [UnknownExpr()])
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(call)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(call)
+
+    assert raised.value.diagnostic.node_type == "UnknownExpr"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", "args", "[0]")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        ("name", "invalid_function_call_name", ("root", "name")),
+        ("args", "invalid_function_call_args", ("root", "args")),
+        (
+            "argument",
+            "invalid_expression_sequence_member",
+            ("root", "args", "[0]"),
+        ),
+    ),
+)
+def test_forged_function_call_fields_fail_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    call = object.__new__(llir.FunctionCall)
+    object.__setattr__(call, "name", "call")
+    object.__setattr__(call, "args", (_var("argument"),))
+    if malformation == "name":
+        object.__setattr__(call, "name", " ")
+    elif malformation == "args":
+        object.__setattr__(call, "args", [_var("argument")])
+    else:
+        object.__setattr__(call, "args", ("argument",))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(call)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(call)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -769,6 +859,50 @@ def test_member_access_identity_rewrite_is_detached_idempotent_and_owned() -> No
     assert cast(llir.Var, second_member.base).name == "it"
 
 
+def test_function_call_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original = llir.FunctionCall(
+        "scorch_tensor_from_vector",
+        [llir.FunctionCall("std::move", [_var("values")]), _var("dtype")],
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.FunctionCall, rewriter.rewrite(original))
+    second = cast(llir.FunctionCall, rewriter.rewrite(first))
+
+    assert _record(original) == _record(first) == _record(second)
+    assert _structural_snapshot(original) == _structural_snapshot(first)
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    assert type(first.args) is tuple
+    assert type(second.args) is tuple
+
+    original_move = cast(llir.FunctionCall, original.args[0])
+    first_move = cast(llir.FunctionCall, first.args[0])
+    second_move = cast(llir.FunctionCall, second.args[0])
+    assert original_move is not first_move
+    assert first_move is not second_move
+    assert original_move.args[0] is not first_move.args[0]
+    assert first_move.args[0] is not second_move.args[0]
+
+    cast(llir.Var, first_move.args[0]).name = "owned"
+    assert cast(llir.Var, original_move.args[0]).name == "values"
+    assert cast(llir.Var, second_move.args[0]).name == "values"
+
+    class ReplaceValue(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "values":
+                rewritten.name = "replacement"
+            return rewritten
+
+    replacement = cast(llir.FunctionCall, ReplaceValue(_CONTEXT).rewrite(original))
+    replacement_move = cast(llir.FunctionCall, replacement.args[0])
+    assert cast(llir.Var, replacement_move.args[0]).name == "replacement"
+    assert cast(llir.Var, original_move.args[0]).name == "values"
+    assert replacement_move.args[0] is not original_move.args[0]
+
+
 def test_assignment_target_rewrite_owns_replacement_and_preserves_original() -> None:
     class ReplaceIndexRewriter(LLIRRewriter):
         def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
@@ -1018,9 +1152,10 @@ def test_typed_var_children_reject_other_supported_expressions(
     assert raised.value.diagnostic.path == ("root", "var")
 
 
-def test_function_call_default_arguments_are_not_shared() -> None:
+def test_function_call_default_arguments_are_empty_immutable_tuples() -> None:
     first = llir.FunctionCall("first")
     second = llir.FunctionCall("second")
-    first.args.append(_var("arg"))
 
-    assert second.args == []
+    assert type(first.args) is tuple
+    assert type(second.args) is tuple
+    assert first.args == second.args == ()

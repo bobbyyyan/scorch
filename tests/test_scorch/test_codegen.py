@@ -114,6 +114,72 @@ def test_cast_codegen_parenthesizes_lower_precedence_operand() -> None:
     assert LLIRLowerer().lower_llir(expression) == "(float) (a + b)"
 
 
+def test_function_call_is_frozen_typed_owned_and_structurally_equal() -> None:
+    argument = _var("values")
+    caller_args = [argument]
+    call = llir.FunctionCall("std::move", caller_args)
+    tuple_call = llir.FunctionCall("std::move", (_var("values"),))
+
+    caller_args.append(_var("later"))
+
+    assert call.name == "std::move"
+    assert type(call.args) is tuple
+    assert call.args == (argument,)
+    assert call == tuple_call
+    assert call != llir.FunctionCall("std::move", (_var("other"),))
+    assert call != llir.FunctionCall("other", (_var("values"),))
+    assert get_type_hints(llir.FunctionCall) == {
+        "name": str,
+        "args": Tuple[llir.Expr, ...],
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        call.name = "other"
+    with pytest.raises(FrozenInstanceError):
+        call.args = ()
+
+
+@pytest.mark.parametrize("name", ("", "   ", 1, None))
+def test_function_call_rejects_malformed_names(name: object) -> None:
+    with pytest.raises(TypeError, match="FunctionCall.name"):
+        llir.FunctionCall(cast(str, name))
+
+
+@pytest.mark.parametrize("arguments", ("argument", {"argument"}, {_var("value")}))
+def test_function_call_rejects_malformed_argument_containers(
+    arguments: object,
+) -> None:
+    with pytest.raises(TypeError, match="FunctionCall.args must be a list or tuple"):
+        llir.FunctionCall("call", cast(list[llir.Expr], arguments))
+
+
+def test_function_call_rejects_non_expression_arguments() -> None:
+    with pytest.raises(TypeError, match="contain only LLIR expressions"):
+        llir.FunctionCall("call", [cast(llir.Expr, "argument")])
+
+
+def test_nested_function_call_codegen_is_byte_exact_and_postfix_correct() -> None:
+    conversion = llir.FunctionCall(
+        "scorch_tensor_from_vector",
+        [
+            llir.FunctionCall(
+                "std::move",
+                [llir.Var("Result_values", llir.DataType.STD_VECTOR_FLOAT32)],
+            ),
+            llir.Var("torch::kFloat32", llir.DataType.NO_TYPE),
+        ],
+    )
+    indexed_call = llir.ArrayAccess(
+        llir.FunctionCall("factory", [llir.Add(_var("a"), _var("b"))]),
+        llir.Literal(0),
+    )
+
+    assert LLIRLowerer().lower_llir(conversion) == (
+        "scorch_tensor_from_vector(std::move(Result_values), torch::kFloat32)"
+    )
+    assert LLIRLowerer().lower_llir(indexed_call) == "factory(a + b)[0]"
+
+
 @pytest.mark.parametrize(
     ("expression", "expected"),
     (
@@ -635,6 +701,38 @@ def test_codegen_rejects_member_access_subclasses_and_unknown_children() -> None
         LLIRLowerer().lower_llir(UnknownMemberAccess(_var("it"), "second"))
     with pytest.raises(CodegenError, match="UnknownExpr"):
         LLIRLowerer().lower_llir(llir.MemberAccess(UnknownExpr(), "second"))
+
+
+def test_codegen_rejects_function_call_subclasses_and_unknown_children() -> None:
+    class UnknownFunctionCall(llir.FunctionCall):
+        pass
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownFunctionCall"):
+        LLIRLowerer().lower_llir(UnknownFunctionCall("call"))
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(llir.FunctionCall("call", [UnknownExpr()]))
+
+
+@pytest.mark.parametrize("malformation", ("name", "args", "argument"))
+def test_codegen_rejects_forged_function_call_fields(malformation: str) -> None:
+    call = object.__new__(llir.FunctionCall)
+    object.__setattr__(call, "name", "call")
+    object.__setattr__(call, "args", (_var("argument"),))
+    if malformation == "name":
+        object.__setattr__(call, "name", " ")
+        expected = "FunctionCall.name"
+    elif malformation == "args":
+        object.__setattr__(call, "args", [_var("argument")])
+        expected = "FunctionCall.args must be a tuple"
+    else:
+        object.__setattr__(call, "args", ("argument",))
+        expected = "contain only LLIR expressions"
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(call)
 
 
 @pytest.mark.parametrize("malformation", ("base", "member"))

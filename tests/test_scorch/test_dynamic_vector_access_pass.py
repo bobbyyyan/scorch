@@ -149,6 +149,33 @@ scratch[i] = out_values.at(q);"""
     assert _cpp(rewritten) == expected_cpp
 
 
+def test_structural_function_call_equality_is_explicit_at_deduplication_seam() -> None:
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_crd", llir.DataType.STD_VECTOR_C_INT)),
+        llir.Assign(
+            _access("out_crd", "p", llir.DataType.STD_VECTOR_C_INT),
+            llir.FunctionCall("coordinate", [_var("p")]),
+        ),
+        llir.Assign(
+            _access("out_crd", "p", llir.DataType.STD_VECTOR_C_INT),
+            llir.FunctionCall("coordinate", [_var("p")]),
+        ),
+    ]
+    snapshot = _structural_snapshot(source)
+
+    rewritten = rewrite_dynamic_vector_accesses(
+        source,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+
+    assert len(rewritten) == 2
+    assert type(rewritten[1]) is llir.FunctionCallStmt
+    assert _cpp(rewritten) == (
+        "std::vector<int> out_crd;\nout_crd.emplace_back(coordinate(p));"
+    )
+    assert _structural_snapshot(source) == snapshot
+
+
 def test_dynamic_vector_pass_does_not_mutate_or_alias_caller_input() -> None:
     source = _legacy_dynamic_vector_fixture()
     rewritten = rewrite_dynamic_vector_accesses(

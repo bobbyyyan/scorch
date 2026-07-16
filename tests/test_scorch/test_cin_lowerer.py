@@ -94,6 +94,57 @@ def _assert_workspace_pair_read(
     return base
 
 
+def _assert_vector_move_initialization(
+    statement: llir.Stmt,
+    *,
+    target_name: str,
+    vector_name: str,
+    vector_type: llir.DataType,
+    dtype_name: str,
+) -> llir.FunctionCall:
+    assert type(statement) is llir.VarInit
+    initializer = cast(llir.VarInit, statement)
+    assert initializer.var.name == target_name
+    assert initializer.var.type is llir.DataType.TORCH_TENSOR
+    assert type(initializer.value) is llir.FunctionCall
+    conversion = cast(llir.FunctionCall, initializer.value)
+    assert conversion.name == "scorch_tensor_from_vector"
+    assert type(conversion.args) is tuple
+    assert len(conversion.args) == 2
+    assert type(conversion.args[0]) is llir.FunctionCall
+    move = cast(llir.FunctionCall, conversion.args[0])
+    assert move.name == "std::move"
+    assert type(move.args) is tuple
+    assert len(move.args) == 1
+    assert type(move.args[0]) is llir.Var
+    vector = cast(llir.Var, move.args[0])
+    assert vector.name == vector_name
+    assert vector.type is vector_type
+    assert vector.tensor_access is None
+    assert type(conversion.args[1]) is llir.Var
+    assert cast(llir.Var, conversion.args[1]).name == dtype_name
+    return move
+
+
+def _collect_move_calls(value: llir.Node) -> list[llir.FunctionCall]:
+    calls: list[llir.FunctionCall] = []
+
+    class MoveCollector(LLIRWalker):
+        def visit_function_call(
+            self,
+            node: llir.FunctionCall,
+            path: tuple[str, ...],
+        ) -> None:
+            if node.name == "std::move":
+                calls.append(node)
+            super().visit_function_call(node, path)
+
+    MoveCollector(
+        LLIRTraversalContext(stage="test", pass_name="collect_move_calls")
+    ).walk(value)
+    return calls
+
+
 def test_unknown_cin_node_fails_at_cin_lowering():
     with pytest.raises(
         CompilerInvariantError,
@@ -164,6 +215,58 @@ def test_result_position_initialization_uses_a_frozen_structured_target() -> Non
     assert cast(llir.Var, target.array).name == "Result1_pos"
     assert cast(llir.Literal, target.index).value == 0
     assert LLIRLowerer().lower_llir(assignment) == "Result1_pos[0] = 0;"
+
+
+def test_final_result_assembly_uses_structured_typed_move_calls() -> None:
+    statements = ResultTensorAssembler(
+        TensorVar("Result", fmt="ds")
+    ).emit_final_assembly()
+    initializers = {
+        statement.var.name: statement
+        for statement in statements
+        if type(statement) is llir.VarInit
+    }
+
+    expected = (
+        (
+            "Result1_pos_torch",
+            "Result1_pos",
+            llir.DataType.STD_VECTOR_C_INT,
+            "torch::kInt",
+        ),
+        (
+            "Result1_crd_torch",
+            "Result1_crd",
+            llir.DataType.STD_VECTOR_C_INT,
+            "torch::kInt",
+        ),
+        (
+            "Result_values_torch",
+            "Result_values",
+            llir.DataType.STD_VECTOR_FLOAT32,
+            "torch::kFloat32",
+        ),
+    )
+    moves = [
+        _assert_vector_move_initialization(
+            initializers[target_name],
+            target_name=target_name,
+            vector_name=vector_name,
+            vector_type=vector_type,
+            dtype_name=dtype_name,
+        )
+        for target_name, vector_name, vector_type, dtype_name in expected
+    ]
+
+    assert [LLIRLowerer().lower_llir(initializers[name]) for name, *_ in expected] == [
+        "torch::Tensor Result1_pos_torch = "
+        "scorch_tensor_from_vector(std::move(Result1_pos), torch::kInt);",
+        "torch::Tensor Result1_crd_torch = "
+        "scorch_tensor_from_vector(std::move(Result1_crd), torch::kInt);",
+        "torch::Tensor Result_values_torch = "
+        "scorch_tensor_from_vector(std::move(Result_values), torch::kFloat32);",
+    ]
+    assert len({id(cast(llir.Var, move.args[0])) for move in moves}) == len(moves)
 
 
 def test_all_coo_workspace_assembly_targets_use_storage_types() -> None:
@@ -269,6 +372,96 @@ def test_outer_workspace_intermediate_reads_use_structured_pair_members() -> Non
     ]
     assert len({id(base) for base in pair_bases}) == len(pair_bases)
     assert all(base is not workspace_loop.var for base in pair_bases)
+
+    assembly_initializers = {
+        node.var.name: node
+        for node in lowered
+        if type(node) is llir.VarInit
+        and type(node.value) is llir.FunctionCall
+        and cast(llir.FunctionCall, node.value).name == "scorch_tensor_from_vector"
+    }
+    expected_moves = (
+        (
+            "T0_crd_tensor",
+            "T0_crd_vec",
+            llir.DataType.STD_VECTOR_C_INT,
+            "torch::kInt",
+        ),
+        (
+            "T1_crd_tensor",
+            "T1_crd_vec",
+            llir.DataType.STD_VECTOR_C_INT,
+            "torch::kInt",
+        ),
+        (
+            "T_val_tensor",
+            "T_val_vec",
+            llir.DataType.STD_VECTOR_FLOAT32,
+            "torch::kFloat32",
+        ),
+    )
+    moves = [
+        _assert_vector_move_initialization(
+            assembly_initializers[target_name],
+            target_name=target_name,
+            vector_name=vector_name,
+            vector_type=vector_type,
+            dtype_name=dtype_name,
+        )
+        for target_name, vector_name, vector_type, dtype_name in expected_moves
+    ]
+    assert [
+        LLIRLowerer().lower_llir(assembly_initializers[name])
+        for name, *_ in expected_moves
+    ] == [
+        "torch::Tensor T0_crd_tensor = "
+        "scorch_tensor_from_vector(std::move(T0_crd_vec), torch::kInt);",
+        "torch::Tensor T1_crd_tensor = "
+        "scorch_tensor_from_vector(std::move(T1_crd_vec), torch::kInt);",
+        "torch::Tensor T_val_tensor = "
+        "scorch_tensor_from_vector(std::move(T_val_vec), torch::kFloat32);",
+    ]
+    assert len({id(cast(llir.Var, move.args[0])) for move in moves}) == len(moves)
+    assert str(statement) == original
+
+
+def test_move_calls_survive_both_production_paths_with_independent_ownership() -> None:
+    statement, _ = _build_outer_workspace_statement("ds")
+    original = str(statement)
+
+    first = CINLowerer().lower_IndexStmt(statement)
+    second = CINLowerer().lower_IndexStmt(statement)
+
+    assert type(first) is llir.Function
+    assert type(second) is llir.Function
+    first_calls = _collect_move_calls(cast(llir.Function, first))
+    second_calls = _collect_move_calls(cast(llir.Function, second))
+    expected = [
+        ("T0_crd_vec", llir.DataType.STD_VECTOR_C_INT),
+        ("T1_crd_vec", llir.DataType.STD_VECTOR_C_INT),
+        ("T_val_vec", llir.DataType.STD_VECTOR_FLOAT32),
+        ("Result1_pos", llir.DataType.STD_VECTOR_C_INT),
+        ("Result1_crd", llir.DataType.STD_VECTOR_C_INT),
+        ("Result_values", llir.DataType.STD_VECTOR_FLOAT32),
+    ]
+
+    def call_values(
+        calls: list[llir.FunctionCall],
+    ) -> list[tuple[str, llir.DataType]]:
+        return [
+            (cast(llir.Var, call.args[0]).name, cast(llir.Var, call.args[0]).type)
+            for call in calls
+        ]
+
+    assert call_values(first_calls) == call_values(second_calls) == expected
+    assert LLIRLowerer().lower_llir(first) == LLIRLowerer().lower_llir(second)
+    assert str(statement) == original
+    assert {id(cast(llir.Var, call.args[0])) for call in first_calls}.isdisjoint(
+        {id(cast(llir.Var, call.args[0])) for call in second_calls}
+    )
+
+    cast(llir.Var, first_calls[0].args[0]).name = "owned_by_first"
+    assert call_values(second_calls) == expected
     assert str(statement) == original
 
 

@@ -28,6 +28,7 @@ import scorch.compiler.scheduler as scheduler_module  # type: ignore[import-unty
 import scorch.ops as ops  # type: ignore[import-untyped]
 import scorch.stensor as stensor_module  # type: ignore[import-untyped]
 import scorch.utils as utils  # type: ignore[import-untyped]
+from scorch.compiler import llir  # type: ignore[import-untyped]
 from scorch.compiler.cin import (  # type: ignore[import-untyped]
     ForAll,
     IndexVar,
@@ -69,6 +70,9 @@ from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     DEBUG_LLIR_PASS_OPTIONS,
     LLIRPassOptions,
     PRODUCTION_LLIR_PASS_OPTIONS,
+)
+from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
+    LLIRTraversalError,
 )
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Schedule,
@@ -2021,6 +2025,81 @@ def test_dynamic_failure_after_abi_keeps_assembly_and_preceding_pass_records(
         "eliminate_single_iteration_loops",
         "hoist_loop_invariant_factors",
     ]
+
+
+def test_malformed_assembled_call_fails_its_owner_and_suppresses_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    original_assembly = ResultTensorAssembler.emit_final_assembly
+
+    def emit_malformed_call(self: ResultTensorAssembler) -> list[llir.Stmt]:
+        malformed = object.__new__(llir.FunctionCall)
+        object.__setattr__(malformed, "name", "std::move")
+        object.__setattr__(
+            malformed,
+            "args",
+            [llir.Var("values", llir.DataType.STD_VECTOR_FLOAT32)],
+        )
+        return [
+            *original_assembly(self),
+            llir.VarInit(
+                llir.Var("malformed_move", llir.DataType.NO_TYPE),
+                malformed,
+            ),
+        ]
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_final_assembly",
+        emit_malformed_call,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value.diagnostic.code == "invalid_function_call_args"
+    assert failure.value.diagnostic.stage == "LLIR rewrite"
+    assert failure.value.diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert _stage_values(context) == [
+        *_EINSUM_PREFIX_THROUGH_ADAPTER,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    ]
+    assert context.stage_run_records[-1].nested_within is CompilerStageId.CIN_LOWERING
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert later_calls == []
+    assert context.compile_options is options
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
 
 
 @pytest.mark.parametrize(
