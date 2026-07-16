@@ -458,18 +458,19 @@ def _rewrite_expression_references(
         return rewritten
     if type(expression) in (llir.BinOp, llir.Add, llir.Mul):
         binary = cast(llir.BinOp, expression)
-        binary.left = _rewrite_expression_references(
+        left = _rewrite_expression_references(
             binary.left,
             replacements,
             context,
             path + ("left",),
         )
-        binary.right = _rewrite_expression_references(
+        right = _rewrite_expression_references(
             binary.right,
             replacements,
             context,
             path + ("right",),
         )
+        return llir.rebuild_binary_expression(binary, left, right)
     if type(expression) is llir.ArrayAccess:
         access = cast(llir.ArrayAccess, expression)
         if type(access.array) is llir.Var and type(access.index) is llir.Var:

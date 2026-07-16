@@ -233,23 +233,45 @@ def _collect_single_step_bounds(
         if type(statement) is not llir.VarInit:
             continue
         initializer = cast(llir.VarInit, statement)
-        if type(initializer.value) is not llir.Var:
-            continue
         statement_path = path + (f"[{index}]",)
-        value_name = _checked_var_name(
-            cast(llir.Var, initializer.value),
-            context,
-            statement_path + ("value",),
-        )
-        match = _SINGLE_STEP_BOUND.match(value_name)
-        if match is None:
+        base: str | None = None
+        if type(initializer.value) is llir.Var:
+            value_name = _checked_var_name(
+                cast(llir.Var, initializer.value),
+                context,
+                statement_path + ("value",),
+            )
+            match = _SINGLE_STEP_BOUND.match(value_name)
+            if match is not None:
+                base = match.group(1)
+        elif type(initializer.value) is llir.Add:
+            value = cast(llir.Add, initializer.value)
+            if (
+                type(value.left) is llir.Var
+                and type(value.right) is llir.Literal
+                and value.left.type is llir.DataType.INT64
+                and not value.left.is_ptr
+                and not value.left.is_restrict
+                and value.left.tensor_access is None
+                and type(value.right.value) is int
+                and value.right.value == 1
+                and value.right.data_type is llir.DataType.INT64
+            ):
+                candidate = _checked_var_name(
+                    cast(llir.Var, value.left),
+                    context,
+                    statement_path + ("value", "left"),
+                )
+                if re.fullmatch(r"\w+", candidate) is not None:
+                    base = candidate
+        if base is None:
             continue
         end_variable = _checked_var_name(
             initializer.var,
             context,
             statement_path + ("var",),
         )
-        bounds[end_variable] = match.group(1)
+        bounds[end_variable] = base
     return bounds
 
 
@@ -333,20 +355,21 @@ def _rewrite_expression_references(
 
     if type(expression) in _BINOP_FAMILY:
         binary = cast(llir.BinOp, expression)
-        binary.left = _rewrite_expression_references(
+        left = _rewrite_expression_references(
             binary.left,
             replacements,
             context,
             path + ("left",),
             in_array_index=in_array_index,
         )
-        binary.right = _rewrite_expression_references(
+        right = _rewrite_expression_references(
             binary.right,
             replacements,
             context,
             path + ("right",),
             in_array_index=in_array_index,
         )
+        return llir.rebuild_binary_expression(binary, left, right)
     if type(expression) is llir.ArrayAccess:
         access = cast(llir.ArrayAccess, expression)
         return llir.ArrayAccess(

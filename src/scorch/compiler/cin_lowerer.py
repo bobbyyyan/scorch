@@ -3289,9 +3289,13 @@ class CINLowerer:
                         tensor_access=expr.tensor_access,
                     )
             return expr
-        if isinstance(expr, llir.BinOp):
-            expr.left = CINLowerer._rewrite_expr_refs(expr.left, replacements)
-            expr.right = CINLowerer._rewrite_expr_refs(expr.right, replacements)
+        if type(expr) in (llir.BinOp, llir.Add, llir.Mul):
+            binary = cast(llir.BinOp, expr)
+            return llir.rebuild_binary_expression(
+                binary,
+                CINLowerer._rewrite_expr_refs(binary.left, replacements),
+                CINLowerer._rewrite_expr_refs(binary.right, replacements),
+            )
         return expr
 
     @staticmethod
@@ -3839,7 +3843,7 @@ class CINLowerer:
                         iter_var = body_stmt.var.name
                         end_var = body_stmt.value.name
 
-            if coo_update is None:
+            if coo_update is None or iter_var is None or end_var is None:
                 result.append(stmt)
                 continue
 
@@ -4136,8 +4140,15 @@ class CINLowerer:
                 flat_body.append(
                     llir.VarInit(
                         var=llir.Var(name=end_var, type=llir.DataType.INT64),
-                        value=llir.Var(
-                            name=f"{iter_var} + 1", type=llir.DataType.INT64
+                        value=llir.Add(
+                            left=llir.Var(
+                                name=iter_var,
+                                type=llir.DataType.INT64,
+                            ),
+                            right=llir.Literal(
+                                1,
+                                data_type=llir.DataType.INT64,
+                            ),
                         ),
                     )
                 )

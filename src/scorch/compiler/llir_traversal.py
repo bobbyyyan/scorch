@@ -239,6 +239,69 @@ def _validate_assign_fields(
         )
 
 
+def _validate_binary_expression_fields(
+    node: llir.BinOp,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if type(node.op) is not str or not node.op:
+        _raise_traversal_error(
+            context,
+            code="invalid_binary_operator",
+            message="binary expression operator must be a non-empty string",
+            path=path + ("op",),
+            value=node.op,
+        )
+    if type(node) is llir.Add and node.op != "+":
+        _raise_traversal_error(
+            context,
+            code="invalid_add_operator",
+            message="Add.op must remain '+'",
+            path=path + ("op",),
+            value=node.op,
+        )
+    if type(node) is llir.Mul and node.op != "*":
+        _raise_traversal_error(
+            context,
+            code="invalid_mul_operator",
+            message="Mul.op must remain '*'",
+            path=path + ("op",),
+            value=node.op,
+        )
+    for field_name, child in (("left", node.left), ("right", node.right)):
+        if not isinstance(child, llir.Expr):
+            _raise_traversal_error(
+                context,
+                code="invalid_binary_child",
+                message=f"BinOp.{field_name} must be an LLIR Expr",
+                path=path + (field_name,),
+                value=child,
+            )
+
+
+def _validate_literal_fields(
+    node: llir.Literal,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if type(node.value) not in (bool, int, float, str):
+        _raise_traversal_error(
+            context,
+            code="invalid_literal_value",
+            message="Literal.value must be a bool, int, float, or string",
+            path=path + ("value",),
+            value=node.value,
+        )
+    if type(node.data_type) is not llir.DataType:
+        _raise_traversal_error(
+            context,
+            code="invalid_literal_data_type",
+            message="Literal.data_type must be a DataType",
+            path=path + ("data_type",),
+            value=node.data_type,
+        )
+
+
 class LLIRWalker:
     """A stateless, exhaustive walker with one typed hook per LLIR node."""
 
@@ -559,6 +622,7 @@ class LLIRWalker:
         self._walk_expr(node.operand, path + ("operand",))
 
     def visit_bin_op(self, node: llir.BinOp, path: LLIRPath) -> None:
+        _validate_binary_expression_fields(node, self.context, path)
         self._walk_expr(node.left, path + ("left",))
         self._walk_expr(node.right, path + ("right",))
 
@@ -569,7 +633,7 @@ class LLIRWalker:
         self.visit_bin_op(node, path)
 
     def visit_literal(self, node: llir.Literal, path: LLIRPath) -> None:
-        pass
+        _validate_literal_fields(node, self.context, path)
 
     def visit_function_call(self, node: llir.FunctionCall, path: LLIRPath) -> None:
         if type(node.name) is not str or not node.name.strip():
@@ -1152,6 +1216,7 @@ class LLIRRewriter:
         )
 
     def rewrite_bin_op(self, node: llir.BinOp, path: LLIRPath) -> llir.BinOp:
+        _validate_binary_expression_fields(node, self.context, path)
         return llir.BinOp(
             op=node.op,
             left=self._rewrite_expr(node.left, path + ("left",)),
@@ -1159,25 +1224,22 @@ class LLIRRewriter:
         )
 
     def rewrite_add(self, node: llir.Add, path: LLIRPath) -> llir.Add:
-        rewritten = llir.Add(
+        _validate_binary_expression_fields(node, self.context, path)
+        return llir.Add(
             left=self._rewrite_expr(node.left, path + ("left",)),
             right=self._rewrite_expr(node.right, path + ("right",)),
         )
-        rewritten.op = node.op
-        return rewritten
 
     def rewrite_mul(self, node: llir.Mul, path: LLIRPath) -> llir.Mul:
-        rewritten = llir.Mul(
+        _validate_binary_expression_fields(node, self.context, path)
+        return llir.Mul(
             left=self._rewrite_expr(node.left, path + ("left",)),
             right=self._rewrite_expr(node.right, path + ("right",)),
         )
-        rewritten.op = node.op
-        return rewritten
 
     def rewrite_literal(self, node: llir.Literal, path: LLIRPath) -> llir.Literal:
-        rewritten = llir.Literal(value=node.value, data_type=node.data_type)
-        rewritten.data_type = node.data_type
-        return rewritten
+        _validate_literal_fields(node, self.context, path)
+        return llir.Literal(value=node.value, data_type=node.data_type)
 
     def rewrite_function_call(
         self, node: llir.FunctionCall, path: LLIRPath

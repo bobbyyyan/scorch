@@ -346,10 +346,13 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
             if self._old in rewritten.name:
                 rewritten.name = rewritten.name.replace(self._old, self._new)
             return rewritten
-        if isinstance(rewritten, llir.BinOp):
-            rewritten.left = self._rewrite_legacy_expr(rewritten.left)
-            rewritten.right = self._rewrite_legacy_expr(rewritten.right)
-            return rewritten
+        if type(rewritten) in (llir.BinOp, llir.Add, llir.Mul):
+            binary = cast(llir.BinOp, rewritten)
+            return llir.rebuild_binary_expression(
+                binary,
+                self._rewrite_legacy_expr(binary.left),
+                self._rewrite_legacy_expr(binary.right),
+            )
         if type(rewritten) is llir.ArrayAccess:
             access = cast(llir.ArrayAccess, rewritten)
             return llir.ArrayAccess(

@@ -299,15 +299,24 @@ class UnaryOp(Expr):
         self.operand = operand
 
 
+@dataclass(frozen=True, repr=False)
 class BinOp(Expr):
-    """Base class for all binary operations."""
+    """An immutable binary expression with structural value semantics."""
 
-    def __init__(self, op: str, left: Expr, right: Expr):
-        self.op = op
-        self.left = left
-        self.right = right
+    op: str
+    left: Expr
+    right: Expr
+
+    def __post_init__(self) -> None:
+        if type(self.op) is not str or not self.op:
+            raise TypeError("BinOp.op must be a non-empty string")
+        if not isinstance(self.left, Expr):
+            raise TypeError("BinOp.left must be an LLIR Expr")
+        if not isinstance(self.right, Expr):
+            raise TypeError("BinOp.right must be an LLIR Expr")
 
 
+@dataclass(frozen=True, repr=False, init=False)
 class Add(BinOp):
     """Addition."""
 
@@ -315,6 +324,7 @@ class Add(BinOp):
         super().__init__("+", left, right)
 
 
+@dataclass(frozen=True, repr=False, init=False)
 class Mul(BinOp):
     """Multiplication."""
 
@@ -322,16 +332,46 @@ class Mul(BinOp):
         super().__init__("*", left, right)
 
 
-@dataclass(frozen=False)
+def rebuild_binary_expression(
+    expression: BinOp,
+    left: Expr,
+    right: Expr,
+) -> BinOp:
+    """Rebuild an exact supported binary node with detached child expressions."""
+
+    if type(expression) is BinOp:
+        return BinOp(expression.op, left, right)
+    if type(expression) is Add:
+        if expression.op != "+":
+            raise TypeError("Add.op must remain '+'")
+        return Add(left, right)
+    if type(expression) is Mul:
+        if expression.op != "*":
+            raise TypeError("Mul.op must remain '*'")
+        return Mul(left, right)
+    raise TypeError(
+        "binary expression must be an exact BinOp, Add, or Mul instance"
+    )
+
+
+@dataclass(frozen=True)
 class Literal(Expr):
-    """A literal value."""
+    """An immutable primitive literal with structural value semantics."""
 
     value: Any
     data_type: Optional[DataType] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        if type(self.value) not in (bool, int, float, str):
+            raise TypeError("Literal.value must be a bool, int, float, or string")
         if self.data_type is None:
-            self.data_type = DataType.from_python_type(type(self.value))
+            object.__setattr__(
+                self,
+                "data_type",
+                DataType.from_python_type(type(self.value)),
+            )
+        elif type(self.data_type) is not DataType:
+            raise TypeError("Literal.data_type must be a DataType or None")
 
 
 """

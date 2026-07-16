@@ -215,7 +215,13 @@ class LLIRLowerer:
         left-associative and floating-point reassociation is not semantics
         preserving.
         """
-        if isinstance(ir, llir.Literal):
+        if type(ir) is llir.Literal:
+            if type(ir.value) not in (bool, int, float, str):
+                raise CodegenError(
+                    "Literal.value must be a bool, int, float, or string"
+                )
+            if type(ir.data_type) is not llir.DataType:
+                raise CodegenError("Literal.data_type must be a DataType")
             return str(ir.value)
 
         if isinstance(ir, llir.Var):
@@ -232,19 +238,32 @@ class LLIRLowerer:
         if isinstance(ir, llir.Sizeof):
             return f"sizeof({ir.data_type.value})"
 
-        if isinstance(ir, llir.BinOp):
-            precedence = self._binary_precedence(ir.op)
+        if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
+            binary = cast(llir.BinOp, ir)
+            if type(binary.op) is not str or not binary.op:
+                raise CodegenError(
+                    "LLIR binary operator must be a non-empty string"
+                )
+            if type(binary) is llir.Add and binary.op != "+":
+                raise CodegenError("Add.op must remain '+'")
+            if type(binary) is llir.Mul and binary.op != "*":
+                raise CodegenError("Mul.op must remain '*'")
+            if not isinstance(binary.left, llir.Expr):
+                raise CodegenError("BinOp.left must be an LLIR Expr")
+            if not isinstance(binary.right, llir.Expr):
+                raise CodegenError("BinOp.right must be an LLIR Expr")
+            precedence = self._binary_precedence(binary.op)
             left = self._render_operand(
-                ir.left,
+                binary.left,
                 parent_precedence=precedence,
                 is_right_child=False,
             )
             right = self._render_operand(
-                ir.right,
+                binary.right,
                 parent_precedence=precedence,
                 is_right_child=True,
             )
-            return f"{left} {ir.op} {right}"
+            return f"{left} {binary.op} {right}"
 
         if isinstance(ir, llir.UnaryOp):
             if ir.op not in self._UNARY_OPERATORS:
@@ -308,7 +327,10 @@ class LLIRLowerer:
         child_precedence = self._expression_precedence(ir)
         needs_parentheses = child_precedence < parent_precedence
 
-        if isinstance(ir, llir.BinOp) and child_precedence == parent_precedence:
+        if (
+            type(ir) in (llir.BinOp, llir.Add, llir.Mul)
+            and child_precedence == parent_precedence
+        ):
             # The left child naturally parses first for left-associative binary
             # operators.  The right child does not, regardless of whether its
             # operator spelling matches the parent.
@@ -319,8 +341,8 @@ class LLIRLowerer:
         return rendered
 
     def _expression_precedence(self, ir: llir.Expr) -> int:
-        if isinstance(ir, llir.BinOp):
-            return self._binary_precedence(ir.op)
+        if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
+            return self._binary_precedence(cast(llir.BinOp, ir).op)
         if isinstance(ir, (llir.Cast, llir.UnaryOp, llir.Sizeof)):
             return self._UNARY_PRECEDENCE
         if (
@@ -329,7 +351,7 @@ class LLIRLowerer:
             or type(ir) is llir.ArrayAccess
         ):
             return self._POSTFIX_PRECEDENCE
-        if isinstance(ir, (llir.Literal, llir.Var, llir.Array)):
+        if type(ir) is llir.Literal or isinstance(ir, (llir.Var, llir.Array)):
             return self._PRIMARY_PRECEDENCE
         raise CodegenError(
             f"No C++ precedence defined for LLIR expression type: {type(ir).__name__}"
