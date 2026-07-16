@@ -2078,9 +2078,15 @@ class CINLowerer:
                         ),
                         tensor_access=result_value_metadata,
                     ),
-                    value=llir.Var(
-                        name=f"{wksp.get_name()}[{loop_var.name}]",
-                        type=llir.DataType.NO_TYPE,
+                    value=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=wksp.get_name(),
+                            type=llir.DataType.ptr_type(wksp.dtype),
+                        ),
+                        index=llir.Var(
+                            name=loop_var.name,
+                            type=loop_var.type,
+                        ),
                     ),
                     op=AssignOp.ADD_ASSIGN,
                 )
