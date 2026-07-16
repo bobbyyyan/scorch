@@ -6,7 +6,6 @@ outer coordinate panel. This pass lowers that explicit schedule after the CSR
 position/coordinate iterators exist in LLIR.
 """
 
-import re
 from typing import Dict, List, Optional, Tuple, cast
 
 from . import llir
@@ -66,12 +65,25 @@ def _find_tagged_loop(
 
 
 def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> str:
-    pattern = re.compile(rf"^([A-Za-z_]\w*_crd)\[{re.escape(position)}\]$")
     for stmt in stmts:
-        if isinstance(stmt, llir.VarInit) and isinstance(stmt.value, llir.Var):
-            match = pattern.match(stmt.value.name)
-            if match:
-                return match.group(1)
+        if type(stmt) is llir.VarInit and type(stmt.value) is llir.ArrayAccess:
+            access = cast(llir.ArrayAccess, stmt.value)
+            if type(access.array) is llir.Var and type(access.index) is llir.Var:
+                array = cast(llir.Var, access.array)
+                index = cast(llir.Var, access.index)
+                if (
+                    access.tensor_access is None
+                    and array.type is llir.DataType.PTR_INT
+                    and array.tensor_access is None
+                    and type(array.name) is str
+                    and array.name.isidentifier()
+                    and array.name.endswith("_crd")
+                    and index.type is llir.DataType.INT
+                    and index.tensor_access is None
+                    and type(index.name) is str
+                    and index.name == position
+                ):
+                    return array.name
         for body in _nested_bodies(stmt):
             try:
                 return _find_coordinate_array(body, position)

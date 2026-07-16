@@ -2,11 +2,11 @@
 
 Version 1 intentionally preserves the generated-name contracts of the legacy
 ``CINLowerer`` optimization.  Sparse position loops are recognized through
-``_pos[`` text, coordinates through ``<tensor>_crd[<position>]``, dense value
-accesses through ``_val`` spellings, and already-hoisted value pointers through
-the exact legacy ``RawStmt`` declaration.  The inserted target spelling and
-next-position distance are fixed as ``__builtin_prefetch(..., 0, 1)``.  These
-are compatibility dependencies, not configurable policy.
+``_pos[`` text, coordinates through structured ``ArrayAccess`` nodes, dense
+value accesses through ``_val`` spellings, and already-hoisted value pointers
+through the exact legacy ``RawStmt`` declaration.  The inserted target spelling
+and next-position distance are fixed as ``__builtin_prefetch(..., 0, 1)``.
+These are compatibility dependencies, not configurable policy.
 
 The common LLIR boundary validates and detaches the complete input tree.  The
 semantic scan remains deliberately narrower: it follows only chains of direct
@@ -238,18 +238,39 @@ def _coordinate_array(
     context: SparsePrefetchContext,
     path: LLIRPath,
 ) -> str | None:
-    pattern = re.compile(r"^(\w+_crd)\[" + re.escape(iterator) + r"\]$")
     for index, statement in enumerate(loop.body):
-        if type(statement) is llir.VarInit and type(statement.value) is llir.Var:
-            match = pattern.match(
-                _checked_name(
-                    cast(llir.Var, statement.value),
-                    context,
-                    path + ("body", f"[{index}]", "value"),
-                )
-            )
-            if match:
-                return match.group(1)
+        if type(statement) is not llir.VarInit:
+            continue
+        value = statement.value
+        if type(value) is not llir.ArrayAccess:
+            continue
+        access = cast(llir.ArrayAccess, value)
+        if type(access.array) is not llir.Var or type(access.index) is not llir.Var:
+            continue
+        array = cast(llir.Var, access.array)
+        access_index = cast(llir.Var, access.index)
+        array_name = _checked_name(
+            array,
+            context,
+            path + ("body", f"[{index}]", "value", "array"),
+        )
+        index_name = _checked_name(
+            access_index,
+            context,
+            path + ("body", f"[{index}]", "value", "index"),
+        )
+        if (
+            access.tensor_access is None
+            and array.type is llir.DataType.PTR_INT
+            and array.tensor_access is None
+            and array_name.isidentifier()
+            and array_name.endswith("_crd")
+            and access_index.type is llir.DataType.INT
+            and access_index.tensor_access is None
+            and index_name == iterator
+        ):
+            return array_name
+
     return None
 
 

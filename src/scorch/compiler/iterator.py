@@ -279,9 +279,11 @@ class ModeIterator:
 
         if self.level_type == LevelType.COORDINATE:
             self.iterator_var_begin_value_llir = llir.Var(
-                name=f"p{self._tensor_var.name}{self._level - 1}"
-                if self.parent_index_var
-                else f"{self._tensor_var.name}{self._level}_pos[0]",
+                name=(
+                    f"p{self._tensor_var.name}{self._level - 1}"
+                    if self.parent_index_var
+                    else f"{self._tensor_var.name}{self._level}_pos[0]"
+                ),
                 type=llir.DataType.INT,
             )
             self.iterator_var_end_var_llir = llir.Var(
@@ -297,16 +299,24 @@ class ModeIterator:
                 name=f"{self.index_var.name}_{self._tensor_var.name}",
                 type=llir.DataType.INT,
             )
-            self.coord_var_value_llir = llir.Var(
-                name=f"{self._tensor_var.name}{self._level}_crd[{self.iterator_var_llir.name}]",
-                type=llir.DataType.INT,
+            self.coord_var_value_llir = llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{self._tensor_var.name}{self._level}_crd",
+                    type=llir.DataType.PTR_INT,
+                ),
+                index=llir.Var(
+                    name=self.iterator_var_llir.name,
+                    type=self.iterator_var_llir.type,
+                ),
             )
 
         elif self.level_type == LevelType.COMPRESSED:
             self.iterator_var_begin_value_llir = llir.Var(
-                name=f"{self._tensor_var.name}{self._level}_pos[p{self._tensor_var.name}{self.level-1}]"
-                if self.parent_index_var
-                else f"{self._tensor_var.name}{self._level}_pos[0]",
+                name=(
+                    f"{self._tensor_var.name}{self._level}_pos[p{self._tensor_var.name}{self.level-1}]"
+                    if self.parent_index_var
+                    else f"{self._tensor_var.name}{self._level}_pos[0]"
+                ),
                 type=llir.DataType.INT,
             )
             self.iterator_var_end_var_llir = llir.Var(
@@ -314,18 +324,26 @@ class ModeIterator:
                 type=llir.DataType.INT,
             )
             self.iterator_var_end_value_llir = llir.Var(
-                name=f"{self._tensor_var.name}{self._level}_pos[p{self._tensor_var.name}{self.level-1} + 1]"
-                if self.parent_index_var
-                else f"{self._tensor_var.name}{self._level}_pos[1]",
+                name=(
+                    f"{self._tensor_var.name}{self._level}_pos[p{self._tensor_var.name}{self.level-1} + 1]"
+                    if self.parent_index_var
+                    else f"{self._tensor_var.name}{self._level}_pos[1]"
+                ),
                 type=llir.DataType.INT,
             )
             self.coord_var_llir = llir.Var(
                 name=f"{self.index_var.name}_{self._tensor_var.name}",
                 type=llir.DataType.INT,
             )
-            self.coord_var_value_llir = llir.Var(
-                name=f"{self._tensor_var.name}{self._level}_crd[{self.iterator_var_llir.name}]",
-                type=llir.DataType.INT,
+            self.coord_var_value_llir = llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{self._tensor_var.name}{self._level}_crd",
+                    type=llir.DataType.PTR_INT,
+                ),
+                index=llir.Var(
+                    name=self.iterator_var_llir.name,
+                    type=self.iterator_var_llir.type,
+                ),
             )
 
         elif self.level_type == LevelType.DENSE:

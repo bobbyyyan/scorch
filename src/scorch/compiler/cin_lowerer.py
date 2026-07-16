@@ -3843,20 +3843,39 @@ class CINLowerer:
                 result.append(stmt)
                 continue
 
-            # Find the coordinate array name from VarInit in body
-            # e.g., i = A0_crd[pA0]
+            # Find the structured coordinate read from VarInit in body.
+            # e.g., i = ArrayAccess(A0_crd, pA0)
             crd_array = None
             coord_var_name = None
+            coord_initializer: Optional[llir.VarInit] = None
             for body_stmt in body:
+                if type(body_stmt) is not llir.VarInit:
+                    continue
+                if type(body_stmt.value) is not llir.ArrayAccess:
+                    continue
+                coordinate_access = cast(llir.ArrayAccess, body_stmt.value)
                 if (
-                    isinstance(body_stmt, llir.VarInit)
-                    and isinstance(body_stmt.value, llir.Var)
-                    and "_crd[" in body_stmt.value.name
+                    type(coordinate_access.array) is not llir.Var
+                    or type(coordinate_access.index) is not llir.Var
                 ):
-                    val_name = body_stmt.value.name
-                    bracket_pos = val_name.index("[")
-                    crd_array = val_name[:bracket_pos]
+                    continue
+                coordinate_array = cast(llir.Var, coordinate_access.array)
+                coordinate_index = cast(llir.Var, coordinate_access.index)
+                if (
+                    coordinate_access.tensor_access is None
+                    and coordinate_array.type is llir.DataType.PTR_INT
+                    and coordinate_array.tensor_access is None
+                    and type(coordinate_array.name) is str
+                    and coordinate_array.name.isidentifier()
+                    and coordinate_array.name.endswith("_crd")
+                    and coordinate_index.type is llir.DataType.INT
+                    and coordinate_index.tensor_access is None
+                    and type(coordinate_index.name) is str
+                    and coordinate_index.name == iter_var
+                ):
+                    crd_array = coordinate_array.name
                     coord_var_name = body_stmt.var.name
+                    coord_initializer = body_stmt
                     break
 
             if crd_array is None:
@@ -3884,13 +3903,8 @@ class CINLowerer:
             # 3. The VarInit for pA1_end (already set in group header)
             inner_body_filtered = []
             for s in inner_body:
-                # Remove: int i = A0_crd[pA0]
-                if (
-                    isinstance(s, llir.VarInit)
-                    and isinstance(s.value, llir.Var)
-                    and "_crd[" in s.value.name
-                    and s.var.name == coord_var_name
-                ):
+                # Remove the exact coordinate initializer matched above.
+                if s is coord_initializer:
                     continue
                 # Remove: while (pA1_end < pA0_end && ...) { pA1_end++; }
                 if isinstance(s, llir.WhileLoop):
