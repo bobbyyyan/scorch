@@ -1,8 +1,8 @@
 """Typed sparse-prefetch insertion over a detached LLIR statement list.
 
 Version 1 intentionally preserves the generated-name contracts of the legacy
-``CINLowerer`` optimization.  Sparse position loops are recognized through
-``_pos[`` text, coordinates through structured ``ArrayAccess`` nodes, dense
+``CINLowerer`` optimization.  Sparse position loops and coordinates are
+recognized through structured ``ArrayAccess`` nodes, dense
 value accesses through ``_val`` spellings, and already-hoisted value pointers
 through the exact legacy ``RawStmt`` declaration.  The inserted target spelling
 and next-position distance are fixed as ``__builtin_prefetch(..., 0, 1)``.
@@ -34,6 +34,7 @@ from .llir_traversal import (
     LLIRTraversalDiagnostic,
     LLIRTraversalError,
 )
+from .iterator import match_mode_position_begin
 
 SPARSE_PREFETCH_TRAVERSAL_CONTEXT = LLIRTraversalContext(
     stage="LLIR transformation",
@@ -404,13 +405,7 @@ def _insert_in_for_loop_bodies(
 
         if not (
             type(loop.init) is llir.VarInit
-            and type(loop.init.value) is llir.Var
-            and "_pos["
-            in _checked_name(
-                cast(llir.Var, loop.init.value),
-                context,
-                loop_path + ("init", "value"),
-            )
+            and match_mode_position_begin(loop.init.value) is not None
         ):
             continue
 

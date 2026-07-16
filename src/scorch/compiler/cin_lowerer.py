@@ -21,6 +21,11 @@ from .cin import (
     PostOps,
 )
 from .iter_lattice import IterationLattice
+from .iterator import (
+    collect_mode_position_arrays,
+    match_mode_position_access,
+    match_mode_position_begin,
+)
 from .llir import AssignOp, DataType
 from .diagnostics import (
     CompileOptionsDiagnostic,
@@ -54,11 +59,18 @@ from .llir_pass_manager import (
     LLIRStatementListArtifact,
 )
 from .compilation_context import CompilerStageId, CompilationContext
+from .llir_traversal import LLIRTraversalContext
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
 
 if TYPE_CHECKING:
     from .scheduler import Schedule
+
+
+_SPARSE_POSITION_DISCOVERY_CONTEXT = LLIRTraversalContext(
+    stage="CIN lowering",
+    pass_name="collect_sparse_position_arrays",
+)
 
 
 @dataclass(frozen=True)
@@ -3211,8 +3223,7 @@ class CINLowerer:
             if isinstance(stmt, llir.ForLoop):
                 if (
                     isinstance(stmt.init, llir.VarInit)
-                    and isinstance(stmt.init.value, llir.Var)
-                    and "_pos[" in stmt.init.value.name
+                    and match_mode_position_begin(stmt.init.value) is not None
                 ):
                     return True
                 if cls._has_sparse_inner_loop(stmt.body):
@@ -3531,10 +3542,9 @@ class CINLowerer:
 
         for stmt in body:
             if isinstance(stmt, llir.VarInit):
-                code = stmt.var.name + " " + str(getattr(stmt.value, "name", ""))
-                m = re.search(r"(\w+_pos)\[", code)
-                if m:
-                    return m.group(1)
+                matched = match_mode_position_access(stmt.value)
+                if matched is not None:
+                    return matched
             if isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
                 result = CINLowerer._find_sparse_pos_array(stmt.body)
                 if result:
@@ -3617,25 +3627,14 @@ class CINLowerer:
 
     def _find_all_sparse_pos_arrays(self, body) -> List[str]:
         """All distinct sparse pos array names (e.g. ['A1_pos', 'B1_pos']) referenced
-        anywhere in `body`, in first-seen order. Generalises _find_sparse_pos_array
-        (which returns only the first, and misses pos arrays hidden in ForLoop
-        init/cond) by rendering the body to C++ text and scanning it. Returns [] if
-        rendering fails, so callers fall back to the A_nnz-only estimate."""
-        import re
+        anywhere in `body`, in deterministic structural pre-order. Generalises
+        _find_sparse_pos_array to nested loop headers while retaining only the
+        explicit RawStmt compatibility escape hatch."""
 
-        try:
-            from .codegen import LLIRLowerer
-
-            text = LLIRLowerer(compile_options=self.compile_options).lower_llir(
-                list(body)
-            )
-        except Exception:
-            return []
-        found: List[str] = []
-        for m in re.finditer(r"(\w+_pos)\[", text):
-            if m.group(1) not in found:
-                found.append(m.group(1))
-        return found
+        return collect_mode_position_arrays(
+            list(body),
+            _SPARSE_POSITION_DISCOVERY_CONTEXT,
+        )
 
     def _spgemm_flop_work_expr(self, body, bound) -> Optional[str]:
         """True SpGEMM-flop work estimate for the thread cap: A_nnz * avg_B_row, the

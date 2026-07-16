@@ -11,10 +11,10 @@ pass now owns output allocation, final assembly, and return emission.
 
 This pass intentionally preserves the remaining legacy spelling contracts.
 It filters result/workspace statements by generated variable names, rewrites a
-hoisted workspace's ``.insert`` spelling, and renders phase bodies to C++ when
-recovering the existing SpGEMM flop estimate.  Those dependencies are contained
-here until structured access and work-estimate metadata replace them; this seam
-does not broaden or redesign generated names.
+hoisted workspace's ``.insert`` spelling, and structurally discovers compressed
+position bounds for the existing SpGEMM flop estimate. Raw statements retain
+their explicit compatibility escape hatch; other expression strings are not
+parsed to recover position semantics.
 
 The selected serial loop is replaced rather than rebuilt in place.  Matching
 legacy behavior, only its init/condition/update survive; its tag, optional
@@ -32,7 +32,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, NoReturn, Optional, Sequence, Tuple, cast
 
 from . import llir
-from .codegen import LLIRLowerer
 from .identity import SymbolId
 from .llir_traversal import (
     LLIRPath,
@@ -54,6 +53,7 @@ from .llir_pass_manager import (
     ResultWritePassSpec,
 )
 from .result_write_pass import ResultWriteContext
+from .iterator import collect_mode_position_arrays, match_mode_position_access
 
 if TYPE_CHECKING:
     from .compile_options import CompileOptions
@@ -596,10 +596,9 @@ def _phase_header_copy(
 def _find_sparse_pos_array(body: Sequence[llir.Stmt]) -> Optional[str]:
     for statement in body:
         if type(statement) is llir.VarInit:
-            code = statement.var.name + " " + str(getattr(statement.value, "name", ""))
-            match = re.search(r"(\w+_pos)\[", code)
-            if match:
-                return match.group(1)
+            matched = match_mode_position_access(statement.value)
+            if matched is not None:
+                return matched
         if type(statement) in (llir.ForLoop, llir.WhileLoop):
             loop = cast(Sequence[llir.Stmt], getattr(statement, "body"))
             result = _find_sparse_pos_array(loop)
@@ -650,22 +649,11 @@ def _parallel_rows_expr(for_loop: llir.ForLoop, bound: str) -> str:
 
 def _find_all_sparse_pos_arrays(
     body: Sequence[llir.Stmt],
-    compile_options: Optional["CompileOptions"],
+    traversal: LLIRTraversalContext,
 ) -> List[str]:
-    """Recover legacy sparse-array spellings from rendered phase C++."""
+    """Collect structured bounds and RawStmt compatibility in structural order."""
 
-    try:
-        text = LLIRLowerer(compile_options=compile_options).lower_llir(list(body))
-    except Exception:
-        # This is the characterized legacy policy fallback.  The input LLIR has
-        # already passed exact-type traversal validation; rendering failure only
-        # disables the richer work estimate.
-        return []
-    found: List[str] = []
-    for match in re.finditer(r"(\w+_pos)\[", text):
-        if match.group(1) not in found:
-            found.append(match.group(1))
-    return found
+    return collect_mode_position_arrays(list(body), traversal)
 
 
 def _parse_pos(pos_name: str) -> Optional[Tuple[str, int]]:
@@ -678,10 +666,10 @@ def _parse_pos(pos_name: str) -> Optional[Tuple[str, int]]:
 def _spgemm_flop_work_expr(
     body: Sequence[llir.Stmt],
     bound: str,
-    compile_options: Optional["CompileOptions"],
+    traversal: LLIRTraversalContext,
 ) -> Optional[str]:
     levels: Dict[str, set[int]] = {}
-    for position_name in _find_all_sparse_pos_arrays(body, compile_options):
+    for position_name in _find_all_sparse_pos_arrays(body, traversal):
         parsed = _parse_pos(position_name)
         if parsed is not None:
             levels.setdefault(parsed[0], set()).add(parsed[1])
@@ -745,7 +733,7 @@ def _build_phase_loop(
     flop_work = _spgemm_flop_work_expr(
         body,
         loop_bound,
-        context.compile_options,
+        context.traversal,
     )
     decision = _parallel_policy_decision(
         header,

@@ -17,6 +17,7 @@ from .llir_traversal import (
     LLIRWalker,
 )
 from .scheduler import Schedule, TileSpec, _RelayoutPlan, _ResultTilePlan
+from .iterator import match_mode_position_bounds
 
 LoopLocation = Tuple[List[llir.Stmt], int, llir.ForLoop]
 
@@ -114,8 +115,6 @@ def _window_sparse_loop(
     container, loop_index, sparse_loop = location
     if not isinstance(sparse_loop.init, llir.VarInit):
         raise NotImplementedError("Panel tiling requires a canonical sparse for-loop")
-    if not isinstance(sparse_loop.init.value, llir.Var):
-        raise NotImplementedError("Panel tiling requires a named CSR row begin")
     if not isinstance(sparse_loop.cond, llir.BinOp):
         raise NotImplementedError("Panel tiling requires a canonical sparse bound")
     if not isinstance(sparse_loop.cond.right, llir.Var):
@@ -124,13 +123,18 @@ def _window_sparse_loop(
     position = sparse_loop.init.var.name
     end_name = sparse_loop.cond.right.name
     end_index, end_init = _find_end_init(container, loop_index, end_name)
-    if not isinstance(end_init.value, llir.Var):
-        raise NotImplementedError("Panel tiling requires a named CSR row end value")
+    row_begin_expr = match_mode_position_bounds(
+        sparse_loop.init.value,
+        end_init.value,
+    )
+    if row_begin_expr is None:
+        raise NotImplementedError(
+            "Panel tiling requires matching structured CSR row bounds"
+        )
     coordinate_array = _find_coordinate_array(sparse_loop.body, position)
 
     row_end = f"{position}_row_end"
     panel_begin = f"{position}_panel_begin"
-    row_begin_expr = sparse_loop.init.value.name
     lower_expr = (
         f"(int) (std::lower_bound({coordinate_array} + {row_begin_expr}, "
         f"{coordinate_array} + {row_end}, {panel_var}) - {coordinate_array})"
