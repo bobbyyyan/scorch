@@ -487,7 +487,7 @@ class Function(Stmt):
         self.body = body
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, repr=False)
 class FunctionCall(Expr):
     """An immutable function call with tuple-owned expression arguments."""
 
