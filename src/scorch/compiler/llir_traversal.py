@@ -572,6 +572,22 @@ class LLIRWalker:
         pass
 
     def visit_function_call(self, node: llir.FunctionCall, path: LLIRPath) -> None:
+        if type(node.name) is not str or not node.name.strip():
+            _raise_traversal_error(
+                self.context,
+                code="invalid_function_call_name",
+                message="FunctionCall.name must be a non-empty string",
+                path=path + ("name",),
+                value=node.name,
+            )
+        if type(node.args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_function_call_args",
+                message="FunctionCall.args must be a tuple",
+                path=path + ("args",),
+                value=node.args,
+            )
         self._walk_expr_sequence(node.args, path + ("args",))
 
     def visit_array(self, node: llir.Array, path: LLIRPath) -> None:
@@ -1166,6 +1182,22 @@ class LLIRRewriter:
     def rewrite_function_call(
         self, node: llir.FunctionCall, path: LLIRPath
     ) -> llir.FunctionCall:
+        if type(node.name) is not str or not node.name.strip():
+            _raise_traversal_error(
+                self.context,
+                code="invalid_function_call_name",
+                message="FunctionCall.name must be a non-empty string",
+                path=path + ("name",),
+                value=node.name,
+            )
+        if type(node.args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_function_call_args",
+                message="FunctionCall.args must be a tuple",
+                path=path + ("args",),
+                value=node.args,
+            )
         return llir.FunctionCall(
             name=node.name,
             args=cast(

@@ -256,7 +256,15 @@ class LLIRLowerer:
             )
             return f"{ir.op} {operand}"
 
-        if isinstance(ir, llir.FunctionCall):
+        if type(ir) is llir.FunctionCall:
+            if type(ir.name) is not str or not ir.name.strip():
+                raise CodegenError("FunctionCall.name must be a non-empty string")
+            if type(ir.args) is not tuple:
+                raise CodegenError("FunctionCall.args must be a tuple")
+            if any(not isinstance(argument, llir.Expr) for argument in ir.args):
+                raise CodegenError(
+                    "FunctionCall.args must contain only LLIR expressions"
+                )
             return (
                 f"{ir.name}"
                 f"({', '.join(self._render_expression(arg) for arg in ir.args)})"
@@ -316,7 +324,7 @@ class LLIRLowerer:
         if isinstance(ir, (llir.Cast, llir.UnaryOp, llir.Sizeof)):
             return self._UNARY_PRECEDENCE
         if (
-            isinstance(ir, llir.FunctionCall)
+            type(ir) is llir.FunctionCall
             or type(ir) is llir.MemberAccess
             or type(ir) is llir.ArrayAccess
         ):

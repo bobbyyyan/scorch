@@ -425,9 +425,14 @@ class ResultTensorAssembler:
                             value=llir.FunctionCall(
                                 name="scorch_tensor_from_vector",
                                 args=[
-                                    llir.Var(
-                                        name=("std::move(" f"{tensor_level_name}_pos)"),
-                                        type=llir.DataType.NO_TYPE,
+                                    llir.FunctionCall(
+                                        name="std::move",
+                                        args=[
+                                            llir.Var(
+                                                name=f"{tensor_level_name}_pos",
+                                                type=llir.DataType.STD_VECTOR_C_INT,
+                                            )
+                                        ],
                                     ),
                                     llir.Var(
                                         name="torch::kInt",
@@ -450,9 +455,14 @@ class ResultTensorAssembler:
                             value=llir.FunctionCall(
                                 name="scorch_tensor_from_vector",
                                 args=[
-                                    llir.Var(
-                                        name=f"std::move({tensor_level_name}_crd)",
-                                        type=llir.DataType.NO_TYPE,
+                                    llir.FunctionCall(
+                                        name="std::move",
+                                        args=[
+                                            llir.Var(
+                                                name=f"{tensor_level_name}_crd",
+                                                type=llir.DataType.STD_VECTOR_C_INT,
+                                            )
+                                        ],
                                     ),
                                     llir.Var(
                                         name="torch::kInt",
@@ -473,9 +483,16 @@ class ResultTensorAssembler:
                     value=llir.FunctionCall(
                         name="scorch_tensor_from_vector",
                         args=[
-                            llir.Var(
-                                name=f"std::move({self.name}_values)",
-                                type=llir.DataType.NO_TYPE,
+                            llir.FunctionCall(
+                                name="std::move",
+                                args=[
+                                    llir.Var(
+                                        name=f"{self.name}_values",
+                                        type=llir.DataType.std_vector_type(
+                                            dtype_to_c_datatype(self.dtype)
+                                        ),
+                                    )
+                                ],
                             ),
                             llir.Var(
                                 name=get_pytorch_c_dtype_str(self.dtype),
@@ -1618,9 +1635,14 @@ class CINLowerer:
                     value=llir.FunctionCall(
                         name="scorch_tensor_from_vector",
                         args=[
-                            llir.Var(
-                                name=f"std::move({intermediate_crd_vecs[i].name})",
-                                type=llir.DataType.NO_TYPE,
+                            llir.FunctionCall(
+                                name="std::move",
+                                args=[
+                                    llir.Var(
+                                        name=intermediate_crd_vecs[i].name,
+                                        type=intermediate_crd_vecs[i].type,
+                                    )
+                                ],
                             ),
                             llir.Var(
                                 name="torch::kInt",
@@ -1655,9 +1677,14 @@ class CINLowerer:
                 value=llir.FunctionCall(
                     name="scorch_tensor_from_vector",
                     args=[
-                        llir.Var(
-                            name=f"std::move({intermediate_val_vec.name})",
-                            type=llir.DataType.NO_TYPE,
+                        llir.FunctionCall(
+                            name="std::move",
+                            args=[
+                                llir.Var(
+                                    name=intermediate_val_vec.name,
+                                    type=intermediate_val_vec.type,
+                                )
+                            ],
                         ),
                         llir.Var(
                             name=get_pytorch_c_dtype_str(intermediate_tensor_var.dtype),

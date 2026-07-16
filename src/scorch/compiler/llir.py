@@ -487,12 +487,30 @@ class Function(Stmt):
         self.body = body
 
 
+@dataclass(frozen=True, init=False)
 class FunctionCall(Expr):
-    """A function call expression."""
+    """An immutable function call with tuple-owned expression arguments."""
 
-    def __init__(self, name: str, args: Optional[List[Expr]] = None):
-        self.name = name
-        self.args = [] if args is None else args
+    name: str
+    args: Tuple[Expr, ...]
+
+    def __init__(
+        self,
+        name: str,
+        args: Optional[Sequence[Expr]] = None,
+    ) -> None:
+        if type(name) is not str or not name.strip():
+            raise TypeError("FunctionCall.name must be a non-empty string")
+        if args is None:
+            normalized_args: Tuple[Expr, ...] = ()
+        else:
+            if type(args) is not list and type(args) is not tuple:
+                raise TypeError("FunctionCall.args must be a list or tuple")
+            if any(not isinstance(argument, Expr) for argument in args):
+                raise TypeError("FunctionCall.args must contain only LLIR expressions")
+            normalized_args = tuple(args)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "args", normalized_args)
 
 
 class FunctionCallStmt(Stmt):
@@ -641,8 +659,8 @@ def _validate_assignment_index(expression: object) -> None:
                 "assignment index FunctionCall.name must be an identifier or "
                 "member path"
             )
-        if type(call.args) is not list:
-            raise TypeError("assignment index FunctionCall.args must be a list")
+        if type(call.args) is not tuple:
+            raise TypeError("assignment index FunctionCall.args must be a tuple")
         for argument in call.args:
             _validate_assignment_index(argument)
         return
