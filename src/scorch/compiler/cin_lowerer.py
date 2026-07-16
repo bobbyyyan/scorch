@@ -1485,9 +1485,15 @@ class CINLowerer:
                                 type=llir.DataType.INT64,
                             ),
                         ),
-                        value=llir.Var(
-                            name=f"{loop_var.name}.first[{i}]",
-                            type=llir.DataType.INT64,
+                        value=llir.ArrayAccess(
+                            array=llir.MemberAccess(
+                                base=llir.Var(
+                                    name=loop_var.name,
+                                    type=loop_var.type,
+                                ),
+                                member="first",
+                            ),
+                            index=llir.Literal(i, llir.DataType.INT64),
                         ),
                     )
                 )
@@ -1507,9 +1513,12 @@ class CINLowerer:
                         ),
                         tensor_access=result_value_metadata,
                     ),
-                    value=llir.Var(
-                        name=f"{loop_var.name}.second",
-                        type=llir.DataType.INT64,
+                    value=llir.MemberAccess(
+                        base=llir.Var(
+                            name=loop_var.name,
+                            type=loop_var.type,
+                        ),
+                        member="second",
                     ),
                 )
             )
@@ -1538,9 +1547,15 @@ class CINLowerer:
                                 type=llir.DataType.INT64,
                             ),
                         ),
-                        value=llir.Var(
-                            name=f"{loop_var.name}.first[{i}]",
-                            type=llir.DataType.INT64,
+                        value=llir.ArrayAccess(
+                            array=llir.MemberAccess(
+                                base=llir.Var(
+                                    name=loop_var.name,
+                                    type=loop_var.type,
+                                ),
+                                member="first",
+                            ),
+                            index=llir.Literal(i, llir.DataType.INT64),
                         ),
                     )
                 )
@@ -1557,9 +1572,12 @@ class CINLowerer:
                             type=llir.DataType.INT64,
                         ),
                     ),
-                    value=llir.Var(
-                        name=f"{loop_var.name}.second",
-                        type=llir.DataType.INT64,
+                    value=llir.MemberAccess(
+                        base=llir.Var(
+                            name=loop_var.name,
+                            type=loop_var.type,
+                        ),
+                        member="second",
                     ),
                 )
             )
@@ -2096,9 +2114,12 @@ class CINLowerer:
                         name=wksp_access.get_index_vars()[0].name,
                         type=llir.DataType.INT64,
                     ),
-                    value=llir.Var(
-                        name=f"{loop_var.name}.first",
-                        type=llir.DataType.NO_TYPE,
+                    value=llir.MemberAccess(
+                        base=llir.Var(
+                            name=loop_var.name,
+                            type=loop_var.type,
+                        ),
+                        member="first",
                     ),
                 )
             )
@@ -2110,9 +2131,15 @@ class CINLowerer:
                             name=index_var.name,
                             type=llir.DataType.INT64,
                         ),
-                        value=llir.Var(
-                            name=f"{loop_var.name}.first[{i}]",
-                            type=llir.DataType.NO_TYPE,
+                        value=llir.ArrayAccess(
+                            array=llir.MemberAccess(
+                                base=llir.Var(
+                                    name=loop_var.name,
+                                    type=loop_var.type,
+                                ),
+                                member="first",
+                            ),
+                            index=llir.Literal(i, llir.DataType.INT64),
                         ),
                     )
                 )
@@ -2123,9 +2150,12 @@ class CINLowerer:
                     name=f"{wksp.get_name()}_value",
                     type=dtype_to_c_datatype(wksp.dtype),
                 ),
-                value=llir.Var(
-                    name=f"{loop_var.name}.second",
-                    type=llir.DataType.NO_TYPE,
+                value=llir.MemberAccess(
+                    base=llir.Var(
+                        name=loop_var.name,
+                        type=loop_var.type,
+                    ),
+                    member="second",
                 ),
             )
         )

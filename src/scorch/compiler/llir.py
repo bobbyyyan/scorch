@@ -510,6 +510,20 @@ class Array(Expr):
 
 
 @dataclass(frozen=True)
+class MemberAccess(Expr):
+    """An immutable typed dot-member access expression."""
+
+    base: Expr
+    member: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base, Expr):
+            raise TypeError("MemberAccess.base must be an LLIR Expr")
+        if type(self.member) is not str or not self.member.isidentifier():
+            raise TypeError("MemberAccess.member must be a non-empty identifier")
+
+
+@dataclass(frozen=True)
 class ArrayAccess(Expr):
     """An immutable typed array/subscript access expression.
 

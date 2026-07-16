@@ -65,6 +65,7 @@ SUPPORTED_LLIR_EXPRESSION_NODE_TYPES: Tuple[Type[llir.Expr], ...] = (
     llir.Literal,
     llir.FunctionCall,
     llir.Array,
+    llir.MemberAccess,
     llir.ArrayAccess,
     llir.Cast,
     llir.Sizeof,
@@ -461,6 +462,8 @@ class LLIRWalker:
             self.visit_function_call(cast(llir.FunctionCall, node), path)
         elif node_type is llir.Array:
             self.visit_array(cast(llir.Array, node), path)
+        elif node_type is llir.MemberAccess:
+            self.visit_member_access(cast(llir.MemberAccess, node), path)
         elif node_type is llir.ArrayAccess:
             self.visit_array_access(cast(llir.ArrayAccess, node), path)
         elif node_type is llir.Cast:
@@ -573,6 +576,25 @@ class LLIRWalker:
 
     def visit_array(self, node: llir.Array, path: LLIRPath) -> None:
         self._walk_expr_sequence(node.values, path + ("values",))
+
+    def visit_member_access(self, node: llir.MemberAccess, path: LLIRPath) -> None:
+        if not isinstance(node.base, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_access_base",
+                message="MemberAccess.base must be an LLIR Expr",
+                path=path + ("base",),
+                value=node.base,
+            )
+        if type(node.member) is not str or not node.member.isidentifier():
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_access_member",
+                message="MemberAccess.member must be a non-empty identifier",
+                path=path + ("member",),
+                value=node.member,
+            )
+        self._walk_expr(node.base, path + ("base",))
 
     def visit_array_access(self, node: llir.ArrayAccess, path: LLIRPath) -> None:
         _validate_tensor_access_metadata(
@@ -1012,6 +1034,8 @@ class LLIRRewriter:
             return self.rewrite_function_call(cast(llir.FunctionCall, node), path)
         if node_type is llir.Array:
             return self.rewrite_array(cast(llir.Array, node), path)
+        if node_type is llir.MemberAccess:
+            return self.rewrite_member_access(cast(llir.MemberAccess, node), path)
         if node_type is llir.ArrayAccess:
             return self.rewrite_array_access(cast(llir.ArrayAccess, node), path)
         if node_type is llir.Cast:
@@ -1157,6 +1181,30 @@ class LLIRRewriter:
                 self._rewrite_expr_sequence(node.values, path + ("values",)),
             ),
             data_type=node.data_type,
+        )
+
+    def rewrite_member_access(
+        self, node: llir.MemberAccess, path: LLIRPath
+    ) -> llir.MemberAccess:
+        if not isinstance(node.base, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_access_base",
+                message="MemberAccess.base must be an LLIR Expr",
+                path=path + ("base",),
+                value=node.base,
+            )
+        if type(node.member) is not str or not node.member.isidentifier():
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_access_member",
+                message="MemberAccess.member must be a non-empty identifier",
+                path=path + ("member",),
+                value=node.member,
+            )
+        return llir.MemberAccess(
+            base=self._rewrite_expr(node.base, path + ("base",)),
+            member=node.member,
         )
 
     def rewrite_array_access(

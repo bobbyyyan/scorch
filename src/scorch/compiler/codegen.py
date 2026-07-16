@@ -265,6 +265,18 @@ class LLIRLowerer:
         if isinstance(ir, llir.Array):
             return "{" + ", ".join(self._render_expression(v) for v in ir.values) + "}"
 
+        if type(ir) is llir.MemberAccess:
+            if not isinstance(ir.base, llir.Expr):
+                raise CodegenError("MemberAccess.base must be an LLIR Expr")
+            if type(ir.member) is not str or not ir.member.isidentifier():
+                raise CodegenError("MemberAccess.member must be a non-empty identifier")
+            base = self._render_operand(
+                ir.base,
+                parent_precedence=self._POSTFIX_PRECEDENCE,
+                is_right_child=False,
+            )
+            return f"{base}.{ir.member}"
+
         if type(ir) is llir.ArrayAccess:
             array = self._render_operand(
                 ir.array,
@@ -303,7 +315,11 @@ class LLIRLowerer:
             return self._binary_precedence(ir.op)
         if isinstance(ir, (llir.Cast, llir.UnaryOp, llir.Sizeof)):
             return self._UNARY_PRECEDENCE
-        if isinstance(ir, llir.FunctionCall) or type(ir) is llir.ArrayAccess:
+        if (
+            isinstance(ir, llir.FunctionCall)
+            or type(ir) is llir.MemberAccess
+            or type(ir) is llir.ArrayAccess
+        ):
             return self._POSTFIX_PRECEDENCE
         if isinstance(ir, (llir.Literal, llir.Var, llir.Array)):
             return self._PRIMARY_PRECEDENCE
