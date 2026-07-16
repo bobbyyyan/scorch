@@ -32,6 +32,54 @@ class UnknownIndexStmt(IndexStmt):
     pass
 
 
+def _build_all_coo_transform_loop() -> llir.ForLoop:
+    return llir.ForLoop(
+        init=llir.VarInit(
+            llir.Var("pMask0", llir.DataType.INT),
+            llir.Literal(0),
+        ),
+        cond=llir.BinOp(
+            "<",
+            llir.Var("pMask0", llir.DataType.INT),
+            llir.Var("pMask0_end", llir.DataType.INT),
+        ),
+        update=llir.Assign(
+            llir.Var("pMask0", llir.DataType.INT),
+            llir.Var("pMask1_end", llir.DataType.INT),
+        ),
+        body=[
+            llir.VarInit(
+                llir.Var("r", llir.DataType.INT),
+                llir.Var("Mask0_crd[pMask0]", llir.DataType.INT),
+            )
+        ],
+    )
+
+
+def _all_coo_transform_coordinate_read(
+    *, scalar_accumulator: bool, source: llir.ForLoop | None = None
+) -> tuple[llir.ForLoop, llir.VarInit, llir.ArrayAccess]:
+    lowerer = CINLowerer()
+    lowerer._used_scalar_accum = scalar_accumulator
+    transformed = lowerer._transform_coo_loop_for_openmp(
+        [source if source is not None else _build_all_coo_transform_loop()]
+    )
+    parallel_loop = next(
+        cast(llir.ForLoop, statement)
+        for statement in transformed
+        if type(statement) is llir.ForLoop
+        and cast(llir.ForLoop, statement).omp_parallel_for
+    )
+    initializer = next(
+        cast(llir.VarInit, statement)
+        for statement in parallel_loop.body
+        if type(statement) is llir.VarInit
+        and cast(llir.VarInit, statement).var.name == "r"
+    )
+    assert type(initializer.value) is llir.ArrayAccess
+    return parallel_loop, initializer, cast(llir.ArrayAccess, initializer.value)
+
+
 def _build_outer_workspace_statement(result_format: str) -> tuple[Where, TensorVar]:
     row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
     result = TensorVar("Result", fmt=result_format)
@@ -528,6 +576,66 @@ def test_nested_workspace_reads_use_structured_pair_members(
     assert len({id(base) for base in pair_bases}) == len(pair_bases)
     assert all(base is not workspace_loop.var for base in pair_bases)
     assert str(consumer) == original
+
+
+@pytest.mark.parametrize("scalar_accumulator", (False, True))
+def test_all_coo_transform_coordinate_initializers_are_structured_typed_and_owned(
+    scalar_accumulator: bool,
+) -> None:
+    source = _build_all_coo_transform_loop()
+    source_cpp = LLIRLowerer().lower_llir(source)
+
+    first_loop, first_initializer, first = _all_coo_transform_coordinate_read(
+        scalar_accumulator=scalar_accumulator,
+        source=source,
+    )
+    second_loop, _, second = _all_coo_transform_coordinate_read(
+        scalar_accumulator=scalar_accumulator
+    )
+
+    expected = llir.ArrayAccess(
+        array=llir.Var("Mask0_crd", llir.DataType.PTR_INT),
+        index=llir.Var("pMask0", llir.DataType.INT64),
+    )
+    assert first == expected == second
+    assert hash(first) == hash(expected) == hash(second)
+    assert first.tensor_access is None
+    assert type(first.array) is llir.Var
+    assert cast(llir.Var, first.array).type is llir.DataType.PTR_INT
+    assert type(first.index) is llir.Var
+    assert cast(llir.Var, first.index).type is llir.DataType.INT64
+    assert first is not second
+    assert first.array is not second.array
+    assert first.index is not second.index
+
+    first_candidates = [cast(llir.VarInit, first_loop.init)] + [
+        cast(llir.VarInit, statement)
+        for statement in first_loop.body
+        if type(statement) is llir.VarInit
+    ]
+    second_candidates = [cast(llir.VarInit, second_loop.init)] + [
+        cast(llir.VarInit, statement)
+        for statement in second_loop.body
+        if type(statement) is llir.VarInit
+    ]
+    first_iterator = next(
+        initializer.var
+        for initializer in first_candidates
+        if initializer.var.name == "pMask0"
+    )
+    second_iterator = next(
+        initializer.var
+        for initializer in second_candidates
+        if initializer.var.name == "pMask0"
+    )
+    assert first.index is not first_iterator
+    assert second.index is not second_iterator
+    assert LLIRLowerer().lower_llir(first_initializer) == (
+        "int64_t r = Mask0_crd[pMask0];"
+    )
+    assert LLIRLowerer().lower_llir(source) == source_cpp
+    with pytest.raises(FrozenInstanceError):
+        first.index = llir.Var("other", llir.DataType.INT64)
 
 
 def test_mutated_unknown_post_op_cannot_be_silently_skipped():

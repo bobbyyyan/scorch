@@ -1,4 +1,4 @@
-"""Audited compatibility budget after structured free-move call migration."""
+"""Audited compatibility budget for the current Phase-3 structured IR."""
 
 import ast
 from collections import Counter
@@ -104,7 +104,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 200,
+        "cin_lowerer.py": 202,
         "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -115,10 +115,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 96,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(constructor_counts.values()) == 375
+    assert sum(constructor_counts.values()) == 377
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 168,
+        "cin_lowerer.py": 172,
         "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -129,7 +129,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 94,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 335
+    assert sum(unclassified_counts.values()) == 339
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -143,7 +143,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 9
 
     assert totals == {
-        "subscript": 21,
+        "subscript": 19,
         "call": 8,
         "member": 3,
         "initializer": 3,
@@ -151,9 +151,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "ternary": 1,
         "arithmetic": 1,
     }
-    assert sum(totals.values()) == 40
+    assert sum(totals.values()) == 38
     assert per_file == {
-        ("cin_lowerer.py", "subscript"): 15,
+        ("cin_lowerer.py", "subscript"): 13,
         ("cin_lowerer.py", "call"): 6,
         ("cin_lowerer.py", "member"): 3,
         ("cin_lowerer.py", "initializer"): 3,
@@ -225,6 +225,17 @@ def test_tiled_workspace_copy_read_cannot_return_to_a_var_name() -> None:
     # The one remaining spelling belongs to the separate non-tiled fallback.
     assert source.count('name=f"{wksp.get_name()}[{loop_var.name}]"') == 1
     assert source.count("type=llir.DataType.ptr_type(wksp.dtype)") == 1
+
+
+def test_all_coo_coordinate_initializers_cannot_return_to_var_names() -> None:
+    source = (_COMPILER_ROOT / "cin_lowerer.py").read_text()
+    transform = source.split("def _transform_coo_loop_for_openmp", 1)[1].split(
+        "def lower_ForAll", 1
+    )[0]
+
+    assert transform.count('name=f"{crd_array}[{iter_var}]"') == 0
+    assert transform.count("name=crd_array,") == 2
+    assert transform.count("name=cast(str, iter_var),") == 2
 
 
 def test_dense_level_shape_reads_cannot_return_to_var_names() -> None:

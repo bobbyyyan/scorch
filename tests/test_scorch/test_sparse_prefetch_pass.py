@@ -1146,12 +1146,56 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
 
 
 def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() -> None:
-    with regblock_force(False):
-        lowerer = CINLowerer()
-        cpp = LLIRLowerer().lower_llir(
-            lowerer.lower_IndexStmt(_build_activating_all_coo_sddmm_cin())
-        )
+    statement = _build_activating_all_coo_sddmm_cin()
+    original = str(statement)
 
+    def lower() -> tuple[CINLowerer, llir.ArrayAccess, str]:
+        lowerer = CINLowerer()
+        lowered = lowerer.lower_IndexStmt(statement)
+        matches: List[llir.ArrayAccess] = []
+
+        class CoordinateReadCollector(LLIRWalker):
+            def visit_var_init(
+                self,
+                node: llir.VarInit,
+                path: Tuple[str, ...],
+            ) -> None:
+                if type(node.value) is llir.ArrayAccess:
+                    access = cast(llir.ArrayAccess, node.value)
+                    if (
+                        node.var.name == "r"
+                        and type(access.array) is llir.Var
+                        and cast(llir.Var, access.array).name == "Mask0_crd"
+                        and type(access.index) is llir.Var
+                        and cast(llir.Var, access.index).name == "pMask0"
+                    ):
+                        matches.append(access)
+                super().visit_var_init(node, path)
+
+        CoordinateReadCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="collect_all_coo_coordinate_read",
+            )
+        ).walk(lowered)
+        assert len(matches) == 1
+        return lowerer, matches[0], LLIRLowerer().lower_llir(lowered)
+
+    with regblock_force(False):
+        lowerer, coordinate_read, cpp = lower()
+        second_lowerer, second_coordinate_read, second_cpp = lower()
+
+    assert str(statement) == original
+    assert second_cpp == cpp
+    assert coordinate_read == llir.ArrayAccess(
+        llir.Var("Mask0_crd", llir.DataType.PTR_INT),
+        llir.Var("pMask0", llir.DataType.INT64),
+    )
+    assert coordinate_read is not second_coordinate_read
+    assert coordinate_read.array is not second_coordinate_read.array
+    assert coordinate_read.index is not second_coordinate_read.index
+    assert coordinate_read.tensor_access is None
+    assert second_lowerer.llir_pass_run_records == lowerer.llir_pass_run_records
     assert len(cpp) == 3521
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667"

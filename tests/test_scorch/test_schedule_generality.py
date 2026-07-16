@@ -869,6 +869,7 @@ def test_all_coo_sddmm_has_no_redundant_end_and_remains_correct():
         cpp = _lower_to_cpp(scheduled)
 
     assert "pMask1_end" not in cpp
+    assert "int64_t i = Mask0_crd[pMask0];" in cpp
     assert "Mask1_crd[pMask0]" in cpp
     assert "Mask_val[pMask0]" in cpp
 

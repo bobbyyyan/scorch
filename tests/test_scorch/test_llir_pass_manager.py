@@ -546,6 +546,77 @@ def test_physical_workspace_copy_read_survives_repeated_production_pipeline() ->
     assert once_read.tensor_access is None
 
 
+def test_all_coo_coordinate_read_survives_repeated_production_pipeline() -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    source_read = llir.ArrayAccess(
+        _var("Mask0_crd", llir.DataType.PTR_INT),
+        _var("pMask0", llir.DataType.INT64),
+    )
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("_group_starts", llir.DataType.STD_VECTOR_C_INT)),
+        llir.VarInit(
+            _var("pMask0", llir.DataType.INT64),
+            _var("_group_starts[_g]", llir.DataType.INT64),
+        ),
+        llir.VarInit(_var("r", llir.DataType.INT64), source_read),
+    ]
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact(artifact.statements)
+
+    once = manager.run_production_pipeline(
+        LLIRStatementListArtifact(source),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+    twice = manager.run_production_pipeline(
+        LLIRStatementListArtifact(once.artifact.value),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once.artifact.value))
+    assert _mutable_ir_ids(once.artifact.value).isdisjoint(
+        _mutable_ir_ids(twice.artifact.value)
+    )
+    assert _structural_snapshot(once.artifact.value) == _structural_snapshot(
+        twice.artifact.value
+    )
+    expected_passes = [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.pass_name for record in once.run_records] == expected_passes
+    assert [record.sequence_index for record in once.run_records] == list(range(5))
+    assert all(record.duration_ns is not None for record in once.run_records)
+
+    once_group_begin = cast(llir.VarInit, once.artifact.value[1])
+    twice_group_begin = cast(llir.VarInit, twice.artifact.value[1])
+    assert cast(llir.Var, once_group_begin.value).name == "_group_starts.at(_g)"
+    assert cast(llir.Var, twice_group_begin.value).name == "_group_starts.at(_g)"
+    once_initializer = cast(llir.VarInit, once.artifact.value[2])
+    twice_initializer = cast(llir.VarInit, twice.artifact.value[2])
+    assert once_initializer.value == source_read
+    assert twice_initializer.value == source_read
+    assert type(once_initializer.value) is llir.ArrayAccess
+    once_read = cast(llir.ArrayAccess, once_initializer.value)
+    assert type(once_read.array) is llir.Var
+    assert cast(llir.Var, once_read.array).type is llir.DataType.PTR_INT
+    assert type(once_read.index) is llir.Var
+    assert cast(llir.Var, once_read.index).type is llir.DataType.INT64
+    assert once_read.tensor_access is None
+
+
 def test_malformed_workspace_pair_read_stops_the_production_pipeline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
