@@ -20,8 +20,10 @@ from scorch.compiler.cin import (
 from scorch.compiler.cin_lowerer import CINLowerer, ResultTensorAssembler
 from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 from scorch.compiler.diagnostics import CompilerInvariantError, UnsupportedFeature
+from scorch.compiler.iterator import ModeIterator  # type: ignore[import-untyped]
 from scorch.compiler.llir_traversal import LLIRTraversalContext, LLIRWalker
 from scorch.compiler.scheduler import Scheduler  # type: ignore[import-untyped]
+from scorch.format import LevelType  # type: ignore[import-untyped]
 
 
 class UnknownCIN(CIN):
@@ -50,7 +52,10 @@ def _build_all_coo_transform_loop() -> llir.ForLoop:
         body=[
             llir.VarInit(
                 llir.Var("r", llir.DataType.INT),
-                llir.Var("Mask0_crd[pMask0]", llir.DataType.INT),
+                llir.ArrayAccess(
+                    array=llir.Var("Mask0_crd", llir.DataType.PTR_INT),
+                    index=llir.Var("pMask0", llir.DataType.INT),
+                ),
             )
         ],
     )
@@ -578,12 +583,125 @@ def test_nested_workspace_reads_use_structured_pair_members(
     assert str(consumer) == original
 
 
+@pytest.mark.parametrize(
+    ("level_type", "fmt"),
+    (
+        pytest.param(LevelType.COORDINATE, "oo", id="coordinate"),
+        pytest.param(LevelType.COMPRESSED, "ds", id="compressed"),
+    ),
+)
+def test_sparse_mode_iterator_coordinate_reads_are_structured_typed_and_owned(
+    level_type: LevelType,
+    fmt: str,
+) -> None:
+    tensor = TensorVar("Input", fmt=fmt)
+    index = IndexVar("column")
+    parent = IndexVar("row")
+    tensor_state = (
+        tensor.name,
+        tensor.symbol_id,
+        tensor.format,
+        tensor.shape,
+        tensor.dtype,
+        tuple(tensor.mode_order or ()),
+        tensor._assignment,
+    )
+
+    def index_state(value: IndexVar) -> tuple[object, ...]:
+        return (
+            value.name,
+            value.index_id,
+            value._expr,
+            value._parent,
+            value.is_tiled,
+            value.is_outer,
+            value.is_inner,
+            value.tile_size_var,
+            tuple(value.tensor_accesses),
+        )
+
+    index_before = index_state(index)
+    parent_before = index_state(parent)
+
+    first_iterator = ModeIterator(
+        _tensor_var=tensor,
+        index_var=index,
+        parent_index_var=parent,
+        _level=1,
+        level_type=level_type,
+    )
+    second_iterator = ModeIterator(
+        _tensor_var=tensor,
+        index_var=index,
+        parent_index_var=parent,
+        _level=1,
+        level_type=level_type,
+    )
+    first = first_iterator.get_coord_var_value_llir()
+    second = second_iterator.get_coord_var_value_llir()
+
+    expected = llir.ArrayAccess(
+        array=llir.Var("Input1_crd", llir.DataType.PTR_INT),
+        index=llir.Var("pInput1", llir.DataType.INT),
+    )
+    assert type(first) is llir.ArrayAccess
+    assert type(second) is llir.ArrayAccess
+    first_access = cast(llir.ArrayAccess, first)
+    second_access = cast(llir.ArrayAccess, second)
+    assert first_access == expected == second_access
+    assert hash(first_access) == hash(expected) == hash(second_access)
+    assert first_access.tensor_access is None
+    assert second_access.tensor_access is None
+    assert type(first_access.array) is llir.Var
+    assert type(first_access.index) is llir.Var
+    first_array = cast(llir.Var, first_access.array)
+    first_index = cast(llir.Var, first_access.index)
+    assert first_array.name == "Input1_crd"
+    assert first_array.type is llir.DataType.PTR_INT
+    assert first_array.tensor_access is None
+    assert first_index.name == "pInput1"
+    assert first_index.type is llir.DataType.INT
+    assert first_index.tensor_access is None
+
+    assert first_access is not second_access
+    assert first_access.array is not second_access.array
+    assert first_access.index is not second_access.index
+    assert first_iterator.iterator_var_llir is not second_iterator.iterator_var_llir
+    assert first_access.index is not first_iterator.iterator_var_llir
+    assert second_access.index is not second_iterator.iterator_var_llir
+    assert LLIRLowerer().lower_llir(first_access) == "Input1_crd[pInput1]"
+    with pytest.raises(FrozenInstanceError):
+        first_access.index = llir.Var("other", llir.DataType.INT)
+
+    assert first_iterator.tensor_var is tensor
+    assert first_iterator.index_var is index
+    assert first_iterator.parent_index_var is parent
+    assert tensor_state == (
+        tensor.name,
+        tensor.symbol_id,
+        tensor.format,
+        tensor.shape,
+        tensor.dtype,
+        tuple(tensor.mode_order or ()),
+        tensor._assignment,
+    )
+    assert index_state(index) == index_before
+    assert index_state(parent) == parent_before
+
+
 @pytest.mark.parametrize("scalar_accumulator", (False, True))
 def test_all_coo_transform_coordinate_initializers_are_structured_typed_and_owned(
     scalar_accumulator: bool,
 ) -> None:
     source = _build_all_coo_transform_loop()
+    source_initializer = cast(llir.VarInit, source.body[0])
+    source_access = cast(llir.ArrayAccess, source_initializer.value)
     source_cpp = LLIRLowerer().lower_llir(source)
+    assert source_cpp == (
+        "for (int pMask0 = 0; pMask0 < pMask0_end; pMask0 = pMask1_end) {\n"
+        "  int r = Mask0_crd[pMask0];\n"
+        "}"
+    )
 
     first_loop, first_initializer, first = _all_coo_transform_coordinate_read(
         scalar_accumulator=scalar_accumulator,
@@ -607,6 +725,10 @@ def test_all_coo_transform_coordinate_initializers_are_structured_typed_and_owne
     assert first is not second
     assert first.array is not second.array
     assert first.index is not second.index
+    assert first is not source_access
+    assert first != source_access
+    assert not any(statement is source_initializer for statement in first_loop.body)
+    assert not any(statement == source_initializer for statement in first_loop.body)
 
     first_candidates = [cast(llir.VarInit, first_loop.init)] + [
         cast(llir.VarInit, statement)
@@ -633,6 +755,9 @@ def test_all_coo_transform_coordinate_initializers_are_structured_typed_and_owne
     assert LLIRLowerer().lower_llir(first_initializer) == (
         "int64_t r = Mask0_crd[pMask0];"
     )
+    first_loop_cpp = LLIRLowerer().lower_llir(first_loop)
+    assert first_loop_cpp.count("  int64_t r = Mask0_crd[pMask0];") == 1
+    assert "  int r = Mask0_crd[pMask0];" not in first_loop_cpp
     assert LLIRLowerer().lower_llir(source) == source_cpp
     with pytest.raises(FrozenInstanceError):
         first.index = llir.Var("other", llir.DataType.INT64)

@@ -617,6 +617,129 @@ def test_all_coo_coordinate_read_survives_repeated_production_pipeline() -> None
     assert once_read.tensor_access is None
 
 
+def test_mode_iterator_coordinate_read_activates_managed_sparse_prefetch() -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    source_read = llir.ArrayAccess(
+        _var("A1_crd", llir.DataType.PTR_INT),
+        _var("pA1", llir.DataType.INT),
+    )
+    sparse_loop = llir.ForLoop(
+        init=llir.VarInit(
+            _var("pA1", llir.DataType.INT),
+            _var("A1_pos[pA0]", llir.DataType.INT),
+        ),
+        cond=llir.BinOp(
+            "<",
+            _var("pA1", llir.DataType.INT),
+            _var("pA1_end", llir.DataType.INT),
+        ),
+        update=llir.Increment(_var("pA1", llir.DataType.INT)),
+        body=[
+            llir.VarInit(_var("j", llir.DataType.INT), source_read),
+            llir.ForLoop(
+                init=llir.VarInit(
+                    _var("k", llir.DataType.INT),
+                    llir.Literal(0),
+                ),
+                cond=llir.BinOp(
+                    "<",
+                    _var("k", llir.DataType.INT),
+                    _var("B1_size", llir.DataType.INT),
+                ),
+                update=llir.Increment(_var("k", llir.DataType.INT)),
+                body=[
+                    llir.VarInit(
+                        _var("pB1", llir.DataType.INT),
+                        llir.Add(
+                            llir.Mul(
+                                _var("j", llir.DataType.INT),
+                                _var("B1_size", llir.DataType.INT),
+                            ),
+                            _var("k", llir.DataType.INT),
+                        ),
+                    ),
+                    llir.Assign(
+                        _access("C_val", "pC1"),
+                        _var("B_val[pB1]"),
+                    ),
+                ],
+            ),
+        ],
+    )
+    source: List[llir.Stmt] = [sparse_loop]
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact(artifact.statements)
+
+    once = manager.run_production_pipeline(
+        LLIRStatementListArtifact(source),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+    twice = manager.run_production_pipeline(
+        LLIRStatementListArtifact(once.artifact.value),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once.artifact.value))
+    assert _mutable_ir_ids(once.artifact.value).isdisjoint(
+        _mutable_ir_ids(twice.artifact.value)
+    )
+    expected_passes = [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    for result in (once, twice):
+        assert [record.pass_name for record in result.run_records] == expected_passes
+        assert [record.sequence_index for record in result.run_records] == list(
+            range(5)
+        )
+        assert all(record.duration_ns is not None for record in result.run_records)
+
+    once_loop = cast(llir.ForLoop, once.artifact.value[0])
+    twice_loop = cast(llir.ForLoop, twice.artifact.value[0])
+    once_prefetches = [
+        cast(llir.RawStmt, statement).code
+        for statement in once_loop.body
+        if type(statement) is llir.RawStmt
+    ]
+    twice_prefetches = [
+        cast(llir.RawStmt, statement).code
+        for statement in twice_loop.body
+        if type(statement) is llir.RawStmt
+    ]
+    expected_prefetch = (
+        "if (pA1 + 1 < pA1_end) "
+        "__builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1)"
+    )
+    assert once_prefetches == [expected_prefetch]
+    assert twice_prefetches == [expected_prefetch, expected_prefetch]
+
+    once_initializer = cast(llir.VarInit, once_loop.body[1])
+    twice_initializer = cast(llir.VarInit, twice_loop.body[2])
+    assert once_initializer.value == source_read
+    assert twice_initializer.value == source_read
+    assert once_initializer.value is not source_read
+    assert twice_initializer.value is not once_initializer.value
+    once_access = cast(llir.ArrayAccess, once_initializer.value)
+    twice_access = cast(llir.ArrayAccess, twice_initializer.value)
+    assert once_access.array is not source_read.array
+    assert once_access.index is not source_read.index
+    assert twice_access.array is not once_access.array
+    assert twice_access.index is not once_access.index
+
+
 def test_malformed_workspace_pair_read_stops_the_production_pipeline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

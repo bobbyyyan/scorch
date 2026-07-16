@@ -119,7 +119,13 @@ def _sparse_loop(
         cond=llir.BinOp("<", _var(iterator), _var(end)),
         update=llir.Increment(_var(iterator)),
         body=[
-            llir.VarInit(_var("coordinate"), _var(f"{coordinate_array}[{iterator}]")),
+            llir.VarInit(
+                _var("coordinate"),
+                llir.ArrayAccess(
+                    _var(coordinate_array, llir.DataType.PTR_INT),
+                    _var(iterator, llir.DataType.INT),
+                ),
+            ),
             *tail,
         ],
     )
@@ -394,9 +400,25 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
     missing_coordinate = _sparse_loop()
     missing_coordinate.body = missing_coordinate.body[1:]
 
-    typed_coordinate = _sparse_loop()
-    cast(llir.VarInit, typed_coordinate.body[0]).value = llir.ArrayAccess(
-        _var("A1_crd"), _var("pA1")
+    legacy_flat_coordinate = _sparse_loop()
+    cast(llir.VarInit, legacy_flat_coordinate.body[0]).value = _var(
+        "A1_crd[pA1]", llir.DataType.INT
+    )
+
+    malformed_structured_coordinate = _sparse_loop()
+    cast(llir.VarInit, malformed_structured_coordinate.body[0]).value = (
+        llir.ArrayAccess(
+            llir.Literal(0),
+            _var("pA1", llir.DataType.INT),
+        )
+    )
+
+    wrong_index_structured_coordinate = _sparse_loop()
+    cast(llir.VarInit, wrong_index_structured_coordinate.body[0]).value = (
+        llir.ArrayAccess(
+            _var("A1_crd", llir.DataType.PTR_INT),
+            _var("pOther", llir.DataType.INT),
+        )
     )
 
     no_inner_loop = _sparse_loop(tail=[llir.BlankLine()])
@@ -566,7 +588,15 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
         ("non-binary condition", [wrong_condition]),
         ("unnamed condition rhs", [unnamed_end]),
         ("missing coordinate", [missing_coordinate]),
-        ("typed coordinate omitted by legacy matcher", [typed_coordinate]),
+        ("legacy flat coordinate spelling", [legacy_flat_coordinate]),
+        (
+            "structured coordinate has a non-variable base",
+            [malformed_structured_coordinate],
+        ),
+        (
+            "structured coordinate uses the wrong iterator",
+            [wrong_index_structured_coordinate],
+        ),
         ("no direct inner loop", [no_inner_loop]),
         ("no direct position init", [no_position]),
         ("wrong position expression", [wrong_position_shape]),
@@ -994,9 +1024,47 @@ def _all_raw_codes(value: object) -> List[str]:
     return codes
 
 
+def _coordinate_reads(
+    value: object,
+    *,
+    target_name: str,
+    array_name: str,
+    index_name: str,
+) -> List[llir.ArrayAccess]:
+    matches: List[llir.ArrayAccess] = []
+
+    class CoordinateReadCollector(LLIRWalker):
+        def visit_var_init(
+            self,
+            node: llir.VarInit,
+            path: Tuple[str, ...],
+        ) -> None:
+            if type(node.value) is llir.ArrayAccess:
+                access = cast(llir.ArrayAccess, node.value)
+                if (
+                    node.var.name == target_name
+                    and type(access.array) is llir.Var
+                    and cast(llir.Var, access.array).name == array_name
+                    and type(access.index) is llir.Var
+                    and cast(llir.Var, access.index).name == index_name
+                ):
+                    matches.append(access)
+            super().visit_var_init(node, path)
+
+    CoordinateReadCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_iterator_coordinate_read",
+        )
+    ).walk(value)
+    return matches
+
+
 def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    statement = _build_activating_spmm_cin()
+    original_statement = str(statement)
     events: List[str] = []
     detached_sparse_output: List[List[llir.Stmt]] = []
     detached_dense_output: List[List[llir.Stmt]] = []
@@ -1031,7 +1099,7 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
         pass_spec: DensePointerHoistPassSpec,
     ) -> LLIRStatementListPassResult:
         events.append("dense_pointer")
-        assert artifact.statements is detached_sparse_output[0]
+        assert artifact.statements is detached_sparse_output[-1]
         assert pass_spec.context.value_array_ctypes == (
             ("A_val", "float"),
             ("B_val", "float"),
@@ -1051,7 +1119,7 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
         ),
     ) -> LLIRStatementListPassResult:
         events.append("single_iteration")
-        assert artifact.statements is detached_dense_output[0]
+        assert artifact.statements is detached_dense_output[-1]
         result = original_single(manager, artifact, pass_spec)
         assert _mutable_ir_ids(artifact.statements).isdisjoint(
             _mutable_ir_ids(result.artifact.statements)
@@ -1067,7 +1135,7 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
         ),
     ) -> LLIRStatementListPassResult:
         events.append("factor_hoist")
-        assert artifact.statements is detached_single_output[0]
+        assert artifact.statements is detached_single_output[-1]
         assert not any(
             "validate_jit_tensor" in code
             for code in _all_raw_codes(artifact.statements)
@@ -1090,7 +1158,7 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
         )
         assert all(
             any(statement is candidate for candidate in artifact.value)
-            for statement in detached_factor_output[0]
+            for statement in detached_factor_output[-1]
         )
         return original_dynamic(manager, artifact, pass_spec)
 
@@ -1108,18 +1176,41 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
         record_factor,
     )
 
-    lowerer = CINLowerer()
-    cpp = LLIRLowerer().lower_llir(
-        lowerer.lower_IndexStmt(_build_activating_spmm_cin())
-    )
+    def lower() -> tuple[CINLowerer, llir.ArrayAccess, str]:
+        lowerer = CINLowerer()
+        lowered = lowerer.lower_IndexStmt(statement)
+        coordinate_reads = _coordinate_reads(
+            lowered,
+            target_name="k",
+            array_name="A1_crd",
+            index_name="pA1",
+        )
+        assert len(coordinate_reads) == 1
+        return lowerer, coordinate_reads[0], LLIRLowerer().lower_llir(lowered)
 
-    assert events == [
+    lowerer, coordinate_read, cpp = lower()
+    second_lowerer, second_coordinate_read, second_cpp = lower()
+
+    expected_events = [
         "sparse_prefetch",
         "dense_pointer",
         "single_iteration",
         "factor_hoist",
         "dynamic_vector",
     ]
+    assert events == expected_events * 2
+    assert str(statement) == original_statement
+    assert second_cpp == cpp
+    assert coordinate_read == llir.ArrayAccess(
+        llir.Var("A1_crd", llir.DataType.PTR_INT),
+        llir.Var("pA1", llir.DataType.INT),
+    )
+    assert coordinate_read is not second_coordinate_read
+    assert coordinate_read.array is not second_coordinate_read.array
+    assert coordinate_read.index is not second_coordinate_read.index
+    assert coordinate_read.tensor_access is None
+    assert second_coordinate_read.tensor_access is None
+    assert second_lowerer.llir_pass_run_records == lowerer.llir_pass_run_records
     assert len(cpp) == 2505
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151"
@@ -1149,41 +1240,38 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
     statement = _build_activating_all_coo_sddmm_cin()
     original = str(statement)
 
-    def lower() -> tuple[CINLowerer, llir.ArrayAccess, str]:
+    def lower() -> tuple[CINLowerer, llir.ArrayAccess, llir.ArrayAccess, str]:
         lowerer = CINLowerer()
         lowered = lowerer.lower_IndexStmt(statement)
-        matches: List[llir.ArrayAccess] = []
-
-        class CoordinateReadCollector(LLIRWalker):
-            def visit_var_init(
-                self,
-                node: llir.VarInit,
-                path: Tuple[str, ...],
-            ) -> None:
-                if type(node.value) is llir.ArrayAccess:
-                    access = cast(llir.ArrayAccess, node.value)
-                    if (
-                        node.var.name == "r"
-                        and type(access.array) is llir.Var
-                        and cast(llir.Var, access.array).name == "Mask0_crd"
-                        and type(access.index) is llir.Var
-                        and cast(llir.Var, access.index).name == "pMask0"
-                    ):
-                        matches.append(access)
-                super().visit_var_init(node, path)
-
-        CoordinateReadCollector(
-            LLIRTraversalContext(
-                stage="test",
-                pass_name="collect_all_coo_coordinate_read",
-            )
-        ).walk(lowered)
-        assert len(matches) == 1
-        return lowerer, matches[0], LLIRLowerer().lower_llir(lowered)
+        transformed_coordinate_reads = _coordinate_reads(
+            lowered,
+            target_name="r",
+            array_name="Mask0_crd",
+            index_name="pMask0",
+        )
+        iterator_coordinate_reads = _coordinate_reads(
+            lowered,
+            target_name="c",
+            array_name="Mask1_crd",
+            index_name="pMask0",
+        )
+        assert len(transformed_coordinate_reads) == 1
+        assert len(iterator_coordinate_reads) == 1
+        return (
+            lowerer,
+            transformed_coordinate_reads[0],
+            iterator_coordinate_reads[0],
+            LLIRLowerer().lower_llir(lowered),
+        )
 
     with regblock_force(False):
-        lowerer, coordinate_read, cpp = lower()
-        second_lowerer, second_coordinate_read, second_cpp = lower()
+        lowerer, coordinate_read, iterator_coordinate_read, cpp = lower()
+        (
+            second_lowerer,
+            second_coordinate_read,
+            second_iterator_coordinate_read,
+            second_cpp,
+        ) = lower()
 
     assert str(statement) == original
     assert second_cpp == cpp
@@ -1195,6 +1283,15 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
     assert coordinate_read.array is not second_coordinate_read.array
     assert coordinate_read.index is not second_coordinate_read.index
     assert coordinate_read.tensor_access is None
+    assert iterator_coordinate_read == llir.ArrayAccess(
+        llir.Var("Mask1_crd", llir.DataType.PTR_INT),
+        llir.Var("pMask0", llir.DataType.INT),
+    )
+    assert iterator_coordinate_read is not second_iterator_coordinate_read
+    assert iterator_coordinate_read.array is not second_iterator_coordinate_read.array
+    assert iterator_coordinate_read.index is not second_iterator_coordinate_read.index
+    assert iterator_coordinate_read.tensor_access is None
+    assert second_iterator_coordinate_read.tensor_access is None
     assert second_lowerer.llir_pass_run_records == lowerer.llir_pass_run_records
     assert len(cpp) == 3521
     assert hashlib.sha256(cpp.encode()).hexdigest() == (

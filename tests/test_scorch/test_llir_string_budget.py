@@ -109,13 +109,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
-        "iterator.py": 19,
+        "iterator.py": 21,
         "llir_traversal.py": 1,
         "result_write_pass.py": 5,
         "schedule_lowerer.py": 96,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(constructor_counts.values()) == 377
+    assert sum(constructor_counts.values()) == 379
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 172,
@@ -123,13 +123,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
-        "iterator.py": 13,
+        "iterator.py": 17,
         "llir_traversal.py": 1,
         "result_write_pass.py": 5,
         "schedule_lowerer.py": 94,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 339
+    assert sum(unclassified_counts.values()) == 343
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -143,7 +143,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 9
 
     assert totals == {
-        "subscript": 19,
+        "subscript": 17,
         "call": 8,
         "member": 3,
         "initializer": 3,
@@ -151,7 +151,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "ternary": 1,
         "arithmetic": 1,
     }
-    assert sum(totals.values()) == 38
+    assert sum(totals.values()) == 36
     assert per_file == {
         ("cin_lowerer.py", "subscript"): 13,
         ("cin_lowerer.py", "call"): 6,
@@ -160,7 +160,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("cin_lowerer.py", "qualified"): 3,
         ("cin_lowerer.py", "ternary"): 1,
         ("cin_lowerer.py", "arithmetic"): 1,
-        ("iterator.py", "subscript"): 6,
+        ("iterator.py", "subscript"): 4,
         ("schedule_lowerer.py", "call"): 2,
     }
 
@@ -236,6 +236,20 @@ def test_all_coo_coordinate_initializers_cannot_return_to_var_names() -> None:
     assert transform.count('name=f"{crd_array}[{iter_var}]"') == 0
     assert transform.count("name=crd_array,") == 2
     assert transform.count("name=cast(str, iter_var),") == 2
+
+
+def test_iterator_coordinate_reads_cannot_return_to_var_names() -> None:
+    path = _COMPILER_ROOT / "iterator.py"
+    violations: list[tuple[int, str]] = []
+    for call in _llir_constructor_calls(path, "Var"):
+        name_expression = _var_name_expression(call)
+        if name_expression is None:
+            continue
+        fragments = _static_string_fragments(name_expression)
+        if "_crd[" in fragments:
+            violations.append((call.lineno, ast.unparse(name_expression)))
+
+    assert violations == []
 
 
 def test_dense_level_shape_reads_cannot_return_to_var_names() -> None:
