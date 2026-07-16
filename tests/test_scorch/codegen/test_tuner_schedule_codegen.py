@@ -1,10 +1,17 @@
+from typing import cast
+
 import torch
 import pytest
 
 from scorch import STensor
+from scorch.compiler import llir  # type: ignore[import-untyped]
 from scorch.compiler.cin import ForAll, IndexVar, TensorVar
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
+    LLIRTraversalContext,
+    LLIRWalker,
+)
 from scorch.compiler.scheduler import (
     RelayoutSpec,
     Schedule,
@@ -87,6 +94,54 @@ def _build_spmm_cin():
     return ForAll(i, ForAll(j, ForAll(k, c._assignment)))
 
 
+def _lower_free_k_workspace_copy_read() -> (
+    tuple[llir.ArrayAccess, tuple[llir.Var, ...]]
+):
+    statement = _build_spmm_cin()
+    scheduled = Scheduler.apply_schedule(statement, _free_k_schedule())
+    lowered = CINLowerer().lower_IndexStmt(scheduled)
+    reads: list[llir.ArrayAccess] = []
+    tile_loop_vars: list[llir.Var] = []
+
+    class WorkspaceCopyCollector(LLIRWalker):
+        def visit_assign(
+            self,
+            node: llir.Assign,
+            path: tuple[str, ...],
+        ) -> None:
+            if type(node.value) is llir.ArrayAccess:
+                value = cast(llir.ArrayAccess, node.value)
+                if (
+                    type(value.array) is llir.Var
+                    and cast(llir.Var, value.array).name == "wksp"
+                ):
+                    reads.append(value)
+            super().visit_assign(node, path)
+
+        def visit_for_loop(
+            self,
+            node: llir.ForLoop,
+            path: tuple[str, ...],
+        ) -> None:
+            if (
+                type(node.init) is llir.VarInit
+                and type(node.init.var) is llir.Var
+                and node.init.var.name == "k_in"
+            ):
+                tile_loop_vars.append(node.init.var)
+            super().visit_for_loop(node, path)
+
+    WorkspaceCopyCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_free_k_workspace_copy_read",
+        )
+    ).walk(lowered)
+    assert len(reads) == 1
+    assert len(tile_loop_vars) == 2
+    return reads[0], tuple(tile_loop_vars)
+
+
 def test_tuner_free_k_schedule_emits_row_outer_stack_tile():
     scheduled = Scheduler.apply_schedule(_build_spmm_cin(), _free_k_schedule())
     lowered = CINLowerer().lower_IndexStmt(scheduled)
@@ -108,6 +163,25 @@ def test_tuner_free_k_schedule_emits_row_outer_stack_tile():
     assert "C_values[pC1] += wksp[k_in];" in cpp
     assert "aligned_alloc" not in cpp
     assert "A1_pos[B1_size]" not in cpp
+
+
+def test_tuner_free_k_workspace_copy_read_is_structured_typed_and_owned() -> None:
+    first, first_loop_vars = _lower_free_k_workspace_copy_read()
+    second, second_loop_vars = _lower_free_k_workspace_copy_read()
+
+    expected = llir.ArrayAccess(
+        array=llir.Var("wksp", llir.DataType.PTR_FLOAT32),
+        index=llir.Var("k_in", llir.DataType.INT64),
+    )
+    assert first == expected
+    assert second == expected
+    assert first is not second
+    assert first.array is not second.array
+    assert first.index is not second.index
+    assert all(first.index is not loop_var for loop_var in first_loop_vars)
+    assert all(second.index is not loop_var for loop_var in second_loop_vars)
+    assert first.tensor_access is None
+    assert LLIRLowerer().lower_llir(first) == "wksp[k_in]"
 
 
 def test_tuner_free_k_schedule_is_correct_for_ragged_tail_and_empty_row():

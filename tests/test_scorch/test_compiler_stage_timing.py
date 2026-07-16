@@ -13,7 +13,7 @@ from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
 from time import perf_counter_ns
 from types import SimpleNamespace
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, cast
 
 import pytest
 import torch
@@ -31,6 +31,7 @@ import scorch.utils as utils  # type: ignore[import-untyped]
 from scorch.compiler import llir  # type: ignore[import-untyped]
 from scorch.compiler.cin import (  # type: ignore[import-untyped]
     ForAll,
+    IndexStmt,
     IndexVar,
     Operation,
     TensorAssign,
@@ -72,7 +73,9 @@ from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     PRODUCTION_LLIR_PASS_OPTIONS,
 )
 from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
+    LLIRTraversalContext,
     LLIRTraversalError,
+    LLIRWalker,
 )
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Schedule,
@@ -2092,6 +2095,109 @@ def test_malformed_assembled_call_fails_its_owner_and_suppresses_later_stages(
         "eliminate_single_iteration_loops",
         "hoist_loop_invariant_factors",
     ]
+    assert later_calls == []
+    assert context.compile_options is options
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_malformed_tiled_workspace_read_fails_cin_lowering_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = Schedule(
+        loop_order=("i", "k", "j"),
+        tiles=(
+            TileSpec(
+                index_var="j",
+                width=4,
+                placement="child_of:i",
+                accum="stack",
+            ),
+        ),
+        tag="malformed-tiled-workspace-read",
+    )
+    options = _default_options(requested_schedule=schedule)
+    context = CompilationContext(options)
+    original_lower_consumer = CINLowerer.lower_ConsumerIndexStmt
+    injected_reads: list[llir.Assign] = []
+
+    def lower_with_malformed_workspace_read(
+        self: CINLowerer,
+        statement: IndexStmt,
+    ) -> list[llir.Stmt]:
+        lowered = original_lower_consumer(self, statement)
+        matches: list[llir.Assign] = []
+
+        class WorkspaceReadCollector(LLIRWalker):
+            def visit_assign(
+                self,
+                node: llir.Assign,
+                path: tuple[str, ...],
+            ) -> None:
+                if type(node.value) is llir.ArrayAccess:
+                    value = cast(llir.ArrayAccess, node.value)
+                    if (
+                        type(value.array) is llir.Var
+                        and cast(llir.Var, value.array).name == "wksp"
+                    ):
+                        matches.append(node)
+                super().visit_assign(node, path)
+
+        WorkspaceReadCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="find_tiled_workspace_read",
+            )
+        ).walk(lowered)
+        for assignment in matches:
+            original = cast(llir.ArrayAccess, assignment.value)
+            malformed = object.__new__(llir.ArrayAccess)
+            object.__setattr__(malformed, "array", original.array)
+            object.__setattr__(malformed, "index", original.index)
+            object.__setattr__(malformed, "tensor_access", object())
+            assignment.value = malformed
+            injected_reads.append(assignment)
+        return lowered
+
+    monkeypatch.setattr(
+        CINLowerer,
+        "lower_ConsumerIndexStmt",
+        lower_with_malformed_workspace_read,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert len(injected_reads) == 1
+    assert failure.value.diagnostic.code == "invalid_tensor_access_metadata"
+    assert failure.value.diagnostic.stage == "LLIR transformation"
+    assert failure.value.diagnostic.pass_name == "insert_sparse_prefetch"
+    assert context.compile_options is options
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert context.llir_pass_run_records == ()
     assert later_calls == []
     assert context.compile_options is options
     with pytest.raises(CompilationContextError) as suppressed:

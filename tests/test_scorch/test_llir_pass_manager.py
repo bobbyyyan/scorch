@@ -478,6 +478,74 @@ def test_workspace_pair_reads_survive_repeated_production_pipeline_noops() -> No
     assert all(record.duration_ns is not None for record in once.run_records)
 
 
+def test_physical_workspace_copy_read_survives_repeated_production_pipeline() -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    source_read = llir.ArrayAccess(
+        _var("wksp", llir.DataType.PTR_FLOAT32),
+        _var("k_in", llir.DataType.INT64),
+    )
+    source: List[llir.Stmt] = [
+        llir.Assign(
+            _access("C_values", "pC1"),
+            source_read,
+            op=llir.AssignOp.ADD_ASSIGN,
+        )
+    ]
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact(artifact.statements)
+
+    once = manager.run_production_pipeline(
+        LLIRStatementListArtifact(source),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+    twice = manager.run_production_pipeline(
+        LLIRStatementListArtifact(once.artifact.value),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    assert _structural_snapshot(source) == _structural_snapshot(once.artifact.value)
+    assert _structural_snapshot(once.artifact.value) == _structural_snapshot(
+        twice.artifact.value
+    )
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once.artifact.value))
+    assert _mutable_ir_ids(once.artifact.value).isdisjoint(
+        _mutable_ir_ids(twice.artifact.value)
+    )
+    expected_passes = [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.pass_name for record in once.run_records] == expected_passes
+    assert [record.pass_name for record in twice.run_records] == expected_passes
+    assert [record.sequence_index for record in once.run_records] == list(range(5))
+    assert all(record.duration_ns is not None for record in once.run_records)
+
+    once_assignment = cast(llir.Assign, once.artifact.value[0])
+    twice_assignment = cast(llir.Assign, twice.artifact.value[0])
+    assert once_assignment.value == source_read
+    assert twice_assignment.value == source_read
+    assert type(once_assignment.value) is llir.ArrayAccess
+    once_read = cast(llir.ArrayAccess, once_assignment.value)
+    assert type(once_read.array) is llir.Var
+    assert cast(llir.Var, once_read.array).type is llir.DataType.PTR_FLOAT32
+    assert type(once_read.index) is llir.Var
+    assert cast(llir.Var, once_read.index).type is llir.DataType.INT64
+    assert once_read.tensor_access is None
+
+
 def test_malformed_workspace_pair_read_stops_the_production_pipeline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
