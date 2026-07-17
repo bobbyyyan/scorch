@@ -291,7 +291,13 @@ class LLIRLowerer:
                 f"({', '.join(self._render_expression(arg) for arg in ir.args)})"
             )
 
-        if isinstance(ir, llir.Array):
+        if type(ir) is llir.Array:
+            if type(ir.values) is not tuple:
+                raise CodegenError("Array.values must be a tuple")
+            if any(not isinstance(value, llir.Expr) for value in ir.values):
+                raise CodegenError("Array.values must contain only LLIR expressions")
+            if type(ir.data_type) is not llir.DataType:
+                raise CodegenError("Array.data_type must be a DataType")
             return "{" + ", ".join(self._render_expression(v) for v in ir.values) + "}"
 
         if type(ir) is llir.MemberAccess:
@@ -353,7 +359,7 @@ class LLIRLowerer:
             or type(ir) is llir.ArrayAccess
         ):
             return self._POSTFIX_PRECEDENCE
-        if type(ir) is llir.Literal or isinstance(ir, (llir.Var, llir.Array)):
+        if type(ir) is llir.Literal or isinstance(ir, llir.Var):
             return self._PRIMARY_PRECEDENCE
         raise CodegenError(
             f"No C++ precedence defined for LLIR expression type: {type(ir).__name__}"

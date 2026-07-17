@@ -557,12 +557,22 @@ class FunctionCallStmt(Stmt):
         self.args = args
 
 
+@dataclass(frozen=True, init=False, repr=False)
 class Array(Expr):
-    """An array expression."""
+    """An immutable braced initializer-list expression."""
 
-    def __init__(self, values: List[Expr], data_type: DataType):
-        self.values = values
-        self.data_type = data_type
+    values: Tuple[Expr, ...]
+    data_type: DataType
+
+    def __init__(self, values: Sequence[Expr], data_type: DataType) -> None:
+        if type(values) is not list and type(values) is not tuple:
+            raise TypeError("Array.values must be a list or tuple")
+        if any(not isinstance(value, Expr) for value in values):
+            raise TypeError("Array.values must contain only LLIR expressions")
+        if type(data_type) is not DataType:
+            raise TypeError("Array.data_type must be a DataType")
+        object.__setattr__(self, "values", tuple(values))
+        object.__setattr__(self, "data_type", data_type)
 
 
 @dataclass(frozen=True)

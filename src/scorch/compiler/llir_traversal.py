@@ -302,6 +302,38 @@ def _validate_literal_fields(
         )
 
 
+def _validate_array_fields(
+    node: llir.Array,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if type(node.values) is not tuple:
+        _raise_traversal_error(
+            context,
+            code="invalid_array_values",
+            message="Array.values must be a tuple",
+            path=path + ("values",),
+            value=node.values,
+        )
+    for index, value in enumerate(node.values):
+        if not isinstance(value, llir.Expr):
+            _raise_traversal_error(
+                context,
+                code="invalid_array_value",
+                message="Array.values must contain only LLIR expressions",
+                path=path + ("values", f"[{index}]"),
+                value=value,
+            )
+    if type(node.data_type) is not llir.DataType:
+        _raise_traversal_error(
+            context,
+            code="invalid_array_data_type",
+            message="Array.data_type must be a DataType",
+            path=path + ("data_type",),
+            value=node.data_type,
+        )
+
+
 def _validate_cast_fields(
     node: llir.Cast,
     context: LLIRTraversalContext,
@@ -678,6 +710,7 @@ class LLIRWalker:
         self._walk_expr_sequence(node.args, path + ("args",))
 
     def visit_array(self, node: llir.Array, path: LLIRPath) -> None:
+        _validate_array_fields(node, self.context, path)
         self._walk_expr_sequence(node.values, path + ("values",))
 
     def visit_member_access(self, node: llir.MemberAccess, path: LLIRPath) -> None:
@@ -1293,9 +1326,10 @@ class LLIRRewriter:
         )
 
     def rewrite_array(self, node: llir.Array, path: LLIRPath) -> llir.Array:
+        _validate_array_fields(node, self.context, path)
         return llir.Array(
             values=cast(
-                List[llir.Expr],
+                Tuple[llir.Expr, ...],
                 self._rewrite_expr_sequence(node.values, path + ("values",)),
             ),
             data_type=node.data_type,

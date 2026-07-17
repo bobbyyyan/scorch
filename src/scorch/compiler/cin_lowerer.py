@@ -150,9 +150,14 @@ class ResultTensorAssembler:
                     value=llir.FunctionCall(
                         name="torch::empty",
                         args=[
-                            llir.Var(
-                                name=f"{{{self.name}_capacity}}",
-                                type=llir.DataType.NO_TYPE,
+                            llir.Array(
+                                values=(
+                                    llir.Var(
+                                        name=f"{self.name}_capacity",
+                                        type=llir.DataType.INT64,
+                                    ),
+                                ),
+                                data_type=llir.DataType.INT64,
                             ),
                             llir.Var(
                                 name=get_pytorch_c_dtype_str(self.dtype),
@@ -209,9 +214,14 @@ class ResultTensorAssembler:
                     value=llir.FunctionCall(
                         name="torch::empty",
                         args=[
-                            llir.Var(
-                                name=f"{{{self.known_nnz_var}}}",
-                                type=llir.DataType.NO_TYPE,
+                            llir.Array(
+                                values=(
+                                    llir.Var(
+                                        name=self.known_nnz_var,
+                                        type=llir.DataType.INT64,
+                                    ),
+                                ),
+                                data_type=llir.DataType.INT64,
                             ),
                             llir.Var(
                                 name=get_pytorch_c_dtype_str(self.dtype),
