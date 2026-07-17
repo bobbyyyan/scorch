@@ -395,11 +395,15 @@ Statement nodes
 """
 
 
+@dataclass(frozen=True)
 class Increment(Stmt):
-    """Increment a variable."""
+    """An immutable post-increment of one exact variable reference."""
 
-    def __init__(self, var: Var):
-        self.var = var
+    var: Var
+
+    def __post_init__(self) -> None:
+        if type(self.var) is not Var:
+            raise TypeError("Increment.var must be an exact LLIR Var")
 
 
 class Return(Stmt):

@@ -182,7 +182,9 @@ class LLIRLowerer:
         elif isinstance(ir, llir.Continue):
             return self.lower_llir("continue;", indent_level)
 
-        elif isinstance(ir, llir.Increment):
+        elif type(ir) is llir.Increment:
+            if type(ir.var) is not llir.Var:
+                raise CodegenError("Increment.var must be an exact LLIR Var")
             if no_semicolon:
                 return self.lower_llir(f"{ir.var.name}++", indent_level)
             return self.lower_llir(f"{ir.var.name}++;", indent_level)

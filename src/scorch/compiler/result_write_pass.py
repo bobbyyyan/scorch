@@ -7,7 +7,7 @@ assignment targets and the fill stores produced here stay structured.
 
 Count and fill are independent transformations.  Production applies each mode
 once to the same original work body.  Applying one mode to the output of the
-other is unsupported because the generated ``RawStmt`` nodes are opaque.
+other remains outside the supported production contract.
 Special position-boundary conditionals are a generated-shape contract for
 compressed levels that have a preceding compressed parent; the surrounding
 OpenMP transform does not declare ``_prev`` for the first compressed level.
@@ -267,6 +267,12 @@ class _ResultWriteRewriter(LLIRRewriter):
         return super().rewrite_statement_sequence_member(node, path)
 
     @staticmethod
+    def _phase_state(prefix: str, level: int) -> llir.Var:
+        """Build one fresh, exactly typed mutable count/fill state reference."""
+
+        return llir.Var(name=f"{prefix}{level}", type=llir.DataType.INT)
+
+    @staticmethod
     def _array_name(target: llir.AssignmentTarget) -> Optional[str]:
         if type(target) is not llir.ArrayAccess:
             return None
@@ -279,7 +285,7 @@ class _ResultWriteRewriter(LLIRRewriter):
     def _phase_index(level: int) -> llir.Add:
         return llir.Add(
             llir.Var(name=f"_base{level}", type=llir.DataType.INT64),
-            llir.Var(name=f"_pos{level}", type=llir.DataType.INT64),
+            _ResultWriteRewriter._phase_state("_pos", level),
         )
 
     @classmethod
@@ -329,7 +335,7 @@ class _ResultWriteRewriter(LLIRRewriter):
         for level in self._compressed_levels:
             if target_name == f"{self._result_name}{level}_crd":
                 if self._mode == "count":
-                    return (llir.RawStmt(code=f"_cnt{level}++"),)
+                    return (llir.Increment(self._phase_state("_cnt", level)),)
                 return (
                     self._store(
                         f"{self._result_name}{level}_crd_data",
@@ -352,7 +358,7 @@ class _ResultWriteRewriter(LLIRRewriter):
         for level in self._compressed_levels:
             if node.var.name == f"p{self._result_name}{level}":
                 if self._mode == "fill":
-                    return (llir.RawStmt(code=f"_pos{level}++"),)
+                    return (llir.Increment(self._phase_state("_pos", level)),)
                 return ()
         return (node,)
 
@@ -363,7 +369,7 @@ class _ResultWriteRewriter(LLIRRewriter):
             if node.name != f"{self._result_name}{level}_crd.push_back":
                 continue
             if self._mode == "count":
-                return (llir.RawStmt(code=f"_cnt{level}++"),)
+                return (llir.Increment(self._phase_state("_cnt", level)),)
 
             coordinate = node.args[0] if node.args else llir.Literal(0)
             replacements = [
@@ -373,7 +379,7 @@ class _ResultWriteRewriter(LLIRRewriter):
                     coordinate,
                     array_type=llir.DataType.PTR_INT,
                 ),
-                llir.RawStmt(code=f"_pos{level}++"),
+                llir.Increment(self._phase_state("_pos", level)),
             ]
             if index + 1 < len(self._compressed_levels):
                 next_level = self._compressed_levels[index + 1]
@@ -443,8 +449,15 @@ class _ResultWriteRewriter(LLIRRewriter):
         if self._mode == "count":
             count_body: List[llir.Stmt] = []
             if parent_level is not None:
-                count_body.append(llir.RawStmt(code=f"_cnt{parent_level}++"))
-            count_body.append(llir.RawStmt(code=f"_prev{level} = _cnt{level}"))
+                count_body.append(
+                    llir.Increment(self._phase_state("_cnt", parent_level))
+                )
+            count_body.append(
+                llir.Assign(
+                    self._phase_state("_prev", level),
+                    self._phase_state("_cnt", level),
+                )
+            )
             return (
                 llir.IfThenElse(
                     cond=self._progress_condition("_cnt", level),
@@ -463,7 +476,7 @@ class _ResultWriteRewriter(LLIRRewriter):
                         coordinate,
                         array_type=llir.DataType.PTR_INT,
                     ),
-                    llir.RawStmt(code=f"_pos{parent_level}++"),
+                    llir.Increment(self._phase_state("_pos", parent_level)),
                     self._store(
                         f"{self._result_name}{level}_pos_data",
                         self._phase_index(parent_level),
@@ -472,7 +485,12 @@ class _ResultWriteRewriter(LLIRRewriter):
                     ),
                 ]
             )
-        fill_body.append(llir.RawStmt(code=f"_prev{level} = _pos{level}"))
+        fill_body.append(
+            llir.Assign(
+                self._phase_state("_prev", level),
+                self._phase_state("_pos", level),
+            )
+        )
         return (
             llir.IfThenElse(
                 cond=self._progress_condition("_pos", level),
@@ -484,8 +502,8 @@ class _ResultWriteRewriter(LLIRRewriter):
     def _progress_condition(prefix: str, level: int) -> llir.BinOp:
         return llir.BinOp(
             op=">",
-            left=llir.Var(name=f"{prefix}{level}", type=llir.DataType.INT64),
-            right=llir.Var(name=f"_prev{level}", type=llir.DataType.INT64),
+            left=_ResultWriteRewriter._phase_state(prefix, level),
+            right=_ResultWriteRewriter._phase_state("_prev", level),
         )
 
     def _find_serial_coordinate(self, node: llir.IfThenElse) -> Optional[llir.Expr]:

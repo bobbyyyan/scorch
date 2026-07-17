@@ -767,9 +767,19 @@ def _build_count_body(
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
     levels = context.compressed_levels
     body: List[llir.Stmt] = [
-        llir.RawStmt(code=f"int _cnt{level} = 0") for level in levels
+        llir.VarInit(
+            var=llir.Var(name=f"_cnt{level}", type=llir.DataType.INT),
+            value=llir.Literal(0, llir.DataType.INT),
+        )
+        for level in levels
     ]
-    body.extend(llir.RawStmt(code=f"int _prev{level} = 0") for level in levels[1:])
+    body.extend(
+        llir.VarInit(
+            var=llir.Var(name=f"_prev{level}", type=llir.DataType.INT),
+            value=llir.Literal(0, llir.DataType.INT),
+        )
+        for level in levels[1:]
+    )
     result_write = manager.run_result_write(
         LLIRRewriteArtifact(work_body),
         ResultWritePassSpec(
@@ -817,10 +827,19 @@ def _build_fill_body(
         body.extend(
             [
                 llir.RawStmt(code=f"int64_t _base{level} = _offset{level}[{loop_var}]"),
-                llir.RawStmt(code=f"int _pos{level} = 0"),
+                llir.VarInit(
+                    var=llir.Var(name=f"_pos{level}", type=llir.DataType.INT),
+                    value=llir.Literal(0, llir.DataType.INT),
+                ),
             ]
         )
-    body.extend(llir.RawStmt(code=f"int _prev{level} = 0") for level in levels[1:])
+    body.extend(
+        llir.VarInit(
+            var=llir.Var(name=f"_prev{level}", type=llir.DataType.INT),
+            value=llir.Literal(0, llir.DataType.INT),
+        )
+        for level in levels[1:]
+    )
     result_write = manager.run_result_write(
         LLIRRewriteArtifact(work_body),
         ResultWritePassSpec(
