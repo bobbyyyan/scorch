@@ -6455,6 +6455,419 @@ qualified-name slice. The 15 subscripts, eight calls, three members, N3
 initializer, and T1 ternary remain open. Phase 3 remains open; Phase 3.5 and
 LoopIR have not begun.
 
+### Phase-3 structured compressed count/fill phase-state slice complete (2026-07-17)
+
+The exact base for this slice was
+`c145cdb2b141df1df296f07d4fa6e7fa96fa67aa`. The verified code/test candidate
+is the ordered trio of scoped commits:
+
+1. `6cda2c14c04a87136505f8f1874e0b23ccbbc4ff` (`refactor(compiler):
+   structure compressed phase state`);
+2. `52043008e9f57478c4ac351fe495d10e318c2899` (`test(compiler): cover
+   structured compressed phase state`); and
+3. `6483c6ae16d94613bb5f66fd1fb88cdba6550058` (`fix(compiler): narrow
+   typed increment codegen`).
+
+Before the first two commits were created, the complete uncommitted functional
+candidate passed a 982-test 18-file variant plus the separate budget/producer
+focus. Retained command history later established that the preceding handoff
+had misstated the literal canonical membership: that variant included
+`test_cin_lowerer.py` and omitted `test_llir_string_budget.py`. The recovered
+literal canonical 18-file command passed 959 tests at the committed test
+candidate and again at the final tip. Exact base/candidate mypy comparison
+also exposed three candidate-only type-narrowing findings in the new exact
+`Increment` codegen branch. The third commit adds the explicit typed cast
+without changing runtime behavior or generated source, and the final tip was
+reverified. No commit in this slice or any preceding Phase-3 slice was amended,
+squashed, reordered, or rewritten. This handoff update is the separate
+documentation-only commit.
+
+#### Complete pre-implementation expression and producer inventory
+
+The exact-base budget was reproduced before editing: 377 production `Var`
+constructors, 28 direct expression strings, 349 other constructor arguments
+including seven known indirect sinks/clones, ten generic string rewrites, and
+52 `RawStmt` calls from 51 production producers. Every remaining direct
+expression and every candidate phase-state producer was classified by
+producer, consumer, exact type, ownership, production reachability, source
+spelling, and compatibility-rewrite interaction before selecting the slice.
+
+The 15 remaining direct subscript sites were:
+
+| ID | Producer and exact `Var.name` spelling | Consumer, type, ownership, reachability, compatibility interaction, and decision |
+| --- | --- | --- |
+| P1 | `CINLowerer._emit_post_ops`: `f"{op.tensor_name}_val[{index_expr}]"` for add | Fresh `Assign.value`, `NO_TYPE`, borrowing the extra-tensor value pointer. Its only caller is the unsupported untiled workspace-copy fallback; it remains exposed to generic value-name scans. No successful public activation; rejected. |
+| P2 | Same producer and spelling for multiply | Same ownership, dormant caller, consumers, and rewrite exposure as P1. Rejected with the complete post-op pair. |
+| M1 | `CINLowerer.get_level_arrays`: `f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()"` | Fresh compressed-position `VarInit.value`, `PTR_INT`, borrowed from the by-value nested Torch-tensor ABI container. Live, but combines two subscripts with a templated member call; `ArrayAccess` alone is insufficient. Rejected as an ABI/member-call seam. |
+| M2 | Same producer with `[1].data_ptr<int>()` | Fresh compressed-coordinate `PTR_INT`; same live borrowed ABI ownership and deferred hierarchy as M1. Rejected. |
+| M3 | Same producer: `f"{tensor.name}_mode_indices[{level}][0]"` | Fresh coordinate-tensor `VarInit.value`, `TORCH_TENSOR`, copied from the nested container. Live, but M4 repeats the access and immediately derives its pointer, so M3 alone is not a complete producer family. Rejected. |
+| M4 | Same producer: `f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()"` | Fresh coordinate-pointer `PTR_INT`, borrowed from the same selected Torch tensor and nested container. Completing M1-M4 requires the deferred templated member-call-on-expression and Torch ABI work. Rejected. |
+| W0 | `lower_TensorAccess`: `f"{tensor_access.tensor.name}_val[{physical_index}]"` | Returned metadata-free `TensorAccess` rvalue, `NO_TYPE`. Supported production lowering uses the structured physical-access route, and this fallback's `_val` spelling is inconsistent with generated workspace storage. Nonactivating and rejected. |
+| D1 | Workspace initialization: `f"{wksp.get_name()}[{wksp.tile_size_var.name}]"` | Fresh `VarInit.var` with the workspace scalar type. This is a live stack-array declarator, not an rvalue access; migration would require prohibited generalized allocation/declarator and target work. Rejected. |
+| W1 | Untiled workspace copy: `f"{wksp.get_name()}[{loop_var.name}]"` | Fresh `Assign.value`, `NO_TYPE`, reading local workspace storage. Direct internal CIN can construct it, but supported scheduled dense workspaces take the preceding `memcpy`; the live tiled path is already structured. Rejected. |
+| C1 | Discarded all-COO pre-scan: `f"{crd_array}[_p]"` | Fresh `NO_TYPE` comparison operand borrowing an input coordinate pointer. Constructed only in a pre-scan tree discarded by the scalar-accumulator production caller; non-emitting and rejected. |
+| C2 | Same pre-scan: `f"{crd_array}[_p - 1]"` | Same discarded ownership/path as C1; its subtraction index also needs a coordinated typed child. Rejected. |
+| G1 | Discarded all-COO group loop: `"_group_starts[_g]"` | Fresh `VarInit.value`, `INT64`, promoting a local `std::vector<int>` element. The grouped tree is discarded and the leaf participates in the legacy bracket-to-`.at(...)` rewrite. Rejected. |
+| G2 | Same group loop: `"_group_starts[_g + 1]"` | Same discarded vector ownership and rewrite interaction as G1, plus an arithmetic index. Rejected. |
+| I1 | Coordinate `ModeIterator` root-begin alternative: `f"{self._tensor_var.name}{self._level}_pos[0]"` | Fresh iterator begin, `INT`. Root coordinate lowering emits literal `0`; this alternative never reaches generated LLIR. Rejected. |
+| I2 | Coordinate `ModeIterator` root-end alternative: `f"{self._tensor_var.name}{self._level}_pos[1]"` | Fresh iterator end, `INT`. Root coordinate lowering derives `.size(0)`; this alternative never reaches generated LLIR. Rejected. |
+
+The eight remaining direct calls were audited independently and remain a
+separate future seam:
+
+| ID | Exact source spelling | Producer, consumer, type, ownership, reachability, rewrite interaction, and decision |
+| --- | --- | --- |
+| K1/K2 | `f"{self.name}_values_torch.data_ptr<{c_datatype.value}>()"` | Dense-capacity and known-NNZ result pointer `VarInit.value` leaves with exact pointer types. Live final Torch ABI, owned as fresh pointer leaves borrowing the result tensor. Requires a templated member-call representation; rejected. |
+| K3 | `f"{tensor.name}_values.data_ptr<{data_type.value}>()"` | Fresh live input value-pointer `VarInit.value` with the exact scalar-pointer type, borrowing the input Torch tensor. Rejected with the `data_ptr<T>()` family. |
+| K4 | `f"{crd_tensor.name}.data_ptr<int>()"` | Fresh intermediate coordinate-pointer `VarInit.value`, `PTR_INT`. Live through applicable managed passes but opaque to their rewrites. Rejected. |
+| K5 | `f"{val_tensor.name}.data_ptr<{data_type.value}>()"` | Fresh intermediate value-pointer `VarInit.value` with the exact scalar-pointer type. Live and representation-bound like K4. Rejected. |
+| K6 | `f"{tname}_values.data_ptr<{c_dtype.value}>()"` | Fresh post-op tensor pointer with the exact scalar-pointer type. Live post-op ABI extraction. Rejected. |
+| K7/K8 | `f"{storage_name}.data()"` | Fresh exact-pointer `VarInit.value` leaves for compact-result and packed-operand schedule storage. Live schedule-stage access requiring the same deferred member/call-on-expression hierarchy. Rejected. |
+
+The other five direct strings remain independent:
+
+| IDs | Category and exact source spelling | Reason retained |
+| --- | --- | --- |
+| B1 | Member: `f"{self.name}.storage.index.mode_indices"` | Live result-assembler `Assign.var`; requires widening `AssignmentTarget` and coordinating the Torch result ABI. |
+| B2 | Member: `f"{self.name}.storage.value"` | Live result-assembler `Assign.var`; same result-ABI seam as B1. |
+| B3 | Member: `f"{tensor.name}.storage.value"` | Dormant compatibility read coherent only with the member ABI family. |
+| N3 | Initializer: `f"{{{', '.join([self._get_mode_index_set(i, lt) for i, lt in enumerate(self.level_types)])}}}"` | Live result `mode_indices` assignment value coupled to B1 and the result ABI. |
+| T1 | Ternary: `f"{outer_end_var} > 0 ? 1 : 0"` | Discarded all-COO group-count initializer requiring a dedicated conditional representation. |
+
+The existing `ArrayAccess` representation was audited before rejecting these
+families. It is a frozen structural node whose `array` and `index` must be
+LLIR `Expr` instances and whose optional tensor metadata must be exact.
+Equality and hashing include the array and index structure while intentionally
+excluding provenance metadata. Common traversal visits array then index in
+deterministic preorder, identity rewriting rebuilds detached nodes and fresh
+children, and traversal/codegen fail closed on unknown expression children and
+`ArrayAccess` subclasses. Codegen preserves postfix precedence for nested
+subscripts and arithmetic indices. `Assign` accepts a structured access target,
+whereas `VarInit.var` and `VarDecl.var` must remain exact `Var`s, which excludes
+D1. Existing managed passes recursively handle ordinary structured accesses,
+and the coordinate matcher requires its exact typed pointer/index shape.
+Dynamic-vector reads are the important compatibility exception: legacy
+`vector[index]` names become `.at(index)`, while a structured read would not
+receive that rewrite, so G1/G2 cannot migrate without changing source or
+widening call support. M1/M2/M4 remain unrepresentable because `FunctionCall`
+owns only a string callee and `MemberAccess.member` is a plain identifier.
+
+None of the direct-expression families therefore offered a complete narrow
+live slice using only the existing representation. The live subscript
+candidates require a Torch ABI/member-call hierarchy or generalized
+allocation/declarator work; the remaining candidates are dormant, discarded,
+or incomplete without an unrelated representation expansion.
+
+The following 12 opaque phase-state producer templates were then audited as
+one coherent family:
+
+| ID | Old producer and exact source spelling | Consumer, exact replacement, ownership, reachability, rewrite interaction, and decision |
+| --- | --- | --- |
+| S1 | `_build_count_body`: `int _cnt{level} = 0` | Count-body local declaration. Replaced by fresh `VarInit(Var(..., INT), Literal(0, INT))`. Live in DS and DSS count bodies; selected. |
+| S2 | `_build_count_body`: `int _prev{level} = 0` | Count-body previous-level state for compressed levels after the first. Same exact typed initializer and fresh ownership. Live in DSS boundary tracking; selected. |
+| S3 | `_build_fill_body`: `int _pos{level} = 0` | Fill-body local position declaration. Same exact typed initializer and fresh ownership. Live in DS and DSS fill bodies; selected. |
+| S4 | `_build_fill_body`: `int _prev{level} = 0` | Fill-body previous-level state. Same exact typed initializer and fresh ownership. Live in DSS boundary tracking; selected. |
+| S5 | `_ResultWriteRewriter._rewrite_assign`: `_cnt{level}++` | Count rewrite of a result-coordinate `Assign`. Replaced by `Increment` with a fresh exact `INT` child `Var`; production-reachable result-write branch and producer-focused coverage; selected. |
+| S6 | `_ResultWriteRewriter._rewrite_increment`: `_pos{level}++` | Fill rewrite of `pResult{level}` increment. Replaced by the same typed `Increment` shape; production-reachable result-write branch and producer-focused coverage; selected. |
+| S7 | `_ResultWriteRewriter._rewrite_function_call`, count mode: `_cnt{level}++` | Count replacement for `Result{level}_crd.push_back`. Fresh exact `INT` child; live DS/DSS sparse assembly; selected. |
+| S8 | Same producer, fill mode: `_pos{level}++` | Follows the structured coordinate store in the fill replacement. Fresh exact `INT` child; live DS/DSS sparse assembly; selected. |
+| S9 | Boundary rewrite, count mode: `_cnt{parent_level}++` | Parent compressed-level count mutation. Fresh exact `INT` child; live DSS boundary path; selected. |
+| S10 | Boundary rewrite, count mode: `_prev{level} = _cnt{level}` | Replaced by typed `Assign` with two independently fresh exact `INT` Vars. Live DSS boundary path; selected. |
+| S11 | Boundary rewrite, fill mode: `_pos{parent_level}++` | Parent compressed-level fill-position mutation. Fresh exact `INT` child; live DSS boundary path; selected. |
+| S12 | Boundary rewrite, fill mode: `_prev{level} = _pos{level}` | Replaced by typed `Assign` with two independently fresh exact `INT` Vars. Live DSS boundary path; selected. |
+
+The old `RawStmt` spellings were visible to generic raw-code traversal, but
+none contained a tensor substitution target or bracket expression affected by
+the compatibility rewrites. Their typed replacements now participate in
+common traversal without changing any substitution result. Migrating
+declarations without all mutations, or mutations without their owning
+declarations, would leave mixed opaque and structured state. S1-S12 are
+therefore the smallest complete live family. Existing `VarInit`, `Increment`,
+and `Assign` nodes cover it without an ABI, parser, allocation,
+assignment-target, or generalized member/call hierarchy change.
+
+#### Representation, consumer, ownership, and deduplication audit
+
+`llir.Increment` is now a frozen dataclass with one exact `llir.Var` child.
+Construction rejects non-`Var` children and `Var` subclasses. Equality and
+hashing are structural, type hints expose the exact child contract, and
+post-construction field replacement is prohibited. Common traversal
+exact-dispatches `Increment`, visits the child at `("var",)` in deterministic
+preorder, and rebuilds a detached node and detached child on every rewrite.
+Repeated identity rewriting remains equal and hash-equal but independently
+owned; replacement rewriting owns its new child. Unknown `Increment`
+subclasses and forged children fail closed in both traversal and codegen.
+
+Codegen now exact-dispatches `Increment`, explicitly narrows it for mypy,
+validates the exact child again, and emits the inherited byte-exact `var++` or
+`var++;` spelling. Existing typed `VarInit` and `Assign` emission preserves
+`int state = 0;` and `lhs = rhs;`. No new precedence-bearing expression is
+introduced. Focused coverage locks both semicolon contexts and the surrounding
+addition/index contexts.
+
+`_ResultWriteRewriter._phase_state(prefix, level)` constructs a fresh
+`DataType.INT` `Var` for every reference. This corrects the old incidental
+`INT64` metadata on `_pos` in `_phase_index` and on `_cnt`, `_pos`, and `_prev`
+in progress comparisons; the generated C++ scalar type remains the existing
+exact `int`. `_base{level}` correctly remains `INT64`. The four declaration
+templates use exact `INT` Vars and exact `Literal(0, INT)` initializers.
+
+The dynamic-vector pass deduplicates only equal adjacent `Assign` statements
+whose target is an `ArrayAccess` into a declared dynamic coordinate vector.
+Scalar `_prev = _cnt` and `_prev = _pos` targets never match that grammar.
+Equal repeated phase-state assignments therefore remain present, are rebuilt
+detached, and emit twice. Phase-state names contain no brackets, so the legacy
+vector read-name rewrite is also inert. No selected statement is an
+assignment-index target, tensor access, ABI leaf, or cache key.
+
+A forged generated `_cnt` child with malformed tensor metadata fails at
+`LLIR transformation / transform_compressed_where_for_openmp`, with exact path
+suffix `("var", "tensor_access")`. It publishes no completed outer pass
+record, does not mutate the source body or exact `CompileOptions` object, and
+suppresses body assembly and every later managed pass, result-ABI stage, C++
+generation, build/request assembly, native work, and cache publication.
+Existing count, fill, and parent-boundary partial-record tests continue to lock
+valid managed prefixes and later-stage suppression.
+
+No ABI signature, layout, source spelling, parser, generalized hierarchy,
+TorchCppABI extraction, allocation representation, zero-fill policy, pass
+policy, or unrelated optimization changed.
+
+#### Locked post-slice compatibility budget
+
+The production budget is now:
+
+- 379 total `Var` constructors;
+- 28 direct expression strings: 15 subscript, eight call, three member, one
+  initializer, one ternary, zero qualified, and zero arithmetic;
+- 351 other constructor arguments;
+- eight known indirect sinks/clones: one
+  `expr.name.replace(old, new)`, one dense-pointer `name`, one traversal
+  `node.name`, one phase-state `f"{prefix}{level}"`, two `prefix_extent`
+  sinks, one `zero_value`, and one single-iteration `name`;
+- ten generic string rewrites;
+- 40 `RawStmt` constructors / 39 production producers;
+- four production phase-state `VarInit` templates, six `Increment` templates,
+  and two `_prev` `Assign` templates;
+- exact helper-call counts of three `_cnt/level`, one `_cnt/parent_level`,
+  four `_pos/level`, one `_pos/parent_level`, three `_prev/level`, and one
+  generic `prefix/level`;
+- no raw `_cnt`, `_pos`, or `_prev` declaration or mutation;
+- no `std::move(` in a production `Var.name`; and
+- no prohibited or new direct string-expression `Assign` target; the same two
+  canonical member lvalues remain unchanged.
+
+#### Verification record
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, native, and
+benchmark command activated the `scorch` conda environment first. The complete
+functional candidate passed a pre-commit 18-file suite variant and the separate
+budget/producer focus; after the canonical membership discrepancy was found,
+the literal suite passed at both the committed test candidate and final tip.
+Capture and latency used the final clean committed `6483c6a` candidate in
+detached worktrees.
+
+- `pytest -q tests/test_scorch/test_llir_string_budget.py` reproduced exact base
+  `c145cdb` at 15 passed and locks final `6483c6a` at 16 passed.
+- Successive pre-commit focused runs passed 190, 366, 54, and 516 tests. The
+  exact four source anchors passed four tests, and the manager/dedup focus
+  passed two tests.
+- The pre-commit 18-file variant passed 982 tests twice. It was a passing
+  expanded noncanonical variant rather than the literal canonical command
+  because it included `test_cin_lowerer.py` and omitted the string-budget
+  file; the separate budget run supplied the omitted coverage.
+- The literal current canonical 18-file command passed 959 tests at
+  `5204300` in 155.31 seconds and at final `6483c6a` in 156.08 seconds. The
+  identical literal command at the preceding qualified-name tip passed 947
+  tests twice. The `953` recorded in the preceding section was a documentation
+  arithmetic error: it added six new `test_cin_lowerer.py` tests even though
+  that file is not in the literal command. The correct prior/current comparison
+  is therefore 947/959, not 953/959.
+- A first extracted 11-file dimensional matrix passed 390 tests but was not
+  the required historical matrix. The exact required 11-file
+  scheduler/CIN/codegen matrix passed 408 tests at `5204300` in 449.43 seconds
+  and again at final `6483c6a` in 451.80 seconds.
+- The authoritative test-candidate
+  `PYTHONPATH="$PWD:$PWD/src" pytest -q -m "not perf" tests` run passed 1,489,
+  skipped 14, and deselected three in 2,165.11 seconds. The final-tip identical
+  command passed 1,489, skipped 14, and deselected three in 2,183.47 seconds.
+  Both emitted only the inherited PyTorch sparse-invariant warning.
+- The exact stage/options/pass/cache/ownership/failure focus plus the exact CSR
+  x dense, DS, DSS, and all-COO source anchors passed 24 tests in 0.63 seconds.
+  It locks stage identity/order/timing, exact `CompileOptions` identity,
+  managed success/partial/failure records, cache identity, independent
+  compilation, caller-owned immutability, the selected owning-stage failure,
+  and later-stage suppression.
+- The DS/DSS activation focus passed three checks in 46.69 seconds. Two native
+  kernels matched their references; the DSS structural check additionally
+  locks one writer per position together with count/fill ownership and
+  completeness.
+- The post-correction seven-file changed-test focus passed 309 tests. The
+  focused and canonical reruns after the codegen cast remained green.
+- Black left all 11 changed Python files byte-identical at base and final. Both
+  logs hash to
+  `fe600974ff19c3d90dbbe9e343d7d7360e088f142b46f8ed08387047b1511dbd`.
+- Flake8 reported the exact same inherited `codegen.py` F541 finding on both
+  sides. The normalized comparison is empty and both normalized outputs hash
+  to
+  `d268ce4b2df07343537e4fb12efaf73955228f78bad6577559c888165f17bd72`.
+- Initial mypy comparison found three candidate-only narrowing errors in the
+  exact `Increment` branch. Commit `6483c6a` adds the explicit typed cast.
+  Final base/candidate mypy runs report the same 20 inherited errors in five
+  files, with an empty normalized comparison and matching normalized hash
+  `abe56b6413a41767d76625f8183c08eb4cc2e6013c41af4157f19cce0c5944a7`.
+- Strict network-enabled
+  `sphinx-build -n -b html -W --keep-going -E -a docs/source OUTPUT`
+  generated HTML on both sides and failed under `-W` only on the same 23
+  inherited unresolved-reference warnings. Normalized warning inventories are
+  byte-identical and hash to
+  `20804d54365541f1d6d34cee971fb80af1f39e56579c706e8dbef67a368e9f92`.
+- `git diff --check` is clean. Exact detached base, test-candidate, and final
+  worktrees remained clean.
+
+#### Exact source/build identity and native correctness
+
+The capture helpers re-hash to
+`605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`
+(inputs),
+`a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`
+(grid), and
+`964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`
+(workspace). The grid predecessor re-hashes to
+`f9cd3cdbecff41131cb50bf56b10766f3ba232b69dc2af146177b35c382a1d62`.
+
+Exact base and final revisions were checked out in turn at the same logical
+`cd -L /tmp/scorch-phase3-structured-access-capture-wt`; `pwd -L` preserved
+the logical `/tmp` spelling. The shared extension root was
+`/tmp/scorch-phase3-structured-access-capture-extensions`. The canonical
+capture worktree was restored to `28dcca51144c7f84008d1e39bb4050c4fb9909f0`
+afterward.
+
+Complete input, 42-cell grid, and workspace capture trees compare
+byte-for-byte. Same-root base/final manifest hashes are:
+
+- inputs:
+  `6cc2517fb97fc9e0e6c6baee9393b961ed3f6d8450194f2eb38c0b74963afd6d`;
+- grid:
+  `7a7fe3f9c05c1f0d3e624607e14f0fc9aefcb5a0b23d9e0a15900f5b7b80fa21`;
+  and
+- workspace:
+  `e37f93ce03be0146b3d353cc7852f5a1308a5b0713a84fb14fe0616845f9c2d3`.
+
+The path-sensitive canonical artifacts were also reproduced exactly on both
+sides:
+
+- manifest:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- grid:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+  and
+- workspace:
+  `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`.
+
+The exact standard source anchors remain:
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| CSR x dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+| preamble | 68,671 | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+
+The workspace sources also remain exact: all-coordinate is 3,528 bytes /
+`5c69621af52939759ffcbaed3649ef1c4461108522b614df8f8a18c86ec0560a`,
+and intermediate-coordinate is 5,252 bytes /
+`b1770961d5f9c9c7fd716bd71cb97f1d5e73c6dcf200ba378b97b65c87fbe5d7`.
+
+The DSS anchor preserves the exact multi-level declarations and boundary
+spellings: `_cnt1`, `_cnt2`, `_prev2`, `_pos1`, `_pos2`, `_cnt2++`,
+`_cnt1++`, `_prev2 = _cnt2`, `_pos2++`, `_pos1++`, and
+`_prev2 = _pos2`. The DS anchor preserves the single-level `_cnt1` and `_pos1`
+paths. Kernel names, signatures, semantic/codegen/build/full keys,
+ABI/index policy, flags, request fields and keys, prepared keys, build
+identities, storage paths, lowerer identity, and `CompileOptions` identity all
+compare exactly.
+
+Every source/build input is therefore byte-identical. The canonical runtime
+waiver applies, so no redundant M5 or Redwood grid was run. The retained M5
+artifact is
+`3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`
+and the retained Redwood artifact is
+`c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+The focused DS/DSS native checks independently establish live correctness.
+
+#### Compiler latency and activation attribution
+
+The final clean detached `6483c6a` code/test candidate was benchmarked alone
+with five warmups and 30 samples:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output /tmp/scorch-phase3-phase-state-results/latency-6483c6a-m5.json
+```
+
+No pytest, native compilation, capture, Sphinx, documentation build, or other
+benchmark controlled by this task overlapped it. An initial attempt was denied
+access to the sandboxed extension cache before sampling and created no result;
+the identical command was rerun with the required cache access.
+
+The final artifact SHA-256 is
+`b27117d925b20615fc46d042e039aa845dac098ab64a54d2d077c08f6500c51d`.
+Its metadata records exact revision
+`6483c6ae16d94613bb5f66fd1fb88cdba6550058`, detached branch, and empty
+status. The required predecessor
+`/tmp/scorch-phase3-std-move-results/latency-0282226-m5.json` re-hashes to
+`35de24307bc3574dd1e734c90d39e53e8502c15d75e8d71d6f5ffac5e7257a7c`.
+The unchanged benchmark script re-hashes to
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+The ordered predecessor/final `{name, build}` collections compare
+byte-for-byte and both hash to
+`d7dc61d5b9893bf0d72462382fc2c14edce10b6363bf7ce8a9f38f9e91834a9c`.
+
+| Case | Activation | p50 old/new ms | p50 ratio / delta ms | p95 old/new ms | p95 ratio / delta ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| small dense | Nonactivating control | 1.834459 / 1.710250 | 0.932 / -0.124209 | 2.698909 / 2.001213 | 0.741 / -0.697696 |
+| reduction | Nonactivating control | 1.591167 / 1.581167 | 0.994 / -0.010000 | 1.959310 / 1.800473 | 0.919 / -0.158837 |
+| CSR intersection | Activates DS `_cnt1`/`_pos1` state | 1.928709 / 2.018771 | 1.047 / +0.090063 | 2.743191 / 2.603902 | 0.949 / -0.139289 |
+| sparse union | Activates DS `_cnt1`/`_pos1` state | 1.878750 / 2.006084 | 1.068 / +0.127333 | 2.370960 / 2.312733 | 0.975 / -0.058227 |
+
+No overall p50 or p95 metric reaches 1.10. The complete stage-level crossing
+ledger is:
+
+| Case | Owning compiler stage | Crossing | Absolute delta |
+| --- | --- | ---: | ---: |
+| CSR intersection | LLIR-to-C++ generation | p50 1.128; p95 1.485 | +0.0089 ms; +0.0400 ms |
+| sparse union | Inclusive CIN lowering | p50 1.102 | +0.1171 ms |
+| sparse union | Legacy CIN adaptation | p95 1.125 | +0.0055 ms |
+| sparse union | LLIR-to-C++ generation | p50 1.148 | +0.0123 ms |
+
+The selected transformation is owned by the nested
+compressed-where/result-write work inside inclusive CIN lowering; typed
+statement emission is owned by LLIR-to-C++ generation. The legacy-adaptation
+crossing does not execute or inspect the selected state nodes and is a small
+unrelated timing shift. All crossings have sub-0.12 ms absolute deltas, build
+collections remain exact, and every overall endpoint remains below 1.10. No
+confirmation run or latency exception is required. DSS `_prev2` boundary state
+is absent from the fixed latency corpus and is directly activated by the exact
+DSS source and native checks.
+
+No design-document or tracked `csrc` file changed. The user-owned `.gitignore`,
+`pyproject.toml`, `src/scorch/__init__.py`,
+`tests/packaging/smoke_install.py`, and
+`tests/test_scorch/test_resources.py` modifications and all untracked material
+under `autotune-levels/`, `bench/`, `bench/bench_results/`, `research-ideas/`,
+`scratchpad/`, `src/scorch/csrc/cuda/`, and the GPU, SuiteSparse, and
+benchmark-analysis tests/modules/tools/manifests remain untouched and
+uncommitted.
+
+This closes only the narrow 12-producer structured mutable compressed
+count/fill phase-state slice. The 15 subscripts, eight calls, three members,
+N3 initializer, T1 ternary, and 40 `RawStmt` constructors / 39 production
+producers remain in the compatibility budget. Phase 3 remains open; Phase 3.5
+and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
