@@ -5364,14 +5364,331 @@ Canonical endpoint ratios are also below 1.10: 0.954/0.875, 0.914/0.838,
 compiler stage requires an adverse attribution or accepted exception.
 
 No design-document or `csrc` file changed. The user-owned `.gitignore`,
+`pyproject.toml`, `src/scorch/__init__.py`,
+`tests/packaging/smoke_install.py`, and
+`tests/test_scorch/test_resources.py` modifications and all untracked material
+under `autotune-levels/`, `bench/`, `bench/bench_results/`, `research-ideas/`,
+`scratchpad/`, `src/scorch/csrc/cuda/`, and the GPU, SuiteSparse, and
+benchmark-analysis tests/modules/tools/manifests remain untouched and
+uncommitted.
+
+This closes only the narrow Phase-3 compressed `ModeIterator` position-bound
+subscript slice. Phase 3 remains open; Phase 3.5 and LoopIR have not begun.
+
+### Phase-3 structured panel-window bound slice complete (2026-07-16)
+
+This continuation used exact base
+`609055d6cba978ca121a92eb84cb2d8eadea2e9f`. It adds the scoped production
+commit `234864cf329dc445f02c9bc00d84183496f5917f` (`refactor(compiler):
+structure panel window bounds`) and the separate scoped test commit
+`da087b1387d717a2e5e5c0998f1f14db8f9323f7` (`test(compiler): cover
+structured panel bounds`). Neither these commits nor any earlier Phase-3
+commit was amended, squashed, reordered, or rewritten. This handoff update is
+the separate documentation-only commit.
+
+#### Complete pre-implementation expression inventory
+
+The exact-base budget was reproduced before editing: 379 production `Var`
+constructors, 33 direct expression strings, 346 other arguments including
+nine known indirect sinks/clones, ten generic string rewrites, and 52
+`RawStmt` calls from 51 production producers. The 33 direct sites were audited
+by producer, consumer, exact type, ownership, reachability, source spelling,
+and compatibility interaction. The 15 remaining direct subscripts were:
+
+| ID | Producer and exact `Var.name` spelling | Consumer, type, and ownership | Reachability, compatibility interaction, and decision |
+| --- | --- | --- | --- |
+| P1 | `CINLowerer._emit_post_ops`: `f"{op.tensor_name}_val[{index_expr}]"` for add | fresh `Assign.value`; `NO_TYPE` | Unsupported untiled post-op fallback; an opaque leaf to generic name rewrites. Dormant and rejected. |
+| P2 | same producer and spelling for multiply | fresh `Assign.value`; `NO_TYPE` | Same unsupported untiled fallback and rewrite exposure as P1. Dormant and rejected. |
+| M1 | `CINLowerer.get_level_arrays`: `f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()"` | fresh compressed-position `VarInit.value`; `PTR_INT` | Live input ABI assembly. It combines two subscripts with a templated member call, so `ArrayAccess` alone is insufficient. Rejected as a Torch/member-call ABI seam. |
+| M2 | same producer: `f"{tensor.name}_mode_indices[{level}][1].data_ptr<int>()"` | fresh compressed-coordinate `VarInit.value`; `PTR_INT` | Live and ABI-bound exactly like M1. Rejected. |
+| M3 | same producer: `f"{tensor.name}_mode_indices[{level}][0]"` | fresh coordinate-tensor `VarInit.value`; `TORCH_TENSOR` | Live nested Torch storage subscript. Coherent only with the deferred mode-index ABI family, not with an isolated pointer `ArrayAccess`. Rejected. |
+| M4 | same producer: `f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()"` | fresh coordinate-pointer `VarInit.value`; `PTR_INT` | Live and ABI/member-call bound like M1. Rejected. |
+| W0 | `lower_TensorAccess`: `f"{tensor_access.tensor.name}_val[{physical_index}]"` | returned `TensorAccess` rvalue; `NO_TYPE` | Only the metadata-free compatibility fallback; supported production lowering constructs metadata and uses structured `ArrayAccess`. Nonactivating and rejected. |
+| D1 | workspace initialization: `f"{wksp.get_name()}[{wksp.tile_size_var.name}]"` | fresh `VarInit.var`; workspace scalar type | Live stack-array declarator, not an expression read. Migration would be generalized allocation/declarator work and would widen assignment/declaration targets. Prohibited and rejected. |
+| W1 | untiled workspace copy: `f"{wksp.get_name()}[{loop_var.name}]"` | fresh `Assign.value`; `NO_TYPE` | Dormant fallback; the tiled live path already uses structured `ArrayAccess`. Rejected rather than migrating an unsupported route. |
+| C1 | discarded all-COO group pre-scan: `f"{crd_array}[_p]"` | fresh comparison operand; `NO_TYPE` | Constructed only in the pre-scan tree later discarded by the scalar-accumulator fast path. No emitted production consumer. Rejected. |
+| C2 | same pre-scan: `f"{crd_array}[_p - 1]"` | fresh comparison operand; `NO_TYPE` | Same discarded tree as C1; its arithmetic index would also need a coordinated typed child. Rejected. |
+| G1 | discarded all-COO group loop: `"_group_starts[_g]"` | fresh `VarInit.value`; `INT64` | Belongs to the discarded group loop and participates in the legacy bracket-to-`.at(...)` compatibility rewrite. Migrating it alone would not affect emitted code. Rejected. |
+| G2 | same group loop: `"_group_starts[_g + 1]"` | fresh `VarInit.value`; `INT64` | Same discarded/rewrite-bound family as G1. Rejected. |
+| I1 | coordinate `ModeIterator` root-begin alternative: `f"{self._tensor_var.name}{self._level}_pos[0]"` | fresh iterator begin value; `INT` | Root coordinate lowering emits literal `0`, so this alternative does not survive into generated LLIR. Non-emitting and rejected. |
+| I2 | coordinate `ModeIterator` root-end alternative: `f"{self._tensor_var.name}{self._level}_pos[1]"` | fresh iterator end value; `INT` | Root coordinate lowering derives the end from `<crd_tensor>.size(0)`, so this alternative also does not survive lowering. Non-emitting and rejected. |
+
+The other 18 direct strings remain separate future seams and were not grouped
+with the selected work:
+
+| IDs | Category and exact source spelling | Producer/consumer/type/ownership | Reachability, rewrite interaction, and decision |
+| --- | --- | --- | --- |
+| K1/K2 | call: concatenated `f"{self.name}_values_torch." f"data_ptr<{c_datatype.value}>()"` at the dense-capacity and known-NNZ result sites | result assembler `VarInit.value`; fresh pointer-typed leaves | Live post-lowering Torch ABI assembly. Requires a templated member-call representation; rejected. |
+| K3 | call: `f"{tensor.name}_values.data_ptr<{data_type.value}>()"` | input value-pointer `VarInit.value`; fresh exact scalar pointer | Live input Torch ABI. Rejected with the other `data_ptr<T>()` calls. |
+| K4 | call: `f"{crd_tensor.name}.data_ptr<int>()"` | intermediate coordinate-pointer `VarInit.value`; fresh `PTR_INT` | Live intermediate conversion artifact; it crosses sparse-prefetch, dense-pointer, single-iteration, invariant-factor, body-assembly, and dynamic-vector traversal, but none rewrites the opaque member-call spelling. Rejected. |
+| K5 | call: `f"{val_tensor.name}.data_ptr<{data_type.value}>()"` | intermediate value-pointer `VarInit.value`; fresh scalar pointer | Same live intermediate traversal timing and representation constraint as K4. Rejected. |
+| K6 | call: `f"{tname}_values.data_ptr<{c_dtype.value}>()"` | post-op tensor-pointer `VarInit.value`; fresh scalar-pointer leaf feeding a restricted declaration target | Live post-op ABI extraction. Rejected. |
+| K7 | call: `f"{storage_name}.data()"` | compact-result schedule storage `VarInit.value`; fresh exact pointer | Live schedule-stage storage access. Encoding it as `FunctionCall(f"{storage}.data", ...)` would only move the opaque member spelling; a real migration needs the prohibited member/call-on-expression hierarchy. Rejected. |
+| K8 | call: `f"{storage_name}.data()"` | packed-operand schedule storage `VarInit.value`; fresh exact pointer | Same live schedule-stage representation constraint as K7. Rejected. |
+| B1 | member: `f"{self.name}.storage.index.mode_indices"` | result assembler `Assign.var`; fresh `NO_TYPE` lvalue | Live canonical result-storage target. Migration requires widening central `AssignmentTarget` and coordinating the Torch result ABI. Rejected. |
+| B2 | member: `f"{self.name}.storage.value"` | result assembler `Assign.var`; fresh `NO_TYPE` lvalue | Same live assignment-target/ABI seam as B1. Rejected. |
+| B3 | member: `f"{tensor.name}.storage.value"` | input storage `VarInit.value`; fresh `TORCH_TENSOR` | Dormant compatibility read and coherent only with the result/input member ABI. Rejected. |
+| N1 | initializer: `f"{{{self.name}_capacity}}"` | dense-capacity `torch::empty` argument; fresh `NO_TYPE` | Live Torch initializer-list syntax. `Array` does not model this call argument without a source/ABI decision. Rejected as its own initializer seam. |
+| N2 | initializer: `f"{{{self.known_nnz_var}}}"` | known-NNZ `torch::empty` argument; fresh `NO_TYPE` | Same live Torch initializer-list seam as N1. Rejected. |
+| N3 | initializer: `f"{{{', '.join([self._get_mode_index_set(i, lt) for i, lt in enumerate(self.level_types)])}}}"` | result `mode_indices` assignment value; fresh `NO_TYPE` | Live nested Torch result initializer and coupled to B1. Rejected. |
+| Q1/Q2 | qualified: `"torch::kInt"` | compressed position/coordinate tensor construction arguments; fresh `NO_TYPE` | Live Torch ABI constants inserted at body assembly and still traversed by dynamic-vector handling, which leaves their opaque qualified spelling unchanged. Rejected as the separate qualified-name seam. |
+| Q3 | qualified: `"torch::kInt"` | intermediate coordinate-tensor construction argument; fresh `NO_TYPE` | Live intermediate ABI constant. Rejected with Q1/Q2. |
+| T1 | ternary: `f"{outer_end_var} > 0 ? 1 : 0"` | all-COO group-count initializer; fresh `INT64` | Constructed only in the discarded group-preparation route. It needs a dedicated conditional representation and has no emitted consumer. Rejected. |
+
+The nine exact-base indirect sinks/clones were one
+`expr.name.replace(old, new)` in `cin_lowerer.py`, one dense-pointer-hoist
+`name`, the common traversal `node.name` clone, `lower_expr`, `upper_expr`, two
+`prefix_extent` sinks and one `zero_value` sink in `schedule_lowerer.py`, and
+one single-iteration `name`. The selected work retires only `lower_expr` and
+`upper_expr`. The other seven remain locked. The ten generic string-rewrite
+sites remain unchanged.
+
+#### Candidate selection and representation audit
+
+No remaining direct subscript family was simultaneously live, coherent, and
+permitted: M1-M4 are Torch ABI/member-call work; D1 is allocation/declarator
+work; P1/P2, W0/W1, C1/C2, G1/G2, and I1/I2 are dormant, discarded, or
+non-emitting. The smallest complete live production family was instead the
+paired panel-window indirect sinks. Both were created together by
+`_window_sparse_loop`, consumed as the lower and upper CSR position bounds,
+typed as `INT`, owned by schedule lowering, and emitted in every real panel
+schedule. Migrating only one would leave two representations for one window,
+so the exact two-expression pair is the narrow atomic slice.
+
+The existing node set is sufficient. `_panel_bound_expression` now builds the
+detached tree
+`Cast(INT, BinOp("-", FunctionCall("std::lower_bound", [Add(coord, begin),
+Add(coord, end), value]), coord))`. `match_mode_position_bounds` returns a
+fresh structured `ArrayAccess` for the compressed row begin instead of
+rendering it and reparsing its spelling. `_find_coordinate_array` returns a
+fresh exact `PTR_INT` base. Lower and upper trees use fresh, accurately typed
+children: row positions are `INT`, panel coordinates are `INT64`, and the
+coordinate array is `PTR_INT`. Both trees are fully built and validated before
+the schedule mutates its statement container, preserving atomic failure and
+caller-owned artifacts.
+
+`ArrayAccess` construction, validation, tensor metadata, structural equality,
+detached rewriting, precedence, exact type dispatch, unknown-child failure,
+and subclass failure were re-audited before reuse. `Cast` was the one weak
+common node on the new path, so the already-frozen node now validates an
+`Expr` child and an exact `DataType`; the common walker and rewriter validate
+forged fields; and C++ generation uses exact dispatch, fail-closed validation,
+and explicit cast precedence. Frozen dataclass equality and hashing are
+structural. The common rewriter creates detached replacements, and repeated
+rewriting does not share child objects with either its input or prior output.
+
+The emitted lower and upper spellings remain byte-for-byte:
+`(int) (std::lower_bound(coord + row_begin, coord + row_end, panel) - coord)`
+and `(int) (std::lower_bound(coord + panel_begin, coord + row_end, panel_end) -
+coord)`. Parentheses and pointer-arithmetic precedence are unchanged. Packed
+prefetch `RawStmt` spelling is unchanged.
+
+Schedule lowering runs after CIN assignment deduplication, the five managed
+LLIR passes, and their compatibility rewrites. Therefore these new trees
+cannot enter the existing consecutive dynamic-coordinate assignment-dedup
+seam, and none of the ten generic string rewrites owns them. They are rvalues,
+so `AssignmentTarget` is unchanged. Construction failure is attributed to the
+owning `schedule lowering` stage and `window_sparse_loop` pass, preserves prior
+stage/pass records and identities, and suppresses C++ generation, build,
+native execution, and cache publication.
+
+Focused coverage locks exact construction and types, frozen `Cast` fields,
+detached ownership, structural equality/hash, malformed and forged fields,
+unknown children and subclasses, deterministic preorder, detached and repeated
+rewriting, replacement ownership, byte-exact emission, cast and
+pointer-arithmetic precedence, both migrated producers, real public schedule
+activation, independent compilation, caller-owned immutability, managed
+partial records, owning-stage failure, and later-stage suppression. A budget
+regression forbids `std::lower_bound` from returning to any production
+`Var.name`.
+
+#### Locked post-slice compatibility budget
+
+The production budget is now:
+
+- 384 total `Var` constructors;
+- 33 direct expression strings: 15 subscript, eight call, three member, three
+  initializer, three qualified, one ternary, and zero arithmetic;
+- 351 other constructor arguments, including seven known indirect sinks/clones;
+- ten generic string rewrites;
+- 52 `RawStmt` constructors / 51 production producers;
+- no `std::move(` or `std::lower_bound` in a production `Var.name`; and
+- no prohibited direct string-expression `Assign` target; the same two
+  canonical member lvalues remain explicit and unchanged.
+
+#### Verification record
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, native, and
+benchmark command activated the `scorch` conda environment first. The complete
+code/test candidate was committed before capture and benchmarking, and both
+detached worktrees were clean.
+
+- `pytest -q tests/test_scorch/test_llir_string_budget.py` reproduced the exact
+  base at 12 passed and locks the candidate at 13 passed.
+- The six changed-subsystem test files, including stage timing and budget,
+  passed 397 tests in 2.14 seconds.
+- The canonical 18-file CIN/plan/options/pass/traversal/codegen/scheduler suite
+  passed 884 tests in 157.25 seconds.
+- The exact required historical 11-file scheduler/CIN/codegen matrix
+  (`test_cin_lowerer`, `test_codegen`, `test_llir_pass_manager`, the three
+  scheduler/schedule files, `test_sparse_prefetch_pass`, and the four required
+  codegen files) passed 363 tests in 448.38 seconds. An additional initially
+  extracted 11-file focus passed 273 tests in 467.78 seconds.
+- `PYTHONPATH="$PWD:$PWD/src" pytest -q -m "not perf" tests` passed 1,406,
+  skipped 14, and deselected three in 2,137.79 seconds, with only the inherited
+  PyTorch sparse-invariant warning.
+- The exact stage/options/pass/cache/ownership/failure focus passed 20 tests;
+  it explicitly locks stage identity/order/timing, `CompileOptions` identity,
+  managed pass and failure records, cache identity, independent compilation,
+  caller-owned immutability, and later-stage suppression.
+- The exact CSR x dense, DS, DSS, and all-COO source anchors passed four tests.
+- Six relevant native panel/ragged direct and compact activations passed in
+  37.09 seconds and all matched their PyTorch/reference results.
+- Black returned zero on the same 11 changed Python files at base and
+  candidate; all files were unchanged and the normalized digest is
+  `fe600974ff19c3d90dbbe9e343d7d7360e088f142b46f8ed08387047b1511dbd`.
+- Flake8 returned the same inherited `codegen.py` F541 finding at base and
+  candidate (line 416 versus shifted line 420). The normalized comparison is
+  empty; normalized base and candidate outputs are byte-identical and both
+  hash to
+  `5c52ca68037189f20b77c9462c99b24971794058eccf8bf237c3ceac3ad3f644`.
+- mypy returned the same 26 inherited errors in six files at base and
+  candidate, with no candidate-only error. The normalized comparison is empty
+  and both normalized outputs hash to
+  `974afd0dc4be27c7b4801f258e99b026c135bce5771c5a25b64bae0eaceb75d0`.
+- Strict Sphinx produced 53 HTML pages on each side and the same 23 inherited
+  unresolved-reference warnings under `-W`; the normalized warning files are
+  byte-identical and both hash to
+  `f50262f6642e5d6735ccfd07b9c1a05c1426dd9e16994357de07e35e27328981`.
+  An initial offline run added the same three inventory-fetch warnings to both
+  sides; the retained local-inventory rerun supplies the canonical 23-warning
+  comparison.
+- `git diff 609055d..da087b1 --check`, the cached diff check, the ordinary diff
+  check, and final detached-worktree status checks were clean.
+
+The two setup-only failures did not enter a product result: the first compact
+capture and latency preflight could not write the sandboxed default Torch
+extension cache. Capture was rerun identically on both sides with
+`TORCH_EXTENSIONS_DIR` under `/tmp`; the final benchmark was rerun with the
+required default cache access. The first latency comparison used unsupported
+flag-form arguments and returned only CLI usage; the recorded comparison uses
+the required positional arguments.
+
+#### Exact source/build identity and native correctness
+
+Canonical capture scripts re-hash to
+`605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`
+(inputs),
+`a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`
+(grid),
+`964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`
+(workspace), and
+`27d5ab5c291d047084689e41a10e1cebda8df51d51fbf69dbd54defdb30205c0`
+(compact/heap). Captures used a logical
+`cd -L /tmp/scorch-phase3-position-bound-identity-capture`; `pwd -L` confirmed
+the logical root, and the canonical worktree symlink was restored afterward.
+
+Base and candidate standard and compact capture directories compare
+byte-for-byte. Same-root manifests share:
+
+- inputs:
+  `49f2889dc2d6d726644495caa94d55392df97d6ad99b27ddafc70672ca7f6036`;
+- grid: `f1b83ab7a7384a07b5305c3f6897663177cb40d0a76777f10c8cd3b245b27a67`;
+- workspace:
+  `8eae0f7c8b887db53ff20b33515eed3755cfa11026fae1127ce576b394dfdfa1`;
+  and
+- compact/heap:
+  `505bba5a97d9d7f595c999d66f277d766563d26698d7f90be5e34a779d448100`.
+
+The retained canonical path-sensitive artifacts still re-hash to the required
+manifest
+`d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`,
+grid `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`,
+and workspace
+`f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`.
+The exact standard source anchors are CSR x dense 2,505 bytes /
+`36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151`,
+DS 7,117 /
+`d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f`,
+DSS 8,660 /
+`1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e`,
+all-COO 3,521 /
+`53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667`,
+and preamble 68,671 /
+`db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`;
+all complete base/candidate files compare exactly.
+
+The activating compact/heap captures are also exact. `panel_heap` is 5,414
+bytes with source SHA-256
+`5f2f59ebcd245c79746129fd50554e24698ccadc1fc30ad879d8503ce6ae02bc`,
+kernel `kernel_d0e556f1c6e6`, and build identity
+`c87be33f09cb619bedfa35473d786240f9062cb7dd07c40eb8bb0e44bf0fc5d8`.
+`full_heap` is 5,334 bytes with source SHA-256
+`4e65ab9737251480abe63687cc898adc924a1e435d9a2a629c02914662b3a476`,
+kernel `kernel_07f39c22f1ac`, and build identity
+`cc603cf55038b31fce70ffdc6652079f40eb371422f524dd4255e16f28914143`.
+The six native activations separately prove live correctness.
+
+Because every source and build input is byte-identical, the canonical runtime
+waiver applies. The retained M5 artifact re-hashes to
+`3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`
+and the Redwood artifact to
+`c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+No new M5 or Redwood runtime gate was required.
+
+#### Compiler latency and activation attribution
+
+The final clean detached `da087b1` code/test candidate was benchmarked alone
+with five warmups and 30 samples:
+
+`python tools/benchmark_compiler_ir.py latency --warmup 5 --samples 30
+--output /tmp/scorch-phase3-panel-window-results/latency-da087b1-m5.json`.
+
+No pytest, native compile/run, capture, Sphinx, documentation, or other
+benchmark process overlapped it. The candidate artifact SHA-256 is
+`d2fa48674895aacddfaf74e6d7692bb2a7c97fcb5b2bd5245c51007ed64eff4d`.
+Its metadata records revision `da087b1` and empty git status.
+The required predecessor
+`/tmp/scorch-phase3-position-bound-results/latency-27f145a-m5.json` re-hashes to
+`ea22426db76679aee026603972bbf8cfd598d1edfa0fe70381100fd140fe1553`;
+the benchmark script re-hashes to
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+All four build objects compare byte-for-byte and share digest
+`90460f1c8fb9971a93820fe49d8d46176c774e18ba059a48411a1acdbb9276e`.
+
+| Case | Panel / common `Cast` constructions | p50 old/new ms | p50 ratio / delta ms | p95 old/new ms | p95 ratio / delta ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small dense | 0 / 0 | 1.574563 / 1.573459 | 0.999 / -0.001104 | 1.754652 / 1.713006 | 0.976 / -0.041646 |
+| reduction | 0 / 0 | 1.453751 / 1.402209 | 0.965 / -0.051542 | 1.620925 / 1.706610 | 1.053 / +0.085686 |
+| CSR intersection | 0 / 12 | 1.670771 / 1.783500 | 1.067 / +0.112729 | 1.773488 / 1.918800 | 1.082 / +0.145312 |
+| sparse union | 0 / 12 | 1.731104 / 1.707334 | 0.986 / -0.023771 | 1.766927 / 1.867131 | 1.057 / +0.100204 |
+
+The canonical latency corpus contains no `schedule_lowering` stage and creates
+zero panel-window expressions. Small dense and reduction are complete
+nonactivating controls. CSR intersection and sparse union do exercise the
+common `Cast` hardening added by this slice: each constructs two initial Casts,
+clones them through the five managed passes, and therefore calls
+`Cast.__post_init__` 12 times; final C++ generation also validates and emits the
+two live Casts. Direct panel-window activation is established by the byte-exact
+panel captures and six native cases. The common-stage p50/p95 deltas are:
+small dense CIN -0.004540/+0.019930 ms and C++ -0.002000/-0.013090;
+reduction CIN -0.017080/+0.010810 and C++ -0.002150/+0.001210; CSR
+intersection CIN +0.027670/+0.068440 and C++ +0.001290/+0.005670; sparse
+union CIN -0.018460/-0.009200 and C++ -0.002600/-0.001120. With no panel-stage
+activation, exact build identity, and all endpoint ratios below 1.10, there is
+no crossing to attribute or adverse exception to accept. For CSR intersection
+and sparse union, the deltas conservatively cover common Cast validation plus
+host noise; small dense and reduction provide the host-noise controls.
+
+No design-document or `csrc` file changed. The user-owned `.gitignore`,
 `pyproject.toml`, and `src/scorch/__init__.py` modifications and all untracked
 material under `autotune-levels/`, `bench/`, `bench/bench_results/`,
 `research-ideas/`, `scratchpad/`, `src/scorch/csrc/cuda/`, and the GPU,
 SuiteSparse, and benchmark-analysis tests/modules/tools/manifests remain
 untouched and uncommitted.
 
-This closes only the narrow Phase-3 compressed `ModeIterator` position-bound
-subscript slice. Phase 3 remains open; Phase 3.5 and LoopIR have not begun.
+This closes only the narrow Phase-3 structured panel-window bound slice. Phase
+3 remains open; Phase 3.5 and LoopIR have not begun.
 
 ## Incremental Migration Plan
 
