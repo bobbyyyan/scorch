@@ -142,6 +142,12 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
         llir.FunctionCallStmt: llir.FunctionCallStmt("call", [value]),
         llir.Array: llir.Array([value, literal], llir.DataType.INT),
         llir.MemberAccess: llir.MemberAccess(value, "member"),
+        llir.MemberCall: llir.MemberCall(
+            value,
+            "member",
+            (llir.DataType.INT,),
+            (index,),
+        ),
         llir.ArrayAccess: llir.ArrayAccess(value, index),
         llir.ForLoop: llir.ForLoop(
             init=None,
@@ -298,6 +304,34 @@ def test_function_call_walker_has_deterministic_preorder() -> None:
         "Var:values",
         "QualifiedName:torch::kFloat32",
     ]
+
+
+def test_member_call_walker_visits_base_then_arguments_in_deterministic_order() -> None:
+    expression = llir.MemberCall(
+        base=llir.MemberAccess(_var("tensor"), "storage"),
+        member="select",
+        template_args=(llir.DataType.FLOAT32,),
+        args=(
+            llir.Add(_var("index"), llir.Literal(1)),
+            llir.QualifiedName(
+                "torch",
+                "kFloat32",
+                llir.DataType.TORCH_SCALAR_TYPE,
+            ),
+        ),
+    )
+
+    expected = [
+        "MemberCall",
+        "MemberAccess",
+        "Var:tensor",
+        "Add",
+        "Var:index",
+        "Literal:1",
+        "QualifiedName:torch::kFloat32",
+    ]
+    assert _record(expression) == expected
+    assert _record(expression) == expected
 
 
 def test_increment_walker_has_deterministic_preorder() -> None:
@@ -705,6 +739,23 @@ def test_unknown_member_access_subclass_fails_closed(operation: str) -> None:
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_member_call_subclass_fails_closed(operation: str) -> None:
+    class UnknownMemberCall(llir.MemberCall):
+        pass
+
+    unknown = UnknownMemberCall(_var("tensor"), "data")
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownMemberCall"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_unknown_function_call_subclass_fails_closed(operation: str) -> None:
     class UnknownFunctionCall(llir.FunctionCall):
         pass
@@ -818,14 +869,25 @@ def test_cast_unknown_child_reports_exact_path(operation: str) -> None:
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
-def test_unknown_assignment_target_subclass_fails_closed(operation: str) -> None:
+@pytest.mark.parametrize("target_kind", ["array", "member"])
+def test_unknown_assignment_target_subclass_fails_closed(
+    operation: str,
+    target_kind: str,
+) -> None:
     class UnknownArrayAccess(llir.ArrayAccess):
+        pass
+
+    class UnknownMemberAccess(llir.MemberAccess):
         pass
 
     assignment = llir.Assign(_var("output"), llir.Literal(1))
     assignment.var = cast(
         llir.AssignmentTarget,
-        UnknownArrayAccess(_var("values"), _var("index")),
+        (
+            UnknownArrayAccess(_var("values"), _var("index"))
+            if target_kind == "array"
+            else UnknownMemberAccess(_var("output"), "value")
+        ),
     )
 
     with pytest.raises(LLIRTraversalError) as raised:
@@ -834,7 +896,9 @@ def test_unknown_assignment_target_subclass_fails_closed(operation: str) -> None
         else:
             LLIRRewriter(_CONTEXT).rewrite(assignment)
 
-    assert raised.value.diagnostic.node_type == "UnknownArrayAccess"
+    assert raised.value.diagnostic.node_type == (
+        "UnknownArrayAccess" if target_kind == "array" else "UnknownMemberAccess"
+    )
     assert raised.value.diagnostic.code == "unknown_llir_node"
     assert raised.value.diagnostic.path == ("root", "var")
 
@@ -871,6 +935,33 @@ def test_member_access_unknown_child_reports_exact_path(operation: str) -> None:
     assert raised.value.diagnostic.node_type == "UnknownExpr"
     assert raised.value.diagnostic.code == "unknown_llir_node"
     assert raised.value.diagnostic.path == ("root", "base")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize("child", ["base", "argument"])
+def test_member_call_unknown_children_report_exact_paths(
+    operation: str,
+    child: str,
+) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    call = (
+        llir.MemberCall(UnknownExpr(), "data")
+        if child == "base"
+        else llir.MemberCall(_var("tensor"), "at", args=(UnknownExpr(),))
+    )
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(call)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(call)
+
+    assert raised.value.diagnostic.node_type == "UnknownExpr"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == (
+        ("root", "base") if child == "base" else ("root", "args", "[0]")
+    )
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -1015,8 +1106,74 @@ def test_forged_member_access_fields_fail_at_traversal_boundary(
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
 @pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        ("base", "invalid_member_call_base", ("root", "base")),
+        ("member", "invalid_member_call_member", ("root", "member")),
+        (
+            "template_args",
+            "invalid_member_call_template_args",
+            ("root", "template_args"),
+        ),
+        (
+            "template_arg",
+            "invalid_member_call_template_arg",
+            ("root", "template_args", "[0]"),
+        ),
+        ("args", "invalid_member_call_args", ("root", "args")),
+        (
+            "argument",
+            "invalid_member_call_argument",
+            ("root", "args", "[0]"),
+        ),
+    ),
+)
+def test_forged_member_call_fields_fail_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    call = object.__new__(llir.MemberCall)
+    object.__setattr__(call, "base", _var("tensor"))
+    object.__setattr__(call, "member", "data_ptr")
+    object.__setattr__(call, "template_args", (llir.DataType.FLOAT32,))
+    object.__setattr__(call, "args", (_var("argument"),))
+    if malformation == "base":
+        object.__setattr__(call, "base", "tensor")
+    elif malformation == "member":
+        object.__setattr__(call, "member", "tensor.data_ptr")
+    elif malformation == "template_args":
+        object.__setattr__(call, "template_args", [llir.DataType.FLOAT32])
+    elif malformation == "template_arg":
+        object.__setattr__(call, "template_args", ("float",))
+    elif malformation == "args":
+        object.__setattr__(call, "args", [_var("argument")])
+    else:
+        object.__setattr__(call, "args", ("argument",))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(call)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(call)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
     "malformation",
-    ["rvalue", "rvalue_name", "array_base", "flat_index", "read_role"],
+    [
+        "rvalue",
+        "rvalue_name",
+        "opaque_member_expression",
+        "member_root",
+        "array_base",
+        "flat_index",
+        "read_role",
+    ],
 )
 def test_forged_malformed_assignment_target_fails_at_traversal_boundary(
     operation: str,
@@ -1027,6 +1184,13 @@ def test_forged_malformed_assignment_target_fails_at_traversal_boundary(
         assignment.var = cast(llir.AssignmentTarget, llir.Literal(0))
     elif malformation == "rvalue_name":
         assignment.var = _var("left + right")
+    elif malformation == "opaque_member_expression":
+        assignment.var = _var("Result.storage.value[0]")
+    elif malformation == "member_root":
+        assignment.var = llir.MemberAccess(
+            llir.Add(_var("Result"), _var("offset")),
+            "storage",
+        )
     elif malformation == "array_base":
         assignment.var = llir.ArrayAccess(
             llir.Add(_var("values"), _var("offset")),
@@ -1057,6 +1221,31 @@ def test_forged_malformed_assignment_target_fails_at_traversal_boundary(
 
     assert raised.value.diagnostic.code == "invalid_assignment_target"
     assert raised.value.diagnostic.path == ("root", "var")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_nested_member_assignment_target_subclass_fails_closed(
+    operation: str,
+) -> None:
+    class UnknownMemberAccess(llir.MemberAccess):
+        pass
+
+    target = llir.MemberAccess(
+        UnknownMemberAccess(_var("Result"), "storage"),
+        "value",
+    )
+    assignment = llir.Assign(_var("output"), llir.Literal(1))
+    assignment.var = target
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(assignment)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(assignment)
+
+    assert raised.value.diagnostic.node_type == "UnknownMemberAccess"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", "var", "base")
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -1452,6 +1641,134 @@ def test_member_access_identity_rewrite_is_detached_idempotent_and_owned() -> No
     cast(llir.Var, first_member.base).name = "owned"
     assert cast(llir.Var, original_member.base).name == "it"
     assert cast(llir.Var, second_member.base).name == "it"
+
+
+def test_member_call_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original = llir.MemberCall(
+        base=llir.MemberAccess(
+            _var("tensor", llir.DataType.TORCH_TENSOR),
+            "storage",
+        ),
+        member="select",
+        template_args=(llir.DataType.FLOAT32,),
+        args=(
+            llir.Add(
+                _var("index", llir.DataType.INT64),
+                llir.Literal(1, llir.DataType.INT64),
+            ),
+        ),
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.MemberCall, rewriter.rewrite(original))
+    second = cast(llir.MemberCall, rewriter.rewrite(first))
+
+    assert _record(original) == _record(first) == _record(second)
+    assert original == first == second
+    assert hash(original) == hash(first) == hash(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    assert type(first.template_args) is tuple
+    assert type(first.args) is tuple
+    assert first.template_args == (llir.DataType.FLOAT32,)
+
+    original_base = cast(llir.MemberAccess, original.base)
+    first_base = cast(llir.MemberAccess, first.base)
+    second_base = cast(llir.MemberAccess, second.base)
+    assert first_base is not original_base
+    assert second_base is not first_base
+    assert first_base.base is not original_base.base
+    assert second_base.base is not first_base.base
+    assert first.args[0] is not original.args[0]
+    assert second.args[0] is not first.args[0]
+
+    cast(llir.Var, first_base.base).name = "owned"
+    assert cast(llir.Var, original_base.base).name == "tensor"
+    assert cast(llir.Var, second_base.base).name == "tensor"
+
+    class ReplaceMemberCallVars(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "tensor":
+                rewritten.name = "replacement_tensor"
+            elif node.name == "index":
+                rewritten.name = "replacement_index"
+            return rewritten
+
+    replacement = cast(
+        llir.MemberCall,
+        ReplaceMemberCallVars(_CONTEXT).rewrite(original),
+    )
+    replacement_base = cast(llir.MemberAccess, replacement.base)
+    replacement_argument = cast(llir.Add, replacement.args[0])
+    assert cast(llir.Var, replacement_base.base).name == "replacement_tensor"
+    assert cast(llir.Var, replacement_argument.left).name == "replacement_index"
+    assert replacement_base is not original_base
+    assert replacement_base.base is not original_base.base
+    assert replacement_argument is not original.args[0]
+    assert cast(llir.Var, original_base.base).name == "tensor"
+    assert cast(llir.Var, cast(llir.Add, original.args[0]).left).name == "index"
+
+
+def test_nested_member_assignment_target_walk_and_rewrite_are_structural() -> None:
+    target = llir.MemberAccess(
+        llir.MemberAccess(
+            _var("Result", llir.DataType.TACO_TENSOR),
+            "storage",
+        ),
+        "value",
+    )
+    assignment = llir.Assign(
+        target,
+        _var("Result_values_torch", llir.DataType.TORCH_TENSOR),
+    )
+
+    expected_record = [
+        "Assign",
+        "MemberAccess",
+        "MemberAccess",
+        "Var:Result",
+        "Var:Result_values_torch",
+    ]
+    assert _record(assignment) == expected_record
+    assert _record(assignment) == expected_record
+
+    rewriter = LLIRRewriter(_CONTEXT)
+    first = cast(llir.Assign, rewriter.rewrite(assignment))
+    second = cast(llir.Assign, rewriter.rewrite(first))
+    assert _record(first) == _record(second) == expected_record
+    assert _structural_snapshot(assignment) == _structural_snapshot(first)
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert _mutable_ir_ids(assignment).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+
+    first_target = cast(llir.MemberAccess, first.var)
+    first_inner = cast(llir.MemberAccess, first_target.base)
+    second_target = cast(llir.MemberAccess, second.var)
+    second_inner = cast(llir.MemberAccess, second_target.base)
+    original_inner = cast(llir.MemberAccess, target.base)
+    assert first_target is not target
+    assert first_inner is not original_inner
+    assert second_target is not first_target
+    assert second_inner is not first_inner
+    assert first_inner.base is not original_inner.base
+    assert second_inner.base is not first_inner.base
+
+    class ReplaceMemberRoot(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "Result":
+                rewritten.name = "Replacement"
+            return rewritten
+
+    replacement = cast(llir.Assign, ReplaceMemberRoot(_CONTEXT).rewrite(assignment))
+    replacement_target = cast(llir.MemberAccess, replacement.var)
+    replacement_inner = cast(llir.MemberAccess, replacement_target.base)
+    assert cast(llir.Var, replacement_inner.base).name == "Replacement"
+    assert replacement_target is not target
+    assert replacement_inner is not original_inner
+    assert replacement_inner.base is not original_inner.base
+    assert cast(llir.Var, original_inner.base).name == "Result"
 
 
 def test_increment_rewrite_is_detached_repeatable_and_replacement_owned() -> None:

@@ -168,6 +168,28 @@ def _lower_with_assignments(stmt: ForAll) -> tuple[str, list[llir.Assign]]:
     return LLIRLowerer().lower_llir(lowered), assignments
 
 
+def _lower_with_var_initializers(stmt: ForAll) -> tuple[str, list[llir.VarInit]]:
+    lowered = CINLowerer().lower_IndexStmt(stmt)
+    initializers: list[llir.VarInit] = []
+
+    class VarInitializerCollector(LLIRWalker):
+        def visit_var_init(
+            self,
+            node: llir.VarInit,
+            path: tuple[str, ...],
+        ) -> None:
+            initializers.append(node)
+            super().visit_var_init(node, path)
+
+    VarInitializerCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_var_initializers",
+        )
+    ).walk(lowered)
+    return LLIRLowerer().lower_llir(lowered), initializers
+
+
 def _loop_chain(stmt):
     names = []
     body = (
@@ -905,6 +927,87 @@ def test_packed_relayout_is_structural_and_name_independent():
     )
 
 
+@pytest.mark.parametrize(
+    ("dtype", "pointer_type", "vector_type", "cpp_scalar"),
+    [
+        (
+            torch.float32,
+            llir.DataType.PTR_FLOAT32,
+            llir.DataType.STD_VECTOR_FLOAT32,
+            "float",
+        ),
+        (
+            torch.float64,
+            llir.DataType.PTR_FLOAT64,
+            llir.DataType.STD_VECTOR_FLOAT64,
+            "double",
+        ),
+    ],
+)
+def test_packed_relayout_data_call_is_typed_owned_and_byte_exact(
+    dtype: torch.dtype,
+    pointer_type: llir.DataType,
+    vector_type: llir.DataType,
+    cpp_scalar: str,
+):
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+    )
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=dtype),
+        schedule,
+    )
+
+    first_cpp, first_initializers = _lower_with_var_initializers(scheduled)
+    second_cpp, second_initializers = _lower_with_var_initializers(scheduled)
+
+    def packed_pointer(initializers: list[llir.VarInit]) -> llir.VarInit:
+        matches = [
+            node for node in initializers if node.var.name == "packed_DenseInput"
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    first = packed_pointer(first_initializers)
+    second = packed_pointer(second_initializers)
+    assert type(first.value) is llir.MemberCall
+    assert type(second.value) is llir.MemberCall
+    first_call = cast(llir.MemberCall, first.value)
+    second_call = cast(llir.MemberCall, second.value)
+
+    assert first.var == llir.Var(
+        "packed_DenseInput",
+        pointer_type,
+        is_restrict=True,
+    )
+    assert first.var.type is pointer_type
+    assert first_call.base == llir.Var(
+        "packed_DenseInput_storage",
+        vector_type,
+    )
+    assert type(first_call.base) is llir.Var
+    assert first_call.base.type is vector_type
+    assert first_call.member == "data"
+    assert first_call.template_args == ()
+    assert first_call.args == ()
+    assert first == second
+    assert first is not second
+    assert first.var is not second.var
+    assert first_call is not second_call
+    assert first_call.base is not second_call.base
+
+    expected = (
+        f"{cpp_scalar}* __restrict__ packed_DenseInput = "
+        "packed_DenseInput_storage.data();"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected
+    assert first_cpp == second_cpp
+    assert first_cpp.count(expected) == 1
+
+
 def test_full_stage_and_heap_result_are_structural_and_name_independent():
     schedule = _packed_schedule(
         row="row",
@@ -954,6 +1057,86 @@ def test_full_stage_and_heap_result_are_structural_and_name_independent():
         "tiled_Output": llir.DataType.PTR_FLOAT32,
         "Output_values": llir.DataType.PTR_FLOAT32,
     }
+
+
+@pytest.mark.parametrize(
+    ("dtype", "pointer_type", "vector_type", "cpp_scalar"),
+    [
+        (
+            torch.float32,
+            llir.DataType.PTR_FLOAT32,
+            llir.DataType.STD_VECTOR_FLOAT32,
+            "float",
+        ),
+        (
+            torch.float64,
+            llir.DataType.PTR_FLOAT64,
+            llir.DataType.STD_VECTOR_FLOAT64,
+            "double",
+        ),
+    ],
+)
+def test_heap_result_data_call_is_typed_owned_and_byte_exact(
+    dtype: torch.dtype,
+    pointer_type: llir.DataType,
+    vector_type: llir.DataType,
+    cpp_scalar: str,
+):
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope="free",
+        accum="heap",
+    )
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=dtype),
+        schedule,
+    )
+
+    first_cpp, first_initializers = _lower_with_var_initializers(scheduled)
+    second_cpp, second_initializers = _lower_with_var_initializers(scheduled)
+
+    def compact_pointer(initializers: list[llir.VarInit]) -> llir.VarInit:
+        matches = [node for node in initializers if node.var.name == "tiled_Output"]
+        assert len(matches) == 1
+        return matches[0]
+
+    first = compact_pointer(first_initializers)
+    second = compact_pointer(second_initializers)
+    assert type(first.value) is llir.MemberCall
+    assert type(second.value) is llir.MemberCall
+    first_call = cast(llir.MemberCall, first.value)
+    second_call = cast(llir.MemberCall, second.value)
+
+    assert first.var == llir.Var(
+        "tiled_Output",
+        pointer_type,
+        is_restrict=True,
+    )
+    assert first.var.type is pointer_type
+    assert first_call.base == llir.Var(
+        "tiled_Output_storage",
+        vector_type,
+    )
+    assert type(first_call.base) is llir.Var
+    assert first_call.base.type is vector_type
+    assert first_call.member == "data"
+    assert first_call.template_args == ()
+    assert first_call.args == ()
+    assert first == second
+    assert first is not second
+    assert first.var is not second.var
+    assert first_call is not second_call
+    assert first_call.base is not second_call.base
+
+    expected = (
+        f"{cpp_scalar}* __restrict__ tiled_Output = " "tiled_Output_storage.data();"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected
+    assert first_cpp == second_cpp
+    assert first_cpp.count(expected) == 1
 
 
 def test_heap_result_copy_read_is_frozen_structured_and_independently_owned():

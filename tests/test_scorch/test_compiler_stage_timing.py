@@ -2305,6 +2305,102 @@ def test_malformed_assembled_call_fails_its_owner_and_suppresses_later_stages(
     assert suppressed.value.diagnostic.code == "failed_compilation"
 
 
+def test_malformed_assembled_member_call_fails_owner_and_suppresses_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _explicit_options()
+    context = CompilationContext(options)
+    original_assembly = ResultTensorAssembler.emit_final_assembly
+    malformed_indices: list[int] = []
+
+    def emit_malformed_call(self: ResultTensorAssembler) -> list[llir.Stmt]:
+        assembled = original_assembly(self)
+        malformed_indices.append(len(assembled))
+        malformed = object.__new__(llir.MemberCall)
+        object.__setattr__(
+            malformed,
+            "base",
+            llir.Var("values_torch", llir.DataType.TORCH_TENSOR),
+        )
+        object.__setattr__(malformed, "member", "data_ptr")
+        object.__setattr__(malformed, "template_args", (llir.DataType.FLOAT32,))
+        object.__setattr__(malformed, "args", [])
+        return [
+            *assembled,
+            llir.VarInit(
+                llir.Var("malformed_data", llir.DataType.PTR_FLOAT32),
+                malformed,
+            ),
+        ]
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_final_assembly",
+        emit_malformed_call,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *_spmm_specs(),
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert malformed_indices and len(malformed_indices) == 1
+    assert failure.value.diagnostic.code == "invalid_member_call_args"
+    assert failure.value.diagnostic.path == (
+        "root",
+        "[31]",
+        "value",
+        "args",
+    )
+    assert failure.value.diagnostic.stage == "LLIR rewrite"
+    assert failure.value.diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert _stage_values(context) == [
+        *_EINSUM_PREFIX_THROUGH_ADAPTER,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    ]
+    assert context.stage_run_records[-1].nested_within is CompilerStageId.CIN_LOWERING
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(len(context.stage_run_records))
+    )
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert later_calls == []
+    assert context.compile_options is options
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
 @pytest.mark.parametrize("route", ("dense_capacity", "known_nnz"))
 def test_malformed_torch_empty_extent_fails_dynamic_owner_and_suppresses_later_stages(
     monkeypatch: pytest.MonkeyPatch,

@@ -618,6 +618,115 @@ def test_function_call_rejects_non_expression_arguments() -> None:
         llir.FunctionCall("call", [cast(llir.Expr, "argument")])
 
 
+def test_member_call_is_frozen_typed_owned_and_structurally_equal() -> None:
+    base = llir.Var("tensor", llir.DataType.TORCH_TENSOR)
+    argument = llir.Var("offset", llir.DataType.INT64)
+    caller_template_args = [llir.DataType.FLOAT32]
+    caller_args = [argument]
+    call = llir.MemberCall(
+        base=base,
+        member="data_ptr",
+        template_args=caller_template_args,
+        args=caller_args,
+    )
+    equal = llir.MemberCall(
+        base=llir.Var("tensor", llir.DataType.TORCH_TENSOR),
+        member="data_ptr",
+        template_args=(llir.DataType.FLOAT32,),
+        args=(llir.Var("offset", llir.DataType.INT64),),
+    )
+
+    caller_template_args.append(llir.DataType.INT)
+    caller_args.append(_var("later"))
+
+    assert call.base is base
+    assert call.member == "data_ptr"
+    assert type(call.template_args) is tuple
+    assert call.template_args == (llir.DataType.FLOAT32,)
+    assert type(call.args) is tuple
+    assert call.args == (argument,)
+    assert call == equal
+    assert hash(call) == hash(equal)
+    assert call != llir.MemberCall(
+        llir.Var("other", llir.DataType.TORCH_TENSOR),
+        "data_ptr",
+        (llir.DataType.FLOAT32,),
+        (llir.Var("offset", llir.DataType.INT64),),
+    )
+    assert call != llir.MemberCall(
+        llir.Var("tensor", llir.DataType.TORCH_TENSOR),
+        "data_ptr",
+        (llir.DataType.FLOAT64,),
+        (llir.Var("offset", llir.DataType.INT64),),
+    )
+    assert get_type_hints(llir.MemberCall) == {
+        "base": llir.Expr,
+        "member": str,
+        "template_args": Tuple[llir.DataType, ...],
+        "args": Tuple[llir.Expr, ...],
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        call.base = _var("other")
+    with pytest.raises(FrozenInstanceError):
+        call.member = "data"
+    with pytest.raises(FrozenInstanceError):
+        call.template_args = ()
+    with pytest.raises(FrozenInstanceError):
+        call.args = ()
+
+
+def test_member_call_defaults_are_independent_empty_immutable_tuples() -> None:
+    first = llir.MemberCall(_var("first"), "data")
+    second = llir.MemberCall(_var("second"), "data")
+
+    assert first.template_args == second.template_args == ()
+    assert first.args == second.args == ()
+    assert type(first.template_args) is tuple
+    assert type(first.args) is tuple
+
+
+@pytest.mark.parametrize("member", ("", "first.second", 1, None))
+def test_member_call_rejects_malformed_base_and_member(member: object) -> None:
+    with pytest.raises(TypeError, match="MemberCall.member"):
+        llir.MemberCall(_var("tensor"), cast(str, member))
+
+    with pytest.raises(TypeError, match="MemberCall.base"):
+        llir.MemberCall(cast(llir.Expr, "tensor"), "data")
+
+
+@pytest.mark.parametrize(
+    "template_args",
+    ("float", {llir.DataType.FLOAT32}, llir.DataType.FLOAT32),
+)
+def test_member_call_rejects_malformed_template_argument_containers(
+    template_args: object,
+) -> None:
+    with pytest.raises(TypeError, match="template_args must be a list or tuple"):
+        llir.MemberCall(
+            _var("tensor"),
+            "data_ptr",
+            template_args=cast(Any, template_args),
+        )
+
+
+def test_member_call_rejects_malformed_template_arguments_and_call_arguments() -> None:
+    with pytest.raises(TypeError, match="contain only DataType values"):
+        llir.MemberCall(
+            _var("tensor"),
+            "data_ptr",
+            template_args=[cast(llir.DataType, "float")],
+        )
+    with pytest.raises(TypeError, match="args must be a list or tuple"):
+        llir.MemberCall(_var("tensor"), "at", args=cast(Any, "index"))
+    with pytest.raises(TypeError, match="contain only LLIR expressions"):
+        llir.MemberCall(
+            _var("tensor"),
+            "at",
+            args=[cast(llir.Expr, "index")],
+        )
+
+
 def test_array_is_frozen_typed_owned_and_structurally_equal() -> None:
     value = _var("extent")
     caller_values = [value]
@@ -758,6 +867,61 @@ def test_nested_function_call_codegen_is_byte_exact_and_postfix_correct() -> Non
 @pytest.mark.parametrize(
     ("expression", "expected"),
     (
+        (
+            llir.MemberCall(
+                llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+                "data",
+            ),
+            "storage.data()",
+        ),
+        (
+            llir.MemberCall(
+                llir.Var("tensor", llir.DataType.TORCH_TENSOR),
+                "data_ptr",
+                template_args=(llir.DataType.FLOAT32,),
+            ),
+            "tensor.data_ptr<float>()",
+        ),
+        (
+            llir.MemberCall(
+                llir.ArrayAccess(_var("tensors"), _var("i")),
+                "data_ptr",
+                template_args=(llir.DataType.INT,),
+            ),
+            "tensors[i].data_ptr<int>()",
+        ),
+        (
+            llir.MemberCall(
+                llir.MemberAccess(_var("owner"), "storage"),
+                "at",
+                template_args=(llir.DataType.INT, llir.DataType.INT64),
+                args=(llir.Add(_var("i"), llir.Literal(1)),),
+            ),
+            "owner.storage.at<int, int64_t>(i + 1)",
+        ),
+        (
+            llir.MemberCall(
+                llir.BinOp("+", _var("owner"), _var("offset")),
+                "data",
+            ),
+            "(owner + offset).data()",
+        ),
+        (
+            llir.MemberCall(llir.FunctionCall("factory"), "data"),
+            "factory().data()",
+        ),
+    ),
+)
+def test_member_call_codegen_is_byte_exact_typed_and_precedence_correct(
+    expression: llir.MemberCall,
+    expected: str,
+) -> None:
+    assert LLIRLowerer().lower_llir(expression) == expected
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
         (llir.MemberAccess(_var("it"), "second"), "it.second"),
         (
             llir.ArrayAccess(
@@ -884,7 +1048,7 @@ def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None
     assert assignment == equal_assignment
     assert assignment != llir.Assign(target, llir.Literal(3), llir.AssignOp.MUL_ASSIGN)
     assert get_type_hints(llir.Assign) == {
-        "var": Union[llir.Var, llir.ArrayAccess],
+        "var": Union[llir.Var, llir.MemberAccess, llir.ArrayAccess],
         "value": llir.Expr,
         "op": llir.AssignOp,
         "cast": bool,
@@ -899,17 +1063,22 @@ def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None
 @pytest.mark.parametrize(
     ("target", "message"),
     (
-        (llir.Literal(1), "exact Var or ArrayAccess"),
-        (llir.FunctionCall("target"), "exact Var or ArrayAccess"),
-        (llir.MemberAccess(_var("target"), "member"), "exact Var or ArrayAccess"),
+        (llir.Literal(1), "exact Var, MemberAccess, or ArrayAccess"),
+        (
+            llir.FunctionCall("target"),
+            "exact Var, MemberAccess, or ArrayAccess",
+        ),
         (
             llir.QualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
-            "exact Var or ArrayAccess",
+            "exact Var, MemberAccess, or ArrayAccess",
         ),
-        (_var("values[i]"), "identifier or member path"),
-        (_var("call()"), "identifier or member path"),
-        (_var("left + right"), "identifier or member path"),
-        (_var("42"), "identifier or member path"),
+        (_var("values[i]"), "assignment Var.name must be an identifier or member path"),
+        (_var("call()"), "assignment Var.name must be an identifier or member path"),
+        (
+            _var("left + right"),
+            "assignment Var.name must be an identifier or member path",
+        ),
+        (_var("42"), "assignment Var.name must be an identifier or member path"),
         (
             llir.ArrayAccess(
                 llir.BinOp("+", _var("values"), _var("offset")), _var("i")
@@ -994,11 +1163,19 @@ def test_assign_rejects_target_subclasses_and_invalid_fields() -> None:
     class UnknownArrayAccess(llir.ArrayAccess):
         pass
 
-    with pytest.raises(TypeError, match="exact Var or ArrayAccess"):
+    class UnknownMemberAccess(llir.MemberAccess):
+        pass
+
+    with pytest.raises(TypeError, match="exact Var, MemberAccess, or ArrayAccess"):
         llir.Assign(UnknownVar("value", llir.DataType.INT), llir.Literal(1))
-    with pytest.raises(TypeError, match="exact Var or ArrayAccess"):
+    with pytest.raises(TypeError, match="exact Var, MemberAccess, or ArrayAccess"):
         llir.Assign(
             UnknownArrayAccess(_var("values"), _var("i")),
+            llir.Literal(1),
+        )
+    with pytest.raises(TypeError, match="exact Var, MemberAccess, or ArrayAccess"):
+        llir.Assign(
+            UnknownMemberAccess(_var("value"), "member"),
             llir.Literal(1),
         )
     with pytest.raises(TypeError, match="unsupported LLIR expression"):
@@ -1036,6 +1213,79 @@ def test_assign_cast_is_scalar_only_and_emits_the_existing_spelling() -> None:
             llir.Literal(1),
             cast=True,
         )
+
+
+def test_nested_member_assignment_target_is_structured_and_byte_exact() -> None:
+    target = llir.MemberAccess(
+        llir.MemberAccess(
+            llir.MemberAccess(
+                llir.Var("Result", llir.DataType.TACO_TENSOR),
+                "storage",
+            ),
+            "index",
+        ),
+        "mode_indices",
+    )
+    value = llir.Array(
+        (
+            llir.Array((), llir.DataType.STD_VECTOR_TORCH_TENSOR),
+            llir.Array(
+                (
+                    llir.Var("Result1_pos_torch", llir.DataType.TORCH_TENSOR),
+                    llir.Var("Result1_crd_torch", llir.DataType.TORCH_TENSOR),
+                ),
+                llir.DataType.STD_VECTOR_TORCH_TENSOR,
+            ),
+        ),
+        llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
+    )
+    assignment = llir.Assign(target, value)
+
+    assert assignment.var is target
+    assert LLIRLowerer().lower_llir(assignment) == (
+        "Result.storage.index.mode_indices = "
+        "{{}, {Result1_pos_torch, Result1_crd_torch}};"
+    )
+
+    # The transitional grammar still accepts an existing dotted Var lvalue;
+    # the production string budget separately prevents migrated producers from
+    # reintroducing one.
+    compatibility_assignment = llir.Assign(
+        _var("Result.storage.value"),
+        _var("Result_values_torch"),
+    )
+    assert LLIRLowerer().lower_llir(compatibility_assignment) == (
+        "Result.storage.value = Result_values_torch;"
+    )
+
+
+def test_nested_member_assignment_rejects_invalid_roots_and_bases() -> None:
+    class UnknownVar(llir.Var):
+        pass
+
+    class UnknownMemberAccess(llir.MemberAccess):
+        pass
+
+    invalid_targets = (
+        llir.MemberAccess(
+            llir.BinOp("+", _var("Result"), _var("offset")),
+            "storage",
+        ),
+        llir.MemberAccess(
+            UnknownVar("Result", llir.DataType.TACO_TENSOR),
+            "storage",
+        ),
+        llir.MemberAccess(
+            UnknownMemberAccess(
+                llir.Var("Result", llir.DataType.TACO_TENSOR),
+                "storage",
+            ),
+            "value",
+        ),
+    )
+    for target in invalid_targets:
+        with pytest.raises(TypeError, match="exact Var root through exact"):
+            llir.Assign(target, llir.Literal(1))
 
 
 def test_indexed_assign_accepts_a_structured_member_call_index() -> None:
@@ -1284,6 +1534,23 @@ def test_codegen_rejects_member_access_subclasses_and_unknown_children() -> None
         LLIRLowerer().lower_llir(llir.MemberAccess(UnknownExpr(), "second"))
 
 
+def test_codegen_rejects_member_call_subclasses_and_unknown_children() -> None:
+    class UnknownMemberCall(llir.MemberCall):
+        pass
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownMemberCall"):
+        LLIRLowerer().lower_llir(UnknownMemberCall(_var("tensor"), "data"))
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(llir.MemberCall(UnknownExpr(), "data"))
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(
+            llir.MemberCall(_var("tensor"), "at", args=(UnknownExpr(),))
+        )
+
+
 def test_codegen_rejects_function_call_subclasses_and_unknown_children() -> None:
     class UnknownFunctionCall(llir.FunctionCall):
         pass
@@ -1330,6 +1597,39 @@ def test_codegen_rejects_forged_member_access_fields(malformation: str) -> None:
 
     with pytest.raises(CodegenError, match=expected):
         LLIRLowerer().lower_llir(access)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ("base", "member", "template_args", "template_arg", "args", "argument"),
+)
+def test_codegen_rejects_forged_member_call_fields(malformation: str) -> None:
+    call = object.__new__(llir.MemberCall)
+    object.__setattr__(call, "base", _var("tensor"))
+    object.__setattr__(call, "member", "data_ptr")
+    object.__setattr__(call, "template_args", (llir.DataType.FLOAT32,))
+    object.__setattr__(call, "args", (_var("argument"),))
+    if malformation == "base":
+        object.__setattr__(call, "base", "tensor")
+        expected = "MemberCall.base"
+    elif malformation == "member":
+        object.__setattr__(call, "member", "tensor.data_ptr")
+        expected = "MemberCall.member"
+    elif malformation == "template_args":
+        object.__setattr__(call, "template_args", [llir.DataType.FLOAT32])
+        expected = "MemberCall.template_args"
+    elif malformation == "template_arg":
+        object.__setattr__(call, "template_args", ("float",))
+        expected = "MemberCall.template_args"
+    elif malformation == "args":
+        object.__setattr__(call, "args", [_var("argument")])
+        expected = "MemberCall.args"
+    else:
+        object.__setattr__(call, "args", ("argument",))
+        expected = "MemberCall.args"
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(call)
 
 
 def test_function_codegen_rejects_non_var_argument() -> None:

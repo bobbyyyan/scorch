@@ -37,6 +37,11 @@ from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Scheduler,
     regblock_force,
 )
+from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
+    mode_index_tensor,
+    tensor_data_ptr,
+    tensor_storage_member,
+)
 from scorch.format import LevelType  # type: ignore[import-untyped]
 
 
@@ -250,6 +255,146 @@ def _assert_torch_qualified_name(
     return qualified
 
 
+def _assert_data_ptr_call(
+    expression: llir.Expr,
+    data_type: llir.DataType,
+) -> llir.MemberCall:
+    assert type(expression) is llir.MemberCall
+    call = cast(llir.MemberCall, expression)
+    assert call.member == "data_ptr"
+    assert type(call.template_args) is tuple
+    assert call.template_args == (data_type,)
+    assert type(call.args) is tuple
+    assert call.args == ()
+    return call
+
+
+def _assert_torch_tensor_var(expression: llir.Expr, name: str) -> llir.Var:
+    assert type(expression) is llir.Var
+    variable = cast(llir.Var, expression)
+    assert variable.name == name
+    assert variable.type is llir.DataType.TORCH_TENSOR
+    assert variable.is_ptr is False
+    assert variable.is_restrict is False
+    assert variable.tensor_access is None
+    return variable
+
+
+def _assert_mode_index_tensor(
+    expression: llir.Expr,
+    *,
+    tensor_name: str,
+    level: int,
+    slot: int,
+) -> tuple[llir.ArrayAccess, llir.ArrayAccess, llir.Var]:
+    assert type(expression) is llir.ArrayAccess
+    outer = cast(llir.ArrayAccess, expression)
+    assert outer.tensor_access is None
+    assert type(outer.index) is llir.Literal
+    outer_index = cast(llir.Literal, outer.index)
+    assert outer_index.value == slot
+    assert outer_index.data_type is llir.DataType.INT
+
+    assert type(outer.array) is llir.ArrayAccess
+    inner = cast(llir.ArrayAccess, outer.array)
+    assert inner.tensor_access is None
+    assert type(inner.index) is llir.Literal
+    inner_index = cast(llir.Literal, inner.index)
+    assert inner_index.value == level
+    assert inner_index.data_type is llir.DataType.INT
+
+    assert type(inner.array) is llir.Var
+    root = cast(llir.Var, inner.array)
+    assert root.name == f"{tensor_name}_mode_indices"
+    assert root.type is llir.DataType.STD_VECTOR_2D_TORCH_TENSOR
+    assert root.is_ptr is False
+    assert root.is_restrict is False
+    assert root.tensor_access is None
+    return outer, inner, root
+
+
+def _assert_tensor_storage_member(
+    expression: llir.Expr,
+    tensor_name: str,
+    *members: str,
+) -> tuple[llir.Var, tuple[llir.MemberAccess, ...]]:
+    chain: list[llir.MemberAccess] = []
+    current = expression
+    while type(current) is llir.MemberAccess:
+        member = cast(llir.MemberAccess, current)
+        chain.append(member)
+        current = member.base
+
+    assert [member.member for member in reversed(chain)] == list(members)
+    assert type(current) is llir.Var
+    root = cast(llir.Var, current)
+    assert root.name == tensor_name
+    assert root.type is llir.DataType.TACO_TENSOR
+    assert root.is_ptr is False
+    assert root.is_restrict is False
+    assert root.tensor_access is None
+    return root, tuple(chain)
+
+
+def _assert_mode_index_initializer(
+    expression: llir.Expr,
+    expected_names: tuple[tuple[str, ...], ...],
+) -> tuple[llir.Array, tuple[llir.Array, ...], tuple[llir.Var, ...]]:
+    assert type(expression) is llir.Array
+    outer = cast(llir.Array, expression)
+    assert outer.data_type is llir.DataType.STD_VECTOR_2D_TORCH_TENSOR
+    assert type(outer.values) is tuple
+    assert len(outer.values) == len(expected_names)
+
+    inner_arrays: list[llir.Array] = []
+    children: list[llir.Var] = []
+    for expression_set, names in zip(outer.values, expected_names):
+        assert type(expression_set) is llir.Array
+        inner = cast(llir.Array, expression_set)
+        inner_arrays.append(inner)
+        assert inner.data_type is llir.DataType.STD_VECTOR_TORCH_TENSOR
+        assert type(inner.values) is tuple
+        assert len(inner.values) == len(names)
+        for child, name in zip(inner.values, names):
+            children.append(_assert_torch_tensor_var(child, name))
+    return outer, tuple(inner_arrays), tuple(children)
+
+
+def test_torch_cpp_abi_helpers_reject_malformed_boundary_inputs() -> None:
+    for tensor_name in ("", "Input.value", 1, None):
+        with pytest.raises(TypeError, match="root"):
+            tensor_storage_member(  # type: ignore[arg-type]
+                tensor_name,
+                "storage",
+            )
+        with pytest.raises(TypeError, match="root"):
+            mode_index_tensor(  # type: ignore[arg-type]
+                tensor_name,
+                0,
+                0,
+            )
+
+    with pytest.raises(TypeError, match="cannot be empty"):
+        tensor_storage_member("Input")
+    with pytest.raises(TypeError, match="non-empty identifier"):
+        tensor_storage_member("Input", "storage.value")
+
+    for level in (-1, True, 1.0):
+        with pytest.raises(TypeError, match="level"):
+            mode_index_tensor("Input", level, 0)  # type: ignore[arg-type]
+    for slot in (-1, True, 1.0):
+        with pytest.raises(TypeError, match="slot"):
+            mode_index_tensor("Input", 0, slot)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="receiver"):
+        tensor_data_ptr(object(), llir.DataType.FLOAT32)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="template argument"):
+        tensor_data_ptr(  # type: ignore[arg-type]
+            llir.Var("Input_values", llir.DataType.TORCH_TENSOR),
+            "float",
+        )
+
+
 def _collect_move_calls(value: llir.Node) -> list[llir.FunctionCall]:
     calls: list[llir.FunctionCall] = []
 
@@ -340,6 +485,50 @@ def test_supported_post_ops_still_lower(kind, tensor_name):
     assert cast(llir.Var, target.array).name == "output"
     assert cast(llir.Var, target.index).name == "i"
     assert LLIRLowerer().lower_llir(assignment).startswith("output[i] ")
+
+
+def test_post_op_extra_tensor_data_ptr_is_live_typed_and_fresh() -> None:
+    index = IndexVar("i")
+    result = TensorVar("Result", fmt="d")
+    source = TensorVar("Input", fmt="d")
+    statement = ForAll(index, TensorAssign(result[index], source[index]))
+    post_ops = PostOps(
+        ops=[PostOp(kind="add", tensor_name="bias")],
+        extra_tensors=["bias"],
+    )
+    original = str(statement)
+
+    first_function = CINLowerer(post_ops=post_ops).lower_IndexStmt(statement)
+    second_function = CINLowerer(post_ops=post_ops).lower_IndexStmt(statement)
+    assert type(first_function) is llir.Function
+    assert type(second_function) is llir.Function
+
+    def pointer_initializer(function: llir.Function) -> llir.VarInit:
+        return next(
+            cast(llir.VarInit, node)
+            for node in function.body
+            if type(node) is llir.VarInit and node.var.name == "bias_val"
+        )
+
+    first = pointer_initializer(cast(llir.Function, first_function))
+    second = pointer_initializer(cast(llir.Function, second_function))
+    assert first.var.type is llir.DataType.PTR_FLOAT32
+    assert first.var.is_restrict is True
+    assert first.var.tensor_access is None
+    first_call = _assert_data_ptr_call(first.value, llir.DataType.FLOAT32)
+    second_call = _assert_data_ptr_call(second.value, llir.DataType.FLOAT32)
+    first_base = _assert_torch_tensor_var(first_call.base, "bias_values")
+    second_base = _assert_torch_tensor_var(second_call.base, "bias_values")
+    assert first_call == second_call
+    assert hash(first_call) == hash(second_call)
+    assert first_call is not second_call
+    assert first_base is not second_base
+    assert first_base is not first.var
+    assert LLIRLowerer().lower_llir(first) == (
+        "float* __restrict__ bias_val = bias_values.data_ptr<float>();"
+    )
+    assert LLIRLowerer().lower_llir(second) == LLIRLowerer().lower_llir(first)
+    assert str(statement) == original
 
 
 def test_result_position_initialization_uses_a_frozen_structured_target() -> None:
@@ -460,6 +649,239 @@ def test_known_nnz_result_torch_empty_extent_is_structured_typed_and_fresh() -> 
         "torch::Tensor Result_values_torch = "
         "torch::empty({_known_nnz}, torch::kFloat32);"
     )
+
+
+@pytest.mark.parametrize(
+    ("fmt", "known_nnz_var", "is_restrict"),
+    (
+        pytest.param("dd", None, True, id="dense"),
+        pytest.param("ds", "_known_nnz", False, id="known-nnz"),
+    ),
+)
+def test_result_value_data_ptr_producers_are_structured_typed_and_fresh(
+    fmt: str,
+    known_nnz_var: str | None,
+    is_restrict: bool,
+) -> None:
+    tensor = TensorVar("Result", fmt=fmt)
+
+    first_statements = ResultTensorAssembler(
+        tensor,
+        known_nnz_var=known_nnz_var,
+    ).emit_value_array_init()
+    second_statements = ResultTensorAssembler(
+        tensor,
+        known_nnz_var=known_nnz_var,
+    ).emit_value_array_init()
+
+    def pointer_initializer(statements: list[llir.Stmt]) -> llir.VarInit:
+        return next(
+            cast(llir.VarInit, statement)
+            for statement in statements
+            if type(statement) is llir.VarInit
+            and cast(llir.VarInit, statement).var.name == "Result_values"
+        )
+
+    first = pointer_initializer(first_statements)
+    second = pointer_initializer(second_statements)
+    assert first.var.name == "Result_values"
+    assert first.var.type is llir.DataType.PTR_FLOAT32
+    assert first.var.is_restrict is is_restrict
+    assert first.var.tensor_access is None
+    first_call = _assert_data_ptr_call(first.value, llir.DataType.FLOAT32)
+    second_call = _assert_data_ptr_call(second.value, llir.DataType.FLOAT32)
+    first_base = _assert_torch_tensor_var(
+        first_call.base,
+        "Result_values_torch",
+    )
+    second_base = _assert_torch_tensor_var(
+        second_call.base,
+        "Result_values_torch",
+    )
+
+    assert first_call == second_call
+    assert hash(first_call) == hash(second_call)
+    assert first_call is not second_call
+    assert first_base is not second_base
+    assert first_base is not first.var
+    assert second_base is not second.var
+    assert LLIRLowerer().lower_llir(first) == (
+        "float* "
+        + ("__restrict__ " if is_restrict else "")
+        + "Result_values = Result_values_torch.data_ptr<float>();"
+    )
+    assert LLIRLowerer().lower_llir(second) == LLIRLowerer().lower_llir(first)
+
+
+def test_multi_compressed_mode_index_data_ptrs_are_nested_typed_and_fresh() -> None:
+    tensor = TensorVar("Input", fmt="dss")
+    first_statements = CINLowerer.get_level_arrays(tensor)
+    second_statements = CINLowerer.get_level_arrays(tensor)
+    expected = (
+        ("Input1_pos", 1, 0),
+        ("Input1_crd", 1, 1),
+        ("Input2_pos", 2, 0),
+        ("Input2_crd", 2, 1),
+    )
+
+    def pointer_initializers(
+        statements: list[llir.Stmt],
+    ) -> dict[str, llir.VarInit]:
+        return {
+            statement.var.name: statement
+            for statement in statements
+            if type(statement) is llir.VarInit
+            and type(statement.value) is llir.MemberCall
+        }
+
+    first = pointer_initializers(first_statements)
+    second = pointer_initializers(second_statements)
+    first_nodes: list[llir.Expr] = []
+    second_nodes: list[llir.Expr] = []
+    for name, level, slot in expected:
+        first_initializer = first[name]
+        second_initializer = second[name]
+        assert first_initializer.var.type is llir.DataType.PTR_INT
+        assert first_initializer.var.is_restrict is True
+        assert first_initializer.var.tensor_access is None
+        first_call = _assert_data_ptr_call(
+            first_initializer.value,
+            llir.DataType.INT,
+        )
+        second_call = _assert_data_ptr_call(
+            second_initializer.value,
+            llir.DataType.INT,
+        )
+        first_access, first_inner, first_root = _assert_mode_index_tensor(
+            first_call.base,
+            tensor_name="Input",
+            level=level,
+            slot=slot,
+        )
+        second_access, second_inner, second_root = _assert_mode_index_tensor(
+            second_call.base,
+            tensor_name="Input",
+            level=level,
+            slot=slot,
+        )
+        assert first_call == second_call
+        assert hash(first_call) == hash(second_call)
+        assert first_call is not second_call
+        assert first_access is not second_access
+        assert first_inner is not second_inner
+        assert first_root is not second_root
+        first_nodes.extend((first_call, first_access, first_inner, first_root))
+        second_nodes.extend((second_call, second_access, second_inner, second_root))
+        assert LLIRLowerer().lower_llir(first_initializer) == (
+            f"int* __restrict__ {name} = "
+            f"Input_mode_indices[{level}][{slot}].data_ptr<int>();"
+        )
+
+    assert len({id(node) for node in first_nodes}) == len(first_nodes)
+    assert len({id(node) for node in second_nodes}) == len(second_nodes)
+    assert {id(node) for node in first_nodes}.isdisjoint(
+        {id(node) for node in second_nodes}
+    )
+
+
+def test_coordinate_mode_index_tensor_and_pointer_are_independently_owned() -> None:
+    tensor = TensorVar("Mask", fmt="oo")
+    first_statements = CINLowerer.get_level_arrays(tensor)
+    second_statements = CINLowerer.get_level_arrays(tensor)
+
+    def initializers(statements: list[llir.Stmt]) -> dict[str, llir.VarInit]:
+        return {
+            statement.var.name: statement
+            for statement in statements
+            if type(statement) is llir.VarInit
+        }
+
+    first = initializers(first_statements)
+    second = initializers(second_statements)
+    for level in range(2):
+        tensor_name = f"Mask{level}_crd_tensor"
+        pointer_name = f"Mask{level}_crd"
+        first_tensor = first[tensor_name]
+        second_tensor = second[tensor_name]
+        assert first_tensor.var.type is llir.DataType.TORCH_TENSOR
+        assert first_tensor.var.is_restrict is False
+        first_access, first_inner, first_root = _assert_mode_index_tensor(
+            first_tensor.value,
+            tensor_name="Mask",
+            level=level,
+            slot=0,
+        )
+        second_access, second_inner, second_root = _assert_mode_index_tensor(
+            second_tensor.value,
+            tensor_name="Mask",
+            level=level,
+            slot=0,
+        )
+
+        first_pointer = first[pointer_name]
+        second_pointer = second[pointer_name]
+        assert first_pointer.var.type is llir.DataType.PTR_INT
+        assert first_pointer.var.is_restrict is True
+        first_call = _assert_data_ptr_call(first_pointer.value, llir.DataType.INT)
+        second_call = _assert_data_ptr_call(second_pointer.value, llir.DataType.INT)
+        first_call_access, first_call_inner, first_call_root = (
+            _assert_mode_index_tensor(
+                first_call.base,
+                tensor_name="Mask",
+                level=level,
+                slot=0,
+            )
+        )
+        second_call_access, second_call_inner, second_call_root = (
+            _assert_mode_index_tensor(
+                second_call.base,
+                tensor_name="Mask",
+                level=level,
+                slot=0,
+            )
+        )
+
+        assert first_access == first_call_access == second_access == second_call_access
+        assert hash(first_access) == hash(first_call_access) == hash(second_access)
+        assert first_access is not first_call_access
+        assert first_inner is not first_call_inner
+        assert first_root is not first_call_root
+        assert second_access is not second_call_access
+        assert second_inner is not second_call_inner
+        assert second_root is not second_call_root
+        assert first_access is not second_access
+        assert first_call_access is not second_call_access
+        assert LLIRLowerer().lower_llir(first_tensor) == (
+            f"torch::Tensor {tensor_name} = Mask_mode_indices[{level}][0];"
+        )
+        assert LLIRLowerer().lower_llir(first_pointer) == (
+            f"int* __restrict__ {pointer_name} = "
+            f"Mask_mode_indices[{level}][0].data_ptr<int>();"
+        )
+
+
+def test_input_value_data_ptr_is_structured_typed_and_fresh() -> None:
+    tensor = TensorVar("Input", fmt="d", dtype=torch.float64)
+    first = cast(llir.VarInit, CINLowerer.get_val_ptr_stmt(tensor))
+    second = cast(llir.VarInit, CINLowerer.get_val_ptr_stmt(tensor))
+
+    assert first.var.name == "Input_val"
+    assert first.var.type is llir.DataType.PTR_FLOAT64
+    assert first.var.is_restrict is True
+    assert first.var.tensor_access is None
+    first_call = _assert_data_ptr_call(first.value, llir.DataType.FLOAT64)
+    second_call = _assert_data_ptr_call(second.value, llir.DataType.FLOAT64)
+    first_base = _assert_torch_tensor_var(first_call.base, "Input_values")
+    second_base = _assert_torch_tensor_var(second_call.base, "Input_values")
+    assert first_call == second_call
+    assert hash(first_call) == hash(second_call)
+    assert first_call is not second_call
+    assert first_base is not second_base
+    assert first_base is not first.var
+    assert LLIRLowerer().lower_llir(first) == (
+        "double* __restrict__ Input_val = Input_values.data_ptr<double>();"
+    )
+    assert LLIRLowerer().lower_llir(second) == LLIRLowerer().lower_llir(first)
 
 
 @pytest.mark.parametrize(
@@ -585,6 +1007,197 @@ def test_final_result_assembly_uses_structured_typed_move_calls() -> None:
     assert len({id(dtype) for dtype in dtypes}) == len(dtypes)
     assert dtypes[0] == dtypes[1]
     assert hash(dtypes[0]) == hash(dtypes[1])
+
+
+@pytest.mark.parametrize(
+    ("fmt", "known_nnz_var", "mode_index_names"),
+    (
+        pytest.param("dd", None, ((), ()), id="dense"),
+        pytest.param(
+            "oo",
+            "_known_nnz",
+            (("Result0_crd_torch",), ("Result1_crd_torch",)),
+            id="known-nnz-coordinate",
+        ),
+        pytest.param(
+            "ds",
+            None,
+            ((), ("Result1_pos_torch", "Result1_crd_torch")),
+            id="dynamic-sparse",
+        ),
+        pytest.param(
+            "oo",
+            None,
+            (("Result0_crd_torch",), ("Result1_crd_torch",)),
+            id="dynamic-coordinate",
+        ),
+        pytest.param(
+            "dss",
+            None,
+            (
+                (),
+                ("Result1_pos_torch", "Result1_crd_torch"),
+                ("Result2_pos_torch", "Result2_crd_torch"),
+            ),
+            id="multi-compressed",
+        ),
+    ),
+)
+def test_final_result_storage_assembly_is_structured_typed_and_fresh(
+    fmt: str,
+    known_nnz_var: str | None,
+    mode_index_names: tuple[tuple[str, ...], ...],
+) -> None:
+    tensor = TensorVar("Result", fmt=fmt)
+    first_statements = ResultTensorAssembler(
+        tensor,
+        known_nnz_var=known_nnz_var,
+    ).emit_final_assembly()
+    second_statements = ResultTensorAssembler(
+        tensor,
+        known_nnz_var=known_nnz_var,
+    ).emit_final_assembly()
+
+    def storage_assignments(
+        statements: list[llir.Stmt],
+    ) -> tuple[llir.Assign, llir.Assign, llir.Return]:
+        assignments = [
+            cast(llir.Assign, statement)
+            for statement in statements
+            if type(statement) is llir.Assign
+        ]
+        returns = [
+            cast(llir.Return, statement)
+            for statement in statements
+            if type(statement) is llir.Return
+        ]
+        assert len(assignments) == 2
+        assert len(returns) == 1
+        return assignments[0], assignments[1], returns[0]
+
+    first_modes, first_values, first_return = storage_assignments(first_statements)
+    second_modes, second_values, second_return = storage_assignments(second_statements)
+    first_mode_root, first_mode_chain = _assert_tensor_storage_member(
+        first_modes.var,
+        "Result",
+        "storage",
+        "index",
+        "mode_indices",
+    )
+    second_mode_root, second_mode_chain = _assert_tensor_storage_member(
+        second_modes.var,
+        "Result",
+        "storage",
+        "index",
+        "mode_indices",
+    )
+    first_value_root, first_value_chain = _assert_tensor_storage_member(
+        first_values.var,
+        "Result",
+        "storage",
+        "value",
+    )
+    second_value_root, second_value_chain = _assert_tensor_storage_member(
+        second_values.var,
+        "Result",
+        "storage",
+        "value",
+    )
+    first_outer, first_inner, first_children = _assert_mode_index_initializer(
+        first_modes.value,
+        mode_index_names,
+    )
+    second_outer, second_inner, second_children = _assert_mode_index_initializer(
+        second_modes.value,
+        mode_index_names,
+    )
+    first_value = _assert_torch_tensor_var(
+        first_values.value,
+        "Result_values_torch",
+    )
+    second_value = _assert_torch_tensor_var(
+        second_values.value,
+        "Result_values_torch",
+    )
+
+    assert first_modes.var == second_modes.var
+    assert hash(first_modes.var) == hash(second_modes.var)
+    assert first_values.var == second_values.var
+    assert hash(first_values.var) == hash(second_values.var)
+    assert first_outer == second_outer
+    assert hash(first_outer) == hash(second_outer)
+    assert first_modes.var is not second_modes.var
+    assert first_values.var is not second_values.var
+    assert first_mode_root is not second_mode_root
+    assert first_value_root is not second_value_root
+    assert first_mode_root is not first_value_root
+    assert second_mode_root is not second_value_root
+    assert {id(node) for node in first_mode_chain + first_value_chain}.isdisjoint(
+        {id(node) for node in second_mode_chain + second_value_chain}
+    )
+    assert first_outer is not second_outer
+    assert all(first is not second for first, second in zip(first_inner, second_inner))
+    assert all(
+        first is not second for first, second in zip(first_children, second_children)
+    )
+    assert len({id(node) for node in first_inner}) == len(first_inner)
+    assert len({id(node) for node in first_children}) == len(first_children)
+    assert first_value is not second_value
+
+    expected_initializer = (
+        "{"
+        + ", ".join("{" + ", ".join(names) + "}" for names in mode_index_names)
+        + "}"
+    )
+    assert LLIRLowerer().lower_llir(first_modes) == (
+        "Result.storage.index.mode_indices = " + expected_initializer + ";"
+    )
+    assert LLIRLowerer().lower_llir(first_values) == (
+        "Result.storage.value = Result_values_torch;"
+    )
+    assert type(first_return.value) is llir.Var
+    assert cast(llir.Var, first_return.value).name == "Result"
+    assert cast(llir.Var, first_return.value).type is llir.DataType.TACO_TENSOR
+    assert LLIRLowerer().lower_llir(first_return) == "return Result;"
+    assert LLIRLowerer().lower_llir(second_modes) == LLIRLowerer().lower_llir(
+        first_modes
+    )
+    assert LLIRLowerer().lower_llir(second_values) == LLIRLowerer().lower_llir(
+        first_values
+    )
+    assert LLIRLowerer().lower_llir(second_return) == "return Result;"
+
+
+def test_tensor_storage_value_read_is_structured_typed_and_fresh() -> None:
+    tensor = TensorVar("Input", fmt="ds")
+    first = cast(llir.VarInit, CINLowerer.get_value_array_statement(tensor))
+    second = cast(llir.VarInit, CINLowerer.get_value_array_statement(tensor))
+
+    assert first.var.name == "Input_values"
+    assert first.var.type is llir.DataType.TORCH_TENSOR
+    assert first.var.tensor_access is None
+    first_root, first_chain = _assert_tensor_storage_member(
+        first.value,
+        "Input",
+        "storage",
+        "value",
+    )
+    second_root, second_chain = _assert_tensor_storage_member(
+        second.value,
+        "Input",
+        "storage",
+        "value",
+    )
+    assert first.value == second.value
+    assert hash(first.value) == hash(second.value)
+    assert first.value is not second.value
+    assert first_root is not second_root
+    assert all(first is not second for first, second in zip(first_chain, second_chain))
+    assert first_root is not first.var
+    assert LLIRLowerer().lower_llir(first) == (
+        "torch::Tensor Input_values = Input.storage.value;"
+    )
+    assert LLIRLowerer().lower_llir(second) == LLIRLowerer().lower_llir(first)
 
 
 def test_all_coo_workspace_assembly_targets_use_storage_types() -> None:
@@ -745,6 +1358,70 @@ def test_outer_workspace_intermediate_reads_use_structured_pair_members() -> Non
     assert len({id(dtype) for dtype in dtypes}) == len(dtypes)
     assert dtypes[0] == dtypes[1]
     assert hash(dtypes[0]) == hash(dtypes[1])
+    assert str(statement) == original
+
+
+def test_intermediate_tensor_data_ptr_producers_are_typed_and_fresh() -> None:
+    statement, result = _build_outer_workspace_statement("ds")
+    original = str(statement)
+
+    def lower() -> list[llir.Stmt]:
+        lowerer = CINLowerer()
+        lowerer.outermost_stmt = statement
+        lowerer.result_tensor_var = result
+        lowerer.result_tensor_access = statement.consumer.get_result_tensor_accesses()[
+            0
+        ]
+        return lowerer.lower_outer_ConsumerIndexStmt(statement.consumer)
+
+    first_statements = lower()
+    second_statements = lower()
+
+    def initializers(statements: list[llir.Stmt]) -> dict[str, llir.VarInit]:
+        return {
+            statement.var.name: statement
+            for statement in statements
+            if type(statement) is llir.VarInit
+        }
+
+    first = initializers(first_statements)
+    second = initializers(second_statements)
+    expected = (
+        ("T0_crd", "T0_crd_tensor", llir.DataType.PTR_INT, llir.DataType.INT),
+        ("T1_crd", "T1_crd_tensor", llir.DataType.PTR_INT, llir.DataType.INT),
+        (
+            "T_val",
+            "T_val_tensor",
+            llir.DataType.PTR_FLOAT32,
+            llir.DataType.FLOAT32,
+        ),
+    )
+    for name, receiver_name, pointer_type, data_type in expected:
+        first_initializer = first[name]
+        second_initializer = second[name]
+        assert first_initializer.var.type is pointer_type
+        assert first_initializer.var.is_restrict is False
+        assert first_initializer.var.tensor_access is None
+        first_call = _assert_data_ptr_call(first_initializer.value, data_type)
+        second_call = _assert_data_ptr_call(second_initializer.value, data_type)
+        first_base = _assert_torch_tensor_var(first_call.base, receiver_name)
+        second_base = _assert_torch_tensor_var(second_call.base, receiver_name)
+        assert first_call == second_call
+        assert hash(first_call) == hash(second_call)
+        assert first_call is not second_call
+        assert first_base is not second_base
+        assert first_base is not first[receiver_name].var
+        assert second_base is not second[receiver_name].var
+
+    assert LLIRLowerer().lower_llir(first["T0_crd"]) == (
+        "int* T0_crd = T0_crd_tensor.data_ptr<int>();"
+    )
+    assert LLIRLowerer().lower_llir(first["T1_crd"]) == (
+        "int* T1_crd = T1_crd_tensor.data_ptr<int>();"
+    )
+    assert LLIRLowerer().lower_llir(first["T_val"]) == (
+        "float* T_val = T_val_tensor.data_ptr<float>();"
+    )
     assert str(statement) == original
 
 

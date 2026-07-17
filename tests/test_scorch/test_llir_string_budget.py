@@ -21,6 +21,17 @@ def _llir_constructor_calls(path: Path, constructor: str) -> list[ast.Call]:
     ]
 
 
+def _function_calls(path: Path, function: str) -> list[ast.Call]:
+    tree = ast.parse(path.read_text())
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == function
+    ]
+
+
 def _var_name_expression(call: ast.Call) -> Optional[ast.expr]:
     for keyword in call.keywords:
         if keyword.arg == "name":
@@ -106,7 +117,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 195,
+        "cin_lowerer.py": 190,
         "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -117,11 +128,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
+        "torch_cpp_abi.py": 2,
     }
-    assert sum(constructor_counts.values()) == 382
+    assert sum(constructor_counts.values()) == 379
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 171,
+        "cin_lowerer.py": 180,
         "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -130,10 +142,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
         "result_write_pass.py": 3,
-        "schedule_lowerer.py": 97,
+        "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
+        "torch_cpp_abi.py": 2,
     }
-    assert sum(unclassified_counts.values()) == 354
+    assert sum(unclassified_counts.values()) == 367
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -148,21 +161,14 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 11
 
     assert totals == {
-        "subscript": 15,
-        "call": 8,
-        "member": 3,
-        "initializer": 1,
+        "subscript": 11,
         "ternary": 1,
     }
-    assert sum(totals.values()) == 28
+    assert sum(totals.values()) == 12
     assert per_file == {
-        ("cin_lowerer.py", "subscript"): 13,
-        ("cin_lowerer.py", "call"): 6,
-        ("cin_lowerer.py", "member"): 3,
-        ("cin_lowerer.py", "initializer"): 1,
+        ("cin_lowerer.py", "subscript"): 9,
         ("cin_lowerer.py", "ternary"): 1,
         ("iterator.py", "subscript"): 2,
-        ("schedule_lowerer.py", "call"): 2,
     }
 
 
@@ -198,10 +204,39 @@ def test_free_move_calls_cannot_return_to_var_names() -> None:
 
     assert violations == []
     assert structured_moves == {"cin_lowerer.py": 5}
-    assert remaining_opaque_calls == {
-        ("cin_lowerer.py", "data_ptr"): 6,
-        ("schedule_lowerer.py", "storage_data"): 2,
+    assert remaining_opaque_calls == {}
+
+
+def test_torch_abi_expression_producer_budget_is_explicit() -> None:
+    helper_calls: Counter[tuple[str, str]] = Counter()
+    for path in sorted(_COMPILER_ROOT.glob("*.py")):
+        for helper in (
+            "mode_index_tensor",
+            "tensor_data_ptr",
+            "tensor_storage_member",
+        ):
+            helper_calls[(path.name, helper)] += len(_function_calls(path, helper))
+    helper_calls += Counter()
+
+    member_call_constructors = Counter(
+        {
+            path.name: len(_llir_constructor_calls(path, "MemberCall"))
+            for path in sorted(_COMPILER_ROOT.glob("*.py"))
+        }
+    )
+    member_call_constructors += Counter()
+
+    assert helper_calls == {
+        ("cin_lowerer.py", "mode_index_tensor"): 4,
+        ("cin_lowerer.py", "tensor_data_ptr"): 9,
+        ("cin_lowerer.py", "tensor_storage_member"): 3,
     }
+    assert member_call_constructors == {
+        "llir_traversal.py": 1,
+        "schedule_lowerer.py": 2,
+        "torch_cpp_abi.py": 1,
+    }
+    assert sum(member_call_constructors.values()) == 4
 
 
 def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
@@ -497,10 +532,7 @@ def test_no_direct_assign_target_reintroduces_a_string_expression() -> None:
                 violations.append((path.name, category, ast.unparse(name_expression)))
 
     assert violations == []
-    assert allowed_members == [
-        ("cin_lowerer.py", "f'{self.name}.storage.index.mode_indices'"),
-        ("cin_lowerer.py", "f'{self.name}.storage.value'"),
-    ]
+    assert allowed_members == []
 
 
 def test_generic_string_rewrite_compatibility_budget_is_explicit() -> None:

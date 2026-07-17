@@ -962,6 +962,60 @@ def test_malformed_function_call_after_assembly_preserves_exact_pass_prefix() ->
     assert _structural_snapshot(source) == source_snapshot
 
 
+def test_malformed_member_call_after_assembly_preserves_exact_pass_prefix() -> None:
+    source = [llir.BlankLine()]
+    source_snapshot = _structural_snapshot(source)
+    malformed = object.__new__(llir.MemberCall)
+    object.__setattr__(
+        malformed,
+        "base",
+        _var("values_torch", llir.DataType.TORCH_TENSOR),
+    )
+    object.__setattr__(malformed, "member", "data_ptr")
+    object.__setattr__(malformed, "template_args", (llir.DataType.FLOAT32,))
+    object.__setattr__(malformed, "args", [])
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact(
+            [
+                *artifact.statements,
+                llir.VarInit(_var("values"), malformed),
+            ]
+        )
+
+    manager = LLIRPassManager.from_compile_options(_compile_options())
+    with pytest.raises(LLIRPassPartialFailure) as raised:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact(source),
+            compressed_where_pass_spec=None,
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=assemble_body,
+        )
+
+    assert type(raised.value.failure) is LLIRTraversalError
+    failure = cast(LLIRTraversalError, raised.value.failure)
+    assert failure.diagnostic.code == "invalid_member_call_args"
+    assert failure.diagnostic.path == ("root", "[1]", "value", "args")
+    assert failure.diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert [record.pass_name for record in raised.value.completed_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert [record.sequence_index for record in raised.value.completed_run_records] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert _structural_snapshot(source) == source_snapshot
+
+
 def test_production_pipeline_rejects_a_detached_compressed_options_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
