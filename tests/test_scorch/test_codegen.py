@@ -39,6 +39,43 @@ def test_codegen_rejects_known_but_unsupported_expression_node() -> None:
         LLIRLowerer().lower_llir(expression)
 
 
+def test_increment_is_frozen_typed_structural_and_byte_exact() -> None:
+    variable = _var("counter")
+    increment = llir.Increment(variable)
+    equal = llir.Increment(_var("counter"))
+
+    assert increment.var is variable
+    assert increment == equal
+    assert hash(increment) == hash(equal)
+    assert increment != llir.Increment(_var("other"))
+    assert get_type_hints(llir.Increment) == {"var": llir.Var}
+    assert LLIRLowerer().lower_llir(increment) == "counter++;"
+    assert LLIRLowerer().lower_llir(increment, no_semicolon=True) == "counter++"
+
+    with pytest.raises(FrozenInstanceError):
+        increment.var = _var("other")
+
+
+def test_increment_rejects_nonexact_vars_and_codegen_fails_closed() -> None:
+    class UnknownVar(llir.Var):
+        pass
+
+    class UnknownIncrement(llir.Increment):
+        pass
+
+    with pytest.raises(TypeError, match="Increment.var must be an exact LLIR Var"):
+        llir.Increment(cast(llir.Var, llir.Literal(1)))
+    with pytest.raises(TypeError, match="Increment.var must be an exact LLIR Var"):
+        llir.Increment(UnknownVar("counter", llir.DataType.INT))
+    with pytest.raises(CodegenError, match="UnknownIncrement"):
+        LLIRLowerer().lower_llir(UnknownIncrement(_var("counter")))
+
+    forged = object.__new__(llir.Increment)
+    object.__setattr__(forged, "var", llir.Literal(1))
+    with pytest.raises(CodegenError, match="Increment.var must be an exact LLIR Var"):
+        LLIRLowerer().lower_llir(forged)
+
+
 def test_codegen_rejects_unknown_binary_operator() -> None:
     expression = llir.BinOp(op="<=>", left=_var("a"), right=_var("b"))
 

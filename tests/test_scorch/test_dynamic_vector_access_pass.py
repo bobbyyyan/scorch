@@ -176,6 +176,41 @@ def test_structural_function_call_equality_is_explicit_at_deduplication_seam() -
     assert _structural_snapshot(source) == snapshot
 
 
+def test_phase_state_assignments_are_detached_and_never_deduplicated() -> None:
+    state_assignments = [
+        llir.Assign(
+            _var("_prev2", llir.DataType.INT),
+            _var("_cnt2", llir.DataType.INT),
+        )
+        for _ in range(2)
+    ]
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_crd", llir.DataType.STD_VECTOR_C_INT)),
+        *state_assignments,
+    ]
+    snapshot = _structural_snapshot(source)
+
+    rewritten = rewrite_dynamic_vector_accesses(
+        source,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+
+    assert _structural_snapshot(source) == snapshot
+    assert len(rewritten) == 3
+    first = cast(llir.Assign, rewritten[1])
+    second = cast(llir.Assign, rewritten[2])
+    assert first == second
+    assert first is not state_assignments[0]
+    assert second is not state_assignments[1]
+    assert first.var is not state_assignments[0].var
+    assert second.var is not state_assignments[1].var
+    assert first.var is not second.var
+    assert first.value is not second.value
+    assert _cpp(rewritten) == (
+        "std::vector<int> out_crd;\n" "_prev2 = _cnt2;\n" "_prev2 = _cnt2;"
+    )
+
+
 def _independent_single_step_add() -> llir.Add:
     return llir.Add(
         _var("base", llir.DataType.INT64),

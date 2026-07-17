@@ -8,6 +8,7 @@ import pytest
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
+import scorch.compiler.result_write_pass as result_write_module  # type: ignore[import-untyped]
 from scorch.compiler.compile_options import CompileOptions  # type: ignore[import-untyped]
 from scorch.compiler.compressed_where_openmp_pass import (  # type: ignore[import-untyped]
     CompressedWhereOpenMPContext,
@@ -1200,6 +1201,71 @@ def test_production_pipeline_nested_fill_failure_preserves_count_and_stops_later
         (record.pass_name, record.configuration_name, record.sequence_index)
         for record in error.value.completed_run_records
     ] == [("rewrite_result_writes", "count", 0)]
+
+
+def test_malformed_generated_phase_state_fails_owner_before_record_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    original_phase_state = result_write_module._ResultWriteRewriter._phase_state
+    later_work: List[str] = []
+
+    def malformed_count_state(prefix: str, level: int) -> llir.Var:
+        state = original_phase_state(prefix, level)
+        if prefix == "_cnt":
+            state.tensor_access = cast(llir.TensorAccessMetadata, "malformed")
+        return state
+
+    def unexpected_later_transform(source: object, context: object) -> NoReturn:
+        del source, context
+        later_work.append("pass")
+        raise AssertionError("later production pass executed after state failure")
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        del compressed_output_parallel
+        later_work.append("body_assembler")
+        return LLIRRewriteArtifact(artifact.statements)
+
+    monkeypatch.setattr(
+        result_write_module._ResultWriteRewriter,
+        "_phase_state",
+        staticmethod(malformed_count_state),
+    )
+    for function_name in (
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ):
+        monkeypatch.setattr(
+            pass_manager_module,
+            function_name,
+            unexpected_later_transform,
+        )
+
+    with pytest.raises(LLIRPassPartialFailure) as error:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact(_compressed_source()),
+            compressed_where_pass_spec=CompressedWhereOpenMPPassSpec(
+                replace(_compressed_context(), compile_options=compile_options)
+            ),
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=assemble_body,
+        )
+
+    failure = cast(LLIRTraversalError, error.value.failure)
+    diagnostic = failure.diagnostic
+    assert diagnostic.code == "invalid_tensor_access_metadata"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "transform_compressed_where_for_openmp"
+    assert diagnostic.path[-2:] == ("var", "tensor_access")
+    assert error.value.completed_run_records == ()
+    assert later_work == []
 
 
 @pytest.mark.parametrize(

@@ -65,7 +65,7 @@ def _result_value_access(
 def _phase_index(level: int) -> llir.Add:
     return llir.Add(
         _var(f"_base{level}", llir.DataType.INT64),
-        _var(f"_pos{level}", llir.DataType.INT64),
+        _var(f"_pos{level}", llir.DataType.INT),
     )
 
 
@@ -216,8 +216,8 @@ def test_count_rewrite_matches_legacy_single_level_structure() -> None:
     source = _single_level_serial_writes()
     source_snapshot = _structural_snapshot(source)
     expected: List[llir.Stmt] = [
-        llir.RawStmt("_cnt1++"),
-        llir.RawStmt("_cnt1++"),
+        llir.Increment(_var("_cnt1", llir.DataType.INT)),
+        llir.Increment(_var("_cnt1", llir.DataType.INT)),
         llir.Assign(_var("scratch"), _var("keep")),
     ]
 
@@ -243,14 +243,14 @@ def test_fill_rewrite_matches_legacy_single_level_structure() -> None:
             _var("coordinate"),
             llir.DataType.PTR_INT,
         ),
-        llir.RawStmt("_pos1++"),
+        llir.Increment(_var("_pos1", llir.DataType.INT)),
         _fill_store(
             "Result1_crd_data",
             _phase_index(1),
             _var("pushed_coordinate"),
             llir.DataType.PTR_INT,
         ),
-        llir.RawStmt("_pos1++"),
+        llir.Increment(_var("_pos1", llir.DataType.INT)),
         _fill_store(
             "Result_values_data",
             _phase_index(1),
@@ -313,16 +313,19 @@ Result1_crd_data[_base1 + _pos1] = it.first[1];"""
 def test_count_rewrite_matches_legacy_multiple_level_boundary() -> None:
     source = _multiple_level_serial_writes()
     expected: List[llir.Stmt] = [
-        llir.RawStmt("_cnt1++"),
+        llir.Increment(_var("_cnt1", llir.DataType.INT)),
         llir.IfThenElse(
             cond=llir.BinOp(
                 ">",
-                _var("_cnt2", llir.DataType.INT64),
-                _var("_prev2", llir.DataType.INT64),
+                _var("_cnt2", llir.DataType.INT),
+                _var("_prev2", llir.DataType.INT),
             ),
             then_body=[
-                llir.RawStmt("_cnt1++"),
-                llir.RawStmt("_prev2 = _cnt2"),
+                llir.Increment(_var("_cnt1", llir.DataType.INT)),
+                llir.Assign(
+                    _var("_prev2", llir.DataType.INT),
+                    _var("_cnt2", llir.DataType.INT),
+                ),
             ],
         ),
     ]
@@ -341,7 +344,7 @@ def test_fill_rewrite_matches_legacy_multiple_level_boundary() -> None:
             _var("outer_coordinate"),
             llir.DataType.PTR_INT,
         ),
-        llir.RawStmt("_pos1++"),
+        llir.Increment(_var("_pos1", llir.DataType.INT)),
         _fill_store(
             "Result2_pos_data",
             _phase_index(1),
@@ -351,8 +354,8 @@ def test_fill_rewrite_matches_legacy_multiple_level_boundary() -> None:
         llir.IfThenElse(
             cond=llir.BinOp(
                 ">",
-                _var("_pos2", llir.DataType.INT64),
-                _var("_prev2", llir.DataType.INT64),
+                _var("_pos2", llir.DataType.INT),
+                _var("_prev2", llir.DataType.INT),
             ),
             then_body=[
                 _fill_store(
@@ -361,14 +364,17 @@ def test_fill_rewrite_matches_legacy_multiple_level_boundary() -> None:
                     _var("parent_coordinate"),
                     llir.DataType.PTR_INT,
                 ),
-                llir.RawStmt("_pos1++"),
+                llir.Increment(_var("_pos1", llir.DataType.INT)),
                 _fill_store(
                     "Result2_pos_data",
                     _phase_index(1),
                     _phase_index(2),
                     llir.DataType.PTR_INT,
                 ),
-                llir.RawStmt("_prev2 = _pos2"),
+                llir.Assign(
+                    _var("_prev2", llir.DataType.INT),
+                    _var("_pos2", llir.DataType.INT),
+                ),
             ],
         ),
     ]
@@ -462,17 +468,17 @@ def test_legacy_control_flow_regions_are_transformed_and_detached() -> None:
     assert cast(llir.VarInit, rewritten_loop.init).var.name == "pResult1"
     assert type(rewritten_loop.update) is llir.Increment
     assert cast(llir.Increment, rewritten_loop.update).var.name == "pResult1"
-    assert [
-        cast(llir.RawStmt, statement).code for statement in rewritten_auto.body
-    ] == ["_cnt1++"]
+    assert rewritten_auto.body == [llir.Increment(_var("_cnt1", llir.DataType.INT))]
     assert rewritten_while.body == []
-    assert [
-        cast(llir.RawStmt, statement).code for statement in rewritten_branches[0]
-    ] == ["_cnt1++"]
+    assert rewritten_branches[0] == [llir.Increment(_var("_cnt1", llir.DataType.INT))]
     assert rewritten_loop.pre_parallel_body is not None
-    assert cast(llir.RawStmt, rewritten_loop.pre_parallel_body[0]).code == "_cnt1++"
+    assert rewritten_loop.pre_parallel_body[0] == llir.Increment(
+        _var("_cnt1", llir.DataType.INT)
+    )
     assert rewritten_loop.post_parallel_body is not None
-    assert cast(llir.RawStmt, rewritten_loop.post_parallel_body[0]).code == "_cnt1++"
+    assert rewritten_loop.post_parallel_body[0] == llir.Increment(
+        _var("_cnt1", llir.DataType.INT)
+    )
 
     assert rewritten_loop.before_parallel_body is not None
     before = cast(llir.Assign, rewritten_loop.before_parallel_body[0])
@@ -586,7 +592,7 @@ def test_nested_list_and_tuple_roots_preserve_container_shapes() -> None:
     second_tuple = cast(Tuple[LLIRStatementValue, ...], second_list[0])
     assert [type(statement) for statement in second_tuple] == [
         llir.Assign,
-        llir.RawStmt,
+        llir.Increment,
     ]
 
 

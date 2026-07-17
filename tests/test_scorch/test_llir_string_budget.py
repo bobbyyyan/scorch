@@ -3,6 +3,7 @@
 import ast
 from collections import Counter
 from pathlib import Path
+import re
 from typing import Optional
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -79,6 +80,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     known_indirect: Counter[tuple[str, str]] = Counter()
     known_indirect_names = {
         "expr.name.replace(old, new)",
+        "f'{prefix}{level}'",
         "name",
         "node.name",
         "prefix_extent",
@@ -103,40 +105,41 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert constructor_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 195,
-        "compressed_where_openmp_pass.py": 5,
+        "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
         "iterator.py": 23,
         "llir_traversal.py": 1,
-        "result_write_pass.py": 5,
+        "result_write_pass.py": 3,
         "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(constructor_counts.values()) == 377
+    assert sum(constructor_counts.values()) == 379
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 171,
-        "compressed_where_openmp_pass.py": 5,
+        "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
         "iterator.py": 21,
         "llir_traversal.py": 1,
-        "result_write_pass.py": 5,
+        "result_write_pass.py": 3,
         "schedule_lowerer.py": 97,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 349
+    assert sum(unclassified_counts.values()) == 351
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
         ("llir_traversal.py", "node.name"): 1,
+        ("result_write_pass.py", "f'{prefix}{level}'"): 1,
         ("schedule_lowerer.py", "prefix_extent"): 2,
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 7
+    assert sum(known_indirect.values()) == 8
 
     assert totals == {
         "subscript": 15,
@@ -375,16 +378,81 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 17,
-        "compressed_where_openmp_pass.py": 19,
+        "compressed_where_openmp_pass.py": 15,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 2,
-        "result_write_pass.py": 8,
         "schedule_lowerer.py": 3,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 52
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 51
+    assert sum(counts.values()) == 40
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 39
+
+
+def test_compressed_phase_state_cannot_return_to_raw_statements() -> None:
+    """Lock every mutable count/fill state producer on typed statements."""
+
+    compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
+    result_write_path = _COMPILER_ROOT / "result_write_pass.py"
+    raw_violations: list[tuple[str, int, str]] = []
+    for path in (compressed_path, result_write_path):
+        for call in _llir_constructor_calls(path, "RawStmt"):
+            spelling = ast.unparse(call)
+            if re.search(r"_(?:cnt|pos|prev)\{(?:level|parent_level)\}", spelling):
+                raw_violations.append((path.name, call.lineno, spelling))
+
+    state_initializers: Counter[str] = Counter()
+    for call in _llir_constructor_calls(compressed_path, "VarInit"):
+        var_expression = next(
+            (keyword.value for keyword in call.keywords if keyword.arg == "var"),
+            call.args[0] if call.args else None,
+        )
+        if var_expression is None or not _is_llir_constructor(var_expression, "Var"):
+            continue
+        var_call = var_expression
+        assert isinstance(var_call, ast.Call)
+        name_expression = _var_name_expression(var_call)
+        if name_expression is None:
+            continue
+        fragments = _static_string_fragments(name_expression)
+        for prefix in ("_cnt", "_pos", "_prev"):
+            if prefix in fragments:
+                state_initializers[prefix] += 1
+
+    assert raw_violations == []
+    assert state_initializers == {"_cnt": 1, "_pos": 1, "_prev": 2}
+    assert len(_llir_constructor_calls(result_write_path, "Increment")) == 6
+    state_references: Counter[tuple[str, str]] = Counter()
+    for call in _llir_constructor_calls(result_write_path, "_phase_state"):
+        assert call.keywords == []
+        assert len(call.args) == 2
+        state_references[(ast.unparse(call.args[0]), ast.unparse(call.args[1]))] += 1
+    assert state_references == {
+        ("'_cnt'", "level"): 3,
+        ("'_cnt'", "parent_level"): 1,
+        ("'_pos'", "level"): 4,
+        ("'_pos'", "parent_level"): 1,
+        ("'_prev'", "level"): 3,
+        ("prefix", "level"): 1,
+    }
+    progress_conditions: Counter[tuple[str, str]] = Counter()
+    for call in _llir_constructor_calls(result_write_path, "_progress_condition"):
+        assert call.keywords == []
+        assert len(call.args) == 2
+        progress_conditions[(ast.unparse(call.args[0]), ast.unparse(call.args[1]))] += 1
+    assert progress_conditions == {
+        ("'_cnt'", "level"): 1,
+        ("'_pos'", "level"): 1,
+    }
+
+    previous_assignments = 0
+    for call in _llir_constructor_calls(result_write_path, "Assign"):
+        target = _assign_target_expression(call)
+        if target is None or not _is_llir_constructor(target, "_phase_state"):
+            continue
+        if "_prev" in _static_string_fragments(target):
+            previous_assignments += 1
+    assert previous_assignments == 2
 
 
 def test_no_direct_assign_target_reintroduces_a_string_expression() -> None:

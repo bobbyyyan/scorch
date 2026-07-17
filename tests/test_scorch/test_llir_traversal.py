@@ -300,6 +300,13 @@ def test_function_call_walker_has_deterministic_preorder() -> None:
     ]
 
 
+def test_increment_walker_has_deterministic_preorder() -> None:
+    increment = llir.Increment(_var("counter"))
+
+    assert _record(increment) == ["Increment", "Var:counter"]
+    assert _record(increment) == ["Increment", "Var:counter"]
+
+
 def test_array_walker_has_deterministic_nested_preorder() -> None:
     expression = llir.FunctionCall(
         "consume",
@@ -712,6 +719,38 @@ def test_unknown_function_call_subclass_fails_closed(operation: str) -> None:
     assert raised.value.diagnostic.node_type == "UnknownFunctionCall"
     assert raised.value.diagnostic.code == "unknown_llir_node"
     assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_increment_subclass_fails_closed(operation: str) -> None:
+    class UnknownIncrement(llir.Increment):
+        pass
+
+    unknown = UnknownIncrement(_var("counter"))
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownIncrement"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_forged_increment_child_fails_at_exact_path(operation: str) -> None:
+    increment = object.__new__(llir.Increment)
+    object.__setattr__(increment, "var", llir.Literal(1))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(increment)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(increment)
+
+    assert raised.value.diagnostic.code == "invalid_var_child"
+    assert raised.value.diagnostic.path == ("root", "var")
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -1413,6 +1452,37 @@ def test_member_access_identity_rewrite_is_detached_idempotent_and_owned() -> No
     cast(llir.Var, first_member.base).name = "owned"
     assert cast(llir.Var, original_member.base).name == "it"
     assert cast(llir.Var, second_member.base).name == "it"
+
+
+def test_increment_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original = llir.Increment(_var("counter"))
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.Increment, rewriter.rewrite(original))
+    second = cast(llir.Increment, rewriter.rewrite(first))
+
+    assert original == first == second
+    assert hash(original) == hash(first) == hash(second)
+    assert first is not original
+    assert second is not first
+    assert first.var is not original.var
+    assert second.var is not first.var
+
+    first.var.name = "owned"
+    assert original.var.name == "counter"
+    assert second.var.name == "counter"
+
+    class ReplaceCounter(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "counter":
+                rewritten.name = "replacement"
+            return rewritten
+
+    replacement = cast(llir.Increment, ReplaceCounter(_CONTEXT).rewrite(original))
+    assert replacement.var.name == "replacement"
+    assert replacement.var is not original.var
+    assert original.var.name == "counter"
 
 
 def test_function_call_rewrite_is_detached_repeatable_and_replacement_owned() -> None:

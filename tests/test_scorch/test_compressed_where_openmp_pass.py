@@ -1,5 +1,7 @@
 import hashlib
+from collections import Counter
 from dataclasses import FrozenInstanceError
+import re
 from typing import List, Set, Tuple, cast
 
 import pytest
@@ -174,6 +176,52 @@ def _assignment_codes(value: object) -> List[str]:
     ]
 
 
+def _phase_state_statements(value: object) -> List[llir.Stmt]:
+    statements: List[llir.Stmt] = []
+    if type(value) is llir.VarInit:
+        initialization = cast(llir.VarInit, value)
+        if initialization.var.name.startswith(("_cnt", "_pos", "_prev")):
+            statements.append(initialization)
+    elif type(value) is llir.Increment:
+        increment = cast(llir.Increment, value)
+        if increment.var.name.startswith(("_cnt", "_pos")):
+            statements.append(increment)
+    elif type(value) is llir.Assign:
+        assignment = cast(llir.Assign, value)
+        if type(assignment.var) is llir.Var and assignment.var.name.startswith("_prev"):
+            statements.append(assignment)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            statements.extend(_phase_state_statements(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            statements.extend(_phase_state_statements(child))
+    return statements
+
+
+def _phase_state_codes(value: object) -> List[str]:
+    return [
+        LLIRLowerer().lower_llir(statement).removesuffix(";")
+        for statement in _phase_state_statements(value)
+    ]
+
+
+def _phase_state_vars(value: object) -> List[llir.Var]:
+    if type(value) is llir.Var:
+        variable = cast(llir.Var, value)
+        if re.fullmatch(r"_(?:cnt|pos|prev)\d+", variable.name):
+            return [variable]
+        return []
+    variables: List[llir.Var] = []
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            variables.extend(_phase_state_vars(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            variables.extend(_phase_state_vars(child))
+    return variables
+
+
 def _call_names(value: object) -> List[str]:
     names: List[str] = []
     if type(value) is llir.FunctionCallStmt:
@@ -219,6 +267,8 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     count_loop, fill_loop = _phase_loops(result)
     count_codes = _raw_codes(count_loop.body)
     fill_codes = _raw_codes(fill_loop.body)
+    count_state_codes = _phase_state_codes(count_loop.body)
+    fill_state_codes = _phase_state_codes(fill_loop.body)
     count_assignment_codes = _assignment_codes(count_loop.body)
     fill_assignment_codes = _assignment_codes(fill_loop.body)
     all_assignment_codes = _assignment_codes(result.statements)
@@ -228,16 +278,16 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
         if type(statement) is llir.RawStmt
     ]
 
-    assert "int _cnt1 = 0" in count_codes
-    assert "_cnt1++" in count_codes
+    assert "int _cnt1 = 0" in count_state_codes
+    assert "_cnt1++" in count_state_codes
     assert "_count1[row] = _cnt1" in count_assignment_codes
     assert "_count1[row] = _cnt1" not in count_codes
     assert "wksp.clear()" in count_codes
     assert "int64_t _base1 = _offset1[row]" in fill_codes
-    assert "int _pos1 = 0" in fill_codes
+    assert "int _pos1 = 0" in fill_state_codes
     assert "Result1_crd_data[_base1 + _pos1] = column" in fill_assignment_codes
     assert "Result1_crd_data[_base1 + _pos1] = column" not in fill_codes
-    assert "_pos1++" in fill_codes
+    assert "_pos1++" in fill_state_codes
     assert "Result_values_data[_base1 + _pos1] = value" in fill_assignment_codes
     assert "Result_values_data[_base1 + _pos1] = value" not in fill_codes
     assert "wksp.clear()" in fill_codes
@@ -315,7 +365,7 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
     )
 
     count_loop, fill_loop = _phase_loops(result)
-    count_codes = _raw_codes(count_loop.body)
+    count_state_codes = _phase_state_codes(count_loop.body)
     all_codes = _raw_codes(result.statements)
     count_boundary = cast(
         llir.IfThenElse,
@@ -334,17 +384,24 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
         ),
     )
 
-    assert "int _cnt1 = 0" in count_codes
-    assert "int _cnt2 = 0" in count_codes
-    assert "int _prev2 = 0" in count_codes
+    assert "int _cnt1 = 0" in count_state_codes
+    assert "int _cnt2 = 0" in count_state_codes
+    assert "int _prev2 = 0" in count_state_codes
     assert cast(llir.BinOp, count_boundary.cond).op == ">"
-    assert _raw_codes(count_boundary.then_body) == ["_cnt1++", "_prev2 = _cnt2"]
+    assert _phase_state_codes(count_boundary.then_body) == [
+        "_cnt1++",
+        "_prev2 = _cnt2",
+    ]
     assert cast(llir.BinOp, fill_boundary.cond).op == ">"
-    assert _raw_codes(fill_boundary.then_body) == [
+    assert _phase_state_codes(fill_boundary.then_body) == [
         "_pos1++",
         "_prev2 = _pos2",
     ]
-    assert _assignment_codes(fill_boundary.then_body) == [
+    assert [
+        code
+        for code in _assignment_codes(fill_boundary.then_body)
+        if not code.startswith("_prev")
+    ] == [
         "Result1_crd_data[_base1 + _pos1] = parent_coordinate",
         "Result2_pos_data[_base1 + _pos1] = _base2 + _pos2",
     ]
@@ -359,6 +416,91 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
         "{Result2_pos_torch, Result2_crd_torch}}" in code
         for code in all_codes
     )
+
+
+def test_count_fill_state_is_typed_structural_fresh_and_never_raw() -> None:
+    boundary = llir.IfThenElse(
+        cond=llir.BinOp(
+            "<",
+            llir.FunctionCall("Result2_pos.back"),
+            _var("pResult2", llir.DataType.INT64),
+        ),
+        then_body=[
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var("parent_coordinate")],
+            )
+        ],
+    )
+    source: List[llir.Stmt] = [
+        _compatible_loop(
+            [
+                _workspace_init(),
+                llir.FunctionCallStmt(
+                    "Result1_crd.push_back",
+                    [_var("row_coordinate")],
+                ),
+                boundary,
+                llir.FunctionCallStmt(
+                    "Result2_crd.push_back",
+                    [_var("leaf_coordinate")],
+                ),
+            ]
+        )
+    ]
+    snapshot = _structural_snapshot(source)
+
+    first = transform_compressed_where_for_openmp(source, _context((1, 2)))
+    second = transform_compressed_where_for_openmp(source, _context((1, 2)))
+    first_state = _phase_state_statements(first.statements)
+    second_state = _phase_state_statements(second.statements)
+    first_state_vars = _phase_state_vars(first.statements)
+    second_state_vars = _phase_state_vars(second.statements)
+
+    assert _structural_snapshot(source) == snapshot
+    assert first_state == second_state
+    assert _mutable_ir_ids(first_state).isdisjoint(_mutable_ir_ids(second_state))
+    assert first_state_vars == second_state_vars
+    assert {id(var) for var in first_state_vars}.isdisjoint(
+        {id(var) for var in second_state_vars}
+    )
+    assert _phase_state_codes(first.statements) == _phase_state_codes(second.statements)
+    assert not any(
+        re.search(r"\b_(?:cnt|pos|prev)\d+\b", code)
+        for code in _raw_codes(first.statements)
+    )
+
+    for statement in first_state:
+        if type(statement) is llir.VarInit:
+            initialization = cast(llir.VarInit, statement)
+            assert type(initialization.var) is llir.Var
+            assert initialization.var.type is llir.DataType.INT
+            assert type(initialization.value) is llir.Literal
+            literal = cast(llir.Literal, initialization.value)
+            assert literal.value == 0
+            assert literal.data_type is llir.DataType.INT
+        elif type(statement) is llir.Increment:
+            increment = cast(llir.Increment, statement)
+            assert type(increment.var) is llir.Var
+            assert increment.var.type is llir.DataType.INT
+        else:
+            assignment = cast(llir.Assign, statement)
+            assert type(assignment.var) is llir.Var
+            assert type(assignment.value) is llir.Var
+            assert assignment.var.type is llir.DataType.INT
+            assert assignment.value.type is llir.DataType.INT
+            assert assignment.var is not assignment.value
+
+    assert all(type(var) is llir.Var for var in first_state_vars)
+    assert all(var.type is llir.DataType.INT for var in first_state_vars)
+    assert Counter(var.name for var in first_state_vars) == {
+        "_cnt1": 4,
+        "_cnt2": 5,
+        "_pos1": 7,
+        "_pos2": 7,
+        "_prev2": 6,
+    }
+    assert len({id(var) for var in first_state_vars}) == len(first_state_vars)
 
 
 def test_first_top_level_compatible_loop_is_selected_and_suffix_is_discarded() -> None:
@@ -524,9 +666,9 @@ def test_nested_control_flow_and_statement_containers_follow_legacy_scopes() -> 
     result = transform_compressed_where_for_openmp([_compatible_loop(body)], _context())
 
     count_loop, _ = _phase_loops(result)
-    count_codes = _raw_codes(count_loop.body)
+    count_state_codes = _phase_state_codes(count_loop.body)
     calls = _call_names(count_loop.body)
-    assert count_codes.count("_cnt1++") == 8
+    assert count_state_codes.count("_cnt1++") == 8
     # The legacy name rewrite descends into ForLoop bodies and If branches, but
     # not ForLoopAuto, WhileLoop, or bare nested statement containers.
     assert calls.count("wksp.insert_unchecked") == 4
@@ -577,7 +719,7 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
         next(
             statement
             for statement in count_loop.body
-            if type(statement) is llir.VarInit
+            if type(statement) is llir.VarInit and statement.var.name == "initialized"
         ),
     )
 
