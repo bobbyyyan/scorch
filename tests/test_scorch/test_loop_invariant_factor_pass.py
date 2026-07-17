@@ -1205,6 +1205,86 @@ def test_nested_typed_materialization_remains_invisible_to_legacy_name_analysis(
     assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
 
 
+def test_ordinary_materialization_lookalike_remains_a_visible_definition() -> None:
+    declaration = llir.VarInit(
+        _var("_inv_0", llir.DataType.FLOAT32),
+        _var("local_scale", llir.DataType.FLOAT32),
+    )
+    candidate = _assignment([_var("_inv_0", llir.DataType.FLOAT32), _var("value[k]")])
+    unrelated_post = llir.Assign(
+        _var("other_accumulator"),
+        _var("_inv_0", llir.DataType.FLOAT32),
+        llir.AssignOp.MUL_ASSIGN,
+    )
+    source = [_loop([declaration, candidate, unrelated_post])]
+    snapshot = _snapshot(source)
+
+    output = hoist_loop_invariant_factors(
+        source,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+
+    assert _snapshot(output) == snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+    assert _compatibility_codes(output) == []
+    output_loop = cast(llir.ForLoop, output[0])
+    assert _factor_names(cast(llir.Assign, output_loop.body[1]).value) == [
+        "_inv_0",
+        "value[k]",
+    ]
+
+
+def test_nested_generated_wrapper_block_remains_invisible_after_reapplication() -> None:
+    inner = _loop(
+        [
+            _assignment(
+                [_var("first_scale"), _var("first_value[inner]")],
+                target=_var("first_accumulator"),
+            ),
+            _assignment(
+                [_var("second_scale"), _var("second_value[inner]")],
+                target=_var("second_accumulator"),
+            ),
+        ],
+        loop_variable="inner",
+    )
+    first = hoist_loop_invariant_factors(
+        [inner],
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    wrapped_inner = hoist_loop_invariant_factors(
+        first,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    outer = _loop(
+        [
+            *wrapped_inner,
+            _assignment(
+                [_var("_inv_0_scale"), _var("outer_value[outer]")],
+                target=_var("outer_accumulator"),
+            ),
+        ],
+        loop_variable="outer",
+    )
+
+    output = hoist_loop_invariant_factors(
+        [outer],
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = _inv_0_scale",
+        "outer_accumulator *= _inv_0",
+    ]
+    output_outer = cast(llir.ForLoop, output[1])
+    assert _compatibility_codes(output_outer.body) == [
+        "float _inv_0 = first_scale",
+        "float _inv_1 = second_scale",
+        "second_accumulator *= _inv_1",
+        "first_accumulator *= _inv_0",
+    ]
+
+
 def test_if_then_else_transform_is_postorder_and_branches_number_independently() -> (
     None
 ):
@@ -1991,7 +2071,7 @@ def _valid_generated_materialization() -> Tuple[llir.VarInit, llir.Assign]:
             _var("scale", llir.DataType.FLOAT32),
         ),
         llir.Assign(
-            _var("accumulator", llir.DataType.FLOAT32),
+            _var("accumulator"),
             _var("_inv_0", llir.DataType.FLOAT32),
             llir.AssignOp.MUL_ASSIGN,
         ),
@@ -2024,7 +2104,7 @@ def _forged_assignment_subclass() -> Tuple[object, object]:
     return (
         declaration,
         _GeneratedAssignSubclass(
-            _var("accumulator", llir.DataType.FLOAT32),
+            _var("accumulator"),
             _var("_inv_0", llir.DataType.FLOAT32),
             llir.AssignOp.MUL_ASSIGN,
         ),
@@ -2057,6 +2137,12 @@ def _forged_declaration_fields() -> Tuple[object, object]:
 def _forged_assignment_target_field() -> Tuple[object, object]:
     declaration, post = _valid_generated_materialization()
     cast(llir.Var, post.var).type = cast(llir.DataType, object())
+    return declaration, post
+
+
+def _forged_assignment_target_name() -> Tuple[object, object]:
+    declaration, post = _valid_generated_materialization()
+    cast(llir.Var, post.var).name = "wrong_accumulator"
     return declaration, post
 
 
@@ -2130,6 +2216,12 @@ def _forged_unknown_declaration_child() -> Tuple[object, object]:
             "Var",
         ),
         (
+            _forged_assignment_target_name,
+            "invalid_loop_invariant_factor_materialization_var",
+            ("root", "[2]", "var"),
+            "Var",
+        ),
+        (
             _forged_assignment_reference_field,
             "invalid_loop_invariant_factor_materialization_var",
             ("root", "[2]", "value"),
@@ -2163,17 +2255,26 @@ def test_forged_generated_materialization_fails_at_the_owning_boundary(
         sequence_index: int,
         context: LoopInvariantFactorHoistContext,
         path: Tuple[str, ...],
-    ) -> Tuple[llir.VarInit, llir.Assign]:
+    ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr]:
         nonlocal calls
         calls += 1
         assert sequence_index == 0
         assert path == ("root", "[0]")
-        return cast(Tuple[llir.VarInit, llir.Assign], factory())
+        declaration, post = factory()
+        invariant_expression = (
+            cast(llir.VarInit, declaration).value
+            if type(declaration) is llir.VarInit
+            else _var("scale", llir.DataType.FLOAT32)
+        )
+        return cast(
+            Tuple[llir.VarInit, llir.Assign, int, llir.Expr],
+            (declaration, post, 0, invariant_expression),
+        )
 
     monkeypatch.setattr(factor_pass_module, "_try_hoist_from_loop", forge_once)
     with pytest.raises(LLIRTraversalError) as raised:
         hoist_loop_invariant_factors(
-            [_activating_loop()],
+            [_activating_loop(accumulator="accumulator")],
             LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
         )
 
@@ -2182,6 +2283,42 @@ def test_forged_generated_materialization_fails_at_the_owning_boundary(
     assert diagnostic.code == expected_code
     assert diagnostic.path == expected_path
     assert diagnostic.node_type == expected_type
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "hoist_loop_invariant_factors"
+
+
+def test_forged_generated_declaration_value_fails_at_the_owning_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forge_declaration_value(
+        loop: llir.ForLoop,
+        sequence_index: int,
+        context: LoopInvariantFactorHoistContext,
+        path: Tuple[str, ...],
+    ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr]:
+        del loop, sequence_index, context, path
+        declaration, post = _valid_generated_materialization()
+        selected_invariant = declaration.value
+        declaration.value = _var("wrong_scale", llir.DataType.FLOAT32)
+        return declaration, post, 0, selected_invariant
+
+    monkeypatch.setattr(
+        factor_pass_module,
+        "_try_hoist_from_loop",
+        forge_declaration_value,
+    )
+    with pytest.raises(LLIRTraversalError) as raised:
+        hoist_loop_invariant_factors(
+            [_activating_loop(accumulator="accumulator")],
+            LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == (
+        "invalid_loop_invariant_factor_materialization_declaration_value"
+    )
+    assert diagnostic.path == ("root", "[0]", "value")
+    assert diagnostic.node_type == "Var"
     assert diagnostic.stage == "LLIR transformation"
     assert diagnostic.pass_name == "hoist_loop_invariant_factors"
 
@@ -2197,12 +2334,12 @@ def test_managed_forged_materialization_adds_no_record_and_is_not_retried(
         sequence_index: int,
         context: LoopInvariantFactorHoistContext,
         path: Tuple[str, ...],
-    ) -> Tuple[llir.VarInit, llir.Assign]:
+    ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr]:
         nonlocal calls
         calls += 1
         declaration, post = _valid_generated_materialization()
         post.op = llir.AssignOp.ADD_ASSIGN
-        return declaration, post
+        return declaration, post, 0, declaration.value
 
     def record_attempt(**kwargs: object) -> NoReturn:
         record_attempts.append(kwargs)
@@ -2216,7 +2353,7 @@ def test_managed_forged_materialization_adds_no_record_and_is_not_retried(
     monkeypatch.setattr(pass_manager_module, "_record", record_attempt)
     with pytest.raises(LLIRTraversalError) as raised:
         LLIRPassManager().run_loop_invariant_factor_hoist(
-            LLIRStatementListArtifact([_activating_loop()]),
+            LLIRStatementListArtifact([_activating_loop(accumulator="accumulator")]),
             LoopInvariantFactorHoistPassSpec(),
         )
 

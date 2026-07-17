@@ -274,48 +274,137 @@ def _collect_defined_vars(
                 )
 
 
+def _matches_materialization_var(
+    variable: object,
+    *,
+    expected_name: str | None,
+    expected_type: llir.DataType | None,
+    expected_is_ptr: bool | None,
+    expected_is_restrict: bool | None,
+) -> bool:
+    return (
+        type(variable) is llir.Var
+        and type(variable.name) is str
+        and bool(variable.name)
+        and (expected_name is None or variable.name == expected_name)
+        and type(variable.type) is llir.DataType
+        and (expected_type is None or variable.type is expected_type)
+        and type(variable.is_ptr) is bool
+        and (expected_is_ptr is None or variable.is_ptr is expected_is_ptr)
+        and type(variable.is_restrict) is bool
+        and (
+            expected_is_restrict is None or variable.is_restrict is expected_is_restrict
+        )
+        and variable.tensor_access is None
+    )
+
+
+def _matches_generated_factor_declaration(
+    statement: object,
+    sequence_index: int,
+) -> bool:
+    if type(statement) is not llir.VarInit:
+        return False
+    initializer = cast(llir.VarInit, statement)
+    return (
+        _matches_materialization_var(
+            initializer.var,
+            expected_name=f"_inv_{sequence_index}",
+            expected_type=llir.DataType.FLOAT32,
+            expected_is_ptr=False,
+            expected_is_restrict=False,
+        )
+        and isinstance(initializer.value, llir.Expr)
+        and initializer.op == "="
+        and initializer.cast is False
+    )
+
+
+def _same_materialization_target(left: object, right: object) -> bool:
+    if not _matches_materialization_var(
+        left,
+        expected_name=None,
+        expected_type=None,
+        expected_is_ptr=None,
+        expected_is_restrict=None,
+    ) or not _matches_materialization_var(
+        right,
+        expected_name=None,
+        expected_type=None,
+        expected_is_ptr=None,
+        expected_is_restrict=None,
+    ):
+        return False
+    typed_left = cast(llir.Var, left)
+    typed_right = cast(llir.Var, right)
+    return (
+        typed_left.name == typed_right.name
+        and typed_left.type is typed_right.type
+        and typed_left.is_ptr is typed_right.is_ptr
+        and typed_left.is_restrict is typed_right.is_restrict
+    )
+
+
+def _loop_contains_materialized_target(loop: llir.ForLoop, target: object) -> bool:
+    return any(
+        type(statement) is llir.Assign
+        and cast(llir.Assign, statement).op is llir.AssignOp.ADD_ASSIGN
+        and _same_materialization_target(cast(llir.Assign, statement).var, target)
+        for statement in loop.body
+    )
+
+
 def _is_materialized_factor_declaration(
     statements: Sequence[LLIRStatementValue],
     declaration_index: int,
 ) -> bool:
-    """Keep generated typed declarations invisible to legacy name analysis."""
+    """Recognize an exact generated declaration/loop/post wrapper block."""
 
-    declaration = statements[declaration_index]
-    if type(declaration) is not llir.VarInit:
-        return False
-    initializer = cast(llir.VarInit, declaration)
-    variable = initializer.var
-    if (
-        type(variable) is not llir.Var
-        or type(variable.name) is not str
-        or not variable.name.startswith("_inv_")
-        or not variable.name.removeprefix("_inv_").isdigit()
-        or variable.type is not llir.DataType.FLOAT32
-        or variable.is_ptr is not False
-        or variable.is_restrict is not False
-        or variable.tensor_access is not None
-        or initializer.op != "="
-        or initializer.cast is not False
+    if not _matches_generated_factor_declaration(
+        statements[declaration_index],
+        declaration_index,
     ):
         return False
 
-    for statement in statements[declaration_index + 1 :]:
-        if type(statement) is not llir.Assign:
-            continue
-        assignment = cast(llir.Assign, statement)
-        reference = assignment.value
+    loop_index = declaration_index + 1
+    while loop_index < len(statements) and _matches_generated_factor_declaration(
+        statements[loop_index],
+        loop_index,
+    ):
+        loop_index += 1
+    if (
+        loop_index >= len(statements)
+        or type(statements[loop_index]) is not llir.ForLoop
+    ):
+        return False
+    loop = cast(llir.ForLoop, statements[loop_index])
+
+    declaration_indices = range(declaration_index, loop_index)
+    for post_offset, generated_index in enumerate(
+        reversed(declaration_indices),
+        start=1,
+    ):
+        post_index = loop_index + post_offset
         if (
-            assignment.op is llir.AssignOp.MUL_ASSIGN
-            and assignment.cast is False
-            and type(reference) is llir.Var
-            and reference.name == variable.name
-            and reference.type is llir.DataType.FLOAT32
-            and reference.is_ptr is False
-            and reference.is_restrict is False
-            and reference.tensor_access is None
+            post_index >= len(statements)
+            or type(statements[post_index]) is not llir.Assign
         ):
-            return True
-    return False
+            return False
+        assignment = cast(llir.Assign, statements[post_index])
+        if (
+            assignment.op is not llir.AssignOp.MUL_ASSIGN
+            or assignment.cast is not False
+            or not _matches_materialization_var(
+                assignment.value,
+                expected_name=f"_inv_{generated_index}",
+                expected_type=llir.DataType.FLOAT32,
+                expected_is_ptr=False,
+                expected_is_restrict=False,
+            )
+            or not _loop_contains_materialized_target(loop, assignment.var)
+        ):
+            return False
+    return True
 
 
 def _collect_mul_factors(
@@ -435,21 +524,12 @@ def _validate_materialization_var(
     context: LoopInvariantFactorHoistContext,
     path: LLIRPath,
 ) -> llir.Var:
-    if (
-        type(variable) is not llir.Var
-        or type(variable.name) is not str
-        or not variable.name
-        or (expected_name is not None and variable.name != expected_name)
-        or type(variable.type) is not llir.DataType
-        or (expected_type is not None and variable.type is not expected_type)
-        or type(variable.is_ptr) is not bool
-        or (expected_is_ptr is not None and variable.is_ptr is not expected_is_ptr)
-        or type(variable.is_restrict) is not bool
-        or (
-            expected_is_restrict is not None
-            and variable.is_restrict is not expected_is_restrict
-        )
-        or variable.tensor_access is not None
+    if not _matches_materialization_var(
+        variable,
+        expected_name=expected_name,
+        expected_type=expected_type,
+        expected_is_ptr=expected_is_ptr,
+        expected_is_restrict=expected_is_restrict,
     ):
         _raise_factor_hoist_error(
             context,
@@ -464,6 +544,9 @@ def _validate_materialization_var(
 def _validate_materialization(
     declaration: object,
     post: object,
+    loop: llir.ForLoop,
+    body_index: object,
+    invariant_expression: object,
     sequence_index: int,
     context: LoopInvariantFactorHoistContext,
     path: LLIRPath,
@@ -497,6 +580,38 @@ def _validate_materialization(
             path=path,
             value=typed_declaration,
         )
+    if typed_declaration.value is not invariant_expression:
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_declaration_value",
+            message="generated factor declaration must own the selected invariant",
+            path=path + ("value",),
+            value=typed_declaration.value,
+        )
+
+    if (
+        type(body_index) is not int
+        or body_index < 0
+        or body_index >= len(loop.body)
+        or type(loop.body[body_index]) is not llir.Assign
+    ):
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_source",
+            message="generated factor materialization requires its source assignment",
+            path=path,
+            value=body_index,
+        )
+    source_assignment = cast(llir.Assign, loop.body[body_index])
+    expected_target = _validate_materialization_var(
+        source_assignment.var,
+        expected_name=None,
+        expected_type=None,
+        expected_is_ptr=None,
+        expected_is_restrict=None,
+        context=context,
+        path=path + (f"source_body[{body_index}]", "var"),
+    )
 
     post_path = path[:-1] + (f"[{sequence_index + 2}]",)
     if type(post) is not llir.Assign:
@@ -510,10 +625,10 @@ def _validate_materialization(
     typed_post = cast(llir.Assign, post)
     _validate_materialization_var(
         typed_post.var,
-        expected_name=None,
-        expected_type=None,
-        expected_is_ptr=None,
-        expected_is_restrict=None,
+        expected_name=expected_target.name,
+        expected_type=expected_target.type,
+        expected_is_ptr=expected_target.is_ptr,
+        expected_is_restrict=expected_target.is_restrict,
         context=context,
         path=post_path + ("var",),
     )
@@ -544,7 +659,7 @@ def _try_hoist_from_loop(
     sequence_index: int,
     context: LoopInvariantFactorHoistContext,
     path: LLIRPath,
-) -> Tuple[llir.VarInit, llir.Assign] | None:
+) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr] | None:
     if type(loop.update) is not llir.Increment:
         return None
 
@@ -650,6 +765,8 @@ def _try_hoist_from_loop(
                 ),
                 op=llir.AssignOp.MUL_ASSIGN,
             ),
+            body_index,
+            invariant_expression,
         )
     return None
 
@@ -718,8 +835,13 @@ def _hoist_in_sequence(
         if emitted is None:
             index += 1
             continue
+        declaration, post, body_index, invariant_expression = emitted
         before, after = _validate_materialization(
-            *emitted,
+            declaration,
+            post,
+            loop,
+            body_index,
+            invariant_expression,
             index,
             context,
             path + (f"[{index}]",),

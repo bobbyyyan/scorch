@@ -1902,7 +1902,7 @@ def test_malformed_typed_factor_materialization_fails_at_its_owning_stage(
         sequence_index: int,
         context: factor_module.LoopInvariantFactorHoistContext,
         path: Tuple[str, ...],
-    ) -> Tuple[llir.VarInit, llir.Assign] | None:
+    ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr] | None:
         emitted = original_materialization(
             loop,
             sequence_index,
