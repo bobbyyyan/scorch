@@ -765,13 +765,18 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
             inverted_edges[tensor_index].append(edge_to_invert)
 
 
+PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE_NAME: Dict[torch.dtype, str] = {
+    torch.float32: "kFloat32",
+    torch.float64: "kFloat64",
+    torch.int32: "kInt32",
+    torch.int64: "kInt64",
+    torch.int8: "kInt8",
+    torch.uint8: "kUInt8",
+}
+
 PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE: Dict[torch.dtype, str] = {
-    torch.float32: "torch::kFloat32",
-    torch.float64: "torch::kFloat64",
-    torch.int32: "torch::kInt32",
-    torch.int64: "torch::kInt64",
-    torch.int8: "torch::kInt8",
-    torch.uint8: "torch::kUInt8",
+    dtype: f"torch::{name}"
+    for dtype, name in PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE_NAME.items()
 }
 
 PYTORCH_DTYPE_TO_DATATYPE: Dict[torch.dtype, DataType] = {
@@ -827,6 +832,12 @@ def get_pytorch_c_dtype_str(dtype: torch.dtype) -> str:
         str: C++ pytorch dtype string.
     """
     return PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE[dtype]
+
+
+def get_pytorch_c_dtype_name(dtype: torch.dtype) -> str:
+    """Get the unqualified C++ PyTorch dtype constant name."""
+
+    return PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE_NAME[dtype]
 
 
 def flatten_2d_list(lst: Iterable[List[Any]]) -> List[Any]:

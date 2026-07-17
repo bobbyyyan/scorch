@@ -224,6 +224,17 @@ class LLIRLowerer:
                 raise CodegenError("Literal.data_type must be a DataType")
             return str(ir.value)
 
+        if type(ir) is llir.QualifiedName:
+            if type(ir.namespace) is not str or not ir.namespace.isidentifier():
+                raise CodegenError(
+                    "QualifiedName.namespace must be a non-empty identifier"
+                )
+            if type(ir.name) is not str or not ir.name.isidentifier():
+                raise CodegenError("QualifiedName.name must be a non-empty identifier")
+            if type(ir.data_type) is not llir.DataType:
+                raise CodegenError("QualifiedName.data_type must be a DataType")
+            return f"{ir.namespace}::{ir.name}"
+
         if isinstance(ir, llir.Var):
             return ir.name
 
@@ -359,7 +370,11 @@ class LLIRLowerer:
             or type(ir) is llir.ArrayAccess
         ):
             return self._POSTFIX_PRECEDENCE
-        if type(ir) is llir.Literal or isinstance(ir, llir.Var):
+        if (
+            type(ir) is llir.Literal
+            or type(ir) is llir.QualifiedName
+            or isinstance(ir, llir.Var)
+        ):
             return self._PRIMARY_PRECEDENCE
         raise CodegenError(
             f"No C++ precedence defined for LLIR expression type: {type(ir).__name__}"

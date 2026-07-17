@@ -63,6 +63,7 @@ SUPPORTED_LLIR_EXPRESSION_NODE_TYPES: Tuple[Type[llir.Expr], ...] = (
     llir.Add,
     llir.Mul,
     llir.Literal,
+    llir.QualifiedName,
     llir.FunctionCall,
     llir.Array,
     llir.MemberAccess,
@@ -297,6 +298,37 @@ def _validate_literal_fields(
             context,
             code="invalid_literal_data_type",
             message="Literal.data_type must be a DataType",
+            path=path + ("data_type",),
+            value=node.data_type,
+        )
+
+
+def _validate_qualified_name_fields(
+    node: llir.QualifiedName,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if type(node.namespace) is not str or not node.namespace.isidentifier():
+        _raise_traversal_error(
+            context,
+            code="invalid_qualified_name_namespace",
+            message="QualifiedName.namespace must be a non-empty identifier",
+            path=path + ("namespace",),
+            value=node.namespace,
+        )
+    if type(node.name) is not str or not node.name.isidentifier():
+        _raise_traversal_error(
+            context,
+            code="invalid_qualified_name_name",
+            message="QualifiedName.name must be a non-empty identifier",
+            path=path + ("name",),
+            value=node.name,
+        )
+    if type(node.data_type) is not llir.DataType:
+        _raise_traversal_error(
+            context,
+            code="invalid_qualified_name_data_type",
+            message="QualifiedName.data_type must be a DataType",
             path=path + ("data_type",),
             value=node.data_type,
         )
@@ -576,6 +608,8 @@ class LLIRWalker:
             self.visit_mul(cast(llir.Mul, node), path)
         elif node_type is llir.Literal:
             self.visit_literal(cast(llir.Literal, node), path)
+        elif node_type is llir.QualifiedName:
+            self.visit_qualified_name(cast(llir.QualifiedName, node), path)
         elif node_type is llir.FunctionCall:
             self.visit_function_call(cast(llir.FunctionCall, node), path)
         elif node_type is llir.Array:
@@ -689,6 +723,9 @@ class LLIRWalker:
 
     def visit_literal(self, node: llir.Literal, path: LLIRPath) -> None:
         _validate_literal_fields(node, self.context, path)
+
+    def visit_qualified_name(self, node: llir.QualifiedName, path: LLIRPath) -> None:
+        _validate_qualified_name_fields(node, self.context, path)
 
     def visit_function_call(self, node: llir.FunctionCall, path: LLIRPath) -> None:
         if type(node.name) is not str or not node.name.strip():
@@ -1167,6 +1204,8 @@ class LLIRRewriter:
             return self.rewrite_mul(cast(llir.Mul, node), path)
         if node_type is llir.Literal:
             return self.rewrite_literal(cast(llir.Literal, node), path)
+        if node_type is llir.QualifiedName:
+            return self.rewrite_qualified_name(cast(llir.QualifiedName, node), path)
         if node_type is llir.FunctionCall:
             return self.rewrite_function_call(cast(llir.FunctionCall, node), path)
         if node_type is llir.Array:
@@ -1297,6 +1336,16 @@ class LLIRRewriter:
     def rewrite_literal(self, node: llir.Literal, path: LLIRPath) -> llir.Literal:
         _validate_literal_fields(node, self.context, path)
         return llir.Literal(value=node.value, data_type=node.data_type)
+
+    def rewrite_qualified_name(
+        self, node: llir.QualifiedName, path: LLIRPath
+    ) -> llir.QualifiedName:
+        _validate_qualified_name_fields(node, self.context, path)
+        return llir.QualifiedName(
+            namespace=node.namespace,
+            name=node.name,
+            data_type=node.data_type,
+        )
 
     def rewrite_function_call(
         self, node: llir.FunctionCall, path: LLIRPath

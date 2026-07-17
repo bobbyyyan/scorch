@@ -61,7 +61,11 @@ from .llir_pass_manager import (
 from .compilation_context import CompilerStageId, CompilationContext
 from .llir_traversal import LLIRTraversalContext
 from ..format import LevelType, TensorFormat, LevelFormat
-from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_str
+from ..utils import (
+    dtype_to_c_datatype,
+    get_pytorch_c_dtype_name,
+    get_pytorch_c_dtype_str,
+)
 
 if TYPE_CHECKING:
     from .scheduler import Schedule
@@ -159,9 +163,10 @@ class ResultTensorAssembler:
                                 ),
                                 data_type=llir.DataType.INT64,
                             ),
-                            llir.Var(
-                                name=get_pytorch_c_dtype_str(self.dtype),
-                                type=llir.DataType.NO_TYPE,
+                            llir.QualifiedName(
+                                namespace="torch",
+                                name=get_pytorch_c_dtype_name(self.dtype),
+                                data_type=llir.DataType.TORCH_SCALAR_TYPE,
                             ),
                         ],
                     ),
@@ -223,9 +228,10 @@ class ResultTensorAssembler:
                                 ),
                                 data_type=llir.DataType.INT64,
                             ),
-                            llir.Var(
-                                name=get_pytorch_c_dtype_str(self.dtype),
-                                type=llir.DataType.NO_TYPE,
+                            llir.QualifiedName(
+                                namespace="torch",
+                                name=get_pytorch_c_dtype_name(self.dtype),
+                                data_type=llir.DataType.TORCH_SCALAR_TYPE,
                             ),
                         ],
                     ),
@@ -456,9 +462,10 @@ class ResultTensorAssembler:
                                             )
                                         ],
                                     ),
-                                    llir.Var(
-                                        name="torch::kInt",
-                                        type=llir.DataType.NO_TYPE,
+                                    llir.QualifiedName(
+                                        namespace="torch",
+                                        name="kInt",
+                                        data_type=llir.DataType.TORCH_SCALAR_TYPE,
                                     ),
                                 ],
                             ),
@@ -486,9 +493,10 @@ class ResultTensorAssembler:
                                             )
                                         ],
                                     ),
-                                    llir.Var(
-                                        name="torch::kInt",
-                                        type=llir.DataType.NO_TYPE,
+                                    llir.QualifiedName(
+                                        namespace="torch",
+                                        name="kInt",
+                                        data_type=llir.DataType.TORCH_SCALAR_TYPE,
                                     ),
                                 ],
                             ),
@@ -516,9 +524,10 @@ class ResultTensorAssembler:
                                     )
                                 ],
                             ),
-                            llir.Var(
-                                name=get_pytorch_c_dtype_str(self.dtype),
-                                type=llir.DataType.NO_TYPE,
+                            llir.QualifiedName(
+                                namespace="torch",
+                                name=get_pytorch_c_dtype_name(self.dtype),
+                                data_type=llir.DataType.TORCH_SCALAR_TYPE,
                             ),
                         ],
                     ),
@@ -1666,9 +1675,10 @@ class CINLowerer:
                                     )
                                 ],
                             ),
-                            llir.Var(
-                                name="torch::kInt",
-                                type=llir.DataType.NO_TYPE,
+                            llir.QualifiedName(
+                                namespace="torch",
+                                name="kInt",
+                                data_type=llir.DataType.TORCH_SCALAR_TYPE,
                             ),
                         ],
                     ),
@@ -1708,9 +1718,12 @@ class CINLowerer:
                                 )
                             ],
                         ),
-                        llir.Var(
-                            name=get_pytorch_c_dtype_str(intermediate_tensor_var.dtype),
-                            type=llir.DataType.NO_TYPE,
+                        llir.QualifiedName(
+                            namespace="torch",
+                            name=get_pytorch_c_dtype_name(
+                                intermediate_tensor_var.dtype
+                            ),
+                            data_type=llir.DataType.TORCH_SCALAR_TYPE,
                         ),
                     ],
                 ),

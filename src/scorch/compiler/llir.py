@@ -111,6 +111,7 @@ class DataType(Enum):
     VOID = "void"
     STRING = "std::string"
     TORCH_TENSOR = "torch::Tensor"
+    TORCH_SCALAR_TYPE = "torch::ScalarType"
     TORCH_FLOAT32 = "torch::kFloat32"
     TORCH_FLOAT64 = "torch::kFloat64"
     TORCH_INT32 = "torch::kInt32"
@@ -370,6 +371,23 @@ class Literal(Expr):
             )
         elif type(self.data_type) is not DataType:
             raise TypeError("Literal.data_type must be a DataType or None")
+
+
+@dataclass(frozen=True, repr=False)
+class QualifiedName(Expr):
+    """An immutable two-component qualified C++ name expression."""
+
+    namespace: str
+    name: str
+    data_type: DataType
+
+    def __post_init__(self) -> None:
+        if type(self.namespace) is not str or not self.namespace.isidentifier():
+            raise TypeError("QualifiedName.namespace must be a non-empty identifier")
+        if type(self.name) is not str or not self.name.isidentifier():
+            raise TypeError("QualifiedName.name must be a non-empty identifier")
+        if type(self.data_type) is not DataType:
+            raise TypeError("QualifiedName.data_type must be a DataType")
 
 
 """
