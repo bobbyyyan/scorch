@@ -60,6 +60,7 @@ from .llir_pass_manager import (
 )
 from .compilation_context import CompilerStageId, CompilationContext
 from .llir_traversal import LLIRTraversalContext
+from .torch_cpp_abi import mode_index_tensor, tensor_data_ptr, tensor_storage_member
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import (
     dtype_to_c_datatype,
@@ -179,12 +180,12 @@ class ResultTensorAssembler:
                         type=llir.DataType.ptr_type(c_datatype),
                         is_restrict=True,
                     ),
-                    value=llir.Var(
-                        name=(
-                            f"{self.name}_values_torch."
-                            f"data_ptr<{c_datatype.value}>()"
+                    value=tensor_data_ptr(
+                        llir.Var(
+                            name=f"{self.name}_values_torch",
+                            type=llir.DataType.TORCH_TENSOR,
                         ),
-                        type=llir.DataType.ptr_type(c_datatype),
+                        c_datatype,
                     ),
                 )
             )
@@ -243,12 +244,12 @@ class ResultTensorAssembler:
                         name=f"{self.name}_values",
                         type=llir.DataType.ptr_type(c_datatype),
                     ),
-                    value=llir.Var(
-                        name=(
-                            f"{self.name}_values_torch."
-                            f"data_ptr<{c_datatype.value}>()"
+                    value=tensor_data_ptr(
+                        llir.Var(
+                            name=f"{self.name}_values_torch",
+                            type=llir.DataType.TORCH_TENSOR,
                         ),
-                        type=llir.DataType.ptr_type(c_datatype),
+                        c_datatype,
                     ),
                 )
             )
@@ -410,15 +411,35 @@ class ResultTensorAssembler:
 
         return stmts
 
-    def _get_mode_index_set(self, i: int, level_type: LevelType) -> str:
-        """Return the mode index set string for a given level."""
+    def _get_mode_index_set(self, i: int, level_type: LevelType) -> llir.Array:
+        """Return one fresh structured mode-index initializer for a level."""
         tensor_level_name = f"{self.name}{i}"
         if level_type == LevelType.DENSE:
-            return "{}"
+            values: Tuple[llir.Expr, ...] = ()
         elif level_type == LevelType.COMPRESSED:
-            return f"{{{tensor_level_name}_pos_torch, {tensor_level_name}_crd_torch}}"
+            values = (
+                llir.Var(
+                    name=f"{tensor_level_name}_pos_torch",
+                    type=llir.DataType.TORCH_TENSOR,
+                ),
+                llir.Var(
+                    name=f"{tensor_level_name}_crd_torch",
+                    type=llir.DataType.TORCH_TENSOR,
+                ),
+            )
         elif level_type == LevelType.COORDINATE:
-            return f"{{{tensor_level_name}_crd_torch}}"
+            values = (
+                llir.Var(
+                    name=f"{tensor_level_name}_crd_torch",
+                    type=llir.DataType.TORCH_TENSOR,
+                ),
+            )
+        else:
+            raise ValueError(f"unsupported result level type {level_type}")
+        return llir.Array(
+            values=values,
+            data_type=llir.DataType.STD_VECTOR_TORCH_TENSOR,
+        )
 
     def emit_final_assembly(self) -> List[llir.Stmt]:
         """Move dynamic buffers to Torch, assign indices/values, and return."""
@@ -537,13 +558,18 @@ class ResultTensorAssembler:
         # mode_indices assignment
         stmts.append(
             llir.Assign(
-                var=llir.Var(
-                    name=f"{self.name}.storage.index.mode_indices",
-                    type=llir.DataType.NO_TYPE,
+                var=tensor_storage_member(
+                    self.name,
+                    "storage",
+                    "index",
+                    "mode_indices",
                 ),
-                value=llir.Var(
-                    name=f"{{{', '.join([self._get_mode_index_set(i, lt) for i, lt in enumerate(self.level_types)])}}}",
-                    type=llir.DataType.NO_TYPE,
+                value=llir.Array(
+                    values=tuple(
+                        self._get_mode_index_set(i, level_type)
+                        for i, level_type in enumerate(self.level_types)
+                    ),
+                    data_type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
                 ),
             )
         )
@@ -551,13 +577,10 @@ class ResultTensorAssembler:
         # _value assignment
         stmts.append(
             llir.Assign(
-                var=llir.Var(
-                    name=f"{self.name}.storage.value",
-                    type=llir.DataType.NO_TYPE,
-                ),
+                var=tensor_storage_member(self.name, "storage", "value"),
                 value=llir.Var(
                     name=f"{self.name}_values_torch",
-                    type=llir.DataType.NO_TYPE,
+                    type=llir.DataType.TORCH_TENSOR,
                 ),
             )
         )
@@ -567,7 +590,7 @@ class ResultTensorAssembler:
             llir.Return(
                 value=llir.Var(
                     name=f"{self.name}",
-                    type=llir.DataType.NO_TYPE,
+                    type=llir.DataType.TACO_TENSOR,
                 )
             )
         )
@@ -849,9 +872,9 @@ class CINLowerer:
                             type=llir.DataType.PTR_INT,
                             is_restrict=True,
                         ),
-                        value=llir.Var(
-                            name=f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()",
-                            type=llir.DataType.PTR_INT,
+                        value=tensor_data_ptr(
+                            mode_index_tensor(tensor.name, level, 0),
+                            llir.DataType.INT,
                         ),
                     )
                 )
@@ -863,9 +886,9 @@ class CINLowerer:
                             type=llir.DataType.PTR_INT,
                             is_restrict=True,
                         ),
-                        value=llir.Var(
-                            name=f"{tensor.name}_mode_indices[{level}][1].data_ptr<int>()",
-                            type=llir.DataType.PTR_INT,
+                        value=tensor_data_ptr(
+                            mode_index_tensor(tensor.name, level, 1),
+                            llir.DataType.INT,
                         ),
                     )
                 )
@@ -876,10 +899,7 @@ class CINLowerer:
                             name=f"{tensor.name}{level}_crd_tensor",
                             type=llir.DataType.TORCH_TENSOR,
                         ),
-                        value=llir.Var(
-                            name=f"{tensor.name}_mode_indices[{level}][0]",
-                            type=llir.DataType.TORCH_TENSOR,
-                        ),
+                        value=mode_index_tensor(tensor.name, level, 0),
                     )
                 )
                 stmts.append(
@@ -889,9 +909,9 @@ class CINLowerer:
                             type=llir.DataType.PTR_INT,
                             is_restrict=True,
                         ),
-                        value=llir.Var(
-                            name=f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()",
-                            type=llir.DataType.PTR_INT,
+                        value=tensor_data_ptr(
+                            mode_index_tensor(tensor.name, level, 0),
+                            llir.DataType.INT,
                         ),
                     )
                 )
@@ -906,9 +926,12 @@ class CINLowerer:
         ptr_type = llir.DataType.ptr_type(tensor.dtype)
         return llir.VarInit(
             var=llir.Var(name=f"{tensor.name}_val", type=ptr_type, is_restrict=True),
-            value=llir.Var(
-                name=f"{tensor.name}_values.data_ptr<{data_type.value}>()",
-                type=ptr_type,
+            value=tensor_data_ptr(
+                llir.Var(
+                    name=f"{tensor.name}_values",
+                    type=llir.DataType.TORCH_TENSOR,
+                ),
+                data_type,
             ),
         )
 
@@ -919,10 +942,7 @@ class CINLowerer:
         """
         return llir.VarInit(
             var=llir.Var(name=f"{tensor.name}_values", type=llir.DataType.TORCH_TENSOR),
-            value=llir.Var(
-                name=f"{tensor.name}.storage.value",
-                type=llir.DataType.TORCH_TENSOR,
-            ),
+            value=tensor_storage_member(tensor.name, "storage", "value"),
         )
 
     def lower_TensorAccess(self, tensor_access: TensorAccess) -> llir.Expr:
@@ -1692,9 +1712,12 @@ class CINLowerer:
                         name=f"{intermediate_tensor_var.get_name()}{i}_crd",
                         type=llir.DataType.PTR_INT,
                     ),
-                    value=llir.Var(
-                        name=f"{crd_tensor.name}.data_ptr<int>()",
-                        type=llir.DataType.PTR_INT,
+                    value=tensor_data_ptr(
+                        llir.Var(
+                            name=crd_tensor.name,
+                            type=llir.DataType.TORCH_TENSOR,
+                        ),
+                        llir.DataType.INT,
                     ),
                 )
             )
@@ -1739,9 +1762,12 @@ class CINLowerer:
                     name=f"{intermediate_tensor_var.get_name()}_val",
                     type=ptr_type,
                 ),
-                value=llir.Var(
-                    name=f"{val_tensor.name}.data_ptr<{data_type.value}>()",
-                    type=ptr_type,
+                value=tensor_data_ptr(
+                    llir.Var(
+                        name=val_tensor.name,
+                        type=llir.DataType.TORCH_TENSOR,
+                    ),
+                    data_type,
                 ),
             )
         )
@@ -2934,9 +2960,12 @@ class CINLowerer:
                                 type=ptr_type,
                                 is_restrict=True,
                             ),
-                            value=llir.Var(
-                                name=f"{tname}_values.data_ptr<{c_dtype.value}>()",
-                                type=ptr_type,
+                            value=tensor_data_ptr(
+                                llir.Var(
+                                    name=f"{tname}_values",
+                                    type=llir.DataType.TORCH_TENSOR,
+                                ),
+                                c_dtype,
                             ),
                         )
                     )

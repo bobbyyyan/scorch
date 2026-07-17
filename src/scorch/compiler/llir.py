@@ -142,6 +142,7 @@ class DataType(Enum):
     STD_VECTOR_FLOAT64 = "std::vector<double>"
     STD_VECTOR_INT8 = "std::vector<int8_t>"
     STD_VECTOR_UINT8 = "std::vector<uint8_t>"
+    STD_VECTOR_TORCH_TENSOR = "std::vector<torch::Tensor>"
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
     ARRAY_INT = "int[]"
 
@@ -611,6 +612,50 @@ class MemberAccess(Expr):
             raise TypeError("MemberAccess.member must be a non-empty identifier")
 
 
+@dataclass(frozen=True, init=False, repr=False)
+class MemberCall(Expr):
+    """An immutable call to one member of a structured receiver expression."""
+
+    base: Expr
+    member: str
+    template_args: Tuple[DataType, ...]
+    args: Tuple[Expr, ...]
+
+    def __init__(
+        self,
+        base: Expr,
+        member: str,
+        template_args: Optional[Sequence[DataType]] = None,
+        args: Optional[Sequence[Expr]] = None,
+    ) -> None:
+        if not isinstance(base, Expr):
+            raise TypeError("MemberCall.base must be an LLIR Expr")
+        if type(member) is not str or not member.isidentifier():
+            raise TypeError("MemberCall.member must be a non-empty identifier")
+        if template_args is None:
+            normalized_template_args: Tuple[DataType, ...] = ()
+        else:
+            if type(template_args) is not list and type(template_args) is not tuple:
+                raise TypeError("MemberCall.template_args must be a list or tuple")
+            if any(type(argument) is not DataType for argument in template_args):
+                raise TypeError(
+                    "MemberCall.template_args must contain only DataType values"
+                )
+            normalized_template_args = tuple(template_args)
+        if args is None:
+            normalized_args: Tuple[Expr, ...] = ()
+        else:
+            if type(args) is not list and type(args) is not tuple:
+                raise TypeError("MemberCall.args must be a list or tuple")
+            if any(not isinstance(argument, Expr) for argument in args):
+                raise TypeError("MemberCall.args must contain only LLIR expressions")
+            normalized_args = tuple(args)
+        object.__setattr__(self, "base", base)
+        object.__setattr__(self, "member", member)
+        object.__setattr__(self, "template_args", normalized_template_args)
+        object.__setattr__(self, "args", normalized_args)
+
+
 @dataclass(frozen=True)
 class ArrayAccess(Expr):
     """An immutable typed array/subscript access expression.
@@ -642,7 +687,7 @@ class ArrayAccess(Expr):
             )
 
 
-AssignmentTarget = Union[Var, ArrayAccess]
+AssignmentTarget = Union[Var, MemberAccess, ArrayAccess]
 
 
 def _is_assignment_name(name: object, *, allow_member: bool) -> bool:
@@ -764,8 +809,31 @@ def _validate_assignment_target(target: object) -> None:
                 "scalar/member Assign targets cannot carry tensor access metadata"
             )
         return
+    if type(target) is MemberAccess:
+        member = cast(MemberAccess, target)
+        while type(member.base) is MemberAccess:
+            if type(member.member) is not str or not member.member.isidentifier():
+                raise TypeError("assignment MemberAccess members must be identifiers")
+            member = cast(MemberAccess, member.base)
+        if type(member.member) is not str or not member.member.isidentifier():
+            raise TypeError("assignment MemberAccess members must be identifiers")
+        if type(member.base) is not Var:
+            raise TypeError(
+                "assignment MemberAccess must have an exact Var root through exact "
+                "MemberAccess bases"
+            )
+        root = cast(Var, member.base)
+        if not _is_assignment_name(root.name, allow_member=False):
+            raise TypeError("assignment MemberAccess root name must be an identifier")
+        if type(root.type) is not DataType:
+            raise TypeError("assignment MemberAccess root type must be a DataType")
+        if root.tensor_access is not None:
+            raise TypeError(
+                "assignment MemberAccess root cannot carry tensor access metadata"
+            )
+        return
     if type(target) is not ArrayAccess:
-        raise TypeError("Assign.var must be an exact Var or ArrayAccess")
+        raise TypeError("Assign.var must be an exact Var, MemberAccess, or ArrayAccess")
 
     access = target
     if type(access.array) is not Var:

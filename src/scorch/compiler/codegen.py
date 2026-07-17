@@ -326,6 +326,36 @@ class LLIRLowerer:
             )
             return f"{base}.{ir.member}"
 
+        if type(ir) is llir.MemberCall:
+            if not isinstance(ir.base, llir.Expr):
+                raise CodegenError("MemberCall.base must be an LLIR Expr")
+            if type(ir.member) is not str or not ir.member.isidentifier():
+                raise CodegenError("MemberCall.member must be a non-empty identifier")
+            if type(ir.template_args) is not tuple or any(
+                type(argument) is not llir.DataType for argument in ir.template_args
+            ):
+                raise CodegenError(
+                    "MemberCall.template_args must be a tuple of DataType values"
+                )
+            if type(ir.args) is not tuple or any(
+                not isinstance(argument, llir.Expr) for argument in ir.args
+            ):
+                raise CodegenError(
+                    "MemberCall.args must be a tuple of LLIR expressions"
+                )
+            base = self._render_operand(
+                ir.base,
+                parent_precedence=self._POSTFIX_PRECEDENCE,
+                is_right_child=False,
+            )
+            template_args = (
+                "<" + ", ".join(argument.value for argument in ir.template_args) + ">"
+                if ir.template_args
+                else ""
+            )
+            args = ", ".join(self._render_expression(argument) for argument in ir.args)
+            return f"{base}.{ir.member}{template_args}({args})"
+
         if type(ir) is llir.ArrayAccess:
             array = self._render_operand(
                 ir.array,
@@ -370,6 +400,7 @@ class LLIRLowerer:
         if (
             type(ir) is llir.FunctionCall
             or type(ir) is llir.MemberAccess
+            or type(ir) is llir.MemberCall
             or type(ir) is llir.ArrayAccess
         ):
             return self._POSTFIX_PRECEDENCE

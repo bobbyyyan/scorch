@@ -960,7 +960,13 @@ def _apply_heap_result_tile(
         ),
         llir.VarInit(
             var=llir.Var(compact_name, pointer_type, is_restrict=True),
-            value=llir.Var(f"{storage_name}.data()", pointer_type),
+            value=llir.MemberCall(
+                base=llir.Var(
+                    storage_name,
+                    llir.DataType.std_vector_type(scalar_type),
+                ),
+                member="data",
+            ),
         ),
         llir.BlankLine(),
     ]
@@ -1242,7 +1248,13 @@ def _apply_relayout(
         ),
         llir.VarInit(
             var=llir.Var(packed_name, pointer_type, is_restrict=True),
-            value=llir.Var(f"{storage_name}.data()", pointer_type),
+            value=llir.MemberCall(
+                base=llir.Var(
+                    storage_name,
+                    llir.DataType.std_vector_type(scalar_type),
+                ),
+                member="data",
+            ),
         ),
         llir.BlankLine(),
     ]

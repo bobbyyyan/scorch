@@ -67,6 +67,7 @@ SUPPORTED_LLIR_EXPRESSION_NODE_TYPES: Tuple[Type[llir.Expr], ...] = (
     llir.FunctionCall,
     llir.Array,
     llir.MemberAccess,
+    llir.MemberCall,
     llir.ArrayAccess,
     llir.Cast,
     llir.Sizeof,
@@ -555,7 +556,7 @@ class LLIRWalker:
             _raise_traversal_error(
                 self.context,
                 code="invalid_assignment_target",
-                message="expected an exact LLIR Var or ArrayAccess",
+                message="expected an exact LLIR Var, MemberAccess, or ArrayAccess",
                 path=path,
                 value=value,
             )
@@ -616,6 +617,8 @@ class LLIRWalker:
             self.visit_array(cast(llir.Array, node), path)
         elif node_type is llir.MemberAccess:
             self.visit_member_access(cast(llir.MemberAccess, node), path)
+        elif node_type is llir.MemberCall:
+            self.visit_member_call(cast(llir.MemberCall, node), path)
         elif node_type is llir.ArrayAccess:
             self.visit_array_access(cast(llir.ArrayAccess, node), path)
         elif node_type is llir.Cast:
@@ -768,6 +771,62 @@ class LLIRWalker:
                 value=node.member,
             )
         self._walk_expr(node.base, path + ("base",))
+
+    def visit_member_call(self, node: llir.MemberCall, path: LLIRPath) -> None:
+        if not isinstance(node.base, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_base",
+                message="MemberCall.base must be an LLIR Expr",
+                path=path + ("base",),
+                value=node.base,
+            )
+        if type(node.member) is not str or not node.member.isidentifier():
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_member",
+                message="MemberCall.member must be a non-empty identifier",
+                path=path + ("member",),
+                value=node.member,
+            )
+        if type(node.template_args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_template_args",
+                message="MemberCall.template_args must be a tuple",
+                path=path + ("template_args",),
+                value=node.template_args,
+            )
+        for index, template_argument in enumerate(node.template_args):
+            if type(template_argument) is not llir.DataType:
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_member_call_template_arg",
+                    message=(
+                        "MemberCall.template_args must contain only DataType values"
+                    ),
+                    path=path + ("template_args", f"[{index}]"),
+                    value=template_argument,
+                )
+        if type(node.args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_args",
+                message="MemberCall.args must be a tuple",
+                path=path + ("args",),
+                value=node.args,
+            )
+        for index, call_argument in enumerate(node.args):
+            if not isinstance(call_argument, llir.Expr):
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_member_call_argument",
+                    message="MemberCall.args must contain only LLIR expressions",
+                    path=path + ("args", f"[{index}]"),
+                    value=call_argument,
+                )
+        self._walk_expr(node.base, path + ("base",))
+        self._walk_expr_sequence(node.args, path + ("args",))
 
     def visit_array_access(self, node: llir.ArrayAccess, path: LLIRPath) -> None:
         _validate_tensor_access_metadata(
@@ -1148,7 +1207,7 @@ class LLIRRewriter:
             _raise_traversal_error(
                 self.context,
                 code="invalid_assignment_target",
-                message="expected an exact LLIR Var or ArrayAccess",
+                message="expected an exact LLIR Var, MemberAccess, or ArrayAccess",
                 path=path,
                 value=value,
             )
@@ -1212,6 +1271,8 @@ class LLIRRewriter:
             return self.rewrite_array(cast(llir.Array, node), path)
         if node_type is llir.MemberAccess:
             return self.rewrite_member_access(cast(llir.MemberAccess, node), path)
+        if node_type is llir.MemberCall:
+            return self.rewrite_member_call(cast(llir.MemberCall, node), path)
         if node_type is llir.ArrayAccess:
             return self.rewrite_array_access(cast(llir.ArrayAccess, node), path)
         if node_type is llir.Cast:
@@ -1406,6 +1467,68 @@ class LLIRRewriter:
         return llir.MemberAccess(
             base=self._rewrite_expr(node.base, path + ("base",)),
             member=node.member,
+        )
+
+    def rewrite_member_call(
+        self, node: llir.MemberCall, path: LLIRPath
+    ) -> llir.MemberCall:
+        if not isinstance(node.base, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_base",
+                message="MemberCall.base must be an LLIR Expr",
+                path=path + ("base",),
+                value=node.base,
+            )
+        if type(node.member) is not str or not node.member.isidentifier():
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_member",
+                message="MemberCall.member must be a non-empty identifier",
+                path=path + ("member",),
+                value=node.member,
+            )
+        if type(node.template_args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_template_args",
+                message="MemberCall.template_args must be a tuple",
+                path=path + ("template_args",),
+                value=node.template_args,
+            )
+        for index, template_argument in enumerate(node.template_args):
+            if type(template_argument) is not llir.DataType:
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_member_call_template_arg",
+                    message=(
+                        "MemberCall.template_args must contain only DataType values"
+                    ),
+                    path=path + ("template_args", f"[{index}]"),
+                    value=template_argument,
+                )
+        if type(node.args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_args",
+                message="MemberCall.args must be a tuple",
+                path=path + ("args",),
+                value=node.args,
+            )
+        for index, call_argument in enumerate(node.args):
+            if not isinstance(call_argument, llir.Expr):
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_member_call_argument",
+                    message="MemberCall.args must contain only LLIR expressions",
+                    path=path + ("args", f"[{index}]"),
+                    value=call_argument,
+                )
+        return llir.MemberCall(
+            base=self._rewrite_expr(node.base, path + ("base",)),
+            member=node.member,
+            template_args=node.template_args,
+            args=self._rewrite_expr_sequence(node.args, path + ("args",)),
         )
 
     def rewrite_array_access(
