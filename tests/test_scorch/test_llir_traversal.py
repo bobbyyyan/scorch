@@ -42,6 +42,9 @@ class _RecordingWalker(LLIRWalker):
             label += f":{cast(llir.Var, node).name}"
         elif type(node) is llir.Literal:
             label += f":{cast(llir.Literal, node).value}"
+        elif type(node) is llir.QualifiedName:
+            qualified = cast(llir.QualifiedName, node)
+            label += f":{qualified.namespace}::{qualified.name}"
         self.events.append(label)
 
 
@@ -113,6 +116,9 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
         llir.Add: llir.Add(value, literal),
         llir.Mul: llir.Mul(value, literal),
         llir.Literal: literal,
+        llir.QualifiedName: llir.QualifiedName(
+            "torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE
+        ),
         llir.Increment: llir.Increment(index),
         llir.Return: llir.Return(value),
         llir.VarDecl: llir.VarDecl(value),
@@ -282,7 +288,7 @@ def test_function_call_walker_has_deterministic_preorder() -> None:
         "scorch_tensor_from_vector",
         [
             llir.FunctionCall("std::move", [_var("values")]),
-            _var("dtype"),
+            llir.QualifiedName("torch", "kFloat32", llir.DataType.TORCH_SCALAR_TYPE),
         ],
     )
 
@@ -290,7 +296,7 @@ def test_function_call_walker_has_deterministic_preorder() -> None:
         "FunctionCall",
         "FunctionCall",
         "Var:values",
-        "Var:dtype",
+        "QualifiedName:torch::kFloat32",
     ]
 
 
@@ -451,6 +457,23 @@ def test_unknown_arithmetic_subclasses_fail_closed(operation: str) -> None:
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_qualified_name_subclass_fails_closed(operation: str) -> None:
+    class UnknownQualifiedName(llir.QualifiedName):
+        pass
+
+    unknown = UnknownQualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE)
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownQualifiedName"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 @pytest.mark.parametrize(
     ("node_type", "field", "invalid", "diagnostic_code", "expected_path"),
     (
@@ -550,6 +573,57 @@ def test_forged_literal_fields_fail_at_traversal_boundary(
             LLIRWalker(_CONTEXT).walk(literal)
         else:
             LLIRRewriter(_CONTEXT).rewrite(literal)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("field", "invalid", "diagnostic_code", "expected_path"),
+    (
+        (
+            "namespace",
+            "torch::detail",
+            "invalid_qualified_name_namespace",
+            ("root", "namespace"),
+        ),
+        (
+            "name",
+            "k-Int",
+            "invalid_qualified_name_name",
+            ("root", "name"),
+        ),
+        (
+            "data_type",
+            "torch::ScalarType",
+            "invalid_qualified_name_data_type",
+            ("root", "data_type"),
+        ),
+    ),
+)
+def test_forged_qualified_name_fields_fail_at_traversal_boundary(
+    operation: str,
+    field: str,
+    invalid: object,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    expression = object.__new__(llir.QualifiedName)
+    object.__setattr__(expression, "namespace", "torch")
+    object.__setattr__(expression, "name", "kInt")
+    object.__setattr__(
+        expression,
+        "data_type",
+        llir.DataType.TORCH_SCALAR_TYPE,
+    )
+    object.__setattr__(expression, field, invalid)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
 
     assert raised.value.diagnostic.code == diagnostic_code
     assert raised.value.diagnostic.path == expected_path
@@ -1262,6 +1336,56 @@ def test_arithmetic_rewrite_is_detached_repeatable_and_replacement_owned() -> No
     assert cast(
         llir.Var, cast(llir.Mul, cast(llir.Add, second.left).left).left
     ).name == ("scale")
+
+
+def test_qualified_name_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original_qualified = llir.QualifiedName(
+        "torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE
+    )
+    original = llir.FunctionCall("consume", (original_qualified,))
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.FunctionCall, rewriter.rewrite(original))
+    second = cast(llir.FunctionCall, rewriter.rewrite(first))
+    first_qualified = cast(llir.QualifiedName, first.args[0])
+    second_qualified = cast(llir.QualifiedName, second.args[0])
+
+    assert _record(original) == _record(first) == _record(second)
+    assert original == first == second
+    assert hash(original) == hash(first) == hash(second)
+    assert first is not original
+    assert second is not first
+    assert first_qualified is not original_qualified
+    assert second_qualified is not first_qualified
+
+    class ReplaceQualifiedName(LLIRRewriter):
+        def rewrite_qualified_name(
+            self,
+            node: llir.QualifiedName,
+            path: LLIRPath,
+        ) -> llir.QualifiedName:
+            rewritten = super().rewrite_qualified_name(node, path)
+            if node.name == "kInt":
+                return llir.QualifiedName(
+                    rewritten.namespace,
+                    "kFloat32",
+                    rewritten.data_type,
+                )
+            return rewritten
+
+    replacement = cast(
+        llir.FunctionCall,
+        ReplaceQualifiedName(_CONTEXT).rewrite(original),
+    )
+    replacement_qualified = cast(llir.QualifiedName, replacement.args[0])
+
+    assert replacement is not original
+    assert replacement_qualified is not original_qualified
+    assert replacement_qualified.name == "kFloat32"
+    assert replacement_qualified.namespace == "torch"
+    assert replacement_qualified.data_type is llir.DataType.TORCH_SCALAR_TYPE
+    assert original_qualified.name == "kInt"
+    assert first_qualified.name == "kInt"
 
 
 def test_member_access_identity_rewrite_is_detached_idempotent_and_owned() -> None:

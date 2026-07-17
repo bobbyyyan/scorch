@@ -960,7 +960,7 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
 
 
 @pytest.mark.parametrize(
-    ("result_format", "expected_pair_reads"),
+    ("result_format", "expected_pair_reads", "expected_dtype_conversions"),
     [
         pytest.param(
             "oo",
@@ -968,6 +968,14 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
                 "SparseProduct0_crd.emplace_back(it.first[0]);",
                 "SparseProduct1_crd.emplace_back(it.first[1]);",
                 "SparseProduct_values.emplace_back(it.second);",
+            ),
+            (
+                "scorch_tensor_from_vector(std::move(SparseProduct0_crd), "
+                "torch::kInt);",
+                "scorch_tensor_from_vector(std::move(SparseProduct1_crd), "
+                "torch::kInt);",
+                "scorch_tensor_from_vector(std::move(SparseProduct_values), "
+                "torch::kFloat32);",
             ),
             id="all-coordinate",
         ),
@@ -978,6 +986,11 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
                 "scorch_vector_set(T1_crd_vec, pT, it.first[1]);",
                 "scorch_vector_set(T_val_vec, pT, it.second);",
             ),
+            (
+                "scorch_tensor_from_vector(std::move(T0_crd_vec), torch::kInt);",
+                "scorch_tensor_from_vector(std::move(T1_crd_vec), torch::kInt);",
+                "scorch_tensor_from_vector(std::move(T_val_vec), torch::kFloat32);",
+            ),
             id="intermediate-coordinate",
         ),
     ],
@@ -985,21 +998,28 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
 def test_outer_workspace_pair_reads_are_stable_and_remain_correct(
     result_format: str,
     expected_pair_reads: tuple[str, ...],
+    expected_dtype_conversions: tuple[str, ...],
 ) -> None:
     schedule = Schedule(
         loop_order=("q", "r", "c"),
         tag=f"workspace-pair-outer-{result_format}",
     )
-    statement = _build_outer_workspace_spgemm(result_format)
-    original = str(statement)
+    first_statement = _build_outer_workspace_spgemm(result_format)
+    second_statement = _build_outer_workspace_spgemm(result_format)
+    first_original = str(first_statement)
+    second_original = str(second_statement)
 
     with regblock_force(False):
-        first_cpp = _lower_to_cpp(Scheduler.apply_schedule(statement, schedule))
-        second_cpp = _lower_to_cpp(Scheduler.apply_schedule(statement, schedule))
+        first_scheduled = Scheduler.apply_schedule(first_statement, schedule)
+        second_scheduled = Scheduler.apply_schedule(second_statement, schedule)
+        first_cpp = _lower_to_cpp(first_scheduled)
+        second_cpp = _lower_to_cpp(second_scheduled)
 
-    assert str(statement) == original
+    assert first_scheduled is not second_scheduled
+    assert str(first_statement) == first_original
+    assert str(second_statement) == second_original
     assert second_cpp == first_cpp
-    for anchor in expected_pair_reads:
+    for anchor in (*expected_pair_reads, *expected_dtype_conversions):
         assert anchor in first_cpp
 
     torch.manual_seed(104)

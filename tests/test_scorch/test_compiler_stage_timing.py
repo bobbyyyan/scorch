@@ -2436,6 +2436,241 @@ def test_malformed_torch_empty_extent_fails_dynamic_owner_and_suppresses_later_s
     assert suppressed.value.diagnostic.code == "failed_compilation"
 
 
+def test_malformed_final_qualified_name_fails_dynamic_owner_and_suppresses_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs = _spmm_specs()
+    options = _explicit_options()
+    context = CompilationContext(options)
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    original_initialization = ResultTensorAssembler.emit_value_array_init
+    injected_names: list[tuple[str, str, llir.DataType]] = []
+
+    def emit_malformed_dtype(self: ResultTensorAssembler) -> list[llir.Stmt]:
+        statements = original_initialization(self)
+        for statement in statements:
+            if type(statement) is not llir.VarInit:
+                continue
+            initializer = cast(llir.VarInit, statement)
+            if type(initializer.value) is not llir.FunctionCall:
+                continue
+            call = cast(llir.FunctionCall, initializer.value)
+            if (
+                call.name != "torch::empty"
+                or type(call.args[1]) is not llir.QualifiedName
+            ):
+                continue
+            dtype_name = cast(llir.QualifiedName, call.args[1])
+            injected_names.append(
+                (dtype_name.namespace, dtype_name.name, dtype_name.data_type)
+            )
+            malformed = object.__new__(llir.QualifiedName)
+            object.__setattr__(malformed, "namespace", "torch::detail")
+            object.__setattr__(malformed, "name", dtype_name.name)
+            object.__setattr__(malformed, "data_type", dtype_name.data_type)
+            initializer.value = llir.FunctionCall(
+                name=call.name,
+                args=(call.args[0], malformed),
+            )
+        return statements
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_value_array_init",
+        emit_malformed_dtype,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *specs,
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert injected_names == [
+        ("torch", "kFloat32", llir.DataType.TORCH_SCALAR_TYPE),
+    ]
+    assert diagnostic.code == "invalid_qualified_name_namespace"
+    assert diagnostic.stage == "LLIR rewrite"
+    assert diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert diagnostic.path[-4:] == ("value", "args", "[1]", "namespace")
+    assert _stage_values(context) == [
+        *_EINSUM_PREFIX_THROUGH_ADAPTER,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    ]
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(6)
+    )
+    assert all(record.duration_ns >= 0 for record in context.stage_run_records)
+    assert context.stage_run_records[-1].nested_within is CompilerStageId.CIN_LOWERING
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert all(record.duration_ns >= 0 for record in context.llir_pass_run_records)
+    assert later_calls == []
+    assert context.compile_options is options
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_malformed_intermediate_qualified_name_fails_first_managed_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = Schedule(
+        loop_order=("q", "r", "c"),
+        tag="malformed-intermediate-qualified-name",
+    )
+    specs = (
+        TensorSpec(
+            "ds",
+            (4, 5),
+            name="SparseLeft",
+            mode_order=(1, 0),
+        ),
+        TensorSpec("ds", (5, 3), name="SparseRight"),
+    )
+    options = _default_options(requested_schedule=schedule)
+    context = CompilationContext(options)
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    schedule_identity = (schedule.cache_key, hash(schedule))
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    original_lower_outer_consumer = CINLowerer.lower_outer_ConsumerIndexStmt
+    injected_names: list[tuple[str, str, llir.DataType]] = []
+
+    def lower_with_malformed_dtype(
+        self: CINLowerer,
+        statement: IndexStmt,
+    ) -> list[llir.Stmt]:
+        lowered = original_lower_outer_consumer(self, statement)
+
+        def inject(value: object) -> None:
+            if injected_names:
+                return
+            if type(value) is llir.QualifiedName:
+                qualified_name = cast(llir.QualifiedName, value)
+                injected_names.append(
+                    (
+                        qualified_name.namespace,
+                        qualified_name.name,
+                        qualified_name.data_type,
+                    )
+                )
+                object.__setattr__(qualified_name, "namespace", "torch::detail")
+                return
+            if isinstance(value, llir.Node):
+                for child in vars(value).values():
+                    inject(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    inject(child)
+
+        inject(lowered)
+        return lowered
+
+    monkeypatch.setattr(
+        CINLowerer,
+        "lower_outer_ConsumerIndexStmt",
+        lower_with_malformed_dtype,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (ResultTensorAssembler, "emit_final_assembly", "result_abi"),
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "rq,qc->rc",
+            *specs,
+            compile_only=True,
+            format="ds",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert injected_names == [
+        ("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
+    ]
+    assert diagnostic.code == "invalid_qualified_name_namespace"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "insert_sparse_prefetch"
+    assert diagnostic.path[-1] == "namespace"
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert context.llir_pass_run_records == ()
+    assert later_calls == []
+    assert context.compile_options is options
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (schedule.cache_key, hash(schedule)) == schedule_identity
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
 def test_malformed_tiled_workspace_read_fails_cin_lowering_and_stops_later_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

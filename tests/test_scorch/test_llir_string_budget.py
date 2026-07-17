@@ -102,7 +102,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 202,
+        "cin_lowerer.py": 195,
         "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -113,10 +113,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(constructor_counts.values()) == 384
+    assert sum(constructor_counts.values()) == 377
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 175,
+        "cin_lowerer.py": 171,
         "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -127,7 +127,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 97,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 353
+    assert sum(unclassified_counts.values()) == 349
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -143,16 +143,14 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "call": 8,
         "member": 3,
         "initializer": 1,
-        "qualified": 3,
         "ternary": 1,
     }
-    assert sum(totals.values()) == 31
+    assert sum(totals.values()) == 28
     assert per_file == {
         ("cin_lowerer.py", "subscript"): 13,
         ("cin_lowerer.py", "call"): 6,
         ("cin_lowerer.py", "member"): 3,
         ("cin_lowerer.py", "initializer"): 1,
-        ("cin_lowerer.py", "qualified"): 3,
         ("cin_lowerer.py", "ternary"): 1,
         ("iterator.py", "subscript"): 2,
         ("schedule_lowerer.py", "call"): 2,
@@ -232,6 +230,53 @@ def test_torch_empty_extents_cannot_return_to_var_names() -> None:
     assert 'name=f"{{{self.name}_capacity}}"' not in value_initialization
     assert 'name=f"{{{self.known_nnz_var}}}"' not in value_initialization
     assert value_initialization.count("llir.Array(") == 2
+
+
+def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
+    violations: list[tuple[str, int, str]] = []
+    structured_counts: Counter[str] = Counter()
+    for path in sorted(_COMPILER_ROOT.glob("*.py")):
+        for call in _llir_constructor_calls(path, "Var"):
+            name_expression = _var_name_expression(call)
+            if name_expression is None:
+                continue
+            spelling = ast.unparse(name_expression)
+            if (
+                "torch::" in _static_string_fragments(name_expression)
+                or "get_pytorch_c_dtype_str(" in spelling
+            ):
+                violations.append((path.name, call.lineno, spelling))
+
+        structured_counts[path.name] = len(
+            _llir_constructor_calls(path, "QualifiedName")
+        )
+    structured_counts += Counter()
+
+    assert violations == []
+    assert structured_counts == {
+        "cin_lowerer.py": 7,
+        "llir_traversal.py": 1,
+    }
+
+    producers = _llir_constructor_calls(
+        _COMPILER_ROOT / "cin_lowerer.py", "QualifiedName"
+    )
+    name_expressions: Counter[str] = Counter()
+    for producer in producers:
+        fields = {
+            keyword.arg: keyword.value
+            for keyword in producer.keywords
+            if keyword.arg is not None
+        }
+        assert ast.unparse(fields["namespace"]) == "'torch'"
+        assert ast.unparse(fields["data_type"]) == ("llir.DataType.TORCH_SCALAR_TYPE")
+        name_expressions[ast.unparse(fields["name"])] += 1
+
+    assert name_expressions == {
+        "'kInt'": 3,
+        "get_pytorch_c_dtype_name(self.dtype)": 3,
+        "get_pytorch_c_dtype_name(intermediate_tensor_var.dtype)": 1,
+    }
 
 
 def test_workspace_pair_reads_cannot_return_to_var_names() -> None:

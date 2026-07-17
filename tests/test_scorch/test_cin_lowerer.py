@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError
 from typing import cast
 
 import pytest
+import torch
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
 from scorch.compiler.cin import (
@@ -210,7 +211,7 @@ def _assert_vector_move_initialization(
     vector_name: str,
     vector_type: llir.DataType,
     dtype_name: str,
-) -> llir.FunctionCall:
+) -> tuple[llir.FunctionCall, llir.QualifiedName]:
     assert type(statement) is llir.VarInit
     initializer = cast(llir.VarInit, statement)
     assert initializer.var.name == target_name
@@ -230,9 +231,23 @@ def _assert_vector_move_initialization(
     assert vector.name == vector_name
     assert vector.type is vector_type
     assert vector.tensor_access is None
-    assert type(conversion.args[1]) is llir.Var
-    assert cast(llir.Var, conversion.args[1]).name == dtype_name
-    return move
+    dtype = _assert_torch_qualified_name(conversion.args[1], dtype_name)
+    return move, dtype
+
+
+def _assert_torch_qualified_name(
+    expression: llir.Expr,
+    expected_spelling: str,
+) -> llir.QualifiedName:
+    assert type(expression) is llir.QualifiedName
+    qualified = cast(llir.QualifiedName, expression)
+    namespace, separator, name = expected_spelling.partition("::")
+    assert separator == "::"
+    assert qualified.namespace == namespace == "torch"
+    assert qualified.name == name
+    assert qualified.data_type is llir.DataType.TORCH_SCALAR_TYPE
+    assert LLIRLowerer().lower_llir(qualified) == expected_spelling
+    return qualified
 
 
 def _collect_move_calls(value: llir.Node) -> list[llir.FunctionCall]:
@@ -252,6 +267,24 @@ def _collect_move_calls(value: llir.Node) -> list[llir.FunctionCall]:
         LLIRTraversalContext(stage="test", pass_name="collect_move_calls")
     ).walk(value)
     return calls
+
+
+def _collect_qualified_names(value: llir.Node) -> list[llir.QualifiedName]:
+    names: list[llir.QualifiedName] = []
+
+    class QualifiedNameCollector(LLIRWalker):
+        def visit_qualified_name(
+            self,
+            node: llir.QualifiedName,
+            path: tuple[str, ...],
+        ) -> None:
+            names.append(node)
+            super().visit_qualified_name(node, path)
+
+    QualifiedNameCollector(
+        LLIRTraversalContext(stage="test", pass_name="collect_qualified_names")
+    ).walk(value)
+    return names
 
 
 def test_unknown_cin_node_fails_at_cin_lowering():
@@ -330,7 +363,8 @@ def _assert_torch_empty_extent(
     statements: list[llir.Stmt],
     *,
     extent_name: str,
-) -> tuple[llir.Array, llir.VarInit]:
+    dtype_name: str = "torch::kFloat32",
+) -> tuple[llir.Array, llir.QualifiedName, llir.VarInit]:
     initializer = next(
         cast(llir.VarInit, statement)
         for statement in statements
@@ -354,9 +388,8 @@ def _assert_torch_empty_extent(
     assert child.is_ptr is False
     assert child.is_restrict is False
     assert child.tensor_access is None
-    assert type(call.args[1]) is llir.Var
-    assert cast(llir.Var, call.args[1]).name == "torch::kFloat32"
-    return extent, initializer
+    dtype = _assert_torch_qualified_name(call.args[1], dtype_name)
+    return extent, dtype, initializer
 
 
 def test_dense_result_torch_empty_extent_is_structured_typed_and_fresh() -> None:
@@ -364,11 +397,11 @@ def test_dense_result_torch_empty_extent_is_structured_typed_and_fresh() -> None
 
     first_statements = ResultTensorAssembler(tensor).emit_value_array_init()
     second_statements = ResultTensorAssembler(tensor).emit_value_array_init()
-    first, first_initializer = _assert_torch_empty_extent(
+    first, first_dtype, first_initializer = _assert_torch_empty_extent(
         first_statements,
         extent_name="Result_capacity",
     )
-    second, second_initializer = _assert_torch_empty_extent(
+    second, second_dtype, second_initializer = _assert_torch_empty_extent(
         second_statements,
         extent_name="Result_capacity",
     )
@@ -379,6 +412,9 @@ def test_dense_result_torch_empty_extent_is_structured_typed_and_fresh() -> None
     assert first is not second
     assert first.values[0] is not second.values[0]
     assert first.values[0] is not capacity_initializer.var
+    assert first_dtype == second_dtype
+    assert hash(first_dtype) == hash(second_dtype)
+    assert first_dtype is not second_dtype
     assert LLIRLowerer().lower_llir(first_initializer) == (
         "torch::Tensor Result_values_torch = "
         "torch::empty({Result_capacity}, torch::kFloat32);"
@@ -400,11 +436,11 @@ def test_known_nnz_result_torch_empty_extent_is_structured_typed_and_fresh() -> 
         tensor,
         known_nnz_var="_known_nnz",
     ).emit_value_array_init()
-    first, first_initializer = _assert_torch_empty_extent(
+    first, first_dtype, first_initializer = _assert_torch_empty_extent(
         first_statements,
         extent_name="_known_nnz",
     )
-    second, second_initializer = _assert_torch_empty_extent(
+    second, second_dtype, second_initializer = _assert_torch_empty_extent(
         second_statements,
         extent_name="_known_nnz",
     )
@@ -413,6 +449,9 @@ def test_known_nnz_result_torch_empty_extent_is_structured_typed_and_fresh() -> 
     assert hash(first) == hash(second)
     assert first is not second
     assert first.values[0] is not second.values[0]
+    assert first_dtype == second_dtype
+    assert hash(first_dtype) == hash(second_dtype)
+    assert first_dtype is not second_dtype
     assert LLIRLowerer().lower_llir(first_initializer) == (
         "torch::Tensor Result_values_torch = "
         "torch::empty({_known_nnz}, torch::kFloat32);"
@@ -420,6 +459,74 @@ def test_known_nnz_result_torch_empty_extent_is_structured_typed_and_fresh() -> 
     assert LLIRLowerer().lower_llir(second_initializer) == (
         "torch::Tensor Result_values_torch = "
         "torch::empty({_known_nnz}, torch::kFloat32);"
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "vector_type", "dtype_name"),
+    [
+        pytest.param(
+            torch.float32,
+            llir.DataType.STD_VECTOR_FLOAT32,
+            "torch::kFloat32",
+            id="float32",
+        ),
+        pytest.param(
+            torch.float64,
+            llir.DataType.STD_VECTOR_FLOAT64,
+            "torch::kFloat64",
+            id="float64",
+        ),
+        pytest.param(
+            torch.int32,
+            llir.DataType.STD_VECTOR_INT32,
+            "torch::kInt32",
+            id="int32",
+        ),
+        pytest.param(
+            torch.int64,
+            llir.DataType.STD_VECTOR_INT,
+            "torch::kInt64",
+            id="int64",
+        ),
+        pytest.param(
+            torch.int8,
+            llir.DataType.STD_VECTOR_INT8,
+            "torch::kInt8",
+            id="int8",
+        ),
+        pytest.param(
+            torch.uint8,
+            llir.DataType.STD_VECTOR_UINT8,
+            "torch::kUInt8",
+            id="uint8",
+        ),
+    ],
+)
+def test_final_value_qualified_dtype_preserves_every_supported_mapping(
+    dtype: torch.dtype,
+    vector_type: llir.DataType,
+    dtype_name: str,
+) -> None:
+    initializers = {
+        statement.var.name: statement
+        for statement in ResultTensorAssembler(
+            TensorVar("Result", fmt="ds", dtype=dtype)
+        ).emit_final_assembly()
+        if type(statement) is llir.VarInit
+    }
+    _, qualified = _assert_vector_move_initialization(
+        initializers["Result_values_torch"],
+        target_name="Result_values_torch",
+        vector_name="Result_values",
+        vector_type=vector_type,
+        dtype_name=dtype_name,
+    )
+
+    assert qualified.name == dtype_name.removeprefix("torch::")
+    assert LLIRLowerer().lower_llir(initializers["Result_values_torch"]) == (
+        "torch::Tensor Result_values_torch = "
+        f"scorch_tensor_from_vector(std::move(Result_values), {dtype_name});"
     )
 
 
@@ -453,7 +560,7 @@ def test_final_result_assembly_uses_structured_typed_move_calls() -> None:
             "torch::kFloat32",
         ),
     )
-    moves = [
+    move_and_dtypes = [
         _assert_vector_move_initialization(
             initializers[target_name],
             target_name=target_name,
@@ -463,6 +570,8 @@ def test_final_result_assembly_uses_structured_typed_move_calls() -> None:
         )
         for target_name, vector_name, vector_type, dtype_name in expected
     ]
+    moves = [move for move, _ in move_and_dtypes]
+    dtypes = [dtype for _, dtype in move_and_dtypes]
 
     assert [LLIRLowerer().lower_llir(initializers[name]) for name, *_ in expected] == [
         "torch::Tensor Result1_pos_torch = "
@@ -473,6 +582,9 @@ def test_final_result_assembly_uses_structured_typed_move_calls() -> None:
         "scorch_tensor_from_vector(std::move(Result_values), torch::kFloat32);",
     ]
     assert len({id(cast(llir.Var, move.args[0])) for move in moves}) == len(moves)
+    assert len({id(dtype) for dtype in dtypes}) == len(dtypes)
+    assert dtypes[0] == dtypes[1]
+    assert hash(dtypes[0]) == hash(dtypes[1])
 
 
 def test_all_coo_workspace_assembly_targets_use_storage_types() -> None:
@@ -606,7 +718,7 @@ def test_outer_workspace_intermediate_reads_use_structured_pair_members() -> Non
             "torch::kFloat32",
         ),
     )
-    moves = [
+    move_and_dtypes = [
         _assert_vector_move_initialization(
             assembly_initializers[target_name],
             target_name=target_name,
@@ -616,6 +728,8 @@ def test_outer_workspace_intermediate_reads_use_structured_pair_members() -> Non
         )
         for target_name, vector_name, vector_type, dtype_name in expected_moves
     ]
+    moves = [move for move, _ in move_and_dtypes]
+    dtypes = [dtype for _, dtype in move_and_dtypes]
     assert [
         LLIRLowerer().lower_llir(assembly_initializers[name])
         for name, *_ in expected_moves
@@ -628,10 +742,13 @@ def test_outer_workspace_intermediate_reads_use_structured_pair_members() -> Non
         "scorch_tensor_from_vector(std::move(T_val_vec), torch::kFloat32);",
     ]
     assert len({id(cast(llir.Var, move.args[0])) for move in moves}) == len(moves)
+    assert len({id(dtype) for dtype in dtypes}) == len(dtypes)
+    assert dtypes[0] == dtypes[1]
+    assert hash(dtypes[0]) == hash(dtypes[1])
     assert str(statement) == original
 
 
-def test_move_calls_survive_both_production_paths_with_independent_ownership() -> None:
+def test_move_calls_and_qualified_names_survive_with_independent_ownership() -> None:
     statement, _ = _build_outer_workspace_statement("ds")
     original = str(statement)
 
@@ -642,6 +759,8 @@ def test_move_calls_survive_both_production_paths_with_independent_ownership() -
     assert type(second) is llir.Function
     first_calls = _collect_move_calls(cast(llir.Function, first))
     second_calls = _collect_move_calls(cast(llir.Function, second))
+    first_qualified = _collect_qualified_names(cast(llir.Function, first))
+    second_qualified = _collect_qualified_names(cast(llir.Function, second))
     expected = [
         ("T0_crd_vec", llir.DataType.STD_VECTOR_C_INT),
         ("T1_crd_vec", llir.DataType.STD_VECTOR_C_INT),
@@ -660,14 +779,39 @@ def test_move_calls_survive_both_production_paths_with_independent_ownership() -
         ]
 
     assert call_values(first_calls) == call_values(second_calls) == expected
+    expected_qualified = [
+        "torch::kInt",
+        "torch::kInt",
+        "torch::kFloat32",
+        "torch::kInt",
+        "torch::kInt",
+        "torch::kFloat32",
+    ]
+    assert (
+        [LLIRLowerer().lower_llir(node) for node in first_qualified]
+        == ([LLIRLowerer().lower_llir(node) for node in second_qualified])
+        == expected_qualified
+    )
+    assert all(
+        node.data_type is llir.DataType.TORCH_SCALAR_TYPE
+        for node in first_qualified + second_qualified
+    )
     assert LLIRLowerer().lower_llir(first) == LLIRLowerer().lower_llir(second)
     assert str(statement) == original
     assert {id(cast(llir.Var, call.args[0])) for call in first_calls}.isdisjoint(
         {id(cast(llir.Var, call.args[0])) for call in second_calls}
     )
+    assert {id(node) for node in first_qualified}.isdisjoint(
+        {id(node) for node in second_qualified}
+    )
 
     cast(llir.Var, first_calls[0].args[0]).name = "owned_by_first"
     assert call_values(second_calls) == expected
+    with pytest.raises(FrozenInstanceError):
+        first_qualified[0].name = "owned_by_first"
+    assert [LLIRLowerer().lower_llir(node) for node in second_qualified] == (
+        expected_qualified
+    )
     assert str(statement) == original
 
 

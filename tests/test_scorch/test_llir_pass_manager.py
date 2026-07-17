@@ -1402,7 +1402,11 @@ def test_dynamic_runner_detaches_structured_initializer_list_arguments() -> None
                         (_var("Result_capacity", llir.DataType.INT64),),
                         llir.DataType.INT64,
                     ),
-                    _var("torch::kFloat32"),
+                    llir.QualifiedName(
+                        "torch",
+                        "kFloat32",
+                        llir.DataType.TORCH_SCALAR_TYPE,
+                    ),
                 ),
             ),
         )
@@ -1422,15 +1426,86 @@ def test_dynamic_runner_detaches_structured_initializer_list_arguments() -> None
     original_array = cast(llir.Array, original_call.args[0])
     once_array = cast(llir.Array, once_call.args[0])
     twice_array = cast(llir.Array, twice_call.args[0])
+    original_dtype = cast(llir.QualifiedName, original_call.args[1])
+    once_dtype = cast(llir.QualifiedName, once_call.args[1])
+    twice_dtype = cast(llir.QualifiedName, twice_call.args[1])
 
     assert original_array == once_array == twice_array
     assert original_array is not once_array
     assert once_array is not twice_array
     assert original_array.values[0] is not once_array.values[0]
     assert once_array.values[0] is not twice_array.values[0]
+    assert original_dtype == once_dtype == twice_dtype
+    assert original_dtype is not once_dtype
+    assert once_dtype is not twice_dtype
+    assert once_dtype.namespace == "torch"
+    assert once_dtype.name == "kFloat32"
+    assert once_dtype.data_type is llir.DataType.TORCH_SCALAR_TYPE
     cast(llir.Var, once_array.values[0]).name = "owned"
     assert cast(llir.Var, original_array.values[0]).name == "Result_capacity"
     assert cast(llir.Var, twice_array.values[0]).name == "Result_capacity"
+
+
+def test_qualified_dtype_survives_repeated_production_pipeline_detached() -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    source: List[llir.Stmt] = [
+        llir.VarInit(
+            _var("tensor", llir.DataType.TORCH_TENSOR),
+            llir.FunctionCall(
+                "scorch_tensor_from_vector",
+                (
+                    llir.FunctionCall("std::move", (_var("values"),)),
+                    llir.QualifiedName(
+                        "torch",
+                        "kFloat32",
+                        llir.DataType.TORCH_SCALAR_TYPE,
+                    ),
+                ),
+            ),
+        )
+    ]
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact(artifact.statements)
+
+    once = manager.run_production_pipeline(
+        LLIRStatementListArtifact(source),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+    twice = manager.run_production_pipeline(
+        LLIRStatementListArtifact(once.artifact.value),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    def dtype_leaf(value: object) -> llir.QualifiedName:
+        initializer = cast(llir.VarInit, cast(List[llir.Stmt], value)[0])
+        call = cast(llir.FunctionCall, initializer.value)
+        return cast(llir.QualifiedName, call.args[1])
+
+    original_dtype = dtype_leaf(source)
+    once_dtype = dtype_leaf(once.artifact.value)
+    twice_dtype = dtype_leaf(twice.artifact.value)
+    assert original_dtype == once_dtype == twice_dtype
+    assert original_dtype is not once_dtype
+    assert once_dtype is not twice_dtype
+    assert [record.pass_name for record in once.run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.sequence_index for record in once.run_records] == list(range(5))
+    assert all(record.duration_ns >= 0 for record in once.run_records)
 
 
 def test_result_count_and_fill_are_independent_not_a_linear_pipeline() -> None:

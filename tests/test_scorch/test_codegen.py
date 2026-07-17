@@ -364,6 +364,179 @@ def test_codegen_rejects_unknown_binary_children() -> None:
         LLIRLowerer().lower_llir(expression)
 
 
+def test_qualified_name_is_frozen_typed_and_structurally_equal() -> None:
+    expression = llir.QualifiedName(
+        namespace="torch",
+        name="kInt",
+        data_type=llir.DataType.TORCH_SCALAR_TYPE,
+    )
+    equal = llir.QualifiedName(
+        namespace="torch",
+        name="kInt",
+        data_type=llir.DataType.TORCH_SCALAR_TYPE,
+    )
+
+    assert expression.namespace == "torch"
+    assert expression.name == "kInt"
+    assert expression.data_type is llir.DataType.TORCH_SCALAR_TYPE
+    assert llir.DataType.TORCH_SCALAR_TYPE.value == "torch::ScalarType"
+    assert expression == equal
+    assert hash(expression) == hash(equal)
+    assert expression != llir.QualifiedName(
+        "at", "kInt", llir.DataType.TORCH_SCALAR_TYPE
+    )
+    assert expression != llir.QualifiedName(
+        "torch", "kFloat32", llir.DataType.TORCH_SCALAR_TYPE
+    )
+    assert expression != llir.QualifiedName("torch", "kInt", llir.DataType.INT)
+    assert get_type_hints(llir.QualifiedName) == {
+        "namespace": str,
+        "name": str,
+        "data_type": llir.DataType,
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        expression.namespace = "at"
+    with pytest.raises(FrozenInstanceError):
+        expression.name = "kFloat32"
+    with pytest.raises(FrozenInstanceError):
+        expression.data_type = llir.DataType.INT
+
+
+@pytest.mark.parametrize(
+    ("namespace", "name", "data_type", "message"),
+    (
+        (1, "kInt", llir.DataType.TORCH_SCALAR_TYPE, "QualifiedName.namespace"),
+        ("", "kInt", llir.DataType.TORCH_SCALAR_TYPE, "QualifiedName.namespace"),
+        (
+            "torch::detail",
+            "kInt",
+            llir.DataType.TORCH_SCALAR_TYPE,
+            "QualifiedName.namespace",
+        ),
+        ("torch", 1, llir.DataType.TORCH_SCALAR_TYPE, "QualifiedName.name"),
+        ("torch", "", llir.DataType.TORCH_SCALAR_TYPE, "QualifiedName.name"),
+        (
+            "torch",
+            "k-Int",
+            llir.DataType.TORCH_SCALAR_TYPE,
+            "QualifiedName.name",
+        ),
+        ("torch", "kInt", "torch::ScalarType", "QualifiedName.data_type"),
+    ),
+)
+def test_qualified_name_rejects_malformed_constructor_fields(
+    namespace: object,
+    name: object,
+    data_type: object,
+    message: str,
+) -> None:
+    with pytest.raises(TypeError, match=message):
+        llir.QualifiedName(
+            namespace=cast(str, namespace),
+            name=cast(str, name),
+            data_type=cast(llir.DataType, data_type),
+        )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
+        (
+            llir.QualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
+            "torch::kInt",
+        ),
+        (
+            llir.FunctionCall(
+                "consume",
+                (
+                    llir.QualifiedName(
+                        "torch", "kFloat32", llir.DataType.TORCH_SCALAR_TYPE
+                    ),
+                ),
+            ),
+            "consume(torch::kFloat32)",
+        ),
+        (
+            llir.BinOp(
+                "==",
+                llir.QualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
+                llir.QualifiedName(
+                    "torch", "kFloat32", llir.DataType.TORCH_SCALAR_TYPE
+                ),
+            ),
+            "torch::kInt == torch::kFloat32",
+        ),
+        (
+            llir.Cast(
+                llir.QualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
+                llir.DataType.INT,
+            ),
+            "(int) torch::kInt",
+        ),
+        (
+            llir.MemberAccess(
+                llir.QualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
+                "value",
+            ),
+            "torch::kInt.value",
+        ),
+        (
+            llir.ArrayAccess(
+                llir.QualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
+                llir.Literal(0),
+            ),
+            "torch::kInt[0]",
+        ),
+    ),
+)
+def test_qualified_name_codegen_is_byte_exact_and_precedence_safe(
+    expression: llir.Expr,
+    expected: str,
+) -> None:
+    assert LLIRLowerer().lower_llir(expression) == expected
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "message"),
+    (
+        ("namespace", "torch::detail", "QualifiedName.namespace"),
+        ("name", "k-Int", "QualifiedName.name"),
+        ("data_type", "torch::ScalarType", "QualifiedName.data_type"),
+    ),
+)
+def test_codegen_rejects_forged_qualified_name_fields(
+    field: str,
+    invalid: object,
+    message: str,
+) -> None:
+    expression = object.__new__(llir.QualifiedName)
+    object.__setattr__(expression, "namespace", "torch")
+    object.__setattr__(expression, "name", "kInt")
+    object.__setattr__(
+        expression,
+        "data_type",
+        llir.DataType.TORCH_SCALAR_TYPE,
+    )
+    object.__setattr__(expression, field, invalid)
+
+    with pytest.raises(CodegenError, match=message):
+        LLIRLowerer().lower_llir(expression)
+
+
+def test_codegen_rejects_unknown_qualified_name_subclass() -> None:
+    class UnknownQualifiedName(llir.QualifiedName):
+        pass
+
+    expression = llir.FunctionCall(
+        "consume",
+        (UnknownQualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),),
+    )
+
+    with pytest.raises(CodegenError, match="UnknownQualifiedName"):
+        LLIRLowerer().lower_llir(expression)
+
+
 def test_function_call_is_frozen_typed_owned_and_structurally_equal() -> None:
     argument = _var("values")
     caller_args = [argument]
@@ -692,6 +865,10 @@ def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None
         (llir.Literal(1), "exact Var or ArrayAccess"),
         (llir.FunctionCall("target"), "exact Var or ArrayAccess"),
         (llir.MemberAccess(_var("target"), "member"), "exact Var or ArrayAccess"),
+        (
+            llir.QualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
+            "exact Var or ArrayAccess",
+        ),
         (_var("values[i]"), "identifier or member path"),
         (_var("call()"), "identifier or member path"),
         (_var("left + right"), "identifier or member path"),

@@ -376,6 +376,50 @@ def test_dynamic_vector_pass_no_vector_declaration_is_detached_no_op() -> None:
     )
 
 
+def test_dynamic_vector_pass_detaches_without_rewriting_qualified_dtype() -> None:
+    source: List[llir.Stmt] = [
+        llir.VarInit(
+            _var("tensor", llir.DataType.TORCH_TENSOR),
+            llir.FunctionCall(
+                "scorch_tensor_from_vector",
+                (
+                    llir.FunctionCall("std::move", (_var("values"),)),
+                    llir.QualifiedName(
+                        "torch",
+                        "kFloat32",
+                        llir.DataType.TORCH_SCALAR_TYPE,
+                    ),
+                ),
+            ),
+        )
+    ]
+
+    first = rewrite_dynamic_vector_accesses(
+        source,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+    second = rewrite_dynamic_vector_accesses(
+        first,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+
+    def dtype_leaf(statements: List[llir.Stmt]) -> llir.QualifiedName:
+        initializer = cast(llir.VarInit, statements[0])
+        call = cast(llir.FunctionCall, initializer.value)
+        return cast(llir.QualifiedName, call.args[1])
+
+    original_dtype = dtype_leaf(source)
+    first_dtype = dtype_leaf(first)
+    second_dtype = dtype_leaf(second)
+    assert original_dtype == first_dtype == second_dtype
+    assert original_dtype is not first_dtype
+    assert first_dtype is not second_dtype
+    assert _cpp(first) == (
+        "torch::Tensor tensor = "
+        "scorch_tensor_from_vector(std::move(values), torch::kFloat32);"
+    )
+
+
 def test_dynamic_vector_pass_detaches_and_preserves_shape_extent_reads() -> None:
     source: List[llir.Stmt] = [
         llir.VarDecl(_var("out_values", llir.DataType.STD_VECTOR_FLOAT32)),
