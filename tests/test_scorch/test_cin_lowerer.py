@@ -326,6 +326,103 @@ def test_result_position_initialization_uses_a_frozen_structured_target() -> Non
     assert LLIRLowerer().lower_llir(assignment) == "Result1_pos[0] = 0;"
 
 
+def _assert_torch_empty_extent(
+    statements: list[llir.Stmt],
+    *,
+    extent_name: str,
+) -> tuple[llir.Array, llir.VarInit]:
+    initializer = next(
+        cast(llir.VarInit, statement)
+        for statement in statements
+        if type(statement) is llir.VarInit
+        and cast(llir.VarInit, statement).var.name == "Result_values_torch"
+    )
+    assert type(initializer.value) is llir.FunctionCall
+    call = cast(llir.FunctionCall, initializer.value)
+    assert call.name == "torch::empty"
+    assert type(call.args) is tuple
+    assert len(call.args) == 2
+    assert type(call.args[0]) is llir.Array
+    extent = cast(llir.Array, call.args[0])
+    assert extent.data_type is llir.DataType.INT64
+    assert type(extent.values) is tuple
+    assert len(extent.values) == 1
+    assert type(extent.values[0]) is llir.Var
+    child = cast(llir.Var, extent.values[0])
+    assert child.name == extent_name
+    assert child.type is llir.DataType.INT64
+    assert child.is_ptr is False
+    assert child.is_restrict is False
+    assert child.tensor_access is None
+    assert type(call.args[1]) is llir.Var
+    assert cast(llir.Var, call.args[1]).name == "torch::kFloat32"
+    return extent, initializer
+
+
+def test_dense_result_torch_empty_extent_is_structured_typed_and_fresh() -> None:
+    tensor = TensorVar("Result", fmt="dd")
+
+    first_statements = ResultTensorAssembler(tensor).emit_value_array_init()
+    second_statements = ResultTensorAssembler(tensor).emit_value_array_init()
+    first, first_initializer = _assert_torch_empty_extent(
+        first_statements,
+        extent_name="Result_capacity",
+    )
+    second, second_initializer = _assert_torch_empty_extent(
+        second_statements,
+        extent_name="Result_capacity",
+    )
+    capacity_initializer = cast(llir.VarInit, first_statements[0])
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first is not second
+    assert first.values[0] is not second.values[0]
+    assert first.values[0] is not capacity_initializer.var
+    assert LLIRLowerer().lower_llir(first_initializer) == (
+        "torch::Tensor Result_values_torch = "
+        "torch::empty({Result_capacity}, torch::kFloat32);"
+    )
+    assert LLIRLowerer().lower_llir(second_initializer) == (
+        "torch::Tensor Result_values_torch = "
+        "torch::empty({Result_capacity}, torch::kFloat32);"
+    )
+
+
+def test_known_nnz_result_torch_empty_extent_is_structured_typed_and_fresh() -> None:
+    tensor = TensorVar("Result", fmt="ds")
+
+    first_statements = ResultTensorAssembler(
+        tensor,
+        known_nnz_var="_known_nnz",
+    ).emit_value_array_init()
+    second_statements = ResultTensorAssembler(
+        tensor,
+        known_nnz_var="_known_nnz",
+    ).emit_value_array_init()
+    first, first_initializer = _assert_torch_empty_extent(
+        first_statements,
+        extent_name="_known_nnz",
+    )
+    second, second_initializer = _assert_torch_empty_extent(
+        second_statements,
+        extent_name="_known_nnz",
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first is not second
+    assert first.values[0] is not second.values[0]
+    assert LLIRLowerer().lower_llir(first_initializer) == (
+        "torch::Tensor Result_values_torch = "
+        "torch::empty({_known_nnz}, torch::kFloat32);"
+    )
+    assert LLIRLowerer().lower_llir(second_initializer) == (
+        "torch::Tensor Result_values_torch = "
+        "torch::empty({_known_nnz}, torch::kFloat32);"
+    )
+
+
 def test_final_result_assembly_uses_structured_typed_move_calls() -> None:
     statements = ResultTensorAssembler(
         TensorVar("Result", fmt="ds")

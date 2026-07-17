@@ -833,6 +833,10 @@ def test_sddmm_default_scalar_accumulator_and_simd_are_unchanged():
     assert "packed_" not in cpp
     assert "int64_t _known_nnz = Mask_values.size(0);" in cpp
     assert "torch::Tensor Sampled0_crd_torch = torch::empty" in cpp
+    assert (
+        "torch::Tensor Sampled_values_torch = "
+        "torch::empty({_known_nnz}, torch::kFloat32);"
+    ) in cpp
     assert "std::vector<float> Sampled_values" not in cpp
 
     torch.manual_seed(102)

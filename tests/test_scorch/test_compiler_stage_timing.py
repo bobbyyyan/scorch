@@ -1182,6 +1182,96 @@ def test_timing_is_excluded_from_source_name_request_and_cache_identity(
     ]
 
 
+def test_known_nnz_extent_is_independent_across_full_compilations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs = _all_coo_sddmm_specs()
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    prepared_builds: list[utils._PreparedJITBuild] = []
+
+    def record_prepared(prepared: utils._PreparedJITBuild) -> object:
+        prepared_builds.append(prepared)
+        return object()
+
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record_prepared)
+    first_context = CompilationContext(options)
+    with scheduler_module.regblock_force(False):
+        first = ops.einsum(
+            "ij,ik,jk->ij",
+            *specs,
+            compile_only=True,
+            format="oo",
+            _compile_options=options,
+            _compilation_context=first_context,
+        )
+    first_stage_records = first_context.stage_run_records
+    first_pass_records = first_context.llir_pass_run_records
+    ops._kernel_cache.clear()
+    ops._einsum_dispatch_cache.clear()
+
+    second_context = CompilationContext(options)
+    with scheduler_module.regblock_force(False):
+        second = ops.einsum(
+            "ij,ik,jk->ij",
+            *specs,
+            compile_only=True,
+            format="oo",
+            _compile_options=options,
+            _compilation_context=second_context,
+        )
+
+    assert isinstance(first, TensorSpec)
+    assert isinstance(second, TensorSpec)
+    assert first == second
+    assert first is not second
+    assert len(prepared_builds) == 2
+    assert prepared_builds[0] == prepared_builds[1]
+    assert (
+        prepared_builds[0].request.cpp_sources == prepared_builds[1].request.cpp_sources
+    )
+    assert any(
+        "torch::empty({_known_nnz}, torch::kFloat32);" in source
+        for source in prepared_builds[0].request.cpp_sources
+    )
+    assert prepared_builds[0].request.build_options is options.build
+    assert prepared_builds[1].request.build_options is options.build
+    assert first_context.compile_options is options
+    assert second_context.compile_options is options
+    assert _stage_values(first_context) == _AUTO_STAGE_SEQUENCE
+    assert _stage_values(second_context) == _AUTO_STAGE_SEQUENCE
+    assert tuple(
+        replace(record, duration_ns=0) for record in first_stage_records
+    ) == tuple(
+        replace(record, duration_ns=0) for record in second_context.stage_run_records
+    )
+    assert tuple(
+        replace(record, duration_ns=0) for record in first_pass_records
+    ) == tuple(
+        replace(record, duration_ns=0)
+        for record in second_context.llir_pass_run_records
+    )
+    assert [record.pass_name for record in first_pass_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+
+
 def test_two_options_snapshots_have_independent_records_results_and_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2207,6 +2297,137 @@ def test_malformed_assembled_call_fails_its_owner_and_suppresses_later_stages(
     ]
     assert later_calls == []
     assert context.compile_options is options
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+@pytest.mark.parametrize("route", ("dense_capacity", "known_nnz"))
+def test_malformed_torch_empty_extent_fails_dynamic_owner_and_suppresses_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+) -> None:
+    specs: Tuple[TensorSpec, ...]
+    if route == "dense_capacity":
+        equation = "ik,kj->ij"
+        specs = _spmm_specs()
+        output_format = "dd"
+        options = _explicit_options()
+        expected_extent = "C_capacity"
+    else:
+        equation = "ij,ik,jk->ij"
+        specs = _all_coo_sddmm_specs()
+        output_format = "oo"
+        options = _default_options()
+        expected_extent = "_known_nnz"
+    context = CompilationContext(options)
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    original_initialization = ResultTensorAssembler.emit_value_array_init
+    injected_extents: list[str] = []
+
+    def emit_malformed_extent(self: ResultTensorAssembler) -> list[llir.Stmt]:
+        statements = original_initialization(self)
+        for statement in statements:
+            if type(statement) is not llir.VarInit:
+                continue
+            initializer = cast(llir.VarInit, statement)
+            if type(initializer.value) is not llir.FunctionCall:
+                continue
+            call = cast(llir.FunctionCall, initializer.value)
+            if call.name != "torch::empty" or type(call.args[0]) is not llir.Array:
+                continue
+            extent = cast(llir.Array, call.args[0])
+            child = cast(llir.Var, extent.values[0])
+            injected_extents.append(child.name)
+            object.__setattr__(extent, "data_type", "int64_t")
+        return statements
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_value_array_init",
+        emit_malformed_extent,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    if route == "known_nnz":
+        with scheduler_module.regblock_force(False):
+            with pytest.raises(LLIRTraversalError) as failure:
+                ops.einsum(
+                    equation,
+                    *specs,
+                    compile_only=True,
+                    format=output_format,
+                    _compile_options=options,
+                    _compilation_context=context,
+                )
+    else:
+        with pytest.raises(LLIRTraversalError) as failure:
+            ops.einsum(
+                equation,
+                *specs,
+                compile_only=True,
+                format=output_format,
+                _compile_options=options,
+                _compilation_context=context,
+            )
+
+    diagnostic = failure.value.diagnostic
+    assert injected_extents == [expected_extent]
+    assert diagnostic.code == "invalid_array_data_type"
+    assert diagnostic.stage == "LLIR rewrite"
+    assert diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert diagnostic.path[-4:] == ("value", "args", "[0]", "data_type")
+    assert _stage_values(context) == [
+        *_EINSUM_PREFIX_THROUGH_ADAPTER,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    ]
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(6)
+    )
+    assert all(record.duration_ns >= 0 for record in context.stage_run_records)
+    assert context.stage_run_records[-1].nested_within is CompilerStageId.CIN_LOWERING
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert all(record.duration_ns >= 0 for record in context.llir_pass_run_records)
+    assert later_calls == []
+    assert context.compile_options is options
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
     with pytest.raises(CompilationContextError) as suppressed:
         context.begin_stage(
             CompilerStageId.SCHEDULE_LOWERING,

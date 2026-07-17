@@ -116,7 +116,10 @@ def test_dense_output_is_torch_owned_from_allocation():
 
     cpp_code = _lower_to_cpp(ForAll(i, result._assignment))
 
-    assert "torch::Tensor Result_values_torch = torch::empty" in cpp_code
+    assert (
+        "torch::Tensor Result_values_torch = "
+        "torch::empty({Result_capacity}, torch::kFloat32);"
+    ) in cpp_code
     assert "Result_values_torch.data_ptr<float>()" in cpp_code
     assert "scorch_zero_dense(Result_values" in cpp_code
     assert "from_blob" not in cpp_code

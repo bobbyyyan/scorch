@@ -1391,6 +1391,48 @@ def test_dynamic_runner_preserves_exact_root_and_detached_idempotence() -> None:
     assert once.run_records[0].configuration_name == "dynamic_vector_access"
 
 
+def test_dynamic_runner_detaches_structured_initializer_list_arguments() -> None:
+    source: List[llir.Stmt] = [
+        llir.VarInit(
+            _var("Result_values_torch", llir.DataType.TORCH_TENSOR),
+            llir.FunctionCall(
+                "torch::empty",
+                (
+                    llir.Array(
+                        (_var("Result_capacity", llir.DataType.INT64),),
+                        llir.DataType.INT64,
+                    ),
+                    _var("torch::kFloat32"),
+                ),
+            ),
+        )
+    ]
+    manager = LLIRPassManager()
+
+    once = manager.run_dynamic_vector_access(LLIRRewriteArtifact(source))
+    twice = manager.run_dynamic_vector_access(once.artifact)
+    once_initializer = cast(llir.VarInit, cast(List[llir.Stmt], once.artifact.value)[0])
+    twice_initializer = cast(
+        llir.VarInit,
+        cast(List[llir.Stmt], twice.artifact.value)[0],
+    )
+    original_call = cast(llir.FunctionCall, cast(llir.VarInit, source[0]).value)
+    once_call = cast(llir.FunctionCall, once_initializer.value)
+    twice_call = cast(llir.FunctionCall, twice_initializer.value)
+    original_array = cast(llir.Array, original_call.args[0])
+    once_array = cast(llir.Array, once_call.args[0])
+    twice_array = cast(llir.Array, twice_call.args[0])
+
+    assert original_array == once_array == twice_array
+    assert original_array is not once_array
+    assert once_array is not twice_array
+    assert original_array.values[0] is not once_array.values[0]
+    assert once_array.values[0] is not twice_array.values[0]
+    cast(llir.Var, once_array.values[0]).name = "owned"
+    assert cast(llir.Var, original_array.values[0]).name == "Result_capacity"
+    assert cast(llir.Var, twice_array.values[0]).name == "Result_capacity"
+
+
 def test_result_count_and_fill_are_independent_not_a_linear_pipeline() -> None:
     source: List[llir.Stmt] = [
         llir.Assign(

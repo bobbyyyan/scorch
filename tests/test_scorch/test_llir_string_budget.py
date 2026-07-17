@@ -116,7 +116,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(constructor_counts.values()) == 384
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 173,
+        "cin_lowerer.py": 175,
         "compressed_where_openmp_pass.py": 5,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -127,7 +127,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 97,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 351
+    assert sum(unclassified_counts.values()) == 353
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -142,16 +142,16 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "subscript": 15,
         "call": 8,
         "member": 3,
-        "initializer": 3,
+        "initializer": 1,
         "qualified": 3,
         "ternary": 1,
     }
-    assert sum(totals.values()) == 33
+    assert sum(totals.values()) == 31
     assert per_file == {
         ("cin_lowerer.py", "subscript"): 13,
         ("cin_lowerer.py", "call"): 6,
         ("cin_lowerer.py", "member"): 3,
-        ("cin_lowerer.py", "initializer"): 3,
+        ("cin_lowerer.py", "initializer"): 1,
         ("cin_lowerer.py", "qualified"): 3,
         ("cin_lowerer.py", "ternary"): 1,
         ("iterator.py", "subscript"): 2,
@@ -221,6 +221,17 @@ def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
 
     assert violations == []
     assert structured_calls == {"schedule_lowerer.py": 1}
+
+
+def test_torch_empty_extents_cannot_return_to_var_names() -> None:
+    source = (_COMPILER_ROOT / "cin_lowerer.py").read_text()
+    value_initialization = source.split("def emit_value_array_init", 1)[1].split(
+        "def _get_mode_index_set", 1
+    )[0]
+
+    assert 'name=f"{{{self.name}_capacity}}"' not in value_initialization
+    assert 'name=f"{{{self.known_nnz_var}}}"' not in value_initialization
+    assert value_initialization.count("llir.Array(") == 2
 
 
 def test_workspace_pair_reads_cannot_return_to_var_names() -> None:

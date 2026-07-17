@@ -294,6 +294,36 @@ def test_function_call_walker_has_deterministic_preorder() -> None:
     ]
 
 
+def test_array_walker_has_deterministic_nested_preorder() -> None:
+    expression = llir.FunctionCall(
+        "consume",
+        (
+            llir.Array(
+                (
+                    _var("extent", llir.DataType.INT64),
+                    llir.Array(
+                        (llir.Add(_var("offset"), llir.Literal(1)),),
+                        llir.DataType.INT64,
+                    ),
+                ),
+                llir.DataType.INT64,
+            ),
+        ),
+    )
+
+    expected = [
+        "FunctionCall",
+        "Array",
+        "Var:extent",
+        "Array",
+        "Add",
+        "Var:offset",
+        "Literal:1",
+    ]
+    assert _record(expression) == expected
+    assert _record(expression) == expected
+
+
 def test_panel_bound_cast_walker_has_deterministic_preorder() -> None:
     coordinate = _var("coordinates", llir.DataType.PTR_INT)
     expression = llir.Cast(
@@ -560,6 +590,23 @@ def test_unknown_array_access_subclass_fails_closed(operation: str) -> None:
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_array_subclass_fails_closed(operation: str) -> None:
+    class UnknownArray(llir.Array):
+        pass
+
+    unknown = UnknownArray((_var("extent"),), llir.DataType.INT64)
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownArray"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_unknown_member_access_subclass_fails_closed(operation: str) -> None:
     class UnknownMemberAccess(llir.MemberAccess):
         pass
@@ -728,6 +775,58 @@ def test_function_call_unknown_child_reports_exact_path(operation: str) -> None:
     assert raised.value.diagnostic.node_type == "UnknownExpr"
     assert raised.value.diagnostic.code == "unknown_llir_node"
     assert raised.value.diagnostic.path == ("root", "args", "[0]")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_array_unknown_child_reports_exact_path(operation: str) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    array = llir.Array((UnknownExpr(),), llir.DataType.INT64)
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(array)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(array)
+
+    assert raised.value.diagnostic.node_type == "UnknownExpr"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", "values", "[0]")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        ("values", "invalid_array_values", ("root", "values")),
+        ("value", "invalid_array_value", ("root", "values", "[0]")),
+        ("data_type", "invalid_array_data_type", ("root", "data_type")),
+    ),
+)
+def test_forged_array_fields_fail_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    array = object.__new__(llir.Array)
+    object.__setattr__(array, "values", (_var("extent"),))
+    object.__setattr__(array, "data_type", llir.DataType.INT64)
+    if malformation == "values":
+        object.__setattr__(array, "values", [_var("extent")])
+    elif malformation == "value":
+        object.__setattr__(array, "values", ("extent",))
+    else:
+        object.__setattr__(array, "data_type", "int64_t")
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(array)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(array)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -1234,6 +1333,48 @@ def test_function_call_rewrite_is_detached_repeatable_and_replacement_owned() ->
     assert cast(llir.Var, replacement_move.args[0]).name == "replacement"
     assert cast(llir.Var, original_move.args[0]).name == "values"
     assert replacement_move.args[0] is not original_move.args[0]
+
+
+def test_array_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original = llir.Array(
+        (
+            llir.Add(_var("extent"), llir.Literal(1, llir.DataType.INT64)),
+            llir.Array((_var("other"),), llir.DataType.INT64),
+        ),
+        llir.DataType.INT64,
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.Array, rewriter.rewrite(original))
+    second = cast(llir.Array, rewriter.rewrite(first))
+
+    assert _record(original) == _record(first) == _record(second)
+    assert original == first == second
+    assert hash(original) == hash(first) == hash(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    assert type(first.values) is tuple
+    assert type(second.values) is tuple
+
+    class ReplaceExtent(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "extent":
+                rewritten.name = "replacement"
+            return rewritten
+
+    replacement = cast(llir.Array, ReplaceExtent(_CONTEXT).rewrite(original))
+    replacement_add = cast(llir.Add, replacement.values[0])
+    original_add = cast(llir.Add, original.values[0])
+    first_add = cast(llir.Add, first.values[0])
+
+    assert cast(llir.Var, replacement_add.left).name == "replacement"
+    assert cast(llir.Var, original_add.left).name == "extent"
+    assert replacement_add is not original_add
+    assert replacement_add.left is not original_add.left
+    cast(llir.Var, replacement_add.left).name = "owned"
+    assert cast(llir.Var, original_add.left).name == "extent"
+    assert cast(llir.Var, first_add.left).name == "extent"
 
 
 def test_cast_rewrite_is_detached_repeatable_and_replacement_owned() -> None:

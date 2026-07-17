@@ -408,6 +408,121 @@ def test_function_call_rejects_non_expression_arguments() -> None:
         llir.FunctionCall("call", [cast(llir.Expr, "argument")])
 
 
+def test_array_is_frozen_typed_owned_and_structurally_equal() -> None:
+    value = _var("extent")
+    caller_values = [value]
+    array = llir.Array(caller_values, llir.DataType.INT64)
+    tuple_array = llir.Array((_var("extent"),), llir.DataType.INT64)
+
+    caller_values.append(_var("later"))
+
+    assert type(array.values) is tuple
+    assert array.values == (value,)
+    assert array.data_type is llir.DataType.INT64
+    assert array == tuple_array
+    assert hash(array) == hash(tuple_array)
+    assert array != llir.Array((_var("other"),), llir.DataType.INT64)
+    assert array != llir.Array((_var("extent"),), llir.DataType.INT)
+    assert get_type_hints(llir.Array) == {
+        "values": Tuple[llir.Expr, ...],
+        "data_type": llir.DataType,
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        array.values = ()
+    with pytest.raises(FrozenInstanceError):
+        array.data_type = llir.DataType.INT
+
+
+@pytest.mark.parametrize("values", ("value", {_var("value")}, None))
+def test_array_rejects_malformed_value_containers(values: object) -> None:
+    with pytest.raises(TypeError, match="Array.values must be a list or tuple"):
+        llir.Array(cast(Any, values), llir.DataType.INT64)
+
+
+def test_array_rejects_malformed_children_and_data_type() -> None:
+    with pytest.raises(TypeError, match="contain only LLIR expressions"):
+        llir.Array([cast(llir.Expr, "extent")], llir.DataType.INT64)
+    with pytest.raises(TypeError, match="Array.data_type"):
+        llir.Array([_var("extent")], cast(llir.DataType, "int64_t"))
+
+
+def test_array_codegen_is_byte_exact_for_empty_nested_and_expression_values() -> None:
+    empty = llir.Array((), llir.DataType.INT64)
+    nested = llir.FunctionCall(
+        "consume",
+        [
+            llir.Array(
+                (
+                    llir.Array((_var("row"),), llir.DataType.INT64),
+                    llir.Add(_var("column"), llir.Literal(1)),
+                ),
+                llir.DataType.INT64,
+            )
+        ],
+    )
+
+    assert LLIRLowerer().lower_llir(empty) == "{}"
+    assert LLIRLowerer().lower_llir(nested) == "consume({{row}, column + 1})"
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        llir.BinOp(
+            "+",
+            llir.Array((_var("value"),), llir.DataType.INT),
+            _var("offset"),
+        ),
+        llir.MemberAccess(
+            llir.Array((_var("value"),), llir.DataType.INT),
+            "member",
+        ),
+        llir.ArrayAccess(
+            llir.Array((_var("value"),), llir.DataType.INT),
+            _var("index"),
+        ),
+    ),
+)
+def test_array_codegen_rejects_operand_contexts_without_a_cpp_precedence(
+    expression: llir.Expr,
+) -> None:
+    with pytest.raises(CodegenError, match="precedence.*Array"):
+        LLIRLowerer().lower_llir(expression)
+
+
+@pytest.mark.parametrize("malformation", ("values", "value", "data_type"))
+def test_codegen_rejects_forged_array_fields(malformation: str) -> None:
+    array = object.__new__(llir.Array)
+    object.__setattr__(array, "values", (_var("extent"),))
+    object.__setattr__(array, "data_type", llir.DataType.INT64)
+    if malformation == "values":
+        object.__setattr__(array, "values", [_var("extent")])
+        expected = "Array.values must be a tuple"
+    elif malformation == "value":
+        object.__setattr__(array, "values", ("extent",))
+        expected = "contain only LLIR expressions"
+    else:
+        object.__setattr__(array, "data_type", "int64_t")
+        expected = "Array.data_type"
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(array)
+
+
+def test_codegen_rejects_array_subclasses_and_unknown_children() -> None:
+    class UnknownArray(llir.Array):
+        pass
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownArray"):
+        LLIRLowerer().lower_llir(UnknownArray((_var("extent"),), llir.DataType.INT64))
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(llir.Array((UnknownExpr(),), llir.DataType.INT64))
+
+
 def test_nested_function_call_codegen_is_byte_exact_and_postfix_correct() -> None:
     conversion = llir.FunctionCall(
         "scorch_tensor_from_vector",
