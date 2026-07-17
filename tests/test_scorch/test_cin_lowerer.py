@@ -838,9 +838,15 @@ def test_compressed_mode_iterator_position_bounds_are_structured_typed_and_owned
     assert match_mode_position_begin(first_begin) == expected_match
     assert match_mode_position_access(first_begin) == array_name
     assert match_mode_position_access(first_end) == array_name
-    assert match_mode_position_bounds(first_begin, first_end) == expected_begin_cpp
+    matched_begin = match_mode_position_bounds(first_begin, first_end)
+    assert type(matched_begin) is llir.ArrayAccess
+    assert matched_begin == expected_begin
+    assert matched_begin is not first_begin
+    assert matched_begin.array is not first_begin.array
+    assert matched_begin.index is not first_begin.index
     assert LLIRLowerer().lower_llir(first_begin) == expected_begin_cpp
     assert LLIRLowerer().lower_llir(first_end) == expected_end_cpp
+    assert LLIRLowerer().lower_llir(matched_begin) == expected_begin_cpp
 
     accesses = [
         cast(llir.ArrayAccess, value)

@@ -294,6 +294,52 @@ def test_function_call_walker_has_deterministic_preorder() -> None:
     ]
 
 
+def test_panel_bound_cast_walker_has_deterministic_preorder() -> None:
+    coordinate = _var("coordinates", llir.DataType.PTR_INT)
+    expression = llir.Cast(
+        llir.BinOp(
+            "-",
+            llir.FunctionCall(
+                "std::lower_bound",
+                [
+                    llir.Add(
+                        coordinate,
+                        llir.ArrayAccess(
+                            _var("positions", llir.DataType.PTR_INT),
+                            _var("parent"),
+                        ),
+                    ),
+                    llir.Add(
+                        _var("coordinates", llir.DataType.PTR_INT),
+                        _var("row_end"),
+                    ),
+                    _var("panel", llir.DataType.INT64),
+                ],
+            ),
+            _var("coordinates", llir.DataType.PTR_INT),
+        ),
+        llir.DataType.INT,
+    )
+
+    expected = [
+        "Cast",
+        "BinOp",
+        "FunctionCall",
+        "Add",
+        "Var:coordinates",
+        "ArrayAccess",
+        "Var:positions",
+        "Var:parent",
+        "Add",
+        "Var:coordinates",
+        "Var:row_end",
+        "Var:panel",
+        "Var:coordinates",
+    ]
+    assert _record(expression) == expected
+    assert _record(expression) == expected
+
+
 def test_walker_and_rewriter_cover_every_declared_node() -> None:
     samples = _node_samples()
     assert set(SUPPORTED_LLIR_NODE_TYPES) == _declared_node_types()
@@ -545,6 +591,70 @@ def test_unknown_function_call_subclass_fails_closed(operation: str) -> None:
     assert raised.value.diagnostic.node_type == "UnknownFunctionCall"
     assert raised.value.diagnostic.code == "unknown_llir_node"
     assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_cast_subclass_fails_closed(operation: str) -> None:
+    class UnknownCast(llir.Cast):
+        pass
+
+    unknown = UnknownCast(_var("value"), llir.DataType.INT)
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownCast"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        ("expression", "invalid_cast_expression", ("root", "expr")),
+        ("data_type", "invalid_cast_data_type", ("root", "data_type")),
+    ),
+)
+def test_forged_cast_fields_fail_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    expression = llir.Cast(_var("value"), llir.DataType.INT)
+    if malformation == "expression":
+        object.__setattr__(expression, "expr", "value")
+    else:
+        object.__setattr__(expression, "data_type", "int")
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_cast_unknown_child_reports_exact_path(operation: str) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    expression = llir.Cast(UnknownExpr(), llir.DataType.INT)
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.node_type == "UnknownExpr"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", "expr")
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -1124,6 +1234,42 @@ def test_function_call_rewrite_is_detached_repeatable_and_replacement_owned() ->
     assert cast(llir.Var, replacement_move.args[0]).name == "replacement"
     assert cast(llir.Var, original_move.args[0]).name == "values"
     assert replacement_move.args[0] is not original_move.args[0]
+
+
+def test_cast_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original = llir.Cast(
+        llir.Add(_var("offset"), llir.Literal(1, llir.DataType.INT)),
+        llir.DataType.INT64,
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.Cast, rewriter.rewrite(original))
+    second = cast(llir.Cast, rewriter.rewrite(first))
+
+    assert _record(original) == _record(first) == _record(second)
+    assert _structural_snapshot(original) == _structural_snapshot(first)
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    assert first.data_type is llir.DataType.INT64
+    assert second.data_type is llir.DataType.INT64
+
+    class ReplaceOffset(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "offset":
+                rewritten.name = "replacement"
+            return rewritten
+
+    replacement = cast(llir.Cast, ReplaceOffset(_CONTEXT).rewrite(original))
+    replacement_add = cast(llir.Add, replacement.expr)
+    original_add = cast(llir.Add, original.expr)
+    assert cast(llir.Var, replacement_add.left).name == "replacement"
+    assert cast(llir.Var, original_add.left).name == "offset"
+    assert replacement_add.left is not original_add.left
+
+    cast(llir.Var, replacement_add.left).name = "owned"
+    assert cast(llir.Var, original_add.left).name == "offset"
 
 
 def test_assignment_target_rewrite_owns_replacement_and_preserves_original() -> None:

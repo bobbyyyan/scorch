@@ -81,8 +81,6 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "expr.name.replace(old, new)",
         "name",
         "node.name",
-        "lower_expr",
-        "upper_expr",
         "prefix_extent",
         "zero_value",
     }
@@ -109,13 +107,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
-        "iterator.py": 21,
+        "iterator.py": 23,
         "llir_traversal.py": 1,
         "result_write_pass.py": 5,
-        "schedule_lowerer.py": 96,
+        "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(constructor_counts.values()) == 379
+    assert sum(constructor_counts.values()) == 384
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 173,
@@ -123,24 +121,22 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
-        "iterator.py": 19,
+        "iterator.py": 21,
         "llir_traversal.py": 1,
         "result_write_pass.py": 5,
-        "schedule_lowerer.py": 94,
+        "schedule_lowerer.py": 97,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 346
+    assert sum(unclassified_counts.values()) == 351
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
         ("llir_traversal.py", "node.name"): 1,
-        ("schedule_lowerer.py", "lower_expr"): 1,
-        ("schedule_lowerer.py", "upper_expr"): 1,
         ("schedule_lowerer.py", "prefix_extent"): 2,
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 9
+    assert sum(known_indirect.values()) == 7
 
     assert totals == {
         "subscript": 15,
@@ -199,6 +195,32 @@ def test_free_move_calls_cannot_return_to_var_names() -> None:
         ("cin_lowerer.py", "data_ptr"): 6,
         ("schedule_lowerer.py", "storage_data"): 2,
     }
+
+
+def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
+    violations: list[tuple[str, int, str]] = []
+    structured_calls: Counter[str] = Counter()
+    for path in sorted(_COMPILER_ROOT.glob("*.py")):
+        for call in _llir_constructor_calls(path, "Var"):
+            name_expression = _var_name_expression(call)
+            if name_expression is None:
+                continue
+            fragments = _static_string_fragments(name_expression)
+            if "std::lower_bound" in fragments:
+                violations.append(
+                    (path.name, call.lineno, ast.unparse(name_expression))
+                )
+
+        for call in _llir_constructor_calls(path, "FunctionCall"):
+            name_expression = _var_name_expression(call)
+            if (
+                isinstance(name_expression, ast.Constant)
+                and name_expression.value == "std::lower_bound"
+            ):
+                structured_calls[path.name] += 1
+
+    assert violations == []
+    assert structured_calls == {"schedule_lowerer.py": 1}
 
 
 def test_workspace_pair_reads_cannot_return_to_var_names() -> None:

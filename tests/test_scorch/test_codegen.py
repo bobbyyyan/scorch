@@ -114,6 +114,77 @@ def test_cast_codegen_parenthesizes_lower_precedence_operand() -> None:
     assert LLIRLowerer().lower_llir(expression) == "(float) (a + b)"
 
 
+def test_cast_is_frozen_typed_and_structurally_equal() -> None:
+    operand = _var("value")
+    expression = llir.Cast(operand, llir.DataType.INT)
+    equal = llir.Cast(_var("value"), llir.DataType.INT)
+
+    assert expression.expr is operand
+    assert expression.data_type is llir.DataType.INT
+    assert expression == equal
+    assert hash(expression) == hash(equal)
+    assert expression != llir.Cast(_var("other"), llir.DataType.INT)
+    assert expression != llir.Cast(_var("value"), llir.DataType.INT64)
+    assert get_type_hints(llir.Cast) == {
+        "expr": llir.Expr,
+        "data_type": llir.DataType,
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        expression.expr = _var("other")
+    with pytest.raises(FrozenInstanceError):
+        expression.data_type = llir.DataType.INT64
+
+
+@pytest.mark.parametrize(
+    ("expression", "data_type", "message"),
+    (
+        ("value", llir.DataType.INT, "Cast.expr"),
+        (_var("value"), "int", "Cast.data_type"),
+    ),
+)
+def test_cast_rejects_malformed_constructor_fields(
+    expression: object,
+    data_type: object,
+    message: str,
+) -> None:
+    with pytest.raises(TypeError, match=message):
+        llir.Cast(
+            cast(llir.Expr, expression),
+            cast(llir.DataType, data_type),
+        )
+
+
+@pytest.mark.parametrize("malformation", ("expression", "data_type"))
+def test_codegen_rejects_forged_cast_fields(malformation: str) -> None:
+    expression = llir.Cast(_var("value"), llir.DataType.INT)
+    if malformation == "expression":
+        object.__setattr__(expression, "expr", "value")
+        message = "Cast.expr"
+    else:
+        object.__setattr__(expression, "data_type", "int")
+        message = "Cast.data_type"
+
+    with pytest.raises(CodegenError, match=message):
+        LLIRLowerer().lower_llir(expression)
+
+
+def test_codegen_rejects_unknown_cast_subclass() -> None:
+    class UnknownCast(llir.Cast):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownCast"):
+        LLIRLowerer().lower_llir(UnknownCast(_var("value"), llir.DataType.INT))
+
+
+def test_codegen_rejects_unknown_cast_child() -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(llir.Cast(UnknownExpr(), llir.DataType.INT))
+
+
 def test_binary_and_literal_nodes_are_frozen_typed_structural_values() -> None:
     left = _var("i")
     one = llir.Literal(1, llir.DataType.INT64)
@@ -542,13 +613,6 @@ def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None
         (
             llir.ArrayAccess(
                 _var("values"),
-                llir.Cast(_var("i"), cast(llir.DataType, "int")),
-            ),
-            "Cast.data_type must be a DataType",
-        ),
-        (
-            llir.ArrayAccess(
-                _var("values"),
                 llir.Sizeof(cast(llir.DataType, "int")),
             ),
             "Sizeof.data_type must be a DataType",
@@ -579,6 +643,17 @@ def test_assign_rejects_arbitrary_rvalues_and_malformed_lvalues(
     with pytest.raises(TypeError, match=message):
         llir.Assign(
             var=cast(llir.AssignmentTarget, target),
+            value=llir.Literal(1),
+        )
+
+
+def test_assign_rejects_forged_cast_index_data_type() -> None:
+    malformed_cast = llir.Cast(_var("i"), llir.DataType.INT)
+    object.__setattr__(malformed_cast, "data_type", "int")
+
+    with pytest.raises(TypeError, match="Cast.data_type must be a DataType"):
+        llir.Assign(
+            var=llir.ArrayAccess(_var("values"), malformed_cast),
             value=llir.Literal(1),
         )
 
@@ -706,13 +781,11 @@ def test_codegen_rejects_forged_malformed_assignment_targets(
         assignment.var = target
         expected = "AccessId"
     else:
+        malformed_cast = llir.Cast(_var("i"), llir.DataType.INT)
+        object.__setattr__(malformed_cast, "data_type", "int")
         target = object.__new__(llir.ArrayAccess)
         object.__setattr__(target, "array", _var("values"))
-        object.__setattr__(
-            target,
-            "index",
-            llir.Cast(_var("i"), cast(llir.DataType, "int")),
-        )
+        object.__setattr__(target, "index", malformed_cast)
         object.__setattr__(target, "tensor_access", None)
         assignment.var = target
         expected = "Cast.data_type must be a DataType"

@@ -1775,6 +1775,107 @@ def test_stage_failures_raise_original_error_and_suppress_all_later_stages(
     assert suppressed.value.diagnostic.code == "failed_compilation"
 
 
+def test_malformed_panel_bound_fails_schedule_stage_and_suppresses_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnknownPanelIndex(llir.Expr):
+        pass
+
+    schedule = Schedule(
+        loop_order=("i", "k", "j"),
+        tiles=(TileSpec("k", 2, kind="panel", accum="direct"),),
+        parallel_loop="i",
+        tag="malformed-structured-panel-bound",
+    )
+    schedule_snapshot = replace(schedule)
+    schedule_hash = hash(schedule)
+    schedule_cache_key = schedule.cache_key
+    options = _default_options(requested_schedule=schedule)
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    context = CompilationContext(options)
+    specs = _spmm_specs()
+    observed_bounds: list[tuple[object, object]] = []
+    original_matcher = schedule_lowerer.match_mode_position_bounds
+
+    def forge_panel_begin(begin: object, end: object) -> llir.ArrayAccess:
+        assert original_matcher(begin, end) is not None
+        observed_bounds.append((begin, end))
+        return llir.ArrayAccess(
+            llir.Var("A1_pos", llir.DataType.PTR_INT),
+            UnknownPanelIndex(),
+        )
+
+    monkeypatch.setattr(
+        schedule_lowerer,
+        "match_mode_position_bounds",
+        forge_panel_begin,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *specs,
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert diagnostic.code == "unknown_llir_node"
+    assert diagnostic.stage == "schedule lowering"
+    assert diagnostic.pass_name == "window_sparse_loop"
+    assert diagnostic.node_type == "UnknownPanelIndex"
+    assert diagnostic.path == ("root", "index")
+    assert len(observed_bounds) == 1
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE[:7]
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(7)
+    )
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert later_calls == []
+    assert context.compile_options is options
+    assert options.requested_schedule is schedule
+    assert schedule == schedule_snapshot
+    assert hash(schedule) == schedule_hash
+    assert schedule.cache_key == schedule_cache_key
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert specs[0].name == "A"
+    assert specs[1].name == "B"
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+    assert CompilerStageId.SCHEDULE_LOWERING.value in str(suppressed.value)
+
+
 def test_frontend_failure_records_nothing_and_never_enters_normalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

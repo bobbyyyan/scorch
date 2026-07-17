@@ -1,4 +1,6 @@
+from collections import Counter
 from dataclasses import FrozenInstanceError, replace
+from typing import cast
 
 import pytest
 import torch
@@ -17,7 +19,11 @@ from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.loop_plan import ScheduledCIN
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
-from scorch.compiler.llir_traversal import LLIRTraversalContext, LLIRWalker
+from scorch.compiler.llir_traversal import (
+    LLIRRewriter,
+    LLIRTraversalContext,
+    LLIRWalker,
+)
 from scorch.compiler.scheduler import (
     RelayoutSpec,
     Schedule,
@@ -401,6 +407,189 @@ def test_panel_tile_lowers_to_windowed_sparse_iteration():
     ) in cpp
     assert cpp.index("j_out = 0") < cpp.index("#pragma omp parallel for")
     assert cpp.index("#pragma omp parallel for") < cpp.index("i = 0")
+
+
+def test_panel_window_bounds_are_structured_typed_detached_and_repeatable():
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(TileSpec("j", 32, kind="panel", accum="direct"),),
+        tag="tile-j-panel-structured-bounds",
+        parallel_loop="i",
+    )
+    scheduled = Scheduler.apply_schedule(_build_spmm(), schedule)
+
+    def lower_and_collect() -> tuple[str, llir.Cast, llir.Cast]:
+        lowered = CINLowerer().lower_IndexStmt(scheduled)
+        assert type(lowered) is llir.Function
+        matches: dict[str, llir.Cast] = {}
+
+        class BoundCollector(LLIRWalker):
+            def visit_var_init(
+                self,
+                node: llir.VarInit,
+                path: tuple[str, ...],
+            ) -> None:
+                if node.var.name in {"pA1_panel_begin", "pA1_end"}:
+                    assert type(node.value) is llir.Cast
+                    matches[node.var.name] = node.value
+                super().visit_var_init(node, path)
+
+        BoundCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="collect_panel_bounds",
+            )
+        ).walk(lowered)
+        assert set(matches) == {"pA1_panel_begin", "pA1_end"}
+        return (
+            LLIRLowerer().lower_llir(lowered),
+            matches["pA1_panel_begin"],
+            matches["pA1_end"],
+        )
+
+    first_cpp, lower, upper = lower_and_collect()
+    second_cpp, second_lower, second_upper = lower_and_collect()
+
+    def unpack(expression: llir.Cast) -> tuple[llir.FunctionCall, llir.Var]:
+        assert expression.data_type is llir.DataType.INT
+        assert type(expression.expr) is llir.BinOp
+        subtraction = expression.expr
+        assert subtraction.op == "-"
+        assert type(subtraction.left) is llir.FunctionCall
+        assert type(subtraction.right) is llir.Var
+        call = subtraction.left
+        coordinate = subtraction.right
+        assert call.name == "std::lower_bound"
+        assert type(call.args) is tuple
+        assert len(call.args) == 3
+        assert coordinate == llir.Var("A1_crd", llir.DataType.PTR_INT)
+        return call, coordinate
+
+    lower_call, lower_coordinate = unpack(lower)
+    upper_call, upper_coordinate = unpack(upper)
+
+    def collect_vars(expression: llir.Expr) -> tuple[llir.Var, ...]:
+        found: list[llir.Var] = []
+
+        class VarCollector(LLIRWalker):
+            def enter_node(self, node: llir.Node, path: tuple[str, ...]) -> None:
+                if type(node) is llir.Var:
+                    found.append(node)
+
+        VarCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="collect_panel_bound_vars",
+            )
+        ).walk(expression)
+        return tuple(found)
+
+    lower_vars = collect_vars(lower)
+    upper_vars = collect_vars(upper)
+    assert Counter((var.name, var.type) for var in lower_vars) == Counter(
+        {
+            ("A1_crd", llir.DataType.PTR_INT): 3,
+            ("A1_pos", llir.DataType.PTR_INT): 1,
+            ("pA0", llir.DataType.INT): 1,
+            ("pA1_row_end", llir.DataType.INT): 1,
+            ("j_out", llir.DataType.INT64): 1,
+        }
+    )
+    assert Counter((var.name, var.type) for var in upper_vars) == Counter(
+        {
+            ("A1_crd", llir.DataType.PTR_INT): 3,
+            ("pA1_panel_begin", llir.DataType.INT): 1,
+            ("pA1_row_end", llir.DataType.INT): 1,
+            ("j_out_end", llir.DataType.INT64): 1,
+        }
+    )
+    for var in (*lower_vars, *upper_vars):
+        assert type(var.name) is str
+        assert var.name.isidentifier()
+        assert type(var.type) is llir.DataType
+        assert var.is_ptr is False
+        assert var.is_restrict is False
+        assert var.tensor_access is None
+
+    for call in (lower_call, upper_call):
+        assert type(call.args[0]) is llir.Add
+        assert type(call.args[1]) is llir.Add
+        for pointer in (call.args[0], call.args[1]):
+            assert type(pointer.left) is llir.Var
+            assert pointer.left == llir.Var("A1_crd", llir.DataType.PTR_INT)
+
+    lower_begin = cast(llir.Add, lower_call.args[0]).right
+    assert type(lower_begin) is llir.ArrayAccess
+    assert lower_begin == llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Var("pA0", llir.DataType.INT),
+    )
+    assert cast(llir.Add, lower_call.args[1]).right == llir.Var(
+        "pA1_row_end",
+        llir.DataType.INT,
+    )
+    assert lower_call.args[2] == llir.Var("j_out", llir.DataType.INT64)
+
+    assert cast(llir.Add, upper_call.args[0]).right == llir.Var(
+        "pA1_panel_begin",
+        llir.DataType.INT,
+    )
+    assert cast(llir.Add, upper_call.args[1]).right == llir.Var(
+        "pA1_row_end",
+        llir.DataType.INT,
+    )
+    assert upper_call.args[2] == llir.Var("j_out_end", llir.DataType.INT64)
+
+    def visited_ids(expression: llir.Expr) -> tuple[int, ...]:
+        found: list[int] = []
+
+        class NodeCollector(LLIRWalker):
+            def enter_node(self, node: llir.Node, path: tuple[str, ...]) -> None:
+                found.append(id(node))
+
+        NodeCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="collect_panel_bound_ids",
+            )
+        ).walk(expression)
+        return tuple(found)
+
+    lower_ids = visited_ids(lower)
+    upper_ids = visited_ids(upper)
+    assert len(lower_ids) == len(set(lower_ids))
+    assert len(upper_ids) == len(set(upper_ids))
+    assert set(lower_ids).isdisjoint(upper_ids)
+    assert lower_coordinate is not upper_coordinate
+
+    assert lower == second_lower
+    assert upper == second_upper
+    assert hash(lower) == hash(second_lower)
+    assert hash(upper) == hash(second_upper)
+    assert set(lower_ids).isdisjoint(visited_ids(second_lower))
+    assert set(upper_ids).isdisjoint(visited_ids(second_upper))
+
+    rewritten_lower = cast(
+        llir.Cast,
+        LLIRRewriter(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="rewrite_panel_bound",
+            )
+        ).rewrite(lower),
+    )
+    assert rewritten_lower == lower
+    assert set(visited_ids(rewritten_lower)).isdisjoint(lower_ids)
+
+    assert LLIRLowerer().lower_llir(lower) == (
+        "(int) (std::lower_bound(A1_crd + A1_pos[pA0], "
+        "A1_crd + pA1_row_end, j_out) - A1_crd)"
+    )
+    assert LLIRLowerer().lower_llir(upper) == (
+        "(int) (std::lower_bound(A1_crd + pA1_panel_begin, "
+        "A1_crd + pA1_row_end, j_out_end) - A1_crd)"
+    )
+    assert first_cpp == second_cpp
 
 
 @pytest.mark.parametrize(
