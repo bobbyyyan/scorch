@@ -152,8 +152,11 @@ def collect_mode_position_arrays(
     return collector.position_arrays
 
 
-def match_mode_position_bounds(begin: object, end: object) -> Optional[str]:
-    """Return the exact rendered begin for one coherent position-bound pair."""
+def match_mode_position_bounds(
+    begin: object,
+    end: object,
+) -> Optional[llir.ArrayAccess]:
+    """Return a fresh structured begin for one coherent position-bound pair."""
 
     begin_match = match_mode_position_begin(begin)
     end_match = _mode_position_access(end)
@@ -166,19 +169,24 @@ def match_mode_position_bounds(begin: object, end: object) -> Optional[str]:
     if parent_name is None:
         if not _int_mode_position_literal(end_access.index, 1):
             return None
-        return f"{array_name}[0]"
-    if type(end_access.index) is not llir.Add:
-        return None
-    index = cast(llir.Add, end_access.index)
-    parent = _plain_mode_position_var(index.left, llir.DataType.INT)
-    if (
-        index.op != "+"
-        or parent is None
-        or parent.name != parent_name
-        or not _int_mode_position_literal(index.right, 1)
-    ):
-        return None
-    return f"{array_name}[{parent_name}]"
+        begin_index: llir.Expr = llir.Literal(0, llir.DataType.INT)
+    else:
+        if type(end_access.index) is not llir.Add:
+            return None
+        index = cast(llir.Add, end_access.index)
+        parent = _plain_mode_position_var(index.left, llir.DataType.INT)
+        if (
+            index.op != "+"
+            or parent is None
+            or parent.name != parent_name
+            or not _int_mode_position_literal(index.right, 1)
+        ):
+            return None
+        begin_index = llir.Var(parent_name, llir.DataType.INT)
+    return llir.ArrayAccess(
+        array=llir.Var(array_name, llir.DataType.PTR_INT),
+        index=begin_index,
+    )
 
 
 @dataclass(frozen=False)

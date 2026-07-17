@@ -227,7 +227,11 @@ class LLIRLowerer:
         if isinstance(ir, llir.Var):
             return ir.name
 
-        if isinstance(ir, llir.Cast):
+        if type(ir) is llir.Cast:
+            if not isinstance(ir.expr, llir.Expr):
+                raise CodegenError("Cast.expr must be an LLIR Expr")
+            if type(ir.data_type) is not llir.DataType:
+                raise CodegenError("Cast.data_type must be a DataType")
             operand = self._render_operand(
                 ir.expr,
                 parent_precedence=self._UNARY_PRECEDENCE,
@@ -341,7 +345,7 @@ class LLIRLowerer:
     def _expression_precedence(self, ir: llir.Expr) -> int:
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
             return self._binary_precedence(cast(llir.BinOp, ir).op)
-        if isinstance(ir, (llir.Cast, llir.UnaryOp, llir.Sizeof)):
+        if type(ir) is llir.Cast or isinstance(ir, (llir.UnaryOp, llir.Sizeof)):
             return self._UNARY_PRECEDENCE
         if (
             type(ir) is llir.FunctionCall

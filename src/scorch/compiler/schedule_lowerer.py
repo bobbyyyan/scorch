@@ -25,6 +25,10 @@ _ACCESS_REWRITE_CONTEXT = LLIRTraversalContext(
     stage="schedule lowering",
     pass_name="redirect_tensor_access",
 )
+_PANEL_WINDOW_CONTEXT = LLIRTraversalContext(
+    stage="schedule lowering",
+    pass_name="window_sparse_loop",
+)
 
 
 def _nested_bodies(stmt: llir.Stmt) -> List[List[llir.Stmt]]:
@@ -65,7 +69,7 @@ def _find_tagged_loop(
     raise LookupError(f"No generated loop is tagged for index variable {name!r}")
 
 
-def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> str:
+def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> llir.Var:
     for stmt in stmts:
         if type(stmt) is llir.VarInit and type(stmt.value) is llir.ArrayAccess:
             access = cast(llir.ArrayAccess, stmt.value)
@@ -75,16 +79,21 @@ def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> str:
                 if (
                     access.tensor_access is None
                     and array.type is llir.DataType.PTR_INT
+                    and array.is_ptr is False
+                    and array.is_restrict is False
                     and array.tensor_access is None
                     and type(array.name) is str
                     and array.name.isidentifier()
                     and array.name.endswith("_crd")
                     and index.type is llir.DataType.INT
+                    and index.is_ptr is False
+                    and index.is_restrict is False
                     and index.tensor_access is None
                     and type(index.name) is str
+                    and index.name.isidentifier()
                     and index.name == position
                 ):
-                    return array.name
+                    return llir.Var(array.name, llir.DataType.PTR_INT)
         for body in _nested_bodies(stmt):
             try:
                 return _find_coordinate_array(body, position)
@@ -93,6 +102,53 @@ def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> str:
     raise LookupError(
         f"Cannot find a coordinate array indexed by sparse position {position!r}"
     )
+
+
+def _panel_bound_expression(
+    coordinate_array: llir.Var,
+    begin: llir.Expr,
+    end: llir.Expr,
+    value: llir.Expr,
+) -> llir.Cast:
+    """Build one detached typed ``lower_bound`` position expression."""
+
+    if not (
+        type(coordinate_array) is llir.Var
+        and type(coordinate_array.name) is str
+        and coordinate_array.name.isidentifier()
+        and coordinate_array.name.endswith("_crd")
+        and coordinate_array.type is llir.DataType.PTR_INT
+        and coordinate_array.is_ptr is False
+        and coordinate_array.is_restrict is False
+        and coordinate_array.tensor_access is None
+    ):
+        raise TypeError("panel coordinate array must be a plain PTR_INT Var")
+
+    rewriter = LLIRRewriter(_PANEL_WINDOW_CONTEXT)
+
+    def detach(expression: llir.Expr) -> llir.Expr:
+        detached = rewriter.rewrite(expression)
+        if not isinstance(detached, llir.Expr):
+            raise AssertionError("a panel bound child must remain an expression")
+        return detached
+
+    expression = llir.Cast(
+        expr=llir.BinOp(
+            op="-",
+            left=llir.FunctionCall(
+                name="std::lower_bound",
+                args=[
+                    llir.Add(detach(coordinate_array), detach(begin)),
+                    llir.Add(detach(coordinate_array), detach(end)),
+                    detach(value),
+                ],
+            ),
+            right=detach(coordinate_array),
+        ),
+        data_type=llir.DataType.INT,
+    )
+    LLIRWalker(_PANEL_WINDOW_CONTEXT).walk(expression)
+    return expression
 
 
 def _find_end_init(
@@ -123,11 +179,21 @@ def _window_sparse_loop(
     position = sparse_loop.init.var.name
     end_name = sparse_loop.cond.right.name
     end_index, end_init = _find_end_init(container, loop_index, end_name)
-    row_begin_expr = match_mode_position_bounds(
+    if not (
+        type(end_init.var) is llir.Var
+        and end_init.var.type is llir.DataType.INT
+        and end_init.var.is_ptr is False
+        and end_init.var.is_restrict is False
+        and end_init.var.tensor_access is None
+    ):
+        raise NotImplementedError(
+            "Panel tiling requires a plain INT sparse iterator end"
+        )
+    row_begin = match_mode_position_bounds(
         sparse_loop.init.value,
         end_init.value,
     )
-    if row_begin_expr is None:
+    if row_begin is None:
         raise NotImplementedError(
             "Panel tiling requires matching structured CSR row bounds"
         )
@@ -135,13 +201,19 @@ def _window_sparse_loop(
 
     row_end = f"{position}_row_end"
     panel_begin = f"{position}_panel_begin"
-    lower_expr = (
-        f"(int) (std::lower_bound({coordinate_array} + {row_begin_expr}, "
-        f"{coordinate_array} + {row_end}, {panel_var}) - {coordinate_array})"
+    row_end_value = llir.Var(row_end, end_init.var.type)
+    panel_begin_value = llir.Var(panel_begin, end_init.var.type)
+    lower_value = _panel_bound_expression(
+        coordinate_array,
+        row_begin,
+        row_end_value,
+        llir.Var(panel_var, llir.DataType.INT64),
     )
-    upper_expr = (
-        f"(int) (std::lower_bound({coordinate_array} + {panel_begin}, "
-        f"{coordinate_array} + {row_end}, {panel_end_var}) - {coordinate_array})"
+    upper_value = _panel_bound_expression(
+        coordinate_array,
+        panel_begin_value,
+        row_end_value,
+        llir.Var(panel_end_var, llir.DataType.INT64),
     )
 
     replacements: List[llir.Stmt] = [
@@ -151,11 +223,11 @@ def _window_sparse_loop(
         ),
         llir.VarInit(
             var=llir.Var(panel_begin, end_init.var.type),
-            value=llir.Var(lower_expr, end_init.var.type),
+            value=lower_value,
         ),
         llir.VarInit(
             var=end_init.var,
-            value=llir.Var(upper_expr, end_init.var.type),
+            value=upper_value,
         ),
     ]
     container[end_index : end_index + 1] = replacements
@@ -574,6 +646,7 @@ def _redirect_sparse_prefetch(
         )
     position = sparse_loop.init.var.name
     coordinate_array = _find_coordinate_array(sparse_loop.body, position)
+    coordinate_name = coordinate_array.name
     end_name = sparse_loop.cond.right.name
     marker = f"__builtin_prefetch(&{operand_value_array}["
     removed = False
@@ -585,7 +658,7 @@ def _redirect_sparse_prefetch(
         retained.append(stmt)
     sparse_loop.body = retained
     if removed:
-        coordinate = f"{coordinate_array}[{position} + 1]"
+        coordinate = f"{coordinate_name}[{position} + 1]"
         staged_row = (
             coordinate
             if stage_row_origin is None
@@ -596,8 +669,8 @@ def _redirect_sparse_prefetch(
             llir.RawStmt(
                 code=(
                     f"if ({position} + 1 < {end_name} && "
-                    f"{coordinate_array}[{position} + 1] >= {panel_var} && "
-                    f"{coordinate_array}[{position} + 1] < {panel_end}) "
+                    f"{coordinate_name}[{position} + 1] >= {panel_var} && "
+                    f"{coordinate_name}[{position} + 1] < {panel_end}) "
                     f"__builtin_prefetch(&{packed_name}[{staged_row} * "
                     f"{panel_tile_var}], 0, 1)"
                 )

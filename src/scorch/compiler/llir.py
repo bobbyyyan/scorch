@@ -854,10 +854,16 @@ class Switch(Stmt):
 
 @dataclass(frozen=True)
 class Cast(Expr):
-    """A cast expression."""
+    """An immutable typed cast expression."""
 
     expr: Expr
     data_type: DataType
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.expr, Expr):
+            raise TypeError("Cast.expr must be an LLIR Expr")
+        if type(self.data_type) is not DataType:
+            raise TypeError("Cast.data_type must be a DataType")
 
 
 @dataclass(frozen=True)
