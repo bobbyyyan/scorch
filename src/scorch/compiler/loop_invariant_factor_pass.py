@@ -12,8 +12,11 @@ The common LLIR rewriter first validates and detaches the complete input tree,
 including containers that the semantic transform intentionally omits.  Unknown
 subclasses and malformed typed children therefore fail closed, while every
 legal structural miss returns a fully detached no-op.  Matching, factor
-classification, raw-substring dependence, generated names, and the quick
-renderer remain intentionally non-symbolic compatibility behavior.
+classification, raw-substring dependence, and generated names remain
+intentionally non-symbolic compatibility behavior.  Successful output
+materialization stays structured for the canonical LLIR emitter.  Exact
+generated declaration/post pairs remain invisible to the legacy definition
+name scan, matching their former opaque-statement behavior.
 """
 
 from __future__ import annotations
@@ -30,6 +33,8 @@ from .llir_traversal import (
     LLIRTraversalContext,
     LLIRTraversalDiagnostic,
     LLIRTraversalError,
+    LLIRValue,
+    LLIRWalker,
 )
 
 LOOP_INVARIANT_FACTOR_HOIST_TRAVERSAL_CONTEXT = LLIRTraversalContext(
@@ -219,13 +224,14 @@ def _collect_defined_vars(
         statement_path = path + (f"[{index}]",)
         if type(statement) is llir.VarInit:
             initializer = cast(llir.VarInit, statement)
-            defined.add(
-                _checked_var_name(
-                    initializer.var,
-                    context,
-                    statement_path + ("var",),
+            if not _is_materialized_factor_declaration(statements, index):
+                defined.add(
+                    _checked_var_name(
+                        initializer.var,
+                        context,
+                        statement_path + ("var",),
+                    )
                 )
-            )
         elif type(statement) is llir.ForLoop:
             loop = cast(llir.ForLoop, statement)
             if type(loop.init) is llir.VarInit:
@@ -266,6 +272,50 @@ def _collect_defined_vars(
                     context,
                     statement_path + ("else_body",),
                 )
+
+
+def _is_materialized_factor_declaration(
+    statements: Sequence[LLIRStatementValue],
+    declaration_index: int,
+) -> bool:
+    """Keep generated typed declarations invisible to legacy name analysis."""
+
+    declaration = statements[declaration_index]
+    if type(declaration) is not llir.VarInit:
+        return False
+    initializer = cast(llir.VarInit, declaration)
+    variable = initializer.var
+    if (
+        type(variable) is not llir.Var
+        or type(variable.name) is not str
+        or not variable.name.startswith("_inv_")
+        or not variable.name.removeprefix("_inv_").isdigit()
+        or variable.type is not llir.DataType.FLOAT32
+        or variable.is_ptr is not False
+        or variable.is_restrict is not False
+        or variable.tensor_access is not None
+        or initializer.op != "="
+        or initializer.cast is not False
+    ):
+        return False
+
+    for statement in statements[declaration_index + 1 :]:
+        if type(statement) is not llir.Assign:
+            continue
+        assignment = cast(llir.Assign, statement)
+        reference = assignment.value
+        if (
+            assignment.op is llir.AssignOp.MUL_ASSIGN
+            and assignment.cast is False
+            and type(reference) is llir.Var
+            and reference.name == variable.name
+            and reference.type is llir.DataType.FLOAT32
+            and reference.is_ptr is False
+            and reference.is_restrict is False
+            and reference.tensor_access is None
+        ):
+            return True
+    return False
 
 
 def _collect_mul_factors(
@@ -352,34 +402,6 @@ def _rebuild_product(factors: Sequence[_Factor]) -> llir.Expr:
     return product
 
 
-def _render_expression(
-    expression: llir.Expr,
-    context: LoopInvariantFactorHoistContext,
-    path: LLIRPath,
-) -> str:
-    """Preserve the legacy quick renderer without broadening it into codegen."""
-
-    if type(expression) is llir.Var:
-        return _checked_var_name(cast(llir.Var, expression), context, path)
-    if type(expression) is llir.Literal:
-        return str(cast(llir.Literal, expression).value)
-    if type(expression) in _BINOP_FAMILY:
-        binary = cast(llir.BinOp, expression)
-        operator = _checked_binary_operator(binary, context, path)
-        return (
-            f"({_render_expression(binary.left, context, path + ('left',))} "
-            f"{operator} "
-            f"{_render_expression(binary.right, context, path + ('right',))})"
-        )
-    if type(expression) is llir.ArrayAccess:
-        access = cast(llir.ArrayAccess, expression)
-        return (
-            f"{_render_expression(access.array, context, path + ('array',))}"
-            f"[{_render_expression(access.index, context, path + ('index',))}]"
-        )
-    return str(expression)
-
-
 def _replace_body_assignment(
     loop: llir.ForLoop,
     body_index: int,
@@ -403,12 +425,126 @@ def _replace_body_assignment(
         loop.body = cast(List[llir.Stmt], rewritten_body)
 
 
+def _validate_materialization_var(
+    variable: object,
+    *,
+    expected_name: str | None,
+    expected_type: llir.DataType | None,
+    expected_is_ptr: bool | None,
+    expected_is_restrict: bool | None,
+    context: LoopInvariantFactorHoistContext,
+    path: LLIRPath,
+) -> llir.Var:
+    if (
+        type(variable) is not llir.Var
+        or type(variable.name) is not str
+        or not variable.name
+        or (expected_name is not None and variable.name != expected_name)
+        or type(variable.type) is not llir.DataType
+        or (expected_type is not None and variable.type is not expected_type)
+        or type(variable.is_ptr) is not bool
+        or (expected_is_ptr is not None and variable.is_ptr is not expected_is_ptr)
+        or type(variable.is_restrict) is not bool
+        or (
+            expected_is_restrict is not None
+            and variable.is_restrict is not expected_is_restrict
+        )
+        or variable.tensor_access is not None
+    ):
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_var",
+            message="generated factor materialization requires an exact scalar Var",
+            path=path,
+            value=variable,
+        )
+    return cast(llir.Var, variable)
+
+
+def _validate_materialization(
+    declaration: object,
+    post: object,
+    sequence_index: int,
+    context: LoopInvariantFactorHoistContext,
+    path: LLIRPath,
+) -> Tuple[llir.VarInit, llir.Assign]:
+    """Validate the complete generated pair at its owning pass boundary."""
+
+    if type(declaration) is not llir.VarInit:
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_declaration",
+            message="generated factor declaration must be an exact VarInit",
+            path=path,
+            value=declaration,
+        )
+    typed_declaration = cast(llir.VarInit, declaration)
+    invariant_name = f"_inv_{sequence_index}"
+    _validate_materialization_var(
+        typed_declaration.var,
+        expected_name=invariant_name,
+        expected_type=llir.DataType.FLOAT32,
+        expected_is_ptr=False,
+        expected_is_restrict=False,
+        context=context,
+        path=path + ("var",),
+    )
+    if typed_declaration.op != "=" or typed_declaration.cast is not False:
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_declaration_fields",
+            message="generated factor declaration requires default initialization fields",
+            path=path,
+            value=typed_declaration,
+        )
+
+    post_path = path[:-1] + (f"[{sequence_index + 2}]",)
+    if type(post) is not llir.Assign:
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_assignment",
+            message="generated factor post statement must be an exact Assign",
+            path=post_path,
+            value=post,
+        )
+    typed_post = cast(llir.Assign, post)
+    _validate_materialization_var(
+        typed_post.var,
+        expected_name=None,
+        expected_type=None,
+        expected_is_ptr=None,
+        expected_is_restrict=None,
+        context=context,
+        path=post_path + ("var",),
+    )
+    _validate_materialization_var(
+        typed_post.value,
+        expected_name=invariant_name,
+        expected_type=llir.DataType.FLOAT32,
+        expected_is_ptr=False,
+        expected_is_restrict=False,
+        context=context,
+        path=post_path + ("value",),
+    )
+    if typed_post.op is not llir.AssignOp.MUL_ASSIGN or typed_post.cast is not False:
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_assignment_fields",
+            message="generated factor post statement requires an uncast multiply-assign",
+            path=post_path,
+            value=typed_post,
+        )
+
+    LLIRWalker(context.traversal).walk(cast(LLIRValue, [typed_declaration, typed_post]))
+    return typed_declaration, typed_post
+
+
 def _try_hoist_from_loop(
     loop: llir.ForLoop,
     sequence_index: int,
     context: LoopInvariantFactorHoistContext,
     path: LLIRPath,
-) -> Tuple[llir.RawStmt, llir.RawStmt] | None:
+) -> Tuple[llir.VarInit, llir.Assign] | None:
     if type(loop.update) is not llir.Increment:
         return None
 
@@ -492,14 +628,28 @@ def _try_hoist_from_loop(
         )
 
         invariant_name = f"_inv_{sequence_index}"
-        invariant_code = _render_expression(
-            invariant_expression,
-            context,
-            assignment_path + ("value", "invariant"),
-        )
         return (
-            llir.RawStmt(code=f"float {invariant_name} = {invariant_code}"),
-            llir.RawStmt(code=f"{accumulator_name} *= {invariant_name}"),
+            llir.VarInit(
+                var=llir.Var(
+                    name=invariant_name,
+                    type=llir.DataType.FLOAT32,
+                ),
+                value=invariant_expression,
+            ),
+            llir.Assign(
+                var=llir.Var(
+                    name=accumulator_name,
+                    type=target.type,
+                    is_ptr=target.is_ptr,
+                    is_restrict=target.is_restrict,
+                    tensor_access=target.tensor_access,
+                ),
+                value=llir.Var(
+                    name=invariant_name,
+                    type=llir.DataType.FLOAT32,
+                ),
+                op=llir.AssignOp.MUL_ASSIGN,
+            ),
         )
     return None
 
@@ -568,7 +718,12 @@ def _hoist_in_sequence(
         if emitted is None:
             index += 1
             continue
-        before, after = emitted
+        before, after = _validate_materialization(
+            *emitted,
+            index,
+            context,
+            path + (f"[{index}]",),
+        )
         working[index : index + 1] = [before, loop, after]
         index += 2
 
