@@ -211,6 +211,58 @@ def test_phase_state_assignments_are_detached_and_never_deduplicated() -> None:
     )
 
 
+def test_factor_materialization_is_detached_and_never_deduplicated() -> None:
+    declarations = [
+        llir.VarInit(
+            _var("_inv_0", llir.DataType.FLOAT32),
+            _access("Mask_val", "pMask0", llir.DataType.PTR_FLOAT32),
+        )
+        for _ in range(2)
+    ]
+    multiplications = [
+        llir.Assign(
+            _var("acc", llir.DataType.FLOAT32),
+            _var("_inv_0", llir.DataType.FLOAT32),
+            llir.AssignOp.MUL_ASSIGN,
+        )
+        for _ in range(2)
+    ]
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_crd", llir.DataType.STD_VECTOR_C_INT)),
+        declarations[0],
+        multiplications[0],
+        declarations[1],
+        multiplications[1],
+    ]
+    snapshot = _structural_snapshot(source)
+
+    first = rewrite_dynamic_vector_accesses(source, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+    second = rewrite_dynamic_vector_accesses(first, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+
+    assert _structural_snapshot(source) == snapshot
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert [type(statement) for statement in first] == [
+        llir.VarDecl,
+        llir.VarInit,
+        llir.Assign,
+        llir.VarInit,
+        llir.Assign,
+    ]
+    assert first[1] == first[3]
+    assert first[2] == first[4]
+    assert first[1] is not declarations[0]
+    assert first[2] is not multiplications[0]
+    assert cast(llir.VarInit, first[1]).var is not declarations[0].var
+    assert cast(llir.Assign, first[2]).value is not multiplications[0].value
+    assert _cpp(first) == (
+        "std::vector<int> out_crd;\n"
+        "float _inv_0 = Mask_val[pMask0];\n"
+        "acc *= _inv_0;\n"
+        "float _inv_0 = Mask_val[pMask0];\n"
+        "acc *= _inv_0;"
+    )
+
+
 def _independent_single_step_add() -> llir.Add:
     return llir.Add(
         _var("base", llir.DataType.INT64),

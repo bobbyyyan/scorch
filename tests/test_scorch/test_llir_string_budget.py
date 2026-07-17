@@ -79,8 +79,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     unclassified_counts: Counter[str] = Counter()
     known_indirect: Counter[tuple[str, str]] = Counter()
     known_indirect_names = {
+        "accumulator_name",
         "expr.name.replace(old, new)",
         "f'{prefix}{level}'",
+        "invariant_name",
         "name",
         "node.name",
         "prefix_extent",
@@ -111,11 +113,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "iter_lattice.py": 35,
         "iterator.py": 23,
         "llir_traversal.py": 1,
+        "loop_invariant_factor_pass.py": 3,
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(constructor_counts.values()) == 379
+    assert sum(constructor_counts.values()) == 382
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 171,
@@ -125,21 +128,24 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "iter_lattice.py": 35,
         "iterator.py": 21,
         "llir_traversal.py": 1,
+        "loop_invariant_factor_pass.py": 3,
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 97,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(unclassified_counts.values()) == 351
+    assert sum(unclassified_counts.values()) == 354
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
         ("llir_traversal.py", "node.name"): 1,
+        ("loop_invariant_factor_pass.py", "accumulator_name"): 1,
+        ("loop_invariant_factor_pass.py", "invariant_name"): 2,
         ("result_write_pass.py", "f'{prefix}{level}'"): 1,
         ("schedule_lowerer.py", "prefix_extent"): 2,
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 8
+    assert sum(known_indirect.values()) == 11
 
     assert totals == {
         "subscript": 15,
@@ -381,12 +387,25 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
         "compressed_where_openmp_pass.py": 15,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
-        "loop_invariant_factor_pass.py": 2,
         "schedule_lowerer.py": 3,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 40
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 39
+    assert sum(counts.values()) == 38
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 37
+
+
+def test_loop_invariant_factor_materialization_cannot_return_to_raw_statements() -> (
+    None
+):
+    path = _COMPILER_ROOT / "loop_invariant_factor_pass.py"
+    source = path.read_text()
+
+    assert _llir_constructor_calls(path, "RawStmt") == []
+    assert len(_llir_constructor_calls(path, "VarInit")) == 1
+    assert len(_llir_constructor_calls(path, "Assign")) == 2
+    assert len(_llir_constructor_calls(path, "Var")) == 3
+    assert source.count("op=llir.AssignOp.MUL_ASSIGN") == 1
+    assert "def _render_expression(" not in source
 
 
 def test_compressed_phase_state_cannot_return_to_raw_statements() -> None:

@@ -11,6 +11,9 @@ from scorch.compiler import llir
 import scorch.compiler.llir_pass_manager as pass_manager_module
 import scorch.compiler.schedule_lowerer as schedule_lowerer_module
 import scorch.compiler.sparse_prefetch_pass as sparse_prefetch_module
+from scorch.compiler import (  # type: ignore[import-untyped]
+    loop_invariant_factor_pass as factor_module,
+)
 from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
 from scorch.compiler.cin_lowerer import CINLowerer, ResultTensorAssembler
 from scorch.compiler.codegen import LLIRLowerer
@@ -1100,6 +1103,49 @@ def _coordinate_reads(
     return matches
 
 
+def _factor_materializations(
+    value: object,
+) -> Tuple[List[llir.VarInit], List[llir.Assign]]:
+    declarations: List[llir.VarInit] = []
+    assignments: List[llir.Assign] = []
+
+    class FactorMaterializationCollector(LLIRWalker):
+        def visit_var_init(
+            self,
+            node: llir.VarInit,
+            path: Tuple[str, ...],
+        ) -> None:
+            if (
+                type(node.var) is llir.Var
+                and type(node.var.name) is str
+                and node.var.name.startswith("_inv_")
+            ):
+                declarations.append(node)
+            super().visit_var_init(node, path)
+
+        def visit_assign(
+            self,
+            node: llir.Assign,
+            path: Tuple[str, ...],
+        ) -> None:
+            if (
+                node.op is llir.AssignOp.MUL_ASSIGN
+                and type(node.value) is llir.Var
+                and type(node.value.name) is str
+                and node.value.name.startswith("_inv_")
+            ):
+                assignments.append(node)
+            super().visit_assign(node, path)
+
+    FactorMaterializationCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_loop_invariant_factor_materializations",
+        )
+    ).walk(value)
+    return declarations, assignments
+
+
 def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1280,7 +1326,14 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
     statement = _build_activating_all_coo_sddmm_cin()
     original = str(statement)
 
-    def lower() -> tuple[CINLowerer, llir.ArrayAccess, llir.ArrayAccess, str]:
+    def lower() -> tuple[
+        CINLowerer,
+        llir.ArrayAccess,
+        llir.ArrayAccess,
+        llir.VarInit,
+        llir.Assign,
+        str,
+    ]:
         lowerer = CINLowerer()
         lowered = lowerer.lower_IndexStmt(statement)
         transformed_coordinate_reads = _coordinate_reads(
@@ -1297,19 +1350,37 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
         )
         assert len(transformed_coordinate_reads) == 1
         assert len(iterator_coordinate_reads) == 1
+        declarations, assignments = _factor_materializations(lowered)
+        assert len(declarations) == 1
+        assert len(assignments) == 1
+        assert not any(
+            "float _inv_" in code or "_accum *= _inv_" in code
+            for code in _all_raw_codes(lowered)
+        )
         return (
             lowerer,
             transformed_coordinate_reads[0],
             iterator_coordinate_reads[0],
+            declarations[0],
+            assignments[0],
             LLIRLowerer().lower_llir(lowered),
         )
 
     with regblock_force(False):
-        lowerer, coordinate_read, iterator_coordinate_read, cpp = lower()
+        (
+            lowerer,
+            coordinate_read,
+            iterator_coordinate_read,
+            declaration,
+            factor_assignment,
+            cpp,
+        ) = lower()
         (
             second_lowerer,
             second_coordinate_read,
             second_iterator_coordinate_read,
+            second_declaration,
+            second_factor_assignment,
             second_cpp,
         ) = lower()
 
@@ -1332,6 +1403,46 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
     assert iterator_coordinate_read.index is not second_iterator_coordinate_read.index
     assert iterator_coordinate_read.tensor_access is None
     assert second_iterator_coordinate_read.tensor_access is None
+    expected_factor_access = llir.ArrayAccess(
+        llir.Var("Mask_val", llir.DataType.PTR_FLOAT32),
+        llir.Var("pMask0", llir.DataType.INT),
+        tensor_access=llir.TensorAccessMetadata(
+            access_id=AccessId(1),
+            tensor_id=SymbolId(1),
+            index_ids=(IndexId(0), IndexId(1)),
+            role=llir.TensorAccessRole.INPUT_READ,
+        ),
+    )
+    assert type(declaration) is llir.VarInit
+    assert declaration == llir.VarInit(
+        llir.Var("_inv_17", llir.DataType.FLOAT32),
+        expected_factor_access,
+    )
+    assert declaration.op == "="
+    assert declaration.cast is False
+    assert type(declaration.value) is llir.ArrayAccess
+    assert type(factor_assignment) is llir.Assign
+    assert factor_assignment == llir.Assign(
+        llir.Var("_accum", llir.DataType.NO_TYPE),
+        llir.Var("_inv_17", llir.DataType.FLOAT32),
+        llir.AssignOp.MUL_ASSIGN,
+    )
+    assert factor_assignment.cast is False
+    assert declaration == second_declaration
+    assert factor_assignment == second_factor_assignment
+    assert declaration is not second_declaration
+    assert factor_assignment is not second_factor_assignment
+    assert _mutable_ir_ids([declaration, factor_assignment]).isdisjoint(
+        _mutable_ir_ids([second_declaration, second_factor_assignment])
+    )
+    assert declaration.var is not factor_assignment.value
+    assert second_declaration.var is not second_factor_assignment.value
+    assert lowerer.llir_pass_pipeline.compile_options is lowerer.compile_options
+    assert (
+        second_lowerer.llir_pass_pipeline.compile_options
+        is second_lowerer.compile_options
+    )
+    assert lowerer.compile_options is not second_lowerer.compile_options
     assert second_lowerer.llir_pass_run_records == lowerer.llir_pass_run_records
     assert len(cpp) == 3521
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
@@ -1776,6 +1887,109 @@ def test_factor_failure_preserves_prior_records_and_stops_all_later_work(
         1,
         2,
     ]
+
+
+def test_malformed_typed_factor_materialization_fails_at_its_owning_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statement = _build_activating_all_coo_sddmm_cin()
+    source_snapshot = _structural_snapshot(statement)
+    events: List[str] = []
+    original_materialization = factor_module._try_hoist_from_loop
+
+    def malformed_materialization(
+        loop: llir.ForLoop,
+        sequence_index: int,
+        context: factor_module.LoopInvariantFactorHoistContext,
+        path: Tuple[str, ...],
+    ) -> Tuple[llir.VarInit, llir.Assign] | None:
+        emitted = original_materialization(
+            loop,
+            sequence_index,
+            context,
+            path,
+        )
+        if emitted is not None:
+            events.append("factor_materialization")
+            emitted[0].var.tensor_access = cast(
+                llir.TensorAccessMetadata,
+                "malformed",
+            )
+        return emitted
+
+    def record_assembly(assembler: ResultTensorAssembler) -> NoReturn:
+        del assembler
+        events.append("assembly")
+        raise AssertionError("result assembly must not run after factor failure")
+
+    def record_dynamic(
+        manager: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[List[llir.Stmt]],
+        pass_spec: DynamicVectorAccessPassSpec = DynamicVectorAccessPassSpec(),
+    ) -> NoReturn:
+        del manager, artifact, pass_spec
+        events.append("dynamic_vector")
+        raise AssertionError("dynamic-vector pass must not run after factor failure")
+
+    def record_function(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        events.append("function")
+        raise AssertionError("Function construction must not run after factor failure")
+
+    def record_schedule(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        events.append("schedule_lowering")
+        raise AssertionError("schedule lowering must not run after factor failure")
+
+    def record_codegen(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        events.append("codegen")
+        raise AssertionError("code generation must not run after factor failure")
+
+    monkeypatch.setattr(
+        factor_module,
+        "_try_hoist_from_loop",
+        malformed_materialization,
+    )
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_final_assembly",
+        record_assembly,
+    )
+    monkeypatch.setattr(LLIRPassManager, "run_dynamic_vector_access", record_dynamic)
+    monkeypatch.setattr(llir, "Function", record_function)
+    monkeypatch.setattr(
+        schedule_lowerer_module,
+        "apply_schedule_to_llir",
+        record_schedule,
+    )
+    monkeypatch.setattr(LLIRLowerer, "lower_llir", record_codegen)
+
+    lowerer = CINLowerer()
+    with regblock_force(False), pytest.raises(LLIRTraversalError) as raised:
+        LLIRLowerer().lower_llir(lowerer.lower_IndexStmt(statement))
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_loop_invariant_factor_materialization_var"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == LOOP_INVARIANT_FACTOR_HOIST_PASS.name
+    assert diagnostic.path == ("root", "[3]", "body", "[17]", "var")
+    assert diagnostic.node_type == "Var"
+    assert events == ["factor_materialization"]
+    assert [
+        (record.pass_name, record.configuration_name, record.sequence_index)
+        for record in lowerer.llir_pass_run_records
+    ] == [
+        ("insert_sparse_prefetch", "sparse_prefetch", 0),
+        ("hoist_dense_pointers", "dense_pointer_hoist", 1),
+        (
+            "eliminate_single_iteration_loops",
+            "single_iteration_loop_elimination",
+            2,
+        ),
+    ]
+    assert lowerer.llir_pass_pipeline.compile_options is lowerer.compile_options
+    assert _structural_snapshot(statement) == source_snapshot
 
 
 def test_dynamic_vector_failure_preserves_prior_records_and_stops_function_build(

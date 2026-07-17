@@ -7,7 +7,9 @@ from typing import Callable, List, NoReturn, Sequence, Set, Tuple, cast
 import pytest
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
+import scorch.compiler.loop_invariant_factor_pass as factor_pass_module  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
+from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     DEBUG_LLIR_PASS_OPTIONS,
@@ -29,6 +31,7 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRTraversalDiagnostic,
     LLIRTraversalError,
     LLIRValue,
+    LLIRRewriter,
     LLIRWalker,
 )
 from scorch.compiler.loop_invariant_factor_pass import (  # type: ignore[import-untyped]
@@ -168,12 +171,30 @@ def _mutable_ir_ids(value: object) -> Set[int]:
     return mutable_ids
 
 
-def _raw_codes(statements: Sequence[object]) -> List[str]:
-    return [
-        cast(llir.RawStmt, statement).code
-        for statement in statements
-        if type(statement) is llir.RawStmt
-    ]
+def _compatibility_codes(statements: Sequence[object]) -> List[str]:
+    """Render only legacy raw prefixes and generated factor materializations."""
+
+    lowerer = LLIRLowerer()
+    codes: List[str] = []
+    for statement in statements:
+        include = type(statement) is llir.RawStmt
+        if type(statement) is llir.VarInit:
+            initialized = cast(llir.VarInit, statement).var
+            include = type(initialized) is llir.Var and initialized.name.startswith(
+                "_inv_"
+            )
+        elif type(statement) is llir.Assign:
+            assignment = cast(llir.Assign, statement)
+            include = (
+                assignment.op is llir.AssignOp.MUL_ASSIGN
+                and type(assignment.value) is llir.Var
+                and cast(llir.Var, assignment.value).name.startswith("_inv_")
+            )
+        if include:
+            codes.append(
+                lowerer.lower_llir(cast(llir.Node, statement)).removesuffix(";")
+            )
+    return codes
 
 
 def _factor_names(expression: llir.Expr) -> List[str]:
@@ -337,11 +358,102 @@ def test_success_is_fully_detached_and_does_not_mutate_the_input() -> None:
 
     assert _snapshot(source) == before
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
-    assert _raw_codes(output) == ["float _inv_0 = scale", "_accum *= _inv_0"]
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = scale",
+        "_accum *= _inv_0",
+    ]
     rewritten_loop = cast(llir.ForLoop, output[1])
     rewritten_assignment = cast(llir.Assign, rewritten_loop.body[0])
     assert _factor_names(rewritten_assignment.value) == ["_values_ptr[k]"]
     assert rewritten_assignment.var is not cast(llir.ForLoop, source[0]).body[0].var
+
+
+def test_success_constructs_exact_owned_structural_materialization_nodes() -> None:
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(41),
+        tensor_id=SymbolId(42),
+        index_ids=(IndexId(43),),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    invariant = llir.ArrayAccess(
+        _var("Mask_val", llir.DataType.PTR_FLOAT32),
+        _var("pMask0", llir.DataType.INT64),
+        tensor_access=metadata,
+    )
+    target = _var(
+        "accumulator",
+        llir.DataType.FLOAT64,
+        is_ptr=True,
+        is_restrict=True,
+    )
+    source = [
+        _activating_loop(
+            loop_variable="q",
+            accumulator=target.name,
+            invariant=invariant,
+            variant=llir.ArrayAccess(
+                _var("values", llir.DataType.PTR_FLOAT64),
+                _var("q", llir.DataType.INT64),
+            ),
+        )
+    ]
+    cast(llir.Assign, source[0].body[0]).var = target
+    before = _snapshot(source)
+
+    first = hoist_loop_invariant_factors(
+        source,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    independent = hoist_loop_invariant_factors(
+        source,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    repeated = hoist_loop_invariant_factors(
+        first,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+
+    declaration = cast(llir.VarInit, first[0])
+    rewritten_loop = cast(llir.ForLoop, first[1])
+    rewritten_assignment = cast(llir.Assign, rewritten_loop.body[0])
+    post = cast(llir.Assign, first[2])
+    assert [type(statement) for statement in first] == [
+        llir.VarInit,
+        llir.ForLoop,
+        llir.Assign,
+    ]
+    assert declaration.var == _var("_inv_0", llir.DataType.FLOAT32)
+    assert declaration.var.is_ptr is False
+    assert declaration.var.is_restrict is False
+    assert declaration.var.tensor_access is None
+    assert declaration.op == "="
+    assert declaration.cast is False
+    assert type(declaration.value) is llir.ArrayAccess
+    assert cast(llir.ArrayAccess, declaration.value).tensor_access is metadata
+    assert type(post.var) is llir.Var
+    assert post.var == target
+    assert cast(llir.Var, post.var).tensor_access is None
+    assert post.value == declaration.var
+    assert post.value is not declaration.var
+    assert post.op is llir.AssignOp.MUL_ASSIGN
+    assert post.cast is False
+    assert post.var is not rewritten_assignment.var
+    assert hash(declaration.var) == hash(cast(llir.Var, post.value))
+    assert hash(declaration) == hash(declaration.var)
+    assert hash(cast(llir.ArrayAccess, declaration.value)) == hash(
+        cast(llir.ArrayAccess, cast(llir.VarInit, independent[0]).value)
+    )
+    with pytest.raises(TypeError):
+        hash(post)
+    assert _snapshot(source) == before
+    assert _snapshot(independent) == _snapshot(first)
+    assert _snapshot(repeated) == _snapshot(first)
+    assert cast(llir.VarInit, independent[0]) == declaration
+    assert cast(llir.Assign, independent[2]) == post
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(independent))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(repeated))
+    assert all(type(statement) is not llir.RawStmt for statement in first)
 
 
 def test_structured_access_factors_preserve_exact_all_coo_hoist_behavior() -> None:
@@ -394,7 +506,7 @@ def test_structured_access_factors_preserve_exact_all_coo_hoist_behavior() -> No
     assert _snapshot(second) == _snapshot(first)
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(first))
     assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
-    assert _raw_codes(first) == [
+    assert _compatibility_codes(first) == [
         "float _inv_0 = Mask_val[pMask0]",
         "_accum *= _inv_0",
     ]
@@ -501,7 +613,7 @@ def test_arbitrary_loop_accumulator_and_factor_names(
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == [
+    assert _compatibility_codes(output) == [
         f"float _inv_0 = {invariant}",
         f"{accumulator} *= _inv_0",
     ]
@@ -529,7 +641,10 @@ def test_loop_identity_comes_only_from_increment_and_init_condition_are_ignored(
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == ["float _inv_0 = outside", "total *= _inv_0"]
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = outside",
+        "total *= _inv_0",
+    ]
     assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
     assert _factor_names(assignment.value) == ["value[actual_driver]"]
 
@@ -550,7 +665,10 @@ def test_every_exact_multiply_node_can_be_a_root_multiply(
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == ["float _inv_0 = scale", "acc *= _inv_0"]
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = scale",
+        "acc *= _inv_0",
+    ]
 
 
 def _legal_miss_loops() -> Tuple[llir.ForLoop, ...]:
@@ -681,8 +799,8 @@ def test_flatten_partition_and_rebuild_orders_are_exact() -> None:
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == [
-        "float _inv_0 = ((inv_a * inv_b) * inv_c)",
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = inv_a * inv_b * inv_c",
         "_accum *= _inv_0",
     ]
     assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
@@ -720,7 +838,10 @@ def test_ptr_marker_loop_name_and_raw_substring_collisions_are_variant() -> None
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == ["float _inv_0 = outside", "_accum *= _inv_0"]
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = outside",
+        "_accum *= _inv_0",
+    ]
     assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[1])
     assert _factor_names(assignment.value) == [
         "_unrelated_ptr[index]",
@@ -739,22 +860,27 @@ def test_supported_non_var_leaves_are_invariant_and_preserve_order() -> None:
             )
         ]
     )
-    original_call_str = str(call)
-
     output = hoist_loop_invariant_factors(
         [loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    declaration = cast(llir.RawStmt, output[0]).code
-    assert declaration.startswith("float _inv_0 = (2.5 * ")
-    assert original_call_str not in declaration
-    assert cast(llir.RawStmt, output[2]).code == "_accum *= _inv_0"
+    declaration = cast(llir.VarInit, output[0])
+    invariant = cast(llir.BinOp, declaration.value)
+    assert type(declaration) is llir.VarInit
+    assert type(invariant.left) is llir.Literal
+    assert type(invariant.right) is llir.FunctionCall
+    assert cast(llir.Literal, invariant.left).value == 2.5
+    assert cast(llir.FunctionCall, invariant.right).name == "scale"
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = 2.5 * scale(argument)",
+        "_accum *= _inv_0",
+    ]
     assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
     assert _factor_names(assignment.value) == ["value[k]"]
 
 
-def test_fallback_renderer_uses_str_for_an_exact_supported_expression(
+def test_structured_function_call_ignores_expression_str_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -771,8 +897,11 @@ def test_fallback_renderer_uses_str_for_an_exact_supported_expression(
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == [
-        "float _inv_0 = CALL<scale>",
+    declaration = cast(llir.VarInit, output[0])
+    assert type(declaration.value) is llir.FunctionCall
+    assert cast(llir.FunctionCall, declaration.value).name == "scale"
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = scale(x)",
         "_accum *= _inv_0",
     ]
 
@@ -791,7 +920,10 @@ def test_declarations_after_use_and_duplicate_definitions_are_visible() -> None:
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == ["float _inv_0 = outside", "_accum *= _inv_0"]
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = outside",
+        "_accum *= _inv_0",
+    ]
     output_loop = cast(llir.ForLoop, output[1])
     assignment = cast(llir.Assign, output_loop.body[0])
     assert _factor_names(assignment.value) == ["late_value", "late_again"]
@@ -837,7 +969,10 @@ def test_defined_variable_analysis_recurses_through_legacy_supported_bodies() ->
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == ["float _inv_0 = outside", "_accum *= _inv_0"]
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = outside",
+        "_accum *= _inv_0",
+    ]
     output_loop = cast(llir.ForLoop, output[1])
     assignment = cast(llir.Assign, output_loop.body[0])
     assert _factor_names(assignment.value) == [
@@ -927,7 +1062,7 @@ def test_definition_analysis_omits_every_legacy_unsupported_container() -> None:
     expected_invariant = _factor_names(
         cast(llir.BinOp, cast(llir.Assign, loop.body[0]).value)
     )[:-1]
-    declaration = cast(llir.RawStmt, output[0]).code
+    declaration = LLIRLowerer().lower_llir(cast(llir.VarInit, output[0]))
     for name in expected_invariant:
         assert name in declaration
     output_loop = cast(llir.ForLoop, output[1])
@@ -1015,17 +1150,59 @@ def test_nested_for_loop_transform_is_postorder_with_independent_indices() -> No
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == [
+    assert _compatibility_codes(output) == [
         "float _inv_0 = top_scale",
         "outer_accum *= _inv_0",
     ]
     output_outer = cast(llir.ForLoop, output[1])
-    assert _raw_codes(output_outer.body) == [
+    assert _compatibility_codes(output_outer.body) == [
         "prefix",
         "float _inv_1 = child_scale",
         "inner_accum *= _inv_1",
     ]
     assert type(output_outer.body[2]) is llir.ForLoop
+
+
+def test_nested_typed_materialization_remains_invisible_to_legacy_name_analysis() -> (
+    None
+):
+    inner = _activating_loop(
+        loop_variable="inner",
+        accumulator="inner_accum",
+        invariant=_var("scale"),
+        variant=_var("inner_value[inner]"),
+    )
+    outer = _loop(
+        [
+            inner,
+            _assignment(
+                [_var("_inv_0_scale"), _var("outer_value[outer]")],
+                target=_var("outer_accum"),
+            ),
+        ],
+        loop_variable="outer",
+    )
+
+    first = hoist_loop_invariant_factors(
+        [outer],
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    second = hoist_loop_invariant_factors(
+        first,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+
+    assert _compatibility_codes(first) == [
+        "float _inv_0 = _inv_0_scale",
+        "outer_accum *= _inv_0",
+    ]
+    output_outer = cast(llir.ForLoop, first[1])
+    assert _compatibility_codes(output_outer.body) == [
+        "float _inv_0 = scale",
+        "inner_accum *= _inv_0",
+    ]
+    assert _snapshot(second) == _snapshot(first)
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
 
 
 def test_if_then_else_transform_is_postorder_and_branches_number_independently() -> (
@@ -1060,18 +1237,18 @@ def test_if_then_else_transform_is_postorder_and_branches_number_independently()
     output_conditional = cast(llir.IfThenElse, output[0])
     assert output_conditional.then_body is not None
     assert output_conditional.else_body is not None
-    assert _raw_codes(output_conditional.then_body) == [
+    assert _compatibility_codes(output_conditional.then_body) == [
         "then_prefix",
         "float _inv_1 = then_scale",
         "then_accum *= _inv_1",
     ]
-    assert _raw_codes(output_conditional.else_body) == [
+    assert _compatibility_codes(output_conditional.else_body) == [
         "float _inv_0 = else_scale",
         "else_accum *= _inv_0",
     ]
 
 
-def test_hardcoded_float_default_semicolons_and_renderer_parentheses() -> None:
+def test_typed_materialization_uses_float_mul_assign_and_canonical_precedence() -> None:
     invariant = llir.BinOp(
         "+",
         _var("left"),
@@ -1091,12 +1268,23 @@ def test_hardcoded_float_default_semicolons_and_renderer_parentheses() -> None:
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    declaration = cast(llir.RawStmt, output[0])
-    post = cast(llir.RawStmt, output[2])
-    assert declaration.code == "float _inv_0 = (left + (middle * 3))"
-    assert post.code == "acc *= _inv_0"
-    assert declaration.add_semicolon is True
-    assert post.add_semicolon is True
+    declaration = cast(llir.VarInit, output[0])
+    post = cast(llir.Assign, output[2])
+    assert type(declaration) is llir.VarInit
+    assert declaration.var == _var("_inv_0", llir.DataType.FLOAT32)
+    assert type(declaration.value) is llir.BinOp
+    assert declaration.value == invariant
+    assert declaration.op == "="
+    assert declaration.cast is False
+    assert type(post) is llir.Assign
+    assert post.var == _var("acc")
+    assert post.value == _var("_inv_0", llir.DataType.FLOAT32)
+    assert post.op is llir.AssignOp.MUL_ASSIGN
+    assert post.cast is False
+    assert LLIRLowerer().lower_llir(declaration) == (
+        "float _inv_0 = left + middle * 3;"
+    )
+    assert LLIRLowerer().lower_llir(post) == "acc *= _inv_0;"
 
 
 def test_generated_name_uses_current_index_without_collision_checks() -> None:
@@ -1110,7 +1298,7 @@ def test_generated_name_uses_current_index_without_collision_checks() -> None:
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == [
+    assert _compatibility_codes(output) == [
         "float _inv_1 = existing",
         "float _inv_1 = scale",
         "_accum *= _inv_1",
@@ -1132,7 +1320,7 @@ def test_successful_siblings_shift_later_suffixes_by_two_and_scanning_continues(
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == [
+    assert _compatibility_codes(output) == [
         "float _inv_0 = first",
         "first_accum *= _inv_0",
         "float _inv_3 = second",
@@ -1174,7 +1362,7 @@ def test_earlier_accumulation_misses_do_not_hide_first_success() -> None:
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(output) == [
+    assert _compatibility_codes(output) == [
         "float _inv_0 = first_scale",
         "first_accum *= _inv_0",
     ]
@@ -1230,11 +1418,11 @@ def test_multiple_accumulations_transform_one_per_application() -> None:
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    assert _raw_codes(first) == [
+    assert _compatibility_codes(first) == [
         "float _inv_0 = first_scale",
         "first_accum *= _inv_0",
     ]
-    assert _raw_codes(second) == [
+    assert _compatibility_codes(second) == [
         "float _inv_0 = first_scale",
         "float _inv_1 = second_scale",
         "second_accum *= _inv_1",
@@ -1688,6 +1876,355 @@ def test_failure_adds_no_run_record_and_stops_without_retry(
 
     assert raised.value is failure
     assert calls == 1
+
+
+def test_generated_materialization_walk_order_is_deterministic() -> None:
+    output = hoist_loop_invariant_factors(
+        [
+            _activating_loop(
+                invariant=llir.ArrayAccess(
+                    _var("weights", llir.DataType.PTR_FLOAT32),
+                    _var("row", llir.DataType.INT64),
+                )
+            )
+        ],
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    materialization = [output[0], output[2]]
+
+    def record_walk() -> List[Tuple[str, Tuple[str, ...]]]:
+        entered: List[Tuple[str, Tuple[str, ...]]] = []
+
+        class RecordingWalker(LLIRWalker):
+            def enter_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+                entered.append((type(node).__name__, path))
+
+        RecordingWalker(LOOP_INVARIANT_FACTOR_HOIST_TRAVERSAL_CONTEXT).walk(
+            materialization
+        )
+        return entered
+
+    expected = [
+        ("VarInit", ("root", "[0]")),
+        ("Var", ("root", "[0]", "var")),
+        ("ArrayAccess", ("root", "[0]", "value")),
+        ("Var", ("root", "[0]", "value", "array")),
+        ("Var", ("root", "[0]", "value", "index")),
+        ("Assign", ("root", "[1]")),
+        ("Var", ("root", "[1]", "var")),
+        ("Var", ("root", "[1]", "value")),
+    ]
+    assert record_walk() == expected
+    assert record_walk() == expected
+
+
+def test_generated_materialization_identity_and_replacement_rewrites_are_owned() -> (
+    None
+):
+    output = hoist_loop_invariant_factors(
+        [_activating_loop()],
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+    materialization = [output[0], output[2]]
+    context = LOOP_INVARIANT_FACTOR_HOIST_TRAVERSAL_CONTEXT
+
+    first = cast(List[llir.Stmt], LLIRRewriter(context).rewrite(materialization))
+    repeated = cast(List[llir.Stmt], LLIRRewriter(context).rewrite(first))
+    assert _snapshot(first) == _snapshot(materialization)
+    assert _snapshot(repeated) == _snapshot(first)
+    assert _mutable_ir_ids(materialization).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(repeated))
+
+    replacement = llir.VarInit(
+        _var("_inv_0", llir.DataType.FLOAT32),
+        llir.ArrayAccess(
+            _var("replacement", llir.DataType.PTR_FLOAT32),
+            _var("offset", llir.DataType.INT64),
+        ),
+    )
+
+    class DeclarationReplacingRewriter(LLIRRewriter):
+        def rewrite_statement_sequence_member(
+            self,
+            node: llir.Stmt,
+            path: Tuple[str, ...],
+        ) -> Sequence[llir.Stmt]:
+            if path == ("root", "[0]"):
+                return (replacement,)
+            return super().rewrite_statement_sequence_member(node, path)
+
+    replaced = cast(
+        List[llir.Stmt],
+        DeclarationReplacingRewriter(context).rewrite(materialization),
+    )
+    replaced_again = cast(
+        List[llir.Stmt],
+        DeclarationReplacingRewriter(context).rewrite(materialization),
+    )
+    assert _snapshot(replaced[0]) == _snapshot(replacement)
+    assert _snapshot(replaced_again) == _snapshot(replaced)
+    assert _mutable_ir_ids(replacement).isdisjoint(_mutable_ir_ids(replaced[0]))
+    assert _mutable_ir_ids(materialization).isdisjoint(_mutable_ir_ids(replaced))
+    assert _mutable_ir_ids(replaced).isdisjoint(_mutable_ir_ids(replaced_again))
+
+
+class _GeneratedVarInitSubclass(llir.VarInit):
+    pass
+
+
+class _GeneratedAssignSubclass(llir.Assign):
+    pass
+
+
+class _GeneratedVarSubclass(llir.Var):
+    pass
+
+
+class _GeneratedUnknownExpression(llir.Expr):
+    pass
+
+
+def _valid_generated_materialization() -> Tuple[llir.VarInit, llir.Assign]:
+    return (
+        llir.VarInit(
+            _var("_inv_0", llir.DataType.FLOAT32),
+            _var("scale", llir.DataType.FLOAT32),
+        ),
+        llir.Assign(
+            _var("accumulator", llir.DataType.FLOAT32),
+            _var("_inv_0", llir.DataType.FLOAT32),
+            llir.AssignOp.MUL_ASSIGN,
+        ),
+    )
+
+
+def _forged_declaration_node() -> Tuple[object, object]:
+    _, post = _valid_generated_materialization()
+    return llir.RawStmt("float _inv_0 = scale"), post
+
+
+def _forged_declaration_subclass() -> Tuple[object, object]:
+    _, post = _valid_generated_materialization()
+    return (
+        _GeneratedVarInitSubclass(
+            _var("_inv_0", llir.DataType.FLOAT32),
+            _var("scale", llir.DataType.FLOAT32),
+        ),
+        post,
+    )
+
+
+def _forged_assignment_node() -> Tuple[object, object]:
+    declaration, _ = _valid_generated_materialization()
+    return declaration, llir.RawStmt("accumulator *= _inv_0")
+
+
+def _forged_assignment_subclass() -> Tuple[object, object]:
+    declaration, _ = _valid_generated_materialization()
+    return (
+        declaration,
+        _GeneratedAssignSubclass(
+            _var("accumulator", llir.DataType.FLOAT32),
+            _var("_inv_0", llir.DataType.FLOAT32),
+            llir.AssignOp.MUL_ASSIGN,
+        ),
+    )
+
+
+def _forged_declaration_var_subclass() -> Tuple[object, object]:
+    _, post = _valid_generated_materialization()
+    return (
+        llir.VarInit(
+            _GeneratedVarSubclass("_inv_0", llir.DataType.FLOAT32),
+            _var("scale", llir.DataType.FLOAT32),
+        ),
+        post,
+    )
+
+
+def _forged_declaration_var_field() -> Tuple[object, object]:
+    declaration, post = _valid_generated_materialization()
+    declaration.var.is_ptr = cast(bool, 1)
+    return declaration, post
+
+
+def _forged_declaration_fields() -> Tuple[object, object]:
+    declaration, post = _valid_generated_materialization()
+    declaration.op = "+="
+    return declaration, post
+
+
+def _forged_assignment_target_field() -> Tuple[object, object]:
+    declaration, post = _valid_generated_materialization()
+    cast(llir.Var, post.var).type = cast(llir.DataType, object())
+    return declaration, post
+
+
+def _forged_assignment_reference_field() -> Tuple[object, object]:
+    declaration, post = _valid_generated_materialization()
+    cast(llir.Var, post.value).name = "_inv_7"
+    return declaration, post
+
+
+def _forged_assignment_fields() -> Tuple[object, object]:
+    declaration, post = _valid_generated_materialization()
+    post.op = llir.AssignOp.ADD_ASSIGN
+    return declaration, post
+
+
+def _forged_unknown_declaration_child() -> Tuple[object, object]:
+    declaration, post = _valid_generated_materialization()
+    declaration.value = cast(llir.Expr, _GeneratedUnknownExpression())
+    return declaration, post
+
+
+@pytest.mark.parametrize(
+    ("factory", "expected_code", "expected_path", "expected_type"),
+    (
+        (
+            _forged_declaration_node,
+            "invalid_loop_invariant_factor_materialization_declaration",
+            ("root", "[0]"),
+            "RawStmt",
+        ),
+        (
+            _forged_declaration_subclass,
+            "invalid_loop_invariant_factor_materialization_declaration",
+            ("root", "[0]"),
+            "_GeneratedVarInitSubclass",
+        ),
+        (
+            _forged_assignment_node,
+            "invalid_loop_invariant_factor_materialization_assignment",
+            ("root", "[2]"),
+            "RawStmt",
+        ),
+        (
+            _forged_assignment_subclass,
+            "invalid_loop_invariant_factor_materialization_assignment",
+            ("root", "[2]"),
+            "_GeneratedAssignSubclass",
+        ),
+        (
+            _forged_declaration_var_subclass,
+            "invalid_loop_invariant_factor_materialization_var",
+            ("root", "[0]", "var"),
+            "_GeneratedVarSubclass",
+        ),
+        (
+            _forged_declaration_var_field,
+            "invalid_loop_invariant_factor_materialization_var",
+            ("root", "[0]", "var"),
+            "Var",
+        ),
+        (
+            _forged_declaration_fields,
+            "invalid_loop_invariant_factor_materialization_declaration_fields",
+            ("root", "[0]"),
+            "VarInit",
+        ),
+        (
+            _forged_assignment_target_field,
+            "invalid_loop_invariant_factor_materialization_var",
+            ("root", "[2]", "var"),
+            "Var",
+        ),
+        (
+            _forged_assignment_reference_field,
+            "invalid_loop_invariant_factor_materialization_var",
+            ("root", "[2]", "value"),
+            "Var",
+        ),
+        (
+            _forged_assignment_fields,
+            "invalid_loop_invariant_factor_materialization_assignment_fields",
+            ("root", "[2]"),
+            "Assign",
+        ),
+        (
+            _forged_unknown_declaration_child,
+            "unknown_llir_node",
+            ("root", "[0]", "value"),
+            "_GeneratedUnknownExpression",
+        ),
+    ),
+)
+def test_forged_generated_materialization_fails_at_the_owning_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    factory: Callable[[], Tuple[object, object]],
+    expected_code: str,
+    expected_path: Tuple[str, ...],
+    expected_type: str,
+) -> None:
+    calls = 0
+
+    def forge_once(
+        loop: llir.ForLoop,
+        sequence_index: int,
+        context: LoopInvariantFactorHoistContext,
+        path: Tuple[str, ...],
+    ) -> Tuple[llir.VarInit, llir.Assign]:
+        nonlocal calls
+        calls += 1
+        assert sequence_index == 0
+        assert path == ("root", "[0]")
+        return cast(Tuple[llir.VarInit, llir.Assign], factory())
+
+    monkeypatch.setattr(factor_pass_module, "_try_hoist_from_loop", forge_once)
+    with pytest.raises(LLIRTraversalError) as raised:
+        hoist_loop_invariant_factors(
+            [_activating_loop()],
+            LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert calls == 1
+    assert diagnostic.code == expected_code
+    assert diagnostic.path == expected_path
+    assert diagnostic.node_type == expected_type
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "hoist_loop_invariant_factors"
+
+
+def test_managed_forged_materialization_adds_no_record_and_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    record_attempts: List[object] = []
+
+    def forge_invalid_assignment(
+        loop: llir.ForLoop,
+        sequence_index: int,
+        context: LoopInvariantFactorHoistContext,
+        path: Tuple[str, ...],
+    ) -> Tuple[llir.VarInit, llir.Assign]:
+        nonlocal calls
+        calls += 1
+        declaration, post = _valid_generated_materialization()
+        post.op = llir.AssignOp.ADD_ASSIGN
+        return declaration, post
+
+    def record_attempt(**kwargs: object) -> NoReturn:
+        record_attempts.append(kwargs)
+        raise AssertionError("failed pass must not create a run record")
+
+    monkeypatch.setattr(
+        factor_pass_module,
+        "_try_hoist_from_loop",
+        forge_invalid_assignment,
+    )
+    monkeypatch.setattr(pass_manager_module, "_record", record_attempt)
+    with pytest.raises(LLIRTraversalError) as raised:
+        LLIRPassManager().run_loop_invariant_factor_hoist(
+            LLIRStatementListArtifact([_activating_loop()]),
+            LoopInvariantFactorHoistPassSpec(),
+        )
+
+    assert raised.value.diagnostic.code == (
+        "invalid_loop_invariant_factor_materialization_assignment_fields"
+    )
+    assert calls == 1
+    assert record_attempts == []
 
 
 def test_timing_and_run_records_are_nonsemantic_and_optional() -> None:
