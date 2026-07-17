@@ -6109,6 +6109,352 @@ This closes only the narrow Phase-3 N1/N2 structured `torch::empty` extent
 initializer-list slice. The initializer family remains open because N3 is
 deferred, and Phase 3 remains open. Phase 3.5 and LoopIR have not begun.
 
+### Phase-3 structured Torch dtype qualified-name slice complete (2026-07-16)
+
+The exact base for this slice was
+`60ae6dcc521405fc9a341d0ce35e1a4a8ebbed07`. The verified code/test candidate
+is the ordered pair of scoped commits:
+
+1. `942a69de0a812750abcde35c9945a01206ed01bd` (`refactor(compiler):
+   structure torch dtype constants`); and
+2. `d22791c3bb9cd90962018e2efc3cd20bae871649` (`test(compiler): cover
+   structured torch dtype constants`).
+
+The complete uncommitted code/test candidate passed the canonical suite before
+either commit was created. Neither these commits nor any earlier Phase-3
+commit was amended, squashed, reordered, or rewritten. This handoff update is
+the separate documentation-only commit.
+
+#### Complete pre-implementation expression inventory
+
+The exact-base budget was reproduced before editing: 384 production `Var`
+constructors, 31 direct expression strings, 353 other constructor arguments
+including seven known indirect sinks/clones, ten generic string rewrites, and
+52 `RawStmt` calls from 51 production producers. Every site was classified by
+producer, consumer, exact type, ownership, production reachability, source
+spelling, and compatibility-rewrite interaction before selecting the slice.
+
+The 15 direct subscript sites were unchanged from the preceding audit:
+
+| ID | Producer and exact `Var.name` spelling | Consumer, type, ownership, reachability, compatibility interaction, and decision |
+| --- | --- | --- |
+| P1 | `CINLowerer._emit_post_ops`: `f"{op.tensor_name}_val[{index_expr}]"` for add | Fresh `Assign.value`, `NO_TYPE`, borrowing the extra-tensor value pointer. Its only caller is the unsupported untiled workspace copy fallback; it remains exposed to generic value-name scans. No successful public activation; rejected. |
+| P2 | Same producer and spelling for multiply | Same ownership, dormant caller, consumers, and rewrite exposure as P1. Rejected with the complete post-op pair. |
+| M1 | `CINLowerer.get_level_arrays`: `f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()"` | Fresh compressed-position `VarInit.value`, `PTR_INT`, borrowed from the by-value nested Torch-tensor ABI container. Live, but combines two subscripts with a templated member call; `ArrayAccess` alone is insufficient. Rejected as an ABI/member-call seam. |
+| M2 | Same producer with `[1].data_ptr<int>()` | Fresh compressed-coordinate `PTR_INT`; same live borrowed ABI ownership and deferred hierarchy as M1. Rejected. |
+| M3 | Same producer: `f"{tensor.name}_mode_indices[{level}][0]"` | Fresh coordinate-tensor `VarInit.value`, `TORCH_TENSOR`, copied from the nested container. Live, but M4 repeats the access and immediately derives its pointer, so M3 alone is not a complete producer family. Rejected. |
+| M4 | Same producer: `f"{tensor.name}_mode_indices[{level}][0].data_ptr<int>()"` | Fresh coordinate-pointer `PTR_INT`, borrowed from the same selected Torch tensor and nested container. Completing M1-M4 requires the deferred templated member-call-on-expression and Torch ABI work. Rejected. |
+| W0 | `lower_TensorAccess`: `f"{tensor_access.tensor.name}_val[{physical_index}]"` | Returned metadata-free `TensorAccess` rvalue, `NO_TYPE`. Supported production lowering uses the structured physical-access route, and this fallback's `_val` spelling is inconsistent with generated workspace storage. Nonactivating and rejected. |
+| D1 | Workspace initialization: `f"{wksp.get_name()}[{wksp.tile_size_var.name}]"` | Fresh `VarInit.var` with the workspace scalar type. This is a live stack-array declarator, not an rvalue access; migration would require prohibited generalized allocation/declarator and target work. Rejected. |
+| W1 | Untiled workspace copy: `f"{wksp.get_name()}[{loop_var.name}]"` | Fresh `Assign.value`, `NO_TYPE`, reading local workspace storage. Direct internal CIN can construct it, but supported scheduled dense workspaces take the preceding `memcpy`; the live tiled path is already structured. Rejected. |
+| C1 | Discarded all-COO pre-scan: `f"{crd_array}[_p]"` | Fresh `NO_TYPE` comparison operand borrowing an input coordinate pointer. Constructed only in a pre-scan tree discarded by the scalar-accumulator production caller; non-emitting and rejected. |
+| C2 | Same pre-scan: `f"{crd_array}[_p - 1]"` | Same discarded ownership/path as C1; its subtraction index also needs a coordinated typed child. Rejected. |
+| G1 | Discarded all-COO group loop: `"_group_starts[_g]"` | Fresh `VarInit.value`, `INT64`, promoting a local `std::vector<int>` element. The grouped tree is discarded and the leaf participates in the legacy bracket-to-`.at(...)` rewrite. Rejected. |
+| G2 | Same group loop: `"_group_starts[_g + 1]"` | Same discarded vector ownership and rewrite interaction as G1, plus an arithmetic index. Rejected. |
+| I1 | Coordinate `ModeIterator` root-begin alternative: `f"{self._tensor_var.name}{self._level}_pos[0]"` | Fresh iterator begin, `INT`. Root coordinate lowering emits literal `0`; this alternative never reaches generated LLIR. Rejected. |
+| I2 | Coordinate `ModeIterator` root-end alternative: `f"{self._tensor_var.name}{self._level}_pos[1]"` | Fresh iterator end, `INT`. Root coordinate lowering derives `.size(0)`; this alternative never reaches generated LLIR. Rejected. |
+
+The other 16 direct strings remained separate seams:
+
+| IDs | Category and exact source spelling | Producer, consumer, type, ownership, reachability, rewrite interaction, and decision |
+| --- | --- | --- |
+| K1/K2 | Call: `f"{self.name}_values_torch." f"data_ptr<{c_datatype.value}>()"` | Dense-capacity and known-NNZ result pointer `VarInit.value` leaves with exact pointer types. Live post-lowering Torch ABI; requires a templated member-call representation. Rejected. |
+| K3 | Call: `f"{tensor.name}_values.data_ptr<{data_type.value}>()"` | Fresh live input value-pointer `VarInit.value`; exact scalar-pointer type, borrowed from the Torch tensor. Rejected with the `data_ptr<T>()` family. |
+| K4 | Call: `f"{crd_tensor.name}.data_ptr<int>()"` | Fresh intermediate coordinate-pointer `VarInit.value`, `PTR_INT`. Live through all applicable managed passes but opaque to their rewrites. Rejected. |
+| K5 | Call: `f"{val_tensor.name}.data_ptr<{data_type.value}>()"` | Fresh intermediate value-pointer `VarInit.value`; live and representation-bound like K4. Rejected. |
+| K6 | Call: `f"{tname}_values.data_ptr<{c_dtype.value}>()"` | Fresh post-op tensor pointer with the exact scalar-pointer type. Live post-op ABI extraction. Rejected. |
+| K7/K8 | Calls: `f"{storage_name}.data()"` | Fresh exact-pointer `VarInit.value` leaves for compact-result and packed-operand schedule storage. Live schedule-stage access requiring the same deferred member/call-on-expression hierarchy. Rejected. |
+| B1 | Member: `f"{self.name}.storage.index.mode_indices"` | Fresh live result-assembler `Assign.var`, `NO_TYPE` lvalue. Requires widening `AssignmentTarget` and coordinating the Torch result ABI. Rejected. |
+| B2 | Member: `f"{self.name}.storage.value"` | Fresh live result-assembler `Assign.var`, `NO_TYPE` lvalue. Same result-ABI seam as B1. Rejected. |
+| B3 | Member: `f"{tensor.name}.storage.value"` | Fresh input-storage `VarInit.value`, `TORCH_TENSOR`. Dormant compatibility read coherent only with the member ABI family. Rejected. |
+| N3 | Initializer: `f"{{{', '.join([self._get_mode_index_set(i, lt) for i, lt in enumerate(self.level_types)])}}}"` | Fresh live result `mode_indices` assignment value, `NO_TYPE`. Coupled to B1 and the result ABI. Rejected. |
+| Q1 | Qualified constant: `"torch::kInt"` | Fresh compressed-position `scorch_tensor_from_vector` argument, previously `NO_TYPE`. Live final result/ABI assembly and traversed by dynamic-vector handling. Selected. |
+| Q2 | Qualified constant: `"torch::kInt"` | Fresh final compressed/coordinate-coordinate conversion argument, previously `NO_TYPE`. Same live final path as Q1. Selected. |
+| Q3 | Qualified constant: `"torch::kInt"` | Fresh intermediate coordinate-vector conversion argument, previously `NO_TYPE`. Live before managed rewriting in outer-workspace assembly. Selected. |
+| T1 | Ternary: `f"{outer_end_var} > 0 ? 1 : 0"` | Fresh `INT64` group-count initializer in the discarded all-COO group-preparation route. Non-emitting and requires a dedicated conditional representation. Rejected. |
+
+Four additional live dtype leaves were counted under `other` because their
+old names came through a helper rather than direct string literals:
+
+| ID | Producer and old source spelling | Consumer, type, ownership, reachability, and decision |
+| --- | --- | --- |
+| H1 | Dense-capacity `torch::empty` dtype argument from `get_pytorch_c_dtype_str(self.dtype)` | Fresh final result/ABI `FunctionCall.args` leaf, previously `NO_TYPE`; live and rebuilt once by dynamic-vector handling. Selected. |
+| H2 | Known-NNZ `torch::empty` dtype argument from the same helper | Same fresh final ownership and pass path as H1; live sparse-output route. Selected. |
+| H3 | Final dynamic values-vector conversion dtype from the same helper | Fresh final `scorch_tensor_from_vector` argument; live result/ABI assembly and dynamic-vector rebuild. Selected. |
+| H4 | Intermediate values-vector conversion dtype from the same helper | Fresh outer-workspace `scorch_tensor_from_vector` argument; live before managed rewriting and crosses all applicable managed passes. Selected. |
+
+Selecting only Q1-Q3 would have left four live instances of the same semantic
+Torch scalar-type constant family opaque. Q1-Q3 plus H1-H4 are therefore the
+smallest complete live family. The seven indirect sinks/clones remain one
+`expr.name.replace(old, new)`, the dense-pointer-hoist `name`, the common
+traversal `node.name`, two `prefix_extent` sinks, one `zero_value` sink, and one
+single-iteration `name`. All ten generic string rewrites remain unchanged.
+
+#### Candidate selection, representation, and consumer audit
+
+The new frozen `llir.QualifiedName(namespace, name, data_type)` is the narrow
+representation required by these seven sites: an immutable, childless,
+two-component qualified C++ name. Both components must be exact `str` values
+accepted by `str.isidentifier()`; `data_type` must be an exact `DataType`. The
+exact semantic type is
+`DataType.TORCH_SCALAR_TYPE = "torch::ScalarType"`. Every producer constructs a
+fresh leaf, equality and hashing are structural, and primary-expression
+precedence permits the existing call, comparison, cast, member, and subscript
+contexts without changing parentheses.
+
+Common traversal validates the exact node and fields, visits it as a leaf in
+deterministic preorder, and rebuilds a detached `QualifiedName` on every
+rewrite. Repeated rewriting and replacement ownership remain detached. Exact
+codegen dispatch emits `namespace::name`; unknown subclasses and forged fields
+fail closed in traversal and codegen. `QualifiedName` remains excluded from
+`AssignmentTarget` and the assignment-index grammar, so this slice does not
+create a generalized lvalue or name hierarchy.
+
+The terminal helper `get_pytorch_c_dtype_name` returns exactly `kFloat32`,
+`kFloat64`, `kInt32`, `kInt64`, `kInt8`, or `kUInt8`; the existing
+`get_pytorch_c_dtype_str` remains byte-compatible for the two `RawStmt`
+ABI-validation consumers. The intentional spelling distinction is preserved:
+coordinate conversions use exact `torch::kInt`, while `torch.int32` through
+the dtype helper remains exact `torch::kInt32`. Qualified callee strings such
+as `torch::empty` and `std::move`, all RawStmt dtype text, the eight call sites,
+three members, N3, 15 subscripts, and T1 remain independent future seams.
+
+H1/H2 and Q1/Q2/H3 enter during final result/ABI body assembly after the
+earlier managed transformations; only dynamic-vector rewriting later rebuilds
+them. Q3/H4 enter during outer-workspace intermediate assembly before managed
+rewriting and cross all applicable managed passes. Compatibility name rewrites
+match exact `Var` objects and therefore ignore `QualifiedName`. The selected
+leaves are nested `FunctionCall.args` inside `VarInit.value`; they are not
+assignment targets, tensor accesses, hash keys, or adjacent `Assign` statements.
+The existing adjacent-assignment deduplication seam is therefore unaffected.
+
+A malformed final leaf is owned by
+`LLIR rewrite / rewrite_dynamic_vector_accesses` after the exact four completed
+records `insert_sparse_prefetch`, `hoist_dense_pointers`,
+`eliminate_single_iteration_loops`, and `hoist_loop_invariant_factors`. A
+malformed intermediate leaf is owned by
+`LLIR transformation / insert_sparse_prefetch` with zero completed records.
+Both failures preserve the exact `CompileOptions` object and caller-owned
+inputs and publish only valid records. The final failure preserves the already
+completed result-ABI assembly record and suppresses schedule lowering, C++
+generation, build/request assembly, native work, and cache publication. The
+intermediate failure suppresses result-ABI assembly and every later stage.
+
+No ABI signature, layout, source spelling, parser, generalized hierarchy,
+allocation representation, pass policy, or unrelated optimization changed.
+
+#### Locked post-slice compatibility budget
+
+The production budget is now:
+
+- 377 total `Var` constructors;
+- 28 direct expression strings: 15 subscript, eight call, three member, one
+  initializer, one ternary, zero qualified, and zero arithmetic;
+- 349 other constructor arguments, including the same seven indirect
+  sinks/clones;
+- ten generic string rewrites;
+- 52 `RawStmt` constructors / 51 production producers;
+- seven production `QualifiedName` constructors plus the one common-traversal
+  rebuild constructor;
+- no direct Torch dtype constant or `get_pytorch_c_dtype_str(...)` remains in a
+  production `Var.name`; and
+- no new direct string-expression assignment target; the same canonical member
+  lvalues remain unchanged.
+
+#### Verification record
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, native, and
+benchmark command activated the `scorch` conda environment first. The
+complete candidate passed the required canonical suite while uncommitted;
+capture and latency then used the final clean committed `d22791c` candidate in
+detached worktrees.
+
+- `pytest -q tests/test_scorch/test_llir_string_budget.py` reproduced exact base
+  `60ae6dc` at 14 passed and locks candidate `d22791c` at 15 passed.
+- The focused changed compiler tests passed 469 in 2.47 seconds; the node
+  contract focus passed 280; the producer/budget focus passed 54.
+- The canonical 18-file CIN/plan/options/pass/traversal/codegen/scheduler suite
+  passed 953 tests. The required historical 11-file scheduler/CIN/codegen
+  matrix passed 405 tests. These are the inherited 914/379 suites plus exactly
+  the 39/26 newly collected regressions in the changed files.
+- The authoritative clean detached committed-candidate command
+  `PYTHONPATH="$PWD:$PWD/src" pytest -q -m "not perf" tests` passed 1,477,
+  skipped 14, and deselected three in 2,155.79 seconds, with only the inherited
+  PyTorch sparse-invariant warning.
+- The exact CSR x dense, DS, DSS, and all-COO source anchors passed four tests
+  in 0.83 seconds.
+- Six relevant native activations passed in 116.64 seconds and matched their
+  PyTorch/reference results: default scalar/SIMD SDDMM, all-COO SDDMM, default
+  sparse-assembly SpGEMM, outer-workspace all-coordinate, outer-workspace
+  intermediate Q3/H4, and default SpMV/dense matmul.
+- The exact 13-test stage/options/pass/cache/ownership/failure focus passed in
+  0.56 seconds. It locks typed stage identity/order/timing, exact
+  `CompileOptions` identity, managed success/partial/failure records, cache
+  identity, independent compilation, caller-owned immutability, both selected
+  failure owners, and later-stage suppression.
+- Black left all 13 changed Python files unchanged at exact base and candidate,
+  with only the inherited Python 3.11/target-3.15 warning.
+- Flake8 reported the exact same six inherited findings on both sides: two
+  F841, one C901, two F401, and one F541. The normalized comparison is empty.
+- mypy reported the same 55 inherited errors in seven files on both sides after
+  normalizing locations and embedded line references; there is no
+  candidate-only error.
+- Network-enabled strict
+  `sphinx-build -n -b html -W --keep-going -E -a docs/source OUTPUT` builds
+  generated the same documentation at base and candidate and failed under
+  `-W` only on the exact same 23 inherited unresolved-reference warnings. An
+  initial restricted-network/non-nitpicky comparison was noncanonical because
+  it added inventory-fetch warnings; it was replaced by the authoritative
+  strict comparison.
+- `git diff --check` is clean, and exact base/candidate detached worktrees were
+  clean throughout capture and latency.
+
+An initial shared-worktree full-suite attempt was noncanonical because pytest
+also collected user-owned GPU/SuiteSparse/packaging work and encountered an
+unrelated failure outside this slice. The clean detached committed-candidate
+run above is the authoritative repository result. No user-owned artifact was
+edited to make it pass.
+
+#### Exact source/build identity and native correctness
+
+The capture helpers re-hash to
+`605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`
+(inputs),
+`a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`
+(grid),
+`964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`
+(workspace), and
+`27d5ab5c291d047084689e41a10e1cebda8df51d51fbf69dbd54defdb30205c0`
+(compact/heap). The grid predecessor
+`/tmp/scorch-phase2-sparse-prefetch-final/kernel-aa-c8af101-m5.json` re-hashes
+to `f9cd3cdbecff41131cb50bf56b10766f3ba232b69dc2af146177b35c382a1d62`.
+
+Exact base and candidate worktrees were exposed in turn at the same logical
+`cd -L /tmp/scorch-phase3-position-bound-identity-capture`; `pwd -L` confirmed
+the logical `/tmp` path instead of `/private/tmp`. The shared capture root
+`TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-qualified-capture-extensions` made
+build-directory and `.so` storage paths identical. Complete input, 42-cell
+grid, activating workspace, and compact/heap capture trees compare
+byte-for-byte. Their new same-root manifest hashes are respectively:
+
+- inputs: `db399fbb5fe0c0d6b4a42e926c34eef9967f1a03a050e5d13683ec009cbcd579`;
+- grid: `4fed8f7e812266770581e43ddc7dfbfcf40f5d5740964c0c49a5697f9d4c1c2d`;
+- workspace: `f7475c322b6a94d9821dd884697314d20a7062cab4ea49ce1510db0ac35e9d97`;
+  and
+- compact/heap:
+  `ff0239e3450c308bfd69b4d35f24653f5e23a7bc796a2e273bcd1dee3e41aea5`.
+
+A second same-root cross-check using the preceding handoff's default extension
+storage for the first three captures reproduced its exact input manifest
+`49f2889dc2d6d726644495caa94d55392df97d6ad99b27ddafc70672ca7f6036`,
+grid `f1b83ab7a7384a07b5305c3f6897663177cb40d0a76777f10c8cd3b245b27a67`,
+and workspace manifest
+`8eae0f7c8b887db53ff20b33515eed3755cfa11026fae1127ce576b394dfdfa1`
+on both sides. The canonical symlink was restored to
+`/tmp/scorch-phase3-position-bound-final-wt` after both comparisons. The
+retained path-sensitive canonical artifacts remain:
+
+- manifest: `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- grid: `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+  and
+- workspace: `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`.
+
+The exact standard source anchors remain:
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| CSR x dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+| preamble | 68,671 | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+
+The activating workspace sources also remain exact: all-coordinate is 3,528
+bytes / `5c69621af52939759ffcbaed3649ef1c4461108522b614df8f8a18c86ec0560a`
+and intermediate-coordinate Q3/H4 is 5,252 bytes /
+`b1770961d5f9c9c7fd716bd71cb97f1d5e73c6dcf200ba378b97b65c87fbe5d7`.
+The captures preserve exact spellings including
+`torch::empty({C_capacity}, torch::kFloat32)`, all three known-NNZ
+`torch::empty` calls, final
+`scorch_tensor_from_vector(..., torch::kInt/kFloat32)`, and intermediate
+`T0_crd_vec`, `T1_crd_vec`, and `T_val_vec` conversions. Kernel names,
+signatures, semantic/codegen/build/full keys, ABI/index policy, exact flags,
+request fields and keys, prepared keys, build identities, storage paths, and
+lowerer/options identity compare exactly.
+
+Every source/build input is therefore byte-identical. The canonical runtime
+waiver applies: no redundant M5 or Redwood grid was run. The retained M5
+artifact is
+`3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`
+and the retained Redwood artifact is
+`c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+The six native activation tests independently establish live correctness,
+including the Q3/H4 route absent from the standard source anchors.
+
+#### Compiler latency and activation attribution
+
+The final clean detached `d22791c` code/test candidate was benchmarked alone
+with five warmups and 30 samples:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output /tmp/scorch-phase3-qualified-results/latency-d22791c-m5.json
+```
+
+No pytest, native compile/run, capture, Sphinx, documentation build, or other
+benchmark controlled by this task overlapped it. The first attempt was denied
+write access to the existing default Torch extension cache before any sample
+or output artifact; the identical command was then rerun with the required
+cache access. The final artifact SHA-256 is
+`8dc3926dbcac6566963feea74fee1b620ebca3add95e2a8b5845dd8624974179`.
+Its metadata records exact revision
+`d22791c3bb9cd90962018e2efc3cd20bae871649`, detached branch, and empty status.
+The predecessor
+`/tmp/scorch-phase3-initializer-results/latency-c2c4784-m5.json` re-hashes to
+`8ad21977740f8cc13ff1926e662cc3f55b97f9baa5ca7ed8820e249f9d542353`;
+the unchanged benchmark script re-hashes to
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+The ordered four-case `{name, build}` collections compare byte-for-byte and
+share compact canonical digest
+`6db47a11decc175172b78dd512ffe523ddb8a7bd87f974db83916e93ffcdcd12`.
+
+| Case | QualifiedName constructions / emitted leaves | p50 old/new ms | p50 ratio / delta ms | p95 old/new ms | p95 ratio / delta ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small dense | 2 / 1 | 1.708625 / 1.578437 | 0.924 / -0.130188 | 2.074667 / 1.847881 | 0.891 / -0.226785 |
+| reduction | 2 / 1 | 1.537604 / 1.490146 | 0.969 / -0.047458 | 1.739163 / 1.682925 | 0.968 / -0.056237 |
+| CSR intersection | 6 / 3 | 2.708604 / 1.743875 | 0.644 / -0.964729 | 3.622131 / 1.928344 | 0.532 / -1.693787 |
+| sparse union | 6 / 3 | 2.034771 / 1.759729 | 0.865 / -0.275041 | 2.425598 / 1.800750 | 0.742 / -0.624848 |
+
+Small dense and reduction activate one final H1 leaf, which is rebuilt once by
+dynamic-vector handling and emitted once. CSR intersection and sparse union
+activate three final Q1/Q2/H3 leaves, each rebuilt once and emitted once. H2
+known-NNZ and Q3/H4 intermediate producers are absent from the latency corpus;
+their exact source and native anchors provide direct activation evidence.
+
+The owning stages are nested result-ABI assembly, inclusive CIN lowering
+(including post-assembly dynamic-vector rebuilding), and LLIR-to-C++
+generation. All their p50 and p95 ratios are below 1.0 in all four cases. The
+canonical endpoint, canonical endpoint extension, every other compiler stage,
+and the ordinary compatibility endpoint were also checked using raw JSON
+values. There is no metric at or above 1.10, so the complete crossing ledger is
+empty and no confirmation run or latency exception is required. Downstream
+kernel-name/build-request assembly receives byte-identical source/build input.
+
+No design-document or `csrc` file changed. The user-owned `.gitignore`,
+`pyproject.toml`, `src/scorch/__init__.py`,
+`tests/packaging/smoke_install.py`, and
+`tests/test_scorch/test_resources.py` modifications and all untracked material
+under `autotune-levels/`, `bench/`, `bench/bench_results/`, `research-ideas/`,
+`scratchpad/`, `src/scorch/csrc/cuda/`, and the GPU, SuiteSparse, and
+benchmark-analysis tests/modules/tools/manifests remain untouched and
+uncommitted.
+
+This closes only the narrow Phase-3 seven-site structured Torch dtype
+qualified-name slice. The 15 subscripts, eight calls, three members, N3
+initializer, and T1 ternary remain open. Phase 3 remains open; Phase 3.5 and
+LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
