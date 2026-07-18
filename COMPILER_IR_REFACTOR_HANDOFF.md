@@ -7900,6 +7900,630 @@ broader than the originally required narrow family and is not evidence that the
 requested seam separation was followed. Phase 3 remains open; Phase 3.5 and
 LoopIR have not begun.
 
+### Phase-3 fixed stack-array declaration slice complete (2026-07-17)
+
+The exact base for this slice is
+`c50dde8d7322d9c863c0637010bd8da1d1e80788`. The ordered clean code/test
+candidate is:
+
+1. `a81e89bfde459f799845a7fdc5c380d363afe084` —
+   `refactor(compiler): structure fixed stack arrays`;
+2. `03acc36c2610b772d15a01dd31d1717b3736a1d7` —
+   `test(compiler): cover fixed stack array migration`; and
+3. `378a06d9791aeb0775b687565897068649382197` —
+   `test(compiler): preserve typing baseline`.
+
+The third commit changes only the import route used by one test and leaves the
+production tree byte-identical to `03acc36`. No existing commit was amended,
+squashed, reordered, or rewritten. This handoff update is the separate scoped
+documentation change.
+
+This section supersedes only the prior D1 debt status and scope decision. The
+earlier audit correctly rejected D1 while generalized allocation/declarator
+work was prohibited. After that audit, the user asked for the best design and
+explicitly authorized the recommended narrow declaration statement. That
+later authorization does not alter the earlier structured Torch-ABI
+scope-deviation record or authorize a generalized allocation hierarchy.
+
+#### Complete pre-implementation inventory and selection
+
+At exact base `c50dde8`, the locked production budget was 379 `Var`
+constructors: 12 direct expression strings (11 subscript and one ternary) and
+367 other constructor arguments, including the same 11 indirect sinks/clones.
+There were ten generic string rewrites and 38 `RawStmt` constructors / 37
+semantic producers. Every one of the 11 subscript sites was classified before
+selection:
+
+| ID | Producer and source spelling | Consumer, type, and ownership | Production reachability and compatibility interaction | Decision |
+| --- | --- | --- | --- | --- |
+| P1 | `CINLowerer._emit_post_ops`, `cin_lowerer.py:777`; add leaf at `:808`, `f"{op.tensor_name}_val[{index_expr}]"` | Fresh `Assign.value` at `:805-812`, `NO_TYPE`, logically loading `T` through a borrowed post-op value pointer; the target is already a structured `ArrayAccess` and the operation is `ADD_ASSIGN`. | The only caller is the untiled workspace element-copy fallback at `:2055-2061`. Supported scheduled dense workspaces return through `memcpy` at `:1992-2020`; no successful public activation exists. If made live, the flat `_val[word]` spelling is recognized by dense-pointer legacy scanning and remains exposed to generic generated-string rewrites. | Rejected with P2: a coherent pair, but dormant and not the smallest live family. |
+| P2 | The same producer; multiply leaf at `cin_lowerer.py:819` with the same spelling shape | Fresh `Assign.value` at `:816-823`, `NO_TYPE`, using the same borrowed pointer; operation `MUL_ASSIGN`. | Same sole dormant caller, dense-pointer scanner exposure, and generic-rewrite exposure as P1. | Rejected with P1. |
+| W0 | `CINLowerer.lower_TensorAccess`, `cin_lowerer.py:948`; fallback at `:973-977`, `f"{tensor_access.tensor.name}_val[{physical_index}]"` | Returned metadata-free `llir.Expr`, `NO_TYPE`, intended as a physical `T` read from workspace storage. Workspace metadata resolution returns `None` at `:1008-1021`. | Supported non-workspace lowering already takes structured `ArrayAccess` at `:979-985`; supported `Where` producers/consumers use other lowerers. The `_val` spelling is inconsistent with generated `wksp` storage and can enter dense-pointer scans or generic rewrites if activated. | Rejected: no supported activation and semantically suspect source spelling. |
+| D1 | Exact-base `CINLowerer.lower_Where`, old `cin_lowerer.py:1329`, `f"{wksp.get_name()}[{wksp.tile_size_var.name}]"`; candidate producer at `:1327-1332` | Pre-slice, a fresh `VarInit.var` with the workspace scalar type used as a C-array declarator, plus an empty typed `Array` initializer. Candidate owns a rank-one automatic declaration name, exact scalar element type, fresh constexpr extent, and exact empty-brace initializer. | The only individually live site. Explicit stack-accumulation schedules, the regblock stack arm, and tiled TTM activate it. The locked source is `float wksp[kTile_k] = {};`. It is a declaration, not an element access, and never required dynamic-vector checked-access rewriting. | Selected after explicit user authorization for the narrow statement node. |
+| W1 | `CINLowerer.lower_ConsumerIndexStmt`, `cin_lowerer.py:1803`; fallback at `:2047-2050`, `f"{wksp.get_name()}[{loop_var.name}]"` | Fresh `Assign.value`, `NO_TYPE`, borrowing local untiled workspace storage. | It is below the no-tile guard at `:1983`; supported dense results return through `memcpy`. Internal CIN can construct it, but no supported public planner activation exists. The live tiled read is already structured. | Rejected: dormant fallback. |
+| C1 | `CINLowerer._transform_coo_loop_for_openmp`, `cin_lowerer.py:3843`; current-coordinate leaf at `:4036-4038`, `f"{crd_array}[_p]"` | Fresh left operand of a pre-scan inequality, `NO_TYPE`, logically reading `int` through a borrowed input coordinate pointer. | The only caller is scalar-accumulator guarded. It constructs the pre-scan, then the same true condition selects the flat scalar route at `:4145-4254` and discards the pre-scan. C1 never reaches final LLIR, managed passes, or codegen. | Rejected: dead final-tree path. |
+| C2 | Same transform; predecessor leaf at `:4039-4042`, `f"{crd_array}[_p - 1]"` | Fresh right comparison operand, `NO_TYPE`, same borrowed pointer; its index also embeds subtraction. | Discarded with C1. A structural form would additionally require an explicit typed subtraction child and exact boundary semantics. | Rejected: dead and coupled to a separate arithmetic-index concern. |
+| G1 | Same transform; grouped begin at `:4084-4088`, `"_group_starts[_g]"` | Fresh `VarInit.value`, `INT64`, promoting an `int` read from a locally owned `std::vector<int>`. | Constructed in `group_body`, but discarded by the scalar route. If made live, `_DynamicVectorAccessRewriter` recognizes `_group_starts` and rewrites brackets to `.at(...)`; a plain `ArrayAccess` would bypass that compatibility behavior. | Rejected: discarded and compatibility-rewrite coupled. |
+| G2 | Same transform; grouped end at `:4089-4093`, `"_group_starts[_g + 1]"` | Fresh `VarInit.value`, `INT64`, same local-vector ownership/promotion, plus an arithmetic index. | Same discarded group route and required `.at(...)` rewrite as G1; it also needs a typed add child. | Rejected with G1. |
+| I1 | `ModeIterator.__post_init__`, `iterator.py:406`; root-coordinate begin alternative at `:486-494`, `f"{self._tensor_var.name}{self._level}_pos[0]"` | Fresh `iterator_var_begin_value_llir`, `INT`, logically reading borrowed position storage. | For the only bracket case, root coordinate iteration, `get_init_stmt` emits literal zero at `:281-299`. The opaque alternative never enters generated LLIR or a pass. | Rejected: constructed but non-emitting. |
+| I2 | Same constructor; root-coordinate end alternative at `:499-503`, `f"{self._tensor_var.name}{self._level}_pos[1]"` | Fresh `iterator_var_end_value_llir`, `INT`, reading the same borrowed position storage. | Root coordinate lowering emits `<tensor><level>_crd_tensor.size(0)` at `:301-321`; the bracket alternative never survives. | Rejected: constructed but non-emitting. |
+
+D1 was therefore the sole live site. P1/P2, W0/W1, and I1/I2 have no
+successful supported public activation; C1/C2 and G1/G2 are constructed but
+discarded. Existing `ArrayAccess` remains the right representation for actual
+element access, but reusing it for D1 would conflate an expression with a
+declaration.
+
+The chosen boundary takes the useful LLVM/Clang/MLIR distinction—storage
+declaration is a statement, element access is an expression, and neither is
+encoded in a symbol name—without importing any compiler's generalized
+allocation system. The transitional production form is exactly:
+
+```python
+llir.FixedStackArrayDecl(
+    name="wksp",
+    element_type=llir.DataType.FLOAT32,
+    extent=llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+    initializer=llir.Array([], llir.DataType.FLOAT32),
+)
+```
+
+It adds one statement node and one production constructor. It changes no ABI,
+signature, storage layout, `AssignmentTarget`, or `ArrayAccess` contract and
+adds no parser, heap allocation, arbitrary declarator, generalized call/member
+hierarchy, or other prohibited expansion.
+
+#### Representation, traversal, ownership, and compatibility audit
+
+- `llir.py:601-685` defines the frozen structural statement. Supported element
+  types are exactly `FLOAT32`, `FLOAT64`, `INT32`, `INT64`, `INT8`, and
+  `UINT8`.
+- The extent is either an exact metadata-free, non-pointer, non-restrict
+  identifier `Var(CONSTEXPR_INT)` or a positive integral `Literal` typed
+  `INT`, `INT32`, `INT64`, `UINT32`, or `UINT64`. Dynamic extents, heap
+  storage, multidimensional arrays, alignment, and arbitrary initializers are
+  deliberately outside the node.
+- The initializer must be an exact empty `Array` whose type is identical to
+  the element type. `Array` snapshots the caller sequence into an owned tuple.
+  `TileSizeVar.llir_var` at `cin.py:515-517` supplies a fresh exact extent on
+  every production access. The parent is frozen and structurally equal/hashable;
+  because legacy `Var` remains mutable, the guarantee is fresh child ownership
+  and detached rewriting rather than deep transitive immutability.
+- Exact statement registration is at `llir_traversal.py:76-82`; forged-field
+  validation is at `:371-441`. Deterministic walk order is extent then
+  initializer at `:938-945`. Detached rewriting follows the same order,
+  validates replacements, and builds a fresh parent at `:1668-1733`.
+  Unknown children and non-exact subclasses fail closed.
+- Codegen first takes the common validation walk and then emits
+  `T name[extent] = {};` at `codegen.py:125-138`. Admitted extents are primary
+  expressions, so no wider declarator-precedence grammar is introduced. The
+  locked production bytes remain exactly `float wksp[kTile_k] = {};`.
+- `AssignmentTarget` remains exactly `Var | MemberAccess | ArrayAccess`.
+  Existing `ArrayAccess` construction, validation, precedence, equality,
+  ownership, traversal, and rewriting are unchanged.
+- The loop-invariant defined-name collector records the fixed declaration at
+  `loop_invariant_factor_pass.py:215-228`, so workspace reads cannot be
+  misclassified as invariant. Schedule name hygiene recursively records it at
+  `schedule_lowerer.py:353-370`, preventing packed-storage name collisions.
+- Dynamic-vector discovery intentionally still recognizes only `VarDecl`, and
+  assignment deduplication still considers only adjacent qualifying `Assign`
+  stores. A fixed stack array is neither and does not perturb either seam.
+- The global registry's seven managed pass identities and order remain
+  unchanged. The production paths audited for this slice execute their usual
+  five-pass subset. Common traversal validates and detaches the node;
+  specialized compatibility passes otherwise leave it alone. The ten locked
+  generic string-rewrite markers remain ten, and none parses
+  `FixedStackArrayDecl.name`.
+- A malformed declaration created inside `lower_Where` fails during the first
+  owning sparse-prefetch traversal, records no completed LLIR pass, and
+  suppresses result-ABI work, schedule lowering, C++ generation, build
+  preparation, native loading, and cache publication. A malformed declaration
+  appended after body assembly preserves the exact four-pass
+  sparse-prefetch/dense-pointer/single-iteration/factor prefix, then fails in
+  the owning dynamic-vector traversal and suppresses every later stage.
+
+#### Locked post-slice compatibility budget
+
+Final candidate `378a06d` has exactly:
+
+- 378 production `Var` constructors;
+- 11 direct expression strings: ten subscript and one ternary;
+- 367 other constructor arguments, including the same 11 indirect
+  sinks/clones;
+- ten generic string rewrites;
+- 38 `RawStmt` constructors / 37 semantic producers;
+- two `FixedStackArrayDecl` constructor templates: one production producer and
+  one common-traversal rebuild;
+- one production fixed-stack-array producer;
+- unchanged nine `tensor_data_ptr`, four `mode_index_tensor`, and three
+  `tensor_storage_member` production calls;
+- unchanged four `MemberCall` constructor templates;
+- no direct opaque call, member, initializer, qualified, or separately
+  classified arithmetic expression in a production `Var.name`;
+- no `std::move(` in a production `Var.name`; and
+- no direct string-expression `Assign` target.
+
+The ten remaining subscripts are exactly P1/P2, W0, W1, C1/C2, G1/G2, and
+I1/I2: eight in `cin_lowerer.py` and two in `iterator.py`. T1 remains the
+single ternary at `cin_lowerer.py:4013-4016`. Those are separate future seams;
+none was grouped into this slice.
+
+#### Verification record
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, native, and
+benchmark invocation first sourced the conda hook and activated `scorch`.
+Implementation, tests, and the handoff remained separate. The complete
+functional implementation and initial test set passed the canonical suite
+before the first two commits. The later `378a06d` correction changes only a
+test import route; the final focused selection, 11-file matrix, complete
+non-performance suite, quality comparison, captures, and latency gate all used
+the final committed candidate. Final acceptance used exact detached `c50dde8`
+and clean committed `378a06d` worktrees.
+
+The focused node/traversal and affected-pipeline commands included:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_traversal.py
+
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/test_dynamic_vector_access_pass.py \
+  tests/test_scorch/test_loop_invariant_factor_pass.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_compiler_stage_timing.py
+
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py::test_tuner_free_k_stack_workspace_is_structured_owned_and_byte_exact \
+  tests/test_scorch/test_llir_string_budget.py
+```
+
+The first passed 411 tests; the affected five-file pipeline run passed 291,
+including six new cases; and the final producer/budget focus passed 20 tests in
+3.29 seconds. Before editing, the required budget reproduction was:
+
+```sh
+pytest -q tests/test_scorch/test_llir_string_budget.py
+```
+
+It passed all 18 then-existing tests. Construction,
+exact typing, ownership, structural equality/hash, malformed and forged
+fields, unknown children/subclasses, deterministic traversal, detached and
+repeated rewriting, replacement ownership, byte-exact emission, precedence,
+every migrated producer, real activation, managed partial records, owning
+failures, and later-stage suppression are all exercised.
+
+The literal canonical 18-file suite was:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_cin_analysis.py \
+  tests/test_scorch/test_loop_plan.py \
+  tests/test_scorch/test_compile_options.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_traversal.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_dynamic_vector_access_pass.py \
+  tests/test_scorch/test_result_write_pass.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py \
+  tests/test_scorch/test_dense_pointer_hoist_pass.py \
+  tests/test_scorch/test_single_iteration_loop_pass.py \
+  tests/test_scorch/test_loop_invariant_factor_pass.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_llir_string_budget.py
+```
+
+It passed 1,114 tests in 169.06 seconds. The required historical 11-file
+scheduler/CIN/codegen matrix was:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py \
+  tests/test_scorch/codegen/test_1d_operations.py \
+  tests/test_scorch/codegen/test_codegen_perf_optimizations.py \
+  tests/test_scorch/codegen/test_regblock_dual_path.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py
+```
+
+The exact committed candidate passed 498 tests in 421.95 seconds. The complete
+non-performance suite was:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" pytest -q -m "not perf" tests
+```
+
+It passed 1,659 tests, skipped 14, and deselected three in 2,208.65 seconds,
+with only the inherited PyTorch sparse-invariant warning.
+
+The exact CSR x dense, DS, DSS, and all-COO source anchors passed four tests in
+0.81 seconds:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_sparse_prefetch_pass.py::test_production_routes_the_detached_list_at_the_original_optimization_seam \
+  tests/test_scorch/test_compressed_where_openmp_pass.py::test_production_ds_generated_cpp_matches_pre_extraction_bytes \
+  tests/test_scorch/test_compressed_where_openmp_pass.py::test_production_dss_generated_cpp_matches_pre_extraction_bytes \
+  tests/test_scorch/test_sparse_prefetch_pass.py::test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist
+```
+
+The final native activation command was:
+
+```sh
+pytest -q \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py::test_tuner_free_k_schedule_is_correct_for_ragged_tail_and_empty_row \
+  tests/test_scorch/test_schedule_generality.py::test_ttm_row_and_free_axis_tiles_compose_with_ragged_tails \
+  tests/test_scorch/codegen/test_regblock_dual_path.py::test_dual_path_correct_both_sides_of_cutoff
+```
+
+It passed six cases in 38.01 seconds: one free-k stack accumulation, one tiled
+TTM, and all four regblock branch/cutoff parameterizations. Each exercises
+native compilation/execution and compares against PyTorch.
+
+The exact 18-node stage/cache/ownership/failure selection was:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/test_compile_options.py::test_distinct_snapshots_compile_independently_without_mutating_owned_ir \
+  tests/test_scorch/test_compile_options.py::test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages \
+  tests/test_scorch/test_compiler_stage_timing.py::test_stage_identities_records_and_owner_are_typed_frozen_and_stable \
+  tests/test_scorch/test_compiler_stage_timing.py::test_production_and_debug_record_the_exact_complete_stage_sequence \
+  tests/test_scorch/test_compiler_stage_timing.py::test_one_options_snapshot_routes_through_one_owner_without_rereads \
+  tests/test_scorch/test_compiler_stage_timing.py::test_existing_llir_pass_records_are_context_owned_ordered_and_unchanged \
+  tests/test_scorch/test_compiler_stage_timing.py::test_timing_is_excluded_from_source_name_request_and_cache_identity \
+  tests/test_scorch/test_compiler_stage_timing.py::test_known_nnz_extent_is_independent_across_full_compilations \
+  tests/test_scorch/test_compiler_stage_timing.py::test_two_options_snapshots_have_independent_records_results_and_requests \
+  tests/test_scorch/test_compiler_stage_timing.py::test_caller_owned_cin_llir_and_first_result_are_not_mutated \
+  tests/test_scorch/test_compiler_stage_timing.py::test_malformed_tiled_stack_decl_fails_first_pass_and_suppresses_later_stages \
+  tests/test_scorch/test_llir_pass_manager.py::test_fixed_stack_array_survives_repeated_production_pipeline_detached \
+  tests/test_scorch/test_llir_pass_manager.py::test_malformed_fixed_stack_array_after_assembly_preserves_pass_prefix \
+  tests/test_scorch/test_dynamic_vector_access_pass.py::test_fixed_stack_array_preserves_coordinate_assignment_deduplication \
+  tests/test_scorch/test_loop_invariant_factor_pass.py::test_fixed_stack_array_declaration_marks_workspace_reads_variant \
+  tests/test_scorch/test_schedule_api.py::test_fixed_stack_array_name_participates_in_schedule_name_hygiene \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py::test_tuner_free_k_stack_workspace_is_structured_owned_and_byte_exact \
+  tests/test_scorch/test_schedule_api.py::test_packed_and_unpacked_schedules_cannot_alias_either_cache
+```
+
+It passed 19 cases in 0.58 seconds from the exact clean detached candidate
+worktree. It explicitly locks stage
+identity/order/timing, one
+`CompileOptions` identity, managed pass and failure records, cache identity,
+independent compilation, caller-owned CIN/LLIR immutability, the real malformed
+D1 first-owner failure, the exact post-assembly partial prefix, and later-stage
+suppression. The focused post-import correction check passed 20 tests in 3.29
+seconds.
+
+The comparable quality file set was all six changed production modules and all
+nine changed test modules:
+
+```sh
+CHANGED_PYTHON=(
+  src/scorch/compiler/llir.py
+  src/scorch/compiler/llir_traversal.py
+  src/scorch/compiler/codegen.py
+  src/scorch/compiler/cin_lowerer.py
+  src/scorch/compiler/loop_invariant_factor_pass.py
+  src/scorch/compiler/schedule_lowerer.py
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py
+  tests/test_scorch/test_codegen.py
+  tests/test_scorch/test_compiler_stage_timing.py
+  tests/test_scorch/test_dynamic_vector_access_pass.py
+  tests/test_scorch/test_llir_pass_manager.py
+  tests/test_scorch/test_llir_string_budget.py
+  tests/test_scorch/test_llir_traversal.py
+  tests/test_scorch/test_loop_invariant_factor_pass.py
+  tests/test_scorch/test_schedule_api.py
+)
+python -m black --check "${CHANGED_PYTHON[@]}"
+python -m flake8 "${CHANGED_PYTHON[@]}"
+python -m mypy "${CHANGED_PYTHON[@]}"
+```
+
+Black reports all 15 files unchanged at both base and candidate; both logs
+hash to
+`72f1dd1d4d1ef3ec68156ee6a687a236539f8fe49c86d491964fb085811c5192`.
+Flake8 reports the same six inherited findings on both sides—two F841, one
+C901, and two F401 in `cin_lowerer.py`, plus one F541 in `codegen.py`—and the
+normalized outputs both hash to
+`887c5ec97093fdd38441f44b8c0c2c179048b970a52b6361988a4597bfa8e7e8`.
+On this different 15-file comparison set, mypy reports the same 58 inherited
+errors in seven files at both revisions;
+sorted normalized outputs both hash to
+`208c0b048071244620b1c844ee35feef674ee4aea1f519fcc9ec05b3dcddf445`.
+The separate `378a06d` test-only correction removed the candidate-only
+import-untyped diagnostic without changing production or runtime behavior.
+
+Strict documentation commands were:
+
+```sh
+sphinx-build -n -b html -W --keep-going -E -a \
+  docs/source /tmp/scorch-phase3-fixed-stack-sphinx-base-c50dde8-quality
+sphinx-build -n -b html -W --keep-going -E -a \
+  docs/source /tmp/scorch-phase3-fixed-stack-sphinx-candidate-03acc36-quality
+git diff --check
+```
+
+The candidate Sphinx run was performed at `03acc36`. Final candidate `378a06d`
+changes only `tests/test_scorch/codegen/test_tuner_schedule_codegen.py`, outside
+the Sphinx source inputs, so `docs/source` and `src` are byte-identical and the
+strict result carries forward input-for-input.
+
+Both Sphinx runs generated all 53 HTML files and reached the same 23 inherited
+unresolved references (18 class, two attribute, two exception, and one
+function); normalized output hashes are both
+`e5dfe6603fc04bd77e0b7eaa90ba22c44a476448eb006572816fc3b34329e793`.
+`git diff --check` was clean, and both exact detached worktrees remained clean.
+
+#### Exact source/build identity and native correctness
+
+The canonical capture helpers re-hash to:
+
+- inputs:
+  `605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`;
+- 42-cell grid:
+  `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`;
+- workspace pair:
+  `964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`;
+  and
+- dedicated D1 tiled-workspace activation:
+  `9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff`.
+
+Exact base `c50dde8` and candidate `378a06d` were checked out in turn in the
+same logical `cd -L /tmp/scorch-phase3-structured-access-capture-wt`. The three
+canonical helpers used
+`/tmp/scorch-phase3-structured-access-capture-extensions`. The dedicated D1
+helper constructs `CompileOptions` from an explicit empty environment, so its
+recorded request/prepared paths use the same default
+`/Users/bobby/Library/Caches/torch_extensions/py311_cpu` root on both sides;
+the shell `TORCH_EXTENSIONS_DIR` prefix did not alter those D1 paths. For each
+revision, the capture commands were:
+
+```sh
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_inputs.py "$OUT/inputs"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_spmm_grid.py "$OUT/grid.json" \
+  /tmp/scorch-phase2-sparse-prefetch-final/kernel-aa-c8af101-m5.json
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_workspace_pair.py "$OUT/workspace"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_tiled_workspace.py "$OUT/tiled-workspace"
+```
+
+`OUT` was the matching base or candidate directory under
+`/tmp/scorch-phase3-fixed-stack-canonical-capture`. Input, grid, workspace, and
+dedicated D1 trees compare byte-for-byte. The shared capture worktree was
+restored cleanly to
+`28dcca51144c7f84008d1e39bb4050c4fb9909f0` afterward.
+
+Both sides reproduce the retained path-sensitive canonical hashes:
+
+- input manifest:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- grid:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+  and
+- workspace manifest:
+  `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`.
+
+The canonical corpus does not activate D1, so the dedicated capture closes
+that gap. Base and candidate D1 manifests both hash to
+`a6d2a729d06f5975496c62bb56a43823778ccdb0696e97624ecf9c191da349ee`.
+That current-seam manifest is not the older `9985e0de...` archive recorded for
+the pre-D1 slice because `CompileOptions` cache-key fields evolved between
+that older exact base and `c50dde8`; the applicable `c50dde8`/`378a06d`
+comparison is exact, and the source and preamble hashes remain unchanged.
+Both contain a 3,060-byte source with SHA-256
+`2b9d28654e33225e1093500fc861e76f0f67cb241c7ab28b43c05b774d9f7222`
+and the 68,671-byte preamble with SHA-256
+`db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`.
+The declaration remains on line 39, the structured write on line 60, and the
+readback on line 72.
+
+The other exact source anchors remain:
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| CSR x dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+| preamble | 68,671 | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+| workspace all-coordinate | 3,528 | `5c69621af52939759ffcbaed3649ef1c4461108522b614df8f8a18c86ec0560a` |
+| workspace intermediate-coordinate | 5,252 | `b1770961d5f9c9c7fd716bd71cb97f1d5e73c6dcf200ba378b97b65c87fbe5d7` |
+
+Kernel names, signatures, semantic/codegen/build/full keys, ABI/index policy,
+flags, request/prepared keys, build identities, extension paths, lowerer
+identity, exact `CompileOptions` identity, and all other source/build inputs
+also compare exactly. The complete source/build corpus is byte-identical, so
+the canonical runtime waiver applies instead of rerunning identical M5 and
+Redwood grids. The retained waiver artifacts re-hash to:
+
+- M5:
+  `3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+  and
+- Redwood:
+  `c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+
+The six-case native focus independently activates all three live D1 families
+and validates their numerical results. Thus the waiver covers unchanged full
+grids while the focused native tests prove correctness of the migrated
+producer itself.
+
+#### Compiler latency, activation, and complete crossing attribution
+
+The immediate predecessor is
+`/tmp/scorch-phase3-member-call-results/latency-62146b7-m5.json`, SHA-256
+`7e9689a8804849527efe5515def4d3e5ad0db39b135a0cd7997944cb335216a0`.
+Although the exact slice base is `c50dde8`, that commit changes only this
+handoff document over executable revision `62146b7`; the retained `62146b7`
+artifact is therefore the exact executable predecessor.
+The final clean detached `378a06d` candidate was benchmarked alone with five
+warmups and 30 samples:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output /tmp/scorch-phase3-fixed-stack-results/latency-378a06d-m5.json
+```
+
+The primary comparison contained one broad nonactivating CSR p95 wave, so the
+same clean candidate was measured exactly once more under the established
+confirmation policy. The primary artifact was retained:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output \
+  /tmp/scorch-phase3-fixed-stack-results/latency-378a06d-m5-confirmation.json
+```
+
+No pytest, native compilation, capture, Sphinx/documentation build, or other
+benchmark overlapped either run. Primary SHA-256 is
+`e93a4772396edb17db9f8f1184749845ca39ecdd2e36500dae61a9a453cb4b22`;
+confirmation SHA-256 is
+`e2613567fd7c64c4141cc76a9cfed3822da7a397f6274ee6555869ce1dd74872`.
+Both record exact revision `378a06d9791aeb0775b687565897068649382197`,
+empty status, M5/arm64, Python 3.11.15, Torch 2.13.0, six threads, five warmups,
+and 30 samples. The harness re-hashes to
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+
+Schema, corpus, configuration, host, case descriptors, stage identities,
+nesting, run multiplicities, sample counts, and recomputed summaries all
+compare exactly. Every ordinary, canonical, endpoint-extension, and stage
+series has 30 samples. Ordered `{name, build}` collections are byte-identical
+across predecessor, primary, and confirmation and all hash to
+`d7dc61d5b9893bf0d72462382fc2c14edce10b6363bf7ce8a9f38f9e91834a9c`.
+
+The official predecessor-to-primary p50/p95 ratios are small dense
+`0.871/0.836`, reduction `0.877/0.856`, CSR intersection `1.028/1.156`, and
+sparse union `0.824/0.578`. The confirmation ratios are small dense
+`0.999/1.284`, reduction `0.927/0.898`, CSR intersection `0.898/0.896`, and
+sparse union `0.778/0.544`. The comparator correctly returned nonzero for each
+run's single endpoint investigation.
+
+The literal official comparison commands were:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" python tools/benchmark_compiler_ir.py \
+  compare-latency \
+  /tmp/scorch-phase3-member-call-results/latency-62146b7-m5.json \
+  /tmp/scorch-phase3-fixed-stack-results/latency-378a06d-m5.json
+
+PYTHONPATH="$PWD:$PWD/src" python tools/benchmark_compiler_ir.py \
+  compare-latency \
+  /tmp/scorch-phase3-member-call-results/latency-62146b7-m5.json \
+  /tmp/scorch-phase3-fixed-stack-results/latency-378a06d-m5-confirmation.json
+```
+
+A separate no-native audit intercepted the exact four benchmark cases at CIN
+output, post-schedule output, and the codegen root. Every case constructed and
+carried exactly zero `FixedStackArrayDecl` nodes; fixed-node walker, rewriter,
+and codegen hooks were entered zero times. No case published
+`SCHEDULE_LOWERING`. Each case did run five managed passes within CIN lowering
+and then LLIR-to-C++ generation, so the only slice-related work is a nonmatching
+common-dispatch check in owning stages `L` and `X`. `N`, `F`, `R`, `G`, `A`,
+and `S` do not inspect the selected node; nested result-ABI time `A` is already
+included in `L` and must not be added.
+
+That audit was a read-only inline Python invocation from the clean candidate
+worktree:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src:$PWD/tools" python - <<'PY'
+# Load benchmark_compiler_ir and wrap the exact FixedStackArrayDecl constructor,
+# fixed-node walker/rewriter hooks, CIN pre/post-schedule boundaries, and LLIR
+# codegen with counters. For every _build_latency_cases() case, clear compiler
+# caches and invoke once under _intercept_native_builds(...,
+# stop_before_build=True). Require _CompilationCaptured, no native capture, one
+# CompilationContext, and print constructor/tree/hook counts plus exact stage
+# and LLIR-pass records.
+PY
+```
+
+No standalone helper or redirected log was created; the committed benchmark
+tool and three JSON artifacts are the stable inputs. A second read-only inline
+Python audit loaded those artifacts, checked schema/corpus/configuration/host,
+case/build identity, nesting and run counts, recomputed every percentile, and
+enumerated `new / old > 1.10` over `O/C/E` plus every common stage: 86 metrics
+per candidate artifact.
+
+Across all 86 common endpoint/stage p50/p95 metrics, `O` is the ordinary
+compatibility endpoint, `C` the canonical endpoint, `E` canonical endpoint
+extension, `L` inclusive CIN lowering, `N` CIN normalization/verification,
+`F` validated frontend construction, `R` kernel-name/build-request assembly,
+`G` legacy CIN adaptation, `X` LLIR-to-C++ generation, `A` nested result-ABI
+assembly, and `S` scheduling/loop-plan construction. Each ledger entry below
+is `old/new ms; exact ratio; signed delta ms`. These are every strict `>1.10`
+crossing; all omitted metrics remain at or below 1.10.
+
+Primary, all in nonactivating CSR-intersection p95:
+
+- `O.95 2.222945500/2.569666700; 1.155973774; +0.346721200`;
+- `C.95 2.572133150/2.943662650; 1.144444116; +0.371529500`;
+- `E.95 0.366010450/0.431321350; 1.178439987; +0.065310900`;
+- `L.95 1.099825000/1.349631400; 1.227132862; +0.249806400`;
+- `F.95 0.051891700/0.070054650; 1.350016477; +0.018162950`;
+- `R.95 0.472648250/0.576651600; 1.220043870; +0.104003350`;
+- `G.95 0.031058150/0.035972550; 1.158232219; +0.004914400`;
+- `X.95 0.104606100/0.160202150; 1.531480000; +0.055596050`;
+- `A.95 0.022702600/0.028583000; 1.259018791; +0.005880400`; and
+- `S.95 0.192502050/0.231960750; 1.204978077; +0.039458700`.
+
+Confirmation, all in nonactivating small-dense p95:
+
+- `O.95 2.172235600/2.788664700; 1.283776355; +0.616429100`;
+- `C.95 2.516695500/3.112260050; 1.236645454; +0.595564550`;
+- `E.95 0.349937350/0.433004200; 1.237376348; +0.083066850`;
+- `L.95 0.770323250/0.878876750; 1.140919413; +0.108553500`;
+- `N.95 0.027465450/0.036343900; 1.323258858; +0.008878450`;
+- `F.95 0.057247800/0.074692000; 1.304713893; +0.017444200`;
+- `R.95 0.480543450/0.577737350; 1.202258297; +0.097193900`;
+- `G.95 0.034606550/0.050741850; 1.466249886; +0.016135300`;
+- `X.95 0.069354050/0.085031250; 1.226045919; +0.015677200`;
+- `A.95 0.017083550/0.019675150; 1.151701491; +0.002591600`; and
+- `S.95 0.338117600/0.405553500; 1.199445104; +0.067435900`.
+
+The primary CSR wave disappears completely in confirmation: its ordinary p95
+ratio moves from `1.156` to `0.896`. The confirmation wave instead moves to
+small dense and includes unrelated `N/F/R/G/A/S` stages. No case/metric
+crossing repeats, the selected producer is inactive in every case, and the
+build objects are identical. This is nonrepeatable host/run p95 distribution
+variance, not a stable selected-slice cost. The binding policy called for the
+one retained confirmation and does not justify a third opportunistic run.
+There is no repeatable owning-stage or endpoint regression requiring a typed
+infrastructure exception.
+
+No design-document or tracked `csrc` file changed. The user-owned `.gitignore`,
+`pyproject.toml`, `src/scorch/__init__.py`,
+`tests/packaging/smoke_install.py`, and
+`tests/test_scorch/test_resources.py` modifications remain untouched and
+uncommitted. All user-owned untracked material under `autotune-levels/`,
+`bench/`, `bench/bench_results/`, `research-ideas/`, `scratchpad/`,
+`src/scorch/csrc/cuda/`, the GPU/SuiteSparse/benchmark-analysis
+tests/modules/tools/manifests, and scheduler receipt/status files likewise
+remains untouched and uncommitted.
+
+This closes only the one-producer fixed stack-array declaration slice. Phase 3
+remains open. Phase 3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
