@@ -9817,6 +9817,529 @@ was migrated. Structured symbol completion, the ten generic rewrites, emitter
 closure, parallel zero-fill, and generalized allocation/parallel representation
 remain open. Phase 3 remains open. Phase 3.5 and LoopIR have not begun.
 
+### Phase-3 exact compressed-Where workspace-insert rewrite slice complete (2026-07-18)
+
+The exact base for this slice is
+`c9077aa56e02b179653a58ca70d2479e36acd9f7`. The final verified executable
+code/test candidate is `623831d51520b2c5009f5216643f8a87cb9ecc84`.
+Three scoped commits were preserved without amending, squashing, reordering, or
+rewriting any earlier commit:
+
+- `3672a040748380e0fb56ffea246c4e09fb91bc20`
+  (`refactor(compiler): narrow workspace insert rewriting`);
+- `b97189e7476edef21a5cd649b1a6e37a6c91aab4`
+  (`test(compiler): lock exact workspace insert matching`); and
+- `623831d51520b2c5009f5216643f8a87cb9ecc84`
+  (`test(compiler): close workspace insert failure gaps`).
+
+The production and initial focused tests were kept uncommitted until the
+complete candidate had passed the canonical suite once. The last commit adds
+only the two review-driven failure-closure test families. This handoff update
+is a separate documentation-only commit after every acceptance gate and the
+final committed-candidate measurement.
+
+#### Complete pre-implementation inventory and selection
+
+The exact-base budget contained ten generic string rewrites. Every site was
+re-audited by producer, consumed field and type, ownership, production
+reachability, source spelling, downstream consumer, and interaction with the
+remaining compatibility rewrites:
+
+| Owner and sites | Producer, consumer, ownership, reachability, and spelling | Decision |
+| --- | --- | --- |
+| `cin_lowerer.py`, two `_rewrite_val_refs` arms | Detached compatibility traversal mutates `FunctionCallStmt.name` and `RawStmt.code` from `<array>[` to `<array>.data()[`. Structured `ArrayAccess` bases already have a separate typed rewrite. The lexical arms occur only under the discarded grouped all-COO route once known NNZ selects the live scalar/flat path. | Rejected as production-unreachable DCE-like cleanup and retained as a separate future seam. |
+| `compressed_where_openmp_pass.py`, one `Var.name` arm | `_WorkspaceInsertRewriter` recursively cloned expressions and changed any `Var.name` containing `<workspace>.insert`. Codegen would emit that name literally, but no production producer encodes a workspace insertion in a `Var`; the synthetic field could also be an lvalue, array base/index, initializer, or ordinary value. | Rejected and removed: production-dead broad substring mutation, not a semantic insertion operation. |
+| `compressed_where_openmp_pass.py`, one `FunctionCallStmt.name` arm | `CINLowerer.lower_TensorAssign` is the sole compiler producer. For a non-dense `WorkspaceAccess`, it creates exact name `<workspace>.insert` with a structured `Array[INT64]` of fresh `INT64` index `Var` children and the lowered RHS expression. Common codegen emits the stored call name and structured arguments verbatim. The compressed-Where pass consumes it only after the workspace declaration is hoisted and duplicates the detached work body into count/fill phases. | **Selected.** It is the only live operation among the three fields and can use exact operation-name equality without an ABI change, parser, or hierarchy. |
+| `compressed_where_openmp_pass.py`, one `RawStmt.code` arm | Detached compatibility cloning changed any raw code containing `<workspace>.insert`. No production compiler path emits the workspace insertion as `RawStmt`; codegen would otherwise emit the text verbatim. | Rejected and removed with the dead `Var` arm; raw text remains opaque and unchanged. |
+| `dense_pointer_hoist_pass.py`, call/raw arms | Live tensor loads use structured `ArrayAccess`. Current production call names and raw producers do not contain the matched word-index spelling; the two arms remain compatibility-only. | Rejected as a distinct dense-pointer compatibility seam. |
+| `dynamic_vector_access_pass.py`, one regex `Var.name` arm | The only current opaque vector reads are dormant all-COO G1/G2. Correct migration must distinguish reads from lvalues and retain checked `.at(index)` member-call semantics. | Rejected because it needs a separate read/lvalue representation decision, not this call-name correction. |
+| `single_iteration_loop_pass.py`, call/raw arms | The live all-COO route rewrites typed `ArrayAccess` indices. Production call/raw fields contain no matching loop token; these remain compatibility-only. | Rejected as a separate single-iteration compatibility seam. |
+
+The selected family is therefore exactly one producer/consumer contract:
+`lower_TensorAssign` produces a semantic `FunctionCallStmt`, the
+compressed-Where owning pass changes the exact operation name when it hoists
+that workspace, and common codegen emits the result. The live DS production
+route exercises the contract twice, once in each generated count/fill phase.
+The nested DSS route is the negative control: its workspace is not hoisted at
+that seam, so its two calls retain checked `wksp.insert`.
+
+This is deliberately analogous to an LLVM dialect-conversion legality rule:
+identify and rewrite one known operation at its owning boundary, while leaving
+unknown text and unrelated operations untouched. Prefix, suffix, further
+member, already-rewritten, argument, `Var`, initializer, `ArrayAccess`, and raw
+spellings are not the selected operation. Migrating all remaining rewrites,
+introducing a generalized member/call hierarchy, parsing opaque strings,
+changing the workspace ABI, or broadening recursion would all exceed this
+slice and were rejected.
+
+#### Exact rewrite boundary, ownership, and failure behavior
+
+`_WorkspaceInsertRewriter` now accepts only an exact built-in nonempty `str`
+for every `FunctionCallStmt.name` that reaches its characterized statement
+scope. It renames the call only when:
+
+```text
+call.name == f"{workspace_name}.insert"
+```
+
+and assigns the exact replacement
+`f"{workspace_name}.insert_unchecked"`. There is no substring replacement in
+the pass. Malformed `None`, empty, whitespace-only, `str`-subclass, and forged
+non-string call names raise the pass-owned
+`invalid_workspace_insert_call_name` diagnostic at the exact `name` path.
+Malformed call-argument containers and members continue to fail through the
+common traversal with their original structured diagnostic and path.
+
+The characterized recursion boundary is unchanged: direct statements,
+`ForLoop.body`, and every `IfThenElse` body/branch are visited;
+`ForLoopAuto`, `WhileLoop`, and arbitrary nested statement containers are
+detached but not searched. The pass does not infer new semantics from those
+containers. Exact type checks also preserve fail-closed behavior for unknown
+nodes and subclasses rather than silently treating them as known operations.
+
+Every returned mutable LLIR node and expression child is detached from the
+caller. Repeated transforms produce mutually disjoint graphs with deterministic
+structural snapshots; retained immutable tensor-access metadata keeps its
+identity. Nonmatching call names, all `Var.name` values, `RawStmt.code`,
+structured expression fields, and source LLIR remain unchanged. The common
+rewriter continues to validate and freshly clone the structured call arguments,
+so replacement ownership does not alias caller-owned children.
+
+The production-pipeline failure test proves that a malformed consumed name
+raises the original `LLIRTraversalError` through `LLIRPassPartialFailure`,
+publishes zero completed run records, performs neither count nor fill result
+rewriting, skips sparse prefetch, dense-pointer hoisting, single-iteration
+elimination, factor hoisting, dynamic-vector rewriting, and body assembly, and
+leaves caller-owned LLIR unchanged. The existing 12-position owning-stage
+matrix continues to prove partial-record accounting and later-stage
+suppression everywhere else.
+
+Generated C++ is byte-for-byte unchanged. The DS source still contains exactly
+two `wksp.insert_unchecked(` calls and no checked `wksp.insert(` call; DSS still
+contains exactly two checked calls and no unchecked call. Existing common
+expression emission retains its structural equality, precedence,
+unknown-child, and unknown-subclass coverage. No assignment-deduplication seam
+changes: the selected node is a statement call, never an `Assign` target, and
+all assignment structure and spelling remain unchanged.
+
+#### Locked post-slice compatibility budget
+
+The production budget is now:
+
+- 377 total `Var` constructors;
+- ten direct expression strings: nine subscript and one ternary;
+- 367 other constructor arguments, including the same 11 known indirect
+  sinks/clones;
+- seven generic string rewrites, down exactly from ten;
+- 38 `RawStmt` constructors / 37 semantic producers;
+- two `FixedStackArrayDecl` constructor templates / one production producer;
+- no direct opaque call, member, initializer, qualified, or separately
+  classified arithmetic expression in a production `Var.name`;
+- no `std::move(` in a production `Var.name`; and
+- no direct string-expression `Assign` target.
+
+The nine remaining direct subscripts are exactly P1/P2, W1, C1/C2, G1/G2,
+and I1/I2. T1 remains the sole ternary. The seven remaining generic rewrites
+are the two `cin_lowerer.py` call/raw `.data()` compatibility arms, two
+`dense_pointer_hoist_pass.py` call/raw arms, one
+`dynamic_vector_access_pass.py` `Var.name` regex arm, and two
+`single_iteration_loop_pass.py` call/raw arms. The selected slice changes no
+`Var` or `RawStmt` constructor count and creates no new indirect sink or clone.
+
+#### Verification record and exact commands
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, and benchmark
+invocation sourced the conda hook and activated `scorch`. Before editing,
+`pytest -q tests/test_scorch/test_llir_string_budget.py` passed all 22 tests in
+2.19 seconds. The initial compressed-Where/budget focus passed 65 tests in 3.48
+seconds. After review closed the forged-argument and managed-failure gaps, the
+three new exact tests passed in 0.66 seconds.
+
+The complete uncommitted code/test tree passed the literal canonical 18-file
+suite before any commit was created. The final 623831d tree, including the last
+three tests, passed 1,129 tests in 152.23 seconds with the same command:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_cin_analysis.py \
+  tests/test_scorch/test_loop_plan.py \
+  tests/test_scorch/test_compile_options.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_traversal.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_dynamic_vector_access_pass.py \
+  tests/test_scorch/test_result_write_pass.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py \
+  tests/test_scorch/test_dense_pointer_hoist_pass.py \
+  tests/test_scorch/test_single_iteration_loop_pass.py \
+  tests/test_scorch/test_loop_invariant_factor_pass.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_llir_string_budget.py
+```
+
+The committed final candidate passed the required historical 11-file matrix,
+508 tests in 409.54 seconds:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py \
+  tests/test_scorch/codegen/test_1d_operations.py \
+  tests/test_scorch/codegen/test_codegen_perf_optimizations.py \
+  tests/test_scorch/codegen/test_regblock_dual_path.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py
+```
+
+The authoritative full non-performance run was isolated in the clean detached
+final worktree with native build concurrency capped to one because the host was
+using approximately 8 GiB of swap:
+
+```sh
+MAX_JOBS=1 PYTHONPATH="$PWD:$PWD/src" \
+pytest -q -m "not perf" tests
+```
+
+It passed 1,683 tests, skipped 14, deselected three, and emitted only the one
+inherited PyTorch sparse-invariant warning in 2,046.19 seconds. Several earlier
+uncapped final-candidate attempts were discarded: unrelated mode-order and
+packed tile-ijk native compiler subprocesses were terminated by host
+`SIGKILL`, and one interrupted parent yielded no complete summary. Every
+flagged parameter passed in an isolated retry, including the two mode-order
+cases and the three packed tile-ijk cases. No user process was stopped or
+modified; the authoritative complete run above changed only native build
+parallelism, not test semantics or selection.
+
+The exact stage/options/cache/ownership/failure selection passed all 24 expanded
+cases in 0.64 seconds:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/test_compile_options.py::test_distinct_snapshots_compile_independently_without_mutating_owned_ir \
+  tests/test_scorch/test_compile_options.py::test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages \
+  tests/test_scorch/test_compiler_stage_timing.py::test_stage_identities_records_and_owner_are_typed_frozen_and_stable \
+  tests/test_scorch/test_compiler_stage_timing.py::test_production_and_debug_record_the_exact_complete_stage_sequence \
+  tests/test_scorch/test_compiler_stage_timing.py::test_one_options_snapshot_routes_through_one_owner_without_rereads \
+  tests/test_scorch/test_compiler_stage_timing.py::test_existing_llir_pass_records_are_context_owned_ordered_and_unchanged \
+  tests/test_scorch/test_compiler_stage_timing.py::test_timing_is_excluded_from_source_name_request_and_cache_identity \
+  tests/test_scorch/test_compiler_stage_timing.py::test_known_nnz_extent_is_independent_across_full_compilations \
+  tests/test_scorch/test_compiler_stage_timing.py::test_two_options_snapshots_have_independent_records_results_and_requests \
+  tests/test_scorch/test_compiler_stage_timing.py::test_caller_owned_cin_llir_and_first_result_are_not_mutated \
+  tests/test_scorch/test_compiler_stage_timing.py::test_stage_failures_raise_original_error_and_suppress_all_later_stages \
+  tests/test_scorch/test_schedule_api.py::test_packed_and_unpacked_schedules_cannot_alias_either_cache
+```
+
+Those 24 cases retain exact stage identity/order/timing, the single
+`CompileOptions` identity, managed success/partial-failure records, original
+error identity, cache identity, independent compilation, caller-owned
+immutability, and later-stage suppression at every owning position. The four
+exact source anchors passed in 0.73 seconds:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_sparse_prefetch_pass.py::test_production_routes_the_detached_list_at_the_original_optimization_seam \
+  tests/test_scorch/test_compressed_where_openmp_pass.py::test_production_ds_generated_cpp_matches_pre_extraction_bytes \
+  tests/test_scorch/test_compressed_where_openmp_pass.py::test_production_dss_generated_cpp_matches_pre_extraction_bytes \
+  tests/test_scorch/test_sparse_prefetch_pass.py::test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist
+```
+
+The native activation command expanded to nine cases and passed all nine in
+68.71 seconds with `MAX_JOBS=1`:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py::test_tuner_free_k_schedule_is_correct_for_ragged_tail_and_empty_row \
+  tests/test_scorch/test_schedule_generality.py::test_ttm_row_and_free_axis_tiles_compose_with_ragged_tails \
+  tests/test_scorch/codegen/test_regblock_dual_path.py::test_dual_path_correct_both_sides_of_cutoff \
+  tests/test_scorch/test_native_abi.py::test_jit_abi_rejects_noncanonical_coo_order_on_cached_entry \
+  tests/test_scorch/test_native_abi.py::test_jit_abi_uses_physical_extents_for_rectangular_mode_order \
+  tests/test_scorch/test_compile_semantics.py::test_compile_executes_graph_after_supported_fusion_prefix
+```
+
+The final locked string-budget file passed all 23 tests in 1.98 seconds.
+
+Black, Flake8, and mypy were compared at exact base and final candidate over
+the same four changed Python files:
+
+```sh
+python -m black --check \
+  src/scorch/compiler/compressed_where_openmp_pass.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_llir_string_budget.py
+python -m flake8 \
+  src/scorch/compiler/compressed_where_openmp_pass.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_llir_string_budget.py
+python -m mypy \
+  src/scorch/compiler/compressed_where_openmp_pass.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_llir_string_budget.py
+```
+
+Black 26.5.1 returned zero at both revisions with all four files unchanged and
+the same Python-3.11/repository-target warning. Flake8 7.3.0 returned zero with
+no findings at either revision. Mypy 2.2.0 returned one at both revisions with
+the exact same eight inherited `[import-untyped]` diagnostics in
+`test_compressed_where_openmp_pass.py`; no candidate-only diagnostic appeared.
+
+Strict Sphinx ran at exact base and final candidate as:
+
+```sh
+sphinx-build -n -b html -W --keep-going -E -a \
+  docs/source OUTPUT
+```
+
+Both Sphinx 8.2.3 builds completed all 53 HTML pages and returned one only
+because `-W` promoted the same 23 inherited unresolved-reference warnings:
+18 class, two attribute, two exception, and one function reference. After
+normalizing the worktree root, the warning lines compare exactly; the
+non-doctree output trees are byte-identical. Doctrees are excluded because they
+serialize absolute source paths.
+
+#### Exact source/build identity and native correctness
+
+The four canonical capture helpers re-hash to:
+
+- inputs:
+  `605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`;
+- 42-cell grid:
+  `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`;
+- workspace pair:
+  `964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`;
+  and
+- tiled workspace:
+  `9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff`.
+
+The retained grid predecessor at
+`/tmp/scorch-phase3-member-call-capture/grid-predecessor.json` re-hashes to
+`aaad2e7a6ee9b4decd05b3a9547fe6576f58ef44c0332c5f4dc76da696eff969`.
+Exact base and final candidate were checked out in turn in the same clean
+logical `cd -L /tmp/scorch-phase3-structured-access-capture-wt`, using the
+shared extension root. Each revision ran:
+
+```sh
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_inputs.py "$OUT/inputs"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_spmm_grid.py "$OUT/grid.json" \
+  /tmp/scorch-phase3-member-call-capture/grid-predecessor.json
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_workspace_pair.py "$OUT/workspace"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_tiled_workspace.py "$OUT/tiled-workspace"
+```
+
+Both trees contain 14 files and `diff -qr` is empty. All 42 grid cells and all
+ordered build/request objects match. Both sides reproduce:
+
+- input manifest:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- grid:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+- workspace manifest:
+  `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`;
+  and
+- tiled-workspace manifest:
+  `7bc0f70f84d2693f76fdf179b9ae7e684e4fa3ebe93c5d175ec98206a024a5a7`.
+
+The exact generated sources remain:
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| CSR x dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+| workspace all-coordinate | 3,528 | `5c69621af52939759ffcbaed3649ef1c4461108522b614df8f8a18c86ec0560a` |
+| workspace intermediate-coordinate | 5,252 | `b1770961d5f9c9c7fd716bd71cb97f1d5e73c6dcf200ba378b97b65c87fbe5d7` |
+| tiled workspace | 3,060 | `2b9d28654e33225e1093500fc861e76f0f67cb241c7ab28b43c05b774d9f7222` |
+| preamble | 68,671 | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+
+Kernel names, signatures, source, semantic/codegen/build/full keys, ABI/index
+policy, flags, request/prepared keys, extension paths, lowerer identity,
+`CompileOptions` identity, stage order/timing records, cache identities, and
+caller-owned inputs are identical. The four source anchors and nine native
+activations independently establish correctness.
+
+Because every source/build input is byte-identical, the canonical runtime
+waiver applies. The retained M5 artifact re-hashes to
+`3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+the Redwood artifact re-hashes to
+`c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+No new full M5 or Redwood runtime grid was required.
+
+#### Compiler latency, activation, and complete crossing attribution
+
+The exact executable predecessor is
+`/tmp/scorch-phase3-workspace-guard-results/latency-b82332a-m5.json`, SHA-256
+`13bb354c7c2534cedb756663d7ef1925b66fafc35531cf01f95f2ff766cd423e`.
+The unchanged harness hashes to
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+Both final runs used the clean detached 623831d worktree, five warmups, 30
+samples, M5/arm64, Python 3.11.15, Torch 2.13.0, six Torch threads, schema one,
+and corpus `phase0-v1`. No pytest, native build/run, capture, Sphinx,
+documentation build, or other benchmark overlapped either measurement.
+
+The primary final-candidate command was:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output \
+  /tmp/scorch-phase3-workspace-insert-results/latency-623831d-m5.json
+```
+
+The artifact hashes to
+`88a1e93584c9a0487b30e35dda2f95b4c0719d5949ad3f363f01966881f89b72`
+and records exact revision `623831d51520b2c5009f5216643f8a87cb9ecc84`,
+detached branch, and empty status. The official ordinary compatibility endpoint
+comparison was:
+
+| Case | p50 old/new ms; ratio; delta | p95 old/new ms; ratio; delta | Result |
+| --- | --- | --- | --- |
+| small dense | `1.674187500/1.770917000; 1.057776981; +0.096729500` | `1.870129350/2.704235350; 1.446015138; +0.834106000` | investigate |
+| reduction | `1.484416500/1.725125000; 1.162156982; +0.240708500` | `1.573087650/2.073656550; 1.318207889; +0.500568900` | investigate |
+| CSR intersection | `1.805812000/1.944354000; 1.076720057; +0.138542000` | `1.961468750/2.175856250; 1.109299473; +0.214387500` | investigate |
+| sparse union | `1.980437500/2.056916500; 1.038617225; +0.076479000` | `2.400787500/2.463837500; 1.026262216; +0.063050000` | target |
+
+That broad tail wave warranted the policy's single confirmation. Exactly one
+confirmation was run, alone, with the same command and configuration, writing
+`latency-623831d-m5-confirmation.json`. It hashes to
+`21a84a53e8d6dadb1eaa5c8dcc6a4f484a9e4969ec61c274cb90defa38072e34`.
+No third or opportunistic run was taken. Its ordinary endpoint comparison was:
+
+| Case | p50 old/new ms; ratio; delta | p95 old/new ms; ratio; delta | Result |
+| --- | --- | --- | --- |
+| small dense | `1.674187500/1.663667000; 0.993716056; -0.010520500` | `1.870129350/1.864918600; 0.997213695; -0.005210750` | target |
+| reduction | `1.484416500/1.556062500; 1.048265430; +0.071646000` | `1.573087650/1.787165100; 1.136087427; +0.214077450` | investigate |
+| CSR intersection | `1.805812000/1.766687000; 0.978333846; -0.039125000` | `1.961468750/1.870945500; 0.953849252; -0.090523250` | target |
+| sparse union | `1.980437500/1.827208500; 0.922628712; -0.153229000` | `2.400787500/1.929081100; 0.803520137; -0.471706400` | target |
+
+An isolated no-native activation audit wrapped
+`LLIRPassManager.run_compressed_where_openmp`, rewriter construction, direct
+call visits, exact matches, and renames while compiling all four latency cases.
+Every counter was zero for small dense, reduction, CSR intersection, and sparse
+union: `activation=none` in every case. The corpus never runs the selected pass,
+never constructs `_WorkspaceInsertRewriter`, never visits a candidate call, and
+never performs this rename. The separate DS source/native path is the positive
+production activation; DSS is the checked-call nonactivation control.
+
+The exhaustive comparison validates all 86 common endpoint/stage p50/p95
+metrics, every 30-sample series and recomputed percentile, exact case order,
+and equal build objects. The ordered build digest is
+`7b171d0ad6c8933265104d5e4c311d24fd5a5b50d5cf12c684e644efa83af3b5`.
+In the ledger below, `O` is the ordinary compatibility endpoint, `C` the
+canonical endpoint, `E` the canonical endpoint extension, `F` validated
+frontend construction, `N` CIN normalization/verification, `S` scheduling and
+loop-plan construction, `G` legacy CIN adaptation, `L` inclusive CIN lowering,
+`A` nested result-ABI assembly, `X` LLIR-to-C++ generation, and `R` kernel-name
+and build-request assembly. `A` is nested inside `L`; their deltas must not be
+added. Every entry is `old/new ms; exact ratio; signed delta ms`, every listed
+case has `activation=none`, and omitted metrics are at or below the strict 1.10
+threshold.
+
+The primary run has exactly 40 strict crossings:
+
+- small dense, `activation=none` (10):
+  `C.95 2.186133450/3.179539400; 1.454412310; +0.993405950`,
+  `E.95 0.336906100/0.513133000; 1.523074233; +0.176226900`,
+  `F.95 0.043210350/0.064887800; 1.501672632; +0.021677450`,
+  `G.95 0.028945650/0.042875000; 1.481224294; +0.013929350`,
+  `L.95 0.763150150/0.894433150; 1.172027746; +0.131283000`,
+  `N.95 0.024933250/0.042344950; 1.698332548; +0.017411700`,
+  `O.95 1.870129350/2.704235350; 1.446015138; +0.834106000`,
+  `R.95 0.447179200/0.652258450; 1.458606416; +0.205079250`,
+  `S.95 0.291131550/0.551670800; 1.894919324; +0.260539250`, and
+  `X.95 0.068206250/0.109404200; 1.604020159; +0.041197950`.
+- reduction, `activation=none` (18):
+  `A.50 0.012000000/0.013479000; 1.123250000; +0.001479000`,
+  `A.95 0.012485300/0.017629200; 1.411996508; +0.005143900`,
+  `C.50 1.781291500/2.063979000; 1.158698057; +0.282687500`,
+  `C.95 1.867508450/2.402575150; 1.286513670; +0.535066700`,
+  `E.95 0.301639950/0.386454200; 1.281177112; +0.084814250`,
+  `F.50 0.031145500/0.039124500; 1.256184682; +0.007979000`,
+  `F.95 0.032614400/0.051278800; 1.572274823; +0.018664400`,
+  `G.50 0.023083500/0.025916000; 1.122706695; +0.002832500`,
+  `G.95 0.023606100/0.030512800; 1.292581155; +0.006906700`,
+  `L.50 0.527250000/0.589958000; 1.118934092; +0.062708000`,
+  `L.95 0.596735450/0.764056400; 1.280393850; +0.167320950`,
+  `N.95 0.021146550/0.025114400; 1.187635808; +0.003967850`,
+  `O.50 1.484416500/1.725125000; 1.162156982; +0.240708500`,
+  `O.95 1.573087650/2.073656550; 1.318207889; +0.500568900`,
+  `R.95 0.400900150/0.502114100; 1.252466730; +0.101213950`,
+  `S.95 0.234943200/0.293963550; 1.251211144; +0.059020350`,
+  `X.50 0.048875000/0.054583500; 1.116797954; +0.005708500`, and
+  `X.95 0.050049850/0.060956400; 1.217913740; +0.010906550`.
+- CSR intersection, `activation=none` (10):
+  `A.95 0.020625000/0.023193750; 1.124545455; +0.002568750`,
+  `C.95 2.266943750/2.500874850; 1.103192283; +0.233931100`,
+  `E.95 0.316104350/0.351137800; 1.110828750; +0.035033450`,
+  `F.50 0.032875000/0.040146000; 1.221171103; +0.007271000`,
+  `F.95 0.036266850/0.046479350; 1.281593246; +0.010212500`,
+  `G.95 0.026324850/0.030056400; 1.141750095; +0.003731550`,
+  `N.95 0.008170650/0.009651750; 1.181270768; +0.001481100`,
+  `O.95 1.961468750/2.175856250; 1.109299473; +0.214387500`,
+  `S.95 0.156518000/0.177313200; 1.132861396; +0.020795200`, and
+  `X.95 0.093435600/0.106900300; 1.144106743; +0.013464700`.
+- sparse union, `activation=none` (2):
+  `A.95 0.026031100/0.029631100; 1.138296115; +0.003600000`, and
+  `L.95 1.490524850/1.686618600; 1.131560202; +0.196093750`.
+
+The single confirmation has exactly eight strict crossings, all reduction p95
+with `activation=none`:
+
+- `A.95 0.012485300/0.014429500; 1.155719126; +0.001944200`;
+- `C.95 1.867508450/2.098725300; 1.123810337; +0.231216850`;
+- `F.95 0.032614400/0.041670800; 1.277681024; +0.009056400`;
+- `G.95 0.023606100/0.026383850; 1.117670856; +0.002777750`;
+- `L.95 0.596735450/0.672649700; 1.127215921; +0.075914250`;
+- `N.95 0.021146550/0.024092100; 1.139292225; +0.002945550`;
+- `O.95 1.573087650/1.787165100; 1.136087427; +0.214077450`; and
+- `X.95 0.050049850/0.056792000; 1.134708695; +0.006742150`.
+
+The primary wave spans unrelated endpoints and stages that never activate the
+slice; it collapses from 40 to eight crossings on the one allowed
+confirmation. The remaining wave is confined to reduction p95, has no median
+crossing, has only `+0.075914250 ms` in inclusive lowering (including nested
+ABI work), and at most `+0.231216850 ms` at an endpoint. Exact sources, build
+objects, and stage inventories are identical. These are attributed to host
+tail noise in non-owning work, not to the selected rewrite; the 1.10 threshold
+requires investigation and attribution, not automatic rejection.
+
+No design-document or tracked `csrc` file changed. The user-owned tracked
+changes to `.gitignore`, `pyproject.toml`, `src/scorch/__init__.py`,
+`tests/packaging/smoke_install.py`, and `tests/test_scorch/test_resources.py`
+remain untouched and uncommitted. All user-owned untracked material under
+`autotune-levels/`, `bench/`, `bench/bench_results/`, `research-ideas/`,
+`scratchpad/`, `src/scorch/csrc/cuda/`, the GPU/SuiteSparse/selector-analysis
+tests/modules/tools/manifests, and scheduler receipt/status files likewise
+remains untouched and uncommitted, including files added while this slice ran.
+
+This closes only the narrow exact compressed-Where workspace-insert rewrite
+slice. It does not claim that all remaining generic rewrites or opaque
+expressions are complete. The nine subscript sites, one ternary, seven generic
+rewrites, emitter closure, parallel zero-fill, generalized allocation, and
+generalized parallel representation remain open. Phase 3 remains open. Phase
+3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
