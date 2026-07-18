@@ -730,16 +730,47 @@ class ResultTensorAssembler:
             elif level_type == LevelType.COORDINATE:
                 if self.known_nnz_var:
                     # Known-size coordinate arrays are Torch-owned from creation.
-                    stmts.append(
-                        llir.RawStmt(
-                            code=(
-                                f"torch::Tensor {self.name}{i}_crd_torch = "
-                                f"torch::empty({{{self.known_nnz_var}}}, torch::kInt);\n"
-                                f"  int* {self.name}{i}_crd = "
-                                f"{self.name}{i}_crd_torch.data_ptr<int>();"
+                    stmts.extend(
+                        [
+                            llir.VarInit(
+                                var=llir.Var(
+                                    name=f"{self.name}{i}_crd_torch",
+                                    type=llir.DataType.TORCH_TENSOR,
+                                ),
+                                value=llir.FunctionCall(
+                                    name="torch::empty",
+                                    args=(
+                                        llir.Array(
+                                            values=(
+                                                llir.Var(
+                                                    name=self.known_nnz_var,
+                                                    type=llir.DataType.INT64,
+                                                ),
+                                            ),
+                                            data_type=llir.DataType.INT64,
+                                        ),
+                                        llir.QualifiedName(
+                                            namespace="torch",
+                                            name="kInt",
+                                            data_type=(llir.DataType.TORCH_SCALAR_TYPE),
+                                        ),
+                                    ),
+                                ),
                             ),
-                            add_semicolon=False,
-                        )
+                            llir.VarInit(
+                                var=llir.Var(
+                                    name=f"{self.name}{i}_crd",
+                                    type=llir.DataType.PTR_INT,
+                                ),
+                                value=tensor_data_ptr(
+                                    llir.Var(
+                                        name=f"{self.name}{i}_crd_torch",
+                                        type=llir.DataType.TORCH_TENSOR,
+                                    ),
+                                    llir.DataType.INT,
+                                ),
+                            ),
+                        ]
                     )
                 else:
                     stmts.append(
