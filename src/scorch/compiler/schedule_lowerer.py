@@ -355,7 +355,9 @@ def _declared_names(function: llir.Function) -> set[str]:
 
     def collect(stmts: List[llir.Stmt]) -> None:
         for stmt in stmts:
-            if isinstance(stmt, (llir.VarInit, llir.VarDecl)):
+            if type(stmt) is llir.FixedStackArrayDecl:
+                names.add(stmt.name)
+            elif isinstance(stmt, (llir.VarInit, llir.VarDecl)):
                 names.add(stmt.var.name)
             elif isinstance(stmt, llir.ForLoop) and stmt.init is not None:
                 names.add(stmt.init.var.name)

@@ -78,6 +78,7 @@ SUPPORTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
     llir.Return,
     llir.VarDecl,
     llir.VarInit,
+    llir.FixedStackArrayDecl,
     llir.Assign,
     llir.Allocate,
     llir.Free,
@@ -364,6 +365,79 @@ def _validate_array_fields(
             message="Array.data_type must be a DataType",
             path=path + ("data_type",),
             value=node.data_type,
+        )
+
+
+def _validate_fixed_stack_array_decl_fields(
+    node: llir.FixedStackArrayDecl,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if type(node.name) is not str or not node.name.isidentifier():
+        _raise_traversal_error(
+            context,
+            code="invalid_fixed_stack_array_name",
+            message="FixedStackArrayDecl.name must be a non-empty identifier",
+            path=path + ("name",),
+            value=node.name,
+        )
+    if (
+        type(node.element_type) is not llir.DataType
+        or node.element_type not in llir._FIXED_STACK_ARRAY_ELEMENT_TYPES
+    ):
+        _raise_traversal_error(
+            context,
+            code="invalid_fixed_stack_array_element_type",
+            message=(
+                "FixedStackArrayDecl.element_type must be a supported scalar "
+                "DataType"
+            ),
+            path=path + ("element_type",),
+            value=node.element_type,
+        )
+    if not llir._is_fixed_stack_array_extent(node.extent):
+        _raise_traversal_error(
+            context,
+            code="invalid_fixed_stack_array_extent",
+            message=(
+                "FixedStackArrayDecl.extent must be an exact metadata-free "
+                "constexpr Var or positive integral Literal"
+            ),
+            path=path + ("extent",),
+            value=node.extent,
+        )
+    if type(node.initializer) is not llir.Array:
+        _raise_traversal_error(
+            context,
+            code="invalid_fixed_stack_array_initializer",
+            message="FixedStackArrayDecl.initializer must be an exact Array",
+            path=path + ("initializer",),
+            value=node.initializer,
+        )
+    initializer = cast(llir.Array, node.initializer)
+    if type(initializer.values) is not tuple:
+        _raise_traversal_error(
+            context,
+            code="invalid_fixed_stack_array_initializer",
+            message="FixedStackArrayDecl.initializer values must be a tuple",
+            path=path + ("initializer", "values"),
+            value=initializer.values,
+        )
+    if initializer.values:
+        _raise_traversal_error(
+            context,
+            code="invalid_fixed_stack_array_initializer",
+            message="FixedStackArrayDecl.initializer must be empty",
+            path=path + ("initializer", "values"),
+            value=initializer.values,
+        )
+    if initializer.data_type is not node.element_type:
+        _raise_traversal_error(
+            context,
+            code="invalid_fixed_stack_array_initializer_type",
+            message=("FixedStackArrayDecl.initializer type must match element_type"),
+            path=path + ("initializer", "data_type"),
+            value=initializer.data_type,
         )
 
 
@@ -654,6 +728,10 @@ class LLIRWalker:
             self.visit_var_decl(cast(llir.VarDecl, node), path)
         elif node_type is llir.VarInit:
             self.visit_var_init(cast(llir.VarInit, node), path)
+        elif node_type is llir.FixedStackArrayDecl:
+            self.visit_fixed_stack_array_decl(
+                cast(llir.FixedStackArrayDecl, node), path
+            )
         elif node_type is llir.Assign:
             self.visit_assign(cast(llir.Assign, node), path)
         elif node_type is llir.Allocate:
@@ -856,6 +934,15 @@ class LLIRWalker:
     def visit_var_init(self, node: llir.VarInit, path: LLIRPath) -> None:
         self._walk_var_child(node.var, path + ("var",))
         self._walk_expr(node.value, path + ("value",))
+
+    def visit_fixed_stack_array_decl(
+        self,
+        node: llir.FixedStackArrayDecl,
+        path: LLIRPath,
+    ) -> None:
+        _validate_fixed_stack_array_decl_fields(node, self.context, path)
+        self._walk_expr(node.extent, path + ("extent",))
+        self._walk_expr(node.initializer, path + ("initializer",))
 
     def visit_assign(self, node: llir.Assign, path: LLIRPath) -> None:
         _validate_assign_fields(node, self.context, path)
@@ -1297,6 +1384,10 @@ class LLIRRewriter:
             return self.rewrite_var_decl(cast(llir.VarDecl, node), path)
         if node_type is llir.VarInit:
             return self.rewrite_var_init(cast(llir.VarInit, node), path)
+        if node_type is llir.FixedStackArrayDecl:
+            return self.rewrite_fixed_stack_array_decl(
+                cast(llir.FixedStackArrayDecl, node), path
+            )
         if node_type is llir.Assign:
             return self.rewrite_assign(cast(llir.Assign, node), path)
         if node_type is llir.Allocate:
@@ -1573,6 +1664,73 @@ class LLIRRewriter:
         )
         rewritten.cast = node.cast
         return rewritten
+
+    def rewrite_fixed_stack_array_decl(
+        self,
+        node: llir.FixedStackArrayDecl,
+        path: LLIRPath,
+    ) -> llir.FixedStackArrayDecl:
+        _validate_fixed_stack_array_decl_fields(node, self.context, path)
+        extent = self._rewrite_expr(
+            node.extent,
+            path + ("extent",),
+        )
+        if not llir._is_fixed_stack_array_extent(extent):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_fixed_stack_array_extent",
+                message=(
+                    "FixedStackArrayDecl.extent must be an exact metadata-free "
+                    "constexpr Var or positive integral Literal"
+                ),
+                path=path + ("extent",),
+                value=extent,
+            )
+        initializer = self._rewrite_expr(
+            node.initializer,
+            path + ("initializer",),
+        )
+        if type(initializer) is not llir.Array:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_fixed_stack_array_initializer",
+                message="FixedStackArrayDecl.initializer must be an exact Array",
+                path=path + ("initializer",),
+                value=initializer,
+            )
+        typed_initializer = cast(llir.Array, initializer)
+        if type(typed_initializer.values) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_fixed_stack_array_initializer",
+                message="FixedStackArrayDecl.initializer values must be a tuple",
+                path=path + ("initializer", "values"),
+                value=typed_initializer.values,
+            )
+        if typed_initializer.values:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_fixed_stack_array_initializer",
+                message="FixedStackArrayDecl.initializer must be empty",
+                path=path + ("initializer", "values"),
+                value=typed_initializer.values,
+            )
+        if typed_initializer.data_type is not node.element_type:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_fixed_stack_array_initializer_type",
+                message=(
+                    "FixedStackArrayDecl.initializer type must match element_type"
+                ),
+                path=path + ("initializer", "data_type"),
+                value=typed_initializer.data_type,
+            )
+        return llir.FixedStackArrayDecl(
+            name=node.name,
+            element_type=node.element_type,
+            extent=extent,
+            initializer=typed_initializer,
+        )
 
     def rewrite_assign(self, node: llir.Assign, path: LLIRPath) -> llir.Stmt:
         _validate_assign_fields(node, self.context, path)

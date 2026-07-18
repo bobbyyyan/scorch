@@ -13,6 +13,10 @@ _ASSIGNMENT_CODEGEN_CONTEXT = LLIRTraversalContext(
     stage="C++ code generation",
     pass_name="emit_assignment",
 )
+_FIXED_STACK_ARRAY_CODEGEN_CONTEXT = LLIRTraversalContext(
+    stage="C++ code generation",
+    pass_name="emit_fixed_stack_array_decl",
+)
 
 
 class LLIRLowerer:
@@ -117,6 +121,21 @@ class LLIRLowerer:
 
         elif isinstance(ir, llir.BlankLine):
             return self.lower_llir(" ", indent_level)
+
+        elif type(ir) is llir.FixedStackArrayDecl:
+            declaration = cast(llir.FixedStackArrayDecl, ir)
+            try:
+                LLIRWalker(_FIXED_STACK_ARRAY_CODEGEN_CONTEXT).walk(declaration)
+            except LLIRTraversalError as error:
+                raise CodegenError(
+                    f"Invalid LLIR fixed stack array declaration: {error}"
+                ) from error
+            return self.lower_llir(
+                f"{declaration.element_type.value} {declaration.name}"
+                f"[{self._render_expression(declaration.extent)}] = "
+                f"{self._render_expression(declaration.initializer)};",
+                indent_level,
+            )
 
         elif isinstance(ir, llir.VarInit):
             return self.lower_llir(

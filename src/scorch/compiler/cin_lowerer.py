@@ -1324,15 +1324,11 @@ class CINLowerer:
                         # Tiled dense workspaces have compile-time bounds. Use stack allocation
                         # so inner kernels avoid heap traffic.
                         workspace_init_stmts.append(
-                            llir.VarInit(
-                                var=llir.Var(
-                                    name=f"{wksp.get_name()}[{wksp.tile_size_var.name}]",
-                                    type=wksp_ctype,
-                                ),
-                                value=llir.Array(
-                                    values=[],
-                                    data_type=wksp_ctype,
-                                ),
+                            llir.FixedStackArrayDecl(
+                                name=wksp.get_name(),
+                                element_type=wksp_ctype,
+                                extent=wksp.tile_size_var.llir_var,
+                                initializer=llir.Array(values=[], data_type=wksp_ctype),
                             )
                         )
                     else:

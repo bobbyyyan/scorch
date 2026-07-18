@@ -598,6 +598,93 @@ class Array(Expr):
         object.__setattr__(self, "data_type", data_type)
 
 
+_FIXED_STACK_ARRAY_ELEMENT_TYPES = frozenset(
+    {
+        DataType.FLOAT32,
+        DataType.FLOAT64,
+        DataType.INT32,
+        DataType.INT64,
+        DataType.INT8,
+        DataType.UINT8,
+    }
+)
+_FIXED_STACK_ARRAY_LITERAL_EXTENT_TYPES = frozenset(
+    {
+        DataType.INT,
+        DataType.INT32,
+        DataType.INT64,
+        DataType.UINT32,
+        DataType.UINT64,
+    }
+)
+
+
+def _is_fixed_stack_array_extent(value: object) -> bool:
+    """Whether ``value`` is one exact supported fixed array extent."""
+
+    if type(value) is Var:
+        extent = cast(Var, value)
+        return bool(
+            type(extent.name) is str
+            and extent.name.isidentifier()
+            and extent.type is DataType.CONSTEXPR_INT
+            and extent.is_ptr is False
+            and extent.is_restrict is False
+            and extent.tensor_access is None
+        )
+    if type(value) is Literal:
+        extent_literal = cast(Literal, value)
+        return bool(
+            type(extent_literal.value) is int
+            and extent_literal.value > 0
+            and type(extent_literal.data_type) is DataType
+            and extent_literal.data_type in _FIXED_STACK_ARRAY_LITERAL_EXTENT_TYPES
+        )
+    return False
+
+
+@dataclass(frozen=True)
+class FixedStackArrayDecl(Stmt):
+    """One fixed-size, empty-brace-initialized automatic C++ array.
+
+    This deliberately narrow transitional statement keeps declaration/storage
+    separate from :class:`ArrayAccess`.  It does not represent dynamic extents,
+    heap storage, multidimensional arrays, alignment, or non-empty initializers.
+    """
+
+    name: str
+    element_type: DataType
+    extent: Expr
+    initializer: Array
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name.isidentifier():
+            raise TypeError("FixedStackArrayDecl.name must be a non-empty identifier")
+        if (
+            type(self.element_type) is not DataType
+            or self.element_type not in _FIXED_STACK_ARRAY_ELEMENT_TYPES
+        ):
+            raise TypeError(
+                "FixedStackArrayDecl.element_type must be a supported scalar "
+                "DataType"
+            )
+        if not _is_fixed_stack_array_extent(self.extent):
+            raise TypeError(
+                "FixedStackArrayDecl.extent must be an exact metadata-free "
+                "constexpr Var or positive integral Literal"
+            )
+        if type(self.initializer) is not Array:
+            raise TypeError("FixedStackArrayDecl.initializer must be an exact Array")
+        if type(self.initializer.values) is not tuple:
+            raise TypeError("FixedStackArrayDecl.initializer values must be a tuple")
+        if self.initializer.values:
+            raise TypeError("FixedStackArrayDecl.initializer must be empty")
+        if self.initializer.data_type is not self.element_type:
+            raise TypeError(
+                "FixedStackArrayDecl.initializer type must match element_type"
+            )
+
+
 @dataclass(frozen=True)
 class MemberAccess(Expr):
     """An immutable typed dot-member access expression."""

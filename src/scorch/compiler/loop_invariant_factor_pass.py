@@ -222,7 +222,10 @@ def _collect_defined_vars(
 
     for index, statement in enumerate(statements):
         statement_path = path + (f"[{index}]",)
-        if type(statement) is llir.VarInit:
+        if type(statement) is llir.FixedStackArrayDecl:
+            declaration = cast(llir.FixedStackArrayDecl, statement)
+            defined.add(declaration.name)
+        elif type(statement) is llir.VarInit:
             initializer = cast(llir.VarInit, statement)
             if not _is_materialized_factor_declaration(statements, index):
                 defined.add(
