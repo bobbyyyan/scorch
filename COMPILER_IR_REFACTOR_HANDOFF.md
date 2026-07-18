@@ -8900,6 +8900,594 @@ remains open. Parallel zero-fill, allocation/parallel representation, emitter
 closure, and remaining compatibility rewrites also remain open. Phase 3 is not
 complete. Phase 3.5 and LoopIR have not begun.
 
+### Phase-3 frozen kernel-ABI assembly slice complete (2026-07-18)
+
+The exact base for this slice is
+`1e888c2eecd08a106cad03565aa268616f4328c6`. The verified executable
+code/test candidate is `965746dc10e186bddb423dff31dd32a16588ce1b`.
+Three scoped commits were created after the uncommitted candidate passed the
+canonical compiler suite:
+
+- `287eb70a1609fc9edb7b0f78036bc0dc6bbf3dbc`
+  (`refactor(compiler): extract kernel ABI assembly`);
+- `6b6134ef9d2e0c1bda8d6a9aa3df3616e59ed20d`
+  (`test(compiler): lock kernel ABI extraction`); and
+- `965746dc10e186bddb423dff31dd32a16588ce1b`
+  (`test(compiler): preserve kernel ABI quality baseline`).
+
+The third commit is a test-only quality correction discovered by the exact
+base/candidate mypy comparison. No earlier production, test, or documentation
+commit was amended, squashed, reordered, or rewritten. This handoff update is
+a separate documentation-only commit after all acceptance work.
+
+#### Complete pre-implementation inventory and selection
+
+The exact-base lexical budget already contained only ten direct subscript
+spellings and one ternary. The prior result-ABI audit proved that none was a
+supported live final-LLIR family: two post-op leaves depend on a dormant
+workspace route, one workspace fallback has the wrong storage contract, the
+all-COO pre-scan/group leaves and ternary are discarded, two iterator
+placeholders never enter a statement tree, and the vector-backed group leaves
+require the existing checked-access compatibility rewrite. Structuring one of
+them would either migrate dead spelling, perform prohibited DCE, or require a
+new conditional/generalized hierarchy.
+
+The later explicit recommendation review therefore selected one LLVM-like
+target boundary: freeze semantic kernel metadata once, then let the existing
+Torch/C++ ABI layer materialize the public signature, validation, input
+prologue, post-op pointers, and final function wrapper. This is one live family
+for every generated outer kernel and does not change the ABI. The complete
+exact-base producer/consumer inventory was:
+
+| Family | Exact base producer and inputs | Output, ownership, reachability, and consumer |
+| --- | --- | --- |
+| Result contract | `final_result_tensor_var or result_tensor_var`: mutable name, optional shape, level list, dtype | Supplies expected result shape/rank to the public validator. Live for every outer `evaluate`; runtime supplies the physical result shape by value. |
+| Input contracts | Ordered `stmt.get_rhs_tensor_vars()`: mutable name, levels, optional mode order/shape, dtype | Supplies every public input triple and its validation/prologue. Workspace result temporaries are not RHS ABI arguments. Live D/S/O paths consume the generated extent/index/value locals. |
+| Public arguments | Inline `kernel_args`: `result_shape`, then shape/mode-index/value for every RHS tensor, then `PostOps.extra_tensors` | Fresh caller-by-value `llir.Var` arguments consumed by `llir.Function`, schedule lowering, codegen, and the existing `module.evaluate(*args)` packers. |
+| Result validation | Inline `validate_jit_result_shape` `RawStmt` | First body statement; validates expected extents/rank before any result subscript. Native support code consumes the exact rendered call. |
+| Input validation | Local level-code map, `_cpp_int_vector`, and one `validate_jit_tensor` `RawStmt` per RHS tensor | Validates dtype, D/S/O code tuple, physical mode order, and known physical shape before nested mode-index access or `data_ptr`. The by-value mode-index vector may be replaced locally with checked int32 tensors without mutating the caller. |
+| Extra validation | One `validate_jit_extra_tensor` `RawStmt` per post-op extra | Uses the final-result dtype and preserves extra order. Live add/multiply post-op kernels consume the validated tensor. |
+| Dense input level | `get_level_arrays`: `INT64` `VarInit` from existing structured `N_shape[level]` | Fresh local extent, owned by the lowered body and consumed by loop bounds. Live for every D level. |
+| Compressed input level | `get_level_arrays`: restrict `PTR_INT` position/coordinate `VarInit` values from structured `N_mode_indices[level][slot].data_ptr<int>()` | Fresh local pointers borrowing caller-owned Torch tensors. Live for every S level and consumed by sparse iteration. |
+| Coordinate input level | `get_level_arrays`: Torch coordinate handle plus restrict `PTR_INT` from slot zero | Fresh local handle/pointer borrowing caller storage. Live for every O level. |
+| Input values | `get_val_ptr_stmt`: dtype-specific restrict pointer from `N_values.data_ptr<T>()` | Fresh local pointer borrowing the input value tensor; live for every RHS tensor and consumed by loads. |
+| Extra values | Inline post-op loop: dtype-specific restrict pointer from `E_values.data_ptr<T>()` | Fresh local pointer borrowing the extra tensor; live only when an extra is present and consumed by post-op assignments. |
+| Function wrapper | Inline `llir.Function(TACO_TENSOR, "evaluate", kernel_args, body_stmts)` after the managed pipeline | Owns a fresh argument list and compiler-owned body container; schedule lowering and `LLIRLowerer` consume it. Live once per outer kernel. |
+
+The exact public argument schema remains:
+
+1. `result_shape: STD_VECTOR_INT` (`std::vector<int64_t>`);
+2. for every RHS tensor, in collector order,
+   `N_shape: STD_VECTOR_INT`,
+   `N_mode_indices: STD_VECTOR_2D_TORCH_TENSOR`, and
+   `N_values: TORCH_TENSOR`; then
+3. every `E_values: TORCH_TENSOR` in `PostOps.extra_tensors` order.
+
+All arguments remain by value with no pointer/restrict/access metadata. The
+function remains `Tensor evaluate(...)` with LLIR return type `TACO_TENSOR`.
+The existing normal, cached-dispatch, and direct-CIN runtime packers already
+supply result shape followed by each input triple; the normal post-op path then
+appends extras. No runtime packing, cache, `ops.py`, or public ABI changed.
+
+The coherent family was selected because it has one semantic snapshot point,
+one target-specific owner, one public ordering contract, complete live
+activation, and existing structured LLIR children. It required no parser,
+generalized member/call hierarchy, or allocation representation. The following
+remained separate and were rejected from this slice:
+
+- `ResultTensorAssembler` allocation, mode-index/result storage, and final
+  return assembly, whose existing frozen ownership was already complete;
+- compressed-output allocation/fill/final assembly and parallel zero-fill;
+- generalized allocation, emitter, CxxIR, or build-spec work;
+- the ten dead/latent/rewrite-coupled subscript spellings and discarded
+  ternary;
+- runtime argument packing or native validator implementation changes;
+- parsing, DCE, and unrelated scheduling/optimization work; and
+- Phase 3.5, the LoopIR feasibility spike, and LoopIR itself.
+
+#### Representation, validation, ownership, and exact spelling
+
+`torch_cpp_abi.py` now owns two frozen exact dataclasses:
+
+- `KernelTensorABI(name, level_types, mode_order, shape, dtype)`; and
+- `TorchCppKernelABI(result_shape, result_rank, input_tensors,
+  extra_tensor_names, extra_tensor_dtype, function_name="evaluate")`.
+
+`CINLowerer._kernel_tensor_abi` converts mutable semantic input metadata to
+immutable tuples. `_torch_cpp_kernel_abi` snapshots the result, ordered inputs,
+and ordered post-op extras once at the outer non-recursive lowering boundary.
+Neither object retains a `TensorVar`, `PostOps`, CIN node, or mutable semantic
+container. `torch_cpp_abi.py` imports neither `cin` nor `cin_lowerer`; the
+dependency remains one-way from semantic lowering to the target ABI layer.
+
+The former producers map exactly as follows:
+
+| Former owner | Frozen ABI owner |
+| --- | --- |
+| `CINLowerer.get_level_arrays` | `KernelTensorABI.emit_level_array_bindings` |
+| `CINLowerer.get_val_ptr_stmt` | `KernelTensorABI.emit_value_pointer` |
+| Manual per-input comment/prologue loop | `TorchCppKernelABI.emit_input_prologue` |
+| Inline `kernel_args` construction | `TorchCppKernelABI.emit_arguments` |
+| Local `_cpp_int_vector`, level-code map, and three validator families | ABI `_cpp_int_vector`, `KernelTensorABI._level_kind_codes`, and `TorchCppKernelABI.emit_validation` |
+| Inline extra-pointer loop | `TorchCppKernelABI.emit_extra_tensor_prologue` |
+| Inline function constructor | `TorchCppKernelABI.assemble_function` |
+
+Valid source spelling remains byte-for-byte:
+
+```cpp
+int64_t N0_size = N_shape[0];
+int* __restrict__ N1_pos = N_mode_indices[1][0].data_ptr<int>();
+int* __restrict__ N1_crd = N_mode_indices[1][1].data_ptr<int>();
+torch::Tensor N0_crd_tensor = N_mode_indices[0][0];
+T* __restrict__ N_val = N_values.data_ptr<T>();
+T* __restrict__ E_val = E_values.data_ptr<T>();
+```
+
+The three validator families retain exact names, comma/space spelling, D/S/O
+codes `0/1/2`, and `{}` for an unknown compile-time shape. All subscripts reuse
+the existing `ArrayAccess`; all `data_ptr<T>()` calls reuse the existing
+`MemberCall`. No new node hierarchy was introduced.
+
+Construction and every public emission method reject malformed or forged
+fields: non-identifiers; mutable/wrong-element tuples; unsupported singleton
+levels; non-permutation mode orders; known shape/rank mismatch; negative
+extents; wrong dtypes; subclass/unknown tensor snapshots; inconsistent extra
+dtype ownership; duplicate/colliding generated argument names; and a non-list
+function body. Empty shape remains the intentional runtime-shaped contract.
+Exact-int and permutation checks tighten only malformed direct/internal callers
+that bypass public `STensor`/`TensorSpec` normalization; no valid production
+ABI or source changes.
+
+Every emission produces fresh LLIR nodes. Frozen snapshots compare and hash
+structurally, but repeated emissions have disjoint identity. The function owns
+a fresh argument list and a copied outer body container. Mutating the source
+tensor's name, format, shape, mode order, dtype, or post-op list later cannot
+change the snapshot. Nested body ownership remains the existing compiler-owned
+pass artifact contract.
+
+#### Traversal, pass, rewrite, deduplication, and failure audit
+
+The snapshot and prologue/validation statements are created inside inclusive
+`CIN_LOWERING` before recursive body lowering. The existing body-assembly
+continuation inserts them after sparse-prefetch, dense-pointer-hoist,
+single-iteration, and loop-invariant-factor work, while nested
+`RESULT_ABI_ASSEMBLY` is active. Dynamic-vector rewriting then traverses,
+validates, and detaches the assembled statements. `assemble_function` runs
+after dynamic rewriting and the nested child stage, still inside CIN lowering;
+optional schedule lowering and C++ emission remain downstream.
+
+This preserves the exact ordinary and compressed-output body ordering:
+
+1. result/input/extra validation;
+2. result-level sizes;
+3. ordered input prologue;
+4. route-specific result/tile work;
+5. post-op pointers;
+6. recursive compute; and
+7. ordinary final result assembly only when the compressed-output owner has not
+   already emitted it.
+
+The first four ordinary passes and the compressed-output transform operate on
+the recursive body before these ABI statements are inserted. Dynamic-vector is
+the only managed pass that traverses them. Its bracket-in-name compatibility
+rewrite does not match any moved identifier; its vector discovery accepts
+`VarDecl`, while these declarations are `VarInit`; and its adjacent dynamic
+coordinate assignment deduplication sees no moved `Assign`. Raw validation
+spelling is unchanged. Function arguments are constructed after that pass.
+The same ten generic string-rewrite sites remain; no compatibility parser or
+assignment-dedup behavior changed.
+
+Failure timing is explicit:
+
+- snapshot, input-prologue, validation, and extra-prologue failures publish no
+  completed CIN/result-ABI record, retain the outer prefix through legacy CIN
+  adaptation, record no managed LLIR pass, leave both caches empty, and suppress
+  schedule lowering, C++ generation, request construction, and native loading;
+- dynamic-vector failure retains the completed nested result-ABI record and the
+  four preceding ordinary pass records, but no dynamic/CIN completion; and
+- function-wrapper failure retains the completed nested result-ABI record and
+  all five ordinary pass records, but no CIN completion or later stage.
+
+All preserve the original exception identity. Successful stage identities,
+order, nesting/timing, `CompileOptions` identity, sequence indices, cache keys,
+caller-owned immutability, and independent compilation remain unchanged.
+
+The DS compressed-output activation monkeypatches ordinary
+`ResultTensorAssembler.emit_final_assembly` to fail, proving that its pass-owned
+final result suppresses ordinary assembly. Its public contract is
+`SparseProduct`, both real RHS tensors are validated, and no workspace enters
+the public signature or validator.
+
+#### Locked post-slice compatibility budget
+
+Global totals remain unchanged:
+
+- 378 production `Var` constructors;
+- 11 direct expression strings: ten subscript and one ternary;
+- 367 other constructor arguments, including the same 11 indirect sinks/clones;
+- ten generic string rewrites;
+- 38 `RawStmt` constructors / 37 semantic producers;
+- two `FixedStackArrayDecl` constructor templates / one production producer;
+- nine `tensor_data_ptr`, four `mode_index_tensor`, and three
+  `tensor_storage_member` production calls;
+- no direct opaque call, member, initializer, qualified, or separately
+  classified arithmetic expression in a production `Var.name`;
+- no `std::move(` in a production `Var.name`; and
+- no direct string-expression `Assign` target.
+
+The ten subscripts remain eight in `cin_lowerer.py` and two in `iterator.py`;
+the ternary remains in `cin_lowerer.py`. Only target-owner locations changed:
+
+- `Var` constructors moved from 153/38 to 138/53 in
+  `cin_lowerer.py`/`torch_cpp_abi.py`;
+- unclassified `Var` arguments moved from 144/38 to 129/53;
+- `RawStmt` constructors moved from 15/2 to 12/5;
+- all four `mode_index_tensor` and five relevant `tensor_data_ptr` calls moved
+  from `cin_lowerer.py` to `torch_cpp_abi.py`;
+- `cin_lowerer.py` now has no `llir.Function` constructor and the ABI module has
+  the sole production producer; and
+- all three public validator spellings now occur once, only in the ABI module.
+
+Structured move/qualified/member/storage totals and every global count are
+unchanged.
+
+#### Verification record and exact commands
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, and benchmark
+invocation sourced the conda hook and activated `scorch`. Before editing,
+
+```sh
+pytest -q tests/test_scorch/test_llir_string_budget.py
+```
+
+passed the then-current 20 tests. The complete uncommitted production/test
+candidate passed the literal canonical 18-file suite before the first two
+commits. After the exact quality comparison found two test-only mypy findings,
+the correction changed no production or test semantics; the affected four-file
+focus passed 198 tests and the corrected uncommitted candidate again passed all
+1,120 canonical tests before commit `965746d`.
+
+The literal canonical and required historical commands were:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_cin_analysis.py \
+  tests/test_scorch/test_loop_plan.py \
+  tests/test_scorch/test_compile_options.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_traversal.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_dynamic_vector_access_pass.py \
+  tests/test_scorch/test_result_write_pass.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py \
+  tests/test_scorch/test_dense_pointer_hoist_pass.py \
+  tests/test_scorch/test_single_iteration_loop_pass.py \
+  tests/test_scorch/test_loop_invariant_factor_pass.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_llir_string_budget.py
+
+pytest -q \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py \
+  tests/test_scorch/codegen/test_1d_operations.py \
+  tests/test_scorch/codegen/test_codegen_perf_optimizations.py \
+  tests/test_scorch/codegen/test_regblock_dual_path.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py
+```
+
+The committed final candidate results are:
+
+- corrected literal canonical suite: 1,120 passed in 158.51 seconds;
+- required 11-file scheduler/CIN/codegen matrix: 503 passed in 426.37 seconds;
+- `PYTHONPATH="$PWD:$PWD/src" pytest -q -m "not perf" tests`: 1,670
+  passed, 14 skipped, three deselected in 1,967.62 seconds, with only the
+  inherited PyTorch sparse-invariant warning;
+- affected CIN/stage/compressed-output/budget focus: 198 passed;
+- exact stage/cache/ownership/failure focus: 24 passed in 0.84 seconds;
+- exact CSR x dense, DS, DSS, and all-COO source anchors: four passed in
+  0.49 seconds;
+- relevant native activation: nine passed in 74.14 seconds; and
+- final budget test: 21 passed in 2.18 seconds.
+
+The exact source anchors were:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_sparse_prefetch_pass.py::test_production_routes_the_detached_list_at_the_original_optimization_seam \
+  tests/test_scorch/test_compressed_where_openmp_pass.py::test_production_ds_generated_cpp_matches_pre_extraction_bytes \
+  tests/test_scorch/test_compressed_where_openmp_pass.py::test_production_dss_generated_cpp_matches_pre_extraction_bytes \
+  tests/test_scorch/test_sparse_prefetch_pass.py::test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist
+```
+
+The nine-case native command was:
+
+```sh
+pytest -q \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py::test_tuner_free_k_schedule_is_correct_for_ragged_tail_and_empty_row \
+  tests/test_scorch/test_schedule_generality.py::test_ttm_row_and_free_axis_tiles_compose_with_ragged_tails \
+  tests/test_scorch/codegen/test_regblock_dual_path.py::test_dual_path_correct_both_sides_of_cutoff \
+  tests/test_scorch/test_native_abi.py::test_jit_abi_rejects_noncanonical_coo_order_on_cached_entry \
+  tests/test_scorch/test_native_abi.py::test_jit_abi_uses_physical_extents_for_rectangular_mode_order \
+  tests/test_scorch/test_compile_semantics.py::test_compile_executes_graph_after_supported_fusion_prefix
+```
+
+The first node executes once, the TTM once, the regblock node four
+parameterizations, and the three ABI/compile-semantic nodes once each. All
+compile and execute native kernels or validate the live cached ABI path; numeric
+cases compare against PyTorch/reference results.
+
+The 24-case stage selection reused the ten exact identity/order/options/cache/
+ownership nodes from the previous handoff, added the complete 12-parameter
+`test_stage_failures_raise_original_error_and_suppress_all_later_stages`, and
+retained the packed/unpacked cache-alias test. It explicitly covers the four new
+input-prologue/validation/extra-prologue/function-wrapper failure sites.
+
+Focused ABI tests cover exact construction types, frozen equality/hash and
+snapshot detachment, malformed/forged fields, unknown subclasses, unique
+arguments, deterministic traversal, detached/repeated rewrite, replacement
+identity, exact validation and function bytes, fresh prologue children,
+precedence, post-op activation, all D/S/O producer forms, compressed-output
+ownership, partial managed records, owning-stage failure, and later-stage
+suppression.
+
+Black, Flake8, and mypy were run on the same six changed Python files in clean
+detached worktrees at exact base and final candidate:
+
+```sh
+python -m black --check \
+  src/scorch/compiler/cin_lowerer.py \
+  src/scorch/compiler/torch_cpp_abi.py \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_llir_string_budget.py
+python -m flake8 \
+  src/scorch/compiler/cin_lowerer.py \
+  src/scorch/compiler/torch_cpp_abi.py \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_llir_string_budget.py
+python -m mypy \
+  src/scorch/compiler/cin_lowerer.py \
+  src/scorch/compiler/torch_cpp_abi.py \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_llir_string_budget.py
+```
+
+Black 26.5.1 returned zero with all six files unchanged at both revisions (and
+the same Python-3.11/target warning). Flake8 7.3.0 improved from five to four
+findings: the same two F841/two F401 findings remain and the inherited C901 was
+removed; no finding was added. Mypy 2.2.0 improved from 43 errors in three files
+to 41 in the same three files: 41 are shared and the two nullable
+`final_result_tensor_var.dtype` errors were removed. The initial `6b6134e`
+comparison exposed an unignored untyped-package import and a reused-loop-variable
+inference error in tests; `965746d` removes both candidate-only findings.
+
+Strict Sphinx ran at exact base and final candidate as:
+
+```sh
+sphinx-build -n -b html -W --keep-going -E -a docs/source \
+  /tmp/scorch-phase3-kernel-abi-sphinx-base-1e888c2-html
+sphinx-build -n -b html -W --keep-going -E -a docs/source \
+  /tmp/scorch-phase3-kernel-abi-sphinx-final-965746d-html
+```
+
+Both completed HTML generation, produced the same 53-page inventory, and exited
+one only because `-W` promoted the same 23 inherited unresolved references: 18
+class, two attribute, two exception, and one function. Normalized warning and
+HTML-inventory diffs are empty. The final correction changed only tests;
+`docs/source` and `src` are byte-identical to `6b6134e`.
+
+`git diff 1e888c2..965746d --check`, ordinary `git diff --check`, candidate
+worktree status, and the capture/latency worktree status checks were clean.
+
+#### Exact source/build identity and native correctness
+
+The four canonical helpers retain their audited SHA-256 values:
+
+- inputs: `605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`;
+- 42-cell grid: `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`;
+- workspace pair: `964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`;
+  and
+- tiled workspace: `9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff`.
+
+Exact base and final candidate were checked out in turn in the same clean
+logical `cd -L /tmp/scorch-phase3-structured-access-capture-wt`. The four
+commands for each revision were:
+
+```sh
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_inputs.py "$OUT/inputs"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_spmm_grid.py "$OUT/grid.json" \
+  /tmp/scorch-phase3-member-call-capture/grid-predecessor.json
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_workspace_pair.py "$OUT/workspace"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_tiled_workspace.py "$OUT/tiled-workspace"
+```
+
+One setup-only attempt supplied a newer full-grid capture as the grid helper's
+summary-only predecessor. The helper failed closed on the first cell before
+writing a retained grid. The recorded run restarted from an absent output root
+with the schema-compatible audited predecessor above. The shared capture
+worktree was restored cleanly to
+`28dcca51144c7f84008d1e39bb4050c4fb9909f0`.
+
+The complete base/candidate trees each contain 14 files and `diff -qr` is empty.
+All 42 grid cells match. Both sides reproduce:
+
+- input manifest:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- grid:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+- workspace manifest:
+  `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`;
+  and
+- shared-root tiled-workspace manifest:
+  `7bc0f70f84d2693f76fdf179b9ae7e684e4fa3ebe93c5d175ec98206a024a5a7`.
+
+The exact generated sources remain:
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| CSR x dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+| live post-op extra | 1,614 | `053c0fdc42da8bb2efb47af831e2ab5e79efca1130286e5f32504f379a7e66ea` |
+| preamble | 68,671 | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+
+Kernel names, signatures, semantic/codegen/build/full keys, ABI/index policy,
+flags, request/prepared keys, build identities, extension paths, lowerer/options
+identity, stage records, and all source/build inputs are identical. The nine
+native activations independently establish live correctness.
+
+Because every source/build input is byte-identical, the canonical runtime waiver
+applies. The retained M5 artifact at
+`/tmp/scorch-phase2-all-coo-pmask-results/kernel-aa-641ec81-m5.json` re-hashes
+to `3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`.
+The retained Redwood artifact under the corresponding `redwood/` directory
+re-hashes to
+`c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+No new M5 or Redwood runtime grid was required.
+
+#### Compiler latency, activation, and complete crossing attribution
+
+The immediate executable predecessor is
+`/tmp/scorch-phase3-result-abi-results/latency-01a3b63-m5.json`, SHA-256
+`bfd0b70e8f599ef6b3eef7c12e96d5818307294802bb6462839263d76768449b`.
+The unchanged harness hashes to
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+
+The exact clean committed code/test candidate was benchmarked alone from
+`/tmp/scorch-phase3-kernel-abi-latency-wt`:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output /tmp/scorch-phase3-kernel-abi-results/latency-965746d-m5.json
+```
+
+The primary contained a broad p95 wave across every case, so the single
+policy-allowed confirmation was retained under the same uncontended conditions:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output \
+  /tmp/scorch-phase3-kernel-abi-results/latency-965746d-m5-confirmation.json
+```
+
+The literal comparisons were:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" python tools/benchmark_compiler_ir.py \
+  compare-latency \
+  /tmp/scorch-phase3-result-abi-results/latency-01a3b63-m5.json \
+  /tmp/scorch-phase3-kernel-abi-results/latency-965746d-m5.json
+PYTHONPATH="$PWD:$PWD/src" python tools/benchmark_compiler_ir.py \
+  compare-latency \
+  /tmp/scorch-phase3-result-abi-results/latency-01a3b63-m5.json \
+  /tmp/scorch-phase3-kernel-abi-results/latency-965746d-m5-confirmation.json
+```
+
+No pytest, native build/run, capture, Sphinx, documentation, or other benchmark
+overlapped either run. Primary SHA-256 is
+`65586fb7ef4dd319c1d9d54d41697916a071866a5fb20653af3f1fc6e3ba6b87`;
+confirmation SHA-256 is
+`dac090acb680b517abc40223a6fdf80e18e2762f5d3f9580d4ea59c4d245e52f`.
+Both record exact revision `965746dc10e186bddb423dff31dd32a16588ce1b`,
+empty branch/status, M5/arm64, Python 3.11.15, Torch 2.13.0, six threads,
+schema 1, corpus `phase0-v1`, five warmups, and 30 samples. Every endpoint and
+stage series has 30 samples. Schema, configuration, case descriptors, and
+ordered build objects are byte-identical across predecessor/primary/
+confirmation; the normalized ordered build digest is
+`7b171d0ad6c8933265104d5e4c311d24fd5a5b50d5cf12c684e644efa83af3b5`.
+
+The official endpoint p50/p95 ratios are:
+
+| Case | Primary | Confirmation |
+| --- | --- | --- |
+| small dense | `1.148 / 1.544` | `1.004 / 0.796` |
+| reduction | `1.068 / 1.181` | `1.095 / 1.548` |
+| CSR intersection | `1.056 / 1.371` | `0.998 / 1.158` |
+| sparse union | `1.069 / 1.276` | `1.080 / 1.634` |
+
+A no-native one-sample audit wrapped the exact benchmark cases. Every case
+constructs one `TorchCppKernelABI` with two `KernelTensorABI` children, emits
+input prologue/validation/empty extra prologue once, emits each tensor's level
+bindings/value pointer once, and wraps one function/argument list. All this work
+is inside inclusive `CIN_LOWERING`. None is inside nested
+`RESULT_ABI_ASSEMBLY`, LLIR-to-C++ generation, or build-request assembly. Small
+dense uses two DD inputs, reduction DD/D, and both sparse cases two DS inputs;
+only the sparse cases create additional index-pointer prologue nodes.
+
+Every strict endpoint `>1.10` crossing is attributed below. Times are
+predecessor/candidate milliseconds; deltas are candidate minus predecessor.
+The CIN column is the only activating compiler stage. It is inclusive and must
+not be added to nested result-ABI time.
+
+| Run/case/quantile | Endpoint old/new; ratio; delta | Activating CIN old/new; ratio; delta | Attribution |
+| --- | --- | --- | --- |
+| primary small dense p50 | `1.760355/2.020458; 1.148; +0.260104` | `0.628375/0.749834; 1.193; +0.121459` | Activated; not reproduced by confirmation (`1.004` endpoint, `1.028` CIN). |
+| primary small dense p95 | `2.552294/3.939652; 1.544; +1.387358` | `1.121921/1.527173; 1.361; +0.405252` | Activated, but confirmation reverses to `0.796` endpoint/`0.717` CIN. |
+| primary reduction p95 | `1.754467/2.072815; 1.181; +0.318348` | `0.627792/0.834398; 1.329; +0.206606` | Activated; broad tail movement also crosses non-owning stages. |
+| primary CSR p95 | `2.244981/3.076973; 1.371; +0.831992` | `1.095502/1.570489; 1.434; +0.474987` | Activated; p50 remains `1.056`, and non-owning stages move too. |
+| primary union p95 | `1.976937/2.521831; 1.276; +0.544894` | `1.289729/1.650402; 1.280; +0.360672` | Activated; p50 remains `1.069`, and non-owning stages move too. |
+| confirmation reduction p95 | `1.754467/2.716087; 1.548; +0.961621` | `0.627792/0.886486; 1.412; +0.258694` | Activated; endpoint p50 remains `1.095`. |
+| confirmation CSR p95 | `2.244981/2.599865; 1.158; +0.354883` | `1.095502/1.456798; 1.330; +0.361296` | Activated; endpoint p50 improves to `0.998`. |
+| confirmation union p95 | `1.976937/3.229544; 1.634; +1.252607` | `1.289729/1.913669; 1.484; +0.623939` | Activated; endpoint p50 remains `1.080`. |
+
+The primary's small-dense endpoint wave disappears completely in confirmation,
+while confirmation moves reduction/union tails farther. Both runs also cross
+non-activating frontend, normalization, scheduling, result-ABI, C++ generation,
+and request stages by absolute deltas from a few microseconds to hundreds of
+microseconds. With byte-identical source/build objects, that is a broad
+host/distribution tail wave rather than format-specific ABI work.
+
+The repeatable plausible owning median is modest: reduction CIN p50 adds
+`+0.054229 ms` (`1.101`) in primary and `+0.081520 ms` (`1.151`) in
+confirmation, while compatible endpoint p50 remains `1.068/1.095`. No endpoint
+median crosses 1.10 in confirmation, and no non-small-dense endpoint median
+crosses in primary. Under the binding policy the broad p95 crossings are fully
+investigated, not an automatic rejection; no third opportunistic run is
+permitted or warranted.
+
+No design-document or tracked `csrc` file changed. The user-owned tracked
+changes to `.gitignore`, `pyproject.toml`, `src/scorch/__init__.py`,
+`tests/packaging/smoke_install.py`, and `tests/test_scorch/test_resources.py`
+remain untouched and uncommitted. All user-owned untracked material under
+`autotune-levels/`, `bench/`, `bench/bench_results/`, `research-ideas/`,
+`scratchpad/`, `src/scorch/csrc/cuda/`, the GPU/SuiteSparse/selector-analysis
+tests/modules/tools/manifests, and scheduler receipt/status files likewise
+remains untouched and uncommitted.
+
+This closes only the narrow frozen public kernel signature/input-validation/
+prologue/function-wrapper Phase-3 slice. Existing result assembly, compressed
+output ownership, parallel zero-fill, generalized allocation/parallel
+representation, emitter closure, and remaining dead/compatibility expressions
+remain outside it. Phase 3 remains open. Phase 3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
