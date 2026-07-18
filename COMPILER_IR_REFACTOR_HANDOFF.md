@@ -8524,6 +8524,382 @@ remains untouched and uncommitted.
 This closes only the one-producer fixed stack-array declaration slice. Phase 3
 remains open. Phase 3.5 and LoopIR have not begun.
 
+### Phase-3 result-tensor ABI ownership slice complete (2026-07-17)
+
+The exact base for this slice is
+`d5e0720a3608680da0bca2a8b733693c4ad287c8`. The verified executable
+candidate is `01a3b63ad9d9032497d6d0cecff97c983f76fd38`. Two scoped commits were
+created only after the complete uncommitted candidate passed the canonical
+suite:
+
+- `27eb1b5` (`refactor(compiler): extract result tensor ABI assembly`); and
+- `01a3b63` (`test(compiler): lock result ABI extraction boundary`).
+
+No earlier commit was amended, squashed, reordered, or rewritten. The handoff
+update is a separate documentation-only commit after all acceptance work.
+
+#### Complete pre-implementation inventory and selection
+
+The post-fixed-stack budget contained ten direct subscript spellings and one
+ternary. Every site was re-audited at exact base `d5e0720` by producer,
+consumer, exact type, ownership, source spelling, production reachability, and
+compatibility-rewrite interaction:
+
+| IDs | Producer and type | Ownership, reachability, and consumers | Decision |
+| --- | --- | --- | --- |
+| P1/P2 | `_emit_post_ops` add/multiply RHS, `NO_TYPE` | Fresh leaves borrowing an extra-tensor value pointer. Their only production-source caller is W1; dense-pointer and generic string rewrites would inspect them before codegen. | Dormant and inseparable from the unsupported `_post_ops`/W1 contract; rejected. |
+| W0 | `lower_TensorAccess` workspace fallback, `NO_TYPE` | Borrowed workspace storage. Reached only when tensor metadata is absent; supported workspace paths use specialized lowering, and this fallback's `<workspace>_val[...]` spelling does not match actual storage. | Latent wrong-code fallback; a future contract decision should fail it closed, not structure it. |
+| W1 | Untiled dense-workspace copy RHS, `NO_TYPE` | Borrowed local storage. Requires a dense untiled workspace whose corresponding result level is not dense, while scheduler construction derives workspace density from those same result levels. | Scheduler-unreachable; reject with P1/P2. |
+| C1/C2 | All-COO pre-scan coordinate reads, `NO_TYPE` | Borrowed `int*`; C2 also embeds `_p - 1`. Production constructs the pre-scan only on a scalar-accumulation route that then selects the flat branch and discards it. | Dead final-tree construction and arithmetic-coupled; rejected. |
+| G1/G2 | `_group_starts[_g]` and `_group_starts[_g + 1]`, `INT64` | Elements of a locally owned `std::vector<int>`. The same discarded group route is their only source; if activated, dynamic-vector rewriting must preserve checked `.at(...)` behavior. | Dead and rewrite-coupled; plain `ArrayAccess` would be wrong. |
+| I1/I2 | Root-coordinate placeholder begin/end, `INT` | Borrowed position storage, but emitted initialization uses literal zero and `crd_tensor.size(0)` instead. Neither placeholder enters a statement tree or traversal. | Semantically obsolete placeholders; leave for iterator cleanup/LoopIR. |
+| T1 | `outer_end > 0 ? 1 : 0`, `INT64` | Fresh opaque leaf used only by the same discarded grouped all-COO pre-scan. No conditional expression node exists; `IfThenElse` is statement-only. | A byte-exact migration requires the design's general conditional node, precedence, traversal, and manual-rewriter support. Rejected for a non-surviving producer. |
+
+Thus no remaining string-expression family is a supported live final-LLIR
+candidate. Migrating one would improve only the lexical budget, not production
+semantics. Deleting the grouped route would be prohibited DCE, and adding a
+general conditional solely for T1 would be an unjustified hierarchy expansion.
+
+The Phase-3 exit audit instead identified the complete
+`ResultTensorAssembler` family as the smallest coherent live production seam.
+At the base it retained a mutable semantic `TensorVar` and owned all of the
+following concrete Torch/C++ boundary work inside `cin_lowerer.py`:
+
+| Producer family | Inputs and output | Consumers and activation |
+| --- | --- | --- |
+| `emit_value_array_init` | Dense capacity/product and `torch::empty`, known-NNZ Torch storage, or dynamic `std::vector`; also the existing `scorch_zero_dense` call | Invoked for every non-workspace result and re-invoked for the known-NNZ route before the managed pipeline barrier. |
+| `emit_level_indices_init` | Dense/compressed/coordinate position and coordinate buffers, reserve hints, structured zero-position assignment | Invoked with each value initializer; statements are traversed and rewritten by the managed LLIR pipeline. |
+| `_get_mode_index_set` | Fresh tuple-owned structured Torch mode-index arrays | Consumed only by final result assembly. |
+| `emit_final_assembly` | Typed vector moves, mode-index/value storage assignments, and return construction | Invoked exactly once in nested `RESULT_ABI_ASSEMBLY` unless the owning compressed-output route suppresses later assembly. |
+
+The three base construction sites all belonged to this one family: initial
+value/index setup, known-NNZ reassembly, and final result assembly. Kernel
+argument construction, validation calls, function signature construction,
+parallel zero-fill policy, allocation generalization, and post-op ABI remain
+separate later seams. Moving this family changes ownership and dependency
+direction without changing the generated ABI or C++ spelling.
+
+#### Representation, ownership, and dependency result
+
+`ResultTensorAssembler` now lives in `torch_cpp_abi.py` as a frozen dataclass.
+It owns only a validated result name, immutable `Tuple[LevelType, ...]`,
+`torch.dtype`, and optional known-NNZ/fixed-parent/reserve policy values.
+`levels` and density are derived from that immutable tuple. It no longer owns or
+imports `TensorVar`; `torch_cpp_abi.py` has no dependency on CIN or
+`CINLowerer`.
+
+`CINLowerer` has one `_result_tensor_abi_assembler` boundary that snapshots the
+semantic tensor into those ABI values. Its three existing call positions and
+the lazy `LLIRBodyAssembler` continuation remain in place. The nested result-ABI
+stage, managed pass order, partial/failure records, later-stage suppression,
+and caller-owned artifacts are unchanged.
+
+An independent AST review found `_has_fixed_position_count`,
+`emit_level_indices_init`, `_get_mode_index_set`, and `emit_final_assembly`
+identical to the base. `emit_value_array_init` differs only by reading dense
+rank from the frozen `self.levels` snapshot instead of mutable
+`self.tensor_var.levels`. The legacy import identity still aliases the exact
+extracted class. No blocker was found.
+
+Focused tests lock malformed names/layout tuples/dtypes/options, exact metadata
+types, frozen assignment failure, structural equality and hashing, independence
+from later `TensorVar` name/format/dtype mutation, detached repeated emission,
+byte-exact dense/known-NNZ/sparse assembly, module ownership, one production
+construction boundary, and absence of a reverse CIN import. Existing stage
+tests now monkeypatch the extracted class rather than a stale location.
+
+#### Locked post-slice compatibility budget
+
+The global budget is intentionally unchanged:
+
+- 378 production `Var` constructors;
+- 11 direct expression strings: ten subscript and one ternary;
+- 367 other constructor arguments, including the same 11 known indirect
+  sinks/clones;
+- ten generic string rewrites;
+- 38 `RawStmt` constructors / 37 semantic producers;
+- two `FixedStackArrayDecl` constructor templates / one production producer;
+- nine `tensor_data_ptr`, four `mode_index_tensor`, and three
+  `tensor_storage_member` production calls;
+- no direct opaque call, member, initializer, qualified, or separately
+  classified arithmetic expression in a production `Var.name`;
+- no `std::move(` in a production `Var.name`; and
+- no direct string-expression `Assign` target.
+
+Only location ownership changed. `Var` constructors moved from 189/2 to
+153/38 in `cin_lowerer.py`/`torch_cpp_abi.py`; their unclassified counts moved
+from 180/2 to 144/38. Structured move calls are now split 2/3; qualified Torch
+names 2/5; `RawStmt` producers 15/2; `tensor_data_ptr` calls 7/2; and
+`tensor_storage_member` calls 1/2. All global totals remain exact.
+
+#### Verification record
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, native, and
+benchmark invocation sourced the conda hook and activated `scorch`. Before
+editing, `pytest -q tests/test_scorch/test_llir_string_budget.py` passed all 19
+then-existing tests. The complete uncommitted candidate then passed the literal
+canonical 18-file command before either commit was created.
+
+The committed-candidate results are:
+
+- affected CIN/stage/sparse-prefetch/budget files: 183 passed;
+- ABI construction/emission focus: 39 passed;
+- ABI stage/failure focus: 16 passed;
+- exact stage/cache/ownership/failure focus: 19 passed;
+- literal canonical 18-file suite: 1,115 passed in 152.86 seconds;
+- required historical 11-file scheduler/CIN/codegen matrix: 499 passed in
+  430.15 seconds;
+- `PYTHONPATH="$PWD:$PWD/src" pytest -q -m "not perf" tests`, from a clean
+  detached candidate worktree: 1,661 passed, 14 skipped, three deselected in
+  2,129.40 seconds, with only the inherited PyTorch sparse-invariant warning;
+- exact CSR x dense, DS, DSS, and all-COO source anchors: four passed;
+- relevant native activation: six passed in 36.65 seconds; and
+- final `git diff --check`: clean.
+
+The ABI-specific focus covered malformed snapshots, frozen ownership, dense and
+known-NNZ extents, typed data pointers, every supported final dtype mapping,
+typed move calls, structured result storage, and the exact budget. The failure
+focus covered barrier ordering, no premature ABI record, post-ABI dynamic
+failure records, original-error identity, malformed call/member/extent/dtype
+ownership, cache emptiness, and later-stage suppression. The 19-case focus
+retained exact stage identities/order/timing, `CompileOptions` identity,
+managed pass records, cache identity, independent compilation, caller-owned
+immutability, and suppression behavior.
+
+Black `--check` passed all six changed Python files at both exact base and
+candidate. Flake8 reported the same five inherited findings on both sides;
+after line-number normalization both logs hash to
+`3d41ec51b6cc172e943b331c03350b7ddcad64b4eba42c0d225f4db28978b39c`.
+Mypy reported the same 45 inherited errors in three files; normalized logs are
+byte-identical and hash to
+`376110d663dd68216bf5d14a3787aa04768c2f51dd5045eea36c4f6e825d8530`.
+There is no new quality finding.
+
+Strict Sphinx used `-n -b html -W --keep-going -E -a` on exact detached base
+and candidate. Both generated 53 byte-identical HTML files and reached the same
+23 inherited unresolved references. Normalized warning logs hash to
+`237b35ace568db79e4f086178ce67c4d0111fa005518d81be034f49ba116b929`;
+the identical non-doctree output manifests hash to
+`ed7d001f0fc2b8078523a44a7dfb08f58a1ea457953e441baaba9e02a3d8aa3d`.
+
+#### Exact source/build identity and native correctness
+
+Exact base `d5e0720` and candidate `01a3b63` were checked out in turn in the
+same logical `cd -L /tmp/scorch-phase3-structured-access-capture-wt`. The four
+canonical capture helpers retained their audited hashes:
+
+- inputs: `605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`;
+- 42-cell grid: `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`;
+- workspace pair: `964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`;
+  and
+- tiled workspace: `9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff`.
+
+Both 14-file capture trees compare byte-for-byte, all 42 grid cells match, and
+the retained path-sensitive canonical hashes reproduce on both sides:
+
+- input manifest:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- grid:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+  and
+- workspace manifest:
+  `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`.
+
+The dedicated tiled-workspace manifests are likewise identical and hash to
+`7bc0f70f84d2693f76fdf179b9ae7e684e4fa3ebe93c5d175ec98206a024a5a7`
+in this shared-extension-root capture context. That whole-manifest hash is
+path-sensitive because `_prepare_jit_build` records the active extension root;
+the applicable base/candidate comparison is exact. Its 3,060-byte source still
+hashes to `2b9d28654e33225e1093500fc861e76f0f67cb241c7ab28b43c05b774d9f7222`
+and its 68,671-byte preamble to
+`db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`.
+
+The exact source anchors remain:
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| CSR x dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+| preamble | 68,671 | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+
+Kernel names, signatures, semantic/codegen/build/full keys, ABI/index policy,
+flags, request/prepared keys, build identities, extension paths, lowerer and
+exact `CompileOptions` identity, stage records, and all source/build inputs are
+identical. The canonical M5 and Redwood runtime waiver therefore applies; its
+artifacts re-hash to
+`3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`
+and
+`c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+The six-case native focus independently compiled/executed free-k stack,
+ragged-tail TTM, and all four regblock branch/cutoff cases against PyTorch.
+
+#### Compiler latency, activation, and complete crossing attribution
+
+The official executable predecessor is
+`/tmp/scorch-phase3-fixed-stack-results/latency-378a06d-m5.json`, SHA-256
+`e93a4772396edb17db9f8f1184749845ca39ecdd2e36500dae61a9a453cb4b22`.
+Exact base `d5e0720` changes only this handoff over executable revision
+`378a06d`, so the artifact is the immediate executable predecessor.
+
+The exact clean detached `01a3b63` candidate was benchmarked alone with five
+warmups and 30 samples:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output /tmp/scorch-phase3-result-abi-results/latency-01a3b63-m5.json
+```
+
+The primary contained a broad small-dense p95 wave, so the one confirmation
+allowed by policy was retained:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output \
+  /tmp/scorch-phase3-result-abi-results/latency-01a3b63-m5-confirmation.json
+```
+
+No pytest, native build, capture, documentation build, or other benchmark
+overlapped either run. Primary SHA-256 is
+`bfd0b70e8f599ef6b3eef7c12e96d5818307294802bb6462839263d76768449b`;
+confirmation SHA-256 is
+`b893ac33b457187e3cb754ede889f9c1702ced75a5cda215a72c41cd32a841ad`.
+Both record exact revision `01a3b63ad9d9032497d6d0cecff97c983f76fd38`,
+empty status/branch, M5/arm64, Python 3.11.15, Torch 2.13.0, six threads,
+schema 1, corpus `phase0-v1`, five warmups, and 30 samples. Every endpoint and
+stage series has 30 samples and recomputes exactly. Ordered `{name, build}`
+objects are byte-identical across predecessor, primary, and confirmation and
+hash to `d7dc61d5b9893bf0d72462382fc2c14edce10b6363bf7ce8a9f38f9e91834a9c`.
+
+An isolated no-native audit wrapped the one ABI snapshot boundary and all three
+emission methods under the exact benchmark cases. Every case activated exactly
+the same pattern: one constructor plus value/index initialization in inclusive
+`CIN_LOWERING`, then one constructor plus final assembly in nested
+`RESULT_ABI_ASSEMBLY`. Small dense used `C/(d,d)`, reduction `C/(d)`, CSR
+intersection `C/(d,s)`, and sparse union `A/(d,s)`; all were float32 with no
+known-NNZ, reserve, or fixed-parent policy. Native capture remained empty.
+
+`O/C/E/L/N/F/R/G/X/A/S` retain their established meanings. `L` is inclusive
+and contains nested `A`, so their deltas are not added. Official primary
+ordinary p50/p95 ratios are small dense `1.079434/1.406187`, reduction
+`1.081314/1.083178`, CSR intersection `0.966212/0.873647`, and sparse union
+`0.963929/0.909697`.
+
+The primary has exactly 17 strict `>1.10` crossings (`old/new ms; ratio; signed
+delta ms`):
+
+- small dense: `O.95 1.815045800/2.552293900; 1.406187050; +0.737248100`,
+  `C.95 2.124679650/2.941276900; 1.384338999; +0.816597250`,
+  `E.95 0.328326750/0.423928650; 1.291179138; +0.095601900`,
+  `L.95 0.712433150/1.121921050; 1.574773788; +0.409487900`,
+  `F.50 0.035208000/0.040062500; 1.137880595; +0.004854500`,
+  `F.95 0.042620950/0.052162500; 1.223869951; +0.009541550`,
+  `R.95 0.446844050/0.534378800; 1.195895526; +0.087534750`,
+  `G.50 0.025583500/0.028333000; 1.107471613; +0.002749500`,
+  `G.95 0.030862350/0.062620350; 2.029020797; +0.031758000`,
+  `X.95 0.062637500/0.092972700; 1.484297745; +0.030335200`,
+  `A.50 0.012812500/0.014812500; 1.156097561; +0.002000000`,
+  `A.95 0.016508000/0.019291700; 1.168627332; +0.002783700`, and
+  `S.95 0.305486050/0.391831700; 1.282650059; +0.086345650`;
+- reduction: `F.50 0.031437500/0.036542000; 1.162369781; +0.005104500`,
+  `F.95 0.035126900/0.042116300; 1.198975714; +0.006989400`,
+  `G.95 0.024889400/0.028655950; 1.151331491; +0.003766550`, and
+  `A.50 0.011416500/0.013041500; 1.142337844; +0.001625000`.
+
+The confirmation has exactly 56 strict crossings:
+
+- small dense: `O.50 1.630813000/1.820625000; 1.116391027; +0.189812000`,
+  `O.95 1.815045800/3.168492000; 1.745681569; +1.353446200`,
+  `C.50 1.938500500/2.150562500; 1.109394865; +0.212062000`,
+  `C.95 2.124679650/3.564223100; 1.677534352; +1.439543450`,
+  `E.95 0.328326750/0.420197550; 1.279815154; +0.091870800`,
+  `L.95 0.712433150/1.058712800; 1.486052130; +0.346279650`,
+  `N.95 0.028895950/0.041970800; 1.452480365; +0.013074850`,
+  `F.50 0.035208000/0.043313000; 1.230203363; +0.008105000`,
+  `F.95 0.042620950/0.061195500; 1.435807977; +0.018574550`,
+  `R.95 0.446844050/0.561539400; 1.256678700; +0.114695350`,
+  `G.50 0.025583500/0.028208500; 1.102605195; +0.002625000`,
+  `G.95 0.030862350/0.086996200; 2.818845616; +0.056133850`,
+  `X.95 0.062637500/0.074191850; 1.184463780; +0.011554350`,
+  `A.50 0.012812500/0.015333500; 1.196760976; +0.002521000`,
+  `A.95 0.016508000/0.023352750; 1.414632299; +0.006844750`,
+  `S.50 0.248292000/0.273833000; 1.102866786; +0.025541000`, and
+  `S.95 0.305486050/0.468531100; 1.533723389; +0.163045050`;
+- reduction: `O.50 1.477562500/1.737375000; 1.175838586; +0.259812500`,
+  `O.95 1.619740250/2.807337800; 1.733202469; +1.187597550`,
+  `C.50 1.772625000/2.058938000; 1.161519216; +0.286313000`,
+  `C.95 1.925062650/3.160512650; 1.641771321; +1.235450000`,
+  `E.95 0.317373100/0.434512500; 1.369090512; +0.117139400`,
+  `L.50 0.498375000/0.577041500; 1.157845999; +0.078666500`,
+  `L.95 0.637685300/1.051079650; 1.648273294; +0.413394350`,
+  `N.95 0.022342300/0.035316400; 1.580696705; +0.012974100`,
+  `F.50 0.031437500/0.042146000; 1.340628231; +0.010708500`,
+  `F.95 0.035126900/0.075297950; 2.143597926; +0.040171050`,
+  `R.95 0.415158300/0.557593750; 1.343087083; +0.142435450`,
+  `G.50 0.023520500/0.027145500; 1.154120873; +0.003625000`,
+  `G.95 0.024889400/0.045989550; 1.847756475; +0.021100150`,
+  `X.50 0.048375000/0.055708000; 1.151586563; +0.007333000`,
+  `X.95 0.051658550/0.075562500; 1.462729790; +0.023903950`,
+  `A.50 0.011416500/0.014187500; 1.242718872; +0.002771000`,
+  `A.95 0.013252300/0.021934000; 1.655108924; +0.008681700`,
+  `S.50 0.230353500/0.255874000; 1.110788419; +0.025520500`, and
+  `S.95 0.256692750/0.367958550; 1.433459067; +0.111265800`;
+- CSR intersection: `O.95 2.569666700/3.397626900; 1.322205288; +0.827960200`,
+  `C.95 2.943662650/3.799822400; 1.290848461; +0.856159750`,
+  `L.95 1.349631400/1.755479350; 1.300710216; +0.405847950`,
+  `N.50 0.008833000/0.009729000; 1.101437790; +0.000896000`,
+  `N.95 0.010647550/0.012575000; 1.181022864; +0.001927450`,
+  `F.50 0.040687500/0.045000000; 1.105990783; +0.004312500`,
+  `F.95 0.070054650/0.077304650; 1.103490632; +0.007250000`,
+  `G.95 0.035972550/0.064939250; 1.805244555; +0.028966700`,
+  `X.95 0.160202150/0.198639800; 1.239932173; +0.038437650`,
+  `A.95 0.028583000/0.049689100; 1.738414442; +0.021106100`, and
+  `S.95 0.231960750/0.360233450; 1.552993125; +0.128272700`;
+- sparse union: `O.95 2.173183150/2.709721500; 1.246890535; +0.536538350`,
+  `C.95 2.493039700/3.039546500; 1.219213035; +0.546506800`,
+  `L.95 1.337737350/1.832314550; 1.369711738; +0.494577200`,
+  `F.50 0.015521000/0.017645500; 1.136879067; +0.002124500`,
+  `F.95 0.018062350/0.021554200; 1.193322021; +0.003491850`,
+  `G.50 0.029479500/0.033229000; 1.127190081; +0.003749500`,
+  `G.95 0.040200150/0.046562500; 1.158266822; +0.006362350`,
+  `A.50 0.020187000/0.022854500; 1.132139496; +0.002667500`, and
+  `A.95 0.022329050/0.028843750; 1.291758942; +0.006514700`.
+
+All 17 primary crossings repeat, but only small `L.95`, small `A.50/A.95`, and
+reduction `A.50` touch owning stages, and only the three `A` entries isolate
+the nested ABI work. Confirmation expands to 56/86 metrics across every case
+and non-owning `N/F/R/G/X/S`; endpoint p95 deltas range from +0.537 to +1.353
+ms and inclusive-`L` p95 deltas from +0.346 to +0.495 ms. With identical build
+objects and equal two-constructor activation, that is a whole-run/host
+distribution wave, not format-specific ABI work.
+
+The repeatable directly owning signal is small: `A` adds +0.002000/+0.002521
+ms at small-dense p50, +0.002784/+0.006845 ms at small-dense p95, and
++0.001625/+0.002771 ms at reduction p50 in primary/confirmation. This bounds
+the repeatable frozen-snapshot/validation cost below 0.007 ms. Under the binding
+policy, it is an explicitly reviewed modest typed ownership exception; the
+architecture is not weakened for non-owning host variance, and no third
+opportunistic run is permitted or warranted.
+
+No design-document or tracked `csrc` file changed. The user-owned `.gitignore`,
+`pyproject.toml`, `src/scorch/__init__.py`,
+`tests/packaging/smoke_install.py`, and
+`tests/test_scorch/test_resources.py` modifications remain untouched and
+uncommitted. All user-owned untracked material under `autotune-levels/`,
+`bench/`, `bench/bench_results/`, `research-ideas/`, `scratchpad/`,
+`src/scorch/csrc/cuda/`, the GPU/SuiteSparse/benchmark-analysis
+tests/modules/tools/manifests, and scheduler receipt/status files likewise
+remains untouched and uncommitted.
+
+This closes only the narrow `ResultTensorAssembler` ownership/extraction slice.
+Full TorchCppABI extraction, including kernel signatures/prologue/validation,
+remains open. Parallel zero-fill, allocation/parallel representation, emitter
+closure, and remaining compatibility rewrites also remain open. Phase 3 is not
+complete. Phase 3.5 and LoopIR have not begun.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
