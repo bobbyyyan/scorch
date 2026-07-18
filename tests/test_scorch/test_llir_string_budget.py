@@ -97,6 +97,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "name",
         "node.name",
         "prefix_extent",
+        "sparse_values_tensor",
         "zero_value",
     }
     for path in sorted(_COMPILER_ROOT.glob("*.py")):
@@ -117,7 +118,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 137,
+        "cin_lowerer.py": 139,
         "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -130,10 +131,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 53,
     }
-    assert sum(constructor_counts.values()) == 377
+    assert sum(constructor_counts.values()) == 379
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 129,
+        "cin_lowerer.py": 131,
         "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -146,9 +147,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 53,
     }
-    assert sum(unclassified_counts.values()) == 367
+    assert sum(unclassified_counts.values()) == 369
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
+        ("cin_lowerer.py", "sparse_values_tensor"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
         ("llir_traversal.py", "node.name"): 1,
         ("loop_invariant_factor_pass.py", "accumulator_name"): 1,
@@ -158,7 +160,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 11
+    assert sum(known_indirect.values()) == 12
 
     assert totals == {
         "subscript": 9,
@@ -302,11 +304,12 @@ def test_torch_abi_expression_producer_budget_is_explicit() -> None:
         ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
     assert member_call_constructors == {
+        "cin_lowerer.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 2,
         "torch_cpp_abi.py": 1,
     }
-    assert sum(member_call_constructors.values()) == 4
+    assert sum(member_call_constructors.values()) == 5
 
 
 def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
@@ -595,7 +598,7 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
     counts += Counter()
 
     assert counts == {
-        "cin_lowerer.py": 12,
+        "cin_lowerer.py": 11,
         "compressed_where_openmp_pass.py": 15,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
@@ -603,8 +606,46 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 5,
     }
-    assert sum(counts.values()) == 38
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 37
+    assert sum(counts.values()) == 37
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 36
+
+
+def test_known_nnz_tensor_size_cannot_return_to_raw_statements() -> None:
+    path = _COMPILER_ROOT / "cin_lowerer.py"
+    raw_violations: list[tuple[int, str]] = []
+    for call in _llir_constructor_calls(path, "RawStmt"):
+        spelling = ast.unparse(call)
+        if "_known_nnz" in spelling or ".size(0)" in spelling:
+            raw_violations.append((call.lineno, spelling))
+
+    member_calls = []
+    for call in _llir_constructor_calls(path, "MemberCall"):
+        fields = {
+            keyword.arg: keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        member = fields.get("member")
+        if isinstance(member, ast.Constant) and member.value == "size":
+            member_calls.append(fields)
+
+    assert raw_violations == []
+    assert len(member_calls) == 1
+    fields = member_calls[0]
+    assert set(fields) == {"base", "member", "args"}
+    assert _is_llir_constructor(fields["base"], "Var")
+    base = fields["base"]
+    assert isinstance(base, ast.Call)
+    base_fields = {
+        keyword.arg: keyword.value
+        for keyword in base.keywords
+        if keyword.arg is not None
+    }
+    assert ast.unparse(base_fields["name"]) == "sparse_values_tensor"
+    assert ast.unparse(base_fields["type"]) == "llir.DataType.TORCH_TENSOR"
+    assert ast.unparse(fields["args"]) == (
+        "(llir.Literal(value=0, data_type=llir.DataType.INT64),)"
+    )
 
 
 def test_loop_invariant_factor_materialization_cannot_return_to_raw_statements() -> (

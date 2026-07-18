@@ -1238,6 +1238,13 @@ def test_known_nnz_extent_is_independent_across_full_compilations(
     assert (
         prepared_builds[0].request.cpp_sources == prepared_builds[1].request.cpp_sources
     )
+    assert (
+        sum(
+            source.count("int64_t _known_nnz = A_values.size(0);")
+            for source in prepared_builds[0].request.cpp_sources
+        )
+        == 1
+    )
     assert any(
         "torch::empty({_known_nnz}, torch::kFloat32);" in source
         for source in prepared_builds[0].request.cpp_sources
@@ -2462,6 +2469,273 @@ def test_malformed_assembled_member_call_fails_owner_and_suppresses_later_stages
     ]
     assert later_calls == []
     assert context.compile_options is options
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_known_nnz_size_construction_failure_fails_result_abi_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs = _all_coo_sddmm_specs()
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    context = CompilationContext(options)
+    error = RuntimeError("injected known-nnz result/ABI assembly failure")
+    observed: list[tuple[str, llir.DataType, str, llir.DataType, str, int]] = []
+    original_instrument = CINLowerer._instrument_body_assembler
+
+    def instrument_failing_known_nnz(
+        self: CINLowerer,
+        body_assembler: cin_lowerer_module.LLIRBodyAssembler,
+    ) -> cin_lowerer_module.LLIRBodyAssembler:
+        def observe_then_fail(
+            transformed_body: cin_lowerer_module.LLIRStatementListArtifact,
+            compressed_output_parallel: bool,
+        ) -> cin_lowerer_module.LLIRRewriteArtifact[list[llir.Stmt]]:
+            assembled = body_assembler(
+                transformed_body,
+                compressed_output_parallel,
+            )
+            matches = [
+                cast(llir.VarInit, candidate)
+                for candidate in assembled.value
+                if type(candidate) is llir.VarInit
+                and cast(llir.VarInit, candidate).var.name == "_known_nnz"
+            ]
+            assert len(matches) == 1
+            initializer = matches[0]
+            assert type(initializer.value) is llir.MemberCall
+            call = cast(llir.MemberCall, initializer.value)
+            assert type(call.base) is llir.Var
+            base = cast(llir.Var, call.base)
+            assert call.template_args == ()
+            assert len(call.args) == 1
+            assert type(call.args[0]) is llir.Literal
+            extent = cast(llir.Literal, call.args[0])
+            observed.append(
+                (
+                    initializer.var.name,
+                    initializer.var.type,
+                    base.name,
+                    base.type,
+                    call.member,
+                    cast(int, extent.value),
+                )
+            )
+            raise error
+
+        return original_instrument(self, observe_then_fail)
+
+    monkeypatch.setattr(
+        CINLowerer,
+        "_instrument_body_assembler",
+        instrument_failing_known_nnz,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_dynamic_vector_access",
+                "dynamic_vector",
+            ),
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with scheduler_module.regblock_force(False):
+        with pytest.raises(RuntimeError) as failure:
+            ops.einsum(
+                "ij,ik,jk->ij",
+                *specs,
+                compile_only=True,
+                format="oo",
+                _compile_options=options,
+                _compilation_context=context,
+            )
+
+    assert failure.value is error
+    assert observed == [
+        (
+            "_known_nnz",
+            llir.DataType.INT64,
+            "A_values",
+            llir.DataType.TORCH_TENSOR,
+            "size",
+            0,
+        )
+    ]
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert all(record.duration_ns >= 0 for record in context.llir_pass_run_records)
+    assert later_calls == []
+    assert context.compile_options is options
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_malformed_known_nnz_size_fails_dynamic_owner_and_suppresses_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs = _all_coo_sddmm_specs()
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    context = CompilationContext(options)
+    original_dynamic = llir_pass_manager.LLIRPassManager.run_dynamic_vector_access
+    injected: list[tuple[str, llir.DataType, str, llir.DataType, str, int]] = []
+
+    def run_with_malformed_known_nnz(
+        self: llir_pass_manager.LLIRPassManager,
+        artifact: llir_pass_manager.LLIRRewriteArtifact[list[llir.Stmt]],
+        pass_spec: llir_pass_manager.DynamicVectorAccessPassSpec,
+    ) -> object:
+        matches = [
+            cast(llir.VarInit, candidate)
+            for candidate in artifact.value
+            if type(candidate) is llir.VarInit
+            and cast(llir.VarInit, candidate).var.name == "_known_nnz"
+        ]
+        assert len(matches) == 1
+        initializer = matches[0]
+        assert type(initializer.value) is llir.MemberCall
+        call = cast(llir.MemberCall, initializer.value)
+        assert type(call.base) is llir.Var
+        base = cast(llir.Var, call.base)
+        assert len(call.args) == 1
+        assert type(call.args[0]) is llir.Literal
+        extent = cast(llir.Literal, call.args[0])
+        injected.append(
+            (
+                initializer.var.name,
+                initializer.var.type,
+                base.name,
+                base.type,
+                call.member,
+                cast(int, extent.value),
+            )
+        )
+        object.__setattr__(call, "args", list(call.args))
+        return original_dynamic(self, artifact, pass_spec)
+
+    monkeypatch.setattr(
+        llir_pass_manager.LLIRPassManager,
+        "run_dynamic_vector_access",
+        run_with_malformed_known_nnz,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with scheduler_module.regblock_force(False):
+        with pytest.raises(LLIRTraversalError) as failure:
+            ops.einsum(
+                "ij,ik,jk->ij",
+                *specs,
+                compile_only=True,
+                format="oo",
+                _compile_options=options,
+                _compilation_context=context,
+            )
+
+    diagnostic = failure.value.diagnostic
+    assert injected == [
+        (
+            "_known_nnz",
+            llir.DataType.INT64,
+            "A_values",
+            llir.DataType.TORCH_TENSOR,
+            "size",
+            0,
+        )
+    ]
+    assert diagnostic.code == "invalid_member_call_args"
+    assert diagnostic.path == ("root", "[22]", "value", "args")
+    assert diagnostic.stage == "LLIR rewrite"
+    assert diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert _stage_values(context) == [
+        *_EINSUM_PREFIX_THROUGH_ADAPTER,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    ]
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(len(context.stage_run_records))
+    )
+    assert all(record.duration_ns >= 0 for record in context.stage_run_records)
+    assert context.stage_run_records[-1].nested_within is CompilerStageId.CIN_LOWERING
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert all(record.duration_ns >= 0 for record in context.llir_pass_run_records)
+    assert later_calls == []
+    assert context.compile_options is options
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
     with pytest.raises(CompilationContextError) as suppressed:
         context.begin_stage(
             CompilerStageId.SCHEDULE_LOWERING,

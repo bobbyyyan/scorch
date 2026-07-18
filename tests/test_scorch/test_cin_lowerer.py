@@ -2788,6 +2788,120 @@ def test_production_all_coo_end_bound_activates_then_is_suppressed(
     ]
 
 
+def test_production_known_nnz_size_is_structured_typed_owned_and_byte_exact() -> None:
+    with regblock_force(False):
+        statement = _build_activating_all_coo_sddmm()
+        statement_before = str(statement)
+        first_lowerer = CINLowerer()
+        first_function = cast(
+            llir.Function,
+            first_lowerer.lower_IndexStmt(statement),
+        )
+        second_lowerer = CINLowerer()
+        second_function = cast(
+            llir.Function,
+            second_lowerer.lower_IndexStmt(statement),
+        )
+
+    def known_nnz_initializer(function: llir.Function) -> llir.VarInit:
+        matches = [
+            cast(llir.VarInit, candidate)
+            for candidate in function.body
+            if type(candidate) is llir.VarInit
+            and cast(llir.VarInit, candidate).var.name == "_known_nnz"
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    first = known_nnz_initializer(first_function)
+    second = known_nnz_initializer(second_function)
+    expected = llir.VarInit(
+        var=llir.Var("_known_nnz", llir.DataType.INT64),
+        value=llir.MemberCall(
+            base=llir.Var("Mask_values", llir.DataType.TORCH_TENSOR),
+            member="size",
+            args=(llir.Literal(0, llir.DataType.INT64),),
+        ),
+    )
+
+    assert type(first) is llir.VarInit
+    assert first == expected == second
+    assert hash(first) == hash(expected) == hash(second)
+    assert first is not second
+    assert first.var is not second.var
+    assert first.var.name == "_known_nnz"
+    assert first.var.type is llir.DataType.INT64
+    assert first.var.tensor_access is None
+    assert first.var.is_ptr is False
+    assert first.var.is_restrict is False
+    assert first.op == "="
+    assert first.cast is False
+
+    assert type(first.value) is llir.MemberCall
+    assert type(second.value) is llir.MemberCall
+    first_call = cast(llir.MemberCall, first.value)
+    second_call = cast(llir.MemberCall, second.value)
+    assert first_call == second_call
+    assert hash(first_call) == hash(second_call)
+    assert first_call is not second_call
+    assert first_call.member == "size"
+    assert first_call.template_args == ()
+    assert type(first_call.args) is tuple
+    assert len(first_call.args) == 1
+    assert first_call.args[0] is not second_call.args[0]
+    assert type(first_call.args[0]) is llir.Literal
+    extent = cast(llir.Literal, first_call.args[0])
+    assert type(extent.value) is int
+    assert extent.value == 0
+    assert extent.data_type is llir.DataType.INT64
+
+    assert type(first_call.base) is llir.Var
+    assert type(second_call.base) is llir.Var
+    first_base = cast(llir.Var, first_call.base)
+    second_base = cast(llir.Var, second_call.base)
+    first_argument = next(
+        argument
+        for argument in first_function.args
+        if type(argument) is llir.Var and argument.name == "Mask_values"
+    )
+    assert first_base is not second_base
+    assert first_base is not first_argument
+    assert first_base.name == "Mask_values"
+    assert first_base.type is first_argument.type is llir.DataType.TORCH_TENSOR
+    assert first_base.tensor_access is None
+    assert first_base.is_ptr is False
+    assert first_base.is_restrict is False
+
+    first_cpp = LLIRLowerer().lower_llir(first_function)
+    second_cpp = LLIRLowerer().lower_llir(second_function)
+    assert first_cpp == second_cpp
+    assert LLIRLowerer().lower_llir(first) == (
+        "int64_t _known_nnz = Mask_values.size(0);"
+    )
+    assert first_cpp.count("int64_t _known_nnz = Mask_values.size(0);") == 1
+    assert not any(
+        type(candidate) is llir.RawStmt
+        and candidate.code.startswith("int64_t _known_nnz =")
+        for candidate in first_function.body
+    )
+    assert str(statement) == statement_before
+    assert first_lowerer.llir_pass_run_records == second_lowerer.llir_pass_run_records
+    assert [record.pass_name for record in first_lowerer.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+
+    first.var.name = "owned_target"
+    first_base.name = "owned_receiver"
+    assert second.var.name == "_known_nnz"
+    assert second_base.name == "Mask_values"
+    assert first_argument.name == "Mask_values"
+    assert str(statement) == statement_before
+
+
 def test_mutated_unknown_post_op_cannot_be_silently_skipped():
     post_ops = PostOps(ops=[], extra_tensors=[])
     lowerer = CINLowerer(post_ops=post_ops)
