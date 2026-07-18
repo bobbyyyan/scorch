@@ -392,18 +392,25 @@ class CINLowerer:
         """
         Lower a TensorAccess to LLIR
         """
+        tensor_var = tensor_access.get_tensor()
+        tensor_access_metadata = self._tensor_access_metadata(
+            tensor_access,
+            llir.TensorAccessRole.INPUT_READ,
+        )
+        if tensor_access_metadata is None:
+            raise CompilerInvariantError(
+                "stage=CIN lowering pass=lower_TensorAccess: "
+                f"workspace tensor '{tensor_var.get_name()}' reached generic value "
+                "lowering; workspace reads require a workspace-specific consumer"
+            )
+
         sorted_index_vars = tensor_access.get_sorted_index_vars()
         last_index_var = sorted_index_vars[-1]
 
         # If the level_type corresponding to the last index var is dense, then we can just use
         # the index var as the index into the value array
-        tensor_var = tensor_access.get_tensor()
         level = tensor_access.level_of_index_var(last_index_var)
         level_type = tensor_var.get_level_types()[level]
-        tensor_access_metadata = self._tensor_access_metadata(
-            tensor_access,
-            llir.TensorAccessRole.INPUT_READ,
-        )
 
         if len(tensor_access.indices) == 1 and level_type == LevelType.DENSE:
             physical_index = last_index_var.name
@@ -411,12 +418,6 @@ class CINLowerer:
             physical_index = (
                 f"p{tensor_access.tensor.get_name()}"
                 f"{tensor_access.level_of_index_var(last_index_var)}"
-            )
-
-        if tensor_access_metadata is None:
-            return llir.Var(
-                name=f"{tensor_access.tensor.name}_val[{physical_index}]",
-                type=llir.DataType.NO_TYPE,
             )
 
         return llir.ArrayAccess(
