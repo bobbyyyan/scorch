@@ -132,9 +132,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 53,
+        "torch_cpp_abi.py": 57,
     }
-    assert sum(constructor_counts.values()) == 382
+    assert sum(constructor_counts.values()) == 386
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 131,
@@ -148,9 +148,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 53,
+        "torch_cpp_abi.py": 57,
     }
-    assert sum(unclassified_counts.values()) == 372
+    assert sum(unclassified_counts.values()) == 376
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
@@ -304,7 +304,7 @@ def test_torch_abi_expression_producer_budget_is_explicit() -> None:
         ("cin_lowerer.py", "tensor_data_ptr"): 2,
         ("cin_lowerer.py", "tensor_storage_member"): 1,
         ("torch_cpp_abi.py", "mode_index_tensor"): 4,
-        ("torch_cpp_abi.py", "tensor_data_ptr"): 7,
+        ("torch_cpp_abi.py", "tensor_data_ptr"): 8,
         ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
     assert member_call_constructors == {
@@ -377,7 +377,7 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
     assert structured_counts == {
         "cin_lowerer.py": 2,
         "llir_traversal.py": 1,
-        "torch_cpp_abi.py": 5,
+        "torch_cpp_abi.py": 6,
     }
 
     producers = []
@@ -397,7 +397,7 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
         name_expressions[ast.unparse(fields["name"])] += 1
 
     assert name_expressions == {
-        "'kInt'": 3,
+        "'kInt'": 4,
         "get_pytorch_c_dtype_name(self.dtype)": 3,
         "get_pytorch_c_dtype_name(intermediate_tensor_var.dtype)": 1,
     }
@@ -608,10 +608,55 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 3,
         "sparse_prefetch_pass.py": 1,
-        "torch_cpp_abi.py": 5,
+        "torch_cpp_abi.py": 4,
     }
-    assert sum(counts.values()) == 36
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 35
+    assert sum(counts.values()) == 35
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 34
+
+
+def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:
+    path = _COMPILER_ROOT / "torch_cpp_abi.py"
+    raw_violations = [
+        (call.lineno, ast.unparse(call))
+        for call in _llir_constructor_calls(path, "RawStmt")
+        if "known_nnz_var" in ast.unparse(call) and "_crd_torch" in ast.unparse(call)
+    ]
+    coordinate_owner_initializers: list[ast.Call] = []
+    for call in _llir_constructor_calls(path, "VarInit"):
+        fields = {
+            keyword.arg: keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        target = fields.get("var")
+        if target is None or not _is_llir_constructor(target, "Var"):
+            continue
+        assert isinstance(target, ast.Call)
+        name_expression = _var_name_expression(target)
+        value = fields.get("value")
+        if (
+            name_expression is not None
+            and "_crd_torch" in _static_string_fragments(name_expression)
+            and value is not None
+            and _is_llir_constructor(value, "FunctionCall")
+            and isinstance(value, ast.Call)
+            and ast.unparse(_var_name_expression(value)) == "'torch::empty'"
+        ):
+            coordinate_owner_initializers.append(call)
+
+    assert raw_violations == []
+    assert len(coordinate_owner_initializers) == 1
+    assert (
+        sum(
+            len(_llir_constructor_calls(path, constructor))
+            for constructor in ("VarInit", "Array", "FunctionCall", "QualifiedName")
+        )
+        == 40
+    )
+    assert len(_llir_constructor_calls(path, "VarInit")) == 20
+    assert len(_llir_constructor_calls(path, "Array")) == 5
+    assert len(_llir_constructor_calls(path, "FunctionCall")) == 9
+    assert len(_llir_constructor_calls(path, "QualifiedName")) == 6
 
 
 def test_known_nnz_tensor_size_cannot_return_to_raw_statements() -> None:

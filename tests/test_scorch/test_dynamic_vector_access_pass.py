@@ -357,6 +357,86 @@ def test_fill_base_offset_loads_are_detached_and_never_deduplicated() -> None:
     )
 
 
+def test_known_nnz_coordinate_owner_pair_is_detached_without_lexical_rewrite() -> None:
+    source: List[llir.Stmt] = [
+        llir.VarInit(
+            _var("Result0_crd_torch", llir.DataType.TORCH_TENSOR),
+            llir.FunctionCall(
+                "torch::empty",
+                (
+                    llir.Array(
+                        (_var("_known_nnz", llir.DataType.INT64),),
+                        llir.DataType.INT64,
+                    ),
+                    llir.QualifiedName(
+                        "torch",
+                        "kInt",
+                        llir.DataType.TORCH_SCALAR_TYPE,
+                    ),
+                ),
+            ),
+        ),
+        llir.VarInit(
+            _var("Result0_crd", llir.DataType.PTR_INT),
+            llir.MemberCall(
+                _var("Result0_crd_torch", llir.DataType.TORCH_TENSOR),
+                "data_ptr",
+                template_args=(llir.DataType.INT,),
+            ),
+        ),
+    ]
+    snapshot = _structural_snapshot(source)
+
+    first = rewrite_dynamic_vector_accesses(source, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+    second = rewrite_dynamic_vector_accesses(first, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+
+    assert _structural_snapshot(source) == snapshot
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert first == second == source
+    assert first is not source
+    assert second is not first
+    assert all(rewritten is not original for rewritten, original in zip(first, source))
+    first_owner = cast(llir.VarInit, first[0])
+    second_owner = cast(llir.VarInit, second[0])
+    source_owner = cast(llir.VarInit, source[0])
+    first_extent = cast(
+        llir.Array,
+        cast(llir.FunctionCall, first_owner.value).args[0],
+    )
+    second_extent = cast(
+        llir.Array,
+        cast(llir.FunctionCall, second_owner.value).args[0],
+    )
+    source_extent = cast(
+        llir.Array,
+        cast(llir.FunctionCall, source_owner.value).args[0],
+    )
+    first_pointer = cast(llir.VarInit, first[1])
+    second_pointer = cast(llir.VarInit, second[1])
+    source_pointer = cast(llir.VarInit, source[1])
+    first_receiver = cast(llir.Var, cast(llir.MemberCall, first_pointer.value).base)
+    second_receiver = cast(llir.Var, cast(llir.MemberCall, second_pointer.value).base)
+    source_receiver = cast(llir.Var, cast(llir.MemberCall, source_pointer.value).base)
+    assert first_extent is not source_extent
+    assert second_extent is not first_extent
+    assert first_extent.values[0] is not source_extent.values[0]
+    assert second_extent.values[0] is not first_extent.values[0]
+    assert first_receiver is not source_receiver
+    assert second_receiver is not first_receiver
+    assert _cpp(first) == (
+        "torch::Tensor Result0_crd_torch = "
+        "torch::empty({_known_nnz}, torch::kInt);\n"
+        "int* Result0_crd = Result0_crd_torch.data_ptr<int>();"
+    )
+
+    cast(llir.Var, first_extent.values[0]).name = "owned_extent"
+    first_receiver.name = "owned_receiver"
+    assert cast(llir.Var, source_extent.values[0]).name == "_known_nnz"
+    assert cast(llir.Var, second_extent.values[0]).name == "_known_nnz"
+    assert source_receiver.name == "Result0_crd_torch"
+    assert second_receiver.name == "Result0_crd_torch"
+
+
 def _independent_single_step_add() -> llir.Add:
     return llir.Add(
         _var("base", llir.DataType.INT64),

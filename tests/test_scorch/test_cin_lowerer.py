@@ -1185,6 +1185,154 @@ def test_known_nnz_result_torch_empty_extent_is_structured_typed_and_fresh() -> 
     )
 
 
+def test_known_nnz_coordinate_torch_owners_and_pointers_are_structured_and_fresh() -> (
+    None
+):
+    tensor = TensorVar("Result", fmt="oo")
+    first_statements = _result_tensor_assembler(
+        tensor,
+        known_nnz_var="_known_nnz",
+    ).emit_level_indices_init()
+    second_statements = _result_tensor_assembler(
+        tensor,
+        known_nnz_var="_known_nnz",
+    ).emit_level_indices_init()
+
+    def initializers(statements: list[llir.Stmt]) -> dict[str, llir.VarInit]:
+        return {
+            statement.var.name: statement
+            for statement in statements
+            if type(statement) is llir.VarInit
+        }
+
+    first = initializers(first_statements)
+    second = initializers(second_statements)
+    assert set(first) == {
+        "Result0_crd_torch",
+        "Result0_crd",
+        "pResult0",
+        "Result1_crd_torch",
+        "Result1_crd",
+        "pResult1",
+    }
+    assert set(second) == set(first)
+
+    owner_children: list[tuple[llir.Var, llir.QualifiedName]] = []
+    pointer_receivers: list[llir.Var] = []
+    for level in range(2):
+        owner_name = f"Result{level}_crd_torch"
+        pointer_name = f"Result{level}_crd"
+        first_owner = first[owner_name]
+        second_owner = second[owner_name]
+        first_pointer = first[pointer_name]
+        second_pointer = second[pointer_name]
+
+        assert first_owner == second_owner
+        assert hash(first_owner) == hash(second_owner)
+        assert first_owner is not second_owner
+        assert first_owner.var is not second_owner.var
+        assert first_owner.var.name == owner_name
+        assert first_owner.var.type is llir.DataType.TORCH_TENSOR
+        assert first_owner.var.is_ptr is False
+        assert first_owner.var.is_restrict is False
+        assert first_owner.var.tensor_access is None
+        assert first_owner.op == "="
+        assert first_owner.cast is False
+
+        assert type(first_owner.value) is llir.FunctionCall
+        assert type(second_owner.value) is llir.FunctionCall
+        first_empty = cast(llir.FunctionCall, first_owner.value)
+        second_empty = cast(llir.FunctionCall, second_owner.value)
+        assert first_empty == second_empty
+        assert hash(first_empty) == hash(second_empty)
+        assert first_empty is not second_empty
+        assert first_empty.name == "torch::empty"
+        assert type(first_empty.args) is tuple
+        assert len(first_empty.args) == 2
+        assert type(first_empty.args[0]) is llir.Array
+        assert type(second_empty.args[0]) is llir.Array
+        first_extent = cast(llir.Array, first_empty.args[0])
+        second_extent = cast(llir.Array, second_empty.args[0])
+        assert first_extent == second_extent
+        assert hash(first_extent) == hash(second_extent)
+        assert first_extent is not second_extent
+        assert first_extent.data_type is llir.DataType.INT64
+        assert type(first_extent.values) is tuple
+        assert len(first_extent.values) == 1
+        assert first_extent.values[0] is not second_extent.values[0]
+        assert type(first_extent.values[0]) is llir.Var
+        extent = cast(llir.Var, first_extent.values[0])
+        assert extent.name == "_known_nnz"
+        assert extent.type is llir.DataType.INT64
+        assert extent.is_ptr is False
+        assert extent.is_restrict is False
+        assert extent.tensor_access is None
+        dtype = _assert_torch_qualified_name(first_empty.args[1], "torch::kInt")
+        second_dtype = _assert_torch_qualified_name(second_empty.args[1], "torch::kInt")
+        assert dtype == second_dtype
+        assert hash(dtype) == hash(second_dtype)
+        assert dtype is not second_dtype
+        owner_children.append((extent, dtype))
+
+        assert first_pointer == second_pointer
+        assert hash(first_pointer) == hash(second_pointer)
+        assert first_pointer is not second_pointer
+        assert first_pointer.var is not second_pointer.var
+        assert first_pointer.var.name == pointer_name
+        assert first_pointer.var.type is llir.DataType.PTR_INT
+        assert first_pointer.var.is_ptr is False
+        assert first_pointer.var.is_restrict is False
+        assert first_pointer.var.tensor_access is None
+        first_data_ptr = _assert_data_ptr_call(
+            first_pointer.value,
+            llir.DataType.INT,
+        )
+        second_data_ptr = _assert_data_ptr_call(
+            second_pointer.value,
+            llir.DataType.INT,
+        )
+        assert first_data_ptr == second_data_ptr
+        assert hash(first_data_ptr) == hash(second_data_ptr)
+        assert first_data_ptr is not second_data_ptr
+        first_receiver = _assert_torch_tensor_var(first_data_ptr.base, owner_name)
+        second_receiver = _assert_torch_tensor_var(second_data_ptr.base, owner_name)
+        assert first_receiver is not second_receiver
+        assert first_receiver is not first_owner.var
+        pointer_receivers.append(first_receiver)
+
+        assert LLIRLowerer().lower_llir([first_owner, first_pointer]) == (
+            f"torch::Tensor {owner_name} = "
+            "torch::empty({_known_nnz}, torch::kInt);\n"
+            f"int* {pointer_name} = {owner_name}.data_ptr<int>();"
+        )
+
+    assert len({id(child) for pair in owner_children for child in pair}) == 4
+    assert len({id(receiver) for receiver in pointer_receivers}) == 2
+    assert not any(
+        type(statement) is llir.RawStmt and "_known_nnz" in statement.code
+        for statement in first_statements
+    )
+
+    first["Result0_crd_torch"].var.name = "owned_owner"
+    owner_children[0][0].name = "owned_extent"
+    pointer_receivers[0].name = "owned_receiver"
+    assert second["Result0_crd_torch"].var.name == "Result0_crd_torch"
+    second_empty = cast(
+        llir.FunctionCall,
+        second["Result0_crd_torch"].value,
+    )
+    second_extent = cast(llir.Array, second_empty.args[0])
+    assert cast(llir.Var, second_extent.values[0]).name == "_known_nnz"
+    second_pointer = cast(
+        llir.MemberCall,
+        second["Result0_crd"].value,
+    )
+    assert cast(llir.Var, second_pointer.base).name == "Result0_crd_torch"
+    assert first["Result1_crd_torch"].var.name == "Result1_crd_torch"
+    assert owner_children[1][0].name == "_known_nnz"
+    assert pointer_receivers[1].name == "Result1_crd_torch"
+
+
 @pytest.mark.parametrize(
     ("fmt", "known_nnz_var", "is_restrict"),
     (
@@ -2879,9 +3027,72 @@ def test_production_known_nnz_size_is_structured_typed_owned_and_byte_exact() ->
         "int64_t _known_nnz = Mask_values.size(0);"
     )
     assert first_cpp.count("int64_t _known_nnz = Mask_values.size(0);") == 1
+    for level in range(2):
+        owner_name = f"Sampled{level}_crd_torch"
+        pointer_name = f"Sampled{level}_crd"
+        first_owner = next(
+            cast(llir.VarInit, candidate)
+            for candidate in first_function.body
+            if type(candidate) is llir.VarInit
+            and cast(llir.VarInit, candidate).var.name == owner_name
+        )
+        second_owner = next(
+            cast(llir.VarInit, candidate)
+            for candidate in second_function.body
+            if type(candidate) is llir.VarInit
+            and cast(llir.VarInit, candidate).var.name == owner_name
+        )
+        first_pointer = next(
+            cast(llir.VarInit, candidate)
+            for candidate in first_function.body
+            if type(candidate) is llir.VarInit
+            and cast(llir.VarInit, candidate).var.name == pointer_name
+        )
+        second_pointer = next(
+            cast(llir.VarInit, candidate)
+            for candidate in second_function.body
+            if type(candidate) is llir.VarInit
+            and cast(llir.VarInit, candidate).var.name == pointer_name
+        )
+        assert first_owner == second_owner
+        assert first_owner is not second_owner
+        assert first_owner.var is not second_owner.var
+        assert first_owner.var.type is llir.DataType.TORCH_TENSOR
+        assert type(first_owner.value) is llir.FunctionCall
+        owner_call = cast(llir.FunctionCall, first_owner.value)
+        assert owner_call.name == "torch::empty"
+        assert type(owner_call.args[0]) is llir.Array
+        owner_extent = cast(llir.Array, owner_call.args[0])
+        assert type(owner_extent.values[0]) is llir.Var
+        assert cast(llir.Var, owner_extent.values[0]).name == "_known_nnz"
+        _assert_torch_qualified_name(owner_call.args[1], "torch::kInt")
+
+        assert first_pointer == second_pointer
+        assert first_pointer is not second_pointer
+        assert first_pointer.var is not second_pointer.var
+        assert first_pointer.var.type is llir.DataType.PTR_INT
+        pointer_call = _assert_data_ptr_call(
+            first_pointer.value,
+            llir.DataType.INT,
+        )
+        receiver = _assert_torch_tensor_var(pointer_call.base, owner_name)
+        assert receiver is not first_owner.var
+        assert (
+            first_cpp.count(
+                f"torch::Tensor {owner_name} = "
+                "torch::empty({_known_nnz}, torch::kInt);"
+            )
+            == 1
+        )
+        assert (
+            first_cpp.count(f"int* {pointer_name} = {owner_name}.data_ptr<int>();") == 1
+        )
     assert not any(
         type(candidate) is llir.RawStmt
-        and candidate.code.startswith("int64_t _known_nnz =")
+        and (
+            candidate.code.startswith("int64_t _known_nnz =")
+            or ("_known_nnz" in candidate.code and "_crd_torch" in candidate.code)
+        )
         for candidate in first_function.body
     )
     assert str(statement) == statement_before

@@ -1966,6 +1966,132 @@ def test_fill_base_load_rewrite_is_deterministic_repeatable_and_owned() -> None:
     assert cast(llir.Var, original_access.index).name == "row"
 
 
+def test_known_nnz_coordinate_allocation_rewrite_is_deterministic_and_owned() -> None:
+    original: List[llir.Stmt] = [
+        llir.VarInit(
+            var=llir.Var("Result0_crd_torch", llir.DataType.TORCH_TENSOR),
+            value=llir.FunctionCall(
+                "torch::empty",
+                (
+                    llir.Array(
+                        (llir.Var("_known_nnz", llir.DataType.INT64),),
+                        llir.DataType.INT64,
+                    ),
+                    llir.QualifiedName(
+                        "torch",
+                        "kInt",
+                        llir.DataType.TORCH_SCALAR_TYPE,
+                    ),
+                ),
+            ),
+        ),
+        llir.VarInit(
+            var=llir.Var("Result0_crd", llir.DataType.PTR_INT),
+            value=llir.MemberCall(
+                base=llir.Var(
+                    "Result0_crd_torch",
+                    llir.DataType.TORCH_TENSOR,
+                ),
+                member="data_ptr",
+                template_args=(llir.DataType.INT,),
+            ),
+        ),
+    ]
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(List[llir.Stmt], rewriter.rewrite(original))
+    second = cast(List[llir.Stmt], rewriter.rewrite(first))
+
+    assert _record(original) == [
+        "VarInit",
+        "Var:Result0_crd_torch",
+        "FunctionCall",
+        "Array",
+        "Var:_known_nnz",
+        "QualifiedName:torch::kInt",
+        "VarInit",
+        "Var:Result0_crd",
+        "MemberCall",
+        "Var:Result0_crd_torch",
+    ]
+    assert _record(first) == _record(original)
+    assert _record(second) == _record(original)
+    assert _structural_snapshot(original) == _structural_snapshot(first)
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    for original_statement, first_statement, second_statement in zip(
+        original,
+        first,
+        second,
+    ):
+        assert original_statement == first_statement == second_statement
+        assert (
+            hash(original_statement) == hash(first_statement) == hash(second_statement)
+        )
+
+    original_owner = cast(llir.VarInit, original[0])
+    first_owner = cast(llir.VarInit, first[0])
+    second_owner = cast(llir.VarInit, second[0])
+    original_extent = cast(
+        llir.Array,
+        cast(llir.FunctionCall, original_owner.value).args[0],
+    )
+    first_extent = cast(
+        llir.Array,
+        cast(llir.FunctionCall, first_owner.value).args[0],
+    )
+    second_extent = cast(
+        llir.Array,
+        cast(llir.FunctionCall, second_owner.value).args[0],
+    )
+    original_pointer = cast(llir.VarInit, original[1])
+    first_pointer = cast(llir.VarInit, first[1])
+    second_pointer = cast(llir.VarInit, second[1])
+    original_receiver = cast(
+        llir.Var, cast(llir.MemberCall, original_pointer.value).base
+    )
+    first_receiver = cast(llir.Var, cast(llir.MemberCall, first_pointer.value).base)
+    second_receiver = cast(llir.Var, cast(llir.MemberCall, second_pointer.value).base)
+
+    cast(llir.Var, first_extent.values[0]).name = "owned_extent"
+    first_receiver.name = "owned_receiver"
+    assert cast(llir.Var, original_extent.values[0]).name == "_known_nnz"
+    assert cast(llir.Var, second_extent.values[0]).name == "_known_nnz"
+    assert original_receiver.name == "Result0_crd_torch"
+    assert second_receiver.name == "Result0_crd_torch"
+
+    class ReplaceCoordinateVars(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            rewritten.name = {
+                "Result0_crd_torch": "Replacement0_crd_torch",
+                "Result0_crd": "Replacement0_crd",
+                "_known_nnz": "replacement_nnz",
+            }.get(node.name, node.name)
+            return rewritten
+
+    replacement = cast(
+        List[llir.Stmt],
+        ReplaceCoordinateVars(_CONTEXT).rewrite(original),
+    )
+    replacement_owner = cast(llir.VarInit, replacement[0])
+    replacement_extent = cast(
+        llir.Array,
+        cast(llir.FunctionCall, replacement_owner.value).args[0],
+    )
+    replacement_pointer = cast(llir.VarInit, replacement[1])
+    replacement_receiver = cast(
+        llir.Var,
+        cast(llir.MemberCall, replacement_pointer.value).base,
+    )
+    assert replacement_owner.var.name == "Replacement0_crd_torch"
+    assert cast(llir.Var, replacement_extent.values[0]).name == "replacement_nnz"
+    assert replacement_pointer.var.name == "Replacement0_crd"
+    assert replacement_receiver.name == "Replacement0_crd_torch"
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(replacement))
+
+
 def test_member_call_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
     original = llir.MemberCall(
         base=llir.MemberAccess(
