@@ -13,10 +13,10 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRTraversalContext,
     LLIRWalker,
 )
-from scorch.compiler.loop_plan import ScheduledCIN
 from scorch.compiler.scheduler import (
     RelayoutSpec,
     Schedule,
+    ScheduledCIN,
     Scheduler,
     TileSpec,
     schedule_force,
