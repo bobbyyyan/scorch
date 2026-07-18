@@ -10,11 +10,11 @@ sum statements.  The returned ``applied`` bit tells the ABI builder that this
 pass now owns output allocation, final assembly, and return emission.
 
 This pass intentionally preserves the remaining legacy spelling contracts.
-It filters result/workspace statements by generated variable names, rewrites a
-hoisted workspace's ``.insert`` spelling, and structurally discovers compressed
-position bounds for the existing SpGEMM flop estimate. Raw statements retain
-their explicit compatibility escape hatch; other expression strings are not
-parsed to recover position semantics.
+It filters result/workspace statements by generated variable names, exactly
+matches a hoisted workspace's ``FunctionCallStmt`` ``.insert`` name, and
+structurally discovers compressed position bounds for the existing SpGEMM flop
+estimate. Raw statements retain their explicit compatibility escape hatch;
+other expression strings are not parsed to recover position semantics.
 
 The selected serial loop is replaced rather than rebuilt in place.  Matching
 legacy behavior, only its init/condition/update survive; its tag, optional
@@ -336,50 +336,31 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
 
     def __init__(self, context: CompressedWhereOpenMPContext) -> None:
         super().__init__(context.traversal)
+        self._context = context
         self._old = f"{context.workspace_name}.insert"
         self._new = f"{context.workspace_name}.insert_unchecked"
         self._identity = LLIRRewriter(context.traversal)
 
-    def _rewrite_legacy_expr(self, expression: llir.Expr) -> llir.Expr:
-        rewritten = self._identity.rewrite(expression)
-        if isinstance(rewritten, llir.Var):
-            if self._old in rewritten.name:
-                rewritten.name = rewritten.name.replace(self._old, self._new)
-            return rewritten
-        if type(rewritten) in (llir.BinOp, llir.Add, llir.Mul):
-            binary = cast(llir.BinOp, rewritten)
-            return llir.rebuild_binary_expression(
-                binary,
-                self._rewrite_legacy_expr(binary.left),
-                self._rewrite_legacy_expr(binary.right),
-            )
-        if type(rewritten) is llir.ArrayAccess:
-            access = cast(llir.ArrayAccess, rewritten)
-            return llir.ArrayAccess(
-                array=self._rewrite_legacy_expr(access.array),
-                index=self._rewrite_legacy_expr(access.index),
-                tensor_access=access.tensor_access,
-            )
-        return rewritten
-
-    def _rewrite_for_loop(self, node: llir.ForLoop) -> llir.ForLoop:
+    def _rewrite_for_loop(self, node: llir.ForLoop, path: LLIRPath) -> llir.ForLoop:
         rewritten = cast(llir.ForLoop, self._identity.rewrite(node))
         rewritten.body = cast(
             List[llir.Stmt],
             self.rewrite_statement_sequence(
-                cast(LLIRStatementSequence, node.body), ("workspace", "body")
+                cast(LLIRStatementSequence, node.body), path + ("body",)
             ),
         )
         return rewritten
 
-    def _rewrite_if_then_else(self, node: llir.IfThenElse) -> llir.IfThenElse:
+    def _rewrite_if_then_else(
+        self, node: llir.IfThenElse, path: LLIRPath
+    ) -> llir.IfThenElse:
         rewritten = cast(llir.IfThenElse, self._identity.rewrite(node))
         if node.then_body is not None:
             rewritten.then_body = cast(
                 List[llir.Stmt],
                 self.rewrite_statement_sequence(
                     cast(LLIRStatementSequence, node.then_body),
-                    ("workspace", "then_body"),
+                    path + ("then_body",),
                 ),
             )
         if node.else_body is not None:
@@ -387,7 +368,7 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
                 List[llir.Stmt],
                 self.rewrite_statement_sequence(
                     cast(LLIRStatementSequence, node.else_body),
-                    ("workspace", "else_body"),
+                    path + ("else_body",),
                 ),
             )
         if node.then_body_list is not None:
@@ -396,51 +377,45 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
                     List[llir.Stmt],
                     self.rewrite_statement_sequence(
                         cast(LLIRStatementSequence, body),
-                        ("workspace", f"then_body_list[{index}]"),
+                        path + ("then_body_list", f"[{index}]"),
                     ),
                 )
                 for index, body in enumerate(node.then_body_list)
             ]
         return rewritten
 
-    def _rewrite_legacy_statement(self, node: llir.Stmt) -> llir.Stmt:
-        if type(node) is llir.Assign:
-            assign = cast(llir.Assign, node)
-            rewritten_assign = cast(llir.Assign, self._identity.rewrite(assign))
-            rewritten_target = self._rewrite_legacy_expr(assign.var)
-            llir._validate_assignment_target(rewritten_target)
-            rewritten_assign.var = cast(llir.AssignmentTarget, rewritten_target)
-            rewritten_assign.value = self._rewrite_legacy_expr(assign.value)
-            return rewritten_assign
-        if type(node) is llir.VarInit:
-            var_init = cast(llir.VarInit, node)
-            rewritten_init = cast(llir.VarInit, self._identity.rewrite(var_init))
-            rewritten_init.value = self._rewrite_legacy_expr(var_init.value)
-            return rewritten_init
+    def _rewrite_legacy_statement(self, node: llir.Stmt, path: LLIRPath) -> llir.Stmt:
         if type(node) is llir.FunctionCallStmt:
             call = cast(llir.FunctionCallStmt, node)
+            if type(call.name) is not str or not call.name.strip():
+                _raise_compressed_where_error(
+                    self._context,
+                    code="invalid_workspace_insert_call_name",
+                    message=(
+                        "a consumed workspace insert FunctionCallStmt name must "
+                        "be a non-empty exact string"
+                    ),
+                    path=path + ("name",),
+                    value=call.name,
+                )
             rewritten_call = cast(llir.FunctionCallStmt, self._identity.rewrite(call))
-            rewritten_call.name = call.name.replace(self._old, self._new)
-            rewritten_call.args = [self._rewrite_legacy_expr(arg) for arg in call.args]
+            if call.name == self._old:
+                rewritten_call.name = self._new
             return rewritten_call
         if type(node) is llir.ForLoop:
-            return self._rewrite_for_loop(cast(llir.ForLoop, node))
+            return self._rewrite_for_loop(cast(llir.ForLoop, node), path)
         if type(node) is llir.IfThenElse:
-            return self._rewrite_if_then_else(cast(llir.IfThenElse, node))
-        if type(node) is llir.RawStmt:
-            raw = cast(llir.RawStmt, node)
-            rewritten_raw = cast(llir.RawStmt, self._identity.rewrite(raw))
-            rewritten_raw.code = raw.code.replace(self._old, self._new)
-            return rewritten_raw
+            return self._rewrite_if_then_else(cast(llir.IfThenElse, node), path)
         return cast(llir.Stmt, self._identity.rewrite(node))
 
     def rewrite_statement_sequence(
         self, statements: LLIRStatementSequence, path: LLIRPath
     ) -> LLIRStatementSequence:
         rewritten: List[LLIRStatementValue] = []
-        for statement in statements:
+        for index, statement in enumerate(statements):
+            item_path = path + (f"[{index}]",)
             if isinstance(statement, llir.Stmt):
-                rewritten.append(self._rewrite_legacy_statement(statement))
+                rewritten.append(self._rewrite_legacy_statement(statement, item_path))
             else:
                 # The legacy helper did not descend through arbitrary nested
                 # containers.  Detach them without broadening rewrite scope.
