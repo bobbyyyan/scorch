@@ -110,6 +110,15 @@ def _access(
     )
 
 
+def _fixed_stack_array_decl() -> llir.FixedStackArrayDecl:
+    return llir.FixedStackArrayDecl(
+        name="wksp",
+        element_type=llir.DataType.FLOAT32,
+        extent=_var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        initializer=llir.Array([], llir.DataType.FLOAT32),
+    )
+
+
 def _result_metadata() -> llir.TensorAccessMetadata:
     return llir.TensorAccessMetadata(
         access_id=AccessId(43),
@@ -407,6 +416,66 @@ def test_production_pipeline_runs_ordinary_passes_in_exact_order() -> None:
     assert [record.sequence_index for record in result.run_records] == list(range(5))
     assert result.compressed_output_parallel is False
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(result.artifact.value))
+
+
+def test_fixed_stack_array_survives_repeated_production_pipeline_detached() -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    source_decl = _fixed_stack_array_decl()
+    source: List[llir.Stmt] = [source_decl]
+    source_snapshot = _structural_snapshot(source)
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact(artifact.statements)
+
+    once = manager.run_production_pipeline(
+        LLIRStatementListArtifact(source),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+    twice = manager.run_production_pipeline(
+        LLIRStatementListArtifact(once.artifact.value),
+        compressed_where_pass_spec=None,
+        dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+        body_assembler=assemble_body,
+    )
+
+    assert _structural_snapshot(source) == source_snapshot
+    assert _structural_snapshot(once.artifact.value) == source_snapshot
+    assert _structural_snapshot(twice.artifact.value) == source_snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once.artifact.value))
+    assert _mutable_ir_ids(once.artifact.value).isdisjoint(
+        _mutable_ir_ids(twice.artifact.value)
+    )
+    expected_passes = [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    for result in (once, twice):
+        assert [record.pass_name for record in result.run_records] == expected_passes
+        assert [record.sequence_index for record in result.run_records] == list(
+            range(5)
+        )
+        assert all(record.duration_ns is not None for record in result.run_records)
+
+    once_decl = cast(llir.FixedStackArrayDecl, once.artifact.value[0])
+    twice_decl = cast(llir.FixedStackArrayDecl, twice.artifact.value[0])
+    assert type(once_decl) is llir.FixedStackArrayDecl
+    assert type(twice_decl) is llir.FixedStackArrayDecl
+    assert once_decl == source_decl == twice_decl
+    assert hash(once_decl) == hash(source_decl) == hash(twice_decl)
+    assert once_decl.extent is not source_decl.extent
+    assert once_decl.initializer is not source_decl.initializer
+    assert twice_decl.extent is not once_decl.extent
+    assert twice_decl.initializer is not once_decl.initializer
 
 
 def test_workspace_pair_reads_survive_repeated_production_pipeline_noops() -> None:
@@ -1013,6 +1082,67 @@ def test_malformed_member_call_after_assembly_preserves_exact_pass_prefix() -> N
         2,
         3,
     ]
+    assert _structural_snapshot(source) == source_snapshot
+
+
+def test_malformed_fixed_stack_array_after_assembly_preserves_pass_prefix() -> None:
+    source = [llir.BlankLine()]
+    source_snapshot = _structural_snapshot(source)
+    malformed = object.__new__(llir.FixedStackArrayDecl)
+    object.__setattr__(malformed, "name", "wksp")
+    object.__setattr__(malformed, "element_type", llir.DataType.FLOAT32)
+    object.__setattr__(malformed, "extent", _var("runtime_extent", llir.DataType.INT))
+    object.__setattr__(
+        malformed,
+        "initializer",
+        llir.Array([], llir.DataType.FLOAT32),
+    )
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        assert compressed_output_parallel is False
+        return LLIRRewriteArtifact([*artifact.statements, malformed])
+
+    manager = LLIRPassManager.from_compile_options(_compile_options())
+    with pytest.raises(LLIRPassPartialFailure) as raised:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact(source),
+            compressed_where_pass_spec=None,
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=assemble_body,
+        )
+
+    assert type(raised.value.failure) is LLIRTraversalError
+    failure = cast(LLIRTraversalError, raised.value.failure)
+    assert failure.diagnostic.code == "invalid_fixed_stack_array_extent"
+    assert failure.diagnostic.path == ("root", "[1]", "extent")
+    assert failure.diagnostic.stage == "LLIR rewrite"
+    assert failure.diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert [record.pass_name for record in raised.value.completed_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert [
+        record.configuration_name for record in raised.value.completed_run_records
+    ] == [
+        "sparse_prefetch",
+        "dense_pointer_hoist",
+        "single_iteration_loop_elimination",
+        "loop_invariant_factor_hoist",
+    ]
+    assert [record.sequence_index for record in raised.value.completed_run_records] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert all(
+        record.duration_ns is not None for record in raised.value.completed_run_records
+    )
     assert _structural_snapshot(source) == source_snapshot
 
 

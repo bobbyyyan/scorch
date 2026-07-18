@@ -785,6 +785,306 @@ def test_array_codegen_is_byte_exact_for_empty_nested_and_expression_values() ->
     assert LLIRLowerer().lower_llir(nested) == "consume({{row}, column + 1})"
 
 
+def test_fixed_stack_array_decl_is_frozen_typed_owned_and_structural() -> None:
+    extent = llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT)
+    caller_values: list[llir.Expr] = []
+    initializer = llir.Array(caller_values, llir.DataType.FLOAT32)
+    declaration = llir.FixedStackArrayDecl(
+        name="wksp",
+        element_type=llir.DataType.FLOAT32,
+        extent=extent,
+        initializer=initializer,
+    )
+    equal = llir.FixedStackArrayDecl(
+        name="wksp",
+        element_type=llir.DataType.FLOAT32,
+        extent=llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        initializer=llir.Array((), llir.DataType.FLOAT32),
+    )
+    caller_values.append(llir.Literal(0.0))
+
+    assert declaration.name == "wksp"
+    assert declaration.element_type is llir.DataType.FLOAT32
+    assert declaration.extent is extent
+    assert declaration.initializer is initializer
+    assert declaration.initializer.values == ()
+    assert type(declaration.extent) is llir.Var
+    assert type(declaration.initializer) is llir.Array
+    assert declaration == equal
+    assert hash(declaration) == hash(equal)
+    assert declaration != llir.FixedStackArrayDecl(
+        "other",
+        llir.DataType.FLOAT32,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), llir.DataType.FLOAT32),
+    )
+    assert declaration != llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT64,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), llir.DataType.FLOAT64),
+    )
+    assert get_type_hints(llir.FixedStackArrayDecl) == {
+        "name": str,
+        "element_type": llir.DataType,
+        "extent": llir.Expr,
+        "initializer": llir.Array,
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        declaration.name = "other"
+    with pytest.raises(FrozenInstanceError):
+        declaration.element_type = llir.DataType.FLOAT64
+    with pytest.raises(FrozenInstanceError):
+        declaration.extent = llir.Literal(8)
+    with pytest.raises(FrozenInstanceError):
+        declaration.initializer = llir.Array((), llir.DataType.FLOAT32)
+
+
+@pytest.mark.parametrize(
+    ("element_type", "expected"),
+    (
+        (llir.DataType.FLOAT32, "float wksp[kTile_k] = {};"),
+        (llir.DataType.FLOAT64, "double wksp[kTile_k] = {};"),
+        (llir.DataType.INT32, "int32_t wksp[kTile_k] = {};"),
+        (llir.DataType.INT64, "int64_t wksp[kTile_k] = {};"),
+        (llir.DataType.INT8, "int8_t wksp[kTile_k] = {};"),
+        (llir.DataType.UINT8, "uint8_t wksp[kTile_k] = {};"),
+    ),
+)
+def test_fixed_stack_array_decl_codegen_is_byte_exact_for_supported_scalars(
+    element_type: llir.DataType,
+    expected: str,
+) -> None:
+    declaration = llir.FixedStackArrayDecl(
+        "wksp",
+        element_type,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), element_type),
+    )
+
+    assert LLIRLowerer().lower_llir(declaration) == expected
+    assert LLIRLowerer().lower_llir(declaration, indent_level=2) == f"    {expected}"
+
+
+@pytest.mark.parametrize(
+    "extent_type",
+    (
+        llir.DataType.INT,
+        llir.DataType.INT32,
+        llir.DataType.INT64,
+        llir.DataType.UINT32,
+        llir.DataType.UINT64,
+    ),
+)
+def test_fixed_stack_array_literal_extent_codegen_is_structured_and_byte_exact(
+    extent_type: llir.DataType,
+) -> None:
+    declaration = llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        llir.Literal(8, extent_type),
+        llir.Array((), llir.DataType.FLOAT32),
+    )
+
+    assert type(declaration.extent) is llir.Literal
+    assert LLIRLowerer().lower_llir(declaration) == "float wksp[8] = {};"
+
+
+@pytest.mark.parametrize("name", ("", "workspace[8]", "two words", 1, None))
+def test_fixed_stack_array_decl_rejects_malformed_names(name: object) -> None:
+    with pytest.raises(TypeError, match="FixedStackArrayDecl.name"):
+        llir.FixedStackArrayDecl(
+            cast(str, name),
+            llir.DataType.FLOAT32,
+            llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+            llir.Array((), llir.DataType.FLOAT32),
+        )
+
+
+@pytest.mark.parametrize(
+    "element_type",
+    (llir.DataType.AUTO, llir.DataType.UINT32, llir.DataType.PTR_FLOAT32, "float"),
+)
+def test_fixed_stack_array_decl_rejects_unsupported_element_types(
+    element_type: object,
+) -> None:
+    with pytest.raises(TypeError, match="supported scalar DataType"):
+        llir.FixedStackArrayDecl(
+            "wksp",
+            cast(llir.DataType, element_type),
+            llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+            llir.Array((), llir.DataType.FLOAT32),
+        )
+
+
+@pytest.mark.parametrize(
+    "extent",
+    (
+        llir.Var("runtime", llir.DataType.INT),
+        llir.Var("kTile + 1", llir.DataType.CONSTEXPR_INT),
+        llir.Var("pointer", llir.DataType.CONSTEXPR_INT, is_ptr=True),
+        llir.Var("restricted", llir.DataType.CONSTEXPR_INT, is_restrict=True),
+        llir.Var(
+            "annotated",
+            llir.DataType.CONSTEXPR_INT,
+            tensor_access=_result_metadata(),
+        ),
+        llir.Literal(0),
+        llir.Literal(-1),
+        llir.Literal(True),
+        llir.Literal(1.5),
+        llir.Literal(8, llir.DataType.UINT16),
+        llir.Add(llir.Literal(4), llir.Literal(4)),
+    ),
+)
+def test_fixed_stack_array_decl_rejects_nonfixed_extents(extent: llir.Expr) -> None:
+    with pytest.raises(TypeError, match="exact metadata-free constexpr Var"):
+        llir.FixedStackArrayDecl(
+            "wksp",
+            llir.DataType.FLOAT32,
+            extent,
+            llir.Array((), llir.DataType.FLOAT32),
+        )
+
+
+def test_fixed_stack_array_decl_rejects_nonexact_extent_subclasses() -> None:
+    class UnknownVar(llir.Var):
+        pass
+
+    class UnknownLiteral(llir.Literal):
+        pass
+
+    for extent in (
+        UnknownVar("kTile_k", llir.DataType.CONSTEXPR_INT),
+        UnknownLiteral(8),
+    ):
+        with pytest.raises(TypeError, match="exact metadata-free constexpr Var"):
+            llir.FixedStackArrayDecl(
+                "wksp",
+                llir.DataType.FLOAT32,
+                extent,
+                llir.Array((), llir.DataType.FLOAT32),
+            )
+
+
+def test_fixed_stack_array_decl_requires_exact_empty_matching_initializer() -> None:
+    class UnknownArray(llir.Array):
+        pass
+
+    extent = llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT)
+    with pytest.raises(TypeError, match="initializer must be an exact Array"):
+        llir.FixedStackArrayDecl(
+            "wksp",
+            llir.DataType.FLOAT32,
+            extent,
+            cast(llir.Array, "{}"),
+        )
+    with pytest.raises(TypeError, match="initializer must be an exact Array"):
+        llir.FixedStackArrayDecl(
+            "wksp",
+            llir.DataType.FLOAT32,
+            extent,
+            UnknownArray((), llir.DataType.FLOAT32),
+        )
+    with pytest.raises(TypeError, match="initializer must be empty"):
+        llir.FixedStackArrayDecl(
+            "wksp",
+            llir.DataType.FLOAT32,
+            extent,
+            llir.Array((llir.Literal(0.0),), llir.DataType.FLOAT32),
+        )
+    with pytest.raises(TypeError, match="type must match element_type"):
+        llir.FixedStackArrayDecl(
+            "wksp",
+            llir.DataType.FLOAT32,
+            extent,
+            llir.Array((), llir.DataType.FLOAT64),
+        )
+
+
+@pytest.mark.parametrize(
+    ("malformation", "expected"),
+    (
+        ("name", "FixedStackArrayDecl.name"),
+        ("element_type", "supported scalar DataType"),
+        ("extent", "FixedStackArrayDecl.extent"),
+        ("initializer", "initializer must be an exact Array"),
+        ("initializer_values_container", "initializer values must be a tuple"),
+        ("initializer_values", "initializer must be empty"),
+        ("initializer_type", "initializer type must match element_type"),
+    ),
+)
+def test_codegen_rejects_forged_fixed_stack_array_fields(
+    malformation: str,
+    expected: str,
+) -> None:
+    declaration = llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), llir.DataType.FLOAT32),
+    )
+    if malformation == "name":
+        object.__setattr__(declaration, "name", "wksp[8]")
+    elif malformation == "element_type":
+        object.__setattr__(declaration, "element_type", llir.DataType.AUTO)
+    elif malformation == "extent":
+        object.__setattr__(declaration, "extent", _var("runtime"))
+    elif malformation == "initializer":
+        object.__setattr__(declaration, "initializer", "{}")
+    elif malformation == "initializer_values_container":
+        initializer = object.__new__(llir.Array)
+        object.__setattr__(initializer, "values", [])
+        object.__setattr__(initializer, "data_type", llir.DataType.FLOAT32)
+        object.__setattr__(declaration, "initializer", initializer)
+    elif malformation == "initializer_values":
+        object.__setattr__(
+            declaration,
+            "initializer",
+            llir.Array((llir.Literal(0.0),), llir.DataType.FLOAT32),
+        )
+    else:
+        object.__setattr__(
+            declaration,
+            "initializer",
+            llir.Array((), llir.DataType.FLOAT64),
+        )
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(declaration)
+
+
+def test_codegen_rejects_fixed_stack_array_subclasses_and_unknown_children() -> None:
+    class UnknownFixedStackArrayDecl(llir.FixedStackArrayDecl):
+        pass
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    extent = llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT)
+    initializer = llir.Array((), llir.DataType.FLOAT32)
+    with pytest.raises(CodegenError, match="UnknownFixedStackArrayDecl"):
+        LLIRLowerer().lower_llir(
+            UnknownFixedStackArrayDecl(
+                "wksp",
+                llir.DataType.FLOAT32,
+                extent,
+                initializer,
+            )
+        )
+
+    forged = llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        extent,
+        initializer,
+    )
+    object.__setattr__(forged, "extent", UnknownExpr())
+    with pytest.raises(CodegenError, match="FixedStackArrayDecl.extent"):
+        LLIRLowerer().lower_llir(forged)
+
+
 @pytest.mark.parametrize(
     "expression",
     (

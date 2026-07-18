@@ -123,6 +123,12 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
         llir.Return: llir.Return(value),
         llir.VarDecl: llir.VarDecl(value),
         llir.VarInit: llir.VarInit(value, literal),
+        llir.FixedStackArrayDecl: llir.FixedStackArrayDecl(
+            "workspace",
+            llir.DataType.FLOAT32,
+            llir.Var("kTile", llir.DataType.CONSTEXPR_INT),
+            llir.Array((), llir.DataType.FLOAT32),
+        ),
         llir.Assign: llir.Assign(value, literal),
         llir.Allocate: llir.Allocate(value, literal),
         llir.Free: llir.Free(value),
@@ -369,6 +375,42 @@ def test_array_walker_has_deterministic_nested_preorder() -> None:
     ]
     assert _record(expression) == expected
     assert _record(expression) == expected
+
+
+def test_fixed_stack_array_walker_has_deterministic_preorder() -> None:
+    declaration = llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), llir.DataType.FLOAT32),
+    )
+
+    expected = ["FixedStackArrayDecl", "Var:kTile_k", "Array"]
+    assert _record(declaration) == expected
+    assert _record(declaration) == expected
+
+
+def test_fixed_stack_array_rewriter_visits_extent_before_initializer() -> None:
+    events: List[str] = []
+
+    class RecordingRewriter(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            events.append("extent")
+            return super().rewrite_var(node, path)
+
+        def rewrite_array(self, node: llir.Array, path: LLIRPath) -> llir.Array:
+            events.append("initializer")
+            return super().rewrite_array(node, path)
+
+    declaration = llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), llir.DataType.FLOAT32),
+    )
+
+    RecordingRewriter(_CONTEXT).rewrite(declaration)
+    assert events == ["extent", "initializer"]
 
 
 def test_panel_bound_cast_walker_has_deterministic_preorder() -> None:
@@ -719,6 +761,160 @@ def test_unknown_array_subclass_fails_closed(operation: str) -> None:
     assert raised.value.diagnostic.node_type == "UnknownArray"
     assert raised.value.diagnostic.code == "unknown_llir_node"
     assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_fixed_stack_array_decl_subclass_fails_closed(
+    operation: str,
+) -> None:
+    class UnknownFixedStackArrayDecl(llir.FixedStackArrayDecl):
+        pass
+
+    unknown = UnknownFixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), llir.DataType.FLOAT32),
+    )
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownFixedStackArrayDecl"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        (
+            "name",
+            "invalid_fixed_stack_array_name",
+            ("root", "name"),
+        ),
+        (
+            "element_type",
+            "invalid_fixed_stack_array_element_type",
+            ("root", "element_type"),
+        ),
+        (
+            "extent",
+            "invalid_fixed_stack_array_extent",
+            ("root", "extent"),
+        ),
+        (
+            "initializer",
+            "invalid_fixed_stack_array_initializer",
+            ("root", "initializer"),
+        ),
+        (
+            "initializer_values_container",
+            "invalid_fixed_stack_array_initializer",
+            ("root", "initializer", "values"),
+        ),
+        (
+            "initializer_values",
+            "invalid_fixed_stack_array_initializer",
+            ("root", "initializer", "values"),
+        ),
+        (
+            "initializer_type",
+            "invalid_fixed_stack_array_initializer_type",
+            ("root", "initializer", "data_type"),
+        ),
+    ),
+)
+def test_forged_fixed_stack_array_fields_fail_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    declaration = llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), llir.DataType.FLOAT32),
+    )
+    if malformation == "name":
+        object.__setattr__(declaration, "name", "wksp[8]")
+    elif malformation == "element_type":
+        object.__setattr__(declaration, "element_type", llir.DataType.AUTO)
+    elif malformation == "extent":
+        object.__setattr__(declaration, "extent", _var("runtime"))
+    elif malformation == "initializer":
+        object.__setattr__(declaration, "initializer", "{}")
+    elif malformation == "initializer_values_container":
+        initializer = object.__new__(llir.Array)
+        object.__setattr__(initializer, "values", [])
+        object.__setattr__(initializer, "data_type", llir.DataType.FLOAT32)
+        object.__setattr__(declaration, "initializer", initializer)
+    elif malformation == "initializer_values":
+        object.__setattr__(
+            declaration,
+            "initializer",
+            llir.Array((llir.Literal(0.0),), llir.DataType.FLOAT32),
+        )
+    else:
+        object.__setattr__(
+            declaration,
+            "initializer",
+            llir.Array((), llir.DataType.FLOAT64),
+        )
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(declaration)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(declaration)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize("child_kind", ["extent", "initializer"])
+def test_fixed_stack_array_unknown_children_fail_at_exact_path(
+    operation: str,
+    child_kind: str,
+) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    class UnknownArray(llir.Array):
+        pass
+
+    declaration = llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        llir.Array((), llir.DataType.FLOAT32),
+    )
+    if child_kind == "extent":
+        object.__setattr__(declaration, "extent", UnknownExpr())
+        diagnostic_code = "invalid_fixed_stack_array_extent"
+        expected_path = ("root", "extent")
+    else:
+        object.__setattr__(
+            declaration,
+            "initializer",
+            UnknownArray((), llir.DataType.FLOAT32),
+        )
+        diagnostic_code = "invalid_fixed_stack_array_initializer"
+        expected_path = ("root", "initializer")
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(declaration)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(declaration)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -1509,6 +1705,62 @@ def test_identity_rewriter_is_detached_and_structurally_idempotent() -> None:
     original_body = cast(List[LLIRStatementValue], original_nested[1])
     original_loop = cast(llir.ForLoop, original_body[1])
     assert len(original_loop.body) == 1
+
+
+def test_fixed_stack_array_rewrite_is_detached_repeatable_and_replacement_owned() -> (
+    None
+):
+    original_extent = llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT)
+    original_initializer = llir.Array((), llir.DataType.FLOAT32)
+    original = llir.FixedStackArrayDecl(
+        "wksp",
+        llir.DataType.FLOAT32,
+        original_extent,
+        original_initializer,
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.FixedStackArrayDecl, rewriter.rewrite(original))
+    second = cast(llir.FixedStackArrayDecl, rewriter.rewrite(first))
+
+    assert _record(original) == _record(first) == _record(second)
+    assert original == first == second
+    assert hash(original) == hash(first) == hash(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    assert type(first.extent) is llir.Var
+    assert type(second.extent) is llir.Var
+    assert type(first.initializer) is llir.Array
+    assert type(second.initializer) is llir.Array
+    assert first.extent is not original_extent
+    assert second.extent is not first.extent
+    assert first.initializer is not original_initializer
+    assert second.initializer is not first.initializer
+    assert first.initializer.values == second.initializer.values == ()
+
+    class ReplaceExtent(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "kTile_k":
+                rewritten.name = "replacement_extent"
+            return rewritten
+
+    replacement = cast(
+        llir.FixedStackArrayDecl,
+        ReplaceExtent(_CONTEXT).rewrite(original),
+    )
+    replacement_extent = cast(llir.Var, replacement.extent)
+    first_extent = cast(llir.Var, first.extent)
+
+    assert replacement is not original
+    assert replacement_extent is not original_extent
+    assert replacement.initializer is not original_initializer
+    assert replacement_extent.name == "replacement_extent"
+    assert replacement_extent.type is llir.DataType.CONSTEXPR_INT
+    assert original_extent.name == "kTile_k"
+    replacement_extent.name = "owned_replacement"
+    assert original_extent.name == "kTile_k"
+    assert first_extent.name == "kTile_k"
 
 
 def test_arithmetic_rewrite_is_detached_repeatable_and_replacement_owned() -> None:

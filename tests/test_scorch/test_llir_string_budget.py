@@ -117,7 +117,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 190,
+        "cin_lowerer.py": 189,
         "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -130,7 +130,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 2,
     }
-    assert sum(constructor_counts.values()) == 379
+    assert sum(constructor_counts.values()) == 378
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 180,
@@ -161,15 +161,65 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 11
 
     assert totals == {
-        "subscript": 11,
+        "subscript": 10,
         "ternary": 1,
     }
-    assert sum(totals.values()) == 12
+    assert sum(totals.values()) == 11
     assert per_file == {
-        ("cin_lowerer.py", "subscript"): 9,
+        ("cin_lowerer.py", "subscript"): 8,
         ("cin_lowerer.py", "ternary"): 1,
         ("iterator.py", "subscript"): 2,
     }
+
+
+def test_fixed_stack_array_declaration_producer_budget_is_explicit() -> None:
+    constructor_counts = Counter(
+        {
+            path.name: len(_llir_constructor_calls(path, "FixedStackArrayDecl"))
+            for path in sorted(_COMPILER_ROOT.glob("*.py"))
+        }
+    )
+    constructor_counts += Counter()
+
+    assert constructor_counts == {
+        "cin_lowerer.py": 1,
+        "llir_traversal.py": 1,
+    }
+    assert sum(constructor_counts.values()) == 2
+    assert (
+        sum(constructor_counts.values()) - constructor_counts["llir_traversal.py"] == 1
+    )
+
+    producers = _llir_constructor_calls(
+        _COMPILER_ROOT / "cin_lowerer.py", "FixedStackArrayDecl"
+    )
+    assert len(producers) == 1
+    fields = {
+        keyword.arg: keyword.value
+        for keyword in producers[0].keywords
+        if keyword.arg is not None
+    }
+    assert set(fields) == {"name", "element_type", "extent", "initializer"}
+    assert ast.unparse(fields["name"]) == "wksp.get_name()"
+    assert ast.unparse(fields["element_type"]) == "wksp_ctype"
+    assert ast.unparse(fields["extent"]) == "wksp.tile_size_var.llir_var"
+    assert _is_llir_constructor(fields["initializer"], "Array")
+    initializer = fields["initializer"]
+    assert isinstance(initializer, ast.Call)
+    initializer_fields = {
+        keyword.arg: keyword.value
+        for keyword in initializer.keywords
+        if keyword.arg is not None
+    }
+    assert ast.unparse(initializer_fields["values"]) == "[]"
+    assert ast.unparse(initializer_fields["data_type"]) == "wksp_ctype"
+
+    source = (_COMPILER_ROOT / "cin_lowerer.py").read_text()
+    lower_where = source.split("def lower_Where", 1)[1].split(
+        "def lower_ProducerIndexStmt", 1
+    )[0]
+    assert 'name=f"{wksp.get_name()}[{wksp.tile_size_var.name}]"' not in lower_where
+    assert lower_where.count("llir.FixedStackArrayDecl(") == 1
 
 
 def test_free_move_calls_cannot_return_to_var_names() -> None:

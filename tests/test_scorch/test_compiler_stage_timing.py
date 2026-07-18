@@ -36,6 +36,7 @@ from scorch.compiler.cin import (  # type: ignore[import-untyped]
     Operation,
     TensorAssign,
     TensorVar,
+    Where,
 )
 from scorch.compiler.cin_analysis import (  # type: ignore[import-untyped]
     canonical_cin_dump,
@@ -2393,6 +2394,140 @@ def test_malformed_assembled_member_call_fails_owner_and_suppresses_later_stages
     ]
     assert later_calls == []
     assert context.compile_options is options
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_malformed_tiled_stack_decl_fails_first_pass_and_suppresses_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = Schedule(
+        loop_order=("i", "k", "j"),
+        tiles=(
+            TileSpec(
+                index_var="j",
+                width=4,
+                placement="child_of:i",
+                accum="stack",
+            ),
+        ),
+        tag="malformed-tiled-stack-declaration",
+    )
+    options = _default_options(requested_schedule=schedule)
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    schedule_identity = (schedule.cache_key, hash(schedule))
+    schedule_snapshot = replace(schedule)
+    specs = _spmm_specs()
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    context = CompilationContext(options)
+    original_lower_where = CINLowerer.lower_Where
+    injected_declarations: list[tuple[str, str, llir.DataType]] = []
+
+    def lower_with_malformed_declaration(
+        self: CINLowerer,
+        statement: Where,
+    ) -> llir.Stmt | list[llir.Stmt]:
+        lowered = original_lower_where(self, statement)
+        declarations: list[llir.FixedStackArrayDecl] = []
+
+        class StackDeclarationCollector(LLIRWalker):
+            def visit_fixed_stack_array_decl(
+                self,
+                node: llir.FixedStackArrayDecl,
+                path: tuple[str, ...],
+            ) -> None:
+                if node.name == "wksp":
+                    declarations.append(node)
+                super().visit_fixed_stack_array_decl(node, path)
+
+        StackDeclarationCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="find_tiled_stack_declaration",
+            )
+        ).walk(lowered)
+        for declaration in declarations:
+            extent = cast(llir.Var, declaration.extent)
+            injected_declarations.append((declaration.name, extent.name, extent.type))
+            object.__setattr__(
+                declaration,
+                "extent",
+                llir.Var("runtime_extent", llir.DataType.INT),
+            )
+        return lowered
+
+    monkeypatch.setattr(
+        CINLowerer,
+        "lower_Where",
+        lower_with_malformed_declaration,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (ResultTensorAssembler, "emit_final_assembly", "result_abi"),
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *specs,
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert injected_declarations == [
+        ("wksp", "kTile_j", llir.DataType.CONSTEXPR_INT),
+    ]
+    assert diagnostic.code == "invalid_fixed_stack_array_extent"
+    assert diagnostic.path == (
+        "root",
+        "[1]",
+        "body",
+        "[5]",
+        "body",
+        "[1]",
+        "extent",
+    )
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "insert_sparse_prefetch"
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(len(context.stage_run_records))
+    )
+    assert all(record.duration_ns >= 0 for record in context.stage_run_records)
+    assert context.llir_pass_run_records == ()
+    assert later_calls == []
+    assert context.compile_options is options
+    assert options.requested_schedule is schedule
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert schedule == schedule_snapshot
+    assert (schedule.cache_key, hash(schedule)) == schedule_identity
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
     with pytest.raises(CompilationContextError) as suppressed:
         context.begin_stage(
             CompilerStageId.SCHEDULE_LOWERING,

@@ -1,3 +1,4 @@
+import hashlib
 from typing import cast
 
 import torch
@@ -12,6 +13,7 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRTraversalContext,
     LLIRWalker,
 )
+from scorch.compiler.loop_plan import ScheduledCIN
 from scorch.compiler.scheduler import (
     RelayoutSpec,
     Schedule,
@@ -142,6 +144,46 @@ def _lower_free_k_workspace_copy_read() -> (
     return reads[0], tuple(tile_loop_vars)
 
 
+def _lower_free_k_stack_workspace(
+    scheduled: ScheduledCIN,
+) -> tuple[llir.FixedStackArrayDecl, llir.VarInit, str]:
+    lowered = CINLowerer().lower_IndexStmt(scheduled)
+    declarations: list[llir.FixedStackArrayDecl] = []
+    tile_size_initializers: list[llir.VarInit] = []
+
+    class StackWorkspaceCollector(LLIRWalker):
+        def visit_fixed_stack_array_decl(
+            self,
+            node: llir.FixedStackArrayDecl,
+            path: tuple[str, ...],
+        ) -> None:
+            declarations.append(node)
+            super().visit_fixed_stack_array_decl(node, path)
+
+        def visit_var_init(
+            self,
+            node: llir.VarInit,
+            path: tuple[str, ...],
+        ) -> None:
+            if type(node.var) is llir.Var and node.var.name == "kTile_k":
+                tile_size_initializers.append(node)
+            super().visit_var_init(node, path)
+
+    StackWorkspaceCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_free_k_stack_workspace",
+        )
+    ).walk(lowered)
+    assert len(declarations) == 1
+    assert len(tile_size_initializers) == 1
+    return (
+        declarations[0],
+        tile_size_initializers[0],
+        LLIRLowerer().lower_llir(lowered),
+    )
+
+
 def test_tuner_free_k_schedule_emits_row_outer_stack_tile():
     scheduled = Scheduler.apply_schedule(_build_spmm_cin(), _free_k_schedule())
     lowered = CINLowerer().lower_IndexStmt(scheduled)
@@ -163,6 +205,101 @@ def test_tuner_free_k_schedule_emits_row_outer_stack_tile():
     assert "C_values[pC1] += wksp[k_in];" in cpp
     assert "aligned_alloc" not in cpp
     assert "A1_pos[B1_size]" not in cpp
+
+
+def test_tuner_free_k_stack_workspace_is_structured_owned_and_byte_exact() -> None:
+    def ownership_state(cin: ForAll) -> tuple[object, ...]:
+        return (
+            str(cin),
+            tuple(
+                (
+                    id(index_var),
+                    index_var.index_id,
+                    index_var.name,
+                    index_var.is_tiled,
+                    index_var.is_outer,
+                    index_var.is_inner,
+                    index_var.tile_size_var,
+                    index_var._parent,
+                    tuple(index_var._legacy_tensor_accesses),
+                )
+                for index_var in cin.index_vars
+            ),
+            tuple(
+                (
+                    id(access),
+                    access.access_id,
+                    id(access.tensor),
+                    tuple(id(index_var) for index_var in access.indices),
+                    access.index_ids,
+                )
+                for access in cin.tensor_accesses
+            ),
+        )
+
+    statement = _build_spmm_cin()
+    original_state = ownership_state(statement)
+    scheduled = Scheduler.apply_schedule(statement, _free_k_schedule())
+    scheduled_cin = cast(ForAll, scheduled.normalized_cin)
+    scheduled_state = ownership_state(scheduled_cin)
+    scheduled_plan = scheduled.verified_loop_plan
+
+    first, first_tile_size, first_cpp = _lower_free_k_stack_workspace(scheduled)
+    second, second_tile_size, second_cpp = _lower_free_k_stack_workspace(scheduled)
+
+    expected = llir.FixedStackArrayDecl(
+        name="wksp",
+        element_type=llir.DataType.FLOAT32,
+        extent=llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        initializer=llir.Array(values=[], data_type=llir.DataType.FLOAT32),
+    )
+    assert type(first) is llir.FixedStackArrayDecl
+    assert type(second) is llir.FixedStackArrayDecl
+    assert first == second == expected
+    assert hash(first) == hash(second) == hash(expected)
+    assert first is not second
+    assert first.name == "wksp"
+    assert type(first.name) is str
+    assert first.element_type is llir.DataType.FLOAT32
+    assert type(first.extent) is llir.Var
+    assert first.extent.name == "kTile_k"
+    assert first.extent.type is llir.DataType.CONSTEXPR_INT
+    assert first.extent.is_ptr is False
+    assert first.extent.is_restrict is False
+    assert first.extent.tensor_access is None
+    assert type(first.initializer) is llir.Array
+    assert first.initializer.values == ()
+    assert first.initializer.data_type is llir.DataType.FLOAT32
+
+    assert first.extent is not second.extent
+    assert first.initializer is not second.initializer
+    assert (
+        first_tile_size
+        == second_tile_size
+        == llir.VarInit(
+            var=llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+            value=llir.Literal(4),
+        )
+    )
+    assert first.extent == first_tile_size.var
+    assert second.extent == second_tile_size.var
+    assert first.extent is not first_tile_size.var
+    assert second.extent is not second_tile_size.var
+    assert first_tile_size is not second_tile_size
+    assert first_tile_size.var is not second_tile_size.var
+    assert LLIRLowerer().lower_llir(first) == "float wksp[kTile_k] = {};"
+
+    assert first_cpp == second_cpp
+    assert first_cpp.count("float wksp[kTile_k] = {};") == 1
+    assert len(first_cpp) == 3060
+    assert hashlib.sha256(first_cpp.encode()).hexdigest() == (
+        "2b9d28654e33225e1093500fc861e76f0f67cb241c7ab28b43c05b774d9f7222"
+    )
+
+    assert ownership_state(statement) == original_state
+    assert scheduled.normalized_cin is scheduled_cin
+    assert ownership_state(scheduled_cin) == scheduled_state
+    assert scheduled.verified_loop_plan is scheduled_plan
 
 
 def test_tuner_free_k_workspace_copy_read_is_structured_typed_and_owned() -> None:

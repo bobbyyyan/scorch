@@ -176,6 +176,54 @@ def test_structural_function_call_equality_is_explicit_at_deduplication_seam() -
     assert _structural_snapshot(source) == snapshot
 
 
+def test_fixed_stack_array_preserves_coordinate_assignment_deduplication() -> None:
+    declaration = llir.FixedStackArrayDecl(
+        name="wksp",
+        element_type=llir.DataType.FLOAT32,
+        extent=_var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        initializer=llir.Array([], llir.DataType.FLOAT32),
+    )
+    assignments = [
+        llir.Assign(
+            _access("out_crd", "p", llir.DataType.STD_VECTOR_C_INT),
+            llir.FunctionCall("coordinate", [_var("p")]),
+        )
+        for _ in range(2)
+    ]
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_crd", llir.DataType.STD_VECTOR_C_INT)),
+        declaration,
+        *assignments,
+    ]
+    source_snapshot = _structural_snapshot(source)
+
+    once = rewrite_dynamic_vector_accesses(source, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+    twice = rewrite_dynamic_vector_accesses(once, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+
+    assert _structural_snapshot(source) == source_snapshot
+    assert _structural_snapshot(once) == _structural_snapshot(twice)
+    assert [type(statement) for statement in once] == [
+        llir.VarDecl,
+        llir.FixedStackArrayDecl,
+        llir.FunctionCallStmt,
+    ]
+    once_decl = cast(llir.FixedStackArrayDecl, once[1])
+    twice_decl = cast(llir.FixedStackArrayDecl, twice[1])
+    assert once_decl == declaration == twice_decl
+    assert once_decl is not declaration
+    assert once_decl.extent is not declaration.extent
+    assert once_decl.initializer is not declaration.initializer
+    assert twice_decl is not once_decl
+    assert twice_decl.extent is not once_decl.extent
+    assert twice_decl.initializer is not once_decl.initializer
+    assert _cpp(once) == _cpp(twice)
+    assert _cpp(once) == (
+        "std::vector<int> out_crd;\n"
+        "float wksp[kTile_k] = {};\n"
+        "out_crd.emplace_back(coordinate(p));"
+    )
+
+
 def test_phase_state_assignments_are_detached_and_never_deduplicated() -> None:
     state_assignments = [
         llir.Assign(

@@ -1283,6 +1283,35 @@ def test_packed_relayout_generates_hygienic_staging_names():
     assert "(k_pack - k_pack_out) * kTile_k + k_in" in loop_cpp
 
 
+def test_fixed_stack_array_name_participates_in_schedule_name_hygiene():
+    declaration = llir.FixedStackArrayDecl(
+        name="packed_DenseInput",
+        element_type=llir.DataType.FLOAT32,
+        extent=llir.Var("kTile_free", llir.DataType.CONSTEXPR_INT),
+        initializer=llir.Array([], llir.DataType.FLOAT32),
+    )
+    function = llir.Function(
+        return_type=llir.DataType.VOID,
+        name="kernel",
+        args=[],
+        body=[
+            llir.IfThenElse(
+                cond=llir.Var("condition", llir.DataType.BOOL),
+                then_body=[declaration],
+            )
+        ],
+    )
+
+    used_names = schedule_lowerer_module._declared_names(function)
+
+    assert used_names == {"packed_DenseInput"}
+    assert (
+        schedule_lowerer_module._unique_name("packed_DenseInput", used_names)
+        == "packed_DenseInput_1"
+    )
+    assert used_names == {"packed_DenseInput", "packed_DenseInput_1"}
+
+
 def test_packed_and_unpacked_schedules_cannot_alias_either_cache():
     packed = _packed_schedule()
     unpacked = replace(packed, relayout=None, tag=packed.tag)

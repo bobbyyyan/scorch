@@ -929,6 +929,55 @@ def test_declarations_after_use_and_duplicate_definitions_are_visible() -> None:
     assert _factor_names(assignment.value) == ["late_value", "late_again"]
 
 
+def test_fixed_stack_array_declaration_marks_workspace_reads_variant() -> None:
+    declaration = llir.FixedStackArrayDecl(
+        name="wksp",
+        element_type=llir.DataType.FLOAT32,
+        extent=_var("kTile_k", llir.DataType.CONSTEXPR_INT),
+        initializer=llir.Array([], llir.DataType.FLOAT32),
+    )
+    workspace_read = llir.ArrayAccess(
+        _var("wksp", llir.DataType.PTR_FLOAT32),
+        _var("column", llir.DataType.INT64),
+    )
+    loop = _activating_loop(
+        loop_variable="q",
+        invariant=llir.BinOp("*", _var("outside"), workspace_read),
+        variant=_var("_values_ptr[q]"),
+        tail=[declaration],
+    )
+    source: List[llir.Stmt] = [loop]
+    source_snapshot = _snapshot(source)
+
+    output = hoist_loop_invariant_factors(
+        source,
+        LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
+    )
+
+    assert _snapshot(source) == source_snapshot
+    assert _compatibility_codes(output) == [
+        "float _inv_0 = outside",
+        "_accum *= _inv_0",
+    ]
+    output_loop = cast(llir.ForLoop, output[1])
+    assignment = cast(llir.Assign, output_loop.body[0])
+    assert assignment.value == llir.BinOp(
+        "*",
+        workspace_read,
+        _var("_values_ptr[q]"),
+    )
+    assert LLIRLowerer().lower_llir(assignment) == (
+        "_accum += wksp[column] * _values_ptr[q];"
+    )
+    rewritten_decl = cast(llir.FixedStackArrayDecl, output_loop.body[1])
+    assert type(rewritten_decl) is llir.FixedStackArrayDecl
+    assert rewritten_decl == declaration
+    assert rewritten_decl is not declaration
+    assert rewritten_decl.extent is not declaration.extent
+    assert rewritten_decl.initializer is not declaration.initializer
+    assert LLIRLowerer().lower_llir(rewritten_decl) == "float wksp[kTile_k] = {};"
+
+
 def test_defined_variable_analysis_recurses_through_legacy_supported_bodies() -> None:
     nested_for = _loop(
         [llir.VarInit(_var("nested_body"), llir.Literal(0))],
