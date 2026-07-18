@@ -78,6 +78,7 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
 )
 from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
     ResultTensorAssembler,
+    TorchCppKernelABI,
 )
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Schedule,
@@ -1770,6 +1771,16 @@ def test_legality_verification_is_nonsemantic_and_plans_are_independent() -> Non
         ("adapter", _EXPLICIT_STAGE_SEQUENCE[:4]),
         ("cin_pass", _EINSUM_PREFIX_THROUGH_ADAPTER),
         ("abi", _EINSUM_PREFIX_THROUGH_ADAPTER),
+        ("kernel_abi_input_prologue", _EINSUM_PREFIX_THROUGH_ADAPTER),
+        ("kernel_abi_validation", _EINSUM_PREFIX_THROUGH_ADAPTER),
+        ("kernel_abi_extra_prologue", _EINSUM_PREFIX_THROUGH_ADAPTER),
+        (
+            "kernel_abi_function",
+            [
+                *_EINSUM_PREFIX_THROUGH_ADAPTER,
+                CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+            ],
+        ),
         ("schedule_lowering", _EXPLICIT_STAGE_SEQUENCE[:7]),
         ("cpp", _EXPLICIT_STAGE_SEQUENCE[:8]),
         ("request", _EXPLICIT_STAGE_SEQUENCE[:9]),
@@ -1783,6 +1794,7 @@ def test_stage_failures_raise_original_error_and_suppress_all_later_stages(
     options = _explicit_options()
     context = CompilationContext(options)
     error = RuntimeError(f"injected {failure_site} failure")
+    later_calls: list[str] = []
     if failure_site == "normalization":
         monkeypatch.setattr(
             cin_analysis,
@@ -1813,6 +1825,30 @@ def test_stage_failures_raise_original_error_and_suppress_all_later_stages(
             "emit_final_assembly",
             _raise_same(error),
         )
+    elif failure_site == "kernel_abi_input_prologue":
+        monkeypatch.setattr(
+            TorchCppKernelABI,
+            "emit_input_prologue",
+            _raise_same(error),
+        )
+    elif failure_site == "kernel_abi_validation":
+        monkeypatch.setattr(
+            TorchCppKernelABI,
+            "emit_validation",
+            _raise_same(error),
+        )
+    elif failure_site == "kernel_abi_extra_prologue":
+        monkeypatch.setattr(
+            TorchCppKernelABI,
+            "emit_extra_tensor_prologue",
+            _raise_same(error),
+        )
+    elif failure_site == "kernel_abi_function":
+        monkeypatch.setattr(
+            TorchCppKernelABI,
+            "assemble_function",
+            _raise_same(error),
+        )
     elif failure_site == "schedule_lowering":
         monkeypatch.setattr(
             schedule_lowerer,
@@ -1826,9 +1862,21 @@ def test_stage_failures_raise_original_error_and_suppress_all_later_stages(
     else:  # pragma: no cover - the parameter list is exhaustive
         raise AssertionError(failure_site)
     _isolate_compiler_caches(monkeypatch)
-    monkeypatch.setattr(
-        ops, "_load_validated_prepared_kernel", lambda prepared: object()
-    )
+    if failure_site.startswith("kernel_abi_"):
+        _forbid_boundaries(
+            monkeypatch,
+            later_calls,
+            (
+                (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+                (LLIRLowerer, "lower_llir", "cpp_generation"),
+                (ops, "_prepare_generated_kernel_build", "build_request"),
+                (ops, "_load_validated_prepared_kernel", "native_load"),
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            ops, "_load_validated_prepared_kernel", lambda prepared: object()
+        )
 
     with pytest.raises(RuntimeError) as failure:
         ops.einsum(
@@ -1858,6 +1906,26 @@ def test_stage_failures_raise_original_error_and_suppress_all_later_stages(
             "eliminate_single_iteration_loops",
             "hoist_loop_invariant_factors",
         ]
+    elif failure_site in {
+        "kernel_abi_input_prologue",
+        "kernel_abi_validation",
+        "kernel_abi_extra_prologue",
+    }:
+        assert context.llir_pass_run_records == ()
+        assert later_calls == []
+        assert ops._kernel_cache == {}
+        assert ops._einsum_dispatch_cache == {}
+    elif failure_site == "kernel_abi_function":
+        assert [record.pass_name for record in context.llir_pass_run_records] == [
+            "insert_sparse_prefetch",
+            "hoist_dense_pointers",
+            "eliminate_single_iteration_loops",
+            "hoist_loop_invariant_factors",
+            "rewrite_dynamic_vector_accesses",
+        ]
+        assert later_calls == []
+        assert ops._kernel_cache == {}
+        assert ops._einsum_dispatch_cache == {}
     with pytest.raises(CompilationContextError) as suppressed:
         context.begin_stage(
             CompilerStageId.LLIR_TO_CPP_GENERATION,

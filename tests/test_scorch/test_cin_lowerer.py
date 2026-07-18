@@ -18,7 +18,7 @@ from scorch.compiler.cin import (
     Where,
     Workspace,
 )
-from scorch.compiler.cin_lowerer import CINLowerer
+from scorch.compiler.cin_lowerer import CINLowerer, _torch_cpp_kernel_abi
 from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 from scorch.compiler.diagnostics import CompilerInvariantError, UnsupportedFeature
 from scorch.compiler.iterator import (  # type: ignore[import-untyped]
@@ -29,6 +29,7 @@ from scorch.compiler.iterator import (  # type: ignore[import-untyped]
     match_mode_position_bounds,
 )
 from scorch.compiler.llir_traversal import (
+    LLIRRewriter,
     LLIRTraversalContext,
     LLIRTraversalError,
     LLIRWalker,
@@ -38,7 +39,9 @@ from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     regblock_force,
 )
 from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
+    KernelTensorABI,
     ResultTensorAssembler,
+    TorchCppKernelABI,
     mode_index_tensor,
     tensor_data_ptr,
     tensor_storage_member,
@@ -68,6 +71,17 @@ def _result_tensor_assembler(
         known_nnz_var=known_nnz_var,
         exact_dense_parent_positions=exact_dense_parent_positions,
         reserve_hint_var=reserve_hint_var,
+    )
+
+
+def _kernel_tensor_abi(tensor_var: TensorVar) -> KernelTensorABI:
+    level_types = tuple(tensor_var.get_level_types())
+    return KernelTensorABI(
+        name=tensor_var.get_name(),
+        level_types=level_types,
+        mode_order=tuple(tensor_var.get_mode_order() or tuple(range(len(level_types)))),
+        shape=tuple(tensor_var.shape or ()),
+        dtype=tensor_var.dtype,
     )
 
 
@@ -507,6 +521,385 @@ def test_result_tensor_assembler_owns_one_frozen_abi_snapshot() -> None:
         assembler.known_nnz_var = None
 
 
+def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
+    valid_tensor = {
+        "name": "Input",
+        "level_types": (LevelType.DENSE, LevelType.COMPRESSED),
+        "mode_order": (1, 0),
+        "shape": (3, 5),
+        "dtype": torch.float32,
+    }
+    for name in ("", "Input.value", 1):
+        with pytest.raises(TypeError, match="kernel tensor name"):
+            KernelTensorABI(**{**valid_tensor, "name": name})  # type: ignore[arg-type]
+    for levels in ([LevelType.DENSE], (LevelType.DENSE, "compressed"), "ds"):
+        with pytest.raises(TypeError, match="immutable LevelType tuple"):
+            KernelTensorABI(  # type: ignore[arg-type]
+                **{**valid_tensor, "level_types": levels}
+            )
+    for mode_order in ([1, 0], (True, 0), (1.0, 0)):
+        with pytest.raises(TypeError, match="mode order"):
+            KernelTensorABI(  # type: ignore[arg-type]
+                **{**valid_tensor, "mode_order": mode_order}
+            )
+    for mode_order in ((0,), (0, 0), (0, 2)):
+        with pytest.raises(ValueError, match="rank-sized permutation"):
+            KernelTensorABI(**{**valid_tensor, "mode_order": mode_order})
+    for shape in ([3, 5], (True, 5), (3.0, 5)):
+        with pytest.raises(TypeError, match="kernel tensor shape"):
+            KernelTensorABI(**{**valid_tensor, "shape": shape})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="shape must match the level rank"):
+        KernelTensorABI(**{**valid_tensor, "shape": (3,)})
+    with pytest.raises(ValueError, match="extents must be non-negative"):
+        KernelTensorABI(**{**valid_tensor, "shape": (3, -1)})
+    with pytest.raises(TypeError, match="kernel tensor dtype"):
+        KernelTensorABI(**{**valid_tensor, "dtype": "float32"})  # type: ignore[arg-type]
+
+    tensor = KernelTensorABI(**valid_tensor)
+    valid_kernel = {
+        "result_shape": (3, 5),
+        "result_rank": 2,
+        "input_tensors": (tensor,),
+    }
+    for function_name in ("", "scorch.evaluate", 1):
+        with pytest.raises(TypeError, match="function name"):
+            TorchCppKernelABI(  # type: ignore[arg-type]
+                **valid_kernel,
+                function_name=function_name,
+            )
+    for result_shape in ([3, 5], (True, 5), (3.0, 5)):
+        with pytest.raises(TypeError, match="kernel result shape"):
+            TorchCppKernelABI(  # type: ignore[arg-type]
+                **{**valid_kernel, "result_shape": result_shape}
+            )
+    for result_rank in (-1, True, 2.0):
+        with pytest.raises(TypeError, match="kernel result rank"):
+            TorchCppKernelABI(  # type: ignore[arg-type]
+                **{**valid_kernel, "result_rank": result_rank}
+            )
+    with pytest.raises(ValueError, match="shape must match the result rank"):
+        TorchCppKernelABI(**{**valid_kernel, "result_shape": (3,)})
+    with pytest.raises(ValueError, match="extents must be non-negative"):
+        TorchCppKernelABI(**{**valid_kernel, "result_shape": (3, -1)})
+    for input_tensors in ([tensor], (object(),)):
+        with pytest.raises(TypeError, match="exact KernelTensorABI tuple"):
+            TorchCppKernelABI(  # type: ignore[arg-type]
+                **{**valid_kernel, "input_tensors": input_tensors}
+            )
+
+    class UnknownKernelTensorABI(KernelTensorABI):
+        pass
+
+    unknown_tensor = UnknownKernelTensorABI(**valid_tensor)
+    with pytest.raises(TypeError, match="exact KernelTensorABI tuple"):
+        TorchCppKernelABI(**{**valid_kernel, "input_tensors": (unknown_tensor,)})
+    for extra_names in (["bias"], ("bias.value",), (1,)):
+        with pytest.raises(TypeError, match="extra tensor names"):
+            TorchCppKernelABI(  # type: ignore[arg-type]
+                **valid_kernel,
+                extra_tensor_names=extra_names,
+                extra_tensor_dtype=torch.float32,
+            )
+    with pytest.raises(TypeError, match="when present"):
+        TorchCppKernelABI(**valid_kernel, extra_tensor_names=("bias",))
+    with pytest.raises(TypeError, match="without extra tensors"):
+        TorchCppKernelABI(**valid_kernel, extra_tensor_dtype=torch.float32)
+    with pytest.raises(ValueError, match="argument names must be unique"):
+        TorchCppKernelABI(**{**valid_kernel, "input_tensors": (tensor, tensor)})
+    with pytest.raises(ValueError, match="argument names must be unique"):
+        TorchCppKernelABI(
+            **valid_kernel,
+            extra_tensor_names=("Input",),
+            extra_tensor_dtype=torch.float32,
+        )
+    result_name_collision = KernelTensorABI(
+        "result",
+        (LevelType.DENSE,),
+        (0,),
+        (),
+        torch.float32,
+    )
+    with pytest.raises(ValueError, match="argument names must be unique"):
+        TorchCppKernelABI(
+            result_shape=(),
+            result_rank=1,
+            input_tensors=(result_name_collision,),
+        )
+
+    forged_tensor = KernelTensorABI(**valid_tensor)
+    object.__setattr__(forged_tensor, "shape", [3, 5])
+    with pytest.raises(TypeError, match="kernel tensor shape"):
+        forged_tensor.emit_value_pointer()
+
+    forged_kernel = TorchCppKernelABI(**valid_kernel)
+    object.__setattr__(forged_kernel, "input_tensors", (forged_tensor,))
+    with pytest.raises(TypeError, match="kernel tensor shape"):
+        forged_kernel.emit_arguments()
+
+    forged_order = KernelTensorABI(**valid_tensor)
+    object.__setattr__(forged_order, "mode_order", (0, 0))
+    with pytest.raises(ValueError, match="rank-sized permutation"):
+        forged_order.emit_level_array_bindings()
+
+
+def test_kernel_abi_owns_one_frozen_semantic_snapshot() -> None:
+    result = TensorVar("Result", shape=(5, 3), fmt="dd", dtype=torch.float64)
+    left = TensorVar(
+        "Left",
+        shape=(3, 5),
+        fmt="ds",
+        dtype=torch.float64,
+        mode_order=[1, 0],
+    )
+    mask = TensorVar("Mask", shape=(5, 3), fmt="oo", dtype=torch.float32)
+    post_ops = PostOps(
+        ops=[PostOp(kind="add", tensor_name="bias")],
+        extra_tensors=["bias"],
+    )
+    abi = _torch_cpp_kernel_abi(result, [left, mask], post_ops)
+    equal = TorchCppKernelABI(
+        result_shape=(5, 3),
+        result_rank=2,
+        input_tensors=(
+            KernelTensorABI(
+                "Left",
+                (LevelType.DENSE, LevelType.COMPRESSED),
+                (1, 0),
+                (3, 5),
+                torch.float64,
+            ),
+            KernelTensorABI(
+                "Mask",
+                (LevelType.COORDINATE, LevelType.COORDINATE),
+                (0, 1),
+                (5, 3),
+                torch.float32,
+            ),
+        ),
+        extra_tensor_names=("bias",),
+        extra_tensor_dtype=torch.float64,
+    )
+
+    assert abi == equal
+    assert hash(abi) == hash(equal)
+    assert abi is not equal
+    assert not hasattr(abi, "result_tensor_var")
+    assert not hasattr(abi, "post_ops")
+    assert all(not hasattr(tensor, "tensor_var") for tensor in abi.input_tensors)
+
+    result.name = "ChangedResult"
+    result.shape = (9, 9)
+    result.format = TensorVar("OtherResult", fmt="s").format
+    result.dtype = torch.float32
+    left.name = "ChangedLeft"
+    left.shape = (7, 11)
+    left.mode_order.reverse()
+    left.format = TensorVar("OtherLeft", fmt="oo").format
+    left.dtype = torch.float32
+    mask.name = "ChangedMask"
+    post_ops.extra_tensors.append("scale")
+
+    assert abi == equal
+    assert abi.emit_arguments() == equal.emit_arguments()
+    assert abi.emit_validation() == equal.emit_validation()
+    assert LLIRLowerer().lower_llir(
+        abi.emit_input_prologue()
+    ) == LLIRLowerer().lower_llir(equal.emit_input_prologue())
+    assert LLIRLowerer().lower_llir(
+        abi.emit_extra_tensor_prologue()
+    ) == LLIRLowerer().lower_llir(equal.emit_extra_tensor_prologue())
+
+    with pytest.raises(FrozenInstanceError):
+        abi.result_rank = 3
+    with pytest.raises(FrozenInstanceError):
+        abi.input_tensors = ()
+    with pytest.raises(FrozenInstanceError):
+        abi.input_tensors[0].shape = ()
+
+
+def test_kernel_abi_arguments_validation_and_function_are_fresh_and_byte_exact() -> (
+    None
+):
+    abi = TorchCppKernelABI(
+        result_shape=(5, 3),
+        result_rank=2,
+        input_tensors=(
+            KernelTensorABI(
+                "Left",
+                (LevelType.DENSE, LevelType.COMPRESSED),
+                (1, 0),
+                (3, 5),
+                torch.float64,
+            ),
+            KernelTensorABI(
+                "Mask",
+                (LevelType.COORDINATE, LevelType.COORDINATE),
+                (0, 1),
+                (5, 3),
+                torch.float32,
+            ),
+        ),
+        extra_tensor_names=("bias",),
+        extra_tensor_dtype=torch.float64,
+    )
+    first_args = abi.emit_arguments()
+    second_args = abi.emit_arguments()
+    expected_arguments = (
+        ("result_shape", llir.DataType.STD_VECTOR_INT),
+        ("Left_shape", llir.DataType.STD_VECTOR_INT),
+        ("Left_mode_indices", llir.DataType.STD_VECTOR_2D_TORCH_TENSOR),
+        ("Left_values", llir.DataType.TORCH_TENSOR),
+        ("Mask_shape", llir.DataType.STD_VECTOR_INT),
+        ("Mask_mode_indices", llir.DataType.STD_VECTOR_2D_TORCH_TENSOR),
+        ("Mask_values", llir.DataType.TORCH_TENSOR),
+        ("bias_values", llir.DataType.TORCH_TENSOR),
+    )
+    assert tuple((argument.name, argument.type) for argument in first_args) == (
+        expected_arguments
+    )
+    assert first_args == second_args
+    assert first_args is not second_args
+    assert all(first is not second for first, second in zip(first_args, second_args))
+    assert all(
+        not argument.is_ptr
+        and not argument.is_restrict
+        and argument.tensor_access is None
+        for argument in first_args
+    )
+
+    first_validation = abi.emit_validation()
+    second_validation = abi.emit_validation()
+    expected_validation = (
+        "scorch_native::validate_jit_result_shape(result_shape, {5, 3}, 2, "
+        '"evaluate")',
+        'scorch_native::validate_jit_tensor("evaluate", "Left", Left_shape, '
+        "Left_mode_indices, Left_values, torch::kFloat64, {0, 1}, {1, 0}, {3, 5})",
+        'scorch_native::validate_jit_tensor("evaluate", "Mask", Mask_shape, '
+        "Mask_mode_indices, Mask_values, torch::kFloat32, {2, 2}, {0, 1}, {5, 3})",
+        "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat64, "
+        '"evaluate", "bias_values")',
+    )
+    assert (
+        tuple(statement.code for statement in first_validation) == expected_validation
+    )
+    assert first_validation == second_validation
+    assert all(
+        first is not second
+        for first, second in zip(first_validation, second_validation)
+    )
+    assert all(statement.add_semicolon is True for statement in first_validation)
+    assert LLIRLowerer().lower_llir(first_validation) == "\n".join(
+        f"{code};" for code in expected_validation
+    )
+
+    artifact: list[llir.Stmt] = [
+        *first_validation,
+        *abi.emit_input_prologue(),
+        *abi.emit_extra_tensor_prologue(),
+    ]
+
+    def traversal_snapshot(value: list[llir.Stmt]) -> tuple[tuple[str, ...], ...]:
+        paths: list[tuple[str, ...]] = []
+
+        class OrderCollector(LLIRWalker):
+            def enter_node(
+                self,
+                node: llir.Node,
+                path: tuple[str, ...],
+            ) -> None:
+                paths.append((*path, type(node).__name__))
+
+        OrderCollector(
+            LLIRTraversalContext(stage="test", pass_name="kernel_abi_order")
+        ).walk(value)
+        return tuple(paths)
+
+    first_snapshot = traversal_snapshot(artifact)
+    assert traversal_snapshot(artifact) == first_snapshot
+    rewritten = cast(
+        list[llir.Stmt],
+        LLIRRewriter(
+            LLIRTraversalContext(stage="test", pass_name="rewrite_kernel_abi")
+        ).rewrite(artifact),
+    )
+    assert rewritten is not artifact
+    assert len(rewritten) == len(artifact)
+    assert traversal_snapshot(rewritten) == first_snapshot
+    assert LLIRLowerer().lower_llir(rewritten) == LLIRLowerer().lower_llir(artifact)
+
+    def node_ids(value: list[llir.Stmt]) -> set[int]:
+        identities: set[int] = set()
+
+        class IdentityCollector(LLIRWalker):
+            def enter_node(
+                self,
+                node: llir.Node,
+                path: tuple[str, ...],
+            ) -> None:
+                del path
+                identities.add(id(node))
+
+        IdentityCollector(
+            LLIRTraversalContext(stage="test", pass_name="kernel_abi_ownership")
+        ).walk(value)
+        return identities
+
+    assert node_ids(artifact).isdisjoint(node_ids(rewritten))
+
+    body = [
+        llir.Comment("body"),
+        llir.Return(llir.Var("Result", llir.DataType.TACO_TENSOR)),
+    ]
+    first_function = abi.assemble_function(body)
+    second_function = abi.assemble_function(body)
+    assert first_function.return_type is llir.DataType.TACO_TENSOR
+    assert first_function.name == "evaluate"
+    assert first_function.args == second_function.args == first_args
+    assert first_function.args is not second_function.args
+    assert first_function.body == second_function.body == body
+    assert first_function.body is not second_function.body
+    assert first_function.body is not body
+    body.append(llir.BlankLine())
+    assert len(first_function.body) == len(second_function.body) == 2
+    assert (
+        LLIRLowerer()
+        .lower_llir(first_function)
+        .startswith(
+            "Tensor evaluate(std::vector<int64_t> result_shape, "
+            "std::vector<int64_t> Left_shape, "
+            "std::vector<std::vector<torch::Tensor>> Left_mode_indices, "
+            "torch::Tensor Left_values, std::vector<int64_t> Mask_shape, "
+            "std::vector<std::vector<torch::Tensor>> Mask_mode_indices, "
+            "torch::Tensor Mask_values, torch::Tensor bias_values) {"
+        )
+    )
+
+    with pytest.raises(TypeError, match="exact LLIR list"):
+        abi.assemble_function(tuple(body))  # type: ignore[arg-type]
+
+
+def test_kernel_abi_rejects_unsupported_singleton_validation() -> None:
+    with pytest.raises(ValueError, match="unsupported JIT level type"):
+        KernelTensorABI(
+            "Input",
+            (LevelType.SINGLETON,),
+            (0,),
+            (4,),
+            torch.float32,
+        )
+
+    forged = KernelTensorABI(
+        "Input",
+        (LevelType.DENSE,),
+        (0,),
+        (4,),
+        torch.float32,
+    )
+    object.__setattr__(forged, "level_types", (LevelType.SINGLETON,))
+    with pytest.raises(ValueError, match="unsupported JIT level type"):
+        forged.emit_level_array_bindings()
+
+
 def _collect_move_calls(value: llir.Node) -> list[llir.FunctionCall]:
     calls: list[llir.FunctionCall] = []
 
@@ -614,6 +1007,34 @@ def test_post_op_extra_tensor_data_ptr_is_live_typed_and_fresh() -> None:
     second_function = CINLowerer(post_ops=post_ops).lower_IndexStmt(statement)
     assert type(first_function) is llir.Function
     assert type(second_function) is llir.Function
+    first_function = cast(llir.Function, first_function)
+    second_function = cast(llir.Function, second_function)
+    assert first_function.return_type is llir.DataType.TACO_TENSOR
+    assert first_function.name == second_function.name == "evaluate"
+    assert tuple(
+        (argument.name, argument.type) for argument in first_function.args
+    ) == (
+        ("result_shape", llir.DataType.STD_VECTOR_INT),
+        ("Input_shape", llir.DataType.STD_VECTOR_INT),
+        ("Input_mode_indices", llir.DataType.STD_VECTOR_2D_TORCH_TENSOR),
+        ("Input_values", llir.DataType.TORCH_TENSOR),
+        ("bias_values", llir.DataType.TORCH_TENSOR),
+    )
+    assert first_function.args == second_function.args
+    assert first_function.args is not second_function.args
+    assert all(
+        first is not second
+        for first, second in zip(first_function.args, second_function.args)
+    )
+    validation = first_function.body[:3]
+    assert all(type(node) is llir.RawStmt for node in validation)
+    assert [cast(llir.RawStmt, node).code for node in validation] == [
+        'scorch_native::validate_jit_result_shape(result_shape, {}, 1, "evaluate")',
+        'scorch_native::validate_jit_tensor("evaluate", "Input", Input_shape, '
+        "Input_mode_indices, Input_values, torch::kFloat32, {0}, {0}, {})",
+        "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat32, "
+        '"evaluate", "bias_values")',
+    ]
 
     def pointer_initializer(function: llir.Function) -> llir.VarInit:
         return next(
@@ -622,8 +1043,8 @@ def test_post_op_extra_tensor_data_ptr_is_live_typed_and_fresh() -> None:
             if type(node) is llir.VarInit and node.var.name == "bias_val"
         )
 
-    first = pointer_initializer(cast(llir.Function, first_function))
-    second = pointer_initializer(cast(llir.Function, second_function))
+    first = pointer_initializer(first_function)
+    second = pointer_initializer(second_function)
     assert first.var.type is llir.DataType.PTR_FLOAT32
     assert first.var.is_restrict is True
     assert first.var.tensor_access is None
@@ -641,6 +1062,7 @@ def test_post_op_extra_tensor_data_ptr_is_live_typed_and_fresh() -> None:
     )
     assert LLIRLowerer().lower_llir(second) == LLIRLowerer().lower_llir(first)
     assert str(statement) == original
+    assert post_ops.extra_tensors == ["bias"]
 
 
 def test_result_position_initialization_uses_a_frozen_structured_target() -> None:
@@ -827,8 +1249,9 @@ def test_result_value_data_ptr_producers_are_structured_typed_and_fresh(
 
 def test_multi_compressed_mode_index_data_ptrs_are_nested_typed_and_fresh() -> None:
     tensor = TensorVar("Input", fmt="dss")
-    first_statements = CINLowerer.get_level_arrays(tensor)
-    second_statements = CINLowerer.get_level_arrays(tensor)
+    tensor_abi = _kernel_tensor_abi(tensor)
+    first_statements = tensor_abi.emit_level_array_bindings()
+    second_statements = tensor_abi.emit_level_array_bindings()
     expected = (
         ("Input1_pos", 1, 0),
         ("Input1_crd", 1, 1),
@@ -898,8 +1321,9 @@ def test_multi_compressed_mode_index_data_ptrs_are_nested_typed_and_fresh() -> N
 
 def test_coordinate_mode_index_tensor_and_pointer_are_independently_owned() -> None:
     tensor = TensorVar("Mask", fmt="oo")
-    first_statements = CINLowerer.get_level_arrays(tensor)
-    second_statements = CINLowerer.get_level_arrays(tensor)
+    tensor_abi = _kernel_tensor_abi(tensor)
+    first_statements = tensor_abi.emit_level_array_bindings()
+    second_statements = tensor_abi.emit_level_array_bindings()
 
     def initializers(statements: list[llir.Stmt]) -> dict[str, llir.VarInit]:
         return {
@@ -974,8 +1398,9 @@ def test_coordinate_mode_index_tensor_and_pointer_are_independently_owned() -> N
 
 def test_input_value_data_ptr_is_structured_typed_and_fresh() -> None:
     tensor = TensorVar("Input", fmt="d", dtype=torch.float64)
-    first = cast(llir.VarInit, CINLowerer.get_val_ptr_stmt(tensor))
-    second = cast(llir.VarInit, CINLowerer.get_val_ptr_stmt(tensor))
+    tensor_abi = _kernel_tensor_abi(tensor)
+    first = tensor_abi.emit_value_pointer()
+    second = tensor_abi.emit_value_pointer()
 
     assert first.var.name == "Input_val"
     assert first.var.type is llir.DataType.PTR_FLOAT64

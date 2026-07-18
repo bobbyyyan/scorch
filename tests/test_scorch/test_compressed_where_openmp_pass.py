@@ -24,6 +24,7 @@ from scorch.compiler.llir_traversal import (
 )
 from scorch.compiler.llir_pass_manager import DEBUG_LLIR_PASS_OPTIONS
 from scorch.compiler.scheduler import Scheduler
+from scorch.compiler.torch_cpp_abi import ResultTensorAssembler
 
 
 def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Var:
@@ -1144,7 +1145,9 @@ def test_successful_transform_is_single_use_and_not_idempotent() -> None:
     )
 
 
-def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
+def test_production_ds_generated_cpp_matches_pre_extraction_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
     result = TensorVar("SparseProduct", fmt="ds")
     left = TensorVar("SparseLeft", fmt="ds")
@@ -1161,8 +1164,40 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes() -> None:
         ),
     )
 
+    def reject_ordinary_final_assembly(
+        assembler: ResultTensorAssembler,
+    ) -> List[llir.Stmt]:
+        del assembler
+        raise AssertionError(
+            "compressed-output ABI must not run ordinary final assembly"
+        )
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_final_assembly",
+        reject_ordinary_final_assembly,
+    )
     lowerer = CINLowerer()
-    cpp = LLIRLowerer().lower_llir(lowerer.lower_IndexStmt(cin))
+    lowered = lowerer.lower_IndexStmt(cin)
+    assert type(lowered) is llir.Function
+    function = cast(llir.Function, lowered)
+    assert [cast(llir.Var, argument).name for argument in function.args] == [
+        "result_shape",
+        "SparseLeft_shape",
+        "SparseLeft_mode_indices",
+        "SparseLeft_values",
+        "SparseRight_shape",
+        "SparseRight_mode_indices",
+        "SparseRight_values",
+    ]
+    validation = [cast(llir.RawStmt, statement).code for statement in function.body[:3]]
+    assert validation[0] == (
+        'scorch_native::validate_jit_result_shape(result_shape, {}, 2, "evaluate")'
+    )
+    assert '"SparseLeft"' in validation[1]
+    assert '"SparseRight"' in validation[2]
+    assert all("wksp" not in statement for statement in validation)
+    cpp = LLIRLowerer().lower_llir(function)
 
     assert len(cpp) == 7117
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
