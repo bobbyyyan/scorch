@@ -117,7 +117,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 138,
+        "cin_lowerer.py": 137,
         "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -130,7 +130,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 53,
     }
-    assert sum(constructor_counts.values()) == 378
+    assert sum(constructor_counts.values()) == 377
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 129,
@@ -161,15 +161,30 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(known_indirect.values()) == 11
 
     assert totals == {
-        "subscript": 10,
+        "subscript": 9,
         "ternary": 1,
     }
-    assert sum(totals.values()) == 11
+    assert sum(totals.values()) == 10
     assert per_file == {
-        ("cin_lowerer.py", "subscript"): 8,
+        ("cin_lowerer.py", "subscript"): 7,
         ("cin_lowerer.py", "ternary"): 1,
         ("iterator.py", "subscript"): 2,
     }
+
+
+def test_generic_workspace_reads_have_no_opaque_value_fallback() -> None:
+    source = (_COMPILER_ROOT / "cin_lowerer.py").read_text()
+    tensor_access_lowering = source.split("def lower_TensorAccess", 1)[1].split(
+        "def lower_BinaryOp", 1
+    )[0]
+
+    assert 'name=f"{tensor_access.tensor.name}_val[{physical_index}]"' not in (
+        tensor_access_lowering
+    )
+    assert tensor_access_lowering.count("if tensor_access_metadata is None:") == 1
+    assert "workspace reads require a workspace-specific consumer" in (
+        tensor_access_lowering
+    )
 
 
 def test_fixed_stack_array_declaration_producer_budget_is_explicit() -> None:

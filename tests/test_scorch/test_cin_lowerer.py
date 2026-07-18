@@ -2836,6 +2836,66 @@ def test_nonworkspace_tensor_reads_lower_to_frozen_structured_accesses(
     assert access.tensor is tensor
 
 
+@pytest.mark.parametrize(
+    ("dim", "dense", "index_names"),
+    (
+        pytest.param(0, False, (), id="scalar"),
+        pytest.param(1, True, ("i",), id="dense"),
+        pytest.param(2, False, ("i", "j"), id="coordinate"),
+    ),
+)
+def test_generic_workspace_reads_fail_closed_before_llir_construction(
+    dim: int,
+    dense: bool,
+    index_names: tuple[str, ...],
+) -> None:
+    workspace = Workspace("wksp", dim=dim, dense=dense)
+    index_vars = tuple(IndexVar(name) for name in index_names)
+    if not index_vars:
+        access = workspace.get_default_access()
+    else:
+        key = index_vars[0] if len(index_vars) == 1 else index_vars
+        access = workspace[key]
+    original_indices = tuple(access.indices)
+
+    with pytest.raises(
+        CompilerInvariantError,
+        match=(
+            r"stage=CIN lowering pass=lower_TensorAccess: workspace tensor 'wksp' "
+            r"reached generic value lowering; workspace reads require a "
+            r"workspace-specific consumer"
+        ),
+    ):
+        CINLowerer().lower_TensorAccess(access)
+
+    assert tuple(access.indices) == original_indices
+    assert access.tensor is workspace
+
+
+def test_direct_workspace_rhs_fails_before_an_invalid_kernel_is_built() -> None:
+    index = IndexVar("i")
+    result = TensorVar("Result", fmt="d")
+    workspace = Workspace("wksp", dim=1, dense=True)
+    statement = ForAll(
+        index,
+        TensorAssign(result[index], workspace[index]),
+    )
+    original = str(statement)
+    lowerer = CINLowerer()
+
+    with pytest.raises(
+        CompilerInvariantError,
+        match=(
+            r"stage=CIN lowering pass=lower_TensorAccess: workspace tensor 'wksp' "
+            r"reached generic value lowering"
+        ),
+    ):
+        lowerer.lower_IndexStmt(statement)
+
+    assert lowerer.llir_pass_run_records == ()
+    assert str(statement) == original
+
+
 def test_dense_level_shape_reads_use_frozen_structured_array_accesses() -> None:
     row, column = IndexVar("row"), IndexVar("column")
     result = TensorVar("Result", shape=(3, 5), fmt="dd")
