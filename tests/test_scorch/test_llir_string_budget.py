@@ -634,13 +634,16 @@ def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:
         assert isinstance(target, ast.Call)
         name_expression = _var_name_expression(target)
         value = fields.get("value")
+        value_name_expression = (
+            _var_name_expression(value) if isinstance(value, ast.Call) else None
+        )
         if (
             name_expression is not None
             and "_crd_torch" in _static_string_fragments(name_expression)
             and value is not None
             and _is_llir_constructor(value, "FunctionCall")
-            and isinstance(value, ast.Call)
-            and ast.unparse(_var_name_expression(value)) == "'torch::empty'"
+            and value_name_expression is not None
+            and ast.unparse(value_name_expression) == "'torch::empty'"
         ):
             coordinate_owner_initializers.append(call)
 
