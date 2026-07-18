@@ -537,14 +537,14 @@ def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
             KernelTensorABI(  # type: ignore[arg-type]
                 **{**valid_tensor, "level_types": levels}
             )
-    for mode_order in ([1, 0], (True, 0), (1.0, 0)):
+    for malformed_mode_order in ([1, 0], (True, 0), (1.0, 0)):
         with pytest.raises(TypeError, match="mode order"):
             KernelTensorABI(  # type: ignore[arg-type]
-                **{**valid_tensor, "mode_order": mode_order}
+                **{**valid_tensor, "mode_order": malformed_mode_order}
             )
-    for mode_order in ((0,), (0, 0), (0, 2)):
+    for invalid_mode_order in ((0,), (0, 0), (0, 2)):
         with pytest.raises(ValueError, match="rank-sized permutation"):
-            KernelTensorABI(**{**valid_tensor, "mode_order": mode_order})
+            KernelTensorABI(**{**valid_tensor, "mode_order": invalid_mode_order})
     for shape in ([3, 5], (True, 5), (3.0, 5)):
         with pytest.raises(TypeError, match="kernel tensor shape"):
             KernelTensorABI(**{**valid_tensor, "shape": shape})  # type: ignore[arg-type]

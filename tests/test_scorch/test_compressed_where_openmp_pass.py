@@ -24,7 +24,9 @@ from scorch.compiler.llir_traversal import (
 )
 from scorch.compiler.llir_pass_manager import DEBUG_LLIR_PASS_OPTIONS
 from scorch.compiler.scheduler import Scheduler
-from scorch.compiler.torch_cpp_abi import ResultTensorAssembler
+from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
+    ResultTensorAssembler,
+)
 
 
 def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Var:
