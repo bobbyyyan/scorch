@@ -132,9 +132,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 102,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 57,
+        "torch_cpp_abi.py": 59,
     }
-    assert sum(constructor_counts.values()) == 389
+    assert sum(constructor_counts.values()) == 391
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 131,
@@ -148,9 +148,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 102,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 57,
+        "torch_cpp_abi.py": 59,
     }
-    assert sum(unclassified_counts.values()) == 379
+    assert sum(unclassified_counts.values()) == 381
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
@@ -608,13 +608,13 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 2,
         "sparse_prefetch_pass.py": 1,
-        "torch_cpp_abi.py": 4,
+        "torch_cpp_abi.py": 3,
     }
-    assert sum(counts.values()) == 34
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 33
+    assert sum(counts.values()) == 33
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 32
 
 
-def test_direct_initialization_budget_and_packed_storage_owner_are_explicit() -> None:
+def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
     counts = Counter(
         {
             path.name: len(_llir_constructor_calls(path, "DirectInit"))
@@ -626,8 +626,9 @@ def test_direct_initialization_budget_and_packed_storage_owner_are_explicit() ->
     assert counts == {
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
+        "torch_cpp_abi.py": 1,
     }
-    assert sum(counts.values()) == 2
+    assert sum(counts.values()) == 3
 
     schedule_source = (_COMPILER_ROOT / "schedule_lowerer.py").read_text()
     relayout = schedule_source.split("def _apply_relayout", 1)[1].split(
@@ -635,6 +636,15 @@ def test_direct_initialization_budget_and_packed_storage_owner_are_explicit() ->
     )[0]
     assert "llir.RawStmt(" not in relayout
     assert "packed_storage = _packed_storage_declaration(" in relayout
+
+    torch_abi_source = (_COMPILER_ROOT / "torch_cpp_abi.py").read_text()
+    level_initialization = torch_abi_source.split("def emit_level_indices_init", 1)[
+        1
+    ].split("def emit_final_assembly", 1)[0]
+    assert "llir.RawStmt(" not in level_initialization
+    assert level_initialization.count("llir.DirectInit(") == 1
+    assert "data_type=llir.DataType.SIZE_T" in level_initialization
+    assert "type=llir.DataType.INT64" in level_initialization
 
 
 def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:

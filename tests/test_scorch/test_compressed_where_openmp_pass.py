@@ -175,6 +175,19 @@ def _assignments(value: object) -> List[llir.Assign]:
     return assignments
 
 
+def _direct_initializations(value: object) -> List[llir.DirectInit]:
+    declarations: List[llir.DirectInit] = []
+    if type(value) is llir.DirectInit:
+        declarations.append(cast(llir.DirectInit, value))
+    elif isinstance(value, llir.Node):
+        for child in vars(value).values():
+            declarations.extend(_direct_initializations(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            declarations.extend(_direct_initializations(child))
+    return declarations
+
+
 def _assignment_codes(value: object) -> List[str]:
     return [
         LLIRLowerer().lower_llir([assignment]).removesuffix(";")
@@ -691,7 +704,13 @@ def test_legacy_prefix_and_work_body_filters_are_top_level_only() -> None:
     cast(llir.VarInit, position_loop.init).var.name = "pResult1"
     nested = llir.IfThenElse(
         cond=_var("guard"),
-        then_body=[llir.RawStmt("keep_nested")],
+        then_body=[
+            llir.RawStmt("keep_nested"),
+            llir.DirectInit(
+                llir.Var("Result1_pos_nested", llir.DataType.STD_VECTOR_C_INT),
+                (llir.Literal(2), llir.Literal(0)),
+            ),
+        ],
     )
     selected = _compatible_loop(
         [
@@ -711,7 +730,15 @@ def test_legacy_prefix_and_work_body_filters_are_top_level_only() -> None:
     source = [
         llir.Comment("keep-prefix"),
         llir.VarDecl(_var("Result_values")),
-        llir.VarDecl(_var("Result1_pos")),
+        llir.VarDecl(_var("Result1_pos_dynamic")),
+        llir.DirectInit(
+            llir.Var("Result1_pos", llir.DataType.STD_VECTOR_C_INT),
+            (llir.Literal(8), llir.Literal(0)),
+        ),
+        llir.DirectInit(
+            llir.Var("Other1_pos", llir.DataType.STD_VECTOR_C_INT),
+            (llir.Literal(8), llir.Literal(0)),
+        ),
         llir.VarDecl(_var("Result1_crd")),
         llir.VarInit(_var("pResult1"), llir.Literal(0)),
         llir.VarInit(_var("Result1_pos_index"), llir.Literal(0)),
@@ -740,9 +767,14 @@ def test_legacy_prefix_and_work_body_filters_are_top_level_only() -> None:
     ] == ["keep-prefix"]
     assert not any(
         type(statement) is llir.VarDecl
-        and statement.var.name in {"Result_values", "Result1_pos", "Result1_crd"}
+        and statement.var.name
+        in {"Result_values", "Result1_pos_dynamic", "Result1_crd"}
         for statement in result.statements
     )
+    assert [
+        declaration.var.name
+        for declaration in _direct_initializations(result.statements)
+    ] == ["Other1_pos", "Result1_pos_nested", "Result1_pos_nested"]
 
 
 def test_nested_control_flow_and_statement_containers_follow_legacy_scopes() -> None:

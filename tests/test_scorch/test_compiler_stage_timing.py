@@ -3385,6 +3385,134 @@ def test_malformed_torch_empty_extent_fails_dynamic_owner_and_suppresses_later_s
     assert suppressed.value.diagnostic.code == "failed_compilation"
 
 
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "node_type", "diagnostic_path"),
+    (
+        (
+            "field",
+            "invalid_direct_init_var_type",
+            "DataType",
+            ("root", "[13]", "var", "type"),
+        ),
+        (
+            "subclass",
+            "unknown_llir_node",
+            "UnknownResultPositionInit",
+            ("root", "[13]"),
+        ),
+    ),
+)
+def test_malformed_fixed_result_position_owner_fails_result_abi_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+    diagnostic_code: str,
+    node_type: str,
+    diagnostic_path: tuple[str, ...],
+) -> None:
+    specs = (TensorSpec("oo", (2, 3), name="A"),)
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    options = _default_options()
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    context = CompilationContext(options)
+    original_initialization = ResultTensorAssembler.emit_level_indices_init
+    injected: list[tuple[str, llir.DataType]] = []
+
+    class UnknownResultPositionInit(llir.DirectInit):
+        pass
+
+    def emit_malformed_result_position(
+        self: ResultTensorAssembler,
+    ) -> list[llir.Stmt]:
+        statements = original_initialization(self)
+        for index, statement in enumerate(statements):
+            if type(statement) is not llir.DirectInit:
+                continue
+            declaration = cast(llir.DirectInit, statement)
+            if not declaration.var.name.endswith("_pos"):
+                continue
+            injected.append((declaration.var.name, declaration.var.type))
+            if malformation == "field":
+                declaration.var.type = llir.DataType.VOID
+            else:
+                statements[index] = UnknownResultPositionInit(
+                    declaration.var,
+                    declaration.args,
+                )
+            break
+        return statements
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_level_indices_init",
+        emit_malformed_result_position,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ij->ij",
+            *specs,
+            compile_only=True,
+            format="ds",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert injected == [("B1_pos", llir.DataType.STD_VECTOR_C_INT)]
+    assert diagnostic.code == diagnostic_code
+    assert diagnostic.stage == "LLIR rewrite"
+    assert diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
+    assert diagnostic.node_type == node_type
+    assert diagnostic.path == diagnostic_path
+    assert _stage_values(context) == [
+        *_EINSUM_PREFIX_THROUGH_ADAPTER,
+        CompilerStageId.RESULT_ABI_ASSEMBLY.value,
+    ]
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(6)
+    )
+    assert all(record.duration_ns >= 0 for record in context.stage_run_records)
+    assert context.stage_run_records[-1].nested_within is CompilerStageId.CIN_LOWERING
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+    ]
+    assert later_calls == []
+    assert context.compile_options is options
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
 @pytest.mark.parametrize("malformation", ("forged_field", "unknown_subclass"))
 def test_malformed_known_nnz_coordinate_owner_fails_result_abi_and_stops_later_work(
     monkeypatch: pytest.MonkeyPatch,

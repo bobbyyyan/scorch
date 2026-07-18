@@ -1082,6 +1082,69 @@ def test_result_position_initialization_uses_a_frozen_structured_target() -> Non
     assert LLIRLowerer().lower_llir(assignment) == "Result1_pos[0] = 0;"
 
 
+def test_fixed_result_position_owner_is_typed_fresh_direct_initialization() -> None:
+    tensor = TensorVar("Result", fmt="ds")
+    assembler = _result_tensor_assembler(
+        tensor,
+        exact_dense_parent_positions=True,
+    )
+
+    first = next(
+        cast(llir.DirectInit, statement)
+        for statement in assembler.emit_level_indices_init()
+        if type(statement) is llir.DirectInit
+    )
+    second = next(
+        cast(llir.DirectInit, statement)
+        for statement in assembler.emit_level_indices_init()
+        if type(statement) is llir.DirectInit
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first is not second
+    assert first.var is not second.var
+    assert first.args is not second.args
+    assert first.var.name == "Result1_pos"
+    assert first.var.type is llir.DataType.STD_VECTOR_C_INT
+    assert first.var.is_ptr is False
+    assert first.var.is_restrict is False
+    assert first.var.tensor_access is None
+    assert type(first.args) is tuple
+    assert len(first.args) == 2
+
+    extent = cast(llir.Add, first.args[0])
+    equal_extent = cast(llir.Add, second.args[0])
+    assert type(extent) is llir.Add
+    assert extent is not equal_extent
+    assert type(extent.left) is llir.Cast
+    parent_cast = cast(llir.Cast, extent.left)
+    equal_parent_cast = cast(llir.Cast, equal_extent.left)
+    assert parent_cast is not equal_parent_cast
+    assert parent_cast.data_type is llir.DataType.SIZE_T
+    assert type(parent_cast.expr) is llir.Var
+    parent_size = cast(llir.Var, parent_cast.expr)
+    equal_parent_size = cast(llir.Var, equal_parent_cast.expr)
+    assert parent_size is not equal_parent_size
+    assert parent_size.name == "Result0_size"
+    assert parent_size.type is llir.DataType.INT64
+    assert type(extent.right) is llir.Literal
+    assert cast(llir.Literal, extent.right).value == 1
+    assert cast(llir.Literal, extent.right).data_type is llir.DataType.INT
+    assert extent.right is not equal_extent.right
+    assert type(first.args[1]) is llir.Literal
+    assert cast(llir.Literal, first.args[1]).value == 0
+    assert cast(llir.Literal, first.args[1]).data_type is llir.DataType.INT
+    assert first.args[1] is not second.args[1]
+
+    assert LLIRLowerer().lower_llir(first) == (
+        "std::vector<int> Result1_pos((size_t) Result0_size + 1, 0);"
+    )
+    assert "scorch_tensor_from_vector(std::move(Result1_pos), torch::kInt)" in (
+        LLIRLowerer().lower_llir(assembler.emit_final_assembly())
+    )
+
+
 def _assert_torch_empty_extent(
     statements: list[llir.Stmt],
     *,
