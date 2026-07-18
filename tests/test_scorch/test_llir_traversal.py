@@ -123,6 +123,10 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
         llir.Return: llir.Return(value),
         llir.VarDecl: llir.VarDecl(value),
         llir.VarInit: llir.VarInit(value, literal),
+        llir.DirectInit: llir.DirectInit(
+            llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+            (literal,),
+        ),
         llir.FixedStackArrayDecl: llir.FixedStackArrayDecl(
             "workspace",
             llir.DataType.FLOAT32,
@@ -457,6 +461,47 @@ def test_panel_bound_cast_walker_has_deterministic_preorder() -> None:
     ]
     assert _record(expression) == expected
     assert _record(expression) == expected
+
+
+def test_direct_init_walker_and_rewriter_have_deterministic_preorder() -> None:
+    declaration = llir.DirectInit(
+        llir.Var("packed_B_storage", llir.DataType.STD_VECTOR_FLOAT32),
+        (
+            llir.Mul(
+                llir.Cast(
+                    llir.Var("kTile_j", llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+                llir.Cast(
+                    llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+            ),
+        ),
+    )
+    expected = [
+        "DirectInit",
+        "Var:packed_B_storage",
+        "Mul",
+        "Cast",
+        "Var:kTile_j",
+        "Cast",
+        "Var:kTile_k",
+    ]
+
+    assert _record(declaration) == expected
+
+    rewrite_events: List[str] = []
+
+    class RecordingRewriter(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewrite_events.append(node.name)
+            return super().rewrite_var(node, path)
+
+    rewritten = RecordingRewriter(_CONTEXT).rewrite(declaration)
+    assert type(rewritten) is llir.DirectInit
+    assert rewrite_events == ["packed_B_storage", "kTile_j", "kTile_k"]
+    assert _record(rewritten) == expected
 
 
 def test_walker_and_rewriter_cover_every_declared_node() -> None:
@@ -1062,6 +1107,169 @@ def test_cast_unknown_child_reports_exact_path(operation: str) -> None:
     assert raised.value.diagnostic.node_type == "UnknownExpr"
     assert raised.value.diagnostic.code == "unknown_llir_node"
     assert raised.value.diagnostic.path == ("root", "expr")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_direct_init_subclass_fails_closed(operation: str) -> None:
+    class UnknownDirectInit(llir.DirectInit):
+        pass
+
+    unknown = UnknownDirectInit(
+        llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        (llir.Literal(4),),
+    )
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownDirectInit"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        ("target", "invalid_direct_init_var", ("root", "var")),
+        ("name", "invalid_direct_init_var_name", ("root", "var", "name")),
+        ("type", "invalid_direct_init_var_type", ("root", "var", "type")),
+        (
+            "pointer",
+            "invalid_direct_init_var_is_ptr",
+            ("root", "var", "is_ptr"),
+        ),
+        (
+            "restrict",
+            "invalid_direct_init_var_is_restrict",
+            ("root", "var", "is_restrict"),
+        ),
+        (
+            "metadata",
+            "invalid_direct_init_var_metadata",
+            ("root", "var", "tensor_access"),
+        ),
+        ("args", "invalid_direct_init_args", ("root", "args")),
+        ("empty", "empty_direct_init_args", ("root", "args")),
+        (
+            "argument",
+            "invalid_direct_init_argument",
+            ("root", "args", "[0]"),
+        ),
+    ),
+)
+def test_forged_direct_init_fields_fail_at_exact_traversal_path(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    declaration = llir.DirectInit(
+        llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        (llir.Literal(4),),
+    )
+    if malformation == "target":
+        object.__setattr__(declaration, "var", llir.Literal(1))
+    elif malformation == "name":
+        declaration.var.name = "not a name"
+    elif malformation == "type":
+        declaration.var.type = llir.DataType.VOID
+    elif malformation == "pointer":
+        declaration.var.is_ptr = True
+    elif malformation == "restrict":
+        declaration.var.is_restrict = True
+    elif malformation == "metadata":
+        declaration.var.tensor_access = _result_metadata()
+    elif malformation == "args":
+        object.__setattr__(declaration, "args", [llir.Literal(4)])
+    elif malformation == "empty":
+        object.__setattr__(declaration, "args", ())
+    else:
+        object.__setattr__(declaration, "args", ("extent",))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(declaration)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(declaration)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_direct_init_unknown_child_reports_exact_path(operation: str) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    declaration = llir.DirectInit(
+        llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        (UnknownExpr(),),
+    )
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(declaration)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(declaration)
+
+    assert raised.value.diagnostic.node_type == "UnknownExpr"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", "args", "[0]")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("missing_field", "diagnostic_code", "expected_path"),
+    (
+        ("var", "invalid_direct_init_var", ("root", "var")),
+        ("args", "invalid_direct_init_args", ("root", "args")),
+        ("var_name", "invalid_direct_init_var_name", ("root", "var", "name")),
+    ),
+)
+def test_direct_init_missing_forged_fields_fail_closed(
+    operation: str,
+    missing_field: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    declaration = object.__new__(llir.DirectInit)
+    variable = (
+        object.__new__(llir.Var)
+        if missing_field == "var_name"
+        else llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32)
+    )
+    if missing_field != "var":
+        object.__setattr__(declaration, "var", variable)
+    if missing_field != "args":
+        object.__setattr__(declaration, "args", (llir.Literal(4),))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(declaration)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(declaration)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+def test_direct_init_rewrite_rejects_invalid_target_replacement() -> None:
+    declaration = llir.DirectInit(
+        llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        (llir.Literal(4),),
+    )
+
+    class InvalidTargetReplacement(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            return llir.Var(node.name, llir.DataType.VOID)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        InvalidTargetReplacement(_CONTEXT).rewrite(declaration)
+
+    assert raised.value.diagnostic.code == "invalid_direct_init_var_type"
+    assert raised.value.diagnostic.path == ("root", "var", "type")
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -2371,6 +2579,58 @@ def test_cast_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
 
     cast(llir.Var, replacement_add.left).name = "owned"
     assert cast(llir.Var, original_add.left).name == "offset"
+
+
+def test_direct_init_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original = llir.DirectInit(
+        llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        (
+            llir.Mul(
+                llir.Cast(
+                    _var("rows", llir.DataType.INT64),
+                    llir.DataType.SIZE_T,
+                ),
+                llir.Cast(
+                    _var("columns", llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+            ),
+        ),
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.DirectInit, rewriter.rewrite(original))
+    second = cast(llir.DirectInit, rewriter.rewrite(first))
+
+    assert _record(original) == _record(first) == _record(second)
+    assert original == first == second
+    assert hash(original) == hash(first) == hash(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+    assert type(first.args) is tuple
+    assert type(second.args) is tuple
+
+    class ReplaceRows(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "rows":
+                rewritten.name = "replacement_rows"
+            return rewritten
+
+    replacement = cast(llir.DirectInit, ReplaceRows(_CONTEXT).rewrite(original))
+    replacement_extent = cast(llir.Mul, replacement.args[0])
+    replacement_rows = cast(llir.Var, cast(llir.Cast, replacement_extent.left).expr)
+    original_extent = cast(llir.Mul, original.args[0])
+    original_rows = cast(llir.Var, cast(llir.Cast, original_extent.left).expr)
+    first_extent = cast(llir.Mul, first.args[0])
+    first_rows = cast(llir.Var, cast(llir.Cast, first_extent.left).expr)
+
+    assert replacement_rows.name == "replacement_rows"
+    assert original_rows.name == "rows"
+    assert replacement_rows is not original_rows
+    replacement_rows.name = "owned"
+    assert original_rows.name == "rows"
+    assert first_rows.name == "rows"
 
 
 def test_assignment_target_rewrite_owns_replacement_and_preserves_original() -> None:

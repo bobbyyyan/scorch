@@ -85,6 +85,7 @@ from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
     TorchCppKernelABI,
 )
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
+    RelayoutSpec,
     Schedule,
     Scheduler,
     TileSpec,
@@ -510,6 +511,127 @@ def test_production_and_debug_record_the_exact_complete_stage_sequence(
         None,
         None,
     ]
+
+
+def test_packed_storage_activation_is_independent_and_records_complete_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec(
+                "k",
+                4,
+                placement="outermost",
+                accum="direct",
+                unroll=False,
+            ),
+            TileSpec(
+                "j",
+                3,
+                placement="child_of:k_out",
+                kind="panel",
+                accum="direct",
+            ),
+        ),
+        relayout=RelayoutSpec("B", "k", 4, scope_var="j"),
+        tag="structured-packed-storage",
+        parallel_loop="i",
+    )
+    schedule_snapshot = replace(schedule)
+    schedule_identity = (schedule.cache_key, hash(schedule))
+    options = _default_options(requested_schedule=schedule)
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs = _spmm_specs()
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    prepared_builds: list[utils._PreparedJITBuild] = []
+
+    def record_prepared(prepared: utils._PreparedJITBuild) -> object:
+        prepared_builds.append(prepared)
+        return object()
+
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record_prepared)
+
+    first_context = CompilationContext(options)
+    first = ops.einsum(
+        "ij,jk->ik",
+        *specs,
+        compile_only=True,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=first_context,
+    )
+    first_stage_records = first_context.stage_run_records
+    first_pass_records = first_context.llir_pass_run_records
+    ops._kernel_cache.clear()
+    ops._einsum_dispatch_cache.clear()
+
+    second_context = CompilationContext(options)
+    second = ops.einsum(
+        "ij,jk->ik",
+        *specs,
+        compile_only=True,
+        format="dd",
+        _compile_options=options,
+        _compilation_context=second_context,
+    )
+
+    assert isinstance(first, TensorSpec)
+    assert isinstance(second, TensorSpec)
+    assert first == second
+    assert first is not second
+    assert len(prepared_builds) == 2
+    assert prepared_builds[0] == prepared_builds[1]
+    assert (
+        prepared_builds[0].request.cpp_sources == prepared_builds[1].request.cpp_sources
+    )
+    expected = (
+        "std::vector<float> packed_B_storage(" "(size_t) kTile_j * (size_t) kTile_k);"
+    )
+    assert (
+        sum(source.count(expected) for source in prepared_builds[0].request.cpp_sources)
+        == 1
+    )
+    assert prepared_builds[0].request.build_options is options.build
+    assert prepared_builds[1].request.build_options is options.build
+    assert first_context.compile_options is options
+    assert second_context.compile_options is options
+    assert _stage_values(first_context) == _EXPLICIT_STAGE_SEQUENCE
+    assert _stage_values(second_context) == _EXPLICIT_STAGE_SEQUENCE
+    assert [record.pass_name for record in first_pass_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.sequence_index for record in first_pass_records] == list(range(5))
+    assert tuple(
+        replace(record, duration_ns=0) for record in first_stage_records
+    ) == tuple(
+        replace(record, duration_ns=0) for record in second_context.stage_run_records
+    )
+    assert tuple(
+        replace(record, duration_ns=0) for record in first_pass_records
+    ) == tuple(
+        replace(record, duration_ns=0)
+        for record in second_context.llir_pass_run_records
+    )
+    assert all(record.duration_ns >= 0 for record in first_stage_records)
+    assert all(record.duration_ns >= 0 for record in first_pass_records)
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert schedule == schedule_snapshot
+    assert (schedule.cache_key, hash(schedule)) == schedule_identity
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
 
 
 def test_regblock_dual_path_records_both_schedule_and_lowering_arms(
@@ -2134,6 +2256,159 @@ def test_malformed_panel_bound_fails_schedule_stage_and_suppresses_later_work(
     ) == options_identity
     assert specs[0].name == "A"
     assert specs[1].name == "B"
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+    assert CompilerStageId.SCHEDULE_LOWERING.value in str(suppressed.value)
+
+
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "node_type"),
+    (
+        ("field", "invalid_direct_init_var_type", "DataType"),
+        ("child", "unknown_llir_node", "UnknownPackedExtent"),
+        ("subclass", "unknown_llir_node", "UnknownDirectInit"),
+    ),
+)
+def test_malformed_packed_storage_fails_schedule_owner_and_suppresses_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+    diagnostic_code: str,
+    node_type: str,
+) -> None:
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec(
+                "k",
+                4,
+                placement="outermost",
+                accum="direct",
+                unroll=False,
+            ),
+            TileSpec(
+                "j",
+                3,
+                placement="child_of:k_out",
+                kind="panel",
+                accum="direct",
+            ),
+        ),
+        relayout=RelayoutSpec("B", "k", 4, scope_var="j"),
+        tag="malformed-packed-storage",
+        parallel_loop="i",
+    )
+    schedule_snapshot = replace(schedule)
+    schedule_identity = (schedule.cache_key, hash(schedule))
+    options = _default_options(requested_schedule=schedule)
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    context = CompilationContext(options)
+    specs = _spmm_specs()
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    original_builder = schedule_lowerer._packed_storage_declaration
+    injected: list[tuple[str, llir.DataType]] = []
+
+    class UnknownPackedExtent(llir.Expr):
+        pass
+
+    class UnknownDirectInit(llir.DirectInit):
+        pass
+
+    def build_malformed_packed_storage(
+        *,
+        storage_name: str,
+        scalar_type: llir.DataType,
+        stage_rows: str,
+        stage_rows_type: llir.DataType,
+        pack_tile_var: str,
+    ) -> llir.DirectInit:
+        declaration = original_builder(
+            storage_name=storage_name,
+            scalar_type=scalar_type,
+            stage_rows=stage_rows,
+            stage_rows_type=stage_rows_type,
+            pack_tile_var=pack_tile_var,
+        )
+        injected.append((declaration.var.name, declaration.var.type))
+        if malformation == "field":
+            declaration.var.type = llir.DataType.VOID
+            return declaration
+        if malformation == "child":
+            object.__setattr__(declaration, "args", (UnknownPackedExtent(),))
+            return declaration
+        return UnknownDirectInit(declaration.var, declaration.args)
+
+    monkeypatch.setattr(
+        schedule_lowerer,
+        "_packed_storage_declaration",
+        build_malformed_packed_storage,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ij,jk->ik",
+            *specs,
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert injected == [
+        ("packed_B_storage", llir.DataType.STD_VECTOR_FLOAT32),
+    ]
+    assert diagnostic.code == diagnostic_code
+    assert diagnostic.stage == "schedule lowering"
+    assert diagnostic.pass_name == "build_packed_storage"
+    assert diagnostic.node_type == node_type
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE[:7]
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(7)
+    )
+    assert all(record.duration_ns >= 0 for record in context.stage_run_records)
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == list(
+        range(5)
+    )
+    assert all(record.duration_ns >= 0 for record in context.llir_pass_run_records)
+    assert later_calls == []
+    assert context.compile_options is options
+    assert options.requested_schedule is schedule
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert schedule == schedule_snapshot
+    assert (schedule.cache_key, hash(schedule)) == schedule_identity
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
     with pytest.raises(CompilationContextError) as suppressed:
         context.begin_stage(
             CompilerStageId.LLIR_TO_CPP_GENERATION,

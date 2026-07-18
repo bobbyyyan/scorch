@@ -190,6 +190,39 @@ def _lower_with_var_initializers(stmt: ForAll) -> tuple[str, list[llir.VarInit]]
     return LLIRLowerer().lower_llir(lowered), initializers
 
 
+def _lower_with_direct_initializers(
+    stmt: ForAll,
+) -> tuple[str, list[llir.DirectInit], list[str]]:
+    lowered = CINLowerer().lower_IndexStmt(stmt)
+    initializers: list[llir.DirectInit] = []
+    raw_codes: list[str] = []
+
+    class DirectInitializerCollector(LLIRWalker):
+        def visit_direct_init(
+            self,
+            node: llir.DirectInit,
+            path: tuple[str, ...],
+        ) -> None:
+            initializers.append(node)
+            super().visit_direct_init(node, path)
+
+        def visit_raw_stmt(
+            self,
+            node: llir.RawStmt,
+            path: tuple[str, ...],
+        ) -> None:
+            raw_codes.append(node.code)
+            super().visit_raw_stmt(node, path)
+
+    DirectInitializerCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_direct_initializers",
+        )
+    ).walk(lowered)
+    return LLIRLowerer().lower_llir(lowered), initializers, raw_codes
+
+
 def _loop_chain(stmt):
     names = []
     body = (
@@ -1008,6 +1041,111 @@ def test_packed_relayout_data_call_is_typed_owned_and_byte_exact(
     assert first_cpp.count(expected) == 1
 
 
+@pytest.mark.parametrize(
+    ("dtype", "vector_type", "cpp_scalar"),
+    [
+        (torch.float32, llir.DataType.STD_VECTOR_FLOAT32, "float"),
+        (torch.float64, llir.DataType.STD_VECTOR_FLOAT64, "double"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("scope", "stage_rows", "stage_rows_type"),
+    [
+        ("reduce", "kTile_reduce", llir.DataType.CONSTEXPR_INT),
+        ("free", "DenseInput0_size", llir.DataType.INT64),
+    ],
+)
+def test_packed_storage_owner_is_direct_typed_fresh_and_byte_exact(
+    dtype: torch.dtype,
+    vector_type: llir.DataType,
+    cpp_scalar: str,
+    scope: str,
+    stage_rows: str,
+    stage_rows_type: llir.DataType,
+) -> None:
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope=scope,
+        accum="direct",
+    )
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=dtype),
+        schedule,
+    )
+
+    first_cpp, first_initializers, first_raw_codes = _lower_with_direct_initializers(
+        scheduled
+    )
+    second_cpp, second_initializers, second_raw_codes = _lower_with_direct_initializers(
+        scheduled
+    )
+
+    first_matches = [
+        node
+        for node in first_initializers
+        if node.var.name == "packed_DenseInput_storage"
+    ]
+    second_matches = [
+        node
+        for node in second_initializers
+        if node.var.name == "packed_DenseInput_storage"
+    ]
+    assert len(first_matches) == len(second_matches) == 1
+    first = first_matches[0]
+    second = second_matches[0]
+
+    assert first.var == llir.Var("packed_DenseInput_storage", vector_type)
+    assert first.var.type is vector_type
+    assert first.var.is_ptr is False
+    assert first.var.is_restrict is False
+    assert first.var.tensor_access is None
+    assert type(first.args) is tuple
+    assert len(first.args) == 1
+    extent = cast(llir.Mul, first.args[0])
+    assert type(extent) is llir.Mul
+    assert type(extent.left) is llir.Cast
+    assert type(extent.right) is llir.Cast
+    left = cast(llir.Cast, extent.left)
+    right = cast(llir.Cast, extent.right)
+    assert left.data_type is llir.DataType.SIZE_T
+    assert right.data_type is llir.DataType.SIZE_T
+    assert left.expr == llir.Var(stage_rows, stage_rows_type)
+    assert right.expr == llir.Var("kTile_free", llir.DataType.CONSTEXPR_INT)
+    assert type(left.expr) is type(right.expr) is llir.Var
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first is not second
+    assert first.var is not second.var
+    second_extent = cast(llir.Mul, second.args[0])
+    assert extent is not second_extent
+    assert left is not cast(llir.Cast, second_extent.left)
+    assert left.expr is not cast(llir.Cast, second_extent.left).expr
+    assert right.expr is not cast(llir.Cast, second_extent.right).expr
+
+    expected = (
+        f"std::vector<{cpp_scalar}> packed_DenseInput_storage("
+        f"(size_t) {stage_rows} * (size_t) kTile_free);"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected
+    assert first_cpp == second_cpp
+    assert first_cpp.count(expected) == 1
+    assert all("packed_DenseInput_storage" not in code for code in first_raw_codes)
+    assert all("packed_DenseInput_storage" not in code for code in second_raw_codes)
+
+    _, pointer_initializers = _lower_with_var_initializers(scheduled)
+    pointer = next(
+        node for node in pointer_initializers if node.var.name == "packed_DenseInput"
+    )
+    assert type(pointer.value) is llir.MemberCall
+    receiver = cast(llir.MemberCall, pointer.value).base
+    assert receiver == first.var
+    assert receiver is not first.var
+
+
 def test_full_stage_and_heap_result_are_structural_and_name_independent():
     schedule = _packed_schedule(
         row="row",
@@ -1310,6 +1448,42 @@ def test_fixed_stack_array_name_participates_in_schedule_name_hygiene():
         == "packed_DenseInput_1"
     )
     assert used_names == {"packed_DenseInput", "packed_DenseInput_1"}
+
+
+def test_direct_init_name_participates_in_schedule_name_hygiene():
+    declaration = llir.DirectInit(
+        var=llir.Var(
+            "packed_DenseInput_storage",
+            llir.DataType.STD_VECTOR_FLOAT32,
+        ),
+        args=(llir.Literal(4),),
+    )
+    function = llir.Function(
+        return_type=llir.DataType.VOID,
+        name="kernel",
+        args=[],
+        body=[
+            llir.IfThenElse(
+                cond=llir.Var("condition", llir.DataType.BOOL),
+                then_body=[declaration],
+            )
+        ],
+    )
+
+    used_names = schedule_lowerer_module._declared_names(function)
+
+    assert used_names == {"packed_DenseInput_storage"}
+    assert (
+        schedule_lowerer_module._unique_name(
+            "packed_DenseInput_storage",
+            used_names,
+        )
+        == "packed_DenseInput_storage_1"
+    )
+    assert used_names == {
+        "packed_DenseInput_storage",
+        "packed_DenseInput_storage_1",
+    }
 
 
 def test_packed_and_unpacked_schedules_cannot_alias_either_cache():

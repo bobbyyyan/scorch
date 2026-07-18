@@ -76,6 +76,172 @@ def test_increment_rejects_nonexact_vars_and_codegen_fails_closed() -> None:
         LLIRLowerer().lower_llir(forged)
 
 
+def test_direct_init_is_frozen_typed_structural_and_byte_exact() -> None:
+    target = llir.Var("packed_B_storage", llir.DataType.STD_VECTOR_FLOAT32)
+    extent = llir.Mul(
+        llir.Cast(
+            llir.Var("kTile_j", llir.DataType.CONSTEXPR_INT),
+            llir.DataType.SIZE_T,
+        ),
+        llir.Cast(
+            llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+            llir.DataType.SIZE_T,
+        ),
+    )
+    caller_args = [extent]
+    declaration = llir.DirectInit(target, caller_args)
+    equal = llir.DirectInit(
+        llir.Var("packed_B_storage", llir.DataType.STD_VECTOR_FLOAT32),
+        (
+            llir.Mul(
+                llir.Cast(
+                    llir.Var("kTile_j", llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+                llir.Cast(
+                    llir.Var("kTile_k", llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+            ),
+        ),
+    )
+
+    caller_args.append(llir.Literal(0))
+
+    assert declaration.var is target
+    assert declaration.args == (extent,)
+    assert type(declaration.args) is tuple
+    assert declaration == equal
+    assert hash(declaration) == hash(equal)
+    assert get_type_hints(llir.DirectInit) == {
+        "var": llir.Var,
+        "args": Tuple[llir.Expr, ...],
+    }
+    assert (
+        LLIRLowerer().lower_llir(declaration) == "std::vector<float> packed_B_storage("
+        "(size_t) kTile_j * (size_t) kTile_k);"
+    )
+    assert (
+        LLIRLowerer().lower_llir(declaration, indent_level=2)
+        == "    std::vector<float> packed_B_storage("
+        "(size_t) kTile_j * (size_t) kTile_k);"
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        declaration.var = _var("other")
+    with pytest.raises(FrozenInstanceError):
+        declaration.args = (llir.Literal(1),)
+
+
+def test_direct_init_emits_multiple_arguments_in_order() -> None:
+    declaration = llir.DirectInit(
+        llir.Var("positions", llir.DataType.STD_VECTOR_C_INT),
+        (llir.Literal(4), llir.Literal(0)),
+    )
+
+    assert LLIRLowerer().lower_llir(declaration) == (
+        "std::vector<int> positions(4, 0);"
+    )
+
+
+def test_direct_init_rejects_malformed_construction() -> None:
+    class UnknownVar(llir.Var):
+        pass
+
+    metadata = _result_metadata()
+    invalid_targets = (
+        cast(llir.Var, llir.Literal(1)),
+        UnknownVar("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        llir.Var("not a name", llir.DataType.STD_VECTOR_FLOAT32),
+        llir.Var("storage", llir.DataType.NO_TYPE),
+        llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32, is_ptr=True),
+        llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32, is_restrict=True),
+        llir.Var(
+            "storage",
+            llir.DataType.STD_VECTOR_FLOAT32,
+            tensor_access=metadata,
+        ),
+    )
+    for target in invalid_targets:
+        with pytest.raises((TypeError, ValueError), match="DirectInit.var"):
+            llir.DirectInit(target, (llir.Literal(1),))
+
+    with pytest.raises(TypeError, match="DirectInit.args must be a list or tuple"):
+        llir.DirectInit(
+            llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+            cast(Any, {llir.Literal(1)}),
+        )
+    with pytest.raises(TypeError, match="DirectInit.args must be non-empty"):
+        llir.DirectInit(
+            llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+            (),
+        )
+    with pytest.raises(TypeError, match="only LLIR expressions"):
+        llir.DirectInit(
+            llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+            cast(Any, ("extent",)),
+        )
+
+
+@pytest.mark.parametrize("malformation", ("subclass", "target", "args", "child"))
+def test_direct_init_codegen_rejects_unknown_and_forged_nodes(
+    malformation: str,
+) -> None:
+    class UnknownDirectInit(llir.DirectInit):
+        pass
+
+    class UnknownVar(llir.Var):
+        pass
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    declaration: llir.DirectInit = llir.DirectInit(
+        llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        (llir.Literal(4),),
+    )
+    if malformation == "subclass":
+        declaration = UnknownDirectInit(
+            llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+            (llir.Literal(4),),
+        )
+        expected = "UnknownDirectInit"
+    elif malformation == "target":
+        object.__setattr__(
+            declaration,
+            "var",
+            UnknownVar("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        )
+        expected = "DirectInit.var must be an exact LLIR Var"
+    elif malformation == "args":
+        object.__setattr__(declaration, "args", [llir.Literal(4)])
+        expected = "DirectInit.args must be a tuple"
+    else:
+        object.__setattr__(declaration, "args", (UnknownExpr(),))
+        expected = "UnknownExpr"
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(declaration)
+
+
+@pytest.mark.parametrize("missing_field", ("var", "args"))
+def test_direct_init_codegen_rejects_missing_forged_fields(
+    missing_field: str,
+) -> None:
+    declaration = object.__new__(llir.DirectInit)
+    if missing_field != "var":
+        object.__setattr__(
+            declaration,
+            "var",
+            llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+        )
+    if missing_field != "args":
+        object.__setattr__(declaration, "args", (llir.Literal(4),))
+
+    with pytest.raises(CodegenError, match=f"DirectInit.{missing_field}"):
+        LLIRLowerer().lower_llir(declaration)
+
+
 def test_codegen_rejects_unknown_binary_operator() -> None:
     expression = llir.BinOp(op="<=>", left=_var("a"), right=_var("b"))
 

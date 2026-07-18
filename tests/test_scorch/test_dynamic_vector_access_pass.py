@@ -637,6 +637,44 @@ def test_dynamic_vector_pass_no_vector_declaration_is_detached_no_op() -> None:
     )
 
 
+def test_direct_initialized_vector_is_detached_but_not_classified_as_dynamic() -> None:
+    source: List[llir.Stmt] = [
+        llir.DirectInit(
+            _var("packed_storage", llir.DataType.STD_VECTOR_FLOAT32),
+            (
+                llir.Mul(
+                    llir.Cast(
+                        _var("rows", llir.DataType.INT64),
+                        llir.DataType.SIZE_T,
+                    ),
+                    llir.Cast(
+                        _var("columns", llir.DataType.CONSTEXPR_INT),
+                        llir.DataType.SIZE_T,
+                    ),
+                ),
+            ),
+        ),
+        llir.Assign(
+            _access("packed_storage", "i", llir.DataType.STD_VECTOR_FLOAT32),
+            _var("value", llir.DataType.FLOAT32),
+        ),
+    ]
+
+    rewritten = rewrite_dynamic_vector_accesses(
+        source,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+
+    assert [type(statement) for statement in rewritten] == [
+        llir.DirectInit,
+        llir.Assign,
+    ]
+    assert _cpp(rewritten) == _cpp(source)
+    rewritten_decl = cast(llir.DirectInit, rewritten[0])
+    rewritten_decl.var.name = "changed"
+    assert cast(llir.DirectInit, source[0]).var.name == "packed_storage"
+
+
 def test_dynamic_vector_pass_detaches_without_rewriting_qualified_dtype() -> None:
     source: List[llir.Stmt] = [
         llir.VarInit(
