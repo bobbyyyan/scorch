@@ -864,6 +864,9 @@ def _should_drop_prefix_statement(
             or name.startswith(f"{result_name}{level}_crd")
             for level in levels
         )
+    if type(statement) is llir.DirectInit:
+        name = statement.var.name
+        return any(name.startswith(f"{result_name}{level}_pos") for level in levels)
     if type(statement) is llir.VarInit:
         name = statement.var.name
         return any(

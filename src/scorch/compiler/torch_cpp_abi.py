@@ -654,10 +654,29 @@ class ResultTensorAssembler:
                     # without a copy. Parent coordinates are ABI-validated
                     # against this same extent before the generated loop.
                     stmts.append(
-                        llir.RawStmt(
-                            code=(
-                                f"std::vector<int> {self.name}{i}_pos("
-                                f"(size_t){self.name}{i - 1}_size + 1, 0)"
+                        llir.DirectInit(
+                            var=llir.Var(
+                                name=f"{self.name}{i}_pos",
+                                type=llir.DataType.STD_VECTOR_C_INT,
+                            ),
+                            args=(
+                                llir.Add(
+                                    llir.Cast(
+                                        expr=llir.Var(
+                                            name=f"{self.name}{i - 1}_size",
+                                            type=llir.DataType.INT64,
+                                        ),
+                                        data_type=llir.DataType.SIZE_T,
+                                    ),
+                                    llir.Literal(
+                                        value=1,
+                                        data_type=llir.DataType.INT,
+                                    ),
+                                ),
+                                llir.Literal(
+                                    value=0,
+                                    data_type=llir.DataType.INT,
+                                ),
                             ),
                         )
                     )
