@@ -29,6 +29,9 @@ import scorch.ops as ops  # type: ignore[import-untyped]
 import scorch.stensor as stensor_module  # type: ignore[import-untyped]
 import scorch.utils as utils  # type: ignore[import-untyped]
 from scorch.compiler import llir  # type: ignore[import-untyped]
+from scorch.compiler import (  # type: ignore[import-untyped]
+    compressed_where_openmp_pass as compressed_where_module,
+)
 from scorch.compiler.cin import (  # type: ignore[import-untyped]
     ForAll,
     IndexStmt,
@@ -74,6 +77,7 @@ from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
 from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRTraversalContext,
     LLIRTraversalError,
+    LLIRValue,
     LLIRWalker,
 )
 from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
@@ -1272,6 +1276,103 @@ def test_known_nnz_extent_is_independent_across_full_compilations(
         "eliminate_single_iteration_loops",
         "hoist_loop_invariant_factors",
         "rewrite_dynamic_vector_accesses",
+    ]
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+
+
+def test_compressed_base_load_is_independent_across_full_compilations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs = (
+        TensorSpec("ds", (2, 3), name="A"),
+        TensorSpec("ds", (3, 4), name="B"),
+    )
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    prepared_builds: list[utils._PreparedJITBuild] = []
+
+    def record_prepared(prepared: utils._PreparedJITBuild) -> object:
+        prepared_builds.append(prepared)
+        return object()
+
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record_prepared)
+    first_context = CompilationContext(options)
+    first = ops.einsum(
+        "ik,kj->ij",
+        *specs,
+        compile_only=True,
+        format="ds",
+        _compile_options=options,
+        _compilation_context=first_context,
+    )
+    first_stage_records = first_context.stage_run_records
+    first_pass_records = first_context.llir_pass_run_records
+    ops._kernel_cache.clear()
+    ops._einsum_dispatch_cache.clear()
+
+    second_context = CompilationContext(options)
+    second = ops.einsum(
+        "ik,kj->ij",
+        *specs,
+        compile_only=True,
+        format="ds",
+        _compile_options=options,
+        _compilation_context=second_context,
+    )
+
+    assert isinstance(first, TensorSpec)
+    assert isinstance(second, TensorSpec)
+    assert first == second
+    assert first is not second
+    assert len(prepared_builds) == 2
+    assert prepared_builds[0] == prepared_builds[1]
+    assert prepared_builds[0].request.cpp_sources == (
+        prepared_builds[1].request.cpp_sources
+    )
+    assert (
+        sum(
+            source.count("int64_t _base1 = _offset1[i];")
+            for source in prepared_builds[0].request.cpp_sources
+        )
+        == 1
+    )
+    assert prepared_builds[0].request.build_options is options.build
+    assert prepared_builds[1].request.build_options is options.build
+    assert first_context.compile_options is options
+    assert second_context.compile_options is options
+    assert _stage_values(first_context) == _AUTO_STAGE_SEQUENCE
+    assert _stage_values(second_context) == _AUTO_STAGE_SEQUENCE
+    assert tuple(
+        replace(record, duration_ns=0) for record in first_stage_records
+    ) == tuple(
+        replace(record, duration_ns=0) for record in second_context.stage_run_records
+    )
+    assert tuple(
+        replace(record, duration_ns=0) for record in first_pass_records
+    ) == tuple(
+        replace(record, duration_ns=0)
+        for record in second_context.llir_pass_run_records
+    )
+    assert [record.configuration_name for record in first_pass_records] == [
+        "compressed_where_openmp",
+        "count",
+        "fill",
+        "sparse_prefetch",
+        "dense_pointer_hoist",
+        "single_iteration_loop_elimination",
+        "loop_invariant_factor_hoist",
+        "dynamic_vector_access",
     ]
     assert tuple(spec.metadata for spec in specs) == specs_snapshot
     assert (
@@ -3655,6 +3756,163 @@ def test_malformed_mode_iterator_position_bound_stops_all_later_work(
     assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
     assert context.llir_pass_run_records == ()
     assert later_calls == []
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
+def test_malformed_compressed_base_load_fails_owner_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs = (
+        TensorSpec("ds", (2, 3), name="A"),
+        TensorSpec("ds", (3, 4), name="B"),
+    )
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    context = CompilationContext(options)
+    injected: list[tuple[str, llir.DataType, str, llir.DataType, str]] = []
+
+    def base_loads(value: object) -> list[llir.VarInit]:
+        matches: list[llir.VarInit] = []
+        if type(value) is llir.VarInit:
+            initializer = cast(llir.VarInit, value)
+            access = initializer.value
+            if (
+                initializer.var.name.startswith("_base")
+                and type(access) is llir.ArrayAccess
+                and type(cast(llir.ArrayAccess, access).array) is llir.Var
+                and cast(
+                    llir.Var, cast(llir.ArrayAccess, access).array
+                ).name.startswith("_offset")
+            ):
+                matches.append(initializer)
+        if isinstance(value, llir.Node):
+            for child in vars(value).values():
+                matches.extend(base_loads(child))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                matches.extend(base_loads(child))
+        return matches
+
+    class InjectingWalker(LLIRWalker):
+        def walk(self, value: LLIRValue) -> None:
+            matches = base_loads(value)
+            if matches and not injected:
+                initializer = matches[0]
+                access = cast(llir.ArrayAccess, initializer.value)
+                array = cast(llir.Var, access.array)
+                index = cast(llir.Var, access.index)
+                injected.append(
+                    (
+                        initializer.var.name,
+                        initializer.var.type,
+                        array.name,
+                        array.type,
+                        index.name,
+                    )
+                )
+                forged = object.__new__(llir.ArrayAccess)
+                object.__setattr__(forged, "array", array)
+                object.__setattr__(forged, "index", index)
+                object.__setattr__(forged, "tensor_access", object())
+                initializer.value = forged
+            super().walk(value)
+
+    monkeypatch.setattr(compressed_where_module, "LLIRWalker", InjectingWalker)
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_sparse_prefetch",
+                "sparse_prefetch",
+            ),
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_dense_pointer_hoist",
+                "dense_pointer_hoist",
+            ),
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_single_iteration_loop_elimination",
+                "single_iteration",
+            ),
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_loop_invariant_factor_hoist",
+                "factor_hoist",
+            ),
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_dynamic_vector_access",
+                "dynamic_vector",
+            ),
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *specs,
+            compile_only=True,
+            format="ds",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert injected == [
+        (
+            "_base1",
+            llir.DataType.INT64,
+            "_offset1",
+            llir.DataType.STD_VECTOR_INT,
+            "i",
+        )
+    ]
+    assert diagnostic.code == "invalid_tensor_access_metadata"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "transform_compressed_where_for_openmp"
+    assert diagnostic.path[-2:] == ("value", "tensor_access")
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [
+        (record.pass_name, record.configuration_name)
+        for record in context.llir_pass_run_records
+    ] == [
+        ("rewrite_result_writes", "count"),
+        ("rewrite_result_writes", "fill"),
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == [
+        0,
+        1,
+    ]
+    assert all(record.duration_ns >= 0 for record in context.llir_pass_run_records)
+    assert later_calls == []
+    assert context.compile_options is options
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
     with pytest.raises(CompilationContextError) as suppressed:
         context.begin_stage(
             CompilerStageId.SCHEDULE_LOWERING,

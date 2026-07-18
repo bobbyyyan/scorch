@@ -7,6 +7,7 @@ from typing import List, Set, Tuple, cast
 import pytest
 
 from scorch.compiler import llir
+from scorch.compiler import compressed_where_openmp_pass as compressed_where_module
 from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
@@ -21,6 +22,8 @@ from scorch.compiler.llir_traversal import (
     LLIRStatementValue,
     LLIRTraversalContext,
     LLIRTraversalError,
+    LLIRValue,
+    LLIRWalker,
 )
 from scorch.compiler.llir_pass_manager import DEBUG_LLIR_PASS_OPTIONS
 from scorch.compiler.scheduler import Scheduler
@@ -225,6 +228,30 @@ def _phase_state_vars(value: object) -> List[llir.Var]:
     return variables
 
 
+def _base_offset_loads(value: object) -> List[llir.VarInit]:
+    loads: List[llir.VarInit] = []
+    if type(value) is llir.VarInit:
+        initializer = cast(llir.VarInit, value)
+        access = initializer.value
+        if (
+            re.fullmatch(r"_base\d+", initializer.var.name)
+            and type(access) is llir.ArrayAccess
+            and type(cast(llir.ArrayAccess, access).array) is llir.Var
+            and re.fullmatch(
+                r"_offset\d+",
+                cast(llir.Var, cast(llir.ArrayAccess, access).array).name,
+            )
+        ):
+            loads.append(initializer)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            loads.extend(_base_offset_loads(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            loads.extend(_base_offset_loads(child))
+    return loads
+
+
 def _call_names(value: object) -> List[str]:
     names: List[str] = []
     if type(value) is llir.FunctionCallStmt:
@@ -286,7 +313,12 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     assert "_count1[row] = _cnt1" in count_assignment_codes
     assert "_count1[row] = _cnt1" not in count_codes
     assert "wksp.clear()" in count_codes
-    assert "int64_t _base1 = _offset1[row]" in fill_codes
+    base_load_codes = [
+        LLIRLowerer().lower_llir(load).removesuffix(";")
+        for load in _base_offset_loads(fill_loop.body)
+    ]
+    assert base_load_codes == ["int64_t _base1 = _offset1[row]"]
+    assert "int64_t _base1 = _offset1[row]" not in fill_codes
     assert "int _pos1 = 0" in fill_state_codes
     assert "Result1_crd_data[_base1 + _pos1] = column" in fill_assignment_codes
     assert "Result1_crd_data[_base1 + _pos1] = column" not in fill_codes
@@ -504,6 +536,83 @@ def test_count_fill_state_is_typed_structural_fresh_and_never_raw() -> None:
         "_prev2": 6,
     }
     assert len({id(var) for var in first_state_vars}) == len(first_state_vars)
+
+
+def test_fill_base_offset_loads_are_typed_owned_structural_and_never_raw() -> None:
+    source: List[llir.Stmt] = [_compatible_loop(_ds_work_body(), bound="A0_size")]
+    source_header = cast(llir.VarInit, cast(llir.ForLoop, source[0]).init).var
+    snapshot = _structural_snapshot(source)
+
+    first = transform_compressed_where_for_openmp(source, _context((1, 2)))
+    second = transform_compressed_where_for_openmp(source, _context((1, 2)))
+    first_loads = _base_offset_loads(first.statements)
+    second_loads = _base_offset_loads(second.statements)
+
+    assert _structural_snapshot(source) == snapshot
+    assert [load.var.name for load in first_loads] == ["_base1", "_base2"]
+    assert first_loads == second_loads
+    assert [hash(load) for load in first_loads] == [hash(load) for load in second_loads]
+    assert _mutable_ir_ids(first_loads).isdisjoint(_mutable_ir_ids(second_loads))
+    assert [LLIRLowerer().lower_llir(load) for load in first_loads] == [
+        "int64_t _base1 = _offset1[row];",
+        "int64_t _base2 = _offset2[row];",
+    ]
+    assert not any(
+        re.search(r"int64_t _base\d+ = _offset\d+\[", code)
+        for code in _raw_codes(first.statements)
+    )
+
+    for level, initializer in enumerate(first_loads, start=1):
+        assert type(initializer) is llir.VarInit
+        assert type(initializer.var) is llir.Var
+        assert initializer.var.name == f"_base{level}"
+        assert initializer.var.type is llir.DataType.INT64
+        assert initializer.var.is_ptr is False
+        assert initializer.var.is_restrict is False
+        assert initializer.var.tensor_access is None
+        assert initializer.op == "="
+        assert initializer.cast is False
+
+        assert type(initializer.value) is llir.ArrayAccess
+        access = cast(llir.ArrayAccess, initializer.value)
+        assert access.tensor_access is None
+        assert type(access.array) is llir.Var
+        offset = cast(llir.Var, access.array)
+        assert offset.name == f"_offset{level}"
+        assert offset.type is llir.DataType.STD_VECTOR_INT
+        assert offset.is_ptr is False
+        assert offset.is_restrict is False
+        assert offset.tensor_access is None
+        assert type(access.index) is llir.Var
+        index = cast(llir.Var, access.index)
+        assert index.name == "row"
+        assert index.type is llir.DataType.INT
+        assert index.is_ptr is False
+        assert index.is_restrict is False
+        assert index.tensor_access is None
+        assert index is not source_header
+        assert len({id(initializer.var), id(offset), id(index)}) == 3
+
+        expected = llir.VarInit(
+            llir.Var(f"_base{level}", llir.DataType.INT64),
+            llir.ArrayAccess(
+                llir.Var(f"_offset{level}", llir.DataType.STD_VECTOR_INT),
+                llir.Var("row", llir.DataType.INT),
+            ),
+        )
+        assert initializer == expected
+        assert hash(initializer) == hash(expected)
+
+    first_access = cast(llir.ArrayAccess, first_loads[0].value)
+    cast(llir.Var, first_access.array).name = "owned_offset"
+    cast(llir.Var, first_access.index).name = "owned_index"
+    assert cast(llir.Var, cast(llir.ArrayAccess, second_loads[0].value).array).name == (
+        "_offset1"
+    )
+    assert cast(llir.Var, cast(llir.ArrayAccess, second_loads[0].value).index).name == (
+        "row"
+    )
+    assert source_header.name == "row"
 
 
 def test_first_top_level_compatible_loop_is_selected_and_suffix_is_discarded() -> None:
@@ -1090,6 +1199,81 @@ def test_malformed_typed_child_fails_with_pass_specific_diagnostic() -> None:
 
 
 @pytest.mark.parametrize(
+    ("malformation", "expected_code", "expected_suffix"),
+    (
+        ("unknown_array", "unknown_llir_node", ("value", "array")),
+        ("unknown_index", "unknown_llir_node", ("value", "index")),
+        ("access_subclass", "unknown_llir_node", ("value",)),
+        (
+            "forged_metadata",
+            "invalid_tensor_access_metadata",
+            ("value", "tensor_access"),
+        ),
+    ),
+)
+def test_generated_fill_base_loads_fail_closed_at_compressed_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+    expected_code: str,
+    expected_suffix: Tuple[str, ...],
+) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    class UnknownArrayAccess(llir.ArrayAccess):
+        pass
+
+    injected: List[str] = []
+
+    class InjectingWalker(LLIRWalker):
+        def walk(self, value: LLIRValue) -> None:
+            loads = _base_offset_loads(value)
+            if loads and not injected:
+                initializer = loads[0]
+                access = cast(llir.ArrayAccess, initializer.value)
+                if malformation == "unknown_array":
+                    initializer.value = llir.ArrayAccess(
+                        UnknownExpr(),
+                        access.index,
+                    )
+                elif malformation == "unknown_index":
+                    initializer.value = llir.ArrayAccess(
+                        access.array,
+                        UnknownExpr(),
+                    )
+                elif malformation == "access_subclass":
+                    unknown = object.__new__(UnknownArrayAccess)
+                    object.__setattr__(unknown, "array", access.array)
+                    object.__setattr__(unknown, "index", access.index)
+                    object.__setattr__(unknown, "tensor_access", None)
+                    initializer.value = unknown
+                else:
+                    forged = object.__new__(llir.ArrayAccess)
+                    object.__setattr__(forged, "array", access.array)
+                    object.__setattr__(forged, "index", access.index)
+                    object.__setattr__(forged, "tensor_access", object())
+                    initializer.value = forged
+                injected.append(initializer.var.name)
+            super().walk(value)
+
+    monkeypatch.setattr(compressed_where_module, "LLIRWalker", InjectingWalker)
+    context = _context()
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(
+            [_compatible_loop(_ds_work_body())],
+            context,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert injected == ["_base1"]
+    assert diagnostic.code == expected_code
+    assert diagnostic.stage == context.traversal.stage
+    assert diagnostic.pass_name == context.traversal.pass_name
+    assert diagnostic.path[-len(expected_suffix) :] == expected_suffix
+
+
+@pytest.mark.parametrize(
     ("context", "expected_code", "expected_path"),
     [
         (
@@ -1298,6 +1482,14 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes(
     assert '"SparseLeft"' in validation[1]
     assert '"SparseRight"' in validation[2]
     assert all("wksp" not in statement for statement in validation)
+    production_base_loads = _base_offset_loads(function)
+    assert [load.var.name for load in production_base_loads] == ["_base1"]
+    production_access = cast(llir.ArrayAccess, production_base_loads[0].value)
+    assert cast(llir.Var, production_access.array).type is (
+        llir.DataType.STD_VECTOR_INT
+    )
+    assert cast(llir.Var, production_access.index).name == "r"
+    assert cast(llir.Var, production_access.index).type is llir.DataType.INT64
     cpp = LLIRLowerer().lower_llir(function)
 
     assert len(cpp) == 7117
@@ -1392,7 +1584,16 @@ def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
     )
 
     lowerer = CINLowerer()
-    cpp = LLIRLowerer().lower_llir(lowerer.lower_IndexStmt(cin))
+    lowered = lowerer.lower_IndexStmt(cin)
+    production_base_loads = _base_offset_loads(lowered)
+    assert [load.var.name for load in production_base_loads] == ["_base1", "_base2"]
+    for level, load in enumerate(production_base_loads, start=1):
+        access = cast(llir.ArrayAccess, load.value)
+        assert cast(llir.Var, access.array).name == f"_offset{level}"
+        assert cast(llir.Var, access.array).type is llir.DataType.STD_VECTOR_INT
+        assert cast(llir.Var, access.index).name == "batch"
+        assert cast(llir.Var, access.index).type is llir.DataType.INT64
+    cpp = LLIRLowerer().lower_llir(lowered)
 
     assert len(cpp) == 8660
     assert hashlib.sha256(cpp.encode()).hexdigest() == (

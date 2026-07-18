@@ -113,13 +113,16 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
             else:
                 unclassified_counts[path.name] += 1
                 spelling = ast.unparse(name_expression)
-                if spelling in known_indirect_names:
+                if spelling in known_indirect_names or (
+                    path.name == "compressed_where_openmp_pass.py"
+                    and spelling == "loop_var.name"
+                ):
                     known_indirect[(path.name, spelling)] += 1
 
     assert constructor_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 139,
-        "compressed_where_openmp_pass.py": 9,
+        "compressed_where_openmp_pass.py": 12,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -131,11 +134,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 53,
     }
-    assert sum(constructor_counts.values()) == 379
+    assert sum(constructor_counts.values()) == 382
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 131,
-        "compressed_where_openmp_pass.py": 9,
+        "compressed_where_openmp_pass.py": 12,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -147,10 +150,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 53,
     }
-    assert sum(unclassified_counts.values()) == 369
+    assert sum(unclassified_counts.values()) == 372
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
+        ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
         ("llir_traversal.py", "node.name"): 1,
         ("loop_invariant_factor_pass.py", "accumulator_name"): 1,
@@ -160,7 +164,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 12
+    assert sum(known_indirect.values()) == 13
 
     assert totals == {
         "subscript": 9,
@@ -599,15 +603,15 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 11,
-        "compressed_where_openmp_pass.py": 15,
+        "compressed_where_openmp_pass.py": 14,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 3,
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 5,
     }
-    assert sum(counts.values()) == 37
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 36
+    assert sum(counts.values()) == 36
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 35
 
 
 def test_known_nnz_tensor_size_cannot_return_to_raw_statements() -> None:
@@ -726,6 +730,87 @@ def test_compressed_phase_state_cannot_return_to_raw_statements() -> None:
         if "_prev" in _static_string_fragments(target):
             previous_assignments += 1
     assert previous_assignments == 2
+
+
+def test_compressed_fill_base_loads_are_structured_and_total_loads_stay_raw() -> None:
+    """Lock W3 without absorbing the separately blocked W9 bound seam."""
+
+    path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
+    raw_base_violations: list[tuple[int, str]] = []
+    raw_total_producers: list[tuple[int, str]] = []
+    for call in _llir_constructor_calls(path, "RawStmt"):
+        spelling = ast.unparse(call)
+        if "_base{level}" in spelling or (
+            "_offset{level}" in spelling and "loop_var" in spelling
+        ):
+            raw_base_violations.append((call.lineno, spelling))
+        if "_total{level}" in spelling and "_offset{level}" in spelling:
+            raw_total_producers.append((call.lineno, spelling))
+
+    base_initializers: list[dict[str, ast.expr]] = []
+    for call in _llir_constructor_calls(path, "VarInit"):
+        fields = {
+            keyword.arg: keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        target = fields.get("var")
+        if target is None or not _is_llir_constructor(target, "Var"):
+            continue
+        assert isinstance(target, ast.Call)
+        name_expression = _var_name_expression(target)
+        if name_expression is not None and "_base" in _static_string_fragments(
+            name_expression
+        ):
+            base_initializers.append(fields)
+
+    assert raw_base_violations == []
+    assert len(raw_total_producers) == 1
+    assert len(base_initializers) == 1
+
+    fields = base_initializers[0]
+    assert set(fields) == {"var", "value"}
+    target = fields["var"]
+    assert isinstance(target, ast.Call)
+    target_fields = {
+        keyword.arg: keyword.value
+        for keyword in target.keywords
+        if keyword.arg is not None
+    }
+    assert ast.unparse(target_fields["name"]) == "f'_base{level}'"
+    assert ast.unparse(target_fields["type"]) == "llir.DataType.INT64"
+
+    value = fields["value"]
+    assert _is_llir_constructor(value, "ArrayAccess")
+    assert isinstance(value, ast.Call)
+    access_fields = {
+        keyword.arg: keyword.value
+        for keyword in value.keywords
+        if keyword.arg is not None
+    }
+    assert set(access_fields) == {"array", "index"}
+
+    array = access_fields["array"]
+    assert _is_llir_constructor(array, "Var")
+    assert isinstance(array, ast.Call)
+    array_fields = {
+        keyword.arg: keyword.value
+        for keyword in array.keywords
+        if keyword.arg is not None
+    }
+    assert ast.unparse(array_fields["name"]) == "f'_offset{level}'"
+    assert ast.unparse(array_fields["type"]) == "llir.DataType.STD_VECTOR_INT"
+
+    index = access_fields["index"]
+    assert _is_llir_constructor(index, "Var")
+    assert isinstance(index, ast.Call)
+    index_fields = {
+        keyword.arg: keyword.value
+        for keyword in index.keywords
+        if keyword.arg is not None
+    }
+    assert ast.unparse(index_fields["name"]) == "loop_var.name"
+    assert ast.unparse(index_fields["type"]) == "loop_var.type"
 
 
 def test_no_direct_assign_target_reintroduces_a_string_expression() -> None:

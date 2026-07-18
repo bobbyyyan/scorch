@@ -311,6 +311,52 @@ def test_factor_materialization_is_detached_and_never_deduplicated() -> None:
     )
 
 
+def test_fill_base_offset_loads_are_detached_and_never_deduplicated() -> None:
+    def base_load() -> llir.VarInit:
+        return llir.VarInit(
+            _var("_base1", llir.DataType.INT64),
+            llir.ArrayAccess(
+                _var("_offset1", llir.DataType.STD_VECTOR_INT),
+                _var("row", llir.DataType.INT64),
+            ),
+        )
+
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_crd", llir.DataType.STD_VECTOR_C_INT)),
+        base_load(),
+        base_load(),
+    ]
+    snapshot = _structural_snapshot(source)
+
+    first = rewrite_dynamic_vector_accesses(source, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+    second = rewrite_dynamic_vector_accesses(first, DYNAMIC_VECTOR_ACCESS_CONTEXT)
+
+    assert _structural_snapshot(source) == snapshot
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert [type(statement) for statement in first] == [
+        llir.VarDecl,
+        llir.VarInit,
+        llir.VarInit,
+    ]
+    assert first[1] == first[2]
+    assert first[1] is not source[1]
+    assert first[2] is not source[2]
+    first_access = cast(llir.ArrayAccess, cast(llir.VarInit, first[1]).value)
+    second_access = cast(llir.ArrayAccess, cast(llir.VarInit, second[1]).value)
+    source_access = cast(llir.ArrayAccess, cast(llir.VarInit, source[1]).value)
+    assert first_access is not source_access
+    assert second_access is not first_access
+    assert first_access.array is not source_access.array
+    assert first_access.index is not source_access.index
+    assert second_access.array is not first_access.array
+    assert second_access.index is not first_access.index
+    assert _cpp(first) == (
+        "std::vector<int> out_crd;\n"
+        "int64_t _base1 = _offset1[row];\n"
+        "int64_t _base1 = _offset1[row];"
+    )
+
+
 def _independent_single_step_add() -> llir.Add:
     return llir.Add(
         _var("base", llir.DataType.INT64),

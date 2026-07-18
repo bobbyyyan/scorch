@@ -941,6 +941,7 @@ def test_spgemm_default_workspace_and_sparse_assembly_are_unchanged():
     assert ".insert_unchecked(" in auto_cpp
     assert "torch::Tensor SparseProduct1_crd_torch = torch::empty" in auto_cpp
     assert "SparseProduct1_pos_data" in auto_cpp
+    assert auto_cpp.count("int64_t _base1 = _offset1[r];") == 1
     assert "packed_" not in auto_cpp
     assert auto_cpp.count("int64_t c = it.first;") == 2
     assert auto_cpp.count("float wksp_value = it.second;") == 2

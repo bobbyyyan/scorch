@@ -1895,6 +1895,77 @@ def test_member_access_identity_rewrite_is_detached_idempotent_and_owned() -> No
     assert cast(llir.Var, second_member.base).name == "it"
 
 
+def test_fill_base_load_rewrite_is_deterministic_repeatable_and_owned() -> None:
+    original = llir.VarInit(
+        llir.Var("_base1", llir.DataType.INT64),
+        llir.ArrayAccess(
+            llir.Var("_offset1", llir.DataType.STD_VECTOR_INT),
+            llir.Var("row", llir.DataType.INT64),
+        ),
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.VarInit, rewriter.rewrite(original))
+    second = cast(llir.VarInit, rewriter.rewrite(first))
+
+    assert _record(original) == [
+        "VarInit",
+        "Var:_base1",
+        "ArrayAccess",
+        "Var:_offset1",
+        "Var:row",
+    ]
+    assert _record(first) == _record(original)
+    assert _record(second) == _record(original)
+    assert original == first == second
+    assert hash(original) == hash(first) == hash(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+
+    original_access = cast(llir.ArrayAccess, original.value)
+    first_access = cast(llir.ArrayAccess, first.value)
+    second_access = cast(llir.ArrayAccess, second.value)
+    assert first.var is not original.var
+    assert second.var is not first.var
+    assert first_access is not original_access
+    assert second_access is not first_access
+    assert first_access.array is not original_access.array
+    assert first_access.index is not original_access.index
+    assert second_access.array is not first_access.array
+    assert second_access.index is not first_access.index
+
+    cast(llir.Var, first_access.array).name = "owned_offset"
+    cast(llir.Var, first_access.index).name = "owned_index"
+    assert cast(llir.Var, original_access.array).name == "_offset1"
+    assert cast(llir.Var, original_access.index).name == "row"
+    assert cast(llir.Var, second_access.array).name == "_offset1"
+    assert cast(llir.Var, second_access.index).name == "row"
+
+    class ReplaceLoadVars(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            replacements = {
+                "_base1": "replacement_base",
+                "_offset1": "replacement_offset",
+                "row": "replacement_row",
+            }
+            rewritten.name = replacements.get(node.name, node.name)
+            return rewritten
+
+    replacement = cast(llir.VarInit, ReplaceLoadVars(_CONTEXT).rewrite(original))
+    replacement_access = cast(llir.ArrayAccess, replacement.value)
+    assert replacement.var.name == "replacement_base"
+    assert cast(llir.Var, replacement_access.array).name == "replacement_offset"
+    assert cast(llir.Var, replacement_access.index).name == "replacement_row"
+    assert replacement.var is not original.var
+    assert replacement_access is not original_access
+    assert replacement_access.array is not original_access.array
+    assert replacement_access.index is not original_access.index
+    assert original.var.name == "_base1"
+    assert cast(llir.Var, original_access.array).name == "_offset1"
+    assert cast(llir.Var, original_access.index).name == "row"
+
+
 def test_member_call_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
     original = llir.MemberCall(
         base=llir.MemberAccess(
