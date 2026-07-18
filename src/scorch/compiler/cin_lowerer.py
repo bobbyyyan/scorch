@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, cast
 
 from . import llir
 from .cin import (
@@ -61,8 +61,9 @@ from .llir_pass_manager import (
 from .compilation_context import CompilerStageId, CompilationContext
 from .llir_traversal import LLIRTraversalContext
 from .torch_cpp_abi import (
+    KernelTensorABI,
     ResultTensorAssembler,
-    mode_index_tensor,
+    TorchCppKernelABI,
     tensor_data_ptr,
     tensor_storage_member,
 )
@@ -70,7 +71,6 @@ from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import (
     dtype_to_c_datatype,
     get_pytorch_c_dtype_name,
-    get_pytorch_c_dtype_str,
 )
 
 if TYPE_CHECKING:
@@ -107,6 +107,37 @@ def _result_tensor_abi_assembler(
         known_nnz_var=known_nnz_var,
         exact_dense_parent_positions=exact_dense_parent_positions,
         reserve_hint_var=reserve_hint_var,
+    )
+
+
+def _kernel_tensor_abi(tensor_var: TensorVar) -> KernelTensorABI:
+    """Snapshot one semantic input at the Torch/C++ ABI ownership boundary."""
+
+    level_types = tuple(tensor_var.get_level_types())
+    mode_order = tuple(tensor_var.get_mode_order() or tuple(range(len(level_types))))
+    return KernelTensorABI(
+        name=tensor_var.get_name(),
+        level_types=level_types,
+        mode_order=mode_order,
+        shape=tuple(tensor_var.shape or ()),
+        dtype=tensor_var.dtype,
+    )
+
+
+def _torch_cpp_kernel_abi(
+    result_tensor_var: TensorVar,
+    input_tensor_vars: List[TensorVar],
+    post_ops: Optional[PostOps],
+) -> TorchCppKernelABI:
+    """Snapshot one complete public kernel ABI without retaining semantic IR."""
+
+    extra_tensor_names = tuple(post_ops.extra_tensors) if post_ops is not None else ()
+    return TorchCppKernelABI(
+        result_shape=tuple(result_tensor_var.shape or ()),
+        result_rank=len(result_tensor_var.get_level_types()),
+        input_tensors=tuple(_kernel_tensor_abi(tensor) for tensor in input_tensor_vars),
+        extra_tensor_names=extra_tensor_names,
+        extra_tensor_dtype=(result_tensor_var.dtype if extra_tensor_names else None),
     )
 
 
@@ -346,106 +377,6 @@ class CINLowerer:
                     )
                 )
         return stmts
-
-    @staticmethod
-    def get_level_arrays(tensor: TensorVar) -> List[llir.Stmt]:
-        """
-        Generate the bounds variable definitions given a TensorVar
-        """
-        # Iterate over the levels in tensor, then depending on whether it is sparse or dense, generate the bound
-        # variables
-        stmts: List[llir.Stmt] = []
-        level_types = tensor.get_level_types()
-        for level, level_type in enumerate(level_types):
-            if level_type == LevelType.DENSE:
-                stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{tensor.name}{level}_size",
-                            type=llir.DataType.INT64,
-                        ),
-                        value=llir.ArrayAccess(
-                            array=llir.Var(
-                                name=f"{tensor.name}_shape",
-                                type=llir.DataType.STD_VECTOR_INT,
-                            ),
-                            index=llir.Literal(
-                                value=level,
-                                data_type=llir.DataType.INT64,
-                            ),
-                        ),
-                    )
-                )
-            elif level_type == LevelType.COMPRESSED:
-                stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{tensor.name}{level}_pos",
-                            type=llir.DataType.PTR_INT,
-                            is_restrict=True,
-                        ),
-                        value=tensor_data_ptr(
-                            mode_index_tensor(tensor.name, level, 0),
-                            llir.DataType.INT,
-                        ),
-                    )
-                )
-                #
-                stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{tensor.name}{level}_crd",
-                            type=llir.DataType.PTR_INT,
-                            is_restrict=True,
-                        ),
-                        value=tensor_data_ptr(
-                            mode_index_tensor(tensor.name, level, 1),
-                            llir.DataType.INT,
-                        ),
-                    )
-                )
-            elif level_type == LevelType.COORDINATE:
-                stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{tensor.name}{level}_crd_tensor",
-                            type=llir.DataType.TORCH_TENSOR,
-                        ),
-                        value=mode_index_tensor(tensor.name, level, 0),
-                    )
-                )
-                stmts.append(
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{tensor.name}{level}_crd",
-                            type=llir.DataType.PTR_INT,
-                            is_restrict=True,
-                        ),
-                        value=tensor_data_ptr(
-                            mode_index_tensor(tensor.name, level, 0),
-                            llir.DataType.INT,
-                        ),
-                    )
-                )
-        return stmts
-
-    @staticmethod
-    def get_val_ptr_stmt(tensor: TensorVar) -> llir.Stmt:
-        """
-        Get the value pointer for a tensor
-        """
-        data_type = dtype_to_c_datatype(tensor.dtype)
-        ptr_type = llir.DataType.ptr_type(tensor.dtype)
-        return llir.VarInit(
-            var=llir.Var(name=f"{tensor.name}_val", type=ptr_type, is_restrict=True),
-            value=tensor_data_ptr(
-                llir.Var(
-                    name=f"{tensor.name}_values",
-                    type=llir.DataType.TORCH_TENSOR,
-                ),
-                data_type,
-            ),
-        )
 
     @staticmethod
     def get_value_array_statement(tensor: TensorVar) -> llir.Stmt:
@@ -2176,6 +2107,14 @@ class CINLowerer:
             if isinstance(stmt, Where):
                 return self.lower_Where(stmt)
 
+        result_contract = self.final_result_tensor_var or self.result_tensor_var
+        assert result_contract is not None, "No result tensor ABI contract"
+        kernel_abi = _torch_cpp_kernel_abi(
+            result_contract,
+            rhs_tensor_vars,
+            self.post_ops,
+        )
+
         tensor_value_array_init_stmts: List[llir.Stmt] = []
         result_level_indices_init_stmts: List[llir.Stmt] = []
         # A compressed level below a dense result parent always has one
@@ -2225,16 +2164,9 @@ class CINLowerer:
                 *result_level_indices_init_stmts,
             ]
 
-        # Generate iterator bounds
-        tensor_level_array_assign_stmts: List[llir.Stmt] = []
-
-        for tensor in rhs_tensor_vars:
-            tensor_level_array_assign_stmts.append(llir.BlankLine())
-            tensor_level_array_assign_stmts.append(
-                llir.Comment(f"Get {tensor.get_name()}'s level & value arrays")
-            )
-            tensor_level_array_assign_stmts.extend(self.get_level_arrays(tensor))
-            tensor_level_array_assign_stmts.append(self.get_val_ptr_stmt(tensor))
+        # Snapshot-owned public input bindings retain their original construction
+        # point before recursive compute lowering and the managed pass pipeline.
+        tensor_level_array_assign_stmts = kernel_abi.emit_input_prologue()
 
         # Generate per-level size variables for each dense level in result tensor
         result_tensor_level_sizes: List[llir.Stmt] = []
@@ -2341,142 +2273,11 @@ class CINLowerer:
 
         # Finally, return function that computes the result
         if stmt == self.outermost_stmt:
-            kernel_args: List[llir.Var] = []
-
-            kernel_args.append(
-                llir.Var(
-                    name="result_shape",
-                    type=llir.DataType.STD_VECTOR_INT,
-                )
-            )
-
-            for tensor in rhs_tensor_vars:
-                kernel_args.append(
-                    llir.Var(
-                        name=f"{tensor.get_name()}_shape",
-                        type=llir.DataType.STD_VECTOR_INT,
-                    )
-                )
-                kernel_args.append(
-                    llir.Var(
-                        name=f"{tensor.get_name()}_mode_indices",
-                        type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
-                    )
-                )
-                kernel_args.append(
-                    llir.Var(
-                        name=f"{tensor.get_name()}_values",
-                        type=llir.DataType.TORCH_TENSOR,
-                    )
-                )
-
-            # Append extra tensor args for PostOps (bias, scale, etc.)
-            if self.post_ops and self.post_ops.extra_tensors:
-                for tname in self.post_ops.extra_tensors:
-                    kernel_args.append(
-                        llir.Var(
-                            name=f"{tname}_values",
-                            type=llir.DataType.TORCH_TENSOR,
-                        )
-                    )
-
-            # Every load_inline ``evaluate`` function is a public native ABI.
-            # Validate its by-value arguments before emitting any nested container
-            # access or data_ptr call.  The shared helper also range-checks int64
-            # indices and replaces only these local mode-index handles with int32
-            # copies, matching the legacy generated pointer type without mutating
-            # caller-owned tensors.
-            abi_validation_stmts: List[llir.Stmt] = []
-
-            def _cpp_int_vector(values: Sequence[int]) -> str:
-                return "{" + ", ".join(str(int(value)) for value in values) + "}"
-
-            result_contract = self.final_result_tensor_var or self.result_tensor_var
-            if result_contract is not None:
-                expected_result_shape = result_contract.shape or ()
-                expected_result_rank = len(result_contract.get_level_types())
-                abi_validation_stmts.append(
-                    llir.RawStmt(
-                        code=(
-                            "scorch_native::validate_jit_result_shape("
-                            f"result_shape, {_cpp_int_vector(expected_result_shape)}, "
-                            f"{expected_result_rank}, "
-                            '"evaluate")'
-                        ),
-                        add_semicolon=True,
-                    )
-                )
-
-            level_kind_code = {
-                LevelType.DENSE: 0,
-                LevelType.COMPRESSED: 1,
-                LevelType.COORDINATE: 2,
-            }
-            for tensor in rhs_tensor_vars:
-                level_types = tensor.get_level_types()
-                try:
-                    level_kinds = [level_kind_code[level] for level in level_types]
-                except KeyError as error:
-                    raise ValueError(
-                        f"unsupported JIT level type {error.args[0]} for ABI validation"
-                    ) from error
-                mode_order = tensor.get_mode_order() or list(range(len(level_types)))
-                expected_shape = tensor.shape or ()
-                tname = tensor.get_name()
-                abi_validation_stmts.append(
-                    llir.RawStmt(
-                        code=(
-                            "scorch_native::validate_jit_tensor("
-                            f'"evaluate", "{tname}", {tname}_shape, '
-                            f"{tname}_mode_indices, {tname}_values, "
-                            f"{get_pytorch_c_dtype_str(tensor.dtype)}, "
-                            f"{_cpp_int_vector(level_kinds)}, "
-                            f"{_cpp_int_vector(mode_order)}, "
-                            f"{_cpp_int_vector(expected_shape)})"
-                        ),
-                        add_semicolon=True,
-                    )
-                )
-
-            if self.post_ops and self.post_ops.extra_tensors:
-                postop_dtype = get_pytorch_c_dtype_str(
-                    self.final_result_tensor_var.dtype
-                )
-                for tname in self.post_ops.extra_tensors:
-                    abi_validation_stmts.append(
-                        llir.RawStmt(
-                            code=(
-                                "scorch_native::validate_jit_extra_tensor("
-                                f'{tname}_values, {postop_dtype}, "evaluate", '
-                                f'"{tname}_values")'
-                            ),
-                            add_semicolon=True,
-                        )
-                    )
-
-            # Extract data pointers for PostOps extra tensors
-            postop_ptr_stmts: List[llir.Stmt] = []
-            if self.post_ops and self.post_ops.extra_tensors:
-                _postop_dtype = self.final_result_tensor_var.dtype
-                c_dtype = dtype_to_c_datatype(_postop_dtype)
-                ptr_type = llir.DataType.ptr_type(_postop_dtype)
-                for tname in self.post_ops.extra_tensors:
-                    postop_ptr_stmts.append(
-                        llir.VarInit(
-                            var=llir.Var(
-                                name=f"{tname}_val",
-                                type=ptr_type,
-                                is_restrict=True,
-                            ),
-                            value=tensor_data_ptr(
-                                llir.Var(
-                                    name=f"{tname}_values",
-                                    type=llir.DataType.TORCH_TENSOR,
-                                ),
-                                c_dtype,
-                            ),
-                        )
-                    )
+            # Validate public by-value arguments before any nested mode-index
+            # access or data_ptr call. Validation may replace only these local
+            # handles with checked int32 copies; caller-owned tensors stay intact.
+            abi_validation_stmts = kernel_abi.emit_validation()
+            postop_ptr_stmts = kernel_abi.emit_extra_tensor_prologue()
 
             # The former ``lower_IndexStmt(..., recurse=True)`` path repeated
             # this bookkeeping before descending.  Keep that observable
@@ -2620,14 +2421,7 @@ class CINLowerer:
                 raise failure.failure from None
             self._record_llir_pass_runs(pipeline_result.run_records)
             body_stmts = pipeline_result.artifact.value
-
-            function = llir.Function(
-                return_type=llir.DataType.TACO_TENSOR,
-                name="evaluate",
-                args=kernel_args,
-                body=body_stmts,
-            )
-            return function
+            return kernel_abi.assemble_function(body_stmts)
 
         return []
 

@@ -7,7 +7,11 @@ import torch
 
 from . import llir
 from ..format import LevelType
-from ..utils import dtype_to_c_datatype, get_pytorch_c_dtype_name
+from ..utils import (
+    dtype_to_c_datatype,
+    get_pytorch_c_dtype_name,
+    get_pytorch_c_dtype_str,
+)
 
 
 def tensor_storage_member(tensor_name: str, *members: str) -> llir.MemberAccess:
@@ -59,6 +63,371 @@ def tensor_data_ptr(receiver: llir.Expr, data_type: llir.DataType) -> llir.Membe
         member="data_ptr",
         template_args=(data_type,),
     )
+
+
+@dataclass(frozen=True)
+class KernelTensorABI:
+    """Immutable ABI metadata for one public JIT tensor argument triple."""
+
+    name: str
+    level_types: Tuple[LevelType, ...]
+    mode_order: Tuple[int, ...]
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        if type(self.name) is not str or not self.name.isidentifier():
+            raise TypeError("kernel tensor name must be a non-empty identifier")
+        if type(self.level_types) is not tuple or any(
+            type(level_type) is not LevelType for level_type in self.level_types
+        ):
+            raise TypeError("kernel tensor levels must be an immutable LevelType tuple")
+        supported_levels = (
+            LevelType.DENSE,
+            LevelType.COMPRESSED,
+            LevelType.COORDINATE,
+        )
+        unsupported_level = next(
+            (
+                level_type
+                for level_type in self.level_types
+                if level_type not in supported_levels
+            ),
+            None,
+        )
+        if unsupported_level is not None:
+            raise ValueError(
+                f"unsupported JIT level type {unsupported_level} for ABI validation"
+            )
+        if type(self.mode_order) is not tuple or any(
+            type(level) is not int for level in self.mode_order
+        ):
+            raise TypeError("kernel tensor mode order must be an immutable int tuple")
+        rank = len(self.level_types)
+        if len(self.mode_order) != rank or set(self.mode_order) != set(range(rank)):
+            raise ValueError(
+                "kernel tensor mode order must be a rank-sized permutation"
+            )
+        if type(self.shape) is not tuple or any(
+            type(extent) is not int for extent in self.shape
+        ):
+            raise TypeError("kernel tensor shape must be an immutable int tuple")
+        if self.shape and len(self.shape) != rank:
+            raise ValueError("known kernel tensor shape must match the level rank")
+        if any(extent < 0 for extent in self.shape):
+            raise ValueError("known kernel tensor extents must be non-negative")
+        if not isinstance(self.dtype, torch.dtype):
+            raise TypeError("kernel tensor dtype must be a torch.dtype")
+
+    def _level_kind_codes(self) -> Tuple[int, ...]:
+        self._validate()
+        level_kind_code = {
+            LevelType.DENSE: 0,
+            LevelType.COMPRESSED: 1,
+            LevelType.COORDINATE: 2,
+        }
+        return tuple(level_kind_code[level] for level in self.level_types)
+
+    def emit_level_array_bindings(self) -> List[llir.Stmt]:
+        """Build fresh dense extents and sparse mode-index pointer bindings."""
+
+        self._validate()
+        stmts: List[llir.Stmt] = []
+        for level, level_type in enumerate(self.level_types):
+            if level_type == LevelType.DENSE:
+                stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{self.name}{level}_size",
+                            type=llir.DataType.INT64,
+                        ),
+                        value=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{self.name}_shape",
+                                type=llir.DataType.STD_VECTOR_INT,
+                            ),
+                            index=llir.Literal(
+                                value=level,
+                                data_type=llir.DataType.INT64,
+                            ),
+                        ),
+                    )
+                )
+            elif level_type == LevelType.COMPRESSED:
+                stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{self.name}{level}_pos",
+                            type=llir.DataType.PTR_INT,
+                            is_restrict=True,
+                        ),
+                        value=tensor_data_ptr(
+                            mode_index_tensor(self.name, level, 0),
+                            llir.DataType.INT,
+                        ),
+                    )
+                )
+                stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{self.name}{level}_crd",
+                            type=llir.DataType.PTR_INT,
+                            is_restrict=True,
+                        ),
+                        value=tensor_data_ptr(
+                            mode_index_tensor(self.name, level, 1),
+                            llir.DataType.INT,
+                        ),
+                    )
+                )
+            elif level_type == LevelType.COORDINATE:
+                stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{self.name}{level}_crd_tensor",
+                            type=llir.DataType.TORCH_TENSOR,
+                        ),
+                        value=mode_index_tensor(self.name, level, 0),
+                    )
+                )
+                stmts.append(
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{self.name}{level}_crd",
+                            type=llir.DataType.PTR_INT,
+                            is_restrict=True,
+                        ),
+                        value=tensor_data_ptr(
+                            mode_index_tensor(self.name, level, 0),
+                            llir.DataType.INT,
+                        ),
+                    )
+                )
+        return stmts
+
+    def emit_value_pointer(self) -> llir.VarInit:
+        """Build a fresh typed pointer binding for this tensor's values."""
+
+        self._validate()
+        data_type = dtype_to_c_datatype(self.dtype)
+        return llir.VarInit(
+            var=llir.Var(
+                name=f"{self.name}_val",
+                type=llir.DataType.ptr_type(self.dtype),
+                is_restrict=True,
+            ),
+            value=tensor_data_ptr(
+                llir.Var(
+                    name=f"{self.name}_values",
+                    type=llir.DataType.TORCH_TENSOR,
+                ),
+                data_type,
+            ),
+        )
+
+
+def _cpp_int_vector(values: Tuple[int, ...]) -> str:
+    """Render one validated ABI metadata tuple as a C++ initializer list."""
+
+    if type(values) is not tuple or any(type(value) is not int for value in values):
+        raise TypeError("C++ integer vector values must be an immutable int tuple")
+    return "{" + ", ".join(str(value) for value in values) + "}"
+
+
+@dataclass(frozen=True)
+class TorchCppKernelABI:
+    """Own one frozen public ``evaluate`` signature and input ABI contract."""
+
+    result_shape: Tuple[int, ...]
+    result_rank: int
+    input_tensors: Tuple[KernelTensorABI, ...]
+    extra_tensor_names: Tuple[str, ...] = ()
+    extra_tensor_dtype: Optional[torch.dtype] = None
+    function_name: str = "evaluate"
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        if type(self.function_name) is not str or not self.function_name.isidentifier():
+            raise TypeError("kernel function name must be a non-empty identifier")
+        if type(self.result_shape) is not tuple or any(
+            type(extent) is not int for extent in self.result_shape
+        ):
+            raise TypeError("kernel result shape must be an immutable int tuple")
+        if type(self.result_rank) is not int or self.result_rank < 0:
+            raise TypeError("kernel result rank must be a non-negative int")
+        if self.result_shape and len(self.result_shape) != self.result_rank:
+            raise ValueError("known kernel result shape must match the result rank")
+        if any(extent < 0 for extent in self.result_shape):
+            raise ValueError("known kernel result extents must be non-negative")
+        if type(self.input_tensors) is not tuple or any(
+            type(tensor) is not KernelTensorABI for tensor in self.input_tensors
+        ):
+            raise TypeError(
+                "kernel inputs must be an immutable exact KernelTensorABI tuple"
+            )
+        for tensor in self.input_tensors:
+            tensor._validate()
+        if type(self.extra_tensor_names) is not tuple or any(
+            type(name) is not str or not name.isidentifier()
+            for name in self.extra_tensor_names
+        ):
+            raise TypeError("extra tensor names must be an immutable identifier tuple")
+        if self.extra_tensor_names:
+            if not isinstance(self.extra_tensor_dtype, torch.dtype):
+                raise TypeError("extra tensor dtype must be a torch.dtype when present")
+        elif self.extra_tensor_dtype is not None:
+            raise TypeError("extra tensor dtype must be None without extra tensors")
+        argument_names = ["result_shape"]
+        for tensor in self.input_tensors:
+            argument_names.extend(
+                (
+                    f"{tensor.name}_shape",
+                    f"{tensor.name}_mode_indices",
+                    f"{tensor.name}_values",
+                )
+            )
+        argument_names.extend(f"{name}_values" for name in self.extra_tensor_names)
+        if len(argument_names) != len(set(argument_names)):
+            raise ValueError("kernel ABI argument names must be unique")
+
+    def emit_arguments(self) -> List[llir.Var]:
+        """Build a fresh ordered public function-argument list."""
+
+        self._validate()
+        arguments = [
+            llir.Var(
+                name="result_shape",
+                type=llir.DataType.STD_VECTOR_INT,
+            )
+        ]
+        for tensor in self.input_tensors:
+            arguments.extend(
+                [
+                    llir.Var(
+                        name=f"{tensor.name}_shape",
+                        type=llir.DataType.STD_VECTOR_INT,
+                    ),
+                    llir.Var(
+                        name=f"{tensor.name}_mode_indices",
+                        type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
+                    ),
+                    llir.Var(
+                        name=f"{tensor.name}_values",
+                        type=llir.DataType.TORCH_TENSOR,
+                    ),
+                ]
+            )
+        for name in self.extra_tensor_names:
+            arguments.append(
+                llir.Var(
+                    name=f"{name}_values",
+                    type=llir.DataType.TORCH_TENSOR,
+                )
+            )
+        return arguments
+
+    def emit_validation(self) -> List[llir.RawStmt]:
+        """Build fresh validation calls in exact public-argument order."""
+
+        self._validate()
+        validation = [
+            llir.RawStmt(
+                code=(
+                    "scorch_native::validate_jit_result_shape("
+                    f"result_shape, {_cpp_int_vector(self.result_shape)}, "
+                    f'{self.result_rank}, "{self.function_name}")'
+                ),
+                add_semicolon=True,
+            )
+        ]
+        for tensor in self.input_tensors:
+            validation.append(
+                llir.RawStmt(
+                    code=(
+                        "scorch_native::validate_jit_tensor("
+                        f'"{self.function_name}", "{tensor.name}", '
+                        f"{tensor.name}_shape, {tensor.name}_mode_indices, "
+                        f"{tensor.name}_values, "
+                        f"{get_pytorch_c_dtype_str(tensor.dtype)}, "
+                        f"{_cpp_int_vector(tensor._level_kind_codes())}, "
+                        f"{_cpp_int_vector(tensor.mode_order)}, "
+                        f"{_cpp_int_vector(tensor.shape)})"
+                    ),
+                    add_semicolon=True,
+                )
+            )
+        if self.extra_tensor_names:
+            assert self.extra_tensor_dtype is not None
+            extra_dtype = get_pytorch_c_dtype_str(self.extra_tensor_dtype)
+            for name in self.extra_tensor_names:
+                validation.append(
+                    llir.RawStmt(
+                        code=(
+                            "scorch_native::validate_jit_extra_tensor("
+                            f"{name}_values, {extra_dtype}, "
+                            f'"{self.function_name}", "{name}_values")'
+                        ),
+                        add_semicolon=True,
+                    )
+                )
+        return validation
+
+    def emit_input_prologue(self) -> List[llir.Stmt]:
+        """Build fresh shape/index/value bindings for every input tensor."""
+
+        self._validate()
+        stmts: List[llir.Stmt] = []
+        for tensor in self.input_tensors:
+            stmts.append(llir.BlankLine())
+            stmts.append(llir.Comment(f"Get {tensor.name}'s level & value arrays"))
+            stmts.extend(tensor.emit_level_array_bindings())
+            stmts.append(tensor.emit_value_pointer())
+        return stmts
+
+    def emit_extra_tensor_prologue(self) -> List[llir.Stmt]:
+        """Build fresh typed value pointers for post-op tensor arguments."""
+
+        self._validate()
+        if not self.extra_tensor_names:
+            return []
+        assert self.extra_tensor_dtype is not None
+        c_dtype = dtype_to_c_datatype(self.extra_tensor_dtype)
+        ptr_type = llir.DataType.ptr_type(self.extra_tensor_dtype)
+        return [
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{name}_val",
+                    type=ptr_type,
+                    is_restrict=True,
+                ),
+                value=tensor_data_ptr(
+                    llir.Var(
+                        name=f"{name}_values",
+                        type=llir.DataType.TORCH_TENSOR,
+                    ),
+                    c_dtype,
+                ),
+            )
+            for name in self.extra_tensor_names
+        ]
+
+    def assemble_function(self, body: List[llir.Stmt]) -> llir.Function:
+        """Wrap one verified body in a fresh ABI-owned function signature."""
+
+        self._validate()
+        if type(body) is not list:
+            raise TypeError("kernel function body must be an exact LLIR list")
+        return llir.Function(
+            return_type=llir.DataType.TACO_TENSOR,
+            name=self.function_name,
+            args=self.emit_arguments(),
+            body=list(body),
+        )
 
 
 @dataclass(frozen=True)
