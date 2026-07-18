@@ -181,8 +181,9 @@ def rewrite_dynamic_vector_accesses(
 ) -> LLIRRewriteValueT:
     """Return a detached LLIR value with checked dynamic-vector accesses.
 
-    Only vectors declared by ``VarDecl`` are dynamic.  Pre-sized vectors use
-    ``VarInit`` and intentionally stay on the indexed schedule-storage path.
+    Only vectors declared by ``VarDecl`` are dynamic. Pre-sized vectors use
+    ``VarInit`` or ``DirectInit`` and intentionally stay on the indexed
+    schedule-storage path.
     """
 
     collector = _DynamicVectorDeclarationCollector(context)

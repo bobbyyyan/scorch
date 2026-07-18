@@ -17,6 +17,10 @@ _FIXED_STACK_ARRAY_CODEGEN_CONTEXT = LLIRTraversalContext(
     stage="C++ code generation",
     pass_name="emit_fixed_stack_array_decl",
 )
+_DIRECT_INIT_CODEGEN_CONTEXT = LLIRTraversalContext(
+    stage="C++ code generation",
+    pass_name="emit_direct_init",
+)
 
 
 class LLIRLowerer:
@@ -140,6 +144,20 @@ class LLIRLowerer:
         elif isinstance(ir, llir.VarInit):
             return self.lower_llir(
                 f"{self._lower_typed_var(ir.var)} {ir.op} {self._render_expression(ir.value)};",
+                indent_level,
+            )
+
+        elif type(ir) is llir.DirectInit:
+            direct_initialization = cast(llir.DirectInit, ir)
+            try:
+                LLIRWalker(_DIRECT_INIT_CODEGEN_CONTEXT).walk(direct_initialization)
+            except LLIRTraversalError as error:
+                raise CodegenError(
+                    f"Invalid LLIR direct initialization: {error}"
+                ) from error
+            return self.lower_llir(
+                f"{self._lower_typed_var(direct_initialization.var)}("
+                f"{', '.join(self._render_expression(arg) for arg in direct_initialization.args)});",
                 indent_level,
             )
 

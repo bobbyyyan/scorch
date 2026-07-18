@@ -106,6 +106,7 @@ class DataType(Enum):
     INT32 = "int32_t"
     UINT64 = "uint64_t"
     INT64 = "int64_t"
+    SIZE_T = "size_t"
     FLOAT32 = "float"
     FLOAT64 = "double"
     VOID = "void"
@@ -231,6 +232,21 @@ class DataType(Enum):
             return cls.STRING
         else:
             raise NotImplementedError(f"Unsupported type: {py_type}")
+
+
+_DIRECT_INIT_DATA_TYPES = frozenset(
+    {
+        DataType.STD_VECTOR_INT,
+        DataType.STD_VECTOR_C_INT,
+        DataType.STD_VECTOR_INT32,
+        DataType.STD_VECTOR_FLOAT32,
+        DataType.STD_VECTOR_FLOAT64,
+        DataType.STD_VECTOR_INT8,
+        DataType.STD_VECTOR_UINT8,
+        DataType.STD_VECTOR_TORCH_TENSOR,
+        DataType.STD_VECTOR_2D_TORCH_TENSOR,
+    }
+)
 
 
 class TensorAccessRole(Enum):
@@ -438,6 +454,43 @@ class VarInit(Stmt):
 
     def __hash__(self):
         return hash(self.var)
+
+
+@dataclass(frozen=True, init=False)
+class DirectInit(Stmt):
+    """A typed C++ direct-initialization declaration.
+
+    ``args`` must be nonempty so this node cannot accidentally emit the C++
+    most-vexing-parse form ``T value()``. Use :class:`VarDecl` for an
+    uninitialized declaration.
+    """
+
+    var: Var
+    args: Tuple[Expr, ...]
+
+    def __init__(self, var: Var, args: Sequence[Expr]) -> None:
+        if type(var) is not Var:
+            raise TypeError("DirectInit.var must be an exact LLIR Var")
+        if type(var.name) is not str or not var.name.isidentifier():
+            raise TypeError("DirectInit.var.name must be a non-empty identifier")
+        if type(var.type) is not DataType or var.type not in _DIRECT_INIT_DATA_TYPES:
+            raise TypeError(
+                "DirectInit.var.type must be a supported standard-vector DataType"
+            )
+        if var.is_ptr is not False:
+            raise TypeError("DirectInit.var.is_ptr must be False")
+        if var.is_restrict is not False:
+            raise TypeError("DirectInit.var.is_restrict must be False")
+        if var.tensor_access is not None:
+            raise TypeError("DirectInit.var.tensor_access must be None")
+        if type(args) is not list and type(args) is not tuple:
+            raise TypeError("DirectInit.args must be a list or tuple")
+        if not args:
+            raise TypeError("DirectInit.args must be non-empty")
+        if any(not isinstance(argument, Expr) for argument in args):
+            raise TypeError("DirectInit.args must contain only LLIR expressions")
+        object.__setattr__(self, "var", var)
+        object.__setattr__(self, "args", tuple(args))
 
 
 @dataclass(frozen=False)

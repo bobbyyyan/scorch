@@ -78,6 +78,7 @@ SUPPORTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
     llir.Return,
     llir.VarDecl,
     llir.VarInit,
+    llir.DirectInit,
     llir.FixedStackArrayDecl,
     llir.Assign,
     llir.Allocate,
@@ -102,6 +103,8 @@ SUPPORTED_LLIR_NODE_TYPES: Tuple[Type[llir.Node], ...] = (
     *SUPPORTED_LLIR_EXPRESSION_NODE_TYPES,
     *SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
 )
+
+_MISSING_LLIR_FIELD = object()
 
 
 @dataclass(frozen=True)
@@ -464,6 +467,114 @@ def _validate_cast_fields(
         )
 
 
+def _validate_direct_init_var(
+    value: object,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if type(value) is not llir.Var:
+        _raise_traversal_error(
+            context,
+            code="invalid_direct_init_var",
+            message="DirectInit.var must be an exact LLIR Var",
+            path=path,
+            value=value,
+        )
+    variable = cast(llir.Var, value)
+    name = getattr(variable, "name", _MISSING_LLIR_FIELD)
+    if type(name) is not str or not name.isidentifier():
+        _raise_traversal_error(
+            context,
+            code="invalid_direct_init_var_name",
+            message="DirectInit.var.name must be a non-empty identifier",
+            path=path + ("name",),
+            value=name,
+        )
+    data_type = getattr(variable, "type", _MISSING_LLIR_FIELD)
+    if (
+        type(data_type) is not llir.DataType
+        or data_type not in llir._DIRECT_INIT_DATA_TYPES
+    ):
+        _raise_traversal_error(
+            context,
+            code="invalid_direct_init_var_type",
+            message=(
+                "DirectInit.var.type must be a supported standard-vector DataType"
+            ),
+            path=path + ("type",),
+            value=data_type,
+        )
+    for field_name in ("is_ptr", "is_restrict"):
+        field_value = getattr(variable, field_name, _MISSING_LLIR_FIELD)
+        if field_value is not False:
+            _raise_traversal_error(
+                context,
+                code=f"invalid_direct_init_var_{field_name}",
+                message=f"DirectInit.var.{field_name} must be False",
+                path=path + (field_name,),
+                value=field_value,
+            )
+    tensor_access = getattr(variable, "tensor_access", _MISSING_LLIR_FIELD)
+    if tensor_access is not None:
+        _raise_traversal_error(
+            context,
+            code="invalid_direct_init_var_metadata",
+            message="DirectInit.var.tensor_access must be None",
+            path=path + ("tensor_access",),
+            value=tensor_access,
+        )
+
+
+def _validate_direct_init_args(
+    value: object,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    if type(value) is not tuple:
+        _raise_traversal_error(
+            context,
+            code="invalid_direct_init_args",
+            message="DirectInit.args must be a tuple",
+            path=path,
+            value=value,
+        )
+    args = cast(Tuple[object, ...], value)
+    if not args:
+        _raise_traversal_error(
+            context,
+            code="empty_direct_init_args",
+            message="DirectInit.args must be non-empty",
+            path=path,
+            value=args,
+        )
+    for index, argument in enumerate(args):
+        if not isinstance(argument, llir.Expr):
+            _raise_traversal_error(
+                context,
+                code="invalid_direct_init_argument",
+                message="DirectInit.args must contain only LLIR expressions",
+                path=path + (f"[{index}]",),
+                value=argument,
+            )
+
+
+def _validate_direct_init_fields(
+    node: llir.DirectInit,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    _validate_direct_init_var(
+        getattr(node, "var", _MISSING_LLIR_FIELD),
+        context,
+        path + ("var",),
+    )
+    _validate_direct_init_args(
+        getattr(node, "args", _MISSING_LLIR_FIELD),
+        context,
+        path + ("args",),
+    )
+
+
 class LLIRWalker:
     """A stateless, exhaustive walker with one typed hook per LLIR node."""
 
@@ -728,6 +839,8 @@ class LLIRWalker:
             self.visit_var_decl(cast(llir.VarDecl, node), path)
         elif node_type is llir.VarInit:
             self.visit_var_init(cast(llir.VarInit, node), path)
+        elif node_type is llir.DirectInit:
+            self.visit_direct_init(cast(llir.DirectInit, node), path)
         elif node_type is llir.FixedStackArrayDecl:
             self.visit_fixed_stack_array_decl(
                 cast(llir.FixedStackArrayDecl, node), path
@@ -934,6 +1047,11 @@ class LLIRWalker:
     def visit_var_init(self, node: llir.VarInit, path: LLIRPath) -> None:
         self._walk_var_child(node.var, path + ("var",))
         self._walk_expr(node.value, path + ("value",))
+
+    def visit_direct_init(self, node: llir.DirectInit, path: LLIRPath) -> None:
+        _validate_direct_init_fields(node, self.context, path)
+        self._walk_var_child(node.var, path + ("var",))
+        self._walk_expr_sequence(node.args, path + ("args",))
 
     def visit_fixed_stack_array_decl(
         self,
@@ -1384,6 +1502,8 @@ class LLIRRewriter:
             return self.rewrite_var_decl(cast(llir.VarDecl, node), path)
         if node_type is llir.VarInit:
             return self.rewrite_var_init(cast(llir.VarInit, node), path)
+        if node_type is llir.DirectInit:
+            return self.rewrite_direct_init(cast(llir.DirectInit, node), path)
         if node_type is llir.FixedStackArrayDecl:
             return self.rewrite_fixed_stack_array_decl(
                 cast(llir.FixedStackArrayDecl, node), path
@@ -1664,6 +1784,19 @@ class LLIRRewriter:
         )
         rewritten.cast = node.cast
         return rewritten
+
+    def rewrite_direct_init(
+        self, node: llir.DirectInit, path: LLIRPath
+    ) -> llir.DirectInit:
+        _validate_direct_init_fields(node, self.context, path)
+        variable = self._rewrite_var_child(node.var, path + ("var",))
+        _validate_direct_init_var(variable, self.context, path + ("var",))
+        args = self._rewrite_expr_sequence(node.args, path + ("args",))
+        _validate_direct_init_args(args, self.context, path + ("args",))
+        return llir.DirectInit(
+            var=variable,
+            args=cast(Tuple[llir.Expr, ...], args),
+        )
 
     def rewrite_fixed_stack_array_decl(
         self,

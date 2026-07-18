@@ -29,6 +29,10 @@ _PANEL_WINDOW_CONTEXT = LLIRTraversalContext(
     stage="schedule lowering",
     pass_name="window_sparse_loop",
 )
+_PACKED_STORAGE_CONTEXT = LLIRTraversalContext(
+    stage="schedule lowering",
+    pass_name="build_packed_storage",
+)
 
 
 def _nested_bodies(stmt: llir.Stmt) -> List[List[llir.Stmt]]:
@@ -357,7 +361,7 @@ def _declared_names(function: llir.Function) -> set[str]:
         for stmt in stmts:
             if type(stmt) is llir.FixedStackArrayDecl:
                 names.add(stmt.name)
-            elif isinstance(stmt, (llir.VarInit, llir.VarDecl)):
+            elif isinstance(stmt, (llir.VarInit, llir.DirectInit, llir.VarDecl)):
                 names.add(stmt.var.name)
             elif isinstance(stmt, llir.ForLoop) and stmt.init is not None:
                 names.add(stmt.init.var.name)
@@ -974,6 +978,36 @@ def _apply_heap_result_tile(
     ]
 
 
+def _packed_storage_declaration(
+    *,
+    storage_name: str,
+    scalar_type: llir.DataType,
+    stage_rows: str,
+    stage_rows_type: llir.DataType,
+    pack_tile_var: str,
+) -> llir.DirectInit:
+    """Build one detached typed owner for reusable packed operand storage."""
+
+    return llir.DirectInit(
+        var=llir.Var(
+            storage_name,
+            llir.DataType.std_vector_type(scalar_type),
+        ),
+        args=(
+            llir.Mul(
+                llir.Cast(
+                    llir.Var(stage_rows, stage_rows_type),
+                    llir.DataType.SIZE_T,
+                ),
+                llir.Cast(
+                    llir.Var(pack_tile_var, llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+            ),
+        ),
+    )
+
+
 def _apply_relayout(
     function: llir.Function,
     schedule: Schedule,
@@ -1240,14 +1274,20 @@ def _apply_relayout(
 
     pack_container, pack_index, _ = pack_location
     stage_rows = panel_tile_var if panel_scoped else panel_axis_bound
+    stage_rows_type = (
+        llir.DataType.CONSTEXPR_INT if panel_scoped else llir.DataType.INT64
+    )
+    packed_storage = _packed_storage_declaration(
+        storage_name=storage_name,
+        scalar_type=scalar_type,
+        stage_rows=stage_rows,
+        stage_rows_type=stage_rows_type,
+        pack_tile_var=pack_tile_var,
+    )
+    LLIRWalker(_PACKED_STORAGE_CONTEXT).walk(packed_storage)
     pack_container[pack_index:pack_index] = [
         llir.Comment(f"Allocate reusable packed storage for {plan.operand}"),
-        llir.RawStmt(
-            code=(
-                f"std::vector<{scalar_type.value}> {storage_name}("
-                f"(size_t) {stage_rows} * (size_t) {pack_tile_var})"
-            )
-        ),
+        packed_storage,
         llir.VarInit(
             var=llir.Var(packed_name, pointer_type, is_restrict=True),
             value=llir.MemberCall(
