@@ -60,7 +60,12 @@ from .llir_pass_manager import (
 )
 from .compilation_context import CompilerStageId, CompilationContext
 from .llir_traversal import LLIRTraversalContext
-from .torch_cpp_abi import mode_index_tensor, tensor_data_ptr, tensor_storage_member
+from .torch_cpp_abi import (
+    ResultTensorAssembler,
+    mode_index_tensor,
+    tensor_data_ptr,
+    tensor_storage_member,
+)
 from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import (
     dtype_to_c_datatype,
@@ -86,516 +91,23 @@ class _LoweredOuterBody:
     compressed_where_pass_spec: Optional[CompressedWhereOpenMPPassSpec] = None
 
 
-class ResultTensorAssembler:
-    """Assembles LLIR statements for result tensor initialization and final construction."""
+def _result_tensor_abi_assembler(
+    tensor_var: TensorVar,
+    *,
+    known_nnz_var: Optional[str] = None,
+    exact_dense_parent_positions: bool = False,
+    reserve_hint_var: Optional[str] = None,
+) -> ResultTensorAssembler:
+    """Snapshot one semantic result at the Torch/C++ ABI ownership boundary."""
 
-    def __init__(
-        self,
-        tensor_var: TensorVar,
-        known_nnz_var: Optional[str] = None,
-        exact_dense_parent_positions: bool = False,
-        reserve_hint_var: Optional[str] = None,
-    ):
-        self.tensor_var = tensor_var
-        self.name = tensor_var.get_name()
-        self.level_types = tensor_var.get_level_types()
-        self.is_dense = tensor_var.is_dense()
-        self.dtype = tensor_var.dtype
-        self.known_nnz_var = known_nnz_var
-        self.exact_dense_parent_positions = exact_dense_parent_positions
-        self.reserve_hint_var = reserve_hint_var
-
-    def _has_fixed_position_count(self, level: int) -> bool:
-        """A compressed level below a dense parent has parent_size + 1 slots."""
-        return (
-            self.exact_dense_parent_positions
-            and level > 0
-            and self.level_types[level - 1] == LevelType.DENSE
-        )
-
-    def emit_value_array_init(self) -> List[llir.Stmt]:
-        """Emit Torch-owned known-size storage or a dynamic ``std::vector``."""
-        stmts: List[llir.Stmt] = []
-        if self.is_dense:
-            # capacity = product of all dimension sizes
-            res_capacity_expr: llir.Expr = llir.Var(
-                name=f"{self.name}0_size",
-                type=llir.DataType.INT64,
-            )
-            for i in range(1, self.tensor_var.levels):
-                res_capacity_expr = llir.BinOp(
-                    left=res_capacity_expr,
-                    op="*",
-                    right=llir.Var(
-                        name=f"{self.name}{i}_size",
-                        type=llir.DataType.INT64,
-                    ),
-                )
-            stmts.append(
-                llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_capacity",
-                        type=llir.DataType.INT64,
-                    ),
-                    value=res_capacity_expr,
-                )
-            )
-
-            c_datatype = dtype_to_c_datatype(self.dtype)
-            res_capacity_var = llir.Var(
-                name=f"{self.name}_capacity",
-                type=llir.DataType.INT64,
-            )
-            stmts.append(
-                llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_values_torch",
-                        type=llir.DataType.TORCH_TENSOR,
-                    ),
-                    value=llir.FunctionCall(
-                        name="torch::empty",
-                        args=[
-                            llir.Array(
-                                values=(
-                                    llir.Var(
-                                        name=f"{self.name}_capacity",
-                                        type=llir.DataType.INT64,
-                                    ),
-                                ),
-                                data_type=llir.DataType.INT64,
-                            ),
-                            llir.QualifiedName(
-                                namespace="torch",
-                                name=get_pytorch_c_dtype_name(self.dtype),
-                                data_type=llir.DataType.TORCH_SCALAR_TYPE,
-                            ),
-                        ],
-                    ),
-                )
-            )
-            stmts.append(
-                llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_values",
-                        type=llir.DataType.ptr_type(c_datatype),
-                        is_restrict=True,
-                    ),
-                    value=tensor_data_ptr(
-                        llir.Var(
-                            name=f"{self.name}_values_torch",
-                            type=llir.DataType.TORCH_TENSOR,
-                        ),
-                        c_datatype,
-                    ),
-                )
-            )
-
-            # Zero the whole dense buffer before the parallel += accumulate. The
-            # generated kernel accumulates into C, so it needs the full buffer
-            # zeroed (not empty-rows-only like the prebuilt SpMM). scorch_zero_dense
-            # (scorch/csrc/header.h) parallelizes that zero across cores for large
-            # outputs — where the serial memset was a big fraction of runtime — and
-            # falls back to a single memset below SCORCH_MEMSET_GRAIN_BYTES. Takes
-            # the element count; it computes the byte span internally.
-            stmts.append(
-                llir.FunctionCallStmt(
-                    name="scorch_zero_dense",
-                    args=[
-                        llir.Var(
-                            name=f"{self.name}_values",
-                            type=llir.DataType.ptr_type(self.dtype),
-                        ),
-                        res_capacity_var,
-                    ],
-                )
-            )
-        elif self.known_nnz_var:
-            c_datatype = dtype_to_c_datatype(self.dtype)
-            stmts.append(
-                llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_values_torch",
-                        type=llir.DataType.TORCH_TENSOR,
-                    ),
-                    value=llir.FunctionCall(
-                        name="torch::empty",
-                        args=[
-                            llir.Array(
-                                values=(
-                                    llir.Var(
-                                        name=self.known_nnz_var,
-                                        type=llir.DataType.INT64,
-                                    ),
-                                ),
-                                data_type=llir.DataType.INT64,
-                            ),
-                            llir.QualifiedName(
-                                namespace="torch",
-                                name=get_pytorch_c_dtype_name(self.dtype),
-                                data_type=llir.DataType.TORCH_SCALAR_TYPE,
-                            ),
-                        ],
-                    ),
-                )
-            )
-            stmts.append(
-                llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_values",
-                        type=llir.DataType.ptr_type(c_datatype),
-                    ),
-                    value=tensor_data_ptr(
-                        llir.Var(
-                            name=f"{self.name}_values_torch",
-                            type=llir.DataType.TORCH_TENSOR,
-                        ),
-                        c_datatype,
-                    ),
-                )
-            )
-        else:
-            stmts.append(
-                llir.VarDecl(
-                    llir.Var(
-                        name=f"{self.name}_values",
-                        type=llir.DataType.std_vector_type(
-                            dtype_to_c_datatype(self.dtype)
-                        ),
-                    )
-                )
-            )
-            if self.reserve_hint_var:
-                stmts.append(
-                    llir.FunctionCallStmt(
-                        name=f"{self.name}_values.reserve",
-                        args=[
-                            llir.Var(
-                                name=self.reserve_hint_var,
-                                type=llir.DataType.INT64,
-                            )
-                        ],
-                    )
-                )
-        return stmts
-
-    def emit_level_indices_init(self) -> List[llir.Stmt]:
-        """Emit per-level index array initialization for COMPRESSED/COORDINATE levels."""
-        stmts: List[llir.Stmt] = []
-        for i, level_type in enumerate(self.level_types):
-            if level_type == LevelType.COMPRESSED:
-                if self._has_fixed_position_count(i):
-                    # A dense parent fixes the exact position-array length.
-                    # Size a standard vector once, then transfer it to Torch
-                    # without a copy. Parent coordinates are ABI-validated
-                    # against this same extent before the generated loop.
-                    stmts.append(
-                        llir.RawStmt(
-                            code=(
-                                f"std::vector<int> {self.name}{i}_pos("
-                                f"(size_t){self.name}{i - 1}_size + 1, 0)"
-                            ),
-                        )
-                    )
-                else:
-                    # Sparse parents have a dynamically assembled fiber count.
-                    stmts.append(
-                        llir.VarDecl(
-                            llir.Var(
-                                name=f"{self.name}{i}_pos",
-                                type=llir.DataType.STD_VECTOR_C_INT,
-                            )
-                        )
-                    )
-                stmts.append(
-                    llir.VarDecl(
-                        llir.Var(
-                            name=f"{self.name}{i}_crd",
-                            type=llir.DataType.STD_VECTOR_C_INT,
-                        )
-                    )
-                )
-                if self.reserve_hint_var:
-                    stmts.append(
-                        llir.FunctionCallStmt(
-                            name=f"{self.name}{i}_crd.reserve",
-                            args=[
-                                llir.Var(
-                                    name=self.reserve_hint_var,
-                                    type=llir.DataType.INT64,
-                                )
-                            ],
-                        )
-                    )
-                if not self._has_fixed_position_count(i):
-                    # pos[0] = 0 for the append-built position vector.
-                    stmts.append(
-                        llir.Assign(
-                            var=llir.ArrayAccess(
-                                array=llir.Var(
-                                    name=f"{self.name}{i}_pos",
-                                    type=llir.DataType.STD_VECTOR_C_INT,
-                                ),
-                                index=llir.Literal(0),
-                            ),
-                            value=llir.Literal(0),
-                        )
-                    )
-                # int p<name><i> = 0
-                stmts.append(
-                    llir.VarInit(
-                        llir.Var(
-                            name=f"p{self.name}{i}",
-                            type=llir.DataType.INT64,
-                        ),
-                        value=llir.Literal(0),
-                    )
-                )
-                # int <name><i>_pos_index = 0
-                stmts.append(
-                    llir.VarInit(
-                        llir.Var(
-                            name=f"{self.name}{i}_pos_index",
-                            type=llir.DataType.INT64,
-                        ),
-                        value=llir.Literal(0),
-                    )
-                )
-                stmts.append(llir.BlankLine())
-
-            elif level_type == LevelType.COORDINATE:
-                if self.known_nnz_var:
-                    # Known-size coordinate arrays are Torch-owned from creation.
-                    stmts.append(
-                        llir.RawStmt(
-                            code=(
-                                f"torch::Tensor {self.name}{i}_crd_torch = "
-                                f"torch::empty({{{self.known_nnz_var}}}, torch::kInt);\n"
-                                f"  int* {self.name}{i}_crd = "
-                                f"{self.name}{i}_crd_torch.data_ptr<int>();"
-                            ),
-                            add_semicolon=False,
-                        )
-                    )
-                else:
-                    stmts.append(
-                        llir.VarDecl(
-                            llir.Var(
-                                name=f"{self.name}{i}_crd",
-                                type=llir.DataType.STD_VECTOR_C_INT,
-                            )
-                        )
-                    )
-                    if self.reserve_hint_var:
-                        stmts.append(
-                            llir.FunctionCallStmt(
-                                name=f"{self.name}{i}_crd.reserve",
-                                args=[
-                                    llir.Var(
-                                        name=self.reserve_hint_var,
-                                        type=llir.DataType.INT64,
-                                    )
-                                ],
-                            )
-                        )
-                # int p<name><i> = 0
-                stmts.append(
-                    llir.VarInit(
-                        llir.Var(
-                            name=f"p{self.name}{i}",
-                            type=llir.DataType.INT64,
-                        ),
-                        value=llir.Literal(0),
-                    )
-                )
-                stmts.append(llir.BlankLine())
-
-        return stmts
-
-    def _get_mode_index_set(self, i: int, level_type: LevelType) -> llir.Array:
-        """Return one fresh structured mode-index initializer for a level."""
-        tensor_level_name = f"{self.name}{i}"
-        if level_type == LevelType.DENSE:
-            values: Tuple[llir.Expr, ...] = ()
-        elif level_type == LevelType.COMPRESSED:
-            values = (
-                llir.Var(
-                    name=f"{tensor_level_name}_pos_torch",
-                    type=llir.DataType.TORCH_TENSOR,
-                ),
-                llir.Var(
-                    name=f"{tensor_level_name}_crd_torch",
-                    type=llir.DataType.TORCH_TENSOR,
-                ),
-            )
-        elif level_type == LevelType.COORDINATE:
-            values = (
-                llir.Var(
-                    name=f"{tensor_level_name}_crd_torch",
-                    type=llir.DataType.TORCH_TENSOR,
-                ),
-            )
-        else:
-            raise ValueError(f"unsupported result level type {level_type}")
-        return llir.Array(
-            values=values,
-            data_type=llir.DataType.STD_VECTOR_TORCH_TENSOR,
-        )
-
-    def emit_final_assembly(self) -> List[llir.Stmt]:
-        """Move dynamic buffers to Torch, assign indices/values, and return."""
-        stmts: List[llir.Stmt] = []
-
-        # TacoTensor decl
-        stmts.extend(
-            [
-                llir.Comment("Assemble final result"),
-                llir.VarDecl(
-                    var=llir.Var(
-                        name=f"{self.name}",
-                        type=llir.DataType.TACO_TENSOR,
-                    )
-                ),
-            ]
-        )
-
-        # Move dynamic index vectors into Torch storage contexts. Known-size
-        # coordinate tensors were allocated before the compute loop.
-        for i, level_type in enumerate(self.level_types):
-            tensor_level_name = f"{self.name}{i}"
-
-            if level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
-                if level_type == LevelType.COMPRESSED:
-                    stmts.append(
-                        llir.VarInit(
-                            var=llir.Var(
-                                name=f"{tensor_level_name}_pos_torch",
-                                type=llir.DataType.TORCH_TENSOR,
-                            ),
-                            value=llir.FunctionCall(
-                                name="scorch_tensor_from_vector",
-                                args=[
-                                    llir.FunctionCall(
-                                        name="std::move",
-                                        args=[
-                                            llir.Var(
-                                                name=f"{tensor_level_name}_pos",
-                                                type=llir.DataType.STD_VECTOR_C_INT,
-                                            )
-                                        ],
-                                    ),
-                                    llir.QualifiedName(
-                                        namespace="torch",
-                                        name="kInt",
-                                        data_type=llir.DataType.TORCH_SCALAR_TYPE,
-                                    ),
-                                ],
-                            ),
-                        )
-                    )
-
-                if self.known_nnz_var and level_type == LevelType.COORDINATE:
-                    continue
-                else:
-                    stmts.append(
-                        llir.VarInit(
-                            var=llir.Var(
-                                name=f"{tensor_level_name}_crd_torch",
-                                type=llir.DataType.TORCH_TENSOR,
-                            ),
-                            value=llir.FunctionCall(
-                                name="scorch_tensor_from_vector",
-                                args=[
-                                    llir.FunctionCall(
-                                        name="std::move",
-                                        args=[
-                                            llir.Var(
-                                                name=f"{tensor_level_name}_crd",
-                                                type=llir.DataType.STD_VECTOR_C_INT,
-                                            )
-                                        ],
-                                    ),
-                                    llir.QualifiedName(
-                                        namespace="torch",
-                                        name="kInt",
-                                        data_type=llir.DataType.TORCH_SCALAR_TYPE,
-                                    ),
-                                ],
-                            ),
-                        )
-                    )
-
-        if not self.is_dense and not self.known_nnz_var:
-            stmts.append(
-                llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_values_torch",
-                        type=llir.DataType.TORCH_TENSOR,
-                    ),
-                    value=llir.FunctionCall(
-                        name="scorch_tensor_from_vector",
-                        args=[
-                            llir.FunctionCall(
-                                name="std::move",
-                                args=[
-                                    llir.Var(
-                                        name=f"{self.name}_values",
-                                        type=llir.DataType.std_vector_type(
-                                            dtype_to_c_datatype(self.dtype)
-                                        ),
-                                    )
-                                ],
-                            ),
-                            llir.QualifiedName(
-                                namespace="torch",
-                                name=get_pytorch_c_dtype_name(self.dtype),
-                                data_type=llir.DataType.TORCH_SCALAR_TYPE,
-                            ),
-                        ],
-                    ),
-                )
-            )
-
-        # mode_indices assignment
-        stmts.append(
-            llir.Assign(
-                var=tensor_storage_member(
-                    self.name,
-                    "storage",
-                    "index",
-                    "mode_indices",
-                ),
-                value=llir.Array(
-                    values=tuple(
-                        self._get_mode_index_set(i, level_type)
-                        for i, level_type in enumerate(self.level_types)
-                    ),
-                    data_type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
-                ),
-            )
-        )
-
-        # _value assignment
-        stmts.append(
-            llir.Assign(
-                var=tensor_storage_member(self.name, "storage", "value"),
-                value=llir.Var(
-                    name=f"{self.name}_values_torch",
-                    type=llir.DataType.TORCH_TENSOR,
-                ),
-            )
-        )
-
-        # return statement
-        stmts.append(
-            llir.Return(
-                value=llir.Var(
-                    name=f"{self.name}",
-                    type=llir.DataType.TACO_TENSOR,
-                )
-            )
-        )
-
-        return stmts
+    return ResultTensorAssembler(
+        name=tensor_var.get_name(),
+        level_types=tuple(tensor_var.get_level_types()),
+        dtype=tensor_var.dtype,
+        known_nnz_var=known_nnz_var,
+        exact_dense_parent_positions=exact_dense_parent_positions,
+        reserve_hint_var=reserve_hint_var,
+    )
 
 
 class CINLowerer:
@@ -2699,7 +2211,7 @@ class CINLowerer:
             self.tensor_var_to_llir[result_tensor_var] = self.lower_TensorVar(
                 result_tensor_var
             )
-            assembler = ResultTensorAssembler(
+            assembler = _result_tensor_abi_assembler(
                 result_tensor_var,
                 exact_dense_parent_positions=exact_dense_parent_positions,
                 reserve_hint_var=reserve_hint_var,
@@ -3018,7 +2530,7 @@ class CINLowerer:
                         assembled_value_init_stmts = []
                         assembled_level_indices_stmts = []
                         for result_tensor_var in non_workspace_result_tensor_vars:
-                            assembler = ResultTensorAssembler(
+                            assembler = _result_tensor_abi_assembler(
                                 result_tensor_var,
                                 known_nnz_var=self._known_nnz_var,
                                 exact_dense_parent_positions=(
@@ -3076,7 +2588,7 @@ class CINLowerer:
                     assert (
                         self.final_result_tensor_var is not None
                     ), "No final result tensor"
-                    final_assembler = ResultTensorAssembler(
+                    final_assembler = _result_tensor_abi_assembler(
                         self.final_result_tensor_var,
                         known_nnz_var=self._known_nnz_var,
                         exact_dense_parent_positions=exact_dense_parent_positions,
