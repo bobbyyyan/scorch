@@ -672,13 +672,13 @@ def test_nested_control_flow_and_statement_containers_follow_legacy_scopes() -> 
     count_state_codes = _phase_state_codes(count_loop.body)
     calls = _call_names(count_loop.body)
     assert count_state_codes.count("_cnt1++") == 8
-    # The legacy name rewrite descends into ForLoop bodies and If branches, but
-    # not ForLoopAuto, WhileLoop, or bare nested statement containers.
+    # The exact call-name rewrite descends into ForLoop bodies and If branches,
+    # but not ForLoopAuto, WhileLoop, or bare nested statement containers.
     assert calls.count("wksp.insert_unchecked") == 4
     assert calls.count("wksp.insert") == 4
 
 
-def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
+def test_workspace_insert_rewrite_matches_only_the_exact_call_name() -> None:
     metadata = llir.TensorAccessMetadata(
         access_id=AccessId(1),
         tensor_id=SymbolId(2),
@@ -699,13 +699,21 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
     initialization = llir.VarInit(
         _var("initialized"), _var("wksp.insert_initial_value")
     )
-    raw = llir.RawStmt("wksp.insert(raw_value)")
+    raw = llir.RawStmt("wksp.insert(raw_value)", add_semicolon=False)
+    calls = [
+        llir.FunctionCallStmt("wksp.insert", [_var("wksp.insert_argument")]),
+        llir.FunctionCallStmt("prefix_wksp.insert", [_var("prefix_argument")]),
+        llir.FunctionCallStmt("wksp.insert_suffix", [_var("suffix_argument")]),
+        llir.FunctionCallStmt("wksp.insert.more", [_var("member_argument")]),
+        llir.FunctionCallStmt("wksp.insert_unchecked", [_var("unchecked_argument")]),
+    ]
     source: List[llir.Stmt] = [
-        _compatible_loop([_workspace_init(), assignment, initialization, raw])
+        _compatible_loop([_workspace_init(), assignment, initialization, raw, *calls])
     ]
     snapshot = _structural_snapshot(source)
 
     result = transform_compressed_where_for_openmp(source, _context())
+    repeated = transform_compressed_where_for_openmp(source, _context())
 
     count_loop, fill_loop = _phase_loops(result)
     rewritten_assignment = cast(
@@ -726,13 +734,11 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
         ),
     )
 
-    assert cast(llir.Var, target.array).name == "wksp.insert_unchecked_targets"
-    assert cast(llir.Var, target.index).name == "wksp.insert_unchecked_target_index"
-    assert cast(llir.Var, value.left).name == "wksp.insert_unchecked_value"
-    assert cast(llir.Var, value_access.array).name == "wksp.insert_unchecked_values"
-    assert cast(llir.Var, value_access.index).name == (
-        "wksp.insert_unchecked_value_index"
-    )
+    assert cast(llir.Var, target.array).name == "wksp.insert_targets"
+    assert cast(llir.Var, target.index).name == "wksp.insert_target_index"
+    assert cast(llir.Var, value.left).name == "wksp.insert_value"
+    assert cast(llir.Var, value_access.array).name == "wksp.insert_values"
+    assert cast(llir.Var, value_access.index).name == "wksp.insert_value_index"
     assert value_access.tensor_access is metadata
     fill_assignment = cast(
         llir.Assign,
@@ -753,11 +759,67 @@ def test_workspace_reference_rewrite_covers_each_legacy_field_form() -> None:
     assert fill_value.right is not value.right
     assert cast(llir.ArrayAccess, fill_value.right).tensor_access is metadata
     assert cast(llir.Var, rewritten_initialization.value).name == (
-        "wksp.insert_unchecked_initial_value"
+        "wksp.insert_initial_value"
     )
-    assert "wksp.insert_unchecked(raw_value)" in _raw_codes(count_loop.body)
+
+    expected_names = {
+        "wksp.insert_argument": "wksp.insert_unchecked",
+        "prefix_argument": "prefix_wksp.insert",
+        "suffix_argument": "wksp.insert_suffix",
+        "member_argument": "wksp.insert.more",
+        "unchecked_argument": "wksp.insert_unchecked",
+    }
+    for phase_loop in (count_loop, fill_loop):
+        phase_calls = [
+            cast(llir.FunctionCallStmt, statement)
+            for statement in phase_loop.body
+            if type(statement) is llir.FunctionCallStmt
+        ]
+        actual_names = {
+            cast(llir.Var, call.args[0]).name: call.name for call in phase_calls
+        }
+        assert actual_names == expected_names
+        assert all(type(call.args[0]) is llir.Var for call in phase_calls)
+        rewritten_raw = next(
+            cast(llir.RawStmt, statement)
+            for statement in phase_loop.body
+            if type(statement) is llir.RawStmt
+            and statement.code == "wksp.insert(raw_value)"
+        )
+        assert rewritten_raw.add_semicolon is False
+
     assert _structural_snapshot(source) == snapshot
+    assert _structural_snapshot(result.statements) == _structural_snapshot(
+        repeated.statements
+    )
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(result.statements))
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(repeated.statements))
+    assert _mutable_ir_ids(result.statements).isdisjoint(
+        _mutable_ir_ids(repeated.statements)
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [None, "", "   ", type("WorkspaceCallName", (str,), {})("wksp.insert")],
+    ids=["none", "empty", "whitespace", "str-subclass"],
+)
+def test_workspace_insert_rewrite_rejects_malformed_call_names(
+    name: object,
+) -> None:
+    malformed = llir.FunctionCallStmt(cast(str, name), [_var("value")])
+    source = [_compatible_loop([_workspace_init(), malformed])]
+    snapshot = _structural_snapshot(source)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(source, _context())
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_workspace_insert_call_name"
+    assert diagnostic.stage == _context().traversal.stage
+    assert diagnostic.pass_name == _context().traversal.pass_name
+    assert diagnostic.path == ("root", "[0]", "name")
+    assert _structural_snapshot(source) == snapshot
 
 
 def test_retained_metadata_is_preserved_but_selected_loop_policy_is_reset() -> None:
@@ -1205,6 +1267,8 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes(
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f"
     )
+    assert cpp.count("wksp.insert_unchecked(") == 2
+    assert "wksp.insert(" not in cpp
     assert cpp.count("int pSparseLeft1_end = SparseLeft1_pos[pSparseLeft0 + 1];") == 2
     assert cpp.count("pSparseLeft1 < pSparseLeft1_end; pSparseLeft1++") == 2
     assert (
@@ -1297,6 +1361,8 @@ def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
         "1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e"
     )
+    assert cpp.count("wksp.insert(") == 2
+    assert "wksp.insert_unchecked(" not in cpp
     assert cpp.count("int pLeft1_end = Left1_pos[pLeft0 + 1];") == 2
     assert cpp.count("pLeft1 < pLeft1_end; pLeft1++") == 2
     assert cpp.count("int pLeft2_end = Left2_pos[pLeft1 + 1];") == 2

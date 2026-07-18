@@ -719,11 +719,6 @@ def test_generic_string_rewrite_compatibility_budget_is_explicit() -> None:
             "stmt.name = stmt.name.replace(old, new)",
             "stmt.code = stmt.code.replace(old, new)",
         ),
-        "compressed_where_openmp_pass.py": (
-            "rewritten.name = rewritten.name.replace(self._old, self._new)",
-            "rewritten_call.name = call.name.replace(self._old, self._new)",
-            "rewritten_raw.code = raw.code.replace(self._old, self._new)",
-        ),
         "dense_pointer_hoist_pass.py": (
             "call.name = name",
             "raw_statement.code = code",
@@ -741,4 +736,12 @@ def test_generic_string_rewrite_compatibility_budget_is_explicit() -> None:
         source = (_COMPILER_ROOT / filename).read_text()
         for marker in expected_markers:
             assert source.count(marker) == 1
-    assert sum(len(expected_markers) for expected_markers in markers.values()) == 10
+    assert sum(len(expected_markers) for expected_markers in markers.values()) == 7
+
+
+def test_workspace_insert_rewrite_is_exact_and_never_lexical() -> None:
+    source = (_COMPILER_ROOT / "compressed_where_openmp_pass.py").read_text()
+
+    assert source.count("if call.name == self._old:") == 1
+    assert source.count("rewritten_call.name = self._new") == 1
+    assert ".replace(self._old, self._new)" not in source
