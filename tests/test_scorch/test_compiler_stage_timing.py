@@ -42,10 +42,7 @@ from scorch.compiler.cin_analysis import (  # type: ignore[import-untyped]
     canonical_cin_dump,
     normalize_cin,
 )
-from scorch.compiler.cin_lowerer import (  # type: ignore[import-untyped]
-    CINLowerer,
-    ResultTensorAssembler,
-)
+from scorch.compiler.cin_lowerer import CINLowerer  # type: ignore[import-untyped]
 from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 from scorch.compiler.iterator import ModeIterator  # type: ignore[import-untyped]
 from scorch.compiler.compilation_context import (  # type: ignore[import-untyped]
@@ -78,6 +75,9 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
     LLIRTraversalContext,
     LLIRTraversalError,
     LLIRWalker,
+)
+from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
+    ResultTensorAssembler,
 )
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Schedule,

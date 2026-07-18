@@ -18,7 +18,7 @@ from scorch.compiler.cin import (
     Where,
     Workspace,
 )
-from scorch.compiler.cin_lowerer import CINLowerer, ResultTensorAssembler
+from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 from scorch.compiler.diagnostics import CompilerInvariantError, UnsupportedFeature
 from scorch.compiler.iterator import (  # type: ignore[import-untyped]
@@ -38,6 +38,7 @@ from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     regblock_force,
 )
 from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
+    ResultTensorAssembler,
     mode_index_tensor,
     tensor_data_ptr,
     tensor_storage_member,
@@ -51,6 +52,23 @@ class UnknownCIN(CIN):
 
 class UnknownIndexStmt(IndexStmt):
     pass
+
+
+def _result_tensor_assembler(
+    tensor_var: TensorVar,
+    *,
+    known_nnz_var: str | None = None,
+    exact_dense_parent_positions: bool = False,
+    reserve_hint_var: str | None = None,
+) -> ResultTensorAssembler:
+    return ResultTensorAssembler(
+        name=tensor_var.get_name(),
+        level_types=tuple(tensor_var.get_level_types()),
+        dtype=tensor_var.dtype,
+        known_nnz_var=known_nnz_var,
+        exact_dense_parent_positions=exact_dense_parent_positions,
+        reserve_hint_var=reserve_hint_var,
+    )
 
 
 def _build_all_coo_transform_loop() -> llir.ForLoop:
@@ -394,6 +412,100 @@ def test_torch_cpp_abi_helpers_reject_malformed_boundary_inputs() -> None:
             "float",
         )
 
+    valid_metadata = {
+        "name": "Result",
+        "level_types": (LevelType.DENSE, LevelType.COMPRESSED),
+        "dtype": torch.float32,
+    }
+    for name in ("", "Result.value", 1):
+        with pytest.raises(TypeError, match="result tensor name"):
+            ResultTensorAssembler(  # type: ignore[arg-type]
+                **{**valid_metadata, "name": name}
+            )
+    for level_types in (
+        [LevelType.DENSE],
+        (LevelType.DENSE, "compressed"),
+        "ds",
+    ):
+        with pytest.raises(TypeError, match="immutable LevelType tuple"):
+            ResultTensorAssembler(  # type: ignore[arg-type]
+                **{**valid_metadata, "level_types": level_types}
+            )
+    for dtype in ("float32", None):
+        with pytest.raises(TypeError, match="torch.dtype"):
+            ResultTensorAssembler(  # type: ignore[arg-type]
+                **{**valid_metadata, "dtype": dtype}
+            )
+    for known_nnz_var in ("", "known-nnz", 1):
+        with pytest.raises(TypeError, match="known nnz"):
+            ResultTensorAssembler(  # type: ignore[arg-type]
+                **valid_metadata,
+                known_nnz_var=known_nnz_var,
+            )
+    with pytest.raises(TypeError, match="exact dense parent"):
+        ResultTensorAssembler(  # type: ignore[arg-type]
+            **valid_metadata,
+            exact_dense_parent_positions=1,
+        )
+    for reserve_hint_var in ("", "reserve.hint", 1):
+        with pytest.raises(TypeError, match="reserve hint"):
+            ResultTensorAssembler(  # type: ignore[arg-type]
+                **valid_metadata,
+                reserve_hint_var=reserve_hint_var,
+            )
+
+
+def test_result_tensor_assembler_owns_one_frozen_abi_snapshot() -> None:
+    tensor = TensorVar("Result", fmt="ds", dtype=torch.float32)
+    assembler = _result_tensor_assembler(
+        tensor,
+        known_nnz_var="_known_nnz",
+        exact_dense_parent_positions=True,
+        reserve_hint_var="_reserve_hint",
+    )
+    equal = _result_tensor_assembler(
+        TensorVar("Result", fmt="ds", dtype=torch.float32),
+        known_nnz_var="_known_nnz",
+        exact_dense_parent_positions=True,
+        reserve_hint_var="_reserve_hint",
+    )
+
+    assert ResultTensorAssembler.__module__ == "scorch.compiler.torch_cpp_abi"
+    assert assembler == equal
+    assert hash(assembler) == hash(equal)
+    assert assembler is not equal
+    assert assembler.name == "Result"
+    assert assembler.level_types == (LevelType.DENSE, LevelType.COMPRESSED)
+    assert assembler.levels == 2
+    assert assembler.is_dense is False
+    assert assembler.dtype is torch.float32
+    assert assembler.known_nnz_var == "_known_nnz"
+    assert assembler.exact_dense_parent_positions is True
+    assert assembler.reserve_hint_var == "_reserve_hint"
+    assert not hasattr(assembler, "tensor_var")
+
+    tensor.name = "Mutated"
+    tensor.format = TensorVar("Other", fmt="oo").format
+    tensor.dtype = torch.float64
+    assert assembler == equal
+    lowerer = LLIRLowerer()
+    assert lowerer.lower_llir(assembler.emit_value_array_init()) == lowerer.lower_llir(
+        equal.emit_value_array_init()
+    )
+    assert lowerer.lower_llir(
+        assembler.emit_level_indices_init()
+    ) == lowerer.lower_llir(equal.emit_level_indices_init())
+    assert lowerer.lower_llir(assembler.emit_final_assembly()) == lowerer.lower_llir(
+        equal.emit_final_assembly()
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        assembler.name = "Other"
+    with pytest.raises(FrozenInstanceError):
+        assembler.level_types = ()
+    with pytest.raises(FrozenInstanceError):
+        assembler.known_nnz_var = None
+
 
 def _collect_move_calls(value: llir.Node) -> list[llir.FunctionCall]:
     calls: list[llir.FunctionCall] = []
@@ -534,7 +646,7 @@ def test_post_op_extra_tensor_data_ptr_is_live_typed_and_fresh() -> None:
 def test_result_position_initialization_uses_a_frozen_structured_target() -> None:
     result = TensorVar("Result", fmt="ds")
 
-    statements = ResultTensorAssembler(result).emit_level_indices_init()
+    statements = _result_tensor_assembler(result).emit_level_indices_init()
     assignment = next(
         cast(llir.Assign, statement)
         for statement in statements
@@ -584,8 +696,8 @@ def _assert_torch_empty_extent(
 def test_dense_result_torch_empty_extent_is_structured_typed_and_fresh() -> None:
     tensor = TensorVar("Result", fmt="dd")
 
-    first_statements = ResultTensorAssembler(tensor).emit_value_array_init()
-    second_statements = ResultTensorAssembler(tensor).emit_value_array_init()
+    first_statements = _result_tensor_assembler(tensor).emit_value_array_init()
+    second_statements = _result_tensor_assembler(tensor).emit_value_array_init()
     first, first_dtype, first_initializer = _assert_torch_empty_extent(
         first_statements,
         extent_name="Result_capacity",
@@ -617,11 +729,11 @@ def test_dense_result_torch_empty_extent_is_structured_typed_and_fresh() -> None
 def test_known_nnz_result_torch_empty_extent_is_structured_typed_and_fresh() -> None:
     tensor = TensorVar("Result", fmt="ds")
 
-    first_statements = ResultTensorAssembler(
+    first_statements = _result_tensor_assembler(
         tensor,
         known_nnz_var="_known_nnz",
     ).emit_value_array_init()
-    second_statements = ResultTensorAssembler(
+    second_statements = _result_tensor_assembler(
         tensor,
         known_nnz_var="_known_nnz",
     ).emit_value_array_init()
@@ -665,11 +777,11 @@ def test_result_value_data_ptr_producers_are_structured_typed_and_fresh(
 ) -> None:
     tensor = TensorVar("Result", fmt=fmt)
 
-    first_statements = ResultTensorAssembler(
+    first_statements = _result_tensor_assembler(
         tensor,
         known_nnz_var=known_nnz_var,
     ).emit_value_array_init()
-    second_statements = ResultTensorAssembler(
+    second_statements = _result_tensor_assembler(
         tensor,
         known_nnz_var=known_nnz_var,
     ).emit_value_array_init()
@@ -932,7 +1044,7 @@ def test_final_value_qualified_dtype_preserves_every_supported_mapping(
 ) -> None:
     initializers = {
         statement.var.name: statement
-        for statement in ResultTensorAssembler(
+        for statement in _result_tensor_assembler(
             TensorVar("Result", fmt="ds", dtype=dtype)
         ).emit_final_assembly()
         if type(statement) is llir.VarInit
@@ -953,7 +1065,7 @@ def test_final_value_qualified_dtype_preserves_every_supported_mapping(
 
 
 def test_final_result_assembly_uses_structured_typed_move_calls() -> None:
-    statements = ResultTensorAssembler(
+    statements = _result_tensor_assembler(
         TensorVar("Result", fmt="ds")
     ).emit_final_assembly()
     initializers = {
@@ -1049,11 +1161,11 @@ def test_final_result_storage_assembly_is_structured_typed_and_fresh(
     mode_index_names: tuple[tuple[str, ...], ...],
 ) -> None:
     tensor = TensorVar("Result", fmt=fmt)
-    first_statements = ResultTensorAssembler(
+    first_statements = _result_tensor_assembler(
         tensor,
         known_nnz_var=known_nnz_var,
     ).emit_final_assembly()
-    second_statements = ResultTensorAssembler(
+    second_statements = _result_tensor_assembler(
         tensor,
         known_nnz_var=known_nnz_var,
     ).emit_final_assembly()

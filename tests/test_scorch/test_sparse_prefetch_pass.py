@@ -15,7 +15,7 @@ from scorch.compiler import (  # type: ignore[import-untyped]
     loop_invariant_factor_pass as factor_module,
 )
 from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
-from scorch.compiler.cin_lowerer import CINLowerer, ResultTensorAssembler
+from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_pass_manager import (
@@ -54,6 +54,9 @@ from scorch.compiler.sparse_prefetch_pass import (
     SPARSE_PREFETCH_TRAVERSAL_CONTEXT,
     SparsePrefetchContext,
     insert_sparse_prefetch,
+)
+from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
+    ResultTensorAssembler,
 )
 
 

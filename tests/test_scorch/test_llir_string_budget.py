@@ -117,7 +117,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 189,
+        "cin_lowerer.py": 153,
         "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -128,12 +128,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 2,
+        "torch_cpp_abi.py": 38,
     }
     assert sum(constructor_counts.values()) == 378
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 180,
+        "cin_lowerer.py": 144,
         "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -144,7 +144,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 99,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 2,
+        "torch_cpp_abi.py": 38,
     }
     assert sum(unclassified_counts.values()) == 367
     assert known_indirect == {
@@ -253,7 +253,10 @@ def test_free_move_calls_cannot_return_to_var_names() -> None:
                 structured_moves[path.name] += 1
 
     assert violations == []
-    assert structured_moves == {"cin_lowerer.py": 5}
+    assert structured_moves == {
+        "cin_lowerer.py": 2,
+        "torch_cpp_abi.py": 3,
+    }
     assert remaining_opaque_calls == {}
 
 
@@ -278,8 +281,10 @@ def test_torch_abi_expression_producer_budget_is_explicit() -> None:
 
     assert helper_calls == {
         ("cin_lowerer.py", "mode_index_tensor"): 4,
-        ("cin_lowerer.py", "tensor_data_ptr"): 9,
-        ("cin_lowerer.py", "tensor_storage_member"): 3,
+        ("cin_lowerer.py", "tensor_data_ptr"): 7,
+        ("cin_lowerer.py", "tensor_storage_member"): 1,
+        ("torch_cpp_abi.py", "tensor_data_ptr"): 2,
+        ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
     assert member_call_constructors == {
         "llir_traversal.py": 1,
@@ -316,9 +321,9 @@ def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
 
 
 def test_torch_empty_extents_cannot_return_to_var_names() -> None:
-    source = (_COMPILER_ROOT / "cin_lowerer.py").read_text()
+    source = (_COMPILER_ROOT / "torch_cpp_abi.py").read_text()
     value_initialization = source.split("def emit_value_array_init", 1)[1].split(
-        "def _get_mode_index_set", 1
+        "def emit_level_indices_init", 1
     )[0]
 
     assert 'name=f"{{{self.name}_capacity}}"' not in value_initialization
@@ -348,13 +353,16 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
 
     assert violations == []
     assert structured_counts == {
-        "cin_lowerer.py": 7,
+        "cin_lowerer.py": 2,
         "llir_traversal.py": 1,
+        "torch_cpp_abi.py": 5,
     }
 
-    producers = _llir_constructor_calls(
-        _COMPILER_ROOT / "cin_lowerer.py", "QualifiedName"
-    )
+    producers = []
+    for filename in ("cin_lowerer.py", "torch_cpp_abi.py"):
+        producers.extend(
+            _llir_constructor_calls(_COMPILER_ROOT / filename, "QualifiedName")
+        )
     name_expressions: Counter[str] = Counter()
     for producer in producers:
         fields = {
@@ -371,6 +379,49 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
         "get_pytorch_c_dtype_name(self.dtype)": 3,
         "get_pytorch_c_dtype_name(intermediate_tensor_var.dtype)": 1,
     }
+
+
+def test_result_tensor_assembler_is_owned_by_the_torch_cpp_abi_module() -> None:
+    lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
+    abi_path = _COMPILER_ROOT / "torch_cpp_abi.py"
+    lowerer_tree = ast.parse(lowerer_path.read_text())
+    abi_tree = ast.parse(abi_path.read_text())
+
+    lowerer_definitions = [
+        node
+        for node in ast.walk(lowerer_tree)
+        if isinstance(node, ast.ClassDef) and node.name == "ResultTensorAssembler"
+    ]
+    abi_definitions = [
+        node
+        for node in ast.walk(abi_tree)
+        if isinstance(node, ast.ClassDef) and node.name == "ResultTensorAssembler"
+    ]
+    assert lowerer_definitions == []
+    assert len(abi_definitions) == 1
+
+    abi_imports = [
+        node
+        for node in ast.walk(lowerer_tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 1
+        and node.module == "torch_cpp_abi"
+    ]
+    assert len(abi_imports) == 1
+    assert "ResultTensorAssembler" in {alias.name for alias in abi_imports[0].names}
+    assert not any(
+        isinstance(node, ast.ImportFrom) and node.module in {"cin", "cin_lowerer"}
+        for node in ast.walk(abi_tree)
+    )
+
+    producers = Counter(
+        {
+            path.name: len(_function_calls(path, "ResultTensorAssembler"))
+            for path in sorted(_COMPILER_ROOT.glob("*.py"))
+        }
+    )
+    producers += Counter()
+    assert producers == {"cin_lowerer.py": 1}
 
 
 def test_workspace_pair_reads_cannot_return_to_var_names() -> None:
@@ -468,12 +519,13 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
     counts += Counter()
 
     assert counts == {
-        "cin_lowerer.py": 17,
+        "cin_lowerer.py": 15,
         "compressed_where_openmp_pass.py": 15,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 3,
         "sparse_prefetch_pass.py": 1,
+        "torch_cpp_abi.py": 2,
     }
     assert sum(counts.values()) == 38
     assert sum(counts.values()) - counts["llir_traversal.py"] == 37
