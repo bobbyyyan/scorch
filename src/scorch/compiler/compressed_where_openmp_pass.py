@@ -792,7 +792,7 @@ def _build_fill_body(
     work_body: List[llir.Stmt],
     context: CompressedWhereOpenMPContext,
     *,
-    loop_var: str,
+    loop_var: llir.Var,
     workspace_hoisted: bool,
     manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
@@ -801,7 +801,22 @@ def _build_fill_body(
     for level in levels:
         body.extend(
             [
-                llir.RawStmt(code=f"int64_t _base{level} = _offset{level}[{loop_var}]"),
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"_base{level}",
+                        type=llir.DataType.INT64,
+                    ),
+                    value=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"_offset{level}",
+                            type=llir.DataType.STD_VECTOR_INT,
+                        ),
+                        index=llir.Var(
+                            name=loop_var.name,
+                            type=loop_var.type,
+                        ),
+                    ),
+                ),
                 llir.VarInit(
                     var=llir.Var(name=f"_pos{level}", type=llir.DataType.INT),
                     value=llir.Literal(0, llir.DataType.INT),
@@ -1079,12 +1094,12 @@ def _build_transformed_statements(
     context: CompressedWhereOpenMPContext,
     manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
-    loop_var = cast(llir.VarInit, for_loop.init).var.name
+    loop_var = cast(llir.VarInit, for_loop.init).var
     work_body, workspace_hoisted = _extract_work_body(for_loop, context)
     count_body, count_records = _build_count_body(
         work_body,
         context,
-        loop_var=loop_var,
+        loop_var=loop_var.name,
         workspace_hoisted=workspace_hoisted,
         manager=manager,
     )
