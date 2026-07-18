@@ -2319,12 +2319,24 @@ class CINLowerer:
                     if sparse_values_tensor:
                         self._known_nnz_var = "_known_nnz"
                         known_nnz_init_stmts.append(
-                            llir.RawStmt(
-                                code=(
-                                    "int64_t _known_nnz = "
-                                    f"{sparse_values_tensor}.size(0)"
+                            llir.VarInit(
+                                var=llir.Var(
+                                    name="_known_nnz",
+                                    type=llir.DataType.INT64,
                                 ),
-                                add_semicolon=True,
+                                value=llir.MemberCall(
+                                    base=llir.Var(
+                                        name=sparse_values_tensor,
+                                        type=llir.DataType.TORCH_TENSOR,
+                                    ),
+                                    member="size",
+                                    args=(
+                                        llir.Literal(
+                                            value=0,
+                                            data_type=llir.DataType.INT64,
+                                        ),
+                                    ),
+                                ),
                             )
                         )
 
