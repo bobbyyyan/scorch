@@ -1387,6 +1387,107 @@ def test_production_pipeline_nested_fill_failure_preserves_count_and_stops_later
     ] == [("rewrite_result_writes", "count", 0)]
 
 
+def test_workspace_insert_name_failure_stops_pipeline_before_record_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compile_options = _compile_options()
+    manager = LLIRPassManager.from_compile_options(compile_options)
+    malformed = llir.FunctionCallStmt(cast(str, object()), [_var("value")])
+    source = [
+        _compatible_loop(
+            [
+                llir.VarInit(
+                    _var("wksp", llir.DataType.AUTO),
+                    llir.FunctionCall(
+                        "coo_workspace_1d<float, 1>", [llir.Literal(1024)]
+                    ),
+                ),
+                malformed,
+            ]
+        )
+    ]
+    source_snapshot = _structural_snapshot(source)
+    observed_failures: List[LLIRTraversalError] = []
+    result_write_modes: List[str] = []
+    later_work: List[str] = []
+    original_compressed = LLIRPassManager.run_compressed_where_openmp
+
+    def capture_compressed_failure(
+        self: LLIRPassManager,
+        artifact: LLIRStatementListArtifact,
+        pass_spec: CompressedWhereOpenMPPassSpec,
+    ) -> ManagedCompressedWhereOpenMPResult:
+        try:
+            return original_compressed(self, artifact, pass_spec)
+        except LLIRTraversalError as failure:
+            observed_failures.append(failure)
+            raise
+
+    def unexpected_result_write(
+        self: LLIRPassManager,
+        artifact: LLIRRewriteArtifact[object],
+        pass_spec: ResultWritePassSpec,
+    ) -> NoReturn:
+        del self, artifact
+        result_write_modes.append(pass_spec.context.mode)
+        raise AssertionError("result-write work ran after workspace-name failure")
+
+    def unexpected_later_transform(source: object, context: object) -> NoReturn:
+        del source, context
+        later_work.append("pass")
+        raise AssertionError("later production pass ran after workspace-name failure")
+
+    def assemble_body(
+        artifact: LLIRStatementListArtifact,
+        compressed_output_parallel: bool,
+    ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
+        del artifact, compressed_output_parallel
+        later_work.append("body_assembler")
+        raise AssertionError("body assembly ran after workspace-name failure")
+
+    monkeypatch.setattr(
+        LLIRPassManager,
+        "run_compressed_where_openmp",
+        capture_compressed_failure,
+    )
+    monkeypatch.setattr(LLIRPassManager, "run_result_write", unexpected_result_write)
+    for function_name in (
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ):
+        monkeypatch.setattr(
+            pass_manager_module,
+            function_name,
+            unexpected_later_transform,
+        )
+
+    with pytest.raises(LLIRPassPartialFailure) as error:
+        manager.run_production_pipeline(
+            LLIRStatementListArtifact(source),
+            compressed_where_pass_spec=CompressedWhereOpenMPPassSpec(
+                replace(_compressed_context(), compile_options=compile_options)
+            ),
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(_dense_context()),
+            body_assembler=assemble_body,
+        )
+
+    assert len(observed_failures) == 1
+    assert error.value.failure is observed_failures[0]
+    diagnostic = observed_failures[0].diagnostic
+    assert diagnostic.code == "invalid_workspace_insert_call_name"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "transform_compressed_where_for_openmp"
+    # The workspace rewriter consumes the filtered, re-rooted work-body artifact.
+    assert diagnostic.path == ("root", "[0]", "name")
+    assert error.value.completed_run_records == ()
+    assert result_write_modes == []
+    assert later_work == []
+    assert _structural_snapshot(source) == source_snapshot
+
+
 def test_malformed_generated_phase_state_fails_owner_before_record_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

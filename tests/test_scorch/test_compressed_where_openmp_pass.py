@@ -822,6 +822,43 @@ def test_workspace_insert_rewrite_rejects_malformed_call_names(
     assert _structural_snapshot(source) == snapshot
 
 
+@pytest.mark.parametrize(
+    ("args", "expected_code", "expected_path"),
+    [
+        (
+            object(),
+            "invalid_expression_sequence",
+            ("root", "[0]", "body", "[1]", "args"),
+        ),
+        (
+            ["not_an_expression"],
+            "invalid_expression_sequence_member",
+            ("root", "[0]", "body", "[1]", "args", "[0]"),
+        ),
+    ],
+    ids=["container", "member"],
+)
+def test_workspace_insert_rewrite_rejects_malformed_call_args(
+    args: object,
+    expected_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    malformed = llir.FunctionCallStmt("wksp.insert", [])
+    malformed.args = cast(List[llir.Expr], args)
+    source = [_compatible_loop([_workspace_init(), malformed])]
+    snapshot = _structural_snapshot(source)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(source, _context())
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == expected_code
+    assert diagnostic.stage == _context().traversal.stage
+    assert diagnostic.pass_name == _context().traversal.pass_name
+    assert diagnostic.path == expected_path
+    assert _structural_snapshot(source) == snapshot
+
+
 def test_retained_metadata_is_preserved_but_selected_loop_policy_is_reset() -> None:
     inner = _compatible_loop([llir.RawStmt("inner")], bound="inner_limit")
     inner.omp_parallel_for = True
