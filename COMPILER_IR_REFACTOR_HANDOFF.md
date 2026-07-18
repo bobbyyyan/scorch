@@ -10340,6 +10340,712 @@ rewrites, emitter closure, parallel zero-fill, generalized allocation, and
 generalized parallel representation remain open. Phase 3 remains open. Phase
 3.5 and LoopIR have not begun.
 
+### Phase-3 structured known-NNZ tensor-size slice complete (2026-07-18)
+
+The exact base for this slice was
+`1606193f1223e37686b9f3985a5f78820d123289`. The verified code/test candidate
+is the ordered pair of scoped commits:
+
+1. `d27daa1bcfd5dec5ea472343b034fba681929900`
+   (`refactor(compiler): structure known-nnz tensor size`); and
+2. `6a665adc7eacf1ccede3d4eb540939fe7bfacc8f`
+   (`test(compiler): cover structured known-nnz size`).
+
+No commit was amended, squashed, reordered, or rewritten. The complete
+uncommitted code/test candidate passed the canonical suite before either commit
+was created. The production commit changes only
+`src/scorch/compiler/cin_lowerer.py`; the test commit changes only
+`test_cin_lowerer.py`, `test_compiler_stage_timing.py`,
+`test_llir_string_budget.py`, and `test_schedule_generality.py`.
+
+#### Complete pre-implementation inventory and selection
+
+The exact-base budget was reproduced before editing:
+
+- 377 production `Var` constructors;
+- ten direct expression strings: nine subscripts and one ternary;
+- 367 other constructor arguments, including 11 known indirect sinks/clones;
+- seven generic string rewrites;
+- 38 `RawStmt` constructors / 37 semantic producers; and
+- four `MemberCall` constructor templates.
+
+The 38 raw constructors split exactly as follows:
+
+| File | Constructors |
+| --- | ---: |
+| `cin_lowerer.py` | 12 |
+| `compressed_where_openmp_pass.py` | 15 |
+| `torch_cpp_abi.py` | 5 |
+| `schedule_lowerer.py` | 3 |
+| `dense_pointer_hoist_pass.py` | 1 |
+| `sparse_prefetch_pass.py` | 1 |
+| `llir_traversal.py` | 1 common reconstruction clone |
+
+Every semantic producer was classified by payload, ownership, production
+reachability, consumer, and compatibility interaction:
+
+| IDs | Raw family and decision |
+| --- | --- |
+| C1 | Fixed-position `std::vector<int>` direct initialization. Live owning allocation; rejected as direct-initialization/generalized allocation work. |
+| C2 | Known-NNZ Torch coordinate allocation plus typed `data_ptr<int>()`. Live Torch owner/borrowed pointer pair; rejected as compound Torch allocation/ABI work. |
+| C3-C5 | Dense-workspace extent, per-worker pointer, and `memset`. Live coupled workspace family; rejected because completing it begins the prohibited parallel zero-fill/allocation seam. |
+| C6 | Dense-workspace `memcpy` into an addressed result subscript. Live, but needs coordinated address/subscript/copy representation and compatibility updates. |
+| C7 | Nested templated `_dynamic_reserve` policy. Live, but coupled to allocation policy and qualified/template-call spelling. |
+| C8-C10 | Result, input, and extra-tensor validation calls. One live public TorchCppABI family; rejected as broader ABI work. |
+| **C11** | **`int64_t _known_nnz = Input_values.size(0)`. One live cardinality query, exactly representable by existing `VarInit` and `MemberCall`; selected.** |
+| C12-C13 | Adaptive `_nnz` and `_chunk` scheduling state. Live, mutually coupled optimization policy; rejected as unrelated optimization work. |
+| C14 | Atomic declaration retained only in unread compatibility state while codegen emits its own declaration. Non-emitting/DCE-like; rejected. |
+| C15-C16 | Workspace thread count and aligned-buffer owner. Live allocation pair; rejected as generalized allocation work. |
+| C17 | All-COO output-vector `resize`. Constructed only in the grouped tree discarded by the production scalar route; rejected as non-emitting. |
+| W1-W5 | Compressed-Where worker view, count/fill `clear`, and compound pool construction. Live DS/DSS ownership family; accurate custom types, direct allocation, and standalone member-call statements remain absent. |
+| W6-W9 | Count/offset vectors, prefix loop, fill base, and totals. W3/W9 are individually expressible, but the smallest coherent offset family has two producer templates and remains rooted in raw allocation/prefix construction. |
+| W10-W14 | Position, coordinate, and value Torch allocation/pointer pairs plus the position-copy loop. Live compound Torch allocation family; rejected. |
+| W15 | Compound result declaration, nested storage assignments, and return. Live result-ABI assembly; rejected as broader ABI/member-lvalue work. |
+| D1 | Const/restrict dense pointer from an addressed structured access. Live and compatibility-parsed; const-pointer and exact address spelling remain unresolved. |
+| S1/P1 | Relayout and ordinary sparse prefetch conditionals. Live optimization-specific conditional/address representations; rejected. |
+| S2/S3 | Direct-initialized heap-tile and packed-operand vectors. Live generalized allocation family; rejected. |
+| R1 | Common `RawStmt` detached reconstruction, not a semantic producer; this explains 38 constructors versus 37 producers. |
+
+The nine remaining direct subscript strings were also re-audited and kept
+separate from the raw-statement slice:
+
+| Family | Decision |
+| --- | --- |
+| P1/P2 | Post-op extra-tensor reads occur only under the unsupported untiled workspace fallback; non-emitting in supported production. |
+| W1 | Untiled dense-workspace read is bypassed by the dense-result `memcpy`; sparse result levels receive sparse workspaces. |
+| C1/C2 | All-COO pre-scan reads are constructed in a grouped tree discarded by the scalar-accumulator production branch. |
+| G1/G2 | Group-start reads are discarded with that grouped tree and also require checked vector `.at(...)` semantics. |
+| I1/I2 | Root coordinate-position placeholders are replaced by literal zero and `crd_tensor.size(0)` before returned LLIR is built. |
+
+These nine are the unmigrated remainder of the original 22-site subscript
+inventory; the other 13 were closed by the preceding narrow structured-access
+slices. The remaining ternary is likewise in the discarded all-COO grouped
+pre-scan. None of these sites is a coherent live emitted family; migrating them
+would be DCE-adjacent cleanup.
+
+C11 was previously rejected only because receiver-call IR did not exist.
+`MemberCall` now supplies the exact representation without a new parser,
+hierarchy, ABI contract, allocation abstraction, or optimization:
+
+```python
+llir.VarInit(
+    var=llir.Var("_known_nnz", llir.DataType.INT64),
+    value=llir.MemberCall(
+        base=llir.Var(
+            sparse_values_tensor,
+            llir.DataType.TORCH_TENSOR,
+        ),
+        member="size",
+        args=(
+            llir.Literal(
+                value=0,
+                data_type=llir.DataType.INT64,
+            ),
+        ),
+    ),
+)
+```
+
+It emits byte-for-byte:
+
+```cpp
+int64_t _known_nnz = Mask_values.size(0);
+```
+
+The target, Torch-tensor receiver, call, tuple, and dimension literal are fresh
+compiler-owned nodes. The receiver denotes the existing validated by-value
+Torch tensor handle and borrows caller storage without mutation. Independent
+lowerings produce disjoint mutable containers and receiver `Var` objects while
+retaining structural equality and hashing.
+
+C11 is live when scalar accumulation preserves a sparse output and the ordered
+RHS list contains a compressed or coordinate leaf. Default DS-mask -> OO SDDMM
+covers the compressed-leaf route; all-COO SDDMM covers the coordinate-leaf
+route. The local is emitted before known-size coordinate/value allocation and
+is consumed by the existing `ResultTensorAssembler` extent contract.
+
+Construction occurs at the one-shot result/ABI assembly barrier after sparse
+prefetch, dense-pointer hoisting, single-iteration elimination, and
+loop-invariant factor hoisting. Dynamic-vector rewriting then validates and
+detachedly reconstructs the `VarInit`, receiver, member call, and argument in
+deterministic order. It has no matching vector declaration and changes no
+spelling. Assignment deduplication does not inspect this `VarInit`; the seven
+remaining generic rewrites do not consume it. Schedule lowering leaves the
+top-level declaration unchanged and common codegen emits it.
+
+Malformed or forged member fields fail closed at the dynamic-vector owner with
+the exact four completed pre-assembly pass records. A failure while constructing
+the statement belongs to nested `RESULT_ABI_ASSEMBLY`, preserves the original
+error object, records no premature ABI success, leaves caches empty, and
+suppresses dynamic rewriting, schedule lowering, C++ generation, build-request
+assembly, and native loading.
+
+#### Updated locked budget
+
+After the slice:
+
+- 379 production `Var` constructors;
+- ten direct expression strings: nine subscripts and one ternary;
+- 369 other constructor arguments;
+- 12 known indirect sinks/clones, adding only the accurately typed
+  `sparse_values_tensor` receiver;
+- seven unchanged generic string rewrites;
+- 37 `RawStmt` constructors / 36 semantic producers; and
+- five `MemberCall` constructor templates.
+
+There is still no direct opaque call, member, initializer, qualified, or
+separately classified arithmetic expression in a production `Var.name`, no
+`std::move(` in a production `Var.name`, and no string-expression assignment
+target.
+
+#### Verification record and commands
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, and benchmark
+invocation sourced the conda hook and activated `scorch`.
+
+The focused existing-`MemberCall` construction, validation, traversal,
+rewriting, codegen, precedence, ownership, and new production-producer
+selection passed 28 tests:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_codegen.py::test_member_call_is_frozen_typed_owned_and_structurally_equal \
+  tests/test_scorch/test_codegen.py::test_member_call_defaults_are_independent_empty_immutable_tuples \
+  tests/test_scorch/test_codegen.py::test_member_call_rejects_malformed_base_and_member \
+  tests/test_scorch/test_codegen.py::test_member_call_rejects_malformed_template_argument_containers \
+  tests/test_scorch/test_codegen.py::test_member_call_rejects_malformed_template_arguments_and_call_arguments \
+  tests/test_scorch/test_codegen.py::test_member_call_codegen_is_byte_exact_typed_and_precedence_correct \
+  tests/test_scorch/test_codegen.py::test_codegen_rejects_member_call_subclasses_and_unknown_children \
+  tests/test_scorch/test_codegen.py::test_codegen_rejects_forged_member_call_fields \
+  tests/test_scorch/test_llir_traversal.py::test_member_call_walker_visits_base_then_arguments_in_deterministic_order \
+  tests/test_scorch/test_llir_traversal.py::test_unknown_member_call_subclass_fails_closed \
+  tests/test_scorch/test_llir_traversal.py::test_member_call_rewrite_is_detached_repeatable_and_replacement_owned \
+  tests/test_scorch/test_cin_lowerer.py::test_production_known_nnz_size_is_structured_typed_owned_and_byte_exact
+```
+
+Before editing, the exact-base locked budget passed all 23 tests. The final
+candidate adds the dedicated known-NNZ regression and passes all 24 tests:
+
+```sh
+pytest -q tests/test_scorch/test_llir_string_budget.py
+```
+
+The complete uncommitted candidate and final committed candidate passed the
+literal canonical 18-file suite, 1,132 tests in 159.64 seconds:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_cin_analysis.py \
+  tests/test_scorch/test_loop_plan.py \
+  tests/test_scorch/test_compile_options.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_traversal.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_dynamic_vector_access_pass.py \
+  tests/test_scorch/test_result_write_pass.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py \
+  tests/test_scorch/test_dense_pointer_hoist_pass.py \
+  tests/test_scorch/test_single_iteration_loop_pass.py \
+  tests/test_scorch/test_loop_invariant_factor_pass.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_llir_string_budget.py
+```
+
+The final committed candidate passed the required historical 11-file
+scheduler/CIN/codegen matrix, 509 tests in 413.03 seconds:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py \
+  tests/test_scorch/codegen/test_1d_operations.py \
+  tests/test_scorch/codegen/test_codegen_perf_optimizations.py \
+  tests/test_scorch/codegen/test_regblock_dual_path.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py
+```
+
+The exact stage/source/caller-ownership/failure focus passed 31 tests in
+0.80 seconds. It included both new failure tests, exact stage identity/order and
+timing, one `CompileOptions` identity, managed success and partial-failure
+records, cache identity, independent compilation, caller-owned CIN/LLIR
+immutability, original-error identity, all four source anchors, and later-stage
+suppression.
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/test_compile_options.py::test_distinct_snapshots_compile_independently_without_mutating_owned_ir \
+  tests/test_scorch/test_compile_options.py::test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages \
+  tests/test_scorch/test_compiler_stage_timing.py::test_stage_identities_records_and_owner_are_typed_frozen_and_stable \
+  tests/test_scorch/test_compiler_stage_timing.py::test_production_and_debug_record_the_exact_complete_stage_sequence \
+  tests/test_scorch/test_compiler_stage_timing.py::test_one_options_snapshot_routes_through_one_owner_without_rereads \
+  tests/test_scorch/test_compiler_stage_timing.py::test_existing_llir_pass_records_are_context_owned_ordered_and_unchanged \
+  tests/test_scorch/test_compiler_stage_timing.py::test_timing_is_excluded_from_source_name_request_and_cache_identity \
+  tests/test_scorch/test_compiler_stage_timing.py::test_known_nnz_extent_is_independent_across_full_compilations \
+  tests/test_scorch/test_compiler_stage_timing.py::test_two_options_snapshots_have_independent_records_results_and_requests \
+  tests/test_scorch/test_compiler_stage_timing.py::test_caller_owned_cin_llir_and_first_result_are_not_mutated \
+  tests/test_scorch/test_compiler_stage_timing.py::test_stage_failures_raise_original_error_and_suppress_all_later_stages \
+  tests/test_scorch/test_compiler_stage_timing.py::test_known_nnz_size_construction_failure_fails_result_abi_owner \
+  tests/test_scorch/test_compiler_stage_timing.py::test_malformed_known_nnz_size_fails_dynamic_owner_and_suppresses_later_stages \
+  tests/test_scorch/test_schedule_api.py::test_packed_and_unpacked_schedules_cannot_alias_either_cache \
+  tests/test_scorch/test_cin_lowerer.py::test_production_known_nnz_size_is_structured_typed_owned_and_byte_exact \
+  tests/test_scorch/test_sparse_prefetch_pass.py::test_production_routes_the_detached_list_at_the_original_optimization_seam \
+  tests/test_scorch/test_compressed_where_openmp_pass.py::test_production_ds_generated_cpp_matches_pre_extraction_bytes \
+  tests/test_scorch/test_compressed_where_openmp_pass.py::test_production_dss_generated_cpp_matches_pre_extraction_bytes \
+  tests/test_scorch/test_sparse_prefetch_pass.py::test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist
+```
+
+The relevant native activation selection passed 11 cases in 107.05 seconds
+with `MAX_JOBS=1`. It includes default DS-mask SDDMM and all-COO SDDMM positive
+activation plus the retained free-k, TTM, regblock, ABI, mode-order, and
+supported-fusion correctness cases.
+
+```sh
+MAX_JOBS=1 PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py::test_tuner_free_k_schedule_is_correct_for_ragged_tail_and_empty_row \
+  tests/test_scorch/test_schedule_generality.py::test_ttm_row_and_free_axis_tiles_compose_with_ragged_tails \
+  tests/test_scorch/codegen/test_regblock_dual_path.py::test_dual_path_correct_both_sides_of_cutoff \
+  tests/test_scorch/test_native_abi.py::test_jit_abi_rejects_noncanonical_coo_order_on_cached_entry \
+  tests/test_scorch/test_native_abi.py::test_jit_abi_uses_physical_extents_for_rectangular_mode_order \
+  tests/test_scorch/test_compile_semantics.py::test_compile_executes_graph_after_supported_fusion_prefix \
+  tests/test_scorch/test_schedule_generality.py::test_sddmm_default_scalar_accumulator_and_simd_are_unchanged \
+  tests/test_scorch/test_schedule_generality.py::test_all_coo_sddmm_has_no_redundant_end_and_remains_correct
+```
+
+The authoritative exact full gate used a new detached candidate worktree and
+new `TMPDIR`, extension, pytest temporary, and pytest cache roots:
+
+```sh
+PYTEST_ADDOPTS= \
+MAX_JOBS=1 \
+TMPDIR=/tmp/scorch-phase3-known-nnz-authoritative2-run/tmp \
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-known-nnz-authoritative2-run/extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+pytest -q -m "not perf" \
+  --basetemp=/tmp/scorch-phase3-known-nnz-authoritative2-run/pytest-tmp \
+  -o cache_dir=/tmp/scorch-phase3-known-nnz-authoritative2-run/pytest-cache \
+  tests
+```
+
+It passed 1,687 tests, skipped 14, deselected three, and emitted only the one
+inherited PyTorch sparse-invariant warning in 1,961.23 seconds. An earlier
+diagnostic attempt reached 50% before four `test_kernels.py` children were
+lost to host `SIGKILL`/a stale follower lock; it was interrupted with
+`4 failed, 846 passed, 14 skipped, 3 deselected` and is not an acceptance
+result. A new-root retry was likewise killed during its first prefix while
+macOS `syspolicyd` consumed more than 8 GiB RSS. No user or system process was
+stopped. After the daemon was reclaimed naturally, the wholly new-root command
+above passed unchanged.
+
+Black, Flake8, and mypy were compared at exact base and final candidate over
+the same five changed Python files:
+
+```sh
+python -m black --check \
+  src/scorch/compiler/cin_lowerer.py \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_schedule_generality.py
+
+python -m flake8 \
+  src/scorch/compiler/cin_lowerer.py \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_schedule_generality.py
+
+python -m mypy \
+  src/scorch/compiler/cin_lowerer.py \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_schedule_generality.py
+```
+
+Black passed both revisions with the same Python-3.11 target warning. Flake8
+reported exactly the same four inherited `cin_lowerer.py` findings at both
+revisions: two `F841` and two `F401`; their base lines
+`749/1442/3071/3295` move only to candidate lines
+`749/1442/3083/3307`. Mypy reported the same 40 inherited errors in three
+files across five checked files at both revisions. There is no candidate-only
+quality diagnostic.
+
+Strict Sphinx ran at exact base and final candidate as:
+
+```sh
+sphinx-build -n -b html -W --keep-going -E -a \
+  docs/source OUTPUT
+```
+
+Both Sphinx 8.2.3 runs returned one only because `-W` promoted the same 23
+inherited unresolved-reference warnings. Each produced 187 output files; the
+normalized warning sets and non-doctree output trees compare exactly.
+Doctrees were excluded because they serialize absolute source paths.
+`git diff --check` was clean.
+
+#### Exact source/build identity and runtime waiver
+
+The four canonical capture helpers re-hash to:
+
+- inputs:
+  `605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`;
+- 42-cell grid:
+  `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`;
+- workspace pair:
+  `964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`;
+  and
+- tiled workspace:
+  `9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff`.
+
+Exact base and candidate captures used logical `cd -L` paths, the shared
+`/tmp/scorch-phase3-structured-access-capture-extensions` root, and:
+
+```sh
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_inputs.py "$OUT/inputs"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_spmm_grid.py "$OUT/grid.json" \
+  /tmp/scorch-phase3-member-call-capture/grid-predecessor.json
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_workspace_pair.py "$OUT/workspace"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_tiled_workspace.py "$OUT/tiled-workspace"
+```
+
+The trees under `/tmp/scorch-phase3-known-nnz-canonical-capture` both contain
+14 files and `diff -qr` is empty. Both sides reproduce:
+
+- input manifest:
+  `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024`;
+- 42-cell grid:
+  `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6`;
+- workspace manifest:
+  `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90`;
+  and
+- tiled-workspace manifest:
+  `7bc0f70f84d2693f76fdf179b9ae7e684e4fa3ebe93c5d175ec98206a024a5a7`.
+
+The exact generated sources are identical:
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| CSR x dense | 2,505 | `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` |
+| DS | 7,117 | `d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f` |
+| DSS | 8,660 | `1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e` |
+| all-COO | 3,521 | `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` |
+| workspace all-coordinate | 3,528 | `5c69621af52939759ffcbaed3649ef1c4461108522b614df8f8a18c86ec0560a` |
+| workspace intermediate-coordinate | 5,252 | `b1770961d5f9c9c7fd716bd71cb97f1d5e73c6dcf200ba378b97b65c87fbe5d7` |
+| tiled workspace | 3,060 | `2b9d28654e33225e1093500fc861e76f0f67cb241c7ab28b43c05b774d9f7222` |
+| preamble | 68,671 | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+
+All 42 grid cells, ordered build/request objects, kernel names, signatures,
+semantic/codegen/build/full keys, ABI/index policy, flags, extension paths,
+lowerer identity, `CompileOptions` identity, stage order/records, cache
+identity, independent compilation, and caller-owned inputs compare exactly.
+
+Every source/build input is byte-identical, so the canonical runtime waiver
+applies. No redundant full M5 or Redwood grid was run. The retained M5 artifact
+at `/tmp/scorch-phase2-all-coo-pmask-results/kernel-aa-641ec81-m5.json`
+re-hashes to
+`3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+the corresponding Redwood artifact re-hashes to
+`c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+The 11 native activation cases independently establish live correctness.
+
+#### Compiler latency, activation, and complete crossing attribution
+
+The exact executable predecessor is
+`/tmp/scorch-phase3-workspace-insert-results/latency-623831d-m5.json`,
+SHA-256
+`88a1e93584c9a0487b30e35dda2f95b4c0719d5949ad3f363f01966881f89b72`.
+The final primary and confirmation artifacts are:
+
+- `/tmp/scorch-phase3-known-nnz-results/latency-6a665ad-m5.json`,
+  SHA-256
+  `320c01a8550f0ed30bfb75256cc4efe414ed1db9a4fe07734b76c6d0ceb81c3d`;
+- `/tmp/scorch-phase3-known-nnz-results/latency-6a665ad-confirmation-m5.json`,
+  SHA-256
+  `56a18ea45a7a68f0e8288a06c81e866440ae5ccc8a1654848a388c8decbf0bf4`.
+
+The unchanged harness re-hashes to
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+Each committed-candidate run used five warmups and 30 samples in an isolated
+clean worktree without overlapping tests, native compilation, captures, or
+documentation builds:
+
+```sh
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output /tmp/scorch-phase3-known-nnz-results/latency-6a665ad-m5.json
+
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 \
+  --output \
+  /tmp/scorch-phase3-known-nnz-results/latency-6a665ad-confirmation-m5.json
+
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py compare-latency \
+  /tmp/scorch-phase3-workspace-insert-results/latency-623831d-m5.json \
+  /tmp/scorch-phase3-known-nnz-results/latency-6a665ad-m5.json
+
+PYTHONPATH="$PWD/src" python tools/benchmark_compiler_ir.py compare-latency \
+  /tmp/scorch-phase3-workspace-insert-results/latency-623831d-m5.json \
+  /tmp/scorch-phase3-known-nnz-results/latency-6a665ad-confirmation-m5.json
+```
+
+Both comparisons exited one because the 1.10 investigation threshold was
+crossed. One earlier zero-sample candidate process was killed by the same host
+pressure before writing an artifact and was discarded. The primary was the
+first valid measurement. Its broad nonactivating tail wave warranted exactly
+the policy's one confirmation; no third valid or opportunistic run was taken.
+
+The four corpus build objects are byte-identical on both sides:
+
+| Case | Bytes | Source SHA-256 |
+| --- | ---: | --- |
+| small dense | 70,791 | `ae7494ecd994dd398c94b87f9d6921eeedf942c134e04db862d958abb0681217` |
+| reduction | 70,539 | `f3dc8c6ba4d3daef7f6a8709bf5131eef9b37946b51a2620619e4223e8af40b5` |
+| CSR intersection | 71,703 | `f5a41439108c47d2a9424598367336f796f5cf8574064af43bd515419e5b8e24` |
+| sparse union | 72,515 | `e13b4669f5666515374c785fb4ef78e525100e0aa869a2cc31a1f0434548341f` |
+
+The common ordered four-case `{name, build}` projection for predecessor,
+primary, and confirmation hashes to
+`d7dc61d5b9893bf0d72462382fc2c14edce10b6363bf7ce8a9f38f9e91834a9c`.
+
+The exact no-native activation command was:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" python - <<'PY'
+from collections import Counter
+import inspect
+from tools import benchmark_compiler_ir as bench
+from scorch import ops
+from scorch.compiler import llir
+from scorch.compiler.scheduler import regblock_force
+from scorch.layout import TensorSpec
+
+events = []
+sources = []
+orig_init = llir.MemberCall.__init__
+orig_summary = bench._prepared_source_summary
+
+def traced(self, base, member, template_args=None, args=None):
+    orig_init(self, base=base, member=member, template_args=template_args, args=args)
+    if (
+        member == "size"
+        and type(self.base) is llir.Var
+        and self.base.type is llir.DataType.TORCH_TENSOR
+        and self.base.name.endswith("_values")
+        and self.template_args == ()
+        and len(self.args) == 1
+        and type(self.args[0]) is llir.Literal
+        and self.args[0].value == 0
+        and self.args[0].data_type is llir.DataType.INT64
+    ):
+        events.append(inspect.currentframe().f_back.f_code.co_name)
+
+def summary(prepared):
+    sources.extend(prepared.request.cpp_sources)
+    return orig_summary(prepared)
+
+def invoke_sddmm():
+    specs = (
+        TensorSpec("oo", (2, 3), name="Mask"),
+        TensorSpec("dd", (2, 4), name="Query"),
+        TensorSpec("dd", (3, 4), name="Key"),
+    )
+    with regblock_force(False):
+        return ops.einsum(
+            "ij,ik,jk->ij", *specs, compile_only=True, format="oo"
+        )
+
+llir.MemberCall.__init__ = traced
+bench._prepared_source_summary = summary
+try:
+    cases = [
+        *bench._build_latency_cases(),
+        bench.LatencyCase(
+            "all_coo_positive",
+            "ij,ik,jk->ij",
+            ("oo", "dd", "dd"),
+            "oo",
+            invoke_sddmm,
+        ),
+    ]
+    for case in cases:
+        events.clear()
+        sources.clear()
+        _, _, _, runs = bench._time_captured_compilation(case)
+        marker = sum(s.count("int64_t _known_nnz = ") for s in sources)
+        stage_counts = Counter(r["stage_id"] for r in runs)
+        print(
+            case.name,
+            dict(Counter(events)),
+            "source_markers",
+            marker,
+            "A/L",
+            stage_counts["result_abi_assembly"],
+            stage_counts["cin_lowering"],
+        )
+finally:
+    llir.MemberCall.__init__ = orig_init
+    bench._prepared_source_summary = orig_summary
+PY
+```
+
+An isolated no-native activation audit reports exactly
+`activation={}`, marker count zero, `A=1`, and `L=1` for each of the four
+latency cases. The separate all-COO positive control reports
+`assemble_body=1`, `rewrite_member_call=1`, marker count one, `A=1`, and
+`L=1`. Thus every corpus crossing is in non-owning work; the positive control
+proves the selected producer and traversal hook are genuinely live.
+
+Across all 86 common endpoint/stage p50/p95 metrics, `O` is the ordinary
+compatibility endpoint, `C` the canonical endpoint, `E` canonical endpoint
+extension, `L` inclusive CIN lowering, `N` CIN normalization/verification,
+`F` validated frontend construction, `R` kernel-name/build-request assembly,
+`G` legacy CIN adaptation, `X` LLIR-to-C++ generation, `A` nested result-ABI
+assembly, and `S` scheduling/loop-plan construction. `A` is nested within `L`;
+their deltas must not be added. Every entry below is
+`old/new ms; ratio; signed delta ms`. These are every strict `>1.10` crossing;
+omitted metrics are at or below 1.10.
+
+Primary: 32/86 strict crossings, all `activation=none`.
+
+- small dense (13):
+  `O.50 1.770917000/2.057500000; 1.161827460; +0.286583000`,
+  `O.95 2.704235350/3.663656400; 1.354784597; +0.959421050`,
+  `C.50 2.088417000/2.386521000; 1.142741608; +0.298104000`,
+  `C.95 3.179539400/4.026572550; 1.266401212; +0.847033150`,
+  `L.95 0.894433150/1.285374850; 1.437083196; +0.390941700`,
+  `N.50 0.022625000/0.025208500; 1.114187845; +0.002583500`,
+  `F.50 0.038917000/0.049937500; 1.283179587; +0.011020500`,
+  `F.95 0.064887800/0.111312800; 1.715465773; +0.046425000`,
+  `G.50 0.026646000/0.030313000; 1.137619155; +0.003667000`,
+  `G.95 0.042875000/0.087518600; 2.041250146; +0.044643600`,
+  `A.50 0.014416500/0.016770500; 1.163285125; +0.002354000`,
+  `A.95 0.018118750/0.031712200; 1.750242152; +0.013593450`, and
+  `S.50 0.262729000/0.292478500; 1.113232647; +0.029749500`.
+- reduction (9):
+  `O.95 2.073656550/3.321170800; 1.601601191; +1.247514250`,
+  `C.95 2.402575150/3.798046350; 1.580823122; +1.395471200`,
+  `E.95 0.386454200/0.433562650; 1.121899180; +0.047108450`,
+  `L.95 0.764056400/1.281031250; 1.676618702; +0.516974850`,
+  `N.95 0.025114400/0.034616700; 1.378360622; +0.009502300`,
+  `G.95 0.030512800/0.059812350; 1.960237998; +0.029299550`,
+  `X.95 0.060956400/0.107922850; 1.770492516; +0.046966450`,
+  `A.95 0.017629200/0.040432850; 2.293515871; +0.022803650`, and
+  `S.95 0.293963550/0.534935050; 1.819732582; +0.240971500`.
+- CSR intersection (8):
+  `O.95 2.175856250/3.302356250; 1.517727217; +1.126500000`,
+  `C.95 2.500874850/3.631223250; 1.451981194; +1.130348400`,
+  `L.95 1.114318600/1.995568900; 1.790842314; +0.881250300`,
+  `N.95 0.009651750/0.012187350; 1.262708835; +0.002535600`,
+  `F.95 0.046479350/0.052693750; 1.133702386; +0.006214400`,
+  `G.95 0.030056400/0.066673250; 2.218271317; +0.036616850`,
+  `A.95 0.023193750/0.032937350; 1.420095931; +0.009743600`, and
+  `S.95 0.177313200/0.304497850; 1.717288109; +0.127184650`.
+- sparse union (2):
+  `N.95 0.010768600/0.012481550; 1.159068960; +0.001712950`, and
+  `F.95 0.020521500/0.045926750; 2.237982116; +0.025405250`.
+
+Confirmation: 45/86 strict crossings, all `activation=none`.
+
+- small dense (8):
+  `O.50 1.770917000/2.005916500; 1.132699330; +0.234999500`,
+  `C.50 2.088417000/2.350979500; 1.125723215; +0.262562500`,
+  `E.50 0.313875000/0.345458000; 1.100622859; +0.031583000`,
+  `L.95 0.894433150/1.261971200; 1.410917294; +0.367538050`,
+  `F.50 0.038917000/0.048145500; 1.237132873; +0.009228500`,
+  `G.50 0.026646000/0.029396000; 1.103204984; +0.002750000`,
+  `A.50 0.014416500/0.016625000; 1.153192522; +0.002208500`, and
+  `A.95 0.018118750/0.034141150; 1.884299414; +0.016022400`.
+- reduction (20):
+  `O.50 1.725125000/2.182229000; 1.264968625; +0.457104000`,
+  `O.95 2.073656550/2.766331400; 1.334035475; +0.692674850`,
+  `C.50 2.063979000/2.522895500; 1.222345528; +0.458916500`,
+  `C.95 2.402575150/3.164739250; 1.317227996; +0.762164100`,
+  `E.95 0.386454200/0.455695800; 1.179171555; +0.069241600`,
+  `L.50 0.589958000/0.765229000; 1.297090640; +0.175271000`,
+  `L.95 0.764056400/1.017695800; 1.331964237; +0.253639400`,
+  `N.50 0.022103500/0.025708500; 1.163096342; +0.003605000`,
+  `N.95 0.025114400/0.048994650; 1.950858870; +0.023880250`,
+  `F.50 0.039124500/0.052146000; 1.332822145; +0.013021500`,
+  `F.95 0.051278800/0.074281550; 1.448582065; +0.023002750`,
+  `R.95 0.502114100/0.580837350; 1.156783588; +0.078723250`,
+  `G.50 0.025916000/0.029917000; 1.154383392; +0.004001000`,
+  `G.95 0.030512800/0.051705950; 1.694565887; +0.021193150`,
+  `X.50 0.054583500/0.061583000; 1.128234723; +0.006999500`,
+  `X.95 0.060956400/0.105970650; 1.738466346; +0.045014250`,
+  `A.50 0.013479000/0.016583000; 1.230284146; +0.003104000`,
+  `A.95 0.017629200/0.029722550; 1.685984049; +0.012093350`,
+  `S.50 0.248876000/0.303562500; 1.219733924; +0.054686500`, and
+  `S.95 0.293963550/0.409100900; 1.391672199; +0.115137350`.
+- CSR intersection (11):
+  `O.95 2.175856250/2.651135050; 1.218432996; +0.475278800`,
+  `C.95 2.500874850/3.031051900; 1.211996634; +0.530177050`,
+  `E.95 0.351137800/0.440039550; 1.253181942; +0.088901750`,
+  `L.95 1.114318600/1.268587200; 1.138442094; +0.154268600`,
+  `N.95 0.009651750/0.010743600; 1.113124563; +0.001091850`,
+  `F.50 0.040146000/0.045396000; 1.130772680; +0.005250000`,
+  `F.95 0.046479350/0.055679500; 1.197940591; +0.009200150`,
+  `R.95 0.452847950/0.584887800; 1.291576566; +0.132039850`,
+  `X.95 0.106900300/0.145718750; 1.363127606; +0.038818450`,
+  `A.95 0.023193750/0.026933700; 1.161248181; +0.003739950`, and
+  `S.95 0.177313200/0.200072850; 1.128358464; +0.022759650`.
+- sparse union (6):
+  `O.95 2.463837500/3.036466450; 1.232413440; +0.572628950`,
+  `C.95 2.857372800/3.409939400; 1.193382747; +0.552566600`,
+  `L.95 1.686618600/2.062485900; 1.222852576; +0.375867300`,
+  `R.95 0.499389400/0.554272550; 1.109900511; +0.054883150`,
+  `X.95 0.128454350/0.181712650; 1.414608770; +0.053258300`, and
+  `A.95 0.029631100/0.043165250; 1.456754896; +0.013534150`.
+
+The primary and confirmation waves occur entirely in cases that do not
+construct C11. They vary across unrelated frontend, scheduling, normalization,
+adaptation, lowering, codegen, request, and endpoint tails despite identical
+sources/build objects. Even nested `A` is non-owning in these cases: the audit
+shows one ordinary ABI assembly but zero known-NNZ marker/call rewrites. The
+positive control activates exactly once. These crossings are therefore
+attributed to host-wide compiler-latency noise in nonactivating work, not to
+the selected representation change. The 1.10 threshold required complete
+enumeration and attribution; it did not justify rejecting a byte-identical,
+zero-activation corpus result.
+
+#### Preserved user material and phase status
+
+The user-owned dirty tree was checksummed before and after the complete work.
+Its digest remains exactly
+`1569e20a2cb101d3757d0c8be7571adfe426d0a9177886f9c7983cce6251e108`.
+The tracked user changes to `.gitignore`, `pyproject.toml`,
+`src/scorch/__init__.py`, `tests/packaging/smoke_install.py`, and
+`tests/test_scorch/test_resources.py`, together with all user-owned untracked
+GPU, SuiteSparse, benchmark, research, scheduler-receipt, `autotune-levels/`,
+`bench/`, `research-ideas/`, `scratchpad/`, and `src/scorch/csrc/cuda/`
+material, remain untouched and uncommitted. No design document or `csrc` file
+changed.
+
+Only the narrow Phase-3 **structured known-NNZ `Tensor.size(0)` declaration**
+slice is complete. Phase 3 remains open. Phase 3.5 and LoopIR have not begun.
+No TorchCppABI extraction, parallel zero-fill extraction, generalized
+allocation migration, generalized member/call hierarchy, parsing, DCE, or
+unrelated optimization work was started.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
