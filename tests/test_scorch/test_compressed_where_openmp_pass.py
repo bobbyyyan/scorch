@@ -553,6 +553,7 @@ def test_fill_base_offset_loads_are_typed_owned_structural_and_never_raw() -> No
     assert first_loads == second_loads
     assert [hash(load) for load in first_loads] == [hash(load) for load in second_loads]
     assert _mutable_ir_ids(first_loads).isdisjoint(_mutable_ir_ids(second_loads))
+    assert _mutable_ir_ids(first_loads[0]).isdisjoint(_mutable_ir_ids(first_loads[1]))
     assert [LLIRLowerer().lower_llir(load) for load in first_loads] == [
         "int64_t _base1 = _offset1[row];",
         "int64_t _base2 = _offset2[row];",
@@ -606,6 +607,9 @@ def test_fill_base_offset_loads_are_typed_owned_structural_and_never_raw() -> No
     first_access = cast(llir.ArrayAccess, first_loads[0].value)
     cast(llir.Var, first_access.array).name = "owned_offset"
     cast(llir.Var, first_access.index).name = "owned_index"
+    sibling_access = cast(llir.ArrayAccess, first_loads[1].value)
+    assert cast(llir.Var, sibling_access.array).name == "_offset2"
+    assert cast(llir.Var, sibling_access.index).name == "row"
     assert cast(llir.Var, cast(llir.ArrayAccess, second_loads[0].value).array).name == (
         "_offset1"
     )
