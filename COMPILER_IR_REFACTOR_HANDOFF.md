@@ -14022,6 +14022,794 @@ open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not claimed
 formally closed without a separate design-requirement audit. Phase 2 retains
 its recorded canonical closure.
 
+### Phase-3 typed heap-result direct initialization complete (2026-07-18)
+
+This records only the narrow Phase-3 S2 heap-result storage-owner
+`DirectInit` slice, not completion of the broader heap-result family or Phase
+3. The exact committed base is
+`bff279c7c1ef417da7c8949d9571fdb0f4fc6417`. Two ordered scoped commits
+landed:
+
+- `8854cd9f342134fdfe81004cbec2dc870c99bbbf`,
+  `refactor(compiler): type heap result storage`; and
+- `27f46f4d4694b7666fa547f01e664b3383f75c11`,
+  `test(compiler): cover heap result storage`.
+
+Neither commit was amended, squashed, reordered, or rewritten. The production
+commit changes only `src/scorch/compiler/schedule_lowerer.py`. The test commit
+changes only:
+
+- `tests/test_scorch/codegen/test_tuner_schedule_codegen.py`;
+- `tests/test_scorch/test_compiler_stage_timing.py`;
+- `tests/test_scorch/test_llir_string_budget.py`;
+- `tests/test_scorch/test_schedule_api.py`; and
+- `tests/test_scorch/test_schedule_generality.py`.
+
+This handoff update is a separate documentation-only commit. It does not
+amend either code/test commit.
+
+#### Complete preimplementation inventory and S2 selection
+
+The exact base budget was:
+
+- 391 production `Var` constructors;
+- ten direct expression strings: nine subscripts and one ternary;
+- 13 known indirect sinks/clones;
+- seven generic string rewrites;
+- 33 `RawStmt` constructors / 32 semantic producers;
+- three `DirectInit` constructor templates: S3, C1, and traversal
+  reconstruction;
+- two `RawStmt` constructors in `schedule_lowerer.py`; and
+- three raw constructors in `torch_cpp_abi.py`.
+
+The remaining named Phase-3 work was re-audited by producer, consumer, exact
+type, ownership and borrow lifetime, emitted spelling, production
+reachability, and pass interaction. S2 was selected because the heap-result
+route has one live owned declaration with an already structured borrow and a
+bounded lifetime:
+
+~~~cpp
+std::vector<T> tiled_*_storage(
+    (size_t) prefix_extent * (size_t) tile_extent);
+~~~
+
+The vector owns the temporary result storage. Its existing typed `.data()`
+`MemberCall` borrows that storage. The surrounding initialization, compact
+accumulation, result copy, and owner lifetime were already one coherent S2
+boundary. The direct-accumulation control does not allocate this owner.
+
+The rejected boundaries remain separate:
+
+- W6-W9 are the raw offset-operation/source-spelling family and must be
+  audited together with their consumers;
+- Torch/generalized allocation needs a separate typed call/member/allocation
+  ownership decision;
+- the parallel zero-fill family crosses allocation and pass-extraction
+  ownership and remains one later audited slice;
+- the seven generic rewrites have distinct producers and consumers and were
+  not bundled into this owner migration; and
+- unified exhaustive CxxIR emission remains a separate Phase-3 exit
+  deliverable.
+
+S3 packed-relayout and C1 fixed-result-position owners were already migrated;
+this slice does not generalize either helper. The raw `prefix_extent` strings
+reused by the S2 initialization/copy loops and OpenMP clauses remain outside
+this declaration-only boundary. No W6-W9 operation, Torch allocation,
+parallel policy, generic rewrite, parser, ABI, or generalized initializer
+hierarchy was changed.
+
+#### Representation, typing, ownership, validation, and rewriting
+
+`_heap_result_storage_declaration` now returns one exact detached
+`llir.DirectInit`. The declaration target is exactly
+`STD_VECTOR_FLOAT32` or `STD_VECTOR_FLOAT64`. Each prefix dimension is a fresh
+`INT64` `Var`; multiple dimensions are folded into fresh `Mul` nodes. The
+complete prefix product is cast to `SIZE_T`. The tile dimension is a fresh
+`CONSTEXPR_INT` `Var`, also cast to `SIZE_T`, and the two cast operands form
+the declaration's single `Mul` argument.
+
+The validation owner is exactly:
+
+- stage: `schedule lowering`; and
+- pass: `build_heap_result_storage`.
+
+The declaration is walked and validated before the function is mutated. An
+empty prefix fails immediately. Missing or forged fields, an unknown child,
+an unknown subclass, and an invalid replacement fail closed under the
+existing exact frozen `DirectInit` contract. Repeated lowering yields equal
+and equally hashed trees whose owner, tuple, casts, products, and leaves are
+detached. Name collection includes the typed owner, so existing schedule name
+hygiene remains binding.
+
+The vector remains the sole owner and the existing typed `.data()` member call
+remains a borrow. The dynamic-vector pass continues to exclude pre-sized
+`DirectInit` declarations. The existing initialization, compute, copy, and
+borrow lifetimes remain unchanged; malformed typed owners now fail at the new
+schedule-lowering validation boundary before later stages or cache
+publication.
+
+The one-prefix form intentionally adopts the existing exact `Cast` spelling:
+
+~~~diff
+-std::vector<T> tiled_C_storage((size_t) (C0_size) * (size_t) kTile_k);
++std::vector<T> tiled_C_storage((size_t) C0_size * (size_t) kTile_k);
+~~~
+
+The multi-prefix spelling remains byte-identical:
+
+~~~cpp
+std::vector<T> tiled_C_storage(
+    (size_t) (C0_size * C1_size) * (size_t) kTile_d);
+~~~
+
+No new IR node or schema was added. `DataType.SIZE_T`, exact frozen
+`DirectInit`, common traversal/validation/reconstruction, live emission,
+declared-name handling, and the dynamic-vector exclusion were reused exactly
+as landed in the earlier DirectInit slices.
+
+#### Focused, matrix, and locked-budget verification
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, native, and
+benchmark command sourced the conda hook and activated `scorch` first.
+
+~~~sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate scorch
+~~~
+
+After that common activation, the structural, failure, and budget core
+invocation ran:
+
+~~~sh
+PYTHONPATH="$PWD/src" PYTEST_ADDOPTS= PYTHONDONTWRITEBYTECODE=1 \
+pytest -q \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_schedule_api.py::test_heap_result_storage_owner_is_direct_typed_fresh_and_byte_exact \
+  tests/test_scorch/test_schedule_api.py::test_direct_result_tile_does_not_allocate_heap_storage \
+  tests/test_scorch/test_schedule_api.py::test_full_stage_and_heap_result_are_structural_and_name_independent \
+  tests/test_scorch/test_schedule_api.py::test_heap_result_storage_uses_a_hygienic_owner_name \
+  tests/test_scorch/test_compiler_stage_timing.py::test_malformed_heap_result_storage_fails_schedule_owner_and_stops_later_work \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py::test_tuner_packed_tileijk_storage_scopes_and_loop_nesting
+~~~
+
+Result: 39 passed in 3.54s.
+
+The content-equivalent uncommitted candidate's independent native core
+invocation ran after creating the displayed persistent roots:
+
+~~~sh
+PYTHONPATH="$PWD/src" PYTEST_ADDOPTS= PYTHONDONTWRITEBYTECODE=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/s2-working/native-focused/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/s2-working/native-focused/torch-extensions \
+pytest -q \
+  tests/test_scorch/test_schedule_generality.py::test_ttm_heap_result_tile_is_generic_compact_accumulation \
+  tests/test_scorch/test_schedule_generality.py::test_spmm_heap_result_tile_without_relayout_matches_torch \
+  --basetemp=/Users/bobby/.cache/scorch-codex/s2-working/native-focused/pytest-basetemp \
+  -o cache_dir=/Users/bobby/.cache/scorch-codex/s2-working/native-focused/pytest-cache
+~~~
+
+Result: 6 passed in 58.74s.
+
+The broad content-equivalent precommit matrix core invocation ran after
+creating the displayed persistent roots:
+
+~~~sh
+PYTHONPATH="$PWD/src" PYTEST_ADDOPTS= PYTHONDONTWRITEBYTECODE=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/s2-working/focused-matrix/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/s2-working/focused-matrix/torch-extensions \
+pytest -q \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_traversal.py \
+  tests/test_scorch/test_dynamic_vector_access_pass.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_loop_plan.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py \
+  --basetemp=/Users/bobby/.cache/scorch-codex/s2-working/focused-matrix/pytest-basetemp \
+  -o cache_dir=/Users/bobby/.cache/scorch-codex/s2-working/focused-matrix/pytest-cache
+~~~
+
+Result: 789 passed in 409.63s (0:06:49). This is a content-equivalent
+precommit result, not an exact detached-revision ledger.
+
+The strengthened one-/multi-prefix and budget core invocation ran:
+
+~~~sh
+PYTHONPATH="$PWD/src" PYTEST_ADDOPTS= PYTHONDONTWRITEBYTECODE=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/s2-working/native-focused/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/s2-working/native-focused/torch-extensions \
+pytest -q \
+  tests/test_scorch/test_schedule_generality.py::test_ttm_heap_result_tile_is_generic_compact_accumulation \
+  tests/test_scorch/test_schedule_api.py::test_heap_result_storage_owner_is_direct_typed_fresh_and_byte_exact \
+  tests/test_scorch/test_llir_string_budget.py
+~~~
+
+Result: 30 passed in 9.65s.
+
+The final clean detached candidate budget command was:
+
+~~~sh
+PYTHONPATH="$PWD/src" PYTEST_ADDOPTS= PYTHONDONTWRITEBYTECODE=1 \
+pytest -q tests/test_scorch/test_llir_string_budget.py
+~~~
+
+Result: 27 passed in 2.15s.
+
+The tests cover both vector scalar types, one and multiple prefix dimensions,
+exact tree shape/types/spelling, equality and hashing, detached ownership,
+typed `.data()` borrowing, direct-accumulation control, hygienic naming,
+stage identity/order/timing, caller-owned schedule/options/spec immutability,
+cache suppression, empty-prefix rejection, forged-field rejection, unknown
+child and subclass rejection, later C++ generation/build/native suppression,
+ragged tails, and zero row/reduction/output-column domains.
+
+#### Authoritative full non-performance suite closure
+
+The authoritative exact-candidate run used persistent worktree, temporary,
+extension, basetemp, cache, and log roots:
+
+~~~sh
+PYTHONPATH="$PWD:$PWD/src" \
+PYTEST_ADDOPTS= \
+PYTHONDONTWRITEBYTECODE=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/full-run/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/full-run/torch-extensions \
+pytest -q -m "not perf" tests \
+  --basetemp=/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/full-run/pytest-basetemp \
+  -o cache_dir=/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/full-run/pytest-cache
+~~~
+
+Result: 1,772 passed, 14 skipped, three deselected, one warning in 2,016.73s
+(0:33:36), exit 0. The sole warning is the inherited PyTorch sparse-invariant
+warning in `test_model_absent_falls_back_to_analytic`.
+
+Revision and status before and after are exact clean
+`27f46f4d4694b7666fa547f01e664b3383f75c11`. The run started at
+2026-07-19T04:33:20Z and ended at 2026-07-19T05:06:57Z. Its 3,047-byte log
+hashes to
+`a9a7e281007f70ea3b0c84b09c73a6258092cac048b98833bf1ce349cb38bd15`.
+This exact S2 run had no failure or retry. The earlier packed-DirectInit
+SIGKILL history and successful five-test retry remain recorded in that slice's
+section and are not reclassified as S2 failures.
+
+#### Native S2 correctness on M5 and Redwood
+
+The final clean committed candidate ran the same two active node IDs on the
+local M5:
+
+~~~sh
+PYTHONPATH="$PWD:$PWD/src" PYTEST_ADDOPTS= PYTHONDONTWRITEBYTECODE=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/native-m5/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/native-m5/torch-extensions \
+pytest -q \
+  tests/test_scorch/test_schedule_generality.py::test_ttm_heap_result_tile_is_generic_compact_accumulation \
+  tests/test_scorch/test_schedule_generality.py::test_spmm_heap_result_tile_without_relayout_matches_torch \
+  --basetemp=/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/native-m5/pytest-basetemp \
+  -o cache_dir=/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/native-m5/pytest-cache
+~~~
+
+Result: 6 passed in 57.48s, exit 0. Revision/status before and after were
+exact clean `27f46f4d4694b7666fa547f01e664b3383f75c11`. The run started at
+2026-07-19T05:15:59Z and ended at 2026-07-19T05:16:56Z. Its log hashes to
+`ef9e05d832ea54357f5ac051d2610a069d35f21a9da801b58e7d45bb69c13506`.
+
+Redwood received a complete Git bundle and a guarded runner, then checked out
+the same exact clean candidate:
+
+~~~sh
+ssh redwood \
+  'test ! -e /scratch/bobbyy/scorch-s2-27f46f4-20260719T0517Z && \
+   test ! -e /scratch/bobbyy/scorch-s2-27f46f4-20260719T0517Z.bundle'
+scp /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/redwood.bundle \
+  redwood:/scratch/bobbyy/scorch-s2-27f46f4-20260719T0517Z.bundle
+scp /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/run_redwood_native.sh \
+  redwood:/scratch/bobbyy/scorch-s2-27f46f4-20260719T0517Z.run.sh
+ssh redwood \
+  'bash /scratch/bobbyy/scorch-s2-27f46f4-20260719T0517Z.run.sh'
+~~~
+
+Result: 6 passed in 93.18s (0:01:33), exit 0. The run started at
+2026-07-19T05:18:00Z and ended at 2026-07-19T05:19:34Z. The host was Linux
+x86_64 with 32 CPUs; Python was 3.11.15, Torch was 2.5.1, and Torch used 24
+threads. Revision/status before and after were exact clean `27f46f4`. The
+remote root was
+`/scratch/bobbyy/scorch-s2-27f46f4-20260719T0517Z`. The local copy of the log
+hashes to
+`3706c5775774ddec8c2aad48cfecd1904a930d24c06bb174bae747cbfd4ed853`;
+the runner hashes to
+`f4db785a7b4f3f10e802e345563d3be11a2bce567f430c2b0a80555f202d8593`;
+and the bundle hashes to
+`6ed757efcec208293df578ee6bfd4c89f3b8888b7e7e23bbaa1b2653b79c1086`.
+
+Together the active M5/Redwood gates cover float32 TTM and float32/float64
+SpMM, one-/multi-prefix owners, and SpMM ragged tails and zero rows, reduction
+extent, and output columns against PyTorch.
+The float64 TTM evidence below is compile-only and byte-identical across base
+and candidate; it is not claimed as native runtime coverage.
+
+#### Canonical capture identity, active source/build evidence, and waivers
+
+Exact clean base and candidate were captured sequentially through the same
+logical worktree path. For each guarded `SIDE` value (`base`, then
+`candidate`), the capture wrapper used this core command template for the four
+recovered canonical helpers and the grid predecessor:
+
+~~~sh
+cd -L /tmp/scorch-phase3-structured-access-capture-wt
+
+HELPERS=/Users/bobby/.cache/scorch-codex/directinit-cac066e/helpers-recovery
+GRID_PREDECESSOR=/Users/bobby/.cache/scorch-codex/directinit-cac066e/grid-recovery/grid-predecessor.json
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python "$HELPERS/scorch_phase3_capture_inputs.py" "$SIDE/inputs"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python "$HELPERS/scorch_phase3_capture_spmm_grid.py" \
+  "$SIDE/grid.json" "$GRID_PREDECESSOR"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python "$HELPERS/scorch_phase3_capture_workspace_pair.py" "$SIDE/workspace"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python "$HELPERS/scorch_phase3_capture_tiled_workspace.py" \
+  "$SIDE/tiled-workspace"
+~~~
+
+The exact helper hashes are:
+
+| Helper | SHA-256 |
+| --- | --- |
+| inputs | `605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3` |
+| 42-cell grid | `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3` |
+| workspace pair | `964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59` |
+| tiled workspace | `9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff` |
+
+The retained grid predecessor hashes to
+`aaad2e7a6ee9b4decd05b3a9547fe6576f58ef44c0332c5f4dc76da696eff969`.
+
+Each canonical side contains 14 files. Their recursive diff is empty, SHA-256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+Both sides reproduce:
+
+| Capture | Base and candidate SHA-256 |
+| --- | --- |
+| inputs manifest | `d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024` |
+| 42-cell grid | `204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6` |
+| workspace manifest | `f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90` |
+| tiled-workspace manifest | `7bc0f70f84d2693f76fdf179b9ae7e684e4fa3ebe93c5d175ec98206a024a5a7` |
+
+All canonical inputs have zero S2 activation. Every canonical C++ source,
+preamble, function ABI, flag, name, request, prepared key, build directory,
+extension path, and cache/build identity is equal. The extension root contains
+zero files, proving capture stopped before native compilation. The retained
+standard-grid runtime waivers therefore apply:
+
+- M5:
+  `3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246`;
+  and
+- Redwood:
+  `c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d`.
+
+Those waivers cover only the byte-identical, nonactivating canonical grid. The
+dedicated active S2 sources below include an intentional one-prefix spelling
+change, so the newly run M5 and Redwood gates above independently cover active
+runtime correctness.
+
+The dedicated active capture ran at the same logical path and intercepted the
+compiler immediately before native build. Its guarded wrapper ran the capture
+template once with `SIDE=base` and then once with `SIDE=candidate`:
+
+~~~sh
+cd -L /tmp/scorch-phase3-structured-access-capture-wt
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-s2-capture-extensions \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/src" \
+python /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/source-build-capture/capture_s2_source_build.py \
+  capture "$SIDE" \
+  /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/source-build-capture/"$SIDE"
+~~~
+
+After both sides existed, the wrapper ran the comparison exactly once:
+
+~~~sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/src" \
+python /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/source-build-capture/capture_s2_source_build.py \
+  compare \
+  /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/source-build-capture/base \
+  /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/source-build-capture/candidate \
+  /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/source-build-capture/comparison
+~~~
+
+The capture records logical `/tmp` and physical `/private/tmp`, empty status
+on both sides, one `RawStmt` owner at the base and one exact `DirectInit` owner
+at the candidate for every case, and zero native-build calls/files. Its
+artifact ledger is:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| helper | 24,136 | `a913965f09e658df4086020ee4be1316cc4ed4c73abffe3baec12e7bbc3261f4` |
+| base manifest | 21,990 | `20f0dee788c638f799bdd618304abe28bd7cf63fc59d8577ea7a423ac5fe150b` |
+| candidate manifest | 26,277 | `0f1716f6eaa359940deb99efdc5bf4b80cdcebe2539fa83897a8bb3eb61e7e9e` |
+| comparison JSON | 1,849 | `190a897b6a185d678cf5cfa9dfed2fc8374f5935191983f061b408ef7e687622` |
+| source diff | 833 | `f9d03a007cd3453095b31b7c91c9b0e31b3cc041fa9f24e2f29c49b77267461d` |
+| base/candidate preamble | 68,671 | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+
+All four dedicated cases activate S2. Exact source and kernel identities are:
+
+| Case | Base owner | Candidate owner | Base bytes / SHA-256 / kernel | Candidate bytes / SHA-256 / kernel |
+| --- | --- | --- | --- | --- |
+| SpMM float32 | `RawStmt` | `DirectInit` | 4,015 / `e0fafcf96d017257a573f70fd1907f4c2d94a4f680e345415e2dc1ca965c4de0` / `kernel_0eb00fa0bd4d` | 4,013 / `99462a2ad74b8bb9fce41ae505c3a3ed4db1d01d5ef8e94a297f65083463b6e1` / `kernel_e1a93b7c889c` |
+| SpMM float64 | `RawStmt` | `DirectInit` | 4,022 / `9b0023ce11d8819a809b6a4680be88c3f9a04de5fa045a76716fb29bc393d89a` / `kernel_bc03b0ee262f` | 4,020 / `3cafd50af73d6ff6f17befe588a4625e469ca1272dcbe6b605a3bd67a5630c54` / `kernel_167f47abaf2f` |
+| TTM float32 | `RawStmt` | `DirectInit` | 4,117 / `003f9d32906f8603c8cedccf2f6034762df8c51b9b9a6fc8e011cb859ac8aab5` / `kernel_fe0e70cd6816` | identical |
+| TTM float64 | `RawStmt` | `DirectInit` | 4,124 / `2769b47414cc553e82bfa277aebeebb263bee28fb1c7d7db8e78861431808d0c` / `kernel_69c1088bee35` | identical |
+
+The per-case request/build/prepared ledger is:
+
+| Case | Build identity base -> candidate | Request cache base -> candidate | Prepared cache base -> candidate | Codegen cache-key SHA-256 |
+| --- | --- | --- | --- | --- |
+| SpMM float32 | `9471778645bb9dc6458cc98b7d137d825caee46f199f0c7dac4d89fa0f9e7234` -> `013f22e0d340cbffd41732749878c9e367571923de3e295e3f8166f569ed8f5f` | `592055fb8b3f77e83fa250822d432f55f6c68812e71bcd901f0f53b36684754d` -> `7efe66c5be6343ee020cdc40f9f15473c51520f702b40c7542fa68c2838b0ff9` | `8ab3c285bf204ffc703e882a2991fda7b36d0841992c1bfbf1ec09016495254a` -> `0e62214f0b5975d923940c53dcc6b8da2f54ead57199ce6653da6abf09cc4b8b` | `3283363704241d0de76f12db78578634411cfbf73be70f55760aca733adb1c2f` |
+| SpMM float64 | `3b44a5ea30393b5fda3b630b9cb0e5442a9af6ada0ef4eab687fb59df6105dd3` -> `7d1cfb8f44be3d658c0d175465fb2e071a0bc127e1b015d20785a03ebf82df4e` | `5d0f2b2a9678b7e824202329c81b2e34a04672d2bef906a3ef756f5caa78da9f` -> `6d9014934abfefd6656bd890c8024c0642bc4bd84e93a2167c95e43a1e0f6003` | `50e202aa7f2767fb5e5284faee492e426f84806809eaa677c171aa5dc0f80477` -> `3d99184882ead75c295c56fb50e13440e82b88da5116303f4c464df750bdd92e` | `85f6d8619a13a0d16cca289d289ec7290a2de0383a14ac6cbafdc9fb5b6e2a0c` |
+| TTM float32 | both `719761c52018180def22a31c72c96095c4ef4d2b36ba5f304038bd882d0964f7` | both `33c6e2bfef734d95c11a2cba8f1f99f8f2579e17abc33a88365f9d0f0105b0f9` | both `1d994d82acfba072649eecaac78affe11e3c9c9b114df820dad2d62ed0ee788f` | `6fa6a47db78232f494bd57254bb2c04a2a6a21dc3e1fb521400905886a437af2` |
+| TTM float64 | both `452c66a99b7a68198ecdca52a97d778819edfcfa7d14c0aa6cf8e29def34fc5a` | both `0e1f9806cf5fd9a68c19b5ee112112642aed98021976879d6e667b93abbcce49` | both `6ebacb78dc9ce83be352884321a84dde964537b45fe071cc52b72dd2081cc4f7` | `653575e11085155d338fae1fb82201fd818e0e03c9255171607176ffecd68bbf` |
+
+The shared identities not repeated in that table are:
+
+- common build-options cache:
+  `946b3609479fe584dde8ef3167543d52e0e793e08309bb2821fb18e381dece6d`;
+- SpMM compile-options cache:
+  `363bcc2c536f79edf10fb35d2723d9b571ea3d87264333347a8d1f73bc389cb9`;
+- SpMM schedule cache:
+  `91fb7227f55eb5f385c31ed47afa257126fdb75dcd4e70e254aeeb84376d643c`;
+- TTM compile-options cache:
+  `932a682c5afc8c8d5ae359d7368b6228aeb145f80ebe6c074cf224ef8c1b6957`;
+  and
+- TTM schedule cache:
+  `f76fa4216106e9440c81702069f6ef96678d43b96ac3ea3ef777fa5c18dc429f`.
+
+For the one-prefix cases, the two removed parentheses are the entire source
+diff. Codegen cache keys, compile options, build options, schedule identities,
+preamble, function ABI, flags, and stage IDs stay equal; source-derived kernel,
+request, build, and prepared identities change as expected. Both multi-prefix
+TTM build objects are completely equal.
+
+#### Exact-base quality and strict Sphinx comparison
+
+The external runner
+`/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/run_quality_comparison.sh`
+hashes to
+`d1e306a42e7e524551c933fb41279e83d15ca3577e811165d9933fa6efd04a3c`.
+It compared exact clean detached base and candidate on the six changed Python
+files. The runner used lowercase `quality_root` and local `side` variables;
+the following per-side core command template expands its `changed_python`
+array for readability:
+
+~~~sh
+python -m black --check \
+  src/scorch/compiler/schedule_lowerer.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py
+
+python -m flake8 \
+  src/scorch/compiler/schedule_lowerer.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py
+
+python -m mypy \
+  src/scorch/compiler/schedule_lowerer.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py
+
+PYTHONPATH="$PWD:$PWD/src" \
+sphinx-build -n -b html -W --keep-going -E -a \
+  docs/source "$quality_root/$side-html"
+~~~
+
+The common environment was Python 3.11.15, Black 26.5.1, Flake8 7.3.0,
+mypy 2.2.0, and Sphinx 8.2.3. Base/candidate status before and after was empty.
+
+- Black exited 0/0 and left all six files unchanged. Both runs emitted the
+  same inherited warning that Python 3.11 cannot perform Black's AST safety
+  parse for the repository's Python 3.15 target. The equal logs hash to
+  `70044f00efcede3b31014dd8da50e68cb3ee17daca8163d03d16871ecda2ac28`.
+- Flake8 exited 0/0 with empty output, SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Mypy exited 1/1 for the same 22 inherited `import-untyped` errors in three
+  test files. Normalized logs are equal and hash to
+  `607385d44a28d60a7952049da701117ccc133d7ee95f70bc521c78c1846fa55e`.
+- Strict Sphinx exited 1/1 only because `-W` promoted the same 23 inherited
+  unresolved-reference warnings. Normalized warning logs are equal and hash
+  to
+  `e5dfe6603fc04bd77e0b7eaa90ba22c44a476448eb006572816fc3b34329e793`.
+
+Each Sphinx tree has 187 files and 142 non-doctree files. The complete
+non-doctree manifests are byte-identical and both hash to
+`9175d4a8f86b96285b320423fa6ce915ffff61e36b2e6fb8510919141624cfc9`.
+All five comparison diff files are empty. The evidence `SHA256SUMS` file
+hashes to
+`a1a03e86bd1f2f4f7b5b90a73009d883b2937fc7ff42ec7062bb76ad412e0707`.
+There is no candidate-only quality or documentation finding.
+
+#### Cache-local pytest-xdist scaling evidence
+
+This is supplemental test-infrastructure evidence, not a Phase-3 gate or a
+repository dependency/configuration change. `pytest-xdist` 3.8.0 and
+`execnet` 2.1.2 were installed only under
+`/Users/bobby/.cache/scorch-codex/pytest-xdist-env`; neither the conda
+environment nor `pyproject.toml` was changed. Every pilot used the exact same
+nine-file, 789-test matrix, exact clean detached candidate, isolated temp/cache
+roots, `MAX_JOBS=1`, `OMP_NUM_THREADS=1`, and `MKL_NUM_THREADS=1`.
+
+The four-worker run used `--dist loadfile`; the later runs used
+`--dist worksteal`. The actual invocations used literal worker counts,
+distribution names, and paths. The following parameterized template
+represents those four commands, with `PILOT_ROOT` resolving to
+`/Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/xdist-pilot-$WORKERS`
+for each displayed row:
+
+~~~sh
+mkdir -p "$PILOT_ROOT/tmp"
+PYTHONPATH="/Users/bobby/.cache/scorch-codex/pytest-xdist-env:$PWD:$PWD/src" \
+PYTEST_ADDOPTS= PYTHONDONTWRITEBYTECODE=1 MAX_JOBS=1 \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+TMPDIR="$PILOT_ROOT/tmp" \
+python -m pytest -q -n "$WORKERS" --dist "$DIST" \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_traversal.py \
+  tests/test_scorch/test_dynamic_vector_access_pass.py \
+  tests/test_scorch/test_schedule_api.py \
+  tests/test_scorch/test_schedule_generality.py \
+  tests/test_scorch/test_loop_plan.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/codegen/test_tuner_schedule_codegen.py \
+  --basetemp="$PILOT_ROOT/pytest-basetemp" \
+  -o cache_dir="$PILOT_ROOT/pytest-cache"
+~~~
+
+| Workers / distribution | Exact result | Observed wall ratio / reduction vs 409.63s serial | Log SHA-256 |
+| --- | --- | --- | --- |
+| 4 / `loadfile` | 789 passed in 230.29s | 1.778757x / 43.780973% | `0d7c32dfa98984cf0d2dcb2df62a160941c16d8c0e293e0c7fd17ba3a6c2c9df` |
+| 8 / `worksteal` | 789 passed in 95.90s | 4.271429x / 76.588629% | `5ce7aed8db2e09887ea6e6358749f1a1ce68471392451f45845a43351057c5ee` |
+| 12 / `worksteal` | 789 passed in 74.71s | 5.482934x / 81.761590% | `92d5a187bd23e1d20fef0b981126a4155cc441bae0b7c18cfeddf8eefcc76d49` |
+| 16 / `worksteal` | 789 passed in 68.32s | 5.995755x / 83.321534% | `e4df373523d79ce1397c324089ee9f14ba0a9ffc44edc4c11af887e8a2ce11f3` |
+
+These ratios use the 409.63-second content-equivalent precommit serial matrix
+above; there is no separate exact-detached-candidate serial control. That
+serial run also did not set `OMP_NUM_THREADS=1` or `MKL_NUM_THREADS=1`, while
+the exact committed pilots set both. The table therefore compares the
+observed wall time of each complete configuration; it does not isolate xdist
+as the sole cause of the change.
+The host exposes 18 CPUs and 128 GiB. Twelve workers retain six threads of
+headroom while delivering 91.45% of the 16-worker throughput; use 12 as the
+routine compiler-matrix default and 16 for maximum throughput only while
+native builds and other heavy work are idle. The 16-worker gain over 12 is
+6.39s, 1.093530x, or 8.553072%. Worker count and distribution strategy changed
+together between the early pilots, so the evidence supports each combined
+configuration rather than isolated causation. The authoritative full suite is
+still the serial run above; full-suite xdist remains unvalidated, and
+performance benchmarks and authoritative latency gates remain serial.
+
+#### Final-candidate compiler latency and complete crossing attribution
+
+The exact executable predecessor is the retained duplicate-generator artifact:
+
+`/Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/latency/latency-a657646-m5.json`
+
+It is 54,902 bytes and hashes to
+`f11e67e9e9b14dc69523b5c68f457d3a760408d7225e19a87f725df757d742ad`.
+Exact base `bff279c` differs from `a657646` only by the duplicate-generator
+handoff documentation, so `a6576469a280dde33a6c6d301de04b56a916a9ab` is
+the exact executable predecessor. It was not rerun.
+
+After all tests, captures, native compilation, quality, Sphinx, and xdist jobs
+were idle, the exact clean final candidate alone ran:
+
+~~~sh
+PYTHONPATH="$PWD/src" PYTHONDONTWRITEBYTECODE=1 \
+python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 \
+  --samples 30 \
+  --output /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/latency/latency-27f46f4-m5.json
+~~~
+
+The harness hashes to
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+The benchmark exited 0 and ran from 2026-07-19T05:35:44Z through
+2026-07-19T05:35:52Z. Revision before/after is exact
+`27f46f4d4694b7666fa547f01e664b3383f75c11`; the benchmark metadata's
+`git_status_short` field and the post-run worktree status are empty. The
+55,202-byte candidate JSON hashes to
+`86b015927a55f1b4cd2733eac5ae3d7c6b6b46a0be75c3cc19a80807cf3e4ca8`;
+its 842-byte console log hashes to
+`b8f50a4d859a120ad6ae1437965da21474159d15958b3a8c28a79085e6ee6943`.
+
+Metadata is equal on hostname, arm64 machine, macOS 26.4.1, Python 3.11.15,
+Scorch 0.0.1, Torch 2.13.0, and six Torch threads. Schema, corpus, kind, and
+the five-warmup/30-sample configuration are equal. Every endpoint and stage
+series has exactly 30 observations.
+
+The adapted comparator is 6,993 bytes and hashes to
+`f4967344357aa538e7b7adddce549c7ca481f8187a3e91d46dca996cbef8c7e3`.
+It ran:
+
+~~~sh
+python /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/compare_s2_latency.py \
+  /Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/latency/latency-a657646-m5.json \
+  /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/latency/latency-27f46f4-m5.json \
+  /Users/bobby/.cache/scorch-codex/s2-heap-result-27f46f4/latency/comparison-a657646-27f46f4.json
+~~~
+
+It validates exact revisions, stable metadata, equal corpus/configuration,
+ordered cases, equal operation/formats/output/build objects, 30 observations
+per endpoint/stage series, and equal stage runs/nesting. The 40,551-byte
+comparison JSON hashes to
+`dc3ef2150ea22ac31b29efdbaf601defd633de59a064e41ccaa7e1af0428e271`;
+its 10,954-byte log hashes to
+`50fac5bf67da8db7f3f35186bad02368972eda79f816235a12df6c09f7fadba8`.
+
+All four benchmark cases have zero S2 activation: none requests a heap result
+tile, which is the only route to `_heap_result_storage_declaration`. Equal
+complete build objects are the fail-closed backstop. Exact endpoint results
+are:
+
+| Case / endpoint family | Activation | p50 old -> new ms | p50 ratio / delta ms | p95 old -> new ms | p95 ratio / delta ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small dense / compatibility | 0 | 1.632458500 -> 1.658875500 | 1.016182341 / +0.026417000 | 1.813841550 -> 2.297856400 | 1.266845166 / +0.484014850 |
+| small dense / canonical | 0 | 1.938437500 -> 1.956687500 | 1.009414799 / +0.018250000 | 2.142229500 -> 2.714858150 | 1.267304997 / +0.572628650 |
+| small dense / endpoint extension | 0 | 0.294771000 -> 0.289729000 | 0.982895197 / -0.005042000 | 0.338118750 -> 0.350795500 | 1.037492005 / +0.012676750 |
+| reduction / compatibility | 0 | 1.505750000 -> 1.860979000 | 1.235914993 / +0.355229000 | 1.606533000 -> 2.985498250 | 1.858348537 / +1.378965250 |
+| reduction / canonical | 0 | 1.790062500 -> 2.198562500 | 1.228204322 / +0.408500000 | 1.900633000 -> 3.404345800 | 1.791164207 / +1.503712800 |
+| reduction / endpoint extension | 0 | 0.280875000 -> 0.319625500 | 1.137963507 / +0.038750500 | 0.297977050 -> 0.419783850 | 1.408779132 / +0.121806800 |
+| CSR intersection / compatibility | 0 | 1.789771000 -> 2.083479000 | 1.164103676 / +0.293708000 | 1.937791550 -> 2.417699850 | 1.247657340 / +0.479908300 |
+| CSR intersection / canonical | 0 | 2.071333000 -> 2.385750000 | 1.151794521 / +0.314417000 | 2.230777300 -> 2.735564250 | 1.226282987 / +0.504786950 |
+| CSR intersection / endpoint extension | 0 | 0.283625000 -> 0.303000500 | 1.068313795 / +0.019375500 | 0.303916700 -> 0.368947950 | 1.213977218 / +0.065031250 |
+| sparse union / compatibility | 0 | 1.825625000 -> 2.125479000 | 1.164247313 / +0.299854000 | 1.910756250 -> 2.371377050 | 1.241067274 / +0.460620800 |
+| sparse union / canonical | 0 | 2.109479500 -> 2.475917000 | 1.173709913 / +0.366437500 | 2.186975000 -> 2.691794050 | 1.230829822 / +0.504819050 |
+| sparse union / endpoint extension | 0 | 0.283000000 -> 0.307292000 | 1.085837456 / +0.024292000 | 0.296091850 -> 0.383142000 | 1.293997116 / +0.087050150 |
+
+The comparison has 24 endpoint rows and 62 stage rows. Sixty-three ratios
+exceed 1.10; the maximum is 2.107820207. The complete required crossing ledger
+follows:
+
+| Case | Activation | Endpoint / compiler stage | Metric | Old ms | New ms | Ratio | Delta ms |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: |
+| small_dense | 0 | endpoint | p95_ms | 1.813841550 | 2.297856400 | 1.266845166 | +0.484014850 |
+| small_dense | 0 | endpoint | canonical_p95_ms | 2.142229500 | 2.714858150 | 1.267304997 | +0.572628650 |
+| reduction | 0 | endpoint | p50_ms | 1.505750000 | 1.860979000 | 1.235914993 | +0.355229000 |
+| reduction | 0 | endpoint | p95_ms | 1.606533000 | 2.985498250 | 1.858348537 | +1.378965250 |
+| reduction | 0 | endpoint | canonical_p50_ms | 1.790062500 | 2.198562500 | 1.228204322 | +0.408500000 |
+| reduction | 0 | endpoint | canonical_p95_ms | 1.900633000 | 3.404345800 | 1.791164207 | +1.503712800 |
+| reduction | 0 | endpoint | canonical_endpoint_extension_p50_ms | 0.280875000 | 0.319625500 | 1.137963507 | +0.038750500 |
+| reduction | 0 | endpoint | canonical_endpoint_extension_p95_ms | 0.297977050 | 0.419783850 | 1.408779132 | +0.121806800 |
+| csr_intersection | 0 | endpoint | p50_ms | 1.789771000 | 2.083479000 | 1.164103676 | +0.293708000 |
+| csr_intersection | 0 | endpoint | p95_ms | 1.937791550 | 2.417699850 | 1.247657340 | +0.479908300 |
+| csr_intersection | 0 | endpoint | canonical_p50_ms | 2.071333000 | 2.385750000 | 1.151794521 | +0.314417000 |
+| csr_intersection | 0 | endpoint | canonical_p95_ms | 2.230777300 | 2.735564250 | 1.226282987 | +0.504786950 |
+| csr_intersection | 0 | endpoint | canonical_endpoint_extension_p95_ms | 0.303916700 | 0.368947950 | 1.213977218 | +0.065031250 |
+| sparse_union | 0 | endpoint | p50_ms | 1.825625000 | 2.125479000 | 1.164247313 | +0.299854000 |
+| sparse_union | 0 | endpoint | p95_ms | 1.910756250 | 2.371377050 | 1.241067274 | +0.460620800 |
+| sparse_union | 0 | endpoint | canonical_p50_ms | 2.109479500 | 2.475917000 | 1.173709913 | +0.366437500 |
+| sparse_union | 0 | endpoint | canonical_p95_ms | 2.186975000 | 2.691794050 | 1.230829822 | +0.504819050 |
+| sparse_union | 0 | endpoint | canonical_endpoint_extension_p95_ms | 0.296091850 | 0.383142000 | 1.293997116 | +0.087050150 |
+| small_dense | 0 | cin_lowering | p95_ms | 0.720901600 | 0.873437650 | 1.211590666 | +0.152536050 |
+| small_dense | 0 | frontend_validated_operation_construction | p95_ms | 0.048728800 | 0.059053800 | 1.211887015 | +0.010325000 |
+| small_dense | 0 | legacy_cin_adaptation | p95_ms | 0.029137500 | 0.036345500 | 1.247378807 | +0.007208000 |
+| small_dense | 0 | llir_to_cpp_generation | p95_ms | 0.068214250 | 0.083517000 | 1.224333625 | +0.015302750 |
+| small_dense | 0 | result_abi_assembly | p95_ms | 0.016497800 | 0.018528800 | 1.123107323 | +0.002031000 |
+| small_dense | 0 | scheduling_and_loop_plan_construction | p95_ms | 0.298422700 | 0.348348100 | 1.167297595 | +0.049925400 |
+| reduction | 0 | cin_lowering | p50_ms | 0.548083000 | 0.667188000 | 1.217311976 | +0.119105000 |
+| reduction | 0 | cin_lowering | p95_ms | 0.642668600 | 1.119766150 | 1.742369473 | +0.477097550 |
+| reduction | 0 | cin_normalization_and_verification | p95_ms | 0.023166550 | 0.035235350 | 1.520958019 | +0.012068800 |
+| reduction | 0 | frontend_validated_operation_construction | p50_ms | 0.034666500 | 0.052666500 | 1.519233266 | +0.018000000 |
+| reduction | 0 | frontend_validated_operation_construction | p95_ms | 0.041639250 | 0.073581100 | 1.767109158 | +0.031941850 |
+| reduction | 0 | kernel_name_and_build_request_assembly | p95_ms | 0.404750000 | 0.595640100 | 1.471624707 | +0.190890100 |
+| reduction | 0 | legacy_cin_adaptation | p50_ms | 0.023228500 | 0.029416500 | 1.266396883 | +0.006188000 |
+| reduction | 0 | legacy_cin_adaptation | p95_ms | 0.025625300 | 0.039651900 | 1.547373104 | +0.014026600 |
+| reduction | 0 | llir_to_cpp_generation | p50_ms | 0.050312500 | 0.059167000 | 1.175990062 | +0.008854500 |
+| reduction | 0 | llir_to_cpp_generation | p95_ms | 0.055064800 | 0.086437500 | 1.569741468 | +0.031372700 |
+| reduction | 0 | result_abi_assembly | p50_ms | 0.012792000 | 0.015312500 | 1.197037211 | +0.002520500 |
+| reduction | 0 | result_abi_assembly | p95_ms | 0.013724700 | 0.028929200 | 2.107820207 | +0.015204500 |
+| reduction | 0 | scheduling_and_loop_plan_construction | p50_ms | 0.231270000 | 0.266459000 | 1.152155489 | +0.035189000 |
+| reduction | 0 | scheduling_and_loop_plan_construction | p95_ms | 0.244854650 | 0.368304900 | 1.504177683 | +0.123450250 |
+| csr_intersection | 0 | cin_lowering | p95_ms | 1.004159750 | 1.195493900 | 1.190541545 | +0.191334150 |
+| csr_intersection | 0 | cin_normalization_and_verification | p50_ms | 0.008167000 | 0.009208000 | 1.127464185 | +0.001041000 |
+| csr_intersection | 0 | cin_normalization_and_verification | p95_ms | 0.008971500 | 0.011714650 | 1.305762693 | +0.002743150 |
+| csr_intersection | 0 | frontend_validated_operation_construction | p50_ms | 0.033458500 | 0.046021000 | 1.375465128 | +0.012562500 |
+| csr_intersection | 0 | frontend_validated_operation_construction | p95_ms | 0.043081250 | 0.064110600 | 1.488132308 | +0.021029350 |
+| csr_intersection | 0 | kernel_name_and_build_request_assembly | p95_ms | 0.409972250 | 0.487604100 | 1.189358792 | +0.077631850 |
+| csr_intersection | 0 | legacy_cin_adaptation | p50_ms | 0.024625000 | 0.028584000 | 1.160771574 | +0.003959000 |
+| csr_intersection | 0 | legacy_cin_adaptation | p95_ms | 0.027041000 | 0.041775300 | 1.544887393 | +0.014734300 |
+| csr_intersection | 0 | llir_to_cpp_generation | p95_ms | 0.112139550 | 0.132117150 | 1.178149458 | +0.019977600 |
+| csr_intersection | 0 | result_abi_assembly | p50_ms | 0.019312500 | 0.022291500 | 1.154252427 | +0.002979000 |
+| csr_intersection | 0 | result_abi_assembly | p95_ms | 0.020920650 | 0.028167150 | 1.346380251 | +0.007246500 |
+| csr_intersection | 0 | scheduling_and_loop_plan_construction | p50_ms | 0.148958500 | 0.168103500 | 1.128525730 | +0.019145000 |
+| csr_intersection | 0 | scheduling_and_loop_plan_construction | p95_ms | 0.164539700 | 0.216525000 | 1.315943812 | +0.051985300 |
+| sparse_union | 0 | cin_lowering | p50_ms | 1.232916500 | 1.367625000 | 1.109260035 | +0.134708500 |
+| sparse_union | 0 | cin_lowering | p95_ms | 1.303524850 | 1.553745350 | 1.191956832 | +0.250220500 |
+| sparse_union | 0 | cin_normalization_and_verification | p50_ms | 0.007937500 | 0.009104500 | 1.147023622 | +0.001167000 |
+| sparse_union | 0 | cin_normalization_and_verification | p95_ms | 0.008712200 | 0.010545650 | 1.210446271 | +0.001833450 |
+| sparse_union | 0 | frontend_validated_operation_construction | p50_ms | 0.014020500 | 0.017646000 | 1.258585642 | +0.003625500 |
+| sparse_union | 0 | frontend_validated_operation_construction | p95_ms | 0.015587650 | 0.025837650 | 1.657571860 | +0.010250000 |
+| sparse_union | 0 | kernel_name_and_build_request_assembly | p95_ms | 0.409151750 | 0.487062350 | 1.190419814 | +0.077910600 |
+| sparse_union | 0 | legacy_cin_adaptation | p50_ms | 0.026979000 | 0.035354000 | 1.310426628 | +0.008375000 |
+| sparse_union | 0 | legacy_cin_adaptation | p95_ms | 0.033625000 | 0.045247700 | 1.345656506 | +0.011622700 |
+| sparse_union | 0 | llir_to_cpp_generation | p95_ms | 0.112887200 | 0.140387500 | 1.243608664 | +0.027500300 |
+| sparse_union | 0 | result_abi_assembly | p50_ms | 0.019083500 | 0.022458500 | 1.176854351 | +0.003375000 |
+| sparse_union | 0 | result_abi_assembly | p95_ms | 0.020737650 | 0.029850150 | 1.439418160 | +0.009112500 |
+
+These 63 crossings establish a timing-state difference between the two single
+run artifacts; they are not evidence that S2 caused a compiler-latency
+regression. None of the cases activates the migrated owner and every complete
+build object is equal. The only evidence-supported classification is
+nonactivating run-to-run/host timing variation; no S2 causality is assigned.
+No predecessor or confirmation benchmark ran.
+
+#### Updated locked budget, preserved material, and exact phase status
+
+The exact post-slice locked budget is:
+
+- 394 production `Var` constructors, including 105 in
+  `schedule_lowerer.py`;
+- ten direct expression strings: nine subscripts and one ternary;
+- 13 known indirect sinks/clones;
+- seven generic string rewrites;
+- 32 `RawStmt` constructors / 31 semantic producers;
+- four `DirectInit` templates: S3, C1, S2, and traversal reconstruction;
+- one `RawStmt` constructor in `schedule_lowerer.py`; and
+- three raw constructors in `torch_cpp_abi.py`.
+
+The two S2 commits contain only the six intended paths above. Every staging
+operation used explicit pathspecs. The user-owned tracked modifications remain
+unstaged, untouched, and uncommitted. Their working-file SHA-256 values at
+closure are:
+
+- `.gitignore`:
+  `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`;
+- `pyproject.toml`:
+  `191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`;
+- `src/scorch/__init__.py`:
+  `5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`;
+- `tests/packaging/smoke_install.py`:
+  `f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`;
+  and
+- `tests/test_scorch/test_resources.py`:
+  `3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+All 85 default-collapsed user-owned untracked status entries (4,133 individual
+entries under `--untracked-files=all` at final review), including autotune,
+benchmark, GPU, CUDA, SuiteSparse, research, scheduler/receipt, scratchpad,
+test-analysis, tooling, temporary, and the literal `-` material, remain
+untouched and uncommitted. `COMPILER_IR_REFACTOR_DESIGN.md` and
+tracked/untracked `csrc` material were not modified by this slice or handoff.
+
+Only the narrow Phase-3 typed S2 heap-result storage-owner `DirectInit` slice
+is complete. Broader S2 prefix strings and heap/allocation work remain open.
+W6-W9 offset operations, Torch/generalized allocation seams, the seven generic
+rewrites, parallel zero-fill typed-pass extraction, and unified exhaustive
+CxxIR emission remain open. Phase 3 remains open. Phase 3.5 and LoopIR have
+not begun. Phases 0 and 1 are not claimed formally closed without a separate
+design-requirement audit. Phase 2 retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
