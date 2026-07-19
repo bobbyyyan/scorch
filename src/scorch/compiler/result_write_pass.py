@@ -521,12 +521,6 @@ class _ResultWriteRewriter(LLIRRewriter):
     def rewrite_function(self, node: llir.Function, path: LLIRPath) -> llir.Function:
         return self._identity.rewrite_function(node, path)
 
-    def rewrite_case(self, node: llir.Case, path: LLIRPath) -> llir.Case:
-        return self._identity.rewrite_case(node, path)
-
-    def rewrite_switch(self, node: llir.Switch, path: LLIRPath) -> llir.Switch:
-        return self._identity.rewrite_switch(node, path)
-
 
 def rewrite_result_writes(
     value: LLIRRewriteValueT,

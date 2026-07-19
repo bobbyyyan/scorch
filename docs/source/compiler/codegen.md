@@ -49,20 +49,22 @@ need:
 |------|-------|
 | `VarDecl(var)` | `type name;` |
 | `VarInit(var, value, op, cast)` | `type name = value;` |
+| `DirectInit(var, args)` | `type name(args...);` |
 | `Assign(var, value, op)` | `name op value;` (`op` includes `+=`, `*=`, …) |
 | `Increment(var)` | `x++;` |
-| `Allocate` / `Free` | heap `calloc`/`realloc`/`free` |
+| `FixedStackArrayDecl(...)` | `type name[extent] = {};` |
 | `ForLoop(...)` | a C `for` loop, carrying OpenMP metadata (below) |
-| `ForLoopAuto(var, array, body)` | `for (auto x : arr)` |
+| `ForLoopAuto(var, array, body)` | `for (type x : arr)` |
 | `WhileLoop(cond, body)` | `while (…)` — used for sparse merge co-iteration |
 | `IfThenElse(...)` | `if` / else-if chains |
-| `Switch` / `Case` | `switch` |
 | `Function(return_type, name, args, body)` | a full C++ function definition |
-| `Return` / `Break` / `Continue` / `Comment` | control flow and formatting |
+| `FunctionCallStmt` / `RawStmt` | call and compatibility statements |
+| `Return` / `Break` / `Continue` / `Comment` / `BlankLine` | control flow and formatting |
 
 Expressions cover the arithmetic and memory-access surface: `Var` (with optional
-`__restrict__`), `Literal`, `BinOp` / `Add` / `Mul`, `UnaryOp`, `Cast`, `Sizeof`,
-`FunctionCall`, and `Array` / `ArrayAccess`.
+`__restrict__`), `Literal`, `QualifiedName`, `BinOp` / `Add` / `Mul`, `UnaryOp`,
+`Cast`, `Sizeof`, `FunctionCall`, `MemberAccess` / `MemberCall`, and `Array` /
+`ArrayAccess`.
 
 As a concrete example, the innermost SpMM update `C[i,k] += A[i,j] * B[j,k]`
 lowers to a single `Assign`:
@@ -110,15 +112,18 @@ turns into `#pragma` directives:
 
 Codegen is `LLIRLowerer` in `compiler/codegen.py`. Its docstring is exactly *"lower
 LLIR to C++ code (string)."* It is a recursive, **string-emitting** walker —
-`lower_llir(ir, indent_level, ...)` — that dispatches on Python type through an
-`isinstance` chain:
+`lower_llir(ir, indent_level, ...)` — that dispatches on exact Python node types:
 
 - bare strings pass through with indentation applied;
-- lists are joined with newlines (empties dropped);
+- exact lists and tuples of statements are joined with newlines (empties dropped);
 - `VarInit` prints `type name = value;`, `Assign` prints `name op value;`;
 - expression nodes route to `lower_expression`;
 - loops route to `lower_loop_construct`, conditionals to `lower_conditional`,
   functions to `lower_function_definition`.
+
+The declared-node and traversal registries contain the same exact node families
+that this emitter accepts. Unknown subclasses and list/tuple subclasses fail
+closed. Scalar strings are an internal formatting path rather than LLIR nodes.
 
 :::{note}
 LLIR node definitions live in `compiler/llir.py`. The production C++ emitter is

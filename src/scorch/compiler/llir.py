@@ -19,9 +19,8 @@ Eq, Ne, Lt, Le, Gt, Ge,
 IfThenElse, For, While, Block,
 Function, Call,
 VarAssign, VarDecl,
-Yield, Allocate, Free, Comment, BlankLine, Print, GetTensorProperty,
-Continue, Sort,
-Cast, Case, Switch, Load, Malloc, Sizeof, Store, Scope
+Yield, Comment, BlankLine, Continue, Sort,
+Cast, Load, Malloc, Sizeof, Store, Scope
 """
 
 LLIR_STMT = TypeVar("LLIR_STMT", bound="Stmt")
@@ -43,34 +42,6 @@ class Stmt(Node):
     """Base class for all statements."""
 
     pass
-
-
-class TensorProperty(Enum):
-    """Tensor properties."""
-
-    INDICES = "indices"
-    VALUES = "values"
-    NAME = "name"
-    SHAPE = "shape"
-    DTYPE = "dtype"
-
-
-class GetTensorProperty(Expr):
-    """Get tensor property."""
-
-    def __init__(
-        self,
-        tensor: Expr,
-        tensor_property: TensorProperty,
-        level: int = 0,
-        index: int = 0,
-        name: Optional[str] = None,
-    ):
-        self.tensor = tensor
-        self.tensor_property = tensor_property
-        self.level = level
-        self.index = index
-        self.name = name
 
 
 class AssignOp(Enum):
@@ -514,36 +485,6 @@ class Assign(Stmt):
             if type(self.var) is not Var:
                 raise TypeError("Assign.cast requires an exact Var target")
             self.value = Cast(self.value, self.var.type)
-
-
-class Allocate(Stmt):
-    """Allocate memory for a pointer variable."""
-
-    def __init__(
-        self,
-        var: Expr,
-        num_elements: Expr,
-        is_realloc: bool = False,
-        use_calloc: bool = False,
-    ):
-        self.var = var
-        self.num_elements = num_elements
-        self.is_realloc = is_realloc
-        self.use_calloc = use_calloc
-
-
-class Free(Stmt):
-    """Free memory for a pointer variable."""
-
-    def __init__(self, var: Expr):
-        self.var = var
-
-
-class Print(Stmt):
-    """A print statement."""
-
-    def __init__(self, value: Expr):
-        self.value = value
 
 
 class Comment(Stmt):
@@ -1006,7 +947,7 @@ class ForLoop(Stmt):
         self,
         init: Optional[Union[VarInit, VarDecl]],
         cond: Expr,
-        update: Union[Increment, VarInit, FunctionCall, Assign],
+        update: Union[Increment, FunctionCall, Assign],
         body: List[Stmt],
         omp_parallel_for: bool = False,
         omp_schedule: Optional[str] = None,
@@ -1073,23 +1014,6 @@ class IfThenElse(Stmt):
     then_body_list: Optional[List[List[Stmt]]] = None
 
     make_last_case_else: bool = False
-
-
-class Case(Stmt):
-    """A case statement in C/C++."""
-
-    def __init__(self, cond: Expr, body: List[Stmt]):
-        self.cond = cond
-        self.body = body
-
-
-class Switch(Stmt):
-    """A switch statement in C/C++."""
-
-    def __init__(self, cond: Expr, cases: List[Case], default: List[Stmt]):
-        self.cond = cond
-        self.cases = cases
-        self.default = default
 
 
 @dataclass(frozen=True)

@@ -11,8 +11,8 @@ These are compatibility dependencies, not configurable policy.
 The common LLIR boundary validates and detaches the complete input tree.  The
 semantic scan remains deliberately narrower: it follows only chains of direct
 ``ForLoop.body`` children, processes nested loops before their containing loop,
-and does not enter conditionals, switches, functions, or auxiliary parallel
-regions.  The root must be an exact list; nested list/tuple members admitted by
+and does not enter conditionals, functions, or auxiliary parallel regions. The
+root must be an exact list; nested list/tuple members admitted by
 the current LLIR statement-sequence contract are validated and detached but are
 also semantically omitted.  A legal structural miss is a detached no-op.
 Reapplying the complete pass inserts another identical group of prefetch

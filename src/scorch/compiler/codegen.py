@@ -1,13 +1,33 @@
-from typing import TYPE_CHECKING, List, Optional, TypeVar, Union, cast
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, TypeAlias, Union, cast
 
 from . import llir
 from .diagnostics import CodegenError
-from .llir_traversal import LLIRTraversalContext, LLIRTraversalError, LLIRWalker
+from .llir_traversal import (
+    LLIRTraversalContext,
+    LLIRTraversalError,
+    LLIRWalker,
+    SUPPORTED_LLIR_EXPRESSION_NODE_TYPES,
+    SUPPORTED_LLIR_NODE_TYPES,
+    SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
+)
 
 if TYPE_CHECKING:
     from .compile_options import CompileOptions
 
-LLIR_NODE = TypeVar("LLIR_NODE", bound=llir.Node)
+LLIRStatementEmissionValue: TypeAlias = Union[
+    llir.Stmt,
+    List["LLIRStatementEmissionValue"],
+    Tuple["LLIRStatementEmissionValue", ...],
+]
+LLIREmissionValue: TypeAlias = Union[llir.Node, LLIRStatementEmissionValue, str]
+
+EMITTED_LLIR_EXPRESSION_NODE_TYPES: Tuple[Type[llir.Expr], ...] = (
+    SUPPORTED_LLIR_EXPRESSION_NODE_TYPES
+)
+EMITTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
+    SUPPORTED_LLIR_STATEMENT_NODE_TYPES
+)
+EMITTED_LLIR_NODE_TYPES: Tuple[Type[llir.Node], ...] = SUPPORTED_LLIR_NODE_TYPES
 
 _ASSIGNMENT_CODEGEN_CONTEXT = LLIRTraversalContext(
     stage="C++ code generation",
@@ -76,15 +96,106 @@ class LLIRLowerer:
         self.no_comments = (
             not compile_options.emit_comments if compile_options is not None else False
         )
+        self._emission_depth = 0
 
     @staticmethod
     def _lower_typed_var(var: llir.Var) -> str:
+        if type(var) is not llir.Var:
+            raise CodegenError(
+                "typed variable emission requires an exact LLIR Var; got "
+                f"{type(var).__name__}"
+            )
         qualifier = "__restrict__ " if var.is_restrict else ""
         return f"{var.type.value} {qualifier}{var.name}"
 
+    @staticmethod
+    def _validate_expression_sequence(value: object, field: str) -> None:
+        if type(value) is not list and type(value) is not tuple:
+            raise CodegenError(f"{field} must be an exact list or tuple")
+        for expression in value:
+            if type(expression) not in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
+                raise CodegenError(
+                    f"{field} must contain exact LLIR expressions; got "
+                    f"{type(expression).__name__}"
+                )
+
+    @classmethod
+    def _validate_statement_sequence(cls, value: object, field: str) -> None:
+        if type(value) is not list and type(value) is not tuple:
+            raise CodegenError(f"{field} must be an exact list or tuple")
+        for statement in value:
+            if type(statement) is list or type(statement) is tuple:
+                cls._validate_statement_sequence(statement, field)
+            elif type(statement) not in EMITTED_LLIR_STATEMENT_NODE_TYPES:
+                raise CodegenError(
+                    f"{field} must contain exact LLIR statements; got "
+                    f"{type(statement).__name__}"
+                )
+
+    @classmethod
+    def _validate_exact_codegen_tree(
+        cls,
+        value: object,
+        path: str = "root",
+    ) -> None:
+        """Reject unknown node/container subclasses anywhere in one emission tree.
+
+        This is a cheap type-boundary scan, not the full LLIR verifier. It runs
+        once per public emission call so branch-selective formatting cannot hide
+        an unknown child while recursive formatting remains linear.
+        """
+
+        if type(value) is str:
+            return
+        if isinstance(value, str):
+            raise CodegenError(
+                f"{path} must not contain a string subclass; got {type(value).__name__}"
+            )
+        if isinstance(value, llir.Node):
+            if type(value) not in EMITTED_LLIR_NODE_TYPES:
+                raise CodegenError(
+                    "No C++ codegen implemented for LLIR node type: "
+                    f"{type(value).__name__} at {path}"
+                )
+            for field, child in vars(value).items():
+                cls._validate_exact_codegen_tree(child, f"{path}.{field}")
+            return
+        if type(value) is list or type(value) is tuple:
+            for index, child in enumerate(value):
+                cls._validate_exact_codegen_tree(child, f"{path}[{index}]")
+            return
+        if isinstance(value, (list, tuple)):
+            raise CodegenError(
+                f"{path} must not contain a list/tuple subclass; got "
+                f"{type(value).__name__}"
+            )
+
+    def _validate_direct_entry(self, value: object) -> None:
+        if self._emission_depth == 0:
+            self._validate_exact_codegen_tree(value)
+
     def lower_llir(
         self,
-        ir: Union[LLIR_NODE, List[LLIR_NODE], str, List[str]],
+        ir: LLIREmissionValue,
+        indent_level: int = 0,
+        no_semicolon: bool = False,
+        no_comments: bool = False,
+    ) -> str:
+        self._validate_direct_entry(ir)
+        self._emission_depth += 1
+        try:
+            return self._lower_llir_impl(
+                ir,
+                indent_level=indent_level,
+                no_semicolon=no_semicolon,
+                no_comments=no_comments,
+            )
+        finally:
+            self._emission_depth -= 1
+
+    def _lower_llir_impl(
+        self,
+        ir: LLIREmissionValue,
         indent_level: int = 0,
         no_semicolon: bool = False,
         no_comments: bool = False,
@@ -110,20 +221,21 @@ class LLIRLowerer:
                 )
             self.no_comments = True
 
-        if isinstance(ir, str):
+        if type(ir) is str:
             return indent_level * self.indent_str + ir
 
-        elif isinstance(ir, list):
+        elif type(ir) is list or type(ir) is tuple:
+            self._validate_statement_sequence(ir, "LLIR statement sequences")
             lines = [self.lower_llir(node, indent_level) for node in ir]
             lines = [line for line in lines if line != ""]
             return "\n".join(lines)
 
-        elif isinstance(ir, llir.Comment):
+        elif type(ir) is llir.Comment:
             if self.no_comments:
                 return ""
             return self.lower_llir(f"// {ir.value}", indent_level)
 
-        elif isinstance(ir, llir.BlankLine):
+        elif type(ir) is llir.BlankLine:
             return self.lower_llir(" ", indent_level)
 
         elif type(ir) is llir.FixedStackArrayDecl:
@@ -141,9 +253,10 @@ class LLIRLowerer:
                 indent_level,
             )
 
-        elif isinstance(ir, llir.VarInit):
+        elif type(ir) is llir.VarInit:
             return self.lower_llir(
-                f"{self._lower_typed_var(ir.var)} {ir.op} {self._render_expression(ir.value)};",
+                f"{self._lower_typed_var(ir.var)} {ir.op} "
+                f"{self._render_expression(ir.value)};",
                 indent_level,
             )
 
@@ -191,32 +304,39 @@ class LLIRLowerer:
                 indent_level,
             )
 
-        elif isinstance(ir, llir.Expr):
-            return self.lower_expression(ir, indent_level)
+        elif type(ir) in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
+            return self.lower_expression(cast(llir.Expr, ir), indent_level)
 
-        elif isinstance(ir, llir.FunctionCallStmt):
+        elif type(ir) is llir.FunctionCallStmt:
+            self._validate_expression_sequence(
+                ir.args,
+                "LLIR FunctionCallStmt.args",
+            )
             return self.lower_llir(
                 f"{ir.name}({', '.join(self._render_expression(arg) for arg in ir.args)});",
                 indent_level,
             )
 
-        elif isinstance(ir, (llir.WhileLoop, llir.ForLoop, llir.ForLoopAuto)):
-            return self.lower_loop_construct(ir, indent_level)
+        elif type(ir) in (llir.WhileLoop, llir.ForLoop, llir.ForLoopAuto):
+            return self.lower_loop_construct(
+                cast(Union[llir.WhileLoop, llir.ForLoop, llir.ForLoopAuto], ir),
+                indent_level,
+            )
 
-        elif isinstance(ir, llir.IfThenElse):
+        elif type(ir) is llir.IfThenElse:
             return self.lower_conditional(ir, indent_level)
 
-        elif isinstance(ir, llir.VarDecl):
+        elif type(ir) is llir.VarDecl:
             return self.lower_llir(f"{self._lower_typed_var(ir.var)};", indent_level)
 
-        elif isinstance(ir, llir.RawStmt):
+        elif type(ir) is llir.RawStmt:
             suffix = ";" if ir.add_semicolon else ""
             return self.lower_llir(f"{ir.code}{suffix}", indent_level)
 
-        elif isinstance(ir, llir.Break):
+        elif type(ir) is llir.Break:
             return self.lower_llir("break;", indent_level)
 
-        elif isinstance(ir, llir.Continue):
+        elif type(ir) is llir.Continue:
             return self.lower_llir("continue;", indent_level)
 
         elif type(ir) is llir.Increment:
@@ -227,10 +347,10 @@ class LLIRLowerer:
                 return self.lower_llir(f"{increment.var.name}++", indent_level)
             return self.lower_llir(f"{increment.var.name}++;", indent_level)
 
-        elif isinstance(ir, llir.Function):
+        elif type(ir) is llir.Function:
             return self.lower_function_definition(ir, indent_level)
 
-        elif isinstance(ir, llir.Return):
+        elif type(ir) is llir.Return:
             return self.lower_llir(
                 f"return {self._render_expression(ir.value)};", indent_level
             )
@@ -244,6 +364,7 @@ class LLIRLowerer:
         ir: llir.Expr,
         indent_level: int = 0,
     ) -> str:
+        self._validate_direct_entry(ir)
         return self.lower_llir(self._render_expression(ir), indent_level)
 
     def _render_expression(self, ir: llir.Expr) -> str:
@@ -275,7 +396,7 @@ class LLIRLowerer:
                 raise CodegenError("QualifiedName.data_type must be a DataType")
             return f"{ir.namespace}::{ir.name}"
 
-        if isinstance(ir, llir.Var):
+        if type(ir) is llir.Var:
             return ir.name
 
         if type(ir) is llir.Cast:
@@ -290,7 +411,7 @@ class LLIRLowerer:
             )
             return f"({ir.data_type.value}) {operand}"
 
-        if isinstance(ir, llir.Sizeof):
+        if type(ir) is llir.Sizeof:
             return f"sizeof({ir.data_type.value})"
 
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
@@ -318,7 +439,7 @@ class LLIRLowerer:
             )
             return f"{left} {binary.op} {right}"
 
-        if isinstance(ir, llir.UnaryOp):
+        if type(ir) is llir.UnaryOp:
             if ir.op not in self._UNARY_OPERATORS:
                 raise CodegenError(f"Unsupported LLIR unary operator: {ir.op!r}")
             operand = self._render_operand(
@@ -432,7 +553,7 @@ class LLIRLowerer:
     def _expression_precedence(self, ir: llir.Expr) -> int:
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
             return self._binary_precedence(cast(llir.BinOp, ir).op)
-        if type(ir) is llir.Cast or isinstance(ir, (llir.UnaryOp, llir.Sizeof)):
+        if type(ir) in (llir.Cast, llir.UnaryOp, llir.Sizeof):
             return self._UNARY_PRECEDENCE
         if (
             type(ir) is llir.FunctionCall
@@ -444,7 +565,7 @@ class LLIRLowerer:
         if (
             type(ir) is llir.Literal
             or type(ir) is llir.QualifiedName
-            or isinstance(ir, llir.Var)
+            or type(ir) is llir.Var
         ):
             return self._PRIMARY_PRECEDENCE
         raise CodegenError(
@@ -479,10 +600,45 @@ class LLIRLowerer:
         ir: Union[llir.WhileLoop, llir.ForLoop, llir.ForLoopAuto],
         indent_level: int = 0,
     ) -> str:
+        self._validate_direct_entry(ir)
         pragma_lines: List[str] = []
-        if isinstance(ir, llir.WhileLoop):
+        if type(ir) is llir.WhileLoop:
+            if type(ir.cond) not in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
+                raise CodegenError("LLIR WhileLoop.cond must be an exact expression")
+            self._validate_statement_sequence(ir.body, "LLIR WhileLoop.body")
             header = f"while ({self.lower_llir(ir.cond)}) {{"
-        elif isinstance(ir, llir.ForLoop):
+        elif type(ir) is llir.ForLoop:
+            if ir.init is not None and type(ir.init) not in (
+                llir.VarInit,
+                llir.VarDecl,
+            ):
+                raise CodegenError(
+                    "LLIR ForLoop.init must be an exact VarInit, VarDecl, or None"
+                )
+            if type(ir.cond) not in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
+                raise CodegenError("LLIR ForLoop.cond must be an exact expression")
+            if type(ir.update) not in (
+                llir.Increment,
+                llir.FunctionCall,
+                llir.Assign,
+            ):
+                raise CodegenError(
+                    "LLIR ForLoop.update must be an exact supported update node"
+                )
+            self._validate_statement_sequence(ir.body, "LLIR ForLoop.body")
+            for field in (
+                "before_parallel_body",
+                "pre_parallel_body",
+                "post_parallel_body",
+            ):
+                value = getattr(ir, field)
+                if value is not None:
+                    self._validate_statement_sequence(value, f"LLIR ForLoop.{field}")
+            if hasattr(ir, "_hoisted_ptr_decls"):
+                self._validate_statement_sequence(
+                    getattr(ir, "_hoisted_ptr_decls"),
+                    "LLIR ForLoop._hoisted_ptr_decls",
+                )
             # Atomic work-stealing: replace for loop with while + atomic counter
             if getattr(ir, "_use_atomic_scheduling", False):
                 chunk_var = ir._atomic_chunk_var
@@ -595,13 +751,20 @@ class LLIRLowerer:
                 f"for ({init_lowered} {self.lower_llir(ir.cond)};"
                 f" {self.lower_llir(ir.update, no_semicolon=True)}) {{"
             )
-        elif isinstance(ir, llir.ForLoopAuto):
+        elif type(ir) is llir.ForLoopAuto:
+            if type(ir.var) is not llir.Var:
+                raise CodegenError("LLIR ForLoopAuto.var must be an exact Var")
+            if type(ir.array) not in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
+                raise CodegenError("LLIR ForLoopAuto.array must be an exact expression")
+            self._validate_statement_sequence(ir.body, "LLIR ForLoopAuto.body")
             header = (
                 f"for ({ir.var.type.value} {self.lower_llir(ir.var)}"
                 f" : {self.lower_llir(ir.array)}) {{"
             )
         else:
-            raise ValueError(f"Unknown loop type: {type(ir)}")
+            raise CodegenError(
+                f"No C++ codegen implemented for LLIR loop type: {type(ir).__name__}"
+            )
 
         loop_text = (
             self.lower_llir(header, indent_level)
@@ -628,6 +791,44 @@ class LLIRLowerer:
         return pragma_text + "\n" + loop_text
 
     def lower_conditional(self, ir: llir.IfThenElse, indent_level: int = 0) -> str:
+        self._validate_direct_entry(ir)
+        if type(ir) is not llir.IfThenElse:
+            raise CodegenError(
+                "conditional emission requires an exact LLIR IfThenElse; got "
+                f"{type(ir).__name__}"
+            )
+        if ir.cond is not None and type(ir.cond) not in (
+            EMITTED_LLIR_EXPRESSION_NODE_TYPES
+        ):
+            raise CodegenError("LLIR IfThenElse.cond must be an exact expression")
+        if ir.then_body is not None:
+            self._validate_statement_sequence(
+                ir.then_body,
+                "LLIR IfThenElse.then_body",
+            )
+        if ir.cond_list is not None:
+            self._validate_expression_sequence(
+                ir.cond_list,
+                "LLIR IfThenElse.cond_list",
+            )
+        if ir.then_body_list is not None:
+            if (
+                type(ir.then_body_list) is not list
+                and type(ir.then_body_list) is not tuple
+            ):
+                raise CodegenError(
+                    "LLIR IfThenElse.then_body_list must be an exact list or tuple"
+                )
+            for branch in ir.then_body_list:
+                self._validate_statement_sequence(
+                    branch,
+                    "LLIR IfThenElse.then_body_list branch",
+                )
+        if ir.else_body is not None:
+            self._validate_statement_sequence(
+                ir.else_body,
+                "LLIR IfThenElse.else_body",
+            )
         result = ""
         if ir.cond_list:
             if not ir.then_body_list:
@@ -693,9 +894,17 @@ class LLIRLowerer:
     def lower_function_definition(
         self, ir: llir.Function, indent_level: int = 0
     ) -> str:
-        if not all(isinstance(arg, llir.Var) for arg in ir.args):
+        self._validate_direct_entry(ir)
+        if type(ir) is not llir.Function:
+            raise CodegenError(
+                "function emission requires an exact LLIR Function; got "
+                f"{type(ir).__name__}"
+            )
+        self._validate_expression_sequence(ir.args, "LLIR Function.args")
+        self._validate_statement_sequence(ir.body, "LLIR Function.body")
+        if not all(type(arg) is llir.Var for arg in ir.args):
             invalid_types = [
-                type(arg).__name__ for arg in ir.args if not isinstance(arg, llir.Var)
+                type(arg).__name__ for arg in ir.args if type(arg) is not llir.Var
             ]
             raise CodegenError(
                 "LLIR Function arguments must be Var nodes; got "

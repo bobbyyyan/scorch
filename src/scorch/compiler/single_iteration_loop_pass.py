@@ -420,9 +420,9 @@ def _rewrite_statement_references(
     """Apply exactly the broader legacy generated-string rewrite scope.
 
     Loop headers and auxiliary parallel bodies, ``WhileLoop``, ``ForLoopAuto``,
-    ``Function``, ``Switch``/``Case``, raw nested statement containers, and
-    unsupported expression containers remain intentionally untouched.  The
-    common detachment performed before this function still validates them.
+    ``Function``, raw nested statement containers, and unsupported expression
+    containers remain intentionally untouched. The common detachment performed
+    before this function still validates them.
     """
 
     for index, statement in enumerate(statements):

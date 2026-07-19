@@ -6,7 +6,7 @@ formerly owned by ``CINLowerer``.  Transform recursion processes direct
 before their containing sequence.  Defined-variable analysis has a distinct
 scope: it additionally enters ``WhileLoop.body`` and nested loop bodies, but
 still omits auxiliary parallel bodies, ``then_body_list``, ``ForLoopAuto``,
-``Function``, ``Switch``/``Case``, and raw nested list/tuple members.
+``Function``, and raw nested list/tuple members.
 
 The common LLIR rewriter first validates and detaches the complete input tree,
 including containers that the semantic transform intentionally omits.  Unknown

@@ -575,9 +575,9 @@ def _rewrite_statement_references(
     """Apply exactly the broader legacy rewrite scope.
 
     Loop headers, auxiliary parallel bodies, WhileLoop, ForLoopAuto, Function,
-    Switch/Case, and unsupported expression containers are deliberately omitted.
-    The common rewrite performed before this function has still validated and
-    detached all of them.
+    and unsupported expression containers are deliberately omitted. The common
+    rewrite performed before this function has still validated and detached all
+    of them.
     """
 
     for index, statement in enumerate(statements):

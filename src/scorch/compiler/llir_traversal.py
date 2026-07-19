@@ -56,7 +56,6 @@ LLIRRewriteValueT = TypeVar(
 
 
 SUPPORTED_LLIR_EXPRESSION_NODE_TYPES: Tuple[Type[llir.Expr], ...] = (
-    llir.GetTensorProperty,
     llir.Var,
     llir.UnaryOp,
     llir.BinOp,
@@ -81,9 +80,6 @@ SUPPORTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
     llir.DirectInit,
     llir.FixedStackArrayDecl,
     llir.Assign,
-    llir.Allocate,
-    llir.Free,
-    llir.Print,
     llir.Comment,
     llir.BlankLine,
     llir.RawStmt,
@@ -95,8 +91,6 @@ SUPPORTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
     llir.ForLoopAuto,
     llir.WhileLoop,
     llir.IfThenElse,
-    llir.Case,
-    llir.Switch,
 )
 
 SUPPORTED_LLIR_NODE_TYPES: Tuple[Type[llir.Node], ...] = (
@@ -666,7 +660,7 @@ class LLIRWalker:
         self._walk_statements(statements, path)
 
     def _walk_for_loop_update(self, update: object, path: LLIRPath) -> None:
-        if type(update) in (llir.Increment, llir.VarInit, llir.Assign):
+        if type(update) in (llir.Increment, llir.Assign):
             self._walk_stmt(cast(llir.Stmt, update), path)
             return
         if type(update) is llir.FunctionCall:
@@ -675,9 +669,7 @@ class LLIRWalker:
         _raise_traversal_error(
             self.context,
             code="invalid_for_loop_update",
-            message=(
-                "ForLoop.update must be Increment, VarInit, FunctionCall, or Assign"
-            ),
+            message=("ForLoop.update must be Increment, FunctionCall, or Assign"),
             path=path,
             value=update,
         )
@@ -780,9 +772,7 @@ class LLIRWalker:
                 value=node,
             )
         self.enter_node(node, path)
-        if node_type is llir.GetTensorProperty:
-            self.visit_get_tensor_property(cast(llir.GetTensorProperty, node), path)
-        elif node_type is llir.Var:
+        if node_type is llir.Var:
             self.visit_var(cast(llir.Var, node), path)
         elif node_type is llir.UnaryOp:
             self.visit_unary_op(cast(llir.UnaryOp, node), path)
@@ -847,12 +837,6 @@ class LLIRWalker:
             )
         elif node_type is llir.Assign:
             self.visit_assign(cast(llir.Assign, node), path)
-        elif node_type is llir.Allocate:
-            self.visit_allocate(cast(llir.Allocate, node), path)
-        elif node_type is llir.Free:
-            self.visit_free(cast(llir.Free, node), path)
-        elif node_type is llir.Print:
-            self.visit_print(cast(llir.Print, node), path)
         elif node_type is llir.Comment:
             self.visit_comment(cast(llir.Comment, node), path)
         elif node_type is llir.BlankLine:
@@ -875,10 +859,6 @@ class LLIRWalker:
             self.visit_while_loop(cast(llir.WhileLoop, node), path)
         elif node_type is llir.IfThenElse:
             self.visit_if_then_else(cast(llir.IfThenElse, node), path)
-        elif node_type is llir.Case:
-            self.visit_case(cast(llir.Case, node), path)
-        elif node_type is llir.Switch:
-            self.visit_switch(cast(llir.Switch, node), path)
         else:
             _raise_traversal_error(
                 self.context,
@@ -888,11 +868,6 @@ class LLIRWalker:
                 value=node,
             )
         self.leave_node(node, path)
-
-    def visit_get_tensor_property(
-        self, node: llir.GetTensorProperty, path: LLIRPath
-    ) -> None:
-        self._walk_expr(node.tensor, path + ("tensor",))
 
     def visit_var(self, node: llir.Var, path: LLIRPath) -> None:
         _validate_tensor_access_metadata(
@@ -1075,16 +1050,6 @@ class LLIRWalker:
             )
         self._walk_expr(node.value, path + ("value",))
 
-    def visit_allocate(self, node: llir.Allocate, path: LLIRPath) -> None:
-        self._walk_expr(node.var, path + ("var",))
-        self._walk_expr(node.num_elements, path + ("num_elements",))
-
-    def visit_free(self, node: llir.Free, path: LLIRPath) -> None:
-        self._walk_expr(node.var, path + ("var",))
-
-    def visit_print(self, node: llir.Print, path: LLIRPath) -> None:
-        self._walk_expr(node.value, path + ("value",))
-
     def visit_comment(self, node: llir.Comment, path: LLIRPath) -> None:
         pass
 
@@ -1148,15 +1113,6 @@ class LLIRWalker:
         if node.then_body_list is not None:
             self._walk_branches(node.then_body_list, path + ("then_body_list",))
         self._walk_optional_statements(node.else_body, path + ("else_body",))
-
-    def visit_case(self, node: llir.Case, path: LLIRPath) -> None:
-        self._walk_expr(node.cond, path + ("cond",))
-        self._walk_statements(node.body, path + ("body",))
-
-    def visit_switch(self, node: llir.Switch, path: LLIRPath) -> None:
-        self._walk_expr(node.cond, path + ("cond",))
-        self._walk_statements(node.cases, path + ("cases",))
-        self._walk_statements(node.default, path + ("default",))
 
 
 class LLIRRewriter:
@@ -1325,11 +1281,11 @@ class LLIRRewriter:
 
     def _rewrite_for_loop_update(
         self, update: object, path: LLIRPath
-    ) -> Union[llir.Increment, llir.VarInit, llir.FunctionCall, llir.Assign]:
-        if type(update) in (llir.Increment, llir.VarInit, llir.Assign):
+    ) -> Union[llir.Increment, llir.FunctionCall, llir.Assign]:
+        if type(update) in (llir.Increment, llir.Assign):
             rewritten = self._rewrite_stmt(cast(llir.Stmt, update), path)
-            if type(rewritten) in (llir.Increment, llir.VarInit, llir.Assign):
-                return cast(Union[llir.Increment, llir.VarInit, llir.Assign], rewritten)
+            if type(rewritten) in (llir.Increment, llir.Assign):
+                return cast(Union[llir.Increment, llir.Assign], rewritten)
             _raise_traversal_error(
                 self.context,
                 code="invalid_rewritten_for_loop_update",
@@ -1351,9 +1307,7 @@ class LLIRRewriter:
         _raise_traversal_error(
             self.context,
             code="invalid_for_loop_update",
-            message=(
-                "ForLoop.update must be Increment, VarInit, FunctionCall, or Assign"
-            ),
+            message=("ForLoop.update must be Increment, FunctionCall, or Assign"),
             path=path,
             value=update,
         )
@@ -1452,10 +1406,6 @@ class LLIRRewriter:
 
     def _rewrite_expr(self, node: llir.Expr, path: LLIRPath) -> llir.Expr:
         node_type = type(node)
-        if node_type is llir.GetTensorProperty:
-            return self.rewrite_get_tensor_property(
-                cast(llir.GetTensorProperty, node), path
-            )
         if node_type is llir.Var:
             return self.rewrite_var(cast(llir.Var, node), path)
         if node_type is llir.UnaryOp:
@@ -1510,12 +1460,6 @@ class LLIRRewriter:
             )
         if node_type is llir.Assign:
             return self.rewrite_assign(cast(llir.Assign, node), path)
-        if node_type is llir.Allocate:
-            return self.rewrite_allocate(cast(llir.Allocate, node), path)
-        if node_type is llir.Free:
-            return self.rewrite_free(cast(llir.Free, node), path)
-        if node_type is llir.Print:
-            return self.rewrite_print(cast(llir.Print, node), path)
         if node_type is llir.Comment:
             return self.rewrite_comment(cast(llir.Comment, node), path)
         if node_type is llir.BlankLine:
@@ -1540,27 +1484,12 @@ class LLIRRewriter:
             return self.rewrite_while_loop(cast(llir.WhileLoop, node), path)
         if node_type is llir.IfThenElse:
             return self.rewrite_if_then_else(cast(llir.IfThenElse, node), path)
-        if node_type is llir.Case:
-            return self.rewrite_case(cast(llir.Case, node), path)
-        if node_type is llir.Switch:
-            return self.rewrite_switch(cast(llir.Switch, node), path)
         _raise_traversal_error(
             self.context,
             code="unknown_llir_node",
             message=f"unsupported LLIR statement type '{node_type.__name__}'",
             path=path,
             value=node,
-        )
-
-    def rewrite_get_tensor_property(
-        self, node: llir.GetTensorProperty, path: LLIRPath
-    ) -> llir.GetTensorProperty:
-        return llir.GetTensorProperty(
-            tensor=self._rewrite_expr(node.tensor, path + ("tensor",)),
-            tensor_property=node.tensor_property,
-            level=node.level,
-            index=node.index,
-            name=node.name,
         )
 
     def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
@@ -1884,22 +1813,6 @@ class LLIRRewriter:
         rewritten.cast = node.cast
         return rewritten
 
-    def rewrite_allocate(self, node: llir.Allocate, path: LLIRPath) -> llir.Allocate:
-        return llir.Allocate(
-            var=self._rewrite_expr(node.var, path + ("var",)),
-            num_elements=self._rewrite_expr(
-                node.num_elements, path + ("num_elements",)
-            ),
-            is_realloc=node.is_realloc,
-            use_calloc=node.use_calloc,
-        )
-
-    def rewrite_free(self, node: llir.Free, path: LLIRPath) -> llir.Free:
-        return llir.Free(self._rewrite_expr(node.var, path + ("var",)))
-
-    def rewrite_print(self, node: llir.Print, path: LLIRPath) -> llir.Print:
-        return llir.Print(self._rewrite_expr(node.value, path + ("value",)))
-
     def rewrite_comment(self, node: llir.Comment, path: LLIRPath) -> llir.Comment:
         return llir.Comment(node.value)
 
@@ -2047,22 +1960,4 @@ class LLIRRewriter:
             cond_list=cast(Optional[List[llir.Expr]], cond_list),
             then_body_list=cast(Optional[List[List[llir.Stmt]]], then_body_list),
             make_last_case_else=node.make_last_case_else,
-        )
-
-    def rewrite_case(self, node: llir.Case, path: LLIRPath) -> llir.Case:
-        cond = self._rewrite_expr(node.cond, path + ("cond",))
-        body = self._rewrite_statements(node.body, path + ("body",))
-        return llir.Case(
-            cond=cond,
-            body=cast(List[llir.Stmt], body),
-        )
-
-    def rewrite_switch(self, node: llir.Switch, path: LLIRPath) -> llir.Switch:
-        cond = self._rewrite_expr(node.cond, path + ("cond",))
-        cases = self._rewrite_statements(node.cases, path + ("cases",))
-        default = self._rewrite_statements(node.default, path + ("default",))
-        return llir.Switch(
-            cond=cond,
-            cases=cast(List[llir.Case], cases),
-            default=cast(List[llir.Stmt], default),
         )
