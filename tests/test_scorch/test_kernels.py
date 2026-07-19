@@ -88,6 +88,40 @@ def test_sparse_to_dense():
     assert b_sparse_to_torch.tolist() == tensor_b_torch.tolist()
 
 
+@pytest.mark.parametrize(
+    ("dense", "expected_positions", "expected_coordinates", "expected_values"),
+    (
+        (
+            torch.tensor(
+                [
+                    [1.0, 0.0, 2.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [3.0, 4.0, 0.0, 5.0],
+                ]
+            ),
+            [0, 2, 2, 5],
+            [0, 2, 0, 1, 3],
+            [1.0, 2.0, 3.0, 4.0, 5.0],
+        ),
+        (torch.empty((0, 4)), [0], [], []),
+    ),
+)
+def test_unary_sparse_copy_uses_fixed_dense_parent_positions(
+    dense,
+    expected_positions,
+    expected_coordinates,
+    expected_values,
+):
+    source = STensor.from_torch(dense, "A").to_sparse("oo")
+
+    result = einsum("ij->ij", source, format="ds")
+
+    assert result.index.mode_indices[1][0].tolist() == expected_positions
+    assert result.index.mode_indices[1][1].tolist() == expected_coordinates
+    assert result.values.tolist() == expected_values
+    assert result.to_torch().tolist() == dense.tolist()
+
+
 def test_to_torch():
     tensor_a_torch = torch.Tensor([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 8, 4])
     tensor_b_torch = torch.Tensor([2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 1, 2.5])
