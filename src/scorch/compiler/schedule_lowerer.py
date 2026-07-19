@@ -33,6 +33,10 @@ _PACKED_STORAGE_CONTEXT = LLIRTraversalContext(
     stage="schedule lowering",
     pass_name="build_packed_storage",
 )
+_HEAP_RESULT_STORAGE_CONTEXT = LLIRTraversalContext(
+    stage="schedule lowering",
+    pass_name="build_heap_result_storage",
+)
 
 
 def _nested_bodies(stmt: llir.Stmt) -> List[List[llir.Stmt]]:
@@ -703,6 +707,42 @@ def _remove_dense_result_zero(function: llir.Function, result: str) -> None:
     del function.body[matches[0]]
 
 
+def _heap_result_storage_declaration(
+    *,
+    storage_name: str,
+    scalar_type: llir.DataType,
+    prefix_dimension_names: Tuple[str, ...],
+    tile_size_name: str,
+) -> llir.DirectInit:
+    """Build one detached typed owner for reusable heap-result storage."""
+
+    if not prefix_dimension_names:
+        raise ValueError("heap-result storage requires a nonempty dense prefix")
+    prefix_dimensions = tuple(
+        llir.Var(prefix_dimension_name, llir.DataType.INT64)
+        for prefix_dimension_name in prefix_dimension_names
+    )
+    prefix_product: llir.Expr = prefix_dimensions[0]
+    for dimension in prefix_dimensions[1:]:
+        prefix_product = llir.Mul(prefix_product, dimension)
+
+    return llir.DirectInit(
+        var=llir.Var(
+            storage_name,
+            llir.DataType.std_vector_type(scalar_type),
+        ),
+        args=(
+            llir.Mul(
+                llir.Cast(prefix_product, llir.DataType.SIZE_T),
+                llir.Cast(
+                    llir.Var(tile_size_name, llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+            ),
+        ),
+    )
+
+
 def _apply_heap_result_tile(
     function: llir.Function,
     schedule: Schedule,
@@ -757,13 +797,21 @@ def _apply_heap_result_tile(
     copy_logical = _unique_name(f"{plan.tile_var}_copy_logical", used_names)
 
     trailing_bound = f"{plan.result}{plan.result_level}_size"
-    prefix_extent = " * ".join(
+    prefix_dimension_names = tuple(
         f"{plan.result}{level}_size" for level in range(plan.result_level)
     )
+    prefix_extent = " * ".join(prefix_dimension_names)
     if not prefix_extent:
         raise NotImplementedError(
             "Heap accumulation requires at least one dense result prefix level"
         )
+    storage_declaration = _heap_result_storage_declaration(
+        storage_name=storage_name,
+        scalar_type=scalar_type,
+        prefix_dimension_names=prefix_dimension_names,
+        tile_size_name=tile_size_name,
+    )
+    LLIRWalker(_HEAP_RESULT_STORAGE_CONTEXT).walk(storage_declaration)
 
     compact_access = llir.ArrayAccess(
         array=llir.Var(
@@ -958,12 +1006,7 @@ def _apply_heap_result_tile(
     )
     tile_container[tile_index:tile_index] = [
         llir.Comment(f"Allocate reusable compact result tile for {plan.result}"),
-        llir.RawStmt(
-            code=(
-                f"std::vector<{scalar_type.value}> {storage_name}("
-                f"(size_t) ({prefix_extent}) * (size_t) {tile_size_name})"
-            )
-        ),
+        storage_declaration,
         llir.VarInit(
             var=llir.Var(compact_name, pointer_type, is_restrict=True),
             value=llir.MemberCall(
