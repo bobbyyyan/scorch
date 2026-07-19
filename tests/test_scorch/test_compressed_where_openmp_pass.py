@@ -1,10 +1,11 @@
 import hashlib
 from collections import Counter
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import re
 from typing import List, Set, Tuple, cast
 
 import pytest
+import torch
 
 from scorch.compiler import llir
 from scorch.compiler import compressed_where_openmp_pass as compressed_where_module
@@ -18,6 +19,7 @@ from scorch.compiler.compressed_where_openmp_pass import (
     transform_compressed_where_for_openmp,
 )
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
+from scorch.format import LevelType
 from scorch.compiler.llir_traversal import (
     LLIRStatementValue,
     LLIRTraversalContext,
@@ -36,6 +38,20 @@ def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Va
     return llir.Var(name=name, type=data_type)
 
 
+def _result_assembler(
+    compressed_levels: Tuple[int, ...] = (1,),
+    *,
+    name: str = "Result",
+    dtype: torch.dtype = torch.float32,
+) -> ResultTensorAssembler:
+    return ResultTensorAssembler(
+        name=name,
+        level_types=(LevelType.DENSE,)
+        + tuple(LevelType.COMPRESSED for _ in compressed_levels),
+        dtype=dtype,
+    )
+
+
 def _context(
     compressed_levels: Tuple[int, ...] = (1,),
     *,
@@ -46,6 +62,7 @@ def _context(
         result_name="Result",
         result_id=result_id,
         compressed_levels=compressed_levels,
+        result_assembler=_result_assembler(compressed_levels),
         workspace_name="wksp",
         workspace_ctype="float",
         policy=policy,
@@ -368,6 +385,25 @@ def _phase_loops(result: CompressedWhereOpenMPResult) -> Tuple[llir.ForLoop, ...
     return loops
 
 
+def _result_assembly_tail(
+    statements: List[llir.Stmt],
+) -> Tuple[llir.VarDecl, llir.Assign, llir.Assign, llir.Return]:
+    tail = statements[-4:]
+    assert [type(statement) for statement in tail] == [
+        llir.VarDecl,
+        llir.Assign,
+        llir.Assign,
+        llir.Return,
+    ]
+    declaration, mode_indices, values, return_statement = tail
+    return (
+        cast(llir.VarDecl, declaration),
+        cast(llir.Assign, mode_indices),
+        cast(llir.Assign, values),
+        cast(llir.Return, return_statement),
+    )
+
+
 def test_policy_context_and_result_are_frozen() -> None:
     policy = CompressedWhereOpenMPPolicy()
     context = _context(policy=policy)
@@ -377,6 +413,8 @@ def test_policy_context_and_result_are_frozen() -> None:
         policy.omp_schedule = "static"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         context.result_name = "Other"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        context.result_assembler = _result_assembler()  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         result.applied = True  # type: ignore[misc]
 
@@ -461,8 +499,23 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     assert any("torch::Tensor Result1_pos_torch" in code for code in top_level_codes)
     assert any("torch::Tensor Result1_crd_torch" in code for code in top_level_codes)
     assert any("torch::Tensor Result_values_torch" in code for code in top_level_codes)
-    assert any(
-        "Tensor Result;" in code and "return Result;" in code
+    declaration, mode_indices, values, return_statement = _result_assembly_tail(
+        result.statements
+    )
+    assert LLIRLowerer().lower_llir(declaration) == "Tensor Result;"
+    assert LLIRLowerer().lower_llir(mode_indices) == (
+        "Result.storage.index.mode_indices = "
+        "{{}, {Result1_pos_torch, Result1_crd_torch}};"
+    )
+    assert LLIRLowerer().lower_llir(values) == (
+        "Result.storage.value = Result_values_torch;"
+    )
+    assert LLIRLowerer().lower_llir(return_statement) == "return Result;"
+    assert not any(
+        "Tensor Result;" in code
+        or "storage.index.mode_indices" in code
+        or "storage.value" in code
+        or "return Result" in code
         for code in top_level_codes
     )
 
@@ -566,11 +619,73 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
     assert "Result2_pos_data[0] = 0" in _assignment_codes(result.statements)
     assert "Result2_pos_data[0] = 0" not in all_codes
     assert _assignment_codes(result.statements).count("Result2_pos_data[0] = 0") == 1
-    assert any(
+    _, mode_indices, _, _ = _result_assembly_tail(result.statements)
+    assert LLIRLowerer().lower_llir(mode_indices) == (
+        "Result.storage.index.mode_indices = "
         "{{}, {Result1_pos_torch, Result1_crd_torch}, "
-        "{Result2_pos_torch, Result2_crd_torch}}" in code
-        for code in all_codes
+        "{Result2_pos_torch, Result2_crd_torch}};"
     )
+
+
+@pytest.mark.parametrize(
+    ("compressed_levels", "expected_mode_indices"),
+    [
+        (
+            (1,),
+            "{{}, {Result1_pos_torch, Result1_crd_torch}}",
+        ),
+        (
+            (1, 2),
+            "{{}, {Result1_pos_torch, Result1_crd_torch}, "
+            "{Result2_pos_torch, Result2_crd_torch}}",
+        ),
+    ],
+)
+def test_compressed_result_assembly_reuses_frozen_abi_epilogue(
+    compressed_levels: Tuple[int, ...],
+    expected_mode_indices: str,
+) -> None:
+    context = _context(compressed_levels)
+    source = [_compatible_loop(_ds_work_body())]
+
+    first = transform_compressed_where_for_openmp(source, context)
+    second = transform_compressed_where_for_openmp(source, context)
+
+    first_tail = list(_result_assembly_tail(first.statements))
+    second_tail = list(_result_assembly_tail(second.statements))
+    expected_tail = [
+        context.result_assembler.emit_result_declaration(),
+        *context.result_assembler.emit_storage_epilogue(),
+    ]
+    expected_cpp = (
+        "Tensor Result;\n"
+        f"Result.storage.index.mode_indices = {expected_mode_indices};\n"
+        "Result.storage.value = Result_values_torch;\n"
+        "return Result;"
+    )
+
+    assert _structural_snapshot(first_tail) == _structural_snapshot(expected_tail)
+    assert _structural_snapshot(second_tail) == _structural_snapshot(first_tail)
+    assert _mutable_ir_ids(first_tail).isdisjoint(_mutable_ir_ids(second_tail))
+    assert _mutable_ir_ids(first_tail).isdisjoint(_mutable_ir_ids(expected_tail))
+    assert LLIRLowerer().lower_llir(first_tail) == expected_cpp
+    assert LLIRLowerer().lower_llir(second_tail) == expected_cpp
+    assert not any(
+        marker in code
+        for code in _raw_codes(first.statements)
+        for marker in (
+            "Tensor Result;",
+            "storage.index.mode_indices",
+            "storage.value",
+            "return Result",
+        )
+    )
+
+    first_modes = cast(llir.Assign, first_tail[1]).value
+    second_modes = cast(llir.Assign, second_tail[1]).value
+    assert first_modes == second_modes
+    assert hash(first_modes) == hash(second_modes)
+    assert first_modes is not second_modes
 
 
 def test_count_fill_state_is_typed_structural_fresh_and_never_raw() -> None:
@@ -1651,18 +1766,24 @@ def test_custom_parallel_policy_is_an_explicit_context_input() -> None:
 
 
 @pytest.mark.parametrize(
-    ("workspace_ctype", "torch_dtype", "pointer_type"),
+    ("workspace_ctype", "result_dtype", "torch_dtype", "pointer_type"),
     [
-        ("float", "torch::kFloat32", llir.DataType.PTR_FLOAT32),
-        ("double", "torch::kFloat64", llir.DataType.PTR_FLOAT64),
-        ("int", "torch::kInt32", llir.DataType.PTR_INT),
-        ("int32_t", "torch::kInt32", llir.DataType.PTR_INT_32),
-        ("int64_t", "torch::kInt64", llir.DataType.PTR_INT_64),
-        ("custom_scalar", "torch::kFloat32", llir.DataType.NO_TYPE),
+        ("float", torch.float32, "torch::kFloat32", llir.DataType.PTR_FLOAT32),
+        ("double", torch.float64, "torch::kFloat64", llir.DataType.PTR_FLOAT64),
+        ("int", torch.int32, "torch::kInt32", llir.DataType.PTR_INT),
+        ("int32_t", torch.int32, "torch::kInt32", llir.DataType.PTR_INT_32),
+        ("int64_t", torch.int64, "torch::kInt64", llir.DataType.PTR_INT_64),
+        (
+            "custom_scalar",
+            torch.float32,
+            "torch::kFloat32",
+            llir.DataType.NO_TYPE,
+        ),
     ],
 )
 def test_workspace_ctype_explicitly_controls_value_allocation(
     workspace_ctype: str,
+    result_dtype: torch.dtype,
     torch_dtype: str,
     pointer_type: llir.DataType,
 ) -> None:
@@ -1670,6 +1791,7 @@ def test_workspace_ctype_explicitly_controls_value_allocation(
         result_name="Result",
         result_id=SymbolId(1),
         compressed_levels=(1,),
+        result_assembler=_result_assembler(dtype=result_dtype),
         workspace_name="wksp",
         workspace_ctype=workspace_ctype,
     )
@@ -1907,6 +2029,7 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
                 result_name="",
                 result_id=SymbolId(1),
                 compressed_levels=(1,),
+                result_assembler=_result_assembler(),
                 workspace_name="wksp",
                 workspace_ctype="float",
             ),
@@ -1918,6 +2041,7 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
                 result_name="Result",
                 result_id=cast(SymbolId, object()),
                 compressed_levels=(1,),
+                result_assembler=_result_assembler(),
                 workspace_name="wksp",
                 workspace_ctype="float",
             ),
@@ -1929,6 +2053,7 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
                 result_name="Result",
                 result_id=SymbolId(1),
                 compressed_levels=(),
+                result_assembler=_result_assembler(),
                 workspace_name="wksp",
                 workspace_ctype="float",
             ),
@@ -1940,6 +2065,7 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
                 result_name="Result",
                 result_id=SymbolId(1),
                 compressed_levels=(2,),
+                result_assembler=_result_assembler(),
                 workspace_name="wksp",
                 workspace_ctype="float",
             ),
@@ -1951,6 +2077,7 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
                 result_name="Result",
                 result_id=SymbolId(1),
                 compressed_levels=(1,),
+                result_assembler=_result_assembler(),
                 workspace_name="",
                 workspace_ctype="float",
             ),
@@ -1962,6 +2089,7 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
                 result_name="Result",
                 result_id=SymbolId(1),
                 compressed_levels=(1,),
+                result_assembler=_result_assembler(),
                 workspace_name="wksp",
                 workspace_ctype="",
             ),
@@ -1973,6 +2101,7 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
                 result_name="Result",
                 result_id=SymbolId(1),
                 compressed_levels=(1,),
+                result_assembler=_result_assembler(),
                 workspace_name="wksp",
                 workspace_ctype="float",
                 policy=CompressedWhereOpenMPPolicy(omp_schedule="", flop_grain="grain"),
@@ -1985,6 +2114,7 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
                 result_name="Result",
                 result_id=SymbolId(1),
                 compressed_levels=(1,),
+                result_assembler=_result_assembler(),
                 workspace_name="wksp",
                 workspace_ctype="float",
                 traversal=LLIRTraversalContext(stage="", pass_name="pass"),
@@ -2004,6 +2134,109 @@ def test_invalid_contexts_fail_structurally(
 
     assert raised.value.diagnostic.code == expected_code
     assert raised.value.diagnostic.path == expected_path
+
+
+def test_result_assembler_context_contract_is_exact_and_fail_closed() -> None:
+    class ResultAssemblerSubclass(ResultTensorAssembler):
+        pass
+
+    mismatched_name = _result_assembler(name="Other")
+    mismatched_levels = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COORDINATE),
+        dtype=torch.float32,
+    )
+    mismatched_dtype = _result_assembler(dtype=torch.float64)
+    forged = _result_assembler()
+    object.__setattr__(forged, "dtype", "float32")
+    missing_field = _result_assembler()
+    object.__delattr__(missing_field, "level_types")
+    cases = (
+        (
+            cast(ResultTensorAssembler, object()),
+            "invalid_compressed_where_result_assembler",
+            ("context", "result_assembler"),
+        ),
+        (
+            mismatched_name,
+            "mismatched_compressed_where_result_assembler",
+            ("context", "result_assembler", "name"),
+        ),
+        (
+            mismatched_levels,
+            "mismatched_compressed_where_result_assembler",
+            ("context", "result_assembler", "level_types"),
+        ),
+        (
+            mismatched_dtype,
+            "mismatched_compressed_where_result_assembler",
+            ("context", "result_assembler", "dtype"),
+        ),
+        (
+            forged,
+            "invalid_compressed_where_result_assembler",
+            ("context", "result_assembler"),
+        ),
+        (
+            missing_field,
+            "invalid_compressed_where_result_assembler",
+            ("context", "result_assembler"),
+        ),
+        (
+            ResultAssemblerSubclass(
+                name="Result",
+                level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+                dtype=torch.float32,
+            ),
+            "invalid_compressed_where_result_assembler",
+            ("context", "result_assembler"),
+        ),
+    )
+
+    for result_assembler, expected_code, expected_path in cases:
+        context = replace(_context(), result_assembler=result_assembler)
+        with pytest.raises(LLIRTraversalError) as raised:
+            transform_compressed_where_for_openmp([llir.Break()], context)
+
+        diagnostic = raised.value.diagnostic
+        assert diagnostic.code == expected_code
+        assert diagnostic.path == expected_path
+        assert diagnostic.stage == context.traversal.stage
+        assert diagnostic.pass_name == context.traversal.pass_name
+
+    missing = _context()
+    object.__delattr__(missing, "result_assembler")
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp([llir.Break()], missing)
+    assert raised.value.diagnostic.code == ("invalid_compressed_where_result_assembler")
+    assert raised.value.diagnostic.path == ("context", "result_assembler")
+
+
+def test_unknown_shared_result_epilogue_node_fails_at_compressed_pass_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnknownResultEpilogue(llir.Stmt):
+        pass
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_storage_epilogue",
+        lambda self: [UnknownResultEpilogue()],
+    )
+    context = _context()
+    source = [_compatible_loop(_ds_work_body())]
+    source_snapshot = _structural_snapshot(source)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(source, context)
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "unknown_llir_node"
+    assert diagnostic.node_type == "UnknownResultEpilogue"
+    assert diagnostic.stage == context.traversal.stage
+    assert diagnostic.pass_name == context.traversal.pass_name
+    assert diagnostic.path[:1] == ("root",)
+    assert _structural_snapshot(source) == source_snapshot
 
 
 @pytest.mark.parametrize(
@@ -2087,6 +2320,23 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     lowered = lowerer.lower_IndexStmt(cin)
     assert type(lowered) is llir.Function
     function = cast(llir.Function, lowered)
+    declaration, mode_indices, values, return_statement = _result_assembly_tail(
+        function.body
+    )
+    assert type(declaration) is llir.VarDecl
+    assert type(mode_indices) is llir.Assign
+    assert type(values) is llir.Assign
+    assert type(return_statement) is llir.Return
+    assert not any(
+        marker in code
+        for code in _raw_codes(function.body)
+        for marker in (
+            "Tensor SparseProduct;",
+            "storage.index.mode_indices",
+            "storage.value",
+            "return SparseProduct",
+        )
+    )
     assert [cast(llir.Var, argument).name for argument in function.args] == [
         "result_shape",
         "SparseLeft_shape",

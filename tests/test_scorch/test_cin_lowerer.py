@@ -1916,6 +1916,39 @@ def test_final_result_storage_assembly_is_structured_typed_and_fresh(
     assert LLIRLowerer().lower_llir(second_return) == "return Result;"
 
 
+def test_result_storage_epilogue_is_the_shared_validated_abi_boundary() -> None:
+    assembler = _result_tensor_assembler(TensorVar("Result", fmt="dss"))
+
+    declaration = assembler.emit_result_declaration()
+    epilogue = assembler.emit_storage_epilogue()
+    full_assembly = assembler.emit_final_assembly()
+
+    assert [type(statement) for statement in epilogue] == [
+        llir.Assign,
+        llir.Assign,
+        llir.Return,
+    ]
+    assert LLIRLowerer().lower_llir(declaration) == "Tensor Result;"
+    assert LLIRLowerer().lower_llir(epilogue) == LLIRLowerer().lower_llir(
+        full_assembly[-3:]
+    )
+    assert declaration is not full_assembly[1]
+    assert all(
+        shared is not ordinary for shared, ordinary in zip(epilogue, full_assembly[-3:])
+    )
+    assert not any(type(statement) is llir.VarInit for statement in epilogue)
+
+    object.__setattr__(assembler, "level_types", (LevelType.DENSE, "compressed"))
+    with pytest.raises(TypeError, match="immutable LevelType tuple"):
+        assembler.validate()
+    with pytest.raises(TypeError, match="immutable LevelType tuple"):
+        assembler.emit_result_declaration()
+    with pytest.raises(TypeError, match="immutable LevelType tuple"):
+        assembler.emit_storage_epilogue()
+    with pytest.raises(TypeError, match="immutable LevelType tuple"):
+        assembler.emit_final_assembly()
+
+
 def test_tensor_storage_value_read_is_structured_typed_and_fresh() -> None:
     tensor = TensorVar("Input", fmt="ds")
     first = cast(llir.VarInit, CINLowerer.get_value_array_statement(tensor))

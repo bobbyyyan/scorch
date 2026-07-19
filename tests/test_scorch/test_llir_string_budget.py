@@ -605,15 +605,65 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 11,
-        "compressed_where_openmp_pass.py": 10,
+        "compressed_where_openmp_pass.py": 9,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 3,
     }
-    assert sum(counts.values()) == 28
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 27
+    assert sum(counts.values()) == 27
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 26
+
+
+def test_compressed_result_assembly_is_owned_by_the_typed_abi_epilogue() -> None:
+    compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
+    compressed_source = compressed_path.read_text()
+    final_assembly = compressed_source.split("def _final_assembly", 1)[1].split(
+        "def _build_transformed_statements", 1
+    )[0]
+    build = compressed_source.split("def _build_transformed_statements", 1)[1].split(
+        "def _transform_compressed_where_for_openmp_managed", 1
+    )[0]
+    abi_source = (_COMPILER_ROOT / "torch_cpp_abi.py").read_text()
+    declaration = abi_source.split("def emit_result_declaration", 1)[1].split(
+        "def emit_storage_epilogue", 1
+    )[0]
+    epilogue = abi_source.split("def emit_storage_epilogue", 1)[1].split(
+        "def emit_final_assembly", 1
+    )[0]
+    final = abi_source.split("def emit_final_assembly", 1)[1]
+
+    assert "llir.RawStmt(" not in final_assembly
+    assert "context.result_assembler.emit_result_declaration()" in final_assembly
+    assert "context.result_assembler.emit_storage_epilogue()" in final_assembly
+    assert "result.extend(_final_assembly(context))" in build
+    for marker in (
+        "Tensor {result_name}",
+        "storage.index.mode_indices",
+        "storage.value",
+        "return {result_name}",
+    ):
+        assert marker not in final_assembly
+
+    assert declaration.count("llir.VarDecl(") == 1
+    assert declaration.count("llir.Var(") == 1
+    assert epilogue.count("llir.Assign(") == 2
+    assert epilogue.count("llir.Return(") == 1
+    assert "tensor_storage_member(" in epilogue
+    assert "self._get_mode_index_set(i, level_type)" in epilogue
+    assert "stmts.extend(self.emit_storage_epilogue())" in final
+
+    lowerer_source = (_COMPILER_ROOT / "cin_lowerer.py").read_text()
+    compressed_context = lowerer_source.split("CompressedWhereOpenMPContext(", 1)[
+        1
+    ].split("workspace_name=workspace_name", 1)[0]
+    assert (
+        compressed_context.count(
+            "result_assembler=_result_tensor_abi_assembler(result_tensor)"
+        )
+        == 1
+    )
 
 
 def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
@@ -649,7 +699,7 @@ def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
     torch_abi_source = (_COMPILER_ROOT / "torch_cpp_abi.py").read_text()
     level_initialization = torch_abi_source.split("def emit_level_indices_init", 1)[
         1
-    ].split("def emit_final_assembly", 1)[0]
+    ].split("def _get_mode_index_set", 1)[0]
     assert "llir.RawStmt(" not in level_initialization
     assert level_initialization.count("llir.DirectInit(") == 1
     assert "data_type=llir.DataType.SIZE_T" in level_initialization

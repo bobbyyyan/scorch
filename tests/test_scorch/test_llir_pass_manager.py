@@ -5,6 +5,7 @@ from time import perf_counter_ns
 from typing import Callable, List, NoReturn, Set, Tuple, cast
 
 import pytest
+import torch
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
@@ -70,6 +71,8 @@ from scorch.compiler.identity import (  # type: ignore[import-untyped]
     IndexId,
     SymbolId,
 )
+from scorch.compiler.torch_cpp_abi import ResultTensorAssembler  # type: ignore[import-untyped]
+from scorch.format import LevelType
 from scorch.compiler.loop_invariant_factor_pass import (  # type: ignore[import-untyped]
     LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     LoopInvariantFactorHoistContext,
@@ -143,6 +146,11 @@ def _compressed_context() -> CompressedWhereOpenMPContext:
         result_name="Result",
         result_id=_RESULT_ID,
         compressed_levels=(1,),
+        result_assembler=ResultTensorAssembler(
+            name="Result",
+            level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+            dtype=torch.float32,
+        ),
         workspace_name="wksp",
         workspace_ctype="float",
     )
@@ -2129,6 +2137,37 @@ def test_compressed_fill_failure_carries_only_completed_count_record(
         (record.pass_name, record.configuration_name, record.sequence_index)
         for record in error.value.completed_run_records
     ] == [("rewrite_result_writes", "count", 0)]
+
+
+def test_compressed_result_epilogue_failure_carries_count_and_fill_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = RuntimeError("synthetic compressed result epilogue failure")
+
+    def fail_result_epilogue(self: ResultTensorAssembler) -> NoReturn:
+        del self
+        raise failure
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_storage_epilogue",
+        fail_result_epilogue,
+    )
+
+    with pytest.raises(LLIRPassPartialFailure) as error:
+        LLIRPassManager().run_compressed_where_openmp(
+            LLIRStatementListArtifact(_compressed_source()),
+            CompressedWhereOpenMPPassSpec(_compressed_context()),
+        )
+
+    assert error.value.failure is failure
+    assert [
+        (record.pass_name, record.configuration_name, record.sequence_index)
+        for record in error.value.completed_run_records
+    ] == [
+        ("rewrite_result_writes", "count", 0),
+        ("rewrite_result_writes", "fill", 1),
+    ]
 
 
 def test_compressed_runner_rejects_malformed_nested_records_without_carrying_them(

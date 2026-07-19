@@ -13,7 +13,7 @@ from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
 from time import perf_counter_ns
 from types import SimpleNamespace
-from typing import Callable, Optional, Tuple, cast
+from typing import Callable, NoReturn, Optional, Tuple, cast
 
 import pytest
 import torch
@@ -4917,6 +4917,51 @@ def test_compressed_where_ordinary_parent_failure_preserves_count_and_fill(
         ("rewrite_result_writes", "count"),
         ("rewrite_result_writes", "fill"),
     ]
+
+
+def test_compressed_where_result_epilogue_failure_stops_before_later_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    context = CompilationContext(options)
+    error = RuntimeError("injected compressed result epilogue failure")
+
+    def fail_result_epilogue(self: ResultTensorAssembler) -> NoReturn:
+        del self
+        raise error
+
+    monkeypatch.setattr(
+        ResultTensorAssembler,
+        "emit_storage_epilogue",
+        fail_result_epilogue,
+    )
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            TensorSpec("ds", (2, 3), name="A"),
+            TensorSpec("ds", (3, 4), name="B"),
+            compile_only=True,
+            format="ds",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [
+        (record.pass_name, record.configuration_name)
+        for record in context.llir_pass_run_records
+    ] == [
+        ("rewrite_result_writes", "count"),
+        ("rewrite_result_writes", "fill"),
+    ]
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
 
 
 def test_compressed_where_success_retains_count_fill_and_all_seven_pass_ids(
