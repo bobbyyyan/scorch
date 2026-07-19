@@ -15489,6 +15489,494 @@ open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not claimed
 formally closed without a separate design-requirement audit. Phase 2 retains its
 recorded canonical closure.
 
+### Phase-3 typed compressed result assembly complete (2026-07-18)
+
+This records only the narrow Phase-3 W15 compressed-result declaration and
+storage-epilogue slice. It does not close the compressed allocation family or
+Phase 3. The exact committed base is
+5ea0dce3334c73a190376530cb416fd3871e01dd. Four ordered scoped commits landed:
+
+- a825ca0a4446bfdf35afeead88ff98e012c750c7,
+  **refactor(compiler): type compressed result assembly**;
+- 50be13f8abd4a6bd8b07cfdba148bc0702404e59,
+  **test(compiler): cover typed compressed result assembly**;
+- f3ad0c7973f6bcf1d5e1e5679a595c2a8e18b513,
+  **fix(compiler): preserve inserted workspace dtype**; and
+- 091e7e9e4a05daf59d299f9865c95ef606a2eaae,
+  **test(compiler): cover inserted workspace dtype**.
+
+None was amended, squashed, reordered, or rewritten. The production commits
+change only cin_lowerer.py, compressed_where_openmp_pass.py,
+torch_cpp_abi.py, and scheduler.py. The test commits change only the seven
+corresponding compiler/kernel test files. The exact 11-path base/candidate diff
+is 642 insertions and 85 deletions; git diff --check 5ea0dce..091e7e9 is
+clean. This handoff is a separate documentation-only commit.
+
+#### Complete preimplementation inventory and W15 selection
+
+The locked starting budget at 5ea0dce was:
+
+- 398 production Var constructors;
+- ten direct expression strings: nine subscripts and one ternary;
+- 14 known indirect sinks/clones;
+- seven generic string rewrites;
+- 28 RawStmt constructors / 27 semantic producers; and
+- six DirectInit constructor templates.
+
+The complete remaining compressed-Where ownership inventory was rechecked:
+
+| Family | Exact role | Decision |
+| --- | --- | --- |
+| W1/W2/W4 | Borrowed worker view and clear member calls | Requires a structured subscript receiver plus member-call statement ownership; remains separate. |
+| W5 | Worker-pool construction, reserve loop, and emplace_back | Compound allocation/loop/member-call lifetime boundary; remains separate. |
+| W6-W9 | Count owners, offset owners, prefix mutation, and terminal totals | Already completed in the preceding narrow slice. |
+| W10 | First-position Torch owner, borrowed int pointer, and copy loop input | Torch allocation plus templated data_ptr ownership; rejected from this slice. |
+| W11 | Compact loop copying offsets into first-position storage | Coupled to W10 and its compact-loop/source policy; rejected. |
+| W12-W14 | Coordinate, deeper-position, and value Torch owners plus borrowed pointers | Generalized Torch allocation/member-call family; rejected. |
+| **W15** | **Tensor result declaration, nested mode-index/value assignments, and return** | **Selected as the smallest complete live family because the ordinary result ABI already owned identical typed operations.** |
+
+W15 was one compound RawStmt that encoded four semantic statements. Existing
+VarDecl, Assign, Member, Array, Return, Var, and DataType nodes already express
+the whole family. Reusing the ordinary frozen result-ABI owner closes the
+declaration/epilogue boundary without inventing a parser, node, hierarchy, or
+second metadata source. W10-W14 were not bundled because they own Torch
+allocation, templated pointer borrowing, and a copy loop rather than final
+Tensor assembly. W1/W2/W4/W5, the seven generic rewrites, parallel zero-fill
+extraction, generalized allocation, and duplicate-generator removal were also
+left untouched.
+
+#### Representation, typing, ownership, validation, and rewrite behavior
+
+ResultTensorAssembler.validate is now the public validation owner and is reused
+by construction and each new emitter. emit_result_declaration returns a fresh
+VarDecl whose exact child is Var(result_name, TACO_TENSOR).
+emit_storage_epilogue returns three fresh statements:
+
+1. Assign to result.storage.index.mode_indices from the existing typed nested
+   Array built from the assembler's exact level types;
+2. Assign result.storage.value from the existing TORCH_TENSOR owner; and
+3. Return a fresh TACO_TENSOR result reference.
+
+emit_final_assembly now reuses these helpers after its ordinary dynamic-buffer
+moves. The compressed path calls only the declaration and storage epilogue:
+W10-W14 already own its Torch buffers, so replaying std::move operations would
+duplicate ownership and is deliberately excluded. The former one RawStmt is
+therefore exactly four typed statements and emits the same spelling for the
+unchanged dtype paths.
+
+CompressedWhereOpenMPContext now requires the exact frozen
+ResultTensorAssembler snapshot. CINLowerer constructs that snapshot from the
+same result tensor that supplies result_name/result_id and routes it into the
+managed compressed pass. Context validation is fail-closed for a missing,
+forged, non-exact, or subclassed assembler; invalid frozen fields; a name
+mismatch; a level-layout mismatch; and a recognized production workspace dtype
+mismatch. The exact supported shape is one dense level followed by the
+context's compressed levels. Recognized float, double, int/int32_t, and
+long-long/int64_t workspace spellings are checked against the result dtype.
+Free-form direct-pass compatibility spellings remain intentionally
+uninterpreted rather than guessed.
+
+Every emitted statement and child is fresh. Repeated helpers produce equal,
+equally hashed, detached trees without sharing mutable IR objects. Existing
+common traversal validates, walks, rewrites, reconstructs, and replacement-
+validates every reused node; unknown children/subclasses and forged fields
+still fail closed. The managed failure owner remains stage **LLIR
+transformation**, pass **transform_compressed_where_for_openmp**, and later
+passes/codegen/build publication remain suppressed after failure. No LLIR
+schema, traversal case, codegen case, ABI signature, cache contract, or public
+API was added.
+
+#### Full-suite failure, upstream dtype correction, and final green closure
+
+The initial implementation/test candidate 50be13f was run from a clean detached
+worktree with pytest-xdist 3.8.0 installed only in the active conda environment.
+No repository dependency file changed. The 18-logical-core M5 command used 12
+workers, file affinity, one OpenMP thread per worker, isolated per-worker
+session/JIT caches, and the non-performance marker:
+
+~~~sh
+PYTHONPATH="$PWD:$PWD/src" \
+PYTEST_ADDOPTS= \
+PYTHONDONTWRITEBYTECODE=1 \
+OMP_NUM_THREADS=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/w15-50be13f/full-run-xdist12/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/w15-50be13f/full-run-xdist12/torch-extensions \
+python -m pytest -q -n 12 --dist loadfile -m "not perf" tests \
+  --basetemp=/Users/bobby/.cache/scorch-codex/w15-50be13f/full-run-xdist12/pytest-basetemp \
+  -o cache_dir=/Users/bobby/.cache/scorch-codex/w15-50be13f/full-run-xdist12/pytest-cache
+~~~
+
+It produced **1 failed, 1,788 passed, 14 skipped, 2 warnings in 638.12
+seconds**. The sole deterministic failure was
+test_matmul_ds_ds_ds_float64_zero_output_rows:
+mismatched_compressed_where_result_assembler. The new boundary exposed that
+Scheduler inserted Workspace without a dtype, silently defaulting a semantic
+float64 result to float32. A direct executable-predecessor reproduction at
+5ea0dce returned an empty float32 values tensor for that semantic float64
+result; the old equality assertion had not checked dtype.
+The first runner and log hash to
+010c485b75e2f7ca84a0bb5aada276cda389e8f415ecb78873c70f476a763175
+and 290599edfc77de2a56732e51c65464a047766cc153472f2e48d1b05179c0a7c0.
+It ran from 2026-07-19T08:59:20Z through 09:09:58Z with exact clean
+50be13f receipts.
+
+The narrow correction was made at the scheduler owner:
+auto-inserted Workspace now receives result_tensor_access.tensor.dtype.
+The fail-closed assembler/workspace check was retained. Scheduler coverage
+locks float32, float64, int32, and int64 propagation; native coverage locks both
+nonempty float64 arithmetic and the previously silent zero-row result dtype.
+The exact correction command was:
+
+~~~sh
+python -m black --check \
+  src/scorch/compiler/scheduler.py \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_kernels.py
+PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS= \
+PYTHONPATH="$PWD:$PWD/src" OMP_NUM_THREADS=1 MAX_JOBS=1 \
+python -m pytest -q \
+  tests/test_scorch/test_scheduler.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_kernels.py::test_matmul_ds_ds_ds_float64 \
+  tests/test_scorch/test_kernels.py::test_matmul_ds_ds_ds_float64_zero_output_rows
+~~~
+
+Black exited 0 with three files unchanged and the inherited Python-3.11 versus
+configured Python-3.15 safety warning; **74 tests passed in 40.20 seconds**.
+
+The final guarded full-suite runner hashes to
+205701eced2d12fd1518d0b1570b2fedc9b81104c6db1ba5a0ef5f188c368c6c.
+It was invoked as:
+
+~~~sh
+bash /Users/bobby/.cache/scorch-codex/w15-50be13f/run_full_suite_final.sh
+~~~
+
+It ran the same 12-worker command at exact clean 091e7e9 from
+2026-07-19T09:19:16Z through 09:29:57Z and produced:
+
+~~~text
+1791 passed, 14 skipped, 2 warnings in 640.18s (0:10:40)
+~~~
+
+The warnings are the two inherited PyTorch sparse-invariant warnings in
+test_autotune_levels.py and test_autotune_learned.py. Revision/status receipts
+are exact and clean before and after. The final log hashes to
+30112286b664459dbbd1ffe0b10a8973fa9ee09c070fd7a563c6ac2de76e5d22.
+No test was retried or substituted. Unlike the earlier DirectInit history
+already recorded above, neither W15 full run involved SIGKILL. Twelve workers
+reduced the former roughly 30-minute serial wall time substantially, but
+isolated per-worker JIT compilation dominates the tail; adding workers is not
+expected to make this suite a 90-second run without a separate cache strategy.
+
+Before the implementation commits, the exact eight-file Black command exited
+0 and the five-file structural/pass command passed **300 tests in 3.62
+seconds**. Its Flake8 probe reported four inherited cin_lowerer findings.
+
+#### Canonical source/build capture and runtime ownership
+
+All capture commands activated scorch first and used logical cd -L under the
+canonical /tmp path. The exact recovered canonical helper hashes were:
+
+- inputs:
+  605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3;
+- grid:
+  a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3;
+- workspace pair:
+  964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59;
+  and
+- Black-formatted tiled workspace:
+  9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff.
+
+The W15 imported-builder helper hashes to
+0b3de352114a39b9be093f07e720b3dd1640631d39018724d12498207d7daaad.
+The final capture was invoked as:
+
+~~~sh
+bash /Users/bobby/.cache/scorch-codex/w15-50be13f/run_capture_gate_final.sh
+~~~
+
+The runner hashes to
+e0eee06c0b360398a0f4e972be1788a8faf8adbf27f5b15e921b879ae91d1021
+and exited 0 from 09:32:42Z through 09:32:48Z; its log hashes to
+ff856d710e39a9d047d0d6f9155f960e5d6b62431ed4d8accc2f675914792f61.
+A retained first attempt exited 1 after proving the live workspace token was
+linked_list_workspace rather than the helper's pre-transform coo_workspace
+expectation. Only that assertion was corrected; both worktrees and the
+canonical extension root were restored, and no native file was created.
+
+The exact base/candidate unchanged source/build anchors were:
+
+| Input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| preamble | 68,671 | db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544 |
+| CSR-by-dense | 2,505 | 36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151 |
+| DS float32 | 7,129 | 971d69c06f3d980a092041816c62a0618713dc4aed41955517135db3a9c0a92d |
+| DSS float32 | 8,684 | 63b2fed89ed0f16c07c5e01797ee973a8b07667b97cb6453d9479a57cbad3e66 |
+| all-COO SDDMM | 3,521 | 53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667 |
+
+The 42-cell grid, workspace-pair manifest, and tiled-workspace manifest are
+byte-identical with SHA-256 values 204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6,
+f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90,
+and 7bc0f70f84d2693f76fdf179b9ae7e684e4fa3ebe93c5d175ec98206a024a5a7.
+The exact base/candidate input manifests hash to
+fca3c653fb33cc485f349880618380edfd282a9874da86f73585c81c1bbef1cb
+and 39131737380cb96abc65bd3fbbfce291144955341801c9d2f86fa28138e8cfeb;
+the comparison hashes to
+6175c86a262c3ee3cc0817742e146c5c42e77e374793c4e9ec5e7e31d1bc0563.
+
+Float64 DS is the one deliberate source/build change caused by the scheduler
+correctness fix:
+
+| Side | Workspace dtype | Bytes / source SHA-256 | Build identity |
+| --- | --- | --- | --- |
+| base | float32 | 7,133 / 2ea818bd2bd107857bd6bf2eb4877dccd61e16af945e96c13835deaa6bbe416e | 6b8c367140f60c2b7bde5ae364f161cedce776988d9765c6465e3f7c042df955 |
+| candidate | float64 | 7,138 / 31e033075a939a0d3bb9f16379f7bbf677edec51ecb2a8a9524794f45099e5d7 | 3f70ad5f01db89cd3e7a302bf0a289fb141e36354015a3bb6b2e67748b9008ce |
+
+Its semantic/codegen cache-key hash remains
+0cdb0406976cd2c9179c47b71bc52d0ccaeed7ebc6a5370ed6724bb3541d3997,
+while source-bearing request/prepared/kernel/build identities change exactly as
+required. The retained M5 and Redwood waivers continue to apply only to the
+byte-identical nonactivating inputs. Their artifacts retain SHA-256 values
+3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246
+and c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d.
+They were not extended to float64 DS.
+Because an active source/build input changed, complete committed-candidate
+native and A/A gates ran on both machines.
+
+#### Native correctness and two-machine noise controls
+
+The exact native command on both machines was:
+
+~~~sh
+pytest -q \
+  tests/test_scorch/test_schedule_generality.py::test_spgemm_default_workspace_and_sparse_assembly_are_unchanged \
+  tests/test_scorch/codegen/test_codegen_perf_optimizations.py::test_parallel_dss_runtime_positions_are_complete_and_monotonic \
+  tests/test_scorch/test_kernels.py::test_matmul_ds_ds_ds_zero_output_columns \
+  tests/test_scorch/test_kernels.py::test_matmul_ds_ds_ds_float64 \
+  tests/test_scorch/test_kernels.py::test_matmul_ds_ds_ds_float64_zero_output_rows
+~~~
+
+The M5 runner hashes to
+cb106022477427f481eecac3b35e7f6a538641aa29ecfb701308c9d81490dec4
+and passed all five tests in **104.41 seconds**. Redwood received an exact Git
+bundle, used remote root
+/scratch/bobbyy/scorch-w15-091e7e9-20260719T0940Z, and passed the same five
+tests in **167.97 seconds**. The remote native runner hashes to
+7d2960113590045f889a2dcb1a10966d7c34c9f97dbb3d2a0082f039144eb638;
+the transfer runner hashes to
+ece2ef1a12c9d70eb56b4a64df27288812208096853127c291901d8929c3dfac.
+
+The generated-kernel A/A command was:
+
+~~~sh
+python tools/benchmark_compiler_ir.py kernel-aa \
+  --warmup 3 --rounds 5 --calls 3 --threads 6 \
+  --output /Users/bobby/.cache/scorch-codex/w15-50be13f/kernel-aa-m5-final/kernel-aa-091e7e9-m5.json
+~~~
+
+M5 used six threads; all 42 cells were correct, all 21 builds completed, and
+the exact machine geomean band was [0.966, 1.035]. The artifact hashes to
+15a0ea0889f8826e00cae7a8cc65c4a33f1477b8fbc8fff0511bd0234c2b3c58.
+Redwood used 24 threads; all 42 cells were correct, all 21 builds completed,
+and the band was [0.973, 1.028]. Its artifact hashes to
+5acd626e04d60cda62dff67ebf81a30b070b6475f1c9266e9d5e698c99dcbcee.
+Its exact command differed only as follows:
+
+~~~sh
+python tools/benchmark_compiler_ir.py kernel-aa \
+  --warmup 3 --rounds 5 --calls 3 --threads 24 \
+  --output /scratch/bobbyy/scorch-w15-091e7e9-20260719T0940Z/kernel-aa/kernel-aa-091e7e9-redwood.json
+~~~
+
+#### Exact-base quality and strict Sphinx comparison
+
+The comparison covered exactly all 11 changed Python paths and invoked:
+
+~~~sh
+python -m black --check \
+  src/scorch/compiler/cin_lowerer.py \
+  src/scorch/compiler/compressed_where_openmp_pass.py \
+  src/scorch/compiler/scheduler.py \
+  src/scorch/compiler/torch_cpp_abi.py \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_compiler_stage_timing.py \
+  tests/test_scorch/test_compressed_where_openmp_pass.py \
+  tests/test_scorch/test_kernels.py \
+  tests/test_scorch/test_llir_pass_manager.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_scheduler.py
+python -m flake8 <the same 11 paths>
+python -m mypy --cache-dir=<isolated-side-cache> <the same 11 paths>
+PYTHONPATH="$PWD:$PWD/src" \
+sphinx-build -n -b html -W --keep-going -E -a \
+  docs/source /Users/bobby/.cache/scorch-codex/w15-50be13f/quality-evidence-final/<side>-html
+~~~
+
+The final runner hashes to
+ba4b88a5a15dc3f0276d75c6e013f4bec872db3b3677a4d64370d51d4577aaba
+and exited 0. An earlier evidence attempt exited at harness gate 88 only
+because it required identical mypy diagnostics; it was retained, and the final
+runner was corrected to require the exact observed two-line test-only delta.
+No source or diagnostic was hidden.
+
+Exact results:
+
+- Black: base 0, candidate 0, identical log SHA-256
+  fe600974ff19c3d90dbbe9e343d7d7360e088f142b46f8ed08387047b1511dbd;
+- Flake8: base 1, candidate 1, the same ten inherited findings, normalized
+  SHA-256
+  34167dcbd5c72dc3fab64d13c19aa1b605ab23dba3da3007c31a3e7e76d31c75;
+- mypy: base 1 with 53 diagnostics and normalized SHA-256
+  73226d0f7afafad75f47390ce5dde4b96238cb08a4e3b99c8b96a76939a284de;
+  candidate 1 with 55 and SHA-256
+  9d092f05a5185bac132e11d0c08d27125882282d2982a106b92d0b55a47b73a9;
+  the only additions are import-untyped diagnostics for new scorch.format
+  imports in test_compressed_where_openmp_pass.py and
+  test_llir_pass_manager.py. They are test-only missing-py.typed findings,
+  not production type errors, and are recorded rather than called inherited;
+- strict Sphinx: base 1, candidate 1, solely the same 23 inherited unresolved-
+  reference warnings, normalized SHA-256
+  f94a84d6406b0d5c270b6b0319ea65b953d373f98595a5b25a142957240b492d;
+  and
+- Sphinx emitted 187 files / 142 non-doctree files on both sides; all
+  non-doctree files are byte-identical with manifest SHA-256
+  4d43f694e7a502377422bde153677f72006226cb637221cc0acee5b0f96e8e5e.
+
+#### Final-candidate compiler latency and complete attribution
+
+Latency ran last, after pytest, capture, native compilation, both A/A controls,
+quality, and Sphinx were idle. The retained executable predecessor is exact
+f61a739:
+
+/Users/bobby/.cache/scorch-codex/w6-w9-f61a739/latency/latency-f61a739-m5.json
+
+It hashes to
+b5a7b8e291b40593b66334f159327dac0fa1c8bb9a0d8dbce491232a0c1ed07b
+and was not regenerated or benchmarked. The exact harness hashes to
+de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383.
+An untimed preparation runner and source-only activation runner exited 0; their
+hashes are fa06c3bce5400266e5a18ad37705a385b5f7bbe70d79dc468644d233baa31029
+and db9ea5a2b4a3e1b7c576407356cd9ce66b6ea3ad59f0c47aab34edd110d8a0ec.
+The activation helper hashes to
+58863c6a49a02c0285da649fc6fc0c864883541a8759ff1eb3cfc9e5698a1ae9.
+
+Every latency case has zero compressed-W15 branch activations, but one ordinary
+emit_final_assembly, emit_result_declaration, and emit_storage_epilogue
+activation. That distinction is binding: the shared helper refactor executes,
+while the compressed storage-only branch does not. All four complete build
+objects are byte-identical to the predecessor:
+
+| Case | Bytes | SHA-256 |
+| --- | ---: | --- |
+| small dense | 70,791 | ae7494ecd994dd398c94b87f9d6921eeedf942c134e04db862d958abb0681217 |
+| reduction | 70,539 | f3dc8c6ba4d3daef7f6a8709bf5131eef9b37946b51a2620619e4223e8af40b5 |
+| CSR intersection | 71,703 | f5a41439108c47d2a9424598367336f796f5cf8574064af43bd515419e5b8e24 |
+| sparse union | 72,515 | e13b4669f5666515374c785fb4ef78e525100e0aa869a2cc31a1f0434548341f |
+
+The exact clean committed-candidate command was:
+
+~~~sh
+PYTHONPATH="$PWD/src" \
+PYTHONDONTWRITEBYTECODE=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/w15-50be13f/latency-final/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/w15-50be13f/latency-input-cache-final/torch-extensions \
+python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 \
+  --samples 30 \
+  --output /Users/bobby/.cache/scorch-codex/w15-50be13f/latency-final/latency-091e7e9-m5.json
+~~~
+
+It ran at exact clean 091e7e9 with Python 3.11.15, Torch 2.13.0, and six Torch
+threads. The input-cache manifest is identical before/after. The runner hashes
+to 1d1e8a0a6cf9cd4deba07c7ffda208abcb26c1948a78616783dbc25d9297d720;
+the result hashes to
+9c53304148999cf5b5fcb237f7cdd8e2d642a5beb6be7ef180d2b5b6443bb888.
+
+The exact 24 endpoint rows are:
+
+| Case / family | p50 old -> new ms | ratio / delta ms | p95 old -> new ms | ratio / delta ms |
+| --- | ---: | ---: | ---: | ---: |
+| small dense / compatibility | 1.553625500 -> 1.573812500 | 1.012993479 / +0.020187000 | 1.772066850 -> 1.806965100 | 1.019693529 / +0.034898250 |
+| small dense / canonical | 1.814646000 -> 1.835333500 | 1.011400295 / +0.020687500 | 2.047822800 -> 2.074352050 | 1.012954856 / +0.026529250 |
+| small dense / extension | 0.261750500 -> 0.262062500 | 1.001191975 / +0.000312000 | 0.292599700 -> 0.299785300 | 1.024557783 / +0.007185600 |
+| reduction / compatibility | 1.415854000 -> 1.433395500 | 1.012389342 / +0.017541500 | 1.558851900 -> 1.519647800 | 0.974850658 / -0.039204100 |
+| reduction / canonical | 1.679521000 -> 1.715395500 | 1.021359959 / +0.035874500 | 1.826585600 -> 1.789791850 | 0.979856542 / -0.036793750 |
+| reduction / extension | 0.261208500 -> 0.261729000 | 1.001992661 / +0.000520500 | 0.281679500 -> 0.283400000 | 1.006108006 / +0.001720500 |
+| CSR intersection / compatibility | 1.749438000 -> 1.711500000 | 0.978314179 / -0.037938000 | 1.910387500 -> 1.814960750 | 0.950048485 / -0.095426750 |
+| CSR intersection / canonical | 2.012771000 -> 1.975396000 | 0.981431072 / -0.037375000 | 2.194851900 -> 2.074452050 | 0.945144431 / -0.120399850 |
+| CSR intersection / extension | 0.263916500 -> 0.261770500 | 0.991868640 / -0.002146000 | 0.288618600 -> 0.284142000 | 0.984489565 / -0.004476600 |
+| sparse union / compatibility | 1.802146000 -> 1.772979000 | 0.983815407 / -0.029167000 | 1.977757850 -> 1.981497700 | 1.001890954 / +0.003739850 |
+| sparse union / canonical | 2.070667000 -> 2.041146000 | 0.985743241 / -0.029521000 | 2.257706250 -> 2.259468750 | 1.000780660 / +0.001762500 |
+| sparse union / extension | 0.262583500 -> 0.267500000 | 1.018723568 / +0.004916500 | 0.291162650 -> 0.291468900 | 1.001051818 / +0.000306250 |
+
+The comparison helper hashes to
+fe7dfefcd7d5343e30435164c06c6fe96d4dc73fcda6e16934d100a274d5b1a2.
+It recomputed all percentiles and validated exact schemas, revisions, worktree
+roots/status, runtime metadata, build objects, and sample counts. Its 24
+endpoint rows and 62 stage rows are stored in a comparison artifact with
+SHA-256
+7d77f571b26fe105fed7b59a9db62604930731e3cf0e5040fa2e9fc26eb2b169.
+Every endpoint is below 1.10; the maximum is 1.024557783 above.
+
+The complete greater-than-1.10 crossing ledger has exactly two rows:
+
+| Case | Compressed/shared activation | Stage / metric | Old -> new ms | Ratio / absolute delta | Attribution |
+| --- | ---: | --- | ---: | ---: | --- |
+| sparse union | 0 / 1 | legacy_cin_adaptation p95 | 0.031397250 -> 0.036568750 | 1.164711878 / 0.005171500 | Pre-helper, source-identical unrelated-stage variance. |
+| CSR intersection | 0 / 1 | llir_to_cpp_generation p95 | 0.099806100 -> 0.110431250 | 1.106457922 / 0.010625150 | Post-helper emission of a byte-identical build object; unrelated-stage variance. |
+
+The directly owned result_abi_assembly stage has a maximum ratio of
+1.085749321 and no crossing. CIN lowering is parent-inclusive and also has no
+crossing. Both reported crossings have small absolute time, occur outside the
+new helper's owning stage, and cannot be attributed to the inactive compressed
+branch. They remain explicitly recorded rather than discarded.
+
+#### Updated locked budget, preserved material, and exact phase status
+
+The exact post-slice budget is:
+
+- 398 production Var constructors;
+- ten direct expression strings: nine subscripts and one ternary;
+- 14 known indirect sinks/clones;
+- seven generic string rewrites;
+- 27 RawStmt constructors / 26 semantic producers, down by exactly one;
+- nine RawStmt constructors in compressed_where_openmp_pass.py;
+- six DirectInit constructor templates, unchanged.
+
+The W10-W14 source span is byte-unchanged with SHA-256
+4d1e548febbf7c936e114bc1b2879646f8844c0764984c799f3704d0353114f9.
+All staging used explicit pathspecs. The user-owned tracked files remained
+unstaged, untouched, and uncommitted with exact working-file hashes:
+
+- .gitignore:
+  301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105;
+- pyproject.toml:
+  191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea;
+- src/scorch/__init__.py:
+  5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845;
+- tests/packaging/smoke_install.py:
+  f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679;
+  and
+- tests/test_scorch/test_resources.py:
+  3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9.
+
+All user-owned untracked autotune, benchmark, GPU, CUDA, SuiteSparse, research,
+scheduler/receipt, scratchpad, test-analysis, tooling, temporary, and literal
+“-” material remains untouched and uncommitted.
+COMPILER_IR_REFACTOR_DESIGN.md and csrc were not modified.
+
+Only the narrow Phase-3 typed W15 compressed result declaration/storage
+epilogue slice is complete. W10-W14 Torch allocation/copy, W1/W2/W4/W5
+workspace member/allocation work, Torch/generalized allocation seams elsewhere,
+the seven generic rewrites, parallel zero-fill typed-pass extraction, and
+unified exhaustive CxxIR emission/duplicate-generator removal remain open.
+Phase 3 remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are
+not claimed formally closed without a separate design-requirement audit.
+Phase 2 retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
