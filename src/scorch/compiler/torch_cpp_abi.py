@@ -483,6 +483,190 @@ class ResultTensorAssembler:
             and self.level_types[level - 1] == LevelType.DENSE
         )
 
+    def emit_first_compressed_position_allocation(
+        self,
+        loop_bound: llir.Var,
+        offsets: llir.Var,
+    ) -> List[llir.Stmt]:
+        """Build and initialize first-level position storage from exact offsets."""
+
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError(
+                "first compressed position allocation requires an exact "
+                "ResultTensorAssembler"
+            )
+        self.validate()
+        if (
+            self.levels < 2
+            or self.level_types[0] is not LevelType.DENSE
+            or any(
+                level_type is not LevelType.COMPRESSED
+                for level_type in self.level_types[1:]
+            )
+        ):
+            raise ValueError(
+                "first compressed position allocation requires one dense level "
+                "followed by one or more compressed levels"
+            )
+
+        if type(loop_bound) is not llir.Var:
+            raise TypeError("first compressed position bound must be an exact LLIR Var")
+        if set(vars(loop_bound)) != {
+            "name",
+            "type",
+            "is_ptr",
+            "is_restrict",
+            "tensor_access",
+        }:
+            raise TypeError(
+                "first compressed position bound must be a complete LLIR Var"
+            )
+        try:
+            bound_name = loop_bound.name
+            bound_type = loop_bound.type
+            bound_is_ptr = loop_bound.is_ptr
+            bound_is_restrict = loop_bound.is_restrict
+            bound_access = loop_bound.tensor_access
+        except AttributeError as failure:
+            raise TypeError(
+                "first compressed position bound must be a complete LLIR Var"
+            ) from failure
+        if type(bound_name) is not str or not bound_name.isidentifier():
+            raise ValueError("first compressed position bound must be an identifier")
+        if bound_type not in (llir.DataType.INT, llir.DataType.INT64):
+            raise TypeError("first compressed position bound must be INT or INT64")
+        if bound_is_ptr is not False:
+            raise TypeError("first compressed position bound cannot be a pointer")
+        if bound_is_restrict is not False:
+            raise TypeError(
+                "first compressed position bound cannot be restrict-qualified"
+            )
+        if bound_access is not None:
+            raise TypeError(
+                "first compressed position bound cannot carry tensor provenance"
+            )
+
+        if type(offsets) is not llir.Var:
+            raise TypeError(
+                "first compressed position offsets must be an exact LLIR Var"
+            )
+        if set(vars(offsets)) != {
+            "name",
+            "type",
+            "is_ptr",
+            "is_restrict",
+            "tensor_access",
+        }:
+            raise TypeError(
+                "first compressed position offsets must be a complete LLIR Var"
+            )
+        try:
+            offsets_name = offsets.name
+            offsets_type = offsets.type
+            offsets_is_ptr = offsets.is_ptr
+            offsets_is_restrict = offsets.is_restrict
+            offsets_access = offsets.tensor_access
+        except AttributeError as failure:
+            raise TypeError(
+                "first compressed position offsets must be a complete LLIR Var"
+            ) from failure
+        if offsets_name != "_offset1":
+            raise ValueError("first compressed position offsets must be named _offset1")
+        if offsets_type is not llir.DataType.STD_VECTOR_INT:
+            raise TypeError(
+                "first compressed position offsets must have STD_VECTOR_INT type"
+            )
+        if offsets_is_ptr is not False:
+            raise TypeError("first compressed position offsets cannot be a pointer")
+        if offsets_is_restrict is not False:
+            raise TypeError(
+                "first compressed position offsets cannot be restrict-qualified"
+            )
+        if offsets_access is not None:
+            raise TypeError(
+                "first compressed position offsets cannot carry tensor provenance"
+            )
+
+        owner_name = f"{self.name}1_pos_torch"
+        pointer_name = f"{self.name}1_pos_data"
+
+        def bound_reference() -> llir.Var:
+            return llir.Var(name=bound_name, type=bound_type)
+
+        def offsets_reference() -> llir.Var:
+            return llir.Var(name=offsets_name, type=offsets_type)
+
+        def owner_reference() -> llir.Var:
+            return llir.Var(name=owner_name, type=llir.DataType.TORCH_TENSOR)
+
+        def pointer_reference() -> llir.Var:
+            return llir.Var(name=pointer_name, type=llir.DataType.PTR_INT)
+
+        def index_reference() -> llir.Var:
+            return llir.Var(name="_i", type=llir.DataType.INT)
+
+        return [
+            llir.VarInit(
+                var=owner_reference(),
+                value=llir.FunctionCall(
+                    name="torch::empty",
+                    args=(
+                        llir.Array(
+                            values=(
+                                llir.Cast(
+                                    expr=llir.Add(
+                                        bound_reference(),
+                                        llir.Literal(1, llir.DataType.INT),
+                                    ),
+                                    data_type=llir.DataType.INT64,
+                                ),
+                            ),
+                            data_type=llir.DataType.INT64,
+                        ),
+                        llir.QualifiedName(
+                            namespace="torch",
+                            name="kInt",
+                            data_type=llir.DataType.TORCH_SCALAR_TYPE,
+                        ),
+                    ),
+                ),
+            ),
+            llir.VarInit(
+                var=pointer_reference(),
+                value=tensor_data_ptr(
+                    owner_reference(),
+                    llir.DataType.INT,
+                ),
+            ),
+            llir.ForLoop(
+                init=llir.VarInit(
+                    var=index_reference(),
+                    value=llir.Literal(0, llir.DataType.INT),
+                ),
+                cond=llir.BinOp(
+                    "<=",
+                    index_reference(),
+                    bound_reference(),
+                ),
+                update=llir.Increment(index_reference()),
+                body=[
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=pointer_reference(),
+                            index=index_reference(),
+                        ),
+                        value=llir.Cast(
+                            expr=llir.ArrayAccess(
+                                array=offsets_reference(),
+                                index=index_reference(),
+                            ),
+                            data_type=llir.DataType.INT,
+                        ),
+                    )
+                ],
+            ),
+        ]
+
     def emit_compressed_coordinate_allocations(
         self,
         total_vars: Tuple[llir.Var, ...],

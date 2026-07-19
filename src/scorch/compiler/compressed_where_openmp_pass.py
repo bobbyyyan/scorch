@@ -1144,30 +1144,16 @@ def _prefix_sum_statements(
 
 
 def _position_and_coordinate_allocations(
-    context: CompressedWhereOpenMPContext, loop_bound: str
+    context: CompressedWhereOpenMPContext,
+    loop_bound: str,
+    loop_bound_type: llir.DataType,
 ) -> List[llir.Stmt]:
-    result_name = context.result_name
     levels = context.compressed_levels
     first_level = levels[0]
-    statements: List[llir.Stmt] = [
-        llir.RawStmt(
-            code=(
-                f"torch::Tensor {result_name}{first_level}_pos_torch = "
-                f"torch::empty({{(long long)({loop_bound} + 1)}}, torch::kInt);\n"
-                f"  int* {result_name}{first_level}_pos_data = "
-                f"{result_name}{first_level}_pos_torch.data_ptr<int>();"
-            ),
-            add_semicolon=False,
-        ),
-        llir.RawStmt(
-            code=(
-                f"for (int _i = 0; _i <= {loop_bound}; _i++) "
-                f"{result_name}{first_level}_pos_data[_i] = "
-                f"(int)_offset{first_level}[_i];"
-            ),
-            add_semicolon=False,
-        ),
-    ]
+    statements = context.result_assembler.emit_first_compressed_position_allocation(
+        _loop_bound_reference(loop_bound, loop_bound_type),
+        _offset_reference(first_level),
+    )
     total_vars = tuple(_total_reference(level) for level in levels)
     statements.extend(
         context.result_assembler.emit_compressed_coordinate_allocations(total_vars)
@@ -1268,7 +1254,13 @@ def _build_transformed_statements(
         )
         result.append(count_loop)
         result.extend(_prefix_sum_statements(context, loop_bound, loop_bound_type))
-        result.extend(_position_and_coordinate_allocations(context, loop_bound))
+        result.extend(
+            _position_and_coordinate_allocations(
+                context,
+                loop_bound,
+                loop_bound_type,
+            )
+        )
         result.append(_value_allocation(context))
         result.append(fill_loop)
         result.extend(_final_assembly(context))
