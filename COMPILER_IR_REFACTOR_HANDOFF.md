@@ -18466,6 +18466,458 @@ LoopIR have not begun. Phases 0 and 1 are not claimed formally closed without
 a separate design-requirement audit. Phase 2 retains its recorded canonical
 closure.
 
+### Phase-3 exact LLIR emission accepted set complete (2026-07-19)
+
+Only the narrow Phase-3 exact **LLIR node-family accepted-set** slice is
+complete in this section. It aligns the declared schema, common traversal, and
+production C++ emitter at the node-family boundary and makes the emitter reject
+unknown node/container subclasses before producing partial output. It does not
+claim complete per-field verifier parity or the unified exhaustive CxxIR
+emission exit review. The exact slice base is
+`743274c1bc790135706b5d84f1af616613930441` and the exact committed candidate
+is `5c6b26efd99550e12441b32fb45f03a500e2349b`. Its ordered commits are:
+
+- `abaa16a3b369f742160b844bde9f5c7194c95501`,
+  **refactor(compiler): align exact LLIR emission set**;
+- `ede8f471e8eb74782bd828e5357dfc4fd00e8b9d`,
+  **test(compiler): lock exact LLIR emission set**; and
+- `5c6b26efd99550e12441b32fb45f03a500e2349b`,
+  **fix(compiler): preserve exact emitter typing**.
+
+No commit was amended, squashed, reordered, or rewritten.
+
+The exact base/candidate diff is 642 insertions and 360 deletions in 16 files:
+`docs/source/compiler/codegen.md`; `codegen.py`; `llir.py`;
+`llir_traversal.py`; five production LLIR passes; and their seven focused test
+files. `git diff --check 743274c..5c6b26e` exited 0. No CIN, scheduling policy,
+kernel ABI, generated C++ spelling, cache schema, csrc, Phase-3.5, or LoopIR
+work is part of this slice.
+
+#### Complete preimplementation inventory and selection
+
+At the exact base, Python reflection found 38 declared concrete LLIR node
+families: 15 expressions and 23 statements. Common traversal accepted all 38,
+but the production emitter could emit only 32. The complete six-family mismatch
+and its disposition were:
+
+| Base family | Base ownership and use | Decision |
+| --- | --- | --- |
+| `GetTensorProperty` | Declared expression with traversal/rewrite reconstruction, but no production producer and no emitter branch. `TensorProperty` existed only for this node. | Remove both the dead node and its sole-use enum. |
+| `Allocate` | Declared statement with traversal/rewrite reconstruction, but no production producer and no emitter branch. Live allocation remains represented by other typed nodes or audited raw compatibility seams. | Remove the dead schema family; do not generalize allocation in this slice. |
+| `Free` | Declared statement with traversal/rewrite reconstruction, but no production producer and no emitter branch. | Remove the dead schema family; live raw lifetime seams remain separately audited. |
+| `Print` | Declared statement with traversal/rewrite reconstruction, but no production producer and no emitter branch. | Remove the dead schema family. |
+| `Case` | Declared statement with traversal/rewrite reconstruction, test fixtures, and an identity-only result-write pass hook, but no semantic production producer and no emitter branch. It was usable only under the equally dead `Switch`. | Remove the dead schema family and its identity-only hook. |
+| `Switch` | Declared statement with traversal/rewrite reconstruction, test fixtures, and an identity-only result-write pass hook, but no semantic production producer and no emitter branch. | Remove the dead schema family and its identity-only hook. |
+
+Repository-wide source, test, and documentation searches found no live semantic
+producer, serialization owner, parser/ABI edge, or generated path for any of
+the six. Their only in-tree behavior was definition, traversal/reconstruction,
+test fixture, stale documentation, or the two identity-only result-write hooks.
+The removal can break undocumented out-of-tree imports, old pickles, or
+reflection that depended on these non-emittable classes; that compatibility
+cost is explicit rather than hidden behind a schema the production compiler
+could never lower.
+
+One additional accepted field role was invalid: `ForLoop.update` admitted
+`VarInit` in its annotation, walker, and rewriter even though rendering a typed
+declaration in a C++ `for` update clause produces invalid C++. The role is now
+exactly `Increment`, `FunctionCall`, or `Assign`; `VarInit` remains supported as
+the loop initializer, where its emitted grammar is valid.
+
+After removal, the exact shared registry is 32 node families: 14 expressions
+(`Var`, `UnaryOp`, `BinOp`, `Add`, `Mul`, `Literal`, `QualifiedName`,
+`FunctionCall`, `Array`, `MemberAccess`, `MemberCall`, `ArrayAccess`, `Cast`,
+and `Sizeof`) and 18 statements (`Increment`, `Return`, `VarDecl`, `VarInit`,
+`DirectInit`, `FixedStackArrayDecl`, `Assign`, `Comment`, `BlankLine`,
+`RawStmt`, `Continue`, `Break`, `Function`, `FunctionCallStmt`, `ForLoop`,
+`ForLoopAuto`, `WhileLoop`, and `IfThenElse`). Reflection, traversal samples,
+and byte-exact emitter samples prove set equality for every family.
+
+This accepted-set mismatch was selected as the smallest coherent remaining
+emission slice because all six dead families had zero semantic production
+ownership and the surviving registry could be locked without changing source
+output. The
+following were deliberately rejected as separate ownership boundaries:
+
+- broad per-field domain parity and an all-node verifier remain part of the
+  unified exhaustive-emission exit review;
+- W14 compressed-Where value ownership needs a scalar-type policy plus an
+  explicit compatibility fallback;
+- W1/W2/W4/W5 workspace allocation/lifetime, remaining Torch/generalized
+  allocation seams, and C8-C10 validation calls each need their own ownership
+  review;
+- the seven generic string rewrites do not share one producer/consumer seam;
+- parallel zero-fill still needs typed-pass extraction plus its activation and
+  performance review; and
+- Phase 3.5 and production LoopIR remain prohibited until every Phase-3
+  deliverable and the exit review are complete.
+
+#### Exact representation, validation, traversal, and ownership behavior
+
+`codegen.py` now exposes `EMITTED_LLIR_EXPRESSION_NODE_TYPES`,
+`EMITTED_LLIR_STATEMENT_NODE_TYPES`, and `EMITTED_LLIR_NODE_TYPES` as the exact
+common traversal registries. Production dispatch uses exact types rather than
+accepting arbitrary subclasses through `isinstance`. Every direct public entry
+to `lower_llir`, `lower_expression`, `lower_loop_construct`,
+`lower_conditional`, or `lower_function_definition` performs one cheap root
+scan before recursive formatting. The scan uses `vars()` over exact accepted
+nodes, so an unknown descendant hidden in any instance field is rejected even
+when a formatting branch would not otherwise inspect that child.
+
+Exact `list` and `tuple` statement roots, including nested mixtures, are
+accepted. A list/tuple subclass, string subclass, unknown `Node` subclass,
+subclass of a supported node, expression in a statement sequence, statement in
+an expression sequence, or unknown nested descendant raises `CodegenError`
+with its exact root path before emission. Exact scalar strings remain only the
+emitter's internal formatting path and are not added to the LLIR schema. Direct
+helper calls enforce the same boundary, so callers cannot bypass it by skipping
+`lower_llir`.
+
+This is intentionally a cheap production trust-boundary scan, not the complete
+LLIR verifier. It establishes exact node/container categories but does not
+generally prove every primitive field domain, exact instance field set, or
+cross-field semantic invariant. Existing node-owned validation still applies;
+closing the remaining field-domain gap is required before the broader
+exhaustive-emission exit review can close.
+
+The emitter is read-only and does not acquire mutable IR ownership. Common
+walker/rewriter support now covers exactly the emitted registry; rewrite tests
+continue to prove equal detached reconstruction, nested list/tuple shape,
+replacement validation, and caller-input preservation for the surviving
+families. The final typing repair changes only the recursive annotation to a
+covariant `Sequence` view while retaining runtime exact-list/tuple checks. It
+also adds the repository's inherited untyped-package import exceptions to two
+tests and types the dynamically fabricated unknown-node fixture; runtime
+acceptance is not widened.
+
+#### Focused, full-suite, source/build, native, and quality verification
+
+All Python-based commands below ran after activating the `scorch` Conda
+environment. The exact focused command was:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_traversal.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_dense_pointer_hoist_pass.py \
+  tests/test_scorch/test_loop_invariant_factor_pass.py \
+  tests/test_scorch/test_result_write_pass.py \
+  tests/test_scorch/test_single_iteration_loop_pass.py \
+  tests/test_scorch/test_sparse_prefetch_pass.py
+```
+
+It produced `786 passed in 4.71s`; the codegen/traversal-only subset produced
+`473 passed`. Tests cover all 32 exact emissions, reflected declared/traversal/
+emitter equality, every declared-node subclass, unknown root and hidden child,
+exact and subclassed strings/lists/tuples, nested category failures, direct
+helper entry, valid tuple roots, the narrowed loop update, and every adjusted
+pass consumer. Black passed on every final changed Python file.
+
+The first exact base/candidate quality attempt at test commit `ede8f47` did its
+job and failed its evidence gate with exit 88: base mypy reported 18 inherited
+errors, candidate mypy reported 36, and the added-error ledger contained 18
+candidate-only diagnostics—15 invariant recursive-list call-site errors plus a
+missing dynamic fixture annotation and two untyped-package imports. Commit
+`5c6b26e` fixed those findings without weakening runtime checks. The focused
+suite remained green afterward.
+
+The authoritative full non-performance run used a clean detached persistent
+worktree and the requested parallel test configuration:
+
+```sh
+TMPDIR=/Users/bobby/.cache/scorch-codex/emitter-5c6b26e/full-suite/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/emitter-5c6b26e/full-suite/torch-extensions \
+OMP_NUM_THREADS=1 MAX_JOBS=1 PYTHONUNBUFFERED=1 \
+python -m pytest -q -n 12 --dist loadfile -m "not perf" tests \
+  --basetemp=/Users/bobby/.cache/scorch-codex/emitter-5c6b26e/full-suite/basetemp \
+  -o cache_dir=/Users/bobby/.cache/scorch-codex/emitter-5c6b26e/full-suite/pytest-cache
+```
+
+It ran from `2026-07-19T21:55:51Z` through `2026-07-19T22:06:14Z` and
+produced `1917 passed, 14 skipped, 2 warnings in 622.79s (0:10:22)`;
+pytest and gate exits were zero. Before/after revisions were exact `5c6b26e`
+and both status receipts were empty. The complete log hashes to
+`2421cc6969d6fb2e03fd1ba7536f3885fb5e6e373017e493423b136f011ca095`.
+An earlier clean pre-fix diagnostic at `ede8f47` also reached
+`1917 passed, 14 skipped, 2 warnings in 642.54s`, but it is not substituted for
+the authoritative final run.
+
+The exact canonical source/build command was:
+
+```sh
+/bin/zsh /Users/bobby/.cache/scorch-codex/emitter-5c6b26e/run_capture_gate.sh
+```
+
+The authoritative gate ran from `2026-07-19T21:50:13Z` through
+`2026-07-19T21:50:20Z` and exited 0 with exact clean base/candidate revisions.
+Base and candidate were byte-identical for all five canonical inputs, all 42
+grid cells and 21 build requests, the workspace pair, and the tiled-workspace
+capture; changed-artifact count was zero. The exact manifests are:
+
+| Capture | SHA-256 |
+| --- | --- |
+| Five canonical input manifest | `2c59bf03b0e5d3e7f3c5be4502b90a59a10aa5ad00c72de196f8c3911f947987` |
+| 42-cell/21-build grid | `4f04139bf1f3e01201dabd0279c1ae95124c1749beb94791c04ba1dde8fc7b5b` |
+| Workspace pair | `e9b60a1b8e1b787480618ffbb5c93947a3849604dd47da1a95bab04448a9cfae` |
+| Tiled workspace | `641fdf973aab8c72d3ea6975c53adad99a218ae1bc04fc8101425a4f925fb346` |
+
+The common preamble hashes to
+`db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544`.
+Exact source hashes are CSR-dense
+`36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151`,
+DS `e914264c94ef57a9572c979231bcaf1593c9ca4e4d44474985fb877040dd4815`,
+DSS `b8549ff394919f38f83d8b76595e0b55334c09c3a637ae2e7e69fc63ba6b850c`,
+all-COO `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667`,
+and DS float64
+`1e26c2282b149542d93fe51f702623b1ffb1c4c42c09a3333783556177eae1cd`.
+Workspace sources hash to
+`5c69621af52939759ffcbaed3649ef1c4461108522b614df8f8a18c86ec0560a`
+and `b1770961d5f9c9c7fd716bd71cb97f1d5e73c6dcf200ba378b97b65c87fbe5d7`;
+the tiled source hashes to
+`2b9d28654e33225e1093500fc861e76f0f67cb241c7ab28b43c05b774d9f7222`.
+The exact helper hashes remain
+`605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3`,
+`a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3`,
+`964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59`,
+and `9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff`.
+The authoritative wrapper hashes to
+`a00eaf1f71ef1008c2abf9311f984739398eccc7dfaa0f241720c5078c8b663d`.
+
+Because `bd94194..743274c` changes only this handoff and the authoritative
+`743274c..5c6b26e` capture is byte-identical, the binding runtime-waiver rule
+applies: rerunning identical binaries would measure only machine noise. The
+retained active native correctness and same-binary controls at `bd94194` are:
+
+- M5 five-test DS/DSS matrix: `5 passed in 117.95s`; native log
+  `824fb1c9f372b02254a0ca294552adae522775343613eae92308842efec3dffb`.
+  Its 42-cell/21-build A/A control used three warmups, five
+  rounds, three calls, and six threads; exact band
+  `[0.9903721919062012, 1.0097214039049984]`, JSON
+  `855fa6974a50a2b27cc8cf3fbc7d308ec9c19745ef4a3acd35cff34c55a9e905`,
+  source/build manifest
+  `9db0e662eb28ea4addf336820a472d7958f16c6a48fec47028996fb6ef3ecb7b`.
+- Redwood five-test DS/DSS matrix: `5 passed in 196.49s`; native log
+  `df568b12b1f47665f623aedb894dd56a9ad784762dbda440f76a00f73a611654`.
+  Its 42-cell/21-build A/A control used three warmups, five
+  rounds, three calls, and 24 threads; exact band
+  `[0.9546134963067668, 1.0475443767229624]`, JSON
+  `e6adb966eb8d30ba600f5a51f727edd666c33d4658704923cadb95fd7ca92209`,
+  source/build manifest
+  `7eed32610d6b94a9937500ae6ac10178ed6bc09a2f24f1c2c518015a9925181d`.
+
+Redwood source, compilation, extension cache, tests, and results stayed under
+`/scratch/bobbyy`; no AFS storage was used. Structural accepted-set activation
+is never waived and is supplied by the focused/reflection suite plus the
+latency activation ledger below.
+
+The final exact quality and strict Sphinx comparison command was:
+
+```sh
+/bin/zsh /Users/bobby/.cache/scorch-codex/emitter-ede8f47/run_quality_sphinx_5c6b26e.sh
+```
+
+It ran from `2026-07-19T21:49:25Z` through `2026-07-19T21:49:54Z` and its
+comparison gate exited 0. Across the exact 15 changed Python files, Black was
+`0/0` with matching log hash
+`72f1dd1d4d1ef3ec68156ee6a687a236539f8fe49c86d491964fb085811c5192`;
+Flake8 was `1/1` with the same one
+inherited `codegen.py` F541 and normalized hash
+`8b3f27c07b395c09f0d35ae49ebe6794c847dbb0cb423a39b10697f23545041f`;
+mypy was `1/1` with the same 18 inherited errors, no additions/removals, and
+normalized hash
+`a84766b4892f279f68530910764f3efef3b04e4cea434d777832efc419e73391`.
+The runner, summary, and complete evidence ledger hash to
+`d7c02207fdded413b411c0d2f591b4e4f8746bc7d3c3480673fa6beda9e92561`,
+`d16f61dd013e6d41993d41917d74eaa621dc475e21921d923f82bb866d9c4061`,
+and `7928a398f3dffdce030ef65c744386ee22a72553869aee7b9588268b16f4369e`
+respectively.
+
+Strict Sphinx used:
+
+```sh
+sphinx-build -n -b html -W --keep-going -E -a docs/source OUT
+```
+
+Base and candidate were `1/1` solely for the same 23 inherited unresolved
+references; normalized warning logs are byte-identical at
+`f94a84d6406b0d5c270b6b0319ea65b953d373f98595a5b25a142957240b492d`.
+Each produced 187 files, 53 HTML pages, and 142 non-doctree files. Exactly the
+intentional `compiler/codegen.html` and `searchindex.js` outputs differ; the
+other 140 non-doctree files are byte-identical. There is no candidate-only
+Sphinx finding.
+
+#### Candidate-only latency activation, crossings, and accepted exception
+
+Latency ran last in the clean isolated candidate worktree after all other work
+was idle. The exact final candidate alone was measured with five warmups and 30
+samples; retained predecessor `bd94194` was read but not executed. The ordered
+commands were:
+
+```sh
+/bin/bash /Users/bobby/.cache/scorch-codex/emitter-5c6b26e/run_latency_activation_gate.sh
+/bin/bash /Users/bobby/.cache/scorch-codex/emitter-5c6b26e/run_latency_benchmark_gate.sh
+/bin/bash /Users/bobby/.cache/scorch-codex/emitter-5c6b26e/run_latency_comparison_v2.sh
+```
+
+The activation gate ran from `2026-07-19T22:07:32Z` through
+`2026-07-19T22:07:40Z` and exited 0. Its manifest hashes to
+`721e0ef3913c9c986b52571bf3ea722509dd335fc49c37e34498cde734bec4fa`
+and locks the 14-expression/18-statement/32-total accepted set at hash
+`8346de68a972559c50bf87c77da468a0082fd18f1d1282661f832b29ad746fe3`.
+Every removed symbol is absent and every case has zero removed
+node occurrences, byte-identical build objects, and exactly one root scan. The
+four case profiles are:
+
+| Case | Validator invocations | Node occurrences | Exact lists | Exact tuples | Strings | Other values |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| small dense | 599 | 146 | 5 | 11 | 115 | 322 |
+| reduction | 512 | 124 | 5 | 10 | 98 | 275 |
+| CSR intersection | 1,040 | 262 | 16 | 25 | 195 | 542 |
+| sparse union | 1,314 | 332 | 28 | 25 | 249 | 680 |
+
+The activation helper and log hash to
+`55df130aa2b446c870f51d3b8afd0bae86399d710e71173c26e863f22f346042`
+and `276491849a132a56e4c4bb3ec9c4d56cb63487bd59be28f32911be1b37fc9409`.
+The prebuilt extension-cache manifest remained unchanged.
+
+The exact benchmark command inside the candidate-only gate was:
+
+```sh
+python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 --output latency-5c6b26e-m5.json
+```
+
+The benchmark ran from `2026-07-19T22:12:48Z` through
+`2026-07-19T22:12:51Z` and exited 0. Candidate artifact
+`848a8eb53525fbd0620e402400d265b2f1062c339f58e0d4852ca606dcdd0dd3`
+was compared with read-only predecessor
+`35120335533a26764c575da5603d65834a8fe6d9f7bd374bfa8d41341b776c10`;
+the harness remained exact at
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+The first combined wrapper then
+exited 1 because its comparison step was stale and incompatible: its temporary
+JSON retained W12 activation fields and its printer raised
+`KeyError("attribution_class")`. That partial artifact
+(`8af6388534cc7e3e8e5015ce5f729688ec024675c22b0b7e7694c9d208cfaed7`)
+is retained only as failure evidence and is not authoritative. The benchmark
+was not rerun.
+
+The comparison-only v2 command ran from `2026-07-19T22:14:42Z` through
+`2026-07-19T22:14:44Z` and reused the immutable predecessor/candidate
+artifacts, supplied the retained printer compatibility field, validated the
+exact-emitter profile, removed the stale fields, and installed the exact
+accepted-set activation block. The built-in comparison exited 1 as expected
+for `INVESTIGATE`; strict comparison and the recovery gate exited 0. The
+authoritative 24-endpoint/62-stage comparison hashes to
+`c8933bc1327e97e9c391184460593c29c7c147d1e391a693448d7539e559026d`;
+helper and runner hashes are
+`b165560d83c7bcdf229ed7086f8805e2b33818551c69f3a5b8ed8c5cfa615e7b`
+and `fc22054b87aeb978488951cab0801e63249fc4aef0d22816f2e2d1a6bbc38bca`.
+
+Every exact ratio above 1.10 is recorded below. `Direct scan` means the
+one-per-root accepted-set scan runs in that stage; `enclosing` means the
+endpoint includes that stage; `outside` means the crossing is in a separately
+timed scope and is not charged to the scan.
+
+| Case | Compiler stage or endpoint | Metric | Old ms | New ms | Ratio | Signed/absolute delta ms | Activation/attribution |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| small dense | `llir_to_cpp_generation` | p50 | 0.054521000 | 0.153500500 | 2.815438088 | +0.098979500 | Direct scan; general fail-closed boundary. |
+| small dense | `llir_to_cpp_generation` | p95 | 0.063756100 | 0.170666300 | 2.676862292 | +0.106910200 | Direct scan; general fail-closed boundary. |
+| reduction | `llir_to_cpp_generation` | p50 | 0.047333500 | 0.134645500 | 2.844613223 | +0.087312000 | Direct scan; general fail-closed boundary. |
+| reduction | `llir_to_cpp_generation` | p95 | 0.053099850 | 0.148014550 | 2.787475859 | +0.094914700 | Direct scan; general fail-closed boundary. |
+| CSR intersection | `llir_to_cpp_generation` | p50 | 0.083374500 | 0.252854000 | 3.032749822 | +0.169479500 | Direct scan; general fail-closed boundary. |
+| CSR intersection | `llir_to_cpp_generation` | p95 | 0.089570500 | 0.282118900 | 3.149685443 | +0.192548400 | Direct scan; general fail-closed boundary. |
+| sparse union | `llir_to_cpp_generation` | p50 | 0.104479500 | 0.330645500 | 3.164692595 | +0.226166000 | Direct scan; general fail-closed boundary. |
+| sparse union | `llir_to_cpp_generation` | p95 | 0.108235350 | 0.713217000 | 6.589501489 | +0.604981650 | Direct stage contains scan, plus correlated late-run tail; not all charged to scan. |
+| CSR intersection | compatible endpoint | p50 | 1.581854500 | 1.764791500 | 1.115647172 | +0.182937000 | Enclosing endpoint contains scan. |
+| CSR intersection | compatible endpoint | p95 | 1.668543450 | 1.897405950 | 1.137163045 | +0.228862500 | Enclosing endpoint contains scan. |
+| CSR intersection | canonical endpoint | p50 | 1.839729000 | 2.030792000 | 1.103853883 | +0.191063000 | Enclosing endpoint contains scan. |
+| CSR intersection | canonical endpoint | p95 | 1.926206250 | 2.166979500 | 1.124998686 | +0.240773250 | Enclosing endpoint contains scan. |
+| sparse union | compatible endpoint | p50 | 1.691729000 | 1.954896000 | 1.155560968 | +0.263167000 | Enclosing endpoint contains scan. |
+| sparse union | compatible endpoint | p95 | 1.813472950 | 3.722854050 | 2.052886452 | +1.909381100 | Enclosing endpoint plus correlated late-run tail. |
+| sparse union | canonical endpoint | p50 | 1.957625500 | 2.219563000 | 1.133803682 | +0.261937500 | Enclosing endpoint contains scan. |
+| sparse union | canonical endpoint | p95 | 2.097318900 | 4.058864400 | 1.935263350 | +1.961545500 | Enclosing endpoint plus correlated late-run tail. |
+| sparse union | canonical endpoint extension | p95 | 0.285889400 | 0.424175000 | 1.483703138 | +0.138285600 | Outside scan; correlated late-run tail. |
+| small dense | scheduling/LoopPlan construction | p95 | 0.262283800 | 0.289377950 | 1.103300890 | +0.027094150 | Outside scan; host/compiler variance. |
+| sparse union | CIN lowering | p95 | 1.269118750 | 2.130914700 | 1.679050680 | +0.861795950 | Outside scan; correlated late-run tail. |
+| sparse union | CIN normalization/verification | p95 | 0.008308150 | 0.016424850 | 1.976956362 | +0.008116700 | Outside scan; correlated late-run tail. |
+| sparse union | frontend validated-op construction | p95 | 0.016278800 | 0.036420950 | 2.237324004 | +0.020142150 | Outside scan; correlated late-run tail. |
+| sparse union | kernel-name/build-request assembly | p95 | 0.388298100 | 0.594368750 | 1.530702185 | +0.206070650 | Outside scan; correlated late-run tail. |
+| sparse union | legacy CIN adaptation | p95 | 0.029845950 | 0.078196500 | 2.620003719 | +0.048350550 | Outside scan; correlated late-run tail. |
+| sparse union | result ABI assembly | p95 | 0.021485750 | 0.045333150 | 2.109917038 | +0.023847400 | Outside scan; correlated late-run tail. |
+
+The exact accepted-set scan adds a measured central cost of
+`0.087312–0.226166 ms` p50. Across 512–1,314 validator invocations it fits
+`0.171498965 us/invocation` with intercept `-3.076729 us` and
+`R²=0.995571459` (`0.646868–0.704129 us/node`). The three p95 cases without
+the sparse tail add `0.0949147–0.1925484 ms` and fit
+`0.187924831 us/invocation` with `R²=0.998287896`. This is a modest,
+explicitly accepted general-infrastructure exception under the binding policy:
+it buys one exhaustive fail-closed emission boundary, does not weaken
+validation, and adds no format-, expression-, or corpus-specific shortcut.
+
+Sparse-union's material p95 movement is not assigned wholesale to that
+exception. Its late samples slow every recorded pre-codegen, direct-codegen,
+and post-codegen scope together; last-12 versus first-18 medians rise across
+all ten recorded scopes. The exact external host cause was not instrumented,
+which remains an evidence limitation, but cross-stage sample correlation and
+byte-identical source/build objects rule out an emitted-source or build-identity
+regression and show that the new scan is not the sole cause. Small-dense and
+reduction endpoints remain below 1.10. No benchmark result was discarded or
+rerun to seek a more favorable sample.
+
+#### Updated locked budget, preserved material, and exact phase status
+
+The production string/raw budget is unchanged from the preceding slice:
+
+- 411 production `Var` constructors;
+- ten direct expression strings: nine subscripts and one ternary;
+- 14 known indirect sinks/clones;
+- seven generic string rewrites;
+- 23 `RawStmt` constructors / 22 semantic producers; and
+- six `DirectInit` constructor templates.
+
+The schema budget changes from 15 expression/23 statement families to
+14 expression/18 statement families, with zero production producers removed.
+The remaining 22 semantic raw producers are C3-C7/C12-C17 (11),
+W1/W2/W4/W5/W14 (five), C8-C10 (three), D1, S1, and P1. A fresh read-only
+ownership audit selected canonical W14 compressed-Where value owner/borrow as
+the next smallest coherent production candidate, with an explicit raw fallback
+for noncanonical direct-pass scalar spellings. That audit did not start
+implementation.
+
+All staging used explicit pathspecs. The five protected tracked files remained
+unstaged, untouched, and uncommitted at their exact hashes:
+
+- `.gitignore`: `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`;
+- `pyproject.toml`: `191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`;
+- `src/scorch/__init__.py`: `5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`;
+- `tests/packaging/smoke_install.py`: `f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`;
+  and
+- `tests/test_scorch/test_resources.py`: `3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+All untracked autotune, benchmark, GPU/CUDA, SuiteSparse, research, scheduler,
+scratchpad, analysis-test, tool, temporary, and literal `-` material remained
+outside every commit. Ignored/untracked `AGENTS.md`, which records the severe
+AFS-space restriction plus Redwood `/scratch/bobbyy` and MKT `/scr/u/bobbyy`
+storage roots, remains uncommitted at
+`52f54c83057325852d44367eea276fa9f66887ca8cf8fd4e26514fd8ca77ae87`.
+The separately authorized AFS cleanup evidence remains under
+`/Users/bobby/.cache/scorch-codex/afs-cleanup-20260719`; reported quota fell
+from 27% to 6% and approximately 1.02 GiB was reclaimed. No compiler gate used
+AFS. `COMPILER_IR_REFACTOR_DESIGN.md` and csrc were not modified.
+
+Only the narrow Phase-3 **exact LLIR node-family accepted-set** slice is
+complete. The broader per-field exhaustive CxxIR-emission exit review remains
+open, as do W14 value ownership, W1/W2/W4/W5 workspace lifetime/allocation,
+remaining Torch/generalized allocation seams, the seven generic rewrites, and
+parallel zero-fill typed-pass extraction. Duplicate-generator removal is
+complete, but those remaining deliverables prevent Phase-3 closure. Phase 3
+remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not
+claimed formally closed without a separate design-requirement audit. Phase 2
+retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
