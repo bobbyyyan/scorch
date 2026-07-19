@@ -103,12 +103,13 @@ class CompressedWhereOpenMPContext:
     remaining output-assembly renderer; standalone pass callers may omit it.
 
     ``result_assembler`` is the frozen Torch/C++ ABI snapshot for the same
-    result.  This pass uses only its typed result declaration and storage
-    epilogue; the compressed allocation path already owns the Torch buffers and
-    must not run the ordinary dynamic-vector moves a second time. Its dtype must
-    agree with every recognized production ``workspace_ctype`` spelling.
-    Free-form direct-pass compatibility spellings remain deliberately
-    uninterpreted by this W15 storage-only boundary.
+    result.  This pass delegates typed compressed-coordinate allocation, the
+    result declaration, and the storage epilogue to that snapshot. The remaining
+    compressed allocation path already owns its Torch buffers and must not run
+    the ordinary dynamic-vector moves a second time. Its dtype must agree with
+    every recognized production ``workspace_ctype`` spelling. Free-form
+    direct-pass compatibility spellings remain deliberately uninterpreted by
+    the storage-only dtype boundary.
     """
 
     result_name: str
@@ -1028,6 +1029,10 @@ def _offset_reference(level: int) -> llir.Var:
     return llir.Var(name=f"_offset{level}", type=llir.DataType.STD_VECTOR_INT)
 
 
+def _total_reference(level: int) -> llir.Var:
+    return llir.Var(name=f"_total{level}", type=llir.DataType.INT64)
+
+
 def _prefix_index_reference() -> llir.Var:
     return llir.Var(name="_i", type=llir.DataType.INT)
 
@@ -1127,7 +1132,7 @@ def _prefix_sum_statements(
         )
     statements.extend(
         llir.VarInit(
-            var=llir.Var(name=f"_total{level}", type=llir.DataType.INT64),
+            var=_total_reference(level),
             value=llir.ArrayAccess(
                 array=_offset_reference(level),
                 index=_loop_bound_reference(loop_bound, loop_bound_type),
@@ -1163,18 +1168,11 @@ def _position_and_coordinate_allocations(
             add_semicolon=False,
         ),
     ]
-    for level in levels:
-        statements.append(
-            llir.RawStmt(
-                code=(
-                    f"torch::Tensor {result_name}{level}_crd_torch = "
-                    f"torch::empty({{(long long)_total{level}}}, torch::kInt);\n"
-                    f"  int* {result_name}{level}_crd_data = "
-                    f"{result_name}{level}_crd_torch.data_ptr<int>();"
-                ),
-                add_semicolon=False,
-            )
+    statements.extend(
+        context.result_assembler.emit_compressed_coordinate_allocations(
+            tuple(_total_reference(level) for level in levels)
         )
+    )
     for parent_level, level in zip(levels, levels[1:]):
         statements.extend(
             [
