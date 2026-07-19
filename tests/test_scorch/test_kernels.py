@@ -972,6 +972,21 @@ def test_matmul_ds_ds_ds_zero_output_columns():
     assert torch.equal(result.to_torch(in_place=False), left_torch @ right_torch)
 
 
+def test_matmul_ds_ds_ds_float64_zero_output_rows():
+    left_torch = torch.empty((0, 4), dtype=torch.float64)
+    right_torch = torch.arange(12, dtype=torch.float64).reshape(4, 3)
+    left = STensor.from_torch(left_torch, "ZeroRowFloat64Left").to_sparse("ds")
+    right = STensor.from_torch(right_torch, "ZeroRowFloat64Right").to_sparse("ds")
+
+    result = matmul(left, right, output_format="ds", use_cache=False)
+    positions, coordinates = result.storage.index.mode_indices[1]
+
+    assert tuple(result.shape) == (0, 3)
+    assert positions.tolist() == [0]
+    assert coordinates.numel() == result.values.numel() == 0
+    assert torch.equal(result.to_torch(in_place=False), left_torch @ right_torch)
+
+
 def test_spmm_ss_dd_dd_ikj_gustavson():
     i = IndexVar("i")
     j = IndexVar("j")

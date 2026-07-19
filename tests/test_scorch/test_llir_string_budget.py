@@ -94,6 +94,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "expr.name.replace(old, new)",
         "f'{prefix}{level}'",
         "invariant_name",
+        "loop_bound",
         "name",
         "node.name",
         "prefix_extent",
@@ -122,7 +123,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert constructor_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 139,
-        "compressed_where_openmp_pass.py": 12,
+        "compressed_where_openmp_pass.py": 16,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -134,11 +135,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 59,
     }
-    assert sum(constructor_counts.values()) == 394
+    assert sum(constructor_counts.values()) == 398
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 131,
-        "compressed_where_openmp_pass.py": 12,
+        "compressed_where_openmp_pass.py": 16,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -150,10 +151,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 59,
     }
-    assert sum(unclassified_counts.values()) == 384
+    assert sum(unclassified_counts.values()) == 388
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
+        ("compressed_where_openmp_pass.py", "loop_bound"): 1,
         ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
         ("llir_traversal.py", "node.name"): 1,
@@ -164,7 +166,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 13
+    assert sum(known_indirect.values()) == 14
 
     assert totals == {
         "subscript": 9,
@@ -603,15 +605,15 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 11,
-        "compressed_where_openmp_pass.py": 14,
+        "compressed_where_openmp_pass.py": 10,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 3,
     }
-    assert sum(counts.values()) == 32
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 31
+    assert sum(counts.values()) == 28
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 27
 
 
 def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
@@ -624,11 +626,12 @@ def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
     counts += Counter()
 
     assert counts == {
+        "compressed_where_openmp_pass.py": 2,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 2,
         "torch_cpp_abi.py": 1,
     }
-    assert sum(counts.values()) == 4
+    assert sum(counts.values()) == 6
 
     schedule_source = (_COMPILER_ROOT / "schedule_lowerer.py").read_text()
     heap_result = schedule_source.split("def _apply_heap_result_tile", 1)[1].split(
@@ -819,29 +822,133 @@ def test_compressed_phase_state_cannot_return_to_raw_statements() -> None:
     assert previous_assignments == 2
 
 
-def test_compressed_fill_base_loads_are_structured_and_total_loads_stay_raw() -> None:
-    """Lock W3 without absorbing the separately blocked W9 bound seam."""
+def test_compressed_offset_family_is_structured() -> None:
+    """Lock the exact W3 and W6-W9 production templates outside RawStmt."""
 
     path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
-    raw_base_violations: list[tuple[int, str]] = []
-    raw_total_producers: list[tuple[int, str]] = []
-    for call in _llir_constructor_calls(path, "RawStmt"):
-        spelling = ast.unparse(call)
-        if "_base{level}" in spelling or (
-            "_offset{level}" in spelling and "loop_var" in spelling
-        ):
-            raw_base_violations.append((call.lineno, spelling))
-        if "_total{level}" in spelling and "_offset{level}" in spelling:
-            raw_total_producers.append((call.lineno, spelling))
+    tree = ast.parse(path.read_text())
 
-    base_initializers: list[dict[str, ast.expr]] = []
-    for call in _llir_constructor_calls(path, "VarInit"):
-        fields = {
+    def fields(call: ast.Call) -> dict[str, ast.expr]:
+        return {
             keyword.arg: keyword.value
             for keyword in call.keywords
             if keyword.arg is not None
         }
-        target = fields.get("var")
+
+    def calls(function: ast.FunctionDef, constructor: str) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == constructor
+        ]
+
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    count_builder = functions["_count_and_offset_statements"]
+    prefix_builder = functions["_prefix_sum_statements"]
+    prefix_loop_builder = functions["_prefix_sum_loop"]
+
+    raw_violations: list[tuple[int, str]] = []
+    for call in _llir_constructor_calls(path, "RawStmt"):
+        spelling = ast.unparse(call)
+        fragments = _static_string_fragments(call)
+        if any(
+            marker in fragments
+            for marker in (
+                "_base{level}",
+                "std::vector<int> _count{level}",
+                "std::vector<int64_t> _offset{level}",
+                "_offset{level}[_i + 1]",
+                "int64_t _total{level} = _offset{level}[",
+            )
+        ):
+            raw_violations.append((call.lineno, spelling))
+
+    count_initializations = calls(count_builder, "DirectInit")
+    offset_initializations = calls(prefix_builder, "DirectInit")
+    prefix_loops = calls(prefix_loop_builder, "ForLoop")
+    total_initializations = [
+        call
+        for call in calls(prefix_builder, "VarInit")
+        if "_total" in _static_string_fragments(call)
+    ]
+
+    assert raw_violations == []
+    assert len(count_initializations) == 1
+    assert len(offset_initializations) == 1
+    assert len(prefix_loops) == 1
+    assert len(total_initializations) == 1
+
+    count_fields = fields(count_initializations[0])
+    assert set(count_fields) == {"var", "args"}
+    assert ast.unparse(count_fields["var"]) == "_count_reference(level)"
+    assert isinstance(count_fields["args"], ast.Tuple)
+    count_args = count_fields["args"].elts
+    assert len(count_args) == 2
+    assert ast.unparse(count_args[0]) == (
+        "llir.Cast(_loop_bound_reference(loop_bound, loop_bound_type), "
+        "llir.DataType.SIZE_T)"
+    )
+    assert ast.unparse(count_args[1]) == "llir.Literal(0, llir.DataType.INT)"
+
+    offset_fields = fields(offset_initializations[0])
+    assert set(offset_fields) == {"var", "args"}
+    assert ast.unparse(offset_fields["var"]) == "_offset_reference(level)"
+    assert isinstance(offset_fields["args"], ast.Tuple)
+    offset_args = offset_fields["args"].elts
+    assert len(offset_args) == 1
+    assert ast.unparse(offset_args[0]) == (
+        "llir.Add(llir.Cast(_loop_bound_reference(loop_bound, loop_bound_type), "
+        "llir.DataType.SIZE_T), llir.Literal(1, llir.DataType.INT))"
+    )
+
+    loop_fields = fields(prefix_loops[0])
+    assert set(loop_fields) == {"init", "cond", "update", "body"}
+    assert ast.unparse(loop_fields["init"]) == (
+        "llir.VarInit(var=_prefix_index_reference(), "
+        "value=llir.Literal(0, llir.DataType.INT))"
+    )
+    assert ast.unparse(loop_fields["cond"]) == (
+        "llir.BinOp('<', _prefix_index_reference(), "
+        "_loop_bound_reference(loop_bound, loop_bound_type))"
+    )
+    assert ast.unparse(loop_fields["update"]) == (
+        "llir.Increment(_prefix_index_reference())"
+    )
+    assert len(calls(prefix_loop_builder, "Assign")) == 1
+    assert len(calls(prefix_loop_builder, "ArrayAccess")) == 3
+    assert len(calls(prefix_loop_builder, "Add")) == 2
+    assert len(calls(prefix_loop_builder, "Increment")) == 1
+    assert (
+        len(
+            [
+                call
+                for call in ast.walk(prefix_loop_builder)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_prefix_index_reference"
+            ]
+        )
+        == 6
+    )
+
+    total_fields = fields(total_initializations[0])
+    assert set(total_fields) == {"var", "value"}
+    assert ast.unparse(total_fields["var"]) == (
+        "llir.Var(name=f'_total{level}', type=llir.DataType.INT64)"
+    )
+    assert ast.unparse(total_fields["value"]) == (
+        "llir.ArrayAccess(array=_offset_reference(level), "
+        "index=_loop_bound_reference(loop_bound, loop_bound_type))"
+    )
+
+    base_initializers: list[dict[str, ast.expr]] = []
+    for call in _llir_constructor_calls(path, "VarInit"):
+        initializer_fields = fields(call)
+        target = initializer_fields.get("var")
         if target is None or not _is_llir_constructor(target, "Var"):
             continue
         assert isinstance(target, ast.Call)
@@ -849,15 +956,13 @@ def test_compressed_fill_base_loads_are_structured_and_total_loads_stay_raw() ->
         if name_expression is not None and "_base" in _static_string_fragments(
             name_expression
         ):
-            base_initializers.append(fields)
+            base_initializers.append(initializer_fields)
 
-    assert raw_base_violations == []
-    assert len(raw_total_producers) == 1
     assert len(base_initializers) == 1
 
-    fields = base_initializers[0]
-    assert set(fields) == {"var", "value"}
-    target = fields["var"]
+    base_fields = base_initializers[0]
+    assert set(base_fields) == {"var", "value"}
+    target = base_fields["var"]
     assert isinstance(target, ast.Call)
     target_fields = {
         keyword.arg: keyword.value
@@ -867,7 +972,7 @@ def test_compressed_fill_base_loads_are_structured_and_total_loads_stay_raw() ->
     assert ast.unparse(target_fields["name"]) == "f'_base{level}'"
     assert ast.unparse(target_fields["type"]) == "llir.DataType.INT64"
 
-    value = fields["value"]
+    value = base_fields["value"]
     assert _is_llir_constructor(value, "ArrayAccess")
     assert isinstance(value, ast.Call)
     access_fields = {

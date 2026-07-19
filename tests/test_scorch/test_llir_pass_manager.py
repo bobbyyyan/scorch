@@ -226,6 +226,38 @@ def _structural_snapshot(value: object) -> object:
     return value
 
 
+def _compressed_offset_family(statements: List[llir.Stmt]) -> List[llir.Stmt]:
+    """Select the generated W6--W9 level-one family in structural order."""
+
+    selected: List[llir.Stmt] = []
+    for statement in statements:
+        if type(statement) is llir.DirectInit and statement.var.name in (
+            "_count1",
+            "_offset1",
+        ):
+            selected.append(statement)
+            continue
+        if type(statement) is llir.Assign:
+            target = statement.var
+            if (
+                type(target) is llir.ArrayAccess
+                and type(target.array) is llir.Var
+                and target.array.name == "_offset1"
+                and type(target.index) is llir.Literal
+                and target.index.value == 0
+            ):
+                selected.append(statement)
+            continue
+        if type(statement) is llir.ForLoop:
+            init = statement.init
+            if type(init) is llir.VarInit and init.var.name == "_i":
+                selected.append(statement)
+            continue
+        if type(statement) is llir.VarInit and statement.var.name == "_total1":
+            selected.append(statement)
+    return selected
+
+
 def _record(duration_ns: int) -> LLIRPassRunRecord:
     return LLIRPassRunRecord(
         sequence_index=0,
@@ -1239,6 +1271,7 @@ def test_production_pipeline_preserves_applied_compressed_order_and_policy(
     nested_source_ids: List[int] = []
     nested_modes: List[str] = []
     assembly_modes: List[bool] = []
+    assembled_offset_family: List[List[llir.Stmt]] = []
     original_result_write = LLIRPassManager.run_result_write
 
     def observe_result_write(
@@ -1257,6 +1290,24 @@ def test_production_pipeline_preserves_applied_compressed_order_and_policy(
         compressed_output_parallel: bool,
     ) -> LLIRRewriteArtifact[List[llir.Stmt]]:
         assembly_modes.append(compressed_output_parallel)
+        family = _compressed_offset_family(artifact.statements)
+        assert [type(statement) for statement in family] == [
+            llir.DirectInit,
+            llir.DirectInit,
+            llir.Assign,
+            llir.ForLoop,
+            llir.VarInit,
+        ]
+        assert [
+            cast(llir.DirectInit, statement).var.name for statement in family[:2]
+        ] == ["_count1", "_offset1"]
+        assert [
+            len(cast(llir.DirectInit, statement).args) for statement in family[:2]
+        ] == [2, 1]
+        prefix_loop = cast(llir.ForLoop, family[3])
+        assert len(prefix_loop.body) == 1
+        assert type(prefix_loop.body[0]) is llir.Assign
+        assembled_offset_family.append(family)
         return LLIRRewriteArtifact(artifact.statements)
 
     monkeypatch.setattr(
@@ -1303,6 +1354,14 @@ def test_production_pipeline_preserves_applied_compressed_order_and_policy(
     assert all(record.verified_after is verified for record in result.run_records)
     assert all(record.duration_ns is not None for record in result.run_records)
     assert result.compressed_output_parallel is True
+    assert len(assembled_offset_family) == 1
+    final_offset_family = _compressed_offset_family(result.artifact.value)
+    assert _structural_snapshot(final_offset_family) == _structural_snapshot(
+        assembled_offset_family[0]
+    )
+    assert _mutable_ir_ids(final_offset_family).isdisjoint(
+        _mutable_ir_ids(assembled_offset_family[0])
+    )
 
 
 def test_production_pipeline_nested_fill_failure_preserves_count_and_stops_later_work(

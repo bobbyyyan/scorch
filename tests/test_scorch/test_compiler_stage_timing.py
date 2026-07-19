@@ -4640,6 +4640,158 @@ def test_malformed_compressed_base_load_fails_owner_and_stops_later_work(
     assert suppressed.value.diagnostic.code == "failed_compilation"
 
 
+def test_malformed_compressed_offset_init_fails_owner_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _default_options()
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    specs = (
+        TensorSpec("ds", (2, 3), name="A"),
+        TensorSpec("ds", (3, 4), name="B"),
+    )
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    context = CompilationContext(options)
+    injected: list[
+        tuple[
+            str,
+            llir.DataType,
+            llir.DataType,
+            str,
+            llir.DataType,
+            int,
+            llir.DataType,
+        ]
+    ] = []
+    injected_paths: list[Tuple[str, ...]] = []
+
+    class InjectingWalker(LLIRWalker):
+        def enter_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if (
+                type(node) is llir.DirectInit
+                and node.var.name == "_offset1"
+                and not injected
+            ):
+                initializer = cast(llir.DirectInit, node)
+                argument = cast(llir.Add, initializer.args[0])
+                bound_cast = cast(llir.Cast, argument.left)
+                bound = cast(llir.Var, bound_cast.expr)
+                increment = cast(llir.Literal, argument.right)
+                injected.append(
+                    (
+                        initializer.var.name,
+                        initializer.var.type,
+                        bound_cast.data_type,
+                        bound.name,
+                        bound.type,
+                        cast(int, increment.value),
+                        cast(llir.DataType, increment.data_type),
+                    )
+                )
+                injected_paths.append(path)
+                object.__setattr__(argument, "op", "-")
+            super().enter_node(node, path)
+
+    monkeypatch.setattr(compressed_where_module, "LLIRWalker", InjectingWalker)
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_sparse_prefetch",
+                "sparse_prefetch",
+            ),
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_dense_pointer_hoist",
+                "dense_pointer_hoist",
+            ),
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_single_iteration_loop_elimination",
+                "single_iteration",
+            ),
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_loop_invariant_factor_hoist",
+                "factor_hoist",
+            ),
+            (
+                llir_pass_manager.LLIRPassManager,
+                "run_dynamic_vector_access",
+                "dynamic_vector",
+            ),
+            (schedule_lowerer, "apply_schedule_to_llir", "schedule_lowering"),
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ik,kj->ij",
+            *specs,
+            compile_only=True,
+            format="ds",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert injected == [
+        (
+            "_offset1",
+            llir.DataType.STD_VECTOR_INT,
+            llir.DataType.SIZE_T,
+            "A0_size",
+            llir.DataType.INT,
+            1,
+            llir.DataType.INT,
+        )
+    ]
+    assert injected_paths == [("root", "[4]")]
+    assert diagnostic.code == "invalid_add_operator"
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "transform_compressed_where_for_openmp"
+    assert diagnostic.path == ("root", "[4]", "args", "[0]", "op")
+    assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
+    assert [
+        (record.pass_name, record.configuration_name)
+        for record in context.llir_pass_run_records
+    ] == [
+        ("rewrite_result_writes", "count"),
+        ("rewrite_result_writes", "fill"),
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == [
+        0,
+        1,
+    ]
+    assert all(record.duration_ns >= 0 for record in context.llir_pass_run_records)
+    assert later_calls == []
+    assert context.compile_options is options
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.SCHEDULE_LOWERING,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
 @pytest.mark.parametrize(
     ("failed_mode", "expected_configurations"),
     [("count", []), ("fill", ["count"])],

@@ -63,13 +63,14 @@ def _compatible_loop(
     body: List[llir.Stmt],
     *,
     bound: str = "A0_size",
+    bound_type: llir.DataType = llir.DataType.INT64,
     cond_op: str = "<",
     update: llir.Assign | None = None,
 ) -> llir.ForLoop:
     row = _var("row", llir.DataType.INT)
     return llir.ForLoop(
         init=llir.VarInit(row, llir.Literal(0)),
-        cond=llir.BinOp(cond_op, row, _var(bound, llir.DataType.INT64)),
+        cond=llir.BinOp(cond_op, row, _var(bound, bound_type)),
         update=update or llir.Increment(_var("row", llir.DataType.INT)),
         body=body,
     )
@@ -175,6 +176,21 @@ def _assignments(value: object) -> List[llir.Assign]:
     return assignments
 
 
+def _offset_zero_assignments(value: object) -> List[llir.Assign]:
+    return [
+        assignment
+        for assignment in _assignments(value)
+        if type(assignment.var) is llir.ArrayAccess
+        and type(cast(llir.ArrayAccess, assignment.var).array) is llir.Var
+        and re.fullmatch(
+            r"_offset\d+",
+            cast(llir.Var, cast(llir.ArrayAccess, assignment.var).array).name,
+        )
+        and type(cast(llir.ArrayAccess, assignment.var).index) is llir.Literal
+        and cast(llir.Literal, cast(llir.ArrayAccess, assignment.var).index).value == 0
+    ]
+
+
 def _direct_initializations(value: object) -> List[llir.DirectInit]:
     declarations: List[llir.DirectInit] = []
     if type(value) is llir.DirectInit:
@@ -186,6 +202,70 @@ def _direct_initializations(value: object) -> List[llir.DirectInit]:
         for child in value:
             declarations.extend(_direct_initializations(child))
     return declarations
+
+
+def _offset_family_direct_initializations(value: object) -> List[llir.DirectInit]:
+    return [
+        declaration
+        for declaration in _direct_initializations(value)
+        if re.fullmatch(r"_(?:count|offset)\d+", declaration.var.name)
+    ]
+
+
+def _prefix_sum_loops(value: object) -> List[llir.ForLoop]:
+    loops: List[llir.ForLoop] = []
+    if type(value) is llir.ForLoop:
+        loop = cast(llir.ForLoop, value)
+        if (
+            type(loop.init) is llir.VarInit
+            and cast(llir.VarInit, loop.init).var.name == "_i"
+            and not loop.omp_parallel_for
+        ):
+            loops.append(loop)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            loops.extend(_prefix_sum_loops(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            loops.extend(_prefix_sum_loops(child))
+    return loops
+
+
+def _total_offset_loads(value: object) -> List[llir.VarInit]:
+    loads: List[llir.VarInit] = []
+    if type(value) is llir.VarInit:
+        initializer = cast(llir.VarInit, value)
+        access = initializer.value
+        if (
+            re.fullmatch(r"_total\d+", initializer.var.name)
+            and type(access) is llir.ArrayAccess
+            and type(cast(llir.ArrayAccess, access).array) is llir.Var
+            and re.fullmatch(
+                r"_offset\d+",
+                cast(llir.Var, cast(llir.ArrayAccess, access).array).name,
+            )
+        ):
+            loads.append(initializer)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            loads.extend(_total_offset_loads(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            loads.extend(_total_offset_loads(child))
+    return loads
+
+
+def _named_vars(value: object, name: str) -> List[llir.Var]:
+    variables: List[llir.Var] = []
+    if type(value) is llir.Var and cast(llir.Var, value).name == name:
+        variables.append(cast(llir.Var, value))
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            variables.extend(_named_vars(child, name))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            variables.extend(_named_vars(child, name))
+    return variables
 
 
 def _assignment_codes(value: object) -> List[str]:
@@ -320,6 +400,17 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
         for statement in result.statements
         if type(statement) is llir.RawStmt
     ]
+    offset_family_codes = [
+        LLIRLowerer().lower_llir(declaration)
+        for declaration in _offset_family_direct_initializations(result.statements)
+    ]
+    prefix_sum_codes = [
+        LLIRLowerer().lower_llir(loop) for loop in _prefix_sum_loops(result.statements)
+    ]
+    total_load_codes = [
+        LLIRLowerer().lower_llir(load)
+        for load in _total_offset_loads(result.statements)
+    ]
 
     assert "int _cnt1 = 0" in count_state_codes
     assert "_cnt1++" in count_state_codes
@@ -348,9 +439,25 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     assert _call_names(count_loop.body).count("wksp.insert_unchecked") == 1
     assert _call_names(fill_loop.body).count("wksp.insert_unchecked") == 1
 
-    assert "std::vector<int> _count1((size_t)A0_size, 0)" in top_level_codes
-    assert "std::vector<int64_t> _offset1((size_t)A0_size + 1)" in top_level_codes
-    assert "int64_t _total1 = _offset1[A0_size]" in top_level_codes
+    assert offset_family_codes == [
+        "std::vector<int> _count1((size_t) A0_size, 0);",
+        "std::vector<int64_t> _offset1((size_t) A0_size + 1);",
+    ]
+    assert prefix_sum_codes == [
+        "for (int _i = 0; _i < A0_size; _i++) {\n"
+        "  _offset1[_i + 1] = _offset1[_i] + _count1[_i];\n"
+        "}"
+    ]
+    assert total_load_codes == ["int64_t _total1 = _offset1[A0_size];"]
+    assert not any(
+        re.search(
+            r"std::vector<(?:int|int64_t)> _(?:count|offset)\d+|"
+            r"_offset\d+\[_i \+ 1\] = _offset\d+\[_i\] \+ _count\d+\[_i\]|"
+            r"int64_t _total\d+ = _offset\d+\[",
+            code,
+        )
+        for code in top_level_codes
+    )
     assert any("torch::Tensor Result1_pos_torch" in code for code in top_level_codes)
     assert any("torch::Tensor Result1_crd_torch" in code for code in top_level_codes)
     assert any("torch::Tensor Result_values_torch" in code for code in top_level_codes)
@@ -632,6 +739,414 @@ def test_fill_base_offset_loads_are_typed_owned_structural_and_never_raw() -> No
     assert source_header.name == "row"
 
 
+def test_offset_family_is_typed_owned_structural_fresh_and_never_raw() -> None:
+    source: List[llir.Stmt] = [_compatible_loop(_ds_work_body(), bound="A0_size")]
+    source_loop = cast(llir.ForLoop, source[0])
+    source_bound = cast(llir.Var, cast(llir.BinOp, source_loop.cond).right)
+    snapshot = _structural_snapshot(source)
+
+    first = transform_compressed_where_for_openmp(source, _context((1, 2)))
+    second = transform_compressed_where_for_openmp(source, _context((1, 2)))
+    first_owners = _offset_family_direct_initializations(first.statements)
+    second_owners = _offset_family_direct_initializations(second.statements)
+    first_prefix_loops = _prefix_sum_loops(first.statements)
+    second_prefix_loops = _prefix_sum_loops(second.statements)
+    first_totals = _total_offset_loads(first.statements)
+    second_totals = _total_offset_loads(second.statements)
+    first_zeroes = _offset_zero_assignments(first.statements)
+    second_zeroes = _offset_zero_assignments(second.statements)
+
+    assert _structural_snapshot(source) == snapshot
+    assert _structural_snapshot(first.statements) == _structural_snapshot(
+        second.statements
+    )
+    assert [owner.var.name for owner in first_owners] == [
+        "_count1",
+        "_count2",
+        "_offset1",
+        "_offset2",
+    ]
+    assert first_owners == second_owners
+    assert [hash(owner) for owner in first_owners] == [
+        hash(owner) for owner in second_owners
+    ]
+    assert len(first_prefix_loops) == len(second_prefix_loops) == 2
+    assert [load.var.name for load in first_totals] == ["_total1", "_total2"]
+    assert first_totals == second_totals
+    assert [hash(load) for load in first_totals] == [
+        hash(load) for load in second_totals
+    ]
+    assert len(first_zeroes) == len(second_zeroes) == 2
+
+    count_loop, _ = _phase_loops(first)
+    family_order: List[str] = []
+    for statement in first.statements:
+        if type(statement) is llir.DirectInit and re.fullmatch(
+            r"_(?:count|offset)\d+", statement.var.name
+        ):
+            family_order.append(statement.var.name)
+        elif statement is count_loop:
+            family_order.append("count-loop")
+        elif statement in first_zeroes:
+            target = cast(llir.ArrayAccess, cast(llir.Assign, statement).var)
+            family_order.append(f"{cast(llir.Var, target.array).name}[0]")
+        elif statement in first_prefix_loops:
+            target = cast(
+                llir.ArrayAccess,
+                cast(llir.Assign, cast(llir.ForLoop, statement).body[0]).var,
+            )
+            family_order.append(
+                f"prefix-{cast(llir.Var, target.array).name.removeprefix('_offset')}"
+            )
+        elif statement in first_totals:
+            family_order.append(cast(llir.VarInit, statement).var.name)
+    assert family_order == [
+        "_count1",
+        "_count2",
+        "count-loop",
+        "_offset1",
+        "_offset1[0]",
+        "prefix-1",
+        "_offset2",
+        "_offset2[0]",
+        "prefix-2",
+        "_total1",
+        "_total2",
+    ]
+
+    family_nodes: List[llir.Node] = [
+        *first_owners,
+        *first_zeroes,
+        *first_prefix_loops,
+        *first_totals,
+    ]
+    for index, node in enumerate(family_nodes):
+        for sibling in family_nodes[index + 1 :]:
+            assert _mutable_ir_ids(node).isdisjoint(_mutable_ir_ids(sibling))
+    assert _mutable_ir_ids(family_nodes).isdisjoint(
+        _mutable_ir_ids(
+            [
+                *second_owners,
+                *second_zeroes,
+                *second_prefix_loops,
+                *second_totals,
+            ]
+        )
+    )
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(family_nodes))
+
+    for level, owner in enumerate(first_owners[:2], start=1):
+        assert type(owner) is llir.DirectInit
+        assert type(owner.var) is llir.Var
+        assert owner.var.name == f"_count{level}"
+        assert owner.var.type is llir.DataType.STD_VECTOR_C_INT
+        assert owner.var.is_ptr is False
+        assert owner.var.is_restrict is False
+        assert owner.var.tensor_access is None
+        assert type(owner.args) is tuple
+        assert len(owner.args) == 2
+        extent = cast(llir.Cast, owner.args[0])
+        assert type(extent) is llir.Cast
+        assert extent.data_type is llir.DataType.SIZE_T
+        assert type(extent.expr) is llir.Var
+        bound = cast(llir.Var, extent.expr)
+        assert (bound.name, bound.type) == ("A0_size", llir.DataType.INT64)
+        assert bound.is_ptr is False
+        assert bound.is_restrict is False
+        assert bound.tensor_access is None
+        fill = cast(llir.Literal, owner.args[1])
+        assert type(fill) is llir.Literal
+        assert (fill.value, fill.data_type) == (0, llir.DataType.INT)
+        expected = llir.DirectInit(
+            llir.Var(f"_count{level}", llir.DataType.STD_VECTOR_C_INT),
+            (
+                llir.Cast(
+                    llir.Var("A0_size", llir.DataType.INT64),
+                    llir.DataType.SIZE_T,
+                ),
+                llir.Literal(0, llir.DataType.INT),
+            ),
+        )
+        assert owner == expected
+        assert hash(owner) == hash(expected)
+
+    for level, owner in enumerate(first_owners[2:], start=1):
+        assert type(owner) is llir.DirectInit
+        assert type(owner.var) is llir.Var
+        assert owner.var.name == f"_offset{level}"
+        assert owner.var.type is llir.DataType.STD_VECTOR_INT
+        assert owner.var.is_ptr is False
+        assert owner.var.is_restrict is False
+        assert owner.var.tensor_access is None
+        assert type(owner.args) is tuple
+        assert len(owner.args) == 1
+        extent = cast(llir.Add, owner.args[0])
+        assert type(extent) is llir.Add
+        assert extent.op == "+"
+        assert type(extent.left) is llir.Cast
+        extent_cast = cast(llir.Cast, extent.left)
+        assert extent_cast.data_type is llir.DataType.SIZE_T
+        assert type(extent_cast.expr) is llir.Var
+        bound = cast(llir.Var, extent_cast.expr)
+        assert (bound.name, bound.type) == ("A0_size", llir.DataType.INT64)
+        assert bound.is_ptr is False
+        assert bound.is_restrict is False
+        assert bound.tensor_access is None
+        assert type(extent.right) is llir.Literal
+        increment = cast(llir.Literal, extent.right)
+        assert (increment.value, increment.data_type) == (1, llir.DataType.INT)
+        expected = llir.DirectInit(
+            llir.Var(f"_offset{level}", llir.DataType.STD_VECTOR_INT),
+            (
+                llir.Add(
+                    llir.Cast(
+                        llir.Var("A0_size", llir.DataType.INT64),
+                        llir.DataType.SIZE_T,
+                    ),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+            ),
+        )
+        assert owner == expected
+        assert hash(owner) == hash(expected)
+
+    assert [LLIRLowerer().lower_llir(assignment) for assignment in first_zeroes] == [
+        "_offset1[0] = 0;",
+        "_offset2[0] = 0;",
+    ]
+    for level, assignment in enumerate(first_zeroes, start=1):
+        target = cast(llir.ArrayAccess, assignment.var)
+        assert target.tensor_access is None
+        assert type(target.array) is llir.Var
+        assert (
+            cast(llir.Var, target.array).name,
+            cast(llir.Var, target.array).type,
+        ) == (f"_offset{level}", llir.DataType.STD_VECTOR_INT)
+        assert type(target.index) is llir.Literal
+        assert (
+            cast(llir.Literal, target.index).value,
+            cast(llir.Literal, target.index).data_type,
+        ) == (0, llir.DataType.INT)
+        assert type(assignment.value) is llir.Literal
+        assert (
+            cast(llir.Literal, assignment.value).value,
+            cast(llir.Literal, assignment.value).data_type,
+        ) == (0, llir.DataType.INT)
+
+    for level, loop in enumerate(first_prefix_loops, start=1):
+        assert type(loop) is llir.ForLoop
+        assert loop.omp_parallel_for is False
+        assert loop.omp_schedule is None
+        assert loop.omp_num_threads is None
+        assert loop.omp_chunk_expr is None
+        assert type(loop.init) is llir.VarInit
+        initialization = cast(llir.VarInit, loop.init)
+        assert (initialization.var.name, initialization.var.type) == (
+            "_i",
+            llir.DataType.INT,
+        )
+        assert type(initialization.value) is llir.Literal
+        assert (
+            cast(llir.Literal, initialization.value).value,
+            cast(llir.Literal, initialization.value).data_type,
+        ) == (0, llir.DataType.INT)
+        assert type(loop.cond) is llir.BinOp
+        condition = cast(llir.BinOp, loop.cond)
+        assert condition.op == "<"
+        assert type(condition.left) is llir.Var
+        assert (
+            cast(llir.Var, condition.left).name,
+            cast(llir.Var, condition.left).type,
+        ) == (
+            "_i",
+            llir.DataType.INT,
+        )
+        assert type(condition.right) is llir.Var
+        assert (
+            cast(llir.Var, condition.right).name,
+            cast(llir.Var, condition.right).type,
+        ) == ("A0_size", llir.DataType.INT64)
+        assert type(loop.update) is llir.Increment
+        assert (
+            cast(llir.Increment, loop.update).var.name,
+            cast(llir.Increment, loop.update).var.type,
+        ) == ("_i", llir.DataType.INT)
+        assert len(loop.body) == 1
+        assert type(loop.body[0]) is llir.Assign
+        assignment = cast(llir.Assign, loop.body[0])
+        assert type(assignment.var) is llir.ArrayAccess
+        target = cast(llir.ArrayAccess, assignment.var)
+        assert type(target.array) is llir.Var
+        assert (
+            cast(llir.Var, target.array).name,
+            cast(llir.Var, target.array).type,
+        ) == (f"_offset{level}", llir.DataType.STD_VECTOR_INT)
+        assert type(target.index) is llir.Add
+        target_index = cast(llir.Add, target.index)
+        assert type(target_index.left) is llir.Var
+        assert (
+            cast(llir.Var, target_index.left).name,
+            cast(llir.Var, target_index.left).type,
+        ) == ("_i", llir.DataType.INT)
+        assert type(target_index.right) is llir.Literal
+        assert (
+            cast(llir.Literal, target_index.right).value,
+            cast(llir.Literal, target_index.right).data_type,
+        ) == (1, llir.DataType.INT)
+        assert type(assignment.value) is llir.Add
+        value = cast(llir.Add, assignment.value)
+        assert type(value.left) is llir.ArrayAccess
+        assert type(value.right) is llir.ArrayAccess
+        offset_access = cast(llir.ArrayAccess, value.left)
+        count_access = cast(llir.ArrayAccess, value.right)
+        assert type(offset_access.array) is llir.Var
+        assert (
+            cast(llir.Var, offset_access.array).name,
+            cast(llir.Var, offset_access.array).type,
+        ) == (f"_offset{level}", llir.DataType.STD_VECTOR_INT)
+        assert type(count_access.array) is llir.Var
+        assert (
+            cast(llir.Var, count_access.array).name,
+            cast(llir.Var, count_access.array).type,
+        ) == (f"_count{level}", llir.DataType.STD_VECTOR_C_INT)
+        assert type(offset_access.index) is llir.Var
+        assert type(count_access.index) is llir.Var
+        assert (
+            cast(llir.Var, offset_access.index).name,
+            cast(llir.Var, offset_access.index).type,
+        ) == ("_i", llir.DataType.INT)
+        assert (
+            cast(llir.Var, count_access.index).name,
+            cast(llir.Var, count_access.index).type,
+        ) == ("_i", llir.DataType.INT)
+        assert len({id(var) for var in _named_vars(loop, "_i")}) == 6
+
+    for level, initializer in enumerate(first_totals, start=1):
+        assert type(initializer) is llir.VarInit
+        assert (initializer.var.name, initializer.var.type) == (
+            f"_total{level}",
+            llir.DataType.INT64,
+        )
+        assert initializer.var.is_ptr is False
+        assert initializer.var.is_restrict is False
+        assert initializer.var.tensor_access is None
+        assert initializer.op == "="
+        assert initializer.cast is False
+        assert type(initializer.value) is llir.ArrayAccess
+        access = cast(llir.ArrayAccess, initializer.value)
+        assert access.tensor_access is None
+        assert type(access.array) is llir.Var
+        assert (
+            cast(llir.Var, access.array).name,
+            cast(llir.Var, access.array).type,
+        ) == (f"_offset{level}", llir.DataType.STD_VECTOR_INT)
+        assert type(access.index) is llir.Var
+        assert (
+            cast(llir.Var, access.index).name,
+            cast(llir.Var, access.index).type,
+        ) == ("A0_size", llir.DataType.INT64)
+        expected = llir.VarInit(
+            llir.Var(f"_total{level}", llir.DataType.INT64),
+            llir.ArrayAccess(
+                llir.Var(f"_offset{level}", llir.DataType.STD_VECTOR_INT),
+                llir.Var("A0_size", llir.DataType.INT64),
+            ),
+        )
+        assert initializer == expected
+        assert hash(initializer) == hash(expected)
+
+    assert [LLIRLowerer().lower_llir(owner) for owner in first_owners] == [
+        "std::vector<int> _count1((size_t) A0_size, 0);",
+        "std::vector<int> _count2((size_t) A0_size, 0);",
+        "std::vector<int64_t> _offset1((size_t) A0_size + 1);",
+        "std::vector<int64_t> _offset2((size_t) A0_size + 1);",
+    ]
+    assert [LLIRLowerer().lower_llir(loop) for loop in first_prefix_loops] == [
+        "for (int _i = 0; _i < A0_size; _i++) {\n"
+        f"  _offset{level}[_i + 1] = _offset{level}[_i] + _count{level}[_i];\n"
+        "}"
+        for level in (1, 2)
+    ]
+    assert [LLIRLowerer().lower_llir(load) for load in first_totals] == [
+        "int64_t _total1 = _offset1[A0_size];",
+        "int64_t _total2 = _offset2[A0_size];",
+    ]
+    assert not any(
+        re.search(
+            r"std::vector<(?:int|int64_t)> _(?:count|offset)\d+|"
+            r"_offset\d+\[_i \+ 1\] = _offset\d+\[_i\] \+ _count\d+\[_i\]|"
+            r"int64_t _total\d+ = _offset\d+\[",
+            code,
+        )
+        for code in _raw_codes(first.statements)
+    )
+
+    first_bounds = _named_vars(family_nodes, "A0_size")
+    second_bounds = _named_vars(
+        [*second_owners, *second_prefix_loops, *second_totals],
+        "A0_size",
+    )
+    assert len(first_bounds) == len(second_bounds) == 8
+    assert all(bound.type is llir.DataType.INT64 for bound in first_bounds)
+    assert len({id(bound) for bound in first_bounds}) == len(first_bounds)
+    assert {id(bound) for bound in first_bounds}.isdisjoint(
+        {id(bound) for bound in second_bounds}
+    )
+    assert all(bound is not source_bound for bound in first_bounds)
+
+    first_owners[0].var.name = "owned_count"
+    first_prefix_target = cast(
+        llir.ArrayAccess,
+        cast(llir.Assign, first_prefix_loops[0].body[0]).var,
+    )
+    cast(llir.Var, first_prefix_target.array).name = "owned_offset"
+    assert first_owners[1].var.name == "_count2"
+    assert second_owners[0].var.name == "_count1"
+    second_prefix_target = cast(
+        llir.ArrayAccess,
+        cast(llir.Assign, second_prefix_loops[0].body[0]).var,
+    )
+    assert cast(llir.Var, second_prefix_target.array).name == "_offset1"
+    assert source_bound.name == "A0_size"
+
+
+@pytest.mark.parametrize(
+    "bound_type",
+    (llir.DataType.INT, llir.DataType.INT64),
+)
+def test_offset_family_preserves_exact_loop_bound_type(
+    bound_type: llir.DataType,
+) -> None:
+    source = [
+        _compatible_loop(
+            _ds_work_body(),
+            bound="extent",
+            bound_type=bound_type,
+        )
+    ]
+    source_bound = cast(
+        llir.Var,
+        cast(llir.BinOp, cast(llir.ForLoop, source[0]).cond).right,
+    )
+
+    result = transform_compressed_where_for_openmp(source, _context())
+    family: List[llir.Node] = [
+        *_offset_family_direct_initializations(result.statements),
+        *_prefix_sum_loops(result.statements),
+        *_total_offset_loads(result.statements),
+    ]
+    bounds = _named_vars(family, "extent")
+
+    assert len(bounds) == 4
+    assert all(type(bound) is llir.Var for bound in bounds)
+    assert all(bound.type is bound_type for bound in bounds)
+    assert all(bound.is_ptr is False for bound in bounds)
+    assert all(bound.is_restrict is False for bound in bounds)
+    assert all(bound.tensor_access is None for bound in bounds)
+    assert len({id(bound) for bound in bounds}) == len(bounds)
+    assert all(bound is not source_bound for bound in bounds)
+
+
 def test_first_top_level_compatible_loop_is_selected_and_suffix_is_discarded() -> None:
     auto_prefix = llir.ForLoopAuto(
         _var("item"), _var("items"), [llir.RawStmt("keep_auto_prefix")]
@@ -774,7 +1289,13 @@ def test_legacy_prefix_and_work_body_filters_are_top_level_only() -> None:
     assert [
         declaration.var.name
         for declaration in _direct_initializations(result.statements)
-    ] == ["Other1_pos", "Result1_pos_nested", "Result1_pos_nested"]
+    ] == [
+        "Other1_pos",
+        "_count1",
+        "Result1_pos_nested",
+        "_offset1",
+        "Result1_pos_nested",
+    ]
 
 
 def test_nested_control_flow_and_statement_containers_follow_legacy_scopes() -> None:
@@ -1310,6 +1831,70 @@ def test_generated_fill_base_loads_fail_closed_at_compressed_owner(
 
 
 @pytest.mark.parametrize(
+    ("producer", "expected_code", "expected_suffix"),
+    (
+        ("W6", "invalid_direct_init_args", ("args",)),
+        ("W7", "invalid_add_operator", ("args", "[0]", "op")),
+        ("W8", "invalid_add_operator", ("body", "[0]", "value", "op")),
+        (
+            "W9",
+            "invalid_tensor_access_metadata",
+            ("value", "tensor_access"),
+        ),
+    ),
+)
+def test_generated_offset_family_fails_closed_at_compressed_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    producer: str,
+    expected_code: str,
+    expected_suffix: Tuple[str, ...],
+) -> None:
+    source = [_compatible_loop(_ds_work_body())]
+    snapshot = _structural_snapshot(source)
+    injected: List[str] = []
+
+    class InjectingWalker(LLIRWalker):
+        def walk(self, value: LLIRValue) -> None:
+            owners = _offset_family_direct_initializations(value)
+            prefix_loops = _prefix_sum_loops(value)
+            totals = _total_offset_loads(value)
+            if owners and prefix_loops and totals and not injected:
+                if producer == "W6":
+                    count = next(
+                        owner for owner in owners if owner.var.name == "_count1"
+                    )
+                    object.__setattr__(count, "args", list(count.args))
+                elif producer == "W7":
+                    offset = next(
+                        owner for owner in owners if owner.var.name == "_offset1"
+                    )
+                    object.__setattr__(cast(llir.Add, offset.args[0]), "op", "-")
+                elif producer == "W8":
+                    prefix = prefix_loops[0]
+                    assignment = cast(llir.Assign, prefix.body[0])
+                    object.__setattr__(cast(llir.Add, assignment.value), "op", "-")
+                else:
+                    access = cast(llir.ArrayAccess, totals[0].value)
+                    object.__setattr__(access, "tensor_access", object())
+                injected.append(producer)
+            super().walk(value)
+
+    monkeypatch.setattr(compressed_where_module, "LLIRWalker", InjectingWalker)
+    context = _context()
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(source, context)
+
+    diagnostic = raised.value.diagnostic
+    assert injected == [producer]
+    assert diagnostic.code == expected_code
+    assert diagnostic.stage == context.traversal.stage
+    assert diagnostic.pass_name == context.traversal.pass_name
+    assert diagnostic.path[-len(expected_suffix) :] == expected_suffix
+    assert _structural_snapshot(source) == snapshot
+
+
+@pytest.mark.parametrize(
     ("context", "expected_code", "expected_path"),
     [
         (
@@ -1466,7 +2051,7 @@ def test_successful_transform_is_single_use_and_not_idempotent() -> None:
     )
 
 
-def test_production_ds_generated_cpp_matches_pre_extraction_bytes(
+def test_production_ds_generated_cpp_locks_typed_offset_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
@@ -1526,11 +2111,29 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes(
     )
     assert cast(llir.Var, production_access.index).name == "r"
     assert cast(llir.Var, production_access.index).type is llir.DataType.INT64
+    production_owners = _offset_family_direct_initializations(function)
+    production_prefix_loops = _prefix_sum_loops(function)
+    production_totals = _total_offset_loads(function)
+    production_family: List[llir.Node] = [
+        *production_owners,
+        *production_prefix_loops,
+        *production_totals,
+    ]
+    assert [owner.var.name for owner in production_owners] == [
+        "_count1",
+        "_offset1",
+    ]
+    assert len(production_prefix_loops) == 1
+    assert [total.var.name for total in production_totals] == ["_total1"]
+    production_bounds = _named_vars(production_family, "SparseLeft0_size")
+    assert len(production_bounds) == 4
+    assert all(bound.type is llir.DataType.INT for bound in production_bounds)
+    assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    assert len(cpp) == 7117
+    assert len(cpp) == 7129
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "d4443cacbdb721dc88803da9cc21fa9018eb005f49d0f550e5fac3630d2ccd1f"
+        "971d69c06f3d980a092041816c62a0618713dc4aed41955517135db3a9c0a92d"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -1594,7 +2197,7 @@ def test_production_ds_generated_cpp_matches_pre_extraction_bytes(
     ]
 
 
-def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
+def test_production_dss_generated_cpp_locks_typed_offset_family() -> None:
     batch, row, reduction, column = (
         IndexVar("batch"),
         IndexVar("row"),
@@ -1629,11 +2232,34 @@ def test_production_dss_generated_cpp_matches_pre_extraction_bytes() -> None:
         assert cast(llir.Var, access.array).type is llir.DataType.STD_VECTOR_INT
         assert cast(llir.Var, access.index).name == "batch"
         assert cast(llir.Var, access.index).type is llir.DataType.INT64
+    production_owners = _offset_family_direct_initializations(lowered)
+    production_prefix_loops = _prefix_sum_loops(lowered)
+    production_totals = _total_offset_loads(lowered)
+    production_family: List[llir.Node] = [
+        *production_owners,
+        *production_prefix_loops,
+        *production_totals,
+    ]
+    assert [owner.var.name for owner in production_owners] == [
+        "_count1",
+        "_count2",
+        "_offset1",
+        "_offset2",
+    ]
+    assert len(production_prefix_loops) == 2
+    assert [total.var.name for total in production_totals] == [
+        "_total1",
+        "_total2",
+    ]
+    production_bounds = _named_vars(production_family, "Left0_size")
+    assert len(production_bounds) == 8
+    assert all(bound.type is llir.DataType.INT for bound in production_bounds)
+    assert len({id(bound) for bound in production_bounds}) == 8
     cpp = LLIRLowerer().lower_llir(lowered)
 
-    assert len(cpp) == 8660
+    assert len(cpp) == 8684
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "1471ec06cf2682e4d80f1b433f03e18f833b1d7d092b7f6ad6701a17caa0c83e"
+        "63b2fed89ed0f16c07c5e01797ee973a8b07667b97cb6453d9479a57cbad3e66"
     )
     assert cpp.count("wksp.insert(") == 2
     assert "wksp.insert_unchecked(" not in cpp
