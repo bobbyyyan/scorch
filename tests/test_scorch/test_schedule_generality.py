@@ -17,7 +17,11 @@ from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
-from scorch.compiler.llir_traversal import LLIRTraversalError  # type: ignore[import-untyped]
+from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
+    LLIRTraversalContext,
+    LLIRTraversalError,
+    LLIRWalker,
+)
 from scorch.compiler.schedule_lowerer import (  # type: ignore[import-untyped]
     _contains_tensor_access,
     _matches_tensor_access,
@@ -669,12 +673,77 @@ def test_ttm_heap_result_tile_is_generic_compact_accumulation():
     )
 
     scheduled = Scheduler.apply_schedule(_build_ttm(), schedule)
-    cpp = _lower_to_cpp(scheduled)
+
+    def lower_with_storage_owner() -> tuple[str, llir.DirectInit]:
+        lowered = CINLowerer().lower_IndexStmt(scheduled)
+        owners: list[llir.DirectInit] = []
+
+        class StorageOwnerCollector(LLIRWalker):
+            def visit_direct_init(
+                self,
+                node: llir.DirectInit,
+                path: tuple[str, ...],
+            ) -> None:
+                if node.var.name == "tiled_Projected_storage":
+                    owners.append(node)
+                super().visit_direct_init(node, path)
+
+        StorageOwnerCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="collect_ttm_heap_storage_owner",
+            )
+        ).walk(lowered)
+        assert len(owners) == 1
+        return LLIRLowerer().lower_llir(lowered), owners[0]
+
+    cpp, owner = lower_with_storage_owner()
+    second_cpp, second_owner = lower_with_storage_owner()
 
     allocation = (
         "std::vector<float> tiled_Projected_storage("
         "(size_t) (Projected0_size * Projected1_size) * (size_t) kTile_d);"
     )
+    assert owner.var == llir.Var(
+        "tiled_Projected_storage",
+        llir.DataType.STD_VECTOR_FLOAT32,
+    )
+    assert len(owner.args) == 1
+    extent = cast(llir.Mul, owner.args[0])
+    assert type(extent) is llir.Mul
+    assert type(extent.left) is llir.Cast
+    assert type(extent.right) is llir.Cast
+    prefix = cast(llir.Cast, extent.left)
+    tile = cast(llir.Cast, extent.right)
+    assert prefix.data_type is llir.DataType.SIZE_T
+    assert tile.data_type is llir.DataType.SIZE_T
+    assert type(prefix.expr) is llir.Mul
+    prefix_product = cast(llir.Mul, prefix.expr)
+    assert prefix_product.left == llir.Var(
+        "Projected0_size",
+        llir.DataType.INT64,
+    )
+    assert prefix_product.right == llir.Var(
+        "Projected1_size",
+        llir.DataType.INT64,
+    )
+    assert tile.expr == llir.Var("kTile_d", llir.DataType.CONSTEXPR_INT)
+    assert owner == second_owner
+    assert hash(owner) == hash(second_owner)
+    assert owner is not second_owner
+    assert owner.var is not second_owner.var
+    second_extent = cast(llir.Mul, second_owner.args[0])
+    second_prefix = cast(llir.Cast, second_extent.left)
+    second_prefix_product = cast(llir.Mul, second_prefix.expr)
+    second_tile = cast(llir.Cast, second_extent.right)
+    assert extent is not second_extent
+    assert prefix is not second_prefix
+    assert prefix_product is not second_prefix_product
+    assert prefix_product.left is not second_prefix_product.left
+    assert prefix_product.right is not second_prefix_product.right
+    assert tile is not second_tile
+    assert tile.expr is not second_tile.expr
+    assert cpp == second_cpp
     init_loop = "Projected_tile_init < Projected0_size * Projected1_size"
     copy_loop = "Projected_tile_copy < Projected0_size * Projected1_size"
     assert allocation in cpp
@@ -684,6 +753,7 @@ def test_ttm_heap_result_tile_is_generic_compact_accumulation():
     assert "tiled_Projected[pProjected1 * kTile_d + d_in] +=" in cpp
     assert "Projected_values[pProjected2] +=" not in cpp
     assert "scorch_zero_dense(Projected_values, Projected_capacity)" not in cpp
+    assert "packed_" not in cpp
 
     torch.manual_seed(105)
     core = torch.randn(5, 3, 4)
@@ -698,6 +768,59 @@ def test_ttm_heap_result_tile_is_generic_compact_accumulation():
     reference = torch.einsum("abc,cd->abd", core, factor)
 
     assert torch.allclose(result.to_torch(), reference, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shape"),
+    [
+        pytest.param(torch.float32, (5, 4, 7), id="float32-ragged"),
+        pytest.param(torch.float64, (5, 4, 7), id="float64-ragged"),
+        pytest.param(torch.float32, (0, 4, 7), id="zero-rows"),
+        pytest.param(torch.float32, (5, 0, 7), id="zero-reduction"),
+        pytest.param(torch.float32, (5, 4, 0), id="zero-output-columns"),
+    ],
+)
+def test_spmm_heap_result_tile_without_relayout_matches_torch(
+    dtype: torch.dtype,
+    shape: tuple[int, int, int],
+) -> None:
+    rows, reduction, columns = shape
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec(
+                "k",
+                3,
+                placement="outermost",
+                accum="heap",
+                unroll=False,
+            ),
+        ),
+        tag="generic-spmm-heap-k-no-relayout",
+        parallel_loop="i",
+    )
+
+    torch.manual_seed(109)
+    sparse = torch.randn(rows, reduction, dtype=dtype)
+    if sparse.numel():
+        sparse[sparse.abs() < 0.5] = 0
+    dense = torch.randn(reduction, columns, dtype=dtype)
+    result = einsum(
+        "ij,jk->ik",
+        _sparse_stensor(sparse, "Sparse"),
+        STensor.from_torch(dense, "Dense"),
+        format="dd",
+        schedule=schedule,
+    )
+    reference = sparse @ dense
+    tolerance = 1e-3 if dtype is torch.float32 else 1e-9
+
+    assert torch.allclose(
+        result.to_torch(),
+        reference,
+        atol=tolerance,
+        rtol=tolerance,
+    )
 
 
 @pytest.mark.parametrize(

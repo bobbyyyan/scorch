@@ -130,11 +130,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
         "result_write_pass.py": 3,
-        "schedule_lowerer.py": 102,
+        "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 59,
     }
-    assert sum(constructor_counts.values()) == 391
+    assert sum(constructor_counts.values()) == 394
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 131,
@@ -146,11 +146,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
         "result_write_pass.py": 3,
-        "schedule_lowerer.py": 102,
+        "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 59,
     }
-    assert sum(unclassified_counts.values()) == 381
+    assert sum(unclassified_counts.values()) == 384
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
@@ -606,12 +606,12 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
         "compressed_where_openmp_pass.py": 14,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
-        "schedule_lowerer.py": 2,
+        "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 3,
     }
-    assert sum(counts.values()) == 33
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 32
+    assert sum(counts.values()) == 32
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 31
 
 
 def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
@@ -625,12 +625,18 @@ def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
 
     assert counts == {
         "llir_traversal.py": 1,
-        "schedule_lowerer.py": 1,
+        "schedule_lowerer.py": 2,
         "torch_cpp_abi.py": 1,
     }
-    assert sum(counts.values()) == 3
+    assert sum(counts.values()) == 4
 
     schedule_source = (_COMPILER_ROOT / "schedule_lowerer.py").read_text()
+    heap_result = schedule_source.split("def _apply_heap_result_tile", 1)[1].split(
+        "def _packed_storage_declaration", 1
+    )[0]
+    assert "llir.RawStmt(" not in heap_result
+    assert "storage_declaration = _heap_result_storage_declaration(" in heap_result
+
     relayout = schedule_source.split("def _apply_relayout", 1)[1].split(
         "def apply_schedule_to_llir", 1
     )[0]

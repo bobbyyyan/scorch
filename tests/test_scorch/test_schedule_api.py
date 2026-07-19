@@ -125,6 +125,29 @@ def _packed_schedule(
     )
 
 
+def _heap_schedule(
+    *,
+    row="i",
+    panel="j",
+    pack="k",
+    nc=4,
+) -> Schedule:
+    return Schedule(
+        loop_order=(row, panel, pack),
+        tiles=(
+            TileSpec(
+                pack,
+                nc,
+                placement="outermost",
+                accum="heap",
+                unroll=False,
+            ),
+        ),
+        tag="heap-result-tile",
+        parallel_loop=row,
+    )
+
+
 def _lower_to_cpp(stmt: ForAll) -> str:
     lowered = CINLowerer().lower_IndexStmt(stmt)
     return LLIRLowerer().lower_llir(lowered)
@@ -1146,6 +1169,129 @@ def test_packed_storage_owner_is_direct_typed_fresh_and_byte_exact(
     assert receiver is not first.var
 
 
+@pytest.mark.parametrize(
+    ("dtype", "vector_type", "pointer_type", "cpp_scalar"),
+    [
+        (
+            torch.float32,
+            llir.DataType.STD_VECTOR_FLOAT32,
+            llir.DataType.PTR_FLOAT32,
+            "float",
+        ),
+        (
+            torch.float64,
+            llir.DataType.STD_VECTOR_FLOAT64,
+            llir.DataType.PTR_FLOAT64,
+            "double",
+        ),
+    ],
+)
+def test_heap_result_storage_owner_is_direct_typed_fresh_and_byte_exact(
+    dtype: torch.dtype,
+    vector_type: llir.DataType,
+    pointer_type: llir.DataType,
+    cpp_scalar: str,
+) -> None:
+    schedule = _heap_schedule(row="row", panel="reduce", pack="free")
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=dtype),
+        schedule,
+    )
+
+    first_cpp, first_initializers, first_raw_codes = _lower_with_direct_initializers(
+        scheduled
+    )
+    second_cpp, second_initializers, second_raw_codes = _lower_with_direct_initializers(
+        scheduled
+    )
+
+    first_matches = [
+        node for node in first_initializers if node.var.name == "tiled_Output_storage"
+    ]
+    second_matches = [
+        node for node in second_initializers if node.var.name == "tiled_Output_storage"
+    ]
+    assert len(first_matches) == len(second_matches) == 1
+    first = first_matches[0]
+    second = second_matches[0]
+    assert first.var == llir.Var("tiled_Output_storage", vector_type)
+    assert first.var.type is vector_type
+    assert first.var.is_ptr is False
+    assert first.var.is_restrict is False
+    assert first.var.tensor_access is None
+    assert type(first.args) is tuple
+    assert len(first.args) == 1
+
+    extent = cast(llir.Mul, first.args[0])
+    assert type(extent) is llir.Mul
+    assert type(extent.left) is llir.Cast
+    assert type(extent.right) is llir.Cast
+    prefix = cast(llir.Cast, extent.left)
+    tile = cast(llir.Cast, extent.right)
+    assert prefix.data_type is llir.DataType.SIZE_T
+    assert tile.data_type is llir.DataType.SIZE_T
+    assert prefix.expr == llir.Var("Output0_size", llir.DataType.INT64)
+    assert tile.expr == llir.Var("kTile_free", llir.DataType.CONSTEXPR_INT)
+    assert type(prefix.expr) is type(tile.expr) is llir.Var
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first is not second
+    assert first.var is not second.var
+    assert first.args is not second.args
+    second_extent = cast(llir.Mul, second.args[0])
+    assert extent is not second_extent
+    assert prefix is not cast(llir.Cast, second_extent.left)
+    assert prefix.expr is not cast(llir.Cast, second_extent.left).expr
+    assert tile is not cast(llir.Cast, second_extent.right)
+    assert tile.expr is not cast(llir.Cast, second_extent.right).expr
+
+    expected = (
+        f"std::vector<{cpp_scalar}> tiled_Output_storage("
+        "(size_t) Output0_size * (size_t) kTile_free);"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected
+    assert first_cpp == second_cpp
+    assert first_cpp.count(expected) == 1
+    assert "packed_" not in first_cpp
+    assert all("tiled_Output_storage" not in code for code in first_raw_codes)
+    assert all("tiled_Output_storage" not in code for code in second_raw_codes)
+
+    _, pointer_initializers = _lower_with_var_initializers(scheduled)
+    pointer = next(
+        node for node in pointer_initializers if node.var.name == "tiled_Output"
+    )
+    assert pointer.var.type is pointer_type
+    assert type(pointer.value) is llir.MemberCall
+    receiver = cast(llir.MemberCall, pointer.value).base
+    assert receiver == first.var
+    assert receiver is not first.var
+
+
+def test_direct_result_tile_does_not_allocate_heap_storage() -> None:
+    schedule = Schedule(
+        loop_order=("row", "reduce", "free"),
+        tiles=(
+            TileSpec(
+                "free",
+                4,
+                placement="outermost",
+                accum="direct",
+                unroll=False,
+            ),
+        ),
+        tag="direct-result-tile-control",
+        parallel_loop="row",
+    )
+    scheduled = Scheduler.apply_schedule(_build_named_spmm(), schedule)
+
+    cpp, initializers, raw_codes = _lower_with_direct_initializers(scheduled)
+
+    assert all(node.var.name != "tiled_Output_storage" for node in initializers)
+    assert "tiled_Output_storage" not in cpp
+    assert all("tiled_Output_storage" not in code for code in raw_codes)
+
+
 def test_full_stage_and_heap_result_are_structural_and_name_independent():
     schedule = _packed_schedule(
         row="row",
@@ -1166,7 +1312,7 @@ def test_full_stage_and_heap_result_are_structural_and_name_independent():
     )
     compact_result = (
         "std::vector<float> tiled_Output_storage("
-        "(size_t) (Output0_size) * (size_t) kTile_free);"
+        "(size_t) Output0_size * (size_t) kTile_free);"
     )
     pack_loop = (
         "for (int64_t reduce_pack = 0; "
@@ -1419,6 +1565,29 @@ def test_packed_relayout_generates_hygienic_staging_names():
 
     assert "for (int64_t k_pack_1 = 0; k_pack_1 < kTile_k; k_pack_1++)" in loop_cpp
     assert "(k_pack - k_pack_out) * kTile_k + k_in" in loop_cpp
+
+
+def test_heap_result_storage_uses_a_hygienic_owner_name() -> None:
+    pack = "tiled_Output_storage"
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(pack_name=pack),
+        _heap_schedule(row="row", panel="reduce", pack=pack),
+    )
+
+    cpp, initializers, raw_codes = _lower_with_direct_initializers(scheduled)
+
+    owners = [
+        initializer
+        for initializer in initializers
+        if initializer.var.name.startswith("tiled_Output_storage")
+    ]
+    assert [owner.var.name for owner in owners] == ["tiled_Output_storage_1"]
+    assert (
+        "std::vector<float> tiled_Output_storage_1("
+        "(size_t) Output0_size * (size_t) kTile_tiled_Output_storage);"
+    ) in cpp
+    assert "tiled_Output_storage_1.data()" in cpp
+    assert all("tiled_Output_storage_1" not in code for code in raw_codes)
 
 
 def test_fixed_stack_array_name_participates_in_schedule_name_hygiene():

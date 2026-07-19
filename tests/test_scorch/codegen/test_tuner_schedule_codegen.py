@@ -535,7 +535,7 @@ def test_tuner_packed_tileijk_storage_scopes_and_loop_nesting(scope_var, accum):
         assert f"C_values[pC1] += A_val[pA1] * {packed_read}" in cpp
     else:
         allocation_c = (
-            "std::vector<float> tiled_C_storage((size_t) (C0_size) * "
+            "std::vector<float> tiled_C_storage((size_t) C0_size * "
             "(size_t) kTile_k);"
         )
         init_loop = (

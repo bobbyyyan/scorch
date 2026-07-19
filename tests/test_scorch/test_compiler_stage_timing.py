@@ -2418,6 +2418,178 @@ def test_malformed_packed_storage_fails_schedule_owner_and_suppresses_later_work
     assert CompilerStageId.SCHEDULE_LOWERING.value in str(suppressed.value)
 
 
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "node_type", "diagnostic_path"),
+    (
+        (
+            "field",
+            "invalid_direct_init_var_type",
+            "DataType",
+            ("root", "var", "type"),
+        ),
+        (
+            "child",
+            "unknown_llir_node",
+            "UnknownHeapResultExtent",
+            ("root", "args", "[0]"),
+        ),
+        (
+            "subclass",
+            "unknown_llir_node",
+            "UnknownHeapResultInit",
+            ("root",),
+        ),
+    ),
+)
+def test_malformed_heap_result_storage_fails_schedule_owner_and_stops_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+    diagnostic_code: str,
+    node_type: str,
+    diagnostic_path: tuple[str, ...],
+) -> None:
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec(
+                "k",
+                4,
+                placement="outermost",
+                accum="heap",
+                unroll=False,
+            ),
+        ),
+        tag="malformed-heap-result-storage",
+        parallel_loop="i",
+    )
+    schedule_snapshot = replace(schedule)
+    schedule_identity = (schedule.cache_key, hash(schedule))
+    options = _default_options(requested_schedule=schedule)
+    options_identity = (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    )
+    context = CompilationContext(options)
+    specs = _spmm_specs()
+    specs_snapshot = tuple(spec.metadata for spec in specs)
+    original_builder = schedule_lowerer._heap_result_storage_declaration
+    injected: list[tuple[str, llir.DataType, tuple[str, ...], str]] = []
+
+    class UnknownHeapResultExtent(llir.Expr):
+        pass
+
+    class UnknownHeapResultInit(llir.DirectInit):
+        pass
+
+    def build_malformed_heap_result_storage(
+        *,
+        storage_name: str,
+        scalar_type: llir.DataType,
+        prefix_dimension_names: tuple[str, ...],
+        tile_size_name: str,
+    ) -> llir.DirectInit:
+        declaration = original_builder(
+            storage_name=storage_name,
+            scalar_type=scalar_type,
+            prefix_dimension_names=prefix_dimension_names,
+            tile_size_name=tile_size_name,
+        )
+        injected.append(
+            (
+                storage_name,
+                scalar_type,
+                prefix_dimension_names,
+                tile_size_name,
+            )
+        )
+        if malformation == "field":
+            declaration.var.type = llir.DataType.VOID
+            return declaration
+        if malformation == "child":
+            object.__setattr__(declaration, "args", (UnknownHeapResultExtent(),))
+            return declaration
+        return UnknownHeapResultInit(declaration.var, declaration.args)
+
+    monkeypatch.setattr(
+        schedule_lowerer,
+        "_heap_result_storage_declaration",
+        build_malformed_heap_result_storage,
+    )
+    later_calls: list[str] = []
+    _forbid_boundaries(
+        monkeypatch,
+        later_calls,
+        (
+            (LLIRLowerer, "lower_llir", "cpp_generation"),
+            (ops, "_prepare_generated_kernel_build", "build_request"),
+            (ops, "_load_validated_prepared_kernel", "native_load"),
+        ),
+    )
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(LLIRTraversalError) as failure:
+        ops.einsum(
+            "ij,jk->ik",
+            *specs,
+            compile_only=True,
+            format="dd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    diagnostic = failure.value.diagnostic
+    assert injected == [
+        (
+            "tiled_C_storage",
+            llir.DataType.FLOAT32,
+            ("C0_size",),
+            "kTile_k",
+        )
+    ]
+    assert diagnostic.code == diagnostic_code
+    assert diagnostic.stage == "schedule lowering"
+    assert diagnostic.pass_name == "build_heap_result_storage"
+    assert diagnostic.node_type == node_type
+    assert diagnostic.path == diagnostic_path
+    assert _stage_values(context) == _EXPLICIT_STAGE_SEQUENCE[:7]
+    assert [record.sequence_index for record in context.stage_run_records] == list(
+        range(7)
+    )
+    assert all(record.duration_ns >= 0 for record in context.stage_run_records)
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    assert [record.sequence_index for record in context.llir_pass_run_records] == list(
+        range(5)
+    )
+    assert all(record.duration_ns >= 0 for record in context.llir_pass_run_records)
+    assert later_calls == []
+    assert context.compile_options is options
+    assert options.requested_schedule is schedule
+    assert tuple(spec.metadata for spec in specs) == specs_snapshot
+    assert schedule == schedule_snapshot
+    assert (schedule.cache_key, hash(schedule)) == schedule_identity
+    assert (
+        options.cache_key,
+        options.semantic_cache_key,
+        options.cache_fingerprint,
+    ) == options_identity
+    assert ops._kernel_cache == {}
+    assert ops._einsum_dispatch_cache == {}
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+    assert CompilerStageId.SCHEDULE_LOWERING.value in str(suppressed.value)
+
+
 def test_frontend_failure_records_nothing_and_never_enters_normalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
