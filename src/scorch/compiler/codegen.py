@@ -1,4 +1,14 @@
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, TypeAlias, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypeAlias,
+    Union,
+    cast,
+)
 
 from . import llir
 from .diagnostics import CodegenError
@@ -16,8 +26,7 @@ if TYPE_CHECKING:
 
 LLIRStatementEmissionValue: TypeAlias = Union[
     llir.Stmt,
-    List["LLIRStatementEmissionValue"],
-    Tuple["LLIRStatementEmissionValue", ...],
+    Sequence["LLIRStatementEmissionValue"],
 ]
 LLIREmissionValue: TypeAlias = Union[llir.Node, LLIRStatementEmissionValue, str]
 

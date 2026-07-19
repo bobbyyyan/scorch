@@ -3,11 +3,11 @@ from typing import Dict, List, Sequence, Set, Tuple, Type, cast
 import pytest
 
 from scorch.compiler import llir
-from scorch.compiler.codegen import (
+from scorch.compiler.codegen import (  # type: ignore[import-untyped]
     EMITTED_LLIR_NODE_TYPES,
     LLIRLowerer,
 )
-from scorch.compiler.diagnostics import CodegenError
+from scorch.compiler.diagnostics import CodegenError  # type: ignore[import-untyped]
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_traversal import (
     LLIRPath,
@@ -560,7 +560,7 @@ def test_every_declared_node_subclass_fails_closed_in_traversal_and_codegen() ->
     lowerer = LLIRLowerer()
     for node_type, sample in _node_samples().items():
         unknown_type = type(f"Unknown{node_type.__name__}", (node_type,), {})
-        unknown = object.__new__(unknown_type)
+        unknown: llir.Node = object.__new__(unknown_type)
         vars(unknown).update(vars(sample))
 
         with pytest.raises(LLIRTraversalError) as traversal_error:
