@@ -925,54 +925,125 @@ def _workspace_pool_statement(
     )
 
 
+def _loop_bound_reference(loop_bound: str, loop_bound_type: llir.DataType) -> llir.Var:
+    """Return one fresh typed reference to the selected outer-loop bound."""
+
+    return llir.Var(name=loop_bound, type=loop_bound_type)
+
+
+def _count_reference(level: int) -> llir.Var:
+    return llir.Var(name=f"_count{level}", type=llir.DataType.STD_VECTOR_C_INT)
+
+
+def _offset_reference(level: int) -> llir.Var:
+    return llir.Var(name=f"_offset{level}", type=llir.DataType.STD_VECTOR_INT)
+
+
+def _prefix_index_reference() -> llir.Var:
+    return llir.Var(name="_i", type=llir.DataType.INT)
+
+
 def _count_and_offset_statements(
-    context: CompressedWhereOpenMPContext, loop_bound: str
+    context: CompressedWhereOpenMPContext,
+    loop_bound: str,
+    loop_bound_type: llir.DataType,
 ) -> List[llir.Stmt]:
     statements: List[llir.Stmt] = []
     for level in context.compressed_levels:
         statements.append(
-            llir.RawStmt(
-                code=f"std::vector<int> _count{level}((size_t){loop_bound}, 0)"
+            llir.DirectInit(
+                var=_count_reference(level),
+                args=(
+                    llir.Cast(
+                        _loop_bound_reference(loop_bound, loop_bound_type),
+                        llir.DataType.SIZE_T,
+                    ),
+                    llir.Literal(0, llir.DataType.INT),
+                ),
             )
         )
     return statements
 
 
+def _prefix_sum_loop(
+    level: int,
+    loop_bound: str,
+    loop_bound_type: llir.DataType,
+) -> llir.ForLoop:
+    return llir.ForLoop(
+        init=llir.VarInit(
+            var=_prefix_index_reference(),
+            value=llir.Literal(0, llir.DataType.INT),
+        ),
+        cond=llir.BinOp(
+            "<",
+            _prefix_index_reference(),
+            _loop_bound_reference(loop_bound, loop_bound_type),
+        ),
+        update=llir.Increment(_prefix_index_reference()),
+        body=[
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=_offset_reference(level),
+                    index=llir.Add(
+                        _prefix_index_reference(),
+                        llir.Literal(1, llir.DataType.INT),
+                    ),
+                ),
+                value=llir.Add(
+                    llir.ArrayAccess(
+                        array=_offset_reference(level),
+                        index=_prefix_index_reference(),
+                    ),
+                    llir.ArrayAccess(
+                        array=_count_reference(level),
+                        index=_prefix_index_reference(),
+                    ),
+                ),
+            )
+        ],
+    )
+
+
 def _prefix_sum_statements(
-    context: CompressedWhereOpenMPContext, loop_bound: str
+    context: CompressedWhereOpenMPContext,
+    loop_bound: str,
+    loop_bound_type: llir.DataType,
 ) -> List[llir.Stmt]:
     statements: List[llir.Stmt] = []
     for level in context.compressed_levels:
         statements.extend(
             [
-                llir.RawStmt(
-                    code=(
-                        f"std::vector<int64_t> _offset{level}("
-                        f"(size_t){loop_bound} + 1)"
-                    )
+                llir.DirectInit(
+                    var=_offset_reference(level),
+                    args=(
+                        llir.Add(
+                            llir.Cast(
+                                _loop_bound_reference(loop_bound, loop_bound_type),
+                                llir.DataType.SIZE_T,
+                            ),
+                            llir.Literal(1, llir.DataType.INT),
+                        ),
+                    ),
                 ),
                 llir.Assign(
                     var=llir.ArrayAccess(
-                        array=llir.Var(
-                            name=f"_offset{level}",
-                            type=llir.DataType.STD_VECTOR_INT,
-                        ),
-                        index=llir.Literal(0),
+                        array=_offset_reference(level),
+                        index=llir.Literal(0, llir.DataType.INT),
                     ),
-                    value=llir.Literal(0),
+                    value=llir.Literal(0, llir.DataType.INT),
                 ),
-                llir.RawStmt(
-                    code=(
-                        f"for (int _i = 0; _i < {loop_bound}; _i++) "
-                        f"_offset{level}[_i + 1] = _offset{level}[_i] + "
-                        f"_count{level}[_i];"
-                    ),
-                    add_semicolon=False,
-                ),
+                _prefix_sum_loop(level, loop_bound, loop_bound_type),
             ]
         )
     statements.extend(
-        llir.RawStmt(code=f"int64_t _total{level} = _offset{level}[{loop_bound}]")
+        llir.VarInit(
+            var=llir.Var(name=f"_total{level}", type=llir.DataType.INT64),
+            value=llir.ArrayAccess(
+                array=_offset_reference(level),
+                index=_loop_bound_reference(loop_bound, loop_bound_type),
+            ),
+        )
         for level in context.compressed_levels
     )
     return statements
@@ -1098,6 +1169,7 @@ def _build_transformed_statements(
     manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
     loop_var = cast(llir.VarInit, for_loop.init).var
+    loop_bound_type = cast(llir.Var, cast(llir.BinOp, for_loop.cond).right).type
     work_body, workspace_hoisted = _extract_work_body(for_loop, context)
     count_body, count_records = _build_count_body(
         work_body,
@@ -1137,9 +1209,11 @@ def _build_transformed_statements(
         result = _filtered_prefix(statements, loop_index, context)
         if workspace_hoisted:
             result.append(_workspace_pool_statement(context, count_loop, fill_loop))
-        result.extend(_count_and_offset_statements(context, loop_bound))
+        result.extend(
+            _count_and_offset_statements(context, loop_bound, loop_bound_type)
+        )
         result.append(count_loop)
-        result.extend(_prefix_sum_statements(context, loop_bound))
+        result.extend(_prefix_sum_statements(context, loop_bound, loop_bound_type))
         result.extend(_position_and_coordinate_allocations(context, loop_bound))
         result.append(_value_allocation(context))
         result.append(fill_loop)
