@@ -1413,6 +1413,605 @@ def test_known_nnz_coordinate_torch_owners_and_pointers_are_structured_and_fresh
         ),
     ),
 )
+@pytest.mark.parametrize(
+    "bound_type",
+    (llir.DataType.INT, llir.DataType.INT64),
+    ids=("int-bound", "int64-bound"),
+)
+def test_first_compressed_position_allocation_is_typed_fresh_and_rewritable(
+    level_types: tuple[LevelType, ...],
+    bound_type: llir.DataType,
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=level_types,
+        dtype=torch.float32,
+    )
+    caller_bound = llir.Var("extent", bound_type)
+    caller_offsets = llir.Var("_offset1", llir.DataType.STD_VECTOR_INT)
+
+    first = assembler.emit_first_compressed_position_allocation(
+        caller_bound,
+        caller_offsets,
+    )
+    second = assembler.emit_first_compressed_position_allocation(
+        caller_bound,
+        caller_offsets,
+    )
+
+    assert [type(statement) for statement in first] == [
+        llir.VarInit,
+        llir.VarInit,
+        llir.ForLoop,
+    ]
+    assert [type(statement) for statement in second] == [
+        llir.VarInit,
+        llir.VarInit,
+        llir.ForLoop,
+    ]
+    owner = cast(llir.VarInit, first[0])
+    pointer = cast(llir.VarInit, first[1])
+    copy_loop = cast(llir.ForLoop, first[2])
+    equal_owner = cast(llir.VarInit, second[0])
+    equal_pointer = cast(llir.VarInit, second[1])
+    equal_loop = cast(llir.ForLoop, second[2])
+
+    assert owner == equal_owner
+    assert hash(owner) == hash(equal_owner)
+    assert owner is not equal_owner
+    assert owner.var is not equal_owner.var
+    assert owner.var.name == "Result1_pos_torch"
+    assert owner.var.type is llir.DataType.TORCH_TENSOR
+    assert owner.var.is_ptr is False
+    assert owner.var.is_restrict is False
+    assert owner.var.tensor_access is None
+    assert owner.op == "="
+    assert owner.cast is False
+    assert type(owner.value) is llir.FunctionCall
+    empty = cast(llir.FunctionCall, owner.value)
+    equal_empty = cast(llir.FunctionCall, equal_owner.value)
+    assert empty == equal_empty
+    assert hash(empty) == hash(equal_empty)
+    assert empty is not equal_empty
+    assert empty.name == "torch::empty"
+    assert type(empty.args) is tuple
+    assert len(empty.args) == 2
+
+    assert type(empty.args[0]) is llir.Array
+    extent = cast(llir.Array, empty.args[0])
+    equal_extent = cast(llir.Array, equal_empty.args[0])
+    assert extent == equal_extent
+    assert hash(extent) == hash(equal_extent)
+    assert extent is not equal_extent
+    assert extent.data_type is llir.DataType.INT64
+    assert type(extent.values) is tuple
+    assert len(extent.values) == 1
+    assert type(extent.values[0]) is llir.Cast
+    extent_cast = cast(llir.Cast, extent.values[0])
+    equal_extent_cast = cast(llir.Cast, equal_extent.values[0])
+    assert extent_cast == equal_extent_cast
+    assert hash(extent_cast) == hash(equal_extent_cast)
+    assert extent_cast is not equal_extent_cast
+    assert extent_cast.data_type is llir.DataType.INT64
+    assert type(extent_cast.expr) is llir.Add
+    cardinality = cast(llir.Add, extent_cast.expr)
+    equal_cardinality = cast(llir.Add, equal_extent_cast.expr)
+    assert cardinality == equal_cardinality
+    assert hash(cardinality) == hash(equal_cardinality)
+    assert cardinality is not equal_cardinality
+    assert cardinality.op == "+"
+    assert type(cardinality.left) is llir.Var
+    extent_bound = cast(llir.Var, cardinality.left)
+    assert extent_bound.name == "extent"
+    assert extent_bound.type is bound_type
+    assert extent_bound.is_ptr is False
+    assert extent_bound.is_restrict is False
+    assert extent_bound.tensor_access is None
+    assert extent_bound is not caller_bound
+    assert type(cardinality.right) is llir.Literal
+    extent_increment = cast(llir.Literal, cardinality.right)
+    assert extent_increment.value == 1
+    assert extent_increment.data_type is llir.DataType.INT
+    dtype = _assert_torch_qualified_name(empty.args[1], "torch::kInt")
+    equal_dtype = _assert_torch_qualified_name(
+        equal_empty.args[1],
+        "torch::kInt",
+    )
+    assert dtype == equal_dtype
+    assert hash(dtype) == hash(equal_dtype)
+    assert dtype is not equal_dtype
+
+    assert pointer == equal_pointer
+    assert hash(pointer) == hash(equal_pointer)
+    assert pointer is not equal_pointer
+    assert pointer.var is not equal_pointer.var
+    assert pointer.var.name == "Result1_pos_data"
+    assert pointer.var.type is llir.DataType.PTR_INT
+    assert pointer.var.is_ptr is False
+    assert pointer.var.is_restrict is False
+    assert pointer.var.tensor_access is None
+    assert pointer.op == "="
+    assert pointer.cast is False
+    data_ptr = _assert_data_ptr_call(pointer.value, llir.DataType.INT)
+    equal_data_ptr = _assert_data_ptr_call(
+        equal_pointer.value,
+        llir.DataType.INT,
+    )
+    assert data_ptr == equal_data_ptr
+    assert hash(data_ptr) == hash(equal_data_ptr)
+    assert data_ptr is not equal_data_ptr
+    receiver = _assert_torch_tensor_var(data_ptr.base, "Result1_pos_torch")
+    equal_receiver = _assert_torch_tensor_var(
+        equal_data_ptr.base,
+        "Result1_pos_torch",
+    )
+    assert receiver is not owner.var
+    assert receiver is not equal_receiver
+
+    assert copy_loop is not equal_loop
+    assert copy_loop.omp_parallel_for is False
+    assert copy_loop.omp_schedule is None
+    assert copy_loop.omp_num_threads is None
+    assert copy_loop.omp_chunk_expr is None
+    assert copy_loop.unroll is False
+    assert copy_loop.simd is False
+    assert copy_loop.before_parallel_body is None
+    assert copy_loop.pre_parallel_body is None
+    assert copy_loop.post_parallel_body is None
+    assert copy_loop.scorch_index_var is None
+    assert type(copy_loop.init) is llir.VarInit
+    initialization = cast(llir.VarInit, copy_loop.init)
+    assert initialization.var.name == "_i"
+    assert initialization.var.type is llir.DataType.INT
+    assert initialization.var.is_ptr is False
+    assert initialization.var.is_restrict is False
+    assert initialization.var.tensor_access is None
+    assert initialization.op == "="
+    assert initialization.cast is False
+    assert type(initialization.value) is llir.Literal
+    initial_zero = cast(llir.Literal, initialization.value)
+    assert initial_zero.value == 0
+    assert initial_zero.data_type is llir.DataType.INT
+
+    assert type(copy_loop.cond) is llir.BinOp
+    condition = cast(llir.BinOp, copy_loop.cond)
+    assert type(condition) is llir.BinOp
+    assert condition.op == "<="
+    assert type(condition.left) is llir.Var
+    condition_index = cast(llir.Var, condition.left)
+    assert condition_index.name == "_i"
+    assert condition_index.type is llir.DataType.INT
+    assert type(condition.right) is llir.Var
+    condition_bound = cast(llir.Var, condition.right)
+    assert condition_bound.name == "extent"
+    assert condition_bound.type is bound_type
+    assert condition_bound.is_ptr is False
+    assert condition_bound.is_restrict is False
+    assert condition_bound.tensor_access is None
+    assert condition_bound is not caller_bound
+    assert condition_bound is not extent_bound
+
+    assert type(copy_loop.update) is llir.Increment
+    update = cast(llir.Increment, copy_loop.update)
+    assert update.var.name == "_i"
+    assert update.var.type is llir.DataType.INT
+    assert len(copy_loop.body) == 1
+    assert type(copy_loop.body[0]) is llir.Assign
+    assignment = cast(llir.Assign, copy_loop.body[0])
+    assert assignment.op is llir.AssignOp.ASSIGN
+    assert assignment.cast is False
+    assert type(assignment.var) is llir.ArrayAccess
+    target = cast(llir.ArrayAccess, assignment.var)
+    assert target.tensor_access is None
+    assert type(target.array) is llir.Var
+    target_pointer = cast(llir.Var, target.array)
+    assert target_pointer.name == "Result1_pos_data"
+    assert target_pointer.type is llir.DataType.PTR_INT
+    assert target_pointer.is_ptr is False
+    assert target_pointer.is_restrict is False
+    assert target_pointer.tensor_access is None
+    assert target_pointer is not pointer.var
+    assert type(target.index) is llir.Var
+    target_index = cast(llir.Var, target.index)
+    assert target_index.name == "_i"
+    assert target_index.type is llir.DataType.INT
+
+    assert type(assignment.value) is llir.Cast
+    value_cast = cast(llir.Cast, assignment.value)
+    assert value_cast.data_type is llir.DataType.INT
+    assert type(value_cast.expr) is llir.ArrayAccess
+    source_access = cast(llir.ArrayAccess, value_cast.expr)
+    assert source_access.tensor_access is None
+    assert type(source_access.array) is llir.Var
+    source_offsets = cast(llir.Var, source_access.array)
+    assert source_offsets.name == "_offset1"
+    assert source_offsets.type is llir.DataType.STD_VECTOR_INT
+    assert source_offsets.is_ptr is False
+    assert source_offsets.is_restrict is False
+    assert source_offsets.tensor_access is None
+    assert source_offsets is not caller_offsets
+    assert type(source_access.index) is llir.Var
+    source_index = cast(llir.Var, source_access.index)
+    assert source_index.name == "_i"
+    assert source_index.type is llir.DataType.INT
+    index_references = (
+        initialization.var,
+        condition_index,
+        update.var,
+        target_index,
+        source_index,
+    )
+    assert len({id(index) for index in index_references}) == len(index_references)
+
+    expected_cpp = (
+        "torch::Tensor Result1_pos_torch = "
+        "torch::empty({(int64_t) (extent + 1)}, torch::kInt);\n"
+        "int* Result1_pos_data = Result1_pos_torch.data_ptr<int>();\n"
+        "for (int _i = 0; _i <= extent; _i++) {\n"
+        "  Result1_pos_data[_i] = (int) _offset1[_i];\n"
+        "}"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected_cpp
+    assert LLIRLowerer().lower_llir(second) == expected_cpp
+
+    def traversal_snapshot_and_ids(
+        value: list[llir.Stmt],
+        pass_name: str,
+    ) -> tuple[tuple[tuple[str, ...], ...], set[int]]:
+        paths: list[tuple[str, ...]] = []
+        identities: set[int] = set()
+
+        class Collector(LLIRWalker):
+            def enter_node(
+                self,
+                node: llir.Node,
+                path: tuple[str, ...],
+            ) -> None:
+                paths.append((*path, type(node).__name__))
+                identities.add(id(node))
+
+        Collector(LLIRTraversalContext(stage="test", pass_name=pass_name)).walk(value)
+        return tuple(paths), identities
+
+    first_snapshot, first_ids = traversal_snapshot_and_ids(
+        first,
+        "first_position_first",
+    )
+    second_snapshot, second_ids = traversal_snapshot_and_ids(
+        second,
+        "first_position_second",
+    )
+    assert first_snapshot == second_snapshot
+    assert len(first_ids) == len(first_snapshot)
+    assert len(second_ids) == len(second_snapshot)
+    assert first_ids.isdisjoint(second_ids)
+    assert id(caller_bound) not in first_ids | second_ids
+    assert id(caller_offsets) not in first_ids | second_ids
+
+    rewritten = cast(
+        list[llir.Stmt],
+        LLIRRewriter(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="rewrite_first_compressed_position",
+            )
+        ).rewrite(first),
+    )
+    rewritten_snapshot, rewritten_ids = traversal_snapshot_and_ids(
+        rewritten,
+        "first_position_rewritten",
+    )
+    assert rewritten_snapshot == first_snapshot
+    assert rewritten_ids.isdisjoint(first_ids)
+    assert LLIRLowerer().lower_llir(rewritten) == expected_cpp
+
+    class RenameFirstPositionReferences(LLIRRewriter):
+        def rewrite_var(
+            self,
+            node: llir.Var,
+            path: tuple[str, ...],
+        ) -> llir.Var:
+            rewritten_var = super().rewrite_var(node, path)
+            rewritten_var.name = {
+                "Result1_pos_torch": "Renamed1_pos_torch",
+                "Result1_pos_data": "Renamed1_pos_data",
+                "extent": "renamed_extent",
+                "_offset1": "renamed_offsets",
+                "_i": "renamed_i",
+            }.get(node.name, node.name)
+            return rewritten_var
+
+    renamed = cast(
+        list[llir.Stmt],
+        RenameFirstPositionReferences(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="rename_first_compressed_position",
+            )
+        ).rewrite(first),
+    )
+    renamed_cpp = LLIRLowerer().lower_llir(renamed)
+    assert "Renamed1_pos_torch" in renamed_cpp
+    assert "Renamed1_pos_data" in renamed_cpp
+    assert "renamed_extent" in renamed_cpp
+    assert "renamed_offsets" in renamed_cpp
+    assert "renamed_i" in renamed_cpp
+    assert LLIRLowerer().lower_llir(first) == expected_cpp
+
+    caller_bound.name = "caller_owned_bound"
+    caller_offsets.name = "caller_owned_offsets"
+    extent_bound.name = "first_owned_bound"
+    source_offsets.name = "first_owned_offsets"
+    assert LLIRLowerer().lower_llir(second) == expected_cpp
+    assert LLIRLowerer().lower_llir(rewritten) == expected_cpp
+
+
+@pytest.mark.parametrize(
+    "level_types",
+    (
+        (),
+        (LevelType.DENSE,),
+        (LevelType.COMPRESSED,),
+        (LevelType.DENSE, LevelType.COORDINATE),
+        (LevelType.DENSE, LevelType.COMPRESSED, LevelType.DENSE),
+    ),
+)
+def test_first_compressed_position_allocation_rejects_other_layouts(
+    level_types: tuple[LevelType, ...],
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=level_types,
+        dtype=torch.float32,
+    )
+
+    with pytest.raises(ValueError, match="one dense level"):
+        assembler.emit_first_compressed_position_allocation(
+            llir.Var("extent", llir.DataType.INT64),
+            llir.Var("_offset1", llir.DataType.STD_VECTOR_INT),
+        )
+
+
+@pytest.mark.parametrize(
+    ("argument", "field", "forged_value", "expected_message"),
+    (
+        pytest.param(
+            "bound",
+            "name",
+            "not.an.identifier",
+            "bound must be an identifier",
+            id="bound-name",
+        ),
+        pytest.param(
+            "bound",
+            "type",
+            llir.DataType.FLOAT32,
+            "bound must be INT or INT64",
+            id="bound-type",
+        ),
+        pytest.param(
+            "bound",
+            "is_ptr",
+            True,
+            "bound cannot be a pointer",
+            id="bound-pointer",
+        ),
+        pytest.param(
+            "bound",
+            "is_restrict",
+            True,
+            "bound cannot be restrict-qualified",
+            id="bound-restrict",
+        ),
+        pytest.param(
+            "bound",
+            "tensor_access",
+            object(),
+            "bound cannot carry tensor provenance",
+            id="bound-provenance",
+        ),
+        pytest.param(
+            "offsets",
+            "name",
+            "other_offsets",
+            "offsets must be named _offset1",
+            id="offsets-name",
+        ),
+        pytest.param(
+            "offsets",
+            "type",
+            llir.DataType.STD_VECTOR_C_INT,
+            "offsets must have STD_VECTOR_INT type",
+            id="offsets-type",
+        ),
+        pytest.param(
+            "offsets",
+            "is_ptr",
+            True,
+            "offsets cannot be a pointer",
+            id="offsets-pointer",
+        ),
+        pytest.param(
+            "offsets",
+            "is_restrict",
+            True,
+            "offsets cannot be restrict-qualified",
+            id="offsets-restrict",
+        ),
+        pytest.param(
+            "offsets",
+            "tensor_access",
+            object(),
+            "offsets cannot carry tensor provenance",
+            id="offsets-provenance",
+        ),
+    ),
+)
+def test_first_compressed_position_allocation_validates_every_boundary_field(
+    argument: str,
+    field: str,
+    forged_value: object,
+    expected_message: str,
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    bound = llir.Var("extent", llir.DataType.INT64)
+    offsets = llir.Var("_offset1", llir.DataType.STD_VECTOR_INT)
+    object.__setattr__(bound if argument == "bound" else offsets, field, forged_value)
+
+    with pytest.raises((TypeError, ValueError), match=expected_message):
+        assembler.emit_first_compressed_position_allocation(bound, offsets)
+
+
+@pytest.mark.parametrize("argument", ("bound", "offsets"))
+@pytest.mark.parametrize(
+    "missing_field",
+    ("name", "type", "is_ptr", "is_restrict", "tensor_access"),
+)
+def test_first_compressed_position_allocation_rejects_missing_boundary_fields(
+    argument: str,
+    missing_field: str,
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    complete_fields = {
+        "name": "extent" if argument == "bound" else "_offset1",
+        "type": (
+            llir.DataType.INT64 if argument == "bound" else llir.DataType.STD_VECTOR_INT
+        ),
+        "is_ptr": False,
+        "is_restrict": False,
+        "tensor_access": None,
+    }
+    incomplete = object.__new__(llir.Var)
+    for field, value in complete_fields.items():
+        if field != missing_field:
+            object.__setattr__(incomplete, field, value)
+    bound = (
+        incomplete if argument == "bound" else llir.Var("extent", llir.DataType.INT64)
+    )
+    offsets = (
+        incomplete
+        if argument == "offsets"
+        else llir.Var("_offset1", llir.DataType.STD_VECTOR_INT)
+    )
+
+    with pytest.raises(TypeError, match=f"{argument} must be a complete LLIR Var"):
+        assembler.emit_first_compressed_position_allocation(bound, offsets)
+
+
+@pytest.mark.parametrize("argument", ("bound", "offsets"))
+def test_first_compressed_position_allocation_rejects_extra_boundary_fields(
+    argument: str,
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    bound = llir.Var("extent", llir.DataType.INT64)
+    offsets = llir.Var("_offset1", llir.DataType.STD_VECTOR_INT)
+    object.__setattr__(bound if argument == "bound" else offsets, "extra", object())
+
+    with pytest.raises(TypeError, match=f"{argument} must be a complete LLIR Var"):
+        assembler.emit_first_compressed_position_allocation(bound, offsets)
+
+
+@pytest.mark.parametrize("argument", ("bound", "offsets"))
+def test_first_compressed_position_allocation_rejects_boundary_subclasses(
+    argument: str,
+) -> None:
+    class UnknownVar(llir.Var):
+        pass
+
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    bound = (
+        UnknownVar("extent", llir.DataType.INT64)
+        if argument == "bound"
+        else llir.Var("extent", llir.DataType.INT64)
+    )
+    offsets = (
+        UnknownVar("_offset1", llir.DataType.STD_VECTOR_INT)
+        if argument == "offsets"
+        else llir.Var("_offset1", llir.DataType.STD_VECTOR_INT)
+    )
+
+    with pytest.raises(TypeError, match=f"{argument} must be an exact LLIR Var"):
+        assembler.emit_first_compressed_position_allocation(bound, offsets)
+
+
+@pytest.mark.parametrize("argument", ("bound", "offsets"))
+def test_first_compressed_position_allocation_rejects_non_vars(argument: str) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    bound = (
+        cast(llir.Var, object())
+        if argument == "bound"
+        else llir.Var(
+            "extent",
+            llir.DataType.INT64,
+        )
+    )
+    offsets = (
+        cast(llir.Var, object())
+        if argument == "offsets"
+        else llir.Var(
+            "_offset1",
+            llir.DataType.STD_VECTOR_INT,
+        )
+    )
+
+    with pytest.raises(TypeError, match=f"{argument} must be an exact LLIR Var"):
+        assembler.emit_first_compressed_position_allocation(bound, offsets)
+
+
+def test_first_compressed_position_allocation_rejects_assembler_subclasses() -> None:
+    class ResultAssemblerSubclass(ResultTensorAssembler):
+        pass
+
+    assembler = ResultAssemblerSubclass(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+
+    with pytest.raises(TypeError, match="exact ResultTensorAssembler"):
+        assembler.emit_first_compressed_position_allocation(
+            llir.Var("extent", llir.DataType.INT64),
+            llir.Var("_offset1", llir.DataType.STD_VECTOR_INT),
+        )
+
+
+@pytest.mark.parametrize(
+    "level_types",
+    (
+        pytest.param(
+            (LevelType.DENSE, LevelType.COMPRESSED),
+            id="ds",
+        ),
+        pytest.param(
+            (
+                LevelType.DENSE,
+                LevelType.COMPRESSED,
+                LevelType.COMPRESSED,
+            ),
+            id="dss",
+        ),
+    ),
+)
 def test_compressed_coordinate_torch_owners_are_typed_fresh_and_ordered(
     level_types: tuple[LevelType, ...],
 ) -> None:

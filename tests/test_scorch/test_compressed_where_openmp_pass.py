@@ -236,6 +236,8 @@ def _prefix_sum_loops(value: object) -> List[llir.ForLoop]:
         if (
             type(loop.init) is llir.VarInit
             and cast(llir.VarInit, loop.init).var.name == "_i"
+            and type(loop.cond) is llir.BinOp
+            and cast(llir.BinOp, loop.cond).op == "<"
             and not loop.omp_parallel_for
         ):
             loops.append(loop)
@@ -285,6 +287,52 @@ def _compressed_coordinate_initializations(value: object) -> List[llir.VarInit]:
         for child in value:
             initializations.extend(_compressed_coordinate_initializations(child))
     return initializations
+
+
+def _first_position_initializations(value: object) -> List[llir.VarInit]:
+    initializations: List[llir.VarInit] = []
+    if type(value) is llir.VarInit:
+        initialization = cast(llir.VarInit, value)
+        if initialization.var.name in {
+            "Result1_pos_torch",
+            "Result1_pos_data",
+        }:
+            initializations.append(initialization)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            initializations.extend(_first_position_initializations(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            initializations.extend(_first_position_initializations(child))
+    return initializations
+
+
+def _first_position_copy_loops(value: object) -> List[llir.ForLoop]:
+    loops: List[llir.ForLoop] = []
+    if type(value) is llir.ForLoop:
+        loop = cast(llir.ForLoop, value)
+        condition = loop.cond
+        if (
+            type(condition) is llir.BinOp
+            and condition.op == "<="
+            and len(loop.body) == 1
+            and type(loop.body[0]) is llir.Assign
+        ):
+            assignment = cast(llir.Assign, loop.body[0])
+            target = assignment.var
+            if (
+                type(target) is llir.ArrayAccess
+                and type(target.array) is llir.Var
+                and target.array.name == "Result1_pos_data"
+            ):
+                loops.append(loop)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            loops.extend(_first_position_copy_loops(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            loops.extend(_first_position_copy_loops(child))
+    return loops
 
 
 def _deeper_position_owner_initializations(value: object) -> List[llir.VarInit]:
@@ -568,7 +616,25 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
         )
         for code in top_level_codes
     )
-    assert any("torch::Tensor Result1_pos_torch" in code for code in top_level_codes)
+    assert not any(
+        "Result1_pos_torch" in code
+        or "Result1_pos_data" in code
+        or "_offset1[_i]" in code
+        for code in top_level_codes
+    )
+    assert LLIRLowerer().lower_llir(
+        [
+            *_first_position_initializations(result.statements),
+            *_first_position_copy_loops(result.statements),
+        ]
+    ) == (
+        "torch::Tensor Result1_pos_torch = "
+        "torch::empty({(int64_t) (A0_size + 1)}, torch::kInt);\n"
+        "int* Result1_pos_data = Result1_pos_torch.data_ptr<int>();\n"
+        "for (int _i = 0; _i <= A0_size; _i++) {\n"
+        "  Result1_pos_data[_i] = (int) _offset1[_i];\n"
+        "}"
+    )
     assert not any("Result1_crd_torch" in code for code in top_level_codes)
     assert [
         LLIRLowerer().lower_llir(initialization)
@@ -707,6 +773,148 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
 
 
 @pytest.mark.parametrize(
+    "bound_type",
+    (llir.DataType.INT, llir.DataType.INT64),
+)
+def test_first_compressed_position_allocation_is_typed_ordered_and_detached(
+    bound_type: llir.DataType,
+) -> None:
+    source = [
+        _compatible_loop(
+            _ds_work_body(),
+            bound="extent",
+            bound_type=bound_type,
+        )
+    ]
+    source_snapshot = _structural_snapshot(source)
+    source_bound = cast(
+        llir.Var,
+        cast(llir.BinOp, cast(llir.ForLoop, source[0]).cond).right,
+    )
+
+    first = transform_compressed_where_for_openmp(source, _context())
+    second = transform_compressed_where_for_openmp(source, _context())
+    first_initializations = _first_position_initializations(first.statements)
+    second_initializations = _first_position_initializations(second.statements)
+    first_copy_loops = _first_position_copy_loops(first.statements)
+    second_copy_loops = _first_position_copy_loops(second.statements)
+    first_family: List[llir.Stmt] = [*first_initializations, *first_copy_loops]
+    second_family: List[llir.Stmt] = [*second_initializations, *second_copy_loops]
+
+    assert [type(statement) for statement in first_family] == [
+        llir.VarInit,
+        llir.VarInit,
+        llir.ForLoop,
+    ]
+    assert [initialization.var.name for initialization in first_initializations] == [
+        "Result1_pos_torch",
+        "Result1_pos_data",
+    ]
+    assert len(first_copy_loops) == len(second_copy_loops) == 1
+    assert _structural_snapshot(first_family) == _structural_snapshot(second_family)
+    assert _mutable_ir_ids(first_family).isdisjoint(_mutable_ir_ids(second_family))
+    assert _structural_snapshot(source) == source_snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(first.statements))
+
+    owner, pointer = first_initializations
+    copy_loop = first_copy_loops[0]
+    assert owner.var.type is llir.DataType.TORCH_TENSOR
+    assert type(owner.value) is llir.FunctionCall
+    empty = cast(llir.FunctionCall, owner.value)
+    assert empty.name == "torch::empty"
+    extent = cast(llir.Array, empty.args[0])
+    assert type(extent) is llir.Array
+    assert extent.data_type is llir.DataType.INT64
+    assert type(extent.values[0]) is llir.Cast
+    extent_cast = cast(llir.Cast, extent.values[0])
+    assert extent_cast.data_type is llir.DataType.INT64
+    assert type(extent_cast.expr) is llir.Add
+    extent_add = cast(llir.Add, extent_cast.expr)
+    assert type(extent_add.left) is llir.Var
+    assert extent_add.left.name == "extent"
+    assert extent_add.left.type is bound_type
+    assert type(extent_add.right) is llir.Literal
+    assert extent_add.right.value == 1
+    assert extent_add.right.data_type is llir.DataType.INT
+    assert type(empty.args[1]) is llir.QualifiedName
+    assert cast(llir.QualifiedName, empty.args[1]).namespace == "torch"
+    assert cast(llir.QualifiedName, empty.args[1]).name == "kInt"
+
+    assert pointer.var.type is llir.DataType.PTR_INT
+    assert type(pointer.value) is llir.MemberCall
+    data_ptr = cast(llir.MemberCall, pointer.value)
+    assert data_ptr.member == "data_ptr"
+    assert data_ptr.template_args == (llir.DataType.INT,)
+    assert data_ptr.args == ()
+    assert type(data_ptr.base) is llir.Var
+    assert data_ptr.base.name == "Result1_pos_torch"
+    assert data_ptr.base.type is llir.DataType.TORCH_TENSOR
+
+    assert type(copy_loop.init) is llir.VarInit
+    assert copy_loop.init.var.name == "_i"
+    assert copy_loop.init.var.type is llir.DataType.INT
+    assert type(copy_loop.init.value) is llir.Literal
+    assert copy_loop.init.value.value == 0
+    assert type(copy_loop.cond) is llir.BinOp
+    assert copy_loop.cond.op == "<="
+    assert type(copy_loop.cond.left) is llir.Var
+    assert copy_loop.cond.left.name == "_i"
+    assert type(copy_loop.cond.right) is llir.Var
+    assert copy_loop.cond.right.name == "extent"
+    assert copy_loop.cond.right.type is bound_type
+    assert type(copy_loop.update) is llir.Increment
+    assert copy_loop.update.var.name == "_i"
+    assert len(copy_loop.body) == 1
+    assignment = cast(llir.Assign, copy_loop.body[0])
+    assert type(assignment) is llir.Assign
+    assert type(assignment.var) is llir.ArrayAccess
+    target = cast(llir.ArrayAccess, assignment.var)
+    assert type(target.array) is llir.Var
+    assert target.array.name == "Result1_pos_data"
+    assert target.array.type is llir.DataType.PTR_INT
+    assert type(target.index) is llir.Var
+    assert target.index.name == "_i"
+    assert type(assignment.value) is llir.Cast
+    value_cast = cast(llir.Cast, assignment.value)
+    assert value_cast.data_type is llir.DataType.INT
+    assert type(value_cast.expr) is llir.ArrayAccess
+    offset_access = cast(llir.ArrayAccess, value_cast.expr)
+    assert type(offset_access.array) is llir.Var
+    assert offset_access.array.name == "_offset1"
+    assert offset_access.array.type is llir.DataType.STD_VECTOR_INT
+    assert type(offset_access.index) is llir.Var
+    assert offset_access.index.name == "_i"
+
+    assert LLIRLowerer().lower_llir(first_family) == (
+        "torch::Tensor Result1_pos_torch = "
+        "torch::empty({(int64_t) (extent + 1)}, torch::kInt);\n"
+        "int* Result1_pos_data = Result1_pos_torch.data_ptr<int>();\n"
+        "for (int _i = 0; _i <= extent; _i++) {\n"
+        "  Result1_pos_data[_i] = (int) _offset1[_i];\n"
+        "}"
+    )
+    assert not any(
+        "Result1_pos_torch" in code
+        or "Result1_pos_data" in code
+        or "_offset1[_i]" in code
+        for code in _raw_codes(first.statements)
+    )
+    bound_references = _named_vars(first_family, "extent")
+    assert len(bound_references) == 2
+    assert all(bound.type is bound_type for bound in bound_references)
+    assert len({id(bound) for bound in bound_references}) == 2
+    assert all(bound is not source_bound for bound in bound_references)
+
+    owner.var.name = "owned_owner"
+    cast(llir.Var, copy_loop.cond.right).name = "owned_bound"
+    second_owner = second_initializations[0]
+    second_loop = second_copy_loops[0]
+    assert second_owner.var.name == "Result1_pos_torch"
+    assert cast(llir.Var, second_loop.cond.right).name == "extent"
+    assert source_bound.name == "extent"
+
+
+@pytest.mark.parametrize(
     ("compressed_levels", "expected_coordinate_names"),
     (
         (
@@ -736,6 +944,8 @@ def test_compressed_coordinate_allocations_are_typed_ordered_and_detached(
 
     first_coordinates = _compressed_coordinate_initializations(first.statements)
     second_coordinates = _compressed_coordinate_initializations(second.statements)
+    first_position_initializations = _first_position_initializations(first.statements)
+    first_position_copy_loops = _first_position_copy_loops(first.statements)
     first_deeper_owners = _deeper_position_owner_initializations(first.statements)
     first_deeper_pointers = _deeper_position_pointer_initializations(first.statements)
     first_deeper_sentinels = _deeper_position_zero_sentinels(first.statements)
@@ -758,9 +968,10 @@ def test_compressed_coordinate_allocations_are_typed_ordered_and_detached(
             code,
         )
         or re.search(
-            r"torch::Tensor Result2_pos_torch|Result2_pos_data\s*=",
+            r"torch::Tensor Result\d+_pos_torch|Result\d+_pos_data\s*=",
             code,
         )
+        or "Result1_pos_data[_i]" in code
         for code in raw_codes
     )
 
@@ -771,19 +982,18 @@ def test_compressed_coordinate_allocations_are_typed_ordered_and_detached(
         if type(statement) is llir.VarInit
         and cast(llir.VarInit, statement).var.name in expected_coordinate_names
     ]
-    first_position_owner = next(
+    first_position_ids = {
+        id(statement)
+        for statement in (
+            *first_position_initializations,
+            *first_position_copy_loops,
+        )
+    }
+    first_position_indices = [
         index
         for index, statement in enumerate(statements)
-        if type(statement) is llir.RawStmt
-        and "torch::Tensor Result1_pos_torch" in cast(llir.RawStmt, statement).code
-    )
-    first_position_copy = next(
-        index
-        for index, statement in enumerate(statements)
-        if type(statement) is llir.RawStmt
-        and "for (int _i = 0;" in cast(llir.RawStmt, statement).code
-        and "Result1_pos_data[_i]" in cast(llir.RawStmt, statement).code
-    )
+        if id(statement) in first_position_ids
+    ]
     values_owner = next(
         index
         for index, statement in enumerate(statements)
@@ -799,7 +1009,17 @@ def test_compressed_coordinate_allocations_are_typed_ordered_and_detached(
     assert coordinate_indices == list(
         range(coordinate_indices[0], coordinate_indices[0] + len(coordinate_indices))
     )
-    assert first_position_owner < first_position_copy < coordinate_indices[0]
+    assert [
+        initialization.var.name for initialization in first_position_initializations
+    ] == [
+        "Result1_pos_torch",
+        "Result1_pos_data",
+    ]
+    assert len(first_position_copy_loops) == 1
+    assert first_position_indices == list(
+        range(first_position_indices[0], first_position_indices[0] + 3)
+    )
+    assert first_position_indices[-1] < coordinate_indices[0]
     if compressed_levels == (1, 2):
         assert [owner.var.name for owner in first_deeper_owners] == [
             "Result2_pos_torch"
@@ -2380,6 +2600,90 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
         ),
         ("unknown_owner_call", "unknown_llir_node", ("value",)),
         (
+            "copy_target_metadata",
+            "invalid_tensor_access_metadata",
+            ("body", "[0]", "var", "tensor_access"),
+        ),
+        (
+            "copy_cast_type",
+            "invalid_cast_data_type",
+            ("body", "[0]", "value", "data_type"),
+        ),
+    ),
+)
+def test_generated_first_position_allocation_fails_closed_at_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+    expected_code: str,
+    expected_suffix: Tuple[str, ...],
+) -> None:
+    class UnknownFunctionCall(llir.FunctionCall):
+        pass
+
+    source = [_compatible_loop(_ds_work_body())]
+    snapshot = _structural_snapshot(source)
+    injected: List[str] = []
+
+    class InjectingWalker(LLIRWalker):
+        def walk(self, value: LLIRValue) -> None:
+            initializations = _first_position_initializations(value)
+            copy_loops = _first_position_copy_loops(value)
+            if len(initializations) == 2 and len(copy_loops) == 1 and not injected:
+                owner, pointer = initializations
+                copy_loop = copy_loops[0]
+                if malformation == "owner_args":
+                    empty = cast(llir.FunctionCall, owner.value)
+                    object.__setattr__(empty, "args", list(empty.args))
+                elif malformation == "pointer_template_args":
+                    data_ptr = cast(llir.MemberCall, pointer.value)
+                    object.__setattr__(
+                        data_ptr,
+                        "template_args",
+                        list(data_ptr.template_args),
+                    )
+                elif malformation == "unknown_owner_call":
+                    empty = cast(llir.FunctionCall, owner.value)
+                    unknown = object.__new__(UnknownFunctionCall)
+                    object.__setattr__(unknown, "name", empty.name)
+                    object.__setattr__(unknown, "args", empty.args)
+                    owner.value = unknown
+                elif malformation == "copy_target_metadata":
+                    assignment = cast(llir.Assign, copy_loop.body[0])
+                    target = cast(llir.ArrayAccess, assignment.var)
+                    object.__setattr__(target, "tensor_access", object())
+                else:
+                    assignment = cast(llir.Assign, copy_loop.body[0])
+                    value_cast = cast(llir.Cast, assignment.value)
+                    object.__setattr__(value_cast, "data_type", object())
+                injected.append(malformation)
+            super().walk(value)
+
+    monkeypatch.setattr(compressed_where_module, "LLIRWalker", InjectingWalker)
+    context = _context()
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(source, context)
+
+    diagnostic = raised.value.diagnostic
+    assert injected == [malformation]
+    assert diagnostic.code == expected_code
+    assert diagnostic.stage == context.traversal.stage
+    assert diagnostic.pass_name == context.traversal.pass_name
+    assert diagnostic.path[-len(expected_suffix) :] == expected_suffix
+    assert _structural_snapshot(source) == snapshot
+
+
+@pytest.mark.parametrize(
+    ("malformation", "expected_code", "expected_suffix"),
+    (
+        ("owner_args", "invalid_function_call_args", ("value", "args")),
+        (
+            "pointer_template_args",
+            "invalid_member_call_template_args",
+            ("value", "template_args"),
+        ),
+        ("unknown_owner_call", "unknown_llir_node", ("value",)),
+        (
             "extent_metadata",
             "invalid_tensor_access_metadata",
             ("value", "args", "[0]", "values", "[0]", "tensor_access"),
@@ -2894,9 +3198,9 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    assert len(cpp) == 7118
+    assert len(cpp) == 7128
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "1599d8418f69faad37720a301ffdbe379ae032cff0dcbb1fedec30f8e6dfcd20"
+        "e914264c94ef57a9572c979231bcaf1593c9ca4e4d44474985fb877040dd4815"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -3020,9 +3324,9 @@ def test_production_dss_generated_cpp_locks_typed_offset_family() -> None:
     assert len({id(bound) for bound in production_bounds}) == 8
     cpp = LLIRLowerer().lower_llir(lowered)
 
-    assert len(cpp) == 8649
+    assert len(cpp) == 8659
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "fc01d863464f507fd54faff4dca1fb17a4216a1897c5e98bbddf51b616987afa"
+        "b8549ff394919f38f83d8b76595e0b55334c09c3a637ae2e7e69fc63ba6b850c"
     )
     assert cpp.count("wksp.insert(") == 2
     assert "wksp.insert_unchecked(" not in cpp
