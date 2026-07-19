@@ -959,6 +959,24 @@ def test_matmul_ds_ds_ds(use_cache):
     assert torch.allclose(result.to_torch(), result_torch)
 
 
+def test_matmul_ds_ds_ds_float64():
+    left_torch = torch.tensor(
+        [[1.0, 0.0], [0.0, 2.0]],
+        dtype=torch.float64,
+    )
+    right_torch = torch.tensor(
+        [[3.0, 4.0], [5.0, 6.0]],
+        dtype=torch.float64,
+    )
+    left = STensor.from_torch(left_torch, "Float64Left").to_sparse("ds")
+    right = STensor.from_torch(right_torch, "Float64Right").to_sparse("ds")
+
+    result = matmul(left, right, output_format="ds", use_cache=False)
+
+    assert result.values.dtype is torch.float64
+    assert torch.allclose(result.to_torch(in_place=False), left_torch @ right_torch)
+
+
 def test_matmul_ds_ds_ds_zero_output_columns():
     left_torch = torch.tensor([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]], dtype=torch.float32)
     right_torch = torch.empty((2, 0), dtype=torch.float32)
@@ -982,6 +1000,7 @@ def test_matmul_ds_ds_ds_float64_zero_output_rows():
     positions, coordinates = result.storage.index.mode_indices[1]
 
     assert tuple(result.shape) == (0, 3)
+    assert result.values.dtype is torch.float64
     assert positions.tolist() == [0]
     assert coordinates.numel() == result.values.numel() == 0
     assert torch.equal(result.to_torch(in_place=False), left_torch @ right_torch)

@@ -1,3 +1,5 @@
+import torch
+
 from scorch.compiler.cin import (
     ForAll,
     IndexVar,
@@ -10,13 +12,19 @@ from scorch.compiler.cin_analysis import canonical_cin_dump
 from scorch.compiler.scheduler import Scheduler
 
 
-def _build_spmm_cin(fmt_c: str, fmt_a: str, fmt_b: str, loop_order: str) -> ForAll:
+def _build_spmm_cin(
+    fmt_c: str,
+    fmt_a: str,
+    fmt_b: str,
+    loop_order: str,
+    result_dtype: torch.dtype = torch.float32,
+) -> ForAll:
     i = IndexVar("i")
     j = IndexVar("j")
     k = IndexVar("k")
     ivars = {"i": i, "j": j, "k": k}
 
-    C = TensorVar("C", fmt=fmt_c)
+    C = TensorVar("C", fmt=fmt_c, dtype=result_dtype)
     A = TensorVar("A", fmt=fmt_a)
     B = TensorVar("B", fmt=fmt_b)
 
@@ -129,6 +137,30 @@ def test_auto_schedule_spmspm_inserts_workspace():
     assert canonical_cin_dump(stmt) == before
     assert original_assignment.parent is None
     assert all(not index_var.tensor_accesses for index_var in stmt.index_vars)
+
+
+def test_inserted_workspace_preserves_result_dtype():
+    for result_dtype in (
+        torch.float32,
+        torch.float64,
+        torch.int32,
+        torch.int64,
+    ):
+        stmt = _build_spmm_cin(
+            fmt_c="ds",
+            fmt_a="ds",
+            fmt_b="ds",
+            loop_order="ijk",
+            result_dtype=result_dtype,
+        )
+
+        scheduled = Scheduler.insert_workspace(stmt)
+
+        _, body = _loop_names(scheduled)
+        assert isinstance(body, Where)
+        workspaces = body.get_workspaces()
+        assert len(workspaces) == 1
+        assert workspaces[0].dtype is result_dtype
 
 
 def test_auto_schedule_spmm_dense_output_no_workspace():
