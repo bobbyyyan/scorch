@@ -258,7 +258,13 @@ def _compressed_offset_family(statements: List[llir.Stmt]) -> List[llir.Stmt]:
             continue
         if type(statement) is llir.ForLoop:
             init = statement.init
-            if type(init) is llir.VarInit and init.var.name == "_i":
+            condition = statement.cond
+            if (
+                type(init) is llir.VarInit
+                and init.var.name == "_i"
+                and type(condition) is llir.BinOp
+                and condition.op == "<"
+            ):
                 selected.append(statement)
             continue
         if type(statement) is llir.VarInit and statement.var.name == "_total1":
