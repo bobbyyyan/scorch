@@ -133,9 +133,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 73,
+        "torch_cpp_abi.py": 76,
     }
-    assert sum(constructor_counts.values()) == 411
+    assert sum(constructor_counts.values()) == 414
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 131,
@@ -149,9 +149,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 73,
+        "torch_cpp_abi.py": 76,
     }
-    assert sum(unclassified_counts.values()) == 401
+    assert sum(unclassified_counts.values()) == 404
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
@@ -306,7 +306,7 @@ def test_torch_abi_expression_producer_budget_is_explicit() -> None:
         ("cin_lowerer.py", "tensor_data_ptr"): 2,
         ("cin_lowerer.py", "tensor_storage_member"): 1,
         ("torch_cpp_abi.py", "mode_index_tensor"): 4,
-        ("torch_cpp_abi.py", "tensor_data_ptr"): 11,
+        ("torch_cpp_abi.py", "tensor_data_ptr"): 12,
         ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
     assert member_call_constructors == {
@@ -379,7 +379,7 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
     assert structured_counts == {
         "cin_lowerer.py": 2,
         "llir_traversal.py": 1,
-        "torch_cpp_abi.py": 9,
+        "torch_cpp_abi.py": 10,
     }
 
     producers = []
@@ -400,6 +400,7 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
 
     assert name_expressions == {
         "'kInt'": 7,
+        "dtype_name": 1,
         "get_pytorch_c_dtype_name(self.dtype)": 3,
         "get_pytorch_c_dtype_name(intermediate_tensor_var.dtype)": 1,
     }
@@ -746,12 +747,12 @@ def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:
             len(_llir_constructor_calls(path, constructor))
             for constructor in ("VarInit", "Array", "FunctionCall", "QualifiedName")
         )
-        == 56
+        == 61
     )
-    assert len(_llir_constructor_calls(path, "VarInit")) == 27
-    assert len(_llir_constructor_calls(path, "Array")) == 8
-    assert len(_llir_constructor_calls(path, "FunctionCall")) == 12
-    assert len(_llir_constructor_calls(path, "QualifiedName")) == 9
+    assert len(_llir_constructor_calls(path, "VarInit")) == 29
+    assert len(_llir_constructor_calls(path, "Array")) == 9
+    assert len(_llir_constructor_calls(path, "FunctionCall")) == 13
+    assert len(_llir_constructor_calls(path, "QualifiedName")) == 10
 
 
 def test_first_compressed_position_allocation_is_structured() -> None:
@@ -864,9 +865,6 @@ def test_compressed_coordinate_torch_allocations_are_structured() -> None:
     position_allocations = compressed_source.split(
         "def _position_and_coordinate_allocations", 1
     )[1].split("_CTYPE_TO_TORCH", 1)[0]
-    value_allocation = compressed_source.split("def _value_allocation", 1)[1].split(
-        "def _final_assembly", 1
-    )[0]
     assert (
         position_allocations.count(
             "context.result_assembler.emit_compressed_coordinate_allocations("
@@ -888,8 +886,6 @@ def test_compressed_coordinate_torch_allocations_are_structured() -> None:
     assert "{result_name}{level}_pos_torch" not in position_allocations
     assert "{result_name}{level}_pos_data" not in position_allocations
     assert "_total{parent_level}" not in position_allocations
-    assert value_allocation.count("llir.RawStmt(") == 1
-    assert "{result_name}_values_torch" in value_allocation
 
 
 def test_deeper_compressed_position_torch_allocations_are_structured() -> None:
@@ -1007,6 +1003,190 @@ def test_deeper_compressed_position_torch_allocations_are_structured() -> None:
         "_total{parent_level}",
     ):
         assert raw_deeper_position_spelling not in position_source
+
+
+def test_compressed_value_allocation_has_typed_and_legacy_paths() -> None:
+    """Lock W14's exact typed template and spelling-preserving fallback."""
+
+    abi_path = _COMPILER_ROOT / "torch_cpp_abi.py"
+    abi_tree = ast.parse(abi_path.read_text())
+    emitters = [
+        node
+        for node in ast.walk(abi_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "emit_compressed_value_allocation"
+    ]
+    assert len(emitters) == 1
+    emitter = emitters[0]
+
+    def calls(function: ast.FunctionDef, name: str) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+                or isinstance(node.func, ast.Name)
+                and node.func.id == name
+            )
+        ]
+
+    expected_template_inventory = {
+        "RawStmt": 0,
+        "VarInit": 2,
+        "Var": 3,
+        "Array": 1,
+        "FunctionCall": 1,
+        "QualifiedName": 1,
+        "tensor_data_ptr": 1,
+        "Cast": 0,
+        "Add": 0,
+        "Literal": 0,
+    }
+    assert {
+        name: len(calls(emitter, name)) for name in expected_template_inventory
+    } == expected_template_inventory
+
+    c_datatype_assignments = [
+        statement
+        for node in emitter.body
+        if isinstance(node, ast.Try)
+        for statement in node.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "c_datatype"
+            for target in statement.targets
+        )
+    ]
+    assert len(c_datatype_assignments) == 1
+    assert ast.unparse(c_datatype_assignments[0].value) == (
+        "dtype_to_c_datatype(self.dtype)"
+    )
+    pointer_type_assignments = [
+        statement
+        for node in emitter.body
+        if isinstance(node, ast.Try)
+        for statement in node.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pointer_type"
+            for target in statement.targets
+        )
+    ]
+    assert len(pointer_type_assignments) == 1
+    assert ast.unparse(pointer_type_assignments[0].value) == (
+        "llir.DataType.ptr_type(c_datatype)"
+    )
+
+    compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
+    compressed_source = compressed_path.read_text()
+    compressed_tree = ast.parse(compressed_source)
+    functions = {
+        node.name: node
+        for node in compressed_tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    legacy = functions["_legacy_value_allocation"]
+    router = functions["_value_allocation"]
+    builder = functions["_build_transformed_statements"]
+
+    assert len(calls(legacy, "RawStmt")) == 1
+    assert calls(router, "RawStmt") == []
+    legacy_raw = calls(legacy, "RawStmt")[0]
+    legacy_fields = {
+        keyword.arg: keyword.value
+        for keyword in legacy_raw.keywords
+        if keyword.arg is not None
+    }
+    assert set(legacy_fields) == {"code", "add_semicolon"}
+    assert ast.unparse(legacy_fields["add_semicolon"]) == "False"
+    legacy_code = ast.unparse(legacy_fields["code"])
+    for spelling in (
+        "(long long)_total{leaf}",
+        "{ctype}* {result_name}_values_data",
+        "data_ptr<{ctype}>()",
+    ):
+        assert spelling in legacy_code
+
+    torch_dtype_assignments = [
+        node
+        for node in legacy.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "torch_dtype"
+            for target in node.targets
+        )
+    ]
+    assert len(torch_dtype_assignments) == 1
+    assert ast.unparse(torch_dtype_assignments[0].value) == (
+        "_CTYPE_TO_TORCH.get(ctype, 'torch::kFloat32')"
+    )
+
+    ctype_maps = [
+        node
+        for node in compressed_tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "_CTYPE_TO_TORCH"
+    ]
+    assert len(ctype_maps) == 1
+    assert ctype_maps[0].value is not None
+    assert ast.literal_eval(ctype_maps[0].value) == {
+        "float": "torch::kFloat32",
+        "double": "torch::kFloat64",
+        "int": "torch::kInt32",
+        "int32_t": "torch::kInt32",
+        "long long": "torch::kInt64",
+        "int64_t": "torch::kInt64",
+        "int8_t": "torch::kInt8",
+        "uint8_t": "torch::kUInt8",
+    }
+
+    canonical_assignments = [
+        statement
+        for node in router.body
+        if isinstance(node, ast.Try)
+        for statement in node.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "canonical_ctype"
+            for target in statement.targets
+        )
+    ]
+    assert len(canonical_assignments) == 1
+    assert ast.unparse(canonical_assignments[0].value) == (
+        "dtype_to_c_datatype(context.result_assembler.dtype).value"
+    )
+    canonical_branches = [node for node in router.body if isinstance(node, ast.If)]
+    assert len(canonical_branches) == 1
+    assert ast.unparse(canonical_branches[0].test) == (
+        "context.workspace_ctype == canonical_ctype"
+    )
+    typed_calls = calls(router, "emit_compressed_value_allocation")
+    assert len(typed_calls) == 1
+    assert typed_calls[0].keywords == []
+    assert len(typed_calls[0].args) == 1
+    assert ast.unparse(typed_calls[0].args[0]) == (
+        "_total_reference(context.compressed_levels[-1])"
+    )
+    fallback_calls = calls(router, "_legacy_value_allocation")
+    assert len(fallback_calls) == 1
+    assert ast.unparse(router.body[-1]) == (
+        "return [_legacy_value_allocation(context)]"
+    )
+
+    builder_calls = calls(builder, "_value_allocation")
+    assert len(builder_calls) == 1
+    builder_parents = [
+        node
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "extend"
+        and any(call is builder_calls[0] for call in ast.walk(node))
+    ]
+    assert len(builder_parents) == 1
 
 
 def test_known_nnz_tensor_size_cannot_return_to_raw_statements() -> None:

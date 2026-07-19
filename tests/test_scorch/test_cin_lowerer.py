@@ -179,12 +179,15 @@ def _build_activating_all_coo_sddmm() -> ForAll:
     )
 
 
-def _build_outer_workspace_statement(result_format: str) -> tuple[Where, TensorVar]:
+def _build_outer_workspace_statement(
+    result_format: str,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[Where, TensorVar]:
     row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
-    result = TensorVar("Result", fmt=result_format)
-    left = TensorVar("Left", fmt="ds", mode_order=[1, 0])
-    right = TensorVar("Right", fmt="ds")
-    workspace = Workspace("wksp", dim=2)
+    result = TensorVar("Result", fmt=result_format, dtype=dtype)
+    left = TensorVar("Left", fmt="ds", mode_order=[1, 0], dtype=dtype)
+    right = TensorVar("Right", fmt="ds", dtype=dtype)
+    workspace = Workspace("wksp", dim=2, dtype=dtype)
     return (
         Where(
             producer=ForAll(
@@ -2691,6 +2694,495 @@ def test_deeper_compressed_position_allocations_reject_assembler_subclasses() ->
         assembler.emit_deeper_compressed_position_allocations(totals)
 
 
+@pytest.mark.parametrize("dimension", range(1, 6), ids=lambda value: f"dim-{value}")
+@pytest.mark.parametrize(
+    ("scalar_type", "enum_prefix"),
+    (
+        pytest.param(llir.DataType.FLOAT32, "FLOAT32", id="float32"),
+        pytest.param(llir.DataType.FLOAT64, "FLOAT64", id="float64"),
+        pytest.param(llir.DataType.INT32, "INT32", id="int32"),
+        pytest.param(llir.DataType.INT64, "INT64", id="int64"),
+        pytest.param(llir.DataType.INT8, "INT8", id="int8"),
+        pytest.param(llir.DataType.UINT8, "UINT8", id="uint8"),
+    ),
+)
+def test_canonical_coo_workspace_types_cover_every_supported_dimension(
+    scalar_type: llir.DataType,
+    enum_prefix: str,
+    dimension: int,
+) -> None:
+    expected = llir.DataType[f"COO_WORKSPACE_{enum_prefix}_{dimension}"]
+
+    actual = llir.DataType.coo_workspace_type_with_dim(scalar_type, dimension)
+
+    assert actual is expected
+    assert actual.value == f"coo_workspace<{scalar_type.value}, {dimension}>"
+
+
+@pytest.mark.parametrize(
+    "scalar_type",
+    (
+        llir.DataType.FLOAT32,
+        llir.DataType.FLOAT64,
+        llir.DataType.INT32,
+        llir.DataType.INT64,
+        llir.DataType.INT8,
+        llir.DataType.UINT8,
+    ),
+)
+def test_canonical_coo_workspace_type_zero_dimension_is_the_scalar(
+    scalar_type: llir.DataType,
+) -> None:
+    assert llir.DataType.coo_workspace_type_with_dim(scalar_type, 0) is scalar_type
+
+
+@pytest.mark.parametrize("dimension", (-1, 6), ids=("negative", "too-large"))
+@pytest.mark.parametrize(
+    "scalar_type",
+    (
+        llir.DataType.FLOAT32,
+        llir.DataType.FLOAT64,
+        llir.DataType.INT32,
+        llir.DataType.INT64,
+        llir.DataType.INT8,
+        llir.DataType.UINT8,
+    ),
+)
+def test_canonical_coo_workspace_types_fail_closed_outside_supported_dimensions(
+    scalar_type: llir.DataType,
+    dimension: int,
+) -> None:
+    with pytest.raises(ValueError, match="is not a valid DataType"):
+        llir.DataType.coo_workspace_type_with_dim(scalar_type, dimension)
+
+
+@pytest.mark.parametrize(
+    ("level_types", "leaf"),
+    (
+        pytest.param(
+            (LevelType.DENSE, LevelType.COMPRESSED),
+            1,
+            id="ds",
+        ),
+        pytest.param(
+            (
+                LevelType.DENSE,
+                LevelType.COMPRESSED,
+                LevelType.COMPRESSED,
+            ),
+            2,
+            id="dss",
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    ("dtype", "c_type", "pointer_type", "torch_name"),
+    (
+        pytest.param(
+            torch.float32,
+            llir.DataType.FLOAT32,
+            llir.DataType.PTR_FLOAT32,
+            "kFloat32",
+            id="float32",
+        ),
+        pytest.param(
+            torch.float64,
+            llir.DataType.FLOAT64,
+            llir.DataType.PTR_FLOAT64,
+            "kFloat64",
+            id="float64",
+        ),
+        pytest.param(
+            torch.int32,
+            llir.DataType.INT32,
+            llir.DataType.PTR_INT_32,
+            "kInt32",
+            id="int32",
+        ),
+        pytest.param(
+            torch.int64,
+            llir.DataType.INT64,
+            llir.DataType.PTR_INT_64,
+            "kInt64",
+            id="int64",
+        ),
+        pytest.param(
+            torch.int8,
+            llir.DataType.INT8,
+            llir.DataType.PTR_INT8,
+            "kInt8",
+            id="int8",
+        ),
+        pytest.param(
+            torch.uint8,
+            llir.DataType.UINT8,
+            llir.DataType.PTR_UINT8,
+            "kUInt8",
+            id="uint8",
+        ),
+    ),
+)
+def test_compressed_value_allocation_is_typed_fresh_and_rewritable(
+    level_types: tuple[LevelType, ...],
+    leaf: int,
+    dtype: torch.dtype,
+    c_type: llir.DataType,
+    pointer_type: llir.DataType,
+    torch_name: str,
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=level_types,
+        dtype=dtype,
+    )
+    caller_total = llir.Var(f"_total{leaf}", llir.DataType.INT64)
+
+    first = assembler.emit_compressed_value_allocation(caller_total)
+    second = assembler.emit_compressed_value_allocation(caller_total)
+
+    assert [type(statement) for statement in first] == [llir.VarInit, llir.VarInit]
+    assert not any(type(statement) is llir.RawStmt for statement in first)
+    assert first == second
+    assert [hash(statement) for statement in first] == [
+        hash(statement) for statement in second
+    ]
+
+    owner = cast(llir.VarInit, first[0])
+    pointer = cast(llir.VarInit, first[1])
+    equal_owner = cast(llir.VarInit, second[0])
+    equal_pointer = cast(llir.VarInit, second[1])
+    assert owner is not equal_owner
+    assert owner.var is not equal_owner.var
+    assert owner.var.name == "Result_values_torch"
+    assert owner.var.type is llir.DataType.TORCH_TENSOR
+    assert owner.var.is_ptr is False
+    assert owner.var.is_restrict is False
+    assert owner.var.tensor_access is None
+    assert owner.op == "="
+    assert owner.cast is False
+    assert type(owner.value) is llir.FunctionCall
+    empty = cast(llir.FunctionCall, owner.value)
+    equal_empty = cast(llir.FunctionCall, equal_owner.value)
+    assert empty == equal_empty
+    assert hash(empty) == hash(equal_empty)
+    assert empty is not equal_empty
+    assert empty.name == "torch::empty"
+    assert type(empty.args) is tuple
+    assert len(empty.args) == 2
+    assert type(empty.args[0]) is llir.Array
+    extent = cast(llir.Array, empty.args[0])
+    equal_extent = cast(llir.Array, equal_empty.args[0])
+    assert extent == equal_extent
+    assert hash(extent) == hash(equal_extent)
+    assert extent is not equal_extent
+    assert extent.data_type is llir.DataType.INT64
+    assert type(extent.values) is tuple
+    assert len(extent.values) == 1
+    assert type(extent.values[0]) is llir.Var
+    total = cast(llir.Var, extent.values[0])
+    equal_total = cast(llir.Var, equal_extent.values[0])
+    assert total == equal_total
+    assert hash(total) == hash(equal_total)
+    assert total is not equal_total
+    assert total is not caller_total
+    assert total.name == f"_total{leaf}"
+    assert total.type is llir.DataType.INT64
+    assert total.is_ptr is False
+    assert total.is_restrict is False
+    assert total.tensor_access is None
+    dtype_constant = _assert_torch_qualified_name(
+        empty.args[1],
+        f"torch::{torch_name}",
+    )
+    equal_dtype_constant = _assert_torch_qualified_name(
+        equal_empty.args[1],
+        f"torch::{torch_name}",
+    )
+    assert dtype_constant == equal_dtype_constant
+    assert hash(dtype_constant) == hash(equal_dtype_constant)
+    assert dtype_constant is not equal_dtype_constant
+
+    assert pointer is not equal_pointer
+    assert pointer.var is not equal_pointer.var
+    assert pointer.var.name == "Result_values_data"
+    assert pointer.var.type is pointer_type
+    assert pointer.var.is_ptr is False
+    assert pointer.var.is_restrict is False
+    assert pointer.var.tensor_access is None
+    assert pointer.op == "="
+    assert pointer.cast is False
+    assert llir.DataType.ptr_type(c_type) is pointer_type
+    data_ptr = _assert_data_ptr_call(pointer.value, c_type)
+    equal_data_ptr = _assert_data_ptr_call(equal_pointer.value, c_type)
+    assert data_ptr == equal_data_ptr
+    assert hash(data_ptr) == hash(equal_data_ptr)
+    assert data_ptr is not equal_data_ptr
+    receiver = _assert_torch_tensor_var(data_ptr.base, "Result_values_torch")
+    equal_receiver = _assert_torch_tensor_var(
+        equal_data_ptr.base,
+        "Result_values_torch",
+    )
+    assert receiver is not owner.var
+    assert receiver is not equal_receiver
+
+    expected_cpp = (
+        "torch::Tensor Result_values_torch = "
+        f"torch::empty({{{total.name}}}, torch::{torch_name});\n"
+        f"{c_type.value}* Result_values_data = "
+        f"Result_values_torch.data_ptr<{c_type.value}>();"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected_cpp
+    assert LLIRLowerer().lower_llir(second) == expected_cpp
+
+    def traversal_snapshot_and_ids(
+        value: list[llir.Stmt],
+        pass_name: str,
+    ) -> tuple[tuple[tuple[str, ...], ...], set[int]]:
+        paths: list[tuple[str, ...]] = []
+        identities: set[int] = set()
+
+        class Collector(LLIRWalker):
+            def enter_node(
+                self,
+                node: llir.Node,
+                path: tuple[str, ...],
+            ) -> None:
+                paths.append((*path, type(node).__name__))
+                identities.add(id(node))
+
+        Collector(LLIRTraversalContext(stage="test", pass_name=pass_name)).walk(value)
+        return tuple(paths), identities
+
+    first_snapshot, first_ids = traversal_snapshot_and_ids(first, "value_first")
+    second_snapshot, second_ids = traversal_snapshot_and_ids(second, "value_second")
+    assert first_snapshot == second_snapshot
+    assert len(first_ids) == len(first_snapshot)
+    assert len(second_ids) == len(second_snapshot)
+    assert first_ids.isdisjoint(second_ids)
+    assert id(caller_total) not in first_ids | second_ids
+
+    rewritten = cast(
+        list[llir.Stmt],
+        LLIRRewriter(
+            LLIRTraversalContext(stage="test", pass_name="rewrite_value_allocation")
+        ).rewrite(first),
+    )
+    rewritten_snapshot, rewritten_ids = traversal_snapshot_and_ids(
+        rewritten,
+        "value_rewritten",
+    )
+    assert rewritten_snapshot == first_snapshot
+    assert rewritten_ids.isdisjoint(first_ids)
+    assert LLIRLowerer().lower_llir(rewritten) == expected_cpp
+
+    caller_total.name = "caller_owned_total"
+    total.name = "first_owned_total"
+    receiver.name = "first_owned_receiver"
+    assert LLIRLowerer().lower_llir(second) == expected_cpp
+    assert LLIRLowerer().lower_llir(rewritten) == expected_cpp
+
+
+@pytest.mark.parametrize(
+    "level_types",
+    (
+        (),
+        (LevelType.DENSE,),
+        (LevelType.COMPRESSED,),
+        (LevelType.DENSE, LevelType.COORDINATE),
+        (LevelType.DENSE, LevelType.COMPRESSED, LevelType.DENSE),
+    ),
+)
+def test_compressed_value_allocation_rejects_other_layouts(
+    level_types: tuple[LevelType, ...],
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=level_types,
+        dtype=torch.float32,
+    )
+
+    with pytest.raises(ValueError, match="one dense level"):
+        assembler.emit_compressed_value_allocation(
+            llir.Var("_total1", llir.DataType.INT64)
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "forged_value", "expected_message"),
+    (
+        pytest.param(
+            "name",
+            "_total2",
+            "name must match the leaf",
+            id="name",
+        ),
+        pytest.param(
+            "type",
+            llir.DataType.INT,
+            "must have INT64 type",
+            id="type",
+        ),
+        pytest.param(
+            "is_ptr",
+            True,
+            "cannot be a pointer",
+            id="pointer",
+        ),
+        pytest.param(
+            "is_restrict",
+            True,
+            "cannot be restrict-qualified",
+            id="restrict",
+        ),
+        pytest.param(
+            "tensor_access",
+            object(),
+            "cannot carry tensor provenance",
+            id="provenance",
+        ),
+    ),
+)
+def test_compressed_value_allocation_validates_every_total_field(
+    field: str,
+    forged_value: object,
+    expected_message: str,
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    total = llir.Var("_total1", llir.DataType.INT64)
+    object.__setattr__(total, field, forged_value)
+
+    with pytest.raises((TypeError, ValueError), match=expected_message):
+        assembler.emit_compressed_value_allocation(total)
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ("name", "type", "is_ptr", "is_restrict", "tensor_access"),
+)
+def test_compressed_value_allocation_rejects_missing_total_fields(
+    missing_field: str,
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    total = object.__new__(llir.Var)
+    complete_fields = {
+        "name": "_total1",
+        "type": llir.DataType.INT64,
+        "is_ptr": False,
+        "is_restrict": False,
+        "tensor_access": None,
+    }
+    for field, value in complete_fields.items():
+        if field != missing_field:
+            object.__setattr__(total, field, value)
+
+    with pytest.raises(TypeError, match="complete LLIR Var"):
+        assembler.emit_compressed_value_allocation(total)
+
+
+def test_compressed_value_allocation_rejects_extra_fields_and_subclasses() -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    extra = llir.Var("_total1", llir.DataType.INT64)
+    object.__setattr__(extra, "forged", True)
+    with pytest.raises(TypeError, match="complete LLIR Var"):
+        assembler.emit_compressed_value_allocation(extra)
+
+    class TotalSubclass(llir.Var):
+        pass
+
+    with pytest.raises(TypeError, match="exact LLIR Var"):
+        assembler.emit_compressed_value_allocation(
+            TotalSubclass("_total1", llir.DataType.INT64)
+        )
+    with pytest.raises(TypeError, match="exact LLIR Var"):
+        assembler.emit_compressed_value_allocation(object())  # type: ignore[arg-type]
+
+    class ResultAssemblerSubclass(ResultTensorAssembler):
+        pass
+
+    subclass = ResultAssemblerSubclass(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    with pytest.raises(TypeError, match="exact ResultTensorAssembler"):
+        subclass.emit_compressed_value_allocation(
+            llir.Var("_total1", llir.DataType.INT64)
+        )
+
+
+def test_compressed_value_allocation_rejects_unsupported_result_dtype() -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.bool,
+    )
+
+    with pytest.raises(ValueError, match="supported result dtype"):
+        assembler.emit_compressed_value_allocation(
+            llir.Var("_total1", llir.DataType.INT64)
+        )
+
+
+@pytest.mark.parametrize(
+    ("child", "expected_code", "expected_path"),
+    (
+        pytest.param(
+            "function_args",
+            "invalid_function_call_args",
+            ("root", "[0]", "value", "args"),
+            id="function-args",
+        ),
+        pytest.param(
+            "template_args",
+            "invalid_member_call_template_args",
+            ("root", "[1]", "value", "template_args"),
+            id="template-args",
+        ),
+    ),
+)
+def test_compressed_value_allocation_malformed_children_fail_traversal(
+    child: str,
+    expected_code: str,
+    expected_path: tuple[str, ...],
+) -> None:
+    statements = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.int8,
+    ).emit_compressed_value_allocation(llir.Var("_total1", llir.DataType.INT64))
+    if child == "function_args":
+        owner = cast(llir.VarInit, statements[0])
+        empty = cast(llir.FunctionCall, owner.value)
+        object.__setattr__(empty, "args", list(empty.args))
+    else:
+        pointer = cast(llir.VarInit, statements[1])
+        data_ptr = cast(llir.MemberCall, pointer.value)
+        object.__setattr__(data_ptr, "template_args", list(data_ptr.template_args))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        LLIRWalker(
+            LLIRTraversalContext(stage="test", pass_name="value_allocation")
+        ).walk(statements)
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == expected_code
+    assert diagnostic.path == expected_path
+    assert diagnostic.stage == "test"
+    assert diagnostic.pass_name == "value_allocation"
+
+
 @pytest.mark.parametrize(
     ("fmt", "known_nnz_var", "is_restrict"),
     (
@@ -3274,6 +3766,86 @@ def test_tensor_storage_value_read_is_structured_typed_and_fresh() -> None:
         "torch::Tensor Input_values = Input.storage.value;"
     )
     assert LLIRLowerer().lower_llir(second) == LLIRLowerer().lower_llir(first)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "scalar_type", "pointer_type", "workspace_type", "torch_name"),
+    (
+        pytest.param(
+            torch.int8,
+            llir.DataType.INT8,
+            llir.DataType.PTR_INT8,
+            llir.DataType.COO_WORKSPACE_INT8_2,
+            "kInt8",
+            id="int8",
+        ),
+        pytest.param(
+            torch.uint8,
+            llir.DataType.UINT8,
+            llir.DataType.PTR_UINT8,
+            llir.DataType.COO_WORKSPACE_UINT8_2,
+            "kUInt8",
+            id="uint8",
+        ),
+    ),
+)
+def test_production_compressed_where_lowers_narrow_integer_workspace_types(
+    dtype: torch.dtype,
+    scalar_type: llir.DataType,
+    pointer_type: llir.DataType,
+    workspace_type: llir.DataType,
+    torch_name: str,
+) -> None:
+    statement, _ = _build_outer_workspace_statement("ds", dtype)
+    original = str(statement)
+
+    lowered = CINLowerer().lower_IndexStmt(statement)
+
+    assert type(lowered) is llir.Function
+    initializers: list[llir.VarInit] = []
+
+    class InitializerCollector(LLIRWalker):
+        def visit_var_init(
+            self,
+            node: llir.VarInit,
+            path: tuple[str, ...],
+        ) -> None:
+            initializers.append(node)
+            super().visit_var_init(node, path)
+
+    InitializerCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_narrow_integer_where_initializers",
+        )
+    ).walk(lowered)
+    by_name = {initializer.var.name: initializer for initializer in initializers}
+
+    workspace = by_name["wksp"]
+    assert workspace.var.type is workspace_type
+    assert type(workspace.value) is llir.FunctionCall
+    workspace_call = cast(llir.FunctionCall, workspace.value)
+    assert workspace_call.name == f"coo_workspace<{scalar_type.value}, 2>"
+    assert type(workspace_call.args) is tuple
+    assert len(workspace_call.args) == 2
+
+    for pointer_name in ("Left_val", "Right_val", "T_val"):
+        pointer = by_name[pointer_name]
+        assert pointer.var.type is pointer_type
+        data_ptr = _assert_data_ptr_call(pointer.value, scalar_type)
+        assert type(data_ptr.base) is llir.Var
+
+    cpp = LLIRLowerer().lower_llir(lowered)
+    assert (
+        f"coo_workspace<{scalar_type.value}, 2> wksp = "
+        f"coo_workspace<{scalar_type.value}, 2>(1024, result_shape);"
+    ) in cpp
+    assert (
+        "torch::Tensor Result_values_torch = "
+        "scorch_tensor_from_vector(std::move(Result_values), "
+        f"torch::{torch_name});"
+    ) in cpp
+    assert str(statement) == original
 
 
 def test_all_coo_workspace_assembly_targets_use_storage_types() -> None:

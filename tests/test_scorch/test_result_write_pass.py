@@ -84,13 +84,15 @@ def _fill_store(
 def _context(
     mode: _Mode,
     compressed_levels: Tuple[int, ...] = (1,),
+    *,
+    value_pointer_type: llir.DataType = llir.DataType.PTR_FLOAT32,
 ) -> ResultWriteContext:
     return ResultWriteContext(
         result_name="Result",
         result_id=_RESULT_ID,
         compressed_levels=compressed_levels,
         mode=mode,
-        value_pointer_type=llir.DataType.PTR_FLOAT32,
+        value_pointer_type=value_pointer_type,
     )
 
 
@@ -272,6 +274,101 @@ _pos1++;
 Result_values_data[_base1 + _pos1] = 0;
 workspace.sort();
 scratch = keep;"""
+
+
+@pytest.mark.parametrize(
+    ("scalar_type", "pointer_type"),
+    (
+        pytest.param(
+            llir.DataType.FLOAT32,
+            llir.DataType.PTR_FLOAT32,
+            id="float32",
+        ),
+        pytest.param(
+            llir.DataType.FLOAT64,
+            llir.DataType.PTR_FLOAT64,
+            id="float64",
+        ),
+        pytest.param(
+            llir.DataType.INT32,
+            llir.DataType.PTR_INT_32,
+            id="int32",
+        ),
+        pytest.param(
+            llir.DataType.INT64,
+            llir.DataType.PTR_INT_64,
+            id="int64",
+        ),
+        pytest.param(
+            llir.DataType.INT8,
+            llir.DataType.PTR_INT8,
+            id="int8",
+        ),
+        pytest.param(
+            llir.DataType.UINT8,
+            llir.DataType.PTR_UINT8,
+            id="uint8",
+        ),
+    ),
+)
+def test_fill_rewrite_preserves_each_canonical_value_pointer_type(
+    scalar_type: llir.DataType,
+    pointer_type: llir.DataType,
+) -> None:
+    source: List[llir.Stmt] = [
+        llir.Assign(
+            _result_value_access(_var("pResult1")),
+            _var("assigned_value", scalar_type),
+        ),
+        llir.FunctionCallStmt(
+            "Result_values.push_back",
+            [_var("pushed_value", scalar_type)],
+        ),
+    ]
+
+    rewritten = rewrite_result_writes(
+        source,
+        _context("fill", value_pointer_type=pointer_type),
+    )
+
+    assert llir.DataType.ptr_type(scalar_type) is pointer_type
+    assert [type(statement) for statement in rewritten] == [llir.Assign, llir.Assign]
+    for statement in rewritten:
+        assignment = cast(llir.Assign, statement)
+        assert type(assignment.var) is llir.ArrayAccess
+        target = cast(llir.ArrayAccess, assignment.var)
+        assert type(target.array) is llir.Var
+        pointer = cast(llir.Var, target.array)
+        assert pointer.name == "Result_values_data"
+        assert pointer.type is pointer_type
+        assert pointer.is_ptr is False
+        assert pointer.is_restrict is False
+        assert pointer.tensor_access is None
+    assert _cpp(cast(List[llir.Stmt], rewritten)) == (
+        "Result_values_data[_base1 + _pos1] = assigned_value;\n"
+        "Result_values_data[_base1 + _pos1] = pushed_value;"
+    )
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(rewritten))
+
+
+@pytest.mark.parametrize(
+    "scalar_type",
+    (llir.DataType.INT8, llir.DataType.UINT8),
+    ids=("int8-scalar", "uint8-scalar"),
+)
+def test_result_write_rejects_new_scalar_types_where_pointers_are_required(
+    scalar_type: llir.DataType,
+) -> None:
+    context = _context("fill", value_pointer_type=scalar_type)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        rewrite_result_writes([llir.Break()], context)
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "invalid_result_write_value_pointer_type"
+    assert diagnostic.path == ("context", "value_pointer_type")
+    assert diagnostic.stage == RESULT_WRITE_TRAVERSAL_CONTEXT.stage
+    assert diagnostic.pass_name == RESULT_WRITE_TRAVERSAL_CONTEXT.pass_name
 
 
 def test_fill_rewrite_preserves_structured_workspace_pair_reads() -> None:
