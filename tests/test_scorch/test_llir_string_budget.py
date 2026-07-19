@@ -984,7 +984,8 @@ def test_compressed_offset_family_is_structured() -> None:
     total_initializations = [
         call
         for call in calls(prefix_builder, "VarInit")
-        if ast.unparse(fields(call).get("var")) == "_total_reference(level)"
+        if (var := fields(call).get("var")) is not None
+        and ast.unparse(var) == "_total_reference(level)"
     ]
 
     assert raw_violations == []
