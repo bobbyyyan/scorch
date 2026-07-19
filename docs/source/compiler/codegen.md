@@ -121,9 +121,9 @@ LLIR to C++ code (string)."* It is a recursive, **string-emitting** walker —
   functions to `lower_function_definition`.
 
 :::{note}
-`compiler/llir.py` also contains `NodeVisitor` / `CppCodeGenerator` classes. These
-are a partial/legacy visitor; the **live** codegen is `LLIRLowerer` in
-`compiler/codegen.py`. When reading the source, follow `codegen.py`.
+LLIR node definitions live in `compiler/llir.py`. The production C++ emitter is
+`LLIRLowerer` in `compiler/codegen.py`; `llir.py` does not contain a second code
+generator.
 :::
 
 The output of this stage is one big C++ string containing an `evaluate(...)`
