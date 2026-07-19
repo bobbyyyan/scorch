@@ -3684,6 +3684,7 @@ class CINLowerer:
                         result_name=result_tensor.get_name(),
                         result_id=result_access.tensor_id,
                         compressed_levels=compressed_levels,
+                        result_assembler=_result_tensor_abi_assembler(result_tensor),
                         workspace_name=workspace_name,
                         workspace_ctype=workspace_ctype,
                         policy=CompressedWhereOpenMPPolicy(

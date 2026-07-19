@@ -442,6 +442,11 @@ class ResultTensorAssembler:
     reserve_hint_var: Optional[str] = None
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate the frozen result-ABI metadata snapshot."""
+
         if type(self.name) is not str or not self.name.isidentifier():
             raise TypeError("result tensor name must be a non-empty identifier")
         if type(self.level_types) is not tuple or any(
@@ -856,20 +861,62 @@ class ResultTensorAssembler:
             data_type=llir.DataType.STD_VECTOR_TORCH_TENSOR,
         )
 
+    def emit_result_declaration(self) -> llir.VarDecl:
+        """Declare one fresh ABI result owner from this frozen snapshot."""
+
+        self.validate()
+        return llir.VarDecl(
+            var=llir.Var(
+                name=self.name,
+                type=llir.DataType.TACO_TENSOR,
+            )
+        )
+
+    def emit_storage_epilogue(self) -> List[llir.Stmt]:
+        """Assign result storage and return without moving dynamic buffers."""
+
+        self.validate()
+        return [
+            llir.Assign(
+                var=tensor_storage_member(
+                    self.name,
+                    "storage",
+                    "index",
+                    "mode_indices",
+                ),
+                value=llir.Array(
+                    values=tuple(
+                        self._get_mode_index_set(i, level_type)
+                        for i, level_type in enumerate(self.level_types)
+                    ),
+                    data_type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
+                ),
+            ),
+            llir.Assign(
+                var=tensor_storage_member(self.name, "storage", "value"),
+                value=llir.Var(
+                    name=f"{self.name}_values_torch",
+                    type=llir.DataType.TORCH_TENSOR,
+                ),
+            ),
+            llir.Return(
+                value=llir.Var(
+                    name=self.name,
+                    type=llir.DataType.TACO_TENSOR,
+                )
+            ),
+        ]
+
     def emit_final_assembly(self) -> List[llir.Stmt]:
         """Move dynamic buffers to Torch, assign indices/values, and return."""
+        self.validate()
         stmts: List[llir.Stmt] = []
 
         # TacoTensor decl
         stmts.extend(
             [
                 llir.Comment("Assemble final result"),
-                llir.VarDecl(
-                    var=llir.Var(
-                        name=f"{self.name}",
-                        type=llir.DataType.TACO_TENSOR,
-                    )
-                ),
+                self.emit_result_declaration(),
             ]
         )
 
@@ -970,44 +1017,6 @@ class ResultTensorAssembler:
                 )
             )
 
-        # mode_indices assignment
-        stmts.append(
-            llir.Assign(
-                var=tensor_storage_member(
-                    self.name,
-                    "storage",
-                    "index",
-                    "mode_indices",
-                ),
-                value=llir.Array(
-                    values=tuple(
-                        self._get_mode_index_set(i, level_type)
-                        for i, level_type in enumerate(self.level_types)
-                    ),
-                    data_type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
-                ),
-            )
-        )
-
-        # _value assignment
-        stmts.append(
-            llir.Assign(
-                var=tensor_storage_member(self.name, "storage", "value"),
-                value=llir.Var(
-                    name=f"{self.name}_values_torch",
-                    type=llir.DataType.TORCH_TENSOR,
-                ),
-            )
-        )
-
-        # return statement
-        stmts.append(
-            llir.Return(
-                value=llir.Var(
-                    name=f"{self.name}",
-                    type=llir.DataType.TACO_TENSOR,
-                )
-            )
-        )
+        stmts.extend(self.emit_storage_epilogue())
 
         return stmts

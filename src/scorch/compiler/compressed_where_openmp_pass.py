@@ -54,6 +54,9 @@ from .llir_pass_manager import (
 )
 from .result_write_pass import ResultWriteContext
 from .iterator import collect_mode_position_arrays, match_mode_position_access
+from .torch_cpp_abi import ResultTensorAssembler
+from ..format import LevelType
+from ..utils import dtype_to_c_datatype
 
 if TYPE_CHECKING:
     from .compile_options import CompileOptions
@@ -75,6 +78,16 @@ class CompressedWhereOpenMPPolicy:
 COMPRESSED_WHERE_OPENMP_POLICY = CompressedWhereOpenMPPolicy()
 
 
+_RECOGNIZED_WORKSPACE_CTYPE_DATATYPES: Dict[str, str] = {
+    "float": "float",
+    "double": "double",
+    "int": "int32_t",
+    "int32_t": "int32_t",
+    "long long": "int64_t",
+    "int64_t": "int64_t",
+}
+
+
 @dataclass(frozen=True)
 class CompressedWhereOpenMPContext:
     """All lowerer-independent inputs required by this transformation.
@@ -88,11 +101,20 @@ class CompressedWhereOpenMPContext:
     the one-dimensional sparse ``Where`` workspace. ``compile_options`` carries
     the exact outer snapshot through the two nested result-write passes and the
     remaining output-assembly renderer; standalone pass callers may omit it.
+
+    ``result_assembler`` is the frozen Torch/C++ ABI snapshot for the same
+    result.  This pass uses only its typed result declaration and storage
+    epilogue; the compressed allocation path already owns the Torch buffers and
+    must not run the ordinary dynamic-vector moves a second time. Its dtype must
+    agree with every recognized production ``workspace_ctype`` spelling.
+    Free-form direct-pass compatibility spellings remain deliberately
+    uninterpreted by this W15 storage-only boundary.
     """
 
     result_name: str
     result_id: SymbolId
     compressed_levels: Tuple[int, ...]
+    result_assembler: ResultTensorAssembler
     workspace_name: str
     workspace_ctype: str
     policy: CompressedWhereOpenMPPolicy = COMPRESSED_WHERE_OPENMP_POLICY
@@ -281,6 +303,73 @@ def _validate_context(context: object) -> CompressedWhereOpenMPContext:
             path=("context", "compressed_levels"),
             value=levels,
         )
+
+    try:
+        result_assembler = typed_context.result_assembler
+    except AttributeError:
+        _raise_compressed_where_error(
+            typed_context,
+            code="invalid_compressed_where_result_assembler",
+            message="result_assembler snapshot is missing",
+            path=("context", "result_assembler"),
+            value=typed_context,
+        )
+    if type(result_assembler) is not ResultTensorAssembler:
+        _raise_compressed_where_error(
+            typed_context,
+            code="invalid_compressed_where_result_assembler",
+            message="result_assembler must be an exact frozen ABI snapshot",
+            path=("context", "result_assembler"),
+            value=result_assembler,
+        )
+    try:
+        result_assembler.validate()
+    except (AttributeError, TypeError, ValueError) as failure:
+        _raise_compressed_where_error(
+            typed_context,
+            code="invalid_compressed_where_result_assembler",
+            message=f"result_assembler is invalid: {failure}",
+            path=("context", "result_assembler"),
+            value=result_assembler,
+        )
+    if result_assembler.name != typed_context.result_name:
+        _raise_compressed_where_error(
+            typed_context,
+            code="mismatched_compressed_where_result_assembler",
+            message="result_assembler name must match result_name",
+            path=("context", "result_assembler", "name"),
+            value=result_assembler.name,
+        )
+    expected_level_types = (LevelType.DENSE,) + tuple(
+        LevelType.COMPRESSED for _ in levels
+    )
+    if result_assembler.level_types != expected_level_types:
+        _raise_compressed_where_error(
+            typed_context,
+            code="mismatched_compressed_where_result_assembler",
+            message=(
+                "result_assembler levels must be one dense level followed by "
+                "the context's compressed levels"
+            ),
+            path=("context", "result_assembler", "level_types"),
+            value=result_assembler.level_types,
+        )
+    expected_result_ctype = _RECOGNIZED_WORKSPACE_CTYPE_DATATYPES.get(
+        typed_context.workspace_ctype
+    )
+    if expected_result_ctype is not None:
+        try:
+            result_ctype = dtype_to_c_datatype(result_assembler.dtype).value
+        except KeyError:
+            result_ctype = None
+        if result_ctype != expected_result_ctype:
+            _raise_compressed_where_error(
+                typed_context,
+                code="mismatched_compressed_where_result_assembler",
+                message="result_assembler dtype must match workspace_ctype",
+                path=("context", "result_assembler", "dtype"),
+                value=result_assembler.dtype,
+            )
 
     policy = typed_context.policy
     if type(policy) is not CompressedWhereOpenMPPolicy:
@@ -1140,24 +1229,11 @@ def _value_allocation(context: CompressedWhereOpenMPContext) -> llir.RawStmt:
     )
 
 
-def _final_assembly(context: CompressedWhereOpenMPContext) -> llir.RawStmt:
-    result_name = context.result_name
-    rank = context.compressed_levels[-1] + 1
-    mode_indices = ["{}"]
-    mode_indices.extend(
-        f"{{{result_name}{level}_pos_torch, {result_name}{level}_crd_torch}}"
-        for level in range(1, rank)
-    )
-    return llir.RawStmt(
-        code=(
-            f"Tensor {result_name};\n"
-            f"  {result_name}.storage.index.mode_indices = "
-            f"{{{', '.join(mode_indices)}}};\n"
-            f"  {result_name}.storage.value = {result_name}_values_torch;\n"
-            f"  return {result_name};"
-        ),
-        add_semicolon=False,
-    )
+def _final_assembly(context: CompressedWhereOpenMPContext) -> List[llir.Stmt]:
+    return [
+        context.result_assembler.emit_result_declaration(),
+        *context.result_assembler.emit_storage_epilogue(),
+    ]
 
 
 def _build_transformed_statements(
@@ -1217,7 +1293,7 @@ def _build_transformed_statements(
         result.extend(_position_and_coordinate_allocations(context, loop_bound))
         result.append(_value_allocation(context))
         result.append(fill_loop)
-        result.append(_final_assembly(context))
+        result.extend(_final_assembly(context))
     except Exception as failure:
         raise LLIRPassPartialFailure(failure, nested_run_records) from failure
     return result, nested_run_records
