@@ -632,6 +632,16 @@ class ResultTensorAssembler:
                 raise TypeError(
                     "deeper compressed position totals must contain exact LLIR Vars"
                 )
+            if set(vars(total_var)) != {
+                "name",
+                "type",
+                "is_ptr",
+                "is_restrict",
+                "tensor_access",
+            }:
+                raise TypeError(
+                    "deeper compressed position totals must contain complete LLIR Vars"
+                )
             try:
                 total_name = total_var.name
                 total_type = total_var.type
