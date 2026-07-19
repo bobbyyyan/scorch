@@ -199,6 +199,8 @@ def _validate_context(context: object) -> ResultWriteContext:
         llir.DataType.PTR_INT,
         llir.DataType.PTR_INT_32,
         llir.DataType.PTR_INT_64,
+        llir.DataType.PTR_INT8,
+        llir.DataType.PTR_UINT8,
         llir.DataType.PTR_FLOAT32,
         llir.DataType.PTR_FLOAT64,
         llir.DataType.PTR_TORCH_FLOAT32,

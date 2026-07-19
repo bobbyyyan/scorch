@@ -85,6 +85,8 @@ _RECOGNIZED_WORKSPACE_CTYPE_DATATYPES: Dict[str, str] = {
     "int32_t": "int32_t",
     "long long": "int64_t",
     "int64_t": "int64_t",
+    "int8_t": "int8_t",
+    "uint8_t": "uint8_t",
 }
 
 
@@ -158,6 +160,10 @@ def _value_pointer_type(workspace_ctype: str) -> llir.DataType:
         return llir.DataType.PTR_INT_32
     if workspace_ctype == "int64_t":
         return llir.DataType.PTR_INT_64
+    if workspace_ctype == "int8_t":
+        return llir.DataType.PTR_INT8
+    if workspace_ctype == "uint8_t":
+        return llir.DataType.PTR_UINT8
     # Preserve direct-pass compatibility for free-form legacy C type spellings
     # without pretending that they have a precise DataType member.
     return llir.DataType.NO_TYPE
@@ -1174,10 +1180,14 @@ _CTYPE_TO_TORCH: Dict[str, str] = {
     "int32_t": "torch::kInt32",
     "long long": "torch::kInt64",
     "int64_t": "torch::kInt64",
+    "int8_t": "torch::kInt8",
+    "uint8_t": "torch::kUInt8",
 }
 
 
-def _value_allocation(context: CompressedWhereOpenMPContext) -> llir.RawStmt:
+def _legacy_value_allocation(context: CompressedWhereOpenMPContext) -> llir.RawStmt:
+    """Preserve free-form direct-pass scalar spellings without parsing them."""
+
     result_name = context.result_name
     leaf = context.compressed_levels[-1]
     ctype = context.workspace_ctype
@@ -1191,6 +1201,20 @@ def _value_allocation(context: CompressedWhereOpenMPContext) -> llir.RawStmt:
         ),
         add_semicolon=False,
     )
+
+
+def _value_allocation(context: CompressedWhereOpenMPContext) -> List[llir.Stmt]:
+    """Use typed production ownership with an exact legacy compatibility path."""
+
+    try:
+        canonical_ctype = dtype_to_c_datatype(context.result_assembler.dtype).value
+    except KeyError:
+        canonical_ctype = None
+    if context.workspace_ctype == canonical_ctype:
+        return context.result_assembler.emit_compressed_value_allocation(
+            _total_reference(context.compressed_levels[-1])
+        )
+    return [_legacy_value_allocation(context)]
 
 
 def _final_assembly(context: CompressedWhereOpenMPContext) -> List[llir.Stmt]:
@@ -1261,7 +1285,7 @@ def _build_transformed_statements(
                 loop_bound_type,
             )
         )
-        result.append(_value_allocation(context))
+        result.extend(_value_allocation(context))
         result.append(fill_loop)
         result.extend(_final_assembly(context))
     except Exception as failure:

@@ -122,6 +122,8 @@ class DataType(Enum):
     PTR_INT = "int*"
     PTR_INT_32 = "int32_t*"
     PTR_INT_64 = "int64_t*"
+    PTR_INT8 = "int8_t*"
+    PTR_UINT8 = "uint8_t*"
     PTR_FLOAT32 = "float*"
     PTR_FLOAT64 = "double*"
     PTR_TORCH_FLOAT32 = "torch::kFloat32*"

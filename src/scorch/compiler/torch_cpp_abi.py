@@ -916,6 +916,105 @@ class ResultTensorAssembler:
             )
         return statements
 
+    def emit_compressed_value_allocation(
+        self,
+        total_var: llir.Var,
+    ) -> List[llir.Stmt]:
+        """Build Torch-owned values from one exact compressed cardinality."""
+
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError(
+                "compressed value allocation requires an exact " "ResultTensorAssembler"
+            )
+        self.validate()
+        if (
+            self.levels < 2
+            or self.level_types[0] is not LevelType.DENSE
+            or any(
+                level_type is not LevelType.COMPRESSED
+                for level_type in self.level_types[1:]
+            )
+        ):
+            raise ValueError(
+                "compressed value allocation requires one dense level followed "
+                "by one or more compressed levels"
+            )
+        if type(total_var) is not llir.Var:
+            raise TypeError("compressed value total must be an exact LLIR Var")
+        if set(vars(total_var)) != {
+            "name",
+            "type",
+            "is_ptr",
+            "is_restrict",
+            "tensor_access",
+        }:
+            raise TypeError("compressed value total must be a complete LLIR Var")
+        try:
+            total_name = total_var.name
+            total_type = total_var.type
+            total_is_ptr = total_var.is_ptr
+            total_is_restrict = total_var.is_restrict
+            total_access = total_var.tensor_access
+        except AttributeError as failure:
+            raise TypeError(
+                "compressed value total must be a complete LLIR Var"
+            ) from failure
+        expected_total_name = f"_total{self.levels - 1}"
+        if type(total_name) is not str or total_name != expected_total_name:
+            raise ValueError(
+                "compressed value total name must match the leaf result level"
+            )
+        if total_type is not llir.DataType.INT64:
+            raise TypeError("compressed value total must have INT64 type")
+        if total_is_ptr is not False:
+            raise TypeError("compressed value total cannot be a pointer")
+        if total_is_restrict is not False:
+            raise TypeError("compressed value total cannot be restrict-qualified")
+        if total_access is not None:
+            raise TypeError("compressed value total cannot carry tensor provenance")
+
+        try:
+            c_datatype = dtype_to_c_datatype(self.dtype)
+            dtype_name = get_pytorch_c_dtype_name(self.dtype)
+            pointer_type = llir.DataType.ptr_type(c_datatype)
+        except (KeyError, ValueError) as failure:
+            raise ValueError(
+                "compressed value allocation requires a supported result dtype"
+            ) from failure
+
+        owner_name = f"{self.name}_values_torch"
+        pointer_name = f"{self.name}_values_data"
+
+        def total_reference() -> llir.Var:
+            return llir.Var(name=total_name, type=total_type)
+
+        def owner_reference() -> llir.Var:
+            return llir.Var(name=owner_name, type=llir.DataType.TORCH_TENSOR)
+
+        return [
+            llir.VarInit(
+                var=owner_reference(),
+                value=llir.FunctionCall(
+                    name="torch::empty",
+                    args=(
+                        llir.Array(
+                            values=(total_reference(),),
+                            data_type=llir.DataType.INT64,
+                        ),
+                        llir.QualifiedName(
+                            namespace="torch",
+                            name=dtype_name,
+                            data_type=llir.DataType.TORCH_SCALAR_TYPE,
+                        ),
+                    ),
+                ),
+            ),
+            llir.VarInit(
+                var=llir.Var(name=pointer_name, type=pointer_type),
+                value=tensor_data_ptr(owner_reference(), c_datatype),
+            ),
+        ]
+
     def emit_value_array_init(self) -> List[llir.Stmt]:
         """Emit Torch-owned known-size storage or a dynamic ``std::vector``."""
         stmts: List[llir.Stmt] = []
