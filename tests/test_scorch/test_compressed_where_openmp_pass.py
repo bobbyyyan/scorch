@@ -272,6 +272,21 @@ def _total_offset_loads(value: object) -> List[llir.VarInit]:
     return loads
 
 
+def _compressed_coordinate_initializations(value: object) -> List[llir.VarInit]:
+    initializations: List[llir.VarInit] = []
+    if type(value) is llir.VarInit:
+        initialization = cast(llir.VarInit, value)
+        if re.fullmatch(r"Result\d+_crd_(?:torch|data)", initialization.var.name):
+            initializations.append(initialization)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            initializations.extend(_compressed_coordinate_initializations(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            initializations.extend(_compressed_coordinate_initializations(child))
+    return initializations
+
+
 def _named_vars(value: object, name: str) -> List[llir.Var]:
     variables: List[llir.Var] = []
     if type(value) is llir.Var and cast(llir.Var, value).name == name:
@@ -497,7 +512,14 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
         for code in top_level_codes
     )
     assert any("torch::Tensor Result1_pos_torch" in code for code in top_level_codes)
-    assert any("torch::Tensor Result1_crd_torch" in code for code in top_level_codes)
+    assert not any("Result1_crd_torch" in code for code in top_level_codes)
+    assert [
+        LLIRLowerer().lower_llir(initialization)
+        for initialization in _compressed_coordinate_initializations(result.statements)
+    ] == [
+        "torch::Tensor Result1_crd_torch = " "torch::empty({_total1}, torch::kInt);",
+        "int* Result1_crd_data = Result1_crd_torch.data_ptr<int>();",
+    ]
     assert any("torch::Tensor Result_values_torch" in code for code in top_level_codes)
     declaration, mode_indices, values, return_statement = _result_assembly_tail(
         result.statements
@@ -625,6 +647,106 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
         "{{}, {Result1_pos_torch, Result1_crd_torch}, "
         "{Result2_pos_torch, Result2_crd_torch}};"
     )
+
+
+@pytest.mark.parametrize(
+    ("compressed_levels", "expected_coordinate_names"),
+    (
+        (
+            (1,),
+            ("Result1_crd_torch", "Result1_crd_data"),
+        ),
+        (
+            (1, 2),
+            (
+                "Result1_crd_torch",
+                "Result1_crd_data",
+                "Result2_crd_torch",
+                "Result2_crd_data",
+            ),
+        ),
+    ),
+)
+def test_compressed_coordinate_allocations_are_typed_ordered_and_detached(
+    compressed_levels: Tuple[int, ...],
+    expected_coordinate_names: Tuple[str, ...],
+) -> None:
+    source = [_compatible_loop(_ds_work_body())]
+    source_snapshot = _structural_snapshot(source)
+
+    first = transform_compressed_where_for_openmp(source, _context(compressed_levels))
+    second = transform_compressed_where_for_openmp(source, _context(compressed_levels))
+
+    first_coordinates = _compressed_coordinate_initializations(first.statements)
+    second_coordinates = _compressed_coordinate_initializations(second.statements)
+    assert [initialization.var.name for initialization in first_coordinates] == list(
+        expected_coordinate_names
+    )
+    assert _structural_snapshot(first_coordinates) == _structural_snapshot(
+        second_coordinates
+    )
+    assert _mutable_ir_ids(first_coordinates).isdisjoint(
+        _mutable_ir_ids(second_coordinates)
+    )
+    assert _structural_snapshot(source) == source_snapshot
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(first.statements))
+
+    raw_codes = _raw_codes(first.statements)
+    assert not any(
+        re.search(
+            r"torch::Tensor Result\d+_crd_torch|Result\d+_crd_data\s*=",
+            code,
+        )
+        for code in raw_codes
+    )
+
+    statements = first.statements
+    coordinate_indices = [
+        index
+        for index, statement in enumerate(statements)
+        if type(statement) is llir.VarInit
+        and cast(llir.VarInit, statement).var.name in expected_coordinate_names
+    ]
+    first_position_owner = next(
+        index
+        for index, statement in enumerate(statements)
+        if type(statement) is llir.RawStmt
+        and "torch::Tensor Result1_pos_torch" in cast(llir.RawStmt, statement).code
+    )
+    first_position_copy = next(
+        index
+        for index, statement in enumerate(statements)
+        if type(statement) is llir.RawStmt
+        and "for (int _i = 0;" in cast(llir.RawStmt, statement).code
+        and "Result1_pos_data[_i]" in cast(llir.RawStmt, statement).code
+    )
+    values_owner = next(
+        index
+        for index, statement in enumerate(statements)
+        if type(statement) is llir.RawStmt
+        and "torch::Tensor Result_values_torch" in cast(llir.RawStmt, statement).code
+    )
+    fill_loop = next(
+        index
+        for index, statement in enumerate(statements)
+        if type(statement) is llir.ForLoop and statement is _phase_loops(first)[1]
+    )
+
+    assert coordinate_indices == list(
+        range(coordinate_indices[0], coordinate_indices[0] + len(coordinate_indices))
+    )
+    assert first_position_owner < first_position_copy < coordinate_indices[0]
+    if compressed_levels == (1, 2):
+        deeper_position_owner = next(
+            index
+            for index, statement in enumerate(statements)
+            if type(statement) is llir.RawStmt
+            and "torch::Tensor Result2_pos_torch" in cast(llir.RawStmt, statement).code
+        )
+        assert coordinate_indices[-1] < deeper_position_owner < values_owner
+    else:
+        assert not any("Result2_pos_torch" in code for code in raw_codes)
+    assert coordinate_indices[-1] < values_owner < fill_loop
 
 
 @pytest.mark.parametrize(
@@ -2017,6 +2139,80 @@ def test_generated_offset_family_fails_closed_at_compressed_owner(
 
 
 @pytest.mark.parametrize(
+    ("malformation", "expected_code", "expected_suffix"),
+    (
+        ("owner_args", "invalid_function_call_args", ("value", "args")),
+        (
+            "pointer_template_args",
+            "invalid_member_call_template_args",
+            ("value", "template_args"),
+        ),
+        ("unknown_owner_call", "unknown_llir_node", ("value",)),
+        (
+            "extent_metadata",
+            "invalid_tensor_access_metadata",
+            ("value", "args", "[0]", "values", "[0]", "tensor_access"),
+        ),
+    ),
+)
+def test_generated_compressed_coordinate_allocations_fail_closed_at_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+    expected_code: str,
+    expected_suffix: Tuple[str, ...],
+) -> None:
+    class UnknownFunctionCall(llir.FunctionCall):
+        pass
+
+    source = [_compatible_loop(_ds_work_body())]
+    snapshot = _structural_snapshot(source)
+    injected: List[str] = []
+
+    class InjectingWalker(LLIRWalker):
+        def walk(self, value: LLIRValue) -> None:
+            initializations = _compressed_coordinate_initializations(value)
+            if initializations and not injected:
+                owner, pointer = initializations
+                if malformation == "owner_args":
+                    empty = cast(llir.FunctionCall, owner.value)
+                    object.__setattr__(empty, "args", list(empty.args))
+                elif malformation == "pointer_template_args":
+                    data_ptr = cast(llir.MemberCall, pointer.value)
+                    object.__setattr__(
+                        data_ptr,
+                        "template_args",
+                        list(data_ptr.template_args),
+                    )
+                elif malformation == "unknown_owner_call":
+                    empty = cast(llir.FunctionCall, owner.value)
+                    unknown = object.__new__(UnknownFunctionCall)
+                    object.__setattr__(unknown, "name", empty.name)
+                    object.__setattr__(unknown, "args", empty.args)
+                    owner.value = unknown
+                else:
+                    empty = cast(llir.FunctionCall, owner.value)
+                    extent = cast(llir.Array, empty.args[0])
+                    total = cast(llir.Var, extent.values[0])
+                    total.tensor_access = object()  # type: ignore[assignment]
+                injected.append(malformation)
+            super().walk(value)
+
+    monkeypatch.setattr(compressed_where_module, "LLIRWalker", InjectingWalker)
+    context = _context()
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(source, context)
+
+    diagnostic = raised.value.diagnostic
+    assert injected == [malformation]
+    assert diagnostic.code == expected_code
+    assert diagnostic.stage == context.traversal.stage
+    assert diagnostic.pass_name == context.traversal.pass_name
+    assert diagnostic.path[-len(expected_suffix) :] == expected_suffix
+    assert _structural_snapshot(source) == snapshot
+
+
+@pytest.mark.parametrize(
     ("context", "expected_code", "expected_path"),
     [
         (
@@ -2381,9 +2577,9 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    assert len(cpp) == 7129
+    assert len(cpp) == 7118
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "971d69c06f3d980a092041816c62a0618713dc4aed41955517135db3a9c0a92d"
+        "1599d8418f69faad37720a301ffdbe379ae032cff0dcbb1fedec30f8e6dfcd20"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -2507,9 +2703,9 @@ def test_production_dss_generated_cpp_locks_typed_offset_family() -> None:
     assert len({id(bound) for bound in production_bounds}) == 8
     cpp = LLIRLowerer().lower_llir(lowered)
 
-    assert len(cpp) == 8684
+    assert len(cpp) == 8662
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "63b2fed89ed0f16c07c5e01797ee973a8b07667b97cb6453d9479a57cbad3e66"
+        "8b0ca148163508095b5aae852dc2e6507af316f22fbe2560d05c5d8a0ee5171a"
     )
     assert cpp.count("wksp.insert(") == 2
     assert "wksp.insert_unchecked(" not in cpp

@@ -133,9 +133,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 59,
+        "torch_cpp_abi.py": 63,
     }
-    assert sum(constructor_counts.values()) == 398
+    assert sum(constructor_counts.values()) == 402
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 131,
@@ -149,9 +149,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 59,
+        "torch_cpp_abi.py": 63,
     }
-    assert sum(unclassified_counts.values()) == 388
+    assert sum(unclassified_counts.values()) == 392
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
@@ -306,7 +306,7 @@ def test_torch_abi_expression_producer_budget_is_explicit() -> None:
         ("cin_lowerer.py", "tensor_data_ptr"): 2,
         ("cin_lowerer.py", "tensor_storage_member"): 1,
         ("torch_cpp_abi.py", "mode_index_tensor"): 4,
-        ("torch_cpp_abi.py", "tensor_data_ptr"): 8,
+        ("torch_cpp_abi.py", "tensor_data_ptr"): 9,
         ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
     assert member_call_constructors == {
@@ -379,7 +379,7 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
     assert structured_counts == {
         "cin_lowerer.py": 2,
         "llir_traversal.py": 1,
-        "torch_cpp_abi.py": 6,
+        "torch_cpp_abi.py": 7,
     }
 
     producers = []
@@ -399,7 +399,7 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
         name_expressions[ast.unparse(fields["name"])] += 1
 
     assert name_expressions == {
-        "'kInt'": 4,
+        "'kInt'": 5,
         "get_pytorch_c_dtype_name(self.dtype)": 3,
         "get_pytorch_c_dtype_name(intermediate_tensor_var.dtype)": 1,
     }
@@ -605,15 +605,15 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 11,
-        "compressed_where_openmp_pass.py": 9,
+        "compressed_where_openmp_pass.py": 8,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 3,
     }
-    assert sum(counts.values()) == 27
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 26
+    assert sum(counts.values()) == 26
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 25
 
 
 def test_compressed_result_assembly_is_owned_by_the_typed_abi_epilogue() -> None:
@@ -746,12 +746,73 @@ def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:
             len(_llir_constructor_calls(path, constructor))
             for constructor in ("VarInit", "Array", "FunctionCall", "QualifiedName")
         )
-        == 40
+        == 45
     )
-    assert len(_llir_constructor_calls(path, "VarInit")) == 20
-    assert len(_llir_constructor_calls(path, "Array")) == 5
-    assert len(_llir_constructor_calls(path, "FunctionCall")) == 9
-    assert len(_llir_constructor_calls(path, "QualifiedName")) == 6
+    assert len(_llir_constructor_calls(path, "VarInit")) == 22
+    assert len(_llir_constructor_calls(path, "Array")) == 6
+    assert len(_llir_constructor_calls(path, "FunctionCall")) == 10
+    assert len(_llir_constructor_calls(path, "QualifiedName")) == 7
+
+
+def test_compressed_coordinate_torch_allocations_are_structured() -> None:
+    """Lock W12 on typed ABI nodes while retaining adjacent raw producers."""
+
+    abi_path = _COMPILER_ROOT / "torch_cpp_abi.py"
+    abi_tree = ast.parse(abi_path.read_text())
+    emitters = [
+        node
+        for node in ast.walk(abi_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "emit_compressed_coordinate_allocations"
+    ]
+    assert len(emitters) == 1
+    emitter = emitters[0]
+
+    def emitter_calls(name: str) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(emitter)
+            if isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+                or isinstance(node.func, ast.Name)
+                and node.func.id == name
+            )
+        ]
+
+    assert emitter_calls("RawStmt") == []
+    assert len(emitter_calls("VarInit")) == 2
+    assert len(emitter_calls("Var")) == 4
+    assert len(emitter_calls("Array")) == 1
+    assert len(emitter_calls("FunctionCall")) == 1
+    assert len(emitter_calls("QualifiedName")) == 1
+    assert len(emitter_calls("tensor_data_ptr")) == 1
+
+    compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
+    compressed_source = compressed_path.read_text()
+    position_allocations = compressed_source.split(
+        "def _position_and_coordinate_allocations", 1
+    )[1].split("_CTYPE_TO_TORCH", 1)[0]
+    value_allocation = compressed_source.split("def _value_allocation", 1)[1].split(
+        "def _final_assembly", 1
+    )[0]
+    assert (
+        position_allocations.count(
+            "context.result_assembler.emit_compressed_coordinate_allocations("
+        )
+        == 1
+    )
+    assert "_crd_torch" not in position_allocations
+    assert "_crd_data" not in position_allocations
+
+    # W10/W11/W13/W14 remain separate ownership seams for later slices.
+    assert position_allocations.count("llir.RawStmt(") == 3
+    assert "{first_level}_pos_torch" in position_allocations
+    assert "for (int _i = 0; _i <= {loop_bound}; _i++)" in position_allocations
+    assert "{result_name}{level}_pos_torch" in position_allocations
+    assert value_allocation.count("llir.RawStmt(") == 1
+    assert "{result_name}_values_torch" in value_allocation
 
 
 def test_known_nnz_tensor_size_cannot_return_to_raw_statements() -> None:
@@ -923,7 +984,7 @@ def test_compressed_offset_family_is_structured() -> None:
     total_initializations = [
         call
         for call in calls(prefix_builder, "VarInit")
-        if "_total" in _static_string_fragments(call)
+        if ast.unparse(fields(call).get("var")) == "_total_reference(level)"
     ]
 
     assert raw_violations == []
@@ -987,9 +1048,7 @@ def test_compressed_offset_family_is_structured() -> None:
 
     total_fields = fields(total_initializations[0])
     assert set(total_fields) == {"var", "value"}
-    assert ast.unparse(total_fields["var"]) == (
-        "llir.Var(name=f'_total{level}', type=llir.DataType.INT64)"
-    )
+    assert ast.unparse(total_fields["var"]) == "_total_reference(level)"
     assert ast.unparse(total_fields["value"]) == (
         "llir.ArrayAccess(array=_offset_reference(level), "
         "index=_loop_bound_reference(loop_bound, loop_bound_type))"

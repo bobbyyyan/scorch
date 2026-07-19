@@ -1397,6 +1397,235 @@ def test_known_nnz_coordinate_torch_owners_and_pointers_are_structured_and_fresh
 
 
 @pytest.mark.parametrize(
+    "level_types",
+    (
+        pytest.param(
+            (LevelType.DENSE, LevelType.COMPRESSED),
+            id="ds",
+        ),
+        pytest.param(
+            (
+                LevelType.DENSE,
+                LevelType.COMPRESSED,
+                LevelType.COMPRESSED,
+            ),
+            id="dss",
+        ),
+    ),
+)
+def test_compressed_coordinate_torch_owners_are_typed_fresh_and_ordered(
+    level_types: tuple[LevelType, ...],
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=level_types,
+        dtype=torch.float32,
+    )
+    compressed_levels = tuple(range(1, len(level_types)))
+    totals = tuple(
+        llir.Var(f"_total{level}", llir.DataType.INT64) for level in compressed_levels
+    )
+
+    first = assembler.emit_compressed_coordinate_allocations(totals)
+    second = assembler.emit_compressed_coordinate_allocations(totals)
+
+    expected_names = [
+        name
+        for level in compressed_levels
+        for name in (f"Result{level}_crd_torch", f"Result{level}_crd_data")
+    ]
+    assert [type(statement) for statement in first] == [llir.VarInit] * (
+        2 * len(compressed_levels)
+    )
+    assert [cast(llir.VarInit, statement).var.name for statement in first] == (
+        expected_names
+    )
+    assert first == second
+    assert [hash(statement) for statement in first] == [
+        hash(statement) for statement in second
+    ]
+
+    owned_children: list[llir.Node] = []
+    expected_cpp: list[str] = []
+    for index, level in enumerate(compressed_levels):
+        owner = cast(llir.VarInit, first[2 * index])
+        pointer = cast(llir.VarInit, first[2 * index + 1])
+        equal_owner = cast(llir.VarInit, second[2 * index])
+        equal_pointer = cast(llir.VarInit, second[2 * index + 1])
+        owner_name = f"Result{level}_crd_torch"
+        pointer_name = f"Result{level}_crd_data"
+
+        assert owner is not equal_owner
+        assert owner.var is not equal_owner.var
+        assert owner.var.name == owner_name
+        assert owner.var.type is llir.DataType.TORCH_TENSOR
+        assert owner.var.is_ptr is False
+        assert owner.var.is_restrict is False
+        assert owner.var.tensor_access is None
+        assert owner.op == "="
+        assert owner.cast is False
+        assert type(owner.value) is llir.FunctionCall
+        empty = cast(llir.FunctionCall, owner.value)
+        equal_empty = cast(llir.FunctionCall, equal_owner.value)
+        assert empty.name == "torch::empty"
+        assert type(empty.args) is tuple
+        assert len(empty.args) == 2
+        assert type(empty.args[0]) is llir.Array
+        extent = cast(llir.Array, empty.args[0])
+        equal_extent = cast(llir.Array, equal_empty.args[0])
+        assert extent.data_type is llir.DataType.INT64
+        assert type(extent.values) is tuple
+        assert len(extent.values) == 1
+        assert type(extent.values[0]) is llir.Var
+        total = cast(llir.Var, extent.values[0])
+        assert total.name == f"_total{level}"
+        assert total.type is llir.DataType.INT64
+        assert total.is_ptr is False
+        assert total.is_restrict is False
+        assert total.tensor_access is None
+        assert total is not totals[index]
+        dtype = _assert_torch_qualified_name(empty.args[1], "torch::kInt")
+        equal_dtype = _assert_torch_qualified_name(
+            equal_empty.args[1],
+            "torch::kInt",
+        )
+        assert extent == equal_extent
+        assert hash(extent) == hash(equal_extent)
+        assert extent is not equal_extent
+        assert total is not equal_extent.values[0]
+        assert dtype == equal_dtype
+        assert hash(dtype) == hash(equal_dtype)
+        assert dtype is not equal_dtype
+
+        assert pointer is not equal_pointer
+        assert pointer.var is not equal_pointer.var
+        assert pointer.var.name == pointer_name
+        assert pointer.var.type is llir.DataType.PTR_INT
+        assert pointer.var.is_ptr is False
+        assert pointer.var.is_restrict is False
+        assert pointer.var.tensor_access is None
+        assert pointer.op == "="
+        assert pointer.cast is False
+        data_ptr = _assert_data_ptr_call(pointer.value, llir.DataType.INT)
+        equal_data_ptr = _assert_data_ptr_call(
+            equal_pointer.value,
+            llir.DataType.INT,
+        )
+        receiver = _assert_torch_tensor_var(data_ptr.base, owner_name)
+        equal_receiver = _assert_torch_tensor_var(
+            equal_data_ptr.base,
+            owner_name,
+        )
+        assert data_ptr == equal_data_ptr
+        assert hash(data_ptr) == hash(equal_data_ptr)
+        assert data_ptr is not equal_data_ptr
+        assert receiver is not equal_receiver
+        assert receiver is not owner.var
+        owned_children.extend((total, dtype, receiver))
+        expected_cpp.extend(
+            (
+                f"torch::Tensor {owner_name} = "
+                f"torch::empty({{{total.name}}}, torch::kInt);",
+                f"int* {pointer_name} = {owner_name}.data_ptr<int>();",
+            )
+        )
+
+    assert len({id(child) for child in owned_children}) == len(owned_children)
+    assert LLIRLowerer().lower_llir(first) == "\n".join(expected_cpp)
+    totals[0].name = "caller_owned_total"
+    first_source_owner = cast(llir.VarInit, first[0])
+    first_source_empty = cast(llir.FunctionCall, first_source_owner.value)
+    first_source_extent = cast(llir.Array, first_source_empty.args[0])
+    assert cast(llir.Var, first_source_extent.values[0]).name == "_total1"
+    first_owner = cast(llir.VarInit, first[0])
+    first_empty = cast(llir.FunctionCall, first_owner.value)
+    first_extent = cast(llir.Array, first_empty.args[0])
+    cast(llir.Var, first_extent.values[0]).name = "owned_total"
+    first_pointer = cast(llir.VarInit, first[1])
+    first_call = cast(llir.MemberCall, first_pointer.value)
+    cast(llir.Var, first_call.base).name = "owned_receiver"
+    second_owner = cast(llir.VarInit, second[0])
+    second_empty = cast(llir.FunctionCall, second_owner.value)
+    second_extent = cast(llir.Array, second_empty.args[0])
+    assert cast(llir.Var, second_extent.values[0]).name == "_total1"
+    second_pointer = cast(llir.VarInit, second[1])
+    second_call = cast(llir.MemberCall, second_pointer.value)
+    assert cast(llir.Var, second_call.base).name == "Result1_crd_torch"
+    if len(compressed_levels) == 2:
+        sibling_owner = cast(llir.VarInit, first[2])
+        sibling_empty = cast(llir.FunctionCall, sibling_owner.value)
+        sibling_extent = cast(llir.Array, sibling_empty.args[0])
+        assert cast(llir.Var, sibling_extent.values[0]).name == "_total2"
+
+
+@pytest.mark.parametrize(
+    "level_types",
+    (
+        (),
+        (LevelType.DENSE,),
+        (LevelType.COMPRESSED,),
+        (LevelType.DENSE, LevelType.COORDINATE),
+        (LevelType.DENSE, LevelType.COMPRESSED, LevelType.DENSE),
+    ),
+)
+def test_compressed_coordinate_torch_owner_rejects_other_layouts(
+    level_types: tuple[LevelType, ...],
+) -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=level_types,
+        dtype=torch.float32,
+    )
+
+    with pytest.raises(ValueError):
+        assembler.emit_compressed_coordinate_allocations(())
+
+
+def test_compressed_coordinate_torch_owner_rejects_invalid_total_references() -> None:
+    assembler = ResultTensorAssembler(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    valid = llir.Var("_total1", llir.DataType.INT64)
+
+    with pytest.raises(TypeError, match="immutable Var tuple"):
+        assembler.emit_compressed_coordinate_allocations([valid])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="match the compressed levels"):
+        assembler.emit_compressed_coordinate_allocations(())
+
+    class UnknownTotal(llir.Var):
+        pass
+
+    invalid_totals = (
+        UnknownTotal("_total1", llir.DataType.INT64),
+        llir.Var("_total2", llir.DataType.INT64),
+        llir.Var("_total1", llir.DataType.INT),
+        llir.Var("_total1", llir.DataType.INT64, is_ptr=True),
+        llir.Var("_total1", llir.DataType.INT64, is_restrict=True),
+        llir.Var(
+            "_total1",
+            llir.DataType.INT64,
+            tensor_access=cast(llir.TensorAccessMetadata, object()),
+        ),
+    )
+    for total in invalid_totals:
+        with pytest.raises((TypeError, ValueError)):
+            assembler.emit_compressed_coordinate_allocations((total,))
+
+    class ResultAssemblerSubclass(ResultTensorAssembler):
+        pass
+
+    subclass = ResultAssemblerSubclass(
+        name="Result",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+    )
+    with pytest.raises(TypeError, match="exact ResultTensorAssembler"):
+        subclass.emit_compressed_coordinate_allocations((valid,))
+
+
+@pytest.mark.parametrize(
     ("fmt", "known_nnz_var", "is_restrict"),
     (
         pytest.param("dd", None, True, id="dense"),
