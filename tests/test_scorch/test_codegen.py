@@ -22,6 +22,11 @@ def _result_metadata(access_id: int = 1) -> llir.TensorAccessMetadata:
     )
 
 
+def test_llir_does_not_expose_legacy_duplicate_codegen() -> None:
+    assert not hasattr(llir, "NodeVisitor")
+    assert not hasattr(llir, "CppCodeGenerator")
+
+
 def test_codegen_rejects_unknown_statement_node() -> None:
     class UnknownStmt(llir.Stmt):
         pass
