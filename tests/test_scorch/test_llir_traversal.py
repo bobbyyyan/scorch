@@ -3,6 +3,11 @@ from typing import Dict, List, Sequence, Set, Tuple, Type, cast
 import pytest
 
 from scorch.compiler import llir
+from scorch.compiler.codegen import (
+    EMITTED_LLIR_NODE_TYPES,
+    LLIRLowerer,
+)
+from scorch.compiler.diagnostics import CodegenError
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_traversal import (
     LLIRPath,
@@ -106,10 +111,6 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
     index = _var("index")
     literal = llir.Literal(1)
     return {
-        llir.GetTensorProperty: llir.GetTensorProperty(
-            tensor=value,
-            tensor_property=llir.TensorProperty.VALUES,
-        ),
         llir.Var: value,
         llir.UnaryOp: llir.UnaryOp("-", value),
         llir.BinOp: llir.BinOp("+", value, literal),
@@ -134,16 +135,13 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
             llir.Array((), llir.DataType.FLOAT32),
         ),
         llir.Assign: llir.Assign(value, literal),
-        llir.Allocate: llir.Allocate(value, literal),
-        llir.Free: llir.Free(value),
-        llir.Print: llir.Print(value),
         llir.Comment: llir.Comment("comment"),
         llir.BlankLine: llir.BlankLine(),
         llir.RawStmt: llir.RawStmt("raw"),
         llir.Continue: llir.Continue(),
         llir.Break: llir.Break(),
         llir.Function: llir.Function(
-            return_type=llir.DataType.VOID,
+            return_type=llir.DataType.INT,
             name="function",
             args=[value],
             body=[llir.Return(value)],
@@ -176,14 +174,45 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
             then_body=[llir.Break()],
             else_body=[llir.Continue()],
         ),
-        llir.Case: llir.Case(value, [llir.Break()]),
-        llir.Switch: llir.Switch(
-            cond=value,
-            cases=[llir.Case(literal, [llir.Break()])],
-            default=[llir.Continue()],
-        ),
         llir.Cast: llir.Cast(value, llir.DataType.INT64),
         llir.Sizeof: llir.Sizeof(llir.DataType.INT64),
+    }
+
+
+def _node_emissions() -> Dict[Type[llir.Node], str]:
+    return {
+        llir.Var: "value",
+        llir.UnaryOp: "- value",
+        llir.BinOp: "value + 1",
+        llir.Add: "value + 1",
+        llir.Mul: "value * 1",
+        llir.Literal: "1",
+        llir.QualifiedName: "torch::kInt",
+        llir.Increment: "index++;",
+        llir.Return: "return value;",
+        llir.VarDecl: "int value;",
+        llir.VarInit: "int value = 1;",
+        llir.DirectInit: "std::vector<float> storage(1);",
+        llir.FixedStackArrayDecl: "float workspace[kTile] = {};",
+        llir.Assign: "value = 1;",
+        llir.Comment: "// comment",
+        llir.BlankLine: " ",
+        llir.RawStmt: "raw;",
+        llir.Continue: "continue;",
+        llir.Break: "break;",
+        llir.Function: "int function(int value) {\n  return value;\n}",
+        llir.FunctionCall: "call(value)",
+        llir.FunctionCallStmt: "call(value);",
+        llir.Array: "{value, 1}",
+        llir.MemberAccess: "value.member",
+        llir.MemberCall: "value.member<int>(index)",
+        llir.ArrayAccess: "value[index]",
+        llir.ForLoop: "for (; value; index++) {\n  break;\n}",
+        llir.ForLoopAuto: "for (int index : value) {\n  break;\n}",
+        llir.WhileLoop: "while (value) {\n  break;\n}",
+        llir.IfThenElse: "if (value) {\n  break;\n} else {\n  continue;\n}",
+        llir.Cast: "(int64_t) value",
+        llir.Sizeof: "sizeof(int64_t)",
     }
 
 
@@ -506,18 +535,39 @@ def test_direct_init_walker_and_rewriter_have_deterministic_preorder() -> None:
 
 def test_walker_and_rewriter_cover_every_declared_node() -> None:
     samples = _node_samples()
+    emissions = _node_emissions()
     assert set(SUPPORTED_LLIR_NODE_TYPES) == _declared_node_types()
     assert set(samples) == set(SUPPORTED_LLIR_NODE_TYPES)
+    assert set(emissions) == set(SUPPORTED_LLIR_NODE_TYPES)
+    assert EMITTED_LLIR_NODE_TYPES == SUPPORTED_LLIR_NODE_TYPES
 
     walker = LLIRWalker(_CONTEXT)
     rewriter = LLIRRewriter(_CONTEXT)
+    lowerer = LLIRLowerer()
     for node_type in SUPPORTED_LLIR_NODE_TYPES:
         sample = samples[node_type]
+        assert type(sample) is node_type
         walker.walk(sample)
+        assert lowerer.lower_llir(sample) == emissions[node_type]
         rewritten = rewriter.rewrite(sample)
         assert type(rewritten) is node_type
         assert _structural_snapshot(rewritten) == _structural_snapshot(sample)
         assert _mutable_ir_ids(rewritten).isdisjoint(_mutable_ir_ids(sample))
+
+
+def test_every_declared_node_subclass_fails_closed_in_traversal_and_codegen() -> None:
+    walker = LLIRWalker(_CONTEXT)
+    lowerer = LLIRLowerer()
+    for node_type, sample in _node_samples().items():
+        unknown_type = type(f"Unknown{node_type.__name__}", (node_type,), {})
+        unknown = object.__new__(unknown_type)
+        vars(unknown).update(vars(sample))
+
+        with pytest.raises(LLIRTraversalError) as traversal_error:
+            walker.walk(unknown)
+        assert traversal_error.value.diagnostic.node_type == unknown_type.__name__
+        with pytest.raises(CodegenError, match=unknown_type.__name__):
+            lowerer.lower_llir(unknown)
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
@@ -2810,9 +2860,6 @@ def test_statement_sequence_member_hook_validates_replacement_children() -> None
         ),
         (llir.ForLoopAuto(_var("i"), _var("array"), []), "body"),
         (llir.WhileLoop(_var("cond"), []), "body"),
-        (llir.Case(_var("cond"), []), "body"),
-        (llir.Switch(_var("cond"), [], []), "cases"),
-        (llir.Switch(_var("cond"), [], []), "default"),
     ],
 )
 def test_required_statement_children_reject_none(
@@ -2837,6 +2884,11 @@ def test_required_statement_children_reject_none(
     ("field", "invalid_value", "diagnostic_code"),
     [
         ("init", llir.Break(), "invalid_for_loop_init"),
+        (
+            "update",
+            llir.VarInit(_var("j"), llir.Literal(1)),
+            "invalid_for_loop_update",
+        ),
         ("update", [llir.Increment(_var("i"))], "invalid_for_loop_update"),
     ],
 )

@@ -595,11 +595,7 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
     conditional = llir.IfThenElse(
         cond=llir.Literal(True),
         then_body=[_sparse_loop()],
-    )
-    switch = llir.Switch(
-        cond=_var("choice"),
-        cases=[llir.Case(llir.Literal(0), [_sparse_loop()])],
-        default=[_sparse_loop()],
+        else_body=[_sparse_loop()],
     )
     function = llir.Function(
         return_type=llir.DataType.VOID,
@@ -654,7 +650,6 @@ def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
         ("cast expression is not scanned", [cast_hidden_access]),
         ("typed access shapes do not match", [unmatched_typed_accesses]),
         ("conditional container is omitted", [conditional]),
-        ("switch container is omitted", [switch]),
         ("function container is omitted", [function]),
         ("while container is omitted", [while_loop]),
         ("automatic-for container is omitted", [automatic_loop]),

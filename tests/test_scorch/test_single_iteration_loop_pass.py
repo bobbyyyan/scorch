@@ -927,7 +927,7 @@ def test_exact_structured_access_index_is_rewritten_and_reapplication_is_noop() 
     assert rewritten is not access
 
 
-def test_rewrite_omits_headers_parallel_regions_and_legacy_containers() -> None:
+def test_rewrite_omits_headers_parallel_regions_and_nested_containers() -> None:
     old = "Array[ix]"
     nested_header = _loop([], loop_variable="nested")
     nested_header.init = llir.VarInit(_var("nested"), _var(old))
@@ -945,11 +945,6 @@ def test_rewrite_omits_headers_parallel_regions_and_legacy_containers() -> None:
         [_var(old)],
         [llir.RawStmt(old)],
     )
-    switch = llir.Switch(
-        _var(old),
-        [llir.Case(_var(old), [llir.RawStmt(old)])],
-        [llir.RawStmt(old)],
-    )
     conditional = llir.IfThenElse(
         cond=_var(old),
         then_body=[llir.RawStmt(old)],
@@ -964,7 +959,6 @@ def test_rewrite_omits_headers_parallel_regions_and_legacy_containers() -> None:
             while_loop,
             auto_loop,
             function,
-            switch,
             conditional,
             llir.Assign(_var("cast"), llir.Cast(_var(old), llir.DataType.FLOAT32)),
             llir.Assign(_var("unary"), llir.UnaryOp("-", _var(old))),
@@ -1007,11 +1001,7 @@ def test_rewrite_omits_headers_parallel_regions_and_legacy_containers() -> None:
     assert output_function.name == "function_ix]"
     assert cast(llir.Var, output_function.args[0]).name == old
     assert cast(llir.RawStmt, output_function.body[0]).code == old
-    output_switch = cast(llir.Switch, output[4])
-    assert cast(llir.Var, output_switch.cond).name == old
-    assert cast(llir.RawStmt, output_switch.cases[0].body[0]).code == old
-    assert cast(llir.RawStmt, output_switch.default[0]).code == old
-    output_if = cast(llir.IfThenElse, output[5])
+    output_if = cast(llir.IfThenElse, output[4])
     assert cast(llir.Var, output_if.cond).name == old
     assert cast(llir.Var, output_if.cond_list[0]).name == old
     assert cast(llir.RawStmt, cast(List[llir.Stmt], output_if.then_body)[0]).code == (
@@ -1019,17 +1009,17 @@ def test_rewrite_omits_headers_parallel_regions_and_legacy_containers() -> None:
     )
     assert cast(llir.RawStmt, output_if.then_body_list[0][0]).code == "Array[base]"
 
-    cast_expression = cast(llir.Cast, cast(llir.Assign, output[6]).value)
+    cast_expression = cast(llir.Cast, cast(llir.Assign, output[5]).value)
     assert cast(llir.Var, cast_expression.expr).name == old
-    unary = cast(llir.UnaryOp, cast(llir.Assign, output[7]).value)
+    unary = cast(llir.UnaryOp, cast(llir.Assign, output[6]).value)
     assert cast(llir.Var, unary.operand).name == old
-    call = cast(llir.FunctionCall, cast(llir.Assign, output[8]).value)
+    call = cast(llir.FunctionCall, cast(llir.Assign, output[7]).value)
     assert cast(llir.Var, call.args[0]).name == old
-    array = cast(llir.Array, cast(llir.Assign, output[9]).value)
+    array = cast(llir.Array, cast(llir.Assign, output[8]).value)
     assert cast(llir.Var, array.values[0]).name == old
-    assert cast(llir.Var, cast(llir.Return, output[10]).value).name == old
-    assert type(output[11]) is list
-    assert cast(llir.RawStmt, cast(List[llir.Stmt], output[11])[0]).code == old
+    assert cast(llir.Var, cast(llir.Return, output[9]).value).name == old
+    assert type(output[10]) is list
+    assert cast(llir.RawStmt, cast(List[llir.Stmt], output[10])[0]).code == old
 
 
 def test_nested_for_loop_and_if_then_else_analysis_is_postorder() -> None:
@@ -1093,22 +1083,19 @@ def _parallel_analysis_container() -> llir.ForLoop:
     "factory",
     (
         lambda: llir.IfThenElse(
-            cond=_var("condition"),
-            then_body_list=[_program([llir.RawStmt("branch_body")])],
+            cond_list=[_var("first"), _var("second")],
+            then_body_list=[
+                _program([llir.RawStmt("first_branch_body")]),
+                _program([llir.RawStmt("second_branch_body")]),
+            ],
         ),
         _parallel_analysis_container,
         lambda: llir.WhileLoop(_var("condition"), _program()),
         lambda: llir.ForLoopAuto(_var("item"), _var("items"), _program()),
         lambda: llir.Function(llir.DataType.VOID, "function", [], _program()),
-        lambda: llir.Case(llir.Literal(1), _program()),
-        lambda: llir.Switch(
-            _var("selector"),
-            [llir.Case(llir.Literal(1), _program())],
-            _program(),
-        ),
     ),
 )
-def test_analysis_omits_every_legacy_container(
+def test_analysis_omits_every_surviving_container(
     factory: Callable[[], llir.Stmt],
 ) -> None:
     source = [factory()]

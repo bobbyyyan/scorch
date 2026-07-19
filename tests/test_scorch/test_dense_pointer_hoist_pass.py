@@ -844,9 +844,7 @@ def test_positive_rewrite_scope_covers_calls_raw_nested_loops_and_all_if_bodies(
     assert cast(llir.Var, branch_call.args[0]).name == rewritten
 
 
-def test_legacy_rewrite_omits_headers_parallel_regions_and_unsupported_containers() -> (
-    None
-):
+def test_legacy_rewrite_omits_headers_parallel_regions_and_nested_containers() -> None:
     old = "Input_val[position]"
     nested_header = _loop([], loop_variable="nested")
     nested_header.init = llir.VarInit(_var("nested"), _var(old))
@@ -865,11 +863,6 @@ def test_legacy_rewrite_omits_headers_parallel_regions_and_unsupported_container
         [],
         [llir.RawStmt(old)],
     )
-    switch = llir.Switch(
-        _var("selector"),
-        [llir.Case(llir.Literal(1), [llir.RawStmt(old)])],
-        [llir.RawStmt(old)],
-    )
     conditional = llir.IfThenElse(
         cond=_var(old),
         then_body=[llir.BlankLine()],
@@ -884,7 +877,6 @@ def test_legacy_rewrite_omits_headers_parallel_regions_and_unsupported_container
             while_loop,
             auto_loop,
             function,
-            switch,
             conditional,
             llir.Assign(_var("cast"), llir.Cast(_var(old), llir.DataType.FLOAT32)),
             llir.Assign(_var("unary"), llir.UnaryOp("-", _var(old))),
@@ -923,37 +915,32 @@ def test_legacy_rewrite_omits_headers_parallel_regions_and_unsupported_container
     assert (
         cast(llir.RawStmt, cast(llir.Function, output_loop.body[4]).body[0]).code == old
     )
-    output_switch = cast(llir.Switch, output_loop.body[5])
-    assert (
-        cast(llir.RawStmt, cast(llir.Case, output_switch.cases[0]).body[0]).code == old
-    )
-    assert cast(llir.RawStmt, output_switch.default[0]).code == old
-    output_if = cast(llir.IfThenElse, output_loop.body[6])
+    output_if = cast(llir.IfThenElse, output_loop.body[5])
     assert cast(llir.Var, output_if.cond).name == old
     assert cast(llir.Var, output_if.cond_list[0]).name == old
     assert (
         cast(
-            llir.Var, cast(llir.Cast, cast(llir.Assign, output_loop.body[7]).value).expr
+            llir.Var, cast(llir.Cast, cast(llir.Assign, output_loop.body[6]).value).expr
         ).name
         == old
     )
     assert (
         cast(
             llir.Var,
-            cast(llir.UnaryOp, cast(llir.Assign, output_loop.body[8]).value).operand,
+            cast(llir.UnaryOp, cast(llir.Assign, output_loop.body[7]).value).operand,
         ).name
         == old
     )
     assert (
         cast(
             llir.Var,
-            cast(llir.FunctionCall, cast(llir.Assign, output_loop.body[9]).value).args[
+            cast(llir.FunctionCall, cast(llir.Assign, output_loop.body[8]).value).args[
                 0
             ],
         ).name
         == old
     )
-    assert cast(llir.Var, cast(llir.Return, output_loop.body[10]).value).name == old
+    assert cast(llir.Var, cast(llir.Return, output_loop.body[9]).value).name == old
 
 
 def test_preexisting_nonempty_hoisted_declarations_are_consumed_in_reverse() -> None:

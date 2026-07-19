@@ -530,7 +530,7 @@ def test_none_and_empty_optional_loop_regions_preserve_their_shape() -> None:
     assert rewritten_empty.post_parallel_body is not empty.post_parallel_body
 
 
-def test_function_case_and_switch_bodies_are_identity_only_and_detached() -> None:
+def test_function_body_is_identity_only_and_detached() -> None:
     def result_write(value: str) -> llir.Assign:
         return llir.Assign(
             _access("Result1_crd", _var("pResult1")),
@@ -543,12 +543,6 @@ def test_function_case_and_switch_bodies_are_identity_only_and_detached() -> Non
             name="nested",
             args=[],
             body=[result_write("function")],
-        ),
-        llir.Case(_var("case_condition"), [result_write("case")]),
-        llir.Switch(
-            cond=_var("selector"),
-            cases=[llir.Case(_var("switch_case"), [result_write("switch")])],
-            default=[result_write("default")],
         ),
     ]
 

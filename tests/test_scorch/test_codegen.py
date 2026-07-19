@@ -35,13 +35,249 @@ def test_codegen_rejects_unknown_statement_node() -> None:
         LLIRLowerer().lower_llir(UnknownStmt())
 
 
-def test_codegen_rejects_known_but_unsupported_expression_node() -> None:
-    expression = llir.GetTensorProperty(
-        tensor=_var("tensor"), tensor_property=llir.TensorProperty.VALUES
+@pytest.mark.parametrize(
+    "name",
+    (
+        "TensorProperty",
+        "GetTensorProperty",
+        "Allocate",
+        "Free",
+        "Print",
+        "Case",
+        "Switch",
+    ),
+)
+def test_llir_does_not_expose_non_emittable_schema(name: str) -> None:
+    assert not hasattr(llir, name)
+
+
+def test_codegen_rejects_unknown_expression_node() -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(UnknownExpr())
+
+
+def test_codegen_accepts_exact_list_and_tuple_statement_sequences() -> None:
+    statements = [
+        llir.Break(),
+        (llir.Continue(), [llir.Return(llir.Literal(1))]),
+    ]
+    expected = "break;\ncontinue;\nreturn 1;"
+
+    assert LLIRLowerer().lower_llir(statements) == expected
+    assert LLIRLowerer().lower_llir(tuple(statements)) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        llir.Literal(1),
+        "raw",
+    ),
+)
+def test_codegen_statement_sequences_reject_non_statement_members(
+    value: object,
+) -> None:
+    with pytest.raises(CodegenError, match="must contain exact LLIR statements"):
+        LLIRLowerer().lower_llir(cast(Any, [value]))
+
+
+def test_codegen_rejects_string_and_sequence_subclasses() -> None:
+    class UnknownString(str):
+        pass
+
+    class UnknownList(list):
+        pass
+
+    class UnknownTuple(tuple):
+        pass
+
+    lowerer = LLIRLowerer()
+    with pytest.raises(CodegenError, match="UnknownString"):
+        lowerer.lower_llir(cast(Any, UnknownString("raw")))
+    with pytest.raises(CodegenError, match="UnknownList"):
+        lowerer.lower_llir(cast(Any, UnknownList([llir.Break()])))
+    with pytest.raises(CodegenError, match="UnknownTuple"):
+        lowerer.lower_llir(cast(Any, UnknownTuple((llir.Break(),))))
+
+
+def test_direct_codegen_helpers_reject_node_subclasses() -> None:
+    class UnknownVar(llir.Var):
+        pass
+
+    class UnknownForLoop(llir.ForLoop):
+        pass
+
+    class UnknownIfThenElse(llir.IfThenElse):
+        pass
+
+    class UnknownFunction(llir.Function):
+        pass
+
+    lowerer = LLIRLowerer()
+    with pytest.raises(CodegenError, match="UnknownVar"):
+        lowerer.lower_expression(UnknownVar("value", llir.DataType.INT))
+    with pytest.raises(CodegenError, match="UnknownForLoop"):
+        lowerer.lower_loop_construct(
+            UnknownForLoop(
+                None,
+                _var("condition"),
+                llir.Increment(_var("index")),
+                [],
+            )
+        )
+    with pytest.raises(CodegenError, match="UnknownIfThenElse"):
+        lowerer.lower_conditional(
+            UnknownIfThenElse(cond=_var("condition"), then_body=[llir.Break()])
+        )
+    with pytest.raises(CodegenError, match="UnknownFunction"):
+        lowerer.lower_function_definition(
+            UnknownFunction(llir.DataType.VOID, "function", [], [])
+        )
+
+
+def test_codegen_rejects_unknown_nested_node_subclasses() -> None:
+    class UnknownVar(llir.Var):
+        pass
+
+    class UnknownLiteral(llir.Literal):
+        pass
+
+    class UnknownBreak(llir.Break):
+        pass
+
+    unknown_var = UnknownVar("value", llir.DataType.INT)
+    unknown_literal = UnknownLiteral(1)
+    statements = (
+        llir.VarDecl(unknown_var),
+        llir.VarInit(_var("value"), unknown_literal),
+        llir.Assign(_var("value"), unknown_literal),
+        llir.Function(
+            llir.DataType.VOID,
+            "bad_argument",
+            [unknown_var],
+            [],
+        ),
+        llir.Function(
+            llir.DataType.VOID,
+            "bad_body",
+            [],
+            [UnknownBreak()],
+        ),
     )
 
-    with pytest.raises(CodegenError, match="GetTensorProperty"):
-        LLIRLowerer().lower_llir(expression)
+    lowerer = LLIRLowerer()
+    for statement in statements:
+        with pytest.raises(CodegenError):
+            lowerer.lower_llir(statement)
+
+
+def test_codegen_rejects_nested_sequence_subclasses() -> None:
+    class UnknownList(list):
+        pass
+
+    function_args = llir.Function(
+        llir.DataType.VOID,
+        "function_args",
+        cast(Any, UnknownList()),
+        [],
+    )
+    call_args = llir.FunctionCallStmt(
+        "call",
+        cast(Any, UnknownList([llir.Literal(1)])),
+    )
+    conditions = llir.IfThenElse(
+        cond_list=cast(Any, UnknownList([_var("condition")])),
+        then_body_list=[[llir.Break()]],
+    )
+    optional_region = llir.ForLoop(
+        None,
+        _var("condition"),
+        llir.Increment(_var("index")),
+        [],
+        before_parallel_body=cast(Any, UnknownList()),
+    )
+
+    lowerer = LLIRLowerer()
+    for node in (function_args, call_args, conditions, optional_region):
+        with pytest.raises(CodegenError, match="list/tuple subclass"):
+            lowerer.lower_llir(node)
+
+
+@pytest.mark.parametrize(
+    "node",
+    (
+        llir.WhileLoop(cast(Any, llir.Break()), []),
+        llir.IfThenElse(cond=cast(Any, llir.Break()), then_body=[llir.Break()]),
+        llir.WhileLoop(_var("condition"), cast(Any, llir.Break())),
+        llir.Function(
+            llir.DataType.VOID,
+            "body",
+            [],
+            cast(Any, llir.Break()),
+        ),
+        llir.IfThenElse(
+            cond=_var("condition"),
+            then_body=cast(Any, llir.Break()),
+        ),
+        llir.IfThenElse(
+            cond_list=[_var("condition")],
+            then_body_list=cast(Any, [llir.Break()]),
+        ),
+        llir.ForLoop(
+            None,
+            _var("condition"),
+            llir.VarInit(_var("update"), llir.Literal(1)),
+            [],
+        ),
+    ),
+)
+def test_codegen_rejects_invalid_nested_node_categories(node: llir.Node) -> None:
+    with pytest.raises(CodegenError):
+        LLIRLowerer().lower_llir(node)
+
+
+def test_codegen_rejects_unknown_descendants_in_inactive_fields() -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    hidden_conditional_fields = llir.IfThenElse(
+        cond=llir.UnaryOp("-", UnknownExpr()),
+        then_body=[llir.Return(UnknownExpr())],
+        cond_list=[_var("active")],
+        then_body_list=[[llir.Break()]],
+    )
+    hidden_else_condition = llir.IfThenElse(
+        cond_list=[_var("active"), llir.UnaryOp("-", UnknownExpr())],
+        then_body_list=[[llir.Break()], [llir.Continue()]],
+        make_last_case_else=True,
+    )
+    hidden_before_parallel = llir.ForLoop(
+        None,
+        _var("condition"),
+        llir.Increment(_var("index")),
+        [],
+        before_parallel_body=[llir.Return(UnknownExpr())],
+    )
+    hidden_hoisted_declaration = llir.ForLoop(
+        None,
+        _var("condition"),
+        llir.Increment(_var("index")),
+        [],
+    )
+    hidden_hoisted_declaration._hoisted_ptr_decls = [llir.Return(UnknownExpr())]
+
+    lowerer = LLIRLowerer()
+    for node in (
+        hidden_conditional_fields,
+        hidden_else_condition,
+        hidden_before_parallel,
+        hidden_hoisted_declaration,
+    ):
+        with pytest.raises(CodegenError, match="UnknownExpr"):
+            lowerer.lower_llir(node)
 
 
 def test_increment_is_frozen_typed_structural_and_byte_exact() -> None:
@@ -217,7 +453,7 @@ def test_direct_init_codegen_rejects_unknown_and_forged_nodes(
             "var",
             UnknownVar("storage", llir.DataType.STD_VECTOR_FLOAT32),
         )
-        expected = "DirectInit.var must be an exact LLIR Var"
+        expected = "UnknownVar at root.var"
     elif malformation == "args":
         object.__setattr__(declaration, "args", [llir.Literal(4)])
         expected = "DirectInit.args must be a tuple"
@@ -1252,7 +1488,7 @@ def test_codegen_rejects_fixed_stack_array_subclasses_and_unknown_children() -> 
         initializer,
     )
     object.__setattr__(forged, "extent", UnknownExpr())
-    with pytest.raises(CodegenError, match="FixedStackArrayDecl.extent"):
+    with pytest.raises(CodegenError, match="UnknownExpr at root.extent"):
         LLIRLowerer().lower_llir(forged)
 
 
@@ -1803,7 +2039,7 @@ def test_codegen_rejects_forged_malformed_assignment_targets(
             llir.AssignmentTarget,
             UnknownArrayAccess(_var("values"), _var("i")),
         )
-        expected = "Invalid LLIR assignment target"
+        expected = "UnknownArrayAccess at root.var"
     elif malformation == "unknown_child":
         target = object.__new__(llir.ArrayAccess)
         object.__setattr__(target, "array", _var("values"))

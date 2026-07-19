@@ -1034,7 +1034,7 @@ def test_defined_variable_analysis_recurses_through_legacy_supported_bodies() ->
     ]
 
 
-def test_definition_analysis_omits_every_legacy_unsupported_container() -> None:
+def test_definition_analysis_omits_every_surviving_unsupported_container() -> None:
     parallel_owner = _loop([], loop_variable="parallel_owner")
     parallel_owner.before_parallel_body = [
         llir.VarInit(_var("before_defined"), llir.Literal(0))
@@ -1046,8 +1046,17 @@ def test_definition_analysis_omits_every_legacy_unsupported_container() -> None:
         llir.VarInit(_var("post_defined"), llir.Literal(0))
     ]
     conditional = llir.IfThenElse(
-        cond_list=[_var("branch_condition")],
-        then_body_list=[[llir.VarInit(_var("branch_defined"), llir.Literal(0))]],
+        cond_list=[
+            _var("branch_condition"),
+            _var("alternate_condition"),
+            _var("final_condition"),
+        ],
+        then_body_list=[
+            [llir.VarInit(_var("branch_defined"), llir.Literal(0))],
+            [llir.VarInit(_var("alternate_defined"), llir.Literal(0))],
+            [llir.VarInit(_var("final_defined"), llir.Literal(0))],
+        ],
+        make_last_case_else=True,
     )
     auto_loop = llir.ForLoopAuto(
         _var("auto_defined"),
@@ -1060,16 +1069,6 @@ def test_definition_analysis_omits_every_legacy_unsupported_container() -> None:
         [],
         [llir.VarInit(_var("function_defined"), llir.Literal(0))],
     )
-    switch = llir.Switch(
-        _var("switch_condition"),
-        [
-            llir.Case(
-                llir.Literal(1),
-                [llir.VarInit(_var("case_defined"), llir.Literal(0))],
-            )
-        ],
-        [llir.VarInit(_var("default_defined"), llir.Literal(0))],
-    )
     omitted_names = [
         "before_defined",
         "pre_defined",
@@ -1078,8 +1077,8 @@ def test_definition_analysis_omits_every_legacy_unsupported_container() -> None:
         "auto_defined",
         "auto_body_defined",
         "function_defined",
-        "case_defined",
-        "default_defined",
+        "alternate_defined",
+        "final_defined",
         "raw_list_defined",
         "raw_tuple_defined",
     ]
@@ -1096,7 +1095,6 @@ def test_definition_analysis_omits_every_legacy_unsupported_container() -> None:
             conditional,
             auto_loop,
             function,
-            switch,
             [llir.VarInit(_var("raw_list_defined"), llir.Literal(0))],
             (llir.VarInit(_var("raw_tuple_defined"), llir.Literal(0)),),
         ],
@@ -1143,15 +1141,12 @@ def _omitted_transform_roots() -> Tuple[List[llir.Stmt], ...]:
         ],
         [
             llir.IfThenElse(
-                cond_list=[_var("condition")],
-                then_body_list=[[_activating_loop()]],
-            )
-        ],
-        [
-            llir.Switch(
-                _var("condition"),
-                [llir.Case(llir.Literal(1), [_activating_loop()])],
-                [_activating_loop()],
+                cond_list=[_var("first_condition"), _var("final_condition")],
+                then_body_list=[
+                    [_activating_loop(invariant=_var("first_branch"))],
+                    [_activating_loop(invariant=_var("final_branch"))],
+                ],
+                make_last_case_else=True,
             )
         ],
         [parallel_owner],
@@ -1161,7 +1156,7 @@ def _omitted_transform_roots() -> Tuple[List[llir.Stmt], ...]:
 
 
 @pytest.mark.parametrize("source", _omitted_transform_roots())
-def test_transform_recursion_omits_every_legacy_unsupported_container(
+def test_transform_recursion_omits_every_surviving_unsupported_container(
     source: List[llir.Stmt],
 ) -> None:
     before = _snapshot(source)
