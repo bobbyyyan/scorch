@@ -13567,6 +13567,461 @@ LoopIR have not begun. Phases 0 and 1 are not claimed formally closed without
 a separate design-requirement audit. Phase 2 retains its recorded canonical
 closure.
 
+### Phase-3 duplicate LLIR generator removal complete (2026-07-18)
+
+This records only the narrow Phase-3 unused duplicate-generator removal
+sub-slice, not completion of the unified emitter deliverable or Phase 3. The
+exact committed base is
+94d86b96cfcf5abda6c142b2d0a7bf44bbade7fe. Two ordered scoped commits
+landed:
+
+- a73bf4e5194a67982fceef15ffb5576fefcc5e80,
+  refactor(compiler): remove duplicate LLIR generator; and
+- a6576469a280dde33a6c6d301de04b56a916a9ab,
+  test(compiler): lock duplicate generator removal.
+
+No commit was amended, squashed, reordered, or rewritten. The production/docs
+commit deletes 44 lines from src/scorch/compiler/llir.py and replaces the
+three-line stale note in docs/source/compiler/codegen.md. The test commit adds
+five lines only to tests/test_scorch/test_codegen.py. There is no LLIR schema
+or node-typing change, no common llir_traversal.py traversal, validation, or
+rewriting change, and no ABI, ownership, generated-source, or live
+in-repository compiler/generated-kernel runtime behavior change. The
+module-surface compatibility risk is recorded below.
+
+#### Complete reference, ownership, and compatibility audit
+
+At the exact base, the complete tracked src/docs/tests/tools/examples
+exact-name search found:
+
+- one NodeVisitor definition in llir.py;
+- one CppCodeGenerator definition in llir.py;
+- one stale documentation note naming both classes;
+- no import, instantiation, caller, additional subclass, dynamic import,
+  reflection, explicit export, plugin, pickle, or serialization consumer; and
+- no public re-export: compiler/__init__.py is empty and llir.py has no
+  explicit export list.
+
+The audit used:
+
+~~~sh
+rg -n \
+  'class NodeVisitor|class CppCodeGenerator|NodeVisitor|CppCodeGenerator|LLIRLowerer|\.accept\(' \
+  src tests docs tools bench examples \
+  COMPILER_IR_REFACTOR_DESIGN.md COMPILER_IR_REFACTOR_HANDOFF.md \
+  --glob '!bench/bench_results/**' --glob '!tmp/**'
+~~~
+
+The removed NodeVisitor performed runtime-class-name dispatch to
+visit_<ClassName> and raised a generic exception when no method existed. The
+removed CppCodeGenerator was its unused partial subclass with mutable
+indent/code state and only BinOp, UnaryOp, and Return generation methods. It
+was not capable of emitting the production schema.
+
+The sole live emitter before and after is compiler.codegen.LLIRLowerer.
+Production imports in ops.py and stensor.py call it directly. Its existing
+node-specific arms and final CodegenError fallback for otherwise-unhandled
+types remain unchanged. Common traversal remains owned by llir_traversal.py.
+The slice therefore deletes a competing name and implementation without
+moving any live ownership boundary.
+
+Node.accept(visitor) remains byte-for-byte intact. External or custom visitors
+can still implement visit and use that node-level compatibility hook. The
+honest compatibility risk is narrower: unsupported out-of-tree code that
+directly imports the undocumented llir.NodeVisitor or
+llir.CppCodeGenerator module attributes now fails. Repository searches and
+source/build captures cannot exclude such consumers.
+
+The new regression asserts that neither legacy attribute is exposed. The
+documentation now directs readers to LLIRLowerer and explicitly states that
+llir.py has no second generator.
+
+This does not satisfy the Phase-3 exhaustive-emission exit condition. Common
+traversal still accepts, walks, and reconstructs these six families:
+
+- GetTensorProperty;
+- Allocate;
+- Free;
+- Print;
+- Case; and
+- Switch.
+
+LLIRLowerer has no generation arm for any of them and rejects them at its
+fail-closed fallback; GetTensorProperty has explicit rejection coverage.
+The exact production-constructor search:
+
+~~~sh
+rg -n \
+  '\b(GetTensorProperty|Allocate|Free|Print|Case|Switch)\(' \
+  src/scorch --glob '*.py'
+~~~
+
+returned only the six schema definitions and six common traversal
+reconstructions. It found no live production producer. Test-only constructors
+remain. Thus duplicate-generator removal is complete, while unified exhaustive
+CxxIR emission remains open.
+
+#### Focused verification and unchanged locked budget
+
+Every Python command in this section and the remaining gates used:
+
+~~~sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate scorch
+~~~
+
+The fresh exact-base locked-budget check was:
+
+~~~sh
+PYTHONPATH="$PWD:$PWD/src" \
+pytest -q tests/test_scorch/test_llir_string_budget.py
+~~~
+
+Result: 27 passed in 1.98s.
+
+After the production/docs edit:
+
+~~~sh
+PYTHONPATH="$PWD:$PWD/src" \
+pytest -q \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_string_budget.py
+
+python -m black --check src/scorch/compiler/llir.py
+~~~
+
+Results: 236 passed in 3.21s; Black exited 0 and left llir.py unchanged.
+
+After the absence regression:
+
+~~~sh
+PYTHONPATH="$PWD:$PWD/src" \
+pytest -q \
+  tests/test_scorch/test_codegen.py \
+  tests/test_scorch/test_llir_string_budget.py \
+  tests/test_scorch/test_llir_traversal.py \
+  tests/test_scorch/test_compiler_stage_timing.py
+
+python -m black --check tests/test_scorch/test_codegen.py
+~~~
+
+Results: 574 passed in 3.57s; Black exited 0 and left the test unchanged.
+
+The final whitespace check:
+
+~~~sh
+git diff --check \
+  94d86b96cfcf5abda6c142b2d0a7bf44bbade7fe..\
+a6576469a280dde33a6c6d301de04b56a916a9ab
+~~~
+
+exited 0 with no output.
+
+The locked compiler budget is unchanged:
+
+- 391 production Var constructors;
+- ten direct expression strings: nine subscripts and one ternary;
+- 13 known indirect sinks/clones;
+- seven generic string rewrites;
+- 33 RawStmt constructors / 32 semantic producers;
+- three DirectInit constructor templates: S3, C1, and common traversal
+  reconstruction;
+- two RawStmt constructors in schedule_lowerer.py; and
+- three raw constructors in torch_cpp_abi.py.
+
+Only structural class counts change: NodeVisitor goes from one to zero,
+CppCodeGenerator goes from one to zero, and LLIRLowerer remains one.
+
+#### Canonical source/build nonactivation evidence and runtime waivers
+
+Exact clean base 94d86b9 and exact clean candidate a657646 were captured from
+the binding logical path:
+
+~~~sh
+cd -L /tmp/scorch-phase3-structured-access-capture-wt
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_inputs.py "$SIDE/inputs"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_spmm_grid.py "$SIDE/grid.json"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_workspace_pair.py "$SIDE/workspace"
+
+TORCH_EXTENSIONS_DIR=/tmp/scorch-phase3-structured-access-capture-extensions \
+PYTHONPATH="$PWD:$PWD/src" \
+python /tmp/scorch_phase3_capture_tiled_workspace.py \
+  "$SIDE/tiled-workspace"
+~~~
+
+The four exact recovered, Black-formatted helper hashes are:
+
+| Helper | SHA-256 |
+| --- | --- |
+| inputs | 605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3 |
+| 42-cell grid | a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3 |
+| workspace pair | 964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59 |
+| tiled workspace | 9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff |
+
+Both sides produced exactly 14 files. Their recursive diff was empty; the
+durable empty diff hashes to
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.
+Both sides reproduced:
+
+| Capture | Base and candidate SHA-256 |
+| --- | --- |
+| inputs manifest | d2dfcf5cb4299be88f2bf5b35a047bdacf2a0e8a65ab03e17d20ca89a0a17024 |
+| 42-cell grid | 204d80f7df45eb222e5308ab72bbaf0aaa326aa0a7e7677d17ba289b535b0dc6 |
+| workspace manifest | f2d24a8b25ed453f65a73a681d3b7174bf7c573690f1bb5a22f5e86857b11d90 |
+| tiled-workspace manifest | 7bc0f70f84d2693f76fdf179b9ae7e684e4fa3ebe93c5d175ec98206a024a5a7 |
+
+The grid contains 42 expected cells and 21 unique source/build/request
+identities. Every captured C++ source, preamble, function ABI, compiler/linker
+flag, kernel name, request, prepared key, build directory, extension path, and
+cache/build identity is equal. The extension root contains zero files, proving
+the capture stopped before native compilation.
+
+This is nonactivation and identity evidence, not a new native-correctness run.
+Deleting unreferenced Python classes cannot activate a generated kernel, and
+the binding source/build inputs are byte-identical. The retained runtime-waiver
+policy therefore applies:
+
+- M5 waiver:
+  3b655e445d130cbfe3e394563f52498bd25675d7bb5f7c775333ef580fa7b246;
+  and
+- Redwood waiver:
+  c3a6a110fc98614ca50111adab3b7ea5ee93ba7aff9da5715ee110946e683d8d.
+
+No M5 or Redwood runtime gate is claimed as newly run for this slice.
+
+#### Exact base/candidate quality and strict Sphinx comparison
+
+Exact clean detached base 94d86b9 and candidate a657646 were compared on the
+two changed Python files:
+
+~~~sh
+python -m black --check \
+  src/scorch/compiler/llir.py \
+  tests/test_scorch/test_codegen.py
+
+python -m flake8 \
+  src/scorch/compiler/llir.py \
+  tests/test_scorch/test_codegen.py
+
+python -m mypy \
+  src/scorch/compiler/llir.py \
+  tests/test_scorch/test_codegen.py
+~~~
+
+The common environment was Python 3.11.15, Black 26.5.1, Flake8 7.3.0,
+mypy 2.2.0, and Sphinx 8.2.3. Both worktrees had empty status before and
+after.
+
+- Black exited 0/0. The byte-identical logs hash to
+  35f2267f323fe81c7f53cdae899cd99f64f417d2f1b1f0b228f84487ae1f75fe.
+- Flake8 exited 0/0 with empty output, SHA-256
+  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.
+- Mypy exited 1/1 for the same three inherited import-untyped diagnostics in
+  test_codegen.py. The raw logs are byte-identical, SHA-256
+  71dc4673db9bc3432358b66540966ca4b4afe17b91d8d0ad001643227c250add.
+- There is no candidate-only quality finding.
+
+Strict documentation builds ran:
+
+~~~sh
+PYTHONPATH="$PWD:$PWD/src" \
+sphinx-build -n -b html -W --keep-going -E -a \
+  docs/source "$EVIDENCE_ROOT/side-html"
+~~~
+
+Both exited 1 solely because -W promoted the same 23 inherited unresolved
+references. Worktree-path-normalized warning logs are byte-identical with
+SHA-256
+e5dfe6603fc04bd77e0b7eaa90ba22c44a476448eb006572816fc3b34329e793.
+Raw base and candidate logs hash to
+1aee6a0887fc316d86a230c10b27f039b98f453c8357ef6b291f68ffd052bb4b
+and
+38a1586405fbb88b49fd3bb11f8da4ef88498ddf5dede449191606ea7ad558ea.
+
+Each HTML tree contains 187 files and 142 non-doctree files. The base
+non-doctree manifest hashes to
+5193ef1062a6563ece870dc8d20c4ee79c676010e61864e2237166290b7bc014;
+the candidate manifest hashes to
+9175d4a8f86b96285b320423fa6ce915ffff61e36b2e6fb8510919141624cfc9.
+Only compiler/codegen.html and searchindex.js differ, exactly as expected from
+the corrected note. The non-doctree manifest diff hashes to
+5a79098fca78ebe74283a9edbe43d8993716b0260f83a8f6b12f0025a107e2e6.
+The rendered note was inspected and contains the intended LLIRLowerer
+ownership statement.
+
+#### Authoritative exact-final full-suite closure
+
+The authoritative run used persistent worktree and evidence roots under
+/Users/bobby/.cache/scorch-codex/duplicate-generator-a657646 and exact clean
+candidate a657646:
+
+~~~sh
+PYTHONPATH="$PWD:$PWD/src" \
+PYTEST_ADDOPTS= \
+PYTHONDONTWRITEBYTECODE=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/full-run/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/full-run/torch-extensions \
+pytest -q -m "not perf" tests \
+  --basetemp=/Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/full-run/pytest-basetemp \
+  -o cache_dir=/Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/full-run/pytest-cache
+~~~
+
+Result: 1760 passed, 14 skipped, 3 deselected, one inherited sparse-invariant
+warning, in 1978.38s (0:32:58), exit 0. The warning is from
+test_autotune_learned.py and is unchanged inherited behavior.
+
+The exact revision before and after is
+a6576469a280dde33a6c6d301de04b56a916a9ab; status before and after is empty.
+The run started at 2026-07-19T03:03:46Z and finished at
+2026-07-19T03:36:46Z. Its 2,940-byte pytest log hashes to
+4f1c8636bfe32ab79d0dd34892675f14c952c373c2253ce711379078c79cd5a7.
+The guarded wrapper hashes to
+5f4569c3b4d71f5114b290a7915f67b31fcf5ba6d18f4e603a63e52def2d3864.
+
+Launchd attempted seven post-completion wrapper restarts. The pre-pytest
+attempt.started guard rejected each with exit 75 and
+"refusing duplicate full-suite launch"; no second pytest process ran. The
+259-byte guard log hashes to
+c78bb9a76fea1d1009ab3d352b2d95214446fa3b6b9f369f1986362c54cc527f.
+At closure the wrapper, pytest, JIT, ninja, and clang processes were absent,
+and the launch service was absent.
+
+#### Final-candidate compiler latency and crossing attribution
+
+The exact executable predecessor is the retained clean C1 artifact:
+
+/Users/bobby/.cache/scorch-codex/c1-f959a8e/latency/latency-f959a8e-m5.json
+
+It hashes to
+96616f4fe0d63e7f4f10fcabeffdc7c04e3590d80597ebedd4400c554a360eda.
+Base 94d86b9 differs from f959a8e only by handoff documentation, so f959a8e is
+the exact executable predecessor. It was not rerun.
+
+After the full suite and all capture, native, quality, and Sphinx jobs were
+idle, one and only one exact-final candidate benchmark ran in the clean
+detached latency worktree:
+
+~~~sh
+PYTHONPATH="$PWD/src" \
+PYTHONDONTWRITEBYTECODE=1 \
+python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 \
+  --samples 30 \
+  --output /Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/latency/latency-a657646-m5.json
+~~~
+
+The harness hashes to
+de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383.
+The benchmark exited 0 and ran from 2026-07-19T03:39:18Z through
+2026-07-19T03:39:25Z. Revision before/after is exact a657646 and status
+before/after is empty. The artifact hashes to
+f11e67e9e9b14dc69523b5c68f457d3a760408d7225e19a87f725df757d742ad;
+its console log hashes to
+4d2b20be2c05fd7d4d23077c040f145eea8d15e99e7ca0c4de2422d75dd4c364.
+
+Metadata records macOS 26.4.1 arm64, Python 3.11.15, Torch 2.13.0, six Torch
+threads, five warmups, 30 samples, exact revision, and empty status. Every
+endpoint and stage series contains exactly 30 observations.
+
+The Black-formatted comparator hashes to
+0a56b4412fd0410d651fa7953b8febea122c3792f21abf279487acf389aefc0a
+and ran:
+
+~~~sh
+python \
+  /Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/compare_duplicate_generator_latency.py \
+  /Users/bobby/.cache/scorch-codex/c1-f959a8e/latency/latency-f959a8e-m5.json \
+  /Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/latency/latency-a657646-m5.json \
+  /Users/bobby/.cache/scorch-codex/duplicate-generator-a657646/latency/comparison-f959a8e-a657646.json
+~~~
+
+It validates exact revisions, equal corpus/configuration, ordered cases, equal
+build objects, 30 samples in every predecessor/candidate endpoint and stage
+series, and equal stage structure. The comparison JSON and log hash to,
+respectively,
+488574c34e7f35e4f13e2718f5256fb677c6f520cd6eb53aecd7596212d93de5
+and
+178c50f9ebba55b677608ff48432a4e01646a3a0a57d39c757e3477c2fe7f7cc.
+
+Exact endpoint results are:
+
+| Case / endpoint family | Removed-class activations | p50 old -> new ms | p50 ratio | p95 old -> new ms | p95 ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small dense / compatibility | 0 | 1.574875000 -> 1.632458500 | 1.036563854 | 1.735743900 -> 1.813841550 | 1.044993763 |
+| small dense / canonical | 0 | 1.861937000 -> 1.938437500 | 1.041086514 | 2.033975000 -> 2.142229500 | 1.053223122 |
+| small dense / endpoint extension | 0 | 0.285937500 -> 0.294771000 | 1.030893115 | 0.297129350 -> 0.338118750 | 1.137951367 |
+| reduction / compatibility | 0 | 1.479645500 -> 1.505750000 | 1.017642402 | 1.646559900 -> 1.606533000 | 0.975690590 |
+| reduction / canonical | 0 | 1.770271000 -> 1.790062500 | 1.011179927 | 1.940262350 -> 1.900633000 | 0.979575262 |
+| reduction / endpoint extension | 0 | 0.289020500 -> 0.280875000 | 0.971816878 | 0.312996050 -> 0.297977050 | 0.952015369 |
+| CSR intersection / compatibility | 0 | 1.771771000 -> 1.789771000 | 1.010159326 | 1.888477300 -> 1.937791550 | 1.026113234 |
+| CSR intersection / canonical | 0 | 2.054312500 -> 2.071333000 | 1.008285254 | 2.175383400 -> 2.230777300 | 1.025463971 |
+| CSR intersection / endpoint extension | 0 | 0.284875000 -> 0.283625000 | 0.995612111 | 0.305750000 -> 0.303916700 | 0.994003925 |
+| sparse union / compatibility | 0 | 1.792583500 -> 1.825625000 | 1.018432335 | 1.926197400 -> 1.910756250 | 0.991983610 |
+| sparse union / canonical | 0 | 2.079792000 -> 2.109479500 | 1.014274264 | 2.211243600 -> 2.186975000 | 0.989024909 |
+| sparse union / endpoint extension | 0 | 0.283812500 -> 0.283000000 | 0.997137194 | 0.293418750 -> 0.296091850 | 1.009110188 |
+
+The comparison contains 24 endpoint rows and 62 stage rows. Eight ratios
+exceed the binding 1.10 threshold; the complete crossing ledger is:
+
+| Case | Activation | Endpoint or compiler stage | Metric | Old -> new ms | Ratio | Delta ms |
+| --- | ---: | --- | --- | ---: | ---: | ---: |
+| small dense | 0 | canonical endpoint extension | p95 | 0.297129350 -> 0.338118750 | 1.137951367 | +0.040989400 |
+| small dense | 0 | cin_normalization_and_verification | p95 | 0.022995500 -> 0.026332600 | 1.145119697 | +0.003337100 |
+| small dense | 0 | frontend_validated_operation_construction | p95 | 0.038948400 -> 0.048728800 | 1.251111727 | +0.009780400 |
+| small dense | 0 | kernel_name_and_build_request_assembly | p95 | 0.405370650 -> 0.447685600 | 1.104385826 | +0.042314950 |
+| reduction | 0 | frontend_validated_operation_construction | p95 | 0.036368450 -> 0.041639250 | 1.144927815 | +0.005270800 |
+| CSR intersection | 0 | frontend_validated_operation_construction | p95 | 0.037965100 -> 0.043081250 | 1.134759292 | +0.005116150 |
+| CSR intersection | 0 | llir_to_cpp_generation | p95 | 0.090810600 -> 0.112139550 | 1.234872911 | +0.021328950 |
+| sparse union | 0 | legacy_cin_adaptation | p95 | 0.029666850 -> 0.033625000 | 1.133419962 | +0.003958150 |
+
+The maximum ratio is 1.251111727. All eight crossings have zero activation:
+among emitters, the benchmark's production compilation paths call only
+LLIRLowerer, no tracked production consumer can instantiate either removed
+class, and the canonical source/build capture is byte-identical. The benchmark
+cases therefore do not activate this slice. The small absolute p95 shifts are
+nonactivating run-to-run timing noise and are not attributed to
+duplicate-generator removal. No predecessor or opportunistic confirmation
+benchmark ran.
+
+#### Preserved material and exact phase status
+
+The two slice commits contain only the three intended paths. The user-owned
+tracked modifications to .gitignore, pyproject.toml, src/scorch/__init__.py,
+tests/packaging/smoke_install.py, and tests/test_scorch/test_resources.py
+remained unstaged, untouched, and uncommitted. Their working-file SHA-256
+values at gate closure are, respectively:
+
+- 301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105;
+- 191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea;
+- 5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845;
+- f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679;
+  and
+- 3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9.
+
+All user-owned untracked autotune, benchmark, GPU, SuiteSparse, research,
+scheduler, receipt, scratchpad, temporary, and CUDA material also remained
+untouched and uncommitted. Every staging operation used explicit pathspecs.
+COMPILER_IR_REFACTOR_DESIGN.md and csrc were not modified.
+
+Only the narrow Phase-3 unused duplicate LLIR generator removal sub-slice is
+complete. Phase 3 remains open. Unified exhaustive CxxIR emission remains
+open, including the six traversal-accepted/codegen-rejected node families
+above. W6-W9 offset work, S2, Torch/generalized allocation seams, the seven
+generic rewrites, and parallel zero-fill typed-pass extraction also remain
+open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not claimed
+formally closed without a separate design-requirement audit. Phase 2 retains
+its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
