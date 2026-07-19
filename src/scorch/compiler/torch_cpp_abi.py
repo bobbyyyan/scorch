@@ -594,6 +594,134 @@ class ResultTensorAssembler:
             )
         return statements
 
+    def emit_deeper_compressed_position_allocations(
+        self,
+        total_vars: Tuple[llir.Var, ...],
+    ) -> List[llir.Stmt]:
+        """Build deeper position buffers from exact parent cardinalities."""
+
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError(
+                "deeper compressed position allocations require an exact "
+                "ResultTensorAssembler"
+            )
+        self.validate()
+        if (
+            self.levels < 3
+            or self.level_types[0] is not LevelType.DENSE
+            or any(
+                level_type is not LevelType.COMPRESSED
+                for level_type in self.level_types[1:]
+            )
+        ):
+            raise ValueError(
+                "deeper compressed position allocations require one dense level "
+                "followed by two or more compressed levels"
+            )
+        if type(total_vars) is not tuple:
+            raise TypeError(
+                "deeper compressed position totals must be an immutable Var tuple"
+            )
+        if len(total_vars) != self.levels - 1:
+            raise ValueError(
+                "deeper compressed position totals must match the compressed levels"
+            )
+
+        for level, total_var in zip(range(1, self.levels), total_vars):
+            if type(total_var) is not llir.Var:
+                raise TypeError(
+                    "deeper compressed position totals must contain exact LLIR Vars"
+                )
+            try:
+                total_name = total_var.name
+                total_type = total_var.type
+                total_is_ptr = total_var.is_ptr
+                total_is_restrict = total_var.is_restrict
+                total_access = total_var.tensor_access
+            except AttributeError as failure:
+                raise TypeError(
+                    "deeper compressed position totals must contain complete LLIR Vars"
+                ) from failure
+            if total_name != f"_total{level}":
+                raise ValueError(
+                    "deeper compressed position total name must match its result level"
+                )
+            if total_type is not llir.DataType.INT64:
+                raise TypeError(
+                    "deeper compressed position totals must have INT64 type"
+                )
+            if total_is_ptr is not False:
+                raise TypeError("deeper compressed position totals cannot be pointers")
+            if total_is_restrict is not False:
+                raise TypeError(
+                    "deeper compressed position totals cannot be restrict-qualified"
+                )
+            if total_access is not None:
+                raise TypeError(
+                    "deeper compressed position totals cannot carry tensor provenance"
+                )
+
+        statements: List[llir.Stmt] = []
+        for level, parent_total in zip(range(2, self.levels), total_vars[:-1]):
+            owner_name = f"{self.name}{level}_pos_torch"
+            pointer_name = f"{self.name}{level}_pos_data"
+            statements.extend(
+                (
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=owner_name,
+                            type=llir.DataType.TORCH_TENSOR,
+                        ),
+                        value=llir.FunctionCall(
+                            name="torch::empty",
+                            args=(
+                                llir.Array(
+                                    values=(
+                                        llir.Add(
+                                            llir.Var(
+                                                name=parent_total.name,
+                                                type=parent_total.type,
+                                            ),
+                                            llir.Literal(1, llir.DataType.INT),
+                                        ),
+                                    ),
+                                    data_type=llir.DataType.INT64,
+                                ),
+                                llir.QualifiedName(
+                                    namespace="torch",
+                                    name="kInt",
+                                    data_type=llir.DataType.TORCH_SCALAR_TYPE,
+                                ),
+                            ),
+                        ),
+                    ),
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=pointer_name,
+                            type=llir.DataType.PTR_INT,
+                        ),
+                        value=tensor_data_ptr(
+                            llir.Var(
+                                name=owner_name,
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            llir.DataType.INT,
+                        ),
+                    ),
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=pointer_name,
+                                type=llir.DataType.PTR_INT,
+                            ),
+                            index=llir.Literal(0, llir.DataType.INT),
+                        ),
+                        value=llir.Literal(0, llir.DataType.INT),
+                    ),
+                )
+            )
+        return statements
+
     def emit_value_array_init(self) -> List[llir.Stmt]:
         """Emit Torch-owned known-size storage or a dynamic ``std::vector``."""
         stmts: List[llir.Stmt] = []

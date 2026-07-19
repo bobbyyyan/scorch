@@ -103,13 +103,13 @@ class CompressedWhereOpenMPContext:
     remaining output-assembly renderer; standalone pass callers may omit it.
 
     ``result_assembler`` is the frozen Torch/C++ ABI snapshot for the same
-    result.  This pass delegates typed compressed-coordinate allocation, the
-    result declaration, and the storage epilogue to that snapshot. The remaining
-    compressed allocation path already owns its Torch buffers and must not run
-    the ordinary dynamic-vector moves a second time. Its dtype must agree with
-    every recognized production ``workspace_ctype`` spelling. Free-form
-    direct-pass compatibility spellings remain deliberately uninterpreted by
-    the storage-only dtype boundary.
+    result.  This pass delegates typed compressed-coordinate and deeper-position
+    allocation, the result declaration, and the storage epilogue to that
+    snapshot. The remaining compressed allocation path already owns its Torch
+    buffers and must not run the ordinary dynamic-vector moves a second time.
+    Its dtype must agree with every recognized production ``workspace_ctype``
+    spelling. Free-form direct-pass compatibility spellings remain deliberately
+    uninterpreted by the storage-only dtype boundary.
     """
 
     result_name: str
@@ -1168,35 +1168,15 @@ def _position_and_coordinate_allocations(
             add_semicolon=False,
         ),
     ]
+    total_vars = tuple(_total_reference(level) for level in levels)
     statements.extend(
-        context.result_assembler.emit_compressed_coordinate_allocations(
-            tuple(_total_reference(level) for level in levels)
-        )
+        context.result_assembler.emit_compressed_coordinate_allocations(total_vars)
     )
-    for parent_level, level in zip(levels, levels[1:]):
+    if len(levels) > 1:
         statements.extend(
-            [
-                llir.RawStmt(
-                    code=(
-                        f"torch::Tensor {result_name}{level}_pos_torch = "
-                        f"torch::empty({{(long long)(_total{parent_level} + 1)}}, "
-                        "torch::kInt);\n"
-                        f"  int* {result_name}{level}_pos_data = "
-                        f"{result_name}{level}_pos_torch.data_ptr<int>();"
-                    ),
-                    add_semicolon=False,
-                ),
-                llir.Assign(
-                    var=llir.ArrayAccess(
-                        array=llir.Var(
-                            name=f"{result_name}{level}_pos_data",
-                            type=llir.DataType.PTR_INT,
-                        ),
-                        index=llir.Literal(0),
-                    ),
-                    value=llir.Literal(0),
-                ),
-            ]
+            context.result_assembler.emit_deeper_compressed_position_allocations(
+                total_vars
+            )
         )
     return statements
 
