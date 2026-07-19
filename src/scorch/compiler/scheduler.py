@@ -1926,7 +1926,10 @@ class Scheduler:
         ]
 
         workspace = Workspace(
-            name="wksp", dim=dim_workspace, dense=are_all_dense_levels
+            name="wksp",
+            dim=dim_workspace,
+            dtype=result_tensor_access.tensor.dtype,
+            dense=are_all_dense_levels,
         )
 
         workspace_access = WorkspaceAccess(
