@@ -1168,6 +1168,105 @@ def test_function_call_stmt_rejects_non_expression_arguments() -> None:
         llir.FunctionCallStmt("call", [cast(llir.Expr, "argument")])
 
 
+def test_member_call_stmt_is_frozen_typed_owned_and_structurally_equal() -> None:
+    base = llir.Var("wksp", llir.DataType.NO_TYPE)
+    argument = llir.Var("offset", llir.DataType.INT64)
+    caller_template_args = [llir.DataType.FLOAT32]
+    caller_args = [argument]
+    call = llir.MemberCallStmt(
+        base=base,
+        member="reserve",
+        template_args=caller_template_args,
+        args=caller_args,
+    )
+    equal = llir.MemberCallStmt(
+        base=llir.Var("wksp", llir.DataType.NO_TYPE),
+        member="reserve",
+        template_args=(llir.DataType.FLOAT32,),
+        args=(llir.Var("offset", llir.DataType.INT64),),
+    )
+
+    caller_template_args.append(llir.DataType.INT)
+    caller_args.append(_var("later"))
+
+    assert call.base is base
+    assert call.member == "reserve"
+    assert type(call.template_args) is tuple
+    assert call.template_args == (llir.DataType.FLOAT32,)
+    assert type(call.args) is tuple
+    assert call.args == (argument,)
+    assert call == equal
+    assert hash(call) == hash(equal)
+    assert call != llir.MemberCallStmt(
+        llir.Var("other", llir.DataType.NO_TYPE),
+        "reserve",
+        (llir.DataType.FLOAT32,),
+        (llir.Var("offset", llir.DataType.INT64),),
+    )
+    assert call != llir.MemberCallStmt(
+        llir.Var("wksp", llir.DataType.NO_TYPE),
+        "reserve",
+        (llir.DataType.FLOAT64,),
+        (llir.Var("offset", llir.DataType.INT64),),
+    )
+    assert get_type_hints(llir.MemberCallStmt) == {
+        "base": llir.Expr,
+        "member": str,
+        "template_args": Tuple[llir.DataType, ...],
+        "args": Tuple[llir.Expr, ...],
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        call.base = _var("other")
+    with pytest.raises(FrozenInstanceError):
+        call.member = "clear"
+    with pytest.raises(FrozenInstanceError):
+        call.template_args = ()
+    with pytest.raises(FrozenInstanceError):
+        call.args = ()
+
+
+@pytest.mark.parametrize("member", ("", "first.second", 1, None))
+def test_member_call_stmt_rejects_malformed_base_and_member(member: object) -> None:
+    with pytest.raises(TypeError, match="MemberCallStmt.member"):
+        llir.MemberCallStmt(_var("workspace"), cast(str, member))
+
+    with pytest.raises(TypeError, match="MemberCallStmt.base"):
+        llir.MemberCallStmt(cast(llir.Expr, "workspace"), "clear")
+
+
+@pytest.mark.parametrize(
+    "template_args",
+    ("float", {llir.DataType.FLOAT32}, llir.DataType.FLOAT32),
+)
+def test_member_call_stmt_rejects_malformed_template_argument_containers(
+    template_args: object,
+) -> None:
+    with pytest.raises(TypeError, match="template_args must be a list or tuple"):
+        llir.MemberCallStmt(
+            _var("workspace"),
+            "clear",
+            template_args=cast(Any, template_args),
+        )
+
+
+def test_member_call_stmt_rejects_malformed_template_and_call_arguments() -> None:
+    with pytest.raises(TypeError, match="contain only DataType values"):
+        llir.MemberCallStmt(
+            _var("workspace"),
+            "clear",
+            template_args=[cast(llir.DataType, "float")],
+        )
+    with pytest.raises(TypeError, match="args must be a list or tuple"):
+        llir.MemberCallStmt(_var("workspace"), "reserve", args=cast(Any, "extent"))
+    with pytest.raises(TypeError, match="contain only LLIR expressions"):
+        llir.MemberCallStmt(
+            _var("workspace"),
+            "reserve",
+            args=[cast(llir.Expr, "extent")],
+        )
+
+
 def test_member_call_is_frozen_typed_owned_and_structurally_equal() -> None:
     base = llir.Var("tensor", llir.DataType.TORCH_TENSOR)
     argument = llir.Var("offset", llir.DataType.INT64)
@@ -1767,6 +1866,58 @@ def test_member_call_codegen_is_byte_exact_typed_and_precedence_correct(
     expected: str,
 ) -> None:
     assert LLIRLowerer().lower_llir(expression) == expected
+
+
+@pytest.mark.parametrize(
+    ("statement", "expected"),
+    (
+        (
+            llir.MemberCallStmt(
+                llir.Var("wksp", llir.DataType.NO_TYPE),
+                "clear",
+            ),
+            "wksp.clear();",
+        ),
+        (
+            llir.MemberCallStmt(
+                llir.Var("storage", llir.DataType.STD_VECTOR_FLOAT32),
+                "reserve",
+                args=(_var("extent"),),
+            ),
+            "storage.reserve(extent);",
+        ),
+        (
+            llir.MemberCallStmt(
+                llir.ArrayAccess(_var("pool"), _var("i")),
+                "emplace_back",
+                args=(_var("rows"), llir.Literal(True, llir.DataType.BOOL)),
+            ),
+            "pool[i].emplace_back(rows, true);",
+        ),
+        (
+            llir.MemberCallStmt(
+                llir.MemberAccess(_var("owner"), "storage"),
+                "resize",
+                template_args=(llir.DataType.INT, llir.DataType.INT64),
+                args=(llir.Add(_var("i"), llir.Literal(1)),),
+            ),
+            "owner.storage.resize<int, int64_t>(i + 1);",
+        ),
+        (
+            llir.MemberCallStmt(
+                llir.BinOp("+", _var("owner"), _var("offset")),
+                "clear",
+            ),
+            "(owner + offset).clear();",
+        ),
+    ),
+)
+def test_member_call_stmt_codegen_is_byte_exact_typed_and_precedence_correct(
+    statement: llir.MemberCallStmt,
+    expected: str,
+) -> None:
+    assert LLIRLowerer().lower_llir(statement) == expected
+    assert LLIRLowerer().lower_llir(statement, 3) == "      " + expected
 
 
 @pytest.mark.parametrize(
@@ -2477,6 +2628,56 @@ def test_codegen_rejects_forged_member_call_fields(malformation: str) -> None:
     else:
         object.__setattr__(call, "args", ("argument",))
         expected = "MemberCall.args"
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(call)
+
+
+def test_codegen_rejects_member_call_stmt_subclasses_and_unknown_children() -> None:
+    class UnknownMemberCallStmt(llir.MemberCallStmt):
+        pass
+
+    class UnknownExpr(llir.Expr):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownMemberCallStmt"):
+        LLIRLowerer().lower_llir(UnknownMemberCallStmt(_var("workspace"), "clear"))
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(llir.MemberCallStmt(UnknownExpr(), "clear"))
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(
+            llir.MemberCallStmt(_var("workspace"), "reserve", args=(UnknownExpr(),))
+        )
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ("base", "member", "template_args", "template_arg", "args", "argument"),
+)
+def test_codegen_rejects_forged_member_call_stmt_fields(malformation: str) -> None:
+    call = object.__new__(llir.MemberCallStmt)
+    object.__setattr__(call, "base", _var("workspace"))
+    object.__setattr__(call, "member", "clear")
+    object.__setattr__(call, "template_args", (llir.DataType.FLOAT32,))
+    object.__setattr__(call, "args", (_var("argument"),))
+    if malformation == "base":
+        object.__setattr__(call, "base", "workspace")
+        expected = "MemberCallStmt.base"
+    elif malformation == "member":
+        object.__setattr__(call, "member", "workspace.clear")
+        expected = "MemberCallStmt.member"
+    elif malformation == "template_args":
+        object.__setattr__(call, "template_args", [llir.DataType.FLOAT32])
+        expected = "MemberCallStmt.template_args"
+    elif malformation == "template_arg":
+        object.__setattr__(call, "template_args", ("float",))
+        expected = "MemberCallStmt.template_args"
+    elif malformation == "args":
+        object.__setattr__(call, "args", [_var("argument")])
+        expected = "MemberCallStmt.args"
+    else:
+        object.__setattr__(call, "args", ("argument",))
+        expected = "MemberCallStmt.args"
 
     with pytest.raises(CodegenError, match=expected):
         LLIRLowerer().lower_llir(call)

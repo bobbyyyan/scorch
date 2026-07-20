@@ -148,6 +148,12 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
         ),
         llir.FunctionCall: llir.FunctionCall("call", [value]),
         llir.FunctionCallStmt: llir.FunctionCallStmt("call", [value]),
+        llir.MemberCallStmt: llir.MemberCallStmt(
+            value,
+            "member",
+            (llir.DataType.INT,),
+            (index,),
+        ),
         llir.Array: llir.Array([value, literal], llir.DataType.INT),
         llir.MemberAccess: llir.MemberAccess(value, "member"),
         llir.MemberCall: llir.MemberCall(
@@ -203,6 +209,7 @@ def _node_emissions() -> Dict[Type[llir.Node], str]:
         llir.Function: "int function(int value) {\n  return value;\n}",
         llir.FunctionCall: "call(value)",
         llir.FunctionCallStmt: "call(value);",
+        llir.MemberCallStmt: "value.member<int>(index);",
         llir.Array: "{value, 1}",
         llir.MemberAccess: "value.member",
         llir.MemberCall: "value.member<int>(index)",
@@ -1618,6 +1625,64 @@ def test_forged_member_call_fields_fail_at_traversal_boundary(
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
 @pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        ("base", "invalid_member_call_stmt_base", ("root", "base")),
+        ("member", "invalid_member_call_stmt_member", ("root", "member")),
+        (
+            "template_args",
+            "invalid_member_call_stmt_template_args",
+            ("root", "template_args"),
+        ),
+        (
+            "template_arg",
+            "invalid_member_call_stmt_template_arg",
+            ("root", "template_args", "[0]"),
+        ),
+        ("args", "invalid_member_call_stmt_args", ("root", "args")),
+        (
+            "argument",
+            "invalid_member_call_stmt_argument",
+            ("root", "args", "[0]"),
+        ),
+    ),
+)
+def test_forged_member_call_stmt_fields_fail_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    call = object.__new__(llir.MemberCallStmt)
+    object.__setattr__(call, "base", _var("workspace"))
+    object.__setattr__(call, "member", "clear")
+    object.__setattr__(call, "template_args", (llir.DataType.FLOAT32,))
+    object.__setattr__(call, "args", (_var("argument"),))
+    if malformation == "base":
+        object.__setattr__(call, "base", "workspace")
+    elif malformation == "member":
+        object.__setattr__(call, "member", "workspace.clear")
+    elif malformation == "template_args":
+        object.__setattr__(call, "template_args", [llir.DataType.FLOAT32])
+    elif malformation == "template_arg":
+        object.__setattr__(call, "template_args", ("float",))
+    elif malformation == "args":
+        object.__setattr__(call, "args", [_var("argument")])
+    else:
+        object.__setattr__(call, "args", ("argument",))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(call)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(call)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
     "malformation",
     [
         "rvalue",
@@ -2947,6 +3012,18 @@ def test_function_call_stmt_default_arguments_are_empty_immutable_tuples() -> No
     first = llir.FunctionCallStmt("first")
     second = llir.FunctionCallStmt("second")
 
+    assert type(first.args) is tuple
+    assert type(second.args) is tuple
+    assert first.args == second.args == ()
+
+
+def test_member_call_stmt_default_arguments_are_empty_immutable_tuples() -> None:
+    first = llir.MemberCallStmt(_var("first"), "clear")
+    second = llir.MemberCallStmt(_var("second"), "clear")
+
+    assert type(first.template_args) is tuple
+    assert type(second.template_args) is tuple
+    assert first.template_args == second.template_args == ()
     assert type(first.args) is tuple
     assert type(second.args) is tuple
     assert first.args == second.args == ()

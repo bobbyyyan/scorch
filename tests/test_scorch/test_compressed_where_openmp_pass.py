@@ -21,6 +21,7 @@ from scorch.compiler.compressed_where_openmp_pass import (
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.format import LevelType
 from scorch.compiler.llir_traversal import (
+    LLIRRewriter,
     LLIRStatementValue,
     LLIRTraversalContext,
     LLIRTraversalError,
@@ -178,6 +179,19 @@ def _raw_codes(value: object) -> List[str]:
         for child in value:
             codes.extend(_raw_codes(child))
     return codes
+
+
+def _member_call_statements(value: object) -> List[llir.MemberCallStmt]:
+    statements: List[llir.MemberCallStmt] = []
+    if type(value) is llir.MemberCallStmt:
+        statements.append(cast(llir.MemberCallStmt, value))
+    elif isinstance(value, llir.Node):
+        for child in vars(value).values():
+            statements.extend(_member_call_statements(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            statements.extend(_member_call_statements(child))
+    return statements
 
 
 def _assignments(value: object) -> List[llir.Assign]:
@@ -589,7 +603,11 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     assert "_cnt1++" in count_state_codes
     assert "_count1[row] = _cnt1" in count_assignment_codes
     assert "_count1[row] = _cnt1" not in count_codes
-    assert "wksp.clear()" in count_codes
+    assert "wksp.clear()" not in count_codes
+    count_clear_statements = _member_call_statements(count_loop.body)
+    assert [
+        LLIRLowerer().lower_llir(statement) for statement in count_clear_statements
+    ] == ["wksp.clear();"]
     base_load_codes = [
         LLIRLowerer().lower_llir(load).removesuffix(";")
         for load in _base_offset_loads(fill_loop.body)
@@ -602,7 +620,11 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     assert "_pos1++" in fill_state_codes
     assert "Result_values_data[_base1 + _pos1] = value" in fill_assignment_codes
     assert "Result_values_data[_base1 + _pos1] = value" not in fill_codes
-    assert "wksp.clear()" in fill_codes
+    assert "wksp.clear()" not in fill_codes
+    fill_clear_statements = _member_call_statements(fill_loop.body)
+    assert [
+        LLIRLowerer().lower_llir(statement) for statement in fill_clear_statements
+    ] == ["wksp.clear();"]
     assert "_offset1[0] = 0" in all_assignment_codes
     assert "_offset1[0] = 0" not in _raw_codes(result.statements)
     assert all(
@@ -1539,6 +1561,86 @@ def test_count_fill_state_is_typed_structural_fresh_and_never_raw() -> None:
         "_prev2": 6,
     }
     assert len({id(var) for var in first_state_vars}) == len(first_state_vars)
+
+
+def test_workspace_clear_mutations_are_structured_frozen_and_byte_exact() -> None:
+    source: List[llir.Stmt] = [_compatible_loop(_ds_work_body())]
+    snapshot = _structural_snapshot(source)
+
+    first = transform_compressed_where_for_openmp(source, _context())
+    second = transform_compressed_where_for_openmp(source, _context())
+
+    assert _structural_snapshot(source) == snapshot
+    assert first.applied is True
+
+    count_loop, fill_loop = _phase_loops(first)
+    count_clears = _member_call_statements(count_loop.body)
+    fill_clears = _member_call_statements(fill_loop.body)
+    assert len(count_clears) == 1
+    assert len(fill_clears) == 1
+    assert count_loop.body[-1] is count_clears[0]
+    assert fill_loop.body[-1] is fill_clears[0]
+
+    for clear in (*count_clears, *fill_clears):
+        assert type(clear) is llir.MemberCallStmt
+        assert type(clear.base) is llir.Var
+        receiver = cast(llir.Var, clear.base)
+        assert receiver.name == "wksp"
+        assert receiver.type is llir.DataType.NO_TYPE
+        assert receiver.is_ptr is False
+        assert receiver.is_restrict is False
+        assert receiver.tensor_access is None
+        assert clear.member == "clear"
+        assert type(clear.template_args) is tuple
+        assert clear.template_args == ()
+        assert type(clear.args) is tuple
+        assert clear.args == ()
+        assert LLIRLowerer().lower_llir(clear) == "wksp.clear();"
+        with pytest.raises(FrozenInstanceError):
+            clear.member = "insert"  # type: ignore[misc]
+
+    assert count_clears[0] == fill_clears[0]
+    assert _mutable_ir_ids(count_clears[0]).isdisjoint(_mutable_ir_ids(fill_clears[0]))
+    assert _mutable_ir_ids(_member_call_statements(first.statements)).isdisjoint(
+        _mutable_ir_ids(_member_call_statements(second.statements))
+    )
+    assert not any(".clear" in code for code in _raw_codes(first.statements))
+
+    LLIRWalker(_context().traversal).walk(cast(LLIRValue, first.statements))
+    detached = LLIRRewriter(_context().traversal).rewrite(count_clears[0])
+    assert type(detached) is llir.MemberCallStmt
+    assert detached == count_clears[0]
+    assert _mutable_ir_ids(detached).isdisjoint(_mutable_ir_ids(count_clears[0]))
+
+    deeper = transform_compressed_where_for_openmp(
+        [
+            _compatible_loop(
+                [
+                    _workspace_init(),
+                    llir.FunctionCallStmt("wksp.insert", [_var("value")]),
+                    llir.FunctionCallStmt(
+                        "Result1_crd.push_back", [_var("row_coordinate")]
+                    ),
+                    llir.FunctionCallStmt(
+                        "Result2_crd.push_back", [_var("leaf_coordinate")]
+                    ),
+                ]
+            )
+        ],
+        _context((1, 2)),
+    )
+    deeper_count, deeper_fill = _phase_loops(deeper)
+    assert [
+        LLIRLowerer().lower_llir(statement)
+        for statement in _member_call_statements([deeper_count, deeper_fill])
+    ] == ["wksp.clear();", "wksp.clear();"]
+
+    unhoisted = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body(workspace=False))],
+        _context(),
+    )
+    assert unhoisted.applied is True
+    assert _member_call_statements(unhoisted.statements) == []
 
 
 def test_fill_base_offset_loads_are_typed_owned_structural_and_never_raw() -> None:
