@@ -595,10 +595,32 @@ class FunctionCall(Expr):
         object.__setattr__(self, "args", normalized_args)
 
 
+@dataclass(frozen=True, init=False, repr=False)
 class FunctionCallStmt(Stmt):
-    def __init__(self, name: str, args: List[Expr]):
-        self.name = name
-        self.args = args
+    """An immutable call statement with tuple-owned expression arguments."""
+
+    name: str
+    args: Tuple[Expr, ...]
+
+    def __init__(
+        self,
+        name: str,
+        args: Optional[Sequence[Expr]] = None,
+    ) -> None:
+        if type(name) is not str or not name.strip():
+            raise TypeError("FunctionCallStmt.name must be a non-empty string")
+        if args is None:
+            normalized_args: Tuple[Expr, ...] = ()
+        else:
+            if type(args) is not list and type(args) is not tuple:
+                raise TypeError("FunctionCallStmt.args must be a list or tuple")
+            if any(not isinstance(argument, Expr) for argument in args):
+                raise TypeError(
+                    "FunctionCallStmt.args must contain only LLIR expressions"
+                )
+            normalized_args = tuple(args)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "args", normalized_args)
 
 
 @dataclass(frozen=True, init=False, repr=False)

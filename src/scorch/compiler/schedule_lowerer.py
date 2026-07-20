@@ -511,7 +511,7 @@ def _rewrite_stmt_accesses(
             replacement,
         ).walk(cast(LLIRValue, stmts))
     count = 0
-    for stmt in stmts:
+    for stmt_index, stmt in enumerate(stmts):
         if isinstance(stmt, llir.VarInit):
             stmt.value, rewritten = _rewrite_expr_access(
                 stmt.value, tensor_id, index_ids, role, replacement
@@ -602,7 +602,10 @@ def _rewrite_stmt_accesses(
                 )
                 rewritten_args.append(arg)
                 count += arg_count
-            stmt.args = rewritten_args
+            stmts[stmt_index] = llir.FunctionCallStmt(
+                name=stmt.name,
+                args=rewritten_args,
+            )
     if not _validated:
         LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(cast(LLIRValue, stmts))
     return count

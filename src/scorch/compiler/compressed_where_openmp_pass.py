@@ -496,7 +496,10 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
                 )
             rewritten_call = cast(llir.FunctionCallStmt, self._identity.rewrite(call))
             if call.name == self._old:
-                rewritten_call.name = self._new
+                return llir.FunctionCallStmt(
+                    name=self._new,
+                    args=rewritten_call.args,
+                )
             return rewritten_call
         if type(node) is llir.ForLoop:
             return self._rewrite_for_loop(cast(llir.ForLoop, node), path)

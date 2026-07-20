@@ -456,10 +456,9 @@ def _rewrite_statement_references(
             name = _checked_function_name(call, context, statement_path)
             for old, new in replacements.generated_strings:
                 name = name.replace(old, new)
-            call.name = name
-            call.args = cast(
-                List[llir.Expr],
-                _rewrite_expression_sequence(
+            cast(List[LLIRStatementValue], statements)[index] = llir.FunctionCallStmt(
+                name=name,
+                args=_rewrite_expression_sequence(
                     call.args,
                     replacements,
                     context,
