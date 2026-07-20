@@ -804,8 +804,16 @@ class CINLowerer:
                         self._workspace_pool_specs.append((wname, ctype, actual_size))
                         self._workspace_alloc_stmts.extend(
                             [
-                                llir.RawStmt(
-                                    code=f"int64_t {size_var} = {actual_size}"
+                                # The extent alias is typed; the pool borrow
+                                # below stays raw because its casted spelling
+                                # `(size_t)omp_get_thread_num()` has no typed
+                                # byte-identical Cast form today.
+                                llir.VarInit(
+                                    var=size_llir,
+                                    value=llir.Var(
+                                        name=actual_size,
+                                        type=llir.DataType.INT64,
+                                    ),
                                 ),
                                 llir.RawStmt(
                                     code=(
@@ -818,8 +826,25 @@ class CINLowerer:
                             ]
                         )
                         self._workspace_memset_stmts.append(
-                            llir.RawStmt(
-                                code=f"memset({wname}, 0, {size_var} * sizeof({ctype}))"
+                            llir.FunctionCallStmt(
+                                name="memset",
+                                args=[
+                                    llir.Var(
+                                        name=wname,
+                                        type=wksp_ctype_ptr,
+                                    ),
+                                    llir.Literal(
+                                        value=0,
+                                        data_type=llir.DataType.INT,
+                                    ),
+                                    llir.Mul(
+                                        llir.Var(
+                                            name=size_var,
+                                            type=llir.DataType.INT64,
+                                        ),
+                                        llir.Sizeof(data_type=wksp_ctype),
+                                    ),
+                                ],
                             )
                         )
                 else:
