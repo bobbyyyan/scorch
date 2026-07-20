@@ -13,6 +13,12 @@ def _var(name: str) -> llir.Var:
     return llir.Var(name=name, type=llir.DataType.INT)
 
 
+def _forged_sizeof(data_type: object) -> llir.Sizeof:
+    expression = object.__new__(llir.Sizeof)
+    object.__setattr__(expression, "data_type", data_type)
+    return expression
+
+
 def _result_metadata(access_id: int = 1) -> llir.TensorAccessMetadata:
     return llir.TensorAccessMetadata(
         access_id=AccessId(access_id),
@@ -625,6 +631,51 @@ def test_codegen_rejects_unknown_cast_child() -> None:
 
     with pytest.raises(CodegenError, match="UnknownExpr"):
         LLIRLowerer().lower_llir(llir.Cast(UnknownExpr(), llir.DataType.INT))
+
+
+def test_sizeof_is_frozen_typed_and_structurally_equal() -> None:
+    expression = llir.Sizeof(llir.DataType.FLOAT32)
+    equal = llir.Sizeof(llir.DataType.FLOAT32)
+
+    assert expression.data_type is llir.DataType.FLOAT32
+    assert expression == equal
+    assert hash(expression) == hash(equal)
+    assert expression != llir.Sizeof(llir.DataType.FLOAT64)
+    assert get_type_hints(llir.Sizeof) == {"data_type": llir.DataType}
+
+    with pytest.raises(FrozenInstanceError):
+        expression.data_type = llir.DataType.FLOAT64
+
+
+def test_sizeof_rejects_malformed_constructor_data_type() -> None:
+    with pytest.raises(TypeError, match="Sizeof.data_type must be a DataType"):
+        llir.Sizeof(cast(llir.DataType, "float"))
+
+
+@pytest.mark.parametrize("malformation", ("invalid", "missing"))
+@pytest.mark.parametrize("nested_in_zero_fill", (False, True))
+def test_codegen_rejects_forged_sizeof_data_type(
+    malformation: str,
+    nested_in_zero_fill: bool,
+) -> None:
+    expression = (
+        _forged_sizeof("float")
+        if malformation == "invalid"
+        else object.__new__(llir.Sizeof)
+    )
+    ir: llir.Expr | llir.Stmt = expression
+    if nested_in_zero_fill:
+        ir = llir.FunctionCallStmt(
+            "memset",
+            (
+                _var("workspace"),
+                llir.Literal(0),
+                llir.Mul(_var("size"), expression),
+            ),
+        )
+
+    with pytest.raises(CodegenError, match="Sizeof.data_type must be a DataType"):
+        LLIRLowerer().lower_llir(ir)
 
 
 def test_binary_and_literal_nodes_are_frozen_typed_structural_values() -> None:
@@ -2112,7 +2163,7 @@ def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None
         (
             llir.ArrayAccess(
                 _var("values"),
-                llir.Sizeof(cast(llir.DataType, "int")),
+                _forged_sizeof("int"),
             ),
             "Sizeof.data_type must be a DataType",
         ),
@@ -2153,6 +2204,17 @@ def test_assign_rejects_forged_cast_index_data_type() -> None:
     with pytest.raises(TypeError, match="Cast.data_type must be a DataType"):
         llir.Assign(
             var=llir.ArrayAccess(_var("values"), malformed_cast),
+            value=llir.Literal(1),
+        )
+
+
+def test_assign_rejects_forged_sizeof_missing_data_type() -> None:
+    with pytest.raises(TypeError, match="Sizeof.data_type must be a DataType"):
+        llir.Assign(
+            var=llir.ArrayAccess(
+                _var("values"),
+                object.__new__(llir.Sizeof),
+            ),
             value=llir.Literal(1),
         )
 

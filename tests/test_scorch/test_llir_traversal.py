@@ -1167,6 +1167,57 @@ def test_cast_unknown_child_reports_exact_path(operation: str) -> None:
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize("malformation", ("invalid", "missing"))
+def test_forged_sizeof_data_type_fails_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+) -> None:
+    expression = object.__new__(llir.Sizeof)
+    if malformation == "invalid":
+        object.__setattr__(expression, "data_type", "float")
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.code == "invalid_sizeof_data_type"
+    assert raised.value.diagnostic.path == ("root", "data_type")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_nested_zero_fill_sizeof_reports_exact_traversal_path(
+    operation: str,
+) -> None:
+    expression = object.__new__(llir.Sizeof)
+    object.__setattr__(expression, "data_type", "float")
+    zero_fill = llir.FunctionCallStmt(
+        "memset",
+        (
+            _var("workspace"),
+            llir.Literal(0),
+            llir.Mul(_var("size"), expression),
+        ),
+    )
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(zero_fill)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(zero_fill)
+
+    assert raised.value.diagnostic.code == "invalid_sizeof_data_type"
+    assert raised.value.diagnostic.path == (
+        "root",
+        "args",
+        "[2]",
+        "right",
+        "data_type",
+    )
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_unknown_direct_init_subclass_fails_closed(operation: str) -> None:
     class UnknownDirectInit(llir.DirectInit):
         pass
