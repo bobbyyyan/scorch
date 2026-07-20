@@ -782,15 +782,15 @@ def test_kernel_abi_arguments_validation_and_function_are_fresh_and_byte_exact()
         "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat64, "
         '"evaluate", "bias_values")',
     )
-    assert (
-        tuple(statement.code for statement in first_validation) == expected_validation
+    assert all(
+        type(statement) is llir.FunctionCallStmt for statement in first_validation
     )
+    assert all(type(statement.args) is tuple for statement in first_validation)
     assert first_validation == second_validation
     assert all(
         first is not second
         for first, second in zip(first_validation, second_validation)
     )
-    assert all(statement.add_semicolon is True for statement in first_validation)
     assert LLIRLowerer().lower_llir(first_validation) == "\n".join(
         f"{code};" for code in expected_validation
     )
@@ -1030,13 +1030,14 @@ def test_post_op_extra_tensor_data_ptr_is_live_typed_and_fresh() -> None:
         for first, second in zip(first_function.args, second_function.args)
     )
     validation = first_function.body[:3]
-    assert all(type(node) is llir.RawStmt for node in validation)
-    assert [cast(llir.RawStmt, node).code for node in validation] == [
-        'scorch_native::validate_jit_result_shape(result_shape, {}, 1, "evaluate")',
+    assert all(type(node) is llir.FunctionCallStmt for node in validation)
+    assert not any(type(node) is llir.RawStmt for node in validation)
+    assert [LLIRLowerer().lower_llir(node) for node in validation] == [
+        'scorch_native::validate_jit_result_shape(result_shape, {}, 1, "evaluate");',
         'scorch_native::validate_jit_tensor("evaluate", "Input", Input_shape, '
-        "Input_mode_indices, Input_values, torch::kFloat32, {0}, {0}, {})",
+        "Input_mode_indices, Input_values, torch::kFloat32, {0}, {0}, {});",
         "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat32, "
-        '"evaluate", "bias_values")',
+        '"evaluate", "bias_values");',
     ]
 
     def pointer_initializer(function: llir.Function) -> llir.VarInit:
@@ -4104,7 +4105,10 @@ def test_move_calls_and_qualified_names_survive_with_independent_ownership() -> 
         ]
 
     assert call_values(first_calls) == call_values(second_calls) == expected
+    # The two leading constants are the typed validation-call dtype arguments.
     expected_qualified = [
+        "torch::kFloat32",
+        "torch::kFloat32",
         "torch::kInt",
         "torch::kInt",
         "torch::kFloat32",

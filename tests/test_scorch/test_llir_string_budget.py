@@ -133,9 +133,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 76,
+        "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 414
+    assert sum(constructor_counts.values()) == 419
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 131,
@@ -149,9 +149,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
-        "torch_cpp_abi.py": 76,
+        "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 404
+    assert sum(unclassified_counts.values()) == 409
     assert known_indirect == {
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
@@ -379,7 +379,7 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
     assert structured_counts == {
         "cin_lowerer.py": 2,
         "llir_traversal.py": 1,
-        "torch_cpp_abi.py": 10,
+        "torch_cpp_abi.py": 12,
     }
 
     producers = []
@@ -402,7 +402,9 @@ def test_torch_dtype_constants_cannot_return_to_var_names() -> None:
         "'kInt'": 7,
         "dtype_name": 1,
         "get_pytorch_c_dtype_name(self.dtype)": 3,
+        "get_pytorch_c_dtype_name(self.extra_tensor_dtype)": 1,
         "get_pytorch_c_dtype_name(intermediate_tensor_var.dtype)": 1,
+        "get_pytorch_c_dtype_name(tensor.dtype)": 1,
     }
 
 
@@ -611,10 +613,9 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
-        "torch_cpp_abi.py": 3,
     }
-    assert sum(counts.values()) == 23
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 22
+    assert sum(counts.values()) == 20
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 19
 
 
 def test_compressed_result_assembly_is_owned_by_the_typed_abi_epilogue() -> None:
@@ -747,12 +748,12 @@ def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:
             len(_llir_constructor_calls(path, constructor))
             for constructor in ("VarInit", "Array", "FunctionCall", "QualifiedName")
         )
-        == 61
+        == 64
     )
     assert len(_llir_constructor_calls(path, "VarInit")) == 29
-    assert len(_llir_constructor_calls(path, "Array")) == 9
+    assert len(_llir_constructor_calls(path, "Array")) == 10
     assert len(_llir_constructor_calls(path, "FunctionCall")) == 13
-    assert len(_llir_constructor_calls(path, "QualifiedName")) == 10
+    assert len(_llir_constructor_calls(path, "QualifiedName")) == 12
 
 
 def test_first_compressed_position_allocation_is_structured() -> None:

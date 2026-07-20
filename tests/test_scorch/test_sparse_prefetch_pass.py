@@ -1065,6 +1065,19 @@ def _all_raw_codes(value: object) -> List[str]:
     return codes
 
 
+def _all_call_stmt_names(value: object) -> List[str]:
+    names: List[str] = []
+    if type(value) is llir.FunctionCallStmt:
+        names.append(cast(llir.FunctionCallStmt, value).name)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            names.extend(_all_call_stmt_names(child))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            names.extend(_all_call_stmt_names(child))
+    return names
+
+
 def _coordinate_reads(
     value: object,
     *,
@@ -1167,8 +1180,11 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     ) -> LLIRStatementListPassResult:
         events.append("sparse_prefetch")
         assert not any(
-            "validate_jit_tensor" in code
-            for code in _all_raw_codes(artifact.statements)
+            "validate_jit_tensor" in marker
+            for marker in (
+                *_all_raw_codes(artifact.statements),
+                *_all_call_stmt_names(artifact.statements),
+            )
         )
         result = original_sparse(manager, artifact, pass_spec)
         assert _mutable_ir_ids(artifact.statements).isdisjoint(
@@ -1221,8 +1237,11 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
         events.append("factor_hoist")
         assert artifact.statements is detached_single_output[-1]
         assert not any(
-            "validate_jit_tensor" in code
-            for code in _all_raw_codes(artifact.statements)
+            "validate_jit_tensor" in marker
+            for marker in (
+                *_all_raw_codes(artifact.statements),
+                *_all_call_stmt_names(artifact.statements),
+            )
         )
         result = original_factor(manager, artifact, pass_spec)
         assert _mutable_ir_ids(artifact.statements).isdisjoint(
@@ -1238,6 +1257,10 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     ) -> LLIRRewritePassResult[List[llir.Stmt]]:
         events.append("dynamic_vector")
         assert any(
+            "validate_jit_tensor" in name
+            for name in _all_call_stmt_names(artifact.value)
+        )
+        assert not any(
             "validate_jit_tensor" in code for code in _all_raw_codes(artifact.value)
         )
         assert all(

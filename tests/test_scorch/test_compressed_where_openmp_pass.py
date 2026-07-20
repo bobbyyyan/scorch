@@ -3603,9 +3603,14 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
         "SparseRight_mode_indices",
         "SparseRight_values",
     ]
-    validation = [cast(llir.RawStmt, statement).code for statement in function.body[:3]]
+    assert all(
+        type(statement) is llir.FunctionCallStmt for statement in function.body[:3]
+    )
+    validation = [
+        LLIRLowerer().lower_llir(statement) for statement in function.body[:3]
+    ]
     assert validation[0] == (
-        'scorch_native::validate_jit_result_shape(result_shape, {}, 2, "evaluate")'
+        'scorch_native::validate_jit_result_shape(result_shape, {}, 2, "evaluate");'
     )
     assert '"SparseLeft"' in validation[1]
     assert '"SparseRight"' in validation[2]

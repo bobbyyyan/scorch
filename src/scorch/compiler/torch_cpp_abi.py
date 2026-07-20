@@ -10,7 +10,6 @@ from ..format import LevelType
 from ..utils import (
     dtype_to_c_datatype,
     get_pytorch_c_dtype_name,
-    get_pytorch_c_dtype_str,
 )
 
 
@@ -229,12 +228,22 @@ class KernelTensorABI:
         )
 
 
-def _cpp_int_vector(values: Tuple[int, ...]) -> str:
-    """Render one validated ABI metadata tuple as a C++ initializer list."""
+def _int_initializer_list(
+    values: Tuple[int, ...],
+    element_type: llir.DataType,
+) -> llir.Array:
+    """Build one typed initializer list from validated ABI integer metadata."""
 
     if type(values) is not tuple or any(type(value) is not int for value in values):
-        raise TypeError("C++ integer vector values must be an immutable int tuple")
-    return "{" + ", ".join(str(value) for value in values) + "}"
+        raise TypeError("initializer-list values must be an immutable int tuple")
+    if type(element_type) is not llir.DataType:
+        raise TypeError("initializer-list element type must be a DataType")
+    return llir.Array(
+        values=tuple(
+            llir.Literal(value=value, data_type=element_type) for value in values
+        ),
+        data_type=element_type,
+    )
 
 
 @dataclass(frozen=True)
@@ -331,48 +340,103 @@ class TorchCppKernelABI:
             )
         return arguments
 
-    def emit_validation(self) -> List[llir.RawStmt]:
+    def emit_validation(self) -> List[llir.FunctionCallStmt]:
         """Build fresh validation calls in exact public-argument order."""
 
         self._validate()
         validation = [
-            llir.RawStmt(
-                code=(
-                    "scorch_native::validate_jit_result_shape("
-                    f"result_shape, {_cpp_int_vector(self.result_shape)}, "
-                    f'{self.result_rank}, "{self.function_name}")'
+            llir.FunctionCallStmt(
+                name="scorch_native::validate_jit_result_shape",
+                args=(
+                    llir.Var(
+                        name="result_shape",
+                        type=llir.DataType.STD_VECTOR_INT,
+                    ),
+                    _int_initializer_list(
+                        self.result_shape,
+                        llir.DataType.INT64,
+                    ),
+                    llir.Literal(
+                        value=self.result_rank,
+                        data_type=llir.DataType.INT64,
+                    ),
+                    llir.Literal(
+                        value=self.function_name,
+                        data_type=llir.DataType.STRING,
+                    ),
                 ),
-                add_semicolon=True,
             )
         ]
         for tensor in self.input_tensors:
             validation.append(
-                llir.RawStmt(
-                    code=(
-                        "scorch_native::validate_jit_tensor("
-                        f'"{self.function_name}", "{tensor.name}", '
-                        f"{tensor.name}_shape, {tensor.name}_mode_indices, "
-                        f"{tensor.name}_values, "
-                        f"{get_pytorch_c_dtype_str(tensor.dtype)}, "
-                        f"{_cpp_int_vector(tensor._level_kind_codes())}, "
-                        f"{_cpp_int_vector(tensor.mode_order)}, "
-                        f"{_cpp_int_vector(tensor.shape)})"
+                llir.FunctionCallStmt(
+                    name="scorch_native::validate_jit_tensor",
+                    args=(
+                        llir.Literal(
+                            value=self.function_name,
+                            data_type=llir.DataType.STRING,
+                        ),
+                        llir.Literal(
+                            value=tensor.name,
+                            data_type=llir.DataType.STRING,
+                        ),
+                        llir.Var(
+                            name=f"{tensor.name}_shape",
+                            type=llir.DataType.STD_VECTOR_INT,
+                        ),
+                        llir.Var(
+                            name=f"{tensor.name}_mode_indices",
+                            type=llir.DataType.STD_VECTOR_2D_TORCH_TENSOR,
+                        ),
+                        llir.Var(
+                            name=f"{tensor.name}_values",
+                            type=llir.DataType.TORCH_TENSOR,
+                        ),
+                        llir.QualifiedName(
+                            namespace="torch",
+                            name=get_pytorch_c_dtype_name(tensor.dtype),
+                            data_type=llir.DataType.TORCH_SCALAR_TYPE,
+                        ),
+                        _int_initializer_list(
+                            tensor._level_kind_codes(),
+                            llir.DataType.INT,
+                        ),
+                        _int_initializer_list(
+                            tensor.mode_order,
+                            llir.DataType.INT,
+                        ),
+                        _int_initializer_list(
+                            tensor.shape,
+                            llir.DataType.INT64,
+                        ),
                     ),
-                    add_semicolon=True,
                 )
             )
         if self.extra_tensor_names:
             assert self.extra_tensor_dtype is not None
-            extra_dtype = get_pytorch_c_dtype_str(self.extra_tensor_dtype)
             for name in self.extra_tensor_names:
                 validation.append(
-                    llir.RawStmt(
-                        code=(
-                            "scorch_native::validate_jit_extra_tensor("
-                            f"{name}_values, {extra_dtype}, "
-                            f'"{self.function_name}", "{name}_values")'
+                    llir.FunctionCallStmt(
+                        name="scorch_native::validate_jit_extra_tensor",
+                        args=(
+                            llir.Var(
+                                name=f"{name}_values",
+                                type=llir.DataType.TORCH_TENSOR,
+                            ),
+                            llir.QualifiedName(
+                                namespace="torch",
+                                name=get_pytorch_c_dtype_name(self.extra_tensor_dtype),
+                                data_type=llir.DataType.TORCH_SCALAR_TYPE,
+                            ),
+                            llir.Literal(
+                                value=self.function_name,
+                                data_type=llir.DataType.STRING,
+                            ),
+                            llir.Literal(
+                                value=f"{name}_values",
+                                data_type=llir.DataType.STRING,
+                            ),
                         ),
-                        add_semicolon=True,
                     )
                 )
         return validation
