@@ -20320,6 +20320,219 @@ LoopIR have not begun. Phases 0 and 1 are not claimed formally closed
 without a separate design-requirement audit. Phase 2 retains its recorded
 canonical closure.
 
+### Phase-3 typed workspace clear-mutation ownership complete (2026-07-20)
+
+Only the narrow Phase-3 **W2/W4 typed workspace clear-mutation** slice is
+complete in this section. It retires the two compressed-`Where` borrowed-view
+`clear()` raw statements — the count-phase and fill-phase mutations of the
+per-worker workspace view — through a new frozen `llir.MemberCallStmt`
+statement node. The exact base is
+`bf50ce9425da24958588268900481be9601bedab` (the Unicode validation-name
+compatibility fix) and the exact committed candidate is
+`605fb35048f483b780c856e34c428608ce2f2877`. Its ordered commits are:
+
+- `e1603940168a655a2e777708df8cf03a6feb2636`,
+  **refactor(compiler): emit typed workspace clear calls**; and
+- `605fb35048f483b780c856e34c428608ce2f2877`,
+  **test(compiler): cover typed workspace clear calls**.
+
+No commit was amended, squashed, reordered, or rewritten. The complete
+base/candidate range is eight files, 680 insertions, and 11 deletions:
+`llir.py`, `llir_traversal.py`, `codegen.py`, and
+`compressed_where_openmp_pass.py` in production plus `test_codegen.py`,
+`test_llir_traversal.py`, `test_llir_string_budget.py`, and
+`test_compressed_where_openmp_pass.py`. `git diff --check` across the range
+exits 0. No CIN, scheduling policy, kernel ABI, generated C++ spelling, cache
+schema, csrc, native ABI, public Python API, Phase-3.5, or LoopIR work is
+part of this slice.
+
+#### Audit and seam division
+
+A fresh read-only audit of the recommended W1/W2/W4/W5 plus noncanonical-W14
+workspace family found three separate semantic boundaries and shipped only
+the smallest coherent one:
+
+| Family | Decision |
+| --- | --- |
+| **W2/W4** | **Selected. The two `wksp.clear()` mutations are one member-call statement boundary: a structured receiver plus identifier member with no arguments. The historically rejected `FunctionCallStmt("wksp.clear")` spelling would only relocate the dotted opacity, so the slice adds the narrow `MemberCallStmt` statement mirror of the existing `MemberCall` expression instead, and emission is byte-identical.** |
+| W1 | Deferred. The worker-view acquisition `auto wksp = wksp_pool[(size_t)omp_get_thread_num()].make_view()` cannot be typed byte-identically today: the typed `Cast` node renders `(size_t) omp_get_thread_num()` with a space while the raw spelling has none. Normalizing either spelling changes emitted bytes (the Cast form corpus-wide) and mandates the full two-machine generated-kernel gate; that is a deliberate, separately reviewed emission decision, not a mechanical migration. |
+| W5 | Deferred. The pool construction's `int {w}_thread_count = <expr>` initializer reuses the `omp_num_threads` target-policy *string* (`scorch_nthreads(...)`, `omp_get_max_threads()`, or their `std::max`), so typing it requires either parsing rendered policy text (prohibited) or moving the parallel-policy decision to typed expressions — a larger seam that also owns OpenMP pragma spelling. The parameterized `std::vector<linked_list_workspace_1d<T>>` pool type additionally has no `DataType` member and must not gain spelling-forked members for free-form scalar spellings. |
+| W14 fallback | Deferred. `_legacy_value_allocation` is the deliberate compatibility surface for alias (`int`, `long long`) and free-form (`custom_scalar`) direct-pass scalar spellings; typing it would either invent a C-type parser or destroy the characterized free-form contract that the canonical W14 slice explicitly divided away. |
+
+#### Representation, ownership boundary, and emission
+
+`llir.MemberCallStmt(base, member, template_args, args)` mirrors
+`MemberCall` exactly as `FunctionCallStmt` mirrors `FunctionCall`: a frozen
+dataclass with a structured receiver `Expr` child, an identifier-validated
+member, and tuple-owned `DataType` template arguments and expression
+arguments, with list inputs copied into fresh tuples and every malformed
+field failing in the constructor. The common walker and rewriter accept and
+detach it with the new traversal-owned diagnostics
+`invalid_member_call_stmt_base/_member/_template_args/_template_arg/_args/_argument`
+at exact node paths, and the rewriter reconstructs a fresh node with
+detached children. Codegen validates the same fields, renders the receiver
+at postfix precedence (parenthesizing lower-precedence receivers), and
+emits `{receiver}.{member}{<template,...>}({args});` through a dedicated
+`_lower_member_call_stmt` helper so `_lower_llir_impl` stays inside the
+flake8 `max-complexity` budget; unknown subclasses and forged fields fail
+closed in both traversal and codegen.
+
+`compressed_where_openmp_pass._workspace_clear_statement(context)` is the
+one production constructor. Its receiver is
+`llir.Var(context.workspace_name, DataType.NO_TYPE)`: the borrowed view's
+C++ type is compiler-deduced (`auto`) by the still-raw W1 `make_view()`
+statement, so no accurate `DataType` member exists, and `NO_TYPE` is the
+established metadata-free physical-borrow convention. Repeated emission
+returns structurally equal but separately owned statements; count and fill
+bodies never share a node. Rendering is byte-for-byte the previous raw
+spelling `wksp.clear();` under the same indentation mechanics, and the
+statement remains the final statement of each phase body. When the
+workspace is not hoisted, no member-call statement is constructed.
+
+The production string/raw budget after this slice: 420 production `Var`
+constructors (the one new metadata-free receiver); ten direct expression
+strings; 14 known indirect sinks/clones; seven generic string rewrites
+(unchanged); **18 `RawStmt` constructors / 17 semantic producers**
+(`compressed_where_openmp_pass.py` drops from five to three); six
+`DirectInit` templates; and a new pinned `MemberCallStmt` constructor
+budget of exactly two (the pass producer and the traversal
+reconstruction). The remaining 17 semantic raw producers are C3-C7/C12-C17
+(11), W1, W5, the W14 compatibility fallback, D1, S1, and P1.
+
+#### Focused verification and updated structural coverage
+
+The changed-file focused suite ran green in the working tree at the
+candidate: `python -m pytest -q test_codegen.py test_cin_lowerer.py
+test_llir_traversal.py test_llir_string_budget.py
+test_compressed_where_openmp_pass.py test_llir_pass_manager.py
+test_result_write_pass.py test_sparse_prefetch_pass.py` produced
+**1047 passed** (the committed 1011 plus this slice's coverage). An
+adjacent sweep of `tests/test_scorch/codegen`,
+`test_compiler_stage_timing.py`, `test_dense_pointer_hoist_pass.py`,
+`test_dynamic_vector_access_pass.py`, `test_loop_invariant_factor_pass.py`,
+and `test_single_iteration_loop_pass.py` produced **444 passed**. Black
+reported all eight changed files unchanged, Flake8 retained only the
+parent-identical `codegen.py` F541, mypy retained only the three
+parent-identical dynamic-`ForLoop` findings, and `git diff --check` was
+clean.
+
+New coverage locks: node-contract tests
+(`test_member_call_stmt_is_frozen_typed_owned_and_structurally_equal`,
+default-tuple independence, malformed base/member/template/argument
+constructor rejection); byte-exact precedence-correct emission including
+template arguments, subscripted/member/parenthesized receivers, and indent
+handling; forged fields failing closed at the traversal boundary for both
+walk and rewrite with exact codes and paths, and at codegen with exact
+messages; subclass rejection in both; the common walker/rewriter
+node-coverage roster and emissions gaining the new statement; and
+production activation
+(`test_workspace_clear_mutations_are_structured_frozen_and_byte_exact`):
+exactly one structured clear at the end of each phase body with the exact
+receiver shape, structural equality with disjoint mutable identities across
+phases and repeated transforms, rewriter detachment, deeper `d,s,s`
+activation, the unhoisted boundary emitting none, and no raw `.clear`
+spelling anywhere. The DS exactness test re-pins the clear statements from
+raw codes to structured statements without weakening any other assertion,
+and `test_workspace_clear_mutations_are_structured` pins the exact helper
+template, both build-body call sites, and the two-site constructor budget.
+
+#### Byte-identity capture and chained machine evidence
+
+The authoritative source/build capture ran from `2026-07-20T06:02:03Z`
+through `2026-07-20T06:02:09Z` and exited 0
+(`/Users/bobby/.cache/scorch-codex/wcm-605fb35/run_capture_gate.sh`, runner
+`889caa662340093516e49e03179195ffcb740b0ba55f00f552a2e83b7fc27f0e`), using
+the same logical worktree `/tmp/scorch-phase3-w14-capture-wt`, extension
+path `/tmp/scorch-phase3-w14-capture-extensions`, retained W14 input
+wrapper (`ea6f425a…`), and helper set as the predecessor slices. Base and
+candidate emissions are byte-identical for the five canonical inputs, the
+42-cell/21-build grid, the workspace pair, and the tiled workspace: every
+diff receipt is zero bytes. Both sides are additionally pinned byte-equal
+to the same seven retained candidate capture hashes (all-COO `53d6faae…`,
+CSR-dense `36a8599c…`, DS `02043a5a…`, DSS `adc0b71f…`, preamble
+`db297157…`, input manifest `1a8a8797…`, grid `26154ccc…`), which chains
+this slice's identity — including the DS/DSS emissions that contain the
+migrated `wksp.clear();` lines — to the W14 native and same-binary A/A
+evidence on both machines; under the byte-identical waiver policy no new
+generated-kernel machine gate is required (structural activation tests were
+still run, above). The artifact ledger hashes to
+`9a0eb6f506412941777c108b4af833684f337882db1eb50c01133faff3552ef5`.
+
+#### Full-suite, quality, and latency verification
+
+The authoritative full non-performance suite ran in the clean detached
+worktree `wcm-605fb35/worktrees/full` from `2026-07-20T06:02:36Z` through
+`2026-07-20T06:13:11Z` with 12 file-distributed workers and isolated
+caches, producing `2114 passed, 14 skipped, 1 warning in 634.42s`; pytest
+and gate exits were zero and the log hashes to
+`3af68fab45008d1cbd7579c516f65883338a1e3b07b67ba6c5446a8f0d1a7e35`.
+
+The quality comparison ran from `2026-07-20T06:03:31Z` through
+`2026-07-20T06:04:09Z` over the exact eight changed Python files in clean
+base/candidate worktrees: Black `0/0`; Flake8 `1/1` with byte-identical
+normalized findings (the inherited F541); mypy `0/0` with empty normalized
+error logs; strict Sphinx `1/1` with the same 23 inherited warnings; all
+normalized logs and both non-doctree HTML manifests byte-identical
+(`comparison-summary.txt` records every diff exit 0).
+
+The latency gates ran from `2026-07-20T06:13:41Z` through
+`2026-07-20T06:13:57Z` after every other gate was idle and exited 0
+(`run_latency_gates.sh`, `d5d841c0…`). Unlike the validation-call slice,
+**no latency-corpus case can activate this slice**: the slice-specific
+activation helper (`capture_wcm_latency_activation.py`, `29444f73…`)
+patched a counter over the one production clear constructor, ran the
+canonical corpus through the production path, and recorded exactly **zero**
+constructions across `small_dense`/`reduction`/`csr_intersection`/
+`sparse_union` — the corpus contains no compressed-`Where` output kernel —
+while separately proving exact structured production activation on the DS
+and DS,S shapes (applied, exactly two typed `MemberCallStmt` clears each,
+zero raw clears, byte-exact `wksp.clear();` emission, exact receiver
+shape); the activation report hashes to `95088a8d…`. Because the corpus
+cannot execute the changed path, the paired benchmark is a same-session
+drift monitor rather than a slice-cost measurement: after one unrecorded
+cache-priming run, base (`latency-bf50ce9-m5.json`, `233e1d95…`) and
+candidate (`latency-605fb35-m5.json`, `4fd94170…`) each ran five warmups
+and 30 samples in the clean worktrees, and `compare-latency` reports every
+category inside the 1.10 target for both percentiles (`small_dense`
+1.013/0.977, `reduction` 0.984/0.994, `csr_intersection` 0.982/0.938,
+`sparse_union` 1.026/1.029). No crossing occurred and no attribution was
+required.
+
+At documentation time, a read-only hash check reproduced the five protected
+tracked working files exactly:
+
+- `.gitignore`:
+  `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`;
+- `pyproject.toml`:
+  `191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`;
+- `src/scorch/__init__.py`:
+  `5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`;
+- `tests/packaging/smoke_install.py`:
+  `f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`;
+  and
+- `tests/test_scorch/test_resources.py`:
+  `3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+All user-owned untracked autotune, benchmark, GPU/CUDA, SuiteSparse,
+research, scheduler/receipt, scratchpad, test-analysis, tooling, temporary,
+and literal `-` material remained outside both slice commits.
+`COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were not modified.
+
+Only the narrow Phase-3 **W2/W4 typed workspace clear-mutation** slice is
+complete. The raw budget is 18 constructors / 17 semantic producers. The
+recommended next ownership seam is the **C3-C5/C15-C16 parallel zero-fill
+typed-pass extraction** — the named Phase-3 deliverable and the largest
+remaining coherent raw cluster, requiring its own pass-order, cache,
+native, and performance review. The machine-gated alternative is a
+deliberate Cast-spelling normalization decision that would unblock W1 (and
+with it a later W5 parallel-policy seam); it changes emitted bytes
+corpus-wide and therefore requires the full two-machine generated-kernel
+gate. After those remain C6/C7/C12-C14/C17, D1, S1, P1, the seven generic
+rewrites, and the unified exhaustive CxxIR-emission exit review. Phase 3
+remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not
+claimed formally closed without a separate design-requirement audit. Phase
+2 retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
