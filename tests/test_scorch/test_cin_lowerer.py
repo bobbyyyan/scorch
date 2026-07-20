@@ -5610,6 +5610,188 @@ def test_cin_value_reference_rewrite_rebuilds_member_call_stmt_children() -> Non
     )
 
 
+def _dense_workspace_zero_fill_cin() -> ForAll:
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="dd")
+    b = TensorVar("B", fmt="dd")
+    wksp = Workspace("wksp", dim=1, dense=True)
+
+    return ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        wksp[j],
+                        a[i, k] * b[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    c[i, j],
+                    wksp[j],
+                ),
+            ),
+        ),
+    )
+
+
+def _collect_matching_statements(value, predicate) -> list:
+    found: list = []
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            found.extend(_collect_matching_statements(child, predicate))
+        return found
+    if not isinstance(value, llir.Stmt):
+        return found
+    if predicate(value):
+        found.append(value)
+    for attribute in (
+        "body",
+        "then_body",
+        "else_body",
+        "before_parallel_body",
+        "pre_parallel_body",
+        "post_parallel_body",
+    ):
+        child = getattr(value, attribute, None)
+        if child:
+            found.extend(_collect_matching_statements(child, predicate))
+    branches = getattr(value, "then_body_list", None)
+    if branches:
+        for branch in branches:
+            found.extend(_collect_matching_statements(branch, predicate))
+    return found
+
+
+def test_dense_workspace_zero_fill_statements_are_structured_and_byte_exact() -> None:
+    first = CINLowerer().lower_IndexStmt(_dense_workspace_zero_fill_cin())
+    second = CINLowerer().lower_IndexStmt(_dense_workspace_zero_fill_cin())
+
+    def is_memset(stmt: llir.Stmt) -> bool:
+        return type(stmt) is llir.FunctionCallStmt and stmt.name == "memset"
+
+    def is_alias(stmt: llir.Stmt) -> bool:
+        return (
+            type(stmt) is llir.VarInit
+            and type(stmt.var) is llir.Var
+            and stmt.var.name == "wksp0_size"
+        )
+
+    memsets = _collect_matching_statements(first, is_memset)
+    aliases = _collect_matching_statements(first, is_alias)
+    assert len(memsets) == 1
+    assert len(aliases) == 1
+
+    memset = cast(llir.FunctionCallStmt, memsets[0])
+    assert type(memset.args) is tuple
+    assert len(memset.args) == 3
+    receiver, zero, product = memset.args
+    assert type(receiver) is llir.Var
+    assert receiver.name == "wksp"
+    assert receiver.type is llir.DataType.PTR_FLOAT32
+    assert type(zero) is llir.Literal
+    assert zero.value == 0
+    assert zero.data_type is llir.DataType.INT
+    assert type(product) is llir.Mul
+    assert type(product.left) is llir.Var
+    assert cast(llir.Var, product.left).name == "wksp0_size"
+    assert cast(llir.Var, product.left).type is llir.DataType.INT64
+    assert type(product.right) is llir.Sizeof
+    assert cast(llir.Sizeof, product.right).data_type is llir.DataType.FLOAT32
+
+    alias = cast(llir.VarInit, aliases[0])
+    assert alias.var.type is llir.DataType.INT64
+    assert type(alias.value) is llir.Var
+    assert cast(llir.Var, alias.value).name == "B1_size"
+    assert cast(llir.Var, alias.value).type is llir.DataType.INT64
+
+    def is_raw(stmt: llir.Stmt) -> bool:
+        return type(stmt) is llir.RawStmt
+
+    for raw in _collect_matching_statements(first, is_raw):
+        assert "memset" not in cast(llir.RawStmt, raw).code
+        assert not cast(llir.RawStmt, raw).code.startswith("int64_t ")
+
+    assert LLIRLowerer().lower_llir(memset) == (
+        "memset(wksp, 0, wksp0_size * sizeof(float));"
+    )
+    assert LLIRLowerer().lower_llir(alias) == "int64_t wksp0_size = B1_size;"
+    cpp = LLIRLowerer().lower_llir(first)
+    assert cpp.count("memset(wksp, 0, wksp0_size * sizeof(float));") == 1
+    assert cpp.count("int64_t wksp0_size = B1_size;") == 1
+    assert cpp.index("int64_t wksp0_size") < cpp.index("wksp_pool_owner.get()")
+    assert cpp.index("__restrict__ wksp") < cpp.index("memset(wksp, 0,")
+
+    second_memset = cast(
+        llir.FunctionCallStmt,
+        _collect_matching_statements(second, is_memset)[0],
+    )
+    second_alias = cast(
+        llir.VarInit,
+        _collect_matching_statements(second, is_alias)[0],
+    )
+    assert second_memset == memset
+    assert second_memset is not memset
+    assert second_memset.args[0] is not memset.args[0]
+    assert second_memset.args[2] is not memset.args[2]
+    assert second_alias is not alias
+    assert second_alias.var is not alias.var
+
+    rewriter_context = LLIRTraversalContext(
+        stage="zero-fill test",
+        pass_name="detach",
+    )
+    detached = LLIRRewriter(rewriter_context).rewrite(memset)
+    assert detached == memset
+    assert detached is not memset
+    assert detached.args[0] is not memset.args[0]
+    assert detached.args[2] is not memset.args[2]
+
+
+def test_cin_value_reference_rewrite_rebuilds_zero_fill_children() -> None:
+    source = llir.FunctionCallStmt(
+        name="memset",
+        args=(
+            llir.Var(name="wksp", type=llir.DataType.PTR_FLOAT32),
+            llir.Literal(value=0, data_type=llir.DataType.INT),
+            llir.Mul(
+                llir.Var(name="wksp0_size", type=llir.DataType.INT64),
+                llir.Sizeof(data_type=llir.DataType.FLOAT32),
+            ),
+        ),
+    )
+    statements: list[llir.Stmt] = [source]
+
+    CINLowerer._rewrite_val_refs(statements, {"wksp": "thread_wksp"})
+
+    rewritten = cast(llir.FunctionCallStmt, statements[0])
+    assert type(rewritten) is llir.FunctionCallStmt
+    assert rewritten is not source
+    assert rewritten.name == "memset"
+    assert cast(llir.Var, rewritten.args[0]).name == "thread_wksp"
+    assert rewritten.args[1] == llir.Literal(value=0, data_type=llir.DataType.INT)
+    product = cast(llir.Mul, rewritten.args[2])
+    assert cast(llir.Var, product.left).name == "thread_wksp0_size"
+    assert type(product.right) is llir.Sizeof
+    assert cast(llir.Sizeof, product.right).data_type is llir.DataType.FLOAT32
+    assert LLIRLowerer().lower_llir(rewritten) == (
+        "memset(thread_wksp, 0, thread_wksp0_size * sizeof(float));"
+    )
+    assert LLIRLowerer().lower_llir(source) == (
+        "memset(wksp, 0, wksp0_size * sizeof(float));"
+    )
+
+
 def test_nondefault_coo_intersection_keeps_live_coordinate_end_bounds():
     row, column = IndexVar("r"), IndexVar("c")
     result = TensorVar("Intersect", fmt="oo", mode_order=[1, 0])

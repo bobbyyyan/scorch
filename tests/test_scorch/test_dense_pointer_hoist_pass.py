@@ -908,6 +908,50 @@ def test_member_call_rewrite_owns_receiver_and_arguments() -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
+def test_function_call_rewrite_traverses_product_and_sizeof_arguments() -> None:
+    old = "Input_val[position]"
+    call = llir.FunctionCallStmt(
+        name="memset",
+        args=(
+            _var(old),
+            llir.Literal(value=0, data_type=llir.DataType.INT),
+            llir.Mul(
+                _var(old),
+                llir.Sizeof(data_type=llir.DataType.FLOAT32),
+            ),
+        ),
+    )
+    loop = _loop(
+        [
+            _position_init(),
+            llir.Assign(_var("discover"), _var(old)),
+            call,
+        ]
+    )
+    source = [loop]
+    before = _snapshot(source)
+
+    output = hoist_dense_pointers(
+        source,
+        _context(("Input_val", "float")),
+    )
+
+    output_loop = cast(llir.ForLoop, output[1])
+    rewritten = cast(llir.FunctionCallStmt, output_loop.body[1])
+    assert rewritten.name == "memset"
+    assert type(rewritten.args) is tuple
+    assert cast(llir.Var, rewritten.args[0]).name == "_Input_val_ptr[lane]"
+    zero = cast(llir.Literal, rewritten.args[1])
+    assert zero.value == 0
+    assert zero.data_type is llir.DataType.INT
+    product = cast(llir.Mul, rewritten.args[2])
+    assert cast(llir.Var, product.left).name == "_Input_val_ptr[lane]"
+    assert type(product.right) is llir.Sizeof
+    assert cast(llir.Sizeof, product.right).data_type is llir.DataType.FLOAT32
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
 def test_legacy_rewrite_omits_headers_parallel_regions_and_nested_containers() -> None:
     old = "Input_val[position]"
     nested_header = _loop([], loop_variable="nested")

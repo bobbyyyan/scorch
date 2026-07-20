@@ -946,6 +946,44 @@ def test_member_call_rewrite_owns_receiver_and_arguments() -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
+def test_function_call_rewrite_traverses_product_and_sizeof_arguments() -> None:
+    call = llir.FunctionCallStmt(
+        name="memset",
+        args=(
+            _access("Receivers", "lane"),
+            llir.Literal(value=0, data_type=llir.DataType.INT),
+            llir.Mul(
+                _var("Payload[lane]"),
+                llir.Sizeof(data_type=llir.DataType.INT64),
+            ),
+        ),
+    )
+    source = _program([call], loop_variable="lane", base="root")
+    before = _snapshot(source)
+
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert len(output) == 1
+    rewritten = cast(llir.FunctionCallStmt, output[0])
+    assert rewritten.name == "memset"
+    assert type(rewritten.args) is tuple
+    receiver = cast(llir.ArrayAccess, rewritten.args[0])
+    assert cast(llir.Var, receiver.array).name == "Receivers"
+    assert cast(llir.Var, receiver.index).name == "root"
+    zero = cast(llir.Literal, rewritten.args[1])
+    assert zero.value == 0
+    assert zero.data_type is llir.DataType.INT
+    product = cast(llir.Mul, rewritten.args[2])
+    assert cast(llir.Var, product.left).name == "Payload[root]"
+    assert type(product.right) is llir.Sizeof
+    assert cast(llir.Sizeof, product.right).data_type is llir.DataType.INT64
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
 def test_exact_structured_access_index_is_rewritten_and_reapplication_is_noop() -> None:
     metadata = llir.TensorAccessMetadata(
         access_id=AccessId(31),
