@@ -89,6 +89,17 @@ class LLIRLowerer:
     _PRIMARY_PRECEDENCE = 13
     _UNARY_OPERATORS = {"+", "-", "!", "~", "*", "&", "++", "--"}
 
+    # Exact escape table for semantic STRING literal emission.  Characters
+    # outside this table and printable ASCII are rejected rather than guessed
+    # at, so the emitted spelling stays deterministic.
+    _STRING_LITERAL_ESCAPES = {
+        "\\": "\\\\",
+        '"': '\\"',
+        "\n": "\\n",
+        "\t": "\\t",
+        "\r": "\\r",
+    }
+
     def __init__(self, compile_options: Optional["CompileOptions"] = None) -> None:
         """Bind code emission to the compilation's immutable options snapshot.
 
@@ -386,13 +397,7 @@ class LLIRLowerer:
         preserving.
         """
         if type(ir) is llir.Literal:
-            if type(ir.value) not in (bool, int, float, str):
-                raise CodegenError(
-                    "Literal.value must be a bool, int, float, or string"
-                )
-            if type(ir.data_type) is not llir.DataType:
-                raise CodegenError("Literal.data_type must be a DataType")
-            return str(ir.value)
+            return self._render_literal(ir)
 
         if type(ir) is llir.QualifiedName:
             if type(ir.namespace) is not str or not ir.namespace.isidentifier():
@@ -534,6 +539,38 @@ class LLIRLowerer:
         raise CodegenError(
             f"No C++ codegen implemented for LLIR expression type: {type(ir).__name__}"
         )
+
+    def _render_literal(self, ir: llir.Literal) -> str:
+        if type(ir.value) not in (bool, int, float, str):
+            raise CodegenError("Literal.value must be a bool, int, float, or string")
+        if type(ir.data_type) is not llir.DataType:
+            raise CodegenError("Literal.data_type must be a DataType")
+        if type(ir.value) is str and ir.data_type is llir.DataType.STRING:
+            return self._render_string_literal(ir.value)
+        if type(ir.value) is bool and ir.data_type is llir.DataType.BOOL:
+            return "true" if ir.value else "false"
+        return str(ir.value)
+
+    def _render_string_literal(self, value: str) -> str:
+        """Render a semantic STRING literal as a quoted, escaped C++ string.
+
+        Only printable ASCII and the exact escape table are accepted; any
+        other character fails closed instead of guessing a C++ spelling.
+        """
+        rendered = ['"']
+        for character in value:
+            escaped = self._STRING_LITERAL_ESCAPES.get(character)
+            if escaped is not None:
+                rendered.append(escaped)
+            elif " " <= character <= "~":
+                rendered.append(character)
+            else:
+                raise CodegenError(
+                    "Literal STRING value contains an unsupported character: "
+                    f"{character!r}"
+                )
+        rendered.append('"')
+        return "".join(rendered)
 
     def _render_operand(
         self,

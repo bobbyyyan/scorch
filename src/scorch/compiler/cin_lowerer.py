@@ -718,7 +718,7 @@ class CINLowerer:
                         cond=llir.BinOp(
                             op="!=",
                             left=rhs_llir,
-                            right=llir.Literal(value="0"),
+                            right=llir.Literal(value="0", data_type=llir.DataType.INT),
                         ),
                         then_body=llir_stmts,
                     )
@@ -838,7 +838,10 @@ class CINLowerer:
                             value=llir.FunctionCall(
                                 name=f"coo_workspace_1d<{wksp_ctype.value}, {wksp.dim}>",
                                 args=[
-                                    llir.Literal(value=f"{1024}"),
+                                    llir.Literal(
+                                        value="1024",
+                                        data_type=llir.DataType.INT,
+                                    ),
                                 ],
                             ),
                         )
@@ -856,7 +859,10 @@ class CINLowerer:
                     value=llir.FunctionCall(
                         name=f"coo_workspace<{wksp_ctype.value}, {wksp.dim}>",
                         args=[
-                            llir.Literal(value=f"{1024}"),
+                            llir.Literal(
+                                value="1024",
+                                data_type=llir.DataType.INT,
+                            ),
                             llir.Var(
                                 name="result_shape",
                                 type=llir.DataType.STD_VECTOR_INT,
