@@ -20096,6 +20096,230 @@ remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not
 claimed formally closed without a separate design-requirement audit. Phase 2
 retains its recorded canonical closure.
 
+### Phase-3 typed validation-call ownership complete (2026-07-19)
+
+Only the narrow Phase-3 **C8-C10 typed validation-call ownership** slice is
+complete in this section. It retires the last three `torch_cpp_abi.py`
+`RawStmt` producers by rebuilding `TorchCppKernelABI.emit_validation()` on
+the frozen `FunctionCallStmt` schema and semantic literal emission closed by
+the two audited prerequisites. The exact base is
+`3f3e47bfc8d61d52f5b39e0144ed1f1fd4c352c5` (the tuple-call-rewrite
+correctness commit) and the exact committed candidate is
+`eaefa99bbc1e02dbb1187c731cdce54a5e4a19fc`. Its ordered commits are:
+
+- `41992a2df7720d53c4db4c568fd78aa5350bd59b`,
+  **refactor(compiler): emit typed validation calls**; and
+- `eaefa99bbc1e02dbb1187c731cdce54a5e4a19fc`,
+  **test(compiler): cover typed validation calls**.
+
+No commit was amended, squashed, reordered, or rewritten. The complete
+base/candidate range is five files, 392 insertions, and 55 deletions:
+`torch_cpp_abi.py` in production plus `test_cin_lowerer.py`,
+`test_llir_string_budget.py`, `test_compressed_where_openmp_pass.py`, and
+`test_sparse_prefetch_pass.py`. No CIN, scheduling policy, kernel ABI,
+generated C++ spelling, cache schema, csrc, native ABI, LLIR node, public
+Python API, Phase-3.5, or LoopIR work is part of this slice.
+
+#### Representation, ownership boundary, and helper retirement
+
+`emit_validation()` previously rendered three raw C++ call templates through
+f-strings and the `_cpp_int_vector` string helper. It now returns
+`List[llir.FunctionCallStmt]` built entirely from typed nodes:
+
+- the statement names are the exact qualified spellings
+  `scorch_native::validate_jit_result_shape`,
+  `scorch_native::validate_jit_tensor`, and
+  `scorch_native::validate_jit_extra_tensor`;
+- operation and argument names are `llir.Literal(..., DataType.STRING)`
+  semantic string literals rendered through the audited quoting path;
+- dtype constants are `llir.QualifiedName("torch",
+  get_pytorch_c_dtype_name(...), DataType.TORCH_SCALAR_TYPE)` — the
+  `get_pytorch_c_dtype_str` import is retired, and the map identity
+  `PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE[dtype] == "torch::" + name` keeps the
+  spelling byte-exact;
+- integer metadata vectors are typed `llir.Array` initializer lists built by
+  the new `_int_initializer_list` helper (which replaces `_cpp_int_vector`
+  with the same exact-int-tuple validation): `INT64` elements for the result
+  shape and expected tensor shapes matching the native
+  `std::vector<int64_t>` parameters, and `INT` elements for level-kind and
+  mode-order vectors matching `std::vector<int>`; an empty tuple still emits
+  the exact `{}` spelling;
+- the result rank is `llir.Literal(self.result_rank, DataType.INT64)`
+  matching the native `int64_t expected_rank`; no bool argument exists in
+  the native signatures and none was invented;
+- the by-value handles keep their exact public-argument variable types:
+  `result_shape` and `{name}_shape` are `STD_VECTOR_INT`,
+  `{name}_mode_indices` is `STD_VECTOR_2D_TORCH_TENSOR`, and
+  `{name}_values` is `TORCH_TENSOR`, in unchanged argument order.
+
+Repeated `emit_validation()` calls return structurally equal but separately
+owned statement trees with tuple-owned call arguments; the common walker and
+rewriter accept and detach them through the existing frozen call-statement
+diagnostics without any new LLIR node, parser, or raw-expression escape
+hatch.
+
+The production string/raw budget after this slice: 419 production `Var`
+constructors (the five new validation argument handles); ten direct
+expression strings; 14 known indirect sinks/clones; seven generic string
+rewrites (unchanged); **20 `RawStmt` constructors / 19 semantic producers**
+(`torch_cpp_abi.py` reaches zero); and six `DirectInit` templates. The
+`QualifiedName` budget rises to 12 in `torch_cpp_abi.py` with the two new
+audited name spellings `get_pytorch_c_dtype_name(tensor.dtype)` and
+`get_pytorch_c_dtype_name(self.extra_tensor_dtype)`. The remaining 19
+semantic raw producers are C3-C7/C12-C17 (11), W1/W2/W4/W5 plus the W14
+compatibility fallback (five), D1, S1, and P1.
+
+#### Focused verification and updated structural coverage
+
+The changed-file focused suite ran green in the working tree at the
+candidate: `python -m pytest -q test_codegen.py test_cin_lowerer.py
+test_llir_traversal.py test_llir_string_budget.py
+test_compressed_where_openmp_pass.py test_llir_pass_manager.py
+test_result_write_pass.py test_sparse_prefetch_pass.py` produced
+**1007 passed**. Black reported all five changed files unchanged, Flake8
+zero findings, mypy `Success` on `torch_cpp_abi.py` with line-normalized
+test-file findings byte-identical to the base, and `git diff --check` was
+clean.
+
+New coverage
+(`test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact`,
+`test_kernel_abi_validation_handles_empty_shapes_and_unknown_extents`)
+locks: every emitted node exactly `FunctionCallStmt` and never `RawStmt`;
+exact names, argument order, per-argument node types and `DataType` values;
+tuple ownership; structural equality with fresh per-call ownership and
+frozen-instance rejection; `LLIRWalker` acceptance and `LLIRRewriter`
+detachment with disjoint node identities; byte-exact emission against the
+previous raw spellings; the empty-shape/unknown-extent `{}` form; and
+multiple input and extra tensors. Existing tests were re-pinned rather than
+weakened: the ABI freshness test and post-op full-lowering test now assert
+the structured statements and byte-exact rendered strings (full CIN lowering
+still begins with the three validation calls), the compressed-`Where`
+production test renders the structured prologue, the sparse-prefetch staging
+assertions track validation as call-statement names that must never
+reappear as `RawStmt` at any pass seam, and the qualified-name ownership
+test records the two leading validation dtype constants. The tuple-container
+regressions fixed in `3f3e47b` stay green throughout.
+
+#### Byte-identity capture and chained machine evidence
+
+The authoritative source/build capture ran from `2026-07-20T03:43:44Z`
+through `2026-07-20T03:43:50Z` and exited 0
+(`/Users/bobby/.cache/scorch-codex/tvc-eaefa99/run_capture_gate.sh`, runner
+`f730dc9dcc8e453508805262c06ea7d71dc20fd618d0bc9d0efb40eed0c8177c`), using
+the same logical worktree `/tmp/scorch-phase3-w14-capture-wt`, extension
+path `/tmp/scorch-phase3-w14-capture-extensions`, retained W14 input wrapper
+(`ea6f425a…`), and helper set as the two predecessor slices. Base and
+candidate emissions are byte-identical for the five canonical inputs, the
+42-cell/21-build grid, the workspace pair, and the tiled workspace: every
+diff receipt is zero bytes. Both sides are additionally pinned byte-equal to
+the same seven retained W14 candidate capture hashes (all-COO `53d6faae…`,
+CSR-dense `36a8599c…`, DS `02043a5a…`, DSS `adc0b71f…`, preamble
+`db297157…`, input manifest `1a8a8797…`, grid `26154ccc…`), which chains
+this slice's identity to the W14 native and same-binary A/A evidence on both
+machines; under the byte-identical waiver policy no new generated-kernel
+machine gate is required (structural activation tests were still run,
+below). The representative DS emission's validation prologue is unchanged
+byte-for-byte, e.g. `scorch_native::validate_jit_tensor("evaluate",
+"SparseLeft", SparseLeft_shape, SparseLeft_mode_indices, SparseLeft_values,
+torch::kFloat32, {0, 1}, {0, 1}, {});`. The artifact ledger hashes to
+`c891c8d9558016b04bc08ac52566eba6935e7eb6e634625e1e6352373bb14a80`.
+
+#### Full-suite, quality, and latency verification
+
+The authoritative full non-performance suite ran in the clean detached
+worktree `tvc-eaefa99/worktrees/full` from `2026-07-20T03:45:22Z` through
+`2026-07-20T03:55:55Z` with 12 file-distributed workers and isolated caches,
+producing `2074 passed, 14 skipped, 2 warnings in 632.77s` — exactly the
+semantic-literal predecessor's 2069 plus the three `3f3e47b` tuple-rewrite
+regressions in the base plus this slice's two new tests; pytest and gate
+exits were zero and the log hashes to
+`ce55a695ce65e86d24590f17347748ce4858b704463b460aa4134d29fab9ef94`.
+
+The quality comparison ran from `2026-07-20T03:46:45Z` through
+`2026-07-20T03:47:21Z` over the exact five changed Python files in clean
+base/candidate worktrees: Black `0/0`; Flake8 `0/0` with zero findings;
+mypy `1/1`; strict Sphinx `1/1` with the same 23 inherited warnings; all
+normalized logs and both non-doctree HTML manifests byte-identical
+(`comparison-summary.txt` records every diff exit 0).
+
+The latency gates ran from `2026-07-20T03:56:08Z` through
+`2026-07-20T03:56:18Z` after every other gate was idle, using the W15-style
+prepared input cache (four case-kernel directories plus the compiled
+`kernel_5ec9f1a395b3` input family, prepared before any activation capture
+and byte-identical through every stage — both `cache-files.diff` receipts
+are zero bytes). Unlike the semantic-literal corpus, **every latency case
+activates this slice**: the slice-specific activation helper
+(`capture_tvc_latency_activation.py`,
+`d6fe45148cf57b11c9eef02acd48347e8a7a8a22ddfcbbe2f88ee549511204c9`)
+recorded exactly 6 structured validation-call constructions and 5 semantic
+STRING renders on every case (`small_dense`/`reduction`/`csr_intersection`/
+`sparse_union` identical), zero raw validation constructions anywhere,
+in-process probes green on every case (all-call-statement/never-raw shape,
+tuple ownership, structural equality with fresh ownership, byte-exact
+emission, empty-shape `{}`, rewriter detachment), and exact full
+build-object equality against the retained semantic-literal predecessor
+artifact on all four cases. The activation manifest hashes to
+`e5d4e883e516ce0142636bb3feeb94ca36ef0832e396caec43f70954a9defdf6`.
+
+The candidate-only benchmark (five warmups, 30 samples) produced a
+55,098-byte artifact `latency-eaefa99-m5.json` hashing to
+`4bf5dd2e291ed929b326e4b7fbbe638fed2d0ff9d3638016b4280c8617795340`,
+compared against the retained predecessor artifact
+`sbl-cec5d57/latency-final/latency-cec5d57-m5.json` (`2a6cd686…`) with the
+1.10 investigation threshold. Three categories met the target for both p50
+and p95 (`small_dense` 1.060/1.060, `reduction` 1.042/1.015, `sparse_union`
+1.065/1.089); `csr_intersection` was 1.076 at p50 but crossed at p95 with
+**1.115**, requiring attribution. The attribution (retained under
+`latency-attribution/`) resolves the crossing as cross-session machine
+drift, not slice cost: (1) a candidate self-A/A rerun
+(`latency-eaefa99-m5-rerun.json`, `8f62871b…`) drifted up to 1.050 p50 /
+1.078 p95 against the first run of the *identical* code — and moved further
+from the predecessor, not closer; (2) a same-session base A/A control at
+`3f3e47b` (`latency-3f3e47b-m5-aa.json`, `21155852…`, byte-identical
+emissions to the predecessor by the capture chain) itself measured
+1.029-1.049 p50 / 1.035-1.082 p95 against the retained artifact with no
+slice code present, exhibiting the same-direction offset; and (3) the
+same-session paired comparison — candidate first run against that base
+control — is inside target on every category for both percentiles
+(`small_dense` 1.011/0.979, `reduction` 1.013/0.960, `csr_intersection`
+1.026/1.077, `sparse_union` 1.029/1.034). With build-object equality
+already exact on all four cases, the p95 crossing is attributed to session
+drift and accepted under the compiler-latency policy; no sample was
+discarded.
+
+At documentation time, a read-only hash check reproduced the five protected
+tracked working files exactly:
+
+- `.gitignore`:
+  `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`;
+- `pyproject.toml`:
+  `191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`;
+- `src/scorch/__init__.py`:
+  `5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`;
+- `tests/packaging/smoke_install.py`:
+  `f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`;
+  and
+- `tests/test_scorch/test_resources.py`:
+  `3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+All user-owned untracked autotune, benchmark, GPU/CUDA, SuiteSparse,
+research, scheduler/receipt, scratchpad, test-analysis, tooling, temporary,
+and literal `-` material remained outside both slice commits.
+`COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were not modified.
+
+Only the narrow Phase-3 **C8-C10 typed validation-call ownership** slice is
+complete. `torch_cpp_abi.py` no longer constructs any `RawStmt`; the raw
+budget is 20 constructors / 19 semantic producers. The recommended next
+ownership seam is the W1/W2/W4/W5 workspace lifetime/allocation family
+together with the noncanonical W14 compatibility `RawStmt` fallback — the
+largest remaining raw cluster outside `cin_lowerer.py`'s C-family — followed
+by the remaining C3-C7/C12-C17 lowering seams, D1, S1, and P1, the seven
+generic rewrites, parallel zero-fill typed-pass extraction, and the unified
+exhaustive CxxIR-emission exit review. Phase 3 remains open. Phase 3.5 and
+LoopIR have not begun. Phases 0 and 1 are not claimed formally closed
+without a separate design-requirement audit. Phase 2 retains its recorded
+canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
