@@ -844,6 +844,31 @@ def test_positive_rewrite_scope_covers_calls_raw_nested_loops_and_all_if_bodies(
     assert cast(llir.Var, branch_call.args[0]).name == rewritten
 
 
+def test_function_call_rewrite_preserves_tuple_loop_body() -> None:
+    old = "Input_val[position]"
+    loop = _loop([])
+    loop.body = cast(
+        List[llir.Stmt],
+        (
+            _position_init(),
+            llir.Assign(_var("discover"), _var(old)),
+            llir.FunctionCallStmt(f"consume_{old}", [_var(old)]),
+        ),
+    )
+    source = [loop]
+    before = _snapshot(source)
+
+    output = hoist_dense_pointers(source, _context(("Input_val", "float")))
+
+    output_loop = cast(llir.ForLoop, output[1])
+    assert type(output_loop.body) is tuple
+    rewritten_call = cast(llir.FunctionCallStmt, output_loop.body[1])
+    assert rewritten_call.name == "consume__Input_val_ptr[lane]"
+    assert cast(llir.Var, rewritten_call.args[0]).name == "_Input_val_ptr[lane]"
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
 def test_legacy_rewrite_omits_headers_parallel_regions_and_nested_containers() -> None:
     old = "Input_val[position]"
     nested_header = _loop([], loop_variable="nested")

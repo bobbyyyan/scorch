@@ -6,12 +6,14 @@ outer coordinate panel. This pass lowers that explicit schedule after the CSR
 position/coordinate iterators exist in LLIR.
 """
 
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Dict, List, Optional, Sequence, Tuple, cast
 
 from . import llir
 from .identity import IndexId, SymbolId
 from .llir_traversal import (
     LLIRRewriter,
+    LLIRStatementSequence,
+    LLIRStatementValue,
     LLIRTraversalContext,
     LLIRValue,
     LLIRWalker,
@@ -492,15 +494,15 @@ def _rewrite_expr_access(
     return rewritten, rewriter.rewrite_count
 
 
-def _rewrite_stmt_accesses(
-    stmts: List[llir.Stmt],
+def _rewrite_stmt_access_sequence(
+    stmts: LLIRStatementSequence,
     tensor_id: SymbolId,
     index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
     replacement: llir.Expr,
     *,
     _validated: bool = False,
-) -> int:
+) -> Tuple[LLIRStatementSequence, int]:
     """Rewrite matching tensor accesses without parsing rendered C++ names."""
     if not _validated:
         LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(replacement)
@@ -511,7 +513,9 @@ def _rewrite_stmt_accesses(
             replacement,
         ).walk(cast(LLIRValue, stmts))
     count = 0
-    for stmt_index, stmt in enumerate(stmts):
+    rewritten_stmts: List[LLIRStatementValue] = []
+    for stmt in stmts:
+        rewritten_stmt = stmt
         if isinstance(stmt, llir.VarInit):
             stmt.value, rewritten = _rewrite_expr_access(
                 stmt.value, tensor_id, index_ids, role, replacement
@@ -528,7 +532,7 @@ def _rewrite_stmt_accesses(
             count += lhs_count + rhs_count
         elif isinstance(stmt, llir.ForLoop):
             if stmt.init is not None:
-                count += _rewrite_stmt_accesses(
+                rewritten_init, init_count = _rewrite_stmt_access_sequence(
                     [stmt.init],
                     tensor_id,
                     index_ids,
@@ -536,12 +540,14 @@ def _rewrite_stmt_accesses(
                     replacement,
                     _validated=True,
                 )
+                stmt.init = cast(llir.VarInit, rewritten_init[0])
+                count += init_count
             stmt.cond, cond_count = _rewrite_expr_access(
                 stmt.cond, tensor_id, index_ids, role, replacement
             )
             count += cond_count
             if isinstance(stmt.update, llir.Assign):
-                count += _rewrite_stmt_accesses(
+                rewritten_update, update_count = _rewrite_stmt_access_sequence(
                     [stmt.update],
                     tensor_id,
                     index_ids,
@@ -549,27 +555,33 @@ def _rewrite_stmt_accesses(
                     replacement,
                     _validated=True,
                 )
-            count += _rewrite_stmt_accesses(
-                stmt.body,
+                stmt.update = cast(llir.Assign, rewritten_update[0])
+                count += update_count
+            rewritten_body, body_count = _rewrite_stmt_access_sequence(
+                cast(LLIRStatementSequence, stmt.body),
                 tensor_id,
                 index_ids,
                 role,
                 replacement,
                 _validated=True,
             )
+            stmt.body = cast(List[llir.Stmt], rewritten_body)
+            count += body_count
         elif isinstance(stmt, llir.WhileLoop):
             stmt.cond, cond_count = _rewrite_expr_access(
                 stmt.cond, tensor_id, index_ids, role, replacement
             )
             count += cond_count
-            count += _rewrite_stmt_accesses(
-                stmt.body,
+            rewritten_body, body_count = _rewrite_stmt_access_sequence(
+                cast(LLIRStatementSequence, stmt.body),
                 tensor_id,
                 index_ids,
                 role,
                 replacement,
                 _validated=True,
             )
+            stmt.body = cast(List[llir.Stmt], rewritten_body)
+            count += body_count
         elif isinstance(stmt, llir.IfThenElse):
             if stmt.cond is not None:
                 stmt.cond, cond_count = _rewrite_expr_access(
@@ -585,14 +597,48 @@ def _rewrite_stmt_accesses(
                     rewritten_conditions.append(condition)
                     count += cond_count
                 stmt.cond_list = rewritten_conditions
-            for body in _nested_bodies(stmt):
-                count += _rewrite_stmt_accesses(
-                    body,
+            if stmt.then_body is not None:
+                rewritten_body, body_count = _rewrite_stmt_access_sequence(
+                    cast(LLIRStatementSequence, stmt.then_body),
                     tensor_id,
                     index_ids,
                     role,
                     replacement,
                     _validated=True,
+                )
+                stmt.then_body = cast(List[llir.Stmt], rewritten_body)
+                count += body_count
+            if stmt.else_body is not None:
+                rewritten_body, body_count = _rewrite_stmt_access_sequence(
+                    cast(LLIRStatementSequence, stmt.else_body),
+                    tensor_id,
+                    index_ids,
+                    role,
+                    replacement,
+                    _validated=True,
+                )
+                stmt.else_body = cast(List[llir.Stmt], rewritten_body)
+                count += body_count
+            if stmt.then_body_list is not None:
+                rewritten_branches: List[LLIRStatementSequence] = []
+                for branch in stmt.then_body_list:
+                    rewritten_branch, branch_count = _rewrite_stmt_access_sequence(
+                        cast(LLIRStatementSequence, branch),
+                        tensor_id,
+                        index_ids,
+                        role,
+                        replacement,
+                        _validated=True,
+                    )
+                    rewritten_branches.append(rewritten_branch)
+                    count += branch_count
+                stmt.then_body_list = cast(
+                    List[List[llir.Stmt]],
+                    (
+                        tuple(rewritten_branches)
+                        if type(stmt.then_body_list) is tuple
+                        else rewritten_branches
+                    ),
                 )
         elif isinstance(stmt, llir.FunctionCallStmt):
             rewritten_args = []
@@ -602,17 +648,43 @@ def _rewrite_stmt_accesses(
                 )
                 rewritten_args.append(arg)
                 count += arg_count
-            stmts[stmt_index] = llir.FunctionCallStmt(
+            rewritten_stmt = llir.FunctionCallStmt(
                 name=stmt.name,
                 args=rewritten_args,
             )
+        rewritten_stmts.append(rewritten_stmt)
+    rewritten_sequence: LLIRStatementSequence = (
+        tuple(rewritten_stmts) if type(stmts) is tuple else rewritten_stmts
+    )
     if not _validated:
-        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(cast(LLIRValue, stmts))
+        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(cast(LLIRValue, rewritten_sequence))
+    return rewritten_sequence, count
+
+
+def _rewrite_stmt_accesses(
+    stmts: List[llir.Stmt],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
+    role: llir.TensorAccessRole,
+    replacement: llir.Expr,
+    *,
+    _validated: bool = False,
+) -> int:
+    """Rewrite a mutable statement list and retain the legacy count result."""
+    rewritten, count = _rewrite_stmt_access_sequence(
+        cast(LLIRStatementSequence, stmts),
+        tensor_id,
+        index_ids,
+        role,
+        replacement,
+        _validated=_validated,
+    )
+    stmts[:] = cast(List[llir.Stmt], rewritten)
     return count
 
 
 def _contains_tensor_access(
-    stmts: List[llir.Stmt],
+    stmts: Sequence[llir.Stmt],
     tensor_id: SymbolId,
     index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
@@ -832,13 +904,14 @@ def _apply_heap_result_tile(
             llir.Var(name=tile_inner_name, type=llir.DataType.INT64),
         ),
     )
-    rewritten = _rewrite_stmt_accesses(
-        tile_loop.body,
+    rewritten_body, rewritten = _rewrite_stmt_access_sequence(
+        cast(LLIRStatementSequence, tile_loop.body),
         plan.result_id,
         plan.access_index_ids,
         llir.TensorAccessRole.RESULT_WRITE,
         compact_access,
     )
+    tile_loop.body = cast(List[llir.Stmt], rewritten_body)
     if rewritten == 0:
         raise NotImplementedError(
             "Cannot redirect the selected logical result access to compact storage"
@@ -1134,13 +1207,14 @@ def _apply_relayout(
             llir.Var(pack_inner_name, llir.DataType.INT64),
         ),
     )
-    rewritten = _rewrite_stmt_accesses(
-        row_loop.body,
+    rewritten_body, rewritten = _rewrite_stmt_access_sequence(
+        cast(LLIRStatementSequence, row_loop.body),
         plan.operand_id,
         plan.access_index_ids,
         llir.TensorAccessRole.INPUT_READ,
         packed_read,
     )
+    row_loop.body = cast(List[llir.Stmt], rewritten_body)
     if rewritten == 0:
         raise NotImplementedError(
             "Cannot redirect the selected logical operand access to packed storage"

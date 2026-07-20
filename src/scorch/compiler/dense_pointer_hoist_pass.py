@@ -567,11 +567,11 @@ def _checked_raw_code(
 
 
 def _rewrite_statement_references(
-    statements: Sequence[LLIRStatementValue],
+    statements: LLIRStatementSequence,
     replacements: _ReferenceReplacements,
     context: DensePointerHoistContext,
     path: LLIRPath,
-) -> None:
+) -> LLIRStatementSequence:
     """Apply exactly the broader legacy rewrite scope.
 
     Loop headers, auxiliary parallel bodies, WhileLoop, ForLoopAuto, Function,
@@ -580,8 +580,10 @@ def _rewrite_statement_references(
     of them.
     """
 
+    rewritten: List[LLIRStatementValue] = []
     for index, statement in enumerate(statements):
         statement_path = path + (f"[{index}]",)
+        rewritten_statement = statement
         if type(statement) is llir.Assign:
             assignment = cast(llir.Assign, statement)
             rewritten_target = _rewrite_expression_references(
@@ -611,7 +613,7 @@ def _rewrite_statement_references(
             name = _checked_function_name(call, context, statement_path)
             for old, new in replacements.generated_strings:
                 name = name.replace(old, new)
-            cast(List[LLIRStatementValue], statements)[index] = llir.FunctionCallStmt(
+            rewritten_statement = llir.FunctionCallStmt(
                 name=name,
                 args=_rewrite_expression_sequence(
                     call.args,
@@ -622,35 +624,55 @@ def _rewrite_statement_references(
             )
         elif type(statement) is llir.ForLoop:
             loop = cast(llir.ForLoop, statement)
-            _rewrite_statement_references(
-                loop.body,
-                replacements,
-                context,
-                statement_path + ("body",),
+            loop.body = cast(
+                List[llir.Stmt],
+                _rewrite_statement_references(
+                    cast(LLIRStatementSequence, loop.body),
+                    replacements,
+                    context,
+                    statement_path + ("body",),
+                ),
             )
         elif type(statement) is llir.IfThenElse:
             conditional = cast(llir.IfThenElse, statement)
             if conditional.then_body:
-                _rewrite_statement_references(
-                    conditional.then_body,
-                    replacements,
-                    context,
-                    statement_path + ("then_body",),
-                )
-            if conditional.else_body:
-                _rewrite_statement_references(
-                    conditional.else_body,
-                    replacements,
-                    context,
-                    statement_path + ("else_body",),
-                )
-            if conditional.then_body_list:
-                for branch_index, branch in enumerate(conditional.then_body_list):
+                conditional.then_body = cast(
+                    List[llir.Stmt],
                     _rewrite_statement_references(
-                        branch,
+                        cast(LLIRStatementSequence, conditional.then_body),
                         replacements,
                         context,
-                        statement_path + ("then_body_list", f"[{branch_index}]"),
+                        statement_path + ("then_body",),
+                    ),
+                )
+            if conditional.else_body:
+                conditional.else_body = cast(
+                    List[llir.Stmt],
+                    _rewrite_statement_references(
+                        cast(LLIRStatementSequence, conditional.else_body),
+                        replacements,
+                        context,
+                        statement_path + ("else_body",),
+                    ),
+                )
+            if conditional.then_body_list:
+                rewritten_branches: List[LLIRStatementSequence] = []
+                for branch_index, branch in enumerate(conditional.then_body_list):
+                    rewritten_branches.append(
+                        _rewrite_statement_references(
+                            cast(LLIRStatementSequence, branch),
+                            replacements,
+                            context,
+                            statement_path + ("then_body_list", f"[{branch_index}]"),
+                        )
+                    )
+                if type(conditional.then_body_list) is tuple:
+                    conditional.then_body_list = cast(
+                        List[List[llir.Stmt]], tuple(rewritten_branches)
+                    )
+                else:
+                    conditional.then_body_list = cast(
+                        List[List[llir.Stmt]], rewritten_branches
                     )
         elif type(statement) is llir.RawStmt:
             raw_statement = cast(llir.RawStmt, statement)
@@ -658,6 +680,11 @@ def _rewrite_statement_references(
             for old, new in replacements.generated_strings:
                 code = code.replace(old, new)
             raw_statement.code = code
+        rewritten.append(rewritten_statement)
+
+    if type(statements) is tuple:
+        return tuple(rewritten)
+    return rewritten
 
 
 def _apply_loop_analysis(
@@ -717,14 +744,17 @@ def _apply_loop_analysis(
         loop.body = cast(List[llir.Stmt], tuple(retained))
     else:
         loop.body = cast(List[llir.Stmt], retained)
-    _rewrite_statement_references(
-        loop.body,
-        _ReferenceReplacements(
-            generated_strings=tuple(replacements.items()),
-            structured_accesses=tuple(structured_replacements),
+    loop.body = cast(
+        List[llir.Stmt],
+        _rewrite_statement_references(
+            cast(LLIRStatementSequence, loop.body),
+            _ReferenceReplacements(
+                generated_strings=tuple(replacements.items()),
+                structured_accesses=tuple(structured_replacements),
+            ),
+            context,
+            path + ("body",),
         ),
-        context,
-        path + ("body",),
     )
 
 

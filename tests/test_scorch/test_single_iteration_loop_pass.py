@@ -888,6 +888,33 @@ def test_exact_substring_rewrite_order_and_positive_scope() -> None:
     assert cast(llir.Var, branch_call.args[0]).name == "Arg[root]"
 
 
+def test_function_call_rewrite_preserves_tuple_statement_body() -> None:
+    conditional = llir.IfThenElse(
+        cond=_var("condition"),
+        then_body=cast(
+            List[llir.Stmt],
+            (
+                llir.FunctionCallStmt(
+                    "call_lane]_[lane]_lane tail",
+                    [_var("Argument[lane]")],
+                ),
+            ),
+        ),
+    )
+    source = _program([conditional], loop_variable="lane", base="root")
+
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    rewritten_if = cast(llir.IfThenElse, output[0])
+    assert type(rewritten_if.then_body) is tuple
+    call = cast(llir.FunctionCallStmt, rewritten_if.then_body[0])
+    assert call.name == "call_root]_[root]_root tail"
+    assert cast(llir.Var, call.args[0]).name == "Argument[root]"
+
+
 def test_exact_structured_access_index_is_rewritten_and_reapplication_is_noop() -> None:
     metadata = llir.TensorAccessMetadata(
         access_id=AccessId(31),

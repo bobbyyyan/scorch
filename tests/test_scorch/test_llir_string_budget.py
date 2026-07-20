@@ -1522,14 +1522,14 @@ def test_generic_string_rewrite_compatibility_budget_is_explicit() -> None:
             "stmt.code = stmt.code.replace(old, new)",
         ),
         "dense_pointer_hoist_pass.py": (
-            "cast(List[LLIRStatementValue], statements)[index] = llir.FunctionCallStmt(",
+            "rewritten_statement = llir.FunctionCallStmt(",
             "raw_statement.code = code",
         ),
         "dynamic_vector_access_pass.py": (
             "rewritten.name = self._rewrite_name(rewritten.name)",
         ),
         "single_iteration_loop_pass.py": (
-            "cast(List[LLIRStatementValue], statements)[index] = llir.FunctionCallStmt(",
+            "rewritten_statements[index] = llir.FunctionCallStmt(",
             "raw_statement.code = code",
         ),
     }

@@ -19779,14 +19779,20 @@ reconstruction:
 - `cin_lowerer._rewrite_val_refs` rebuilds the call after its generic
   name rewrite and stores it at its exact statement index;
 - `dense_pointer_hoist_pass._rewrite_statement_references` and
-  `single_iteration_loop_pass._rewrite_statement_references` do the same for
-  the broader legacy rewrite scope, through an exact-list view of the owning
-  statement sequence;
-- `schedule_lowerer._rewrite_stmt_accesses` rebuilds the call with its
-  rewritten arguments at its enumerated index; and
+  `single_iteration_loop_pass._rewrite_statement_references` rebuild their
+  owning statement sequences for the broader legacy rewrite scope;
+- `schedule_lowerer._rewrite_stmt_accesses` rebuilds the owning statement
+  sequence with rewritten call arguments; and
 - the compressed-`Where` workspace-insert rename returns a fresh
   `FunctionCallStmt` for the exact matched name instead of mutating the
   detached copy.
+
+A post-candidate correctness follow-up closed a tuple-container hole in the
+original dense-pointer, single-iteration, and schedule writebacks. A
+`typing.cast(List, sequence)` is not a runtime conversion, so indexing through
+that cast failed when the common LLIR boundary preserved a tuple-valued child.
+Those rewrites now rebuild and reattach every affected statement sequence while
+preserving its exact list/tuple container kind.
 
 The common walker and rewriter now pre-validate call statements exactly as
 they already validated `FunctionCall` expressions, raising the new

@@ -430,6 +430,56 @@ def test_schedule_statement_access_rewrite_counts_and_clones_each_replacement():
     )
 
 
+def test_schedule_statement_access_rewrite_preserves_tuple_bodies() -> None:
+    tensor_id = SymbolId(24)
+    index_ids = (IndexId(25),)
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(26),
+        tensor_id=tensor_id,
+        index_ids=index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    access = llir.ArrayAccess(
+        llir.Var("Input_val", llir.DataType.PTR_FLOAT32),
+        llir.Var("pInput", llir.DataType.INT),
+        metadata,
+    )
+    outer_call = llir.FunctionCallStmt("consume", (access,))
+    inner_call = llir.FunctionCallStmt("consume", (access,))
+    conditional = llir.IfThenElse(
+        cond=llir.Var("enabled", llir.DataType.BOOL),
+        then_body=cast(list[llir.Stmt], (inner_call,)),
+    )
+    statements = [outer_call, conditional]
+    replacement = llir.ArrayAccess(
+        llir.Var("packed_Input", llir.DataType.PTR_FLOAT32),
+        llir.Var("packed_position", llir.DataType.INT),
+    )
+
+    count = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+
+    assert count == 2
+    assert type(statements) is list
+    rewritten_outer = cast(llir.FunctionCallStmt, statements[0])
+    rewritten_conditional = cast(llir.IfThenElse, statements[1])
+    assert rewritten_outer is not outer_call
+    assert type(rewritten_conditional.then_body) is tuple
+    rewritten_inner = cast(llir.FunctionCallStmt, rewritten_conditional.then_body[0])
+    assert rewritten_inner is not inner_call
+    assert LLIRLowerer().lower_llir(rewritten_outer) == (
+        "consume(packed_Input[packed_position]);"
+    )
+    assert LLIRLowerer().lower_llir(rewritten_inner) == (
+        "consume(packed_Input[packed_position]);"
+    )
+
+
 def test_schedule_result_target_rewrite_remains_a_valid_detached_lvalue() -> None:
     tensor_id = SymbolId(31)
     index_ids = (IndexId(32), IndexId(33))
