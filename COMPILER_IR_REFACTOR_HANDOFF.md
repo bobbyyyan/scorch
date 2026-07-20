@@ -19890,6 +19890,206 @@ LoopIR have not begun. Phases 0 and 1 are not claimed formally closed without
 a separate design-requirement audit. Phase 2 retains its recorded canonical
 closure.
 
+### Phase-3 semantic string/bool literal emission complete (2026-07-19)
+
+Only the narrow Phase-3 **semantic string/bool literal emission** slice is
+complete in this section. It is the second and final audited prerequisite for
+the open C8-C10 typed-validation-call ownership review, following the frozen
+`FunctionCallStmt` schema. The exact base is
+`cad7e553a1055a1da764df95356067e288b197d3` (the frozen-call-statement
+documentation commit) and the exact committed candidate is
+`cec5d573fb77c103bcf0300ced9526a1183e35f8`. Its ordered commits are:
+
+- `8ddbb0779f523295ac1350f6867863603c3708aa`,
+  **refactor(compiler): emit semantic string and bool literals**; and
+- `cec5d573fb77c103bcf0300ced9526a1183e35f8`,
+  **test(compiler): cover semantic literal emission**.
+
+No commit was amended, squashed, reordered, or rewritten. The complete
+base/candidate range is three files, 149 insertions, and 10 deletions:
+`codegen.py` and `cin_lowerer.py` in production plus `test_codegen.py`. No
+CIN, scheduling policy, kernel ABI, generated C++ spelling, cache schema,
+csrc, Phase-3.5, or LoopIR work is part of this slice.
+
+#### Emission rule, byte-identity audit, and recharacterized spellings
+
+`LLIRLowerer` previously rendered every `Literal` as `str(value)`, so a str
+value emitted unquoted and a bool emitted Python `True`/`False`. The Literal
+branch of `_render_expression` is now a dedicated `_render_literal` method
+(extracted whole so the emitter's flake8 `max-complexity` budget is
+untouched) with two exact semantic cases: an exact-`str` value whose
+`data_type` is exactly `DataType.STRING` renders through
+`_render_string_literal` as a quoted, escaped C++ string literal — printable
+ASCII passes through, the exact class-level escape table
+`_STRING_LITERAL_ESCAPES` covers backslash, double quote, `\n`, `\t`, and
+`\r`, and every other character (non-printable, control, DEL, non-ASCII)
+fails closed with `CodegenError` rather than guessing a spelling — and an
+exact-`bool` value whose `data_type` is exactly `DataType.BOOL` renders as
+`true`/`false`. Every other value/data-type combination keeps the legacy
+`str(value)` spelling byte-for-byte.
+
+The byte-identity claim was established by audit before the change, not
+assumed. An exhaustive AST walk over `src/scorch` found exactly four
+production `Literal` constructions with str values and zero with bool
+values: `iter_lattice.py` `Literal(value="0.0f",
+data_type=DataType.FLOAT32)` (already an explicitly characterized raw
+spelling, untouched) and three `cin_lowerer.py` sites that carried the
+*defaulted* `STRING` data type — the `filter_zeros` comparison zero
+`Literal(value="0")` and the two COO-workspace capacity arguments
+`Literal(value=f"{1024}")`. Under the new rule those three defaulted-STRING
+sites would have become quoted, so they are recharacterized in the same
+refactor commit with their str values unchanged and an explicit
+`DataType.INT`: emission stays `str(value)` byte-for-byte, and every
+value-inspecting pass predicate was audited to require exact-`int` values
+(`iterator.py` expected-offset check, the `cin_lowerer` prealloc zero check,
+`single_iteration_loop_pass` single-step bound check) while every spelling
+consumer uses `str(expr.value)`, so the data-type recharacterization is
+provably inert. All variable-valued `Literal` producers (`TileSizeVar.size`,
+`tile.width`, ABI slot/level/rank ints) were audited as exact ints.
+Production `STRING`-typed and `BOOL`-typed literal construction is therefore
+zero; the semantic paths exist today only for the forthcoming C8-C10 typed
+validation calls and future producers.
+
+The production string/raw budget is unchanged: 414 production `Var`
+constructors; ten direct expression strings; 14 known indirect sinks/clones;
+seven generic string rewrites; 23 `RawStmt` constructors / 22 semantic
+producers; and six `DirectInit` templates. The characterized raw literal
+spellings are now `"0.0f"`/`FLOAT32` in `iter_lattice.py` and `"0"`,
+`"1024"`/`INT` in `cin_lowerer.py`. The remaining 22 semantic raw producers
+are still C3-C7/C12-C17 (11), W1/W2/W4/W5 plus the W14 compatibility
+fallback (five), C8-C10 (three), D1, S1, and P1.
+
+The focused gate (`run_focused_gate.sh`,
+`0c7662cc3519c5b830d36b7bfa8c208a46ae421c0c224647c56c369d104053df`, evidence
+under `/Users/bobby/.cache/scorch-codex/sbl-cec5d57/focused`) ran from
+`2026-07-20T01:53:54Z` through `2026-07-20T01:54:14Z` and exited 0: 539
+focused tests passed (`test_codegen.py`, `test_cin_lowerer.py`,
+`test_llir_string_budget.py`), Black `0/0`, and Flake8/mypy with equal exits
+and byte-identical normalized findings between the base and candidate
+worktrees. The new coverage exercises quoting (including the empty string
+and an embedded `FunctionCall` argument), every escape-table entry,
+closed-fail rejection of non-ASCII, NUL, ESC, DEL, and BEL characters,
+`true`/`false` emission, and the exact non-semantic combinations that keep
+the legacy spelling, including all three characterized raw spellings. One
+failed focused attempt is retained
+(`focused-failed-attempt1-mypy-message-line-drift`, `2026-07-20T01:53:09Z`
+through `2026-07-20T01:53:30Z`): the inherited mypy `no-redef` finding for
+`cin_lowerer.py` embeds a source line number *inside its message text*
+("already defined on line …"), which drifted by the six lines this slice
+adds above it and escaped the position-prefix normalization. The runner's
+mypy normalization was extended to also normalize in-message "on line N"
+references; this was an evidence-tooling defect, recorded and not counted as
+an acceptance gate.
+
+#### Byte-identity capture and chained machine evidence
+
+The authoritative source/build capture ran from `2026-07-20T01:54:37Z`
+through `2026-07-20T01:54:43Z` and exited 0
+(`/Users/bobby/.cache/scorch-codex/sbl-cec5d57/run_capture_gate.sh`,
+runner `965a00e44ba82f9f9f4de9419654379fca50836ece1bdef8cbe5454a8b7de5fc`),
+using the same logical worktree `/tmp/scorch-phase3-w14-capture-wt`,
+extension path `/tmp/scorch-phase3-w14-capture-extensions`, retained W14
+input wrapper (`ea6f425a…`), and helper set as the frozen-call-statement
+slice. Base and candidate emissions are byte-identical for the five
+canonical inputs, the 42-cell/21-build grid, the workspace pair, and the
+tiled workspace: every diff receipt is zero bytes. The base captures are
+additionally pinned byte-equal to the same seven retained W14 candidate
+capture hashes (all-COO `53d6faae…`, CSR-dense `36a8599c…`, DS `02043a5a…`,
+DSS `adc0b71f…`, preamble `db297157…`, input manifest `1a8a8797…`, grid
+`26154ccc…`), which chains this slice's identity to the W14 native and
+same-binary A/A evidence on both machines; under the byte-identical waiver
+policy no new generated-kernel machine gate is required. The artifact ledger
+hashes to
+`fb886f6d84ff3828d6ac2a9abd474d6e685b74a924ae17341520f466677852cc`.
+
+#### Full-suite, quality, and latency verification
+
+The authoritative full non-performance suite ran in the clean detached
+worktree `sbl-cec5d57/worktrees/full` from `2026-07-20T01:55:12Z` through
+`2026-07-20T02:05:44Z` with 12 file-distributed workers and isolated caches,
+producing `2069 passed, 14 skipped, 2 warnings in 631.82s` — exactly the
+predecessor's 2038 plus this slice's 31 new parametrized cases; pytest and
+gate exits were zero and the log hashes to
+`67708c02d4e048c2f850a54c9c9200f68460e69ec029b43084cf1d80b254e8c9`.
+
+The quality comparison ran from `2026-07-20T02:06:03Z` through
+`2026-07-20T02:06:29Z` over the exact three changed Python files in clean
+base/candidate worktrees: Black `0/0`; Flake8 `1/1` with the same five
+inherited findings; mypy `1/1` with the same 35 inherited errors; strict
+Sphinx `1/1` with the same 23 inherited warnings; all normalized logs and
+both non-doctree HTML manifests byte-identical (the runner carries the same
+in-message mypy line normalization as the focused gate, recorded above).
+
+The latency gates ran from `2026-07-20T02:06:41Z` through
+`2026-07-20T02:06:51Z` after every other gate was idle, using the W15-style
+prepared input cache (four case-kernel directories plus the compiled
+`kernel_5ec9f1a395b3` input family, prepared before any activation capture
+and byte-identical through every stage — both `cache-files.diff` receipts
+are zero bytes). The slice-specific activation helper
+(`capture_sbl_latency_activation.py`,
+`92897b5b01f4896831af4ab492e4df5f57e81e234983daac331ad28bb888b0ea`)
+recorded that the latency corpus **never activates the new semantic paths**:
+zero semantic STRING renders and zero semantic BOOL renders on every case,
+against legacy literal renders of 8/6/20/20 for
+`small_dense`/`reduction`/`csr_intersection`/`sparse_union`. Because corpus
+activation is structurally impossible (production STRING/BOOL construction
+is zero), the helper additionally probes the new paths directly in-process
+on every case — quoted emission, escape-table emission, `true`/`false`,
+both characterized legacy raw spellings, and closed-fail rejection of
+non-ASCII and control characters — and all eight probes pass on all four
+cases, with exact full build-object equality against the retained
+frozen-call-statement predecessor artifact on every case. The activation
+manifest hashes to
+`7bf6f7c94e92c856394991564772ba92dc8d1aaf9704bc15f1e4b5e059733e88`.
+The candidate-only benchmark (five warmups, 30 samples) produced a
+55,071-byte artifact
+(`latency-cec5d57-m5.json`) hashing to
+`2a6cd6867d2c7a8b580f81951ff98d946a9a993080cf80d29756115b14375b48`,
+compared against the retained predecessor artifact
+`fcs-3f6f119/latency-final/latency-7bdc187-m5.json`
+(`e6c38d1120746dfe105328d97725d5711a3d1b4f90a7bc9aba5cde9b50a2d889`); every
+endpoint category met the 1.10 target for both p50 and p95 (`small_dense`
+1.022/1.007, `reduction` 1.041/1.066, `csr_intersection` 1.016/1.049,
+`sparse_union` 1.017/1.036) with zero crossings, so no attribution was
+required. No samples were discarded or rerun.
+
+At documentation time, a read-only hash check reproduced the five protected
+tracked working files exactly:
+
+- `.gitignore`:
+  `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`;
+- `pyproject.toml`:
+  `191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`;
+- `src/scorch/__init__.py`:
+  `5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`;
+- `tests/packaging/smoke_install.py`:
+  `f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`;
+  and
+- `tests/test_scorch/test_resources.py`:
+  `3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+Ignored/untracked `AGENTS.md` remains outside compiler commits at
+`52f54c83057325852d44367eea276fa9f66887ca8cf8fd4e26514fd8ca77ae87`. All
+user-owned untracked autotune, benchmark, GPU/CUDA, SuiteSparse, research,
+scheduler/receipt, scratchpad, test-analysis, tooling, temporary, and
+literal `-` material remained outside both slice commits.
+`COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were not modified.
+
+Only the narrow Phase-3 **semantic string/bool literal emission** slice is
+complete. Both audited prerequisites of the C8-C10 typed-validation-call
+ownership review (the frozen `FunctionCallStmt` schema and semantic literal
+emission) are now closed, so the C8-C10 replacement — `FunctionCallStmt`
+with typed `Array` initializer lists, `QualifiedName` dtypes, STRING-literal
+names, and int-literal ranks, byte-exact against the three raw spellings,
+retiring the budget from 23 to 20 `RawStmt` constructors — is unblocked as
+the next slice. The noncanonical W14 compatibility `RawStmt`, W1/W2/W4/W5
+workspace lifetime/allocation work, remaining Torch/generalized allocation
+seams, the seven generic rewrites, parallel zero-fill typed-pass extraction,
+and the unified exhaustive CxxIR-emission exit review remain open. Phase 3
+remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not
+claimed formally closed without a separate design-requirement audit. Phase 2
+retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
