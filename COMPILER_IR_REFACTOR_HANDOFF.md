@@ -19739,6 +19739,157 @@ review is not. Phase 3 remains open. Phase 3.5 and LoopIR have not begun.
 Phases 0 and 1 are not claimed formally closed without a separate
 design-requirement audit. Phase 2 retains its recorded canonical closure.
 
+### Phase-3 frozen call-statement schema complete (2026-07-19)
+
+Only the narrow Phase-3 **frozen `FunctionCallStmt` schema** slice is complete
+in this section. It is the first of the audited prerequisites for the open
+C8-C10 typed-validation-call ownership review, which also still requires
+semantic string/bool literal emission. The exact base is
+`136b9ff1f76a0cc9a065f098b9eeb97be923e000` (the W14 documentation commit) and
+the exact committed candidate is
+`7bdc187c53ee726ad5cb7c8823e91ccacebb2947`. Its ordered commits are:
+
+- `b5d5bfd8df10defd14d956ab35f8adc5776c756a`,
+  **refactor(compiler): freeze call-statement schema**;
+- `3f6f11936fed7159a1b6f28cb598f41063501127`,
+  **test(compiler): cover frozen call statements**; and
+- `7bdc187c53ee726ad5cb7c8823e91ccacebb2947`,
+  **test(compiler): align pipeline workspace-name coverage**.
+
+No commit was amended, squashed, reordered, or rewritten. The complete
+base/candidate range is 13 files, 160 insertions, and 39 deletions: `llir.py`,
+`llir_traversal.py`, `cin_lowerer.py`, `dense_pointer_hoist_pass.py`,
+`single_iteration_loop_pass.py`, `schedule_lowerer.py`, and
+`compressed_where_openmp_pass.py` in production, plus six focused test files.
+No CIN, scheduling policy, kernel ABI, generated C++ spelling, cache schema,
+csrc, Phase-3.5, or LoopIR work is part of this slice.
+
+#### Representation, conversion, and diagnostics
+
+`FunctionCallStmt` was the last mutable call construct: a plain class holding
+a caller-owned mutable argument list with no validation. It is now an
+immutable frozen dataclass mirroring the frozen `FunctionCall` expression:
+tuple-owned arguments, a non-empty exact-`str` name, exact `list`/`tuple`
+argument containers with only LLIR expressions admitted, an empty-tuple
+default, and structural equality/hash.
+
+The five in-place production mutation sites were converted to detached
+reconstruction:
+
+- `cin_lowerer._rewrite_val_refs` rebuilds the call after its generic
+  name rewrite and stores it at its exact statement index;
+- `dense_pointer_hoist_pass._rewrite_statement_references` and
+  `single_iteration_loop_pass._rewrite_statement_references` do the same for
+  the broader legacy rewrite scope, through an exact-list view of the owning
+  statement sequence;
+- `schedule_lowerer._rewrite_stmt_accesses` rebuilds the call with its
+  rewritten arguments at its enumerated index; and
+- the compressed-`Where` workspace-insert rename returns a fresh
+  `FunctionCallStmt` for the exact matched name instead of mutating the
+  detached copy.
+
+The common walker and rewriter now pre-validate call statements exactly as
+they already validated `FunctionCall` expressions, raising the new
+traversal-owned diagnostics `invalid_function_call_stmt_name` and
+`invalid_function_call_stmt_args` with exact node paths before any
+reconstruction can reach the validating constructor. Pass-owned name checks
+remain as retained defense but are no longer reachable through the public
+entries, so the focused pipeline, compressed-`Where`, and single-iteration
+tests now expect the traversal diagnostics at their full body paths and forge
+malformed nodes past the constructor where pass rejection is the subject.
+
+The production string/raw budget is unchanged: 414 production `Var`
+constructors; ten direct expression strings; 14 known indirect sinks/clones;
+seven generic string rewrites (the two `call.name` write-back markers are
+re-pinned to their reconstruction spellings, and the compressed-`Where` exact
+rename is re-pinned to its fresh-construction spelling; no rewrite was added
+or retired); 23 `RawStmt` constructors / 22 semantic producers; and six
+`DirectInit` templates. The remaining 22 semantic raw producers are still
+C3-C7/C12-C17 (11), W1/W2/W4/W5 plus the W14 compatibility fallback (five),
+C8-C10 (three), D1, S1, and P1.
+
+#### Byte-identity capture and retained evidence-tooling failures
+
+The authoritative source/build capture ran from `2026-07-20T00:40:50Z`
+through `2026-07-20T00:40:56Z` and exited 0
+(`/Users/bobby/.cache/scorch-codex/fcs-3f6f119/run_capture_gate.sh`,
+runner `bda0d7a08340fe61270065c58e9e3732f9279b4221431d6606f32fd7f186ffeb`).
+Base and candidate emissions are byte-identical for the five canonical
+inputs, the 42-cell/21-build grid, the workspace pair, and the tiled
+workspace: every diff receipt is zero bytes. The base captures are
+additionally pinned byte-equal to the retained W14 candidate captures
+(all-COO `53d6faae…`, CSR-dense `36a8599c…`, DS `02043a5a…`, DSS
+`adc0b71f…`, preamble `db297157…`, input manifest `1a8a8797…`, grid
+`26154ccc…`), which chains this slice's identity to the W14 native and
+same-binary A/A evidence on both machines; under the byte-identical waiver
+policy no new generated-kernel machine gate is required. The artifact ledger
+hashes to
+`91720fa16a679d630883b5aa6708afb5ea6360ffd10c10acd15bc392fac94a2e`.
+
+Two failed capture attempts are retained. The first
+(`capture-gate-failed-attempt1-canonical-helper-pins`) invoked the canonical
+inputs helper directly, whose embedded per-source expectations predate W14;
+the second (`capture-gate-failed-attempt2-extension-path-identity`) used a
+slice-specific extension-cache path, which changes the path-sensitive
+manifests. The corrected runner captures inputs through the retained W14
+wrapper (`ea6f425a…`) at the same logical worktree and extension paths as
+W14. Both failures were evidence-tooling defects, not compiler defects. A
+diagnostic full-suite and capture run at intermediate commit `3f6f119` is
+also retained (`full-suite-diagnostic-3f6f119`,
+`capture-gate-diagnostic-3f6f119`); its single test failure was the pipeline
+workspace-name expectation aligned by `7bdc187` and is not counted as an
+acceptance gate.
+
+#### Full-suite, quality, and latency verification
+
+The authoritative full non-performance suite ran in a clean detached
+worktree from `2026-07-20T00:41:04Z` through `2026-07-20T00:51:15Z` with 12
+file-distributed workers and isolated caches, producing
+`2038 passed, 14 skipped, 2 warnings in 610.80s`; pytest and gate exits were
+zero and the log hashes to
+`f8e47ad9bda3f92e15dee0452759417602841afe3d49e9770485266fc00b8bdc`.
+
+The quality comparison ran from `2026-07-20T00:51:36Z` through
+`2026-07-20T00:52:03Z` over the exact thirteen changed Python files in clean
+base/candidate worktrees: Black `0/0`; Flake8 `1/1` with the same four
+inherited findings; mypy `1/1` with the same 44 inherited errors; strict
+Sphinx `1/1` with the same 23 inherited warnings; all normalized logs
+byte-identical. A retained first attempt
+(`quality-sphinx-failed-attempt1-file-list`) failed only its changed-file
+inventory before `7bdc187`'s test file was listed.
+
+The latency gates ran from `2026-07-20T00:52:10Z` through
+`2026-07-20T00:52:20Z` after every other gate was idle, using the W15-style
+prepared input cache (four case-kernel directories plus the compiled
+`kernel_5ec9f1a395b3` input family, byte-identical through every stage).
+Unlike the W14 corpus, every latency case activates this slice: the
+activation capture recorded exact frozen-constructor activity of 3/3/6/14
+`FunctionCallStmt` constructions for `small_dense`/`reduction`/
+`csr_intersection`/`sparse_union`, walker/rewriter visits of 1/1 on the two
+workspace-free cases, an in-flight frozen-instance mutation rejection on
+every case, and exact full build-object equality with the retained W14
+predecessor artifact (`a581a49b…`) on all four cases. The activation
+manifest hashes to
+`301feaa29c1c49ee2ce843665212752f373cabf3d82b78095fbdb330c99b99eb`.
+The candidate-only benchmark (five warmups, 30 samples) produced a
+54,935-byte artifact hashing to
+`e6c38d1120746dfe105328d97725d5711a3d1b4f90a7bc9aba5cde9b50a2d889`; every
+endpoint category met the 1.10 target for both p50 and p95 (`small_dense`
+1.031/1.024, `reduction` 1.028/0.978, `csr_intersection` 1.023/1.012,
+`sparse_union` 1.019/1.035) with zero crossings, so no attribution was
+required.
+
+Only the narrow Phase-3 **frozen `FunctionCallStmt` schema** slice is
+complete. C8-C10 typed validation calls still require semantic string/bool
+literal emission before their ownership review; the noncanonical W14
+compatibility `RawStmt`, W1/W2/W4/W5 workspace lifetime/allocation work,
+remaining Torch/generalized allocation seams, the seven generic rewrites,
+parallel zero-fill typed-pass extraction, and the unified exhaustive
+CxxIR-emission exit review remain open. Phase 3 remains open. Phase 3.5 and
+LoopIR have not begun. Phases 0 and 1 are not claimed formally closed without
+a separate design-requirement audit. Phase 2 retains its recorded canonical
+closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
