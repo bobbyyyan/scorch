@@ -796,6 +796,102 @@ def test_codegen_rejects_forged_literal_fields(
         LLIRLowerer().lower_llir(literal)
 
 
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
+        (llir.Literal("name", llir.DataType.STRING), '"name"'),
+        (llir.Literal("", llir.DataType.STRING), '""'),
+        (llir.Literal("kernel_5ec9", llir.DataType.STRING), '"kernel_5ec9"'),
+        (llir.Literal('quote " inside', llir.DataType.STRING), '"quote \\" inside"'),
+        (llir.Literal("back\\slash", llir.DataType.STRING), '"back\\\\slash"'),
+        (llir.Literal("line\nbreak", llir.DataType.STRING), '"line\\nbreak"'),
+        (llir.Literal("tab\tstop", llir.DataType.STRING), '"tab\\tstop"'),
+        (llir.Literal("carriage\rreturn", llir.DataType.STRING), '"carriage\\rreturn"'),
+        (
+            llir.Literal("spaces, punctuation; (x <= ~y)!", llir.DataType.STRING),
+            '"spaces, punctuation; (x <= ~y)!"',
+        ),
+        (
+            llir.FunctionCall(
+                "validate",
+                (llir.Literal("result", llir.DataType.STRING),),
+            ),
+            'validate("result")',
+        ),
+    ),
+)
+def test_semantic_string_literal_codegen_is_quoted_and_byte_exact(
+    expression: llir.Expr,
+    expected: str,
+) -> None:
+    assert LLIRLowerer().lower_llir(expression) == expected
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
+        (llir.Literal(True), "true"),
+        (llir.Literal(False), "false"),
+        (llir.Literal(True, llir.DataType.BOOL), "true"),
+        (llir.Literal(False, llir.DataType.BOOL), "false"),
+        (
+            llir.BinOp("&&", llir.Literal(True), llir.Literal(False)),
+            "true && false",
+        ),
+    ),
+)
+def test_semantic_bool_literal_codegen_is_byte_exact(
+    expression: llir.Expr,
+    expected: str,
+) -> None:
+    assert LLIRLowerer().lower_llir(expression) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "café",
+        "π",
+        "null\x00byte",
+        "escape\x1bcode",
+        "delete\x7fcharacter",
+        "bell\acharacter",
+    ),
+)
+def test_semantic_string_literal_rejects_unsupported_characters(
+    value: str,
+) -> None:
+    with pytest.raises(CodegenError, match="unsupported character"):
+        LLIRLowerer().lower_llir(llir.Literal(value, llir.DataType.STRING))
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
+        # The characterized raw spellings: a str value is quoted only when the
+        # data type is exactly STRING, so explicit non-STRING raw spellings
+        # keep their legacy unquoted emission.
+        (llir.Literal("0.0f", llir.DataType.FLOAT32), "0.0f"),
+        (llir.Literal("0", llir.DataType.INT), "0"),
+        (llir.Literal("1024", llir.DataType.INT), "1024"),
+        # A bool value is spelled true/false only when the data type is
+        # exactly BOOL; a STRING data type quotes only str values.
+        (llir.Literal(True, llir.DataType.INT), "True"),
+        (llir.Literal(False, llir.DataType.INT32), "False"),
+        (llir.Literal(1, llir.DataType.STRING), "1"),
+        (llir.Literal(1, llir.DataType.BOOL), "1"),
+        (llir.Literal(0), "0"),
+        (llir.Literal(-3), "-3"),
+        (llir.Literal(1.5), "1.5"),
+    ),
+)
+def test_nonsemantic_literal_combinations_keep_legacy_spelling(
+    expression: llir.Expr,
+    expected: str,
+) -> None:
+    assert LLIRLowerer().lower_llir(expression) == expected
+
+
 def test_codegen_rejects_unknown_binary_children() -> None:
     class UnknownExpr(llir.Expr):
         pass
