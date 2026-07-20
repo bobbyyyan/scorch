@@ -5792,6 +5792,146 @@ def test_cin_value_reference_rewrite_rebuilds_zero_fill_children() -> None:
     )
 
 
+def test_dense_workspace_write_back_copy_is_structured_and_byte_exact() -> None:
+    first = CINLowerer().lower_IndexStmt(_dense_workspace_zero_fill_cin())
+    second = CINLowerer().lower_IndexStmt(_dense_workspace_zero_fill_cin())
+
+    def is_memcpy(stmt: llir.Stmt) -> bool:
+        return type(stmt) is llir.FunctionCallStmt and stmt.name == "memcpy"
+
+    copies = _collect_matching_statements(first, is_memcpy)
+    assert len(copies) == 1
+
+    copy = cast(llir.FunctionCallStmt, copies[0])
+    assert type(copy.args) is tuple
+    assert len(copy.args) == 3
+    destination, source, byte_count = copy.args
+
+    assert type(destination) is llir.AddressOf
+    row_slot = cast(llir.ArrayAccess, destination.operand)
+    assert type(row_slot) is llir.ArrayAccess
+    values = cast(llir.Var, row_slot.array)
+    assert type(values) is llir.Var
+    assert values.name == "C_values"
+    assert values.type is llir.DataType.PTR_FLOAT32
+    row_start = cast(llir.Mul, row_slot.index)
+    assert type(row_start) is llir.Mul
+    assert type(row_start.left) is llir.Var
+    assert cast(llir.Var, row_start.left).name == "pC0"
+    assert cast(llir.Var, row_start.left).type is llir.DataType.INT64
+    assert type(row_start.right) is llir.Var
+    assert cast(llir.Var, row_start.right).name == "C1_size"
+    assert cast(llir.Var, row_start.right).type is llir.DataType.INT64
+
+    assert type(source) is llir.Var
+    assert cast(llir.Var, source).name == "wksp"
+    assert cast(llir.Var, source).type is llir.DataType.PTR_FLOAT32
+
+    assert type(byte_count) is llir.Mul
+    count = cast(llir.Mul, byte_count)
+    assert type(count.left) is llir.Var
+    assert cast(llir.Var, count.left).name == "wksp0_size"
+    assert cast(llir.Var, count.left).type is llir.DataType.INT64
+    assert type(count.right) is llir.Sizeof
+    assert cast(llir.Sizeof, count.right).data_type is llir.DataType.FLOAT32
+
+    def is_raw(stmt: llir.Stmt) -> bool:
+        return type(stmt) is llir.RawStmt
+
+    for raw in _collect_matching_statements(first, is_raw):
+        assert "memcpy" not in cast(llir.RawStmt, raw).code
+
+    assert LLIRLowerer().lower_llir(copy) == (
+        "memcpy(&C_values[pC0 * C1_size], wksp, wksp0_size * sizeof(float));"
+    )
+    cpp = LLIRLowerer().lower_llir(first)
+    assert (
+        cpp.count("memcpy(&C_values[pC0 * C1_size], wksp, wksp0_size * sizeof(float));")
+        == 1
+    )
+    # The write-back copy stays after the accumulation loop's memset.
+    assert cpp.index("memset(wksp, 0,") < cpp.index("memcpy(&C_values[")
+
+    second_copy = cast(
+        llir.FunctionCallStmt,
+        _collect_matching_statements(second, is_memcpy)[0],
+    )
+    assert second_copy == copy
+    assert second_copy is not copy
+    assert second_copy.args[0] is not copy.args[0]
+    assert (
+        cast(llir.AddressOf, second_copy.args[0]).operand
+        is not cast(llir.AddressOf, copy.args[0]).operand
+    )
+    assert second_copy.args[1] is not copy.args[1]
+    assert second_copy.args[2] is not copy.args[2]
+
+    rewriter_context = LLIRTraversalContext(
+        stage="write-back test",
+        pass_name="detach",
+    )
+    detached = LLIRRewriter(rewriter_context).rewrite(copy)
+    assert detached == copy
+    assert detached is not copy
+    assert detached.args[0] is not copy.args[0]
+    assert (
+        cast(llir.AddressOf, detached.args[0]).operand
+        is not cast(llir.AddressOf, copy.args[0]).operand
+    )
+    assert detached.args[1] is not copy.args[1]
+    assert detached.args[2] is not copy.args[2]
+
+
+def test_cin_value_reference_rewrite_rebuilds_write_back_children() -> None:
+    source = llir.FunctionCallStmt(
+        name="memcpy",
+        args=(
+            llir.AddressOf(
+                operand=llir.ArrayAccess(
+                    array=llir.Var(name="C_values", type=llir.DataType.PTR_FLOAT32),
+                    index=llir.Mul(
+                        llir.Var(name="pC0", type=llir.DataType.INT64),
+                        llir.Var(name="C1_size", type=llir.DataType.INT64),
+                    ),
+                ),
+            ),
+            llir.Var(name="wksp", type=llir.DataType.PTR_FLOAT32),
+            llir.Mul(
+                llir.Var(name="wksp0_size", type=llir.DataType.INT64),
+                llir.Sizeof(data_type=llir.DataType.FLOAT32),
+            ),
+        ),
+    )
+    statements: list[llir.Stmt] = [source]
+
+    CINLowerer._rewrite_val_refs(statements, {"wksp": "thread_wksp"})
+
+    rewritten = cast(llir.FunctionCallStmt, statements[0])
+    assert type(rewritten) is llir.FunctionCallStmt
+    assert rewritten is not source
+    assert rewritten.name == "memcpy"
+    destination = cast(llir.AddressOf, rewritten.args[0])
+    assert type(destination) is llir.AddressOf
+    assert destination is not source.args[0]
+    row_slot = cast(llir.ArrayAccess, destination.operand)
+    assert cast(llir.Var, row_slot.array).name == "C_values"
+    row_start = cast(llir.Mul, row_slot.index)
+    assert cast(llir.Var, row_start.left).name == "pC0"
+    assert cast(llir.Var, row_start.right).name == "C1_size"
+    assert cast(llir.Var, rewritten.args[1]).name == "thread_wksp"
+    byte_count = cast(llir.Mul, rewritten.args[2])
+    assert cast(llir.Var, byte_count.left).name == "thread_wksp0_size"
+    assert type(byte_count.right) is llir.Sizeof
+    assert cast(llir.Sizeof, byte_count.right).data_type is llir.DataType.FLOAT32
+    assert LLIRLowerer().lower_llir(rewritten) == (
+        "memcpy(&C_values[pC0 * C1_size], thread_wksp, "
+        "thread_wksp0_size * sizeof(float));"
+    )
+    assert LLIRLowerer().lower_llir(source) == (
+        "memcpy(&C_values[pC0 * C1_size], wksp, wksp0_size * sizeof(float));"
+    )
+
+
 def test_nondefault_coo_intersection_keeps_live_coordinate_end_bounds():
     row, column = IndexVar("r"), IndexVar("c")
     result = TensorVar("Intersect", fmt="oo", mode_order=[1, 0])

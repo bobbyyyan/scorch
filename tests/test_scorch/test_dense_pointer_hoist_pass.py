@@ -952,6 +952,51 @@ def test_function_call_rewrite_traverses_product_and_sizeof_arguments() -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
+def test_function_call_rewrite_traverses_addressed_copy_arguments() -> None:
+    old = "Input_val[position]"
+    call = llir.FunctionCallStmt(
+        name="memcpy",
+        args=(
+            llir.AddressOf(operand=_var(old)),
+            _var("workspace", llir.DataType.PTR_FLOAT32),
+            llir.Mul(
+                _var(old),
+                llir.Sizeof(data_type=llir.DataType.FLOAT32),
+            ),
+        ),
+    )
+    loop = _loop(
+        [
+            _position_init(),
+            llir.Assign(_var("discover"), _var(old)),
+            call,
+        ]
+    )
+    source = [loop]
+    before = _snapshot(source)
+
+    output = hoist_dense_pointers(
+        source,
+        _context(("Input_val", "float")),
+    )
+
+    output_loop = cast(llir.ForLoop, output[1])
+    rewritten = cast(llir.FunctionCallStmt, output_loop.body[1])
+    assert rewritten.name == "memcpy"
+    assert type(rewritten.args) is tuple
+    destination = cast(llir.AddressOf, rewritten.args[0])
+    assert type(destination) is llir.AddressOf
+    assert cast(llir.Var, destination.operand).name == "_Input_val_ptr[lane]"
+    workspace = cast(llir.Var, rewritten.args[1])
+    assert workspace.name == "workspace"
+    byte_count = cast(llir.Mul, rewritten.args[2])
+    assert cast(llir.Var, byte_count.left).name == "_Input_val_ptr[lane]"
+    assert type(byte_count.right) is llir.Sizeof
+    assert cast(llir.Sizeof, byte_count.right).data_type is llir.DataType.FLOAT32
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
 def test_legacy_rewrite_omits_headers_parallel_regions_and_nested_containers() -> None:
     old = "Input_val[position]"
     nested_header = _loop([], loop_variable="nested")

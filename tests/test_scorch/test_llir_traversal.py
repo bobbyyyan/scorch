@@ -182,6 +182,7 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
         ),
         llir.Cast: llir.Cast(value, llir.DataType.INT64),
         llir.Sizeof: llir.Sizeof(llir.DataType.INT64),
+        llir.AddressOf: llir.AddressOf(llir.ArrayAccess(value, index)),
     }
 
 
@@ -220,6 +221,7 @@ def _node_emissions() -> Dict[Type[llir.Node], str]:
         llir.IfThenElse: "if (value) {\n  break;\n} else {\n  continue;\n}",
         llir.Cast: "(int64_t) value",
         llir.Sizeof: "sizeof(int64_t)",
+        llir.AddressOf: "&value[index]",
     }
 
 
@@ -1215,6 +1217,94 @@ def test_nested_zero_fill_sizeof_reports_exact_traversal_path(
         "right",
         "data_type",
     )
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize("malformation", ("invalid", "missing"))
+def test_forged_address_of_operand_fails_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+) -> None:
+    expression = object.__new__(llir.AddressOf)
+    if malformation == "invalid":
+        object.__setattr__(expression, "operand", "C_values")
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.code == "invalid_address_of_operand"
+    assert raised.value.diagnostic.path == ("root", "operand")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_nested_write_back_address_of_reports_exact_traversal_path(
+    operation: str,
+) -> None:
+    expression = object.__new__(llir.AddressOf)
+    object.__setattr__(expression, "operand", "C_values")
+    write_back = llir.FunctionCallStmt(
+        "memcpy",
+        (
+            expression,
+            _var("workspace"),
+            llir.Mul(_var("size"), llir.Sizeof(llir.DataType.FLOAT32)),
+        ),
+    )
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(write_back)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(write_back)
+
+    assert raised.value.diagnostic.code == "invalid_address_of_operand"
+    assert raised.value.diagnostic.path == (
+        "root",
+        "args",
+        "[0]",
+        "operand",
+    )
+
+
+def test_addressed_copy_walker_has_deterministic_preorder() -> None:
+    write_back = llir.FunctionCallStmt(
+        "memcpy",
+        (
+            llir.AddressOf(
+                operand=llir.ArrayAccess(
+                    array=_var("C_values", llir.DataType.PTR_FLOAT32),
+                    index=llir.Mul(
+                        _var("pC0", llir.DataType.INT64),
+                        _var("C1_size", llir.DataType.INT64),
+                    ),
+                ),
+            ),
+            _var("wksp", llir.DataType.PTR_FLOAT32),
+            llir.Mul(
+                _var("wksp0_size", llir.DataType.INT64),
+                llir.Sizeof(llir.DataType.FLOAT32),
+            ),
+        ),
+    )
+
+    expected = [
+        "FunctionCallStmt",
+        "AddressOf",
+        "ArrayAccess",
+        "Var:C_values",
+        "Mul",
+        "Var:pC0",
+        "Var:C1_size",
+        "Var:wksp",
+        "Mul",
+        "Var:wksp0_size",
+        "Sizeof",
+    ]
+    assert _record(write_back) == expected
+    assert _record(write_back) == expected
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])

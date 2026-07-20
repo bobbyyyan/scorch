@@ -984,6 +984,45 @@ def test_function_call_rewrite_traverses_product_and_sizeof_arguments() -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
+def test_function_call_rewrite_traverses_addressed_copy_arguments() -> None:
+    call = llir.FunctionCallStmt(
+        name="memcpy",
+        args=(
+            llir.AddressOf(operand=_access("Receivers", "lane")),
+            _var("workspace", llir.DataType.PTR_FLOAT32),
+            llir.Mul(
+                _var("Payload[lane]"),
+                llir.Sizeof(data_type=llir.DataType.INT64),
+            ),
+        ),
+    )
+    source = _program([call], loop_variable="lane", base="root")
+    before = _snapshot(source)
+
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert len(output) == 1
+    rewritten = cast(llir.FunctionCallStmt, output[0])
+    assert rewritten.name == "memcpy"
+    assert type(rewritten.args) is tuple
+    destination = cast(llir.AddressOf, rewritten.args[0])
+    assert type(destination) is llir.AddressOf
+    row_slot = cast(llir.ArrayAccess, destination.operand)
+    assert cast(llir.Var, row_slot.array).name == "Receivers"
+    assert cast(llir.Var, row_slot.index).name == "root"
+    workspace = cast(llir.Var, rewritten.args[1])
+    assert workspace.name == "workspace"
+    byte_count = cast(llir.Mul, rewritten.args[2])
+    assert cast(llir.Var, byte_count.left).name == "Payload[root]"
+    assert type(byte_count.right) is llir.Sizeof
+    assert cast(llir.Sizeof, byte_count.right).data_type is llir.DataType.INT64
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
 def test_exact_structured_access_index_is_rewritten_and_reapplication_is_noop() -> None:
     metadata = llir.TensorAccessMetadata(
         access_id=AccessId(31),

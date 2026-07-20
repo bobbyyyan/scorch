@@ -678,6 +678,110 @@ def test_codegen_rejects_forged_sizeof_data_type(
         LLIRLowerer().lower_llir(ir)
 
 
+def _forged_address_of(operand: object) -> llir.AddressOf:
+    expression = object.__new__(llir.AddressOf)
+    object.__setattr__(expression, "operand", operand)
+    return expression
+
+
+def _write_back_destination() -> llir.AddressOf:
+    return llir.AddressOf(
+        operand=llir.ArrayAccess(
+            array=llir.Var(name="C_values", type=llir.DataType.PTR_FLOAT32),
+            index=llir.Mul(
+                llir.Var(name="pC0", type=llir.DataType.INT64),
+                llir.Var(name="C1_size", type=llir.DataType.INT64),
+            ),
+        ),
+    )
+
+
+def test_address_of_is_frozen_typed_and_structurally_equal() -> None:
+    operand = llir.ArrayAccess(_var("values"), _var("position"))
+    expression = llir.AddressOf(operand)
+    equal = llir.AddressOf(llir.ArrayAccess(_var("values"), _var("position")))
+
+    assert expression.operand is operand
+    assert expression == equal
+    assert hash(expression) == hash(equal)
+    assert expression != llir.AddressOf(_var("values"))
+    assert get_type_hints(llir.AddressOf) == {"operand": llir.Expr}
+
+    with pytest.raises(FrozenInstanceError):
+        expression.operand = _var("other")
+
+
+def test_address_of_rejects_malformed_constructor_operand() -> None:
+    with pytest.raises(TypeError, match="AddressOf.operand must be an LLIR Expr"):
+        llir.AddressOf(cast(llir.Expr, "C_values"))
+
+
+def test_codegen_renders_addressed_expressions_byte_exact() -> None:
+    lowerer = LLIRLowerer()
+
+    assert lowerer.lower_llir(_write_back_destination()) == ("&C_values[pC0 * C1_size]")
+    assert lowerer.lower_llir(llir.AddressOf(_var("wksp"))) == "&wksp"
+    assert (
+        lowerer.lower_llir(llir.AddressOf(llir.Add(_var("base"), _var("offset"))))
+        == "&(base + offset)"
+    )
+
+    copy = llir.FunctionCallStmt(
+        "memcpy",
+        (
+            _write_back_destination(),
+            llir.Var(name="wksp", type=llir.DataType.PTR_FLOAT32),
+            llir.Mul(
+                llir.Var(name="wksp0_size", type=llir.DataType.INT64),
+                llir.Sizeof(llir.DataType.FLOAT32),
+            ),
+        ),
+    )
+    assert lowerer.lower_llir(copy) == (
+        "memcpy(&C_values[pC0 * C1_size], wksp, wksp0_size * sizeof(float));"
+    )
+
+
+@pytest.mark.parametrize("malformation", ("invalid", "missing"))
+@pytest.mark.parametrize("nested_in_write_back", (False, True))
+def test_codegen_rejects_forged_address_of_operand(
+    malformation: str,
+    nested_in_write_back: bool,
+) -> None:
+    expression = (
+        _forged_address_of("C_values")
+        if malformation == "invalid"
+        else object.__new__(llir.AddressOf)
+    )
+    ir: llir.Expr | llir.Stmt = expression
+    if nested_in_write_back:
+        ir = llir.FunctionCallStmt(
+            "memcpy",
+            (
+                expression,
+                _var("workspace"),
+                llir.Mul(_var("size"), llir.Sizeof(llir.DataType.FLOAT32)),
+            ),
+        )
+
+    with pytest.raises(CodegenError, match="AddressOf.operand must be an LLIR Expr"):
+        LLIRLowerer().lower_llir(ir)
+
+
+def test_assign_rejects_address_of_subscript_index() -> None:
+    with pytest.raises(
+        TypeError,
+        match="assignment ArrayAccess.index contains an unsupported LLIR expression",
+    ):
+        llir.Assign(
+            var=llir.ArrayAccess(
+                _var("values"),
+                llir.AddressOf(_var("position")),
+            ),
+            value=llir.Literal(1),
+        )
+
+
 def test_binary_and_literal_nodes_are_frozen_typed_structural_values() -> None:
     left = _var("i")
     one = llir.Literal(1, llir.DataType.INT64)

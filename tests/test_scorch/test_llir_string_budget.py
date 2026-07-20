@@ -125,7 +125,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 142,
+        "cin_lowerer.py": 147,
         "compressed_where_openmp_pass.py": 16,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -138,10 +138,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 423
+    assert sum(constructor_counts.values()) == 428
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 134,
+        "cin_lowerer.py": 139,
         "compressed_where_openmp_pass.py": 16,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -154,13 +154,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 413
+    assert sum(unclassified_counts.values()) == 418
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 1,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
-        ("cin_lowerer.py", "size_var"): 1,
+        ("cin_lowerer.py", "size_var"): 2,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
-        ("cin_lowerer.py", "wname"): 2,
+        ("cin_lowerer.py", "wname"): 3,
         ("compressed_where_openmp_pass.py", "loop_bound"): 1,
         ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -172,7 +172,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 18
+    assert sum(known_indirect.values()) == 20
 
     assert totals == {
         "subscript": 9,
@@ -613,15 +613,15 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
     counts += Counter()
 
     assert counts == {
-        "cin_lowerer.py": 9,
+        "cin_lowerer.py": 8,
         "compressed_where_openmp_pass.py": 3,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 16
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 15
+    assert sum(counts.values()) == 15
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 14
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -683,10 +683,10 @@ def test_dense_workspace_zero_fill_is_structured() -> None:
     )
     sizeof_constructors += Counter()
     assert sizeof_constructors == {
-        "cin_lowerer.py": 1,
+        "cin_lowerer.py": 2,
         "llir_traversal.py": 1,
     }
-    assert sum(sizeof_constructors.values()) == 2
+    assert sum(sizeof_constructors.values()) == 3
 
     lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
     lowerer_source = lowerer_path.read_text()
@@ -718,6 +718,40 @@ def test_dense_workspace_zero_fill_is_structured() -> None:
     assert pools.count("llir.RawStmt(") == 2
     assert pools.count("_thread_count = ") == 1
     assert pools.count("scorch_make_aligned_buffer") == 1
+
+
+def test_dense_workspace_write_back_copy_is_structured() -> None:
+    """Lock the C6 typed template and the global AddressOf budget."""
+
+    address_of_constructors = Counter(
+        {
+            path.name: len(_llir_constructor_calls(path, "AddressOf"))
+            for path in sorted(_COMPILER_ROOT.glob("*.py"))
+        }
+    )
+    address_of_constructors += Counter()
+    assert address_of_constructors == {
+        "cin_lowerer.py": 2,
+        "dense_pointer_hoist_pass.py": 1,
+        "llir_traversal.py": 1,
+        "single_iteration_loop_pass.py": 1,
+    }
+    assert sum(address_of_constructors.values()) == 5
+
+    lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
+    lowerer_source = lowerer_path.read_text()
+    consumer_lowering = lowerer_source.split("def lower_ConsumerIndexStmt", 1)[1].split(
+        "def _prepare_scheduled_cin", 1
+    )[0]
+
+    assert consumer_lowering.count('name="memcpy"') == 1
+    assert consumer_lowering.count("llir.AddressOf(") == 1
+    assert consumer_lowering.count("llir.Sizeof(data_type=wksp_write_ctype)") == 1
+    assert "llir.RawStmt(" not in consumer_lowering
+    assert "memcpy" not in "".join(
+        _static_string_fragments(call)
+        for call in _llir_constructor_calls(lowerer_path, "RawStmt")
+    )
 
 
 def test_compressed_result_assembly_is_owned_by_the_typed_abi_epilogue() -> None:
