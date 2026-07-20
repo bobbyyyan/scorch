@@ -20868,6 +20868,240 @@ retained priming-run description, six-commit accounting, and C3's documented
 relationship to the deferred C6 copy. These corrections do not broaden the
 completed seam or alter the remaining Phase-3 recommendation.
 
+### Phase-3 typed workspace write-back copy complete (2026-07-20)
+
+The Sizeof review corrections documented in the preceding section were
+committed exactly as described, with no amend, squash, or reorder, as:
+
+- `bdde945f1732c53fc7910ca293ee244671c9e8e8`,
+  **fix(compiler): fail closed on malformed Sizeof data_type**;
+- `c03eb8d6cf16e6253dfb19488604c15131822333`,
+  **test(compiler): cover malformed Sizeof boundaries**; and
+- `15e2c824893de3b6139ed460654c7efb99465294`,
+  **docs(compiler): record Sizeof review corrections**.
+
+Before committing, the recorded evidence was reproduced in this session:
+the complete codegen/traversal files produce **576 passed**, Black leaves
+the changed files unchanged, `git diff --check` is clean, scoped Flake8
+retains only the inherited F541, and scoped mypy retains only the three
+dynamic-`ForLoop` findings. The five protected tracked files hashed
+exactly as recorded. Only the six intended files were committed.
+
+On top of that base, only the narrow Phase-3 **C6 typed workspace
+write-back copy** slice is complete in this section. The exact base is
+`15e2c824893de3b6139ed460654c7efb99465294` and the exact committed
+candidate is `772fead9932e9285a5cb910d3ab9c65ed538a1f7`. Its ordered
+commits are:
+
+- `f30891ba979d6f7c863aed418467507b7134cc65`,
+  **refactor(compiler): emit typed workspace write-back copy**; and
+- `772fead9932e9285a5cb910d3ab9c65ed538a1f7`,
+  **test(compiler): cover typed workspace write-back copy**.
+
+The complete base/candidate range is 12 files, 589 insertions, and 29
+deletions: `llir.py`, `llir_traversal.py`, `codegen.py`, `cin_lowerer.py`,
+`dense_pointer_hoist_pass.py`, and `single_iteration_loop_pass.py` in
+production, plus six focused test files. No CIN schema or semantics,
+scheduling policy, kernel ABI, generated C++ spelling, cache schema, csrc,
+native ABI, public Python API, pass order, Phase-3.5, or LoopIR work is
+part of this slice.
+
+#### Audit and seam selection
+
+A fresh read-only audit chose the byte-identical C6 seam over the
+recommended-but-deliberate Cast-spelling normalization, which requires an
+explicit emission-spelling decision plus the full two-machine
+generated-kernel gate and was therefore not selectable for autonomous
+completion in this session:
+
+| Family | Decision |
+| --- | --- |
+| **C6** | **Selected. The dense-workspace write-back `memcpy(&{C}_values[{prev} * {size}], {w}, {n} * sizeof({ctype}))` in `lower_ConsumerIndexStmt` is byte-identically typeable once an address-of spelling exists. `UnaryOp` renders `op operand` with a space, so a new frozen `AddressOf` leaf-parent node was added, rendered `&operand` at unary precedence through the common precedence-aware operand renderer (the postfix `ArrayAccess` operand needs and receives no parentheses). Every other component reuses the existing typed nodes exactly as the C3/C5 memset did.** |
+| D1 | Deferred. The hoisted `const {t}* __restrict__ {p} = &{arr}[{base} * {stride}]` declaration needs a const-qualified pointer declaration form that no typed node renders today (`Var.is_restrict` emission has no `const`). `AddressOf` now covers its initializer expression; the declaration qualification remains the blocking decision. |
+| C4/C16, W1 | Deferred. Unchanged: both embed the spaceless `(size_t)expr` cast spelling — the same W1-class Cast-spelling normalization decision, which changes emitted bytes corpus-wide and mandates the full two-machine generated-kernel gate. |
+| W5/C15 | Deferred behind the policy seam, unchanged. |
+| S1 | Deferred. The prefetch raw statement embeds a single-line `if (...) __builtin_prefetch(&...)` conditional spelling that `IfThenElse` cannot reproduce byte-identically; `AddressOf` now covers its address argument when that seam is audited. |
+| C7/C12-C14/C17 | Not audited this session; they are the natural candidates for the next byte-identical audit. |
+
+#### Representation, ownership boundary, and emission
+
+`llir.AddressOf` is a frozen dataclass with structural value semantics
+whose single `operand` field must be an `Expr` at construction
+(`__post_init__` fail-closed, following the Sizeof review precedent from
+day one). `CINLowerer.lower_ConsumerIndexStmt` constructs, per dense
+contiguous result write-back:
+
+- `llir.FunctionCallStmt("memcpy", (llir.AddressOf(llir.ArrayAccess(
+  <PTR-typed values Var>, llir.Mul(<INT64 row-start Var or Literal 0>,
+  <INT64 level-size Var>))), <PTR-typed workspace Var>,
+  llir.Mul(<INT64 extent Var>, llir.Sizeof(<ctype>))))`, rendered
+  `memcpy(&{C}_values[{prev} * {size}], {w}, {n} * sizeof({ctype}));`.
+
+The level-0 branch types the raw `"0"` spelling as `Literal(0, INT)`; no
+known CIN shape reaches it (a 1-D dense-result probe lowers through the
+element-assign fallback and was byte-identical base/candidate,
+`62362aea…`). The dead `resolve_stmts` assignment at the converted site
+was removed (`get_level_iterator_resolve_stmts` is pure), retiring the
+inherited Flake8 F841 finding there; the two inherited F401 findings in
+`cin_lowerer.py` and the F541 in `codegen.py` remain.
+
+Integration is fail-closed at every consumer. The traversal registry
+(`SUPPORTED_LLIR_EXPRESSION_NODE_TYPES`, which the emission accepted set
+aliases) gains `AddressOf`; the exhaustive declared-node coverage test
+forces the sample, emission, walk, rewrite, and detachment obligations
+structurally. The walker and rewriter share a missing-field-safe
+validator reporting `invalid_address_of_operand` at the exact `operand`
+path; the rewriter rebuilds with a detached rewritten operand. Codegen
+renders at unary precedence and reports `CodegenError` for a forged
+non-Expr or missing operand, direct or nested. The CIN value-reference
+rewrite, dense-pointer hoist, and single-iteration elimination gained
+explicit `AddressOf` recursion so the typed destination receives exactly
+the reference-rewrite treatment the raw string received; the schedule
+tensor-access rewrite inherits traversal from the common rewriter. The
+assignment-index subset does not admit `AddressOf` and stays fail-closed.
+
+The production string/raw budget after this slice: **428 production
+`Var` constructors** (unclassified 418; known indirect sinks/clones
+**20**, with `wname` at three and `size_var` at two typed sites); ten
+direct expression strings (unchanged); seven generic string rewrites
+(unchanged); **15 `RawStmt` constructors / 14 semantic producers**
+(`cin_lowerer.py` drops from nine to eight); six `DirectInit` templates
+(unchanged); the `MemberCallStmt` budget of six (unchanged); a `Sizeof`
+budget of **three** (`cin_lowerer.py` two, traversal one); and a new
+pinned global `AddressOf` constructor budget of exactly **five** (the
+`lower_ConsumerIndexStmt` producer, the traversal reconstruction, and
+the CIN/dense-pointer/single-iteration rewrite reconstructions). The
+remaining 14 semantic raw producers are C4, C7, C12-C17 (eight in
+`cin_lowerer.py`), W1, W5, the W14 compatibility fallback, D1, S1, and
+P1.
+
+#### Focused verification and structural coverage
+
+The combined compiler/pass suite (14 compiler test files plus
+`tests/test_scorch/codegen`) produced **1485 passed** at the candidate —
+the predecessor's 1465 (1452 plus the 13 committed Sizeof review items)
+plus this slice's 20 new items. Black leaves all 12 changed files
+unchanged and `git diff --check` is clean. Scoped Flake8 retains only
+inherited findings minus the retired F841; the scoped mypy
+base/candidate comparison over the six production files is byte-identical
+(32 inherited findings both sides) after normalizing line prefixes and
+the embedded line number inside the inherited `no-redef` message.
+
+New coverage locks: node semantics
+(`test_address_of_is_frozen_typed_and_structurally_equal`,
+`test_address_of_rejects_malformed_constructor_operand`); byte-exact
+rendering including the parenthesized-operand form and the complete
+statement (`test_codegen_renders_addressed_expressions_byte_exact`);
+malformed forged operands direct and nested
+(`test_codegen_rejects_forged_address_of_operand` 2x2,
+`test_forged_address_of_operand_fails_at_traversal_boundary` 2x2,
+`test_nested_write_back_address_of_reports_exact_traversal_path` at
+`('root', 'args', '[0]', 'operand')`); the fail-closed assignment-index
+subset (`test_assign_rejects_address_of_subscript_index`); deterministic
+preorder (`test_addressed_copy_walker_has_deterministic_preorder`);
+production activation with exact argument shapes, byte-exact emission,
+memset-before-memcpy ordering, disjoint repeated-lowering ownership, and
+rewriter detachment
+(`test_dense_workspace_write_back_copy_is_structured_and_byte_exact`);
+CIN value-reference rebuilding through `AddressOf` with preserved leaves
+(`test_cin_value_reference_rewrite_rebuilds_write_back_children`); pass
+traversal (`test_function_call_rewrite_traverses_addressed_copy_arguments`
+in both pass suites); and the budget test
+`test_dense_workspace_write_back_copy_is_structured`, which pins the
+global five-site `AddressOf` budget and the single-`memcpy`
+single-`AddressOf` C6 template with no raw `memcpy` spelling anywhere.
+
+#### Byte-identity capture and chained machine evidence
+
+The authoritative capture gate ran from `2026-07-20T19:34:53Z` through
+`2026-07-20T19:34:59Z` and exited 0
+(`/Users/bobby/.cache/scorch-codex/addrcopy-772fead/run_capture_gate.sh`,
+runner `d0853c3e…`), executing both revisions in one clean shared
+worktree with one extension path. Base and candidate emissions are
+byte-identical for the five canonical inputs, the raw 42-cell grid JSON,
+the workspace pair, the tiled workspace, and — retained inside this
+run's artifact ledger, correcting the zero-fill gate's omission — the
+complete dense-workspace activation kernel (2,691 bytes, SHA-256
+`08bc91d8bfd8b0aaaeb6422ca5a32091f2a9793c1ed032f17a475db3b7931617` on
+both sides, byte-equal to the Sizeof-review compare at `89c239c` and
+`b1ddaae`). The base is additionally chained to the retained `b1ddaae`
+candidate capture: the five canonical `.cpp` files byte-identically, and
+the grid on every environment-independent field including each cell's
+emitted `source_sha256` and byte counts (the raw retained grid bytes
+embed the extension root and are compared semantically for the
+documented path-embedding reason; the in-run base/candidate comparison
+shares one root and is raw byte-identity). This chains the slice to the
+W14 native and same-binary A/A evidence on both machines. The capture
+artifact ledger hashes to
+`92d98853199f48bf8a7e784ebea8fa3afc59a9875e82eceee5827c1ddc7b3d0a`.
+
+#### Full-suite and latency verification
+
+The authoritative full non-performance suite ran in the clean detached
+candidate worktree from `2026-07-20T19:35:20Z` through
+`2026-07-20T19:46:03Z` with 12 file-distributed workers and isolated
+caches, producing `2168 passed, 14 skipped, 2 warnings in 642.44s` (the
+Sizeof review's detached-worktree 2148 plus this slice's 20 tests);
+pytest and gate exits were zero and the log hashes to
+`deaccbc50291dd981387d97dacca94bf1610c08398c3d3d7e120a04b0c1f73fa`.
+
+The latency gates ran from `2026-07-20T19:46:13Z` through
+`2026-07-20T19:46:29Z` after every other gate was idle and exited 0
+(`run_latency_gates.sh`, `0533270e…`). The slice-specific activation
+helper (`capture_addrcopy_latency_activation.py`, `8867835d…`) counted
+typed write-back constructions inside the production
+`lower_ConsumerIndexStmt` across the canonical corpus and recorded
+exactly **zero** across
+`small_dense`/`reduction`/`csr_intersection`/`sparse_union` — no corpus
+case lowers a dense-workspace `Where` — while separately proving exact
+structured activation on the dense-workspace production shape (one typed
+memcpy, zero raw offenders, byte-exact
+`memcpy(&C_values[pC0 * C1_size], wksp, wksp0_size * sizeof(float));`
+emission); the activation report hashes to `5802ae7f…`. Because the
+corpus cannot execute the changed path, the paired benchmark is a
+same-session drift monitor: after one retained, unscored priming run,
+base (`latency-15e2c82-m5.json`, `fcc0bebc…`) and candidate
+(`latency-772fead-m5.json`, `c62001ca…`) each ran five warmups and 30
+samples in the clean worktrees, and `compare-latency` reports every
+category inside the 1.10 target for both percentiles (`small_dense`
+1.012/1.033, `reduction` 0.992/0.993, `csr_intersection` 0.995/0.987,
+`sparse_union` 0.994/0.997). No crossing occurred and no attribution was
+required.
+
+At documentation time, a read-only hash check reproduced the five
+protected tracked working files exactly as recorded in the preceding
+sections, and all user-owned untracked autotune, benchmark, GPU/CUDA,
+SuiteSparse, research, scheduler/receipt, scratchpad, test-analysis,
+tooling, temporary, and literal `-` material remained outside the five
+session commits and the sixth, handoff commit.
+`COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were not modified.
+Nothing was pushed.
+
+Evidence limitations: all measurements in this section are
+single-machine (Apple M5); the byte-identical waiver makes no
+two-machine runtime claim necessary. The canonical corpus does not reach
+the write-back copy, so the migrated statement's coverage is the
+capture-retained activation kernel comparison plus the committed
+structural and byte-exact tests. The level-0 `Literal(0)` branch has no
+known reachable production shape and is covered only by the
+base/candidate probe identity and the raw-spelling equivalence argument.
+
+Only the narrow C6 slice is complete. The raw budget is 15 constructors
+/ 14 semantic producers. The recommended next ownership seam is
+unchanged: the **deliberate W1-class Cast-spelling normalization
+decision** (blocking W1 and the C4/C16 zero-fill allocation/borrow half,
+with the W5/C15 policy seam layered behind it), which changes emitted
+bytes corpus-wide and requires the full two-machine generated-kernel
+gate plus an explicit emission-spelling review. Before taking that
+decision, the unaudited C7/C12-C14/C17 lowering seams are the natural
+next read-only audit for a byte-identical alternative; D1 additionally
+needs the const-qualified pointer declaration decision now that
+`AddressOf` covers its initializer. After those remain S1, P1, the seven
+generic rewrites, and the unified exhaustive CxxIR-emission exit review.
+Phase 3 remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and
+1 are not claimed formally closed without a separate design-requirement
+audit. Phase 2 retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
