@@ -466,6 +466,24 @@ def _rewrite_statement_references(
                     statement_path + ("args",),
                 ),
             )
+        elif type(statement) is llir.MemberCallStmt:
+            member_call = cast(llir.MemberCallStmt, statement)
+            rewritten_statements[index] = llir.MemberCallStmt(
+                base=_rewrite_expression_references(
+                    member_call.base,
+                    replacements,
+                    context,
+                    statement_path + ("base",),
+                ),
+                member=member_call.member,
+                template_args=member_call.template_args,
+                args=_rewrite_expression_sequence(
+                    member_call.args,
+                    replacements,
+                    context,
+                    statement_path + ("args",),
+                ),
+            )
         elif type(statement) is llir.ForLoop:
             loop = cast(llir.ForLoop, statement)
             loop.body = cast(

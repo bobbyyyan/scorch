@@ -2614,6 +2614,16 @@ class CINLowerer:
                 stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
             elif isinstance(stmt, llir.VarInit):
                 stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
+            elif isinstance(stmt, llir.MemberCallStmt):
+                stmts[i] = llir.MemberCallStmt(
+                    base=CINLowerer._rewrite_expr_refs(stmt.base, replacements),
+                    member=stmt.member,
+                    template_args=stmt.template_args,
+                    args=tuple(
+                        CINLowerer._rewrite_expr_refs(arg, replacements)
+                        for arg in stmt.args
+                    ),
+                )
             elif isinstance(stmt, llir.FunctionCallStmt):
                 rewritten_name = stmt.name
                 for old, new in replacements.items():

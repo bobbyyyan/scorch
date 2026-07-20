@@ -390,44 +390,39 @@ class LLIRLowerer:
         member_call_stmt: llir.MemberCallStmt,
         indent_level: int,
     ) -> str:
-        if not isinstance(member_call_stmt.base, llir.Expr):
+        base = getattr(member_call_stmt, "base", None)
+        if not isinstance(base, llir.Expr):
             raise CodegenError("MemberCallStmt.base must be an LLIR Expr")
-        if (
-            type(member_call_stmt.member) is not str
-            or not member_call_stmt.member.isidentifier()
-        ):
+        member = getattr(member_call_stmt, "member", None)
+        if type(member) is not str or not member.isidentifier():
             raise CodegenError("MemberCallStmt.member must be a non-empty identifier")
-        if type(member_call_stmt.template_args) is not tuple or any(
-            type(argument) is not llir.DataType
-            for argument in member_call_stmt.template_args
+        template_args = getattr(member_call_stmt, "template_args", None)
+        if type(template_args) is not tuple or any(
+            type(argument) is not llir.DataType for argument in template_args
         ):
             raise CodegenError(
                 "MemberCallStmt.template_args must be a tuple of DataType values"
             )
-        if type(member_call_stmt.args) is not tuple or any(
-            not isinstance(argument, llir.Expr) for argument in member_call_stmt.args
+        args = getattr(member_call_stmt, "args", None)
+        if type(args) is not tuple or any(
+            not isinstance(argument, llir.Expr) for argument in args
         ):
             raise CodegenError(
                 "MemberCallStmt.args must be a tuple of LLIR expressions"
             )
         receiver = self._render_operand(
-            member_call_stmt.base,
+            base,
             parent_precedence=self._POSTFIX_PRECEDENCE,
             is_right_child=False,
         )
         member_template_args = (
-            "<"
-            + ", ".join(argument.value for argument in member_call_stmt.template_args)
-            + ">"
-            if member_call_stmt.template_args
+            "<" + ", ".join(argument.value for argument in template_args) + ">"
+            if template_args
             else ""
         )
-        member_args = ", ".join(
-            self._render_expression(argument) for argument in member_call_stmt.args
-        )
+        member_args = ", ".join(self._render_expression(argument) for argument in args)
         return self.lower_llir(
-            f"{receiver}.{member_call_stmt.member}"
-            f"{member_template_args}({member_args});",
+            f"{receiver}.{member}{member_template_args}({member_args});",
             indent_level,
         )
 

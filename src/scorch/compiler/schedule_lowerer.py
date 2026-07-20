@@ -652,6 +652,28 @@ def _rewrite_stmt_access_sequence(
                 name=stmt.name,
                 args=rewritten_args,
             )
+        elif isinstance(stmt, llir.MemberCallStmt):
+            rewritten_base, base_count = _rewrite_expr_access(
+                stmt.base,
+                tensor_id,
+                index_ids,
+                role,
+                replacement,
+            )
+            count += base_count
+            rewritten_args = []
+            for arg in stmt.args:
+                arg, arg_count = _rewrite_expr_access(
+                    arg, tensor_id, index_ids, role, replacement
+                )
+                rewritten_args.append(arg)
+                count += arg_count
+            rewritten_stmt = llir.MemberCallStmt(
+                base=rewritten_base,
+                member=stmt.member,
+                template_args=stmt.template_args,
+                args=rewritten_args,
+            )
         rewritten_stmts.append(rewritten_stmt)
     rewritten_sequence: LLIRStatementSequence = (
         tuple(rewritten_stmts) if type(stmts) is tuple else rewritten_stmts
