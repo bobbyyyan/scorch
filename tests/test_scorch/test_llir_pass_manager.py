@@ -1465,7 +1465,8 @@ def test_workspace_insert_name_failure_stops_pipeline_before_record_publication(
 ) -> None:
     compile_options = _compile_options()
     manager = LLIRPassManager.from_compile_options(compile_options)
-    malformed = llir.FunctionCallStmt(cast(str, object()), [_var("value")])
+    malformed = llir.FunctionCallStmt("wksp.insert", [_var("value")])
+    object.__setattr__(malformed, "name", object())
     source = [
         _compatible_loop(
             [
@@ -1550,11 +1551,12 @@ def test_workspace_insert_name_failure_stops_pipeline_before_record_publication(
     assert len(observed_failures) == 1
     assert error.value.failure is observed_failures[0]
     diagnostic = observed_failures[0].diagnostic
-    assert diagnostic.code == "invalid_workspace_insert_call_name"
+    assert diagnostic.code == "invalid_function_call_stmt_name"
     assert diagnostic.stage == "LLIR transformation"
     assert diagnostic.pass_name == "transform_compressed_where_for_openmp"
-    # The workspace rewriter consumes the filtered, re-rooted work-body artifact.
-    assert diagnostic.path == ("root", "[0]", "name")
+    # The common validating rewrite rejects the forged name before the
+    # workspace rewriter re-roots the work body.
+    assert diagnostic.path == ("root", "[0]", "body", "[1]", "name")
     assert error.value.completed_run_records == ()
     assert result_write_modes == []
     assert later_work == []
