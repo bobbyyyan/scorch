@@ -881,6 +881,246 @@ def test_kernel_abi_arguments_validation_and_function_are_fresh_and_byte_exact()
         abi.assemble_function(tuple(body))  # type: ignore[arg-type]
 
 
+def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> None:
+    abi = TorchCppKernelABI(
+        result_shape=(5, 3),
+        result_rank=2,
+        input_tensors=(
+            KernelTensorABI(
+                "Left",
+                (LevelType.DENSE, LevelType.COMPRESSED),
+                (1, 0),
+                (3, 5),
+                torch.float64,
+            ),
+            KernelTensorABI(
+                "Mask",
+                (LevelType.COORDINATE, LevelType.COORDINATE),
+                (0, 1),
+                (5, 3),
+                torch.float32,
+            ),
+        ),
+        extra_tensor_names=("bias", "scale"),
+        extra_tensor_dtype=torch.float64,
+    )
+
+    first = abi.emit_validation()
+    second = abi.emit_validation()
+    assert [type(statement) for statement in first] == [llir.FunctionCallStmt] * 5
+    assert not any(type(statement) is llir.RawStmt for statement in first)
+    assert [statement.name for statement in first] == [
+        "scorch_native::validate_jit_result_shape",
+        "scorch_native::validate_jit_tensor",
+        "scorch_native::validate_jit_tensor",
+        "scorch_native::validate_jit_extra_tensor",
+        "scorch_native::validate_jit_extra_tensor",
+    ]
+    assert all(type(statement.args) is tuple for statement in first)
+
+    result_call = first[0]
+    assert [type(argument) for argument in result_call.args] == [
+        llir.Var,
+        llir.Array,
+        llir.Literal,
+        llir.Literal,
+    ]
+    result_vector = cast(llir.Var, result_call.args[0])
+    assert (result_vector.name, result_vector.type) == (
+        "result_shape",
+        llir.DataType.STD_VECTOR_INT,
+    )
+    assert result_call.args[1] == llir.Array(
+        values=(
+            llir.Literal(value=5, data_type=llir.DataType.INT64),
+            llir.Literal(value=3, data_type=llir.DataType.INT64),
+        ),
+        data_type=llir.DataType.INT64,
+    )
+    result_rank = cast(llir.Literal, result_call.args[2])
+    assert type(result_rank.value) is int
+    assert result_rank == llir.Literal(value=2, data_type=llir.DataType.INT64)
+    assert result_call.args[3] == llir.Literal(
+        value="evaluate", data_type=llir.DataType.STRING
+    )
+
+    tensor_call = first[1]
+    assert [type(argument) for argument in tensor_call.args] == [
+        llir.Literal,
+        llir.Literal,
+        llir.Var,
+        llir.Var,
+        llir.Var,
+        llir.QualifiedName,
+        llir.Array,
+        llir.Array,
+        llir.Array,
+    ]
+    assert tensor_call.args[0] == llir.Literal(
+        value="evaluate", data_type=llir.DataType.STRING
+    )
+    assert tensor_call.args[1] == llir.Literal(
+        value="Left", data_type=llir.DataType.STRING
+    )
+    assert [
+        (cast(llir.Var, argument).name, cast(llir.Var, argument).type)
+        for argument in tensor_call.args[2:5]
+    ] == [
+        ("Left_shape", llir.DataType.STD_VECTOR_INT),
+        ("Left_mode_indices", llir.DataType.STD_VECTOR_2D_TORCH_TENSOR),
+        ("Left_values", llir.DataType.TORCH_TENSOR),
+    ]
+    assert tensor_call.args[5] == llir.QualifiedName(
+        namespace="torch",
+        name="kFloat64",
+        data_type=llir.DataType.TORCH_SCALAR_TYPE,
+    )
+    assert tensor_call.args[6] == llir.Array(
+        values=(
+            llir.Literal(value=0, data_type=llir.DataType.INT),
+            llir.Literal(value=1, data_type=llir.DataType.INT),
+        ),
+        data_type=llir.DataType.INT,
+    )
+    assert tensor_call.args[7] == llir.Array(
+        values=(
+            llir.Literal(value=1, data_type=llir.DataType.INT),
+            llir.Literal(value=0, data_type=llir.DataType.INT),
+        ),
+        data_type=llir.DataType.INT,
+    )
+    assert tensor_call.args[8] == llir.Array(
+        values=(
+            llir.Literal(value=3, data_type=llir.DataType.INT64),
+            llir.Literal(value=5, data_type=llir.DataType.INT64),
+        ),
+        data_type=llir.DataType.INT64,
+    )
+    assert first[2].args[6] == llir.Array(
+        values=(
+            llir.Literal(value=2, data_type=llir.DataType.INT),
+            llir.Literal(value=2, data_type=llir.DataType.INT),
+        ),
+        data_type=llir.DataType.INT,
+    )
+
+    extra_call = first[3]
+    assert [type(argument) for argument in extra_call.args] == [
+        llir.Var,
+        llir.QualifiedName,
+        llir.Literal,
+        llir.Literal,
+    ]
+    extra_values = cast(llir.Var, extra_call.args[0])
+    assert (extra_values.name, extra_values.type) == (
+        "bias_values",
+        llir.DataType.TORCH_TENSOR,
+    )
+    assert extra_call.args[1] == llir.QualifiedName(
+        namespace="torch",
+        name="kFloat64",
+        data_type=llir.DataType.TORCH_SCALAR_TYPE,
+    )
+    assert extra_call.args[2] == llir.Literal(
+        value="evaluate", data_type=llir.DataType.STRING
+    )
+    assert extra_call.args[3] == llir.Literal(
+        value="bias_values", data_type=llir.DataType.STRING
+    )
+    assert cast(llir.Var, first[4].args[0]).name == "scale_values"
+    assert first[4].args[3] == llir.Literal(
+        value="scale_values", data_type=llir.DataType.STRING
+    )
+
+    assert first == second
+    assert all(
+        one is not other and hash(one) == hash(other)
+        for one, other in zip(first, second)
+    )
+    with pytest.raises(FrozenInstanceError):
+        first[0].name = "forged"  # type: ignore[misc]
+
+    expected_lines = [
+        "scorch_native::validate_jit_result_shape(result_shape, {5, 3}, 2, "
+        '"evaluate");',
+        'scorch_native::validate_jit_tensor("evaluate", "Left", Left_shape, '
+        "Left_mode_indices, Left_values, torch::kFloat64, {0, 1}, {1, 0}, {3, 5});",
+        'scorch_native::validate_jit_tensor("evaluate", "Mask", Mask_shape, '
+        "Mask_mode_indices, Mask_values, torch::kFloat32, {2, 2}, {0, 1}, {5, 3});",
+        "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat64, "
+        '"evaluate", "bias_values");',
+        "scorch_native::validate_jit_extra_tensor(scale_values, torch::kFloat64, "
+        '"evaluate", "scale_values");',
+    ]
+    assert LLIRLowerer().lower_llir(first) == "\n".join(expected_lines)
+
+    def node_ids(value: list[llir.Stmt]) -> set[int]:
+        identities: set[int] = set()
+
+        class IdentityCollector(LLIRWalker):
+            def enter_node(
+                self,
+                node: llir.Node,
+                path: tuple[str, ...],
+            ) -> None:
+                del path
+                identities.add(id(node))
+
+        IdentityCollector(
+            LLIRTraversalContext(stage="test", pass_name="validation_ownership")
+        ).walk(value)
+        return identities
+
+    first_ids = node_ids(list(first))
+    assert first_ids == node_ids(list(first))
+    assert first_ids.isdisjoint(node_ids(list(second)))
+    rewritten = cast(
+        "list[llir.Stmt]",
+        LLIRRewriter(
+            LLIRTraversalContext(stage="test", pass_name="rewrite_validation")
+        ).rewrite(list(first)),
+    )
+    assert rewritten == list(first)
+    assert first_ids.isdisjoint(node_ids(rewritten))
+    assert LLIRLowerer().lower_llir(rewritten) == "\n".join(expected_lines)
+
+
+def test_kernel_abi_validation_handles_empty_shapes_and_unknown_extents() -> None:
+    abi = TorchCppKernelABI(
+        result_shape=(),
+        result_rank=1,
+        input_tensors=(
+            KernelTensorABI(
+                "Input",
+                (LevelType.COMPRESSED,),
+                (0,),
+                (),
+                torch.float32,
+            ),
+        ),
+    )
+    statements = abi.emit_validation()
+    assert [type(statement) for statement in statements] == (
+        [llir.FunctionCallStmt] * 2
+    )
+    assert cast(llir.FunctionCallStmt, statements[0]).args[1] == llir.Array(
+        values=(),
+        data_type=llir.DataType.INT64,
+    )
+    assert cast(llir.FunctionCallStmt, statements[1]).args[8] == llir.Array(
+        values=(),
+        data_type=llir.DataType.INT64,
+    )
+    assert LLIRLowerer().lower_llir(statements) == "\n".join(
+        [
+            "scorch_native::validate_jit_result_shape(result_shape, {}, 1, "
+            '"evaluate");',
+            'scorch_native::validate_jit_tensor("evaluate", "Input", Input_shape, '
+            "Input_mode_indices, Input_values, torch::kFloat32, {1}, {0}, {});",
+        ]
+    )
+
+
 def test_kernel_abi_rejects_unsupported_singleton_validation() -> None:
     with pytest.raises(ValueError, match="unsupported JIT level type"):
         KernelTensorABI(
