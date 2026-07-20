@@ -18918,6 +18918,827 @@ remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not
 claimed formally closed without a separate design-requirement audit. Phase 2
 retains its recorded canonical closure.
 
+### Phase-3 typed canonical compressed-result value ownership complete (2026-07-19)
+
+Only the narrow canonical W14 compressed-`Where` result-value Torch
+owner/borrow slice is recorded here. The exact base is
+`2e875270e1a62c11821b691b59e2bd5fab35e803`; the exact committed candidate is
+`cd63f26fc46fdffc3b17b931232e730a8c72aeac`. Its ordered scoped commits are:
+
+- `6d9dcfdbda830dc6b8eba23b4f4563531f259e65`,
+  **refactor(compiler): type compressed result values**;
+- `c4a8d6a70e3eb7a95361663a2b15fc94d5261ec1`,
+  **fix(compiler): complete compressed workspace scalar types**; and
+- `cd63f26fc46fdffc3b17b931232e730a8c72aeac`,
+  **test(compiler): cover compressed result values**.
+
+No commit was amended, squashed, reordered, or rewritten. The implementation
+commit changes only `compressed_where_openmp_pass.py`, `llir.py`,
+`result_write_pass.py`, and `torch_cpp_abi.py` (129 insertions, two deletions).
+The follow-up type-completeness commit adds 25 lines only to `llir.py`. The test
+commit changes only `test_cin_lowerer.py`,
+`test_compressed_where_openmp_pass.py`, `test_llir_string_budget.py`, and
+`test_result_write_pass.py` (1,463 insertions, 43 deletions). The complete
+base/candidate range is eight files, 1,617 insertions, and 45 deletions.
+`git diff --check 2e875270..cd63f26` exited 0.
+
+No public Python ABI, generated kernel function ABI, cache schema, generalized
+allocation parser/hierarchy, csrc code, Phase-3.5 work, or LoopIR work is part
+of this slice.
+
+#### Complete preimplementation inventory, ownership boundary, and selection
+
+The exact preimplementation budget at `2e875270` was:
+
+- 411 production `Var` constructors;
+- ten direct expression strings: nine subscripts and one ternary;
+- 14 known indirect sinks/clones;
+- seven generic string rewrites;
+- 23 `RawStmt` constructors / 22 semantic producers;
+- five raw semantic producers in `compressed_where_openmp_pass.py`; and
+- six `DirectInit` constructor templates.
+
+The 22 semantic raw producers were exactly:
+
+| Owner | Exact families before W14 |
+| --- | --- |
+| `cin_lowerer.py` | C3-C7 and C12-C17: 11 |
+| `compressed_where_openmp_pass.py` | W1, W2, W4, W5, W14: 5 |
+| `torch_cpp_abi.py` | C8-C10 validation calls: 3 |
+| `dense_pointer_hoist_pass.py` | D1: 1 |
+| `schedule_lowerer.py` | S1: 1 |
+| `sparse_prefetch_pass.py` | P1: 1 |
+
+`llir_traversal.py` supplied the twenty-third constructor only for detached
+`RawStmt` reconstruction. The candidate review was:
+
+| Family | Decision |
+| --- | --- |
+| W1/W2/W4 | Rejected. The borrowed per-worker workspace view and two `clear()` mutations require a structured subscript receiver, casted `omp_get_thread_num()` call, accurate pool/view types, and a member-call statement boundary. |
+| W5 | Rejected. Thread count, parameterized workspace-pool ownership, reserve, worker loop, and `emplace_back` are one larger allocation/lifetime seam. |
+| W6-W9 | Already typed. W9 owns the exact `INT64` totals consumed by W10-W14. |
+| W10/W11 | Already typed first-position Torch owner/borrow and inclusive offset-copy loop. |
+| W12 | Already typed compressed-coordinate Torch owner/borrow family. |
+| W13 | Already typed deeper-position Torch owner/borrow/sentinel family. |
+| **W14** | **Selected. The canonical result-value Torch owner and its `data_ptr<T>()` borrow are one independently owned two-statement family. DS activates it without W13; DSS proves its ordering after W13. Exact workspace/result dtype equality resolves the canonical type policy while an explicit raw fallback preserves the wider direct-pass compatibility surface. Existing LLIR call/member/array nodes represent it without a new schema family.** |
+| W15 | Already typed final result declaration, storage assignments, and return. It consumes the W14 Torch owner. |
+| C7 | Rejected. Nested templated reserve/allocation policy needs a generalized member/allocation boundary. |
+| C8-C10 | Rejected. Public validation calls require semantic string/bool literals, initializer-list arguments, and a frozen call-statement schema. |
+| C12/C13 | Rejected. Coupled adaptive scheduling state remains a separate scheduling-policy slice. |
+| C14/C17 | Retained compatibility/non-emitting paths; not live W14 ownership. |
+| C3-C5/C15-C16 | Rejected. Parallel zero-fill allocation, borrow, and `memset` require one named typed-pass extraction with pass-order, cache, native, and performance review. |
+| C6/D1 | Rejected. Addressed copy and restricted borrow need address-of, qualification, byte-count/copy-call, and rewrite integration. |
+| S1/P1 | Rejected. Prefetch conditionals need conditional, address-of, nested access, and builtin-call structure and are performance-sensitive. |
+| R1 | Retained while any raw producer remains. It is traversal reconstruction infrastructure, not a live semantic producer. |
+| Seven generic rewrites | Retained. Their producers and consumers differ; they are not one lexical or ownership boundary. |
+| Exhaustive CxxIR emission | The exact node-family accepted set and duplicate-generator removal are complete, but broad per-field verifier parity and the unified exhaustive-emission exit review remain separate Phase-3 work. |
+
+Before this slice, one W14 raw statement jointly emitted:
+
+```cpp
+torch::Tensor Result_values_torch =
+    torch::empty({(long long)_totalN}, torch::kDtype);
+T* Result_values_data = Result_values_torch.data_ptr<T>();
+```
+
+The Torch tensor is the owner. The scalar pointer is a mutable borrow whose
+lifetime is bounded by that owner and is consumed by the already structured
+result-write/final-assembly path. Canonical production obtains
+`workspace_ctype` from the result dtype, but direct pass tests historically
+admit aliases (`int`, `long long`) and arbitrary nonempty spellings such as
+`custom_scalar`. W14 was selected only after dividing those surfaces: exact
+canonical spellings are typed; all deliberately noncanonical spellings retain
+the old raw spelling. This is not a generalized C-type parser.
+
+The complete canonical scalar policy is:
+
+| Workspace spelling | Result dtype | Value pointer | Torch scalar name |
+| --- | --- | --- | --- |
+| `float` | `FLOAT32` | `PTR_FLOAT32` | `torch::kFloat32` |
+| `double` | `FLOAT64` | `PTR_FLOAT64` | `torch::kFloat64` |
+| `int32_t` | `INT32` | `PTR_INT_32` | `torch::kInt32` |
+| `int64_t` | `INT64` | `PTR_INT_64` | `torch::kInt64` |
+| `int8_t` | `INT8` | new `PTR_INT8` | `torch::kInt8` |
+| `uint8_t` | `UINT8` | new `PTR_UINT8` | `torch::kUInt8` |
+
+`int` with `torch.int32`, `long long` with `torch.int64`, and arbitrary
+nonempty spellings remain on the exact legacy raw path. Recognized spelling /
+dtype mismatches fail before transformation; they never escape through the raw
+fallback.
+
+#### Representation, typing, validation, ownership, and rewriting
+
+`ResultTensorAssembler.emit_compressed_value_allocation(total_var)` is the
+narrow typed owner. It fails closed unless:
+
+- `self` is an exact `ResultTensorAssembler`, not a subclass;
+- the complete frozen assembler passes `validate()`;
+- the layout is exactly one dense level followed by one or more compressed
+  levels;
+- `total_var` is an exact, complete `llir.Var`, not a subclass or a forged
+  partial object;
+- its instance fields are exactly `name`, `type`, `is_ptr`, `is_restrict`, and
+  `tensor_access`;
+- its name is `_total<leaf-level>`;
+- its type is exactly `DataType.INT64`; and
+- it is not a pointer, is not restrict-qualified, and carries no tensor
+  provenance.
+
+The assembler dtype must map through `dtype_to_c_datatype`,
+`get_pytorch_c_dtype_name`, and `DataType.ptr_type`. Unsupported result dtypes
+raise `ValueError`; they are not rendered through text. The method returns two
+fresh ordered statements:
+
+```text
+VarInit(
+  Var(Result_values_torch, TORCH_TENSOR),
+  FunctionCall(
+    "torch::empty",
+    (
+      Array((Var(_totalN, INT64),), INT64),
+      QualifiedName("torch", "kDtype", TORCH_SCALAR_TYPE),
+    ),
+  ),
+)
+VarInit(
+  Var(Result_values_data, PTR_T),
+  tensor_data_ptr(Var(Result_values_torch, TORCH_TENSOR), T),
+)
+```
+
+The exact W14 template contains zero `RawStmt`, two `VarInit`, three `Var`, one
+`Array`, one `FunctionCall`, one `QualifiedName`, and one `tensor_data_ptr`
+call, with no `Cast`, `Add`, or `Literal`. The extent, dtype, owner target,
+pointer target, and `data_ptr<T>()` receiver are all rebuilt fresh. Repeated
+emission produces equal/equally hashed detached trees without sharing mutable
+children with the caller or another invocation. Existing exact traversal and
+rewriting validate, visit, detach, reconstruct, and replacement-validate every
+reused node. Tests cover missing/forged fields, node subclasses, unknown
+children, bad child containers, replacement failures, equality/hash, and
+caller/sibling/invocation detachment.
+
+`compressed_where_openmp_pass._value_allocation` routes to the typed assembler
+only when:
+
+```python
+workspace_ctype == dtype_to_c_datatype(result_assembler.dtype).value
+```
+
+The pass otherwise returns the one explicit `_legacy_value_allocation`
+`RawStmt`, preserving exact `(long long)_totalN`, pointer declaration, template
+argument, newline, indentation, and `add_semicolon=False` behavior for aliases
+and free-form direct callers. `_validate_context` separately recognizes both
+canonical spellings and the `int`/`long long` aliases, checks their semantic
+dtype, and rejects recognized mismatches before `_value_allocation` can route.
+Typed-emitter exceptions are not swallowed.
+
+Ordering remains exact:
+
+1. W10 first-position owner/borrow;
+2. W11 inclusive offset copy;
+3. every W12 coordinate owner/borrow pair;
+4. every W13 deeper-position owner/borrow/sentinel triple;
+5. W14 value owner/borrow;
+6. the fill loop; and
+7. W15 final result assembly and return.
+
+`DataType.PTR_INT8` and `PTR_UINT8` give the two narrow integer results valid
+scalar pointer types; the result-write pass admits both through its exact
+pointer-type allowlist. `llir.py` also completes the already bounded
+one-through-five-dimensional `coo_workspace<T, N>` family for `double`,
+`int32_t`, `int64_t`, `int8_t`, and `uint8_t` (25 enum members). This keeps all
+six canonical result dtypes representable and fail-closed through production
+lowering without adding a type parser.
+
+For the four canonical scalar families that were already representable, the
+only emitted-source normalization is the removal of the redundant cast from an
+already-`INT64` total:
+
+```diff
+-torch::empty({(long long)_totalN}, torch::kDtype)
++torch::empty({_totalN}, torch::kDtype)
+```
+
+For `int8_t` and `uint8_t`, the predecessor failed while converting the
+pointer type; the candidate now emits `torch::kInt8`/`torch::kUInt8` and
+`data_ptr<int8_t>()`/`data_ptr<uint8_t>()`. The predecessor raw fallback's
+`torch::kFloat32` default is therefore not retained for canonical production.
+
+#### Focused verification and exact commands
+
+Every Python, pytest, Black, Flake8, mypy, Sphinx, capture, native, and
+benchmark invocation sourced the Conda hook and activated `scorch` first.
+
+The canonical scalar/workspace/result-write focus ran:
+
+```sh
+black tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_result_write_pass.py
+pytest -q \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_result_write_pass.py \
+  -k 'coo_workspace_type or production_compressed_where_lowers_narrow_integer or compressed_value_allocation or canonical_value_pointer_type or rejects_new_scalar_types'
+```
+
+Black left both files unchanged; pytest produced
+`89 passed, 190 deselected in 0.65s`. The complete two-file command:
+
+```sh
+pytest -q \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_result_write_pass.py
+git diff --check -- \
+  tests/test_scorch/test_cin_lowerer.py \
+  tests/test_scorch/test_result_write_pass.py
+```
+
+produced `279 passed in 0.53s`, and the diff check exited 0.
+
+The complete compressed-pass file ran:
+
+```sh
+black --check tests/test_scorch/test_compressed_where_openmp_pass.py
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/test_compressed_where_openmp_pass.py
+flake8 tests/test_scorch/test_compressed_where_openmp_pass.py
+```
+
+Black and Flake8 exited 0; pytest produced `100 passed in 0.66s`. This file
+locks canonical DS/DSS ownership and source spelling, aliases/free-form
+fallbacks, recognized mismatches, exact order, generated-child failures,
+traversal/rewrite detachment, and downstream pass suppression.
+
+The locked-budget focus ran:
+
+```sh
+black --check tests/test_scorch/test_llir_string_budget.py
+PYTHONPATH="$PWD:$PWD/src" pytest -q \
+  tests/test_scorch/test_llir_string_budget.py
+```
+
+Black left the file unchanged and pytest produced `32 passed in 2.29s`.
+
+#### Authoritative full non-performance suite
+
+The authoritative exact-candidate run used a clean detached persistent
+worktree, 12 xdist workers, file-level distribution, one OpenMP thread per
+worker, and isolated temporary/JIT/cache roots:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" \
+PYTEST_ADDOPTS= \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONUNBUFFERED=1 \
+OMP_NUM_THREADS=1 \
+MAX_JOBS=1 \
+TMPDIR=/Users/bobby/.cache/scorch-codex/w14-cd63f26/full-suite/tmp \
+TORCH_EXTENSIONS_DIR=/Users/bobby/.cache/scorch-codex/w14-cd63f26/full-suite/torch-extensions \
+python -m pytest -q -n 12 --dist loadfile -m "not perf" tests \
+  --basetemp=/Users/bobby/.cache/scorch-codex/w14-cd63f26/full-suite/pytest-basetemp \
+  -o cache_dir=/Users/bobby/.cache/scorch-codex/w14-cd63f26/full-suite/pytest-cache
+```
+
+It ran from `2026-07-19T22:51:57Z` through `2026-07-19T23:02:51Z` and
+produced:
+
+```text
+2028 passed, 14 skipped, 2 warnings in 653.80s (0:10:53)
+```
+
+Pytest and gate exits were zero. Revision before/after was exact
+`cd63f26fc46fdffc3b17b931232e730a8c72aeac`; both status receipts were empty.
+The 3,896-byte pytest log hashes to
+`9d6cbc6b3c6b46c12b57665dfb5044a85894ad55eadc2531fb6e8387b30ce847`;
+the runner hashes to
+`41c612c2f55f0e2e25348c9b17bc2baca5dc3207a3ab3b9bbc13672f6bac1356`.
+The two warnings are the inherited sparse-invariant warnings in the autotune
+levels and learned tests. An earlier `nohup` launch artifact contains an empty
+log and never started pytest; it is not a test failure and is not counted.
+
+#### Canonical source/build identity and W14 activation capture
+
+The exact source/build command was:
+
+```sh
+/bin/zsh \
+  /Users/bobby/.cache/scorch-codex/w14-cd63f26/run_capture_gate_authoritative.sh
+```
+
+It ran synchronously from `2026-07-19T23:02:41Z` through
+`2026-07-19T23:02:49Z` and exited 0. It checked exact clean base/candidate
+revisions through logical `/tmp/scorch-phase3-w14-capture-wt`, retained the
+physical `/private/tmp/...` path only as an audit field, restored the candidate
+cleanly, and stopped before native compilation. The command used the four
+canonical helpers at their required exact hashes:
+
+| Helper | SHA-256 |
+| --- | --- |
+| canonical inputs | `605d96ffe71027d078042daef23374679e5b84d4cf973f24b21e5476a9754ff3` |
+| 42-cell grid | `a12c9e71c1a041889c89f659b6abf8a282d95be53e8876794f5aef3eada344d3` |
+| workspace pair | `964214282fc00349936c65880ae0d256e7bd3bc47bbc9061400a999c61919a59` |
+| tiled workspace | `9e4a8c46b0de060fc4b0588929a858bde5e85dc7d78b6fc698dfddc20daf99ff` |
+
+The W14 capture helper hashes to
+`ea6f425a0de000e5aeb2451d56d2c966062714e47f28e3e9339286064ea6c24c`;
+the runner hashes to
+`12f34d5fe1d33eec348846e000e89771c355095b23cc3e187cdca135ff74d6b1`.
+The 43,947-byte comparison receipt hashes to
+`d760a463ddb1c0bac7d61a16f8538fd64aeaeb7ca691c4d5cf7dbc3169feaf24`;
+its 10,257-byte complete artifact ledger hashes to
+`c825fce0ab67b60744f056a59fb1bd7b8079a79032150d470330aea3f59d1ecd`.
+
+The four canonical input labels changed only where W14 activates:
+
+| Label | Base bytes / SHA-256 | Candidate bytes / SHA-256 | Build identity |
+| --- | --- | --- | --- |
+| CSR x dense | 2,505 / `36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151` | identical | identical `53135ad98bb343f61439e56f863b486f3868992876115edbd6d0981a66a5033e` |
+| DS float32 | 7,128 / `e914264c94ef57a9572c979231bcaf1593c9ca4e4d44474985fb877040dd4815` | 7,117 / `02043a5a8625c596d183385bbe58063ebccf3a2dc75cc2f8bb05e45921ce9f12` | `b6131a85cc5ab8506389d3a780c1e484234c6905bcfc24ddbbd55b22ae160edc` -> `0a13a44fcc27da2d911aa8edbada7fdfc2f3f7c3954fc63cb7e835fa928b384b` |
+| DSS float32 | 8,659 / `b8549ff394919f38f83d8b76595e0b55334c09c3a637ae2e7e69fc63ba6b850c` | 8,648 / `adc0b71fd3f98ea3a437ffd980c237f1a649e3cf0b1d00cd64faf81701e49fbc` | `345996802f5bd98ae73b2f681989bb75264098c91d9de2293517778c80b9363a` -> `21113c764797ae909a3ee45657d25f31dc2b4031cc2f9705a6bd748f5924700e` |
+| all-COO | 3,521 / `53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667` | identical | identical `3ed3a2445b0c125ea0f482fe99a4561e566d4959ed325c99c2ac5403c3fde29d` |
+
+For DS, the exact base/candidate kernel names are
+`kernel_8ef2581dce67` / `kernel_21471ed3ec34`; request-cache digests are
+`77058b6e3961dedb784903e0518d7a284f9e2c72fa05045b7905af49a91ba310` /
+`dc839d1a4dec0826d6d89f64eb362a0d7fc6cdc54e51e7b1b64cdb77afab17b0`;
+prepared-cache digests are
+`7473cfdcbd93c9400a9a15226927cf41cd8243cf9ff19fd068a8da954b97d547` /
+`b68a1eea3b9520f955874cc8e697d3fd4bf83b1c60199dd5430f0616690691c8`.
+For DSS, kernel names are `kernel_9d4d90ae6a62` / `kernel_1484f1089cfb`;
+request-cache digests are
+`147be1850d5d687bc34532877e839c001d5ce61c1e76d2e315d926ca9820799e` /
+`35f905bcfc421cfc9a9e3dff386cdc2f47fc3cf81a021539c5e8e76505fe8875`;
+prepared-cache digests are
+`c2cd107d3257e27bcb42e20bada8ca9fa71c4c167b8720989f14072b2795bd9a` /
+`0536d628624df216c4c50ed6031f61715d35daf388b9031fa170f24928db3056`.
+The upstream codegen cache keys remain unchanged for DS
+(`23024130430bd5a89be41c5f73818b82727a93c4b4e2ec2d5f86e869637842b2`)
+and DSS
+(`0491f449063a0db6226ac124d4adab41b848c3e33ed53bff2f6b9f30e9006bb2`).
+
+The exact sole source rewrite occurs at DS line 88 and DSS line 124 and is
+-11 bytes in each source: removal of `(long long)` from the value-owner
+extent. The exact changed fields are kernel name; prepared cache repr/digest/
+path; request build path/identity/cache repr+digest/name/source bytes+hash; and
+top-level source bytes/hash. No unrelated field changed.
+
+The canonical helper manifests are path-sensitive because build options embed
+the requested logical source root. At the W14 logical path they are:
+
+| Capture | Result |
+| --- | --- |
+| base input manifest | `00037fd4b78a50798d90a80603ec4bde79829672c2e7d26778b773d1be36bfea` |
+| candidate input manifest | `1a8a8797420341bd333fd18e7d3d06097b89305468ca822cd2b9c92aad19ca60` |
+| 42 cells / 21 builds | byte-identical, `26154ccccae0cc6ce3f033b7f3a386cca7393ed3d35a67ff2b503568aa3ec193` |
+| workspace pair | wholly identical manifest `a049315c369c9e0f59d852a4ef69146ed85fa367a13b3b89965f97c4428573fc` |
+| tiled workspace | wholly identical manifest `b08654cd7e37f13055f389179cdf1eb49bfa7d790bcedda40c48b01342a46f92` |
+| common preamble | `db29715709809539883f4904c60dd1276cad5af16a5f43549cfc11375321c544` |
+
+The unchanged workspace sources hash to
+`5c69621af52939759ffcbaed3649ef1c4461108522b614df8f8a18c86ec0560a`
+and `b1770961d5f9c9c7fd716bd71cb97f1d5e73c6dcf200ba378b97b65c87fbe5d7`;
+the unchanged tiled source hashes to
+`2b9d28654e33225e1093500fc861e76f0f67cb241c7ab28b43c05b774d9f7222`.
+
+The dedicated W14 matrix contains DS and DSS for all six canonical dtypes:
+
+| Case | Base | Candidate bytes / SHA-256 |
+| --- | --- | --- |
+| DS float32 | 7,128 bytes / existing source | 7,117 / `02043a5a8625c596d183385bbe58063ebccf3a2dc75cc2f8bb05e45921ce9f12` |
+| DS float64 | 7,137 / `1e26c2282b149542d93fe51f702623b1ffb1c4c42c09a3333783556177eae1cd` | 7,126 / `b321f6ee03fa6b71fe91ba7284c3530b3b187a49d1334cd6373f5c52529a284e` |
+| DS int32 | 7,132 / `587dc84482fe821c3eef30aeb5fc1d9e30b72141ec4ae59f6f1f749a7e2c7b90` | 7,121 / `4717e42944222c0e5b7821f1c803e77325eda7dc00bfaf2ed49e6999a13a359a` |
+| DS int64 | 7,140 / `1a985997cf97e8dc05105b89e3ff53b8947f0c1d15b2bb77ee5bac48dcfd078b` | 7,129 / `a1fa8b7d0ee8bdef079644d2f9cafe59c8178803e3e465aad0954c2ac843e5af` |
+| DS int8 | base `ValueError: 'int8_t*' is not a valid DataType` | 7,117 / `7bb239ad8923ed9242bb0cfd1ade797597cf04f8e2a077adaf63500a41ce687d` |
+| DS uint8 | base `ValueError: 'uint8_t*' is not a valid DataType` | 7,129 / `4c59b7a42679c18d6a723b171d4502e7c84bf98e90010ec1d39a20b0c69a72d5` |
+| DSS float32 | 8,659 bytes / existing source | 8,648 / `adc0b71fd3f98ea3a437ffd980c237f1a649e3cf0b1d00cd64faf81701e49fbc` |
+| DSS float64 | 8,669 / `03f215f682d8e9a63cc3f0264a0cfcc0a8d6feb0e6641c6cb5dcf1e461c3d860` | 8,658 / `fd12c8614b53ff3de85e1316e821aa9b4a3fed9e084db3ba03dbbdbe1e48c98b` |
+| DSS int32 | 8,665 / `bb7e8056f36f206be5a92f84ab9f9727e733344f92d315a2c3cb6cfd8255da86` | 8,654 / `36c8088e43868178ccdd98956710bbe6c312a45c89da22044783e99813b79ef7` |
+| DSS int64 | 8,673 / `e56416041e548274f7945dd82e139b6491f9e8ccfb4b7ae2d5e610334c16a100` | 8,662 / `a420dbfd4dd07f503f5d64fc7efe87e2987bad350f925c53ee31dbbc0827e064` |
+| DSS int8 | base `ValueError: 'int8_t*' is not a valid DataType` | 8,649 / `14c3d810132a29c9e322f3d0a39a72f4368134188fb0f8abfa6b331cf6515353` |
+| DSS uint8 | base `ValueError: 'uint8_t*' is not a valid DataType` | 8,662 / `fa0ca287a0ab64b164a093536833ed8e88e845c81503fd0bbfe264b772af43ca` |
+
+The matrix therefore moves from eight successful/four failed captures at the
+base to 12 successful captures at the candidate. Its base/candidate manifest
+hashes are
+`60bec51638046d90042798223214ccce200f1f5d7d4fb3ed252cc14ba8d558f9`
+and `b521773527c2deb08c2e2968c8204acbec7f7c2e451cf74ceca4dbc0a3c729c2`.
+
+#### Runtime-waiver disposition and native gates
+
+The retained M5 and Redwood runtime waivers do **not** close W14. DS/DSS
+generated source, kernel names, request/prepared identities, and native build
+identities changed, and the candidate newly makes canonical int8/uint8
+compressed results representable. The unchanged nonactivating grid can remain
+corroborating control evidence, but byte identity does not waive structural
+activation and cannot waive changed W14 binaries. The binding policy therefore
+requires final committed-candidate native correctness plus complete 42-cell /
+21-build same-binary A/A controls on both machines.
+
+The first M5 native attempt ran from `2026-07-19T23:08:32Z` through
+`2026-07-19T23:09:03Z` and exited 1. One ragged DS float32 case executed and
+matched its reference. The next zero-size case reached an assertion because
+the evidence harness keyed every shape to the ragged source hash even though
+zero-row/zero-column kernels have distinct shape-specialized source. This was
+an evidence-harness failure, not a compiler correctness failure. The failed
+attempt is retained at
+`native-m5-failed-attempt1-shape-keying`; its exact old runner, harness, and
+manifest hashes are
+`7fc5e177f3662a5870d11728ee47452701d83b33b8b4f07f9dd51de9e4a7586e`,
+`a6cc633ab39f27af7827369c62ad700b0b64267b7f8d760e596d8d4b40f282fe`,
+and `8d4eb948212e85a550990415305ae74ad5e14bafd1f692c3a95c4e5f667af615`.
+It must not be counted as an acceptance gate.
+
+The corrected, compilation-free prepared audit contains 24 exact source/build
+keys: DS/DSS ragged across six dtypes plus DS zero-row and zero-column across
+six dtypes. Its artifact and source-manifest hashes are
+`e1578392585d7a3fbd012c718c5ee50f239cef69260fc3a78dc8abf5b57f022d`
+and `b181ff890da9c4c8f73dff6b0602863ab4eb53769a11d46d297e451d94aeea35`;
+the corrected native harness hashes to
+`8441e0f6ebc739d3bc31c589add6c71ec5aa9285e0e4b7dd407379d25dc3bf68`.
+
+The authoritative M5 native gate was launched with:
+
+```sh
+/bin/bash \
+  /Users/bobby/.cache/scorch-codex/w14-cd63f26/run_native_m5.sh
+```
+
+After activating the `scorch` environment and unsetting `OMP_NUM_THREADS`, the
+runner executed the exact clean candidate with:
+
+```sh
+PYTHONPATH="$PWD/src" \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONUNBUFFERED=1 \
+MAX_JOBS=1 \
+TMPDIR="$run_root/tmp" \
+TORCH_EXTENSIONS_DIR="$run_root/torch-extensions" \
+python "$harness" \
+  --mode native \
+  --expected-revision "$revision" \
+  --expected-source-manifest "$expected_sources" \
+  --output "$output" \
+  --source-directory "$run_root/sources"
+```
+
+The gate ran from `2026-07-19T23:13:42Z` through
+`2026-07-19T23:21:57Z`; the native process and enclosing gate both exited 0.
+The environment receipt records macOS 26.4.1 arm64, Python 3.11.15, Torch
+2.13.0, 18 logical CPUs, six Torch threads, and `OMP_NUM_THREADS=None`.
+
+All 24 exact source/build cells compiled and all 24 correctness cells passed,
+for 48 native calls. Coverage was:
+
+- DS ragged, zero-row, and zero-column shapes for `float32`, `float64`,
+  `int32`, `int64`, `int8`, and `uint8` (18 cells);
+- DSS ragged shapes with empty outer slices for the same six dtypes (6 cells);
+- three executions for every ragged cell and one for each zero-size cell;
+- 54 result nonzeros for every DS ragged cell, 112 for every DSS ragged cell,
+  and zero for every zero-size cell; and
+- 24 runtime builds, each loaded once with exactly one generated kernel name.
+
+The result JSON is 41,639 bytes and hashes to
+`1fd371dcddb70fa370889819dd0b4b300ffa46b6dbdab6b3dc21cbabb4675095`.
+The 24-source manifest digest is
+`b181ff890da9c4c8f73dff6b0602863ab4eb53769a11d46d297e451d94aeea35`.
+The runner, native harness, and prepared source-manifest artifact hash to,
+respectively,
+`f434a61647f9e7fa7c1c199a1069125f450a3dc9f32869e74978b926830eb7c4`,
+`8441e0f6ebc739d3bc31c589add6c71ec5aa9285e0e4b7dd407379d25dc3bf68`,
+and `e1578392585d7a3fbd012c718c5ee50f239cef69260fc3a78dc8abf5b57f022d`.
+The 5,017-byte native log hashes to
+`6f2fc3c329cb2e0e1d579c7ff78d3897dc93d599134f5a3b75c3d4b9723583af`;
+the environment, validation, artifact-ledger, and prerequisite-ledger files
+hash to
+`933821681c41d95a21ab7d5ca897399262c550f52aaf16b3a1b07194a1242e10`,
+`6c58ec2e24cd0e58c2add1c4a7f2abb214e4f7a0c44e4b2687dee78e4ddfbfcd`,
+`33291c948a88e05a2e2bb27e5e2f9b34d2b6e1a63593636b45e23197cbcad685`,
+and `c7a9df2699e4dd894dcb9fe1324e9c5133c9385d4ed7b97053faca841ac7af4a`.
+Before and after revisions were exactly
+`cd63f26fc46fdffc3b17b931232e730a8c72aeac`; status before, immediately after
+native execution, and after the gate were empty. This successful gate—not the
+retained evidence-harness failure above—is the M5 acceptance result.
+
+The authoritative M5 same-binary A/A control was then launched with:
+
+```sh
+/bin/bash \
+  /Users/bobby/.cache/scorch-codex/w14-cd63f26/run_kernel_aa_m5.sh
+```
+
+Its exact benchmark command, after the same environment activation and
+`OMP_NUM_THREADS` unset, was:
+
+```sh
+PYTHONPATH="$PWD/src" \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONUNBUFFERED=1 \
+MAX_JOBS=1 \
+TMPDIR="$run_root/tmp" \
+TORCH_EXTENSIONS_DIR="$run_root/torch-extensions" \
+python tools/benchmark_compiler_ir.py kernel-aa \
+  --warmup 3 --rounds 5 --calls 3 --threads 6 --output "$output"
+```
+
+The control ran from `2026-07-19T23:21:57Z` through
+`2026-07-19T23:25:33Z`; both benchmark and gate exited 0. Its exact corpus used
+three warmups, five rounds, three calls, six threads, seed 0, rows
+`[512, 4096, 20000]`, free dimensions `[1, 3, 4, 8, 16, 64, 256]`, and
+densities `[0.02, 0.1]`. All 42 cells were correct and represented 21 exact
+builds. The five round geomeans were
+`[0.9794511245695211, 0.9860190441632102, 0.9994791906676683,
+0.9973557795037142, 0.9745239785600046]`, producing the exact measured
+machine-control band `[0.9745239785600046, 1.0261420160000987]` (reported in
+the console as `[0.975, 1.026]`). The unchanged grid does not activate W14, so
+this is machine-noise control evidence rather than structural W14 coverage.
+
+The 131,836-byte A/A JSON hashes to
+`0386f7b1ff9bfb62b71b48e25c4ffe20c86b8756346dd1be6ba76806ddd499ae`;
+its exact source/build manifest hashes to
+`9db0e662eb28ea4addf336820a472d7958f16c6a48fec47028996fb6ef3ecb7b`.
+The runner and benchmark harness hash to
+`9aa171b2adf039028e942e389f39313df91b71ae78767a470d4fe2c64b79fc0b`
+and `de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`.
+The 4,002-byte benchmark log hashes to
+`827076f4dfcdafdd07b4d02093a2ad5237bef5f55d503c06e4ccb5ca788050d2`;
+the environment, validation, artifact-ledger, and prerequisite-ledger files
+hash to
+`e836afdf6925cd1296eb0e82aff3bdd2fb6ad34e04291b73f2d6d9213ebf0e6e`,
+`18c1b9ea867ccbf71304ccf5abef86d99780c0a0a6122bca1d72b3894e7b5357`,
+`6cd37e64884143d8cf028b1027129620eb563469a3ae7dbf8087ff7950f02294`,
+and `b823ee8b208485a36a5c49ca96aaba6d1f8034d0295d785be3484f90c0479d48`.
+The environment matched the native gate. Revision before and after was exactly
+`cd63f26fc46fdffc3b17b931232e730a8c72aeac`; status before, immediately after
+the benchmark, and after the gate were empty.
+
+The authoritative Redwood transfer/native/A-A gate was launched inside the
+dedicated tmux session `scorch-w14-redwood-cd63f26` with:
+
+```sh
+/bin/bash /Users/bobby/.cache/scorch-codex/w14-cd63f26/run_redwood_gate.sh
+```
+
+It ran from `2026-07-19T23:25:55Z` through `2026-07-19T23:45:11Z` and exited
+0, with `native-remote.exit` and `kernel-aa-remote.exit` both 0.
+Authentication copied the macOS API Kerberos credential into a private,
+short-lived `FILE:` cache that was removed on exit, and bypassed the
+long-lived SSH control socket. Every remote source, worktree, extension-cache,
+compilation, and result path stayed under
+`/scratch/bobbyy/scorch-w14-cd63f26-20260719T2330Z`; AFS was used only for
+authentication/home metadata. The verified branch bundle hashes to
+`1983d68c90ac1810f45a8b38188f260454c23da144f27795d515e3820a0fe116` and lists
+exactly `refs/heads/refactor/compiler-ir-phase3-std-move-call` at
+`cd63f26fc46fdffc3b17b931232e730a8c72aeac`; the transfer runner hashes to
+`1945f7fb48c2b779c15ad7c97b1dd21f604e70afe386fa69760a014b3cc43b88`. The 24
+Redwood-generated kernel sources are byte-identical to the prepared M5 audit
+sources: the retained `native-source.diff` is empty.
+
+The remote native gate ran from `2026-07-19T23:26:00Z` through
+`2026-07-19T23:39:02Z` on `redwood.stanford.edu` (Linux 5.15.0-121 x86_64,
+Intel Core i9-14900K, 32 logical CPUs, 188 GiB RAM, Python 3.11.15, Torch
+2.5.1, 24 Torch threads, `OMP_NUM_THREADS=None`, caches under the run's
+`/scratch/bobbyy` XDG root); the native process and enclosing gate both
+exited 0. All 24 exact source/build cells compiled and all 24 correctness
+cells passed for 48 native calls, with the same DS/DSS dtype/shape coverage,
+per-cell repetition counts, result-nonzero counts, and one-build-per-cell
+loading as M5. The result JSON is 34,642 bytes and hashes to
+`3bb28937ec52841188158386b2a5f6d098cdb12d6e1673c6f8de3fea6af0aaf9`; the
+24-source manifest digest is again
+`b181ff890da9c4c8f73dff6b0602863ab4eb53769a11d46d297e451d94aeea35`; the
+8,740-byte native log hashes to
+`979f162fd8c85f3df8491e845851a1ef248c9845b4405a1ab91c8309699a9c6e`. Revision
+before and after was exactly `cd63f26fc46fdffc3b17b931232e730a8c72aeac`;
+status before, immediately after native execution, and after the gate were
+empty.
+
+The remote same-binary A/A control ran from `2026-07-19T23:39:02Z` through
+`2026-07-19T23:45:05Z` with three warmups, five rounds, three calls, 24
+threads, seed 0, rows `[512, 4096, 20000]`, free dimensions
+`[1, 3, 4, 8, 16, 64, 256]`, and densities `[0.02, 0.1]`; benchmark and gate
+both exited 0. All 42 cells were correct and represented 21 exact builds. The
+measured machine geomean A/A band was `[0.977, 1.024]`. The 113,095-byte A/A
+JSON hashes to
+`2dfaea9db81de17fa768417997c001c42f02a8b49ea80fc56f0424e1edc474fe`; its exact
+source/build manifest hashes to
+`7eed32610d6b94a9937500ae6ac10178ed6bc09a2f24f1c2c518015a9925181d`; the
+7,567-byte benchmark log hashes to
+`c77d810c1b3465cc17cdcf0e08e90152ae30ae9890cbea3c58188090ade67d78`; the
+remote harness hashed to the same
+`de8cb62c618a3823719847f91cf8f8ef149f8e646aa3725eb065d7c9bb256383`. Both
+remote runs were revision-exact and clean before, immediately after the
+benchmark, and after the gate, and every remote artifact was retrieved under
+a hash ledger before remote cleanup. As on M5, the unchanged benchmark grid
+does not activate W14, so the Redwood A/A control is machine-noise control
+evidence rather than structural W14 coverage.
+
+#### Exact quality and strict Sphinx comparison
+
+The exact command was:
+
+```sh
+/bin/zsh \
+  /Users/bobby/.cache/scorch-codex/w14-cd63f26/run_quality_sphinx.sh
+```
+
+It ran from `2026-07-19T22:53:26Z` through `2026-07-19T22:54:02Z` and the
+comparison gate exited 0. It compared exactly the eight changed Python files
+from clean detached base/candidate worktrees:
+
+- Black `0/0`, with matching configured Python-version warning and log hash
+  `977e449a29b204831fb1ae2d210d563ccb639b90806af4c1a6c02beeb970bc03`;
+- Flake8 `0/0`, zero findings, normalized empty hash
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+- mypy `1/1`, the same 13 inherited `import-untyped` diagnostics, no additions
+  or removals, normalized hash
+  `275ce21d72cbab67acaa731bade4e2349b810fdf5858b68cd5e4bbdfadae925a`;
+  and
+- strict Sphinx `1/1` solely for the same 23 inherited unresolved references,
+  normalized warning hash
+  `f94a84d6406b0d5c270b6b0319ea65b953d373f98595a5b25a142957240b492d`.
+
+Strict Sphinx used:
+
+```sh
+PYTHONPATH="$PWD:$PWD/src" \
+sphinx-build -n -b html -W --keep-going -E -a docs/source OUT
+```
+
+Each side produced 187 output files, 53 HTML pages, and 142 non-doctree files.
+All 142 non-doctree files are byte-identical; the shared manifest hashes to
+`59567d651d74426c3a63196acad68b3453daae97f307c063a4aaa82afad9eecb`.
+The comparison summary hashes to
+`46c268b973e6217d6510d8cb415410dc6324e434fc884e3a4c520f8e8db1234b`;
+the runner hashes to
+`cab5f6ccbe4de1d9e21b6fe1bf82cca280b63d9747b8ca97a4bce75293e405bc`;
+the SHA ledger hashes to
+`c0743ce608c3b3732b8db3580c6c9f09f1410102bbe12e99f88c707131d12165`.
+Both worktrees remained exact and clean.
+
+#### Candidate-only latency activation and attribution
+
+The latency stage ran last, after every other gate was green and idle, and
+required two retained evidence-tooling corrections before it could pass. Both
+failures were latency evidence-harness defects, not compiler or W14 defects,
+and neither modified the repository or the three W14 commits.
+
+The first attempt ran the original `run_latency_activation.sh`, which created
+an empty extension cache and invoked the capture helper directly. Building the
+four corpus inputs then legitimately compiled the shared input-preparation
+kernel `kernel_5ec9f1a395b3` into that cache, so the retained base capture
+correctly failed with "activation capture changed the extension cache". The
+predecessor emitter and W15 flows prepare this cache first; the W14 runner had
+omitted that stage. The failed run is retained at
+`latency-activation-failed-attempt1-empty-input-cache` with its cache at
+`latency-input-cache-failed-attempt1-empty`.
+
+The corrected flow added the missing preparation stage as
+`prepare_w14_latency_input_cache.sh`
+(`9360727a76017b90ba2d6260bbbb35a1ed2b7db1a6633a1e068cb81cad0a2b12`), which
+verified every prerequisite receipt, prebuilt the four corpus inputs into
+`latency-input-cache/torch-extensions` (compiling exactly the one
+`kernel_5ec9f1a395b3` input family), pre-created the four case-kernel
+directories `kernel_15881a900beb`, `kernel_16383b9b95dd`,
+`kernel_5628efc92c98`, and `kernel_e00ee3ef0d54`, and recorded the exact
+extension state and per-file hash ledger. It ran green from
+`2026-07-19T23:52:05Z` through `2026-07-19T23:52:11Z` at the exact clean
+candidate.
+
+The second activation attempt then failed inside the W14 wrapper helper
+itself: `_rewrite_manifest` demanded an empty pre-capture extension state even
+though its own base flow records `input_prebuilt_cache_reused` as true. No
+cache state can satisfy both requirements, so the helper pair could never
+pass as written. The failed run is retained at
+`latency-activation-failed-attempt2-empty-cache-assertion`. The correction
+replaced the empty-cache assertion in `capture_w14_latency_activation.py` with
+an exact prepared-scaffold assertion (the four case-kernel directories plus
+only the `kernel_5ec9f1a395b3` input family), recorded
+`extension_cache_initially_empty` as false, and mirrored the same assertions
+and the new helper identity in `compare_w14_latency.py`. The corrected helper
+hashes are
+`35ce7f962a417845bef9476c8b5f7f6caa736fc9b0bd73102333a0b4a8acb998` and
+`ffffb0230988fd43d2d646d551d640461958551336523d9116cf9df8e94b8b4f`; the
+corrected runners are `run_latency_activation_v2.sh`
+(`c53f220fb65a6be86e2ade4244258d1ef8b64669bc1eba747736544c9d79b438`) and
+`run_latency_final_v2.sh`
+(`b7882aafd3f89f2fb4018065a04240600b3ed720558fb9c0d23301ab48fc6bce`). No
+failed attempt is counted as an acceptance gate, and no benchmark sample was
+discarded or rerun to seek a more favorable result.
+
+The authoritative activation gate ran green from `2026-07-19T23:55:13Z`
+through `2026-07-19T23:55:15Z` in the detached latency worktree at the exact
+clean candidate, with native case builds intercepted before compilation. All
+four corpus cases — `small_dense`, `reduction`, `csr_intersection`, and
+`sparse_union` — reported exactly zero compressed-Where pass activations, zero
+value-allocation router calls, zero canonical and legacy router activations,
+zero owner and legacy emitter calls, `w14_active=false`, and
+`source_build_equal=true` against the retained predecessor artifact
+(`848a8eb53525fbd0620e402400d265b2f1062c339f58e0d4852ca606dcdd0dd3`, exact
+full build-object equality). The rewritten activation manifest hashes to
+`691751d8252280b64905d422ebc514ca9046298e8c78a34b0eb7cd3997eee581`, and the
+prepared cache was byte-identical after capture (an empty
+`cache-files.diff`).
+
+The authoritative candidate-only benchmark ran from `2026-07-20T00:00:32Z`
+through `2026-07-20T00:00:35Z` with five warmups and 30 samples, benchmarking
+only exact clean committed `cd63f26` (the predecessor artifact was read-only):
+
+```sh
+python tools/benchmark_compiler_ir.py latency \
+  --warmup 5 --samples 30 --output latency-cd63f26-m5.json
+```
+
+The candidate artifact is 55,034 bytes and hashes to
+`a581a49bece474a919dfd50520955f56569104356fa34d505497264c85ce61b5`; the
+strict comparison artifact is 81,272 bytes, hashes to
+`7e712ed8c3d7439c1b1983ea0896c10c958f2d3ba889fb87822ecec6efb8cd26`, and holds
+all 24 endpoint p50/p95 rows and all 62 compiler-stage rows as the exact
+referenced ledger. Every endpoint category met the 1.10 target for both p50
+and p95: `small_dense` 0.970/0.967, `reduction` 1.007/1.049,
+`csr_intersection` 1.027/1.016, and `sparse_union` 0.985/0.526. None of the
+four benchmark cases activates W14; every row records zero W14 counters,
+`w14_active=false`, and byte-identical source/build objects.
+
+Exactly three compiler-stage p95 ratios crossed 1.10, all on
+microsecond-scale stages with W14 inactive and byte-identical source/build
+identity:
+
+| Case | Stage | p95 old → new ms | Ratio | Signed delta ms |
+| --- | --- | --- | --- | --- |
+| `small_dense` | `cin_normalization_and_verification` | 0.023742 → 0.027874 | 1.174 | +0.004132 |
+| `reduction` | `result_abi_assembly` | 0.012565 → 0.014721 | 1.172 | +0.002156 |
+| `csr_intersection` | `frontend_validated_operation_construction` | 0.034279 → 0.038779 | 1.131 | +0.004500 |
+
+Each crossing carries the attribution class
+`source_build_identical_w14_inactive_timing_variance`: the stage inputs,
+emitted sources, and build objects are byte-identical to the predecessor and
+no W14 code executes in these cases, so the movement is sub-5-microsecond
+host timing variance, not a W14 cost. Under the binding compiler-latency
+policy these crossings are investigated and attributed, not rejection
+triggers; the binding disposition is acceptance. The benchmark left the
+prepared cache byte-identical (an empty final `cache-files.diff`).
+
+#### Updated locked budget, preserved material, and exact phase status
+
+The exact post-slice budget at `cd63f26` is:
+
+- 414 production `Var` constructors, up by three;
+- ten direct expression strings: nine subscripts and one ternary, unchanged;
+- 14 known indirect sinks/clones, unchanged;
+- seven generic string rewrites, unchanged;
+- 23 `RawStmt` constructors / 22 semantic producers, unchanged because the
+  deliberate noncanonical compatibility fallback remains;
+- five raw constructors in `compressed_where_openmp_pass.py`, unchanged;
+- six `DirectInit` templates, unchanged;
+- in `torch_cpp_abi.py`, 29 `VarInit`, nine `Array`, 13 `FunctionCall`, ten
+  `QualifiedName`, and 12 `tensor_data_ptr` constructor/helper sites; and
+- exactly one W14 typed template containing zero `RawStmt`, two `VarInit`,
+  three `Var`, one `Array`, one `FunctionCall`, one `QualifiedName`, and one
+  `tensor_data_ptr`, with zero `Cast`, `Add`, and `Literal`.
+
+The remaining 22 semantic raw producers are still C3-C7/C12-C17 (11),
+W1/W2/W4/W5 plus the W14 compatibility fallback (five), C8-C10 (three), D1,
+S1, and P1. Canonical production no longer uses W14 raw emission, but the raw
+node and its compatibility producer have not been removed.
+
+At documentation time, a read-only hash check reproduced the five protected tracked
+working files exactly:
+
+- `.gitignore`:
+  `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`;
+- `pyproject.toml`:
+  `191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`;
+- `src/scorch/__init__.py`:
+  `5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`;
+- `tests/packaging/smoke_install.py`:
+  `f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`;
+  and
+- `tests/test_scorch/test_resources.py`:
+  `3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+Ignored/untracked `AGENTS.md` remains outside compiler commits at
+`52f54c83057325852d44367eea276fa9f66887ca8cf8fd4e26514fd8ca77ae87`.
+It records the severe AFS-space limit, Redwood `/scratch/bobbyy`, and SC/MKT
+`/scr/u/bobbyy`. The separately authorized AFS cleanup evidence remains under
+`/Users/bobby/.cache/scorch-codex/afs-cleanup-20260719`; reported quota fell
+from 27% to 6% and approximately 1.02 GiB was reclaimed. No W14 compiler gate
+uses AFS.
+
+All user-owned untracked autotune, benchmark, GPU/CUDA, SuiteSparse, research,
+scheduler/receipt, scratchpad, test-analysis, tooling, temporary, and literal
+`-` material remained outside every W14 commit. `COMPILER_IR_REFACTOR_DESIGN.md`
+and tracked csrc were not modified; the user-owned untracked CUDA csrc tree was
+not touched.
+
+Only the narrow Phase-3 **typed canonical W14 compressed-result value Torch
+owner/borrow slice** is complete. The noncanonical W14 compatibility
+`RawStmt`, W1/W2/W4/W5 workspace lifetime/allocation work, remaining
+Torch/generalized allocation seams, the seven generic rewrites, parallel
+zero-fill typed-pass extraction, and unified exhaustive CxxIR-emission exit
+review remain open. Duplicate-generator removal and the exact emitted-node
+accepted set are complete, but the broader per-field exhaustive-emission exit
+review is not. Phase 3 remains open. Phase 3.5 and LoopIR have not begun.
+Phases 0 and 1 are not claimed formally closed without a separate
+design-requirement audit. Phase 2 retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
