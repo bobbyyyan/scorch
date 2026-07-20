@@ -21075,7 +21075,13 @@ SuiteSparse, research, scheduler/receipt, scratchpad, test-analysis,
 tooling, temporary, and literal `-` material remained outside the five
 session commits and the sixth, handoff commit.
 `COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were not modified.
-Nothing was pushed.
+This session pushed nothing. The remote reflog records an external
+periodic push at `2026-07-20T19:16:48Z` — between this session's
+review-correction and implementation commits, and matching a same-day
+`82f27c3` push that predates the session — which advanced
+`origin/refactor/compiler-ir-phase3-std-move-call` to `15e2c82`,
+publishing the three Sizeof review-correction commits. The three C6
+slice commits remain local-only.
 
 Evidence limitations: all measurements in this section are
 single-machine (Apple M5); the byte-identical waiver makes no
