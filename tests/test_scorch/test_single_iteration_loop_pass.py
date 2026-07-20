@@ -915,6 +915,37 @@ def test_function_call_rewrite_preserves_tuple_statement_body() -> None:
     assert cast(llir.Var, call.args[0]).name == "Argument[root]"
 
 
+def test_member_call_rewrite_owns_receiver_and_arguments() -> None:
+    call = llir.MemberCallStmt(
+        base=_access("Receivers", "lane"),
+        member="consume",
+        template_args=(llir.DataType.INT64,),
+        args=(_access("Arguments", "lane"), _var("Payload[lane]")),
+    )
+    source = _program([call], loop_variable="lane", base="root")
+    before = _snapshot(source)
+
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert len(output) == 1
+    rewritten = cast(llir.MemberCallStmt, output[0])
+    receiver = cast(llir.ArrayAccess, rewritten.base)
+    assert cast(llir.Var, receiver.array).name == "Receivers"
+    assert cast(llir.Var, receiver.index).name == "root"
+    assert rewritten.member == "consume"
+    assert rewritten.template_args == (llir.DataType.INT64,)
+    assert type(rewritten.args) is tuple
+    argument = cast(llir.ArrayAccess, rewritten.args[0])
+    assert cast(llir.Var, argument.array).name == "Arguments"
+    assert cast(llir.Var, argument.index).name == "root"
+    assert cast(llir.Var, rewritten.args[1]).name == "Payload[root]"
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
 def test_exact_structured_access_index_is_rewritten_and_reapplication_is_noop() -> None:
     metadata = llir.TensorAccessMetadata(
         access_id=AccessId(31),

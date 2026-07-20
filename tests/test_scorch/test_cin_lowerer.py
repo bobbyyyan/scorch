@@ -5565,6 +5565,51 @@ def test_cin_reference_rewrite_rebuilds_frozen_access_and_preserves_metadata() -
     assert cast(llir.Var, source.index).name == "ix offset"
 
 
+def test_cin_value_reference_rewrite_rebuilds_member_call_stmt_children() -> None:
+    source = llir.MemberCallStmt(
+        base=llir.Var("workspace", llir.DataType.NO_TYPE),
+        member="store",
+        template_args=(llir.DataType.FLOAT32,),
+        args=(
+            llir.ArrayAccess(
+                array=llir.Var("Output_val", llir.DataType.PTR_FLOAT32),
+                index=llir.Var("position", llir.DataType.INT64),
+            ),
+            llir.Var("workspace_limit", llir.DataType.INT64),
+        ),
+    )
+    statements: list[llir.Stmt] = [source]
+
+    CINLowerer._rewrite_val_refs(
+        statements,
+        {
+            "workspace": "thread_workspace",
+            "Output_val[": "Output_val.data()[",
+        },
+    )
+
+    rewritten = cast(llir.MemberCallStmt, statements[0])
+    assert type(rewritten) is llir.MemberCallStmt
+    assert rewritten is not source
+    assert rewritten.base == llir.Var("thread_workspace", llir.DataType.NO_TYPE)
+    assert rewritten.member == source.member == "store"
+    assert rewritten.template_args == source.template_args == (llir.DataType.FLOAT32,)
+    assert rewritten.args == (
+        llir.ArrayAccess(
+            array=llir.Var("Output_val.data()", llir.DataType.PTR_FLOAT32),
+            index=llir.Var("position", llir.DataType.INT64),
+        ),
+        llir.Var("thread_workspace_limit", llir.DataType.INT64),
+    )
+    assert LLIRLowerer().lower_llir(rewritten) == (
+        "thread_workspace.store<float>(Output_val.data()[position], "
+        "thread_workspace_limit);"
+    )
+    assert LLIRLowerer().lower_llir(source) == (
+        "workspace.store<float>(Output_val[position], workspace_limit);"
+    )
+
+
 def test_nondefault_coo_intersection_keeps_live_coordinate_end_bounds():
     row, column = IndexVar("r"), IndexVar("c")
     result = TensorVar("Intersect", fmt="oo", mode_order=[1, 0])

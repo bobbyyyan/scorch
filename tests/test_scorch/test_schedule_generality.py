@@ -430,6 +430,78 @@ def test_schedule_statement_access_rewrite_counts_and_clones_each_replacement():
     )
 
 
+def test_schedule_member_call_statement_rewrites_receiver_and_arguments() -> None:
+    tensor_id = SymbolId(27)
+    index_ids = (IndexId(28),)
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(29),
+        tensor_id=tensor_id,
+        index_ids=index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    access = llir.ArrayAccess(
+        llir.Var("Input_val", llir.DataType.PTR_FLOAT32),
+        llir.Var("pInput", llir.DataType.INT),
+        metadata,
+    )
+    source = llir.MemberCallStmt(
+        base=access,
+        member="consume",
+        template_args=(llir.DataType.FLOAT32,),
+        args=(access,),
+    )
+    statements: list[llir.Stmt] = [source]
+    replacement = llir.ArrayAccess(
+        llir.Var("packed_Input", llir.DataType.PTR_FLOAT32),
+        llir.Var("packed_position", llir.DataType.INT),
+    )
+
+    count = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+    first = cast(llir.MemberCallStmt, statements[0])
+    repeated = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+    second = cast(llir.MemberCallStmt, statements[0])
+
+    assert count == 2
+    assert repeated == 0
+    assert first is not source
+    assert second is not first
+    assert first.member == second.member == "consume"
+    assert first.template_args == second.template_args == (llir.DataType.FLOAT32,)
+    assert type(first.args) is tuple
+    assert type(second.args) is tuple
+    assert first.base is not replacement
+    assert first.args[0] is not replacement
+    assert first.base is not first.args[0]
+    assert second.base is not first.base
+    assert second.args[0] is not first.args[0]
+    assert LLIRLowerer().lower_llir(source) == (
+        "Input_val[pInput].consume<float>(Input_val[pInput]);"
+    )
+    assert LLIRLowerer().lower_llir(first) == (
+        "packed_Input[packed_position].consume<float>("
+        "packed_Input[packed_position]);"
+    )
+    assert LLIRLowerer().lower_llir(second) == LLIRLowerer().lower_llir(first)
+    assert not _contains_tensor_access(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+    )
+
+
 def test_schedule_statement_access_rewrite_preserves_tuple_bodies() -> None:
     tensor_id = SymbolId(24)
     index_ids = (IndexId(25),)

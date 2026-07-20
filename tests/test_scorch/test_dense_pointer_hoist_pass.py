@@ -869,6 +869,45 @@ def test_function_call_rewrite_preserves_tuple_loop_body() -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
+def test_member_call_rewrite_owns_receiver_and_arguments() -> None:
+    old = "Input_val[position]"
+    call = llir.MemberCallStmt(
+        base=_access("Input_val", "position"),
+        member="consume",
+        template_args=(llir.DataType.FLOAT32,),
+        args=(_var(old), _access("Input_val", "position")),
+    )
+    loop = _loop(
+        [
+            _position_init(),
+            llir.Assign(_var("discover"), _var(old)),
+            call,
+        ]
+    )
+    source = [loop]
+    before = _snapshot(source)
+
+    output = hoist_dense_pointers(
+        source,
+        _context(("Input_val", "float")),
+    )
+
+    output_loop = cast(llir.ForLoop, output[1])
+    rewritten = cast(llir.MemberCallStmt, output_loop.body[1])
+    receiver = cast(llir.ArrayAccess, rewritten.base)
+    assert cast(llir.Var, receiver.array).name == "_Input_val_ptr"
+    assert cast(llir.Var, receiver.index).name == "lane"
+    assert rewritten.member == "consume"
+    assert rewritten.template_args == (llir.DataType.FLOAT32,)
+    assert type(rewritten.args) is tuple
+    assert cast(llir.Var, rewritten.args[0]).name == "_Input_val_ptr[lane]"
+    argument = cast(llir.ArrayAccess, rewritten.args[1])
+    assert cast(llir.Var, argument.array).name == "_Input_val_ptr"
+    assert cast(llir.Var, argument.index).name == "lane"
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
 def test_legacy_rewrite_omits_headers_parallel_regions_and_nested_containers() -> None:
     old = "Input_val[position]"
     nested_header = _loop([], loop_variable="nested")

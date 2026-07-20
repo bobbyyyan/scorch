@@ -619,7 +619,7 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
-    """Lock the exact W2/W4 typed template and its member-call-statement budget."""
+    """Lock the W2/W4 template and global member-call-statement budget."""
 
     member_call_stmt_constructors = Counter(
         {
@@ -629,10 +629,14 @@ def test_workspace_clear_mutations_are_structured() -> None:
     )
     member_call_stmt_constructors += Counter()
     assert member_call_stmt_constructors == {
+        "cin_lowerer.py": 1,
         "compressed_where_openmp_pass.py": 1,
+        "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
+        "schedule_lowerer.py": 1,
+        "single_iteration_loop_pass.py": 1,
     }
-    assert sum(member_call_stmt_constructors.values()) == 2
+    assert sum(member_call_stmt_constructors.values()) == 6
 
     compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
     compressed_source = compressed_path.read_text()

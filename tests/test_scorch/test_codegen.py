@@ -2683,6 +2683,34 @@ def test_codegen_rejects_forged_member_call_stmt_fields(malformation: str) -> No
         LLIRLowerer().lower_llir(call)
 
 
+@pytest.mark.parametrize(
+    ("missing_field", "expected"),
+    (
+        ("base", "MemberCallStmt.base"),
+        ("member", "MemberCallStmt.member"),
+        ("template_args", "MemberCallStmt.template_args"),
+        ("args", "MemberCallStmt.args"),
+    ),
+)
+def test_codegen_rejects_forged_member_call_stmt_missing_fields(
+    missing_field: str,
+    expected: str,
+) -> None:
+    call = object.__new__(llir.MemberCallStmt)
+    fields = {
+        "base": _var("workspace"),
+        "member": "clear",
+        "template_args": (),
+        "args": (),
+    }
+    for field, value in fields.items():
+        if field != missing_field:
+            object.__setattr__(call, field, value)
+
+    with pytest.raises(CodegenError, match=expected):
+        LLIRLowerer().lower_llir(call)
+
+
 def test_function_codegen_rejects_non_var_argument() -> None:
     function = llir.Function(
         return_type=llir.DataType.VOID,

@@ -1683,6 +1683,47 @@ def test_forged_member_call_stmt_fields_fail_at_traversal_boundary(
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
 @pytest.mark.parametrize(
+    ("missing_field", "diagnostic_code", "expected_path"),
+    (
+        ("base", "invalid_member_call_stmt_base", ("root", "base")),
+        ("member", "invalid_member_call_stmt_member", ("root", "member")),
+        (
+            "template_args",
+            "invalid_member_call_stmt_template_args",
+            ("root", "template_args"),
+        ),
+        ("args", "invalid_member_call_stmt_args", ("root", "args")),
+    ),
+)
+def test_forged_member_call_stmt_missing_fields_fail_closed(
+    operation: str,
+    missing_field: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    call = object.__new__(llir.MemberCallStmt)
+    fields = {
+        "base": _var("workspace"),
+        "member": "clear",
+        "template_args": (),
+        "args": (),
+    }
+    for field, value in fields.items():
+        if field != missing_field:
+            object.__setattr__(call, field, value)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(call)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(call)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
     "malformation",
     [
         "rvalue",
