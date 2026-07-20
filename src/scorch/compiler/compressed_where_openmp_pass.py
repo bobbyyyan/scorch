@@ -661,6 +661,23 @@ def _workspace_view_statement(context: CompressedWhereOpenMPContext) -> llir.Raw
     )
 
 
+def _workspace_clear_statement(
+    context: CompressedWhereOpenMPContext,
+) -> llir.MemberCallStmt:
+    """Return one fresh typed ``clear()`` mutation of the borrowed worker view.
+
+    The receiver is the per-worker view declared by the raw pre-parallel
+    ``make_view()`` statement.  Its C++ type is compiler-deduced (``auto``), so
+    no accurate ``DataType`` member exists; ``NO_TYPE`` marks the reference as
+    a metadata-free physical borrow exactly as other workspace reads do.
+    """
+
+    return llir.MemberCallStmt(
+        base=llir.Var(name=context.workspace_name, type=llir.DataType.NO_TYPE),
+        member="clear",
+    )
+
+
 def _phase_header_copy(
     source: llir.ForLoop, context: CompressedWhereOpenMPContext
 ) -> llir.ForLoop:
@@ -883,7 +900,7 @@ def _build_count_body(
         for level in levels
     )
     if workspace_hoisted:
-        body.append(llir.RawStmt(code=f"{context.workspace_name}.clear()"))
+        body.append(_workspace_clear_statement(context))
     return body, result_write.run_records
 
 
@@ -945,7 +962,7 @@ def _build_fill_body(
     )
     body.extend(cast(List[llir.Stmt], result_write.artifact.value))
     if workspace_hoisted:
-        body.append(llir.RawStmt(code=f"{context.workspace_name}.clear()"))
+        body.append(_workspace_clear_statement(context))
     return body, result_write.run_records
 
 

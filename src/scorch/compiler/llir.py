@@ -786,6 +786,57 @@ class MemberCall(Expr):
         object.__setattr__(self, "args", normalized_args)
 
 
+@dataclass(frozen=True, init=False, repr=False)
+class MemberCallStmt(Stmt):
+    """An immutable member-call statement on one structured receiver.
+
+    This mirrors :class:`MemberCall` exactly as :class:`FunctionCallStmt`
+    mirrors :class:`FunctionCall`: the receiver is a structured expression
+    child, never a dotted spelling embedded in a call name.
+    """
+
+    base: Expr
+    member: str
+    template_args: Tuple[DataType, ...]
+    args: Tuple[Expr, ...]
+
+    def __init__(
+        self,
+        base: Expr,
+        member: str,
+        template_args: Optional[Sequence[DataType]] = None,
+        args: Optional[Sequence[Expr]] = None,
+    ) -> None:
+        if not isinstance(base, Expr):
+            raise TypeError("MemberCallStmt.base must be an LLIR Expr")
+        if type(member) is not str or not member.isidentifier():
+            raise TypeError("MemberCallStmt.member must be a non-empty identifier")
+        if template_args is None:
+            normalized_template_args: Tuple[DataType, ...] = ()
+        else:
+            if type(template_args) is not list and type(template_args) is not tuple:
+                raise TypeError("MemberCallStmt.template_args must be a list or tuple")
+            if any(type(argument) is not DataType for argument in template_args):
+                raise TypeError(
+                    "MemberCallStmt.template_args must contain only DataType values"
+                )
+            normalized_template_args = tuple(template_args)
+        if args is None:
+            normalized_args: Tuple[Expr, ...] = ()
+        else:
+            if type(args) is not list and type(args) is not tuple:
+                raise TypeError("MemberCallStmt.args must be a list or tuple")
+            if any(not isinstance(argument, Expr) for argument in args):
+                raise TypeError(
+                    "MemberCallStmt.args must contain only LLIR expressions"
+                )
+            normalized_args = tuple(args)
+        object.__setattr__(self, "base", base)
+        object.__setattr__(self, "member", member)
+        object.__setattr__(self, "template_args", normalized_template_args)
+        object.__setattr__(self, "args", normalized_args)
+
+
 @dataclass(frozen=True)
 class ArrayAccess(Expr):
     """An immutable typed array/subscript access expression.

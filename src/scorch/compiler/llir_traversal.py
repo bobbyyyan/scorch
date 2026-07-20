@@ -87,6 +87,7 @@ SUPPORTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
     llir.Break,
     llir.Function,
     llir.FunctionCallStmt,
+    llir.MemberCallStmt,
     llir.ForLoop,
     llir.ForLoopAuto,
     llir.WhileLoop,
@@ -851,6 +852,8 @@ class LLIRWalker:
             self.visit_function(cast(llir.Function, node), path)
         elif node_type is llir.FunctionCallStmt:
             self.visit_function_call_stmt(cast(llir.FunctionCallStmt, node), path)
+        elif node_type is llir.MemberCallStmt:
+            self.visit_member_call_stmt(cast(llir.MemberCallStmt, node), path)
         elif node_type is llir.ForLoop:
             self.visit_for_loop(cast(llir.ForLoop, node), path)
         elif node_type is llir.ForLoopAuto:
@@ -1088,6 +1091,63 @@ class LLIRWalker:
                 path=path + ("args",),
                 value=node.args,
             )
+        self._walk_expr_sequence(node.args, path + ("args",))
+
+    def visit_member_call_stmt(self, node: llir.MemberCallStmt, path: LLIRPath) -> None:
+        if not isinstance(node.base, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_stmt_base",
+                message="MemberCallStmt.base must be an LLIR Expr",
+                path=path + ("base",),
+                value=node.base,
+            )
+        if type(node.member) is not str or not node.member.isidentifier():
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_stmt_member",
+                message="MemberCallStmt.member must be a non-empty identifier",
+                path=path + ("member",),
+                value=node.member,
+            )
+        if type(node.template_args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_stmt_template_args",
+                message="MemberCallStmt.template_args must be a tuple",
+                path=path + ("template_args",),
+                value=node.template_args,
+            )
+        for index, template_argument in enumerate(node.template_args):
+            if type(template_argument) is not llir.DataType:
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_member_call_stmt_template_arg",
+                    message=(
+                        "MemberCallStmt.template_args must contain only DataType "
+                        "values"
+                    ),
+                    path=path + ("template_args", f"[{index}]"),
+                    value=template_argument,
+                )
+        if type(node.args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_stmt_args",
+                message="MemberCallStmt.args must be a tuple",
+                path=path + ("args",),
+                value=node.args,
+            )
+        for index, call_argument in enumerate(node.args):
+            if not isinstance(call_argument, llir.Expr):
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_member_call_stmt_argument",
+                    message="MemberCallStmt.args must contain only LLIR expressions",
+                    path=path + ("args", f"[{index}]"),
+                    value=call_argument,
+                )
+        self._walk_expr(node.base, path + ("base",))
         self._walk_expr_sequence(node.args, path + ("args",))
 
     def visit_for_loop(self, node: llir.ForLoop, path: LLIRPath) -> None:
@@ -1492,6 +1552,8 @@ class LLIRRewriter:
             return self.rewrite_function_call_stmt(
                 cast(llir.FunctionCallStmt, node), path
             )
+        if node_type is llir.MemberCallStmt:
+            return self.rewrite_member_call_stmt(cast(llir.MemberCallStmt, node), path)
         if node_type is llir.ForLoop:
             return self.rewrite_for_loop(cast(llir.ForLoop, node), path)
         if node_type is llir.ForLoopAuto:
@@ -1881,6 +1943,69 @@ class LLIRRewriter:
                 List[llir.Expr],
                 self._rewrite_expr_sequence(node.args, path + ("args",)),
             ),
+        )
+
+    def rewrite_member_call_stmt(
+        self, node: llir.MemberCallStmt, path: LLIRPath
+    ) -> llir.MemberCallStmt:
+        if not isinstance(node.base, llir.Expr):
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_stmt_base",
+                message="MemberCallStmt.base must be an LLIR Expr",
+                path=path + ("base",),
+                value=node.base,
+            )
+        if type(node.member) is not str or not node.member.isidentifier():
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_stmt_member",
+                message="MemberCallStmt.member must be a non-empty identifier",
+                path=path + ("member",),
+                value=node.member,
+            )
+        if type(node.template_args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_stmt_template_args",
+                message="MemberCallStmt.template_args must be a tuple",
+                path=path + ("template_args",),
+                value=node.template_args,
+            )
+        for index, template_argument in enumerate(node.template_args):
+            if type(template_argument) is not llir.DataType:
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_member_call_stmt_template_arg",
+                    message=(
+                        "MemberCallStmt.template_args must contain only DataType "
+                        "values"
+                    ),
+                    path=path + ("template_args", f"[{index}]"),
+                    value=template_argument,
+                )
+        if type(node.args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_member_call_stmt_args",
+                message="MemberCallStmt.args must be a tuple",
+                path=path + ("args",),
+                value=node.args,
+            )
+        for index, call_argument in enumerate(node.args):
+            if not isinstance(call_argument, llir.Expr):
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_member_call_stmt_argument",
+                    message="MemberCallStmt.args must contain only LLIR expressions",
+                    path=path + ("args", f"[{index}]"),
+                    value=call_argument,
+                )
+        return llir.MemberCallStmt(
+            base=self._rewrite_expr(node.base, path + ("base",)),
+            member=node.member,
+            template_args=node.template_args,
+            args=self._rewrite_expr_sequence(node.args, path + ("args",)),
         )
 
     def rewrite_for_loop(self, node: llir.ForLoop, path: LLIRPath) -> llir.ForLoop:
