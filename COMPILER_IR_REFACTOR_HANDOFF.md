@@ -20607,6 +20607,214 @@ remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are not
 claimed formally closed without a separate design-requirement audit. Phase
 2 retains its recorded canonical closure.
 
+### Phase-3 typed workspace zero-fill extent/mutation ownership complete (2026-07-20)
+
+The member-call review corrections documented in the preceding section were
+committed exactly as staged, with no amend, squash, or reorder, as:
+
+- `a8cc4538f6007e2cb12db22d34ac37b73d87361b`,
+  **fix(compiler): integrate typed member-call statements**;
+- `8824e795e728f52dadb5f276dbb3a382fcc31310`,
+  **test(compiler): cover member-call rewrite integration**; and
+- `89c239c04733afd94b044b43325acb9bbadca62b`,
+  **docs(compiler): record workspace-seam review corrections**.
+
+Before committing, the previously recorded evidence was reproduced in this
+session: the combined compiler/pass suite is **1337 passed** in the scorch
+environment, Black leaves all 13 files unchanged, `git diff --check` is
+clean, scoped Flake8 on the six production files is byte-identical to the
+`82f27c3` base after line drift, and scoped mypy over the 13 files is
+byte-identical after `:LINE:` normalization (48 inherited findings both
+sides). The five protected tracked files hashed exactly as recorded. Only
+the 14 intended files were committed; nothing was pushed.
+
+On top of that base, only the narrow Phase-3 **C3/C5 typed workspace
+zero-fill extent/mutation** slice is complete in this section. The exact
+base is `89c239c04733afd94b044b43325acb9bbadca62b` and the exact committed
+candidate is `b1ddaae173ffd6e75544268b2627b8ef174e4df2`. Its ordered
+commits are:
+
+- `eb130e7bcbc32f29cecc22bcd8e0fb086fbf4686`,
+  **refactor(compiler): emit typed workspace zero-fill statements**; and
+- `b1ddaae173ffd6e75544268b2627b8ef174e4df2`,
+  **test(compiler): cover typed workspace zero-fill statements**.
+
+The complete base/candidate range is five files: `cin_lowerer.py` in
+production plus `test_cin_lowerer.py`, `test_llir_string_budget.py`,
+`test_dense_pointer_hoist_pass.py`, and
+`test_single_iteration_loop_pass.py`. No CIN, scheduling policy, kernel
+ABI, generated C++ spelling, cache schema, csrc, native ABI, public Python
+API, pass order, Phase-3.5, or LoopIR work is part of this slice.
+
+#### Audit and seam division
+
+A fresh read-only audit of the recommended C3-C5/C15-C16 parallel
+zero-fill cluster found it is **not one coherent typeable boundary today**
+and shipped only the smallest complete one:
+
+| Family | Decision |
+| --- | --- |
+| **C3+C5** | **Selected. The extent alias `int64_t {size} = {actual}` and the per-iteration mutation `memset({w}, 0, {size} * sizeof({ctype}))` are the zero-fill ownership unit: the alias exists only to name the zero-fill extent and the memset is its only typed consumer. Both are byte-identically expressible through existing globally supported nodes (`VarInit`, `FunctionCallStmt`, precedence-aware `Mul`, `Literal`, `Var`, and the `Sizeof` leaf, which gains its first production constructor), so no new node kind was added.** |
+| C4/C16 | Deferred. The restrict pool borrow and the `scorch_make_aligned_buffer` pool owner both embed the spaceless `(size_t)expr` cast spelling; the typed `Cast` node renders `(size_t) expr` with a space. Typing either is the same deliberate W1-class Cast-spelling normalization decision already deferred for the worker-view acquisition: it changes emitted bytes corpus-wide and mandates the full two-machine generated-kernel gate. |
+| C15 | Deferred. The `int {w}_thread_count = <expr>` initializer reuses the rendered `omp_num_threads` target-policy string (`scorch_nthreads(...)`, `omp_get_max_threads()`, or their `std::max`); typing it requires either parsing rendered policy text (prohibited) or the W5-class typed parallel-policy seam. |
+| Pass relocation | Deferred. Extracting zero-fill ownership into a named typed pass cannot ship while the allocation/borrow half (C4/C15/C16) must stay raw inside `lower_Where`/`_attach_serial_workspace_pools`: relocating only the memset would split the placement decision across two owners without typing anything more, and adding a pass changes pass structure this slice is required to preserve. The in-place statement migration follows the W13/L1-L2/W2-W4 precedent; the named-pass extraction remains open behind the Cast/policy decisions. |
+
+The raw C6 memcpy consumer of the same extent alias remains the separately
+deferred addressed-copy family, exactly as the W2/W4 typed `clear()`
+referenced the raw W1 view acquisition.
+
+#### Representation, ownership boundary, and emission
+
+`CINLowerer.lower_Where` constructs, per dense untiled 1-D workspace:
+
+- `llir.VarInit(var=<INT64 workspace-size Var from size_llir_var>,
+  value=llir.Var(actual_size, INT64))`, rendered
+  `int64_t {size} = {actual};`; and
+- `llir.FunctionCallStmt("memset", (llir.Var(wname, <ctype>*),
+  llir.Literal(0, INT), llir.Mul(llir.Var(size_var, INT64),
+  llir.Sizeof(<ctype>))))`, rendered
+  `memset({w}, 0, {size} * sizeof({ctype}));`.
+
+Both render byte-for-byte the previous raw spellings through the existing
+common codegen (`Sizeof` binds at unary precedence, so the product needs
+and receives no parentheses). The memset receiver reuses the previously
+dead `wksp_ctype_ptr` pointer type, retiring an inherited Flake8 F841
+finding. Repeated lowering returns structurally equal but separately owned
+statements, and the common rewriter detaches both arguments. Downstream
+integration needed no correction: the CIN value-reference rewrite, schedule
+tensor-access rewrite, dense-pointer hoist, and single-iteration
+elimination already recurse through `FunctionCallStmt` arguments and the
+`BinOp` family and pass the `Sizeof`/`Literal` leaves through unchanged;
+this is now locked by tests rather than assumed.
+
+The production string/raw budget after this slice: **423 production `Var`
+constructors** (the three new zero-fill spellings are enumerated as known
+indirect names, with `wname` now counted at both its typed sites); ten
+direct expression strings; **18 known indirect sinks/clones**; seven
+generic string rewrites (unchanged); **16 `RawStmt` constructors / 15
+semantic producers** (`cin_lowerer.py` drops from 11 to nine); six
+`DirectInit` templates; the `MemberCallStmt` budget of six (unchanged); and
+a new pinned global `Sizeof` constructor budget of exactly two (the
+`lower_Where` producer and the traversal reconstruction). The remaining 15
+semantic raw producers are C4, C6, C7, C12-C17 (eight in
+`cin_lowerer.py`), W1, W5, the W14 compatibility fallback, D1, S1, and P1.
+
+#### Focused verification and structural coverage
+
+The combined compiler/pass suite (the 13 predecessor files plus
+`tests/test_scorch/codegen`) produced **1452 passed** in the working tree
+at the candidate. Black leaves all five changed files unchanged and
+`git diff --check` is clean. Scoped Flake8 retains only inherited findings
+minus the retired F841; the scoped mypy base/candidate comparison is
+byte-identical after normalizing both embedded line numbers and the
+line-position drift of the inherited `no-redef` message.
+
+New coverage locks: production activation
+(`test_dense_workspace_zero_fill_statements_are_structured_and_byte_exact`):
+exactly one typed memset with exact argument shapes and types, one typed
+INT64 extent alias, no raw statement spelling either, byte-exact emission
+of both lines, alias-before-borrow-before-memset ordering, disjoint
+ownership across repeated lowerings, and rewriter detachment; CIN
+value-reference rewriting of the memset receiver and product variable with
+preserved `Literal`/`Sizeof` leaves
+(`test_cin_value_reference_rewrite_rebuilds_zero_fill_children`); product
+and `Sizeof` traversal through the dense-pointer and single-iteration
+call-statement rewrites
+(`test_function_call_rewrite_traverses_product_and_sizeof_arguments` in
+both pass suites); and the budget test
+`test_dense_workspace_zero_fill_is_structured`, which pins the global
+two-site `Sizeof` budget, the single `FunctionCallStmt`/`VarInit` template
+in `lower_Where`, the single remaining raw statement there (the C4
+borrow), the absence of any f-string `int64_t` declaration, and the
+deferred C15/C16 spellings in `_attach_serial_workspace_pools`.
+
+#### Byte-identity capture and chained machine evidence
+
+The authoritative capture gate ran from `2026-07-20T18:21:21Z` through
+`2026-07-20T18:21:26Z` and exited 0
+(`/Users/bobby/.cache/scorch-codex/zerofill-b1ddaae/run_capture_gate.sh`,
+runner `beba3ea7…`), executing both revisions in one clean shared
+worktree with one extension path. Base and candidate emissions are
+byte-identical for the five canonical inputs, the raw 42-cell grid JSON,
+the workspace pair, and the tiled workspace. The base is additionally
+chained to the retained `605fb35` candidate capture: the five canonical
+`.cpp` files byte-identically, and the grid on every
+environment-independent field including each cell's emitted
+`source_sha256` and byte counts — the raw retained grid bytes cannot be
+compared directly because `build_directory`/`so_path` and the four cache
+digests embed the extension root, which necessarily differs between gate
+roots; the in-run base/candidate comparison shares one root and is raw
+byte-identity. This chains the slice to the W14 native and same-binary
+A/A evidence on both machines. No capture artifact contains the workspace
+memset (the corpus has no dense-workspace kernel), so the migrated lines
+are additionally proven byte-exact by lowering the dense-workspace
+accumulation kernel at base and candidate and comparing complete rendered
+kernels byte-for-byte. Under the byte-identical waiver policy no new
+generated-kernel machine gate is required; structural activation tests
+were still run and committed. The capture artifact ledger hashes to
+`62771ead20270f71b1e1486b587411cedf2a81c8ce7efb7d14bc010ec0358fe5`.
+
+#### Full-suite and latency verification
+
+The authoritative full non-performance suite ran in the clean detached
+candidate worktree from `2026-07-20T18:21:54Z` through
+`2026-07-20T18:32:54Z` with 12 file-distributed workers and isolated
+caches, producing `2135 passed, 14 skipped, 2 warnings in 660.08s`
+(the predecessor's 2129 plus this slice's coverage); pytest and gate
+exits were zero and the log hashes to
+`98830c248be8db18ef724d79b7491f15e3eadda7bb51665b9d8cca635c6894b8`.
+
+The latency gates ran from `2026-07-20T18:33:00Z` through
+`2026-07-20T18:33:17Z` after every other gate was idle and exited 0
+(`run_latency_gates.sh`, `3c1a1885…`). The slice-specific activation
+helper (`capture_zerofill_latency_activation.py`, `68826514…`) counted
+typed memset constructions inside the production `lower_Where` across the
+canonical corpus and recorded exactly **zero** across
+`small_dense`/`reduction`/`csr_intersection`/`sparse_union` — no corpus
+case lowers a dense-workspace `Where` — while separately proving exact
+structured activation on the dense-workspace production shape (one typed
+memset, one typed alias, zero raw offenders, byte-exact
+`memset(wksp, 0, wksp0_size * sizeof(float));` and
+`int64_t wksp0_size = B1_size;` emissions); the activation report hashes
+to `0c625a9d…`. Because the corpus cannot execute the changed path, the
+paired benchmark is a same-session drift monitor: after one unrecorded
+priming run, base (`latency-89c239c-m5.json`, `37a7ebab…`) and candidate
+(`latency-b1ddaae-m5.json`, `907db909…`) each ran five warmups and 30
+samples in the clean worktrees, and `compare-latency` reports every
+category inside the 1.10 target for both percentiles (`small_dense`
+0.981/0.941, `reduction` 0.978/0.988, `csr_intersection` 1.006/1.017,
+`sparse_union` 0.947/0.636 — the low `sparse_union` p95 ratio reflects a
+transient 3.553 ms spike in the base run's p95, not slice cost). No
+crossing occurred and no attribution was required.
+
+At documentation time, a read-only hash check reproduced the five
+protected tracked working files exactly as recorded in the preceding
+sections, and all user-owned untracked autotune, benchmark, GPU/CUDA,
+SuiteSparse, research, scheduler/receipt, scratchpad, test-analysis,
+tooling, temporary, and literal `-` material remained outside all five
+session commits. `COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were
+not modified. Nothing was pushed.
+
+Evidence limitations: all measurements in this section are single-machine
+(Apple M5); the byte-identical waiver makes no two-machine runtime claim
+necessary, and the retained-chain grid comparison is semantic rather than
+raw-byte for the documented path-embedding reason.
+
+Only the narrow C3/C5 slice is complete. The raw budget is 16
+constructors / 15 semantic producers. The recommended next ownership seam
+is the **deliberate W1-class Cast-spelling normalization decision**: it
+now blocks three raw families across two seams (the W1 worker-view
+acquisition and the C4/C16 zero-fill allocation/borrow half, with the
+W5/C15 policy seam layered behind it), changes emitted bytes corpus-wide,
+and therefore requires the full two-machine generated-kernel gate and an
+explicit emission-spelling review. The byte-identical alternative is the
+C6/D1 addressed-copy family (address-of, qualification, byte-count, and
+copy-call structure). After those remain C7, C12-C14, C17, S1, P1, the
+seven generic rewrites, and the unified exhaustive CxxIR-emission exit
+review. Phase 3 remains open. Phase 3.5 and LoopIR have not begun. Phases
+0 and 1 are not claimed formally closed without a separate
+design-requirement audit. Phase 2 retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
