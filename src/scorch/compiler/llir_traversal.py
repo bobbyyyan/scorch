@@ -462,6 +462,22 @@ def _validate_cast_fields(
         )
 
 
+def _validate_sizeof_fields(
+    node: llir.Sizeof,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    data_type = getattr(node, "data_type", _MISSING_LLIR_FIELD)
+    if type(data_type) is not llir.DataType:
+        _raise_traversal_error(
+            context,
+            code="invalid_sizeof_data_type",
+            message="Sizeof.data_type must be a DataType",
+            path=path + ("data_type",),
+            value=data_type,
+        )
+
+
 def _validate_direct_init_var(
     value: object,
     context: LLIRTraversalContext,
@@ -1011,7 +1027,7 @@ class LLIRWalker:
         self._walk_expr(node.expr, path + ("expr",))
 
     def visit_sizeof(self, node: llir.Sizeof, path: LLIRPath) -> None:
-        pass
+        _validate_sizeof_fields(node, self.context, path)
 
     def visit_increment(self, node: llir.Increment, path: LLIRPath) -> None:
         self._walk_var_child(node.var, path + ("var",))
@@ -1775,6 +1791,7 @@ class LLIRRewriter:
         )
 
     def rewrite_sizeof(self, node: llir.Sizeof, path: LLIRPath) -> llir.Sizeof:
+        _validate_sizeof_fields(node, self.context, path)
         return llir.Sizeof(data_type=node.data_type)
 
     def rewrite_increment(self, node: llir.Increment, path: LLIRPath) -> llir.Increment:

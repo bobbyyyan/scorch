@@ -473,7 +473,10 @@ class LLIRLowerer:
             return f"({ir.data_type.value}) {operand}"
 
         if type(ir) is llir.Sizeof:
-            return f"sizeof({ir.data_type.value})"
+            data_type = getattr(ir, "data_type", None)
+            if type(data_type) is not llir.DataType:
+                raise CodegenError("Sizeof.data_type must be a DataType")
+            return f"sizeof({data_type.value})"
 
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
             binary = cast(llir.BinOp, ir)

@@ -924,7 +924,8 @@ def _validate_assignment_index(expression: object) -> None:
             raise TypeError("assignment index Literal.data_type must be a DataType")
         return
     if expression_type is Sizeof:
-        if type(cast(Sizeof, expression).data_type) is not DataType:
+        data_type = getattr(expression, "data_type", None)
+        if type(data_type) is not DataType:
             raise TypeError("assignment index Sizeof.data_type must be a DataType")
         return
     if expression_type in (BinOp, Add, Mul):
@@ -1135,3 +1136,7 @@ class Sizeof(Expr):
     """A sizeof expression."""
 
     data_type: DataType
+
+    def __post_init__(self) -> None:
+        if type(self.data_type) is not DataType:
+            raise TypeError("Sizeof.data_type must be a DataType")
