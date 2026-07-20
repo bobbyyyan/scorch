@@ -1468,29 +1468,56 @@ class CINLowerer:
                     # Emit memcpy: the workspace has the full row, write once.
                     wname = wksp.get_name()
                     size_var = wksp_index_var.size_llir_var.name
-                    ctype_str = dtype_to_c_datatype(wksp.dtype).value
-                    # Resolve the base pointer for this row in C.
-                    resolve_stmts = (
-                        result_tensor_access.get_level_iterator_resolve_stmts(
-                            level=level
-                        )
-                    )
+                    wksp_write_ctype = dtype_to_c_datatype(wksp.dtype)
                     # The iterator for the row start: pC<level> with j=0
                     # is just pC_prev * C_level_size (which is result_level_iterator_name with j=0).
                     # We can compute it as: &C_values[pC0 * C1_size]
-                    prev_iter = (
-                        f"p{result_tensor_name}{level - 1}" if level > 0 else "0"
+                    row_start: llir.Expr = (
+                        llir.Var(
+                            name=f"p{result_tensor_name}{level - 1}",
+                            type=llir.DataType.INT64,
+                        )
+                        if level > 0
+                        else llir.Literal(value=0, data_type=llir.DataType.INT)
                     )
-                    c_level_size = f"{result_tensor_name}{level}_size"
                     return [
                         llir.BlankLine(),
                         llir.Comment("Write workspace to output (memcpy — pure store)"),
-                        llir.RawStmt(
-                            code=(
-                                f"memcpy(&{result_tensor_name}_values"
-                                f"[{prev_iter} * {c_level_size}], "
-                                f"{wname}, {size_var} * sizeof({ctype_str}))"
-                            )
+                        llir.FunctionCallStmt(
+                            name="memcpy",
+                            args=[
+                                llir.AddressOf(
+                                    operand=llir.ArrayAccess(
+                                        array=llir.Var(
+                                            name=f"{result_tensor_name}_values",
+                                            type=llir.DataType.ptr_type(
+                                                wksp_write_ctype
+                                            ),
+                                        ),
+                                        index=llir.Mul(
+                                            row_start,
+                                            llir.Var(
+                                                name=(
+                                                    f"{result_tensor_name}"
+                                                    f"{level}_size"
+                                                ),
+                                                type=llir.DataType.INT64,
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                llir.Var(
+                                    name=wname,
+                                    type=llir.DataType.ptr_type(wksp_write_ctype),
+                                ),
+                                llir.Mul(
+                                    llir.Var(
+                                        name=size_var,
+                                        type=llir.DataType.INT64,
+                                    ),
+                                    llir.Sizeof(data_type=wksp_write_ctype),
+                                ),
+                            ],
                         ),
                     ]
 
@@ -2718,6 +2745,11 @@ class CINLowerer:
                 binary,
                 CINLowerer._rewrite_expr_refs(binary.left, replacements),
                 CINLowerer._rewrite_expr_refs(binary.right, replacements),
+            )
+        if type(expr) is llir.AddressOf:
+            address = cast(llir.AddressOf, expr)
+            return llir.AddressOf(
+                operand=CINLowerer._rewrite_expr_refs(address.operand, replacements),
             )
         return expr
 

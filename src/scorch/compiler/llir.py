@@ -1140,3 +1140,14 @@ class Sizeof(Expr):
     def __post_init__(self) -> None:
         if type(self.data_type) is not DataType:
             raise TypeError("Sizeof.data_type must be a DataType")
+
+
+@dataclass(frozen=True)
+class AddressOf(Expr):
+    """An immutable address-of expression, spelled ``&operand``."""
+
+    operand: Expr
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operand, Expr):
+            raise TypeError("AddressOf.operand must be an LLIR Expr")

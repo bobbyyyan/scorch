@@ -478,6 +478,17 @@ class LLIRLowerer:
                 raise CodegenError("Sizeof.data_type must be a DataType")
             return f"sizeof({data_type.value})"
 
+        if type(ir) is llir.AddressOf:
+            address_operand = getattr(ir, "operand", None)
+            if not isinstance(address_operand, llir.Expr):
+                raise CodegenError("AddressOf.operand must be an LLIR Expr")
+            operand = self._render_operand(
+                address_operand,
+                parent_precedence=self._UNARY_PRECEDENCE,
+                is_right_child=True,
+            )
+            return f"&{operand}"
+
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
             binary = cast(llir.BinOp, ir)
             if type(binary.op) is not str or not binary.op:
@@ -652,7 +663,7 @@ class LLIRLowerer:
     def _expression_precedence(self, ir: llir.Expr) -> int:
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
             return self._binary_precedence(cast(llir.BinOp, ir).op)
-        if type(ir) in (llir.Cast, llir.UnaryOp, llir.Sizeof):
+        if type(ir) in (llir.Cast, llir.UnaryOp, llir.Sizeof, llir.AddressOf):
             return self._UNARY_PRECEDENCE
         if (
             type(ir) is llir.FunctionCall

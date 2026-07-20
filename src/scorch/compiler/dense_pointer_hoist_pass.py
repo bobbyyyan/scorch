@@ -511,6 +511,16 @@ def _rewrite_expression_references(
             ),
             tensor_access=access.tensor_access,
         )
+    if type(expression) is llir.AddressOf:
+        address = cast(llir.AddressOf, expression)
+        return llir.AddressOf(
+            operand=_rewrite_expression_references(
+                address.operand,
+                replacements,
+                context,
+                path + ("operand",),
+            ),
+        )
     return expression
 
 

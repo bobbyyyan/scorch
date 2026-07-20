@@ -70,6 +70,7 @@ SUPPORTED_LLIR_EXPRESSION_NODE_TYPES: Tuple[Type[llir.Expr], ...] = (
     llir.ArrayAccess,
     llir.Cast,
     llir.Sizeof,
+    llir.AddressOf,
 )
 
 SUPPORTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
@@ -478,6 +479,22 @@ def _validate_sizeof_fields(
         )
 
 
+def _validate_address_of_fields(
+    node: llir.AddressOf,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    operand = getattr(node, "operand", _MISSING_LLIR_FIELD)
+    if not isinstance(operand, llir.Expr):
+        _raise_traversal_error(
+            context,
+            code="invalid_address_of_operand",
+            message="AddressOf.operand must be an LLIR Expr",
+            path=path + ("operand",),
+            value=operand,
+        )
+
+
 def _validate_direct_init_var(
     value: object,
     context: LLIRTraversalContext,
@@ -817,6 +834,8 @@ class LLIRWalker:
             self.visit_cast(cast(llir.Cast, node), path)
         elif node_type is llir.Sizeof:
             self.visit_sizeof(cast(llir.Sizeof, node), path)
+        elif node_type is llir.AddressOf:
+            self.visit_address_of(cast(llir.AddressOf, node), path)
         else:
             _raise_traversal_error(
                 self.context,
@@ -1028,6 +1047,10 @@ class LLIRWalker:
 
     def visit_sizeof(self, node: llir.Sizeof, path: LLIRPath) -> None:
         _validate_sizeof_fields(node, self.context, path)
+
+    def visit_address_of(self, node: llir.AddressOf, path: LLIRPath) -> None:
+        _validate_address_of_fields(node, self.context, path)
+        self._walk_expr(node.operand, path + ("operand",))
 
     def visit_increment(self, node: llir.Increment, path: LLIRPath) -> None:
         self._walk_var_child(node.var, path + ("var",))
@@ -1530,6 +1553,8 @@ class LLIRRewriter:
             return self.rewrite_cast(cast(llir.Cast, node), path)
         if node_type is llir.Sizeof:
             return self.rewrite_sizeof(cast(llir.Sizeof, node), path)
+        if node_type is llir.AddressOf:
+            return self.rewrite_address_of(cast(llir.AddressOf, node), path)
         _raise_traversal_error(
             self.context,
             code="unknown_llir_node",
@@ -1793,6 +1818,14 @@ class LLIRRewriter:
     def rewrite_sizeof(self, node: llir.Sizeof, path: LLIRPath) -> llir.Sizeof:
         _validate_sizeof_fields(node, self.context, path)
         return llir.Sizeof(data_type=node.data_type)
+
+    def rewrite_address_of(
+        self, node: llir.AddressOf, path: LLIRPath
+    ) -> llir.AddressOf:
+        _validate_address_of_fields(node, self.context, path)
+        return llir.AddressOf(
+            operand=self._rewrite_expr(node.operand, path + ("operand",)),
+        )
 
     def rewrite_increment(self, node: llir.Increment, path: LLIRPath) -> llir.Increment:
         return llir.Increment(self._rewrite_var_child(node.var, path + ("var",)))
