@@ -20394,10 +20394,12 @@ constructors (the one new metadata-free receiver); ten direct expression
 strings; 14 known indirect sinks/clones; seven generic string rewrites
 (unchanged); **18 `RawStmt` constructors / 17 semantic producers**
 (`compressed_where_openmp_pass.py` drops from five to three); six
-`DirectInit` templates; and a new pinned `MemberCallStmt` constructor
-budget of exactly two (the pass producer and the traversal
-reconstruction). The remaining 17 semantic raw producers are C3-C7/C12-C17
-(11), W1, W5, the W14 compatibility fallback, D1, S1, and P1.
+`DirectInit` templates; and, at committed candidate `605fb35`, a pinned
+`MemberCallStmt` constructor budget of exactly two (the pass producer and
+the traversal reconstruction). The follow-up review below raises the current
+global reconstruction budget to six. The remaining 17 semantic raw producers
+are C3-C7/C12-C17 (11), W1, W5, the W14 compatibility fallback, D1, S1, and
+P1.
 
 #### Focused verification and updated structural coverage
 
@@ -20412,8 +20414,9 @@ adjacent sweep of `tests/test_scorch/codegen`,
 `test_dynamic_vector_access_pass.py`, `test_loop_invariant_factor_pass.py`,
 and `test_single_iteration_loop_pass.py` produced **444 passed**. Black
 reported all eight changed files unchanged, Flake8 retained only the
-parent-identical `codegen.py` F541, mypy retained only the three
-parent-identical dynamic-`ForLoop` findings, and `git diff --check` was
+parent-identical `codegen.py` F541, and the base/candidate mypy comparison
+retained the same 17 findings: 14 `import-untyped` test-import findings plus
+the three dynamic-`ForLoop` `attr-defined` findings. `git diff --check` was
 clean.
 
 New coverage locks: node-contract tests
@@ -20433,8 +20436,10 @@ phases and repeated transforms, rewriter detachment, deeper `d,s,s`
 activation, the unhoisted boundary emitting none, and no raw `.clear`
 spelling anywhere. The DS exactness test re-pins the clear statements from
 raw codes to structured statements without weakening any other assertion,
-and `test_workspace_clear_mutations_are_structured` pins the exact helper
-template, both build-body call sites, and the two-site constructor budget.
+and, at `605fb35`, `test_workspace_clear_mutations_are_structured` pins the
+exact helper template, both build-body call sites, and the original two-site
+constructor budget. The follow-up review below extends that budget and its
+coverage.
 
 #### Byte-identity capture and chained machine evidence
 
@@ -20451,9 +20456,11 @@ diff receipt is zero bytes. Both sides are additionally pinned byte-equal
 to the same seven retained candidate capture hashes (all-COO `53d6faae…`,
 CSR-dense `36a8599c…`, DS `02043a5a…`, DSS `adc0b71f…`, preamble
 `db297157…`, input manifest `1a8a8797…`, grid `26154ccc…`), which chains
-this slice's identity — including the DS/DSS emissions that contain the
-migrated `wksp.clear();` lines — to the W14 native and same-binary A/A
-evidence on both machines; under the byte-identical waiver policy no new
+this slice's identity — including the canonical DS emission's two migrated
+`wksp.clear();` lines — to the W14 native and same-binary A/A evidence on
+both machines. The canonical DSS emission uses an unhoisted local workspace
+and contains no clear; its synthetic `d,s,s` structural activation is
+covered separately below. Under the byte-identical waiver policy no new
 generated-kernel machine gate is required (structural activation tests were
 still run, above). The artifact ledger hashes to
 `9a0eb6f506412941777c108b4af833684f337882db1eb50c01133faff3552ef5`.
@@ -20470,10 +20477,17 @@ and gate exits were zero and the log hashes to
 The quality comparison ran from `2026-07-20T06:03:31Z` through
 `2026-07-20T06:04:09Z` over the exact eight changed Python files in clean
 base/candidate worktrees: Black `0/0`; Flake8 `1/1` with byte-identical
-normalized findings (the inherited F541); mypy `0/0` with empty normalized
-error logs; strict Sphinx `1/1` with the same 23 inherited warnings; all
-normalized logs and both non-doctree HTML manifests byte-identical
-(`comparison-summary.txt` records every diff exit 0).
+normalized findings (the inherited F541); mypy `1/1`; and strict Sphinx
+`1/1` with the same 23 inherited warnings. The retained raw mypy logs each
+contain the same 17 findings (14 `import-untyped` and three inherited
+dynamic-`ForLoop` `attr-defined` findings). The retained runner incorrectly
+filtered for plain `: error:` before removing ANSI formatting, so it produced
+empty normalized mypy logs and a vacuous zero-byte diff. A follow-up audit
+stripped ANSI first and then line-normalized the raw logs, reproducing all 17
+findings byte-identically; the candidate adds no mypy finding, but the empty
+retained normalized-log diff is not evidence of that fact. The other
+normalized logs and both non-doctree HTML manifests are byte-identical
+(`comparison-summary.txt` records every retained diff exit 0).
 
 The latency gates ran from `2026-07-20T06:13:41Z` through
 `2026-07-20T06:13:57Z` after every other gate was idle and exited 0
@@ -20484,10 +20498,11 @@ patched a counter over the one production clear constructor, ran the
 canonical corpus through the production path, and recorded exactly **zero**
 constructions across `small_dense`/`reduction`/`csr_intersection`/
 `sparse_union` — the corpus contains no compressed-`Where` output kernel —
-while separately proving exact structured production activation on the DS
-and DS,S shapes (applied, exactly two typed `MemberCallStmt` clears each,
-zero raw clears, byte-exact `wksp.clear();` emission, exact receiver
-shape); the activation report hashes to `95088a8d…`. Because the corpus
+while separately proving exact structured activation of the production
+transform on synthetic DS and `d,s,s` shapes (applied, exactly two typed
+`MemberCallStmt` clears each, zero raw clears, byte-exact `wksp.clear();`
+emission, exact receiver shape); the activation report hashes to
+`95088a8d…`. Because the corpus
 cannot execute the changed path, the paired benchmark is a same-session
 drift monitor rather than a slice-cost measurement: after one unrecorded
 cache-priming run, base (`latency-bf50ce9-m5.json`, `233e1d95…`) and
@@ -20517,6 +20532,65 @@ All user-owned untracked autotune, benchmark, GPU/CUDA, SuiteSparse,
 research, scheduler/receipt, scratchpad, test-analysis, tooling, temporary,
 and literal `-` material remained outside both slice commits.
 `COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were not modified.
+
+#### Follow-up rigorous review and corrections (2026-07-20)
+
+A post-commit review of the exact `bf50ce9..82f27c3` range found five
+compiler-contract defects in the new globally supported statement node. None
+changes the existing zero-argument, metadata-free `wksp.clear()` semantics,
+but each was reproducible on another valid `MemberCallStmt` shape:
+
+- constructor-bypassed statements missing `base`, `member`, `template_args`,
+  or `args` leaked `AttributeError` from the walker, rewriter, and codegen
+  instead of their promised structured diagnostics;
+- schedule tensor-access rewriting skipped both the structured receiver and
+  arguments, leaving selected access metadata behind for postflight failure;
+- dense-pointer hoisting could remove a position declaration while leaving it
+  referenced inside a member-call receiver or argument;
+- single-iteration elimination could remove a one-step loop variable while
+  leaving the same stale reference inside a member call; and
+- `CINLowerer._rewrite_val_refs` skipped member-call children while rewriting
+  equivalent assignment, initializer, and free-call children.
+
+The correction guards all four fields at the common traversal/codegen
+boundaries and reconstructs `MemberCallStmt` through the schedule, dense,
+single-iteration, and CIN reference rewrites, preserving the identifier member
+and immutable template arguments while rewriting and detaching the receiver and
+call arguments. The current constructor inventory is therefore exactly six:
+the compressed-Where producer, common traversal reconstruction, and the CIN,
+dense-pointer, schedule, and single-iteration reconstructions. The `RawStmt`
+18/17 and production `Var` 420 budgets do not change.
+
+The retained-evidence audit also corrected two reporting errors above. The
+quality run was mypy `1/1`, with the same 17 inherited raw findings on both
+sides; its ANSI-sensitive filter had produced a vacuous empty normalized diff.
+An ANSI-first follow-up comparison recovered all 17 findings identically. The
+canonical DS capture contains both migrated clears, while canonical DSS uses an
+unhoisted local workspace and contains none; synthetic `d,s,s` activation is a
+separate structural probe.
+
+Review verification is failure-closed and isolated from the protected user
+files:
+
+- the original eight-file suite was independently reproduced at `82f27c3` as
+  **1047 passed**; the corrected combined compiler/pass suite is **1337
+  passed**;
+- an archive-isolated full non-performance run produced **2129 passed, 14
+  skipped**; its sole failure was a benchmark-harness precondition because the
+  archive lacked Git-worktree metadata and was rejected before the test's
+  different-worktree branch. The complete benchmark-harness file then passed
+  **5/5** in a clean detached Git worktree, including that precondition case;
+- Black leaves all 13 corrected Python files unchanged and `git diff --check`
+  is clean; scoped Flake8 and mypy base/current comparisons contain only the
+  same inherited findings after line normalization; and
+- a clean corrected-tree capture is byte-identical to retained `605fb35` for
+  all five canonical inputs, the 42-cell grid, the workspace pair, and tiled
+  workspace, with no extension artifact created.
+
+The five protected tracked files still hash exactly as recorded above. No
+untracked user material, csrc/native ABI, public API, cache schema, or generated
+C++ spelling changed. The C3-C5/C15-C16 parallel zero-fill recommendation and
+Phase-3 status therefore remain unchanged.
 
 Only the narrow Phase-3 **W2/W4 typed workspace clear-mutation** slice is
 complete. The raw budget is 18 constructors / 17 semantic producers. The
