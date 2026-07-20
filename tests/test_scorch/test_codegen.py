@@ -807,6 +807,10 @@ def test_codegen_rejects_forged_literal_fields(
         (llir.Literal("line\nbreak", llir.DataType.STRING), '"line\\nbreak"'),
         (llir.Literal("tab\tstop", llir.DataType.STRING), '"tab\\tstop"'),
         (llir.Literal("carriage\rreturn", llir.DataType.STRING), '"carriage\\rreturn"'),
+        (llir.Literal("café", llir.DataType.STRING), '"caf\\303\\251"'),
+        (llir.Literal("π", llir.DataType.STRING), '"\\317\\200"'),
+        (llir.Literal("π7", llir.DataType.STRING), '"\\317\\2007"'),
+        (llir.Literal("𐐀", llir.DataType.STRING), '"\\360\\220\\220\\200"'),
         (
             llir.Literal("spaces, punctuation; (x <= ~y)!", llir.DataType.STRING),
             '"spaces, punctuation; (x <= ~y)!"',
@@ -850,12 +854,11 @@ def test_semantic_bool_literal_codegen_is_byte_exact(
 @pytest.mark.parametrize(
     "value",
     (
-        "café",
-        "π",
         "null\x00byte",
         "escape\x1bcode",
         "delete\x7fcharacter",
         "bell\acharacter",
+        "surrogate\ud800character",
     ),
 )
 def test_semantic_string_literal_rejects_unsupported_characters(

@@ -89,9 +89,9 @@ class LLIRLowerer:
     _PRIMARY_PRECEDENCE = 13
     _UNARY_OPERATORS = {"+", "-", "!", "~", "*", "&", "++", "--"}
 
-    # Exact escape table for semantic STRING literal emission.  Characters
-    # outside this table and printable ASCII are rejected rather than guessed
-    # at, so the emitted spelling stays deterministic.
+    # Exact escape table for semantic STRING literal emission. Non-ASCII Unicode
+    # scalar values are emitted as UTF-8 octal escapes so the generated source
+    # and runtime bytes stay deterministic without depending on a source encoding.
     _STRING_LITERAL_ESCAPES = {
         "\\": "\\\\",
         '"': '\\"',
@@ -554,8 +554,9 @@ class LLIRLowerer:
     def _render_string_literal(self, value: str) -> str:
         """Render a semantic STRING literal as a quoted, escaped C++ string.
 
-        Only printable ASCII and the exact escape table are accepted; any
-        other character fails closed instead of guessing a C++ spelling.
+        Printable ASCII passes through, non-ASCII Unicode scalar values are
+        encoded as UTF-8 octal escapes, and the exact escape table covers
+        supported controls. Every other character fails closed.
         """
         rendered = ['"']
         for character in value:
@@ -564,6 +565,8 @@ class LLIRLowerer:
                 rendered.append(escaped)
             elif " " <= character <= "~":
                 rendered.append(character)
+            elif ord(character) >= 0x80 and not 0xD800 <= ord(character) <= 0xDFFF:
+                rendered.extend(f"\\{byte:03o}" for byte in character.encode("utf-8"))
             else:
                 raise CodegenError(
                     "Literal STRING value contains an unsupported character: "

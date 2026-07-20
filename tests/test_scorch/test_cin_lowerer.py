@@ -1121,6 +1121,65 @@ def test_kernel_abi_validation_handles_empty_shapes_and_unknown_extents() -> Non
     )
 
 
+def test_kernel_abi_validation_preserves_unicode_identifiers() -> None:
+    abi = TorchCppKernelABI(
+        result_shape=(2,),
+        result_rank=1,
+        input_tensors=(
+            KernelTensorABI(
+                "Δ",
+                (LevelType.DENSE,),
+                (0,),
+                (2,),
+                torch.float32,
+            ),
+        ),
+        extra_tensor_names=("β",),
+        extra_tensor_dtype=torch.float32,
+        function_name="évaluate",
+    )
+    assert LLIRLowerer().lower_llir(abi.emit_validation()) == "\n".join(
+        [
+            "scorch_native::validate_jit_result_shape(result_shape, {2}, 1, "
+            '"\\303\\251valuate");',
+            'scorch_native::validate_jit_tensor("\\303\\251valuate", '
+            '"\\316\\224", Δ_shape, Δ_mode_indices, Δ_values, torch::kFloat32, '
+            "{0}, {0}, {2});",
+            "scorch_native::validate_jit_extra_tensor(β_values, torch::kFloat32, "
+            '"\\303\\251valuate", "\\316\\262_values");',
+        ]
+    )
+    function_cpp = LLIRLowerer().lower_llir(
+        abi.assemble_function(abi.emit_validation())
+    )
+    assert function_cpp.startswith(
+        "Tensor évaluate(std::vector<int64_t> result_shape, "
+        "std::vector<int64_t> Δ_shape, "
+        "std::vector<std::vector<torch::Tensor>> Δ_mode_indices, "
+        "torch::Tensor Δ_values, torch::Tensor β_values) {"
+    )
+
+    index = IndexVar("i")
+    result = TensorVar("Result", fmt="d")
+    source = TensorVar("π", fmt="d")
+    statement = ForAll(index, TensorAssign(result[index], source[index]))
+    post_ops = PostOps(
+        ops=[PostOp(kind="add", tensor_name="β")],
+        extra_tensors=["β"],
+    )
+    lowered = CINLowerer(post_ops=post_ops).lower_IndexStmt(statement)
+    assert type(lowered) is llir.Function
+    cpp = LLIRLowerer().lower_llir(lowered)
+    assert (
+        'scorch_native::validate_jit_tensor("evaluate", "\\317\\200", '
+        "π_shape, π_mode_indices, π_values, torch::kFloat32, {0}, {0}, {});" in cpp
+    )
+    assert (
+        "scorch_native::validate_jit_extra_tensor(β_values, torch::kFloat32, "
+        '"evaluate", "\\316\\262_values");' in cpp
+    )
+
+
 def test_kernel_abi_rejects_unsupported_singleton_validation() -> None:
     with pytest.raises(ValueError, match="unsupported JIT level type"):
         KernelTensorABI(
