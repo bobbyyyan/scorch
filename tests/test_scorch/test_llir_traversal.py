@@ -2941,3 +2941,12 @@ def test_function_call_default_arguments_are_empty_immutable_tuples() -> None:
     assert type(first.args) is tuple
     assert type(second.args) is tuple
     assert first.args == second.args == ()
+
+
+def test_function_call_stmt_default_arguments_are_empty_immutable_tuples() -> None:
+    first = llir.FunctionCallStmt("first")
+    second = llir.FunctionCallStmt("second")
+
+    assert type(first.args) is tuple
+    assert type(second.args) is tuple
+    assert first.args == second.args == ()

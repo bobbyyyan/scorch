@@ -1293,7 +1293,9 @@ def _malformed_condition_operator() -> List[llir.Stmt]:
 
 
 def _malformed_function_name() -> List[llir.Stmt]:
-    return _program([llir.FunctionCallStmt(cast(str, 7), [_var("Array[lane]")])])
+    call = llir.FunctionCallStmt("touch", [_var("Array[lane]")])
+    object.__setattr__(call, "name", 7)
+    return _program([call])
 
 
 def _malformed_raw_code() -> List[llir.Stmt]:
@@ -1314,7 +1316,7 @@ def _malformed_rewritten_var_name() -> List[llir.Stmt]:
         ),
         (
             _malformed_function_name,
-            "invalid_single_iteration_loop_function_name",
+            "invalid_function_call_stmt_name",
             ("root", "[1]", "body", "[0]", "name"),
         ),
         (

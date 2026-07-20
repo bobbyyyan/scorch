@@ -2356,7 +2356,8 @@ def test_workspace_insert_rewrite_matches_only_the_exact_call_name() -> None:
 def test_workspace_insert_rewrite_rejects_malformed_call_names(
     name: object,
 ) -> None:
-    malformed = llir.FunctionCallStmt(cast(str, name), [_var("value")])
+    malformed = llir.FunctionCallStmt("wksp.insert", [_var("value")])
+    object.__setattr__(malformed, "name", name)
     source = [_compatible_loop([_workspace_init(), malformed])]
     snapshot = _structural_snapshot(source)
 
@@ -2364,10 +2365,10 @@ def test_workspace_insert_rewrite_rejects_malformed_call_names(
         transform_compressed_where_for_openmp(source, _context())
 
     diagnostic = raised.value.diagnostic
-    assert diagnostic.code == "invalid_workspace_insert_call_name"
+    assert diagnostic.code == "invalid_function_call_stmt_name"
     assert diagnostic.stage == _context().traversal.stage
     assert diagnostic.pass_name == _context().traversal.pass_name
-    assert diagnostic.path == ("root", "[0]", "name")
+    assert diagnostic.path == ("root", "[0]", "body", "[1]", "name")
     assert _structural_snapshot(source) == snapshot
 
 
@@ -2376,11 +2377,11 @@ def test_workspace_insert_rewrite_rejects_malformed_call_names(
     [
         (
             object(),
-            "invalid_expression_sequence",
+            "invalid_function_call_stmt_args",
             ("root", "[0]", "body", "[1]", "args"),
         ),
         (
-            ["not_an_expression"],
+            ("not_an_expression",),
             "invalid_expression_sequence_member",
             ("root", "[0]", "body", "[1]", "args", "[0]"),
         ),
@@ -2393,7 +2394,7 @@ def test_workspace_insert_rewrite_rejects_malformed_call_args(
     expected_path: Tuple[str, ...],
 ) -> None:
     malformed = llir.FunctionCallStmt("wksp.insert", [])
-    malformed.args = cast(List[llir.Expr], args)
+    object.__setattr__(malformed, "args", args)
     source = [_compatible_loop([_workspace_init(), malformed])]
     snapshot = _structural_snapshot(source)
 

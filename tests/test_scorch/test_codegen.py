@@ -184,10 +184,8 @@ def test_codegen_rejects_nested_sequence_subclasses() -> None:
         cast(Any, UnknownList()),
         [],
     )
-    call_args = llir.FunctionCallStmt(
-        "call",
-        cast(Any, UnknownList([llir.Literal(1)])),
-    )
+    call_args = llir.FunctionCallStmt("call", [])
+    object.__setattr__(call_args, "args", UnknownList([llir.Literal(1)]))
     conditions = llir.IfThenElse(
         cond_list=cast(Any, UnknownList([_var("condition")])),
         then_body_list=[[llir.Break()]],
@@ -1023,6 +1021,52 @@ def test_function_call_rejects_malformed_argument_containers(
 def test_function_call_rejects_non_expression_arguments() -> None:
     with pytest.raises(TypeError, match="contain only LLIR expressions"):
         llir.FunctionCall("call", [cast(llir.Expr, "argument")])
+
+
+def test_function_call_stmt_is_frozen_typed_owned_and_structurally_equal() -> None:
+    argument = _var("values")
+    caller_args = [argument]
+    call = llir.FunctionCallStmt("wksp.insert", caller_args)
+    tuple_call = llir.FunctionCallStmt("wksp.insert", (_var("values"),))
+
+    caller_args.append(_var("later"))
+
+    assert call.name == "wksp.insert"
+    assert type(call.args) is tuple
+    assert call.args == (argument,)
+    assert call == tuple_call
+    assert call != llir.FunctionCallStmt("wksp.insert", (_var("other"),))
+    assert call != llir.FunctionCallStmt("other", (_var("values"),))
+    assert get_type_hints(llir.FunctionCallStmt) == {
+        "name": str,
+        "args": Tuple[llir.Expr, ...],
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        call.name = "other"
+    with pytest.raises(FrozenInstanceError):
+        call.args = ()
+
+
+@pytest.mark.parametrize("name", ("", "   ", 1, None))
+def test_function_call_stmt_rejects_malformed_names(name: object) -> None:
+    with pytest.raises(TypeError, match="FunctionCallStmt.name"):
+        llir.FunctionCallStmt(cast(str, name))
+
+
+@pytest.mark.parametrize("arguments", ("argument", {"argument"}, {_var("value")}))
+def test_function_call_stmt_rejects_malformed_argument_containers(
+    arguments: object,
+) -> None:
+    with pytest.raises(
+        TypeError, match="FunctionCallStmt.args must be a list or tuple"
+    ):
+        llir.FunctionCallStmt("call", cast(list[llir.Expr], arguments))
+
+
+def test_function_call_stmt_rejects_non_expression_arguments() -> None:
+    with pytest.raises(TypeError, match="contain only LLIR expressions"):
+        llir.FunctionCallStmt("call", [cast(llir.Expr, "argument")])
 
 
 def test_member_call_is_frozen_typed_owned_and_structurally_equal() -> None:

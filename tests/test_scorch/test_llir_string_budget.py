@@ -1518,18 +1518,18 @@ def test_no_direct_assign_target_reintroduces_a_string_expression() -> None:
 def test_generic_string_rewrite_compatibility_budget_is_explicit() -> None:
     markers = {
         "cin_lowerer.py": (
-            "stmt.name = stmt.name.replace(old, new)",
+            "rewritten_name = rewritten_name.replace(old, new)",
             "stmt.code = stmt.code.replace(old, new)",
         ),
         "dense_pointer_hoist_pass.py": (
-            "call.name = name",
+            "cast(List[LLIRStatementValue], statements)[index] = llir.FunctionCallStmt(",
             "raw_statement.code = code",
         ),
         "dynamic_vector_access_pass.py": (
             "rewritten.name = self._rewrite_name(rewritten.name)",
         ),
         "single_iteration_loop_pass.py": (
-            "call.name = name",
+            "cast(List[LLIRStatementValue], statements)[index] = llir.FunctionCallStmt(",
             "raw_statement.code = code",
         ),
     }
@@ -1545,5 +1545,6 @@ def test_workspace_insert_rewrite_is_exact_and_never_lexical() -> None:
     source = (_COMPILER_ROOT / "compressed_where_openmp_pass.py").read_text()
 
     assert source.count("if call.name == self._old:") == 1
-    assert source.count("rewritten_call.name = self._new") == 1
+    assert source.count("return llir.FunctionCallStmt(") == 1
+    assert source.count("name=self._new,") == 1
     assert ".replace(self._old, self._new)" not in source
