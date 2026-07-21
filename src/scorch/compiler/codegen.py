@@ -506,7 +506,7 @@ class LLIRLowerer:
                 parent_precedence=self._UNARY_PRECEDENCE,
                 is_right_child=True,
             )
-            return f"({ir.data_type.value}) {operand}"
+            return f"({ir.data_type.value}){operand}"
 
         if type(ir) is llir.Sizeof:
             data_type = getattr(ir, "data_type", None)
