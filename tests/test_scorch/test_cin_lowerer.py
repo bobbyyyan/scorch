@@ -38,6 +38,15 @@ from scorch.compiler.llir_traversal import (
     LLIRTraversalError,
     LLIRWalker,
 )
+from scorch.compiler.parallel_marking_pass import (  # type: ignore[import-untyped]
+    ParallelWorkspacePoolSpec,
+    apply_parallel_policy,
+    atomic_work_stealing_prelude,
+    attach_serial_workspace_pools,
+    find_sparse_pos_array,
+    has_sparse_inner_loop,
+    typed_thread_policy_factory,
+)
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Scheduler,
     regblock_force,
@@ -4922,10 +4931,10 @@ def test_mode_position_matching_is_exact_and_collection_is_structural() -> None:
         "B0_pos",
         "C1_pos",
     ]
-    assert CINLowerer._has_sparse_inner_loop(body) is True
-    assert CINLowerer._find_sparse_pos_array(body) == "A1_pos"
+    assert has_sparse_inner_loop(body) is True
+    assert find_sparse_pos_array(body) == "A1_pos"
     assert (
-        CINLowerer._has_sparse_inner_loop(
+        has_sparse_inner_loop(
             [
                 llir.ForLoop(
                     init=llir.VarInit(
@@ -4941,7 +4950,7 @@ def test_mode_position_matching_is_exact_and_collection_is_structural() -> None:
         is False
     )
     assert (
-        CINLowerer._find_sparse_pos_array(
+        find_sparse_pos_array(
             [
                 llir.VarInit(
                     llir.Var("pA1", llir.DataType.INT),
@@ -4951,9 +4960,7 @@ def test_mode_position_matching_is_exact_and_collection_is_structural() -> None:
         )
         is None
     )
-    assert CINLowerer._find_sparse_pos_array([llir.RawStmt("A1_pos[pA0]")]) == (
-        "A1_pos"
-    )
+    assert find_sparse_pos_array([llir.RawStmt("A1_pos[pA0]")]) == ("A1_pos")
 
     wrong_type = llir.ArrayAccess(
         llir.Var("A1_pos", llir.DataType.STD_VECTOR_C_INT),
@@ -6602,7 +6609,7 @@ def test_atomic_work_stealing_prelude_is_typed() -> None:
 def test_atomic_prelude_rejects_forged_call_template_state() -> None:
     """A forged chunk clamp cannot escape codegen as an AttributeError."""
 
-    statements = CINLowerer._atomic_work_stealing_prelude(
+    statements = atomic_work_stealing_prelude(
         "A1_pos",
         llir.Var(name="A0_size", type=llir.DataType.INT),
     )
@@ -6727,11 +6734,18 @@ def test_reserve_hint_rejects_forged_diagnostic_literal_state() -> None:
 
 
 def test_workspace_pool_specs_build_fresh_policy_values_per_spec() -> None:
-    lowerer = CINLowerer()
-    lowerer._workspace_pool_specs = [
-        ("wksp", llir.DataType.FLOAT32, "B1_size"),
-        ("other", llir.DataType.FLOAT64, "B2_size"),
-    ]
+    pool_specs = (
+        ParallelWorkspacePoolSpec(
+            name="wksp",
+            scalar_type=llir.DataType.FLOAT32,
+            extent="B1_size",
+        ),
+        ParallelWorkspacePoolSpec(
+            name="other",
+            scalar_type=llir.DataType.FLOAT64,
+            extent="B2_size",
+        ),
+    )
     loop = llir.ForLoop(
         init=llir.VarInit(
             llir.Var(name="i", type=llir.DataType.INT64),
@@ -6745,10 +6759,10 @@ def test_workspace_pool_specs_build_fresh_policy_values_per_spec() -> None:
         update=llir.Increment(llir.Var(name="i", type=llir.DataType.INT64)),
         body=[],
     )
-    factory = lowerer._apply_parallel_policy(loop)
+    factory = apply_parallel_policy(loop)
     assert factory is not None
 
-    lowerer._attach_serial_workspace_pools(loop, factory)
+    attach_serial_workspace_pools(loop, pool_specs, factory)
 
     assert loop.before_parallel_body is not None
     assert len(loop.before_parallel_body) == 4
@@ -6768,8 +6782,13 @@ def test_workspace_pool_specs_build_fresh_policy_values_per_spec() -> None:
 
 
 def test_workspace_pool_policy_without_typed_value_fails_closed() -> None:
-    lowerer = CINLowerer()
-    lowerer._workspace_pool_specs = [("wksp", llir.DataType.FLOAT32, "B1_size")]
+    pool_specs = (
+        ParallelWorkspacePoolSpec(
+            name="wksp",
+            scalar_type=llir.DataType.FLOAT32,
+            extent="B1_size",
+        ),
+    )
     loop = llir.ForLoop(
         init=None,
         cond=llir.Var(name="never", type=llir.DataType.BOOL),
@@ -6779,7 +6798,7 @@ def test_workspace_pool_policy_without_typed_value_fails_closed() -> None:
     )
 
     with pytest.raises(CompilerInvariantError, match="no typed value"):
-        lowerer._attach_serial_workspace_pools(loop, None)
+        attach_serial_workspace_pools(loop, pool_specs, None)
 
 
 def test_typed_thread_policy_factory_mirrors_the_affine_trip_count() -> None:
@@ -6802,7 +6821,7 @@ def test_typed_thread_policy_factory_mirrors_the_affine_trip_count() -> None:
         body=[],
     )
 
-    factory = CINLowerer._typed_thread_policy_factory(loop, None)
+    factory = typed_thread_policy_factory(loop, None)
     assert factory is not None
     value = factory()
 

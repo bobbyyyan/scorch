@@ -106,6 +106,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "size_var",
         "sparse_pos",
         "sparse_values_tensor",
+        "spec.extent",
         "wname",
         "zero_value",
     }
@@ -130,7 +131,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 167,
+        "cin_lowerer.py": 154,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -138,6 +139,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "iterator.py": 23,
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
+        "parallel_marking_pass.py": 13,
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
@@ -146,7 +148,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(constructor_counts.values()) == 464
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 159,
+        "cin_lowerer.py": 146,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -154,6 +156,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "iterator.py": 21,
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
+        "parallel_marking_pass.py": 13,
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
@@ -162,19 +165,20 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(unclassified_counts.values()) == 454
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
-        ("cin_lowerer.py", "bound.name"): 1,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "outer_end_bound.name"): 1,
         ("cin_lowerer.py", "outer_end_var"): 3,
         ("cin_lowerer.py", "reserve_hint_var"): 1,
         ("cin_lowerer.py", "size_var"): 2,
-        ("cin_lowerer.py", "sparse_pos"): 2,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
         ("cin_lowerer.py", "wname"): 4,
         ("compressed_where_openmp_pass.py", "bound.name"): 3,
         ("compressed_where_openmp_pass.py", "loop_bound"): 1,
         ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
         ("compressed_where_openmp_pass.py", "sparse_pos"): 1,
+        ("parallel_marking_pass.py", "bound.name"): 1,
+        ("parallel_marking_pass.py", "sparse_pos"): 2,
+        ("parallel_marking_pass.py", "spec.extent"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
         ("llir_traversal.py", "node.name"): 1,
         ("loop_invariant_factor_pass.py", "accumulator_name"): 1,
@@ -184,7 +188,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 34
+    assert sum(known_indirect.values()) == 35
 
     assert totals == {
         "subscript": 9,
@@ -789,22 +793,27 @@ def test_dense_workspace_zero_fill_is_structured() -> None:
 
     # The pool thread count (C15) and RAII owner (C16) are typed: the
     # worker count owns a fresh typed copy of the applied parallel policy,
-    # and the owner calls the templated aligned-buffer allocator.
-    pools = lowerer_source.split("def _attach_serial_workspace_pools", 1)[1].split(
-        "def _tag_first_loop", 1
+    # and the owner calls the templated aligned-buffer allocator. Both are
+    # owned by the parallel-marking pass module.
+    marking_path = _COMPILER_ROOT / "parallel_marking_pass.py"
+    marking_source = marking_path.read_text()
+    pools = marking_source.split("def attach_serial_workspace_pools", 1)[1].split(
+        "def mark_first_for_loop_parallel", 1
     )[0]
     assert pools.count("llir.RawStmt(") == 0
     assert pools.count("llir.VarInit(") == 2
     assert pools.count('"scorch_make_aligned_buffer"') == 1
     assert pools.count('"scorch_checked_size_product"') == 1
     assert pools.count('"omp_get_max_threads"') == 1
-    assert pools.count("template_args=(scalar_type,)") == 1
+    assert pools.count("template_args=(spec.scalar_type,)") == 1
     assert pools.count("thread_policy_factory()") == 1
-    for call in _llir_constructor_calls(lowerer_path, "RawStmt"):
-        fragments = _static_string_fragments(call)
-        assert "pool_owner" not in fragments
-        assert "thread_count" not in fragments
-        assert "__restrict__" not in fragments
+    assert _llir_constructor_calls(marking_path, "RawStmt") == []
+    for path in (lowerer_path, marking_path):
+        for call in _llir_constructor_calls(path, "RawStmt"):
+            fragments = _static_string_fragments(call)
+            assert "pool_owner" not in fragments
+            assert "thread_count" not in fragments
+            assert "__restrict__" not in fragments
 
 
 def test_dense_workspace_write_back_copy_is_structured() -> None:
@@ -931,20 +940,22 @@ def test_atomic_work_stealing_prelude_is_structured() -> None:
     """Lock the C12/C13 typed templates and their structural-piece ownership."""
 
     lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
-    lowerer_source = lowerer_path.read_text()
-    lowerer_tree = ast.parse(lowerer_source)
+    marking_path = _COMPILER_ROOT / "parallel_marking_pass.py"
+    marking_source = marking_path.read_text()
+    marking_tree = ast.parse(marking_source)
 
-    for call in _llir_constructor_calls(lowerer_path, "RawStmt"):
-        fragments = _static_string_fragments(call)
-        assert "int _nnz" not in fragments
-        assert "_chunk" not in fragments
-        assert "omp_get_num_threads" not in fragments
+    for path in (lowerer_path, marking_path):
+        for call in _llir_constructor_calls(path, "RawStmt"):
+            fragments = _static_string_fragments(call)
+            assert "int _nnz" not in fragments
+            assert "_chunk" not in fragments
+            assert "omp_get_num_threads" not in fragments
 
     helpers = [
         node
-        for node in ast.walk(lowerer_tree)
+        for node in ast.walk(marking_tree)
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_atomic_work_stealing_prelude"
+        and node.name == "atomic_work_stealing_prelude"
     ]
     assert len(helpers) == 1
     helper = helpers[0]
@@ -977,10 +988,8 @@ def test_atomic_work_stealing_prelude_is_structured() -> None:
         name: len(helper_calls(name)) for name in expected_template_inventory
     } == expected_template_inventory
 
-    marking = lowerer_source.split("def _mark_first_for_loop_parallel", 1)[1].split(
-        "def _attach_serial_workspace_pools", 1
-    )[0]
-    assert marking.count("self._atomic_work_stealing_prelude(") == 1
+    marking = marking_source.split("def mark_first_for_loop_parallel", 1)[1]
+    assert marking.count("atomic_work_stealing_prelude(") == 1
     assert marking.count("llir.RawStmt(") == 0
     # The pragma text and the typed prelude come from the same validated
     # structural pieces; neither is recovered by parsing the other.
