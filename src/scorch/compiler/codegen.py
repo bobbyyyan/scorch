@@ -139,6 +139,15 @@ class LLIRLowerer:
                     f"{type(expression).__name__}"
                 )
 
+    @staticmethod
+    def _validated_address_of_operand(address: llir.AddressOf) -> llir.AssignmentTarget:
+        operand = getattr(address, "operand", None)
+        try:
+            llir._validate_address_of_operand(operand)
+        except TypeError as error:
+            raise CodegenError(str(error)) from error
+        return cast(llir.AssignmentTarget, operand)
+
     @classmethod
     def _validate_statement_sequence(cls, value: object, field: str) -> None:
         if type(value) is not list and type(value) is not tuple:
@@ -479,9 +488,7 @@ class LLIRLowerer:
             return f"sizeof({data_type.value})"
 
         if type(ir) is llir.AddressOf:
-            address_operand = getattr(ir, "operand", None)
-            if not isinstance(address_operand, llir.Expr):
-                raise CodegenError("AddressOf.operand must be an LLIR Expr")
+            address_operand = self._validated_address_of_operand(ir)
             operand = self._render_operand(
                 address_operand,
                 parent_precedence=self._UNARY_PRECEDENCE,

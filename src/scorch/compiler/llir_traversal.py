@@ -483,16 +483,19 @@ def _validate_address_of_fields(
     node: llir.AddressOf,
     context: LLIRTraversalContext,
     path: LLIRPath,
-) -> None:
+) -> llir.AssignmentTarget:
     operand = getattr(node, "operand", _MISSING_LLIR_FIELD)
-    if not isinstance(operand, llir.Expr):
+    try:
+        llir._validate_address_of_operand(operand)
+    except llir._AddressOfValidationError as error:
         _raise_traversal_error(
             context,
             code="invalid_address_of_operand",
-            message="AddressOf.operand must be an LLIR Expr",
-            path=path + ("operand",),
+            message=str(error),
+            path=path + ("operand",) + error.field_path,
             value=operand,
         )
+    return cast(llir.AssignmentTarget, operand)
 
 
 def _validate_direct_init_var(
@@ -1049,8 +1052,8 @@ class LLIRWalker:
         _validate_sizeof_fields(node, self.context, path)
 
     def visit_address_of(self, node: llir.AddressOf, path: LLIRPath) -> None:
-        _validate_address_of_fields(node, self.context, path)
-        self._walk_expr(node.operand, path + ("operand",))
+        operand = _validate_address_of_fields(node, self.context, path)
+        self._walk_expr(operand, path + ("operand",))
 
     def visit_increment(self, node: llir.Increment, path: LLIRPath) -> None:
         self._walk_var_child(node.var, path + ("var",))
@@ -1822,10 +1825,20 @@ class LLIRRewriter:
     def rewrite_address_of(
         self, node: llir.AddressOf, path: LLIRPath
     ) -> llir.AddressOf:
-        _validate_address_of_fields(node, self.context, path)
-        return llir.AddressOf(
-            operand=self._rewrite_expr(node.operand, path + ("operand",)),
-        )
+        operand_path = path + ("operand",)
+        operand = _validate_address_of_fields(node, self.context, path)
+        rewritten = self._rewrite_expr(operand, operand_path)
+        try:
+            llir._validate_address_of_operand(rewritten)
+        except llir._AddressOfValidationError as error:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_address_of_operand",
+                message=str(error),
+                path=operand_path + error.field_path,
+                value=rewritten,
+            )
+        return llir.AddressOf(operand=cast(llir.AssignmentTarget, rewritten))
 
     def rewrite_increment(self, node: llir.Increment, path: LLIRPath) -> llir.Increment:
         return llir.Increment(self._rewrite_var_child(node.var, path + ("var",)))

@@ -1142,12 +1142,166 @@ class Sizeof(Expr):
             raise TypeError("Sizeof.data_type must be a DataType")
 
 
+_MISSING_ADDRESS_OF_FIELD = object()
+
+
+class _AddressOfValidationError(TypeError):
+    """A typed lvalue-boundary failure with an operand-relative field path."""
+
+    def __init__(self, message: str, field_path: Tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.field_path = field_path
+
+
+def _address_of_instance_field(owner: object, name: str) -> object:
+    """Read one stored field without falling back to dataclass defaults."""
+
+    instance_fields = getattr(owner, "__dict__", None)
+    if type(instance_fields) is not dict or name not in instance_fields:
+        return _MISSING_ADDRESS_OF_FIELD
+    return instance_fields[name]
+
+
+def _validate_address_of_metadata(
+    metadata: object,
+    *,
+    path: Tuple[str, ...],
+) -> None:
+    if metadata is None:
+        return
+    if type(metadata) is not TensorAccessMetadata:
+        raise _AddressOfValidationError(
+            "AddressOf.operand ArrayAccess metadata must be "
+            "TensorAccessMetadata or None",
+            path,
+        )
+    typed_metadata = cast(TensorAccessMetadata, metadata)
+    if type(_address_of_instance_field(typed_metadata, "access_id")) is not AccessId:
+        raise _AddressOfValidationError(
+            "AddressOf.operand ArrayAccess metadata access_id must be an AccessId",
+            path + ("access_id",),
+        )
+    if type(_address_of_instance_field(typed_metadata, "tensor_id")) is not SymbolId:
+        raise _AddressOfValidationError(
+            "AddressOf.operand ArrayAccess metadata tensor_id must be a SymbolId",
+            path + ("tensor_id",),
+        )
+    index_ids = _address_of_instance_field(typed_metadata, "index_ids")
+    if type(index_ids) is not tuple or any(
+        type(index_id) is not IndexId for index_id in index_ids
+    ):
+        raise _AddressOfValidationError(
+            "AddressOf.operand ArrayAccess metadata index_ids must be a tuple "
+            "of IndexId values",
+            path + ("index_ids",),
+        )
+    if type(_address_of_instance_field(typed_metadata, "role")) is not TensorAccessRole:
+        raise _AddressOfValidationError(
+            "AddressOf.operand ArrayAccess metadata role must be a TensorAccessRole",
+            path + ("role",),
+        )
+
+
+def _validate_address_of_root_var(
+    value: object,
+    *,
+    owner: str,
+    path: Tuple[str, ...],
+) -> None:
+    if type(value) is not Var:
+        raise _AddressOfValidationError(
+            f"AddressOf.operand {owner} must be an exact Var",
+            path,
+        )
+    variable = cast(Var, value)
+    name = _address_of_instance_field(variable, "name")
+    if type(name) is not str or not name.isidentifier():
+        raise _AddressOfValidationError(
+            f"AddressOf.operand {owner} name must be a non-empty identifier",
+            path + ("name",),
+        )
+    if type(_address_of_instance_field(variable, "type")) is not DataType:
+        raise _AddressOfValidationError(
+            f"AddressOf.operand {owner} type must be a DataType",
+            path + ("type",),
+        )
+    if type(_address_of_instance_field(variable, "is_ptr")) is not bool:
+        raise _AddressOfValidationError(
+            f"AddressOf.operand {owner} is_ptr must be a bool",
+            path + ("is_ptr",),
+        )
+    if type(_address_of_instance_field(variable, "is_restrict")) is not bool:
+        raise _AddressOfValidationError(
+            f"AddressOf.operand {owner} is_restrict must be a bool",
+            path + ("is_restrict",),
+        )
+    if _address_of_instance_field(variable, "tensor_access") is not None:
+        raise _AddressOfValidationError(
+            f"AddressOf.operand {owner} cannot carry tensor access metadata",
+            path + ("tensor_access",),
+        )
+
+
+def _validate_address_of_operand(operand: object) -> None:
+    """Validate the exact syntactic lvalue subset admitted after unary ``&``."""
+
+    if type(operand) is Var:
+        _validate_address_of_root_var(operand, owner="Var", path=())
+        return
+
+    if type(operand) is MemberAccess:
+        member_access = cast(MemberAccess, operand)
+        member_path: Tuple[str, ...] = ()
+        while type(member_access) is MemberAccess:
+            member = _address_of_instance_field(member_access, "member")
+            if type(member) is not str or not member.isidentifier():
+                raise _AddressOfValidationError(
+                    "AddressOf.operand MemberAccess members must be identifiers",
+                    member_path + ("member",),
+                )
+            base = _address_of_instance_field(member_access, "base")
+            if type(base) is MemberAccess:
+                member_access = cast(MemberAccess, base)
+                member_path += ("base",)
+                continue
+            _validate_address_of_root_var(
+                base,
+                owner="MemberAccess root",
+                path=member_path + ("base",),
+            )
+            return
+
+    if type(operand) is ArrayAccess:
+        access = cast(ArrayAccess, operand)
+        _validate_address_of_root_var(
+            _address_of_instance_field(access, "array"),
+            owner="ArrayAccess root",
+            path=("array",),
+        )
+        index = _address_of_instance_field(access, "index")
+        try:
+            _validate_assignment_index(index)
+        except (AttributeError, TypeError) as error:
+            raise _AddressOfValidationError(
+                f"AddressOf.operand ArrayAccess index is invalid: {error}",
+                ("index",),
+            ) from error
+        _validate_address_of_metadata(
+            _address_of_instance_field(access, "tensor_access"),
+            path=("tensor_access",),
+        )
+        return
+
+    raise _AddressOfValidationError(
+        "AddressOf.operand must be an exact Var, MemberAccess, or ArrayAccess",
+    )
+
+
 @dataclass(frozen=True)
 class AddressOf(Expr):
     """An immutable address-of expression, spelled ``&operand``."""
 
-    operand: Expr
+    operand: AssignmentTarget
 
     def __post_init__(self) -> None:
-        if not isinstance(self.operand, Expr):
-            raise TypeError("AddressOf.operand must be an LLIR Expr")
+        _validate_address_of_operand(self.operand)

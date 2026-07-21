@@ -2748,8 +2748,12 @@ class CINLowerer:
             )
         if type(expr) is llir.AddressOf:
             address = cast(llir.AddressOf, expr)
+            rewritten_operand = CINLowerer._rewrite_expr_refs(
+                address.operand,
+                replacements,
+            )
             return llir.AddressOf(
-                operand=CINLowerer._rewrite_expr_refs(address.operand, replacements),
+                operand=cast(llir.AssignmentTarget, rewritten_operand),
             )
         return expr
 

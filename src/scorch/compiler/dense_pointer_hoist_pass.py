@@ -513,13 +513,14 @@ def _rewrite_expression_references(
         )
     if type(expression) is llir.AddressOf:
         address = cast(llir.AddressOf, expression)
+        rewritten_operand = _rewrite_expression_references(
+            address.operand,
+            replacements,
+            context,
+            path + ("operand",),
+        )
         return llir.AddressOf(
-            operand=_rewrite_expression_references(
-                address.operand,
-                replacements,
-                context,
-                path + ("operand",),
-            ),
+            operand=cast(llir.AssignmentTarget, rewritten_operand),
         )
     return expression
 
