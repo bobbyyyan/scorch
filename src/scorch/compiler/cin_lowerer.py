@@ -2890,12 +2890,9 @@ class CINLowerer:
                                 "_nnz / (omp_get_num_threads() * 128)))"
                             ),
                         ]
-                        # The atomic counter is declared BEFORE the parallel region
-                        # (shared across threads). We store it as a pre-parallel stmt.
-                        self._atomic_counter_decl = llir.RawStmt(
-                            code="std::atomic<int> _next_row{0}",
-                            add_semicolon=True,
-                        )
+                        # The shared atomic counter is declared before the
+                        # parallel region by codegen itself, from the
+                        # _atomic_counter_var marker below.
                         # Wrap the loop body in an atomic work-stealing while loop
                         # We replace the for loop entirely with raw code
                         llir_stmt.pre_parallel_body = adaptive_pre

@@ -618,15 +618,15 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
     counts += Counter()
 
     assert counts == {
-        "cin_lowerer.py": 4,
+        "cin_lowerer.py": 3,
         "compressed_where_openmp_pass.py": 1,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 9
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 8
+    assert sum(counts.values()) == 8
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 7
 
 
 def test_workspace_clear_mutations_are_structured() -> None:

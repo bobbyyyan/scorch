@@ -6576,3 +6576,22 @@ def test_typed_thread_policy_factory_mirrors_the_affine_trip_count() -> None:
     assert rows.right is not stride
     assert factory() == value
     assert factory() is not value
+
+
+def test_atomic_counter_is_emitted_once_by_codegen_without_a_dead_decl() -> None:
+    lowerer = CINLowerer()
+    lowered = lowerer.lower_IndexStmt(_dense_workspace_pool_cin("ds"))
+
+    cpp = LLIRLowerer().lower_llir(lowered)
+    assert cpp.count("std::atomic<int> _next_row{0};") == 1
+    # The lowerer no longer constructs a shadow counter declaration: codegen
+    # owns the emission from the loop's _atomic_counter_var marker alone.
+    assert not hasattr(lowerer, "_atomic_counter_decl")
+
+    counter_raws = _collect_matching_statements(
+        lowered,
+        lambda stmt: (
+            type(stmt) is llir.RawStmt and "_next_row" in cast(llir.RawStmt, stmt).code
+        ),
+    )
+    assert counter_raws == []
