@@ -293,7 +293,7 @@ def test_free_move_calls_cannot_return_to_var_names() -> None:
     assert remaining_opaque_calls == {}
 
 
-def test_torch_abi_expression_producer_budget_is_explicit() -> None:
+def test_expression_producer_budgets_are_explicit() -> None:
     helper_calls: Counter[tuple[str, str]] = Counter()
     for path in sorted(_COMPILER_ROOT.glob("*.py")):
         for helper in (

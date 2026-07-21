@@ -3993,11 +3993,13 @@ def test_production_workspace_view_borrow_is_structured_typed_and_byte_exact() -
     assert len(second_loops) == 2
 
     rendered: List[str] = []
+    first_views: List[llir.VarInit] = []
     for loop in first_loops:
         assert loop.pre_parallel_body is not None
         (statement,) = loop.pre_parallel_body
         assert type(statement) is llir.VarInit
         initializer = cast(llir.VarInit, statement)
+        first_views.append(initializer)
         assert type(initializer.var) is llir.Var
         assert initializer.var.name == "wksp"
         assert initializer.var.type is llir.DataType.AUTO
@@ -4009,7 +4011,9 @@ def test_production_workspace_view_borrow_is_structured_typed_and_byte_exact() -
         assert type(initializer.value) is llir.MemberCall
         member_call = cast(llir.MemberCall, initializer.value)
         assert member_call.member == "make_view"
+        assert type(member_call.template_args) is tuple
         assert member_call.template_args == ()
+        assert type(member_call.args) is tuple
         assert member_call.args == ()
         assert type(member_call.base) is llir.ArrayAccess
         access = cast(llir.ArrayAccess, member_call.base)
@@ -4027,7 +4031,8 @@ def test_production_workspace_view_borrow_is_structured_typed_and_byte_exact() -
         assert type(index.expr) is llir.FunctionCall
         worker = cast(llir.FunctionCall, index.expr)
         assert worker.name == "omp_get_thread_num"
-        assert tuple(worker.args) == ()
+        assert type(worker.args) is tuple
+        assert worker.args == ()
         rendered.append(LLIRLowerer().lower_llir(statement))
 
     assert rendered == [
@@ -4035,14 +4040,21 @@ def test_production_workspace_view_borrow_is_structured_typed_and_byte_exact() -
         "auto wksp = wksp_pool[(size_t)omp_get_thread_num()].make_view();",
     ]
 
-    first_ids = {
-        id(loop.pre_parallel_body[0]) for loop in first_loops if loop.pre_parallel_body
-    }
-    second_ids = {
-        id(loop.pre_parallel_body[0]) for loop in second_loops if loop.pre_parallel_body
-    }
-    assert len(first_ids) == 2
-    assert first_ids.isdisjoint(second_ids)
+    second_views: List[llir.VarInit] = []
+    for loop in second_loops:
+        assert loop.pre_parallel_body is not None
+        (statement,) = loop.pre_parallel_body
+        assert type(statement) is llir.VarInit
+        second_views.append(cast(llir.VarInit, statement))
+
+    assert _mutable_ir_ids(first_views[0]).isdisjoint(_mutable_ir_ids(first_views[1]))
+    assert _mutable_ir_ids(first_views).isdisjoint(_mutable_ir_ids(second_views))
+
+    LLIRWalker(_context().traversal).walk(first_views[0])
+    detached = LLIRRewriter(_context().traversal).rewrite(first_views[0])
+    assert type(detached) is llir.VarInit
+    assert detached == first_views[0]
+    assert _mutable_ir_ids(detached).isdisjoint(_mutable_ir_ids(first_views[0]))
 
 
 @pytest.mark.parametrize(
