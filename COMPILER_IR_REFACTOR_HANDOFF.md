@@ -21586,21 +21586,24 @@ constructor/traversal/codegen compatibility review, not an incidental expansion
 of the C17 correction.
 
 The five protected tracked files remain byte-identical to their recorded
-hashes, and no untracked user material was touched. The review changes are not
-committed or pushed. Raw/constructor budgets remain exactly **14 RawStmt
+hashes, and no untracked user material was touched. The review changes were
+subsequently committed as `fca3140` / `80a302c` / `ffb3a4c`; their later remote
+publication is recorded in the review correction below. Raw/constructor budgets
+remain exactly **14 RawStmt
 constructors / 13 semantic producers, seven MemberCallStmt constructors, and
 430 Var constructors**; the known-indirect Var budget is corrected from the
 historical 25 to **24** because the typed receiver clone no longer uses
 `array_var.name`. The next Phase-3 ownership recommendation is unchanged; this
 review makes no Phase-3.5 or LoopIR claim.
 
-### Phase-3 canonical compact Cast emission (2026-07-20)
+### Phase-3 canonical compact Cast emission (2026-07-21)
 
 The deliberate W1-class Cast-spelling decision that blocked W1 and the
 C4/C16 zero-fill allocation/borrow half is now resolved and implemented:
 **canonical typed `Cast` emission is compact `(size_t)x`**, matching the raw
-seams and the handwritten `csrc` convention. The decision was made from a
-complete read-only inventory, not a local spelling tweak.
+seams and the predominant handwritten `csrc` convention. The decision was made
+from a read-only inventory, with the two count corrections recorded by the
+independent review below, not from a local spelling tweak.
 
 #### Audit inventory
 
@@ -21610,14 +21613,16 @@ the `iter_lattice.py` merge-advance increments through `Assign(cast=True)`
 (the `VarInit`/`Assign` `cast` flag is the only auto-wrap mechanism), the
 `compressed_where_openmp_pass.py` count/offset extent casts, the three
 `torch_cpp_abi.py` sites (torch::empty extent, offsets-to-pos copy, vector-pos
-size), four `schedule_lowerer.py` sites (panel `std::lower_bound` window,
-heap-result-tile and staging size products), and the `llir_traversal.py`
+size), five `schedule_lowerer.py` sites (one panel `std::lower_bound` window,
+two heap-result-tile product casts, and two packed-staging product casts), and
+the `llir_traversal.py`
 rewriter reconstruction as consumer. Raw compact spellings live in exactly
 four seams: the W1 worker-view acquisition and pool `reserve()` in
 `compressed_where_openmp_pass.py`, and the C4 pool borrow and C16
 `scorch_make_aligned_buffer` owner in `cin_lowerer.py`. The handwritten
-`csrc` kernels use the compact form throughout (~230 occurrences, zero
-spaced). Test consumers of the spaced form: 39 substring assertion lines
+`csrc` kernels predominantly use the compact form; two legacy merge-advance
+lines in `src/scorch/csrc/kernels.h` retain the spaced form. Test consumers of
+the spaced form: 39 substring assertion lines
 across nine suites (the 38 the audit grep surfaced plus the `(float) (a +
 b)` precedence lock, which only structural execution exposed), and three
 exact byte-length/SHA-256 production locks in the compressed-where suite
@@ -21647,8 +21652,9 @@ future raw-to-typed step of those seams.
 
 The change is one rendering line in codegen plus the test-expectation
 updates above (Black then rejoined two now-shorter implicit string
-concatenations in the tuner-schedule suite). Emission changes are proven whitespace-only: across the
-20-kernel capture corpus, 14 files change (canonical DS/DSS inputs and all
+concatenations in the tuner-schedule suite). Emission changes are proven
+whitespace-only: across the 20-file capture corpus (19 kernels plus one
+preamble), 14 files change (canonical DS/DSS inputs and all
 12 dtype-matrix kernels) and a mechanical transformation removing exactly
 one space after each typed-cast rendering maps every base file byte-for-byte
 onto its candidate; per-file byte deltas equal cast-site counts (98 sites
@@ -21684,7 +21690,7 @@ session; durable copies live under
 ### Phase-3 typed W1 worker-view acquisition complete (2026-07-21)
 
 With compact Cast emission canonical, the W1 worker-view acquisition is now
-typed. `_workspace_view_statement` returns a frozen typed
+typed. `_workspace_view_statement` returns a structured typed
 `VarInit(Var(wksp, AUTO)) = MemberCall(ArrayAccess(Var(wksp_pool, NO_TYPE),
 Cast(FunctionCall(omp_get_thread_num), SIZE_T)), make_view)` instead of the
 raw `auto {w} = {w}_pool[(size_t)omp_get_thread_num()].make_view()` string.
@@ -21725,7 +21731,7 @@ rationale ("no typed byte-identical Cast form today"), which the compact
 decision has made stale. Refreshing it belongs to the C4/C16 typed-ownership
 slice so this commit touches only the W1 seam.
 
-Byte gates for this slice: the full 20-kernel capture corpus plus preamble
+Byte gates for this slice: the full 20-file corpus (19 kernels plus one preamble)
 and all 42 grid sources are byte-identical between clean base and candidate
 worktrees, and the compiler-latency corpus is inside the 1.10 target in
 every category (worst 1.036 p50 csr_intersection; all p95 below 1.0).
@@ -21737,6 +21743,78 @@ other raw compact cast in this pass, now byte-typable), then the C4/C16
 zero-fill allocation/borrow family, then W5 pool allocation. The older
 Assign index validator's stored-field/cycle hardening remains separately
 scheduled maintenance debt.
+
+### Independent compact-Cast/W1 review corrections (2026-07-21)
+
+An independent review of the nine commits through `1714df2` found no live
+production defect in compact `Cast` emission, the AddressOf/C17 corrections,
+or the typed W1 worker-view acquisition. Removing the space after the closing
+cast parenthesis cannot merge C++ preprocessing tokens, and the existing unary
+precedence boundary still parenthesizes every lower-precedence operand. No
+compiler pass parses the old spaced spelling, and the JIT build identity hashes
+the complete generated source, so changed compressed-output kernels receive
+new cache entries rather than aliasing old binaries.
+
+The Cast decision nevertheless needed a governance/evidence correction. The
+preceding handoff called this an explicit spelling decision that was not to be
+selected autonomously and required a two-machine gate. The implementation
+session selected compact after discovering that the 42-source grid contains no
+typed Cast, but it retained only M5 evidence. This review reopened the spelling
+decision rather than silently relying on that exception. Compact is retained
+because it is token- and AST-equivalent, matches every raw seam it is intended
+to unlock, and is the predominant native-kernel style. The repository's binding
+grid-byte waiver remains controlling: runtime benchmarking is waived because
+every grid source is byte-identical, while structural activation remains
+mandatory.
+
+The missing second-machine evidence was then supplied on x86/Redwood from clean
+detached worktrees. Exact baseline, compact-Cast, and W1 revisions regenerated
+the same **20-file corpus (19 kernels plus one preamble)** as M5, byte for byte.
+Compact changes exactly 14 files by deleting 98 post-cast spaces; W1 changes
+none of those 20 files. All 42 grid source files are byte-identical across all
+three revisions and both machines. With identical source paths and flags, the
+changed canonical DS kernel also compiles to bit-identical Redwood objects
+(both SHA-256
+`8e145a42fe96c574098cdf3b4ec26adf952ed0cb261f7ec510f0ca80694f71c3`).
+The durable cross-machine capture, grid, and object artifacts are retained under
+`/Users/bobby/.cache/scorch-codex/cast-w1-review-1714df2/redwood/`.
+
+The original retained caches remain useful but were not self-describing enough:
+they omit revision/status/command manifests and durable full-suite logs, the W1
+cache does not contain regeneration scripts or object files, and the latency
+candidate JSONs identify patched clean bases rather than the later committed
+candidate revisions. Independent clean-revision regeneration reproduced every
+captured source byte, so this is a provenance/wording correction rather than a
+byte-gate failure. The original M5 object claim applies only to the canonical DS
+kernel; the Redwood comparison above independently covers that same activating
+kernel on the second architecture.
+
+Review coverage was strengthened in `35d3992`: the production W1 regression now
+checks exact tuple storage, deep child detachment between count/fill phases and
+repeated lowerings, and structurally equal/deeply detached common rewriting.
+This also corrects the earlier wording: `VarInit` is mutable, not frozen. The
+global `MemberCall` budget test was renamed to reflect that it now spans
+compressed-Where as well as Torch ABI producers. The inventory above corrects
+the five (not four) `schedule_lowerer.py` Cast sites, the two spaced legacy
+`kernels.h` examples, the stale spaced `iter_lattice.py` comment, and the
+19-kernel-plus-preamble accounting.
+
+Verification at `35d3992` is green. The focused W1/budget suites produce **139
+passed**; the recorded 13-file compiler/pass membership plus
+`tests/test_scorch/codegen` produces **1609 passed**. The authoritative
+non-performance suite ran with 12 file-distributed workers in an isolated
+detached worktree whose `PYTHONPATH` was pinned to that exact tree, producing
+**2319 passed, 14 skipped, 2 warnings in 646.37 seconds**. Black and Flake8 are
+clean on all three reviewed Python files, `git diff --check` is clean, and scoped
+mypy produces the same 23 inherited findings as `1714df2` (no new finding).
+
+During this review, an external actor advanced
+`origin/refactor/compiler-ir-phase3-std-move-call` from `15e2c82` to `1714df2`
+at **2026-07-21 09:45:28 PDT**. Neither this review nor its audit agents ran a
+push, and the local reflog cannot attribute the actor. Corrections after
+`1714df2` remain local unless explicitly published later. The five protected
+tracked files and all untracked GPU, benchmark, research, scheduler, and
+scratch material remain untouched.
 
 ## Incremental Migration Plan
 

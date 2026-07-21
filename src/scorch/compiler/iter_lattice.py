@@ -269,7 +269,7 @@ class LatticePoint:
                         )
                     )
                 else:
-                    # e.g. pA0 += (int) k_A == k;
+                    # e.g. pA0 += (int)k_A == k;
                     stmts.append(
                         llir.Assign(
                             var=it.get_iterator_var_llir(),
