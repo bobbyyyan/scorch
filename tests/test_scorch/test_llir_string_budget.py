@@ -702,6 +702,41 @@ def test_workspace_view_borrow_is_structured() -> None:
         assert "make_view" not in _static_string_fragments(call)
 
 
+def test_workspace_pool_construction_is_structured() -> None:
+    """Lock the typed W5 pool construction template."""
+
+    compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
+    compressed_source = compressed_path.read_text()
+    pool_helpers = compressed_source.split("def _workspace_pool_type", 1)[1].split(
+        "def _loop_bound_reference", 1
+    )[0]
+
+    assert "llir.RawStmt(" not in pool_helpers
+    assert pool_helpers.count("llir.VarInit(") == 2
+    assert pool_helpers.count("llir.VarDecl(") == 1
+    assert pool_helpers.count("llir.MemberCallStmt(") == 2
+    assert pool_helpers.count("llir.ForLoop(") == 1
+    assert pool_helpers.count("llir.Cast(") == 1
+    assert pool_helpers.count("llir.ArrayAccess(") == 1
+    assert pool_helpers.count("llir.Increment(") == 1
+    assert pool_helpers.count("llir.BinOp(") == 1
+    assert pool_helpers.count("llir.FunctionCall(") == 3
+    assert pool_helpers.count("llir.Var(") == 4
+    assert 'member="reserve"' in pool_helpers
+    assert 'member="emplace_back"' in pool_helpers
+    assert 'name="result_shape"' in pool_helpers
+    assert "linked_list_workspace_pool_type" in pool_helpers
+    assert '"std::max"' in pool_helpers
+    assert '"omp_get_max_threads"' in pool_helpers
+    assert "unsupported_compressed_where_workspace_pool_ctype" in pool_helpers
+
+    for call in _llir_constructor_calls(compressed_path, "RawStmt"):
+        fragments = _static_string_fragments(call)
+        assert "reserve" not in fragments
+        assert "emplace_back" not in fragments
+        assert "thread_count" not in fragments
+
+
 def test_dense_workspace_zero_fill_is_structured() -> None:
     """Lock the C3/C5 typed template and the global Sizeof budget."""
 

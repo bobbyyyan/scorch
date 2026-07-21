@@ -4272,3 +4272,224 @@ def test_production_ds_narrow_integer_values_are_structured(
         "Result_values_torch" in code or "Result_values_data" in code
         for code in _raw_codes(lowered)
     )
+
+
+def _expected_pool_thread_count_value() -> llir.FunctionCall:
+    def right_outer() -> llir.Var:
+        return llir.Var(name="B0_size", type=llir.DataType.INT64)
+
+    return llir.FunctionCall(
+        "scorch_nthreads",
+        [
+            llir.Mul(
+                llir.Cast(
+                    expr=llir.ArrayAccess(
+                        array=llir.Var(name="A1_pos", type=llir.DataType.NO_TYPE),
+                        index=llir.Var(name="A0_size", type=llir.DataType.INT64),
+                    ),
+                    data_type=llir.DataType.LONG,
+                ),
+                llir.Select(
+                    cond=llir.BinOp(
+                        ">",
+                        right_outer(),
+                        llir.Literal(0, llir.DataType.INT),
+                    ),
+                    when_true=llir.Add(
+                        llir.BinOp(
+                            "/",
+                            llir.ArrayAccess(
+                                array=llir.Var(
+                                    name="B1_pos",
+                                    type=llir.DataType.NO_TYPE,
+                                ),
+                                index=right_outer(),
+                            ),
+                            right_outer(),
+                        ),
+                        llir.Literal(1, llir.DataType.INT),
+                    ),
+                    when_false=llir.Literal(1, llir.DataType.INT),
+                ),
+            ),
+            llir.Var(name="A0_size", type=llir.DataType.INT64),
+            llir.Var(
+                name="SCORCH_GRAIN_CODEGEN_SPGEMM",
+                type=llir.DataType.NO_TYPE,
+            ),
+        ],
+    )
+
+
+def _pool_type() -> llir.DataType:
+    return llir.DataType.STD_VECTOR_LINKED_LIST_WORKSPACE_1D_FLOAT32
+
+
+_POOL_BLOCK_RENDERING = (
+    "int wksp_thread_count = scorch_nthreads((long)A1_pos[A0_size] * "
+    "(B0_size > 0 ? B1_pos[B0_size] / B0_size + 1 : 1), A0_size, "
+    "SCORCH_GRAIN_CODEGEN_SPGEMM);\n"
+    "std::vector<linked_list_workspace_1d<float>> wksp_pool;\n"
+    "wksp_pool.reserve((size_t)wksp_thread_count);\n"
+    "for (int _worker = 0; _worker < wksp_thread_count; _worker++) {\n"
+    "  wksp_pool.emplace_back(result_shape[1], true);\n"
+    "}"
+)
+
+
+def test_ds_transform_builds_the_typed_workspace_pool_construction() -> None:
+    source: List[llir.Stmt] = [_compatible_loop(_ds_work_body())]
+
+    result = transform_compressed_where_for_openmp(source, _context())
+
+    assert result.applied is True
+    thread_count, declaration, reservation, worker_loop = result.statements[:4]
+
+    assert type(thread_count) is llir.VarInit
+    initializer = cast(llir.VarInit, thread_count)
+    assert initializer.var == llir.Var(name="wksp_thread_count", type=llir.DataType.INT)
+    assert initializer.op == "="
+    assert initializer.cast is False
+    assert type(initializer.value) is llir.FunctionCall
+    assert initializer.value == _expected_pool_thread_count_value()
+
+    assert type(declaration) is llir.VarDecl
+    pool_declaration = cast(llir.VarDecl, declaration)
+    assert pool_declaration.var == llir.Var(name="wksp_pool", type=_pool_type())
+
+    assert type(reservation) is llir.MemberCallStmt
+    reserve = cast(llir.MemberCallStmt, reservation)
+    assert reserve.base == llir.Var(name="wksp_pool", type=_pool_type())
+    assert reserve.member == "reserve"
+    assert type(reserve.template_args) is tuple
+    assert reserve.template_args == ()
+    assert type(reserve.args) is tuple
+    assert reserve.args == (
+        llir.Cast(
+            expr=llir.Var(name="wksp_thread_count", type=llir.DataType.INT),
+            data_type=llir.DataType.SIZE_T,
+        ),
+    )
+
+    assert type(worker_loop) is llir.ForLoop
+    loop = cast(llir.ForLoop, worker_loop)
+    assert _structural_snapshot(loop.init) == _structural_snapshot(
+        llir.VarInit(
+            var=llir.Var(name="_worker", type=llir.DataType.INT),
+            value=llir.Literal(0, llir.DataType.INT),
+        )
+    )
+    assert loop.cond == llir.BinOp(
+        "<",
+        llir.Var(name="_worker", type=llir.DataType.INT),
+        llir.Var(name="wksp_thread_count", type=llir.DataType.INT),
+    )
+    assert _structural_snapshot(loop.update) == _structural_snapshot(
+        llir.Increment(llir.Var(name="_worker", type=llir.DataType.INT))
+    )
+    assert loop.omp_parallel_for is False
+    assert loop.omp_schedule is None
+    assert loop.omp_num_threads is None
+    assert loop.before_parallel_body is None
+    assert loop.pre_parallel_body is None
+    assert loop.post_parallel_body is None
+    assert len(loop.body) == 1
+    (emplacement,) = loop.body
+    assert type(emplacement) is llir.MemberCallStmt
+    emplace = cast(llir.MemberCallStmt, emplacement)
+    assert emplace.base == llir.Var(name="wksp_pool", type=_pool_type())
+    assert emplace.member == "emplace_back"
+    assert emplace.template_args == ()
+    assert type(emplace.args) is tuple
+    assert emplace.args == (
+        llir.ArrayAccess(
+            array=llir.Var(name="result_shape", type=llir.DataType.STD_VECTOR_INT),
+            index=llir.Literal(1, llir.DataType.INT64),
+        ),
+        llir.Literal(True, llir.DataType.BOOL),
+    )
+
+    # The typed worker-count value renders byte-identically to both phase
+    # pragma spellings, and the pool block precedes the count owner exactly.
+    count_loop, fill_loop = _phase_loops(result)
+    rendered_value = LLIRLowerer().lower_llir(cast(llir.Expr, initializer.value))
+    assert rendered_value == count_loop.omp_num_threads
+    assert rendered_value == fill_loop.omp_num_threads
+    count_owner = result.statements[4]
+    assert type(count_owner) is llir.DirectInit
+    assert cast(llir.DirectInit, count_owner).var.name == "_count1"
+    assert LLIRLowerer().lower_llir(result.statements[:4]) == _POOL_BLOCK_RENDERING
+
+    # Sibling statements share no mutable nodes, and a second transform is
+    # fully detached from the first.
+    pool_statements = result.statements[:4]
+    for index, statement in enumerate(pool_statements):
+        for other in pool_statements[index + 1 :]:
+            assert _mutable_ir_ids(statement).isdisjoint(_mutable_ir_ids(other))
+    repeat = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())], _context()
+    )
+    assert _structural_snapshot(repeat.statements[:4]) == _structural_snapshot(
+        pool_statements
+    )
+    assert _mutable_ir_ids(repeat.statements[:4]).isdisjoint(
+        _mutable_ir_ids(pool_statements)
+    )
+
+    walker_context = _context().traversal
+    LLIRWalker(walker_context).walk(cast(LLIRValue, pool_statements))
+    detached = LLIRRewriter(walker_context).rewrite(
+        cast(List[llir.Stmt], pool_statements)
+    )
+    assert _structural_snapshot(detached) == _structural_snapshot(pool_statements)
+    assert _mutable_ir_ids(detached).isdisjoint(_mutable_ir_ids(pool_statements))
+
+
+def test_production_workspace_pool_construction_is_structured_and_byte_exact() -> None:
+    first = _lower_production_ds(torch.float32)
+    second = _lower_production_ds(torch.float32)
+
+    def pool_block(function: llir.Function) -> List[llir.Stmt]:
+        for index, statement in enumerate(function.body):
+            if (
+                type(statement) is llir.VarInit
+                and cast(llir.VarInit, statement).var.name == "wksp_thread_count"
+            ):
+                return cast(List[llir.Stmt], function.body[index : index + 4])
+        raise AssertionError("production DS lowering must build the pool block")
+
+    first_block = pool_block(first)
+    second_block = pool_block(second)
+
+    assert [type(statement) for statement in first_block] == [
+        llir.VarInit,
+        llir.VarDecl,
+        llir.MemberCallStmt,
+        llir.ForLoop,
+    ]
+    initializer = cast(llir.VarInit, first_block[0])
+    assert type(initializer.value) is llir.FunctionCall
+    policy_value = cast(llir.FunctionCall, initializer.value)
+    assert policy_value.name == "scorch_nthreads"
+    assert type(policy_value.template_args) is tuple
+    assert policy_value.template_args == ()
+    assert type(policy_value.args) is tuple
+    assert len(policy_value.args) == 3
+    assert type(policy_value.args[0]) is llir.Mul
+    assert type(cast(llir.Mul, policy_value.args[0]).right) is llir.Select
+    declaration = cast(llir.VarDecl, first_block[1])
+    assert declaration.var.type is _pool_type()
+
+    rendered_value = LLIRLowerer().lower_llir(cast(llir.Expr, initializer.value))
+    phase_loops = _pre_parallel_view_loops(first)
+    assert len(phase_loops) == 2
+    assert all(loop.omp_num_threads == rendered_value for loop in phase_loops)
+
+    assert _structural_snapshot(first_block) == _structural_snapshot(second_block)
+    assert _mutable_ir_ids(first_block).isdisjoint(_mutable_ir_ids(second_block))
+
+    detached = LLIRRewriter(_context().traversal).rewrite(
+        cast(List[llir.Stmt], list(first_block))
+    )
+    assert _structural_snapshot(detached) == _structural_snapshot(first_block)
+    assert _mutable_ir_ids(detached).isdisjoint(_mutable_ir_ids(first_block))
