@@ -128,7 +128,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert constructor_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 149,
-        "compressed_where_openmp_pass.py": 28,
+        "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -140,11 +140,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 442
+    assert sum(constructor_counts.values()) == 446
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 141,
-        "compressed_where_openmp_pass.py": 28,
+        "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -156,7 +156,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 432
+    assert sum(unclassified_counts.values()) == 436
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 1,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -619,14 +619,14 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 7,
-        "compressed_where_openmp_pass.py": 2,
+        "compressed_where_openmp_pass.py": 1,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 13
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 12
+    assert sum(counts.values()) == 12
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 11
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -641,13 +641,13 @@ def test_workspace_clear_mutations_are_structured() -> None:
     member_call_stmt_constructors += Counter()
     assert member_call_stmt_constructors == {
         "cin_lowerer.py": 2,
-        "compressed_where_openmp_pass.py": 1,
+        "compressed_where_openmp_pass.py": 3,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(member_call_stmt_constructors.values()) == 7
+    assert sum(member_call_stmt_constructors.values()) == 9
 
     compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
     compressed_source = compressed_path.read_text()
@@ -695,7 +695,7 @@ def test_workspace_view_borrow_is_structured() -> None:
     assert 'member="make_view"' in view_helper
     assert 'name="omp_get_thread_num"' in view_helper
     assert "llir.DataType.AUTO" in view_helper
-    assert "llir.DataType.NO_TYPE" in view_helper
+    assert "type=_workspace_pool_type(context)" in view_helper
     assert "llir.DataType.SIZE_T" in view_helper
 
     for call in _llir_constructor_calls(compressed_path, "RawStmt"):

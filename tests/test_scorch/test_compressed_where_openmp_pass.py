@@ -2885,8 +2885,11 @@ def test_noncanonical_workspace_ctype_preserves_exact_raw_value_allocation(
         workspace_ctype=workspace_ctype,
     )
 
+    # The direct-pass value-allocation escape hatch is characterized on the
+    # non-hoisted shape: a hoisted workspace additionally requires the typed
+    # pool declaration, which free-form spellings fail closed below.
     result = transform_compressed_where_for_openmp(
-        [_compatible_loop(_ds_work_body())], context
+        [_compatible_loop(_ds_work_body(workspace=False))], context
     )
 
     assert _value_initializations(result.statements) == []
@@ -2913,6 +2916,66 @@ def test_noncanonical_workspace_ctype_preserves_exact_raw_value_allocation(
     assert all(
         cast(llir.Var, target.array).type is pointer_type for target in value_targets
     )
+
+
+@pytest.mark.parametrize(
+    ("workspace_ctype", "result_dtype"),
+    [
+        ("int", torch.int32),
+        ("long long", torch.int64),
+    ],
+)
+def test_recognized_legacy_ctypes_still_build_the_typed_hoisted_pool(
+    workspace_ctype: str,
+    result_dtype: torch.dtype,
+) -> None:
+    context = CompressedWhereOpenMPContext(
+        result_name="Result",
+        result_id=SymbolId(1),
+        compressed_levels=(1,),
+        result_assembler=_result_assembler(dtype=result_dtype),
+        workspace_name="wksp",
+        workspace_ctype=workspace_ctype,
+    )
+
+    result = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())], context
+    )
+
+    assert result.applied is True
+    pool_declarations = [
+        statement
+        for statement in result.statements
+        if type(statement) is llir.VarDecl
+        and cast(llir.VarDecl, statement).var.name == "wksp_pool"
+    ]
+    assert len(pool_declarations) == 1
+    assert cast(llir.VarDecl, pool_declarations[0]).var.type is (
+        llir.DataType.linked_list_workspace_pool_type(workspace_ctype)
+    )
+
+
+def test_free_form_workspace_ctype_fails_closed_for_the_hoisted_pool() -> None:
+    context = CompressedWhereOpenMPContext(
+        result_name="Result",
+        result_id=SymbolId(1),
+        compressed_levels=(1,),
+        result_assembler=_result_assembler(dtype=torch.float32),
+        workspace_name="wksp",
+        workspace_ctype="custom_scalar",
+    )
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(
+            [_compatible_loop(_ds_work_body())], context
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.code == "unsupported_compressed_where_workspace_pool_ctype"
+    assert diagnostic.path == ("context", "workspace_ctype")
+    assert diagnostic.node_type == "str"
+    assert diagnostic.stage == context.traversal.stage
+    assert diagnostic.pass_name == context.traversal.pass_name
 
 
 @pytest.mark.parametrize(
@@ -3854,9 +3917,9 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    assert len(cpp) == 7103
+    assert len(cpp) == 7113
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "9bc9153b7b806554dfbc9124443acd4b42aa8dc036a7c6c13b90363e2595948a"
+        "5c537aad764cbb172ee5214fe758bfc8a98592f967963bc269fcb7a87d24b542"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -4056,9 +4119,9 @@ def test_production_ds_float64_locks_typed_value_source() -> None:
         for code in _raw_codes(lowered)
     )
     cpp = LLIRLowerer().lower_llir(lowered)
-    assert len(cpp) == 6263
+    assert len(cpp) == 6273
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "090d06d70f35b76682396e90006a356ee43b2f99fecdd6150970aa6a3b18d0ad"
+        "c5be37ed95b12660e3f8ce950deafc0f512669c30155e2c6afcfdaf84a2b88f2"
     )
 
 
@@ -4115,7 +4178,7 @@ def test_production_workspace_view_borrow_is_structured_typed_and_byte_exact() -
         assert type(access.array) is llir.Var
         pool = cast(llir.Var, access.array)
         assert pool.name == "wksp_pool"
-        assert pool.type is llir.DataType.NO_TYPE
+        assert pool.type is llir.DataType.STD_VECTOR_LINKED_LIST_WORKSPACE_1D_FLOAT32
         assert pool.is_ptr is False
         assert pool.is_restrict is False
         assert pool.tensor_access is None
