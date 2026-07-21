@@ -717,6 +717,49 @@ def _rewrite_statement_references(
     return rewritten
 
 
+def _hoisted_pointer_declaration(
+    value_array: str,
+    scalar_type: str,
+    pointer_name: str,
+    candidate: _PositionCandidate,
+) -> llir.Stmt:
+    """One D1 const-qualified read-only input-pointer borrow.
+
+    A recognized production scalar spelling owns the typed declaration: the
+    const-pointer type is a fail-closed :class:`llir.DataType` member, the
+    borrow is a typed address of the strided value-array access, and the
+    operand references stay metadata-free ``NO_TYPE`` because the kernel
+    prologue owns their declarations.  Free-form compatibility type text
+    retains the exact legacy raw spelling rather than rendering unchecked
+    type text through a typed declaration.
+    """
+    try:
+        pointer_type = llir.DataType.const_ptr_type(scalar_type)
+    except ValueError:
+        return llir.RawStmt(
+            code=(
+                f"const {scalar_type}* __restrict__ {pointer_name} = "
+                f"&{value_array}[{candidate.base} * {candidate.stride}]"
+            )
+        )
+    return llir.VarInit(
+        var=llir.Var(
+            name=pointer_name,
+            type=pointer_type,
+            is_restrict=True,
+        ),
+        value=llir.AddressOf(
+            operand=llir.ArrayAccess(
+                array=llir.Var(name=value_array, type=llir.DataType.NO_TYPE),
+                index=llir.Mul(
+                    llir.Var(name=candidate.base, type=llir.DataType.NO_TYPE),
+                    llir.Var(name=candidate.stride, type=llir.DataType.NO_TYPE),
+                ),
+            ),
+        ),
+    )
+
+
 def _apply_loop_analysis(
     loop: llir.ForLoop,
     analysis: _LoopAnalysis,
@@ -739,11 +782,11 @@ def _apply_loop_analysis(
             continue
         pointer_name = f"_{value_array}_ptr"
         declarations.append(
-            llir.RawStmt(
-                code=(
-                    f"const {scalar_type}* __restrict__ {pointer_name} = "
-                    f"&{value_array}[{candidate.base} * {candidate.stride}]"
-                )
+            _hoisted_pointer_declaration(
+                value_array,
+                scalar_type,
+                pointer_name,
+                candidate,
             )
         )
         replacements[f"{value_array}[{candidate.position}]"] = (

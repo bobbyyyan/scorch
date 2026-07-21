@@ -179,6 +179,16 @@ class DataType(Enum):
     PTR_UINT8 = "uint8_t*"
     PTR_FLOAT32 = "float*"
     PTR_FLOAT64 = "double*"
+
+    # Const-qualified pointers to the recognized production scalar
+    # spellings, for read-only input borrows (the D1 hoisted declarations).
+    CONST_PTR_INT = "const int*"
+    CONST_PTR_INT32 = "const int32_t*"
+    CONST_PTR_INT64 = "const int64_t*"
+    CONST_PTR_INT8 = "const int8_t*"
+    CONST_PTR_UINT8 = "const uint8_t*"
+    CONST_PTR_FLOAT32 = "const float*"
+    CONST_PTR_FLOAT64 = "const double*"
     PTR_TORCH_FLOAT32 = "torch::kFloat32*"
     PTR_TORCH_FLOAT64 = "torch::kFloat64*"
     PTR_TORCH_INT32 = "torch::kInt32*"
@@ -217,6 +227,16 @@ class DataType(Enum):
         text cannot silently become a typed declaration.
         """
         return DataType(f"std::vector<linked_list_workspace_1d<{element_spelling}>>")
+
+    @classmethod
+    def const_ptr_type(cls, element_spelling: str) -> DataType:
+        """The const-qualified pointer for one recognized scalar spelling.
+
+        Enum lookup by value fails closed with :class:`ValueError` for any
+        spelling without a dedicated const-pointer member, so free-form
+        legacy C type text cannot silently become a typed declaration.
+        """
+        return DataType(f"const {element_spelling}*")
 
     @classmethod
     def coo_workspace_type_with_dim(cls, dtype: DataType, dim: int) -> DataType:
