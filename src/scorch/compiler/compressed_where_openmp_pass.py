@@ -513,6 +513,7 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
             if call.name == self._old:
                 return llir.FunctionCallStmt(
                     name=self._new,
+                    template_args=rewritten_call.template_args,
                     args=rewritten_call.args,
                 )
             return rewritten_call
@@ -669,12 +670,13 @@ def _extract_work_body(
 def _workspace_view_statement(context: CompressedWhereOpenMPContext) -> llir.VarInit:
     """Return one fresh typed per-worker view borrow of the workspace pool.
 
-    The view variable's C++ type is compiler-deduced (``auto``).  The pool
-    receiver carries its accurate declared
-    ``std::vector<linked_list_workspace_1d<...>>`` type now that the typed
-    pool construction owns that declaration; the borrowed view itself stays
-    ``NO_TYPE`` at its ``clear()`` mutation exactly as before, because a
-    compiler-deduced view has no precise DataType member.
+    The view variable's C++ type is compiler-deduced (``auto``).  A recognized
+    pool receiver carries its accurate declared
+    ``std::vector<linked_list_workspace_1d<...>>`` type; a free-form legacy
+    pool stays ``NO_TYPE`` because its declaration remains on the raw
+    compatibility path.  The borrowed view likewise stays ``NO_TYPE`` at its
+    ``clear()`` mutation because a compiler-deduced view has no precise
+    DataType member.
     """
 
     workspace_name = context.workspace_name
@@ -684,7 +686,7 @@ def _workspace_view_statement(context: CompressedWhereOpenMPContext) -> llir.Var
             base=llir.ArrayAccess(
                 array=llir.Var(
                     name=f"{workspace_name}_pool",
-                    type=_workspace_pool_type(context),
+                    type=_workspace_pool_type(context) or llir.DataType.NO_TYPE,
                 ),
                 index=llir.Cast(
                     expr=llir.FunctionCall(name="omp_get_thread_num", args=()),
@@ -923,12 +925,23 @@ def _parallel_policy_decision(
         work = work_estimate
     grain_suffix = f", {grain}" if grain is not None else ""
     policy_args: List[llir.Expr] = [work.expr, rows.expr]
+    policy_is_typed = True
     if grain is not None:
-        policy_args.append(llir.Var(name=grain, type=llir.DataType.NO_TYPE))
+        if re.fullmatch(r"[A-Za-z_]\w*", grain, flags=re.ASCII) is None:
+            # The compatibility policy accepts free-form C++ text.  It remains
+            # valid for the legacy pragma/pool spelling, but must not be
+            # disguised as a structured Var name.
+            policy_is_typed = False
+        else:
+            policy_args.append(llir.Var(name=grain, type=llir.DataType.NO_TYPE))
     return _ParallelPolicyDecision(
         num_threads=f"scorch_nthreads({work.text}, {rows.text}{grain_suffix})",
         chunk_expr=f"scorch_chunk({rows.text}, {work.text}{grain_suffix})",
-        num_threads_expr=llir.FunctionCall("scorch_nthreads", policy_args),
+        num_threads_expr=(
+            llir.FunctionCall("scorch_nthreads", policy_args)
+            if policy_is_typed
+            else None
+        ),
     )
 
 
@@ -1144,27 +1157,21 @@ def _filtered_prefix(
     ]
 
 
-def _workspace_pool_type(context: CompressedWhereOpenMPContext) -> llir.DataType:
-    """Resolve the typed owned pool declaration for the context's workspace.
+def _workspace_pool_type(
+    context: CompressedWhereOpenMPContext,
+) -> Optional[llir.DataType]:
+    """Resolve a typed pool type when the legacy scalar spelling is known.
 
     Every recognized production scalar spelling has a dedicated pool member.
-    A free-form legacy C type spelling cannot become a typed declaration, so
-    it fails closed through this pass's structured diagnostic instead of
-    rendering unchecked type text.
+    Free-form direct-pass spellings deliberately remain on the characterized
+    raw compatibility path rather than being parsed or relocated into typed
+    metadata.
     """
 
     try:
         return llir.DataType.linked_list_workspace_pool_type(context.workspace_ctype)
     except ValueError:
-        _raise_compressed_where_error(
-            context,
-            code="unsupported_compressed_where_workspace_pool_ctype",
-            message=(
-                "workspace_ctype has no typed linked-list workspace pool " "declaration"
-            ),
-            path=("context", "workspace_ctype"),
-            value=context.workspace_ctype,
-        )
+        return None
 
 
 def _thread_count_reference(context: CompressedWhereOpenMPContext) -> llir.Var:
@@ -1174,10 +1181,13 @@ def _thread_count_reference(context: CompressedWhereOpenMPContext) -> llir.Var:
     )
 
 
-def _workspace_pool_reference(context: CompressedWhereOpenMPContext) -> llir.Var:
+def _workspace_pool_reference(
+    context: CompressedWhereOpenMPContext,
+    pool_type: llir.DataType,
+) -> llir.Var:
     return llir.Var(
         name=f"{context.workspace_name}_pool",
-        type=_workspace_pool_type(context),
+        type=pool_type,
     )
 
 
@@ -1214,18 +1224,57 @@ def _thread_count_value(
     return cast(llir.Expr, LLIRRewriter(context.traversal).rewrite(chosen))
 
 
+def _legacy_workspace_pool_statement(
+    context: CompressedWhereOpenMPContext,
+    count_policy: _ParallelPolicyDecision,
+    fill_policy: _ParallelPolicyDecision,
+) -> llir.RawStmt:
+    """Preserve the pre-W5 pool spelling for compatibility-only inputs."""
+
+    count_threads = count_policy.num_threads or "omp_get_max_threads()"
+    fill_threads = fill_policy.num_threads or "omp_get_max_threads()"
+    thread_count = (
+        count_threads
+        if count_threads == fill_threads
+        else f"std::max({count_threads}, {fill_threads})"
+    )
+    workspace = context.workspace_name
+    ctype = context.workspace_ctype
+    first_level = context.compressed_levels[0]
+    return llir.RawStmt(
+        code=(
+            f"int {workspace}_thread_count = {thread_count};\n"
+            f"std::vector<linked_list_workspace_1d<{ctype}>> {workspace}_pool;\n"
+            f"{workspace}_pool.reserve((size_t){workspace}_thread_count);\n"
+            f"for (int _worker = 0; _worker < {workspace}_thread_count; "
+            "_worker++) {\n"
+            f"  {workspace}_pool.emplace_back(result_shape[{first_level}], true);\n"
+            "}"
+        ),
+        add_semicolon=False,
+    )
+
+
 def _workspace_pool_statements(
     context: CompressedWhereOpenMPContext,
     count_policy: _ParallelPolicyDecision,
     fill_policy: _ParallelPolicyDecision,
 ) -> List[llir.Stmt]:
-    """Build the typed per-worker linked-list workspace pool construction.
+    """Build the per-worker linked-list workspace pool construction.
 
-    The four statements own the worker count, the pool declaration, its
-    capacity reservation, and the per-worker emplacement loop.  References to
-    the pool and the worker count carry their accurate declared types because
-    both declarations are owned by this same construction.
+    Recognized scalar types and structurally representable policy operands use
+    four typed statements.  Free-form scalar or policy spellings retain the
+    exact legacy compound RawStmt instead of being parsed or hidden in typed
+    fields.
     """
+
+    pool_type = _workspace_pool_type(context)
+    typed_policies = all(
+        decision.num_threads is None or decision.num_threads_expr is not None
+        for decision in (count_policy, fill_policy)
+    )
+    if pool_type is None or not typed_policies:
+        return [_legacy_workspace_pool_statement(context, count_policy, fill_policy)]
 
     first_level = context.compressed_levels[0]
     return [
@@ -1233,9 +1282,9 @@ def _workspace_pool_statements(
             var=_thread_count_reference(context),
             value=_thread_count_value(context, count_policy, fill_policy),
         ),
-        llir.VarDecl(var=_workspace_pool_reference(context)),
+        llir.VarDecl(var=_workspace_pool_reference(context, pool_type)),
         llir.MemberCallStmt(
-            base=_workspace_pool_reference(context),
+            base=_workspace_pool_reference(context, pool_type),
             member="reserve",
             args=(
                 llir.Cast(
@@ -1257,7 +1306,7 @@ def _workspace_pool_statements(
             update=llir.Increment(_worker_index_reference()),
             body=[
                 llir.MemberCallStmt(
-                    base=_workspace_pool_reference(context),
+                    base=_workspace_pool_reference(context, pool_type),
                     member="emplace_back",
                     args=(
                         llir.ArrayAccess(

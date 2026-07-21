@@ -1027,8 +1027,9 @@ def _validate_assignment_index(expression: object) -> None:
                 "assignment index FunctionCall.name must be an identifier or "
                 "member path"
             )
-        if type(call.template_args) is not tuple or any(
-            type(argument) is not DataType for argument in call.template_args
+        template_args = getattr(call, "template_args", None)
+        if type(template_args) is not tuple or any(
+            type(argument) is not DataType for argument in template_args
         ):
             raise TypeError(
                 "assignment index FunctionCall.template_args must be a tuple of "

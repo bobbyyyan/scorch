@@ -650,6 +650,7 @@ def _rewrite_stmt_access_sequence(
                 count += arg_count
             rewritten_stmt = llir.FunctionCallStmt(
                 name=stmt.name,
+                template_args=stmt.template_args,
                 args=rewritten_args,
             )
         elif isinstance(stmt, llir.MemberCallStmt):

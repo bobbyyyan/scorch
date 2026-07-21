@@ -669,24 +669,27 @@ class LLIRLowerer:
         in the C++ grammar and right-nesting is the natural associativity, so
         neither requires them.
         """
-        if not isinstance(ir.cond, llir.Expr):
+        condition_value = getattr(ir, "cond", None)
+        true_value = getattr(ir, "when_true", None)
+        false_value = getattr(ir, "when_false", None)
+        if not isinstance(condition_value, llir.Expr):
             raise CodegenError("Select.cond must be an LLIR Expr")
-        if not isinstance(ir.when_true, llir.Expr):
+        if not isinstance(true_value, llir.Expr):
             raise CodegenError("Select.when_true must be an LLIR Expr")
-        if not isinstance(ir.when_false, llir.Expr):
+        if not isinstance(false_value, llir.Expr):
             raise CodegenError("Select.when_false must be an LLIR Expr")
         condition = self._render_operand(
-            ir.cond,
+            condition_value,
             parent_precedence=self._CONDITIONAL_PRECEDENCE + 1,
             is_right_child=False,
         )
         when_true = self._render_operand(
-            ir.when_true,
+            true_value,
             parent_precedence=self._CONDITIONAL_PRECEDENCE,
             is_right_child=False,
         )
         when_false = self._render_operand(
-            ir.when_false,
+            false_value,
             parent_precedence=self._CONDITIONAL_PRECEDENCE,
             is_right_child=True,
         )

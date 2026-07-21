@@ -626,6 +626,7 @@ def _rewrite_statement_references(
                 name = name.replace(old, new)
             rewritten_statement = llir.FunctionCallStmt(
                 name=name,
+                template_args=call.template_args,
                 args=_rewrite_expression_sequence(
                     call.args,
                     replacements,

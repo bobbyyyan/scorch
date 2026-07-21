@@ -2711,6 +2711,7 @@ class CINLowerer:
                     rewritten_name = rewritten_name.replace(old, new)
                 stmts[i] = llir.FunctionCallStmt(
                     name=rewritten_name,
+                    template_args=stmt.template_args,
                     args=[
                         CINLowerer._rewrite_expr_refs(arg, replacements)
                         for arg in stmt.args
