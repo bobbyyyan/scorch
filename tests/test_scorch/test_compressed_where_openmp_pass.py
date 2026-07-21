@@ -2998,10 +2998,16 @@ def test_free_form_workspace_ctype_preserves_the_legacy_hoisted_pool() -> None:
         assert cast(llir.Var, pool_access.array).type is llir.DataType.NO_TYPE
 
 
-def test_free_form_policy_grain_uses_the_legacy_pool_without_var_relocation() -> None:
+@pytest.mark.parametrize(
+    "grain",
+    ("1 + 2", "true", "false", "class", "nullptr", "and"),
+)
+def test_free_form_policy_grain_uses_the_legacy_pool_without_var_relocation(
+    grain: str,
+) -> None:
     from scorch.compiler.compressed_where_openmp_pass import _build_phase_loop
 
-    policy = CompressedWhereOpenMPPolicy(flop_grain="1 + 2")
+    policy = CompressedWhereOpenMPPolicy(flop_grain=grain)
     context = _context(policy=policy)
     body = _ds_work_body()
     phase = _build_phase_loop(
@@ -3012,7 +3018,7 @@ def test_free_form_policy_grain_uses_the_legacy_pool_without_var_relocation() ->
     )
 
     assert phase.policy.num_threads is not None
-    assert phase.policy.num_threads.endswith(", 1 + 2)")
+    assert phase.policy.num_threads.endswith(f", {grain})")
     assert phase.policy.num_threads_expr is None
 
     result = transform_compressed_where_for_openmp(
