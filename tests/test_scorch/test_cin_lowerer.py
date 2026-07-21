@@ -6258,3 +6258,321 @@ def test_nondefault_coo_intersection_keeps_live_coordinate_end_bounds():
     assert "pRight1_end = pRight0 + 1;" in cpp
     assert "pRight1_end < pRight0_end" in cpp
     assert "pRight0 = pRight1_end;" in cpp
+
+
+def _dense_workspace_pool_cin(a_fmt: str = "dd") -> ForAll:
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt=a_fmt)
+    b = TensorVar("B", fmt="dd")
+    wksp = Workspace("wksp", dim=1, dense=True)
+
+    return ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        wksp[j],
+                        a[i, k] * b[k, j],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(
+                j,
+                TensorAssign(
+                    c[i, j],
+                    wksp[j],
+                ),
+            ),
+        ),
+    )
+
+
+def _pool_owner_loop(lowered: llir.Node) -> llir.ForLoop:
+    loops = _collect_matching_statements(
+        lowered,
+        lambda stmt: type(stmt) is llir.ForLoop and bool(stmt.before_parallel_body),
+    )
+    assert len(loops) == 1
+    return cast(llir.ForLoop, loops[0])
+
+
+def _expected_pool_owner_value() -> llir.FunctionCall:
+    return llir.FunctionCall(
+        "scorch_make_aligned_buffer",
+        [
+            llir.FunctionCall(
+                "scorch_checked_size_product",
+                [
+                    llir.Cast(
+                        expr=llir.Var(name="wksp_thread_count", type=llir.DataType.INT),
+                        data_type=llir.DataType.SIZE_T,
+                    ),
+                    llir.Cast(
+                        expr=llir.Var(name="B1_size", type=llir.DataType.INT64),
+                        data_type=llir.DataType.SIZE_T,
+                    ),
+                ],
+            )
+        ],
+        template_args=(llir.DataType.FLOAT32,),
+    )
+
+
+def _expected_pool_borrow_value() -> llir.Add:
+    return llir.Add(
+        llir.MemberCall(
+            base=llir.Var(name="wksp_pool_owner", type=llir.DataType.NO_TYPE),
+            member="get",
+        ),
+        llir.Mul(
+            llir.Cast(
+                expr=llir.FunctionCall("omp_get_thread_num"),
+                data_type=llir.DataType.SIZE_T,
+            ),
+            llir.Cast(
+                expr=llir.Var(name="B1_size", type=llir.DataType.INT64),
+                data_type=llir.DataType.SIZE_T,
+            ),
+        ),
+    )
+
+
+def test_dense_workspace_pool_ownership_is_structured_and_byte_exact() -> None:
+    first = CINLowerer().lower_IndexStmt(_dense_workspace_pool_cin())
+    second = CINLowerer().lower_IndexStmt(_dense_workspace_pool_cin())
+
+    loop = _pool_owner_loop(first)
+    assert loop.before_parallel_body is not None
+    thread_count, owner = loop.before_parallel_body
+
+    assert type(thread_count) is llir.VarInit
+    count_init = cast(llir.VarInit, thread_count)
+    assert count_init.var == llir.Var(name="wksp_thread_count", type=llir.DataType.INT)
+    assert count_init.op == "="
+    assert count_init.cast is False
+    assert type(count_init.value) is llir.FunctionCall
+    assert count_init.value == llir.FunctionCall(
+        "scorch_nthreads",
+        [
+            llir.Literal(-1, llir.DataType.INT),
+            llir.Var(name="A0_size", type=llir.DataType.INT),
+        ],
+    )
+    assert LLIRLowerer().lower_llir(cast(llir.Expr, count_init.value)) == (
+        loop.omp_num_threads
+    )
+
+    assert type(owner) is llir.VarInit
+    owner_init = cast(llir.VarInit, owner)
+    assert owner_init.var == llir.Var(name="wksp_pool_owner", type=llir.DataType.AUTO)
+    assert type(owner_init.value) is llir.FunctionCall
+    owner_value = cast(llir.FunctionCall, owner_init.value)
+    assert type(owner_value.template_args) is tuple
+    assert type(owner_value.args) is tuple
+    assert owner_value == _expected_pool_owner_value()
+
+    borrows = _collect_matching_statements(
+        first,
+        lambda stmt: (
+            type(stmt) is llir.VarInit
+            and type(stmt.var) is llir.Var
+            and stmt.var.name == "wksp"
+            and stmt.var.is_restrict
+        ),
+    )
+    assert len(borrows) == 1
+    borrow = cast(llir.VarInit, borrows[0])
+    assert borrow.var == llir.Var(
+        name="wksp",
+        type=llir.DataType.PTR_FLOAT32,
+        is_restrict=True,
+    )
+    assert borrow.var.is_ptr is False
+    assert borrow.var.tensor_access is None
+    assert type(borrow.value) is llir.Add
+    assert borrow.value == _expected_pool_borrow_value()
+    assert loop.pre_parallel_body is not None
+    assert borrow in loop.pre_parallel_body
+
+    assert LLIRLowerer().lower_llir(thread_count) == (
+        "int wksp_thread_count = scorch_nthreads(-1, A0_size);"
+    )
+    assert LLIRLowerer().lower_llir(owner) == (
+        "auto wksp_pool_owner = scorch_make_aligned_buffer<float>("
+        "scorch_checked_size_product((size_t)wksp_thread_count, "
+        "(size_t)B1_size));"
+    )
+    assert LLIRLowerer().lower_llir(borrow) == (
+        "float* __restrict__ wksp = wksp_pool_owner.get() + "
+        "(size_t)omp_get_thread_num() * (size_t)B1_size;"
+    )
+    cpp = LLIRLowerer().lower_llir(first)
+    assert cpp.index("int wksp_thread_count") < cpp.index("auto wksp_pool_owner")
+    assert cpp.index("auto wksp_pool_owner") < cpp.index("#pragma omp parallel")
+    assert cpp.index("int64_t wksp0_size") < cpp.index("__restrict__ wksp")
+    assert cpp.index("__restrict__ wksp") < cpp.index("memset(wksp, 0,")
+
+    def is_raw(stmt: llir.Stmt) -> bool:
+        return type(stmt) is llir.RawStmt
+
+    for raw in _collect_matching_statements(first, is_raw):
+        code = cast(llir.RawStmt, raw).code
+        assert "pool_owner" not in code
+        assert "thread_count" not in code
+        # The D1 const input-pointer declarations legitimately spell
+        # __restrict__; only the workspace borrow must not reappear raw.
+        assert "__restrict__ wksp" not in code
+
+    second_loop = _pool_owner_loop(second)
+    assert second_loop.before_parallel_body is not None
+    second_count, second_owner = second_loop.before_parallel_body
+    assert second_count == thread_count
+    assert second_count is not thread_count
+    assert cast(llir.VarInit, second_count).var is not count_init.var
+    assert cast(llir.VarInit, second_count).value is not count_init.value
+    assert second_owner == owner
+    assert second_owner is not owner
+
+    rewriter_context = LLIRTraversalContext(
+        stage="pool test",
+        pass_name="detach",
+    )
+    for statement in (thread_count, owner, borrow):
+        detached = LLIRRewriter(rewriter_context).rewrite(statement)
+        assert detached == statement
+        assert detached is not statement
+        assert cast(llir.VarInit, detached).var is not (
+            cast(llir.VarInit, statement).var
+        )
+
+
+def test_sparse_workspace_pool_policy_is_typed_on_the_atomic_path() -> None:
+    lowered = CINLowerer().lower_IndexStmt(_dense_workspace_pool_cin("ds"))
+
+    loop = _pool_owner_loop(lowered)
+    assert getattr(loop, "_use_atomic_scheduling", False) is True
+    assert loop.before_parallel_body is not None
+    thread_count, owner = loop.before_parallel_body
+
+    count_init = cast(llir.VarInit, thread_count)
+    assert type(count_init.value) is llir.FunctionCall
+    assert count_init.value == llir.FunctionCall(
+        "scorch_nthreads",
+        [
+            llir.ArrayAccess(
+                array=llir.Var(name="A1_pos", type=llir.DataType.NO_TYPE),
+                index=llir.Var(name="A0_size", type=llir.DataType.INT),
+            ),
+            llir.Var(name="A0_size", type=llir.DataType.INT),
+        ],
+    )
+    assert LLIRLowerer().lower_llir(cast(llir.Expr, count_init.value)) == (
+        loop.omp_num_threads
+    )
+    assert cast(llir.VarInit, owner).value == _expected_pool_owner_value()
+
+    cpp = LLIRLowerer().lower_llir(lowered)
+    assert "int wksp_thread_count = scorch_nthreads(A1_pos[A0_size], A0_size);" in cpp
+    assert (
+        "float* __restrict__ wksp = wksp_pool_owner.get() + "
+        "(size_t)omp_get_thread_num() * (size_t)B1_size;"
+    ) in cpp
+
+
+def test_workspace_pool_specs_build_fresh_policy_values_per_spec() -> None:
+    lowerer = CINLowerer()
+    lowerer._workspace_pool_specs = [
+        ("wksp", llir.DataType.FLOAT32, "B1_size"),
+        ("other", llir.DataType.FLOAT64, "B2_size"),
+    ]
+    loop = llir.ForLoop(
+        init=llir.VarInit(
+            llir.Var(name="i", type=llir.DataType.INT64),
+            llir.Literal(0, llir.DataType.INT),
+        ),
+        cond=llir.BinOp(
+            "<",
+            llir.Var(name="i", type=llir.DataType.INT64),
+            llir.Var(name="A0_size", type=llir.DataType.INT64),
+        ),
+        update=llir.Increment(llir.Var(name="i", type=llir.DataType.INT64)),
+        body=[],
+    )
+    factory = lowerer._apply_parallel_policy(loop)
+    assert factory is not None
+
+    lowerer._attach_serial_workspace_pools(loop, factory)
+
+    assert loop.before_parallel_body is not None
+    assert len(loop.before_parallel_body) == 4
+    first_count, first_owner, second_count, second_owner = loop.before_parallel_body
+    first_value = cast(llir.VarInit, first_count).value
+    second_value = cast(llir.VarInit, second_count).value
+    assert first_value == second_value
+    assert first_value is not second_value
+    assert cast(llir.FunctionCall, first_value).args[1] is not (
+        cast(llir.FunctionCall, second_value).args[1]
+    )
+    assert cast(llir.VarInit, second_owner).value != (
+        cast(llir.VarInit, first_owner).value
+    )
+    second_owner_value = cast(llir.FunctionCall, cast(llir.VarInit, second_owner).value)
+    assert second_owner_value.template_args == (llir.DataType.FLOAT64,)
+
+
+def test_workspace_pool_policy_without_typed_value_fails_closed() -> None:
+    lowerer = CINLowerer()
+    lowerer._workspace_pool_specs = [("wksp", llir.DataType.FLOAT32, "B1_size")]
+    loop = llir.ForLoop(
+        init=None,
+        cond=llir.Var(name="never", type=llir.DataType.BOOL),
+        update=llir.FunctionCall("advance"),
+        body=[],
+        omp_num_threads="scorch_nthreads(opaque, rows)",
+    )
+
+    with pytest.raises(CompilerInvariantError, match="no typed value"):
+        lowerer._attach_serial_workspace_pools(loop, None)
+
+
+def test_typed_thread_policy_factory_mirrors_the_affine_trip_count() -> None:
+    stride = llir.Literal(4, llir.DataType.INT)
+    loop = llir.ForLoop(
+        init=llir.VarInit(
+            llir.Var(name="i", type=llir.DataType.INT64),
+            llir.Literal(0, llir.DataType.INT),
+        ),
+        cond=llir.BinOp(
+            "<",
+            llir.Var(name="i", type=llir.DataType.INT64),
+            llir.Var(name="A0_size", type=llir.DataType.INT64),
+        ),
+        update=llir.Assign(
+            llir.Var(name="i", type=llir.DataType.INT64),
+            stride,
+            op=llir.AssignOp.ADD_ASSIGN,
+        ),
+        body=[],
+    )
+
+    factory = CINLowerer._typed_thread_policy_factory(loop, None)
+    assert factory is not None
+    value = factory()
+
+    assert LLIRLowerer().lower_llir(value) == (
+        "scorch_nthreads(-1, (A0_size + 4 - 1) / 4)"
+    )
+    rows = cast(llir.BinOp, cast(llir.FunctionCall, value).args[1])
+    numerator = cast(llir.BinOp, rows.left)
+    assert cast(llir.Add, numerator.left).right is not stride
+    assert rows.right is not stride
+    assert factory() == value
+    assert factory() is not value
