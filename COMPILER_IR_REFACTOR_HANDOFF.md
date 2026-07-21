@@ -21816,7 +21816,12 @@ push, and the local reflog cannot attribute the actor. Corrections after
 tracked files and all untracked GPU, benchmark, research, scheduler, and
 scratch material remain untouched.
 
-### Phase-3 typed W5/C4/C15/C16 workspace-pool family complete (2026-07-21)
+### Phase-3 typed W5/C4/C15/C16 workspace-pool slice (2026-07-21)
+
+The original slice report is retained below as historical evidence. Its
+free-form-ctype narrowing, 8/7 raw budget, and full-suite provenance claims
+were superseded by the rigorous review correction immediately following this
+section.
 
 The workspace lifetime/allocation and pool-ownership family is typed end to
 end. Twelve commits stacked on `537bde3` (through `d52c382`, all local,
@@ -21965,6 +21970,113 @@ qualified-callee-name precedent), then **C12/C13** (the atomic `_nnz` and
 parallel-marking/zero-fill extraction above, then D1's const-qualified
 input-pointer declarations. W14, S1, P1, Phase 3.5, and LoopIR remain
 outside the boundary.
+
+### Rigorous W5-family review corrections (2026-07-21)
+
+The complete `537bde3..2beff04` stack was reviewed independently rather than
+accepted from its session report. Corrections were committed without amending
+or reordering that stack:
+
+- `d0e3342` — `fix(compiler): preserve typed call and pool compatibility`
+- `72c2ff8` — `test(compiler): cover W5 review boundaries`
+- `8c38d7b` — `fix(compiler): keep C++ policy tokens out of Var names`
+- `86c8ee6` — `test(compiler): reject policy-token Var relocation`
+
+Nothing was pushed. The origin tracking ref remained at `1714df2` throughout
+the review.
+
+#### Defects found and corrected
+
+1. The W5 slice weakened an explicit W14/direct-pass compatibility test. At
+   `537bde3`, a hoisted `custom_scalar` workspace succeeded through the legacy
+   compound pool statement. The slice changed that test to a non-hoisted body
+   and added a test requiring the old hoisted input to fail. Canonical scalar
+   types still use the four typed W5 statements, but an unrecognized scalar
+   now takes the legacy compound `RawStmt` template; its W1 pool reference honestly
+   remains `NO_TYPE`. The original hoisted compatibility test is restored.
+2. `CompressedWhereOpenMPPolicy.flop_grain` accepts free-form compatibility
+   text, but the typed-policy change placed every such string in `Var.name`.
+   Inputs such as `1 + 2` therefore looked structured only because `Var` emits
+   its name verbatim. Only an exact uppercase macro-style ASCII identifier can
+   now become the typed `NO_TYPE` policy reference. Compound expressions,
+   lowercase identifiers, and C++ keywords/literals such as `true`, `class`,
+   and `nullptr` retain the legacy W5 pool statement without parsing or
+   relocating the text.
+3. Five specialized rewriters rebuilt the newly extended
+   `FunctionCallStmt` without copying `template_args`: compressed-Where
+   workspace insertion, dense-pointer hoisting, single-iteration elimination,
+   schedule access rewriting, and CIN value-reference rewriting. All five now
+   preserve the immutable template tuple and have activating regression tests.
+4. A forged `Select` missing one of its new fields escaped codegen as
+   `AttributeError`, and a forged assignment-index `FunctionCall` missing its
+   new template tuple escaped validation the same way. Both boundaries now
+   produce the intended `CodegenError`/`TypeError` diagnostics.
+
+The honest production raw budget is therefore **9 constructors / 8 semantic
+producers**, not 8/7. The remaining compatibility/semantic producers are C7,
+C12, C13, the W5 free-form pool fallback, the W14 value-allocation fallback,
+D1, S1, and P1. This still meets the slice's semantic-producer target of at
+most eight without deleting a supported API path.
+
+One additional byte surface is now explicit: on an affine direct-pass loop,
+the typed W5 worker-count value renders the minimal
+`scorch_nthreads(-1, (N + 4 - 1) / 4)` while the retained pragma string uses
+`scorch_nthreads(-1, ((N + 4 - 1) / 4))`. This is a semantics-neutral,
+non-corpus parenthesis change; it was already locked by a test but omitted from
+the original session report.
+
+#### Evidence audit and corrected verification
+
+The original numeric artifacts largely reproduce: 13 commits on the stated
+base, 1703 tests in the recorded compiler membership, 20 corpus files with 14
+mechanical diffs, 42 byte-identical grid sources, byte-identical C4/C15/C16
+activation pairs, and byte-identical canonical DS objects at SHA-256
+`2ce4424e...0a8430`. The latency controls support session/host drift as the
+cause of the first crossing, but not the narrower claim that position one was
+systematically a uniquely cool run.
+
+The original full-suite provenance is not authoritative as written. Its
+README claims a failing `result-ca699f1.txt` that does not exist, the retained
+final `result.txt` contains only a one-line summary, and the recorded
+`PYTHONPATH=<tree>/src` command imports `tests` and `tools` from the primary
+checkout when launched there (or fails collection from a clean working
+directory). The corrected review run uses the detached worktree as its working
+directory, sets `PYTHONPATH=<tree>:<tree>/src`, and asserts the concrete
+`scorch`, test-module, and benchmark-tool paths before pytest. Result:
+**2423 passed, 14 skipped, 2 warnings in 669.50 seconds** at final revision
+`86c8ee6`.
+
+Review-local verification also includes:
+
+- **1391 passed** across the eight directly affected codegen, traversal,
+  lowerer, compressed-Where, dense-pointer, single-iteration, schedule, and
+  budget files;
+- **18 passed** in the exact new/modified regression selection after the final
+  policy edit;
+- Black clean on all 14 affected production/test files; `git diff --check`
+  clean; Flake8 limited to the same two inherited local-import F401 findings
+  and one inherited F541; scoped mypy limited to the same 32 inherited findings
+  in `cin_lowerer.py` and `codegen.py`;
+- a final `86c8ee6` regeneration of the 20-file corpus and all 42 grid
+  sources, byte-identical file-for-file to the retained W5 candidate captures
+  (`diff -rq` empty on both directories);
+- all five protected tracked-file hashes unchanged at their recorded values,
+  with no untracked GPU, benchmark, research, scheduler, scratch, or tooling
+  material staged.
+
+The final import-provenance command, honest full-suite summary, and regenerated
+source directories are retained under
+`/Users/bobby/.cache/scorch-codex/w5-review-72c2ff8/`; its summary explicitly
+records that the directory name predates the final two correction commits and
+that no raw pytest stream is being claimed.
+
+The next session may safely take a wider coherent family: type **C7 plus
+C12/C13** together using the now-reviewed qualified/template-call boundary,
+then extract the combined parallel-marking/zero-fill pass in the same session
+if the ownership audit confirms no residual raw or dynamic-field split. Treat
+D1 as a stretch goal only after that pass boundary and its stage-order/cache
+identity are gated. Preserve both W5/W14 compatibility fallbacks; do not spend
+the raw budget by silently narrowing them again.
 
 ## Incremental Migration Plan
 
