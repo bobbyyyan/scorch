@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union, cast
 
 from . import llir
 from .cin import (
@@ -59,7 +59,7 @@ from .llir_pass_manager import (
     LLIRStatementListArtifact,
 )
 from .compilation_context import CompilerStageId, CompilationContext
-from .llir_traversal import LLIRTraversalContext
+from .llir_traversal import LLIRRewriter, LLIRTraversalContext
 from .torch_cpp_abi import (
     KernelTensorABI,
     ResultTensorAssembler,
@@ -80,6 +80,11 @@ if TYPE_CHECKING:
 _SPARSE_POSITION_DISCOVERY_CONTEXT = LLIRTraversalContext(
     stage="CIN lowering",
     pass_name="collect_sparse_position_arrays",
+)
+
+_PARALLEL_POLICY_VALUE_CONTEXT = LLIRTraversalContext(
+    stage="CIN lowering",
+    pass_name="typed_parallel_policy_value",
 )
 
 
@@ -739,7 +744,7 @@ class CINLowerer:
         # each worker selects a disjoint slice inside the region. This keeps
         # allocation failures unwindable through pybind instead of OpenMP.
         self._workspace_alloc_stmts: List[llir.Stmt] = []
-        self._workspace_pool_specs: List[tuple[str, str, str]] = []
+        self._workspace_pool_specs: List[Tuple[str, DataType, str]] = []
         self._workspace_free_stmts: List[llir.Stmt] = []
         self._workspace_memset_stmts: List[llir.Stmt] = []
         for wksp in workspaces:
@@ -799,15 +804,16 @@ class CINLowerer:
                         level = dense_ta.level_of_index_var(idx_var)
                         actual_size = f"{dense_ta.tensor.name}{level}_size"
 
-                        ctype = wksp_ctype.value
                         wname = wksp.get_name()
-                        self._workspace_pool_specs.append((wname, ctype, actual_size))
+                        self._workspace_pool_specs.append(
+                            (wname, wksp_ctype, actual_size)
+                        )
                         self._workspace_alloc_stmts.extend(
                             [
-                                # The extent alias is typed; the pool borrow
-                                # below stays raw because its casted spelling
-                                # `(size_t)omp_get_thread_num()` has no typed
-                                # byte-identical Cast form today.
+                                # Both statements are typed: the extent alias
+                                # and the restrict-qualified per-worker slice
+                                # borrowed from the RAII pool owner declared
+                                # by the typed before-parallel construction.
                                 llir.VarInit(
                                     var=size_llir,
                                     value=llir.Var(
@@ -815,12 +821,35 @@ class CINLowerer:
                                         type=llir.DataType.INT64,
                                     ),
                                 ),
-                                llir.RawStmt(
-                                    code=(
-                                        f"{ctype}* __restrict__ {wname} = "
-                                        f"{wname}_pool_owner.get() + "
-                                        f"(size_t)omp_get_thread_num() * "
-                                        f"(size_t){actual_size}"
+                                llir.VarInit(
+                                    var=llir.Var(
+                                        name=wname,
+                                        type=wksp_ctype_ptr,
+                                        is_restrict=True,
+                                    ),
+                                    value=llir.Add(
+                                        llir.MemberCall(
+                                            base=llir.Var(
+                                                name=f"{wname}_pool_owner",
+                                                type=llir.DataType.NO_TYPE,
+                                            ),
+                                            member="get",
+                                        ),
+                                        llir.Mul(
+                                            llir.Cast(
+                                                expr=llir.FunctionCall(
+                                                    "omp_get_thread_num"
+                                                ),
+                                                data_type=llir.DataType.SIZE_T,
+                                            ),
+                                            llir.Cast(
+                                                expr=llir.Var(
+                                                    name=actual_size,
+                                                    type=llir.DataType.INT64,
+                                                ),
+                                                data_type=llir.DataType.SIZE_T,
+                                            ),
+                                        ),
                                     ),
                                 ),
                             ]
@@ -2836,6 +2865,7 @@ class CINLowerer:
                 alloc = getattr(self, "_workspace_alloc_stmts", [])
                 free = getattr(self, "_workspace_free_stmts", [])
 
+                thread_policy_factory: Optional[Callable[[], llir.Expr]] = None
                 if has_sparse and alloc:
                     # Use adaptive atomic work-stealing: chunk scales with
                     # total nnz to balance scheduling overhead vs load
@@ -2879,43 +2909,93 @@ class CINLowerer:
                         llir_stmt.omp_num_threads = (
                             f"scorch_nthreads({sparse_work}, {loop_bound})"
                         )
+                        thread_policy_factory = self._typed_thread_policy_factory(
+                            llir_stmt, sparse_pos
+                        )
                     else:
                         if alloc or free:
                             llir_stmt.pre_parallel_body = alloc or None
                             llir_stmt.post_parallel_body = free or None
-                        self._apply_parallel_policy(llir_stmt)
+                        thread_policy_factory = self._apply_parallel_policy(llir_stmt)
                 else:
                     if has_sparse:
                         llir_stmt.omp_schedule = "dynamic, 64"
                     if alloc or free:
                         llir_stmt.pre_parallel_body = alloc or None
                         llir_stmt.post_parallel_body = free or None
-                    self._apply_parallel_policy(llir_stmt)
-                self._attach_serial_workspace_pools(llir_stmt)
+                    thread_policy_factory = self._apply_parallel_policy(llir_stmt)
+                self._attach_serial_workspace_pools(llir_stmt, thread_policy_factory)
                 return
 
-    def _attach_serial_workspace_pools(self, loop: llir.ForLoop) -> None:
-        """Allocate per-worker dense workspaces before entering OpenMP."""
+    def _attach_serial_workspace_pools(
+        self,
+        loop: llir.ForLoop,
+        thread_policy_factory: Optional[Callable[[], llir.Expr]] = None,
+    ) -> None:
+        """Allocate per-worker dense workspaces before entering OpenMP.
+
+        Each spec receives a typed worker-count initialization owning a fresh
+        copy of the loop's applied thread policy value (or the
+        ``omp_get_max_threads()`` fallback when no policy was applied) and a
+        typed RAII owner initialization calling the templated aligned-buffer
+        allocator.  A policy string without a typed value would silently
+        desynchronize the pragma from the worker count, so that combination
+        fails closed.
+        """
         specs = getattr(self, "_workspace_pool_specs", [])
         if not specs:
             return
+        if thread_policy_factory is None and loop.omp_num_threads:
+            raise CompilerInvariantError(
+                "the workspace-pool thread-count policy has no typed value for "
+                f"applied policy {loop.omp_num_threads!r}"
+            )
 
-        thread_expr = loop.omp_num_threads or "omp_get_max_threads()"
         before: List[llir.Stmt] = []
-        for workspace_name, ctype, extent in specs:
+        for workspace_name, scalar_type, extent in specs:
             before.extend(
                 [
-                    llir.RawStmt(
-                        code=(f"int {workspace_name}_thread_count = " f"{thread_expr}")
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{workspace_name}_thread_count",
+                            type=llir.DataType.INT,
+                        ),
+                        value=(
+                            thread_policy_factory()
+                            if thread_policy_factory is not None
+                            else llir.FunctionCall("omp_get_max_threads")
+                        ),
                     ),
-                    llir.RawStmt(
-                        code=(
-                            f"auto {workspace_name}_pool_owner = "
-                            f"scorch_make_aligned_buffer<{ctype}>("
-                            "scorch_checked_size_product("
-                            f"(size_t){workspace_name}_thread_count, "
-                            f"(size_t){extent}))"
-                        )
+                    llir.VarInit(
+                        var=llir.Var(
+                            name=f"{workspace_name}_pool_owner",
+                            type=llir.DataType.AUTO,
+                        ),
+                        value=llir.FunctionCall(
+                            "scorch_make_aligned_buffer",
+                            [
+                                llir.FunctionCall(
+                                    "scorch_checked_size_product",
+                                    [
+                                        llir.Cast(
+                                            expr=llir.Var(
+                                                name=(f"{workspace_name}_thread_count"),
+                                                type=llir.DataType.INT,
+                                            ),
+                                            data_type=llir.DataType.SIZE_T,
+                                        ),
+                                        llir.Cast(
+                                            expr=llir.Var(
+                                                name=extent,
+                                                type=llir.DataType.INT64,
+                                            ),
+                                            data_type=llir.DataType.SIZE_T,
+                                        ),
+                                    ],
+                                )
+                            ],
+                            template_args=(scalar_type,),
+                        ),
                     ),
                 ]
             )
@@ -3013,6 +3093,64 @@ class CINLowerer:
         return None
 
     @staticmethod
+    def _typed_thread_policy_factory(
+        loop: llir.ForLoop,
+        sparse_pos: Optional[str],
+    ) -> Optional[Callable[[], llir.Expr]]:
+        """Build fresh typed copies of a loop's applied num_threads policy.
+
+        The factory mirrors the string policy exactly from the same structural
+        pieces: the work estimate is the sparse position lookup (or ``-1``),
+        and the trip count is the loop bound (or the affine stride division for
+        ``ADD_ASSIGN`` updates, whose stride is detached from the live update
+        expression on every call).  Position arrays stay metadata-free
+        ``NO_TYPE`` references because the kernel prologue owns their
+        declarations.
+        """
+        if not (
+            isinstance(loop.cond, llir.BinOp)
+            and loop.cond.op == "<"
+            and isinstance(loop.cond.right, llir.Var)
+        ):
+            return None
+        bound_name = loop.cond.right.name
+        bound_type = loop.cond.right.type
+        update = loop.update
+        stride = (
+            update.value
+            if isinstance(update, llir.Assign) and update.op == llir.AssignOp.ADD_ASSIGN
+            else None
+        )
+
+        def build() -> llir.Expr:
+            if sparse_pos is not None:
+                work: llir.Expr = llir.ArrayAccess(
+                    array=llir.Var(name=sparse_pos, type=llir.DataType.NO_TYPE),
+                    index=llir.Var(name=bound_name, type=bound_type),
+                )
+            else:
+                work = llir.Literal(-1, llir.DataType.INT)
+            if stride is None:
+                rows: llir.Expr = llir.Var(name=bound_name, type=bound_type)
+            else:
+                rewriter = LLIRRewriter(_PARALLEL_POLICY_VALUE_CONTEXT)
+                rows = llir.BinOp(
+                    "/",
+                    llir.BinOp(
+                        "-",
+                        llir.Add(
+                            llir.Var(name=bound_name, type=bound_type),
+                            cast(llir.Expr, rewriter.rewrite(stride)),
+                        ),
+                        llir.Literal(1, llir.DataType.INT),
+                    ),
+                    cast(llir.Expr, rewriter.rewrite(stride)),
+                )
+            return llir.FunctionCall("scorch_nthreads", [work, rows])
+
+        return build
+
+    @staticmethod
     def _parallel_rows_expr(for_loop: llir.ForLoop, bound: str) -> str:
         """Return the loop trip count, accounting for affine tile strides."""
         update = for_loop.update
@@ -3045,21 +3183,35 @@ class CINLowerer:
         it and get the header's 500 default). No-op when the bound can't be
         determined. chunk=False keeps the loop's own chunk (e.g. the atomic
         work-stealing _chunk) and only applies the thread cap.
+
+        Returns a factory building fresh typed copies of the applied
+        num_threads value for downstream typed statements, or None when no
+        policy was applied or a free-form work_expr/grain string leaves the
+        policy without a typed value.
         """
         bound = self._extract_loop_bound(loop)
         if not bound:
-            return
+            return None
         rows = self._parallel_rows_expr(loop, bound)
+        sparse_work: Optional[str] = None
+        pos: Optional[str] = None
         if work_expr is not None:
             work = work_expr
         else:
             search_body = body if body is not None else loop.body
             pos = self._find_sparse_pos_array(search_body)
-            work = self._sparse_pos_work_expr(pos, bound) or "-1"
+            sparse_work = self._sparse_pos_work_expr(pos, bound)
+            work = sparse_work or "-1"
         gsuf = f", {grain}" if grain is not None else ""
         loop.omp_num_threads = f"scorch_nthreads({work}, {rows}{gsuf})"
         if chunk:
             loop.omp_chunk_expr = f"scorch_chunk({rows}, {work}{gsuf})"
+        if work_expr is not None or grain is not None:
+            return None
+        return self._typed_thread_policy_factory(
+            loop,
+            pos if sparse_work is not None else None,
+        )
 
     @staticmethod
     def _parse_pos(pos_name: str):

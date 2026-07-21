@@ -127,7 +127,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 149,
+        "cin_lowerer.py": 160,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -140,10 +140,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 446
+    assert sum(constructor_counts.values()) == 457
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 141,
+        "cin_lowerer.py": 152,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -156,15 +156,15 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 436
+    assert sum(unclassified_counts.values()) == 447
     assert known_indirect == {
-        ("cin_lowerer.py", "actual_size"): 1,
+        ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "outer_end_bound.name"): 1,
         ("cin_lowerer.py", "outer_end_var"): 3,
         ("cin_lowerer.py", "size_var"): 2,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
-        ("cin_lowerer.py", "wname"): 3,
+        ("cin_lowerer.py", "wname"): 4,
         ("compressed_where_openmp_pass.py", "loop_bound"): 1,
         ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -176,7 +176,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 24
+    assert sum(known_indirect.values()) == 26
 
     assert totals == {
         "subscript": 9,
@@ -320,13 +320,13 @@ def test_expression_producer_budgets_are_explicit() -> None:
         ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
     assert member_call_constructors == {
-        "cin_lowerer.py": 1,
+        "cin_lowerer.py": 2,
         "compressed_where_openmp_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 2,
         "torch_cpp_abi.py": 1,
     }
-    assert sum(member_call_constructors.values()) == 6
+    assert sum(member_call_constructors.values()) == 7
 
 
 def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
@@ -618,15 +618,15 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
     counts += Counter()
 
     assert counts == {
-        "cin_lowerer.py": 7,
+        "cin_lowerer.py": 4,
         "compressed_where_openmp_pass.py": 1,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 12
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 11
+    assert sum(counts.values()) == 9
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 8
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -767,22 +767,33 @@ def test_dense_workspace_zero_fill_is_structured() -> None:
         _static_string_fragments(call)
         for call in _llir_constructor_calls(lowerer_path, "RawStmt")
     )
-    # The only raw statement left in lower_Where is the C4 pool borrow.
-    assert lower_where.count("llir.RawStmt(") == 1
+    # The whole dense-workspace zero-fill cluster in lower_Where is typed:
+    # the extent alias, the restrict-qualified pool borrow (C4), and the
+    # memset construct no raw statements.
+    assert lower_where.count("llir.RawStmt(") == 0
     assert 'f"int64_t' not in lower_where
+    assert lower_where.count("is_restrict=True") == 1
+    assert lower_where.count('member="get"') == 1
+    assert "__restrict__" not in lower_where
 
-    # The remaining zero-fill cluster members stay raw for documented
-    # reasons: the pool borrow and pool owner (C4/C16) depend on the
-    # spaceless `(size_t)` cast spelling that the typed Cast node cannot
-    # reproduce, and the thread count (C15) embeds the rendered
-    # `omp_num_threads` parallel-policy string.
-    assert lower_where.count("__restrict__ {wname}") == 1
+    # The pool thread count (C15) and RAII owner (C16) are typed: the
+    # worker count owns a fresh typed copy of the applied parallel policy,
+    # and the owner calls the templated aligned-buffer allocator.
     pools = lowerer_source.split("def _attach_serial_workspace_pools", 1)[1].split(
         "def _tag_first_loop", 1
     )[0]
-    assert pools.count("llir.RawStmt(") == 2
-    assert pools.count("_thread_count = ") == 1
-    assert pools.count("scorch_make_aligned_buffer") == 1
+    assert pools.count("llir.RawStmt(") == 0
+    assert pools.count("llir.VarInit(") == 2
+    assert pools.count('"scorch_make_aligned_buffer"') == 1
+    assert pools.count('"scorch_checked_size_product"') == 1
+    assert pools.count('"omp_get_max_threads"') == 1
+    assert pools.count("template_args=(scalar_type,)") == 1
+    assert pools.count("thread_policy_factory()") == 1
+    for call in _llir_constructor_calls(lowerer_path, "RawStmt"):
+        fragments = _static_string_fragments(call)
+        assert "pool_owner" not in fragments
+        assert "thread_count" not in fragments
+        assert "__restrict__" not in fragments
 
 
 def test_dense_workspace_write_back_copy_is_structured() -> None:
