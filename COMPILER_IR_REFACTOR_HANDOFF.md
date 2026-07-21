@@ -21207,6 +21207,229 @@ actor or a periodic-push mechanism. These documentation corrections do not
 change the completed seam, its raw/constructor budgets, or the next Phase-3
 recommendation.
 
+### Phase-3 typed all-COO preallocation ownership complete (2026-07-20)
+
+The AddressOf review corrections documented in the preceding section were
+committed exactly as described, with no amend, squash, or reorder, as:
+
+- `eea02fc` **fix(compiler): restrict AddressOf to exact lvalue operands**;
+- `1a233bc` **test(compiler): cover AddressOf lvalue boundaries**; and
+- `4d2a7db` **docs(compiler): record AddressOf review corrections**.
+
+Before committing, this session independently reproduced the recorded
+evidence rather than trusting it: the five affected suites at **1044
+passed** with the committed collection re-counted at 962 in a clean
+detached worktree; base/candidate byte-identity re-derived from scratch
+against a clean `8143cb6` worktree for the five canonical inputs, the
+workspace pair, the tiled workspace, the 2,691-byte activation kernel
+(SHA-256 `08bc91d8…` reproduced from both trees), and a freshly captured
+42-cell grid identical on every environment-independent field; the
+retained full-suite log re-hashed to `b9805b6b…`; the latency compare log
+and activation report re-read with matching numbers and hashes; and an
+isolated detached-worktree full non-performance run reproduced
+**2250 passed, 14 skipped** exactly. Scoped Black/Flake8/mypy matched the
+recorded inherited findings. The 47 failures observed when sweeping the
+full working tree are all in the user's untracked GPU/CUDA benchmark test
+files and are unrelated. The five protected tracked files hashed exactly
+as recorded before every commit.
+
+On top of that base, only the narrow Phase-3 **C17 typed all-COO
+preallocation** slice is complete in this section. The exact base is
+`4d2a7db` and the exact committed candidate is `3b10df7`. Its ordered
+commits are:
+
+- `270bcfb` **refactor(compiler): emit typed all-COO preallocation**; and
+- `3b10df7` **test(compiler): cover typed all-COO preallocation**.
+
+The complete base/candidate range is four files: `cin_lowerer.py` in
+production plus `test_cin_lowerer.py`, `test_llir_string_budget.py`, and
+`test_dynamic_vector_access_pass.py`. No CIN schema or semantics,
+scheduling policy, kernel ABI, generated C++ spelling, cache schema,
+csrc, native ABI, public Python API, pass order, new LLIR node, Phase-3.5,
+or LoopIR work is part of this slice.
+
+#### Audit and seam selection
+
+A fresh read-only audit of the previously unaudited C7/C12-C14/C17
+lowering seams confirmed they do not form one coherent seam and selected
+the smallest complete byte-identical ownership boundary:
+
+| Family | Decision |
+| --- | --- |
+| **C17** | **Selected. The all-COO preallocation `RawStmt(f"{arr}.resize({outer_end})", add_semicolon=True)` in `_transform_coo_loop_for_openmp` is byte-identically typeable with the existing frozen `MemberCallStmt` node — no new node, no spelling decision, no two-machine gate. The audit newly established its exact liveness: the sole call site gates the transform on scalar accumulation with an all-coordinate output, which always sets `_known_nnz_var`, so the flat route always discards the statements and the grouped `else` route is dead from that call site; additionally, the flat no-known-nnz sub-route cannot complete lowering today because its legacy `arr.data()[` string rewrite produces a non-identifier assignment-target name that the typed assignment-target validation rejects (pre-existing, latent, not fixed here). Construction is live: the canonical all-COO SDDMM shape constructs the statements on every lowering and then discards them.** |
+| C7 | Deferred. `int64_t {hint} = std::min<int64_t>(scorch_native::checked_product(result_shape, "evaluate", "result_shape", true), 2048)` needs a typed qualified/templated free-function-call expression (template argument on a `std::` name plus a two-component qualified callee). `FunctionCall.name` is a plain string, and smuggling `std::min<int64_t>` into it would only relocate opacity, which the W2/W4 precedent rejects. Blocked on a deliberate new-node design decision. |
+| C12/C13 | Deferred, unchanged. Mutually coupled adaptive `_nnz`/`_chunk` scheduling state consumed by the atomic-loop dynamic `ForLoop` attributes; C13 additionally embeds the same nested `std::max`/`std::min` qualified-call spelling as C7. One scheduling-policy slice behind the same call-node decision. |
+| C14 | Deferred. `self._atomic_counter_decl = RawStmt("std::atomic<int> _next_row{0}")` is a dead construction: this session verified the attribute is written once and read nowhere, and codegen emits its own counter declaration. Removal is trivially byte-identical but is DCE-scope work a prior session explicitly declined to begin; it remains an available micro-slice pending that scope decision. |
+
+#### Representation, ownership boundary, and emission
+
+`_collect_output_arrays` now retains the first-seen assignment-target
+array `Var` per name (an insertion-ordered `Dict[str, llir.Var]`,
+preserving the previous name order) instead of only the name. Each
+preallocation is constructed as
+
+- `llir.MemberCallStmt(base=llir.Var(<first-seen name/type/is_ptr/
+  is_restrict>), member="resize", args=(llir.Var(<outer end bound>,
+  INT64),))`, rendered `{arr}.resize({outer_end});`
+
+through the same statement-rendering path the raw spelling used, so
+emission is byte-identical on both preallocation routes. The receiver is
+a fresh detached `Var` cloning the tree's own declared metadata and
+deliberately carries no tensor-access provenance: like the C6 row-slot
+decision, it names the whole array object being resized, not one logical
+element write. The extent argument reuses the exact `INT64` loop-bound
+spelling the flat route already uses.
+
+Pass equivalence was audited explicitly: `_rewrite_val_refs` already
+reconstructs `MemberCallStmt` structurally (its only live call site
+rewrites the inner body with `{arr}[`-keyed replacements that cannot
+match a resize statement in either representation); the
+dense-pointer-hoist and single-iteration rewriters already traverse
+`MemberCallStmt` and their rename keys are bracketed access spellings
+that cannot match a bracket-free receiver name; and the dynamic-vector
+pass neither renames a bracket-free receiver nor converts a member call
+(it only rewrites `Assign` stores), which the new pass-through test
+locks. No replacement key can span the receiver/member boundary, so no
+pass can distinguish the typed statement from the raw text it replaces.
+
+The production string/raw budget after this slice: **430 production
+`Var` constructors** (unclassified 420; known indirect sinks/clones
+**25** — the new `array_var.name` receiver clone and `outer_end_var`
+extent sink, plus the three pre-existing `outer_end_var` sinks now
+classified); ten direct expression strings (unchanged); seven generic
+string rewrites (unchanged); **14 `RawStmt` constructors / 13 semantic
+producers** (`cin_lowerer.py` drops from eight to seven); six
+`DirectInit` templates (unchanged); a `MemberCallStmt` budget of
+**seven** (`cin_lowerer.py` grows from one to two); the `Sizeof` budget
+of three (unchanged); and the `AddressOf` budget of five (unchanged).
+The remaining 13 semantic raw producers are C4, C7, C12-C16 (seven in
+`cin_lowerer.py`), W1, W5, the W14 compatibility fallback, D1, S1, and
+P1.
+
+#### Focused verification and structural coverage
+
+The three edited suites produce **303 passed**. The combined
+compiler/pass suite — here exactly `test_cin_lowerer.py`,
+`test_codegen.py`, `test_compressed_where_openmp_pass.py`,
+`test_dense_pointer_hoist_pass.py`, `test_dynamic_vector_access_pass.py`,
+`test_llir_pass_manager.py`, `test_llir_string_budget.py`,
+`test_llir_traversal.py`, `test_loop_invariant_factor_pass.py`,
+`test_result_write_pass.py`, `test_scheduler.py`,
+`test_single_iteration_loop_pass.py`, `test_sparse_prefetch_pass.py`,
+plus `tests/test_scorch/codegen` — produces **1545 passed** at the
+candidate against a re-counted base collection of 1540 (this membership
+is recorded because earlier sections' combined-suite numbers used an
+unrecorded 13-file membership and are not directly comparable). Black
+leaves all four changed files unchanged and `git diff --check` is clean.
+Scoped Flake8 retains only the two inherited F401 findings in
+`cin_lowerer.py`; scoped mypy over the six Phase-3 production files is
+identical to base after line-number normalization (the same 32 inherited
+findings). A quiet Sphinx HTML build exits zero.
+
+New coverage locks: the grouped route emits exactly one structured
+byte-exact `Sampled_values.resize(pMask0_end);` member-call statement
+with the receiver cloning the assignment-target metadata, detached
+across repeated transforms, ordered immediately before the group loop,
+with no raw resize spelling anywhere
+(`test_all_coo_grouped_preallocation_is_structured_typed_owned_and_byte_exact`);
+the known-nnz route still discards the statements
+(`test_all_coo_flat_preallocation_is_discarded_on_the_known_nnz_route`);
+the production all-COO SDDMM lowering constructs exactly three typed
+resize statements — values plus both coordinate arrays — that never
+reach the emitted kernel
+(`test_production_all_coo_preallocation_constructs_typed_then_discards`);
+the dynamic-vector rewrite passes the typed preallocation through
+byte-identically and detached while converting a sibling store to an
+append
+(`test_typed_preallocation_passes_through_the_dynamic_vector_rewrite`);
+and `test_all_coo_preallocation_is_structured` pins the single
+`MemberCallStmt` producer and keeps `.resize` out of every `RawStmt`
+constructor across the compiler.
+
+#### Byte-identity capture and activation evidence
+
+Fresh base/candidate captures (base `4d2a7db` content in a clean
+detached worktree, candidate the committed slice) are byte-identical for
+the five canonical inputs, the workspace pair, the tiled workspace, and
+the retained C6 dense-workspace activation kernel (2,691 bytes, SHA-256
+`08bc91d8…` on both sides), and all 42 grid cells match on every
+environment-independent field including emitted-source hashes and byte
+counts. Retained under
+`/Users/bobby/.cache/scorch-codex/cooprealloc-3b10df7/capture/`; the
+directory's complete artifact ledger
+(`evidence/artifact-ledger.txt`) hashes to
+`9fc6c0ad91a54ae0913b7767b55a7bbaa184287a32c2cb3528a11aa115441a9f`.
+
+The slice-specific activation probe
+(`capture_cooprealloc_activation.py`) ran at both clean revisions:
+at base, zero typed statements and the raw
+`Sampled_values.resize(pMask0_end)` offender
+(`latency-activation/activation-base.json`, `2d8d165a…`); at the
+candidate, **three** typed resize constructions during the canonical
+all-COO SDDMM lowering with zero emitted, plus the byte-exact synthetic
+grouped-route emission and zero raw offenders
+(`latency-activation/activation.json`, `9a241edb…`).
+
+#### Full-suite and latency verification
+
+An isolated detached-worktree full non-performance run containing the
+slice produced **2255 passed, 14 skipped, 2 warnings** — exactly the
+review correction's 2250 plus this slice's five tests. It ran twice with
+identical counts: first in the patched worktree (623.35s), then in the
+pristine `3b10df7` worktree (624.05s), whose log is retained at
+`full-suite/pytest.log` with SHA-256
+`e14ed3caf07a8383603ec024aa03262f3bf376012eda79546b1691a45f2c168a`.
+
+The paired latency comparison (five warmups, 30 samples, clean
+worktrees, isolated caches) ran twice. Run 1 (base first) reported
+`small_dense` 1.029/1.117 — a p95 crossing — with `reduction`
+0.968/0.918, `csr_intersection` 1.053/1.064, and `sparse_union`
+1.016/0.963. Attribution under the compiler-latency policy:
+`small_dense` never executes a changed line (every changed statement is
+inside `_transform_coo_loop_for_openmp` and its collector, reached only
+on the all-COO scalar-accumulation route), the base and candidate minima
+and medians agree within 3%, and the inflation is confined to the upper
+tail. Run 2 with the visit order reversed (candidate first) reported
+every category inside the 1.10 target at both percentiles —
+`small_dense` 0.977/1.015, `reduction` 1.023/1.075, `csr_intersection`
+1.012/0.995, `sparse_union` 1.010/0.995 — so the crossing follows
+temporal order, not revision, and is attributed to environmental tail
+drift. Both runs are retained under `latency-final/`.
+
+At documentation time, a read-only hash check reproduced the five
+protected tracked working files exactly as recorded, and all user-owned
+untracked material remained outside all session commits.
+`COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were not modified.
+This session pushed nothing;
+`origin/refactor/compiler-ir-phase3-std-move-call` remains at `15e2c82`.
+
+Evidence limitations: all measurements are single-machine (Apple M5);
+the byte-identical waiver makes no two-machine runtime claim necessary.
+No reachable production route emits the preallocation statements, so the
+migrated statement's emission coverage is the committed synthetic
+grouped-route byte-exact test plus the retained activation receipts;
+its construction coverage is live on the canonical all-COO corpus shape.
+The flat no-known-nnz sub-route's latent `arr.data()[`
+assignment-target incompatibility is documented, pre-existing, and
+deliberately not fixed in this byte-identical slice.
+
+Only the narrow C17 slice is complete. The raw budget is 14 constructors
+/ 13 semantic producers. The recommended next ownership seam is
+unchanged: the **deliberate W1-class Cast-spelling normalization
+decision** (blocking W1 and the C4/C16 zero-fill allocation/borrow half,
+with the W5/C15 policy seam layered behind it), which changes emitted
+bytes corpus-wide and requires the full two-machine generated-kernel
+gate plus an explicit emission-spelling review. Independently of that
+decision, three smaller deliberate decisions would each unlock further
+byte-identical work: a typed qualified/templated-call expression node
+(unlocking C7 and, with the scheduling family, C12/C13); the DCE-scope
+decision for the dead C14 construction; and the const-qualified pointer
+declaration form for D1. After those remain S1, P1, the seven generic
+rewrites, and the unified exhaustive CxxIR-emission exit review. Phase 3
+remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are
+not claimed formally closed without a separate design-requirement audit.
+Phase 2 retains its recorded canonical closure.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
