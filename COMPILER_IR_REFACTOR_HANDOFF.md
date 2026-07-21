@@ -22060,6 +22060,9 @@ Review-local verification also includes:
 - a final `86c8ee6` regeneration of the 20-file corpus and all 42 grid
   sources, byte-identical file-for-file to the retained W5 candidate captures
   (`diff -rq` empty on both directories);
+- a paired same-session 5-warmup/30-sample compiler-latency comparison against
+  `2beff04`, with every case inside the 1.10 target (worst p50 `1.047`, worst
+  p95 `1.037`) and identical source hashes in all four categories;
 - all five protected tracked-file hashes unchanged at their recorded values,
   with no untracked GPU, benchmark, research, scheduler, scratch, or tooling
   material staged.
