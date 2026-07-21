@@ -927,10 +927,12 @@ def _parallel_policy_decision(
     policy_args: List[llir.Expr] = [work.expr, rows.expr]
     policy_is_typed = True
     if grain is not None:
-        if re.fullmatch(r"[A-Za-z_]\w*", grain, flags=re.ASCII) is None:
+        if re.fullmatch(r"[A-Z_][A-Z0-9_]*", grain, flags=re.ASCII) is None:
             # The compatibility policy accepts free-form C++ text.  It remains
-            # valid for the legacy pragma/pool spelling, but must not be
-            # disguised as a structured Var name.
+            # valid for the legacy pragma/pool spelling, but only an exact
+            # macro-style identifier can honestly become a structured Var.
+            # This deliberately excludes C++ keywords/literals such as
+            # ``true`` and ``nullptr`` as well as compound expressions.
             policy_is_typed = False
         else:
             policy_args.append(llir.Var(name=grain, type=llir.DataType.NO_TYPE))
