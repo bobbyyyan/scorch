@@ -45,6 +45,48 @@ def _without_instance_field(value: object, field: str) -> object:
 
 
 def _malformed_address_operand(malformation: str) -> object:
+    if malformation == "member_cycle":
+        cyclic_member = object.__new__(llir.MemberAccess)
+        object.__setattr__(cyclic_member, "base", cyclic_member)
+        object.__setattr__(cyclic_member, "member", "field")
+        return cyclic_member
+    if malformation == "index_array_cycle":
+        cyclic_access = object.__new__(llir.ArrayAccess)
+        object.__setattr__(cyclic_access, "array", _var("values"))
+        object.__setattr__(cyclic_access, "index", cyclic_access)
+        object.__setattr__(cyclic_access, "tensor_access", None)
+        return cyclic_access
+    if malformation == "index_binop_cycle":
+        cyclic_binary = object.__new__(llir.BinOp)
+        object.__setattr__(cyclic_binary, "op", "+")
+        object.__setattr__(cyclic_binary, "left", cyclic_binary)
+        object.__setattr__(cyclic_binary, "right", llir.Literal(1))
+        return llir.ArrayAccess(_var("values"), cyclic_binary)
+    if malformation == "index_unary_op_subclass":
+
+        class StringSubclass(str):
+            pass
+
+        unary = llir.UnaryOp("+", _var("position"))
+        unary.op = StringSubclass("+")
+        return llir.ArrayAccess(_var("values"), unary)
+    if malformation.startswith("index_var_"):
+        field = malformation.removeprefix("index_var_")
+        index = _var("position")
+        if field.startswith("invalid_"):
+            setattr(index, field.removeprefix("invalid_"), "invalid")
+        else:
+            index = cast(llir.Var, _without_instance_field(index, field))
+        return llir.ArrayAccess(_var("values"), index)
+    if malformation == "index_array_tensor_access":
+        nested = _without_instance_field(
+            llir.ArrayAccess(_var("indices"), _var("position")),
+            "tensor_access",
+        )
+        return llir.ArrayAccess(
+            _var("values"),
+            cast(llir.ArrayAccess, nested),
+        )
     if malformation.startswith("var_"):
         return _without_instance_field(
             _var("value"),
@@ -1311,6 +1353,16 @@ def test_forged_missing_address_of_operand_fails_at_traversal_boundary(
         ("array_index", ("index",)),
         ("array_tensor_access", ("tensor_access",)),
         ("metadata_role", ("tensor_access", "role")),
+        ("index_var_is_ptr", ("index", "is_ptr")),
+        ("index_var_is_restrict", ("index", "is_restrict")),
+        ("index_var_tensor_access", ("index", "tensor_access")),
+        ("index_var_invalid_is_ptr", ("index", "is_ptr")),
+        ("index_var_invalid_is_restrict", ("index", "is_restrict")),
+        ("index_array_tensor_access", ("index", "tensor_access")),
+        ("member_cycle", ("base",)),
+        ("index_array_cycle", ("index", "index")),
+        ("index_binop_cycle", ("index", "left")),
+        ("index_unary_op_subclass", ("index", "op")),
     ),
 )
 def test_malformed_address_lvalue_reports_exact_traversal_path(

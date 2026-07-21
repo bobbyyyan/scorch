@@ -41,6 +41,20 @@ def test_codegen_rejects_unknown_statement_node() -> None:
         LLIRLowerer().lower_llir(UnknownStmt())
 
 
+def test_codegen_rejects_cyclic_statement_containers() -> None:
+    statements: list[object] = []
+    statements.append(statements)
+
+    with pytest.raises(CodegenError, match=r"root\[0\] must be acyclic"):
+        LLIRLowerer().lower_llir(cast(list[llir.Stmt], statements))
+
+
+def test_codegen_exact_tree_scan_allows_shared_expression_dags() -> None:
+    shared = _var("position")
+
+    assert LLIRLowerer().lower_llir(llir.Add(shared, shared)) == ("position + position")
+
+
 @pytest.mark.parametrize(
     "name",
     (
@@ -693,6 +707,48 @@ def _without_instance_field(value: object, field: str) -> object:
 
 
 def _malformed_address_operand(malformation: str) -> object:
+    if malformation == "member_cycle":
+        cyclic_member = object.__new__(llir.MemberAccess)
+        object.__setattr__(cyclic_member, "base", cyclic_member)
+        object.__setattr__(cyclic_member, "member", "field")
+        return cyclic_member
+    if malformation == "index_array_cycle":
+        cyclic_access = object.__new__(llir.ArrayAccess)
+        object.__setattr__(cyclic_access, "array", _var("values"))
+        object.__setattr__(cyclic_access, "index", cyclic_access)
+        object.__setattr__(cyclic_access, "tensor_access", None)
+        return cyclic_access
+    if malformation == "index_binop_cycle":
+        cyclic_binary = object.__new__(llir.BinOp)
+        object.__setattr__(cyclic_binary, "op", "+")
+        object.__setattr__(cyclic_binary, "left", cyclic_binary)
+        object.__setattr__(cyclic_binary, "right", llir.Literal(1))
+        return llir.ArrayAccess(_var("values"), cyclic_binary)
+    if malformation == "index_unary_op_subclass":
+
+        class StringSubclass(str):
+            pass
+
+        unary = llir.UnaryOp("+", _var("position"))
+        unary.op = StringSubclass("+")
+        return llir.ArrayAccess(_var("values"), unary)
+    if malformation.startswith("index_var_"):
+        field = malformation.removeprefix("index_var_")
+        index = _var("position")
+        if field.startswith("invalid_"):
+            setattr(index, field.removeprefix("invalid_"), "invalid")
+        else:
+            index = cast(llir.Var, _without_instance_field(index, field))
+        return llir.ArrayAccess(_var("values"), index)
+    if malformation == "index_array_tensor_access":
+        nested = _without_instance_field(
+            llir.ArrayAccess(_var("indices"), _var("position")),
+            "tensor_access",
+        )
+        return llir.ArrayAccess(
+            _var("values"),
+            cast(llir.ArrayAccess, nested),
+        )
     if malformation.startswith("var_"):
         return _without_instance_field(
             _var("value"),
@@ -778,6 +834,16 @@ def test_address_of_rejects_non_lvalue_constructor_operands(
         "array_index",
         "array_tensor_access",
         "metadata_role",
+        "index_var_is_ptr",
+        "index_var_is_restrict",
+        "index_var_tensor_access",
+        "index_var_invalid_is_ptr",
+        "index_var_invalid_is_restrict",
+        "index_array_tensor_access",
+        "member_cycle",
+        "index_array_cycle",
+        "index_binop_cycle",
+        "index_unary_op_subclass",
     ),
 )
 def test_address_of_rejects_malformed_structured_lvalues(
@@ -924,6 +990,16 @@ def test_codegen_rejects_forged_missing_address_of_operand(
         "array_index",
         "array_tensor_access",
         "metadata_role",
+        "index_var_is_ptr",
+        "index_var_is_restrict",
+        "index_var_tensor_access",
+        "index_var_invalid_is_ptr",
+        "index_var_invalid_is_restrict",
+        "index_array_tensor_access",
+        "member_cycle",
+        "index_array_cycle",
+        "index_binop_cycle",
+        "index_unary_op_subclass",
     ),
 )
 @pytest.mark.parametrize("nested_in_write_back", (False, True))
@@ -943,7 +1019,10 @@ def test_codegen_rejects_forged_malformed_address_of_lvalue(
             ),
         )
 
-    with pytest.raises(CodegenError, match="AddressOf.operand"):
+    with pytest.raises(
+        CodegenError,
+        match="AddressOf.operand|must be acyclic|string subclass",
+    ):
         LLIRLowerer().lower_llir(ir)
 
 

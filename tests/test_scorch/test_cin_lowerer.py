@@ -136,15 +136,21 @@ def _all_coo_transform_coordinate_read(
     return parallel_loop, initializer, cast(llir.ArrayAccess, initializer.value)
 
 
-def _build_all_coo_transform_loop_with_output_write() -> llir.ForLoop:
+def _build_all_coo_transform_loop_with_output_write(
+    *,
+    output_type: llir.DataType = llir.DataType.STD_VECTOR_FLOAT32,
+    is_ptr: bool = False,
+    is_restrict: bool = False,
+) -> llir.ForLoop:
     source = _build_all_coo_transform_loop()
     source.body.append(
         llir.Assign(
             var=llir.ArrayAccess(
                 array=llir.Var(
                     "Sampled_values",
-                    llir.DataType.PTR_FLOAT32,
-                    is_ptr=True,
+                    output_type,
+                    is_ptr=is_ptr,
+                    is_restrict=is_restrict,
                 ),
                 index=llir.Var("pSampled1", llir.DataType.INT),
             ),
@@ -5171,11 +5177,11 @@ def _grouped_route_resize_statements(
 def test_all_coo_grouped_preallocation_is_structured_typed_owned_and_byte_exact() -> (
     None
 ):
+    first_source = _build_all_coo_transform_loop_with_output_write()
+    first_source_bound = cast(llir.Var, first_source.cond.right)
     first_lowerer = CINLowerer()
     first_lowerer._used_scalar_accum = False
-    first_stmts = first_lowerer._transform_coo_loop_for_openmp(
-        [_build_all_coo_transform_loop_with_output_write()]
-    )
+    first_stmts = first_lowerer._transform_coo_loop_for_openmp([first_source])
     second_lowerer = CINLowerer()
     second_lowerer._used_scalar_accum = False
     second_stmts = second_lowerer._transform_coo_loop_for_openmp(
@@ -5192,16 +5198,19 @@ def test_all_coo_grouped_preallocation_is_structured_typed_owned_and_byte_exact(
     assert type(first.base) is llir.Var
     base = cast(llir.Var, first.base)
     assert base.name == "Sampled_values"
-    assert base.type is llir.DataType.PTR_FLOAT32
-    assert base.is_ptr is True
+    assert base.type is llir.DataType.STD_VECTOR_FLOAT32
+    assert base.is_ptr is False
     assert base.is_restrict is False
     assert base.tensor_access is None
     assert first.member == "resize"
     assert first.template_args == ()
-    assert first.args == (llir.Var("pMask0_end", llir.DataType.INT64),)
+    assert first.args == (llir.Var("pMask0_end", llir.DataType.INT),)
     argument = cast(llir.Var, first.args[0])
-    assert argument.type is llir.DataType.INT64
+    assert argument.type is llir.DataType.INT
+    assert argument.is_ptr is False
+    assert argument.is_restrict is False
     assert argument.tensor_access is None
+    assert argument is not first_source_bound
 
     group_loop = next(
         cast(llir.ForLoop, statement)
@@ -5234,12 +5243,124 @@ def test_all_coo_grouped_preallocation_is_structured_typed_owned_and_byte_exact(
     )
 
 
+@pytest.mark.parametrize(
+    ("output_type", "is_ptr", "is_restrict"),
+    (
+        (llir.DataType.PTR_FLOAT32, True, False),
+        (llir.DataType.FLOAT32, False, False),
+        (llir.DataType.NO_TYPE, False, False),
+        (llir.DataType.STD_VECTOR_FLOAT32, True, False),
+        (llir.DataType.STD_VECTOR_FLOAT32, False, True),
+    ),
+)
+def test_all_coo_preallocation_rejects_known_non_vector_receivers(
+    output_type: llir.DataType,
+    is_ptr: bool,
+    is_restrict: bool,
+) -> None:
+    lowerer = CINLowerer()
+    lowerer._used_scalar_accum = False
+    source = _build_all_coo_transform_loop_with_output_write(
+        output_type=output_type,
+        is_ptr=is_ptr,
+        is_restrict=is_restrict,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="exact metadata-free std::vector Var",
+    ):
+        lowerer._transform_coo_loop_for_openmp([source])
+
+
+def test_all_coo_preallocation_rejects_provenance_bearing_receiver() -> None:
+    source = _build_all_coo_transform_loop_with_output_write()
+    assignment = cast(llir.Assign, source.body[-1])
+    receiver = cast(llir.Var, cast(llir.ArrayAccess, assignment.var).array)
+    index = IndexVar("i")
+    access = TensorVar("Output", fmt="d")[index]
+    receiver.tensor_access = llir.TensorAccessMetadata(
+        access_id=access.access_id,
+        tensor_id=access.tensor_id,
+        index_ids=access.index_ids,
+        role=llir.TensorAccessRole.RESULT_WRITE,
+    )
+    lowerer = CINLowerer()
+    lowerer._used_scalar_accum = False
+
+    with pytest.raises(
+        TypeError,
+        match="exact metadata-free std::vector Var",
+    ):
+        lowerer._transform_coo_loop_for_openmp([source])
+
+
+@pytest.mark.parametrize(
+    ("bound_type", "is_ptr", "is_restrict"),
+    (
+        (llir.DataType.FLOAT32, False, False),
+        (llir.DataType.INT, True, False),
+        (llir.DataType.INT, False, True),
+    ),
+)
+def test_all_coo_preallocation_rejects_invalid_extent_metadata(
+    bound_type: llir.DataType,
+    is_ptr: bool,
+    is_restrict: bool,
+) -> None:
+    source = _build_all_coo_transform_loop_with_output_write()
+    source.cond = llir.BinOp(
+        "<",
+        source.cond.left,
+        llir.Var(
+            "pMask0_end",
+            bound_type,
+            is_ptr=is_ptr,
+            is_restrict=is_restrict,
+        ),
+    )
+    lowerer = CINLowerer()
+    lowerer._used_scalar_accum = False
+
+    with pytest.raises(
+        TypeError,
+        match="exact metadata-free integral Var",
+    ):
+        lowerer._transform_coo_loop_for_openmp([source])
+
+
+def test_all_coo_preallocation_rejects_provenance_bearing_extent() -> None:
+    source = _build_all_coo_transform_loop_with_output_write()
+    bound = cast(llir.Var, source.cond.right)
+    index = IndexVar("i")
+    access = TensorVar("Bound", fmt="d")[index]
+    bound.tensor_access = llir.TensorAccessMetadata(
+        access_id=access.access_id,
+        tensor_id=access.tensor_id,
+        index_ids=access.index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    lowerer = CINLowerer()
+    lowerer._used_scalar_accum = False
+
+    with pytest.raises(
+        TypeError,
+        match="exact metadata-free integral Var",
+    ):
+        lowerer._transform_coo_loop_for_openmp([source])
+
+
 def test_all_coo_flat_preallocation_is_discarded_on_the_known_nnz_route() -> None:
     lowerer = CINLowerer()
     lowerer._used_scalar_accum = True
     lowerer.final_result_tensor_var = TensorVar("Sampled", fmt="oo")
     transformed = lowerer._transform_coo_loop_for_openmp(
-        [_build_all_coo_transform_loop_with_output_write()]
+        [
+            _build_all_coo_transform_loop_with_output_write(
+                output_type=llir.DataType.PTR_FLOAT32,
+                is_ptr=True,
+            )
+        ]
     )
 
     assert lowerer._known_nnz_var == "_known_nnz"
@@ -5252,7 +5373,7 @@ def test_all_coo_flat_preallocation_is_discarded_on_the_known_nnz_route() -> Non
     assert ".resize(" not in LLIRLowerer().lower_llir(list(transformed))
 
 
-def test_production_all_coo_preallocation_constructs_typed_then_discards(
+def test_production_all_coo_preallocation_skips_dead_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     statement = _build_activating_all_coo_sddmm()
@@ -5273,18 +5394,7 @@ def test_production_all_coo_preallocation_constructs_typed_then_discards(
     cpp = LLIRLowerer().lower_llir(lowered)
 
     assert str(statement) == statement_before
-    assert [
-        (cast(llir.Var, record.base).name, record.member) for record in captured
-    ] == [
-        ("Sampled_values", "resize"),
-        ("Sampled0_crd", "resize"),
-        ("Sampled1_crd", "resize"),
-    ]
-    for record in captured:
-        base = cast(llir.Var, record.base)
-        assert type(base) is llir.Var
-        assert base.tensor_access is None
-        assert record.args == (llir.Var("pMask0_end", llir.DataType.INT64),)
+    assert captured == []
     assert ".resize(" not in cpp
 
 

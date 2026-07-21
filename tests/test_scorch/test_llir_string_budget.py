@@ -92,13 +92,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     known_indirect_names = {
         "accumulator_name",
         "actual_size",
-        "array_var.name",
         "expr.name.replace(old, new)",
         "f'{prefix}{level}'",
         "invariant_name",
         "loop_bound",
         "name",
         "node.name",
+        "outer_end_bound.name",
         "outer_end_var",
         "prefix_extent",
         "size_var",
@@ -159,9 +159,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert sum(unclassified_counts.values()) == 420
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 1,
-        ("cin_lowerer.py", "array_var.name"): 1,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
-        ("cin_lowerer.py", "outer_end_var"): 4,
+        ("cin_lowerer.py", "outer_end_bound.name"): 1,
+        ("cin_lowerer.py", "outer_end_var"): 3,
         ("cin_lowerer.py", "size_var"): 2,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
         ("cin_lowerer.py", "wname"): 3,
@@ -176,7 +176,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 25
+    assert sum(known_indirect.values()) == 24
 
     assert totals == {
         "subscript": 9,
