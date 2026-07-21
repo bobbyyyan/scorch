@@ -1649,18 +1649,32 @@ def test_function_call_is_frozen_typed_owned_and_structurally_equal() -> None:
     caller_args.append(_var("later"))
 
     assert call.name == "std::move"
+    assert type(call.template_args) is tuple
+    assert call.template_args == ()
     assert type(call.args) is tuple
     assert call.args == (argument,)
     assert call == tuple_call
     assert call != llir.FunctionCall("std::move", (_var("other"),))
     assert call != llir.FunctionCall("other", (_var("values"),))
+    assert call != llir.FunctionCall(
+        "std::move",
+        (_var("values"),),
+        template_args=(llir.DataType.INT64,),
+    )
+    template_list = [llir.DataType.INT64]
+    templated = llir.FunctionCall("std::move", (_var("values"),), template_list)
+    template_list.append(llir.DataType.INT)
+    assert templated.template_args == (llir.DataType.INT64,)
     assert get_type_hints(llir.FunctionCall) == {
         "name": str,
+        "template_args": Tuple[llir.DataType, ...],
         "args": Tuple[llir.Expr, ...],
     }
 
     with pytest.raises(FrozenInstanceError):
         call.name = "other"
+    with pytest.raises(FrozenInstanceError):
+        call.template_args = ()
     with pytest.raises(FrozenInstanceError):
         call.args = ()
 
@@ -1693,18 +1707,28 @@ def test_function_call_stmt_is_frozen_typed_owned_and_structurally_equal() -> No
     caller_args.append(_var("later"))
 
     assert call.name == "wksp.insert"
+    assert type(call.template_args) is tuple
+    assert call.template_args == ()
     assert type(call.args) is tuple
     assert call.args == (argument,)
     assert call == tuple_call
     assert call != llir.FunctionCallStmt("wksp.insert", (_var("other"),))
     assert call != llir.FunctionCallStmt("other", (_var("values"),))
+    assert call != llir.FunctionCallStmt(
+        "wksp.insert",
+        (_var("values"),),
+        template_args=(llir.DataType.INT64,),
+    )
     assert get_type_hints(llir.FunctionCallStmt) == {
         "name": str,
+        "template_args": Tuple[llir.DataType, ...],
         "args": Tuple[llir.Expr, ...],
     }
 
     with pytest.raises(FrozenInstanceError):
         call.name = "other"
+    with pytest.raises(FrozenInstanceError):
+        call.template_args = ()
     with pytest.raises(FrozenInstanceError):
         call.args = ()
 
@@ -3138,14 +3162,24 @@ def test_codegen_rejects_function_call_subclasses_and_unknown_children() -> None
         LLIRLowerer().lower_llir(llir.FunctionCall("call", [UnknownExpr()]))
 
 
-@pytest.mark.parametrize("malformation", ("name", "args", "argument"))
+@pytest.mark.parametrize(
+    "malformation",
+    ("name", "missing_template_args", "template_arg", "args", "argument"),
+)
 def test_codegen_rejects_forged_function_call_fields(malformation: str) -> None:
     call = object.__new__(llir.FunctionCall)
     object.__setattr__(call, "name", "call")
+    if malformation != "missing_template_args":
+        object.__setattr__(call, "template_args", ())
     object.__setattr__(call, "args", (_var("argument"),))
     if malformation == "name":
         object.__setattr__(call, "name", " ")
         expected = "FunctionCall.name"
+    elif malformation == "missing_template_args":
+        expected = "FunctionCall.template_args must be a tuple of DataType values"
+    elif malformation == "template_arg":
+        object.__setattr__(call, "template_args", ("float",))
+        expected = "FunctionCall.template_args must be a tuple of DataType values"
     elif malformation == "args":
         object.__setattr__(call, "args", [_var("argument")])
         expected = "FunctionCall.args must be a tuple"

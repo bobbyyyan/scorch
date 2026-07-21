@@ -1883,6 +1883,21 @@ def test_forged_array_fields_fail_at_traversal_boundary(
     ("malformation", "diagnostic_code", "expected_path"),
     (
         ("name", "invalid_function_call_name", ("root", "name")),
+        (
+            "missing_template_args",
+            "invalid_function_call_template_args",
+            ("root", "template_args"),
+        ),
+        (
+            "template_args",
+            "invalid_function_call_template_args",
+            ("root", "template_args"),
+        ),
+        (
+            "template_arg",
+            "invalid_function_call_template_arg",
+            ("root", "template_args", "[0]"),
+        ),
         ("args", "invalid_function_call_args", ("root", "args")),
         (
             "argument",
@@ -1899,12 +1914,18 @@ def test_forged_function_call_fields_fail_at_traversal_boundary(
 ) -> None:
     call = object.__new__(llir.FunctionCall)
     object.__setattr__(call, "name", "call")
+    if malformation != "missing_template_args":
+        object.__setattr__(call, "template_args", ())
     object.__setattr__(call, "args", (_var("argument"),))
     if malformation == "name":
         object.__setattr__(call, "name", " ")
+    elif malformation == "template_args":
+        object.__setattr__(call, "template_args", [llir.DataType.INT])
+    elif malformation == "template_arg":
+        object.__setattr__(call, "template_args", ("int",))
     elif malformation == "args":
         object.__setattr__(call, "args", [_var("argument")])
-    else:
+    elif malformation == "argument":
         object.__setattr__(call, "args", ("argument",))
 
     with pytest.raises(LLIRTraversalError) as raised:

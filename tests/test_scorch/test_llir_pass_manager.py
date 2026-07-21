@@ -1030,6 +1030,7 @@ def test_malformed_function_call_after_assembly_preserves_exact_pass_prefix() ->
     source_snapshot = _structural_snapshot(source)
     malformed = object.__new__(llir.FunctionCall)
     object.__setattr__(malformed, "name", "std::move")
+    object.__setattr__(malformed, "template_args", ())
     object.__setattr__(
         malformed,
         "args",

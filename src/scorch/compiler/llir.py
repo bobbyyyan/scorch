@@ -570,20 +570,46 @@ class Function(Stmt):
         self.body = body
 
 
+def _normalized_call_template_args(
+    template_args: Optional[Sequence[DataType]],
+    *,
+    owner: str,
+) -> Tuple[DataType, ...]:
+    """Validate and freeze one optional call template-argument sequence."""
+
+    if template_args is None:
+        return ()
+    if type(template_args) is not list and type(template_args) is not tuple:
+        raise TypeError(f"{owner}.template_args must be a list or tuple")
+    if any(type(argument) is not DataType for argument in template_args):
+        raise TypeError(f"{owner}.template_args must contain only DataType values")
+    return tuple(template_args)
+
+
 @dataclass(frozen=True, init=False, repr=False)
 class FunctionCall(Expr):
-    """An immutable function call with tuple-owned expression arguments."""
+    """An immutable function call with tuple-owned expression arguments.
+
+    ``template_args`` mirrors :class:`MemberCall` exactly: explicit template
+    arguments are typed ``DataType`` values, never spellings embedded in the
+    call name.
+    """
 
     name: str
+    template_args: Tuple[DataType, ...]
     args: Tuple[Expr, ...]
 
     def __init__(
         self,
         name: str,
         args: Optional[Sequence[Expr]] = None,
+        template_args: Optional[Sequence[DataType]] = None,
     ) -> None:
         if type(name) is not str or not name.strip():
             raise TypeError("FunctionCall.name must be a non-empty string")
+        normalized_template_args = _normalized_call_template_args(
+            template_args, owner="FunctionCall"
+        )
         if args is None:
             normalized_args: Tuple[Expr, ...] = ()
         else:
@@ -593,6 +619,7 @@ class FunctionCall(Expr):
                 raise TypeError("FunctionCall.args must contain only LLIR expressions")
             normalized_args = tuple(args)
         object.__setattr__(self, "name", name)
+        object.__setattr__(self, "template_args", normalized_template_args)
         object.__setattr__(self, "args", normalized_args)
 
 
@@ -601,15 +628,20 @@ class FunctionCallStmt(Stmt):
     """An immutable call statement with tuple-owned expression arguments."""
 
     name: str
+    template_args: Tuple[DataType, ...]
     args: Tuple[Expr, ...]
 
     def __init__(
         self,
         name: str,
         args: Optional[Sequence[Expr]] = None,
+        template_args: Optional[Sequence[DataType]] = None,
     ) -> None:
         if type(name) is not str or not name.strip():
             raise TypeError("FunctionCallStmt.name must be a non-empty string")
+        normalized_template_args = _normalized_call_template_args(
+            template_args, owner="FunctionCallStmt"
+        )
         if args is None:
             normalized_args: Tuple[Expr, ...] = ()
         else:
@@ -621,6 +653,7 @@ class FunctionCallStmt(Stmt):
                 )
             normalized_args = tuple(args)
         object.__setattr__(self, "name", name)
+        object.__setattr__(self, "template_args", normalized_template_args)
         object.__setattr__(self, "args", normalized_args)
 
 
@@ -956,6 +989,13 @@ def _validate_assignment_index(expression: object) -> None:
             raise TypeError(
                 "assignment index FunctionCall.name must be an identifier or "
                 "member path"
+            )
+        if type(call.template_args) is not tuple or any(
+            type(argument) is not DataType for argument in call.template_args
+        ):
+            raise TypeError(
+                "assignment index FunctionCall.template_args must be a tuple of "
+                "DataType values"
             )
         if type(call.args) is not tuple:
             raise TypeError("assignment index FunctionCall.args must be a tuple")
@@ -1413,6 +1453,15 @@ def _validate_address_of_index(
                     "AddressOf.operand ArrayAccess index FunctionCall name must be "
                     "an identifier or member path",
                     path + ("name",),
+                )
+            template_arguments = _address_of_instance_field(call, "template_args")
+            if type(template_arguments) is not tuple or any(
+                type(argument) is not DataType for argument in template_arguments
+            ):
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index FunctionCall template_args "
+                    "must be a tuple of DataType values",
+                    path + ("template_args",),
                 )
             arguments = _address_of_instance_field(call, "args")
             if type(arguments) is not tuple:

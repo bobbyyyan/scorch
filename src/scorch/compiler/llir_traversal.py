@@ -983,6 +983,27 @@ class LLIRWalker:
                 path=path + ("name",),
                 value=node.name,
             )
+        template_args = getattr(node, "template_args", _MISSING_LLIR_FIELD)
+        if type(template_args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_function_call_template_args",
+                message="FunctionCall.template_args must be a tuple",
+                path=path + ("template_args",),
+                value=template_args,
+            )
+        for index, template_argument in enumerate(template_args):
+            if type(template_argument) is not llir.DataType:
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_function_call_template_arg",
+                    message=(
+                        "FunctionCall.template_args must contain only DataType "
+                        "values"
+                    ),
+                    path=path + ("template_args", f"[{index}]"),
+                    value=template_argument,
+                )
         if type(node.args) is not tuple:
             _raise_traversal_error(
                 self.context,
@@ -1168,6 +1189,27 @@ class LLIRWalker:
                 path=path + ("name",),
                 value=node.name,
             )
+        template_args = getattr(node, "template_args", _MISSING_LLIR_FIELD)
+        if type(template_args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_function_call_stmt_template_args",
+                message="FunctionCallStmt.template_args must be a tuple",
+                path=path + ("template_args",),
+                value=template_args,
+            )
+        for index, template_argument in enumerate(template_args):
+            if type(template_argument) is not llir.DataType:
+                _raise_traversal_error(
+                    self.context,
+                    code="invalid_function_call_stmt_template_arg",
+                    message=(
+                        "FunctionCallStmt.template_args must contain only DataType "
+                        "values"
+                    ),
+                    path=path + ("template_args", f"[{index}]"),
+                    value=template_argument,
+                )
         if type(node.args) is not tuple:
             _raise_traversal_error(
                 self.context,
@@ -1730,6 +1772,12 @@ class LLIRRewriter:
                 path=path + ("name",),
                 value=node.name,
             )
+        template_args = self._validated_call_template_args(
+            node,
+            path,
+            code_prefix="invalid_function_call",
+            owner="FunctionCall",
+        )
         if type(node.args) is not tuple:
             _raise_traversal_error(
                 self.context,
@@ -1740,11 +1788,42 @@ class LLIRRewriter:
             )
         return llir.FunctionCall(
             name=node.name,
+            template_args=template_args,
             args=cast(
                 List[llir.Expr],
                 self._rewrite_expr_sequence(node.args, path + ("args",)),
             ),
         )
+
+    def _validated_call_template_args(
+        self,
+        node: llir.Node,
+        path: LLIRPath,
+        *,
+        code_prefix: str,
+        owner: str,
+    ) -> Tuple[llir.DataType, ...]:
+        template_args = getattr(node, "template_args", _MISSING_LLIR_FIELD)
+        if type(template_args) is not tuple:
+            _raise_traversal_error(
+                self.context,
+                code=f"{code_prefix}_template_args",
+                message=f"{owner}.template_args must be a tuple",
+                path=path + ("template_args",),
+                value=template_args,
+            )
+        for index, template_argument in enumerate(template_args):
+            if type(template_argument) is not llir.DataType:
+                _raise_traversal_error(
+                    self.context,
+                    code=f"{code_prefix}_template_arg",
+                    message=(
+                        f"{owner}.template_args must contain only DataType values"
+                    ),
+                    path=path + ("template_args", f"[{index}]"),
+                    value=template_argument,
+                )
+        return cast(Tuple[llir.DataType, ...], template_args)
 
     def rewrite_array(self, node: llir.Array, path: LLIRPath) -> llir.Array:
         _validate_array_fields(node, self.context, path)
@@ -2049,6 +2128,12 @@ class LLIRRewriter:
                 path=path + ("name",),
                 value=node.name,
             )
+        template_args = self._validated_call_template_args(
+            node,
+            path,
+            code_prefix="invalid_function_call_stmt",
+            owner="FunctionCallStmt",
+        )
         if type(node.args) is not tuple:
             _raise_traversal_error(
                 self.context,
@@ -2059,6 +2144,7 @@ class LLIRRewriter:
             )
         return llir.FunctionCallStmt(
             name=node.name,
+            template_args=template_args,
             args=cast(
                 List[llir.Expr],
                 self._rewrite_expr_sequence(node.args, path + ("args",)),

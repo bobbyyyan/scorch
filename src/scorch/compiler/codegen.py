@@ -130,6 +130,20 @@ class LLIRLowerer:
         return f"{var.type.value} {qualifier}{var.name}"
 
     @staticmethod
+    def _render_call_template_args(value: object, *, owner: str) -> str:
+        """Render one explicit ``<...>`` call template-argument list."""
+
+        if type(value) is not tuple or any(
+            type(argument) is not llir.DataType for argument in value
+        ):
+            raise CodegenError(
+                f"{owner}.template_args must be a tuple of DataType values"
+            )
+        if not value:
+            return ""
+        return "<" + ", ".join(argument.value for argument in value) + ">"
+
+    @staticmethod
     def _validate_expression_sequence(value: object, field: str) -> None:
         if type(value) is not list and type(value) is not tuple:
             raise CodegenError(f"{field} must be an exact list or tuple")
@@ -365,12 +379,17 @@ class LLIRLowerer:
             return self.lower_expression(cast(llir.Expr, ir), indent_level)
 
         elif type(ir) is llir.FunctionCallStmt:
+            call_template_args = self._render_call_template_args(
+                getattr(ir, "template_args", None),
+                owner="FunctionCallStmt",
+            )
             self._validate_expression_sequence(
                 ir.args,
                 "LLIR FunctionCallStmt.args",
             )
             return self.lower_llir(
-                f"{ir.name}({', '.join(self._render_expression(arg) for arg in ir.args)});",
+                f"{ir.name}{call_template_args}"
+                f"({', '.join(self._render_expression(arg) for arg in ir.args)});",
                 indent_level,
             )
 
@@ -565,6 +584,9 @@ class LLIRLowerer:
         if type(ir) is llir.FunctionCall:
             if type(ir.name) is not str or not ir.name.strip():
                 raise CodegenError("FunctionCall.name must be a non-empty string")
+            template_args = self._render_call_template_args(
+                getattr(ir, "template_args", None), owner="FunctionCall"
+            )
             if type(ir.args) is not tuple:
                 raise CodegenError("FunctionCall.args must be a tuple")
             if any(not isinstance(argument, llir.Expr) for argument in ir.args):
@@ -572,7 +594,7 @@ class LLIRLowerer:
                     "FunctionCall.args must contain only LLIR expressions"
                 )
             return (
-                f"{ir.name}"
+                f"{ir.name}{template_args}"
                 f"({', '.join(self._render_expression(arg) for arg in ir.args)})"
             )
 
