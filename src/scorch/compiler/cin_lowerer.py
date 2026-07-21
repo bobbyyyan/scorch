@@ -3130,20 +3130,24 @@ class CINLowerer:
 
     @classmethod
     def _collect_output_arrays(
-        cls, stmts: List[llir.Stmt], output_arrays: List[str]
+        cls, stmts: List[llir.Stmt], output_arrays: Dict[str, llir.Var]
     ) -> None:
-        """Collect output array names (e.g., D_values, D0_crd) from Assign stmts."""
+        """Collect output array roots (e.g., D_values, D0_crd) from Assign stmts.
+
+        The first-seen assignment-target array ``Var`` is retained per name so
+        preallocation statements can reuse the tree's own declared metadata.
+        """
         import re
 
         for stmt in stmts:
             if isinstance(stmt, llir.Assign) and type(stmt.var) is llir.ArrayAccess:
                 array = cast(llir.ArrayAccess, stmt.var).array
                 if type(array) is llir.Var:
-                    arr_name = cast(llir.Var, array).name
-                    if not re.match(r"^\w+$", arr_name):
+                    array_var = cast(llir.Var, array)
+                    if not re.match(r"^\w+$", array_var.name):
                         continue
-                    if arr_name not in output_arrays:
-                        output_arrays.append(arr_name)
+                    if array_var.name not in output_arrays:
+                        output_arrays[array_var.name] = array_var
             elif isinstance(stmt, llir.ForLoop):
                 cls._collect_output_arrays(stmt.body, output_arrays)
             elif isinstance(stmt, llir.WhileLoop):
@@ -3383,8 +3387,8 @@ class CINLowerer:
             # kernels (no filtering). Replace pD1 references in the body.
             CINLowerer._replace_output_pos_with_input_pos(inner_body_filtered, iter_var)
 
-            # Collect output array names that need pre-allocation
-            output_arrays: List[str] = []
+            # Collect output array roots that need pre-allocation
+            output_arrays: Dict[str, llir.Var] = {}
             import re as _re
 
             CINLowerer._collect_output_arrays(inner_body_filtered, output_arrays)
@@ -3528,13 +3532,28 @@ class CINLowerer:
             )
             self._apply_parallel_policy(group_loop, body=group_body)
 
-            # Pre-allocate output arrays for thread-safe parallel writes
+            # Pre-allocate output arrays for thread-safe parallel writes.
+            # Each receiver is a fresh Var carrying the first-seen declared
+            # metadata of the assignment-target root it preallocates, without
+            # scalar tensor-access provenance: it names the whole array
+            # object, not one logical element write.
             prealloc_stmts: List[llir.Stmt] = []
-            for arr_name in output_arrays:
+            for array_var in output_arrays.values():
                 prealloc_stmts.append(
-                    llir.RawStmt(
-                        code=f"{arr_name}.resize({outer_end_var})",
-                        add_semicolon=True,
+                    llir.MemberCallStmt(
+                        base=llir.Var(
+                            name=array_var.name,
+                            type=array_var.type,
+                            is_ptr=array_var.is_ptr,
+                            is_restrict=array_var.is_restrict,
+                        ),
+                        member="resize",
+                        args=(
+                            llir.Var(
+                                name=outer_end_var,
+                                type=llir.DataType.INT64,
+                            ),
+                        ),
                     )
                 )
 
