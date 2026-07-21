@@ -2864,6 +2864,7 @@ def test_malformed_assembled_call_fails_its_owner_and_suppresses_later_stages(
     def emit_malformed_call(self: ResultTensorAssembler) -> list[llir.Stmt]:
         malformed = object.__new__(llir.FunctionCall)
         object.__setattr__(malformed, "name", "std::move")
+        object.__setattr__(malformed, "template_args", ())
         object.__setattr__(
             malformed,
             "args",
@@ -4756,11 +4757,13 @@ def test_malformed_compressed_offset_init_fails_owner_and_stops_later_work(
             llir.DataType.INT,
         )
     ]
-    assert injected_paths == [("root", "[4]")]
+    # The typed W5 pool construction now precedes the offset owner with
+    # three additional top-level statements.
+    assert injected_paths == [("root", "[7]")]
     assert diagnostic.code == "invalid_add_operator"
     assert diagnostic.stage == "LLIR transformation"
     assert diagnostic.pass_name == "transform_compressed_where_for_openmp"
-    assert diagnostic.path == ("root", "[4]", "args", "[0]", "op")
+    assert diagnostic.path == ("root", "[7]", "args", "[0]", "op")
     assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
     assert [
         (record.pass_name, record.configuration_name)
