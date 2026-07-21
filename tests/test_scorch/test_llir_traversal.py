@@ -3496,9 +3496,112 @@ def test_function_call_stmt_default_arguments_are_empty_immutable_tuples() -> No
     first = llir.FunctionCallStmt("first")
     second = llir.FunctionCallStmt("second")
 
+    assert type(first.template_args) is tuple
+    assert type(second.template_args) is tuple
+    assert first.template_args == second.template_args == ()
     assert type(first.args) is tuple
     assert type(second.args) is tuple
     assert first.args == second.args == ()
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        ("name", "invalid_function_call_stmt_name", ("root", "name")),
+        (
+            "missing_template_args",
+            "invalid_function_call_stmt_template_args",
+            ("root", "template_args"),
+        ),
+        (
+            "template_args",
+            "invalid_function_call_stmt_template_args",
+            ("root", "template_args"),
+        ),
+        (
+            "template_arg",
+            "invalid_function_call_stmt_template_arg",
+            ("root", "template_args", "[0]"),
+        ),
+        ("args", "invalid_function_call_stmt_args", ("root", "args")),
+        (
+            "argument",
+            "invalid_expression_sequence_member",
+            ("root", "args", "[0]"),
+        ),
+    ),
+)
+def test_forged_function_call_stmt_fields_fail_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    call = object.__new__(llir.FunctionCallStmt)
+    object.__setattr__(call, "name", "call")
+    if malformation != "missing_template_args":
+        object.__setattr__(call, "template_args", ())
+    object.__setattr__(call, "args", (_var("argument"),))
+    if malformation == "name":
+        object.__setattr__(call, "name", " ")
+    elif malformation == "template_args":
+        object.__setattr__(call, "template_args", [llir.DataType.INT])
+    elif malformation == "template_arg":
+        object.__setattr__(call, "template_args", ("int",))
+    elif malformation == "args":
+        object.__setattr__(call, "args", [_var("argument")])
+    elif malformation == "argument":
+        object.__setattr__(call, "args", ("argument",))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(call)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(call)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+def test_call_template_args_survive_rewriting_detached() -> None:
+    expression = llir.FunctionCall(
+        "scorch_make_aligned_buffer",
+        [
+            llir.FunctionCall(
+                "scorch_checked_size_product",
+                [
+                    llir.Cast(_var("count"), llir.DataType.SIZE_T),
+                    llir.Cast(
+                        _var("extent", llir.DataType.INT64),
+                        llir.DataType.SIZE_T,
+                    ),
+                ],
+            )
+        ],
+        template_args=(llir.DataType.FLOAT32,),
+    )
+    statement = llir.FunctionCallStmt(
+        "scorch_zero_dense",
+        [_var("target")],
+        template_args=(llir.DataType.FLOAT64, llir.DataType.INT64),
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    rewritten_expression = cast(llir.FunctionCall, rewriter.rewrite(expression))
+    rewritten_statement = cast(llir.FunctionCallStmt, rewriter.rewrite(statement))
+
+    assert _structural_snapshot(rewritten_expression) == _structural_snapshot(
+        expression
+    )
+    assert _structural_snapshot(rewritten_statement) == _structural_snapshot(statement)
+    assert rewritten_expression.template_args == (llir.DataType.FLOAT32,)
+    assert rewritten_statement.template_args == (
+        llir.DataType.FLOAT64,
+        llir.DataType.INT64,
+    )
+    assert _mutable_ir_ids(expression).isdisjoint(_mutable_ir_ids(rewritten_expression))
+    assert _mutable_ir_ids(statement).isdisjoint(_mutable_ir_ids(rewritten_statement))
 
 
 def test_member_call_stmt_default_arguments_are_empty_immutable_tuples() -> None:

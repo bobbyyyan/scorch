@@ -1698,6 +1698,76 @@ def test_function_call_rejects_non_expression_arguments() -> None:
         llir.FunctionCall("call", [cast(llir.Expr, "argument")])
 
 
+@pytest.mark.parametrize(
+    ("node", "expected"),
+    [
+        (
+            llir.FunctionCall(
+                "scorch_make_aligned_buffer",
+                [_var("bytes")],
+                template_args=(llir.DataType.FLOAT32,),
+            ),
+            "scorch_make_aligned_buffer<float>(bytes)",
+        ),
+        (
+            llir.FunctionCall(
+                "std::min",
+                [_var("a"), _var("b")],
+                template_args=(llir.DataType.INT64,),
+            ),
+            "std::min<int64_t>(a, b)",
+        ),
+        (
+            llir.FunctionCall(
+                "identity",
+                (),
+                template_args=(llir.DataType.INT, llir.DataType.INT64),
+            ),
+            "identity<int, int64_t>()",
+        ),
+        (
+            llir.FunctionCall("plain", [_var("a")], template_args=()),
+            "plain(a)",
+        ),
+    ],
+)
+def test_function_call_template_arguments_render_typed_spellings(
+    node: llir.FunctionCall, expected: str
+) -> None:
+    assert LLIRLowerer().lower_llir(node) == expected
+
+
+def test_function_call_stmt_template_arguments_render_typed_spellings() -> None:
+    statement = llir.FunctionCallStmt(
+        "scorch_zero_dense",
+        [_var("target")],
+        template_args=(llir.DataType.FLOAT64,),
+    )
+
+    assert LLIRLowerer().lower_llir(statement) == "scorch_zero_dense<double>(target);"
+    assert (
+        LLIRLowerer().lower_llir(llir.FunctionCallStmt("plain", [_var("a")]))
+        == "plain(a);"
+    )
+
+
+@pytest.mark.parametrize("owner", (llir.FunctionCall, llir.FunctionCallStmt))
+@pytest.mark.parametrize(
+    "template_args",
+    ("float", {llir.DataType.FLOAT32}, (llir.DataType.FLOAT32, "float"), ("float",)),
+)
+def test_call_nodes_reject_malformed_template_arguments(
+    owner: type,
+    template_args: object,
+) -> None:
+    with pytest.raises(TypeError, match=f"{owner.__name__}.template_args"):
+        owner(
+            "call",
+            (),
+            cast(Tuple[llir.DataType, ...], template_args),
+        )
+
+
 def test_function_call_stmt_is_frozen_typed_owned_and_structurally_equal() -> None:
     argument = _var("values")
     caller_args = [argument]
