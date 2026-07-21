@@ -21681,6 +21681,63 @@ retained under `/Users/bobby/.claude/jobs/263fa6bb/tmp/bytecheck/` for this
 session; durable copies live under
 `/Users/bobby/.cache/scorch-codex/cast-compact-ffb3a4c/`.
 
+### Phase-3 typed W1 worker-view acquisition complete (2026-07-21)
+
+With compact Cast emission canonical, the W1 worker-view acquisition is now
+typed. `_workspace_view_statement` returns a frozen typed
+`VarInit(Var(wksp, AUTO)) = MemberCall(ArrayAccess(Var(wksp_pool, NO_TYPE),
+Cast(FunctionCall(omp_get_thread_num), SIZE_T)), make_view)` instead of the
+raw `auto {w} = {w}_pool[(size_t)omp_get_thread_num()].make_view()` string.
+The rendering is byte-identical to the raw spelling, so this slice rides the
+byte-waiver end to end. The view variable's C++ type remains
+compiler-deduced `auto`; the pool receiver keeps honest metadata-free
+`NO_TYPE` reference metadata exactly as the typed `clear()` mutation
+documents, because the pool's `std::vector<linked_list_workspace_1d<...>>`
+declaration is still assembled by the raw pool-allocation statement (W5)
+outside this subtree.
+
+Walker, rewriter, and codegen integration required no new code: the typed
+statement is composed entirely of existing exact node families that
+`LLIRWalker`/`LLIRRewriter` and the emitter already handle exhaustively, and
+no downstream pass pattern-matched the raw view statement (the audit checked
+every `pre_parallel_body` consumer).
+
+Structural activation coverage locks the complete typed shape on the
+production DS lowering: exactly one `VarInit` per pre-parallel body on both
+phase loops, exact AUTO/NO_TYPE/SIZE_T ownership, metadata-free receiver and
+index, empty template/argument tuples, byte-exact rendering, and
+fresh-detached statements across repeated lowerings. A source lock beside
+the W2/W4 clear() lock proves the helper region constructs no `RawStmt`.
+The production DS/DSS/DS-float64 byte/SHA locks are unchanged, confirming
+byte-identical emission through the full pipeline.
+
+Budgets after this slice: **13 RawStmt constructors / 12 semantic
+producers** (`compressed_where_openmp_pass.py` drops from three to two),
+the `MemberCall` expression budget grows from five to **six**, and the Var
+constructor budget grows from 430 to **432** (both new Vars are ordinary
+indirect name sinks; the unclassified total grows 420 to 422). The
+remaining 12 semantic raw producers are C4, C7, C12-C16 (seven in
+`cin_lowerer.py`), W5, the W14 compatibility fallback, D1, S1, and P1.
+
+One documentation seam is deliberately left for the C4/C16 slice: the C4
+pool-borrow comment in `cin_lowerer.py` still cites the pre-normalization
+rationale ("no typed byte-identical Cast form today"), which the compact
+decision has made stale. Refreshing it belongs to the C4/C16 typed-ownership
+slice so this commit touches only the W1 seam.
+
+Byte gates for this slice: the full 20-kernel capture corpus plus preamble
+and all 42 grid sources are byte-identical between clean base and candidate
+worktrees, and the compiler-latency corpus is inside the 1.10 target in
+every category (worst 1.036 p50 csr_intersection; all p95 below 1.0).
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/w1-typed-view-4a33c24/`.
+
+The recommended next seams, in order: the pool `reserve()` statement (the
+other raw compact cast in this pass, now byte-typable), then the C4/C16
+zero-fill allocation/borrow family, then W5 pool allocation. The older
+Assign index validator's stored-field/cycle hardening remains separately
+scheduled maintenance debt.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
