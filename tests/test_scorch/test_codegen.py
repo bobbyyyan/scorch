@@ -684,6 +684,38 @@ def _forged_address_of(operand: object) -> llir.AddressOf:
     return expression
 
 
+def _without_instance_field(value: object, field: str) -> object:
+    forged = object.__new__(type(value))
+    for name, item in vars(value).items():
+        if name != field:
+            object.__setattr__(forged, name, item)
+    return forged
+
+
+def _malformed_address_operand(malformation: str) -> object:
+    if malformation.startswith("var_"):
+        return _without_instance_field(
+            _var("value"),
+            malformation.removeprefix("var_"),
+        )
+    if malformation.startswith("member_"):
+        return _without_instance_field(
+            llir.MemberAccess(_var("value"), "field"),
+            malformation.removeprefix("member_"),
+        )
+    if malformation == "metadata_role":
+        metadata = _without_instance_field(_result_metadata(), "role")
+        return llir.ArrayAccess(
+            _var("values"),
+            _var("position"),
+            tensor_access=cast(llir.TensorAccessMetadata, metadata),
+        )
+    return _without_instance_field(
+        llir.ArrayAccess(_var("values"), _var("position")),
+        malformation.removeprefix("array_"),
+    )
+
+
 def _write_back_destination() -> llir.AddressOf:
     return llir.AddressOf(
         operand=llir.ArrayAccess(
@@ -705,15 +737,76 @@ def test_address_of_is_frozen_typed_and_structurally_equal() -> None:
     assert expression == equal
     assert hash(expression) == hash(equal)
     assert expression != llir.AddressOf(_var("values"))
-    assert get_type_hints(llir.AddressOf) == {"operand": llir.Expr}
+    assert get_type_hints(llir.AddressOf) == {"operand": llir.AssignmentTarget}
 
     with pytest.raises(FrozenInstanceError):
         expression.operand = _var("other")
 
 
-def test_address_of_rejects_malformed_constructor_operand() -> None:
-    with pytest.raises(TypeError, match="AddressOf.operand must be an LLIR Expr"):
-        llir.AddressOf(cast(llir.Expr, "C_values"))
+@pytest.mark.parametrize(
+    "operand",
+    (
+        "C_values",
+        llir.Literal(0),
+        llir.Add(_var("base"), _var("offset")),
+        llir.Sizeof(llir.DataType.FLOAT32),
+        llir.FunctionCall("get_value"),
+        llir.AddressOf(_var("value")),
+    ),
+)
+def test_address_of_rejects_non_lvalue_constructor_operands(
+    operand: object,
+) -> None:
+    with pytest.raises(
+        TypeError,
+        match="AddressOf.operand must be an exact Var, MemberAccess, or ArrayAccess",
+    ):
+        llir.AddressOf(cast(llir.AssignmentTarget, operand))
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "var_name",
+        "var_type",
+        "var_is_ptr",
+        "var_is_restrict",
+        "var_tensor_access",
+        "member_base",
+        "member_member",
+        "array_array",
+        "array_index",
+        "array_tensor_access",
+        "metadata_role",
+    ),
+)
+def test_address_of_rejects_malformed_structured_lvalues(
+    malformation: str,
+) -> None:
+    with pytest.raises(TypeError, match="AddressOf.operand"):
+        llir.AddressOf(
+            cast(llir.AssignmentTarget, _malformed_address_operand(malformation))
+        )
+
+
+def test_address_of_accepts_structured_lvalues_with_either_metadata_role() -> None:
+    for role in (
+        llir.TensorAccessRole.INPUT_READ,
+        llir.TensorAccessRole.RESULT_WRITE,
+    ):
+        metadata = llir.TensorAccessMetadata(
+            access_id=AccessId(1),
+            tensor_id=SymbolId(2),
+            index_ids=(IndexId(3),),
+            role=role,
+        )
+        operand = llir.ArrayAccess(
+            _var("values"),
+            _var("position"),
+            tensor_access=metadata,
+        )
+
+        assert llir.AddressOf(operand).operand is operand
 
 
 def test_codegen_renders_addressed_expressions_byte_exact() -> None:
@@ -722,8 +815,25 @@ def test_codegen_renders_addressed_expressions_byte_exact() -> None:
     assert lowerer.lower_llir(_write_back_destination()) == ("&C_values[pC0 * C1_size]")
     assert lowerer.lower_llir(llir.AddressOf(_var("wksp"))) == "&wksp"
     assert (
-        lowerer.lower_llir(llir.AddressOf(llir.Add(_var("base"), _var("offset"))))
-        == "&(base + offset)"
+        lowerer.lower_llir(
+            llir.AddressOf(
+                llir.MemberAccess(
+                    llir.MemberAccess(_var("entry"), "first"),
+                    "value",
+                )
+            )
+        )
+        == "&entry.first.value"
+    )
+    assert (
+        lowerer.lower_llir(llir.Add(llir.AddressOf(_var("value")), _var("offset")))
+        == "&value + offset"
+    )
+    assert (
+        lowerer.lower_llir(
+            llir.ArrayAccess(llir.AddressOf(_var("value")), _var("index"))
+        )
+        == "(&value)[index]"
     )
 
     copy = llir.FunctionCallStmt(
@@ -742,17 +852,23 @@ def test_codegen_renders_addressed_expressions_byte_exact() -> None:
     )
 
 
-@pytest.mark.parametrize("malformation", ("invalid", "missing"))
+@pytest.mark.parametrize(
+    "operand",
+    (
+        "C_values",
+        llir.Literal(0),
+        llir.Add(_var("base"), _var("offset")),
+        llir.Sizeof(llir.DataType.FLOAT32),
+        llir.FunctionCall("get_value"),
+        llir.AddressOf(_var("value")),
+    ),
+)
 @pytest.mark.parametrize("nested_in_write_back", (False, True))
-def test_codegen_rejects_forged_address_of_operand(
-    malformation: str,
+def test_codegen_rejects_forged_non_lvalue_address_of_operand(
+    operand: object,
     nested_in_write_back: bool,
 ) -> None:
-    expression = (
-        _forged_address_of("C_values")
-        if malformation == "invalid"
-        else object.__new__(llir.AddressOf)
-    )
+    expression = _forged_address_of(operand)
     ir: llir.Expr | llir.Stmt = expression
     if nested_in_write_back:
         ir = llir.FunctionCallStmt(
@@ -764,7 +880,70 @@ def test_codegen_rejects_forged_address_of_operand(
             ),
         )
 
-    with pytest.raises(CodegenError, match="AddressOf.operand must be an LLIR Expr"):
+    with pytest.raises(
+        CodegenError,
+        match="AddressOf.operand must be an exact Var, MemberAccess, or ArrayAccess",
+    ):
+        LLIRLowerer().lower_llir(ir)
+
+
+@pytest.mark.parametrize("nested_in_write_back", (False, True))
+def test_codegen_rejects_forged_missing_address_of_operand(
+    nested_in_write_back: bool,
+) -> None:
+    expression = object.__new__(llir.AddressOf)
+    ir: llir.Expr | llir.Stmt = expression
+    if nested_in_write_back:
+        ir = llir.FunctionCallStmt(
+            "memcpy",
+            (
+                expression,
+                _var("workspace"),
+                llir.Mul(_var("size"), llir.Sizeof(llir.DataType.FLOAT32)),
+            ),
+        )
+
+    with pytest.raises(
+        CodegenError,
+        match="AddressOf.operand must be an exact Var, MemberAccess, or ArrayAccess",
+    ):
+        LLIRLowerer().lower_llir(ir)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "var_name",
+        "var_type",
+        "var_is_ptr",
+        "var_is_restrict",
+        "var_tensor_access",
+        "member_base",
+        "member_member",
+        "array_array",
+        "array_index",
+        "array_tensor_access",
+        "metadata_role",
+    ),
+)
+@pytest.mark.parametrize("nested_in_write_back", (False, True))
+def test_codegen_rejects_forged_malformed_address_of_lvalue(
+    malformation: str,
+    nested_in_write_back: bool,
+) -> None:
+    expression = _forged_address_of(_malformed_address_operand(malformation))
+    ir: llir.Expr | llir.Stmt = expression
+    if nested_in_write_back:
+        ir = llir.FunctionCallStmt(
+            "memcpy",
+            (
+                expression,
+                _var("workspace"),
+                llir.Mul(_var("size"), llir.Sizeof(llir.DataType.FLOAT32)),
+            ),
+        )
+
+    with pytest.raises(CodegenError, match="AddressOf.operand"):
         LLIRLowerer().lower_llir(ir)
 
 

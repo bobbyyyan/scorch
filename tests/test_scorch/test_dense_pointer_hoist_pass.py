@@ -957,7 +957,7 @@ def test_function_call_rewrite_traverses_addressed_copy_arguments() -> None:
     call = llir.FunctionCallStmt(
         name="memcpy",
         args=(
-            llir.AddressOf(operand=_var(old)),
+            llir.AddressOf(operand=_access("Input_val", "position")),
             _var("workspace", llir.DataType.PTR_FLOAT32),
             llir.Mul(
                 _var(old),
@@ -986,7 +986,10 @@ def test_function_call_rewrite_traverses_addressed_copy_arguments() -> None:
     assert type(rewritten.args) is tuple
     destination = cast(llir.AddressOf, rewritten.args[0])
     assert type(destination) is llir.AddressOf
-    assert cast(llir.Var, destination.operand).name == "_Input_val_ptr[lane]"
+    addressed_access = cast(llir.ArrayAccess, destination.operand)
+    assert type(addressed_access) is llir.ArrayAccess
+    assert cast(llir.Var, addressed_access.array).name == "_Input_val_ptr"
+    assert cast(llir.Var, addressed_access.index).name == "lane"
     workspace = cast(llir.Var, rewritten.args[1])
     assert workspace.name == "workspace"
     byte_count = cast(llir.Mul, rewritten.args[2])

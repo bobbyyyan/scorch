@@ -5810,6 +5810,9 @@ def test_dense_workspace_write_back_copy_is_structured_and_byte_exact() -> None:
     assert type(destination) is llir.AddressOf
     row_slot = cast(llir.ArrayAccess, destination.operand)
     assert type(row_slot) is llir.ArrayAccess
+    # This is a physical block base for a whole memcpy span, not one logical
+    # scalar result write.  Scalar tensor-access provenance would be misleading.
+    assert row_slot.tensor_access is None
     values = cast(llir.Var, row_slot.array)
     assert type(values) is llir.Var
     assert values.name == "C_values"

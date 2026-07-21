@@ -36,6 +36,38 @@ def _result_metadata(access_id: int = 1) -> llir.TensorAccessMetadata:
     )
 
 
+def _without_instance_field(value: object, field: str) -> object:
+    forged = object.__new__(type(value))
+    for name, item in vars(value).items():
+        if name != field:
+            object.__setattr__(forged, name, item)
+    return forged
+
+
+def _malformed_address_operand(malformation: str) -> object:
+    if malformation.startswith("var_"):
+        return _without_instance_field(
+            _var("value"),
+            malformation.removeprefix("var_"),
+        )
+    if malformation.startswith("member_"):
+        return _without_instance_field(
+            llir.MemberAccess(_var("value"), "field"),
+            malformation.removeprefix("member_"),
+        )
+    if malformation == "metadata_role":
+        metadata = _without_instance_field(_result_metadata(), "role")
+        return llir.ArrayAccess(
+            _var("values"),
+            _var("position"),
+            tensor_access=cast(llir.TensorAccessMetadata, metadata),
+        )
+    return _without_instance_field(
+        llir.ArrayAccess(_var("values"), _var("position")),
+        malformation.removeprefix("array_"),
+    )
+
+
 class _RecordingWalker(LLIRWalker):
     def __init__(self) -> None:
         super().__init__(_CONTEXT)
@@ -1220,14 +1252,23 @@ def test_nested_zero_fill_sizeof_reports_exact_traversal_path(
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
-@pytest.mark.parametrize("malformation", ("invalid", "missing"))
-def test_forged_address_of_operand_fails_at_traversal_boundary(
+@pytest.mark.parametrize(
+    "operand",
+    (
+        "C_values",
+        llir.Literal(0),
+        llir.Add(_var("base"), _var("offset")),
+        llir.Sizeof(llir.DataType.FLOAT32),
+        llir.FunctionCall("get_value"),
+        llir.AddressOf(_var("value")),
+    ),
+)
+def test_forged_non_lvalue_address_of_operand_fails_at_traversal_boundary(
     operation: str,
-    malformation: str,
+    operand: object,
 ) -> None:
     expression = object.__new__(llir.AddressOf)
-    if malformation == "invalid":
-        object.__setattr__(expression, "operand", "C_values")
+    object.__setattr__(expression, "operand", operand)
 
     with pytest.raises(LLIRTraversalError) as raised:
         if operation == "walk":
@@ -1240,11 +1281,70 @@ def test_forged_address_of_operand_fails_at_traversal_boundary(
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_forged_missing_address_of_operand_fails_at_traversal_boundary(
+    operation: str,
+) -> None:
+    expression = object.__new__(llir.AddressOf)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.code == "invalid_address_of_operand"
+    assert raised.value.diagnostic.path == ("root", "operand")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("malformation", "relative_path"),
+    (
+        ("var_name", ("name",)),
+        ("var_type", ("type",)),
+        ("var_is_ptr", ("is_ptr",)),
+        ("var_is_restrict", ("is_restrict",)),
+        ("var_tensor_access", ("tensor_access",)),
+        ("member_base", ("base",)),
+        ("member_member", ("member",)),
+        ("array_array", ("array",)),
+        ("array_index", ("index",)),
+        ("array_tensor_access", ("tensor_access",)),
+        ("metadata_role", ("tensor_access", "role")),
+    ),
+)
+def test_malformed_address_lvalue_reports_exact_traversal_path(
+    operation: str,
+    malformation: str,
+    relative_path: Tuple[str, ...],
+) -> None:
+    expression = object.__new__(llir.AddressOf)
+    object.__setattr__(
+        expression,
+        "operand",
+        _malformed_address_operand(malformation),
+    )
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.code == "invalid_address_of_operand"
+    assert raised.value.diagnostic.path == ("root", "operand") + relative_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_nested_write_back_address_of_reports_exact_traversal_path(
     operation: str,
 ) -> None:
     expression = object.__new__(llir.AddressOf)
-    object.__setattr__(expression, "operand", "C_values")
+    object.__setattr__(
+        expression,
+        "operand",
+        llir.Add(_var("base"), _var("offset")),
+    )
     write_back = llir.FunctionCallStmt(
         "memcpy",
         (
@@ -1267,6 +1367,18 @@ def test_nested_write_back_address_of_reports_exact_traversal_path(
         "[0]",
         "operand",
     )
+
+
+def test_address_of_rewrite_rejects_a_non_lvalue_child_replacement() -> None:
+    class ReplaceOperandWithLiteral(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            return cast(llir.Var, llir.Literal(0))
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        ReplaceOperandWithLiteral(_CONTEXT).rewrite(llir.AddressOf(_var("value")))
+
+    assert raised.value.diagnostic.code == "invalid_address_of_operand"
+    assert raised.value.diagnostic.path == ("root", "operand")
 
 
 def test_addressed_copy_walker_has_deterministic_preorder() -> None:
