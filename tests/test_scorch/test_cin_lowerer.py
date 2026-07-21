@@ -136,6 +136,24 @@ def _all_coo_transform_coordinate_read(
     return parallel_loop, initializer, cast(llir.ArrayAccess, initializer.value)
 
 
+def _build_all_coo_transform_loop_with_output_write() -> llir.ForLoop:
+    source = _build_all_coo_transform_loop()
+    source.body.append(
+        llir.Assign(
+            var=llir.ArrayAccess(
+                array=llir.Var(
+                    "Sampled_values",
+                    llir.DataType.PTR_FLOAT32,
+                    is_ptr=True,
+                ),
+                index=llir.Var("pSampled1", llir.DataType.INT),
+            ),
+            value=llir.Var("_accum", llir.DataType.FLOAT32),
+        )
+    )
+    return source
+
+
 def _all_coo_transform_end_bound(
     *, source: llir.ForLoop | None = None
 ) -> tuple[llir.ForLoop, llir.VarInit, llir.Add]:
@@ -5137,6 +5155,137 @@ def test_all_coo_transform_end_bound_is_structured_typed_owned_and_byte_exact() 
     )
     assert "  int64_t pMask1_end = pMask0 + 1;" in LLIRLowerer().lower_llir(first_loop)
     assert LLIRLowerer().lower_llir(source) == source_cpp
+
+
+def _grouped_route_resize_statements(
+    statements: list[llir.Stmt],
+) -> list[llir.MemberCallStmt]:
+    return [
+        cast(llir.MemberCallStmt, statement)
+        for statement in statements
+        if type(statement) is llir.MemberCallStmt
+        and cast(llir.MemberCallStmt, statement).member == "resize"
+    ]
+
+
+def test_all_coo_grouped_preallocation_is_structured_typed_owned_and_byte_exact() -> (
+    None
+):
+    first_lowerer = CINLowerer()
+    first_lowerer._used_scalar_accum = False
+    first_stmts = first_lowerer._transform_coo_loop_for_openmp(
+        [_build_all_coo_transform_loop_with_output_write()]
+    )
+    second_lowerer = CINLowerer()
+    second_lowerer._used_scalar_accum = False
+    second_stmts = second_lowerer._transform_coo_loop_for_openmp(
+        [_build_all_coo_transform_loop_with_output_write()]
+    )
+
+    first_resizes = _grouped_route_resize_statements(first_stmts)
+    second_resizes = _grouped_route_resize_statements(second_stmts)
+    assert len(first_resizes) == 1
+    assert len(second_resizes) == 1
+    first = first_resizes[0]
+    second = second_resizes[0]
+
+    assert type(first.base) is llir.Var
+    base = cast(llir.Var, first.base)
+    assert base.name == "Sampled_values"
+    assert base.type is llir.DataType.PTR_FLOAT32
+    assert base.is_ptr is True
+    assert base.is_restrict is False
+    assert base.tensor_access is None
+    assert first.member == "resize"
+    assert first.template_args == ()
+    assert first.args == (llir.Var("pMask0_end", llir.DataType.INT64),)
+    argument = cast(llir.Var, first.args[0])
+    assert argument.type is llir.DataType.INT64
+    assert argument.tensor_access is None
+
+    group_loop = next(
+        cast(llir.ForLoop, statement)
+        for statement in first_stmts
+        if type(statement) is llir.ForLoop
+        and cast(llir.ForLoop, statement).omp_parallel_for
+    )
+    body_assign = next(
+        cast(llir.Assign, statement)
+        for statement in group_loop.body
+        if type(statement) is llir.Assign
+        and type(cast(llir.Assign, statement).var) is llir.ArrayAccess
+    )
+    body_array = cast(llir.Var, cast(llir.ArrayAccess, body_assign.var).array)
+    assert base is not body_array
+    assert base == body_array
+    assert first_stmts[first_stmts.index(group_loop) - 1] is first
+
+    assert first is not second
+    assert first.base is not second.base
+    assert first.args[0] is not second.args[0]
+
+    assert LLIRLowerer().lower_llir(first) == "Sampled_values.resize(pMask0_end);"
+    combined = LLIRLowerer().lower_llir(list(first_stmts))
+    assert combined.count("Sampled_values.resize(pMask0_end);") == 1
+    assert not any(
+        type(statement) is llir.RawStmt
+        and ".resize" in cast(llir.RawStmt, statement).code
+        for statement in first_stmts
+    )
+
+
+def test_all_coo_flat_preallocation_is_discarded_on_the_known_nnz_route() -> None:
+    lowerer = CINLowerer()
+    lowerer._used_scalar_accum = True
+    lowerer.final_result_tensor_var = TensorVar("Sampled", fmt="oo")
+    transformed = lowerer._transform_coo_loop_for_openmp(
+        [_build_all_coo_transform_loop_with_output_write()]
+    )
+
+    assert lowerer._known_nnz_var == "_known_nnz"
+    assert _grouped_route_resize_statements(transformed) == []
+    assert not any(
+        type(statement) is llir.RawStmt
+        and ".resize" in cast(llir.RawStmt, statement).code
+        for statement in transformed
+    )
+    assert ".resize(" not in LLIRLowerer().lower_llir(list(transformed))
+
+
+def test_production_all_coo_preallocation_constructs_typed_then_discards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statement = _build_activating_all_coo_sddmm()
+    statement_before = str(statement)
+    captured: list[llir.MemberCallStmt] = []
+    original_member_call_stmt = llir.MemberCallStmt
+
+    class _RecordingMemberCallStmt(original_member_call_stmt):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            if self.member == "resize":
+                captured.append(self)
+
+    monkeypatch.setattr(llir, "MemberCallStmt", _RecordingMemberCallStmt)
+    with regblock_force(False):
+        lowerer = CINLowerer()
+        lowered = lowerer.lower_IndexStmt(statement)
+    cpp = LLIRLowerer().lower_llir(lowered)
+
+    assert str(statement) == statement_before
+    assert [
+        (cast(llir.Var, record.base).name, record.member) for record in captured
+    ] == [
+        ("Sampled_values", "resize"),
+        ("Sampled0_crd", "resize"),
+        ("Sampled1_crd", "resize"),
+    ]
+    for record in captured:
+        base = cast(llir.Var, record.base)
+        assert type(base) is llir.Var
+        assert base.tensor_access is None
+        assert record.args == (llir.Var("pMask0_end", llir.DataType.INT64),)
+    assert ".resize(" not in cpp
 
 
 def test_production_all_coo_end_bound_activates_then_is_suppressed(

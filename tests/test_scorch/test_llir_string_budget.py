@@ -92,12 +92,14 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     known_indirect_names = {
         "accumulator_name",
         "actual_size",
+        "array_var.name",
         "expr.name.replace(old, new)",
         "f'{prefix}{level}'",
         "invariant_name",
         "loop_bound",
         "name",
         "node.name",
+        "outer_end_var",
         "prefix_extent",
         "size_var",
         "sparse_values_tensor",
@@ -125,7 +127,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 147,
+        "cin_lowerer.py": 149,
         "compressed_where_openmp_pass.py": 16,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -138,10 +140,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 428
+    assert sum(constructor_counts.values()) == 430
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 139,
+        "cin_lowerer.py": 141,
         "compressed_where_openmp_pass.py": 16,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -154,10 +156,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 418
+    assert sum(unclassified_counts.values()) == 420
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 1,
+        ("cin_lowerer.py", "array_var.name"): 1,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
+        ("cin_lowerer.py", "outer_end_var"): 4,
         ("cin_lowerer.py", "size_var"): 2,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
         ("cin_lowerer.py", "wname"): 3,
@@ -172,7 +176,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 20
+    assert sum(known_indirect.values()) == 25
 
     assert totals == {
         "subscript": 9,
@@ -613,15 +617,15 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
     counts += Counter()
 
     assert counts == {
-        "cin_lowerer.py": 8,
+        "cin_lowerer.py": 7,
         "compressed_where_openmp_pass.py": 3,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 15
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 14
+    assert sum(counts.values()) == 14
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 13
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -635,14 +639,14 @@ def test_workspace_clear_mutations_are_structured() -> None:
     )
     member_call_stmt_constructors += Counter()
     assert member_call_stmt_constructors == {
-        "cin_lowerer.py": 1,
+        "cin_lowerer.py": 2,
         "compressed_where_openmp_pass.py": 1,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(member_call_stmt_constructors.values()) == 6
+    assert sum(member_call_stmt_constructors.values()) == 7
 
     compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
     compressed_source = compressed_path.read_text()
@@ -752,6 +756,25 @@ def test_dense_workspace_write_back_copy_is_structured() -> None:
         _static_string_fragments(call)
         for call in _llir_constructor_calls(lowerer_path, "RawStmt")
     )
+
+
+def test_all_coo_preallocation_is_structured() -> None:
+    """Lock the C17 typed template: no raw resize spelling anywhere."""
+
+    lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
+    lowerer_source = lowerer_path.read_text()
+    coo_transform = lowerer_source.split("def _transform_coo_loop_for_openmp", 1)[
+        1
+    ].split("def lower_ForAll", 1)[0]
+
+    assert "llir.RawStmt(" not in coo_transform
+    assert coo_transform.count("llir.MemberCallStmt(") == 1
+    assert coo_transform.count('member="resize"') == 1
+    assert coo_transform.count("for array_var in output_arrays.values()") == 1
+
+    for path in sorted(_COMPILER_ROOT.glob("*.py")):
+        for call in _llir_constructor_calls(path, "RawStmt"):
+            assert ".resize" not in _static_string_fragments(call)
 
 
 def test_compressed_result_assembly_is_owned_by_the_typed_abi_epilogue() -> None:

@@ -829,3 +829,53 @@ def test_malformed_vector_declaration_fails_through_structured_diagnostic() -> N
     assert diagnostic.pass_name == "rewrite_dynamic_vector_accesses"
     assert diagnostic.node_type == "UnknownExpr"
     assert diagnostic.path == ("root", "[0]", "var")
+
+
+def test_typed_preallocation_passes_through_the_dynamic_vector_rewrite() -> None:
+    """The C17 resize statement must survive the pass byte-identically.
+
+    A dynamic-vector store rewrites to an append, but the typed
+    preallocation member call names the whole vector object: its receiver
+    must be detached, never renamed, and never converted to an append or a
+    checked set.
+    """
+
+    preallocation = llir.MemberCallStmt(
+        base=_var("out_values", llir.DataType.STD_VECTOR_FLOAT32),
+        member="resize",
+        args=(_var("pMask0_end", llir.DataType.INT64),),
+    )
+    source: List[llir.Stmt] = [
+        llir.VarDecl(_var("out_values", llir.DataType.STD_VECTOR_FLOAT32)),
+        preallocation,
+        llir.Assign(
+            var=_access("out_values", "p", llir.DataType.STD_VECTOR_FLOAT32),
+            value=_var("_accum", llir.DataType.FLOAT32),
+        ),
+    ]
+    source_cpp = _cpp(source)
+    assert "out_values.resize(pMask0_end);" in source_cpp
+
+    rewritten = rewrite_dynamic_vector_accesses(
+        source,
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+    )
+
+    assert _cpp(source) == source_cpp
+    assert [type(statement) for statement in rewritten] == [
+        llir.VarDecl,
+        llir.MemberCallStmt,
+        llir.FunctionCallStmt,
+    ]
+    rewritten_preallocation = cast(llir.MemberCallStmt, rewritten[1])
+    assert rewritten_preallocation is not preallocation
+    assert rewritten_preallocation.base is not preallocation.base
+    assert rewritten_preallocation.args[0] is not preallocation.args[0]
+    assert rewritten_preallocation.member == "resize"
+    assert cast(llir.Var, rewritten_preallocation.base).name == "out_values"
+    assert cast(llir.Var, rewritten_preallocation.args[0]).name == "pMask0_end"
+    assert _cpp([rewritten_preallocation]) == "out_values.resize(pMask0_end);"
+
+    store = cast(llir.FunctionCallStmt, rewritten[2])
+    assert store.name == "out_values.emplace_back"
+    assert cast(llir.Var, store.args[0]).name == "_accum"
