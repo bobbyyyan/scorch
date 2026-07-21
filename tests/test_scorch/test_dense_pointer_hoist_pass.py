@@ -852,7 +852,11 @@ def test_function_call_rewrite_preserves_tuple_loop_body() -> None:
         (
             _position_init(),
             llir.Assign(_var("discover"), _var(old)),
-            llir.FunctionCallStmt(f"consume_{old}", [_var(old)]),
+            llir.FunctionCallStmt(
+                f"consume_{old}",
+                [_var(old)],
+                template_args=(llir.DataType.FLOAT64,),
+            ),
         ),
     )
     source = [loop]
@@ -864,6 +868,7 @@ def test_function_call_rewrite_preserves_tuple_loop_body() -> None:
     assert type(output_loop.body) is tuple
     rewritten_call = cast(llir.FunctionCallStmt, output_loop.body[1])
     assert rewritten_call.name == "consume__Input_val_ptr[lane]"
+    assert rewritten_call.template_args == (llir.DataType.FLOAT64,)
     assert cast(llir.Var, rewritten_call.args[0]).name == "_Input_val_ptr[lane]"
     assert _snapshot(source) == before
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))

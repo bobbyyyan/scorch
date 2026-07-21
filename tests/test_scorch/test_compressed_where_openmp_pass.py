@@ -2352,7 +2352,11 @@ def test_workspace_insert_rewrite_matches_only_the_exact_call_name() -> None:
     )
     raw = llir.RawStmt("wksp.insert(raw_value)", add_semicolon=False)
     calls = [
-        llir.FunctionCallStmt("wksp.insert", [_var("wksp.insert_argument")]),
+        llir.FunctionCallStmt(
+            "wksp.insert",
+            [_var("wksp.insert_argument")],
+            template_args=(llir.DataType.FLOAT32,),
+        ),
         llir.FunctionCallStmt("prefix_wksp.insert", [_var("prefix_argument")]),
         llir.FunctionCallStmt("wksp.insert_suffix", [_var("suffix_argument")]),
         llir.FunctionCallStmt("wksp.insert.more", [_var("member_argument")]),
@@ -2431,6 +2435,12 @@ def test_workspace_insert_rewrite_matches_only_the_exact_call_name() -> None:
         }
         assert actual_names == expected_names
         assert all(type(call.args[0]) is llir.Var for call in phase_calls)
+        rewritten_insert = next(
+            call
+            for call in phase_calls
+            if cast(llir.Var, call.args[0]).name == "wksp.insert_argument"
+        )
+        assert rewritten_insert.template_args == (llir.DataType.FLOAT32,)
         rewritten_raw = next(
             cast(llir.RawStmt, statement)
             for statement in phase_loop.body
@@ -2885,11 +2895,8 @@ def test_noncanonical_workspace_ctype_preserves_exact_raw_value_allocation(
         workspace_ctype=workspace_ctype,
     )
 
-    # The direct-pass value-allocation escape hatch is characterized on the
-    # non-hoisted shape: a hoisted workspace additionally requires the typed
-    # pool declaration, which free-form spellings fail closed below.
     result = transform_compressed_where_for_openmp(
-        [_compatible_loop(_ds_work_body(workspace=False))], context
+        [_compatible_loop(_ds_work_body())], context
     )
 
     assert _value_initializations(result.statements) == []
@@ -2955,7 +2962,7 @@ def test_recognized_legacy_ctypes_still_build_the_typed_hoisted_pool(
     )
 
 
-def test_free_form_workspace_ctype_fails_closed_for_the_hoisted_pool() -> None:
+def test_free_form_workspace_ctype_preserves_the_legacy_hoisted_pool() -> None:
     context = CompressedWhereOpenMPContext(
         result_name="Result",
         result_id=SymbolId(1),
@@ -2965,17 +2972,62 @@ def test_free_form_workspace_ctype_fails_closed_for_the_hoisted_pool() -> None:
         workspace_ctype="custom_scalar",
     )
 
-    with pytest.raises(LLIRTraversalError) as raised:
-        transform_compressed_where_for_openmp(
-            [_compatible_loop(_ds_work_body())], context
-        )
+    result = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())], context
+    )
 
-    diagnostic = raised.value.diagnostic
-    assert diagnostic.code == "unsupported_compressed_where_workspace_pool_ctype"
-    assert diagnostic.path == ("context", "workspace_ctype")
-    assert diagnostic.node_type == "str"
-    assert diagnostic.stage == context.traversal.stage
-    assert diagnostic.pass_name == context.traversal.pass_name
+    count_loop, fill_loop = _phase_loops(result)
+    assert count_loop.omp_num_threads == fill_loop.omp_num_threads
+    thread_count = cast(str, count_loop.omp_num_threads)
+    pool_codes = [
+        code for code in _raw_codes(result.statements) if "wksp_thread_count" in code
+    ]
+    assert pool_codes == [
+        f"int wksp_thread_count = {thread_count};\n"
+        "std::vector<linked_list_workspace_1d<custom_scalar>> wksp_pool;\n"
+        "wksp_pool.reserve((size_t)wksp_thread_count);\n"
+        "for (int _worker = 0; _worker < wksp_thread_count; _worker++) {\n"
+        "  wksp_pool.emplace_back(result_shape[1], true);\n"
+        "}"
+    ]
+    for phase in (count_loop, fill_loop):
+        assert phase.pre_parallel_body is not None
+        view = cast(llir.VarInit, phase.pre_parallel_body[0])
+        call = cast(llir.MemberCall, view.value)
+        pool_access = cast(llir.ArrayAccess, call.base)
+        assert cast(llir.Var, pool_access.array).type is llir.DataType.NO_TYPE
+
+
+def test_free_form_policy_grain_uses_the_legacy_pool_without_var_relocation() -> None:
+    from scorch.compiler.compressed_where_openmp_pass import _build_phase_loop
+
+    policy = CompressedWhereOpenMPPolicy(flop_grain="1 + 2")
+    context = _context(policy=policy)
+    body = _ds_work_body()
+    phase = _build_phase_loop(
+        _compatible_loop(body),
+        body,
+        context,
+        workspace_hoisted=True,
+    )
+
+    assert phase.policy.num_threads is not None
+    assert phase.policy.num_threads.endswith(", 1 + 2)")
+    assert phase.policy.num_threads_expr is None
+
+    result = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())], context
+    )
+    pool_codes = [
+        code for code in _raw_codes(result.statements) if "wksp_thread_count" in code
+    ]
+    assert len(pool_codes) == 1
+    assert f"int wksp_thread_count = {phase.policy.num_threads};" in pool_codes[0]
+    assert not any(
+        type(statement) is llir.VarDecl
+        and cast(llir.VarDecl, statement).var.name == "wksp_pool"
+        for statement in result.statements
+    )
 
 
 @pytest.mark.parametrize(

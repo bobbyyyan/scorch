@@ -780,6 +780,15 @@ def test_codegen_rejects_forged_select_fields(malformation: str) -> None:
         LLIRLowerer().lower_llir(expression)
 
 
+@pytest.mark.parametrize("missing_field", ("cond", "when_true", "when_false"))
+def test_codegen_rejects_forged_select_missing_fields(missing_field: str) -> None:
+    expression = llir.Select(_var("cond"), _var("a"), _var("b"))
+    object.__delattr__(expression, missing_field)
+
+    with pytest.raises(CodegenError, match=f"Select.{missing_field}"):
+        LLIRLowerer().lower_llir(expression)
+
+
 def test_codegen_rejects_unknown_select_subclass() -> None:
     class UnknownSelect(llir.Select):
         pass
@@ -2966,6 +2975,18 @@ def test_indexed_assign_accepts_a_structured_member_call_index() -> None:
     )
 
     assert LLIRLowerer().lower_llir(assignment) == "values[indices.size()] = 1;"
+
+
+def test_indexed_assign_rejects_function_call_missing_template_args() -> None:
+    call = object.__new__(llir.FunctionCall)
+    object.__setattr__(call, "name", "indices.size")
+    object.__setattr__(call, "args", ())
+
+    with pytest.raises(TypeError, match="FunctionCall.template_args"):
+        llir.Assign(
+            llir.ArrayAccess(_var("values"), call),
+            llir.Literal(1),
+        )
 
 
 @pytest.mark.parametrize(

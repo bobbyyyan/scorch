@@ -6059,6 +6059,7 @@ def test_dense_workspace_zero_fill_statements_are_structured_and_byte_exact() ->
 def test_cin_value_reference_rewrite_rebuilds_zero_fill_children() -> None:
     source = llir.FunctionCallStmt(
         name="memset",
+        template_args=(llir.DataType.FLOAT32,),
         args=(
             llir.Var(name="wksp", type=llir.DataType.PTR_FLOAT32),
             llir.Literal(value=0, data_type=llir.DataType.INT),
@@ -6076,6 +6077,7 @@ def test_cin_value_reference_rewrite_rebuilds_zero_fill_children() -> None:
     assert type(rewritten) is llir.FunctionCallStmt
     assert rewritten is not source
     assert rewritten.name == "memset"
+    assert rewritten.template_args == (llir.DataType.FLOAT32,)
     assert cast(llir.Var, rewritten.args[0]).name == "thread_wksp"
     assert rewritten.args[1] == llir.Literal(value=0, data_type=llir.DataType.INT)
     product = cast(llir.Mul, rewritten.args[2])
@@ -6083,10 +6085,10 @@ def test_cin_value_reference_rewrite_rebuilds_zero_fill_children() -> None:
     assert type(product.right) is llir.Sizeof
     assert cast(llir.Sizeof, product.right).data_type is llir.DataType.FLOAT32
     assert LLIRLowerer().lower_llir(rewritten) == (
-        "memset(thread_wksp, 0, thread_wksp0_size * sizeof(float));"
+        "memset<float>(thread_wksp, 0, thread_wksp0_size * sizeof(float));"
     )
     assert LLIRLowerer().lower_llir(source) == (
-        "memset(wksp, 0, wksp0_size * sizeof(float));"
+        "memset<float>(wksp, 0, wksp0_size * sizeof(float));"
     )
 
 

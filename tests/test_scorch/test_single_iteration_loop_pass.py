@@ -897,6 +897,7 @@ def test_function_call_rewrite_preserves_tuple_statement_body() -> None:
                 llir.FunctionCallStmt(
                     "call_lane]_[lane]_lane tail",
                     [_var("Argument[lane]")],
+                    template_args=(llir.DataType.INT32,),
                 ),
             ),
         ),
@@ -912,6 +913,7 @@ def test_function_call_rewrite_preserves_tuple_statement_body() -> None:
     assert type(rewritten_if.then_body) is tuple
     call = cast(llir.FunctionCallStmt, rewritten_if.then_body[0])
     assert call.name == "call_root]_[root]_root tail"
+    assert call.template_args == (llir.DataType.INT32,)
     assert cast(llir.Var, call.args[0]).name == "Argument[root]"
 
 

@@ -516,8 +516,12 @@ def test_schedule_statement_access_rewrite_preserves_tuple_bodies() -> None:
         llir.Var("pInput", llir.DataType.INT),
         metadata,
     )
-    outer_call = llir.FunctionCallStmt("consume", (access,))
-    inner_call = llir.FunctionCallStmt("consume", (access,))
+    outer_call = llir.FunctionCallStmt(
+        "consume", (access,), template_args=(llir.DataType.FLOAT32,)
+    )
+    inner_call = llir.FunctionCallStmt(
+        "consume", (access,), template_args=(llir.DataType.FLOAT32,)
+    )
     conditional = llir.IfThenElse(
         cond=llir.Var("enabled", llir.DataType.BOOL),
         then_body=cast(list[llir.Stmt], (inner_call,)),
@@ -544,11 +548,13 @@ def test_schedule_statement_access_rewrite_preserves_tuple_bodies() -> None:
     assert type(rewritten_conditional.then_body) is tuple
     rewritten_inner = cast(llir.FunctionCallStmt, rewritten_conditional.then_body[0])
     assert rewritten_inner is not inner_call
+    assert rewritten_outer.template_args == (llir.DataType.FLOAT32,)
+    assert rewritten_inner.template_args == (llir.DataType.FLOAT32,)
     assert LLIRLowerer().lower_llir(rewritten_outer) == (
-        "consume(packed_Input[packed_position]);"
+        "consume<float>(packed_Input[packed_position]);"
     )
     assert LLIRLowerer().lower_llir(rewritten_inner) == (
-        "consume(packed_Input[packed_position]);"
+        "consume<float>(packed_Input[packed_position]);"
     )
 
 

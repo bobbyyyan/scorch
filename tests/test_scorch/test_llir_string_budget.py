@@ -619,14 +619,14 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 3,
-        "compressed_where_openmp_pass.py": 1,
+        "compressed_where_openmp_pass.py": 2,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 8
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 7
+    assert sum(counts.values()) == 9
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 8
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -695,15 +695,15 @@ def test_workspace_view_borrow_is_structured() -> None:
     assert 'member="make_view"' in view_helper
     assert 'name="omp_get_thread_num"' in view_helper
     assert "llir.DataType.AUTO" in view_helper
-    assert "type=_workspace_pool_type(context)" in view_helper
+    assert "type=_workspace_pool_type(context) or llir.DataType.NO_TYPE" in view_helper
     assert "llir.DataType.SIZE_T" in view_helper
 
     for call in _llir_constructor_calls(compressed_path, "RawStmt"):
         assert "make_view" not in _static_string_fragments(call)
 
 
-def test_workspace_pool_construction_is_structured() -> None:
-    """Lock the typed W5 pool construction template."""
+def test_workspace_pool_construction_is_structured_with_legacy_fallback() -> None:
+    """Lock typed W5 ownership and its deliberate compatibility fallback."""
 
     compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
     compressed_source = compressed_path.read_text()
@@ -711,7 +711,7 @@ def test_workspace_pool_construction_is_structured() -> None:
         "def _loop_bound_reference", 1
     )[0]
 
-    assert "llir.RawStmt(" not in pool_helpers
+    assert pool_helpers.count("llir.RawStmt(") == 1
     assert pool_helpers.count("llir.VarInit(") == 2
     assert pool_helpers.count("llir.VarDecl(") == 1
     assert pool_helpers.count("llir.MemberCallStmt(") == 2
@@ -728,13 +728,17 @@ def test_workspace_pool_construction_is_structured() -> None:
     assert "linked_list_workspace_pool_type" in pool_helpers
     assert '"std::max"' in pool_helpers
     assert '"omp_get_max_threads"' in pool_helpers
-    assert "unsupported_compressed_where_workspace_pool_ctype" in pool_helpers
+    assert "_legacy_workspace_pool_statement" in pool_helpers
+    assert "if pool_type is None or not typed_policies" in pool_helpers
 
-    for call in _llir_constructor_calls(compressed_path, "RawStmt"):
-        fragments = _static_string_fragments(call)
-        assert "reserve" not in fragments
-        assert "emplace_back" not in fragments
-        assert "thread_count" not in fragments
+    pool_raws = [
+        _static_string_fragments(call)
+        for call in _llir_constructor_calls(compressed_path, "RawStmt")
+        if "thread_count" in _static_string_fragments(call)
+    ]
+    assert len(pool_raws) == 1
+    assert "reserve" in pool_raws[0]
+    assert "emplace_back" in pool_raws[0]
 
 
 def test_dense_workspace_zero_fill_is_structured() -> None:
