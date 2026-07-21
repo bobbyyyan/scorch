@@ -77,6 +77,7 @@ class DataType(Enum):
     INT32 = "int32_t"
     UINT64 = "uint64_t"
     INT64 = "int64_t"
+    LONG = "long"
     SIZE_T = "size_t"
     FLOAT32 = "float"
     FLOAT64 = "double"
@@ -1129,6 +1130,28 @@ class Cast(Expr):
             raise TypeError("Cast.expr must be an LLIR Expr")
         if type(self.data_type) is not DataType:
             raise TypeError("Cast.data_type must be a DataType")
+
+
+@dataclass(frozen=True)
+class Select(Expr):
+    """An immutable C++ conditional selection, spelled ``cond ? a : b``.
+
+    This is the expression-level counterpart of the :class:`IfThenElse`
+    statement.  All three children are ordinary expressions; the statement
+    form remains the only owner of branch statement lists.
+    """
+
+    cond: Expr
+    when_true: Expr
+    when_false: Expr
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cond, Expr):
+            raise TypeError("Select.cond must be an LLIR Expr")
+        if not isinstance(self.when_true, Expr):
+            raise TypeError("Select.when_true must be an LLIR Expr")
+        if not isinstance(self.when_false, Expr):
+            raise TypeError("Select.when_false must be an LLIR Expr")
 
 
 @dataclass(frozen=True)

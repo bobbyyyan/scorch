@@ -255,6 +255,11 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
             else_body=[llir.Continue()],
         ),
         llir.Cast: llir.Cast(value, llir.DataType.INT64),
+        llir.Select: llir.Select(
+            llir.BinOp(">", value, literal),
+            llir.Add(index, literal),
+            literal,
+        ),
         llir.Sizeof: llir.Sizeof(llir.DataType.INT64),
         llir.AddressOf: llir.AddressOf(llir.ArrayAccess(value, index)),
     }
@@ -294,6 +299,7 @@ def _node_emissions() -> Dict[Type[llir.Node], str]:
         llir.WhileLoop: "while (value) {\n  break;\n}",
         llir.IfThenElse: "if (value) {\n  break;\n} else {\n  continue;\n}",
         llir.Cast: "(int64_t)value",
+        llir.Select: "value > 1 ? index + 1 : 1",
         llir.Sizeof: "sizeof(int64_t)",
         llir.AddressOf: "&value[index]",
     }

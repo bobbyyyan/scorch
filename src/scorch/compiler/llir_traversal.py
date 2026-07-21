@@ -69,6 +69,7 @@ SUPPORTED_LLIR_EXPRESSION_NODE_TYPES: Tuple[Type[llir.Expr], ...] = (
     llir.MemberCall,
     llir.ArrayAccess,
     llir.Cast,
+    llir.Select,
     llir.Sizeof,
     llir.AddressOf,
 )
@@ -463,6 +464,40 @@ def _validate_cast_fields(
         )
 
 
+def _validate_select_fields(
+    node: llir.Select,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    condition = getattr(node, "cond", _MISSING_LLIR_FIELD)
+    if not isinstance(condition, llir.Expr):
+        _raise_traversal_error(
+            context,
+            code="invalid_select_condition",
+            message="Select.cond must be an LLIR Expr",
+            path=path + ("cond",),
+            value=condition,
+        )
+    when_true = getattr(node, "when_true", _MISSING_LLIR_FIELD)
+    if not isinstance(when_true, llir.Expr):
+        _raise_traversal_error(
+            context,
+            code="invalid_select_when_true",
+            message="Select.when_true must be an LLIR Expr",
+            path=path + ("when_true",),
+            value=when_true,
+        )
+    when_false = getattr(node, "when_false", _MISSING_LLIR_FIELD)
+    if not isinstance(when_false, llir.Expr):
+        _raise_traversal_error(
+            context,
+            code="invalid_select_when_false",
+            message="Select.when_false must be an LLIR Expr",
+            path=path + ("when_false",),
+            value=when_false,
+        )
+
+
 def _validate_sizeof_fields(
     node: llir.Sizeof,
     context: LLIRTraversalContext,
@@ -835,6 +870,8 @@ class LLIRWalker:
             self.visit_array_access(cast(llir.ArrayAccess, node), path)
         elif node_type is llir.Cast:
             self.visit_cast(cast(llir.Cast, node), path)
+        elif node_type is llir.Select:
+            self.visit_select(cast(llir.Select, node), path)
         elif node_type is llir.Sizeof:
             self.visit_sizeof(cast(llir.Sizeof, node), path)
         elif node_type is llir.AddressOf:
@@ -1047,6 +1084,12 @@ class LLIRWalker:
     def visit_cast(self, node: llir.Cast, path: LLIRPath) -> None:
         _validate_cast_fields(node, self.context, path)
         self._walk_expr(node.expr, path + ("expr",))
+
+    def visit_select(self, node: llir.Select, path: LLIRPath) -> None:
+        _validate_select_fields(node, self.context, path)
+        self._walk_expr(node.cond, path + ("cond",))
+        self._walk_expr(node.when_true, path + ("when_true",))
+        self._walk_expr(node.when_false, path + ("when_false",))
 
     def visit_sizeof(self, node: llir.Sizeof, path: LLIRPath) -> None:
         _validate_sizeof_fields(node, self.context, path)
@@ -1554,6 +1597,8 @@ class LLIRRewriter:
             return self.rewrite_array_access(cast(llir.ArrayAccess, node), path)
         if node_type is llir.Cast:
             return self.rewrite_cast(cast(llir.Cast, node), path)
+        if node_type is llir.Select:
+            return self.rewrite_select(cast(llir.Select, node), path)
         if node_type is llir.Sizeof:
             return self.rewrite_sizeof(cast(llir.Sizeof, node), path)
         if node_type is llir.AddressOf:
@@ -1816,6 +1861,14 @@ class LLIRRewriter:
         return llir.Cast(
             expr=self._rewrite_expr(node.expr, path + ("expr",)),
             data_type=node.data_type,
+        )
+
+    def rewrite_select(self, node: llir.Select, path: LLIRPath) -> llir.Select:
+        _validate_select_fields(node, self.context, path)
+        return llir.Select(
+            cond=self._rewrite_expr(node.cond, path + ("cond",)),
+            when_true=self._rewrite_expr(node.when_true, path + ("when_true",)),
+            when_false=self._rewrite_expr(node.when_false, path + ("when_false",)),
         )
 
     def rewrite_sizeof(self, node: llir.Sizeof, path: LLIRPath) -> llir.Sizeof:

@@ -84,6 +84,7 @@ class LLIRLowerer:
         "/": 10,
         "%": 10,
     }
+    _CONDITIONAL_PRECEDENCE = 0
     _UNARY_PRECEDENCE = 11
     _POSTFIX_PRECEDENCE = 12
     _PRIMARY_PRECEDENCE = 13
@@ -508,6 +509,9 @@ class LLIRLowerer:
             )
             return f"({ir.data_type.value}){operand}"
 
+        if type(ir) is llir.Select:
+            return self._render_select(cast(llir.Select, ir))
+
         if type(ir) is llir.Sizeof:
             data_type = getattr(ir, "data_type", None)
             if type(data_type) is not llir.DataType:
@@ -635,6 +639,37 @@ class LLIRLowerer:
             f"No C++ codegen implemented for LLIR expression type: {type(ir).__name__}"
         )
 
+    def _render_select(self, ir: llir.Select) -> str:
+        """Render one conditional selection with minimal parenthesization.
+
+        The condition must be a logical-or-expression, so a nested Select
+        there needs parentheses.  Both selected operands are full expressions
+        in the C++ grammar and right-nesting is the natural associativity, so
+        neither requires them.
+        """
+        if not isinstance(ir.cond, llir.Expr):
+            raise CodegenError("Select.cond must be an LLIR Expr")
+        if not isinstance(ir.when_true, llir.Expr):
+            raise CodegenError("Select.when_true must be an LLIR Expr")
+        if not isinstance(ir.when_false, llir.Expr):
+            raise CodegenError("Select.when_false must be an LLIR Expr")
+        condition = self._render_operand(
+            ir.cond,
+            parent_precedence=self._CONDITIONAL_PRECEDENCE + 1,
+            is_right_child=False,
+        )
+        when_true = self._render_operand(
+            ir.when_true,
+            parent_precedence=self._CONDITIONAL_PRECEDENCE,
+            is_right_child=False,
+        )
+        when_false = self._render_operand(
+            ir.when_false,
+            parent_precedence=self._CONDITIONAL_PRECEDENCE,
+            is_right_child=True,
+        )
+        return f"{condition} ? {when_true} : {when_false}"
+
     def _render_literal(self, ir: llir.Literal) -> str:
         if type(ir.value) not in (bool, int, float, str):
             raise CodegenError("Literal.value must be a bool, int, float, or string")
@@ -695,6 +730,8 @@ class LLIRLowerer:
         return rendered
 
     def _expression_precedence(self, ir: llir.Expr) -> int:
+        if type(ir) is llir.Select:
+            return self._CONDITIONAL_PRECEDENCE
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
             return self._binary_precedence(cast(llir.BinOp, ir).op)
         if type(ir) in (llir.Cast, llir.UnaryOp, llir.Sizeof, llir.AddressOf):
