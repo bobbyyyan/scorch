@@ -713,7 +713,7 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     )
 
     flop = (
-        "(long)A1_pos[A0_size] * (B0_size > 0 ? " "(B1_pos[B0_size] / B0_size) + 1 : 1)"
+        "(long)A1_pos[A0_size] * (B0_size > 0 ? " "B1_pos[B0_size] / B0_size + 1 : 1)"
     )
     for loop in (count_loop, fill_loop):
         assert loop.omp_schedule == "dynamic, 64"
@@ -731,7 +731,7 @@ def test_structured_position_bounds_drive_the_exact_spgemm_policy() -> None:
     result = transform_compressed_where_for_openmp(source, _context())
 
     flop = (
-        "(long)A1_pos[A0_size] * (B0_size > 0 ? " "(B1_pos[B0_size] / B0_size) + 1 : 1)"
+        "(long)A1_pos[A0_size] * (B0_size > 0 ? " "B1_pos[B0_size] / B0_size + 1 : 1)"
     )
     for loop in _phase_loops(result):
         assert loop.omp_num_threads == (
@@ -2619,6 +2619,100 @@ def test_parallel_policy_fallbacks_preserve_work_and_trip_count_decisions(
         assert ("SCORCH_GRAIN" in phase.omp_num_threads) is expected_grain
 
 
+@pytest.mark.parametrize(
+    ("body", "update"),
+    [
+        pytest.param(_ds_work_body(), None, id="spgemm-flop-grain"),
+        pytest.param(
+            _ds_work_body(workspace=False, both_operands=False),
+            None,
+            id="sparse-pos-work",
+        ),
+    ],
+)
+def test_parallel_policy_typed_value_matches_its_rendered_spelling(
+    body: List[llir.Stmt],
+    update: llir.Assign | None,
+) -> None:
+    from scorch.compiler.compressed_where_openmp_pass import _build_phase_loop
+
+    phase = _build_phase_loop(
+        _compatible_loop(body, update=update),
+        body,
+        _context(),
+        workspace_hoisted=False,
+    )
+
+    decision = phase.policy
+    assert decision.num_threads is not None
+    assert decision.num_threads_expr is not None
+    assert phase.loop.omp_num_threads == decision.num_threads
+    assert type(decision.num_threads_expr) is llir.FunctionCall
+    assert decision.num_threads_expr.name == "scorch_nthreads"
+    assert LLIRLowerer().lower_llir(decision.num_threads_expr) == (decision.num_threads)
+
+
+def test_parallel_policy_typed_trip_count_uses_the_minimal_spelling() -> None:
+    from scorch.compiler.compressed_where_openmp_pass import _build_phase_loop
+
+    body: List[llir.Stmt] = [llir.RawStmt("work")]
+    phase = _build_phase_loop(
+        _compatible_loop(
+            body,
+            update=llir.Assign(
+                _var("row", llir.DataType.INT),
+                llir.Literal(4),
+                op=llir.AssignOp.ADD_ASSIGN,
+            ),
+        ),
+        body,
+        _context(),
+        workspace_hoisted=False,
+    )
+
+    decision = phase.policy
+    assert decision.num_threads == "scorch_nthreads(-1, ((A0_size + 4 - 1) / 4))"
+    assert decision.num_threads_expr is not None
+    # The legacy pragma spelling keeps its historical redundant parentheses;
+    # the typed value renders the same expression tree minimally.
+    assert LLIRLowerer().lower_llir(decision.num_threads_expr) == (
+        "scorch_nthreads(-1, (A0_size + 4 - 1) / 4)"
+    )
+
+
+def test_spgemm_flop_policy_typed_value_owns_the_select_and_long_cast() -> None:
+    from scorch.compiler.compressed_where_openmp_pass import _build_phase_loop
+
+    body = _ds_work_body()
+    phase = _build_phase_loop(
+        _compatible_loop(body),
+        body,
+        _context(),
+        workspace_hoisted=False,
+    )
+
+    policy_call = phase.policy.num_threads_expr
+    assert type(policy_call) is llir.FunctionCall
+    assert len(policy_call.args) == 3
+    work, rows, grain = policy_call.args
+    assert type(work) is llir.Mul
+    narrowed = cast(llir.Cast, work.left)
+    assert type(narrowed) is llir.Cast
+    assert narrowed.data_type is llir.DataType.LONG
+    selection = cast(llir.Select, work.right)
+    assert type(selection) is llir.Select
+    assert type(selection.cond) is llir.BinOp
+    assert selection.cond.op == ">"
+    assert type(selection.when_true) is llir.Add
+    assert selection.when_false == llir.Literal(1, llir.DataType.INT)
+    assert type(rows) is llir.Var
+    assert cast(llir.Var, rows).name == "A0_size"
+    assert cast(llir.Var, rows).type is llir.DataType.INT64
+    assert type(grain) is llir.Var
+    assert cast(llir.Var, grain).name == "SCORCH_GRAIN_CODEGEN_SPGEMM"
+    assert cast(llir.Var, grain).type is llir.DataType.NO_TYPE
+
+
 def test_custom_parallel_policy_is_an_explicit_context_input() -> None:
     policy = CompressedWhereOpenMPPolicy(
         omp_schedule="guided, 7",
@@ -3760,9 +3854,9 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    assert len(cpp) == 7113
+    assert len(cpp) == 7103
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "cdc259fe5712808b5a22ba8ed77b588f602acf1e1e7bd293da27d4e7c6df93e1"
+        "9bc9153b7b806554dfbc9124443acd4b42aa8dc036a7c6c13b90363e2595948a"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -3900,9 +3994,9 @@ def test_production_dss_generated_cpp_locks_typed_offset_family() -> None:
     assert len({id(bound) for bound in production_bounds}) == 8
     cpp = LLIRLowerer().lower_llir(lowered)
 
-    assert len(cpp) == 8638
+    assert len(cpp) == 8630
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "e0809e9ade1153ec67ded665776cbaa8c34bd6a393e2da77c3aebc54ba6c43bb"
+        "ce718a78faa7a5aeef43e25e8ffaffa077882e0fdbfc5988e24d7465da2f65a5"
     )
     assert cpp.count("wksp.insert(") == 2
     assert "wksp.insert_unchecked(" not in cpp
@@ -3962,9 +4056,9 @@ def test_production_ds_float64_locks_typed_value_source() -> None:
         for code in _raw_codes(lowered)
     )
     cpp = LLIRLowerer().lower_llir(lowered)
-    assert len(cpp) == 6273
+    assert len(cpp) == 6263
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "f32837dc4e26fb2ea28fb9cf167e9f5bee0e65661eb38e47142e9da6450a96da"
+        "090d06d70f35b76682396e90006a356ee43b2f99fecdd6150970aa6a3b18d0ad"
     )
 
 

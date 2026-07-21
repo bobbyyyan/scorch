@@ -142,9 +142,24 @@ class _ManagedCompressedWhereOpenMPExecution:
 
 
 @dataclass(frozen=True)
+class _PolicyExpression:
+    """One parallel-policy operand owned once, in both required forms.
+
+    ``text`` is the legacy rendered spelling consumed by the OpenMP pragma
+    fields, and ``expr`` is the typed LLIR value of the same operand.  Both
+    are constructed together from the same structural pieces, so neither is
+    ever recovered by parsing the other.
+    """
+
+    text: str
+    expr: llir.Expr
+
+
+@dataclass(frozen=True)
 class _ParallelPolicyDecision:
     num_threads: Optional[str]
     chunk_expr: Optional[str]
+    num_threads_expr: Optional[llir.Expr]
 
 
 def _value_pointer_type(workspace_ctype: str) -> llir.DataType:
@@ -721,9 +736,9 @@ def _find_sparse_pos_array(body: Sequence[llir.Stmt]) -> Optional[str]:
     return None
 
 
-def _sparse_pos_work_expr(
-    sparse_pos: Optional[str], loop_bound: Optional[str]
-) -> Optional[str]:
+def _sparse_pos_work_estimate(
+    sparse_pos: Optional[str], loop_bound: Optional[llir.Var]
+) -> Optional[_PolicyExpression]:
     if sparse_pos is None or loop_bound is None:
         return None
     match = re.match(r"([A-Za-z_]\w*?)(\d+)_pos$", sparse_pos)
@@ -731,9 +746,15 @@ def _sparse_pos_work_expr(
         return None
     operand, level_text = match.groups()
     level = int(level_text)
-    if level == 0 or loop_bound != f"{operand}{level - 1}_size":
+    if level == 0 or loop_bound.name != f"{operand}{level - 1}_size":
         return None
-    return f"{sparse_pos}[{loop_bound}]"
+    return _PolicyExpression(
+        text=f"{sparse_pos}[{loop_bound.name}]",
+        expr=llir.ArrayAccess(
+            array=llir.Var(name=sparse_pos, type=llir.DataType.NO_TYPE),
+            index=llir.Var(name=loop_bound.name, type=loop_bound.type),
+        ),
+    )
 
 
 def _expr_to_str(expression: llir.Expr) -> str:
@@ -749,12 +770,45 @@ def _expr_to_str(expression: llir.Expr) -> str:
     return str(expression)
 
 
-def _parallel_rows_expr(for_loop: llir.ForLoop, bound: str) -> str:
+def _extract_loop_bound_reference(for_loop: llir.ForLoop) -> Optional[llir.Var]:
+    """Return one fresh typed reference to the selected loop's upper bound."""
+
+    if type(for_loop.cond) is llir.BinOp and for_loop.cond.op == "<":
+        right = for_loop.cond.right
+        if type(right) is llir.Var:
+            return llir.Var(name=right.name, type=right.type)
+    return None
+
+
+def _parallel_rows_estimate(
+    for_loop: llir.ForLoop,
+    bound: llir.Var,
+    traversal: LLIRTraversalContext,
+) -> _PolicyExpression:
     update = for_loop.update
     if type(update) is llir.Assign and update.op == llir.AssignOp.ADD_ASSIGN:
         step = _expr_to_str(update.value)
-        return f"(({bound} + {step} - 1) / {step})"
-    return bound
+        detached_step = LLIRRewriter(traversal).rewrite(update.value)
+        detached_step_divisor = LLIRRewriter(traversal).rewrite(update.value)
+        return _PolicyExpression(
+            text=f"(({bound.name} + {step} - 1) / {step})",
+            expr=llir.BinOp(
+                "/",
+                llir.BinOp(
+                    "-",
+                    llir.Add(
+                        llir.Var(name=bound.name, type=bound.type),
+                        cast(llir.Expr, detached_step),
+                    ),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+                cast(llir.Expr, detached_step_divisor),
+            ),
+        )
+    return _PolicyExpression(
+        text=bound.name,
+        expr=llir.Var(name=bound.name, type=bound.type),
+    )
 
 
 def _find_all_sparse_pos_arrays(
@@ -773,20 +827,20 @@ def _parse_pos(pos_name: str) -> Optional[Tuple[str, int]]:
     return match.group(1), int(match.group(2))
 
 
-def _spgemm_flop_work_expr(
+def _spgemm_flop_work_estimate(
     body: Sequence[llir.Stmt],
-    bound: str,
+    bound: llir.Var,
     traversal: LLIRTraversalContext,
-) -> Optional[str]:
+) -> Optional[_PolicyExpression]:
     levels: Dict[str, set[int]] = {}
     for position_name in _find_all_sparse_pos_arrays(body, traversal):
         parsed = _parse_pos(position_name)
         if parsed is not None:
             levels.setdefault(parsed[0], set()).add(parsed[1])
 
-    if not bound.endswith("0_size"):
+    if not bound.name.endswith("0_size"):
         return None
-    left_prefix = bound[: -len("0_size")]
+    left_prefix = bound.name[: -len("0_size")]
     if left_prefix not in levels or 0 in levels[left_prefix]:
         return None
     right_prefix = next(
@@ -800,11 +854,49 @@ def _spgemm_flop_work_expr(
     if right_prefix is None:
         return None
 
-    left_nnz = f"(long){left_prefix}{max(levels[left_prefix])}_pos[{bound}]"
+    left_pos = f"{left_prefix}{max(levels[left_prefix])}_pos"
     right_outer = f"{right_prefix}0_size"
-    right_nnz = f"{right_prefix}{max(levels[right_prefix])}_pos[{right_outer}]"
-    return (
-        f"{left_nnz} * ({right_outer} > 0 ? " f"({right_nnz} / {right_outer}) + 1 : 1)"
+    right_pos = f"{right_prefix}{max(levels[right_prefix])}_pos"
+
+    def _right_outer_reference() -> llir.Var:
+        return llir.Var(name=right_outer, type=llir.DataType.INT64)
+
+    return _PolicyExpression(
+        text=(
+            f"(long){left_pos}[{bound.name}] * ({right_outer} > 0 ? "
+            f"{right_pos}[{right_outer}] / {right_outer} + 1 : 1)"
+        ),
+        expr=llir.Mul(
+            llir.Cast(
+                expr=llir.ArrayAccess(
+                    array=llir.Var(name=left_pos, type=llir.DataType.NO_TYPE),
+                    index=llir.Var(name=bound.name, type=bound.type),
+                ),
+                data_type=llir.DataType.LONG,
+            ),
+            llir.Select(
+                cond=llir.BinOp(
+                    ">",
+                    _right_outer_reference(),
+                    llir.Literal(0, llir.DataType.INT),
+                ),
+                when_true=llir.Add(
+                    llir.BinOp(
+                        "/",
+                        llir.ArrayAccess(
+                            array=llir.Var(
+                                name=right_pos,
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            index=_right_outer_reference(),
+                        ),
+                        _right_outer_reference(),
+                    ),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+                when_false=llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
     )
 
 
@@ -812,23 +904,39 @@ def _parallel_policy_decision(
     loop: llir.ForLoop,
     body: Sequence[llir.Stmt],
     *,
-    work_expr: Optional[str],
+    work_estimate: Optional[_PolicyExpression],
     grain: Optional[str],
+    traversal: LLIRTraversalContext,
 ) -> _ParallelPolicyDecision:
-    bound = _extract_loop_bound(loop)
+    bound = _extract_loop_bound_reference(loop)
     if bound is None:
-        return _ParallelPolicyDecision(None, None)
-    rows = _parallel_rows_expr(loop, bound)
-    if work_expr is None:
+        return _ParallelPolicyDecision(None, None, None)
+    rows = _parallel_rows_estimate(loop, bound, traversal)
+    if work_estimate is None:
         sparse_pos = _find_sparse_pos_array(body)
-        work = _sparse_pos_work_expr(sparse_pos, bound) or "-1"
+        work = _sparse_pos_work_estimate(sparse_pos, bound) or _PolicyExpression(
+            text="-1",
+            expr=llir.Literal(-1, llir.DataType.INT),
+        )
     else:
-        work = work_expr
+        work = work_estimate
     grain_suffix = f", {grain}" if grain is not None else ""
+    policy_args: List[llir.Expr] = [work.expr, rows.expr]
+    if grain is not None:
+        policy_args.append(llir.Var(name=grain, type=llir.DataType.NO_TYPE))
     return _ParallelPolicyDecision(
-        num_threads=f"scorch_nthreads({work}, {rows}{grain_suffix})",
-        chunk_expr=f"scorch_chunk({rows}, {work}{grain_suffix})",
+        num_threads=f"scorch_nthreads({work.text}, {rows.text}{grain_suffix})",
+        chunk_expr=f"scorch_chunk({rows.text}, {work.text}{grain_suffix})",
+        num_threads_expr=llir.FunctionCall("scorch_nthreads", policy_args),
     )
+
+
+@dataclass(frozen=True)
+class _PhaseLoop:
+    """One configured phase loop and the policy decision that configured it."""
+
+    loop: llir.ForLoop
+    policy: _ParallelPolicyDecision
 
 
 def _build_phase_loop(
@@ -837,33 +945,37 @@ def _build_phase_loop(
     context: CompressedWhereOpenMPContext,
     *,
     workspace_hoisted: bool,
-    loop_bound: str,
-) -> llir.ForLoop:
+) -> _PhaseLoop:
     header = _phase_header_copy(source, context)
-    flop_work = _spgemm_flop_work_expr(
-        body,
-        loop_bound,
-        context.traversal,
+    flop_bound = _extract_loop_bound_reference(header)
+    flop_work = (
+        _spgemm_flop_work_estimate(body, flop_bound, context.traversal)
+        if flop_bound is not None
+        else None
     )
     decision = _parallel_policy_decision(
         header,
         body,
-        work_expr=flop_work,
+        work_estimate=flop_work,
         grain=context.policy.flop_grain if flop_work else None,
+        traversal=context.traversal,
     )
     pre_parallel_body: Optional[List[llir.Stmt]] = (
         [_workspace_view_statement(context)] if workspace_hoisted else None
     )
-    return llir.ForLoop(
-        init=header.init,
-        cond=header.cond,
-        update=header.update,
-        body=body,
-        omp_parallel_for=True,
-        omp_schedule=context.policy.omp_schedule,
-        pre_parallel_body=pre_parallel_body,
-        omp_num_threads=decision.num_threads,
-        omp_chunk_expr=decision.chunk_expr,
+    return _PhaseLoop(
+        loop=llir.ForLoop(
+            init=header.init,
+            cond=header.cond,
+            update=header.update,
+            body=body,
+            omp_parallel_for=True,
+            omp_schedule=context.policy.omp_schedule,
+            pre_parallel_body=pre_parallel_body,
+            omp_num_threads=decision.num_threads,
+            omp_chunk_expr=decision.chunk_expr,
+        ),
+        policy=decision,
     )
 
 
@@ -1294,28 +1406,28 @@ def _build_transformed_statements(
 
     nested_run_records = (*count_records, *fill_records)
     try:
-        count_loop = _build_phase_loop(
+        count_phase = _build_phase_loop(
             for_loop,
             count_body,
             context,
             workspace_hoisted=workspace_hoisted,
-            loop_bound=loop_bound,
         )
-        fill_loop = _build_phase_loop(
+        fill_phase = _build_phase_loop(
             for_loop,
             fill_body,
             context,
             workspace_hoisted=workspace_hoisted,
-            loop_bound=loop_bound,
         )
 
         result = _filtered_prefix(statements, loop_index, context)
         if workspace_hoisted:
-            result.append(_workspace_pool_statement(context, count_loop, fill_loop))
+            result.append(
+                _workspace_pool_statement(context, count_phase.loop, fill_phase.loop)
+            )
         result.extend(
             _count_and_offset_statements(context, loop_bound, loop_bound_type)
         )
-        result.append(count_loop)
+        result.append(count_phase.loop)
         result.extend(_prefix_sum_statements(context, loop_bound, loop_bound_type))
         result.extend(
             _position_and_coordinate_allocations(
@@ -1325,7 +1437,7 @@ def _build_transformed_statements(
             )
         )
         result.extend(_value_allocation(context))
-        result.append(fill_loop)
+        result.append(fill_phase.loop)
         result.extend(_final_assembly(context))
     except Exception as failure:
         raise LLIRPassPartialFailure(failure, nested_run_records) from failure

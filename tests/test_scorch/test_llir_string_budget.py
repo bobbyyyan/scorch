@@ -128,7 +128,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert constructor_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 149,
-        "compressed_where_openmp_pass.py": 18,
+        "compressed_where_openmp_pass.py": 28,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -140,11 +140,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 432
+    assert sum(constructor_counts.values()) == 442
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 141,
-        "compressed_where_openmp_pass.py": 18,
+        "compressed_where_openmp_pass.py": 28,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -156,7 +156,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 422
+    assert sum(unclassified_counts.values()) == 432
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 1,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
