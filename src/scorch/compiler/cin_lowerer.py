@@ -2280,14 +2280,33 @@ class CINLowerer:
                 )
 
         if reserve_hint_var:
+            # C7: the dynamic reserve hint owns a typed capped checked-product
+            # call.  The std::min template argument is a typed DataType, the
+            # native product's diagnostic operands are semantic string/bool
+            # literals, and the shape vector reference reuses the prologue's
+            # declared type.
             result_tensor_level_sizes.append(
-                llir.RawStmt(
-                    code=(
-                        f"int64_t {reserve_hint_var} = std::min<int64_t>("
-                        "scorch_native::checked_product("
-                        'result_shape, "evaluate", "result_shape", true), '
-                        "2048)"
-                    )
+                llir.VarInit(
+                    var=llir.Var(name=reserve_hint_var, type=llir.DataType.INT64),
+                    value=llir.FunctionCall(
+                        name="std::min",
+                        template_args=(llir.DataType.INT64,),
+                        args=[
+                            llir.FunctionCall(
+                                name="scorch_native::checked_product",
+                                args=[
+                                    llir.Var(
+                                        name="result_shape",
+                                        type=llir.DataType.STD_VECTOR_INT,
+                                    ),
+                                    llir.Literal("evaluate", llir.DataType.STRING),
+                                    llir.Literal("result_shape", llir.DataType.STRING),
+                                    llir.Literal(True, llir.DataType.BOOL),
+                                ],
+                            ),
+                            llir.Literal(2048, llir.DataType.INT64),
+                        ],
+                    ),
                 )
             )
 
@@ -2854,6 +2873,56 @@ class CINLowerer:
             return None
         return f"{sparse_pos}[{loop_bound}]"
 
+    @staticmethod
+    def _atomic_work_stealing_prelude(
+        sparse_pos: str,
+        bound: llir.Var,
+    ) -> List[llir.Stmt]:
+        """Typed C12/C13 atomic work-stealing prelude statements.
+
+        The total-nnz initialization owns the same sparse position lookup the
+        retained ``omp_num_threads`` pragma string spells, built from the same
+        structural pieces (``_sparse_pos_work_expr`` validated both names).
+        The chunk initialization owns the adaptive clamp expression; its
+        division keeps the thread-count product as an explicit right operand
+        so emission preserves the required grouping.  The position array stays
+        a metadata-free ``NO_TYPE`` reference because the kernel prologue owns
+        its declaration, and the bound reference is a fresh typed copy of the
+        loop-condition variable.
+        """
+        return [
+            llir.VarInit(
+                var=llir.Var(name="_nnz", type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=llir.Var(name=sparse_pos, type=llir.DataType.NO_TYPE),
+                    index=llir.Var(name=bound.name, type=bound.type),
+                ),
+            ),
+            llir.VarInit(
+                var=llir.Var(name="_chunk", type=llir.DataType.INT),
+                value=llir.FunctionCall(
+                    "std::max",
+                    [
+                        llir.Literal(16, llir.DataType.INT),
+                        llir.FunctionCall(
+                            "std::min",
+                            [
+                                llir.Literal(256, llir.DataType.INT),
+                                llir.BinOp(
+                                    "/",
+                                    llir.Var(name="_nnz", type=llir.DataType.INT),
+                                    llir.Mul(
+                                        llir.FunctionCall("omp_get_num_threads"),
+                                        llir.Literal(128, llir.DataType.INT),
+                                    ),
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ),
+        ]
+
     def _mark_first_for_loop_parallel(self, stmts: List[llir.Stmt]) -> None:
         for llir_stmt in stmts:
             if isinstance(
@@ -2884,13 +2953,12 @@ class CINLowerer:
                     ):
                         # Replace the omp for with atomic work-stealing
                         llir_stmt.omp_parallel_for = False
-                        adaptive_pre = list(alloc) + [
-                            llir.RawStmt(code=f"int _nnz = {sparse_work}"),
-                            llir.RawStmt(
-                                code="int _chunk = std::max(16, std::min(256, "
-                                "_nnz / (omp_get_num_threads() * 128)))"
-                            ),
-                        ]
+                        adaptive_pre = list(alloc) + (
+                            self._atomic_work_stealing_prelude(
+                                cast(str, sparse_pos),
+                                cast(llir.Var, cast(llir.BinOp, llir_stmt.cond).right),
+                            )
+                        )
                         # The shared atomic counter is declared before the
                         # parallel region by codegen itself, from the
                         # _atomic_counter_var marker below.
