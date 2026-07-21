@@ -21816,6 +21816,156 @@ push, and the local reflog cannot attribute the actor. Corrections after
 tracked files and all untracked GPU, benchmark, research, scheduler, and
 scratch material remain untouched.
 
+### Phase-3 typed W5/C4/C15/C16 workspace-pool family complete (2026-07-21)
+
+The workspace lifetime/allocation and pool-ownership family is typed end to
+end. Twelve commits stacked on `537bde3` (through `d52c382`, all local,
+unpushed) eliminate the W5 compound pool construction, the C15 thread count,
+the C16 aligned-buffer owner, the C4 restrict borrow, and — as the one
+stretch family — the dead C14 atomic-counter construction. Raw budgets move
+from **13 constructors / 12 semantic producers to 8 / 7**; the remaining
+semantic producers are C7, C12, C13, the deliberate W14 compatibility
+fallback, D1, S1, and P1.
+
+#### Representation decisions
+
+Three reusable boundaries were added, each integrated fail-closed across
+constructor validation, the common walker/rewriter with post-rewrite
+validation and exact operand-relative paths, codegen with precedence, the
+registry exhaustiveness sets, and structural equality/tuple-ownership/
+detachment tests:
+
+- **`Select(cond, when_true, when_false)`** — the expression-level
+  conditional (`cond ? a : b`), the design document's conditional/select
+  node. Precedence level 0; the condition operand requires strictly higher
+  precedence (a nested Select there is parenthesized), while both selected
+  operands are full expressions in the C++ grammar and stay bare.
+  `DataType.LONG` (`long`) accompanies it for the SpGEMM flop cast.
+- **`FunctionCall.template_args` / `FunctionCallStmt.template_args`** —
+  typed `DataType` tuples mirroring `MemberCall`/`MemberCallStmt` exactly,
+  with `args` kept as the second positional parameter so no caller changed.
+  This is the representation C16 needed
+  (`scorch_make_aligned_buffer<T>(...)`) and it unblocks C7/C12/C13.
+- **Linked-list workspace pool `DataType` members** for the eight
+  recognized workspace scalar spellings (the canonical six plus legacy
+  `int`/`long long`), resolved by the fail-closed
+  `linked_list_workspace_pool_type` classmethod.
+
+The parallel-policy value is owned once at each decision site:
+`_PolicyExpression(text, expr)` in the compressed-Where pass and the
+typed-policy factory in the CIN lowerer construct the legacy pragma
+spelling and the typed value together from the same structural pieces, so
+neither is recovered by parsing the other. The pragma strings (P1) remain
+the out-of-scope seam and are byte-identical everywhere except one
+deliberate normalization: the SpGEMM flop estimate drops the redundant
+grouping around its per-row division (`(a / b) + 1` -> `a / b + 1`),
+because that is the only spelling the minimal-parenthesization renderer can
+produce and one kernel must not carry two spellings of one policy. Bound
+references are fresh typed copies of the loop-condition variable; position
+arrays and the grain macro are metadata-free `NO_TYPE` references
+(declarations owned by the kernel prologue and the native header).
+
+Typed W5 emits four statements (worker-count `VarInit` owning the typed
+policy value or the `std::max`/`omp_get_max_threads()` selections the raw
+statement compared; pool `VarDecl`; `reserve` `MemberCallStmt` with the
+`(size_t)` cast; the worker `ForLoop` with the `emplace_back`
+`MemberCallStmt`). Pool references now carry the accurate pool `DataType`,
+which also completes the W1 worker-view receiver whose `NO_TYPE` existed
+only because the pool declaration was raw; the borrowed views themselves
+keep `NO_TYPE` (compiler-deduced `auto`). Typed C15/C16/C4 are
+byte-identical to the raw spellings on every production shape, including
+the atomic work-stealing variant; the C4 comment that still cited the
+pre-compact-Cast rationale is replaced, as is its twin in the budget suite.
+
+One deliberate narrowing: a free-form legacy workspace ctype can no longer
+reach a hoisted pool — `_workspace_pool_type` fails closed with
+`unsupported_compressed_where_workspace_pool_ctype` instead of rendering
+unchecked type text. The W14 direct-pass value allocation keeps its escape
+hatch and is characterized on the non-hoisted shape; the recognized legacy
+`int`/`long long` spellings are positively locked to their typed pools.
+C14's removal was proven dead first: one writer, no reader anywhere,
+statement never entered a statement list, and codegen emits the counter
+itself from `_atomic_counter_var` (locked by a new regression).
+
+#### Named parallel-zero-fill pass determination
+
+The extraction remains deferred on the one-owner audit this session was
+conditioned on. Every zero-fill statement is now typed, but placement still
+has three owners: `lower_Where` splices the memsets into the serial body,
+`_mark_first_for_loop_parallel` owns the pre/post-parallel alloc/free
+placement and the atomic-scheduling variant, and
+`_attach_serial_workspace_pools` owns the before-parallel pool placement.
+The parallel-marking method also still owns the raw C12/C13 cluster and the
+legacy dynamic `ForLoop` fields, so a named zero-fill pass could not own
+placement without absorbing parallel marking — splitting one loop's
+parallel configuration across a method and a pass. The honest sequencing is
+C12/C13 typing first (both are representable with the new call template
+arguments and the typed policy pieces), then a single parallel-marking/
+zero-fill extraction with the recorded pass-identity/order/cache review.
+
+#### Verification and gates
+
+Byte gates ran in clean detached worktrees at `537bde3` and `ca699f1`:
+
+- **All 42 grid sources are byte-identical**, so the binding grid
+  byte-waiver applies; no grid runtime benchmark is required.
+- The 20-file capture corpus (19 kernels plus one preamble) differs in
+  exactly the 14 compressed-Where kernels. A mechanical-transformation
+  proof maps every base file byte-for-byte onto its candidate using only
+  the flop-parenthesis normalization and the uniform re-indentation of the
+  five continuation lines of the old W5 raw block (DS family nets +0
+  bytes; DSS family -8). The changed canonical DS kernel compiles to
+  **bit-identical objects** from base and candidate under identical
+  paths/flags (SHA-256 `2ce4424e...0a8430` — the same object the
+  compact-Cast slice's M5 objcheck retained, independently confirming the
+  recipe).
+- The C15/C16/C4 seams have no standard-corpus member, so both activating
+  dense-workspace kernels (dd@dd and the ds@dd atomic path) were captured
+  from both revisions: **byte-identical**, retained with SHAs.
+- Compile latency: the first base-then-candidate comparison showed
+  csr_intersection 1.117/1.159 (INVESTIGATE). The investigation diagnosed
+  a session-position measurement defect: the identical-code base-vs-base
+  comparison across the same positions reproduces the elevation
+  (1.087/1.087, sparse_union 1.109/1.111), while every like-for-like
+  comparison is at parity or better (candidate-vs-warm-base
+  0.974/0.938; the declared steady-state replacement comparison
+  0.898/0.883, all categories TARGET). All runs and comparisons are
+  retained; nothing was averaged away or selectively rerun.
+- Suites: the recorded 13 compiler/pass files plus
+  `tests/test_scorch/codegen` produce **1703 passed** (1609 at the prior
+  handoff plus the new coverage). The first authoritative detached-worktree
+  full suite (at `ca699f1`) surfaced exactly two lock misses in
+  `test_compiler_stage_timing.py` — a suite outside the 13-file membership
+  that pinned the pre-pool top-level statement index and forged a
+  FunctionCall without the new template tuple (2 failed, 2411 passed, 14
+  skipped). `d52c382` updates those two locks while preserving the tests'
+  subjects, and the suite was rerun in full at that revision with
+  `PYTHONPATH` pinned to the detached tree, `scorch.__file__` asserted
+  before launch, and isolated basetemp/cache/extension dirs: **2413
+  passed, 14 skipped, 2 warnings in 634.25 seconds** (2319 at the prior
+  handoff plus the new coverage; both runs retained).
+- Black clean on all eleven touched files; Flake8 and scoped mypy are
+  line-normalized identical to base (two local-import F401s and one F541;
+  32 mypy findings in two files on both revisions); `git diff --check`
+  clean before every commit.
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/w5-c4c15c16-537bde3/` with a
+self-describing README (revisions, commands, manifests, logs, JSONs,
+objects, SHAs). The five protected tracked files hashed exactly as
+recorded before every commit; no untracked user material entered Git;
+`origin/refactor/compiler-ir-phase3-std-move-call` remained at `1714df2`
+throughout with no external movement observed.
+
+The recommended next seams, in order: **C7** (the reserve-hint
+`std::min<int64_t>(scorch_native::checked_product(...), 2048)` — fully
+representable now via call template arguments and the established
+qualified-callee-name precedent), then **C12/C13** (the atomic `_nnz` and
+`_chunk` pair, representable the same way), then the combined
+parallel-marking/zero-fill extraction above, then D1's const-qualified
+input-pointer declarations. W14, S1, P1, Phase 3.5, and LoopIR remain
+outside the boundary.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
