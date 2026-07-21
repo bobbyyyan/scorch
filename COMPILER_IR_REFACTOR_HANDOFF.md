@@ -20926,10 +20926,12 @@ completion in this session:
 #### Representation, ownership boundary, and emission
 
 `llir.AddressOf` is a frozen dataclass with structural value semantics
-whose single `operand` field must be an `Expr` at construction
-(`__post_init__` fail-closed, following the Sizeof review precedent from
-day one). `CINLowerer.lower_ConsumerIndexStmt` constructs, per dense
-contiguous result write-back:
+whose original single `operand` field accepted any `Expr` at construction.
+A later rigorous review, recorded below, found that boundary too broad because
+it admitted C++ rvalues such as `base + offset`; the review correction narrows
+the field to the exact supported syntactic-lvalue subset. The production C6
+operand was already inside that subset. `CINLowerer.lower_ConsumerIndexStmt`
+constructs, per dense contiguous result write-back:
 
 - `llir.FunctionCallStmt("memcpy", (llir.AddressOf(llir.ArrayAccess(
   <PTR-typed values Var>, llir.Mul(<INT64 row-start Var or Literal 0>,
@@ -20938,14 +20940,17 @@ contiguous result write-back:
   `memcpy(&{C}_values[{prev} * {size}], {w}, {n} * sizeof({ctype}));`.
 
 The level-0 branch types the raw `"0"` spelling as `Literal(0, INT)`; no
-known CIN shape reaches it (a 1-D dense-result probe lowers through the
-element-assign fallback and was byte-identical base/candidate,
-`62362aea…`). The dead `resolve_stmts` assignment at the converted site
-was removed (`get_level_iterator_resolve_stmts` is pure), retiring the
-inherited Flake8 F841 finding there; the two inherited F401 findings in
-`cin_lowerer.py` and the F541 in `codegen.py` remain.
+known CIN shape reaches it. The original session reported an ad hoc 1-D
+dense-result probe, but retained no script, log, output, or hash receipt for
+that probe, so it is not counted as evidence. The dead `resolve_stmts`
+assignment at the converted site was removed
+(`get_level_iterator_resolve_stmts` is pure), retiring the inherited Flake8
+F841 finding there; the two inherited F401 findings in `cin_lowerer.py` and
+the F541 in `codegen.py` remain.
 
-Integration is fail-closed at every consumer. The traversal registry
+The original integration was consistent at every consumer and failed closed
+on missing or non-`Expr` fields, but it did not validate C++ lvalue legality;
+the review below narrows that boundary. The traversal registry
 (`SUPPORTED_LLIR_EXPRESSION_NODE_TYPES`, which the emission accepted set
 aliases) gains `AddressOf`; the exhaustive declared-node coverage test
 forces the sample, emission, walk, rewrite, and detachment obligations
@@ -20977,7 +20982,7 @@ P1.
 
 #### Focused verification and structural coverage
 
-The combined compiler/pass suite (14 compiler test files plus
+The combined compiler/pass suite (13 compiler test files plus
 `tests/test_scorch/codegen`) produced **1485 passed** at the candidate —
 the predecessor's 1465 (1452 plus the 13 committed Sizeof review items)
 plus this slice's 20 new items. Black leaves all 12 changed files
@@ -21072,16 +21077,18 @@ At documentation time, a read-only hash check reproduced the five
 protected tracked working files exactly as recorded in the preceding
 sections, and all user-owned untracked autotune, benchmark, GPU/CUDA,
 SuiteSparse, research, scheduler/receipt, scratchpad, test-analysis,
-tooling, temporary, and literal `-` material remained outside the five
-session commits and the sixth, handoff commit.
+tooling, temporary, and literal `-` material remained outside all seven
+session commits.
 `COMPILER_IR_REFACTOR_DESIGN.md` and tracked csrc were not modified.
-This session pushed nothing. The remote reflog records an external
-periodic push at `2026-07-20T19:16:48Z` — between this session's
-review-correction and implementation commits, and matching a same-day
-`82f27c3` push that predates the session — which advanced
-`origin/refactor/compiler-ir-phase3-std-move-call` to `15e2c82`,
-publishing the three Sizeof review-correction commits. The three C6
-slice commits remain local-only.
+The session reported that it pushed nothing. The local remote-tracking reflog
+records an `update by push` at `2026-07-20T19:16:48Z`, between the session's
+review-correction and implementation commits, which advanced
+`origin/refactor/compiler-ir-phase3-std-move-call` to `15e2c82` and published
+the three Sizeof review-correction commits. The reflog alone cannot identify
+the actor or establish a periodic-push mechanism. The three C6 slice commits
+and the later push-documentation correction remain local-only; that correction
+changed no remote or remote-tracking ref, although committing it necessarily
+advanced the local branch ref.
 
 Evidence limitations: all measurements in this section are
 single-machine (Apple M5); the byte-identical waiver makes no
@@ -21089,8 +21096,8 @@ two-machine runtime claim necessary. The canonical corpus does not reach
 the write-back copy, so the migrated statement's coverage is the
 capture-retained activation kernel comparison plus the committed
 structural and byte-exact tests. The level-0 `Literal(0)` branch has no
-known reachable production shape and is covered only by the
-base/candidate probe identity and the raw-spelling equivalence argument.
+known reachable production shape; the unretained ad hoc probe is not evidence,
+so only the typed/raw spelling equivalence argument applies to that branch.
 
 Only the narrow C6 slice is complete. The raw budget is 15 constructors
 / 14 semantic producers. The recommended next ownership seam is
@@ -21107,6 +21114,98 @@ generic rewrites, and the unified exhaustive CxxIR-emission exit review.
 Phase 3 remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and
 1 are not claimed formally closed without a separate design-requirement
 audit. Phase 2 retains its recorded canonical closure.
+
+### Phase-3 typed write-back post-commit review corrections (2026-07-20)
+
+A rigorous review covered the complete Sizeof-correction and C6 range
+`bdde945^..8143cb6`. The Sizeof correction is sound: constructor, traversal,
+rewriting, codegen, and assignment-index validation reject invalid or missing
+`data_type` fields before dereference, while every previously accepted exact
+`DataType` retains its spelling. The review reproduced the two complete
+codegen/traversal files at **576 passed** on exact revision `15e2c82` and found
+no Sizeof regression introduced by that range.
+
+The C6 review found one medium-severity typed-boundary defect. The committed
+`AddressOf` schema accepted any `Expr`, and its byte-emission test explicitly
+blessed `AddressOf(Add(Var("base"), Var("offset")))` as
+`&(base + offset)`. Clang rejects that source with `cannot take the address of
+an rvalue`; literals, calls, `Sizeof`, and nested `AddressOf` expressions could
+cross the same boundary. The production C6 destination was always a legal
+`ArrayAccess`, so this was a malformed-IR compile-failure surface rather than a
+miscompile of a supported kernel.
+
+The review correction closes the boundary consistently:
+
+- `AddressOf.operand` is now the narrow `AssignmentTarget` union and accepts
+  only an exact identifier `Var`, an exact structured `MemberAccess` chain
+  rooted at such a `Var`, or an exact `ArrayAccess` with an identifier `Var`
+  root and the existing checked arithmetic-index subset. Rvalues and unknown
+  subclasses fail at construction.
+- Address validation reads stored instance fields rather than falling back to
+  dataclass class defaults. Forged nodes missing default-bearing `Var.is_ptr`,
+  `Var.is_restrict`, `Var.tensor_access`, or `ArrayAccess.tensor_access` can no
+  longer be silently accepted and normalized during rewriting.
+- An operand-relative typed validation error lets the common walker and
+  rewriter report `invalid_address_of_operand` at exact nested paths such as
+  `operand.index` and `operand.tensor_access.role`. The rewriter validates both
+  the input and the rewritten child, so a custom rewrite cannot replace an
+  lvalue with a literal and escape the boundary.
+- Codegen reuses the same deep validator and converts every malformed direct or
+  nested form to `CodegenError`; the check is extracted from
+  `_render_expression` so the inherited Flake8 complexity budget is unchanged.
+  CIN value-reference rewriting, dense-pointer hoisting, and single-iteration
+  elimination rebuild the narrowed operand explicitly.
+- Both `INPUT_READ` and `RESULT_WRITE` provenance are valid on an addressed
+  outer `ArrayAccess`, while its exact root `Var` stays metadata-free. The C6
+  destination deliberately has no outer scalar provenance: it names a physical
+  block base for a whole `memcpy` span, not one logical scalar result write.
+
+The invalid parenthesized-rvalue regression was removed and replaced by legal
+member-address, address-plus-offset, and postfix-parenthesization cases. New
+matrices cover six non-lvalue categories, eleven malformed structured-lvalue
+shapes, missing top-level/default-bearing fields, both metadata roles, exact
+walker/rewriter paths, post-rewrite revalidation, direct and nested codegen,
+and the production block-copy provenance decision. Across the five directly
+affected suites, collection grows from **962** committed items to **1044** and
+all **1044 pass**.
+
+Valid output is byte-identical to the retained `772fead` candidate. A fresh
+current-working-tree capture compares byte-for-byte on the five canonical C++
+inputs, all workspace and tiled-workspace C++ sources, and the complete
+2,691-byte activating kernel; all 42 grid cells match on every
+environment-independent field including emitted-source hashes and byte counts.
+The activation kernel remains SHA-256
+`08bc91d8bfd8b0aaaeb6422ca5a32091f2a9793c1ed032f17a475db3b7931617`.
+The retained review outputs are under
+`/Users/bobby/.cache/scorch-codex/address-review-current.cVT8GH/`.
+
+Black and `git diff --check` are clean. Scoped Flake8 has only the two inherited
+F401 findings in `cin_lowerer.py` and the inherited F541 in `codegen.py`; the
+new validation does not cross the complexity threshold. Scoped mypy reports
+the same 32 inherited findings in `codegen.py` and `cin_lowerer.py` and none in
+the other four production files. An isolated detached-worktree full
+non-performance run containing only this review correction produced
+**2250 passed, 14 skipped, 2 warnings in 633.92s** — exactly the committed
+candidate's 2168 plus the net 82 review items. Its log is retained at
+`/Users/bobby/.cache/scorch-codex/address-review-full.nOgjSc/pytest-corrected.log`
+with SHA-256
+`b9805b6b18ec564d13b24ebb91374a1ba415807a342a11d94beb9bf6bbe82cd7`.
+A same-session latency check first reproduced the retained activation report
+exactly (zero canonical-corpus constructions and one structured synthetic C6
+construction; SHA-256 `5802ae7f…`), then compared clean `8143cb6` against the
+review candidate with five warmups and 30 samples. Every category remains under
+the 1.10 threshold at both percentiles: `small_dense` 0.988/1.025,
+`reduction` 1.004/1.008, `csr_intersection` 0.995/0.982, and `sparse_union`
+1.014/1.017 for p50/p95. Artifacts are retained under
+`/Users/bobby/.cache/scorch-codex/address-review-full.nOgjSc/latency-review/`.
+
+The evidence audit also corrected four handoff claims above: the focused suite
+was 13 files plus the codegen directory, not 14; the reported level-0 probe had
+no retained artifact and is not evidence; the session made seven commits, not
+six; and the remote-tracking reflog proves only an `update by push`, not its
+actor or a periodic-push mechanism. These documentation corrections do not
+change the completed seam, its raw/constructor budgets, or the next Phase-3
+recommendation.
 
 ## Incremental Migration Plan
 
