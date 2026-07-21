@@ -1137,7 +1137,7 @@ class IterationLattice:
     @staticmethod
     def _mark_simd_on_reduction_loops(stmts: list) -> None:
         """Mark dense reduction loops inside scalar accumulation for SIMD."""
-        from .cin_lowerer import CINLowerer
+        from .parallel_marking_pass import has_sparse_inner_loop
 
         def contains_break(body: list) -> bool:
             for child in body:
@@ -1156,7 +1156,7 @@ class IterationLattice:
         for stmt in stmts:
             if isinstance(stmt, llir.ForLoop):
                 if (
-                    not CINLowerer._has_sparse_inner_loop(stmt.body)
+                    not has_sparse_inner_loop(stmt.body)
                     and not stmt.omp_parallel_for
                     and not stmt.unroll
                     and not contains_break(stmt.body)

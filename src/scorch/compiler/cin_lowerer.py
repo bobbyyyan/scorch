@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, cast
 
 from . import llir
 from .cin import (
@@ -23,8 +23,6 @@ from .cin import (
 from .iter_lattice import IterationLattice
 from .iterator import (
     collect_mode_position_arrays,
-    match_mode_position_access,
-    match_mode_position_begin,
 )
 from .llir import AssignOp, DataType
 from .diagnostics import (
@@ -59,7 +57,14 @@ from .llir_pass_manager import (
     LLIRStatementListArtifact,
 )
 from .compilation_context import CompilerStageId, CompilationContext
-from .llir_traversal import LLIRRewriter, LLIRTraversalContext
+from .llir_traversal import LLIRTraversalContext
+from .parallel_marking_pass import (
+    EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+    ParallelWorkspaceCluster,
+    ParallelWorkspacePoolSpec,
+    apply_parallel_policy,
+    mark_first_for_loop_parallel,
+)
 from .torch_cpp_abi import (
     KernelTensorABI,
     ResultTensorAssembler,
@@ -80,11 +85,6 @@ if TYPE_CHECKING:
 _SPARSE_POSITION_DISCOVERY_CONTEXT = LLIRTraversalContext(
     stage="CIN lowering",
     pass_name="collect_sparse_position_arrays",
-)
-
-_PARALLEL_POLICY_VALUE_CONTEXT = LLIRTraversalContext(
-    stage="CIN lowering",
-    pass_name="typed_parallel_policy_value",
 )
 
 
@@ -212,6 +212,12 @@ class CINLowerer:
         self.index_var_to_result_tensor_level_type = None
 
         self._known_nnz_var: Optional[str] = None
+
+        # The most recent Where lowering's explicit workspace hand-off for
+        # the parallel-marking pass. Rebound per Where; empty otherwise.
+        self._parallel_workspace_cluster: ParallelWorkspaceCluster = (
+            EMPTY_PARALLEL_WORKSPACE_CLUSTER
+        )
 
         # Two-phase parallel compressed output state
         self._where_producer_stmts: Optional[List[llir.Stmt]] = None
@@ -743,10 +749,10 @@ class CINLowerer:
         # Per-thread workspace ownership is constructed serially before OpenMP;
         # each worker selects a disjoint slice inside the region. This keeps
         # allocation failures unwindable through pybind instead of OpenMP.
-        self._workspace_alloc_stmts: List[llir.Stmt] = []
-        self._workspace_pool_specs: List[Tuple[str, DataType, str]] = []
-        self._workspace_free_stmts: List[llir.Stmt] = []
-        self._workspace_memset_stmts: List[llir.Stmt] = []
+        workspace_alloc_stmts: List[llir.Stmt] = []
+        workspace_pool_specs: List[ParallelWorkspacePoolSpec] = []
+        workspace_free_stmts: List[llir.Stmt] = []
+        workspace_memset_stmts: List[llir.Stmt] = []
         for wksp in workspaces:
             assert isinstance(wksp, Workspace), "workspace is not a Workspace"
             # coo_workspace<tensor's ctype> <tensor's name> = coo_workspace<tensor's ctype>(<tensor's dim>);
@@ -805,10 +811,14 @@ class CINLowerer:
                         actual_size = f"{dense_ta.tensor.name}{level}_size"
 
                         wname = wksp.get_name()
-                        self._workspace_pool_specs.append(
-                            (wname, wksp_ctype, actual_size)
+                        workspace_pool_specs.append(
+                            ParallelWorkspacePoolSpec(
+                                name=wname,
+                                scalar_type=wksp_ctype,
+                                extent=actual_size,
+                            )
                         )
-                        self._workspace_alloc_stmts.extend(
+                        workspace_alloc_stmts.extend(
                             [
                                 # Both statements are typed: the extent alias
                                 # and the restrict-qualified per-worker slice
@@ -854,7 +864,7 @@ class CINLowerer:
                                 ),
                             ]
                         )
-                        self._workspace_memset_stmts.append(
+                        workspace_memset_stmts.append(
                             llir.FunctionCallStmt(
                                 name="memset",
                                 args=[
@@ -926,13 +936,23 @@ class CINLowerer:
                 )
             )
 
+        # Freeze this Where's workspace hand-off before recursive producer/
+        # consumer lowering so an explicit parallel loop inside either branch
+        # observes the completed cluster, exactly as the appended live lists
+        # were observed before.
+        self._parallel_workspace_cluster = ParallelWorkspaceCluster(
+            alloc=tuple(workspace_alloc_stmts),
+            free=tuple(workspace_free_stmts),
+            pool_specs=tuple(workspace_pool_specs),
+        )
+
         producer_stmts = self.lower_ProducerIndexStmt(stmt.producer)
         consumer_stmts = self.lower_ConsumerIndexStmt(stmt.consumer)
         self._where_producer_stmts = producer_stmts
         self._where_consumer_stmts = consumer_stmts
         return [
             *workspace_init_stmts,
-            *self._workspace_memset_stmts,
+            *workspace_memset_stmts,
             *producer_stmts,
             *consumer_stmts,
             *workspace_cleanup_stmts,
@@ -2660,50 +2680,6 @@ class CINLowerer:
         return has_sparse_input
 
     @staticmethod
-    def _is_openmp_compatible_for_loop(for_loop: llir.ForLoop) -> bool:
-        if not isinstance(for_loop.init, llir.VarInit):
-            return False
-        if not isinstance(for_loop.init.var, llir.Var):
-            return False
-        loop_var = for_loop.init.var
-
-        if isinstance(for_loop.update, llir.Increment):
-            if for_loop.update.var.name != loop_var.name:
-                return False
-        elif isinstance(for_loop.update, llir.Assign):
-            if type(for_loop.update.var) is not llir.Var:
-                return False
-            if for_loop.update.var.name != loop_var.name:
-                return False
-            if for_loop.update.op not in (AssignOp.ADD_ASSIGN, AssignOp.SUB_ASSIGN):
-                return False
-        else:
-            return False
-
-        if not isinstance(for_loop.cond, llir.BinOp):
-            return False
-        if for_loop.cond.op not in ("<", "<=", ">", ">="):
-            return False
-        if not isinstance(for_loop.cond.left, llir.Var):
-            return False
-        return for_loop.cond.left.name == loop_var.name
-
-    @classmethod
-    def _has_sparse_inner_loop(cls, stmts: List[llir.Stmt]) -> bool:
-        """Check if any ForLoop in stmts (or nested) iterates over a sparse level
-        (identified by init value referencing a _pos array)."""
-        for stmt in stmts:
-            if isinstance(stmt, llir.ForLoop):
-                if (
-                    isinstance(stmt.init, llir.VarInit)
-                    and match_mode_position_begin(stmt.init.value) is not None
-                ):
-                    return True
-                if cls._has_sparse_inner_loop(stmt.body):
-                    return True
-        return False
-
-    @staticmethod
     def _rewrite_val_refs(stmts: list, replacements: dict) -> None:
         """Rewrite _val[pos] → _ptr[loop_var] in LLIR statement trees."""
         for i, stmt in enumerate(stmts):
@@ -2807,17 +2783,6 @@ class CINLowerer:
         return expr
 
     @staticmethod
-    def _expr_to_str(expr) -> str:
-        """Quick-and-dirty LLIR expr to C++ string."""
-        if isinstance(expr, llir.Var):
-            return expr.name
-        if isinstance(expr, llir.Literal):
-            return str(expr.value)
-        if isinstance(expr, llir.BinOp):
-            return f"({CINLowerer._expr_to_str(expr.left)} {expr.op} {CINLowerer._expr_to_str(expr.right)})"
-        return str(expr)
-
-    @staticmethod
     def _find_val_array_access(
         expr: llir.Expr,
         pos_to_stride: Dict[str, str],
@@ -2854,218 +2819,6 @@ class CINLowerer:
                 return left
             return CINLowerer._find_val_array_access(expr.right, pos_to_stride)
         return None
-
-    @staticmethod
-    def _sparse_pos_work_expr(
-        sparse_pos: Optional[str], loop_bound: Optional[str]
-    ) -> Optional[str]:
-        """Return a safe total-nnz expression for a matching dense parent."""
-        import re
-
-        if sparse_pos is None or loop_bound is None:
-            return None
-        match = re.match(r"([A-Za-z_]\w*?)(\d+)_pos$", sparse_pos)
-        if match is None:
-            return None
-        operand, level_text = match.groups()
-        level = int(level_text)
-        if level == 0 or loop_bound != f"{operand}{level - 1}_size":
-            return None
-        return f"{sparse_pos}[{loop_bound}]"
-
-    @staticmethod
-    def _atomic_work_stealing_prelude(
-        sparse_pos: str,
-        bound: llir.Var,
-    ) -> List[llir.Stmt]:
-        """Typed C12/C13 atomic work-stealing prelude statements.
-
-        The total-nnz initialization owns the same sparse position lookup the
-        retained ``omp_num_threads`` pragma string spells, built from the same
-        structural pieces (``_sparse_pos_work_expr`` validated both names).
-        The chunk initialization owns the adaptive clamp expression; its
-        division keeps the thread-count product as an explicit right operand
-        so emission preserves the required grouping.  The position array stays
-        a metadata-free ``NO_TYPE`` reference because the kernel prologue owns
-        its declaration, and the bound reference is a fresh typed copy of the
-        loop-condition variable.
-        """
-        return [
-            llir.VarInit(
-                var=llir.Var(name="_nnz", type=llir.DataType.INT),
-                value=llir.ArrayAccess(
-                    array=llir.Var(name=sparse_pos, type=llir.DataType.NO_TYPE),
-                    index=llir.Var(name=bound.name, type=bound.type),
-                ),
-            ),
-            llir.VarInit(
-                var=llir.Var(name="_chunk", type=llir.DataType.INT),
-                value=llir.FunctionCall(
-                    "std::max",
-                    [
-                        llir.Literal(16, llir.DataType.INT),
-                        llir.FunctionCall(
-                            "std::min",
-                            [
-                                llir.Literal(256, llir.DataType.INT),
-                                llir.BinOp(
-                                    "/",
-                                    llir.Var(name="_nnz", type=llir.DataType.INT),
-                                    llir.Mul(
-                                        llir.FunctionCall("omp_get_num_threads"),
-                                        llir.Literal(128, llir.DataType.INT),
-                                    ),
-                                ),
-                            ],
-                        ),
-                    ],
-                ),
-            ),
-        ]
-
-    def _mark_first_for_loop_parallel(self, stmts: List[llir.Stmt]) -> None:
-        for llir_stmt in stmts:
-            if isinstance(
-                llir_stmt, llir.ForLoop
-            ) and self._is_openmp_compatible_for_loop(llir_stmt):
-                llir_stmt.omp_parallel_for = True
-                has_sparse = self._has_sparse_inner_loop(llir_stmt.body)
-                # Hoist per-thread workspace alloc/free outside the for loop
-                # but inside the OMP parallel region.
-                alloc = getattr(self, "_workspace_alloc_stmts", [])
-                free = getattr(self, "_workspace_free_stmts", [])
-
-                thread_policy_factory: Optional[Callable[[], llir.Expr]] = None
-                if has_sparse and alloc:
-                    # Use adaptive atomic work-stealing: chunk scales with
-                    # total nnz to balance scheduling overhead vs load
-                    # imbalance across all matrix sizes.
-                    llir_stmt.omp_parallel_for = True
-                    llir_stmt.omp_schedule = "dynamic, 64"  # fallback
-                    # Find the sparse pos array to compute nnz
-                    sparse_pos = self._find_sparse_pos_array(llir_stmt.body)
-                    loop_bound = self._extract_loop_bound(llir_stmt)
-                    sparse_work = self._sparse_pos_work_expr(sparse_pos, loop_bound)
-                    if (
-                        sparse_work
-                        and loop_bound
-                        and isinstance(llir_stmt.update, llir.Increment)
-                    ):
-                        # Replace the omp for with atomic work-stealing
-                        llir_stmt.omp_parallel_for = False
-                        adaptive_pre = list(alloc) + (
-                            self._atomic_work_stealing_prelude(
-                                cast(str, sparse_pos),
-                                cast(llir.Var, cast(llir.BinOp, llir_stmt.cond).right),
-                            )
-                        )
-                        # The shared atomic counter is declared before the
-                        # parallel region by codegen itself, from the
-                        # _atomic_counter_var marker below.
-                        # Wrap the loop body in an atomic work-stealing while loop
-                        # We replace the for loop entirely with raw code
-                        llir_stmt.pre_parallel_body = adaptive_pre
-                        llir_stmt.post_parallel_body = free or None
-                        # Mark that the for loop should use atomic scheduling
-                        llir_stmt._use_atomic_scheduling = True
-                        llir_stmt._atomic_chunk_var = "_chunk"
-                        llir_stmt._atomic_counter_var = "_next_row"
-                        llir_stmt._loop_bound = loop_bound
-                        # Work-aware thread cap; chunk stays the atomic _chunk above.
-                        llir_stmt.omp_num_threads = (
-                            f"scorch_nthreads({sparse_work}, {loop_bound})"
-                        )
-                        thread_policy_factory = self._typed_thread_policy_factory(
-                            llir_stmt, sparse_pos
-                        )
-                    else:
-                        if alloc or free:
-                            llir_stmt.pre_parallel_body = alloc or None
-                            llir_stmt.post_parallel_body = free or None
-                        thread_policy_factory = self._apply_parallel_policy(llir_stmt)
-                else:
-                    if has_sparse:
-                        llir_stmt.omp_schedule = "dynamic, 64"
-                    if alloc or free:
-                        llir_stmt.pre_parallel_body = alloc or None
-                        llir_stmt.post_parallel_body = free or None
-                    thread_policy_factory = self._apply_parallel_policy(llir_stmt)
-                self._attach_serial_workspace_pools(llir_stmt, thread_policy_factory)
-                return
-
-    def _attach_serial_workspace_pools(
-        self,
-        loop: llir.ForLoop,
-        thread_policy_factory: Optional[Callable[[], llir.Expr]] = None,
-    ) -> None:
-        """Allocate per-worker dense workspaces before entering OpenMP.
-
-        Each spec receives a typed worker-count initialization owning a fresh
-        copy of the loop's applied thread policy value (or the
-        ``omp_get_max_threads()`` fallback when no policy was applied) and a
-        typed RAII owner initialization calling the templated aligned-buffer
-        allocator.  A policy string without a typed value would silently
-        desynchronize the pragma from the worker count, so that combination
-        fails closed.
-        """
-        specs = getattr(self, "_workspace_pool_specs", [])
-        if not specs:
-            return
-        if thread_policy_factory is None and loop.omp_num_threads:
-            raise CompilerInvariantError(
-                "the workspace-pool thread-count policy has no typed value for "
-                f"applied policy {loop.omp_num_threads!r}"
-            )
-
-        before: List[llir.Stmt] = []
-        for workspace_name, scalar_type, extent in specs:
-            before.extend(
-                [
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{workspace_name}_thread_count",
-                            type=llir.DataType.INT,
-                        ),
-                        value=(
-                            thread_policy_factory()
-                            if thread_policy_factory is not None
-                            else llir.FunctionCall("omp_get_max_threads")
-                        ),
-                    ),
-                    llir.VarInit(
-                        var=llir.Var(
-                            name=f"{workspace_name}_pool_owner",
-                            type=llir.DataType.AUTO,
-                        ),
-                        value=llir.FunctionCall(
-                            "scorch_make_aligned_buffer",
-                            [
-                                llir.FunctionCall(
-                                    "scorch_checked_size_product",
-                                    [
-                                        llir.Cast(
-                                            expr=llir.Var(
-                                                name=(f"{workspace_name}_thread_count"),
-                                                type=llir.DataType.INT,
-                                            ),
-                                            data_type=llir.DataType.SIZE_T,
-                                        ),
-                                        llir.Cast(
-                                            expr=llir.Var(
-                                                name=extent,
-                                                type=llir.DataType.INT64,
-                                            ),
-                                            data_type=llir.DataType.SIZE_T,
-                                        ),
-                                    ],
-                                )
-                            ],
-                            template_args=(scalar_type,),
-                        ),
-                    ),
-                ]
-            )
-        loop.before_parallel_body = before
 
     @staticmethod
     def _tag_first_loop(stmts: List[llir.Stmt], index_var: IndexVar) -> None:
@@ -3127,103 +2880,7 @@ class CINLowerer:
         if not loop.omp_parallel_for and not getattr(
             loop, "_use_atomic_scheduling", False
         ):
-            self._mark_first_for_loop_parallel([loop])
-
-    @staticmethod
-    def _find_sparse_pos_array(body: List[llir.Stmt]) -> Optional[str]:
-        """Find the name of a sparse pos array (e.g. 'A1_pos') in loop body."""
-        import re
-
-        for stmt in body:
-            if isinstance(stmt, llir.VarInit):
-                matched = match_mode_position_access(stmt.value)
-                if matched is not None:
-                    return matched
-            if isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
-                result = CINLowerer._find_sparse_pos_array(stmt.body)
-                if result:
-                    return result
-            if isinstance(stmt, llir.RawStmt):
-                m = re.search(r"(\w+_pos)\[", stmt.code)
-                if m:
-                    return m.group(1)
-        return None
-
-    @staticmethod
-    def _extract_loop_bound(for_loop: llir.ForLoop) -> Optional[str]:
-        """Extract the upper bound variable name from a for loop condition."""
-        if isinstance(for_loop.cond, llir.BinOp) and for_loop.cond.op == "<":
-            right = for_loop.cond.right
-            if isinstance(right, llir.Var):
-                return right.name
-        return None
-
-    @staticmethod
-    def _typed_thread_policy_factory(
-        loop: llir.ForLoop,
-        sparse_pos: Optional[str],
-    ) -> Optional[Callable[[], llir.Expr]]:
-        """Build fresh typed copies of a loop's applied num_threads policy.
-
-        The factory mirrors the string policy exactly from the same structural
-        pieces: the work estimate is the sparse position lookup (or ``-1``),
-        and the trip count is the loop bound (or the affine stride division for
-        ``ADD_ASSIGN`` updates, whose stride is detached from the live update
-        expression on every call).  Position arrays stay metadata-free
-        ``NO_TYPE`` references because the kernel prologue owns their
-        declarations.
-        """
-        if not (
-            isinstance(loop.cond, llir.BinOp)
-            and loop.cond.op == "<"
-            and isinstance(loop.cond.right, llir.Var)
-        ):
-            return None
-        bound_name = loop.cond.right.name
-        bound_type = loop.cond.right.type
-        update = loop.update
-        stride = (
-            update.value
-            if isinstance(update, llir.Assign) and update.op == llir.AssignOp.ADD_ASSIGN
-            else None
-        )
-
-        def build() -> llir.Expr:
-            if sparse_pos is not None:
-                work: llir.Expr = llir.ArrayAccess(
-                    array=llir.Var(name=sparse_pos, type=llir.DataType.NO_TYPE),
-                    index=llir.Var(name=bound_name, type=bound_type),
-                )
-            else:
-                work = llir.Literal(-1, llir.DataType.INT)
-            if stride is None:
-                rows: llir.Expr = llir.Var(name=bound_name, type=bound_type)
-            else:
-                rewriter = LLIRRewriter(_PARALLEL_POLICY_VALUE_CONTEXT)
-                rows = llir.BinOp(
-                    "/",
-                    llir.BinOp(
-                        "-",
-                        llir.Add(
-                            llir.Var(name=bound_name, type=bound_type),
-                            cast(llir.Expr, rewriter.rewrite(stride)),
-                        ),
-                        llir.Literal(1, llir.DataType.INT),
-                    ),
-                    cast(llir.Expr, rewriter.rewrite(stride)),
-                )
-            return llir.FunctionCall("scorch_nthreads", [work, rows])
-
-        return build
-
-    @staticmethod
-    def _parallel_rows_expr(for_loop: llir.ForLoop, bound: str) -> str:
-        """Return the loop trip count, accounting for affine tile strides."""
-        update = for_loop.update
-        if isinstance(update, llir.Assign) and update.op == llir.AssignOp.ADD_ASSIGN:
-            step = CINLowerer._expr_to_str(update.value)
-            return f"(({bound} + {step} - 1) / {step})"
-        return bound
+            mark_first_for_loop_parallel([loop], self._parallel_workspace_cluster)
 
     # Min work per thread for the SpGEMM 2-phase path, where `work` is the true flop
     # (A_nnz*avg_B_row). Emitted by NAME (not as a literal) so the codegen flop grain
@@ -3232,52 +2889,6 @@ class CINLowerer:
     # generated kernel so the macro resolves. Defaults to 1500 there — larger than the
     # A_nnz default (500) because flop is ~avg_B_row bigger; validated on redwood.
     _CG_FLOP_GRAIN = "SCORCH_GRAIN_CODEGEN_SPGEMM"
-
-    def _apply_parallel_policy(
-        self, loop, body=None, chunk=True, work_expr=None, grain=None
-    ):
-        """Attach a work-aware thread cap (+ adaptive schedule chunk) to a parallel
-        ForLoop. codegen.py emits these as num_threads(scorch_nthreads(work,rows)) and
-        schedule(dynamic, scorch_chunk(rows, work)) (helpers in scorch/csrc/header.h).
-
-        rows = loop trip count; work = the C++ work estimate. When work_expr is
-        given it is used verbatim (e.g. the true SpGEMM flop A_nnz*avg_B_row from
-        the 2-phase path, where both operands are known); otherwise work = nnz
-        (<pos>[<bound>]) for the first sparse pos array found in the body, else -1
-        (thread cap by rows only). grain, when given, is emitted as the helpers'
-        grain_default arg (the flop path passes _CG_FLOP_GRAIN; A_nnz sites omit
-        it and get the header's 500 default). No-op when the bound can't be
-        determined. chunk=False keeps the loop's own chunk (e.g. the atomic
-        work-stealing _chunk) and only applies the thread cap.
-
-        Returns a factory building fresh typed copies of the applied
-        num_threads value for downstream typed statements, or None when no
-        policy was applied or a free-form work_expr/grain string leaves the
-        policy without a typed value.
-        """
-        bound = self._extract_loop_bound(loop)
-        if not bound:
-            return None
-        rows = self._parallel_rows_expr(loop, bound)
-        sparse_work: Optional[str] = None
-        pos: Optional[str] = None
-        if work_expr is not None:
-            work = work_expr
-        else:
-            search_body = body if body is not None else loop.body
-            pos = self._find_sparse_pos_array(search_body)
-            sparse_work = self._sparse_pos_work_expr(pos, bound)
-            work = sparse_work or "-1"
-        gsuf = f", {grain}" if grain is not None else ""
-        loop.omp_num_threads = f"scorch_nthreads({work}, {rows}{gsuf})"
-        if chunk:
-            loop.omp_chunk_expr = f"scorch_chunk({rows}, {work}{gsuf})"
-        if work_expr is not None or grain is not None:
-            return None
-        return self._typed_thread_policy_factory(
-            loop,
-            pos if sparse_work is not None else None,
-        )
 
     @staticmethod
     def _parse_pos(pos_name: str):
@@ -3294,8 +2905,9 @@ class CINLowerer:
     def _find_all_sparse_pos_arrays(self, body) -> List[str]:
         """All distinct sparse pos array names (e.g. ['A1_pos', 'B1_pos']) referenced
         anywhere in `body`, in deterministic structural pre-order. Generalises
-        _find_sparse_pos_array to nested loop headers while retaining only the
-        explicit RawStmt compatibility escape hatch."""
+        the parallel-marking pass's find_sparse_pos_array to nested loop
+        headers while retaining only the explicit RawStmt compatibility
+        escape hatch."""
 
         return collect_mode_position_arrays(
             list(body),
@@ -3793,7 +3405,7 @@ class CINLowerer:
                 omp_parallel_for=True,
                 omp_schedule="dynamic, 16",
             )
-            self._apply_parallel_policy(group_loop, body=group_body)
+            apply_parallel_policy(group_loop, body=group_body)
 
             # Build pre-allocation only on routes that emit it.  The live
             # known-NNZ route uses pointer-backed Torch storage and discards
@@ -3941,7 +3553,7 @@ class CINLowerer:
                     omp_parallel_for=True,
                     omp_schedule="dynamic, 64",
                 )
-                self._apply_parallel_policy(flat_loop, body=flat_body)
+                apply_parallel_policy(flat_loop, body=flat_body)
 
                 # The coordinate lattice declares this zero placeholder outside
                 # the original grouped loop so its update can advance the parent.
@@ -4032,13 +3644,13 @@ class CINLowerer:
         )
         self._tag_first_loop(stmts, index_var)
         if stmt.parallel is True:
-            self._mark_first_for_loop_parallel(stmts)
+            mark_first_for_loop_parallel(stmts, self._parallel_workspace_cluster)
         elif (
             is_outermost_forall
             and not self.has_explicit_parallel_loop
             and self._should_parallelize_outer_forall(index_var)
         ):
-            self._mark_first_for_loop_parallel(stmts)
+            mark_first_for_loop_parallel(stmts, self._parallel_workspace_cluster)
         elif (
             is_outermost_forall
             and not self.has_explicit_parallel_loop
