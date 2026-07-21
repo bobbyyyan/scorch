@@ -93,6 +93,8 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "accumulator_name",
         "actual_size",
         "bound.name",
+        "candidate.base",
+        "candidate.stride",
         "expr.name.replace(old, new)",
         "f'{prefix}{level}'",
         "invariant_name",
@@ -101,12 +103,14 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "node.name",
         "outer_end_bound.name",
         "outer_end_var",
+        "pointer_name",
         "prefix_extent",
         "reserve_hint_var",
         "size_var",
         "sparse_pos",
         "sparse_values_tensor",
         "spec.extent",
+        "value_array",
         "wname",
         "zero_value",
     }
@@ -133,7 +137,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "cin.py": 9,
         "cin_lowerer.py": 154,
         "compressed_where_openmp_pass.py": 32,
-        "dense_pointer_hoist_pass.py": 3,
+        "dense_pointer_hoist_pass.py": 7,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
         "iterator.py": 23,
@@ -145,12 +149,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 464
+    assert sum(constructor_counts.values()) == 468
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 146,
         "compressed_where_openmp_pass.py": 32,
-        "dense_pointer_hoist_pass.py": 3,
+        "dense_pointer_hoist_pass.py": 7,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
         "iterator.py": 21,
@@ -162,7 +166,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 454
+    assert sum(unclassified_counts.values()) == 458
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -179,7 +183,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("parallel_marking_pass.py", "bound.name"): 1,
         ("parallel_marking_pass.py", "sparse_pos"): 2,
         ("parallel_marking_pass.py", "spec.extent"): 1,
+        ("dense_pointer_hoist_pass.py", "candidate.base"): 1,
+        ("dense_pointer_hoist_pass.py", "candidate.stride"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
+        ("dense_pointer_hoist_pass.py", "pointer_name"): 1,
+        ("dense_pointer_hoist_pass.py", "value_array"): 1,
         ("llir_traversal.py", "node.name"): 1,
         ("loop_invariant_factor_pass.py", "accumulator_name"): 1,
         ("loop_invariant_factor_pass.py", "invariant_name"): 2,
@@ -187,8 +195,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "prefix_extent"): 2,
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
+        ("torch_cpp_abi.py", "pointer_name"): 4,
     }
-    assert sum(known_indirect.values()) == 35
+    assert sum(known_indirect.values()) == 43
 
     assert totals == {
         "subscript": 9,
@@ -828,11 +837,11 @@ def test_dense_workspace_write_back_copy_is_structured() -> None:
     address_of_constructors += Counter()
     assert address_of_constructors == {
         "cin_lowerer.py": 2,
-        "dense_pointer_hoist_pass.py": 1,
+        "dense_pointer_hoist_pass.py": 2,
         "llir_traversal.py": 1,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(address_of_constructors.values()) == 5
+    assert sum(address_of_constructors.values()) == 6
 
     lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
     lowerer_source = lowerer_path.read_text()
@@ -994,6 +1003,79 @@ def test_atomic_work_stealing_prelude_is_structured() -> None:
     # The pragma text and the typed prelude come from the same validated
     # structural pieces; neither is recovered by parsing the other.
     assert 'f"scorch_nthreads({sparse_work}, {loop_bound})"' in marking
+
+
+def test_hoisted_input_pointer_declaration_is_structured() -> None:
+    """Lock D1's typed template and its exact free-form raw fallback."""
+
+    path = _COMPILER_ROOT / "dense_pointer_hoist_pass.py"
+    source = path.read_text()
+    tree = ast.parse(source)
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    helper = functions["_hoisted_pointer_declaration"]
+    apply_analysis = functions["_apply_loop_analysis"]
+
+    def calls(function: ast.FunctionDef, name: str) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+                or isinstance(node.func, ast.Name)
+                and node.func.id == name
+            )
+        ]
+
+    expected_template_inventory = {
+        "RawStmt": 1,
+        "VarInit": 1,
+        "Var": 4,
+        "AddressOf": 1,
+        "ArrayAccess": 1,
+        "Mul": 1,
+        "const_ptr_type": 1,
+        "Cast": 0,
+    }
+    assert {
+        name: len(calls(helper, name)) for name in expected_template_inventory
+    } == expected_template_inventory
+
+    # The one raw statement in this file is the deliberate free-form
+    # compatibility fallback inside the helper, guarded by the fail-closed
+    # const-pointer enum lookup; it keeps the exact legacy spelling.
+    assert len(_llir_constructor_calls(path, "RawStmt")) == 1
+    helper_source = ast.get_source_segment(source, helper)
+    assert helper_source is not None
+    assert "except ValueError" in helper_source
+    fallback = calls(helper, "RawStmt")[0]
+    fragments = _static_string_fragments(fallback)
+    assert "const " in fragments
+    assert "__restrict__" in fragments
+
+    assert len(calls(apply_analysis, "_hoisted_pointer_declaration")) == 1
+    assert calls(apply_analysis, "RawStmt") == []
+
+    typed_var_fields = {
+        keyword.arg: keyword.value
+        for call in calls(helper, "VarInit")
+        for keyword in call.keywords
+        if keyword.arg == "var"
+    }
+    target = typed_var_fields["var"]
+    assert _is_llir_constructor(target, "Var")
+    assert isinstance(target, ast.Call)
+    target_fields = {
+        keyword.arg: keyword.value
+        for keyword in target.keywords
+        if keyword.arg is not None
+    }
+    assert ast.unparse(target_fields["name"]) == "pointer_name"
+    assert ast.unparse(target_fields["type"]) == "pointer_type"
+    assert ast.unparse(target_fields["is_restrict"]) == "True"
 
 
 def test_compressed_result_assembly_is_owned_by_the_typed_abi_epilogue() -> None:

@@ -29,7 +29,10 @@ from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
     PRODUCTION_LLIR_PASS_OPTIONS,
     DensePointerHoistPassSpec,
 )
+from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
+from scorch.compiler.diagnostics import CodegenError  # type: ignore[import-untyped]
 from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
+    LLIRRewriter,
     LLIRTraversalContext,
     LLIRTraversalDiagnostic,
     LLIRTraversalError,
@@ -166,6 +169,26 @@ def _raw_codes(statements: Sequence[object]) -> List[str]:
     ]
 
 
+def _declaration_codes(statements: Sequence[object]) -> List[str]:
+    """Render hoisted pointer declarations, typed or legacy, as C++ text.
+
+    Typed D1 declarations render through codegen (without the statement
+    semicolon) so expected spellings stay byte-comparable with the raw
+    compatibility form.
+    """
+    codes: List[str] = []
+    for statement in statements:
+        if type(statement) is llir.RawStmt:
+            codes.append(cast(llir.RawStmt, statement).code)
+        elif type(statement) is llir.VarInit and cast(
+            llir.VarInit, statement
+        ).var.name.endswith("_ptr"):
+            rendered = LLIRLowerer().lower_llir(statement)
+            assert rendered.endswith(";")
+            codes.append(rendered[:-1])
+    return codes
+
+
 def _p95(samples: List[int]) -> int:
     ordered = sorted(samples)
     return ordered[int((len(ordered) - 1) * 0.95)]
@@ -220,7 +243,7 @@ def test_context_snapshots_mutable_mapping_ownership() -> None:
         [_activating_loop()],
         context,
     )
-    assert _raw_codes(output) == [
+    assert _declaration_codes(output) == [
         "const float* __restrict__ _Input_val_ptr = " "&Input_val[base * stride]"
     ]
 
@@ -334,12 +357,26 @@ def test_core_transformation_accepts_arbitrary_names_and_c_type_spellings(
     assert source_ids.isdisjoint(_mutable_ir_ids(output))
     assert type(output) is list
     assert len(output) == 2
-    declaration = cast(llir.RawStmt, output[0])
-    assert declaration.code == (
+    expected_code = (
         f"const {c_type}* __restrict__ _UnrelatedTensor_val_ptr = "
         "&UnrelatedTensor_val[parent_position * Unrelated7_size]"
     )
-    assert declaration.add_semicolon is True
+    if c_type == "scalar_t":
+        # Free-form compatibility type text keeps the exact legacy raw form.
+        declaration = cast(llir.RawStmt, output[0])
+        assert type(declaration) is llir.RawStmt
+        assert declaration.code == expected_code
+        assert declaration.add_semicolon is True
+    else:
+        typed_declaration = cast(llir.VarInit, output[0])
+        assert type(typed_declaration) is llir.VarInit
+        assert typed_declaration.var == llir.Var(
+            name="_UnrelatedTensor_val_ptr",
+            type=llir.DataType.const_ptr_type(c_type),
+            is_restrict=True,
+        )
+        assert type(typed_declaration.value) is llir.AddressOf
+        assert LLIRLowerer().lower_llir(typed_declaration) == f"{expected_code};"
     loop = cast(llir.ForLoop, output[1])
     assert len(loop.body) == 1
     assignment = cast(llir.Assign, loop.body[0])
@@ -481,9 +518,12 @@ def test_typed_array_access_activates_and_preserves_structured_provenance() -> N
 
     assert _snapshot(source) == before
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
-    declaration = cast(llir.RawStmt, output[0])
-    assert declaration.code == (
-        "const float* __restrict__ _Input_val_ptr = " "&Input_val[base * stride]"
+    declaration = cast(llir.VarInit, output[0])
+    assert type(declaration) is llir.VarInit
+    assert declaration.var.type is llir.DataType.CONST_PTR_FLOAT32
+    assert declaration.var.is_restrict is True
+    assert LLIRLowerer().lower_llir(declaration) == (
+        "const float* __restrict__ _Input_val_ptr = " "&Input_val[base * stride];"
     )
     rewritten_loop = cast(llir.ForLoop, output[1])
     initializer = cast(llir.VarInit, rewritten_loop.body[0])
@@ -531,7 +571,7 @@ def test_add_rewrite_is_rebuilt_detached_repeatable_and_caller_owned() -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(once))
     assert _mutable_ir_ids(once).isdisjoint(_mutable_ir_ids(twice))
     assert _snapshot(twice) == _snapshot(once)
-    assert _raw_codes(once) == [
+    assert _declaration_codes(once) == [
         "const float* __restrict__ _Input_val_ptr = " "&Input_val[base * stride]"
     ]
     rewritten = cast(
@@ -624,12 +664,12 @@ def test_analysis_is_direct_for_loop_postorder_but_rewrite_reaches_nested_bodies
         ),
     )
 
-    assert _raw_codes(output) == [
+    assert _declaration_codes(output) == [
         "const float* __restrict__ _Outer_val_ptr = "
         "&Outer_val[outer_base * outer_stride]"
     ]
     output_outer = cast(llir.ForLoop, output[1])
-    assert _raw_codes(output_outer.body) == [
+    assert _declaration_codes(output_outer.body) == [
         "const double* __restrict__ _Inner_val_ptr = "
         "&Inner_val[inner_base * inner_stride]"
     ]
@@ -697,7 +737,7 @@ def test_multiple_candidates_reverse_declaration_order_without_deduplication() -
         _context(("Shared_val", "float")),
     )
 
-    assert _raw_codes(output) == [
+    assert _declaration_codes(output) == [
         "const float* __restrict__ _Shared_val_ptr = "
         "&Shared_val[second_base * second_stride]",
         "const float* __restrict__ _Shared_val_ptr = "
@@ -1145,7 +1185,7 @@ def test_new_match_overwrites_preexisting_declarations() -> None:
         _context(("Input_val", "float")),
     )
 
-    assert _raw_codes(output) == [
+    assert _declaration_codes(output) == [
         "const float* __restrict__ _Input_val_ptr = " "&Input_val[base * stride]"
     ]
     assert not hasattr(output[1], "_hoisted_ptr_decls")
@@ -1403,3 +1443,73 @@ def test_empty_and_dense_one_pass_incremental_plumbing_p95_is_below_one_ms() -> 
 
     assert _p95(empty_ns) <= 1_000_000
     assert _p95(incremental_ns) <= 1_000_000
+
+
+@pytest.mark.parametrize(
+    ("c_type", "member"),
+    (
+        ("int", llir.DataType.CONST_PTR_INT),
+        ("int32_t", llir.DataType.CONST_PTR_INT32),
+        ("int64_t", llir.DataType.CONST_PTR_INT64),
+        ("int8_t", llir.DataType.CONST_PTR_INT8),
+        ("uint8_t", llir.DataType.CONST_PTR_UINT8),
+        ("float", llir.DataType.CONST_PTR_FLOAT32),
+        ("double", llir.DataType.CONST_PTR_FLOAT64),
+    ),
+)
+def test_const_pointer_type_resolves_recognized_spellings(
+    c_type: str, member: llir.DataType
+) -> None:
+    assert llir.DataType.const_ptr_type(c_type) is member
+
+
+@pytest.mark.parametrize("c_type", ("scalar_t", "float&", "const float", ""))
+def test_const_pointer_type_fails_closed_on_free_form_spellings(
+    c_type: str,
+) -> None:
+    with pytest.raises(ValueError):
+        llir.DataType.const_ptr_type(c_type)
+
+
+def test_typed_declaration_survives_traversal_and_detachment() -> None:
+    output = hoist_dense_pointers(
+        [_activating_loop()],
+        _context(("Input_val", "float")),
+    )
+    declaration = cast(llir.VarInit, output[0])
+    assert type(declaration) is llir.VarInit
+    assert declaration.var.type is llir.DataType.CONST_PTR_FLOAT32
+    assert declaration.var.is_restrict is True
+    assert type(declaration.value) is llir.AddressOf
+    borrow = cast(llir.AddressOf, declaration.value)
+    access = cast(llir.ArrayAccess, borrow.operand)
+    assert type(access) is llir.ArrayAccess
+    assert cast(llir.Var, access.array).type is llir.DataType.NO_TYPE
+    assert type(access.index) is llir.Mul
+
+    context = LLIRTraversalContext(
+        stage="dense pointer test",
+        pass_name="detach",
+    )
+    LLIRWalker(context).walk(declaration)
+    detached = cast(llir.VarInit, LLIRRewriter(context).rewrite(declaration))
+    assert detached == declaration
+    assert detached is not declaration
+    assert detached.var is not declaration.var
+    assert detached.value is not declaration.value
+    assert detached.var.type is llir.DataType.CONST_PTR_FLOAT32
+    assert detached.var.is_restrict is True
+
+
+def test_typed_declaration_rejects_forged_borrow_state() -> None:
+    output = hoist_dense_pointers(
+        [_activating_loop()],
+        _context(("Input_val", "float")),
+    )
+    declaration = cast(llir.VarInit, output[0])
+    borrow = cast(llir.AddressOf, declaration.value)
+    access = cast(llir.ArrayAccess, borrow.operand)
+
+    object.__setattr__(access, "array", "Input_val")
+    with pytest.raises(CodegenError, match="exact Var"):
+        LLIRLowerer().lower_llir(declaration)
