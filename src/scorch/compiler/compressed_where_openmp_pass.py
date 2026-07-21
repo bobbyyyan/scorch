@@ -651,13 +651,32 @@ def _extract_work_body(
     return work_body, False
 
 
-def _workspace_view_statement(context: CompressedWhereOpenMPContext) -> llir.RawStmt:
+def _workspace_view_statement(context: CompressedWhereOpenMPContext) -> llir.VarInit:
+    """Return one fresh typed per-worker view borrow of the workspace pool.
+
+    The view variable's C++ type is compiler-deduced (``auto``).  The pool
+    receiver is a metadata-free physical borrow exactly as the ``clear()``
+    mutation documents: its ``std::vector<linked_list_workspace_1d<...>>``
+    declaration is assembled by the raw pool-allocation statement outside
+    this subtree, so ``NO_TYPE`` marks the honest reference metadata.
+    """
+
     workspace_name = context.workspace_name
-    return llir.RawStmt(
-        code=(
-            f"auto {workspace_name} = {workspace_name}_pool["
-            "(size_t)omp_get_thread_num()].make_view()"
-        )
+    return llir.VarInit(
+        var=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
+        value=llir.MemberCall(
+            base=llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{workspace_name}_pool",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                index=llir.Cast(
+                    expr=llir.FunctionCall(name="omp_get_thread_num", args=()),
+                    data_type=llir.DataType.SIZE_T,
+                ),
+            ),
+            member="make_view",
+        ),
     )
 
 
@@ -666,7 +685,7 @@ def _workspace_clear_statement(
 ) -> llir.MemberCallStmt:
     """Return one fresh typed ``clear()`` mutation of the borrowed worker view.
 
-    The receiver is the per-worker view declared by the raw pre-parallel
+    The receiver is the per-worker view declared by the typed pre-parallel
     ``make_view()`` statement.  Its C++ type is compiler-deduced (``auto``), so
     no accurate ``DataType`` member exists; ``NO_TYPE`` marks the reference as
     a metadata-free physical borrow exactly as other workspace reads do.
