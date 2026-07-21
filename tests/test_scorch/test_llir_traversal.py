@@ -1249,6 +1249,79 @@ def test_cast_unknown_child_reports_exact_path(operation: str) -> None:
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+def test_unknown_select_subclass_fails_closed(operation: str) -> None:
+    class UnknownSelect(llir.Select):
+        pass
+
+    unknown = UnknownSelect(_var("cond"), _var("a"), _var("b"))
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(unknown)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(unknown)
+
+    assert raised.value.diagnostic.node_type == "UnknownSelect"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root",)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("malformation", "diagnostic_code", "expected_path"),
+    (
+        ("cond", "invalid_select_condition", ("root", "cond")),
+        ("when_true", "invalid_select_when_true", ("root", "when_true")),
+        ("when_false", "invalid_select_when_false", ("root", "when_false")),
+    ),
+)
+def test_forged_select_fields_fail_at_traversal_boundary(
+    operation: str,
+    malformation: str,
+    diagnostic_code: str,
+    expected_path: Tuple[str, ...],
+) -> None:
+    expression = llir.Select(_var("cond"), _var("a"), _var("b"))
+    object.__setattr__(expression, malformation, "forged")
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.code == diagnostic_code
+    assert raised.value.diagnostic.path == expected_path
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize("child", ("cond", "when_true", "when_false"))
+def test_select_unknown_child_reports_exact_path(operation: str, child: str) -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    children = {
+        "cond": _var("cond"),
+        "when_true": _var("a"),
+        "when_false": _var("b"),
+    }
+    children[child] = UnknownExpr()
+    expression = llir.Select(
+        children["cond"],
+        children["when_true"],
+        children["when_false"],
+    )
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(expression)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(expression)
+
+    assert raised.value.diagnostic.node_type == "UnknownExpr"
+    assert raised.value.diagnostic.code == "unknown_llir_node"
+    assert raised.value.diagnostic.path == ("root", child)
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 @pytest.mark.parametrize("malformation", ("invalid", "missing"))
 def test_forged_sizeof_data_type_fails_at_traversal_boundary(
     operation: str,
@@ -3046,6 +3119,44 @@ def test_cast_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
 
     cast(llir.Var, replacement_add.left).name = "owned"
     assert cast(llir.Var, original_add.left).name == "offset"
+
+
+def test_select_rewrite_is_detached_repeatable_and_replacement_owned() -> None:
+    original = llir.Select(
+        llir.BinOp(">", _var("rows", llir.DataType.INT64), llir.Literal(0)),
+        llir.Add(
+            llir.BinOp("/", _var("nnz"), _var("rows", llir.DataType.INT64)),
+            llir.Literal(1),
+        ),
+        llir.Literal(1),
+    )
+    rewriter = LLIRRewriter(_CONTEXT)
+
+    first = cast(llir.Select, rewriter.rewrite(original))
+    second = cast(llir.Select, rewriter.rewrite(first))
+
+    assert _record(original) == _record(first) == _record(second)
+    assert _structural_snapshot(original) == _structural_snapshot(first)
+    assert _structural_snapshot(first) == _structural_snapshot(second)
+    assert _mutable_ir_ids(original).isdisjoint(_mutable_ir_ids(first))
+    assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
+
+    class ReplaceNnz(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: LLIRPath) -> llir.Var:
+            rewritten = super().rewrite_var(node, path)
+            if node.name == "nnz":
+                rewritten.name = "replacement"
+            return rewritten
+
+    replacement = cast(llir.Select, ReplaceNnz(_CONTEXT).rewrite(original))
+    replacement_division = cast(llir.BinOp, cast(llir.Add, replacement.when_true).left)
+    original_division = cast(llir.BinOp, cast(llir.Add, original.when_true).left)
+    assert cast(llir.Var, replacement_division.left).name == "replacement"
+    assert cast(llir.Var, original_division.left).name == "nnz"
+    assert replacement_division.left is not original_division.left
+
+    cast(llir.Var, replacement_division.left).name = "owned"
+    assert cast(llir.Var, original_division.left).name == "nnz"
 
 
 def test_direct_init_rewrite_is_detached_repeatable_and_replacement_owned() -> None:

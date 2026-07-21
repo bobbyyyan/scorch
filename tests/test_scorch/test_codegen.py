@@ -647,6 +647,155 @@ def test_codegen_rejects_unknown_cast_child() -> None:
         LLIRLowerer().lower_llir(llir.Cast(UnknownExpr(), llir.DataType.INT))
 
 
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        (
+            llir.Select(_var("a"), _var("b"), _var("c")),
+            "a ? b : c",
+        ),
+        (
+            llir.Select(
+                llir.BinOp("||", _var("a"), _var("b")),
+                _var("c"),
+                _var("d"),
+            ),
+            "a || b ? c : d",
+        ),
+        (
+            llir.Select(
+                llir.Select(_var("a"), _var("b"), _var("c")),
+                _var("d"),
+                _var("e"),
+            ),
+            "(a ? b : c) ? d : e",
+        ),
+        (
+            llir.Select(
+                _var("a"),
+                llir.Select(_var("b"), _var("c"), _var("d")),
+                _var("e"),
+            ),
+            "a ? b ? c : d : e",
+        ),
+        (
+            llir.Select(
+                _var("a"),
+                _var("b"),
+                llir.Select(_var("c"), _var("d"), _var("e")),
+            ),
+            "a ? b : c ? d : e",
+        ),
+        (
+            llir.Mul(
+                llir.Cast(_var("work"), llir.DataType.LONG),
+                llir.Select(
+                    llir.BinOp(">", _var("rows"), llir.Literal(0)),
+                    llir.Add(
+                        llir.BinOp("/", _var("nnz"), _var("rows")),
+                        llir.Literal(1),
+                    ),
+                    llir.Literal(1),
+                ),
+            ),
+            "(long)work * (rows > 0 ? nnz / rows + 1 : 1)",
+        ),
+        (
+            llir.Cast(
+                llir.Select(_var("a"), _var("b"), _var("c")),
+                llir.DataType.SIZE_T,
+            ),
+            "(size_t)(a ? b : c)",
+        ),
+        (
+            llir.FunctionCall(
+                "scorch_nthreads",
+                [
+                    llir.Select(_var("a"), _var("b"), _var("c")),
+                    _var("rows"),
+                ],
+            ),
+            "scorch_nthreads(a ? b : c, rows)",
+        ),
+    ],
+)
+def test_select_codegen_preserves_ast_precedence(
+    expression: llir.Expr, expected: str
+) -> None:
+    assert LLIRLowerer().lower_llir(expression) == expected
+
+
+def test_select_is_frozen_typed_and_structurally_equal() -> None:
+    condition = _var("cond")
+    expression = llir.Select(condition, _var("a"), _var("b"))
+    equal = llir.Select(_var("cond"), _var("a"), _var("b"))
+
+    assert expression.cond is condition
+    assert expression == equal
+    assert hash(expression) == hash(equal)
+    assert expression != llir.Select(_var("other"), _var("a"), _var("b"))
+    assert expression != llir.Select(_var("cond"), _var("a"), _var("other"))
+    assert get_type_hints(llir.Select) == {
+        "cond": llir.Expr,
+        "when_true": llir.Expr,
+        "when_false": llir.Expr,
+    }
+
+    with pytest.raises(FrozenInstanceError):
+        expression.cond = _var("other")
+    with pytest.raises(FrozenInstanceError):
+        expression.when_true = _var("other")
+    with pytest.raises(FrozenInstanceError):
+        expression.when_false = _var("other")
+
+
+@pytest.mark.parametrize(
+    ("cond", "when_true", "when_false", "message"),
+    (
+        ("cond", _var("a"), _var("b"), "Select.cond"),
+        (_var("cond"), "a", _var("b"), "Select.when_true"),
+        (_var("cond"), _var("a"), "b", "Select.when_false"),
+    ),
+)
+def test_select_rejects_malformed_constructor_fields(
+    cond: object,
+    when_true: object,
+    when_false: object,
+    message: str,
+) -> None:
+    with pytest.raises(TypeError, match=message):
+        llir.Select(
+            cast(llir.Expr, cond),
+            cast(llir.Expr, when_true),
+            cast(llir.Expr, when_false),
+        )
+
+
+@pytest.mark.parametrize("malformation", ("cond", "when_true", "when_false"))
+def test_codegen_rejects_forged_select_fields(malformation: str) -> None:
+    expression = llir.Select(_var("cond"), _var("a"), _var("b"))
+    object.__setattr__(expression, malformation, "forged")
+
+    with pytest.raises(CodegenError, match=f"Select.{malformation}"):
+        LLIRLowerer().lower_llir(expression)
+
+
+def test_codegen_rejects_unknown_select_subclass() -> None:
+    class UnknownSelect(llir.Select):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownSelect"):
+        LLIRLowerer().lower_llir(UnknownSelect(_var("cond"), _var("a"), _var("b")))
+
+
+def test_codegen_rejects_unknown_select_child() -> None:
+    class UnknownExpr(llir.Expr):
+        pass
+
+    with pytest.raises(CodegenError, match="UnknownExpr"):
+        LLIRLowerer().lower_llir(llir.Select(_var("cond"), UnknownExpr(), _var("b")))
+
+
 def test_sizeof_is_frozen_typed_and_structurally_equal() -> None:
     expression = llir.Sizeof(llir.DataType.FLOAT32)
     equal = llir.Sizeof(llir.DataType.FLOAT32)
