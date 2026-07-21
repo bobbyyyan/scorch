@@ -388,6 +388,80 @@ def test_raw_hoisted_pointer_augments_assignment_discovery_in_body_order() -> No
     ]
 
 
+def _typed_hoisted_pointer(
+    value_array: str = "E_val",
+    *,
+    pointer_type: llir.DataType = llir.DataType.CONST_PTR_FLOAT64,
+    is_restrict: bool = True,
+    stride: str = "E1_size",
+) -> llir.VarInit:
+    return llir.VarInit(
+        var=llir.Var(
+            name=f"_{value_array}_ptr",
+            type=pointer_type,
+            is_restrict=is_restrict,
+        ),
+        value=llir.AddressOf(
+            operand=llir.ArrayAccess(
+                array=llir.Var(name=value_array, type=llir.DataType.NO_TYPE),
+                index=llir.Mul(
+                    llir.Var(name="pE0", type=llir.DataType.NO_TYPE),
+                    llir.Var(name=stride, type=llir.DataType.NO_TYPE),
+                ),
+            ),
+        ),
+    )
+
+
+def test_typed_hoisted_pointer_augments_discovery_like_the_raw_form() -> None:
+    """The typed D1 borrow is discovered exactly as its raw spelling was."""
+
+    typed_decoys = [
+        # Not const float/double pointers, not restrict, or not _val-shaped:
+        _typed_hoisted_pointer("F_val", pointer_type=llir.DataType.CONST_PTR_INT32),
+        _typed_hoisted_pointer("G_val", is_restrict=False),
+        llir.VarInit(
+            var=llir.Var(
+                name="_H_ptr",
+                type=llir.DataType.CONST_PTR_FLOAT64,
+                is_restrict=True,
+            ),
+            value=llir.AddressOf(
+                operand=llir.ArrayAccess(
+                    array=llir.Var(name="H_val", type=llir.DataType.NO_TYPE),
+                    index=llir.Mul(
+                        llir.Var(name="pH0", type=llir.DataType.NO_TYPE),
+                        llir.Var(name="H1_size", type=llir.DataType.NO_TYPE),
+                    ),
+                ),
+            ),
+        ),
+    ]
+    source = [
+        _sparse_loop(
+            tail=[_typed_hoisted_pointer(), *typed_decoys, _string_dense_loop()]
+        )
+    ]
+
+    output = insert_sparse_prefetch(source, SPARSE_PREFETCH_CONTEXT)
+
+    loop = cast(llir.ForLoop, output[0])
+    assert [statement.code for statement in _prefetches(loop.body)] == [
+        _expected_prefetch("B_val", "B1_size"),
+        _expected_prefetch("E_val", "E1_size"),
+    ]
+
+
+def test_typed_hoisted_pointer_alone_does_not_create_prefetches() -> None:
+    """Legacy gating is preserved: augmentation needs an assignment match."""
+
+    loop = _sparse_loop(tail=[_typed_hoisted_pointer()])
+    output = insert_sparse_prefetch([loop], SPARSE_PREFETCH_CONTEXT)
+
+    rewritten = cast(llir.ForLoop, output[0])
+    assert _prefetches(rewritten.body) == []
+
+
 def test_sparse_gate_is_structural_and_uses_the_condition_right_hand_var() -> None:
     loop = _sparse_loop()
     loop.cond = llir.Add(llir.Literal(7), _var("named_rhs_end"))

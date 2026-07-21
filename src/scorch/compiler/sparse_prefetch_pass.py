@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Dict, List, NoReturn, Sequence, Tuple, cast
+from typing import Dict, List, NoReturn, Optional, Sequence, Tuple, cast
 
 from . import llir
 from .llir_traversal import (
@@ -324,6 +324,52 @@ def _assignment_dense_arrays(
     return dense_arrays
 
 
+_TYPED_HOISTED_POINTER_TYPES = (
+    llir.DataType.CONST_PTR_FLOAT32,
+    llir.DataType.CONST_PTR_FLOAT64,
+)
+
+
+def _typed_hoisted_dense_array(
+    statement: llir.VarInit,
+) -> Optional[_DenseArrayStride]:
+    """Match the typed D1 borrow exactly as the raw regex matches its text.
+
+    The declared name, referenced value array, and stride mirror the raw
+    pattern's groups; only the two float/double const-pointer spellings the
+    regex admits are recognized.
+    """
+    target = statement.var
+    if (
+        type(target) is not llir.Var
+        or target.type not in _TYPED_HOISTED_POINTER_TYPES
+        or target.is_restrict is not True
+        or type(target.name) is not str
+        or re.fullmatch(r"_\w+_val_ptr", target.name) is None
+    ):
+        return None
+    value = statement.value
+    if type(value) is not llir.AddressOf:
+        return None
+    operand = cast(llir.AddressOf, value).operand
+    if type(operand) is not llir.ArrayAccess:
+        return None
+    access = cast(llir.ArrayAccess, operand)
+    if type(access.array) is not llir.Var or type(access.index) is not llir.Mul:
+        return None
+    array_name = cast(llir.Var, access.array).name
+    index = cast(llir.Mul, access.index)
+    if (
+        type(array_name) is not str
+        or re.fullmatch(r"\w+_val", array_name) is None
+        or type(index.left) is not llir.Var
+        or type(index.right) is not llir.Var
+        or type(cast(llir.Var, index.right).name) is not str
+    ):
+        return None
+    return (array_name, cast(llir.Var, index.right).name)
+
+
 def _augment_from_hoisted_pointers(
     loop: llir.ForLoop,
     dense_arrays: List[_DenseArrayStride],
@@ -335,6 +381,11 @@ def _augment_from_hoisted_pointers(
         return
 
     for index, statement in enumerate(loop.body):
+        if type(statement) is llir.VarInit:
+            typed_match = _typed_hoisted_dense_array(cast(llir.VarInit, statement))
+            if typed_match is not None:
+                _append_dense_array(dense_arrays, typed_match)
+            continue
         if type(statement) is not llir.RawStmt:
             continue
         statement = cast(llir.RawStmt, statement)
