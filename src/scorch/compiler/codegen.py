@@ -166,6 +166,7 @@ class LLIRLowerer:
         cls,
         value: object,
         path: str = "root",
+        active: Optional[set[int]] = None,
     ) -> None:
         """Reject unknown node/container subclasses anywhere in one emission tree.
 
@@ -186,12 +187,38 @@ class LLIRLowerer:
                     "No C++ codegen implemented for LLIR node type: "
                     f"{type(value).__name__} at {path}"
                 )
-            for field, child in vars(value).items():
-                cls._validate_exact_codegen_tree(child, f"{path}.{field}")
+            if active is None:
+                active = set()
+            value_id = id(value)
+            if value_id in active:
+                raise CodegenError(f"{path} must be acyclic")
+            active.add(value_id)
+            try:
+                for field, child in vars(value).items():
+                    cls._validate_exact_codegen_tree(
+                        child,
+                        f"{path}.{field}",
+                        active,
+                    )
+            finally:
+                active.remove(value_id)
             return
         if type(value) is list or type(value) is tuple:
-            for index, child in enumerate(value):
-                cls._validate_exact_codegen_tree(child, f"{path}[{index}]")
+            if active is None:
+                active = set()
+            value_id = id(value)
+            if value_id in active:
+                raise CodegenError(f"{path} must be acyclic")
+            active.add(value_id)
+            try:
+                for index, child in enumerate(value):
+                    cls._validate_exact_codegen_tree(
+                        child,
+                        f"{path}[{index}]",
+                        active,
+                    )
+            finally:
+                active.remove(value_id)
             return
         if isinstance(value, (list, tuple)):
             raise CodegenError(

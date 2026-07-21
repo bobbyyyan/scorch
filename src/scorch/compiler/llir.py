@@ -1242,6 +1242,208 @@ def _validate_address_of_root_var(
         )
 
 
+def _validate_address_of_index(
+    expression: object,
+    *,
+    path: Tuple[str, ...],
+    active: set[int],
+) -> None:
+    """Validate one stored, acyclic assignment-index expression tree."""
+
+    expression_id = id(expression)
+    if expression_id in active:
+        raise _AddressOfValidationError(
+            "AddressOf.operand ArrayAccess index must be acyclic",
+            path,
+        )
+    active.add(expression_id)
+    try:
+        expression_type = type(expression)
+        if expression_type is Var:
+            variable = cast(Var, expression)
+            name = _address_of_instance_field(variable, "name")
+            if not _is_assignment_name(name, allow_member=True):
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Var name must be an "
+                    "identifier or member path",
+                    path + ("name",),
+                )
+            if type(_address_of_instance_field(variable, "type")) is not DataType:
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Var type must be a DataType",
+                    path + ("type",),
+                )
+            if type(_address_of_instance_field(variable, "is_ptr")) is not bool:
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Var is_ptr must be a bool",
+                    path + ("is_ptr",),
+                )
+            if type(_address_of_instance_field(variable, "is_restrict")) is not bool:
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Var is_restrict must be a "
+                    "bool",
+                    path + ("is_restrict",),
+                )
+            if _address_of_instance_field(variable, "tensor_access") is not None:
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Var cannot carry tensor "
+                    "access metadata",
+                    path + ("tensor_access",),
+                )
+            return
+
+        if expression_type is Literal:
+            literal = cast(Literal, expression)
+            if type(_address_of_instance_field(literal, "value")) is not int:
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Literal value must be an "
+                    "int",
+                    path + ("value",),
+                )
+            if type(_address_of_instance_field(literal, "data_type")) is not DataType:
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Literal data_type must be "
+                    "a DataType",
+                    path + ("data_type",),
+                )
+            return
+
+        if expression_type is Sizeof:
+            if (
+                type(_address_of_instance_field(expression, "data_type"))
+                is not DataType
+            ):
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Sizeof data_type must be "
+                    "a DataType",
+                    path + ("data_type",),
+                )
+            return
+
+        if expression_type in (BinOp, Add, Mul):
+            binary = cast(BinOp, expression)
+            op = _address_of_instance_field(binary, "op")
+            if (
+                type(op) is not str
+                or op not in ("+", "-", "*", "/", "%")
+                or (expression_type is Add and op != "+")
+                or (expression_type is Mul and op != "*")
+            ):
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index BinOp op must be a "
+                    "supported arithmetic operator",
+                    path + ("op",),
+                )
+            _validate_address_of_index(
+                _address_of_instance_field(binary, "left"),
+                path=path + ("left",),
+                active=active,
+            )
+            _validate_address_of_index(
+                _address_of_instance_field(binary, "right"),
+                path=path + ("right",),
+                active=active,
+            )
+            return
+
+        if expression_type is UnaryOp:
+            unary = cast(UnaryOp, expression)
+            op = _address_of_instance_field(unary, "op")
+            if type(op) is not str or op not in ("+", "-"):
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index UnaryOp op must be '+' or "
+                    "'-'",
+                    path + ("op",),
+                )
+            _validate_address_of_index(
+                _address_of_instance_field(unary, "operand"),
+                path=path + ("operand",),
+                active=active,
+            )
+            return
+
+        if expression_type is Cast:
+            typed_cast = cast(Cast, expression)
+            if (
+                type(_address_of_instance_field(typed_cast, "data_type"))
+                is not DataType
+            ):
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index Cast data_type must be a "
+                    "DataType",
+                    path + ("data_type",),
+                )
+            _validate_address_of_index(
+                _address_of_instance_field(typed_cast, "expr"),
+                path=path + ("expr",),
+                active=active,
+            )
+            return
+
+        if expression_type is FunctionCall:
+            call = cast(FunctionCall, expression)
+            if not _is_assignment_name(
+                _address_of_instance_field(call, "name"),
+                allow_member=True,
+            ):
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index FunctionCall name must be "
+                    "an identifier or member path",
+                    path + ("name",),
+                )
+            arguments = _address_of_instance_field(call, "args")
+            if type(arguments) is not tuple:
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index FunctionCall args must be "
+                    "a tuple",
+                    path + ("args",),
+                )
+            for argument_index, argument in enumerate(arguments):
+                _validate_address_of_index(
+                    argument,
+                    path=path + ("args", f"[{argument_index}]"),
+                    active=active,
+                )
+            return
+
+        if expression_type is ArrayAccess:
+            access = cast(ArrayAccess, expression)
+            metadata = _address_of_instance_field(access, "tensor_access")
+            _validate_address_of_metadata(
+                metadata,
+                path=path + ("tensor_access",),
+            )
+            if (
+                metadata is not None
+                and _address_of_instance_field(metadata, "role")
+                is not TensorAccessRole.INPUT_READ
+            ):
+                raise _AddressOfValidationError(
+                    "AddressOf.operand ArrayAccess index metadata must have the "
+                    "INPUT_READ role",
+                    path + ("tensor_access", "role"),
+                )
+            _validate_address_of_index(
+                _address_of_instance_field(access, "array"),
+                path=path + ("array",),
+                active=active,
+            )
+            _validate_address_of_index(
+                _address_of_instance_field(access, "index"),
+                path=path + ("index",),
+                active=active,
+            )
+            return
+
+        raise _AddressOfValidationError(
+            "AddressOf.operand ArrayAccess index contains an unsupported LLIR "
+            "expression",
+            path,
+        )
+    finally:
+        active.remove(expression_id)
+
+
 def _validate_address_of_operand(operand: object) -> None:
     """Validate the exact syntactic lvalue subset admitted after unary ``&``."""
 
@@ -1252,7 +1454,14 @@ def _validate_address_of_operand(operand: object) -> None:
     if type(operand) is MemberAccess:
         member_access = cast(MemberAccess, operand)
         member_path: Tuple[str, ...] = ()
+        visited_members: set[int] = set()
         while type(member_access) is MemberAccess:
+            if id(member_access) in visited_members:
+                raise _AddressOfValidationError(
+                    "AddressOf.operand MemberAccess chain must be acyclic",
+                    member_path,
+                )
+            visited_members.add(id(member_access))
             member = _address_of_instance_field(member_access, "member")
             if type(member) is not str or not member.isidentifier():
                 raise _AddressOfValidationError(
@@ -1279,13 +1488,7 @@ def _validate_address_of_operand(operand: object) -> None:
             path=("array",),
         )
         index = _address_of_instance_field(access, "index")
-        try:
-            _validate_assignment_index(index)
-        except (AttributeError, TypeError) as error:
-            raise _AddressOfValidationError(
-                f"AddressOf.operand ArrayAccess index is invalid: {error}",
-                ("index",),
-            ) from error
+        _validate_address_of_index(index, path=("index",), active=set())
         _validate_address_of_metadata(
             _address_of_instance_field(access, "tensor_access"),
             path=("tensor_access",),

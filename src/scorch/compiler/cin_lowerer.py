@@ -3135,7 +3135,9 @@ class CINLowerer:
         """Collect output array roots (e.g., D_values, D0_crd) from Assign stmts.
 
         The first-seen assignment-target array ``Var`` is retained per name so
-        preallocation statements can reuse the tree's own declared metadata.
+        preallocation statements can preserve the reference metadata available
+        in this subtree.  Legacy result references may honestly carry NO_TYPE;
+        their declarations are assembled outside this loop tree.
         """
         import re
 
@@ -3157,6 +3159,48 @@ class CINLowerer:
                     cls._collect_output_arrays(stmt.then_body, output_arrays)
                 if stmt.else_body:
                     cls._collect_output_arrays(stmt.else_body, output_arrays)
+
+    @staticmethod
+    def _coo_preallocation_receiver(array_var: llir.Var) -> llir.Var:
+        """Clone one whole-object receiver admitted by the COO resize seam."""
+
+        if type(array_var) is not llir.Var:
+            raise TypeError(
+                "COO preallocation receiver must be an exact metadata-free "
+                "std::vector Var"
+            )
+        fields = vars(array_var)
+        required_fields = {
+            "name",
+            "type",
+            "is_ptr",
+            "is_restrict",
+            "tensor_access",
+        }
+        array_name = fields.get("name")
+        array_type = fields.get("type")
+        is_vector = type(array_type) is llir.DataType and array_type.value.startswith(
+            "std::vector<"
+        )
+        if (
+            not required_fields.issubset(fields)
+            or type(array_name) is not str
+            or not array_name.isidentifier()
+            or not is_vector
+            or fields["is_ptr"] is not False
+            or fields["is_restrict"] is not False
+            or fields["tensor_access"] is not None
+        ):
+            raise TypeError(
+                "COO preallocation receiver must be an exact metadata-free "
+                "std::vector Var"
+            )
+        return llir.Var(
+            name=cast(str, array_name),
+            type=cast(llir.DataType, array_type),
+            is_ptr=False,
+            is_restrict=False,
+        )
 
     @classmethod
     def _replace_output_pos_with_input_pos(
@@ -3338,15 +3382,16 @@ class CINLowerer:
                 continue
 
             # Extract the end bound from the loop condition
-            outer_end_var = None
+            outer_end_bound: Optional[llir.Var] = None
             if isinstance(stmt.cond, llir.BinOp) and isinstance(
                 stmt.cond.right, llir.Var
             ):
-                outer_end_var = stmt.cond.right.name
+                outer_end_bound = stmt.cond.right
 
-            if outer_end_var is None:
+            if outer_end_bound is None:
                 result.append(stmt)
                 continue
+            outer_end_var = outer_end_bound.name
 
             # Build the inner body: everything except the COO advance
             inner_body = [s for s in body if s is not coo_update]
@@ -3532,30 +3577,60 @@ class CINLowerer:
             )
             self._apply_parallel_policy(group_loop, body=group_body)
 
-            # Pre-allocate output arrays for thread-safe parallel writes.
-            # Each receiver is a fresh Var carrying the first-seen declared
-            # metadata of the assignment-target root it preallocates, without
-            # scalar tensor-access provenance: it names the whole array
-            # object, not one logical element write.
-            prealloc_stmts: List[llir.Stmt] = []
-            for array_var in output_arrays.values():
-                prealloc_stmts.append(
+            # Build pre-allocation only on routes that emit it.  The live
+            # known-NNZ route uses pointer-backed Torch storage and discards
+            # this historical resize block, so it must not be validated as if
+            # it were a std::vector receiver.
+            def preallocation_statements() -> List[llir.Stmt]:
+                bound_fields = vars(outer_end_bound)
+                integral_types = {
+                    llir.DataType.INT,
+                    llir.DataType.UINT8,
+                    llir.DataType.INT8,
+                    llir.DataType.UINT16,
+                    llir.DataType.INT16,
+                    llir.DataType.UINT32,
+                    llir.DataType.INT32,
+                    llir.DataType.UINT64,
+                    llir.DataType.INT64,
+                    llir.DataType.SIZE_T,
+                }
+                if (
+                    type(outer_end_bound) is not llir.Var
+                    or not {
+                        "name",
+                        "type",
+                        "is_ptr",
+                        "is_restrict",
+                        "tensor_access",
+                    }.issubset(bound_fields)
+                    or type(bound_fields["name"]) is not str
+                    or not bound_fields["name"].isidentifier()
+                    or type(bound_fields["type"]) is not llir.DataType
+                    or bound_fields["type"] not in integral_types
+                    or bound_fields["is_ptr"] is not False
+                    or bound_fields["is_restrict"] is not False
+                    or bound_fields["tensor_access"] is not None
+                ):
+                    raise TypeError(
+                        "COO preallocation extent must be an exact metadata-free "
+                        "integral Var"
+                    )
+                return [
                     llir.MemberCallStmt(
-                        base=llir.Var(
-                            name=array_var.name,
-                            type=array_var.type,
-                            is_ptr=array_var.is_ptr,
-                            is_restrict=array_var.is_restrict,
-                        ),
+                        base=CINLowerer._coo_preallocation_receiver(array_var),
                         member="resize",
                         args=(
                             llir.Var(
-                                name=outer_end_var,
-                                type=llir.DataType.INT64,
+                                name=outer_end_bound.name,
+                                type=outer_end_bound.type,
+                                is_ptr=outer_end_bound.is_ptr,
+                                is_restrict=outer_end_bound.is_restrict,
                             ),
                         ),
                     )
-                )
+                    for array_var in output_arrays.values()
+                ]
 
             # ── Optimization: flat parallel loop when each nonzero is
             # independent (scalar accumulator mode). Skips the serial
@@ -3668,12 +3743,12 @@ class CINLowerer:
                     )
                 ]
                 if not self._known_nnz_var:
-                    result.extend(prealloc_stmts)
+                    result.extend(preallocation_statements())
                 result.append(flat_loop)
                 transformed = True
             else:
                 result.extend(pre_scan_stmts)
-                result.extend(prealloc_stmts)
+                result.extend(preallocation_statements())
                 result.append(group_loop)
                 transformed = True
 
