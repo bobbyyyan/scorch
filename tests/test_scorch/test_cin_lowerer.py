@@ -3081,6 +3081,45 @@ def test_canonical_coo_workspace_types_fail_closed_outside_supported_dimensions(
 
 
 @pytest.mark.parametrize(
+    ("element_spelling", "enum_suffix"),
+    (
+        pytest.param("float", "FLOAT32", id="float"),
+        pytest.param("double", "FLOAT64", id="double"),
+        pytest.param("int", "INT", id="int"),
+        pytest.param("int32_t", "INT32", id="int32"),
+        pytest.param("int64_t", "INT64", id="int64"),
+        pytest.param("long long", "LONG_LONG", id="long-long"),
+        pytest.param("int8_t", "INT8", id="int8"),
+        pytest.param("uint8_t", "UINT8", id="uint8"),
+    ),
+)
+def test_linked_list_workspace_pool_types_cover_every_recognized_spelling(
+    element_spelling: str,
+    enum_suffix: str,
+) -> None:
+    expected = llir.DataType[f"STD_VECTOR_LINKED_LIST_WORKSPACE_1D_{enum_suffix}"]
+
+    actual = llir.DataType.linked_list_workspace_pool_type(element_spelling)
+
+    assert actual is expected
+    assert actual.value == (
+        f"std::vector<linked_list_workspace_1d<{element_spelling}>>"
+    )
+
+
+@pytest.mark.parametrize(
+    "element_spelling",
+    ("half", "float; }", "unsigned", ""),
+    ids=("unsupported", "free-form", "unmapped", "empty"),
+)
+def test_linked_list_workspace_pool_types_fail_closed_on_free_form_spellings(
+    element_spelling: str,
+) -> None:
+    with pytest.raises(ValueError, match="is not a valid DataType"):
+        llir.DataType.linked_list_workspace_pool_type(element_spelling)
+
+
+@pytest.mark.parametrize(
     ("level_types", "leaf"),
     (
         pytest.param(

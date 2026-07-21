@@ -144,6 +144,33 @@ class DataType(Enum):
     STD_VECTOR_2D_TORCH_TENSOR = "std::vector<std::vector<torch::Tensor>>"
     ARRAY_INT = "int[]"
 
+    # Owned per-worker sparse workspace pools, one member per recognized
+    # production scalar spelling of the pooled linked-list workspace.
+    STD_VECTOR_LINKED_LIST_WORKSPACE_1D_FLOAT32 = (
+        "std::vector<linked_list_workspace_1d<float>>"
+    )
+    STD_VECTOR_LINKED_LIST_WORKSPACE_1D_FLOAT64 = (
+        "std::vector<linked_list_workspace_1d<double>>"
+    )
+    STD_VECTOR_LINKED_LIST_WORKSPACE_1D_INT = (
+        "std::vector<linked_list_workspace_1d<int>>"
+    )
+    STD_VECTOR_LINKED_LIST_WORKSPACE_1D_INT32 = (
+        "std::vector<linked_list_workspace_1d<int32_t>>"
+    )
+    STD_VECTOR_LINKED_LIST_WORKSPACE_1D_INT64 = (
+        "std::vector<linked_list_workspace_1d<int64_t>>"
+    )
+    STD_VECTOR_LINKED_LIST_WORKSPACE_1D_LONG_LONG = (
+        "std::vector<linked_list_workspace_1d<long long>>"
+    )
+    STD_VECTOR_LINKED_LIST_WORKSPACE_1D_INT8 = (
+        "std::vector<linked_list_workspace_1d<int8_t>>"
+    )
+    STD_VECTOR_LINKED_LIST_WORKSPACE_1D_UINT8 = (
+        "std::vector<linked_list_workspace_1d<uint8_t>>"
+    )
+
     # Pointer types
     PTR_INT = "int*"
     PTR_INT_32 = "int32_t*"
@@ -180,6 +207,16 @@ class DataType(Enum):
         A custom vector type for C++.
         """
         return DataType(f"coo_workspace<{dtype.value}>")
+
+    @classmethod
+    def linked_list_workspace_pool_type(cls, element_spelling: str) -> DataType:
+        """The owned per-worker linked-list workspace pool for one scalar spelling.
+
+        Enum lookup by value fails closed with :class:`ValueError` for any
+        spelling without a dedicated pool member, so free-form legacy C type
+        text cannot silently become a typed declaration.
+        """
+        return DataType(f"std::vector<linked_list_workspace_1d<{element_spelling}>>")
 
     @classmethod
     def coo_workspace_type_with_dim(cls, dtype: DataType, dim: int) -> DataType:
