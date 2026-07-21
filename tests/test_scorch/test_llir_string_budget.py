@@ -128,7 +128,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert constructor_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 149,
-        "compressed_where_openmp_pass.py": 16,
+        "compressed_where_openmp_pass.py": 18,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -140,11 +140,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 430
+    assert sum(constructor_counts.values()) == 432
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 141,
-        "compressed_where_openmp_pass.py": 16,
+        "compressed_where_openmp_pass.py": 18,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 35,
@@ -156,7 +156,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 420
+    assert sum(unclassified_counts.values()) == 422
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 1,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -321,11 +321,12 @@ def test_torch_abi_expression_producer_budget_is_explicit() -> None:
     }
     assert member_call_constructors == {
         "cin_lowerer.py": 1,
+        "compressed_where_openmp_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 2,
         "torch_cpp_abi.py": 1,
     }
-    assert sum(member_call_constructors.values()) == 5
+    assert sum(member_call_constructors.values()) == 6
 
 
 def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
@@ -618,14 +619,14 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
 
     assert counts == {
         "cin_lowerer.py": 7,
-        "compressed_where_openmp_pass.py": 3,
+        "compressed_where_openmp_pass.py": 2,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 14
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 13
+    assert sum(counts.values()) == 13
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 12
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -674,6 +675,31 @@ def test_workspace_clear_mutations_are_structured() -> None:
 
     for call in _llir_constructor_calls(compressed_path, "RawStmt"):
         assert ".clear" not in _static_string_fragments(call)
+
+
+def test_workspace_view_borrow_is_structured() -> None:
+    """Lock the typed W1 worker-view acquisition template."""
+
+    compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
+    compressed_source = compressed_path.read_text()
+    view_helper = compressed_source.split("def _workspace_view_statement", 1)[1].split(
+        "def _workspace_clear_statement", 1
+    )[0]
+
+    assert "llir.RawStmt(" not in view_helper
+    assert view_helper.count("llir.VarInit(") == 1
+    assert view_helper.count("llir.MemberCall(") == 1
+    assert view_helper.count("llir.ArrayAccess(") == 1
+    assert view_helper.count("llir.Cast(") == 1
+    assert view_helper.count("llir.FunctionCall(") == 1
+    assert 'member="make_view"' in view_helper
+    assert 'name="omp_get_thread_num"' in view_helper
+    assert "llir.DataType.AUTO" in view_helper
+    assert "llir.DataType.NO_TYPE" in view_helper
+    assert "llir.DataType.SIZE_T" in view_helper
+
+    for call in _llir_constructor_calls(compressed_path, "RawStmt"):
+        assert "make_view" not in _static_string_fragments(call)
 
 
 def test_dense_workspace_zero_fill_is_structured() -> None:

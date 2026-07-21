@@ -3968,6 +3968,83 @@ def test_production_ds_float64_locks_typed_value_source() -> None:
     )
 
 
+def _pre_parallel_view_loops(value: object) -> List[llir.ForLoop]:
+    loops: List[llir.ForLoop] = []
+    if type(value) is llir.ForLoop:
+        loop = cast(llir.ForLoop, value)
+        if loop.pre_parallel_body:
+            loops.append(loop)
+    if isinstance(value, llir.Node):
+        for child in vars(value).values():
+            loops.extend(_pre_parallel_view_loops(child))
+    elif type(value) is list or type(value) is tuple:
+        for child in value:
+            loops.extend(_pre_parallel_view_loops(child))
+    return loops
+
+
+def test_production_workspace_view_borrow_is_structured_typed_and_byte_exact() -> None:
+    first = _lower_production_ds(torch.float32)
+    second = _lower_production_ds(torch.float32)
+
+    first_loops = _pre_parallel_view_loops(first)
+    second_loops = _pre_parallel_view_loops(second)
+    assert len(first_loops) == 2
+    assert len(second_loops) == 2
+
+    rendered: List[str] = []
+    for loop in first_loops:
+        assert loop.pre_parallel_body is not None
+        (statement,) = loop.pre_parallel_body
+        assert type(statement) is llir.VarInit
+        initializer = cast(llir.VarInit, statement)
+        assert type(initializer.var) is llir.Var
+        assert initializer.var.name == "wksp"
+        assert initializer.var.type is llir.DataType.AUTO
+        assert initializer.var.is_ptr is False
+        assert initializer.var.is_restrict is False
+        assert initializer.var.tensor_access is None
+        assert initializer.op == "="
+        assert initializer.cast is False
+        assert type(initializer.value) is llir.MemberCall
+        member_call = cast(llir.MemberCall, initializer.value)
+        assert member_call.member == "make_view"
+        assert member_call.template_args == ()
+        assert member_call.args == ()
+        assert type(member_call.base) is llir.ArrayAccess
+        access = cast(llir.ArrayAccess, member_call.base)
+        assert access.tensor_access is None
+        assert type(access.array) is llir.Var
+        pool = cast(llir.Var, access.array)
+        assert pool.name == "wksp_pool"
+        assert pool.type is llir.DataType.NO_TYPE
+        assert pool.is_ptr is False
+        assert pool.is_restrict is False
+        assert pool.tensor_access is None
+        assert type(access.index) is llir.Cast
+        index = cast(llir.Cast, access.index)
+        assert index.data_type is llir.DataType.SIZE_T
+        assert type(index.expr) is llir.FunctionCall
+        worker = cast(llir.FunctionCall, index.expr)
+        assert worker.name == "omp_get_thread_num"
+        assert tuple(worker.args) == ()
+        rendered.append(LLIRLowerer().lower_llir(statement))
+
+    assert rendered == [
+        "auto wksp = wksp_pool[(size_t)omp_get_thread_num()].make_view();",
+        "auto wksp = wksp_pool[(size_t)omp_get_thread_num()].make_view();",
+    ]
+
+    first_ids = {
+        id(loop.pre_parallel_body[0]) for loop in first_loops if loop.pre_parallel_body
+    }
+    second_ids = {
+        id(loop.pre_parallel_body[0]) for loop in second_loops if loop.pre_parallel_body
+    }
+    assert len(first_ids) == 2
+    assert first_ids.isdisjoint(second_ids)
+
+
 @pytest.mark.parametrize(
     ("dtype", "scalar_type", "pointer_type", "torch_dtype_name", "ctype"),
     [
