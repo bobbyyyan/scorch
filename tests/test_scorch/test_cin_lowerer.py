@@ -20,7 +20,11 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer, _torch_cpp_kernel_abi
 from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
-from scorch.compiler.diagnostics import CompilerInvariantError, UnsupportedFeature
+from scorch.compiler.diagnostics import (
+    CodegenError,
+    CompilerInvariantError,
+    UnsupportedFeature,
+)
 from scorch.compiler.iterator import (  # type: ignore[import-untyped]
     ModeIterator,
     collect_mode_position_arrays,
@@ -6487,6 +6491,239 @@ def test_sparse_workspace_pool_policy_is_typed_on_the_atomic_path() -> None:
         "float* __restrict__ wksp = wksp_pool_owner.get() + "
         "(size_t)omp_get_thread_num() * (size_t)B1_size;"
     ) in cpp
+
+
+def _expected_atomic_nnz_init() -> llir.VarInit:
+    return llir.VarInit(
+        var=llir.Var(name="_nnz", type=llir.DataType.INT),
+        value=llir.ArrayAccess(
+            array=llir.Var(name="A1_pos", type=llir.DataType.NO_TYPE),
+            index=llir.Var(name="A0_size", type=llir.DataType.INT),
+        ),
+    )
+
+
+def _expected_atomic_chunk_init() -> llir.VarInit:
+    return llir.VarInit(
+        var=llir.Var(name="_chunk", type=llir.DataType.INT),
+        value=llir.FunctionCall(
+            "std::max",
+            [
+                llir.Literal(16, llir.DataType.INT),
+                llir.FunctionCall(
+                    "std::min",
+                    [
+                        llir.Literal(256, llir.DataType.INT),
+                        llir.BinOp(
+                            "/",
+                            llir.Var(name="_nnz", type=llir.DataType.INT),
+                            llir.Mul(
+                                llir.FunctionCall("omp_get_num_threads"),
+                                llir.Literal(128, llir.DataType.INT),
+                            ),
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+
+def test_atomic_work_stealing_prelude_is_typed() -> None:
+    """The C12/C13 prelude owns typed nnz/chunk initializations."""
+
+    lowered = CINLowerer().lower_IndexStmt(_dense_workspace_pool_cin("ds"))
+    loop = _pool_owner_loop(lowered)
+    assert getattr(loop, "_use_atomic_scheduling", False) is True
+    assert loop.pre_parallel_body is not None
+    nnz_init, chunk_init = loop.pre_parallel_body[-2:]
+
+    assert type(nnz_init) is llir.VarInit
+    assert type(chunk_init) is llir.VarInit
+    nnz_init = cast(llir.VarInit, nnz_init)
+    chunk_init = cast(llir.VarInit, chunk_init)
+    assert nnz_init == _expected_atomic_nnz_init()
+    assert chunk_init == _expected_atomic_chunk_init()
+    assert type(nnz_init.value) is llir.ArrayAccess
+    assert type(chunk_init.value) is llir.FunctionCall
+    assert cast(llir.FunctionCall, chunk_init.value).template_args == ()
+
+    # The bound reference is a fresh typed copy of the loop-condition
+    # variable, and the chunk's nnz read is a fresh reference rather than an
+    # alias of the declaration target.
+    access = cast(llir.ArrayAccess, nnz_init.value)
+    loop_bound_reference = cast(llir.BinOp, loop.cond).right
+    assert access.index == loop_bound_reference
+    assert access.index is not loop_bound_reference
+    clamp = cast(llir.FunctionCall, chunk_init.value)
+    inner_clamp = cast(llir.FunctionCall, clamp.args[1])
+    division = cast(llir.BinOp, inner_clamp.args[1])
+    assert division.left == nnz_init.var
+    assert division.left is not nnz_init.var
+
+    assert LLIRLowerer().lower_llir(nnz_init) == "int _nnz = A1_pos[A0_size];"
+    assert LLIRLowerer().lower_llir(chunk_init) == (
+        "int _chunk = std::max(16, std::min(256, "
+        "_nnz / (omp_get_num_threads() * 128)));"
+    )
+
+    cpp = LLIRLowerer().lower_llir(lowered)
+    assert "int _nnz = A1_pos[A0_size];" in cpp
+    assert (
+        "int _chunk = std::max(16, std::min(256, "
+        "_nnz / (omp_get_num_threads() * 128)));"
+    ) in cpp
+    assert cpp.index("#pragma omp parallel") < cpp.index("int _nnz")
+    assert cpp.index("int _nnz") < cpp.index("int _chunk")
+    assert cpp.index("int _chunk") < cpp.index("while (true) {")
+    assert "_next_row.fetch_add(_chunk, std::memory_order_relaxed)" in cpp
+
+    def is_raw(stmt: llir.Stmt) -> bool:
+        return type(stmt) is llir.RawStmt
+
+    for raw in _collect_matching_statements(lowered, is_raw):
+        code = cast(llir.RawStmt, raw).code
+        assert "int _nnz" not in code
+        assert "_chunk" not in code
+
+    rewriter_context = LLIRTraversalContext(
+        stage="atomic prelude test",
+        pass_name="detach",
+    )
+    for statement in (nnz_init, chunk_init):
+        LLIRWalker(rewriter_context).walk(statement)
+        detached = LLIRRewriter(rewriter_context).rewrite(statement)
+        assert detached == statement
+        assert detached is not statement
+        assert cast(llir.VarInit, detached).var is not statement.var
+        assert cast(llir.VarInit, detached).value is not statement.value
+
+
+def test_atomic_prelude_rejects_forged_call_template_state() -> None:
+    """A forged chunk clamp cannot escape codegen as an AttributeError."""
+
+    statements = CINLowerer._atomic_work_stealing_prelude(
+        "A1_pos",
+        llir.Var(name="A0_size", type=llir.DataType.INT),
+    )
+    chunk_init = cast(llir.VarInit, statements[1])
+    clamp = cast(llir.FunctionCall, chunk_init.value)
+
+    object.__setattr__(clamp, "template_args", ("float",))
+    with pytest.raises(CodegenError, match="template_args"):
+        LLIRLowerer().lower_llir(chunk_init)
+
+    del clamp.__dict__["template_args"]
+    with pytest.raises(CodegenError, match="template_args"):
+        LLIRLowerer().lower_llir(chunk_init)
+
+
+def _rank2_dense_conversion_cin() -> ForAll:
+    row = IndexVar("row")
+    column = IndexVar("column")
+    result = TensorVar("Result", fmt="oo")
+    source = TensorVar("Source", fmt="dd")
+    result[row, column] = source[row, column]
+    return ForAll(row, ForAll(column, result._assignment))
+
+
+def _expected_reserve_hint_init() -> llir.VarInit:
+    return llir.VarInit(
+        var=llir.Var(name="_dynamic_reserve", type=llir.DataType.INT64),
+        value=llir.FunctionCall(
+            name="std::min",
+            template_args=(llir.DataType.INT64,),
+            args=[
+                llir.FunctionCall(
+                    name="scorch_native::checked_product",
+                    args=[
+                        llir.Var(
+                            name="result_shape",
+                            type=llir.DataType.STD_VECTOR_INT,
+                        ),
+                        llir.Literal("evaluate", llir.DataType.STRING),
+                        llir.Literal("result_shape", llir.DataType.STRING),
+                        llir.Literal(True, llir.DataType.BOOL),
+                    ],
+                ),
+                llir.Literal(2048, llir.DataType.INT64),
+            ],
+        ),
+    )
+
+
+def test_reserve_hint_declaration_is_typed() -> None:
+    """The C7 dynamic reserve hint owns a typed capped checked-product call."""
+
+    lowered = CINLowerer().lower_IndexStmt(_rank2_dense_conversion_cin())
+
+    def is_reserve_init(stmt: llir.Stmt) -> bool:
+        return (
+            type(stmt) is llir.VarInit
+            and type(cast(llir.VarInit, stmt).var) is llir.Var
+            and cast(llir.VarInit, stmt).var.name == "_dynamic_reserve"
+        )
+
+    initializers = _collect_matching_statements(lowered, is_reserve_init)
+    assert len(initializers) == 1
+    reserve_init = cast(llir.VarInit, initializers[0])
+    assert reserve_init == _expected_reserve_hint_init()
+
+    value = cast(llir.FunctionCall, reserve_init.value)
+    assert type(value) is llir.FunctionCall
+    assert value.template_args == (llir.DataType.INT64,)
+    product = cast(llir.FunctionCall, value.args[0])
+    assert type(product) is llir.FunctionCall
+    assert product.template_args == ()
+
+    rendered = LLIRLowerer().lower_llir(reserve_init)
+    assert rendered == (
+        "int64_t _dynamic_reserve = std::min<int64_t>("
+        "scorch_native::checked_product("
+        'result_shape, "evaluate", "result_shape", true), 2048);'
+    )
+
+    cpp = LLIRLowerer().lower_llir(lowered)
+    assert rendered in cpp
+    assert "Result0_crd.reserve(_dynamic_reserve)" in cpp
+    assert "Result1_crd.reserve(_dynamic_reserve)" in cpp
+    assert "Result_values.reserve(_dynamic_reserve)" in cpp
+
+    def is_raw(stmt: llir.Stmt) -> bool:
+        return type(stmt) is llir.RawStmt
+
+    for raw in _collect_matching_statements(lowered, is_raw):
+        code = cast(llir.RawStmt, raw).code
+        assert "checked_product" not in code
+        assert "_dynamic_reserve" not in code
+
+    rewriter_context = LLIRTraversalContext(
+        stage="reserve hint test",
+        pass_name="detach",
+    )
+    LLIRWalker(rewriter_context).walk(reserve_init)
+    detached = LLIRRewriter(rewriter_context).rewrite(reserve_init)
+    assert detached == reserve_init
+    assert detached is not reserve_init
+    assert cast(llir.VarInit, detached).var is not reserve_init.var
+    assert cast(llir.VarInit, detached).value is not reserve_init.value
+    assert cast(
+        llir.FunctionCall, cast(llir.VarInit, detached).value
+    ).template_args == (llir.DataType.INT64,)
+
+
+def test_reserve_hint_rejects_forged_diagnostic_literal_state() -> None:
+    """A forged diagnostic string literal fails closed at emission."""
+
+    reserve_init = _expected_reserve_hint_init()
+    product = cast(
+        llir.FunctionCall, cast(llir.FunctionCall, reserve_init.value).args[0]
+    )
+    diagnostic = cast(llir.Literal, product.args[1])
+    object.__setattr__(diagnostic, "value", "\x01evaluate")
+
+    with pytest.raises(CodegenError, match="unsupported character"):
+        LLIRLowerer().lower_llir(reserve_init)
 
 
 def test_workspace_pool_specs_build_fresh_policy_values_per_spec() -> None:

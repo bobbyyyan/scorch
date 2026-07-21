@@ -92,6 +92,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     known_indirect_names = {
         "accumulator_name",
         "actual_size",
+        "bound.name",
         "expr.name.replace(old, new)",
         "f'{prefix}{level}'",
         "invariant_name",
@@ -101,7 +102,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "outer_end_bound.name",
         "outer_end_var",
         "prefix_extent",
+        "reserve_hint_var",
         "size_var",
+        "sparse_pos",
         "sparse_values_tensor",
         "wname",
         "zero_value",
@@ -127,7 +130,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
 
     assert constructor_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 160,
+        "cin_lowerer.py": 167,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -140,10 +143,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 457
+    assert sum(constructor_counts.values()) == 464
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 152,
+        "cin_lowerer.py": 159,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 3,
         "dynamic_vector_access_pass.py": 1,
@@ -156,17 +159,22 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "single_iteration_loop_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 447
+    assert sum(unclassified_counts.values()) == 454
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
+        ("cin_lowerer.py", "bound.name"): 1,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
         ("cin_lowerer.py", "outer_end_bound.name"): 1,
         ("cin_lowerer.py", "outer_end_var"): 3,
+        ("cin_lowerer.py", "reserve_hint_var"): 1,
         ("cin_lowerer.py", "size_var"): 2,
+        ("cin_lowerer.py", "sparse_pos"): 2,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
         ("cin_lowerer.py", "wname"): 4,
+        ("compressed_where_openmp_pass.py", "bound.name"): 3,
         ("compressed_where_openmp_pass.py", "loop_bound"): 1,
         ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
+        ("compressed_where_openmp_pass.py", "sparse_pos"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
         ("llir_traversal.py", "node.name"): 1,
         ("loop_invariant_factor_pass.py", "accumulator_name"): 1,
@@ -176,7 +184,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
     }
-    assert sum(known_indirect.values()) == 26
+    assert sum(known_indirect.values()) == 34
 
     assert totals == {
         "subscript": 9,
@@ -618,15 +626,14 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
     counts += Counter()
 
     assert counts == {
-        "cin_lowerer.py": 3,
         "compressed_where_openmp_pass.py": 2,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 9
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 8
+    assert sum(counts.values()) == 6
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 5
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -851,6 +858,133 @@ def test_all_coo_preallocation_is_structured() -> None:
     for path in sorted(_COMPILER_ROOT.glob("*.py")):
         for call in _llir_constructor_calls(path, "RawStmt"):
             assert ".resize" not in _static_string_fragments(call)
+
+
+def test_reserve_hint_declaration_is_structured() -> None:
+    """Lock the C7 typed capped checked-product reserve-hint template."""
+
+    lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
+
+    for call in _llir_constructor_calls(lowerer_path, "RawStmt"):
+        fragments = _static_string_fragments(call)
+        assert "checked_product" not in fragments
+        assert "std::min<" not in fragments
+
+    initializers: list[dict[str, ast.expr]] = []
+    for call in _llir_constructor_calls(lowerer_path, "VarInit"):
+        fields = {
+            keyword.arg: keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        target = fields.get("var")
+        if target is None or not _is_llir_constructor(target, "Var"):
+            continue
+        assert isinstance(target, ast.Call)
+        name_expression = _var_name_expression(target)
+        if (
+            name_expression is not None
+            and ast.unparse(name_expression) == "reserve_hint_var"
+        ):
+            assert ast.unparse(target.keywords[1].value) == "llir.DataType.INT64"
+            initializers.append(fields)
+    assert len(initializers) == 1
+
+    value = initializers[0]["value"]
+    assert _is_llir_constructor(value, "FunctionCall")
+    assert isinstance(value, ast.Call)
+    value_fields = {
+        keyword.arg: keyword.value
+        for keyword in value.keywords
+        if keyword.arg is not None
+    }
+    assert ast.unparse(value_fields["name"]) == "'std::min'"
+    assert ast.unparse(value_fields["template_args"]) == "(llir.DataType.INT64,)"
+    outer_args = value_fields["args"]
+    assert isinstance(outer_args, ast.List)
+    assert len(outer_args.elts) == 2
+    assert ast.unparse(outer_args.elts[1]) == (
+        "llir.Literal(2048, llir.DataType.INT64)"
+    )
+
+    product = outer_args.elts[0]
+    assert _is_llir_constructor(product, "FunctionCall")
+    assert isinstance(product, ast.Call)
+    product_fields = {
+        keyword.arg: keyword.value
+        for keyword in product.keywords
+        if keyword.arg is not None
+    }
+    assert ast.unparse(product_fields["name"]) == "'scorch_native::checked_product'"
+    assert "template_args" not in product_fields
+    product_args = product_fields["args"]
+    assert isinstance(product_args, ast.List)
+    assert [ast.unparse(argument) for argument in product_args.elts] == [
+        "llir.Var(name='result_shape', type=llir.DataType.STD_VECTOR_INT)",
+        "llir.Literal('evaluate', llir.DataType.STRING)",
+        "llir.Literal('result_shape', llir.DataType.STRING)",
+        "llir.Literal(True, llir.DataType.BOOL)",
+    ]
+
+
+def test_atomic_work_stealing_prelude_is_structured() -> None:
+    """Lock the C12/C13 typed templates and their structural-piece ownership."""
+
+    lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
+    lowerer_source = lowerer_path.read_text()
+    lowerer_tree = ast.parse(lowerer_source)
+
+    for call in _llir_constructor_calls(lowerer_path, "RawStmt"):
+        fragments = _static_string_fragments(call)
+        assert "int _nnz" not in fragments
+        assert "_chunk" not in fragments
+        assert "omp_get_num_threads" not in fragments
+
+    helpers = [
+        node
+        for node in ast.walk(lowerer_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_atomic_work_stealing_prelude"
+    ]
+    assert len(helpers) == 1
+    helper = helpers[0]
+
+    def helper_calls(name: str) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(helper)
+            if isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+                or isinstance(node.func, ast.Name)
+                and node.func.id == name
+            )
+        ]
+
+    expected_template_inventory = {
+        "RawStmt": 0,
+        "VarInit": 2,
+        "Var": 5,
+        "ArrayAccess": 1,
+        "FunctionCall": 3,
+        "Literal": 3,
+        "BinOp": 1,
+        "Mul": 1,
+        "Cast": 0,
+    }
+    assert {
+        name: len(helper_calls(name)) for name in expected_template_inventory
+    } == expected_template_inventory
+
+    marking = lowerer_source.split("def _mark_first_for_loop_parallel", 1)[1].split(
+        "def _attach_serial_workspace_pools", 1
+    )[0]
+    assert marking.count("self._atomic_work_stealing_prelude(") == 1
+    assert marking.count("llir.RawStmt(") == 0
+    # The pragma text and the typed prelude come from the same validated
+    # structural pieces; neither is recovered by parsing the other.
+    assert 'f"scorch_nthreads({sparse_work}, {loop_bound})"' in marking
 
 
 def test_compressed_result_assembly_is_owned_by_the_typed_abi_epilogue() -> None:
