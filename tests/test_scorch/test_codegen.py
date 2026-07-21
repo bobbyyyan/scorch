@@ -378,12 +378,12 @@ def test_direct_init_is_frozen_typed_structural_and_byte_exact() -> None:
     }
     assert (
         LLIRLowerer().lower_llir(declaration) == "std::vector<float> packed_B_storage("
-        "(size_t) kTile_j * (size_t) kTile_k);"
+        "(size_t)kTile_j * (size_t)kTile_k);"
     )
     assert (
         LLIRLowerer().lower_llir(declaration, indent_level=2)
         == "    std::vector<float> packed_B_storage("
-        "(size_t) kTile_j * (size_t) kTile_k);"
+        "(size_t)kTile_j * (size_t)kTile_k);"
     )
 
     with pytest.raises(FrozenInstanceError):
@@ -573,7 +573,7 @@ def test_cast_codegen_parenthesizes_lower_precedence_operand() -> None:
         data_type=llir.DataType.FLOAT32,
     )
 
-    assert LLIRLowerer().lower_llir(expression) == "(float) (a + b)"
+    assert LLIRLowerer().lower_llir(expression) == "(float)(a + b)"
 
 
 def test_cast_is_frozen_typed_and_structurally_equal() -> None:
@@ -1426,7 +1426,7 @@ def test_qualified_name_rejects_malformed_constructor_fields(
                 llir.QualifiedName("torch", "kInt", llir.DataType.TORCH_SCALAR_TYPE),
                 llir.DataType.INT,
             ),
-            "(int) torch::kInt",
+            "(int)torch::kInt",
         ),
         (
             llir.MemberAccess(
@@ -2630,7 +2630,7 @@ def test_assign_cast_is_scalar_only_and_emits_the_existing_spelling() -> None:
         llir.Add(llir.Literal(1), llir.Literal(2)),
         cast=True,
     )
-    assert LLIRLowerer().lower_llir(scalar) == "value = (int) (1 + 2);"
+    assert LLIRLowerer().lower_llir(scalar) == "value = (int)(1 + 2);"
 
     with pytest.raises(TypeError, match="cast requires an exact Var target"):
         llir.Assign(

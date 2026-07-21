@@ -472,7 +472,7 @@ def test_tuner_packed_tileijk_emits_pack_before_parallel_compute():
     cpp = LLIRLowerer().lower_llir(CINLowerer().lower_IndexStmt(scheduled))
 
     allocation = (
-        "std::vector<float> packed_B_storage((size_t) kTile_j * " "(size_t) kTile_k);"
+        "std::vector<float> packed_B_storage((size_t)kTile_j * " "(size_t)kTile_k);"
     )
     pack_loop = "for (int64_t j_pack = j_out; j_pack < j_out_end; j_pack++)"
     row_loop = "for (int64_t i = 0; i < A0_size; i++)"
@@ -506,8 +506,7 @@ def test_tuner_packed_tileijk_storage_scopes_and_loop_nesting(scope_var, accum):
     row_loop = "for (int64_t i = 0; i < A0_size; i++)"
     if scope_var == "j":
         allocation = (
-            "std::vector<float> packed_B_storage((size_t) kTile_j * "
-            "(size_t) kTile_k);"
+            "std::vector<float> packed_B_storage((size_t)kTile_j * " "(size_t)kTile_k);"
         )
         pack_loop = "for (int64_t j_pack = j_out; j_pack < j_out_end; j_pack++)"
         packed_read = "packed_B[(j - j_out) * kTile_k + k_in]"
@@ -515,8 +514,7 @@ def test_tuner_packed_tileijk_storage_scopes_and_loop_nesting(scope_var, accum):
         assert "packed_B[(j_pack - j_out) * kTile_k + k_pack] =" in cpp
     else:
         allocation = (
-            "std::vector<float> packed_B_storage((size_t) B0_size * "
-            "(size_t) kTile_k);"
+            "std::vector<float> packed_B_storage((size_t)B0_size * " "(size_t)kTile_k);"
         )
         pack_loop = "for (int64_t j_pack = 0; j_pack < B0_size; j_pack++)"
         packed_read = "packed_B[j * kTile_k + k_in]"
@@ -535,8 +533,7 @@ def test_tuner_packed_tileijk_storage_scopes_and_loop_nesting(scope_var, accum):
         assert f"C_values[pC1] += A_val[pA1] * {packed_read}" in cpp
     else:
         allocation_c = (
-            "std::vector<float> tiled_C_storage((size_t) C0_size * "
-            "(size_t) kTile_k);"
+            "std::vector<float> tiled_C_storage((size_t)C0_size * " "(size_t)kTile_k);"
         )
         init_loop = (
             "for (int64_t C_tile_init = 0; C_tile_init < C0_size; " "C_tile_init++)"

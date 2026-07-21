@@ -1465,7 +1465,7 @@ def test_fixed_result_position_owner_is_typed_fresh_direct_initialization() -> N
     assert first.args[1] is not second.args[1]
 
     assert LLIRLowerer().lower_llir(first) == (
-        "std::vector<int> Result1_pos((size_t) Result0_size + 1, 0);"
+        "std::vector<int> Result1_pos((size_t)Result0_size + 1, 0);"
     )
     assert "scorch_tensor_from_vector(std::move(Result1_pos), torch::kInt)" in (
         LLIRLowerer().lower_llir(assembler.emit_final_assembly())
@@ -1972,10 +1972,10 @@ def test_first_compressed_position_allocation_is_typed_fresh_and_rewritable(
 
     expected_cpp = (
         "torch::Tensor Result1_pos_torch = "
-        "torch::empty({(int64_t) (extent + 1)}, torch::kInt);\n"
+        "torch::empty({(int64_t)(extent + 1)}, torch::kInt);\n"
         "int* Result1_pos_data = Result1_pos_torch.data_ptr<int>();\n"
         "for (int _i = 0; _i <= extent; _i++) {\n"
-        "  Result1_pos_data[_i] = (int) _offset1[_i];\n"
+        "  Result1_pos_data[_i] = (int)_offset1[_i];\n"
         "}"
     )
     assert LLIRLowerer().lower_llir(first) == expected_cpp

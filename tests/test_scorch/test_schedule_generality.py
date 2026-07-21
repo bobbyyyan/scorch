@@ -824,7 +824,7 @@ def test_ttm_heap_result_tile_is_generic_compact_accumulation():
 
     allocation = (
         "std::vector<float> tiled_Projected_storage("
-        "(size_t) (Projected0_size * Projected1_size) * (size_t) kTile_d);"
+        "(size_t)(Projected0_size * Projected1_size) * (size_t)kTile_d);"
     )
     assert owner.var == llir.Var(
         "tiled_Projected_storage",

@@ -293,7 +293,7 @@ def _node_emissions() -> Dict[Type[llir.Node], str]:
         llir.ForLoopAuto: "for (int index : value) {\n  break;\n}",
         llir.WhileLoop: "while (value) {\n  break;\n}",
         llir.IfThenElse: "if (value) {\n  break;\n} else {\n  continue;\n}",
-        llir.Cast: "(int64_t) value",
+        llir.Cast: "(int64_t)value",
         llir.Sizeof: "sizeof(int64_t)",
         llir.AddressOf: "&value[index]",
     }

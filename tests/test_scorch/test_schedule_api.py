@@ -476,11 +476,11 @@ def test_panel_tile_lowers_to_windowed_sparse_iteration():
     assert "pA1 = pA1_panel_begin" in cpp
     assert "int pA1_row_end = A1_pos[pA0 + 1];" in cpp
     assert (
-        "int pA1_panel_begin = (int) (std::lower_bound(A1_crd + "
+        "int pA1_panel_begin = (int)(std::lower_bound(A1_crd + "
         "A1_pos[pA0], A1_crd + pA1_row_end, j_out) - A1_crd);"
     ) in cpp
     assert (
-        "int pA1_end = (int) (std::lower_bound(A1_crd + pA1_panel_begin, "
+        "int pA1_end = (int)(std::lower_bound(A1_crd + pA1_panel_begin, "
         "A1_crd + pA1_row_end, j_out_end) - A1_crd);"
     ) in cpp
     assert cpp.index("j_out = 0") < cpp.index("#pragma omp parallel for")
@@ -660,11 +660,11 @@ def test_panel_window_bounds_are_structured_typed_detached_and_repeatable():
     assert set(visited_ids(rewritten_lower)).isdisjoint(lower_ids)
 
     assert LLIRLowerer().lower_llir(lower) == (
-        "(int) (std::lower_bound(A1_crd + A1_pos[pA0], "
+        "(int)(std::lower_bound(A1_crd + A1_pos[pA0], "
         "A1_crd + pA1_row_end, j_out) - A1_crd)"
     )
     assert LLIRLowerer().lower_llir(upper) == (
-        "(int) (std::lower_bound(A1_crd + pA1_panel_begin, "
+        "(int)(std::lower_bound(A1_crd + pA1_panel_begin, "
         "A1_crd + pA1_row_end, j_out_end) - A1_crd)"
     )
     assert first_cpp == second_cpp
@@ -1151,7 +1151,7 @@ def test_packed_storage_owner_is_direct_typed_fresh_and_byte_exact(
 
     expected = (
         f"std::vector<{cpp_scalar}> packed_DenseInput_storage("
-        f"(size_t) {stage_rows} * (size_t) kTile_free);"
+        f"(size_t){stage_rows} * (size_t)kTile_free);"
     )
     assert LLIRLowerer().lower_llir(first) == expected
     assert first_cpp == second_cpp
@@ -1248,7 +1248,7 @@ def test_heap_result_storage_owner_is_direct_typed_fresh_and_byte_exact(
 
     expected = (
         f"std::vector<{cpp_scalar}> tiled_Output_storage("
-        "(size_t) Output0_size * (size_t) kTile_free);"
+        "(size_t)Output0_size * (size_t)kTile_free);"
     )
     assert LLIRLowerer().lower_llir(first) == expected
     assert first_cpp == second_cpp
@@ -1308,11 +1308,11 @@ def test_full_stage_and_heap_result_are_structural_and_name_independent():
 
     full_stage = (
         "std::vector<float> packed_DenseInput_storage("
-        "(size_t) DenseInput0_size * (size_t) kTile_free);"
+        "(size_t)DenseInput0_size * (size_t)kTile_free);"
     )
     compact_result = (
         "std::vector<float> tiled_Output_storage("
-        "(size_t) Output0_size * (size_t) kTile_free);"
+        "(size_t)Output0_size * (size_t)kTile_free);"
     )
     pack_loop = (
         "for (int64_t reduce_pack = 0; "
@@ -1584,7 +1584,7 @@ def test_heap_result_storage_uses_a_hygienic_owner_name() -> None:
     assert [owner.var.name for owner in owners] == ["tiled_Output_storage_1"]
     assert (
         "std::vector<float> tiled_Output_storage_1("
-        "(size_t) Output0_size * (size_t) kTile_tiled_Output_storage);"
+        "(size_t)Output0_size * (size_t)kTile_tiled_Output_storage);"
     ) in cpp
     assert "tiled_Output_storage_1.data()" in cpp
     assert all("tiled_Output_storage_1" not in code for code in raw_codes)

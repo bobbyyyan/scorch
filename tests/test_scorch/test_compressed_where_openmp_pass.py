@@ -635,8 +635,8 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     assert _call_names(fill_loop.body).count("wksp.insert_unchecked") == 1
 
     assert offset_family_codes == [
-        "std::vector<int> _count1((size_t) A0_size, 0);",
-        "std::vector<int64_t> _offset1((size_t) A0_size + 1);",
+        "std::vector<int> _count1((size_t)A0_size, 0);",
+        "std::vector<int64_t> _offset1((size_t)A0_size + 1);",
     ]
     assert prefix_sum_codes == [
         "for (int _i = 0; _i < A0_size; _i++) {\n"
@@ -666,10 +666,10 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
         ]
     ) == (
         "torch::Tensor Result1_pos_torch = "
-        "torch::empty({(int64_t) (A0_size + 1)}, torch::kInt);\n"
+        "torch::empty({(int64_t)(A0_size + 1)}, torch::kInt);\n"
         "int* Result1_pos_data = Result1_pos_torch.data_ptr<int>();\n"
         "for (int _i = 0; _i <= A0_size; _i++) {\n"
-        "  Result1_pos_data[_i] = (int) _offset1[_i];\n"
+        "  Result1_pos_data[_i] = (int)_offset1[_i];\n"
         "}"
     )
     assert not any("Result1_crd_torch" in code for code in top_level_codes)
@@ -935,10 +935,10 @@ def test_first_compressed_position_allocation_is_typed_ordered_and_detached(
 
     assert LLIRLowerer().lower_llir(first_family) == (
         "torch::Tensor Result1_pos_torch = "
-        "torch::empty({(int64_t) (extent + 1)}, torch::kInt);\n"
+        "torch::empty({(int64_t)(extent + 1)}, torch::kInt);\n"
         "int* Result1_pos_data = Result1_pos_torch.data_ptr<int>();\n"
         "for (int _i = 0; _i <= extent; _i++) {\n"
-        "  Result1_pos_data[_i] = (int) _offset1[_i];\n"
+        "  Result1_pos_data[_i] = (int)_offset1[_i];\n"
         "}"
     )
     assert not any(
@@ -2041,10 +2041,10 @@ def test_offset_family_is_typed_owned_structural_fresh_and_never_raw() -> None:
         assert hash(initializer) == hash(expected)
 
     assert [LLIRLowerer().lower_llir(owner) for owner in first_owners] == [
-        "std::vector<int> _count1((size_t) A0_size, 0);",
-        "std::vector<int> _count2((size_t) A0_size, 0);",
-        "std::vector<int64_t> _offset1((size_t) A0_size + 1);",
-        "std::vector<int64_t> _offset2((size_t) A0_size + 1);",
+        "std::vector<int> _count1((size_t)A0_size, 0);",
+        "std::vector<int> _count2((size_t)A0_size, 0);",
+        "std::vector<int64_t> _offset1((size_t)A0_size + 1);",
+        "std::vector<int64_t> _offset2((size_t)A0_size + 1);",
     ]
     assert [LLIRLowerer().lower_llir(loop) for loop in first_prefix_loops] == [
         "for (int _i = 0; _i < A0_size; _i++) {\n"
@@ -3760,9 +3760,9 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    assert len(cpp) == 7117
+    assert len(cpp) == 7113
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "02043a5a8625c596d183385bbe58063ebccf3a2dc75cc2f8bb05e45921ce9f12"
+        "cdc259fe5712808b5a22ba8ed77b588f602acf1e1e7bd293da27d4e7c6df93e1"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -3900,9 +3900,9 @@ def test_production_dss_generated_cpp_locks_typed_offset_family() -> None:
     assert len({id(bound) for bound in production_bounds}) == 8
     cpp = LLIRLowerer().lower_llir(lowered)
 
-    assert len(cpp) == 8648
+    assert len(cpp) == 8638
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "adc0b71fd3f98ea3a437ffd980c237f1a649e3cf0b1d00cd64faf81701e49fbc"
+        "e0809e9ade1153ec67ded665776cbaa8c34bd6a393e2da77c3aebc54ba6c43bb"
     )
     assert cpp.count("wksp.insert(") == 2
     assert "wksp.insert_unchecked(" not in cpp
@@ -3962,9 +3962,9 @@ def test_production_ds_float64_locks_typed_value_source() -> None:
         for code in _raw_codes(lowered)
     )
     cpp = LLIRLowerer().lower_llir(lowered)
-    assert len(cpp) == 6277
+    assert len(cpp) == 6273
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "b94eb205c39ea975ce1cc746930b776c64d78028c055c854815e198836e980a2"
+        "f32837dc4e26fb2ea28fb9cf167e9f5bee0e65661eb38e47142e9da6450a96da"
     )
 
 

@@ -148,7 +148,7 @@ def test_dense_parent_positions_use_exact_size_raii_vector():
 
     cpp_code = _lower_to_cpp(ForAll(row, ForAll(column, result._assignment)))
 
-    assert "std::vector<int> Result1_pos((size_t) Result0_size + 1, 0)" in cpp_code
+    assert "std::vector<int> Result1_pos((size_t)Result0_size + 1, 0)" in cpp_code
     assert "torch::zeros({Result0_size + 1}" not in cpp_code
     assert "scorch_tensor_from_vector(std::move(Result1_pos)" in cpp_code
 
@@ -158,7 +158,7 @@ def test_dense_parent_positions_use_exact_size_raii_vector():
     dense_cpp = _lower_to_cpp(ForAll(row, ForAll(column, dense_result._assignment)))
 
     assert (
-        "std::vector<int> DenseResult1_pos((size_t) DenseResult0_size + 1, 0)"
+        "std::vector<int> DenseResult1_pos((size_t)DenseResult0_size + 1, 0)"
         in dense_cpp
     )
     assert "scorch_vector_set(DenseResult1_pos" not in dense_cpp

@@ -591,7 +591,7 @@ def test_packed_storage_activation_is_independent_and_records_complete_pipeline(
         prepared_builds[0].request.cpp_sources == prepared_builds[1].request.cpp_sources
     )
     expected = (
-        "std::vector<float> packed_B_storage(" "(size_t) kTile_j * (size_t) kTile_k);"
+        "std::vector<float> packed_B_storage(" "(size_t)kTile_j * (size_t)kTile_k);"
     )
     assert (
         sum(source.count(expected) for source in prepared_builds[0].request.cpp_sources)
