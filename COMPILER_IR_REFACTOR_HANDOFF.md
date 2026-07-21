@@ -21594,6 +21594,93 @@ historical 25 to **24** because the typed receiver clone no longer uses
 `array_var.name`. The next Phase-3 ownership recommendation is unchanged; this
 review makes no Phase-3.5 or LoopIR claim.
 
+### Phase-3 canonical compact Cast emission (2026-07-20)
+
+The deliberate W1-class Cast-spelling decision that blocked W1 and the
+C4/C16 zero-fill allocation/borrow half is now resolved and implemented:
+**canonical typed `Cast` emission is compact `(size_t)x`**, matching the raw
+seams and the handwritten `csrc` convention. The decision was made from a
+complete read-only inventory, not a local spelling tweak.
+
+#### Audit inventory
+
+The typed `Cast` spelling has exactly one owner: the codegen expression
+renderer (previously `f"({type}) {operand}"`). Production constructor sites:
+the `iter_lattice.py` merge-advance increments through `Assign(cast=True)`
+(the `VarInit`/`Assign` `cast` flag is the only auto-wrap mechanism), the
+`compressed_where_openmp_pass.py` count/offset extent casts, the three
+`torch_cpp_abi.py` sites (torch::empty extent, offsets-to-pos copy, vector-pos
+size), four `schedule_lowerer.py` sites (panel `std::lower_bound` window,
+heap-result-tile and staging size products), and the `llir_traversal.py`
+rewriter reconstruction as consumer. Raw compact spellings live in exactly
+four seams: the W1 worker-view acquisition and pool `reserve()` in
+`compressed_where_openmp_pass.py`, and the C4 pool borrow and C16
+`scorch_make_aligned_buffer` owner in `cin_lowerer.py`. The handwritten
+`csrc` kernels use the compact form throughout (~230 occurrences, zero
+spaced). Test consumers of the spaced form: 39 substring assertion lines
+across nine suites (the 38 the audit grep surfaced plus the `(float) (a +
+b)` precedence lock, which only structural execution exposed), and three
+exact byte-length/SHA-256 production locks in the compressed-where suite
+whose lengths dropped by exactly their kernels' cast-site counts (7117 to
+7113, 8648 to 8638, 6277 to 6273). All are updated with this change; the
+new DS/DSS lengths and digests were cross-validated against the
+independently captured corpus files.
+
+The audit corrected one historical overclaim: earlier sections stated that
+normalizing the Cast form changes emitted bytes "corpus-wide". In fact the
+entire 42-cell/21-build ss@dd grid corpus contains **no typed-Cast
+rendering at all**; both fresh grid captures are byte-identical between base
+and candidate. Spaced casts render only in the compressed-output canonical
+and dtype-matrix kernels.
+
+#### Decision rationale
+
+Compact won on every axis: it matches all four raw seams awaiting typed
+ownership, so W1, the pool `reserve()`, and the C4/C16 zero-fill halves can
+each be typed **byte-identically** in later slices under the byte-waiver; it
+matches the handwritten `csrc` style; and the spaced form existed only as an
+incidental codegen choice with a single rendering site. Choosing spaced
+would instead have forced a byte-changing, gate-mandating migration at every
+future raw-to-typed step of those seams.
+
+#### Implementation and verification
+
+The change is one rendering line in codegen plus the test-expectation
+updates above (Black then rejoined two now-shorter implicit string
+concatenations in the tuner-schedule suite). Emission changes are proven whitespace-only: across the
+20-kernel capture corpus, 14 files change (canonical DS/DSS inputs and all
+12 dtype-matrix kernels) and a mechanical transformation removing exactly
+one space after each typed-cast rendering maps every base file byte-for-byte
+onto its candidate; per-file byte deltas equal cast-site counts (98 sites
+total). The four standard canonical inputs' unchanged members (csr_dense,
+all_coo), both workspace-pair kernels, the tiled-workspace kernel, and the
+preamble are byte-identical.
+
+Because every cell of the grid corpus is byte-identical, the binding
+byte-waiver applies to the runtime benchmark as written. Two additional
+pieces of evidence were still captured: (1) a changed kernel
+(canonical DS) compiled from base and candidate under the production flag
+set produces **bit-identical object files** once the embedded source
+filename is held constant, directly demonstrating that the compiled kernels
+are identical; (2) the production compiler-latency corpus (five warmups, 30
+samples, base then candidate, same session) is inside the 1.10 target in
+every category: small_dense 0.987/0.941, reduction 0.986/0.947,
+csr_intersection 1.015/1.030, sparse_union 1.004/1.018 (p50/p95 new/old).
+Structural activation coverage was not waived: the nine consumer suites and
+the focused compiler suites all pass with the compact expectations.
+
+Black, `git diff --check`, scoped Flake8 (inherited F541 only), and scoped
+mypy (three inherited findings, line-normalized identical to base) are all
+clean. Raw/constructor budgets are unchanged: the rendering change touches
+no constructor, and the seven generic string rewrites, 14 RawStmt
+constructors / 13 semantic producers, seven MemberCallStmt constructors, and
+430 Var constructors all stand.
+
+Gate evidence (captures, grid comparisons, object files, latency JSONs) is
+retained under `/Users/bobby/.claude/jobs/263fa6bb/tmp/bytecheck/` for this
+session; durable copies live under
+`/Users/bobby/.cache/scorch-codex/cast-compact-ffb3a4c/`.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
