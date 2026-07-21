@@ -21169,9 +21169,10 @@ and the production block-copy provenance decision. Across the five directly
 affected suites, collection grows from **962** committed items to **1044** and
 all **1044 pass**.
 
-Valid output is byte-identical to the retained `772fead` candidate. A fresh
-current-working-tree capture compares byte-for-byte on the five canonical C++
-inputs, all workspace and tiled-workspace C++ sources, and the complete
+Valid output is byte-identical to the retained `772fead` candidate. The retained
+current-working-tree capture compares byte-for-byte on the four standard
+canonical C++ inputs it actually contains, all workspace and tiled-workspace
+C++ sources, and the complete
 2,691-byte activating kernel; all 42 grid cells match on every
 environment-independent field including emitted-source hashes and byte counts.
 The activation kernel remains SHA-256
@@ -21220,7 +21221,8 @@ Before committing, this session independently reproduced the recorded
 evidence rather than trusting it: the five affected suites at **1044
 passed** with the committed collection re-counted at 962 in a clean
 detached worktree; base/candidate byte-identity re-derived from scratch
-against a clean `8143cb6` worktree for the five canonical inputs, the
+against a clean `8143cb6` worktree for the four standard canonical inputs
+actually present in that capture, the
 workspace pair, the tiled workspace, the 2,691-byte activation kernel
 (SHA-256 `08bc91d8…` reproduced from both trees), and a freshly captured
 42-cell grid identical on every environment-independent field; the
@@ -21228,10 +21230,12 @@ retained full-suite log re-hashed to `b9805b6b…`; the latency compare log
 and activation report re-read with matching numbers and hashes; and an
 isolated detached-worktree full non-performance run reproduced
 **2250 passed, 14 skipped** exactly. Scoped Black/Flake8/mypy matched the
-recorded inherited findings. The 47 failures observed when sweeping the
-full working tree are all in the user's untracked GPU/CUDA benchmark test
-files and are unrelated. The five protected tracked files hashed exactly
-as recorded before every commit.
+recorded inherited findings. The retained full-working-tree sweep actually
+reports **47 failed, 3 errors**: 46 failures and all three collection errors are
+in user-owned untracked tests, while one failure is in the protected tracked
+`tests/test_scorch/test_resources.py`. They remain unrelated to this compiler
+slice, but the earlier “all untracked” characterization was inaccurate. The
+five protected tracked files hashed exactly as recorded before every commit.
 
 On top of that base, only the narrow Phase-3 **C17 typed all-COO
 preallocation** slice is complete in this section. The exact base is
@@ -21273,12 +21277,14 @@ preallocation is constructed as
   INT64),))`, rendered `{arr}.resize({outer_end});`
 
 through the same statement-rendering path the raw spelling used, so
-emission is byte-identical on both preallocation routes. The receiver is
-a fresh detached `Var` cloning the tree's own declared metadata and
-deliberately carries no tensor-access provenance: like the C6 row-slot
-decision, it names the whole array object being resized, not one logical
-element write. The extent argument reuses the exact `INT64` loop-bound
-spelling the flat route already uses.
+emission is byte-identical on both preallocation routes. The committed
+receiver is a fresh detached `Var` cloning only the reference metadata visible
+inside the loop tree, not necessarily the declaration type assembled outside
+that tree; production constructions in fact carry `NO_TYPE`. The committed
+synthetic grouped fixture incorrectly supplied pointer metadata, and the
+extent argument fabricated `INT64` metadata even though the matched source
+bound is `INT`. Both typed-boundary defects are corrected in the review section
+below without changing emitted spelling.
 
 Pass equivalence was audited explicitly: `_rewrite_val_refs` already
 reconstructs `MemberCallStmt` structurally (its only live call site
@@ -21328,7 +21334,7 @@ findings). A quiet Sphinx HTML build exits zero.
 
 New coverage locks: the grouped route emits exactly one structured
 byte-exact `Sampled_values.resize(pMask0_end);` member-call statement
-with the receiver cloning the assignment-target metadata, detached
+with the receiver cloning the assignment-target reference metadata, detached
 across repeated transforms, ordered immediately before the group loop,
 with no raw resize spelling anywhere
 (`test_all_coo_grouped_preallocation_is_structured_typed_owned_and_byte_exact`);
@@ -21350,13 +21356,14 @@ constructor across the compiler.
 
 Fresh base/candidate captures (base `4d2a7db` content in a clean
 detached worktree, candidate the committed slice) are byte-identical for
-the five canonical inputs, the workspace pair, the tiled workspace, and
+the four standard canonical inputs actually retained, the workspace pair, the
+tiled workspace, and
 the retained C6 dense-workspace activation kernel (2,691 bytes, SHA-256
 `08bc91d8…` on both sides), and all 42 grid cells match on every
 environment-independent field including emitted-source hashes and byte
 counts. Retained under
 `/Users/bobby/.cache/scorch-codex/cooprealloc-3b10df7/capture/`; the
-directory's complete artifact ledger
+directory's selected-artifact ledger (it does not enumerate every file)
 (`evidence/artifact-ledger.txt`) hashes to
 `9fc6c0ad91a54ae0913b7767b55a7bbaa184287a32c2cb3528a11aa115441a9f`.
 
@@ -21369,14 +21376,18 @@ candidate, **three** typed resize constructions during the canonical
 all-COO SDDMM lowering with zero emitted, plus the byte-exact synthetic
 grouped-route emission and zero raw offenders
 (`latency-activation/activation.json`, `9a241edb…`).
+The retained helper's docstring overstates that it probes both synthetic
+emitting routes; its implementation and JSON correctly probe only the grouped
+route because the flat no-known-nnz route cannot complete lowering.
 
 #### Full-suite and latency verification
 
 An isolated detached-worktree full non-performance run containing the
 slice produced **2255 passed, 14 skipped, 2 warnings** — exactly the
-review correction's 2250 plus this slice's five tests. It ran twice with
-identical counts: first in the patched worktree (623.35s), then in the
-pristine `3b10df7` worktree (624.05s), whose log is retained at
+review correction's 2250 plus this slice's five tests. It was reported twice
+with identical counts: first in the patched worktree (623.35s), for which no
+artifact was retained, then in the pristine `3b10df7` worktree (624.05s), whose
+log is retained at
 `full-suite/pytest.log` with SHA-256
 `e14ed3caf07a8383603ec024aa03262f3bf376012eda79546b1691a45f2c168a`.
 
@@ -21392,9 +21403,10 @@ and medians agree within 3%, and the inflation is confined to the upper
 tail. Run 2 with the visit order reversed (candidate first) reported
 every category inside the 1.10 target at both percentiles —
 `small_dense` 0.977/1.015, `reduction` 1.023/1.075, `csr_intersection`
-1.012/0.995, `sparse_union` 1.010/0.995 — so the crossing follows
-temporal order, not revision, and is attributed to environmental tail
-drift. Both runs are retained under `latency-final/`.
+1.012/0.995, `sparse_union` 1.010/0.995. The crossing therefore did not
+reproduce after order reversal and is consistent with environmental tail
+drift; the two runs do not prove a temporal-order cause. Both runs are retained
+under `latency-final/`.
 
 At documentation time, a read-only hash check reproduced the five
 protected tracked working files exactly as recorded, and all user-owned
@@ -21429,6 +21441,158 @@ rewrites, and the unified exhaustive CxxIR-emission exit review. Phase 3
 remains open. Phase 3.5 and LoopIR have not begun. Phases 0 and 1 are
 not claimed formally closed without a separate design-requirement audit.
 Phase 2 retains its recorded canonical closure.
+
+### Phase-3 AddressOf/C17 post-commit review corrections (2026-07-20)
+
+A rigorous independent review covered the six-commit range
+`eea02fc^..b7067f5`, including the implementation, structural tests, budget
+locks, handoff claims, and retained artifacts. It found six actionable code
+defects that byte-identical rendering had hidden:
+
+- `AddressOf` validated the outer lvalue deeply but delegated its subscript
+  expression to `_validate_assignment_index`. A forged nested index `Var`
+  missing `is_ptr`, `is_restrict`, or `tensor_access` was accepted at
+  construction, traversal, and codegen; rewriting silently materialized the
+  dataclass defaults. Invalid present pointer/restrict fields were also ignored.
+- Cyclic forged lvalues were unbounded. A self-referential `MemberAccess`
+  caused the AddressOf validator to loop forever, cyclic index expressions
+  escaped as `RecursionError`, and codegen's public exact-tree pre-scan recursed
+  before the AddressOf-specific validator could report a structured error.
+- The new AddressOf-only arithmetic-index validator accepted a `str` subclass
+  spelling `"+"` as a unary operator even though the public codegen boundary
+  rejects string subclasses. This was the first concrete grammar drift from the
+  older assignment-index validator and required an exact-type regression lock.
+- C17 reconstructed the matched `pMask0_end` resize argument as `INT64`, while
+  both the canonical source tree and generated declaration use `INT`. Emission
+  happened to remain unchanged because reference codegen ignores `Var.type`,
+  but the typed node could mislead a later type-aware pass.
+- The grouped-route regression fixture gave `Sampled_values` the known type
+  `PTR_FLOAT32` with `is_ptr=True` and then blessed the dot call
+  `Sampled_values.resize(...)`. Clang rejects that source because `float*` has
+  no `resize` member. Real production constructions carry honest `NO_TYPE`
+  reference metadata because the physical declarations are assembled outside
+  the loop subtree.
+- The first review correction validated and constructed every C17 resize before
+  selecting the emitting route. Tightening the receiver contract therefore made
+  the live pointer-backed known-NNZ route fail on a statement that it immediately
+  discarded. Admitting `NO_TYPE` to avoid that failure would in turn allow an
+  emitting route to call `.resize()` without proving that its receiver is a
+  vector.
+
+The working-tree correction closes each boundary without changing generated
+C++:
+
+- AddressOf now applies one stored-field-aware, acyclic validator to every node
+  in its admitted arithmetic-index grammar. It preserves the existing exact
+  grammar, including exact operator-string types, and metadata-role rules while
+  reporting precise nested paths such as
+  `operand.index.is_ptr`, `operand.index.tensor_access`, and cycle locations.
+  Constructor, walker, rewriter (including post-rewrite revalidation), and
+  codegen all share the result.
+- Codegen's exact-node/container pre-scan now tracks the active recursion path.
+  Cyclic nodes and containers fail deterministically with `CodegenError`, while
+  ordinary DAG sharing remains valid; both cases have direct regression tests.
+- C17 constructs preallocation statements lazily, only on routes that emit
+  them. The live known-NNZ route therefore accepts its pointer-backed Torch
+  storage and constructs zero resize calls. An emitting route admits only an
+  exact metadata-free `std::vector<...>` receiver; `NO_TYPE`, pointer, scalar,
+  and restrict-qualified receivers fail closed instead of asserting a member
+  contract that the tree cannot prove.
+- The resize extent is a fresh detached clone of the matched condition-right
+  value reference. Emitting routes require an exact metadata-free, non-pointer,
+  non-restrict integral `Var`; its source `INT` type and flags are preserved.
+  Float, pointer, restrict-qualified, and provenance-bearing bounds fail closed.
+  The synthetic emitting fixture uses `STD_VECTOR_FLOAT32`, and a standalone
+  Clang C++17 syntax probe accepts its exact vector resize shape.
+
+Regression coverage adds malformed/missing nested index fields, invalid present
+flags, cyclic member/array/binary shapes across construction/traversal/codegen,
+exact diagnostic paths, exact unary operator types, cyclic-container and
+shared-DAG codegen boundaries, the legal vector receiver, six illegal receiver
+forms (including `NO_TYPE` and isolated pointer/provenance cases), exact `INT`
+extent ownership, four invalid extent forms, and zero construction on the live
+production known-NNZ route. The five directly affected suites produce **1038
+passed**. The recorded 14-file compiler/pass membership produces **1607 passed**
+(the committed 1545 plus exactly 62 review regressions). An isolated detached
+worktree containing the exact final seven production/test files produces **2317
+passed, 14 skipped, 3 deselected, 1 warning** in the full non-performance suite,
+again exactly the committed 2255 plus 62.
+
+Black leaves all seven production/test files unchanged and `git diff --check`
+is clean. Scoped Flake8 is line-normalized byte-identical to `b7067f5`: the two
+inherited `cin_lowerer.py` F401 findings and one inherited `codegen.py` F541.
+Scoped mypy over the six Phase-3 production files is likewise line-normalized
+byte-identical to base with the same 32 inherited findings. No new static-quality
+finding is introduced.
+
+Fresh clean-worktree captures compare committed `b7067f5` with the review
+correction byte-for-byte on the four standard canonical kernels, DS-float64,
+all successful DS/DSS typed-matrix cases, and the 2,691-byte dense-workspace C6
+activation kernel. The activation kernel remains SHA-256
+`08bc91d8bfd8b0aaaeb6422ca5a32091f2a9793c1ed032f17a475db3b7931617`.
+The missing DS-float64 gate was also run separately for both historical ranges
+whose handoff text had claimed five inputs: `8143cb6..4d2a7db` and
+`4d2a7db..3b10df7`. All four outputs are byte-identical at 7,126 bytes and
+SHA-256
+`b321f6ee03fa6b71fe91ba7284c3530b3b187a49d1334cd6373f5c52529a284e`.
+Review evidence is retained under
+`/Users/bobby/.cache/scorch-codex/c17-review-b7067f5/`; the capture helper is
+SHA-256
+`ea6f425a0de000e5aeb2451d56d2c966062714e47f28e3e9339286064ea6c24c`.
+These byte-identical results satisfy the runtime-benchmark waiver; structural
+activation coverage was still run.
+
+After the final lazy-construction and exact-metadata changes, the byte gate was
+rerun from the clean base/candidate worktrees. All **23** generated C++ files are
+byte-identical: four standard canonical kernels plus preamble, all 12 DS/DSS
+dtype-matrix kernels including both float64 cases plus preamble, both workspace
+kernels plus preamble, and the tiled-workspace kernel plus preamble. The final
+42-cell grid also matches the retained clean base on every environment-independent
+field (`M/K/N/density`, source bytes/hashes, and prepared-source summary), with
+normalized JSON SHA-256
+`936e88be48d6e32a59006895e725ec3d866d51b38edd55fea312c183f491ecc3`
+on both sides. Final artifacts are under
+`/Users/bobby/.cache/scorch-codex/c17-review-b7067f5/final-capture/`.
+
+The same-session compiler-latency comparison (five warmups, 30 samples, base
+then candidate) is inside the 1.10 target in every category and percentile:
+`small_dense` 1.007/0.980, `reduction` 1.013/1.013, `csr_intersection`
+1.023/1.029, and `sparse_union` 1.020/1.034 for p50/p95 candidate/base.
+Artifacts are under
+`/Users/bobby/.cache/scorch-codex/c17-review-b7067f5/final-latency/`.
+
+The retained-evidence audit corrects several additional overclaims in the
+preceding historical section. The original C17 and AddressOf review capture
+directories each contain four standard canonical kernels plus the preamble,
+not five kernels; the supplemental DS-float64 captures above complete that
+gate. The `9fc6c0ad...` ledger validates every one of its 2,252 listed entries
+but omits the activation runner, `ended-at`, twelve latency-extension files,
+and itself, so it is a selected-artifact ledger rather than a complete directory
+ledger. The first reported 623.35-second patched full-suite run has no retained
+artifact. The reversed-order latency run shows that the p95 crossing did not
+reproduce and is consistent with environmental tail drift, not that temporal
+order was proved causal. Finally, the activation helper's docstring claims two
+synthetic emission probes while its implementation and JSON correctly contain
+only the grouped probe. The false five-input claim in commit `270bcfb`'s body is
+historical commit metadata and is corrected here without rewriting history.
+
+One pre-existing maintenance seam remains deliberately out of scope. AddressOf
+needs operand-relative diagnostic paths, so this narrow correction has a robust
+index-grammar validator distinct from the older `_validate_assignment_index`.
+The older Assign boundary still lacks the same stored-field and cycle hardening.
+The unary exact-type regression locks the concrete drift found here; extracting
+one parameterized shared validator should be a separate slice with Assign-wide
+constructor/traversal/codegen compatibility review, not an incidental expansion
+of the C17 correction.
+
+The five protected tracked files remain byte-identical to their recorded
+hashes, and no untracked user material was touched. The review changes are not
+committed or pushed. Raw/constructor budgets remain exactly **14 RawStmt
+constructors / 13 semantic producers, seven MemberCallStmt constructors, and
+430 Var constructors**; the known-indirect Var budget is corrected from the
+historical 25 to **24** because the typed receiver clone no longer uses
+`array_var.name`. The next Phase-3 ownership recommendation is unchanged; this
+review makes no Phase-3.5 or LoopIR claim.
 
 ## Incremental Migration Plan
 
