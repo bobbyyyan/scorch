@@ -7,15 +7,27 @@ That review found that the original candidate schema could not state sparse
 parent/child dominance, logical coordinate domains, or physical mode order,
 and it blocked Phase 4 until the spike was revised and this review repeated.
 This is that repeated review, conducted over the revised spike at code
-commits `a3a473b` and `b2fe883`.
+commits `a3a473b` and `b2fe883`, followed by independent-review corrections
+through `6ca14f5`.
 
 ## Current verdict
 
-**GO for the general level-based LoopIR foundation.** Every mandatory
-Phase-3.5 GO criterion in `COMPILER_IR_REFACTOR_DESIGN.md` is met by the
-revised candidate. The recorded boundaries below are scope statements the
-schema fails closed on with stable diagnostics, not unstated assumptions, and
-none of them falls inside a mandatory criterion.
+**GO-with-conditions to begin Phase 4; NO-GO to freeze or productionize this
+spike unchanged.** Every mandatory Phase-3.5 feasibility criterion in
+`COMPILER_IR_REFACTOR_DESIGN.md` is met by the review-corrected candidate at
+`6ca14f5`. The recorded boundaries below are scope statements the schema fails
+closed on with stable diagnostics, not unstated assumptions, and none of them
+falls inside a mandatory feasibility criterion.
+
+The first repeated-review stopping point at `b2fe883` did **not** yet justify
+that sentence. Independent review found that DENSE value-bearing leaves below
+sparse levels were storage-representable but unexecutable, caller-owned level
+records could be mutated after validation to change a result, and
+`StoreReduce(MUL)` silently used the wrong zero identity. A mapped-extent-free
+`DenseFor` also deferred failure to execution, and the CSR adapter still
+accepted coercible non-numeric scalar objects. Four review-correction commits
+close those gaps and add the adversarial evidence recorded here; the GO verdict
+applies to the corrected candidate, not to `b2fe883` alone.
 
 Phase 4 was deliberately **not started in this session**; this GO is an
 independently auditable stopping point. The spike remains outside production
@@ -75,22 +87,31 @@ rebuilds the representation around three separated spaces:
   level of the same tensor (`parent_position_mismatch` otherwise), grounded
   at the root. Positions are never recovered from coordinates, rendered
   names, callbacks, or implicit interpreter state.
-- **Explicit value ownership.** Only a cursor over the value-bearing leaf
-  level (the last physical level) may expose a scalar `CursorValue`;
-  structural non-leaf reads are the stable `non_leaf_value` defect.
+- **Explicit value ownership.** A compressed leaf cursor exposes its scalar
+  through `CursorValue`; `PositionLoad(tensor, position)` reads any
+  value-bearing leaf position, including a DENSE leaf below compressed
+  structure. Both forms require the last physical level of the exact input
+  tensor; structural non-leaf reads are the stable `non_leaf_value` defect,
+  and cross-tensor positions are `position_load_mismatch`.
 - **Format-neutral level storage.** `levels.py` adds a validated
   `LevelTensorStorage` whose interface (`segment`, `coordinate_at`,
   `leaf_value`) is all the interpreter's execution core consults. CSR is
   exactly one adapter: `from_csr` on the input side, `CsrOutputBuilder` on
   the assembly side. DCSR, CSC, and CSF-like layouts bind the same storage
   class directly, and `from_dense`/`to_dense` round-trip every
-  DENSE/COMPRESSED composition under every mode permutation. The former
-  CSR-specific `_CSR_LEVELS`/`_CursorState.matrix`/`_segment`/`row_segment`
-  interpreter coupling is gone.
-- **Scatter accumulation.** `StoreReduce` adds coordinate-addressed
-  read-modify-write into dense outputs (`target = target op value`), the
-  target-neutral primitive a permuted traversal needs (CSC SpMV) without
-  making outputs generally readable.
+  DENSE/COMPRESSED composition under every mode permutation. Binding takes a
+  validated deep structural snapshot, so later mutation of caller-owned level
+  records cannot redirect execution. Container boundaries accept only exact
+  integer/float scalar types and do not invoke arbitrary conversion callbacks.
+  The former CSR-specific
+  `_CSR_LEVELS`/`_CursorState.matrix`/`_segment`/`row_segment` interpreter
+  coupling is gone.
+- **Scatter accumulation.** `StoreReduce` adds coordinate-addressed ADD into
+  zero-initialized dense outputs (`target += value`), the target-neutral
+  primitive a permuted traversal needs (CSC SpMV) without making outputs
+  generally readable. Other operators fail with
+  `unsupported_store_reduction` until output initialization carries their
+  identity explicitly.
 - **`COORDINATE`/`SINGLETON` disposition.** Both production level kinds are
   now declared `LevelKind` members, and the verifier fails closed on any
   tensor declaring them with the stable `unsupported_level_kind` defect.
@@ -130,7 +151,7 @@ and one-sided iterators by the two-CSR add.
 
 ## Executed evidence
 
-Six hand-authored programs execute differentially against independent
+Eight hand-authored programs execute differentially against independent
 pure-Python dense references, exactly (accumulation orders match, so no
 tolerances are involved anywhere):
 
@@ -145,17 +166,22 @@ tolerances are involved anywhere):
   separation.
 - **CSF-like three-level row contraction** — two chained parent-position
   descents over an all-compressed rank-3 tensor.
+- **Compressed/dense-leaf SpMV** — compressed physical columns dominate dense
+  row leaves under a permuted mode order; `PositionLoad` reads the leaf scalar.
+- **Dense/compressed/dense contraction** — a rank-3 mixed hierarchy exercises
+  a dense value-bearing leaf below a sparse middle level.
 
-Cross-layout differentials require CSR, DCSR, and CSC storage of one logical
-matrix to produce identical SpMV results, exactly, on both hand-built and
-randomized grids. Position-versus-coordinate discrimination cases (absent
-rows/fibers making storage positions diverge from coordinates) execute
-correctly for DCSR and CSF. Rank-1 compressed iteration executes. Empty
-inputs, empty rows/segments, zero-extent shapes, ragged/mis-shaped denses,
-malformed storage, exhaustion, and randomized grids are covered throughout;
-wrong-parent, wrong-domain, wrong-mode-order, non-leaf-value, malformed
-state, forged identities, and cycle cases are covered adversarially. All 42
-verifier defect codes have direct regression coverage.
+Cross-layout differentials require CSR, DCSR, CSC, and compressed/dense-leaf
+storage of one logical matrix to produce identical SpMV results, exactly, on
+both hand-built and randomized grids. Position-versus-coordinate
+discrimination cases execute correctly for DCSR, CSF, and both dense-leaf
+fixtures. Rank-1 compressed iteration executes. Empty inputs, empty
+rows/segments, zero-extent shapes (including mixed rank 3), signed zero,
+ragged/mis-shaped denses, malformed or subsequently forged storage,
+exhaustion, and randomized grids are covered throughout; wrong-parent,
+wrong-domain, wrong-mode-order, wrong-tensor position loads, non-leaf values,
+malformed state, forged identities, and cycle cases are covered adversarially.
+All 45 verifier defect codes have direct regression coverage.
 
 ## Recorded boundaries (fail closed, not silently assumed)
 
@@ -170,12 +196,15 @@ verifier defect codes have direct regression coverage.
   other layouts are future assembly adapters over the same append stream.
 - **`COORDINATE`/`SINGLETON` fail closed** (`unsupported_level_kind`), with
   Phase 5 as the recorded gate for their iteration.
-- **All-dense tensors bind logical nested lists**; their declared physical
-  mode order does not change interpreter semantics (dense storage order is
-  a performance concern with no observable effect in the oracle).
+- **All-dense tensors bind owned logical nested lists/tuples or an explicit
+  `LevelTensorStorage`**. The explicit form preserves shapes such as `(0, n)`
+  that nested values cannot infer. Ordinary coordinate `Load` stays on the
+  logical copy; physical storage is materialized lazily only for
+  `PositionLoad`.
 - The interpreter grew to earn format neutrality: the spike package is now
-  3,371 lines across seven modules (verifier 1,087; interpreter 592; level
-  storage 408; nodes 515; programs 607; CSR container 136). It remains
+  3,967 lines across seven modules (verifier 1,136; interpreter 675; level
+  storage 627; nodes 533; programs 817; CSR container 152; package metadata
+  27). It remains
   plain, Torch-free Python with no compiler-pipeline involvement, and its
   per-node execution logic is still direct enough to audit by reading.
 
@@ -183,44 +212,53 @@ verifier defect codes have direct regression coverage.
 
 | Phase-3.5 GO criterion | Result | Evidence |
 | --- | --- | --- |
-| Requested CSR examples execute correctly | **Pass** | CSR SpMV and UNION/INTERSECTION execute differentially, exactly; the degenerate sparse-dense SpMV interpretation is justified above and two-cursor merge evidence is separate; DCSR/CSC/CSF extend the corpus. |
+| Requested CSR examples execute correctly | **Pass** | CSR SpMV and UNION/INTERSECTION execute differentially, exactly; the degenerate sparse-dense SpMV interpretation is justified above and two-cursor merge evidence is separate; DCSR/CSC/CSF and two dense-leaf layouts extend the corpus. |
 | No C++ spelling, parsing, callbacks, or operation escape hatch | **Pass** | Automated import/target-syntax neutrality suite (module inventory, AST import whitelist, subprocess closure proof, production-reference scan, token scan) plus direct source review; merge/descent/assembly semantics are intrinsic to nodes. |
 | Verifier states sparse parent/child dominance and merge-progress invariants locally | **Pass** | Dominance is typed parent-position linkage checked at every cursor and dense-position expression, grounded at the root; merge progress is intrinsic to `MergedSparseFor`; domains and value ownership are also stated locally. The old counterexamples are now stable defects. |
-| Interpreter/lowering model can serve as an independent semantic oracle | **Pass** | Torch-free, pipeline-free, container-validated plain Python; storage access is behind the neutral level interface with CSR as one adapter; executes general DENSE/COMPRESSED levels with mode permutation. Size growth recorded above. |
-| Phase 0-3 gates green; latency reviewed; tile-j/tile-ijk parity credible | **Pass** | All 20 corpus and 42 grid sources regenerated from detached `b2fe883` are byte-identical to the retained `1c78633`/`34a1849` captures (which chain to the Phase-3 finals) — the byte waiver applies and no runtime kernel benchmark is required. Both commits touch only the isolated spike and its tests, which the neutrality suite proves are outside every production import, so the retained paired latency receipts (all inside 1.10) remain the operative measurement. No production, native, cache, or emission surface changed, so the parity objective's credibility is unchanged. |
+| Interpreter/lowering model can serve as an independent semantic oracle | **Pass** | Torch-free, pipeline-free, container-validated plain Python; storage access is behind the neutral level interface with CSR as one adapter; executes general DENSE/COMPRESSED levels with mode permutation, including dense value-bearing leaves; snapshots caller storage before execution. Size growth recorded above. |
+| Phase 0-3 gates green; latency reviewed; tile-j/tile-ijk parity credible | **Pass** | The original 20 corpus and 42 grid captures at `b2fe883` are byte-identical to retained Phase-3 captures. Corrections through `6ca14f5` touch only the import-neutral spike/tests and the neutrality suite remains green, so no production emission or measured compiler path can change; the byte waiver and retained latency receipts (all inside 1.10) remain operative. No production, native, cache, or emission surface changed, so the parity objective's credibility is unchanged. |
 
-Every mandatory criterion holds, so the verdict is GO.
+Every mandatory feasibility criterion holds, so Phase 4 may begin under the
+conditions below. This is not approval to freeze the spike unchanged.
 
 ## Verification
 
-Evidence ledger: `/Users/bobby/.cache/scorch-codex/phase35-repeat-b2fe883/`.
-Commits reviewed (stacked on `587cbc1`; nothing amended, nothing pushed):
+Original evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase35-repeat-b2fe883/`. Final independent-
+review ledger: `/Users/bobby/.cache/scorch-codex/phase35-final-6ca14f5.9ZVrpS/`.
+Its verified `SHA256SUMS` manifest hashes to
+`324ab70763a65308c4d7bc0a28aa07e6e78772b4e3d089aeccaac7a896b60cd5`.
+Commits reviewed (stacked on `587cbc1`; nothing amended, reordered, or pushed):
 
 - `a3a473b` — `feat(compiler): add format-neutral level storage to LoopIR spike`
 - `b2fe883` — `feat(compiler): rebase LoopIR spike on logical dimensions and positions`
+- `7f7af51` — `fix(compiler): complete level-general LoopIR spike`
+- `aee7c1f` — `test(compiler): cover LoopIR review corrections`
+- `a9610cb` — `fix(compiler): reject coercive CSR scalar inputs`
+- `6ca14f5` — `test(compiler): lock exact CSR scalar boundaries`
 
 Receipts:
 
-- focused spike suites at `b2fe883`: **539 passed** (126 verifier, 407
-  execution/differential, 6 neutrality); commit `a3a473b`'s intermediate
-  tree also passes its 329 tests from a detached worktree;
+- focused spike suites at clean detached `6ca14f5`: **647 passed** (136
+  verifier, 505 execution/differential, 6 neutrality); commit `a3a473b`'s
+  intermediate tree also passes its historical 329 tests from a detached
+  worktree;
 - spike plus identity/CIN-analysis/LoopPlan/raw-budget adjacency from the
-  detached `b2fe883` worktree: **664 passed**;
+  clean detached `6ca14f5` worktree: **772 passed**;
 - fresh 20-source corpus and 42-source grid captures from detached
   `b2fe883` are byte-identical to the retained `1c78633` candidate captures
   and to the `34a1849` base captures (`diff -rq` empty in all four
   comparisons), so the byte waiver applies;
-- static parity: Black reports only the single inherited finding
-  (`prebuilt_kernels.py`); Flake8 reports exactly the nine inherited
-  findings; mypy (`--check-untyped-defs`) reports exactly the 146 inherited
-  errors in 12 files with zero findings in the spike; `git diff --check`
-  clean before every commit;
+- Black and Flake8 are clean over all changed source/test files; focused mypy
+  succeeds over all seven spike modules; `git diff --check` is clean. The
+  prior full-source inherited-baseline comparison remains applicable because
+  the correction adds no finding in the isolated package;
 - the authoritative clean detached-worktree non-performance suite at exact
-  final code/test commit `b2fe883`, with import provenance asserted
+  final code/test commit `6ca14f5`, with import provenance asserted
   (including the spike interpreter and level-storage modules) and
-  caches/basetemp isolated, passed **3,099 tests with 14 skipped, 3
-  perf-marked deselections, and one known warning in 2,168.57 seconds**
-  (junit: 3,113 collected, 0 failures, 0 errors);
+  caches/basetemp isolated: **3,207 passed, 14 skipped, 3 perf-marked
+  deselections, and one known warning in 2,216.69 seconds** (JUnit: 3,221
+  selected, 0 failures, 0 errors);
 - the five protected tracked files retain their recorded SHA-256 values;
   staging used explicit pathspecs only; no GPU/CUDA, benchmark, packaging,
   scheduler, research, scratchpad, or tooling material was touched; and the
@@ -230,14 +268,18 @@ Receipts:
 
 ## Conditions carried into Phase 4 (work items, not gate failures)
 
-1. Freeze the production LoopIR schema **from** this candidate: builder API,
-   printer, canonical serializer, and the workspace/parallel/tile surface
-   are Phase-4 deliverables on top of these nodes.
+1. Begin with a production-responsibility/gap audit against normalized CIN and
+   the first dense vertical slice. Revise the spike candidate where that audit
+   requires production identity, serialization, construction, or target split,
+   then freeze only the first production subset (builder API, verifier,
+   printer, and canonical serializer). The spike is input to that decision,
+   not an unchanged contract.
 2. Promote the interpreter as the test/debug semantic oracle; keep the
    neutrality discipline until the strangler path deliberately imports it.
 3. Hierarchical merge descent, non-CSR sparse output assembly adapters, and
    `COORDINATE`/`SINGLETON` iteration are Phase-5 surfaces; their fail-closed
    diagnostics (`unsupported_sparse_hierarchy`, "unsupported sparse output
    layout", `unsupported_level_kind`) are the tracked gates.
-4. The biggest Phase-4 risk remains CIN-to-LoopIR lowering, not the schema:
-   nothing in this spike lowers from normalized CIN yet.
+4. Production schema integration and CIN-to-LoopIR lowering are co-leading
+   Phase-4 risks: the semantic core is feasible, but nothing here yet models
+   every production responsibility or lowers normalized CIN.
