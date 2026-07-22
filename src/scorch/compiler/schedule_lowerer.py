@@ -811,22 +811,68 @@ def _redirect_sparse_prefetch(
         retained.append(stmt)
     sparse_loop.body = retained
     if removed:
-        coordinate = f"{coordinate_name}[{position} + 1]"
-        staged_row = (
-            coordinate
-            if stage_row_origin is None
-            else f"({coordinate} - {stage_row_origin})"
-        )
+        staged_names = [position, end_name, packed_name, panel_var, panel_end]
+        staged_names.append(panel_tile_var)
+        if stage_row_origin is not None:
+            staged_names.append(stage_row_origin)
+        if any(
+            type(name) is not str or not name.isidentifier() for name in staged_names
+        ):
+            raise NotImplementedError(
+                "Packed relayout requires identifier spellings for the staged "
+                "prefetch guard"
+            )
+
+        def _reference(name: str) -> llir.Var:
+            return llir.Var(name=name, type=llir.DataType.NO_TYPE)
+
+        def _next_coordinate() -> llir.ArrayAccess:
+            return llir.ArrayAccess(
+                array=_reference(coordinate_name),
+                index=llir.Add(
+                    _reference(position),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+            )
+
+        staged_row: llir.Expr = _next_coordinate()
+        if stage_row_origin is not None:
+            staged_row = llir.BinOp("-", staged_row, _reference(stage_row_origin))
         sparse_loop.body.insert(
             0,
-            llir.RawStmt(
-                code=(
-                    f"if ({position} + 1 < {end_name} && "
-                    f"{coordinate_name}[{position} + 1] >= {panel_var} && "
-                    f"{coordinate_name}[{position} + 1] < {panel_end}) "
-                    f"__builtin_prefetch(&{packed_name}[{staged_row} * "
-                    f"{panel_tile_var}], 0, 1)"
-                )
+            llir.GuardedCallStmt(
+                cond=llir.BinOp(
+                    "&&",
+                    llir.BinOp(
+                        "&&",
+                        llir.BinOp(
+                            "<",
+                            llir.Add(
+                                _reference(position),
+                                llir.Literal(1, llir.DataType.INT),
+                            ),
+                            _reference(end_name),
+                        ),
+                        llir.BinOp(">=", _next_coordinate(), _reference(panel_var)),
+                    ),
+                    llir.BinOp("<", _next_coordinate(), _reference(panel_end)),
+                ),
+                call=llir.FunctionCallStmt(
+                    "__builtin_prefetch",
+                    (
+                        llir.AddressOf(
+                            operand=llir.ArrayAccess(
+                                array=_reference(packed_name),
+                                index=llir.Mul(
+                                    staged_row,
+                                    _reference(panel_tile_var),
+                                ),
+                            )
+                        ),
+                        llir.Literal(0, llir.DataType.INT),
+                        llir.Literal(1, llir.DataType.INT),
+                    ),
+                ),
             ),
         )
 

@@ -146,12 +146,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "loop_invariant_factor_pass.py": 3,
         "parallel_marking_pass.py": 13,
         "result_write_pass.py": 3,
-        "schedule_lowerer.py": 105,
+        "schedule_lowerer.py": 106,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 469
+    assert sum(constructor_counts.values()) == 470
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 146,
@@ -164,12 +164,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "loop_invariant_factor_pass.py": 3,
         "parallel_marking_pass.py": 13,
         "result_write_pass.py": 3,
-        "schedule_lowerer.py": 105,
+        "schedule_lowerer.py": 106,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 459
+    assert sum(unclassified_counts.values()) == 460
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -195,6 +195,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("loop_invariant_factor_pass.py", "accumulator_name"): 1,
         ("loop_invariant_factor_pass.py", "invariant_name"): 2,
         ("result_write_pass.py", "f'{prefix}{level}'"): 1,
+        ("schedule_lowerer.py", "name"): 1,
         ("schedule_lowerer.py", "prefix_extent"): 2,
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
@@ -202,7 +203,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("torch_cpp_abi.py", "pointer_name"): 4,
         ("torch_cpp_abi.py", "bound_name"): 1,
     }
-    assert sum(known_indirect.values()) == 48
+    assert sum(known_indirect.values()) == 49
 
     assert totals == {
         "subscript": 9,
@@ -647,10 +648,9 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
         "compressed_where_openmp_pass.py": 2,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
-        "schedule_lowerer.py": 1,
     }
-    assert sum(counts.values()) == 5
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 4
+    assert sum(counts.values()) == 4
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 3
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -843,10 +843,11 @@ def test_dense_workspace_write_back_copy_is_structured() -> None:
         "cin_lowerer.py": 2,
         "dense_pointer_hoist_pass.py": 2,
         "llir_traversal.py": 1,
+        "schedule_lowerer.py": 1,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(address_of_constructors.values()) == 7
+    assert sum(address_of_constructors.values()) == 8
 
     lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
     lowerer_source = lowerer_path.read_text()

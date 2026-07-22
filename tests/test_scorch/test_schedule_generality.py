@@ -516,11 +516,32 @@ def test_redirect_composes_with_the_typed_sparse_prefetch_producer(
     )
 
     assert produced not in sparse_loop.body
-    assert LLIRLowerer().lower_llir(sparse_loop.body[0]) == (
+    packed_guard = sparse_loop.body[0]
+    assert type(packed_guard) is llir.GuardedCallStmt
+    assert _is_operand_prefetch_guard(packed_guard, "packed_B")
+    assert LLIRLowerer().lower_llir(packed_guard) == (
         "if (pA1 + 1 < pA1_end && A1_crd[pA1 + 1] >= j_out && "
         "A1_crd[pA1 + 1] < j_out_end) "
         f"__builtin_prefetch(&packed_B[{staged_row} * kTile_k], 0, 1);"
     )
+
+
+def test_redirect_rejects_non_identifier_staged_guard_spellings() -> None:
+    output = insert_sparse_prefetch(
+        [_prefetchable_sparse_loop()], SPARSE_PREFETCH_CONTEXT
+    )
+    sparse_loop = cast(llir.ForLoop, output[0])
+
+    with pytest.raises(NotImplementedError, match="identifier spellings"):
+        _redirect_sparse_prefetch(
+            sparse_loop,
+            "B_val",
+            "packed_B",
+            "j_out + 1",
+            "j_out_end",
+            "kTile_k",
+            None,
+        )
 
 
 def test_redirect_recognition_is_structural_and_ignores_decoys() -> None:
