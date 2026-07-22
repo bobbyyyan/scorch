@@ -22136,11 +22136,14 @@ The deferred extraction was completed as a named module,
 OpenMP loop-shape compatibility, sparse-inner-loop/position discovery, the
 typed C12/C13 prelude, the work-aware policy (pragma text and typed value
 from one construction), pre/post-parallel alloc/free placement, and the
-serial before-parallel pool construction. The hand-off is an explicit
-immutable schema — `ParallelWorkspaceCluster` with fail-closed
-`ParallelWorkspacePoolSpec` members — frozen by `lower_Where` before
-recursive producer/consumer lowering, replacing the four transient lowerer
-attributes previously read back through `getattr` defaults. The three
+serial before-parallel pool construction. The hand-off is an explicit frozen
+template carrier — `ParallelWorkspaceCluster` with validated
+`ParallelWorkspacePoolSpec` members — created by `lower_Where` before recursive
+producer/consumer lowering, replacing the four transient lowerer attributes
+previously read back through `getattr` defaults. As corrected by the rigorous
+review below, every consumer revalidates the carrier and deeply detaches fresh
+mutable LLIR ownership for each placement; `frozen=True` alone did not make the
+original carrier's statement children immutable. The three
 invocation sites (auto/explicit marking in `lower_ForAll`, the
 schedule-selected loop in `_apply_explicit_parallel_schedule`) pass the
 cluster explicitly; `iter_lattice`'s SIMD gate imports
@@ -22176,11 +22179,14 @@ linked-list pool precedent; qualifier-in-type follows the existing
 `VarInit` whose target owns the const-pointer type with `is_restrict=True`
 and whose value is the typed `AddressOf` of the strided value-array
 access; base/stride names come from the pass's exact-Var structural
-analysis, and operand references stay metadata-free `NO_TYPE`. Free-form
-compatibility C-type text retains the exact legacy raw statement (the
-pass's documented arbitrary-spelling contract is not narrowed), so the D1
-raw constructor remains as a deliberate compatibility fallback beside
-W5/W14.
+analysis, and operand references stay metadata-free `NO_TYPE`. Typing is used
+only when the value-array spelling is one exact identifier and the base/stride
+spellings fit `AddressOf`'s identifier/member-path grammar. Every other dense
+pointer v1 spelling retains the exact legacy raw statement — including
+recognized C types paired with expression-bearing value/base/stride text, not
+only free-form C-type text — so the documented arbitrary-spelling contract is
+not narrowed. The D1 raw constructor therefore remains a deliberate
+compatibility fallback beside W5/W14.
 
 Integration is fail-closed across the audited boundaries: construction
 (enum lookup), traversal/rewriting (walker/detachment tests with
@@ -22199,11 +22205,11 @@ const-int, non-restrict, and non-`_val`-shaped forms.
 
 #### S1/P1 audit (both deferred to one next milestone)
 
-S1 (`sparse_prefetch_pass.py`, `_prepend_prefetches`) emits
+P1 (`sparse_prefetch_pass.py`, `_prepend_prefetches`) emits
 `if ({it} + 1 < {end}) __builtin_prefetch(&{val}[{crd}[{it} + 1] * {stride}], 0, 1);`
-and P1 (`schedule_lowerer.py`, the packed-relayout prefetch) emits the
-same single-line unbraced-if guarded call with a three-conjunct condition
-and an optional parenthesized staged-row difference. Neither is
+and S1 (`schedule_lowerer.py`, `_redirect_sparse_prefetch`) emits the packed
+relayout form with a three-conjunct condition and an optional parenthesized
+staged-row difference. Neither is
 representable byte-identically today: `IfThenElse` emits braced multi-line
 blocks, and LLIR has no single-line guarded-statement form. Both seams
 share exactly one missing representation — a deliberately narrow inline
@@ -22218,16 +22224,21 @@ milestone and was deliberately not started at the end of this session.
 #### Verification and gates
 
 Evidence is retained under
-`/Users/bobby/.cache/scorch-codex/phase3-c7d1-ec2be56/` with a
-self-describing README (revisions, commands, manifests, logs, JSONs,
-SHAs). Byte gates ran in clean detached worktrees at `e696c9b` and
-`ec2be56`:
+`/Users/bobby/.cache/scorch-codex/phase3-c7d1-ec2be56/`. That directory covers
+only `e696c9b..ec2be56`, not the later review corrections. Its README is a
+useful index but its original broad evidence description was inaccurate: it
+does not retain corpus/grid manifests or their capture scripts, has no raw
+Black/mypy receipts, and its base Flake8 file accidentally includes a Markdown
+parse error. The final-review ledger below supersedes those static/evidence
+claims. Byte gates ran in clean detached worktrees at `e696c9b` and `ec2be56`:
 
 - **All 20 corpus sources and all 42 grid sources are byte-identical** to
   the retained base captures (`diff -rq` empty on both directories). 21 of
-  the 42 grid kernels contain hoisted `_val_ptr` declarations, so the grid
-  is the activating byte gate for typed D1; 23 corpus+grid files carry
-  `__builtin_prefetch` (S1 untouched). The byte-waiver applies; no grid
+  the 42 grid source files — all 21 kernel files; the other 21 are preambles —
+  contain hoisted `_val_ptr` declarations, so the grid is the activating byte
+  gate for typed D1; 23 corpus+grid files carry 44 `__builtin_prefetch`
+  occurrences, all P1 and none the three-conjunct S1 packed form. The
+  byte-waiver applies; no grid
   runtime benchmark or object compile is required (zero source
   differences anywhere).
 - The three activating kernels the standard corpus does not reach —
@@ -22275,11 +22286,116 @@ seven planned rewrites from the earlier inventory are untouched, and the
 exit review has not run.
 
 The next coherent milestone: introduce the narrow inline guarded-call
-statement node and type S1 and P1 together in one session (they are the
-last semantic producers), then run the Phase-3 exit review over the final
-inventory. After that, the 3.5 spike gates LoopIR. Preserve all three
-compatibility fallbacks; do not spend the budget by narrowing supported
+statement node and type S1 and P1 together in one session (they are the last
+live/non-fallback producers), then run the Phase-3 exit review over the final
+inventory. Representation is only one part of that migration:
+`_redirect_sparse_prefetch` currently discovers/removes P1 through a RawStmt
+substring and must gain exact structural recognition, decoy coverage, and
+direct-composition tests. After that, the 3.5 spike gates LoopIR. Preserve all
+three compatibility fallbacks; do not spend the budget by narrowing supported
 free-form inputs.
+
+### Rigorous C7-D1 milestone review corrections (2026-07-21)
+
+Five review code/test commits precede this handoff-only commit; nothing was
+pushed and no earlier commit was amended or reordered:
+
+- `8b16745` — `fix(compiler): harden parallel workspace ownership`
+- `b0776ee` — `test(compiler): cover workspace review boundaries`
+- `5935816` — `fix(compiler): close workspace carrier validation gaps`
+- `0281072` — `test(compiler): cover adversarial workspace carriers`
+- `0d10c86` — `perf(compiler): avoid redundant carrier rewrites`
+
+The review did not accept the prior report as evidence. It read the complete
+`e696c9b..93ca2a1` range, reproduced the relevant behavior in clean detached
+worktrees, and used adversarial forged-state and compatibility probes. It found
+and fixed these concrete defects:
+
+1. **D1 narrowed the existing dense-pointer-v1 contract.** Recognized scalar
+   C types with expression-bearing value/base/stride spellings entered the
+   typed `AddressOf` path even though that node intentionally accepts only
+   identifier/member-path lvalues. Such inputs succeeded at `e696c9b` but
+   raised after the milestone. The final rule uses typed D1 only for honestly
+   representable spellings and otherwise emits the exact legacy raw
+   declaration. Two direct base/final probes reproduce byte-identical output
+   for `parent_position + offset` and `Unrelated7_size * tile` cases.
+2. **The workspace carrier was frozen but its LLIR children were shared.** A
+   placement could mutate the carrier template and a second loop. Placement
+   now recursively detaches fresh ownership for every loop; the corrected test
+   walks the carrier fields themselves and proves the carrier, first placement,
+   and second placement have pairwise-disjoint mutable LLIR identities.
+3. **Carrier and pool validation failed open.** Arbitrary `DataType` pool
+   elements could reach invalid native templates; forged/missing dataclass
+   state was not revalidated at consumption; statement roots and nested fields
+   could leak incidental `AttributeError`/`RecursionError` or injected C++
+   spellings. The final boundary accepts only the six production pool scalar
+   types and the two actual placement statement forms (`VarInit` and
+   `MemberCallStmt`), recursively validates their narrow workspace-borrow
+   expression grammar, rejects cycles/injected names/C++ keywords, and retains
+   the prior valid Unicode-identifier behavior. Validation no longer builds a
+   throwaway detached tree; the actual placement rewrite is the single owner
+   of the copy.
+4. **The atomic helper's local contract was incomplete.** Its `$`-anchored
+   regex accepted a trailing newline, and its nominal scalar bound accepted
+   pointer/vector/tensor/float/void/`NO_TYPE` enum members when metadata flags
+   happened to be false. It now uses `fullmatch` without narrowing the prior
+   Unicode-tail name grammar, requires the structurally matching position/bound
+   pair, and accepts only explicit integral bound types.
+5. **Enum lookup and evidence claims were too permissive.** Pool/const-pointer
+   type helpers now require an exact string instead of invoking arbitrary
+   `__str__`. The old evidence directory is explicitly scoped to
+   `e696c9b..ec2be56`; its invalid Flake8-base receipt and absent manifests/raw
+   logs no longer support final claims. The S1/P1 labels and activation claim
+   are corrected above.
+
+#### Final review gates
+
+The superseding ledger is
+`/Users/bobby/.cache/scorch-codex/phase3-review-0d10c86/`:
+
+- Final `0d10c86` regeneration matches the retained `ec2be56` candidate
+  byte-for-byte across all **20 corpus sources, 42 grid sources, and three
+  activating kernels** (`diff -rq` empty for every directory). The 65-file
+  SHA-256 manifest is `CAPTURE_SHA256SUMS`.
+- Direct D1 compatibility probes at `e696c9b` and `0d10c86` emit the same two
+  expression-bearing legacy declarations byte-for-byte. Typed identifier paths
+  remain covered by the corpus/grid and structural tests.
+- The twelve-file compiler/pass membership passed **1,619 tests** before the
+  final copy-elision-only commit (terminal result, not claimed as a separate
+  retained log); the final focused carrier/D1/budget/CIN sweep passed **402
+  tests** with `focused-402.xml` retained. The authoritative final clean
+  detached-worktree non-performance suite passed **2,464 tests, 14 skipped,
+  one warning in 671.97 seconds**; import provenance was asserted before launch
+  and `full-suite.xml` is retained.
+- Base `93ca2a1` versus final `0d10c86` static checks use the same seven-file
+  scope: Black `0/0` with byte-identical logs, Flake8 `0/0` with empty logs,
+  and scoped mypy with exactly the same four inherited dynamic-`ForLoop`
+  `attr-defined` findings after line normalization. Commands, raw logs, exits,
+  diffs, tool versions, and hashes are retained under `static/`.
+- The final paired compiler-latency run (5 warmups, 30 samples) is inside the
+  1.10 target everywhere with identical source hashes: p50 ratios
+  `1.016/0.997/1.000/0.998` and p95 ratios
+  `1.064/0.969/0.972/0.941` for small-dense/reduction/CSR-intersection/
+  sparse-union respectively. An earlier tail-only sparse-union crossing
+  inverted with order while a same-code base/base control crossed at `1.331`
+  p95; all raw JSONs remain in the ledger rather than being discarded.
+- Raw budgets remain exactly **6 constructors / 5 semantic producers**. The
+  five protected tracked files retain their recorded hashes, no unrelated
+  tracked or untracked material entered a commit, and
+  `origin/refactor/compiler-ir-phase3-std-move-call` remained at `1714df2`.
+
+Phase 3 remains open. The next session should take the full S1/P1 guarded-call
+family, not merely add a node: make the node fail closed in its constructor,
+walker/rewriter, codegen, and specialized rewriters; migrate both producers;
+structurally recognize P1 in `_redirect_sparse_prefetch`; preserve list/tuple
+insertion order, deduplication, semicolon spelling, and reapplication behavior;
+add decoys and direct-composition tests; and retain a packed-schedule S1
+activation with both origin/no-origin address forms. That slice should move the
+budget to **4 constructors / 3 semantic compatibility fallbacks**, not zero.
+Then run the Phase-3 exit inventory/review and explicitly resolve or disposition
+the untouched Assign-validator hardening and seven planned rewrites. Do not
+claim Phase 3 complete merely because the exit review started, and do not claim
+Phase 3.5 or LoopIR readiness before the exit gate actually closes.
 
 ## Incremental Migration Plan
 
