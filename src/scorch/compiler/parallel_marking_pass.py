@@ -40,7 +40,6 @@ from .iterator import (
     match_mode_position_begin,
 )
 from .llir_traversal import (
-    SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
     LLIRRewriter,
     LLIRTraversalContext,
 )
@@ -55,6 +54,126 @@ _PARALLEL_POOL_SCALAR_TYPES = frozenset(
         llir.DataType.UINT8,
     }
 )
+_ATOMIC_BOUND_TYPES = frozenset(
+    {
+        llir.DataType.INT,
+        llir.DataType.UINT8,
+        llir.DataType.INT8,
+        llir.DataType.UINT16,
+        llir.DataType.INT16,
+        llir.DataType.UINT32,
+        llir.DataType.INT32,
+        llir.DataType.UINT64,
+        llir.DataType.INT64,
+        llir.DataType.LONG,
+        llir.DataType.SIZE_T,
+    }
+)
+_PARALLEL_CLUSTER_STATEMENT_TYPES = (
+    llir.VarInit,
+    llir.MemberCallStmt,
+)
+_CPP_KEYWORDS = frozenset(
+    {
+        "alignas",
+        "alignof",
+        "and",
+        "and_eq",
+        "asm",
+        "atomic_cancel",
+        "atomic_commit",
+        "atomic_noexcept",
+        "auto",
+        "bitand",
+        "bitor",
+        "bool",
+        "break",
+        "case",
+        "catch",
+        "char",
+        "char8_t",
+        "char16_t",
+        "char32_t",
+        "class",
+        "co_await",
+        "co_return",
+        "co_yield",
+        "compl",
+        "concept",
+        "const",
+        "const_cast",
+        "consteval",
+        "constexpr",
+        "constinit",
+        "continue",
+        "decltype",
+        "default",
+        "delete",
+        "do",
+        "double",
+        "dynamic_cast",
+        "else",
+        "enum",
+        "explicit",
+        "export",
+        "extern",
+        "false",
+        "float",
+        "for",
+        "friend",
+        "goto",
+        "if",
+        "inline",
+        "int",
+        "long",
+        "mutable",
+        "namespace",
+        "new",
+        "noexcept",
+        "not",
+        "not_eq",
+        "nullptr",
+        "operator",
+        "or",
+        "or_eq",
+        "private",
+        "protected",
+        "public",
+        "reflexpr",
+        "register",
+        "reinterpret_cast",
+        "requires",
+        "return",
+        "short",
+        "signed",
+        "sizeof",
+        "static",
+        "static_assert",
+        "static_cast",
+        "struct",
+        "switch",
+        "synchronized",
+        "template",
+        "this",
+        "thread_local",
+        "throw",
+        "true",
+        "try",
+        "typedef",
+        "typeid",
+        "typename",
+        "union",
+        "unsigned",
+        "using",
+        "virtual",
+        "void",
+        "volatile",
+        "wchar_t",
+        "while",
+        "xor",
+        "xor_eq",
+    }
+)
 _MISSING_PARALLEL_FIELD = object()
 
 _PARALLEL_POLICY_VALUE_CONTEXT = LLIRTraversalContext(
@@ -67,13 +186,118 @@ _PARALLEL_CLUSTER_PLACEMENT_CONTEXT = LLIRTraversalContext(
 )
 
 
+def _is_cpp_identifier(value: object) -> bool:
+    return type(value) is str and value.isidentifier() and value not in _CPP_KEYWORDS
+
+
+def _is_cpp_qualified_name(value: object) -> bool:
+    return type(value) is str and all(
+        _is_cpp_identifier(component) for component in value.split("::")
+    )
+
+
+def _cluster_instance_fields(value: object, owner: str) -> dict:
+    fields = getattr(value, "__dict__", None)
+    if type(fields) is not dict:
+        raise TypeError(f"{owner} fields must be stored directly")
+    return fields
+
+
+def _validate_cluster_var(value: object, owner: str) -> None:
+    if type(value) is not llir.Var:
+        raise TypeError(f"{owner} must be an exact Var")
+    fields = _cluster_instance_fields(value, owner)
+    if (
+        not _is_cpp_identifier(fields.get("name", _MISSING_PARALLEL_FIELD))
+        or type(fields.get("type", _MISSING_PARALLEL_FIELD)) is not llir.DataType
+        or type(fields.get("is_ptr", _MISSING_PARALLEL_FIELD)) is not bool
+        or type(fields.get("is_restrict", _MISSING_PARALLEL_FIELD)) is not bool
+        or fields.get("tensor_access", _MISSING_PARALLEL_FIELD) is not None
+    ):
+        raise TypeError(f"{owner} must be a complete metadata-free C++ identifier Var")
+
+
+def _validate_cluster_expression(
+    value: object,
+    owner: str,
+    active: Optional[set[int]] = None,
+) -> None:
+    """Validate the narrow expression grammar used by workspace borrows."""
+
+    if active is None:
+        active = set()
+    if not isinstance(value, llir.Expr):
+        raise TypeError(f"{owner} must be an LLIR expression")
+    value_id = id(value)
+    if value_id in active:
+        raise TypeError(f"{owner} must be acyclic")
+    active.add(value_id)
+    try:
+        if type(value) is llir.Var:
+            _validate_cluster_var(value, owner)
+            return
+        fields = _cluster_instance_fields(value, owner)
+        if type(value) in (llir.Add, llir.Mul):
+            expected_op = "+" if type(value) is llir.Add else "*"
+            if fields.get("op", _MISSING_PARALLEL_FIELD) != expected_op:
+                raise TypeError(f"{owner}.op must remain {expected_op!r}")
+            _validate_cluster_expression(
+                fields.get("left", _MISSING_PARALLEL_FIELD),
+                f"{owner}.left",
+                active,
+            )
+            _validate_cluster_expression(
+                fields.get("right", _MISSING_PARALLEL_FIELD),
+                f"{owner}.right",
+                active,
+            )
+            return
+        if type(value) is llir.Cast:
+            if (
+                type(fields.get("data_type", _MISSING_PARALLEL_FIELD))
+                is not llir.DataType
+            ):
+                raise TypeError(f"{owner}.data_type must be a DataType")
+            _validate_cluster_expression(
+                fields.get("expr", _MISSING_PARALLEL_FIELD),
+                f"{owner}.expr",
+                active,
+            )
+            return
+        if type(value) is llir.FunctionCall:
+            if not _is_cpp_qualified_name(fields.get("name", _MISSING_PARALLEL_FIELD)):
+                raise TypeError(f"{owner}.name must be a qualified C++ name")
+        elif type(value) is llir.MemberCall:
+            if not _is_cpp_identifier(fields.get("member", _MISSING_PARALLEL_FIELD)):
+                raise TypeError(f"{owner}.member must be a C++ identifier")
+            _validate_cluster_expression(
+                fields.get("base", _MISSING_PARALLEL_FIELD),
+                f"{owner}.base",
+                active,
+            )
+        else:
+            raise TypeError(f"{owner} must use the workspace-borrow expression grammar")
+        template_args = fields.get("template_args", _MISSING_PARALLEL_FIELD)
+        if type(template_args) is not tuple or any(
+            type(argument) is not llir.DataType for argument in template_args
+        ):
+            raise TypeError(f"{owner}.template_args must be a DataType tuple")
+        args = fields.get("args", _MISSING_PARALLEL_FIELD)
+        if type(args) is not tuple:
+            raise TypeError(f"{owner}.args must be an expression tuple")
+        for index, argument in enumerate(args):
+            _validate_cluster_expression(argument, f"{owner}.args[{index}]", active)
+    finally:
+        active.remove(value_id)
+
+
 def _validate_pool_spec_fields(spec: object) -> None:
     fields = getattr(spec, "__dict__", None)
     if type(fields) is not dict:
         raise TypeError("ParallelWorkspacePoolSpec fields must be stored directly")
     name = fields.get("name", _MISSING_PARALLEL_FIELD)
-    if type(name) is not str or not name.isidentifier():
-        raise TypeError("ParallelWorkspacePoolSpec.name must be a non-empty identifier")
+    if not _is_cpp_identifier(name):
+        raise TypeError("ParallelWorkspacePoolSpec.name must be a C++ identifier")
     scalar_type = fields.get("scalar_type", _MISSING_PARALLEL_FIELD)
     if (
         type(scalar_type) is not llir.DataType
@@ -84,10 +308,8 @@ def _validate_pool_spec_fields(spec: object) -> None:
             "DataType"
         )
     extent = fields.get("extent", _MISSING_PARALLEL_FIELD)
-    if type(extent) is not str or not extent.isidentifier():
-        raise TypeError(
-            "ParallelWorkspacePoolSpec.extent must be a non-empty identifier"
-        )
+    if not _is_cpp_identifier(extent):
+        raise TypeError("ParallelWorkspacePoolSpec.extent must be a C++ identifier")
 
 
 @dataclass(frozen=True)
@@ -139,13 +361,96 @@ def _validate_cluster_fields(cluster: object) -> None:
     for field_name in ("alloc", "free"):
         statements = fields.get(field_name, _MISSING_PARALLEL_FIELD)
         if type(statements) is not tuple or any(
-            type(statement) not in SUPPORTED_LLIR_STATEMENT_NODE_TYPES
+            type(statement) not in _PARALLEL_CLUSTER_STATEMENT_TYPES
             for statement in statements
         ):
             raise TypeError(
                 f"ParallelWorkspaceCluster.{field_name} must be a tuple of "
-                "LLIR statements"
+                "VarInit or MemberCallStmt templates"
             )
+        for index, statement in enumerate(statements):
+            if type(statement) is llir.VarInit:
+                statement_fields = _cluster_instance_fields(
+                    statement,
+                    f"ParallelWorkspaceCluster.{field_name}[{index}]",
+                )
+                if (
+                    type(statement_fields.get("var", _MISSING_PARALLEL_FIELD))
+                    is not llir.Var
+                    or not isinstance(
+                        statement_fields.get("value", _MISSING_PARALLEL_FIELD),
+                        llir.Expr,
+                    )
+                    or type(statement_fields.get("op", _MISSING_PARALLEL_FIELD))
+                    is not str
+                    or statement_fields["op"] != "="
+                    or statement_fields.get("cast", _MISSING_PARALLEL_FIELD)
+                    is not False
+                ):
+                    raise TypeError(
+                        f"ParallelWorkspaceCluster.{field_name}[{index}] must "
+                        "be a complete plain VarInit template"
+                    )
+                _validate_cluster_var(
+                    statement_fields["var"],
+                    f"ParallelWorkspaceCluster.{field_name}[{index}].var",
+                )
+                _validate_cluster_expression(
+                    statement_fields["value"],
+                    f"ParallelWorkspaceCluster.{field_name}[{index}].value",
+                )
+            else:
+                statement_fields = _cluster_instance_fields(
+                    statement,
+                    f"ParallelWorkspaceCluster.{field_name}[{index}]",
+                )
+                if not _is_cpp_identifier(
+                    statement_fields.get("member", _MISSING_PARALLEL_FIELD)
+                ):
+                    raise TypeError(
+                        f"ParallelWorkspaceCluster.{field_name}[{index}].member "
+                        "must be a C++ identifier"
+                    )
+                template_args = statement_fields.get(
+                    "template_args", _MISSING_PARALLEL_FIELD
+                )
+                if type(template_args) is not tuple or any(
+                    type(argument) is not llir.DataType for argument in template_args
+                ):
+                    raise TypeError(
+                        f"ParallelWorkspaceCluster.{field_name}[{index}]."
+                        "template_args must be a DataType tuple"
+                    )
+                _validate_cluster_expression(
+                    statement_fields.get("base", _MISSING_PARALLEL_FIELD),
+                    f"ParallelWorkspaceCluster.{field_name}[{index}].base",
+                )
+                args = statement_fields.get("args", _MISSING_PARALLEL_FIELD)
+                if type(args) is not tuple:
+                    raise TypeError(
+                        f"ParallelWorkspaceCluster.{field_name}[{index}].args "
+                        "must be an expression tuple"
+                    )
+                for argument_index, argument in enumerate(args):
+                    _validate_cluster_expression(
+                        argument,
+                        f"ParallelWorkspaceCluster.{field_name}[{index}]."
+                        f"args[{argument_index}]",
+                    )
+            try:
+                LLIRRewriter(_PARALLEL_CLUSTER_PLACEMENT_CONTEXT).rewrite(statement)
+            except (
+                AttributeError,
+                CompilerInvariantError,
+                KeyError,
+                RecursionError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise TypeError(
+                    f"ParallelWorkspaceCluster.{field_name}[{index}] must be "
+                    "a complete acyclic LLIR statement template"
+                ) from error
     pool_specs = fields.get("pool_specs", _MISSING_PARALLEL_FIELD)
     if type(pool_specs) is not tuple or any(
         type(spec) is not ParallelWorkspacePoolSpec for spec in pool_specs
@@ -251,7 +556,10 @@ def sparse_pos_work_expr(
     """Return a safe total-nnz expression for a matching dense parent."""
     if sparse_pos is None or loop_bound is None:
         return None
-    match = re.match(r"([A-Za-z_]\w*?)(\d+)_pos$", sparse_pos)
+    match = re.fullmatch(
+        r"([A-Za-z_]\w*?)(\d+)_pos",
+        sparse_pos,
+    )
     if match is None:
         return None
     operand, level_text = match.groups()
@@ -289,6 +597,7 @@ def atomic_work_stealing_prelude(
     if (
         type(bound_name) is not str
         or type(bound_type) is not llir.DataType
+        or bound_type not in _ATOMIC_BOUND_TYPES
         or bound_fields.get("is_ptr", _MISSING_PARALLEL_FIELD) is not False
         or bound_fields.get("is_restrict", _MISSING_PARALLEL_FIELD) is not False
         or bound_fields.get("tensor_access", _MISSING_PARALLEL_FIELD) is not None
