@@ -111,6 +111,11 @@ class CsrMatrix:
                     f"row {row_number} has {len(row)} columns, expected {n_cols}"
                 )
             for column, value in enumerate(row):
+                if type(value) not in (int, float):
+                    raise CsrFormatError(
+                        f"row {row_number} column {column} must be an exact "
+                        "int or float"
+                    )
                 try:
                     value = float(value)
                 except (OverflowError, TypeError, ValueError) as error:
