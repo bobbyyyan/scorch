@@ -170,7 +170,7 @@ class _Interpreter:
             decl.symbol: decl for decl in program.tensors
         }
         try:
-            input_keys = set(inputs)
+            input_key_snapshot = tuple(inputs)
         except Exception as error:
             raise LoopIRInterpreterError(
                 "input binding keys could not be snapshotted"
@@ -178,17 +178,18 @@ class _Interpreter:
         if any(
             type(symbol) is not SymbolId
             or type(getattr(symbol, "value", None)) is not int
-            for symbol in input_keys
+            for symbol in input_key_snapshot
         ):
             raise LoopIRInterpreterError(
                 "input binding keys must be exact int-valued SymbolId values"
             )
+        input_keys = set(input_key_snapshot)
         if input_keys != set(program.inputs):
             raise LoopIRInterpreterError(
                 "input bindings must cover exactly the declared inputs"
             )
         try:
-            output_keys = set(output_shapes)
+            output_key_snapshot = tuple(output_shapes)
         except Exception as error:
             raise LoopIRInterpreterError(
                 "output shape keys could not be snapshotted"
@@ -196,11 +197,12 @@ class _Interpreter:
         if any(
             type(symbol) is not SymbolId
             or type(getattr(symbol, "value", None)) is not int
-            for symbol in output_keys
+            for symbol in output_key_snapshot
         ):
             raise LoopIRInterpreterError(
                 "output shape keys must be exact int-valued SymbolId values"
             )
+        output_keys = set(output_key_snapshot)
         if output_keys != set(program.outputs):
             raise LoopIRInterpreterError(
                 "output shapes must cover exactly the declared outputs"
