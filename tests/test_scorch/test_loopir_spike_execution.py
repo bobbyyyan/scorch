@@ -142,7 +142,7 @@ def test_spmv_randomized_against_dense_reference(seed, shape, density):
 def test_spmv_short_vector_fails_closed():
     fixture = build_csr_spmv_program()
     matrix = CsrMatrix.from_dense([[0.0, 0.0, 5.0]], 3)
-    with pytest.raises(LoopIRInterpreterError, match="out of bounds"):
+    with pytest.raises(LoopIRInterpreterError, match="extent equality 1 failed"):
         run_program(
             fixture.program,
             {fixture.matrix: matrix, fixture.vector: [1.0, 2.0]},
@@ -449,11 +449,70 @@ def test_shorter_second_operand_fails_closed():
     fixture = build_csr_union_add_program()
     a = CsrMatrix.from_dense([[1.0], [2.0], [3.0]], 1)
     b = CsrMatrix.from_dense([[1.0], [2.0]], 1)
-    with pytest.raises(LoopIRInterpreterError, match="cursor row 2 outside"):
+    with pytest.raises(LoopIRInterpreterError, match="extent equality 0 failed"):
         run_program(
             fixture.program,
             {fixture.lhs: a, fixture.rhs: b},
             {fixture.result: (3, 1)},
+        )
+
+
+@pytest.mark.parametrize("vector", ([4.0], [4.0, 0.0, 0.0, 0.0]))
+def test_spmv_vector_extent_mismatch_is_sparsity_independent(vector):
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[2.0, 0.0, 0.0]], 3)
+    with pytest.raises(LoopIRInterpreterError, match="extent equality 1 failed"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: vector},
+            {fixture.result: (1,)},
+        )
+
+
+def test_spmv_output_extent_mismatch_rejected_before_execution():
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[0.0, 0.0, 0.0]], 3)
+    with pytest.raises(LoopIRInterpreterError, match="extent equality 0 failed"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: [0.0, 0.0, 0.0]},
+            {fixture.result: (2,)},
+        )
+
+
+def test_elementwise_extra_rhs_rows_rejected_before_execution():
+    fixture = build_csr_union_add_program()
+    lhs = CsrMatrix.from_dense([[0.0]], 1)
+    rhs = CsrMatrix.from_dense([[0.0], [9.0]], 1)
+    with pytest.raises(LoopIRInterpreterError, match="extent equality 0 failed"):
+        run_program(
+            fixture.program,
+            {fixture.lhs: lhs, fixture.rhs: rhs},
+            {fixture.result: (1, 1)},
+        )
+
+
+def test_elementwise_column_mismatch_rejected_with_empty_support():
+    fixture = build_csr_intersection_multiply_program()
+    lhs = CsrMatrix.from_dense([[0.0, 0.0, 0.0]], 3)
+    rhs = CsrMatrix.from_dense([[0.0, 0.0]], 2)
+    with pytest.raises(LoopIRInterpreterError, match="extent equality 1 failed"):
+        run_program(
+            fixture.program,
+            {fixture.lhs: lhs, fixture.rhs: rhs},
+            {fixture.result: (1, 3)},
+        )
+
+
+def test_elementwise_output_extent_mismatch_rejected_with_empty_support():
+    fixture = build_csr_union_add_program()
+    lhs = CsrMatrix.from_dense([], 0)
+    rhs = CsrMatrix.from_dense([], 0)
+    with pytest.raises(LoopIRInterpreterError, match="extent equality 1 failed"):
+        run_program(
+            fixture.program,
+            {fixture.lhs: lhs, fixture.rhs: rhs},
+            {fixture.result: (0, 1)},
         )
 
 

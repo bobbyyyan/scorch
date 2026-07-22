@@ -16,6 +16,7 @@ from scorch.compiler.loopir_spike.nodes import (
     DenseFor,
     DimSize,
     Expr,
+    ExtentEquality,
     FloatConst,
     IndexValue,
     IntConst,
@@ -137,6 +138,86 @@ def test_hand_authored_fixture_programs_verify():
     verify_program(build_csr_spmv_program().program)
     verify_program(build_csr_union_add_program().program)
     verify_program(build_csr_intersection_multiply_program().program)
+
+
+def _with_extent_equalities(program, equalities):
+    return LoopProgram(
+        program.node_id,
+        program.tensors,
+        program.inputs,
+        program.outputs,
+        program.body,
+        equalities,
+    )
+
+
+def test_valid_extent_equality_verifies():
+    pair = _VecPair()
+    equality = ExtentEquality(
+        nid(),
+        (DimSize(nid(), pair.x, 0), DimSize(nid(), pair.y, 0)),
+    )
+    verify_program(_with_extent_equalities(pair.program(), (equality,)))
+
+
+def test_extent_equalities_must_be_owned_tuple():
+    program = _VecPair().program()
+    object.__setattr__(program, "extent_equalities", [])
+    expect_defect(program, "malformed_state", "program.extent_equalities")
+
+
+def test_extent_equality_members_have_exact_type():
+    pair = _VecPair()
+    program = _with_extent_equalities(pair.program(), (IntConst(nid(), 0),))
+    expect_defect(program, "malformed_state", "program.extent_equalities[0]")
+
+
+def test_extent_equality_needs_at_least_two_dimensions():
+    pair = _VecPair()
+    equality = ExtentEquality(nid(), (DimSize(nid(), pair.x, 0),))
+    program = _with_extent_equalities(pair.program(), (equality,))
+    expect_defect(program, "degenerate_extent_equality")
+
+
+def test_extent_equality_dimensions_must_be_dimsizes():
+    pair = _VecPair()
+    equality = ExtentEquality(
+        nid(),
+        (DimSize(nid(), pair.x, 0), IntConst(nid(), 0)),
+    )
+    program = _with_extent_equalities(pair.program(), (equality,))
+    expect_defect(program, "malformed_state")
+
+
+def test_extent_equality_rejects_undefined_tensor():
+    pair = _VecPair()
+    equality = ExtentEquality(
+        nid(),
+        (
+            DimSize(nid(), pair.x, 0),
+            DimSize(nid(), new_symbol_id(), 0),
+        ),
+    )
+    program = _with_extent_equalities(pair.program(), (equality,))
+    expect_defect(program, "undefined_tensor")
+
+
+def test_extent_equality_rejects_out_of_rank_dimension():
+    pair = _VecPair()
+    equality = ExtentEquality(
+        nid(),
+        (DimSize(nid(), pair.x, 0), DimSize(nid(), pair.y, 1)),
+    )
+    program = _with_extent_equalities(pair.program(), (equality,))
+    expect_defect(program, "rank_mismatch")
+
+
+def test_extent_equality_rejects_shared_dimension_node():
+    pair = _VecPair()
+    dimension = DimSize(nid(), pair.x, 0)
+    equality = ExtentEquality(nid(), (dimension, dimension))
+    program = _with_extent_equalities(pair.program(), (equality,))
+    expect_defect(program, "shared_node")
 
 
 def test_reduce_identity_table_is_read_only():
@@ -521,6 +602,77 @@ def test_cursor_outer_arity_mismatch_rejected():
         FloatConst(nid(), 1.0),
     )
     expect_defect(setup.program((sparse, append)), "rank_mismatch")
+
+
+@pytest.mark.parametrize(
+    ("levels", "cursor_level", "outer_indices"),
+    (
+        ((COMPRESSED, DENSE), 0, ()),
+        ((COMPRESSED, COMPRESSED), 1, (IntConst(nid(), 0),)),
+        (
+            (DENSE, COMPRESSED, COMPRESSED),
+            2,
+            (IntConst(nid(), 0), IntConst(nid(), 0)),
+        ),
+    ),
+)
+def test_cursor_hierarchies_without_parent_positions_rejected(
+    levels, cursor_level, outer_indices
+):
+    x, y = new_symbol_id(), new_symbol_id()
+    cursor = SparseCursorDecl(nid(), new_cursor_id(), x, cursor_level, outer_indices)
+    sparse = SparseFor(nid(), cursor, new_index_id(), Block(nid(), ()))
+    store = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    program = wrap(
+        (
+            TensorDecl(nid(), x, "x", levels),
+            TensorDecl(nid(), y, "y", (DENSE,)),
+        ),
+        (x,),
+        (y,),
+        (sparse, store),
+    )
+    expect_defect(program, "unsupported_sparse_hierarchy")
+
+
+def test_dense_prefix_compressed_leaf_cursor_is_representable():
+    x, y = new_symbol_id(), new_symbol_id()
+    i, j, k = new_index_id(), new_index_id(), new_index_id()
+    cursor = SparseCursorDecl(
+        nid(),
+        new_cursor_id(),
+        x,
+        2,
+        (IndexValue(nid(), i), IndexValue(nid(), j)),
+    )
+    sparse = SparseFor(nid(), cursor, k, Block(nid(), ()))
+    loops = DenseFor(
+        nid(),
+        i,
+        DimSize(nid(), x, 0),
+        Block(
+            nid(),
+            (
+                DenseFor(
+                    nid(),
+                    j,
+                    DimSize(nid(), x, 1),
+                    Block(nid(), (sparse,)),
+                ),
+            ),
+        ),
+    )
+    store = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    program = wrap(
+        (
+            TensorDecl(nid(), x, "x", (DENSE, DENSE, COMPRESSED)),
+            TensorDecl(nid(), y, "y", (DENSE,)),
+        ),
+        (x,),
+        (y,),
+        (loops, store),
+    )
+    verify_program(program)
 
 
 def test_store_to_compressed_output_rejected():
@@ -1065,6 +1217,19 @@ def test_forged_node_id_rejected():
     expect_defect(pair.program((stmt,)), "invalid_node_id")
 
 
+def test_missing_node_id_value_rejected_with_stable_defect():
+    pair = _VecPair()
+    stmt = Store(
+        nid(),
+        pair.y,
+        (IntConst(nid(), 0),),
+        FloatConst(nid(), 1.0),
+    )
+    object.__delattr__(stmt.node_id, "value")
+    defect = expect_defect(pair.program((stmt,)), "invalid_node_id")
+    assert defect.path == "program.body.statements[0]"
+
+
 def test_forged_symbol_id_value_rejected():
     pair = _VecPair()
     forged = new_symbol_id()
@@ -1076,6 +1241,70 @@ def test_forged_symbol_id_value_rejected():
         Load(nid(), forged, (IntConst(nid(), 0),)),
     )
     expect_defect(pair.program((stmt,)), "invalid_symbol_id")
+
+
+def test_missing_symbol_id_value_rejected_with_stable_defect():
+    pair = _VecPair()
+    object.__delattr__(pair.x, "value")
+    defect = expect_defect(pair.program(), "invalid_symbol_id")
+    assert defect.path == "program.tensors[0]"
+
+
+def test_forged_index_id_value_rejected():
+    pair = _VecPair()
+    loop = pair.copy_loop()
+    object.__setattr__(loop.index, "value", "zero")
+    defect = expect_defect(pair.program((loop,)), "invalid_index_id")
+    assert defect.path == "program.body.statements[0]"
+
+
+def test_missing_cursor_id_value_rejected():
+    setup = _CsrSetup()
+    row = new_index_id()
+    cursor = setup.cursor(setup.a, row)
+    object.__delattr__(cursor.cursor, "value")
+    loop = DenseFor(
+        nid(),
+        row,
+        DimSize(nid(), setup.a, 0),
+        Block(
+            nid(),
+            (
+                SparseFor(
+                    nid(),
+                    cursor,
+                    new_index_id(),
+                    Block(nid(), ()),
+                ),
+            ),
+        ),
+    )
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 0.0),
+    )
+    defect = expect_defect(setup.program((loop, append)), "invalid_cursor_id")
+    assert defect.path == "program.body.statements[0].body.statements[0].cursor"
+
+
+@pytest.mark.parametrize(
+    "field", ("tensors", "inputs", "outputs", "body", "extent_equalities")
+)
+def test_missing_program_fields_rejected_at_exact_path(field):
+    program = _VecPair().program()
+    object.__delattr__(program, field)
+    defect = expect_defect(program, "malformed_state")
+    assert defect.path == f"program.{field}"
+
+
+def test_missing_nested_node_field_rejected_at_exact_path():
+    pair = _VecPair()
+    loop = pair.copy_loop()
+    object.__delattr__(loop.body, "statements")
+    defect = expect_defect(pair.program((loop,)), "malformed_state")
+    assert defect.path == "program.body.statements[0].body.statements"
 
 
 def _nested_value(depth):
