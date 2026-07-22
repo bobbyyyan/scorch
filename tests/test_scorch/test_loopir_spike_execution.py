@@ -439,6 +439,47 @@ def test_disappearing_mapping_values_fail_closed():
         )
 
 
+def test_hostile_foreign_mapping_keys_fail_before_equality_callbacks():
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[1.0]], 1)
+
+    class HostileKey:
+        def __init__(self, collision):
+            self.collision = collision
+
+        def __hash__(self):
+            return hash(self.collision)
+
+        def __eq__(self, _other):
+            raise RuntimeError("foreign key equality callback ran")
+
+    class AdvertisedMapping:
+        def __init__(self, keys):
+            self.keys = keys
+
+        def __iter__(self):
+            return iter(self.keys)
+
+        def __len__(self):
+            return len(self.keys)
+
+        def __getitem__(self, _key):
+            raise AssertionError("foreign key reached value lookup")
+
+    with pytest.raises(LoopIRInterpreterError, match="exact int-valued SymbolId"):
+        run_program(
+            fixture.program,
+            AdvertisedMapping((HostileKey(fixture.matrix), fixture.vector)),
+            {fixture.result: (1,)},
+        )
+    with pytest.raises(LoopIRInterpreterError, match="exact int-valued SymbolId"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: [1.0]},
+            AdvertisedMapping((HostileKey(fixture.result),)),
+        )
+
+
 def test_non_csr_sparse_binding_fails_closed():
     fixture = build_csr_spmv_program()
     with pytest.raises(LoopIRInterpreterError, match="CsrMatrix"):
