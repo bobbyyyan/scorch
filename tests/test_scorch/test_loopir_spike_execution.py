@@ -759,6 +759,21 @@ def test_csr_from_dense_rejects_unrepresentable_values():
         CsrMatrix.from_dense([[10**10000]], 1)
 
 
+@pytest.mark.parametrize("value", (True, "1.5"))
+def test_csr_from_dense_rejects_coercible_non_numeric_values(value):
+    with pytest.raises(CsrFormatError, match="exact int or float"):
+        CsrMatrix.from_dense([[value]], 1)
+
+
+def test_csr_from_dense_rejects_float_callbacks_without_invoking_them():
+    class HostileFloat:
+        def __float__(self):
+            raise RuntimeError("numeric callback ran")
+
+    with pytest.raises(CsrFormatError, match="exact int or float"):
+        CsrMatrix.from_dense([[HostileFloat()]], 1)
+
+
 def test_csr_from_dense_rejects_sequence_subclasses_without_callbacks():
     class HostileList(list):
         def __iter__(self):
