@@ -516,7 +516,6 @@ def _rewrite_statement_references(
                         replacements,
                         context,
                         statement_path + ("call", "args"),
-                        replace_exact_names=True,
                     ),
                 ),
             )

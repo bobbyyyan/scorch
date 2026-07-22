@@ -1084,6 +1084,52 @@ def test_guarded_prefetch_rewrite_matches_the_legacy_whole_statement_scope(
         assert cast(llir.Var, coordinate_left).name == base
 
 
+@pytest.mark.parametrize(
+    ("typed_argument", "raw_argument"),
+    (
+        (_var("lane"), "lane"),
+        (llir.AddressOf(_var("lane")), "&lane"),
+    ),
+)
+def test_guarded_call_rewrite_preserves_legacy_bare_argument_scope(
+    typed_argument: llir.Expr,
+    raw_argument: str,
+) -> None:
+    """Only guard and array-index references receive exact-name rewrites."""
+
+    guard = llir.GuardedCallStmt(
+        cond=llir.BinOp(
+            "<",
+            llir.Add(_var("lane"), llir.Literal(1, llir.DataType.INT)),
+            _var("p_end"),
+        ),
+        call=llir.FunctionCallStmt("consume", (typed_argument,)),
+    )
+    raw = llir.RawStmt(f"if (lane + 1 < p_end) consume({raw_argument})")
+
+    typed_output = eliminate_single_iteration_loops(
+        _program([guard], base="0"),
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+    legacy_output = eliminate_single_iteration_loops(
+        _program([raw], base="0"),
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert LLIRLowerer().lower_llir(typed_output) == LLIRLowerer().lower_llir(
+        legacy_output
+    )
+    rewritten = cast(llir.GuardedCallStmt, typed_output[0])
+    condition_left = cast(llir.Add, cast(llir.BinOp, rewritten.cond).left).left
+    assert type(condition_left) is llir.Literal
+    assert cast(llir.Literal, condition_left).value == 0
+    if type(typed_argument) is llir.AddressOf:
+        rewritten_address = cast(llir.AddressOf, rewritten.call.args[0])
+        assert cast(llir.Var, rewritten_address.operand).name == "lane"
+    else:
+        assert cast(llir.Var, rewritten.call.args[0]).name == "lane"
+
+
 def test_function_call_rewrite_traverses_product_and_sizeof_arguments() -> None:
     call = llir.FunctionCallStmt(
         name="memset",
