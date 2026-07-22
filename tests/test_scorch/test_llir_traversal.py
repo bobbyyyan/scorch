@@ -228,6 +228,13 @@ def _node_samples() -> Dict[Type[llir.Node], llir.Node]:
             (llir.DataType.INT,),
             (index,),
         ),
+        llir.GuardedCallStmt: llir.GuardedCallStmt(
+            cond=llir.BinOp("<", llir.Add(value, literal), index),
+            call=llir.FunctionCallStmt(
+                "call",
+                [llir.AddressOf(llir.ArrayAccess(value, index)), literal],
+            ),
+        ),
         llir.Array: llir.Array([value, literal], llir.DataType.INT),
         llir.MemberAccess: llir.MemberAccess(value, "member"),
         llir.MemberCall: llir.MemberCall(
@@ -290,6 +297,7 @@ def _node_emissions() -> Dict[Type[llir.Node], str]:
         llir.FunctionCall: "call(value)",
         llir.FunctionCallStmt: "call(value);",
         llir.MemberCallStmt: "value.member<int>(index);",
+        llir.GuardedCallStmt: "if (value + 1 < index) call(&value[index], 1);",
         llir.Array: "{value, 1}",
         llir.MemberAccess: "value.member",
         llir.MemberCall: "value.member<int>(index)",

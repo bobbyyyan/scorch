@@ -90,6 +90,7 @@ SUPPORTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
     llir.Function,
     llir.FunctionCallStmt,
     llir.MemberCallStmt,
+    llir.GuardedCallStmt,
     llir.ForLoop,
     llir.ForLoopAuto,
     llir.WhileLoop,
@@ -929,6 +930,8 @@ class LLIRWalker:
             self.visit_function_call_stmt(cast(llir.FunctionCallStmt, node), path)
         elif node_type is llir.MemberCallStmt:
             self.visit_member_call_stmt(cast(llir.MemberCallStmt, node), path)
+        elif node_type is llir.GuardedCallStmt:
+            self.visit_guarded_call_stmt(cast(llir.GuardedCallStmt, node), path)
         elif node_type is llir.ForLoop:
             self.visit_for_loop(cast(llir.ForLoop, node), path)
         elif node_type is llir.ForLoopAuto:
@@ -1280,6 +1283,22 @@ class LLIRWalker:
                 )
         self._walk_expr(base, path + ("base",))
         self._walk_expr_sequence(args, path + ("args",))
+
+    def visit_guarded_call_stmt(
+        self, node: llir.GuardedCallStmt, path: LLIRPath
+    ) -> None:
+        try:
+            llir._validate_guarded_call_fields(node)
+        except TypeError as error:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_guarded_call_stmt",
+                message=str(error),
+                path=path + getattr(error, "field_path", ()),
+                value=node,
+            )
+        self._walk_expr(cast(llir.Expr, node.cond), path + ("cond",))
+        self._walk_stmt(cast(llir.Stmt, node.call), path + ("call",))
 
     def visit_for_loop(self, node: llir.ForLoop, path: LLIRPath) -> None:
         self._walk_optional_statements(
@@ -1689,6 +1708,10 @@ class LLIRRewriter:
             )
         if node_type is llir.MemberCallStmt:
             return self.rewrite_member_call_stmt(cast(llir.MemberCallStmt, node), path)
+        if node_type is llir.GuardedCallStmt:
+            return self.rewrite_guarded_call_stmt(
+                cast(llir.GuardedCallStmt, node), path
+            )
         if node_type is llir.ForLoop:
             return self.rewrite_for_loop(cast(llir.ForLoop, node), path)
         if node_type is llir.ForLoopAuto:
@@ -2216,6 +2239,24 @@ class LLIRRewriter:
             member=member,
             template_args=template_args,
             args=self._rewrite_expr_sequence(args, path + ("args",)),
+        )
+
+    def rewrite_guarded_call_stmt(
+        self, node: llir.GuardedCallStmt, path: LLIRPath
+    ) -> llir.GuardedCallStmt:
+        try:
+            llir._validate_guarded_call_fields(node)
+        except TypeError as error:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_guarded_call_stmt",
+                message=str(error),
+                path=path + getattr(error, "field_path", ()),
+                value=node,
+            )
+        return llir.GuardedCallStmt(
+            cond=self._rewrite_expr(node.cond, path + ("cond",)),
+            call=self.rewrite_function_call_stmt(node.call, path + ("call",)),
         )
 
     def rewrite_for_loop(self, node: llir.ForLoop, path: LLIRPath) -> llir.ForLoop:

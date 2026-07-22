@@ -1291,24 +1291,24 @@ def _validate_address_of_metadata(
     metadata: object,
     *,
     path: Tuple[str, ...],
+    owner: str = "AddressOf.operand ArrayAccess",
 ) -> None:
     if metadata is None:
         return
     if type(metadata) is not TensorAccessMetadata:
         raise _AddressOfValidationError(
-            "AddressOf.operand ArrayAccess metadata must be "
-            "TensorAccessMetadata or None",
+            f"{owner} metadata must be TensorAccessMetadata or None",
             path,
         )
     typed_metadata = cast(TensorAccessMetadata, metadata)
     if type(_address_of_instance_field(typed_metadata, "access_id")) is not AccessId:
         raise _AddressOfValidationError(
-            "AddressOf.operand ArrayAccess metadata access_id must be an AccessId",
+            f"{owner} metadata access_id must be an AccessId",
             path + ("access_id",),
         )
     if type(_address_of_instance_field(typed_metadata, "tensor_id")) is not SymbolId:
         raise _AddressOfValidationError(
-            "AddressOf.operand ArrayAccess metadata tensor_id must be a SymbolId",
+            f"{owner} metadata tensor_id must be a SymbolId",
             path + ("tensor_id",),
         )
     index_ids = _address_of_instance_field(typed_metadata, "index_ids")
@@ -1316,13 +1316,12 @@ def _validate_address_of_metadata(
         type(index_id) is not IndexId for index_id in index_ids
     ):
         raise _AddressOfValidationError(
-            "AddressOf.operand ArrayAccess metadata index_ids must be a tuple "
-            "of IndexId values",
+            f"{owner} metadata index_ids must be a tuple of IndexId values",
             path + ("index_ids",),
         )
     if type(_address_of_instance_field(typed_metadata, "role")) is not TensorAccessRole:
         raise _AddressOfValidationError(
-            "AddressOf.operand ArrayAccess metadata role must be a TensorAccessRole",
+            f"{owner} metadata role must be a TensorAccessRole",
             path + ("role",),
         )
 
@@ -1372,13 +1371,20 @@ def _validate_address_of_index(
     *,
     path: Tuple[str, ...],
     active: set[int],
+    owner: str = "AddressOf.operand ArrayAccess index",
+    metadata_owner: str = "AddressOf.operand ArrayAccess",
 ) -> None:
-    """Validate one stored, acyclic assignment-index expression tree."""
+    """Validate one stored, acyclic assignment-index expression tree.
+
+    ``owner``/``metadata_owner`` only parameterize diagnostic prefixes; the
+    defaults keep every historical AddressOf message byte-identical while the
+    same grammar backs other narrow index-expression boundaries.
+    """
 
     expression_id = id(expression)
     if expression_id in active:
         raise _AddressOfValidationError(
-            "AddressOf.operand ArrayAccess index must be acyclic",
+            f"{owner} must be acyclic",
             path,
         )
     active.add(expression_id)
@@ -1389,30 +1395,27 @@ def _validate_address_of_index(
             name = _address_of_instance_field(variable, "name")
             if not _is_assignment_name(name, allow_member=True):
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Var name must be an "
-                    "identifier or member path",
+                    f"{owner} Var name must be an identifier or member path",
                     path + ("name",),
                 )
             if type(_address_of_instance_field(variable, "type")) is not DataType:
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Var type must be a DataType",
+                    f"{owner} Var type must be a DataType",
                     path + ("type",),
                 )
             if type(_address_of_instance_field(variable, "is_ptr")) is not bool:
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Var is_ptr must be a bool",
+                    f"{owner} Var is_ptr must be a bool",
                     path + ("is_ptr",),
                 )
             if type(_address_of_instance_field(variable, "is_restrict")) is not bool:
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Var is_restrict must be a "
-                    "bool",
+                    f"{owner} Var is_restrict must be a bool",
                     path + ("is_restrict",),
                 )
             if _address_of_instance_field(variable, "tensor_access") is not None:
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Var cannot carry tensor "
-                    "access metadata",
+                    f"{owner} Var cannot carry tensor access metadata",
                     path + ("tensor_access",),
                 )
             return
@@ -1421,14 +1424,12 @@ def _validate_address_of_index(
             literal = cast(Literal, expression)
             if type(_address_of_instance_field(literal, "value")) is not int:
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Literal value must be an "
-                    "int",
+                    f"{owner} Literal value must be an int",
                     path + ("value",),
                 )
             if type(_address_of_instance_field(literal, "data_type")) is not DataType:
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Literal data_type must be "
-                    "a DataType",
+                    f"{owner} Literal data_type must be a DataType",
                     path + ("data_type",),
                 )
             return
@@ -1439,8 +1440,7 @@ def _validate_address_of_index(
                 is not DataType
             ):
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Sizeof data_type must be "
-                    "a DataType",
+                    f"{owner} Sizeof data_type must be a DataType",
                     path + ("data_type",),
                 )
             return
@@ -1455,19 +1455,22 @@ def _validate_address_of_index(
                 or (expression_type is Mul and op != "*")
             ):
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index BinOp op must be a "
-                    "supported arithmetic operator",
+                    f"{owner} BinOp op must be a supported arithmetic operator",
                     path + ("op",),
                 )
             _validate_address_of_index(
                 _address_of_instance_field(binary, "left"),
                 path=path + ("left",),
                 active=active,
+                owner=owner,
+                metadata_owner=metadata_owner,
             )
             _validate_address_of_index(
                 _address_of_instance_field(binary, "right"),
                 path=path + ("right",),
                 active=active,
+                owner=owner,
+                metadata_owner=metadata_owner,
             )
             return
 
@@ -1476,14 +1479,15 @@ def _validate_address_of_index(
             op = _address_of_instance_field(unary, "op")
             if type(op) is not str or op not in ("+", "-"):
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index UnaryOp op must be '+' or "
-                    "'-'",
+                    f"{owner} UnaryOp op must be '+' or '-'",
                     path + ("op",),
                 )
             _validate_address_of_index(
                 _address_of_instance_field(unary, "operand"),
                 path=path + ("operand",),
                 active=active,
+                owner=owner,
+                metadata_owner=metadata_owner,
             )
             return
 
@@ -1494,14 +1498,15 @@ def _validate_address_of_index(
                 is not DataType
             ):
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index Cast data_type must be a "
-                    "DataType",
+                    f"{owner} Cast data_type must be a DataType",
                     path + ("data_type",),
                 )
             _validate_address_of_index(
                 _address_of_instance_field(typed_cast, "expr"),
                 path=path + ("expr",),
                 active=active,
+                owner=owner,
+                metadata_owner=metadata_owner,
             )
             return
 
@@ -1512,8 +1517,7 @@ def _validate_address_of_index(
                 allow_member=True,
             ):
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index FunctionCall name must be "
-                    "an identifier or member path",
+                    f"{owner} FunctionCall name must be an identifier or member path",
                     path + ("name",),
                 )
             template_arguments = _address_of_instance_field(call, "template_args")
@@ -1521,15 +1525,14 @@ def _validate_address_of_index(
                 type(argument) is not DataType for argument in template_arguments
             ):
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index FunctionCall template_args "
-                    "must be a tuple of DataType values",
+                    f"{owner} FunctionCall template_args must be a tuple of "
+                    "DataType values",
                     path + ("template_args",),
                 )
             arguments = _address_of_instance_field(call, "args")
             if type(arguments) is not tuple:
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index FunctionCall args must be "
-                    "a tuple",
+                    f"{owner} FunctionCall args must be a tuple",
                     path + ("args",),
                 )
             for argument_index, argument in enumerate(arguments):
@@ -1537,6 +1540,8 @@ def _validate_address_of_index(
                     argument,
                     path=path + ("args", f"[{argument_index}]"),
                     active=active,
+                    owner=owner,
+                    metadata_owner=metadata_owner,
                 )
             return
 
@@ -1546,6 +1551,7 @@ def _validate_address_of_index(
             _validate_address_of_metadata(
                 metadata,
                 path=path + ("tensor_access",),
+                owner=metadata_owner,
             )
             if (
                 metadata is not None
@@ -1553,25 +1559,27 @@ def _validate_address_of_index(
                 is not TensorAccessRole.INPUT_READ
             ):
                 raise _AddressOfValidationError(
-                    "AddressOf.operand ArrayAccess index metadata must have the "
-                    "INPUT_READ role",
+                    f"{owner} metadata must have the INPUT_READ role",
                     path + ("tensor_access", "role"),
                 )
             _validate_address_of_index(
                 _address_of_instance_field(access, "array"),
                 path=path + ("array",),
                 active=active,
+                owner=owner,
+                metadata_owner=metadata_owner,
             )
             _validate_address_of_index(
                 _address_of_instance_field(access, "index"),
                 path=path + ("index",),
                 active=active,
+                owner=owner,
+                metadata_owner=metadata_owner,
             )
             return
 
         raise _AddressOfValidationError(
-            "AddressOf.operand ArrayAccess index contains an unsupported LLIR "
-            "expression",
+            f"{owner} contains an unsupported LLIR expression",
             path,
         )
     finally:
@@ -1642,3 +1650,164 @@ class AddressOf(Expr):
 
     def __post_init__(self) -> None:
         _validate_address_of_operand(self.operand)
+
+
+_GUARDED_CALL_COMPARISON_OPS = frozenset({"<", "<=", ">", ">=", "==", "!="})
+
+
+class _GuardedCallValidationError(TypeError):
+    """A guarded-call boundary failure with a node-relative field path."""
+
+    def __init__(self, message: str, field_path: Tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.field_path = field_path
+
+
+def _validate_guarded_call_condition(
+    value: object,
+    *,
+    path: Tuple[str, ...],
+    active: set[int],
+) -> None:
+    """Validate one stored, acyclic ``&&``-conjunction of index comparisons."""
+
+    value_id = id(value)
+    if value_id in active:
+        raise _GuardedCallValidationError(
+            "GuardedCallStmt.cond must be acyclic",
+            path,
+        )
+    active.add(value_id)
+    try:
+        if type(value) is not BinOp:
+            raise _GuardedCallValidationError(
+                "GuardedCallStmt.cond must be an exact comparison or '&&' "
+                "conjunction BinOp",
+                path,
+            )
+        op = _address_of_instance_field(value, "op")
+        if op == "&&":
+            _validate_guarded_call_condition(
+                _address_of_instance_field(value, "left"),
+                path=path + ("left",),
+                active=active,
+            )
+            _validate_guarded_call_condition(
+                _address_of_instance_field(value, "right"),
+                path=path + ("right",),
+                active=active,
+            )
+            return
+        if type(op) is not str or op not in _GUARDED_CALL_COMPARISON_OPS:
+            raise _GuardedCallValidationError(
+                "GuardedCallStmt.cond comparisons must use one supported "
+                "comparison operator",
+                path + ("op",),
+            )
+        for side in ("left", "right"):
+            try:
+                _validate_address_of_index(
+                    _address_of_instance_field(value, side),
+                    path=path + (side,),
+                    active=active,
+                    owner="GuardedCallStmt.cond comparison operand",
+                    metadata_owner="GuardedCallStmt.cond comparison ArrayAccess",
+                )
+            except _AddressOfValidationError as error:
+                raise _GuardedCallValidationError(
+                    str(error),
+                    error.field_path,
+                ) from error
+    finally:
+        active.remove(value_id)
+
+
+def _validate_guarded_call_callee(call: object, *, path: Tuple[str, ...]) -> None:
+    """Validate the stored single call statement guarded by the condition."""
+
+    if type(call) is not FunctionCallStmt:
+        raise _GuardedCallValidationError(
+            "GuardedCallStmt.call must be an exact FunctionCallStmt",
+            path,
+        )
+    name = _address_of_instance_field(call, "name")
+    if not _is_assignment_name(name, allow_member=True):
+        raise _GuardedCallValidationError(
+            "GuardedCallStmt.call name must be an identifier or member path",
+            path + ("name",),
+        )
+    template_args = _address_of_instance_field(call, "template_args")
+    if type(template_args) is not tuple or any(
+        type(argument) is not DataType for argument in template_args
+    ):
+        raise _GuardedCallValidationError(
+            "GuardedCallStmt.call template_args must be a tuple of DataType values",
+            path + ("template_args",),
+        )
+    args = _address_of_instance_field(call, "args")
+    if type(args) is not tuple:
+        raise _GuardedCallValidationError(
+            "GuardedCallStmt.call args must be a tuple",
+            path + ("args",),
+        )
+    for index, argument in enumerate(args):
+        argument_path = path + ("args", f"[{index}]")
+        if type(argument) is AddressOf:
+            try:
+                _validate_address_of_operand(
+                    _address_of_instance_field(argument, "operand")
+                )
+            except _AddressOfValidationError as error:
+                raise _GuardedCallValidationError(
+                    str(error),
+                    argument_path + ("operand",) + error.field_path,
+                ) from error
+            continue
+        try:
+            _validate_address_of_index(
+                argument,
+                path=argument_path,
+                active=set(),
+                owner="GuardedCallStmt.call argument",
+                metadata_owner="GuardedCallStmt.call argument ArrayAccess",
+            )
+        except _AddressOfValidationError as error:
+            raise _GuardedCallValidationError(
+                str(error),
+                error.field_path,
+            ) from error
+
+
+def _validate_guarded_call_fields(node: object) -> None:
+    """Revalidate one guarded call from stored fields, never defaults."""
+
+    _validate_guarded_call_condition(
+        _address_of_instance_field(node, "cond"),
+        path=("cond",),
+        active=set(),
+    )
+    _validate_guarded_call_callee(
+        _address_of_instance_field(node, "call"),
+        path=("call",),
+    )
+
+
+@dataclass(frozen=True)
+class GuardedCallStmt(Stmt):
+    """An immutable single-line guarded call, spelled ``if (cond) call;``.
+
+    This deliberately narrow statement owns the legacy inline prefetch-guard
+    seams: exactly one call statement guarded by one condition, emitted
+    unbraced on a single line.  The condition grammar is restricted to
+    ``&&``-conjunctions of comparisons over assignment-index expressions, and
+    call arguments are :class:`AddressOf` borrows or the same index grammar.
+    :class:`IfThenElse` remains the only owner of general braced conditionals;
+    this node does not represent else branches, statement lists, or arbitrary
+    guarded statements.
+    """
+
+    cond: Expr
+    call: FunctionCallStmt
+
+    def __post_init__(self) -> None:
+        _validate_guarded_call_fields(self)

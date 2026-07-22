@@ -399,6 +399,12 @@ class LLIRLowerer:
                 indent_level,
             )
 
+        elif type(ir) is llir.GuardedCallStmt:
+            return self._lower_guarded_call_stmt(
+                cast(llir.GuardedCallStmt, ir),
+                indent_level,
+            )
+
         elif type(ir) in (llir.WhileLoop, llir.ForLoop, llir.ForLoopAuto):
             return self.lower_loop_construct(
                 cast(Union[llir.WhileLoop, llir.ForLoop, llir.ForLoopAuto], ir),
@@ -479,6 +485,24 @@ class LLIRLowerer:
         member_args = ", ".join(self._render_expression(argument) for argument in args)
         return self.lower_llir(
             f"{receiver}.{member}{member_template_args}({member_args});",
+            indent_level,
+        )
+
+    def _lower_guarded_call_stmt(
+        self,
+        guarded_call: llir.GuardedCallStmt,
+        indent_level: int,
+    ) -> str:
+        """Emit one single-line unbraced guarded call, ``if (cond) call;``."""
+
+        try:
+            llir._validate_guarded_call_fields(guarded_call)
+        except TypeError as error:
+            raise CodegenError(str(error)) from error
+        condition = self._render_expression(guarded_call.cond)
+        call_statement = self._lower_llir_impl(guarded_call.call)
+        return self.lower_llir(
+            f"if ({condition}) {call_statement}",
             indent_level,
         )
 
