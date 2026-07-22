@@ -469,14 +469,16 @@ def test_hostile_foreign_mapping_keys_fail_before_equality_callbacks():
     with pytest.raises(LoopIRInterpreterError, match="exact int-valued SymbolId"):
         run_program(
             fixture.program,
-            AdvertisedMapping((HostileKey(fixture.matrix), fixture.vector)),
+            AdvertisedMapping(
+                (HostileKey(fixture.matrix), fixture.matrix, fixture.vector)
+            ),
             {fixture.result: (1,)},
         )
     with pytest.raises(LoopIRInterpreterError, match="exact int-valued SymbolId"):
         run_program(
             fixture.program,
             {fixture.matrix: matrix, fixture.vector: [1.0]},
-            AdvertisedMapping((HostileKey(fixture.result),)),
+            AdvertisedMapping((HostileKey(fixture.result), fixture.result)),
         )
 
 
