@@ -506,6 +506,32 @@ def test_extent_mismatch_rejected_before_any_tensor_materialization(monkeypatch)
         )
 
 
+def test_input_mapping_is_snapshotted_once_before_shape_validation():
+    fixture = build_csr_spmv_program()
+    checked_matrix = CsrMatrix.from_dense([[2.0]], 1)
+    swapped_matrix = CsrMatrix.from_dense([[9.0, 0.0], [0.0, 0.0]], 2)
+
+    class ChangingBindings(dict):
+        def __init__(self):
+            super().__init__({fixture.matrix: checked_matrix, fixture.vector: [3.0]})
+            self.lookups = {fixture.matrix: 0, fixture.vector: 0}
+
+        def __getitem__(self, symbol):
+            self.lookups[symbol] += 1
+            if symbol == fixture.matrix and self.lookups[symbol] > 1:
+                return swapped_matrix
+            return super().__getitem__(symbol)
+
+    bindings = ChangingBindings()
+    results = run_program(
+        fixture.program,
+        bindings,
+        {fixture.result: (1,)},
+    )
+    assert results[fixture.result] == [6.0]
+    assert bindings.lookups == {fixture.matrix: 1, fixture.vector: 1}
+
+
 def test_elementwise_extra_rhs_rows_rejected_before_execution():
     fixture = build_csr_union_add_program()
     lhs = CsrMatrix.from_dense([[0.0]], 1)
