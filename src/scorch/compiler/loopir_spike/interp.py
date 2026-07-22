@@ -169,22 +169,49 @@ class _Interpreter:
         self.decls: Dict[SymbolId, TensorDecl] = {
             decl.symbol: decl for decl in program.tensors
         }
-        if set(inputs) != set(program.inputs):
+        try:
+            input_keys = set(inputs)
+        except Exception as error:
+            raise LoopIRInterpreterError(
+                "input binding keys could not be snapshotted"
+            ) from error
+        if input_keys != set(program.inputs):
             raise LoopIRInterpreterError(
                 "input bindings must cover exactly the declared inputs"
             )
-        if set(output_shapes) != set(program.outputs):
+        try:
+            output_keys = set(output_shapes)
+        except Exception as error:
+            raise LoopIRInterpreterError(
+                "output shape keys could not be snapshotted"
+            ) from error
+        if output_keys != set(program.outputs):
             raise LoopIRInterpreterError(
                 "output shapes must cover exactly the declared outputs"
             )
-        input_values = {symbol: inputs[symbol] for symbol in program.inputs}
+        try:
+            input_values = {symbol: inputs[symbol] for symbol in program.inputs}
+        except Exception as error:
+            raise LoopIRInterpreterError(
+                "input bindings could not be snapshotted"
+            ) from error
+        try:
+            registered_output_shapes = {
+                symbol: output_shapes[symbol] for symbol in program.outputs
+            }
+        except Exception as error:
+            raise LoopIRInterpreterError(
+                "output shapes could not be snapshotted"
+            ) from error
         self.values: Dict[SymbolId, Any] = {}
         self.shapes: Dict[SymbolId, Tuple[int, ...]] = {}
         for symbol in program.inputs:
             self._register_input_shape(self.decls[symbol], input_values[symbol])
         self.builders: Dict[SymbolId, _CsrOutputBuilder] = {}
         for symbol in program.outputs:
-            self._register_output_shape(self.decls[symbol], output_shapes[symbol])
+            self._register_output_shape(
+                self.decls[symbol], registered_output_shapes[symbol]
+            )
         self._check_extent_equalities()
         for symbol in program.inputs:
             self._materialize_input(self.decls[symbol], input_values[symbol])
