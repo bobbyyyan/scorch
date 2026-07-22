@@ -177,16 +177,17 @@ class _Interpreter:
             raise LoopIRInterpreterError(
                 "output shapes must cover exactly the declared outputs"
             )
+        input_values = {symbol: inputs[symbol] for symbol in program.inputs}
         self.values: Dict[SymbolId, Any] = {}
         self.shapes: Dict[SymbolId, Tuple[int, ...]] = {}
         for symbol in program.inputs:
-            self._register_input_shape(self.decls[symbol], inputs[symbol])
+            self._register_input_shape(self.decls[symbol], input_values[symbol])
         self.builders: Dict[SymbolId, _CsrOutputBuilder] = {}
         for symbol in program.outputs:
             self._register_output_shape(self.decls[symbol], output_shapes[symbol])
         self._check_extent_equalities()
         for symbol in program.inputs:
-            self._materialize_input(self.decls[symbol], inputs[symbol])
+            self._materialize_input(self.decls[symbol], input_values[symbol])
         for symbol in program.outputs:
             self._materialize_output(self.decls[symbol])
         self.indices: Dict[IndexId, int] = {}
