@@ -1,7 +1,7 @@
 """Parallel-loop marking and workspace zero-fill placement.
 
 This module is the single owner of the combined parallel-marking/zero-fill
-family: given lowered LLIR statements and one explicit immutable
+family: given lowered LLIR statements and one explicit frozen
 :class:`ParallelWorkspaceCluster`, it selects the first OpenMP-compatible
 loop, decides between plain ``omp parallel for`` and adaptive atomic
 work-stealing, places the cluster's per-worker allocation borrows and
@@ -39,12 +39,55 @@ from .iterator import (
     match_mode_position_access,
     match_mode_position_begin,
 )
-from .llir_traversal import LLIRRewriter, LLIRTraversalContext
+from .llir_traversal import (
+    SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
+    LLIRRewriter,
+    LLIRTraversalContext,
+)
+
+_PARALLEL_POOL_SCALAR_TYPES = frozenset(
+    {
+        llir.DataType.FLOAT32,
+        llir.DataType.FLOAT64,
+        llir.DataType.INT32,
+        llir.DataType.INT64,
+        llir.DataType.INT8,
+        llir.DataType.UINT8,
+    }
+)
+_MISSING_PARALLEL_FIELD = object()
 
 _PARALLEL_POLICY_VALUE_CONTEXT = LLIRTraversalContext(
     stage="CIN lowering",
     pass_name="typed_parallel_policy_value",
 )
+_PARALLEL_CLUSTER_PLACEMENT_CONTEXT = LLIRTraversalContext(
+    stage="CIN lowering",
+    pass_name="place_parallel_workspace_cluster",
+)
+
+
+def _validate_pool_spec_fields(spec: object) -> None:
+    fields = getattr(spec, "__dict__", None)
+    if type(fields) is not dict:
+        raise TypeError("ParallelWorkspacePoolSpec fields must be stored directly")
+    name = fields.get("name", _MISSING_PARALLEL_FIELD)
+    if type(name) is not str or not name.isidentifier():
+        raise TypeError("ParallelWorkspacePoolSpec.name must be a non-empty identifier")
+    scalar_type = fields.get("scalar_type", _MISSING_PARALLEL_FIELD)
+    if (
+        type(scalar_type) is not llir.DataType
+        or scalar_type not in _PARALLEL_POOL_SCALAR_TYPES
+    ):
+        raise TypeError(
+            "ParallelWorkspacePoolSpec.scalar_type must be a supported scalar "
+            "DataType"
+        )
+    extent = fields.get("extent", _MISSING_PARALLEL_FIELD)
+    if type(extent) is not str or not extent.isidentifier():
+        raise TypeError(
+            "ParallelWorkspacePoolSpec.extent must be a non-empty identifier"
+        )
 
 
 @dataclass(frozen=True)
@@ -61,26 +104,18 @@ class ParallelWorkspacePoolSpec:
     extent: str
 
     def __post_init__(self) -> None:
-        if type(self.name) is not str or not self.name.isidentifier():
-            raise TypeError(
-                "ParallelWorkspacePoolSpec.name must be a non-empty identifier"
-            )
-        if type(self.scalar_type) is not llir.DataType:
-            raise TypeError("ParallelWorkspacePoolSpec.scalar_type must be a DataType")
-        if type(self.extent) is not str or not self.extent.isidentifier():
-            raise TypeError(
-                "ParallelWorkspacePoolSpec.extent must be a non-empty identifier"
-            )
+        _validate_pool_spec_fields(self)
 
 
 @dataclass(frozen=True)
 class ParallelWorkspaceCluster:
     """The explicit workspace hand-off from one ``Where`` lowering.
 
-    ``alloc`` holds the typed per-worker borrow statements placed inside the
-    parallel region before the work loop, ``free`` the statements placed
-    after it, and ``pool_specs`` the serial before-parallel pool
-    constructions.  An empty cluster is the no-workspace case.
+    ``alloc`` holds typed per-worker borrow templates placed inside the
+    parallel region before the work loop, ``free`` the statement templates
+    placed after it, and ``pool_specs`` the serial before-parallel pool
+    constructions. Every placement detaches fresh statement ownership from
+    these templates. An empty cluster is the no-workspace case.
     """
 
     alloc: Tuple[llir.Stmt, ...] = ()
@@ -88,22 +123,48 @@ class ParallelWorkspaceCluster:
     pool_specs: Tuple[ParallelWorkspacePoolSpec, ...] = ()
 
     def __post_init__(self) -> None:
-        for field_name in ("alloc", "free"):
-            statements = getattr(self, field_name)
-            if type(statements) is not tuple or any(
-                not isinstance(statement, llir.Stmt) for statement in statements
-            ):
-                raise TypeError(
-                    f"ParallelWorkspaceCluster.{field_name} must be a tuple of "
-                    "LLIR statements"
-                )
-        if type(self.pool_specs) is not tuple or any(
-            type(spec) is not ParallelWorkspacePoolSpec for spec in self.pool_specs
+        _validate_cluster_fields(self)
+
+
+def _validate_cluster_fields(cluster: object) -> None:
+    """Revalidate a cluster, including forged frozen-dataclass state."""
+
+    if type(cluster) is not ParallelWorkspaceCluster:
+        raise TypeError(
+            "parallel workspace cluster must be an exact " "ParallelWorkspaceCluster"
+        )
+    fields = getattr(cluster, "__dict__", None)
+    if type(fields) is not dict:
+        raise TypeError("ParallelWorkspaceCluster fields must be stored directly")
+    for field_name in ("alloc", "free"):
+        statements = fields.get(field_name, _MISSING_PARALLEL_FIELD)
+        if type(statements) is not tuple or any(
+            type(statement) not in SUPPORTED_LLIR_STATEMENT_NODE_TYPES
+            for statement in statements
         ):
             raise TypeError(
-                "ParallelWorkspaceCluster.pool_specs must be a tuple of "
-                "ParallelWorkspacePoolSpec values"
+                f"ParallelWorkspaceCluster.{field_name} must be a tuple of "
+                "LLIR statements"
             )
+    pool_specs = fields.get("pool_specs", _MISSING_PARALLEL_FIELD)
+    if type(pool_specs) is not tuple or any(
+        type(spec) is not ParallelWorkspacePoolSpec for spec in pool_specs
+    ):
+        raise TypeError(
+            "ParallelWorkspaceCluster.pool_specs must be a tuple of "
+            "ParallelWorkspacePoolSpec values"
+        )
+    for spec in pool_specs:
+        _validate_pool_spec_fields(spec)
+
+
+def _detach_cluster_statements(
+    statements: Sequence[llir.Stmt],
+) -> List[llir.Stmt]:
+    """Build one independently owned placement from cluster templates."""
+
+    rewriter = LLIRRewriter(_PARALLEL_CLUSTER_PLACEMENT_CONTEXT)
+    return [cast(llir.Stmt, rewriter.rewrite(statement)) for statement in statements]
 
 
 EMPTY_PARALLEL_WORKSPACE_CLUSTER = ParallelWorkspaceCluster()
@@ -216,12 +277,37 @@ def atomic_work_stealing_prelude(
     its declaration, and the bound reference is a fresh typed copy of the
     loop-condition variable.
     """
+    if type(sparse_pos) is not str:
+        raise TypeError("atomic prelude sparse_pos must be a string")
+    if type(bound) is not llir.Var:
+        raise TypeError("atomic prelude bound must be an exact Var")
+    bound_fields = getattr(bound, "__dict__", None)
+    if type(bound_fields) is not dict:
+        raise TypeError("atomic prelude bound fields must be stored directly")
+    bound_name = bound_fields.get("name", _MISSING_PARALLEL_FIELD)
+    bound_type = bound_fields.get("type", _MISSING_PARALLEL_FIELD)
+    if (
+        type(bound_name) is not str
+        or type(bound_type) is not llir.DataType
+        or bound_fields.get("is_ptr", _MISSING_PARALLEL_FIELD) is not False
+        or bound_fields.get("is_restrict", _MISSING_PARALLEL_FIELD) is not False
+        or bound_fields.get("tensor_access", _MISSING_PARALLEL_FIELD) is not None
+    ):
+        raise TypeError(
+            "atomic prelude bound must be a metadata-free scalar Var with "
+            "complete fields"
+        )
+    if sparse_pos_work_expr(sparse_pos, bound_name) is None:
+        raise TypeError(
+            "atomic prelude sparse_pos and bound must form a validated "
+            "position-work pair"
+        )
     return [
         llir.VarInit(
             var=llir.Var(name="_nnz", type=llir.DataType.INT),
             value=llir.ArrayAccess(
                 array=llir.Var(name=sparse_pos, type=llir.DataType.NO_TYPE),
-                index=llir.Var(name=bound.name, type=bound.type),
+                index=llir.Var(name=bound_name, type=bound_type),
             ),
         ),
         llir.VarInit(
@@ -401,6 +487,8 @@ def attach_serial_workspace_pools(
             "attach_serial_workspace_pools requires exact "
             "ParallelWorkspacePoolSpec values"
         )
+    for spec in pool_specs:
+        _validate_pool_spec_fields(spec)
     if thread_policy_factory is None and loop.omp_num_threads:
         raise CompilerInvariantError(
             "the workspace-pool thread-count policy has no typed value for "
@@ -472,10 +560,12 @@ def mark_first_for_loop_parallel(
     work-aware thread policy are all owned here, and the serial
     before-parallel pool construction closes the placement.
     """
-    if type(cluster) is not ParallelWorkspaceCluster:
-        raise TypeError(
-            "mark_first_for_loop_parallel requires an exact " "ParallelWorkspaceCluster"
-        )
+    _validate_cluster_fields(cluster)
+    # Cluster members are templates, not live loop children.  Detach them on
+    # every application so two markings (or later mutations of one marked
+    # loop) cannot couple each other through shared mutable LLIR nodes.
+    cluster_alloc = _detach_cluster_statements(cluster.alloc)
+    cluster_free = _detach_cluster_statements(cluster.free)
     for llir_stmt in stmts:
         if isinstance(llir_stmt, llir.ForLoop) and is_openmp_compatible_for_loop(
             llir_stmt
@@ -484,8 +574,8 @@ def mark_first_for_loop_parallel(
             has_sparse = has_sparse_inner_loop(llir_stmt.body)
             # Hoist per-thread workspace alloc/free outside the for loop
             # but inside the OMP parallel region.
-            alloc = list(cluster.alloc)
-            free = list(cluster.free)
+            alloc = cluster_alloc
+            free = cluster_free
 
             thread_policy_factory: Optional[Callable[[], llir.Expr]] = None
             if has_sparse and alloc:

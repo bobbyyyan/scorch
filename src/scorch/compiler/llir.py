@@ -226,6 +226,8 @@ class DataType(Enum):
         spelling without a dedicated pool member, so free-form legacy C type
         text cannot silently become a typed declaration.
         """
+        if type(element_spelling) is not str:
+            raise TypeError("linked-list workspace element spelling must be a string")
         return DataType(f"std::vector<linked_list_workspace_1d<{element_spelling}>>")
 
     @classmethod
@@ -236,6 +238,8 @@ class DataType(Enum):
         spelling without a dedicated const-pointer member, so free-form
         legacy C type text cannot silently become a typed declaration.
         """
+        if type(element_spelling) is not str:
+            raise TypeError("const-pointer element spelling must be a string")
         return DataType(f"const {element_spelling}*")
 
     @classmethod

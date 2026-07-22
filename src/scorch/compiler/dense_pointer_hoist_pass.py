@@ -729,19 +729,33 @@ def _hoisted_pointer_declaration(
     const-pointer type is a fail-closed :class:`llir.DataType` member, the
     borrow is a typed address of the strided value-array access, and the
     operand references stay metadata-free ``NO_TYPE`` because the kernel
-    prologue owns their declarations.  Free-form compatibility type text
-    retains the exact legacy raw spelling rather than rendering unchecked
-    type text through a typed declaration.
+    prologue owns their declarations.  Free-form compatibility type text and
+    expression-bearing legacy base/stride spellings retain the exact raw form
+    whenever they cannot be represented without parsing.
     """
-    try:
-        pointer_type = llir.DataType.const_ptr_type(scalar_type)
-    except ValueError:
+
+    def legacy_declaration() -> llir.RawStmt:
         return llir.RawStmt(
             code=(
                 f"const {scalar_type}* __restrict__ {pointer_name} = "
                 f"&{value_array}[{candidate.base} * {candidate.stride}]"
             )
         )
+
+    try:
+        pointer_type = llir.DataType.const_ptr_type(scalar_type)
+    except ValueError:
+        return legacy_declaration()
+    # Dense-pointer v1 deliberately accepts legacy expression-bearing Var
+    # names.  AddressOf admits only the exact identifier/member-path index
+    # grammar, so retain the byte-exact raw declaration whenever one of the
+    # borrowed spellings cannot be represented without parsing it.
+    if not (
+        llir._is_assignment_name(value_array, allow_member=False)
+        and llir._is_assignment_name(candidate.base, allow_member=True)
+        and llir._is_assignment_name(candidate.stride, allow_member=True)
+    ):
+        return legacy_declaration()
     return llir.VarInit(
         var=llir.Var(
             name=pointer_name,
