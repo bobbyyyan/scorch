@@ -22546,7 +22546,7 @@ Evidence is under `/Users/bobby/.cache/scorch-codex/phase3-s1p1-5fbd02b/`
   (`diff -rq` empty for each). The dedicated packed-S1 activation captures —
   four kernels covering the panel-origin and no-origin staged-row forms
   times direct/heap accumulators — are byte-identical between detached base
-  (`952629c`) and candidate (`5fbd02b`) renders. The 73-file SHA-256
+  (`952629c`) and candidate (`6e4c3e1`) renders. The 73-file SHA-256
   manifest is `CAPTURE_SHA256SUMS`. The byte waiver applies; no runtime
   kernel benchmark is required.
 - **Tests.** The focused suites passed at every commit (guarded-call node
@@ -22558,7 +22558,7 @@ Evidence is under `/Users/bobby/.cache/scorch-codex/phase3-s1p1-5fbd02b/`
   run at `5fbd02b` passed identically in 2,153.05 s and is retained);
   import provenance was asserted before launch and `full-suite.xml` is
   retained.
-- **Static parity.** Base `952629c` versus final `5fbd02b` on the identical
+- **Static parity.** Base `952629c` versus final `6e4c3e1` on the identical
   seven changed source files: Black `0/0`, Flake8 exactly the one inherited
   `codegen.py` F541 on both sides (line-shifted 874→898), and scoped mypy
   exactly the three inherited dynamic-`ForLoop` `attr-defined` findings on
@@ -22584,11 +22584,121 @@ Evidence is under `/Users/bobby/.cache/scorch-codex/phase3-s1p1-5fbd02b/`
   packaging, scheduler, research, or scratchpad material was touched.
   `origin/refactor/compiler-ir-phase3-std-move-call` remained at `1714df2`.
 
-The next session should run the Phase-3.5 feasibility spike (hand-authored
-LoopIR for CSR SpMV intersection and sparse elementwise-union with the small
-independent interpreter, then the explicit go/no-go), which gates any LoopIR
-schema work. The retained compatibility surface above is the input inventory
-for post-cutover retirement, not open Phase-3 work.
+### Rigorous review corrections to the Phase-3 exit slice (2026-07-21)
+
+An independent review of `20a1368..ca93def` found concrete regressions behind
+two of the exit report's claims. The P1 predicate was not exact structural
+recognition, and the Assign validator did not in fact read every root-Var
+field. Phase-3 closure was therefore held while the complete correction was
+implemented and verified. Four correction commits precede this handoff update;
+nothing was pushed and no earlier commit was amended or reordered:
+
+- `8c66065` — `fix(compiler): close phase-3 exit review gaps`
+- `f332f3f` — `test(compiler): cover phase-3 exit review corrections`
+- `2cd73e5` — `fix(compiler): preserve guarded-call argument rewrite scope`
+- `6bddfd2` — `fix(compiler): close remaining exit-review boundaries`
+
+The review corrections close seven related boundaries:
+
+1. `_is_operand_prefetch_guard` previously accepted any guarded
+   `__builtin_prefetch` whose first borrowed root had the selected array name.
+   It ignored the condition, iterator/end/coordinate identity, index shape,
+   template arguments, argument count, and `(0, 1)` mode/locality. A same-array
+   decoy could consequently be deleted and replaced by S1. Recognition now
+   requires the complete metadata-free P1 shape and, in the redirect, the
+   containing loop's exact iterator, end, and coordinate names. The formerly
+   contradictory test that classified the three-conjunct S1 replacement as P1
+   now asserts the opposite.
+2. `_redirect_sparse_prefetch` assigned the filtered body before validating or
+   building S1. A rejected staged identifier therefore raised after deleting
+   P1. It now constructs the replacement first and publishes the new body in
+   one final assignment; failed construction preserves the original list and
+   every statement identity.
+3. Single-iteration elimination rewrote a typed guard's array index but not its
+   advancing `iterator + 1` condition. Eliminating `lane = base` could leave
+   `lane` live after the loop disappeared; a canonical zero base additionally
+   became the invalid index `Var("0")`. A first correction applied blanket
+   exact-name replacement, but adversarial review showed that was broader than
+   the legacy token rules for terminal condition names and bare call arguments.
+   The final rule is deliberately narrow: rewrite the exact generated
+   `Add(Var(iterator), Literal(1, INT))` positions in guarded conditions plus
+   the already-owned structured array-index positions. Call arguments otherwise
+   retain the existing FunctionCallStmt rewrite scope, and canonical
+   nonnegative integer bases become typed literals. Tests cover byte equality
+   for P1 at both `root` and `0`, terminal condition names, bare Var/AddressOf
+   arguments, and the retained binary-argument scope.
+4. Assign root validation omitted stored `is_ptr` and `is_restrict` checks for
+   direct Var, ArrayAccess-root, and MemberAccess-root targets. Missing or
+   non-boolean fields passed construction/traversal/codegen. All three paths,
+   including the array hot path, now require exact booleans while preserving
+   legitimate true values.
+5. Cycle detection remained recursive: sufficiently deep cyclic or acyclic
+   index/guard trees escaped as `RecursionError` before reaching the repeated
+   node. Typed validation and the codegen pre-scan now impose a 256-level
+   nesting boundary with controlled TypeError, `invalid_*` traversal, or
+   CodegenError outcomes. Assignment traversal preserves the established
+   unknown-subclass/unknown-child diagnostic precedence while converting a
+   recursion escape at that boundary.
+6. Guard condition validation compared a forged operator with `"&&"` before
+   checking exact type, allowing a string subclass and invoking arbitrary
+   hostile equality. It now checks exact `str` first. The common rewriter also
+   revalidates after child rewrites, so a rewrite that leaves the guard grammar
+   reports `invalid_guarded_call_stmt` at the exact child path instead of
+   leaking a private constructor exception.
+7. Assign traversal prevalidated malformed targets but delayed the diagnostic
+   until after walking or rewriting them. Deleting required stored `Var`,
+   `ArrayAccess`, or `MemberAccess` fields could therefore leak `AttributeError`
+   before the recorded validator error was published. Walker and rewriter now
+   convert that escape to `invalid_assignment_target` while retaining the
+   established unknown-node diagnostic precedence; every required root and
+   child field is covered for both operations.
+
+The RawStmt 4/3, AddressOf, and Var inventories are unchanged. The fixes add no
+new IR node, producer, compatibility fallback, public API, native source, or
+emission spelling. Review evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase3-review-fix.tyJNVF/`:
+
+- the five focused boundary files pass **1,005 tests**;
+- fresh 20-source corpus, 42-source grid, and four packed-S1 activation
+  captures from detached `6bddfd2` are byte-identical to the retained final
+  `6e4c3e1` captures; the 66-file final manifest is
+  `final-captures.sha256` (SHA-256:
+  `e9f17d20527eaf356d7a85f54413ca6bf6ff4a55637a4ea7cfd65cc8feb74c79`);
+- paired 5-warmup/30-sample compiler latency is inside the 1.10 target for all
+  four cases on the final detached commit (worst p50 `0.976`, worst p95
+  `0.966`) with identical source hashes;
+- the authoritative full non-performance suite from clean detached `6bddfd2`,
+  with import provenance asserted and caches/basetemp isolated, passes **2,560
+  tests, 14 skipped, 3 deselected, 1 warning in 2,107.41 s**; the final log,
+  JUnit XML, and provenance receipt are retained as `full-suite-final.*` and
+  `import-provenance-final.txt` (log SHA-256
+  `ffc1344ed51b226dc66be8d0d96e8b41b8dc367b323ecc4d3ff561b388fa82f2`,
+  XML SHA-256
+  `9bcfc01df80aecde7f7d73051da01c72aaa0ab3df035765d72a98bceea203b0a`);
+- Black is clean; Flake8 has only the inherited `codegen.py` F541; scoped mypy
+  has only the three inherited dynamic-ForLoop findings; `git diff --check` is
+  clean;
+- the five protected tracked files retain their recorded hashes, and the local
+  and remote-tracking origin branch both remained at `1714df2` during review.
+
+The prior evidence ledger's packed-S1 and static bullets incorrectly named
+`5fbd02b` as the final candidate even though its own README and retained files
+show the reruns occurred at `6e4c3e1`; those labels are corrected above. The
+exact Assign microbenchmark nanosecond figures in the prior section have no
+retained raw command/output receipt. Their qualitative attribution was
+independently reproduced, but the exact figures should be treated as historical
+report text rather than independently auditable evidence.
+
+With these corrections and the clean full-suite gate below green, the Phase-3
+exit decision is restored: Phase 3 is closed over the explicitly documented
+compatibility surface. This does not start or pre-approve Phase 3.5.
+
+The next session should complete the Phase-3.5 feasibility spike: hand-authored
+generic LoopIR for CSR SpMV and sparse elementwise-add union, a small independent
+interpreter, and a two-CSR intersection fixture that genuinely exercises
+sparse-sparse cursor synchronization, followed by the explicit go/no-go. This
+gates any LoopIR schema work. The retained compatibility surface above is the
+input inventory for post-cutover retirement, not open Phase-3 work.
 
 ## Incremental Migration Plan
 
