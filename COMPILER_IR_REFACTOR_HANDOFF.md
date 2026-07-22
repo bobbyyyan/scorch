@@ -22397,6 +22397,199 @@ the untouched Assign-validator hardening and seven planned rewrites. Do not
 claim Phase 3 complete merely because the exit review started, and do not claim
 Phase 3.5 or LoopIR readiness before the exit gate actually closes.
 
+### S1/P1 guarded-call family migration and Phase-3 exit review (2026-07-21)
+
+Five code commits precede this handoff-only commit; nothing was pushed and no
+earlier commit was amended or reordered:
+
+- `20a1368` — `feat(compiler): add the inline guarded-call statement node`
+- `d252665` — `refactor(compiler): type the P1 prefetch and its structural
+  recognition`
+- `d2a723d` — `refactor(compiler): type the S1 packed prefetch guard`
+- `5fbd02b` — `fix(compiler): harden the Assign lvalue and index boundary`
+- `6e4c3e1` — `perf(compiler): keep Assign hardening off the construction
+  hot path`
+
+This session first independently reviewed `8b16745..952629c` in place of
+trusting the prior report: the range's validation hardening (carrier grammar,
+atomic bounds, `fullmatch` position matching, C++-keyword/identifier
+boundaries, enum non-coercion) reproduced cleanly against its own tests, the
+five protected files hashed exactly, and the 760-test focused baseline passed
+before any change. No concrete regression was found in the range, so no
+corrective commit was needed.
+
+#### The guarded-call statement node
+
+`llir.GuardedCallStmt` is the deliberately narrow single-line unbraced
+statement `if (cond) call;` that both prefetch seams needed. The condition
+grammar is `&&`-conjunctions of comparisons (`< <= > >= == !=`) whose
+operands use the shared assignment-index expression grammar; the body is
+exactly one `FunctionCallStmt` with an identifier/member-path callee and
+`AddressOf`-or-index-grammar arguments. `IfThenElse` remains the only owner
+of braced general conditionals. Integration is fail-closed at every audited
+boundary: a stored-field, cycle-hardened validator runs at construction; the
+common walker and rewriter revalidate forged state (missing fields, cyclic
+conditions, non-grammar children) into `invalid_guarded_call_stmt`
+diagnostics and detach fresh ownership for both children; codegen revalidates
+before emitting one semicolon-terminated line; registry exhaustiveness locks
+cover the node through the shared sample/emission inventories, including the
+unknown-subclass probes. The AddressOf index/metadata validators gained
+`owner`/`metadata_owner` diagnostic-prefix parameters whose defaults keep
+every historical AddressOf message byte-identical.
+
+#### P1 migration and S1 structural recognition (`d252665`)
+
+`_prepend_prefetches` now builds the typed guard instead of raw text.
+Emission is byte-identical (`if ({it} + 1 < {end})
+__builtin_prefetch(&{val}[{crd}[{it} + 1] * {stride}], 0, 1);`), and
+insertion order, per-(array, stride) dedup, the list/tuple body-container
+split, and the characterized non-idempotent reapplication all carry over
+(the production-route 2505-byte SHA-256 cpp lock passed unchanged).
+Spellings outside the node's identifier/member-path grammar — an
+expression-bearing iterator, stride, or `"_val"`-containing array name — are
+now one more legal structural miss: the affected prefetch is skipped, never
+raised, and the suite characterizes each case. `_redirect_sparse_prefetch`
+discovery moved from the RawStmt marker substring to exact structural
+recognition (`_is_operand_prefetch_guard`): the statement must be the typed
+guarded `__builtin_prefetch` whose first argument borrows the selected
+operand value array. Raw-text lookalikes, other callees, other arrays, and
+bare unguarded calls are covered decoys that stay untouched, and
+direct-composition tests drive P1's actual output through the redirect for
+both staged-row forms. The specialized rewrite scopes that can now encounter
+the node were extended in the same commit: the dense-pointer and
+single-iteration generated-string statement rewriters rebuild the guard
+through their existing expression rewriters (the structured array-index
+replacement fires inside coordinate accesses; the two callee name-replace
+arms mirror the FunctionCallStmt arms and are provably inert because every
+generated-string pattern contains a bracket or space while guard callees are
+identifier/member paths), and the schedule lowerer's tensor-access rewriter
+traverses guard conditions and call arguments (metadata-free prefetch
+children pass through untouched and detached).
+
+#### S1 migration (`d2a723d`)
+
+The packed-relayout redirect now inserts the typed three-conjunct guard for
+both staged-row address forms; `Mul(BinOp("-", crd, origin), tile)`
+re-derives the `(a - b) * c` parenthesization exactly as predicted by the
+earlier audit. Non-identifier staged-guard names now fail closed with the
+pass's `NotImplementedError` style instead of being pasted into raw text.
+This removed the last live raw producer: the budget re-pinned to exactly
+**4 RawStmt constructors / 3 semantic producers** — the deliberate W5, W14,
+and D1 compatibility fallbacks plus the common rewriter's detachment clone —
+without narrowing any of the three fallbacks' accepted inputs.
+
+#### Phase-3 exit review
+
+The exit inventory was taken from code, not the prior report:
+
+1. **Raw statement surface.** 4 constructors / 3 semantic producers as
+   above, suite-locked. Remaining raw *consumers* are the characterized
+   compatibility recognition sites: the iterator position-array raw scan,
+   the parallel-marking `find_sparse_pos_array` raw arm, the sparse-prefetch
+   `_HOISTED_VALUE_POINTER` regex twin of the D1 raw fallback, the
+   compressed-Where raw bound collection, and the dense-pointer/
+   single-iteration RawStmt code-replace arms.
+2. **Assign-validator hardening — implemented (`5fbd02b`).** Adversarial
+   probes reproduced two live defects: a forged cyclic MemberAccess chain
+   hung `_validate_assignment_target` forever, and a forged cyclic index
+   escaped as an uncontrolled RecursionError. The assignment index grammar
+   now delegates to the shared stored-field, cycle-hardened index validator
+   with assignment-owner prefixes, and the target validator reads stored
+   state, cycle-checks member chains, and fails closed on missing fields.
+   Accepted honest inputs are unchanged; three dotted diagnostic spellings
+   normalized to the shared dotless form with their two test locks. The
+   hardening initially cost about 4.1x per Assign construction and produced
+   a reproducible sparse-union latency crossing; `6e4c3e1` restructured the
+   shared validator (single stored-field fetch per node, recursion-scoped
+   cycle bookkeeping, positional recursion, and a provably-safe constructor
+   fast path whose every uncertain case falls through to the authoritative
+   validator) with no accepted/rejected outcome or message change, and the
+   final paired run is inside the target everywhere.
+3. **The seven planned generic string-rewrite arms — retained and
+   dispositioned, not migrated.** The two `cin_lowerer._rewrite_val_refs`
+   call/raw `.data()` arms remain production-unreachable DCE-class cleanup
+   under the discarded grouped all-COO route; the two dense-pointer call/raw
+   arms and two single-iteration call/raw arms remain compatibility-only
+   (production fields never contain the matched spellings); the
+   dynamic-vector `Var.name` regex arm remains gated on a read/lvalue
+   representation decision for dormant all-COO G1/G2. Each was re-verified
+   present and unchanged; the earlier inventory's rejection rationale stands
+   and none forms a coherent boundary this session could close without a new
+   representation decision. They are Phase-4-or-later work items, not
+   Phase-3 blockers, because Phase 3's criterion is a measured and
+   documented compatibility budget, which these are.
+4. **Dynamic compatibility fields.** The four atomic-scheduling ForLoop
+   fields (written at `parallel_marking_pass.py` cluster application, read
+   by codegen/cin-lowerer/schedule-lowerer; the three inherited mypy
+   `attr-defined` findings) and `_hoisted_ptr_decls` (dense-pointer
+   writer/deleter, carried by the common walker/rewriter) remain the
+   characterized dynamic surface, blocked on the marking-pass registration
+   design recorded in that module's docstring. `scorch_index_var` is a
+   declared constructor field. No new dynamic field was added.
+
+With S1/P1 migrated, the Assign boundary hardened, the seven rewrite arms
+explicitly dispositioned, the dynamic-field inventory recorded, and every
+gate below green, the **Phase-3 exit review is complete and Phase 3 is
+closed** over this documented residual compatibility surface. Phase 3.5
+(the CSR SpMV intersection + sparse elementwise-union LoopIR interpreter
+spike) has **not** started; no LoopIR readiness is claimed, and the 3.5
+go/no-go gate still guards Phases 4-8.
+
+#### Verification ledger
+
+Evidence is under `/Users/bobby/.cache/scorch-codex/phase3-s1p1-5fbd02b/`
+(README indexes commands, logs, exits, and hashes):
+
+- **Byte gates.** All 20 corpus sources, all 42 grid sources, and the three
+  activating kernels regenerated from the clean detached candidate worktree
+  are byte-identical to the retained `phase3-review-0d10c86` captures
+  (`diff -rq` empty for each). The dedicated packed-S1 activation captures —
+  four kernels covering the panel-origin and no-origin staged-row forms
+  times direct/heap accumulators — are byte-identical between detached base
+  (`952629c`) and candidate (`5fbd02b`) renders. The 73-file SHA-256
+  manifest is `CAPTURE_SHA256SUMS`. The byte waiver applies; no runtime
+  kernel benchmark is required.
+- **Tests.** The focused suites passed at every commit (guarded-call node
+  23; traversal 363; sparse-prefetch 35 with the new structural-miss and
+  composition coverage; the twelve-file compiler membership repeatedly).
+  The authoritative clean detached-worktree non-performance run at the
+  final `6e4c3e1` passed **2,499 tests with 14 skipped, 3 perf-marked
+  deselections, and one warning in 2,214.04 seconds** (a second complete
+  run at `5fbd02b` passed identically in 2,153.05 s and is retained);
+  import provenance was asserted before launch and `full-suite.xml` is
+  retained.
+- **Static parity.** Base `952629c` versus final `5fbd02b` on the identical
+  seven changed source files: Black `0/0`, Flake8 exactly the one inherited
+  `codegen.py` F541 on both sides (line-shifted 874→898), and scoped mypy
+  exactly the three inherited dynamic-`ForLoop` `attr-defined` findings on
+  both sides (line-shifted 850-852→874-876). `git diff --check` was clean
+  before every commit.
+- **Compiler latency.** The first paired run (at `5fbd02b`) crossed on
+  csr_intersection (`1.124/1.816`) and sparse_union (`1.281/1.241`); the
+  reversed-order rerun inverted csr_intersection (`1.022/1.056`, order/tail
+  noise) but reproduced sparse_union (`1.292/1.390`) — a real regression.
+  A cold micro-benchmark attributed it to the hardened Assign validator
+  (1,285 ns to 5,318 ns per construction, multiplied by rewriter
+  detachment rebuilding every Assign each pass). After the `6e4c3e1`
+  optimization the final paired run (5 warmups, 30 samples,
+  base-then-candidate, quiet machine) is **inside the 1.10 target
+  everywhere**: small_dense `0.963/0.978`, reduction `0.962/0.930`,
+  csr_intersection `1.023/0.991`, sparse_union `1.039/1.045` p50/p95.
+  All three paired runs are retained rather than discarded.
+- **Budgets and hygiene.** The budget suite locks 4/3 plus the updated
+  AddressOf (8) and Var (470 constructors, 49 known-indirect) inventories.
+  The five protected tracked files hashed exactly at their recorded values
+  before every commit; only compiler sources, compiler tests, and this
+  handoff were staged, always by explicit pathspec; no GPU/CUDA, benchmark,
+  packaging, scheduler, research, or scratchpad material was touched.
+  `origin/refactor/compiler-ir-phase3-std-move-call` remained at `1714df2`.
+
+The next session should run the Phase-3.5 feasibility spike (hand-authored
+LoopIR for CSR SpMV intersection and sparse elementwise-union with the small
+independent interpreter, then the explicit go/no-go), which gates any LoopIR
+schema work. The retained compatibility surface above is the input inventory
+for post-cutover retirement, not open Phase-3 work.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
