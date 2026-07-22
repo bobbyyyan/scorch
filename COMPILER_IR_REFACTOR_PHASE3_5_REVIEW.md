@@ -1,276 +1,243 @@
-# Phase 3.5 Review: Sparse LoopIR Feasibility Spike and Go/No-Go
+# Phase 3.5 Review: Sparse LoopIR Feasibility Spike and Go/No-Go (Repeated)
 
 Date: 2026-07-22 (America/Los_Angeles)
 
-This document supersedes the initial review at `62e94ff`. That review correctly
-recorded the CSR execution evidence, but drew a GO conclusion from a schema that
-does not meet one of the design's mandatory GO criteria.
+This document supersedes the corrected NO-GO review recorded at `587cbc1`.
+That review found that the original candidate schema could not state sparse
+parent/child dominance, logical coordinate domains, or physical mode order,
+and it blocked Phase 4 until the spike was revised and this review repeated.
+This is that repeated review, conducted over the revised spike at code
+commits `a3a473b` and `b2fe883`.
 
 ## Current verdict
 
-**NO-GO for the general level-based LoopIR foundation.** Do not begin Phase 4.
-Revise the spike and repeat this review first.
+**GO for the general level-based LoopIR foundation.** Every mandatory
+Phase-3.5 GO criterion in `COMPILER_IR_REFACTOR_DESIGN.md` is met by the
+revised candidate. The recorded boundaries below are scope statements the
+schema fails closed on with stable diagnostics, not unstated assumptions, and
+none of them falls inside a mandatory criterion.
 
-The narrower result is positive: **the canonical CSR sparse-merge control
-algorithm is feasible**. The same target-neutral `MergedSparseFor` correctly
-executes UNION and INTERSECTION over sorted, unique CSR row segments, with
-minimum-coordinate selection, aligned-cursor advancement, correct exhaustion,
-and guaranteed progress. That result is worth retaining, but it is not the
-Phase-3.5 GO defined in `COMPILER_IR_REFACTOR_DESIGN.md`.
+Phase 4 was deliberately **not started in this session**; this GO is an
+independently auditable stopping point. The spike remains outside production
+imports and must stay there until the Phase-4 strangler path deliberately
+promotes it.
 
-The design requires every GO criterion to hold and says that, if one fails,
-Phases 4-8 must not start. The criterion that the verifier can state sparse
-parent/child dominance locally is not met. Calling the missing representation a
-Phase-4 revision condition would move a gating design question past its gate.
+## Reproduction of the NO-GO counterexamples
 
-## The CSR question
+Before designing the replacement, every blocking finding of the superseded
+review was independently reproduced against the prior HEAD (`587cbc1`);
+script and transcript are `reproduce_nogo.{py,out}` in the evidence ledger:
 
-The long-term compiler must be based on general physical levels and logical
-modes, not on CSR as its compiler model.
+1. **CSR/CSC indistinguishable.** `TensorDecl` had fields
+   `(node_id, symbol, name, levels)` only; the CSR and CSC declarations were
+   equal objects, so no physical-to-logical mapping existed.
+2. **Merge domains unverifiable, with a live wrong result.** An INTERSECTION
+   merge of a row-compressed operand with a logically transposed
+   column-compressed operand verified and executed, producing
+   `[[10, 40], [0, 120]]` where the logical intent was `[[10, 0], [60, 120]]`
+   — physical level number silently stood in for coordinate domain.
+3. **DCSR unrepresentable.** A level-0 compressed cursor failed closed with
+   `unsupported_sparse_hierarchy`; compressed-under-compressed descent could
+   not be expressed at all.
+4. **The pre-correction acceptance** (a level-1 cursor with a constant outer
+   coordinate on a `(COMPRESSED, COMPRESSED)` tensor, no dominating level-0
+   cursor) was confirmed rejected — an honest boundary, not a solution.
+5. **Value ownership unposeable.** Cursors existed only on compressed
+   leaves, so the non-leaf `CursorValue` question could not even be asked.
 
-`csr.py` and the three CSR fixture builders are appropriate: Phase 3.5
-explicitly asks for CSR SpMV and CSR union/intersection examples. The defect is
-not that CSR appears in the spike. The defect is that CSR storage assumptions
-also live inside `interp.py`, while the candidate nodes omit information that a
-format-neutral level interpreter would need:
+## What was revised
 
-- `_CSR_LEVELS`, `_CursorState.matrix`, `_segment`, `row_segment`, `indices`,
-  `values`, and `_CsrOutputBuilder` make the interpreter CSR-specific;
-- `SparseCursorDecl.outer_indices` contains coordinates, not the dominating
-  parent storage position needed to select a compressed child segment;
-- `TensorDecl.levels` has no physical-level-to-logical-mode mapping or logical
-  coordinate-domain identity, so CSR and CSC have the same IR shape;
-- `LevelKind` omits Scorch's `COORDINATE` and `SINGLETON` level kinds; and
-- merged cursors cannot be proven to iterate the same logical domain.
+The revision keeps the proven merge control and fail-closed discipline and
+rebuilds the representation around three separated spaces:
 
-The CSR interpreter is therefore a useful, independent oracle for the narrow
-CSR merge experiment. It is not yet the general level-based semantic oracle
-that Phase 4 is supposed to promote.
+- **Logical dimensions.** Programs declare stable `DimensionId` identities
+  (`DimensionDecl`); every tensor maps each logical mode to one declared
+  dimension. Shared extent and shared coordinate domain are now the same
+  identity. The interpreter resolves every dimension's extent from all bound
+  inputs and output shapes *before* materializing anything, so incompatible
+  shapes still fail independently of stored sparsity. The temporary
+  `ExtentEquality` contract is **lowered into shared dimension identities
+  and deleted** (the open decision from the superseded review); `DimSize` is
+  deleted with it, and `DenseFor` iterates a declared dimension directly.
+- **Physical levels with explicit mode order.** `TensorDecl.levels` is now a
+  tuple of `LevelDecl(kind, mode)`: physical storage order plus the logical
+  mode each level stores, verified to be a permutation
+  (`invalid_mode_order`). CSR `(dense@0, compressed@1)` and CSC
+  `(dense@1, compressed@0)` are structurally distinct.
+- **Physical positions, separate from coordinates.** `RootPosition`,
+  `DensePosition(tensor, level, parent, coord)` (dense positions are the
+  arithmetic `parent * extent + coord`), and `PositionValue(position)` are
+  position-typed expressions. `SparseFor` binds a `PositionId` beside its
+  coordinate; `SparseCursorDecl` names its dominating parent position
+  explicitly instead of carrying outer coordinates. The verifier's
+  expression typing carries (tensor, level) linkage on every position, so a
+  compressed child must reference a position of the immediately dominating
+  level of the same tensor (`parent_position_mismatch` otherwise), grounded
+  at the root. Positions are never recovered from coordinates, rendered
+  names, callbacks, or implicit interpreter state.
+- **Explicit value ownership.** Only a cursor over the value-bearing leaf
+  level (the last physical level) may expose a scalar `CursorValue`;
+  structural non-leaf reads are the stable `non_leaf_value` defect.
+- **Format-neutral level storage.** `levels.py` adds a validated
+  `LevelTensorStorage` whose interface (`segment`, `coordinate_at`,
+  `leaf_value`) is all the interpreter's execution core consults. CSR is
+  exactly one adapter: `from_csr` on the input side, `CsrOutputBuilder` on
+  the assembly side. DCSR, CSC, and CSF-like layouts bind the same storage
+  class directly, and `from_dense`/`to_dense` round-trip every
+  DENSE/COMPRESSED composition under every mode permutation. The former
+  CSR-specific `_CSR_LEVELS`/`_CursorState.matrix`/`_segment`/`row_segment`
+  interpreter coupling is gone.
+- **Scatter accumulation.** `StoreReduce` adds coordinate-addressed
+  read-modify-write into dense outputs (`target = target op value`), the
+  target-neutral primitive a permuted traversal needs (CSC SpMV) without
+  making outputs generally readable.
+- **`COORDINATE`/`SINGLETON` disposition.** Both production level kinds are
+  now declared `LevelKind` members, and the verifier fails closed on any
+  tensor declaring them with the stable `unsupported_level_kind` defect.
+  Their iteration semantics are the recorded Phase-5 surface
+  ("Coordinate/COO iteration" is a Phase-5 deliverable in the design); the
+  spike makes the gap explicit instead of leaving the kinds unrepresentable.
+- **`MergedSparseFor` semantics unchanged.** Minimum-coordinate selection,
+  aligned advancement, UNION/INTERSECTION emission and exhaustion, and the
+  progress argument are exactly the proven Phase-3.5 semantics; merges gain
+  the requirement that all cursors iterate one shared logical dimension
+  (`merge_domain_mismatch`).
 
-## Commits reviewed and corrections
+Each blocking counterexample now has a stable resolution: CSR and CSC are
+distinct declarations and the CSC fixture executes the permuted layout
+correctly (`test_csc_spmv_is_not_transposed` proves it is not a transpose);
+the transposed-operand merge is rejected with `merge_domain_mismatch`; DCSR
+descent executes through bound parent positions
+(`test_dcsr_spmv_row_positions_differ_from_row_coordinates` discriminates
+positions from coordinates); the old falsely-accepted shapes are rejected
+with `parent_position_mismatch`/`layout_mismatch`; and non-leaf value reads
+are rejected with `non_leaf_value`.
 
-Original spike, stacked on the Phase-3 closure at `34a1849`:
+## The SpMV "intersection" wording
 
-- `71eba38` — `feat(compiler): prototype sparse LoopIR schema and verifier`
-- `1e30817` — `feat(compiler): interpret sparse LoopIR programs`
-- `1c78633` — `test(compiler): execute sparse LoopIR feasibility cases`
-- `62e94ff` — `docs(compiler): record Phase-3.5 go-no-go review`
+The design asks for "CSR SpMV intersection". The SpMV fixture implements the
+sparse-dense intersection in its degenerate optimized form — one sparse
+cursor plus a coordinate-addressed dense load — which this review accepts
+explicitly, with the following justification: intersecting a sparse iterator
+with a dense operand whose iteration space is total yields exactly the
+sparse iterator, so the canonical lowering of that intersection *is* the
+single-cursor loop (the same optimization the production merge lattice
+performs). The fixture is therefore deliberately not claimed as sparse-sparse
+merge evidence. Genuine synchronized two-cursor INTERSECTION is demonstrated
+by the two-CSR elementwise multiply, which reuses the same `MergedSparseFor`
+node with no operation-specific machinery, and genuine UNION with exhausted
+and one-sided iterators by the two-CSR add.
 
-Rigorous-review corrections:
+## Executed evidence
 
-- `de1d1d7` — `fix(compiler): make sparse LoopIR spike fail closed`
-- `79c5837` — `test(compiler): cover sparse LoopIR review boundaries`
-- `245e673` — `fix(compiler): validate LoopIR extents before allocation`
-- `c17636a` — `test(compiler): lock pre-allocation extent validation`
-- `8280ad8` — `fix(compiler): snapshot LoopIR input bindings once`
-- `5733f30` — `test(compiler): cover stateful LoopIR input mappings`
-- `ee58ad9` — `fix(compiler): contain LoopIR mapping lookup failures`
-- `7f32141` — `test(compiler): cover disappearing LoopIR bindings`
-- `775a408` — `fix(compiler): validate LoopIR mapping key identities`
-- `b59491b` — `test(compiler): reject hostile LoopIR mapping keys`
-- `64163d8` — `fix(compiler): validate LoopIR keys before hashing`
-- `e719be3` — `test(compiler): cover colliding LoopIR key snapshots`
+Six hand-authored programs execute differentially against independent
+pure-Python dense references, exactly (accumulation orders match, so no
+tolerances are involved anywhere):
 
-Nothing in the spike or its corrections is imported by production compilation,
-JIT, public APIs, caches, LLIR, code generation, or native code.
+- **CSR SpMV**, **CSR+CSR UNION add** (one-sided coordinates, early
+  exhaustion, explicit-zero cancellation), and **two-CSR INTERSECTION
+  multiply** (structural, not value-based) — the original corpus, preserved
+  case-for-case under the revised schema.
+- **DCSR SpMV** — compressed-under-compressed parent-position descent; the
+  inner cursor's parent is the position bound by the outer sparse loop.
+- **CSC SpMV** — the same logical `y = A @ x` over column-major physical
+  storage, scattering through `StoreReduce`; proves physical/logical mode
+  separation.
+- **CSF-like three-level row contraction** — two chained parent-position
+  descents over an all-compressed rank-3 tensor.
 
-## Findings
+Cross-layout differentials require CSR, DCSR, and CSC storage of one logical
+matrix to produce identical SpMV results, exactly, on both hand-built and
+randomized grids. Position-versus-coordinate discrimination cases (absent
+rows/fibers making storage positions diverge from coordinates) execute
+correctly for DCSR and CSF. Rank-1 compressed iteration executes. Empty
+inputs, empty rows/segments, zero-extent shapes, ragged/mis-shaped denses,
+malformed storage, exhaustion, and randomized grids are covered throughout;
+wrong-parent, wrong-domain, wrong-mode-order, non-leaf-value, malformed
+state, forged identities, and cycle cases are covered adversarially. All 42
+verifier defect codes have direct regression coverage.
 
-### 1. Parent/child dominance is not representable as claimed
+## Recorded boundaries (fail closed, not silently assumed)
 
-The original review said arity-checked `outer_indices` made sparse dominance
-structural and described DCSR/multi-level traversal as representable but
-untested. That is false for this schema.
-
-For a compressed child, Scorch's actual level storage indexes the child's
-position array with the parent's physical storage position. A parent coordinate
-is not interchangeable with that position. Yet `SparseFor` binds only a
-coordinate, and `SparseCursorDecl` has no `LevelRef`, `PositionId`, parent cursor,
-or position expression.
-
-The old verifier accepted a top-level level-1 cursor on a
-`(COMPRESSED, COMPRESSED)` tensor with `outer_indices=(IntConst(0),)` and no
-level-0 cursor at all. It also accepted scalar `CursorValue` reads from
-non-leaf compressed levels. Both contradict explicit one-directional level
-lowering.
-
-The correction now fails closed with `unsupported_sparse_hierarchy` unless a
-cursor targets a compressed leaf whose outer levels are all dense. This makes
-the current boundary honest; it does not solve hierarchical sparse iteration.
-
-### 2. Logical modes and merge domains are missing
-
-Physical level number is not logical coordinate identity. Production Scorch
-supports mode order, so two `(DENSE, COMPRESSED)` layouts may denote CSR-like or
-CSC-like traversal depending on the mapping. The candidate cannot distinguish
-them.
-
-For the same reason, `MergedSparseFor` cannot locally verify that every cursor
-produces coordinates in one shared logical domain. Adding a check that physical
-level numbers happen to match would create false confidence. The repeat spike
-needs explicit logical dimension/domain identities and physical mode order.
-
-### 3. Fixture shape compatibility was data-dependent
-
-The original interpreter used access-time bounds checks but encoded no static
-relationship between operand and output extents. This admitted plausible wrong
-results whenever sparsity hid the mismatch. Reproduced examples included:
-
-- a `1 x 3` SpMV matrix storing only column 0 with a length-1 vector; and
-- UNION of a one-row left operand with a two-row right operand, where the extra
-  right row was silently ignored.
-
-The correction adds target-neutral `ExtentEquality` program preconditions and
-checks them after all input/output shapes are registered but before input copies,
-output allocation, or execution.
-SpMV declares `A[0] == y[0]` and `A[1] == x[0]`; both elementwise fixtures
-declare `A[0] == B[0] == C[0]` and `A[1] == B[1] == C[1]`. This removes
-sparsity-dependent shape acceptance for the three fixtures. It is deliberately
-not a substitute for logical dimension IDs or mode order in the revised schema.
-
-### 4. Malformed stored state leaked Python exceptions
-
-Deleting ordinary dataclass fields such as `Block.statements` or identity
-fields such as `LoopNodeId.value` could leak `AttributeError`, despite the
-verifier being described as the single fail-closed authority.
-
-The correction preflights every exact node's stored dataclass fields before a
-checker reads them and hardens all four identity readers. Missing node state now
-raises `LoopIRVerificationError` with `malformed_state` at the exact field path;
-missing or invalid identity values retain their specific `invalid_*_id` codes.
-
-The original “every defect code is tested” statement was also inaccurate:
-`invalid_index_id` and `invalid_cursor_id` had no tests. The corrected suite
-exercises all 31 current defect codes, including those two and the two new
-boundaries.
-
-### 5. Position-array wording was too broad
-
-The IR nodes contain no position arrays, offsets, target syntax, or rendered
-name recovery. The package as a whole does contain CSR positions: `CsrMatrix`
-owns `indptr`, the interpreter reads row offsets, and `_CsrOutputBuilder`
-constructs canonical CSR output. That storage belongs to the CSR oracle adapter,
-not to LoopIR nodes. Claims that no positions or offsets existed “anywhere in
-the package” are superseded by this narrower statement.
-
-### 6. Caller-supplied mappings crossed the validation boundary
-
-The original interpreter repeatedly consulted caller-owned input mappings, so
-a stateful mapping could advertise one tensor during key validation and return
-another during materialization. Iteration and lookup exceptions also escaped as
-arbitrary Python errors. The first key-identity correction still constructed a
-set before checking key types; a foreign key colliding with an exact
-`SymbolId` could therefore run its `__eq__` callback during set construction.
-
-The corrections snapshot every mapping value once, contain iteration and
-lookup failures as `LoopIRInterpreterError`, snapshot advertised keys into a
-tuple before hashing, and reject every non-exact or malformed `SymbolId` before
-constructing role sets. Regression mappings cover changing/disappearing values,
-lookup failures, malformed keys, and a hostile key advertised beside the exact
-colliding program key.
-
-## What the spike does establish
-
-- One generic `MergedSparseFor` control rule handles canonical CSR UNION and
-  INTERSECTION without operation-specific nodes or callbacks.
-- Candidate selection, aligned advancement, exhaustion, and the strict progress
-  argument are sound for canonical sorted CSR segments.
-- The three CSR fixtures execute differentially against independent dense
-  references across empty, disjoint, overlapping, one-sided, early-exhaustion,
-  explicit-zero, and randomized cases.
-- Ordered `AppendEntry` is sufficient to assemble canonical CSR output in the
-  tested identity-mode-order cases.
-- The spike remains Torch-free, target-syntax-free, and isolated from production
-  imports.
-- Phase 0-3 generated-code, latency, quality, and correctness gates were not
-  affected by adding the isolated experiment.
-
-These are useful feasibility results. They do not establish general
-hierarchical level traversal or a production-ready LoopIR schema.
-
-There is one deliverable wording ambiguity worth preserving. The design asks
-for “CSR SpMV intersection.” The fixture implements the sparse-dense
-intersection in its degenerate optimized form: one sparse cursor plus a dense
-load, so it does not exercise synchronized cursor intersection. A separate
-two-CSR elementwise multiply supplies the genuine two-cursor INTERSECTION test.
-That is strong evidence for merge control, but the repeat review must either
-justify the degenerate SpMV interpretation explicitly or add the literal mixed
-domain/intersection representation the design intended.
+- **Merged cursors must target value-bearing leaf levels**
+  (`unsupported_sparse_hierarchy`). Hierarchical merge *descent* (merging
+  non-leaf levels and descending into children, e.g. DCSR+DCSR union) is
+  not represented; it belongs to the Phase-5 production merge/lattice
+  migration. Hierarchical descent itself is proven by the single-cursor
+  fixtures; merge control is proven at leaf level.
+- **Sparse output assembly is canonical CSR only** ("unsupported sparse
+  output layout" otherwise); dense outputs are rank ≤ 2. Sparse outputs in
+  other layouts are future assembly adapters over the same append stream.
+- **`COORDINATE`/`SINGLETON` fail closed** (`unsupported_level_kind`), with
+  Phase 5 as the recorded gate for their iteration.
+- **All-dense tensors bind logical nested lists**; their declared physical
+  mode order does not change interpreter semantics (dense storage order is
+  a performance concern with no observable effect in the oracle).
+- The interpreter grew to earn format neutrality: the spike package is now
+  3,371 lines across seven modules (verifier 1,087; interpreter 592; level
+  storage 408; nodes 515; programs 607; CSR container 136). It remains
+  plain, Torch-free Python with no compiler-pipeline involvement, and its
+  per-node execution logic is still direct enough to audit by reading.
 
 ## Criterion-by-criterion decision
 
 | Phase-3.5 GO criterion | Result | Evidence |
 | --- | --- | --- |
-| Requested CSR examples execute correctly | Partial/pass with interpretation | SpMV and UNION execute; SpMV uses a one-cursor sparse-dense intersection, while genuine two-cursor INTERSECTION is demonstrated by a separate elementwise multiply. |
-| No C++ spelling, parsing, callbacks, or operation escape hatch | Pass | Automated import/target-syntax neutrality checks and direct source review. |
-| Verifier states sparse parent/child dominance and merge progress locally | **Fail** | Merge progress is local; compressed-parent position dominance is absent and was falsely accepted. |
-| Interpreter/lowering model can serve as an independent semantic oracle | Partial | Independent and useful for CSR; storage access is hard-coded to CSR and cannot execute general levels. |
-| Phase 0-3 gates green and parity remains credible | Pass as non-interference; unproven for LoopIR | Original byte/latency/full-suite receipts remain valid; no production path imports the spike. |
+| Requested CSR examples execute correctly | **Pass** | CSR SpMV and UNION/INTERSECTION execute differentially, exactly; the degenerate sparse-dense SpMV interpretation is justified above and two-cursor merge evidence is separate; DCSR/CSC/CSF extend the corpus. |
+| No C++ spelling, parsing, callbacks, or operation escape hatch | **Pass** | Automated import/target-syntax neutrality suite (module inventory, AST import whitelist, subprocess closure proof, production-reference scan, token scan) plus direct source review; merge/descent/assembly semantics are intrinsic to nodes. |
+| Verifier states sparse parent/child dominance and merge-progress invariants locally | **Pass** | Dominance is typed parent-position linkage checked at every cursor and dense-position expression, grounded at the root; merge progress is intrinsic to `MergedSparseFor`; domains and value ownership are also stated locally. The old counterexamples are now stable defects. |
+| Interpreter/lowering model can serve as an independent semantic oracle | **Pass** | Torch-free, pipeline-free, container-validated plain Python; storage access is behind the neutral level interface with CSR as one adapter; executes general DENSE/COMPRESSED levels with mode permutation. Size growth recorded above. |
+| Phase 0-3 gates green; latency reviewed; tile-j/tile-ijk parity credible | **Pass** | All 20 corpus and 42 grid sources regenerated from detached `b2fe883` are byte-identical to the retained `1c78633`/`34a1849` captures (which chain to the Phase-3 finals) — the byte waiver applies and no runtime kernel benchmark is required. Both commits touch only the isolated spike and its tests, which the neutrality suite proves are outside every production import, so the retained paired latency receipts (all inside 1.10) remain the operative measurement. No production, native, cache, or emission surface changed, so the parity objective's credibility is unchanged. |
 
-Because one mandatory criterion fails, the overall verdict is NO-GO even though
-the merge-control subexperiment passes.
+Every mandatory criterion holds, so the verdict is GO.
 
 ## Verification
 
-The original evidence ledger remains at
-`/Users/bobby/.cache/scorch-codex/phase35-loopir-spike-1c78633/`. Its factual
-receipts were independently checked during this review:
+Evidence ledger: `/Users/bobby/.cache/scorch-codex/phase35-repeat-b2fe883/`.
+Commits reviewed (stacked on `587cbc1`; nothing amended, nothing pushed):
 
-- 297 original focused tests pass;
-- the 20-source corpus and 42-source grid are byte-identical between detached
-  `34a1849` and `1c78633` worktrees and chain to the retained Phase-3 captures;
-- the recorded full suite contains 2,857 passed, 14 skipped, 3 perf-marked
-  deselections, and no failures/errors;
-- the recorded latency ratios are inside 1.10 everywhere; and
-- original static, import-provenance, protected-file, staging, and origin-tip
-  claims match their retained receipts.
+- `a3a473b` — `feat(compiler): add format-neutral level storage to LoopIR spike`
+- `b2fe883` — `feat(compiler): rebase LoopIR spike on logical dimensions and positions`
 
-Review-correction verification through final code/test commit `e719be3`:
+Receipts:
 
-- focused spike suites: **329 passed** (92 verifier, 231 execution, 6
-  neutrality);
-- focused spike plus identity/CIN-analysis/LoopPlan/raw-budget suites:
-  **454 passed**;
-- fresh 20-source corpus and 42-source grid captures from detached `b59491b`
-  are byte-identical to the retained `1c78633` candidate captures, which already
-  chain byte-identically to `34a1849` and the Phase-3 finals; the byte waiver
-  therefore applies and no runtime benchmark is required; `64163d8..e719be3`
-  touch only the isolated interpreter and its tests, which the neutrality suite
-  proves are outside production imports;
-- all 31 verifier defect codes have direct regression coverage;
-- Black and Flake8 are clean on the seven changed source/test files; mypy reports
-  success on the five changed production files; and
-- `git diff --check` is clean.
+- focused spike suites at `b2fe883`: **539 passed** (126 verifier, 407
+  execution/differential, 6 neutrality); commit `a3a473b`'s intermediate
+  tree also passes its 329 tests from a detached worktree;
+- spike plus identity/CIN-analysis/LoopPlan/raw-budget adjacency from the
+  detached `b2fe883` worktree: **664 passed**;
+- fresh 20-source corpus and 42-source grid captures from detached
+  `b2fe883` are byte-identical to the retained `1c78633` candidate captures
+  and to the `34a1849` base captures (`diff -rq` empty in all four
+  comparisons), so the byte waiver applies;
+- static parity: Black reports only the single inherited finding
+  (`prebuilt_kernels.py`); Flake8 reports exactly the nine inherited
+  findings; mypy (`--check-untyped-defs`) reports exactly the 146 inherited
+  errors in 12 files with zero findings in the spike; `git diff --check`
+  clean before every commit;
+- the authoritative clean detached-worktree non-performance suite at exact
+  final code/test commit `b2fe883`, with import provenance asserted
+  (including the spike interpreter and level-storage modules) and
+  caches/basetemp isolated, passed **3,099 tests with 14 skipped, 3
+  perf-marked deselections, and one known warning in 2,168.57 seconds**
+  (junit: 3,113 collected, 0 failures, 0 errors);
+- the five protected tracked files retain their recorded SHA-256 values;
+  staging used explicit pathspecs only; no GPU/CUDA, benchmark, packaging,
+  scheduler, research, scratchpad, or tooling material was touched; and the
+  local remote-tracking ref and live `git ls-remote` tip of
+  `origin/refactor/compiler-ir-phase3-std-move-call` both remain at
+  `1714df2` — nothing was pushed.
 
-The authoritative clean detached-worktree non-performance run at exact final
-code/test commit `e719be3`, with import provenance asserted and caches isolated,
-passed **2,889 tests with 14 skipped, 3 perf-marked deselections, and one known
-warning in 2,033.63 seconds**. It had no failures or errors.
+## Conditions carried into Phase 4 (work items, not gate failures)
 
-## Requirements before repeating the review
-
-The repeat spike must resolve the failed criterion rather than relabel it as
-future work:
-
-1. Add stable logical dimension/domain identities and an explicit mapping from
-   physical levels to logical modes.
-2. Add explicit level references and physical position bindings. A compressed
-   child must reference a dominating parent position; coordinate recovery may
-   not be implicit or string-derived.
-3. Define when a cursor position owns a scalar value; non-leaf structural
-   levels must not expose leaf values.
-4. Put sparse storage behind a format-neutral level interface, with CSR as one
-   adapter rather than the interpreter's execution model.
-5. Represent and verify merge-domain compatibility and shape relationships
-   using the logical dimension model.
-6. Execute at least one nested compressed case (DCSR or a three-level CSF-like
-   fixture) and one permuted-mode case (for example CSC), in addition to the CSR
-   regressions. Include wrong-parent and wrong-domain adversarial tests.
-7. Decide and document the required Phase-4 surface for `COORDINATE` and
-   `SINGLETON`; unsupported kinds must fail explicitly.
-8. Keep the neutrality suite green and keep the package outside production
-   imports until a repeated review records GO.
-
-Only after those conditions are implemented and the explicit review is repeated
-may Phase 4 begin. Phase 0-3 remains complete and valuable regardless of this
-NO-GO; no Phase-3 work is reopened by the decision.
+1. Freeze the production LoopIR schema **from** this candidate: builder API,
+   printer, canonical serializer, and the workspace/parallel/tile surface
+   are Phase-4 deliverables on top of these nodes.
+2. Promote the interpreter as the test/debug semantic oracle; keep the
+   neutrality discipline until the strangler path deliberately imports it.
+3. Hierarchical merge descent, non-CSR sparse output assembly adapters, and
+   `COORDINATE`/`SINGLETON` iteration are Phase-5 surfaces; their fail-closed
+   diagnostics (`unsupported_sparse_hierarchy`, "unsupported sparse output
+   layout", `unsupported_level_kind`) are the tracked gates.
+4. The biggest Phase-4 risk remains CIN-to-LoopIR lowering, not the schema:
+   nothing in this spike lowers from normalized CIN yet.

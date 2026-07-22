@@ -22926,6 +22926,116 @@ The neutrality suite must stay green, and the spike must remain outside
 production imports until that repeated review records GO. This NO-GO does not
 reopen Phase 3 or invalidate its CxxIR/ABI hardening.
 
+### Repeated Phase-3.5 review: level-based LoopIR foundation GO (2026-07-22)
+
+The repeat-Phase-3.5 milestone required by the correction above is complete.
+The definitive result is in `COMPILER_IR_REFACTOR_PHASE3_5_REVIEW.md`, which
+supersedes the NO-GO text recorded at `587cbc1`: **GO for the general
+level-based LoopIR foundation**, every mandatory design criterion met, with
+explicitly recorded fail-closed boundaries. Phase 4 was deliberately not
+started in this session. Two code commits stack on `587cbc1`; nothing was
+amended, reordered, or pushed:
+
+- `a3a473b` — `feat(compiler): add format-neutral level storage to LoopIR spike`
+- `b2fe883` — `feat(compiler): rebase LoopIR spike on logical dimensions and positions`
+
+#### What changed
+
+Every NO-GO counterexample was first independently reproduced at `587cbc1`
+(including a live wrong-result execution for the merge-domain hole:
+`reproduce_nogo.{py,out}` in the evidence ledger). The candidate was then
+rebuilt around three separated spaces while preserving the proven
+`MergedSparseFor` semantics byte-for-byte in behaviour:
+
+1. **Logical dimensions.** `DimensionDecl`/`DimensionId` are declared per
+   program; every tensor maps each logical mode to one dimension. Shared
+   extents and shared coordinate domains are one identity; the interpreter
+   resolves all dimension extents from bound shapes before materializing
+   anything, so shape failures stay sparsity-independent. `ExtentEquality`
+   and `DimSize` are deleted — the temporary contract lowered into shared
+   dimension identities, closing that open decision.
+2. **Physical levels with mode order.** `TensorDecl.levels` is now
+   `LevelDecl(kind, mode)` tuples; modes must be a permutation
+   (`invalid_mode_order`), so CSR and CSC are structurally distinct.
+   `LevelKind` gains production `COORDINATE`/`SINGLETON`, which fail closed
+   (`unsupported_level_kind`) with Phase 5 as their recorded gate.
+3. **Physical positions.** `RootPosition`, `DensePosition`
+   (`parent * extent + coord`), and `PositionValue` are position-typed
+   expressions carrying (tensor, level) linkage in the verifier;
+   `SparseFor` binds a `PositionId` beside its coordinate;
+   `SparseCursorDecl.parent` replaces `outer_indices`. Dominance is the
+   locally-checked rule that every level's parent is the position of the
+   immediately dominating level of the same tensor, grounded at the root
+   (`parent_position_mismatch`). Coordinate domains are checked at loads,
+   stores, appends, dense positions, and merges (`domain_mismatch`,
+   `merge_domain_mismatch`); only leaf cursors expose scalars
+   (`non_leaf_value`). `StoreReduce` adds dense-output scatter accumulation
+   for permuted traversals.
+4. **Format-neutral storage.** New `levels.py`: validated
+   `LevelTensorStorage` with the `segment`/`coordinate_at`/`leaf_value`
+   interface, `from_dense`/`to_dense` for every DENSE/COMPRESSED
+   composition and mode permutation, and CSR as exactly one adapter
+   (`from_csr`, `CsrOutputBuilder`). The interpreter core no longer touches
+   any concrete container.
+
+Fixtures now cover CSR SpMV, CSR UNION add, two-CSR INTERSECTION multiply
+(all preserved case-for-case), plus DCSR SpMV (parent-position descent),
+CSC SpMV (physical/logical separation; proven not-a-transpose), and a
+three-level CSF-like row contraction (chained descents). Cross-layout
+differentials require CSR/DCSR/CSC storage of one logical matrix to agree
+exactly, and dedicated cases make storage positions diverge from
+coordinates so descent-by-coordinate would fail. The verifier's 42 defect
+codes all have direct adversarial coverage; the spike suites total 539
+tests (126 verifier, 407 execution, 6 neutrality). The degenerate
+sparse-dense reading of "CSR SpMV intersection" is now explicitly justified
+in the review rather than left ambiguous.
+
+#### Verification ledger
+
+Evidence: `/Users/bobby/.cache/scorch-codex/phase35-repeat-b2fe883/`.
+
+- Focused spike suites at `b2fe883`: 539 passed; `a3a473b`'s intermediate
+  tree passes its 329 tests from a detached worktree; spike plus
+  identity/CIN-analysis/LoopPlan/raw-budget adjacency from the detached
+  candidate worktree: 664 passed.
+- Byte gates: fresh 20-source corpus and 42-source grid captures from
+  detached `b2fe883` are byte-identical to the retained `1c78633` and
+  `34a1849` captures (four empty `diff -rq` runs), which chain to the
+  Phase-3 finals; the byte waiver applies and no runtime kernel benchmark
+  is required. Both commits touch only the isolated spike and its tests —
+  outside every production import per the neutrality suite — so the
+  retained paired latency receipts remain operative.
+- Static parity: Black single inherited finding (`prebuilt_kernels.py`);
+  Flake8 exactly the nine inherited findings; mypy `--check-untyped-defs`
+  exactly the 146 inherited errors in 12 files, zero in the spike;
+  `git diff --check` clean before every commit.
+- The authoritative clean detached-worktree non-performance suite at exact
+  final code/test commit `b2fe883` (import provenance asserted including
+  the spike interpreter and level-storage modules; isolated caches and
+  basetemp) passed **3,099 tests with 14 skipped, 3 perf-marked
+  deselections, and one known warning in 2,168.57 seconds** with no
+  failures or errors.
+- The five protected tracked files retain their recorded SHA-256 values;
+  staging used explicit pathspecs only; no GPU/CUDA, benchmark, packaging,
+  scheduler, research, scratchpad, or tooling material was staged. The
+  local remote-tracking ref and live `git ls-remote` tip of
+  `origin/refactor/compiler-ir-phase3-std-move-call` both remain at
+  `1714df2`; nothing was pushed.
+
+#### Recorded boundaries and the Phase-4 hand-back
+
+Fail-closed, tracked boundaries (not gate failures): merged cursors must
+target value-bearing leaf levels (`unsupported_sparse_hierarchy` —
+hierarchical merge descent is Phase-5 merge/lattice work); sparse output
+assembly is canonical CSR only; dense outputs are rank ≤ 2;
+`COORDINATE`/`SINGLETON` iteration is Phase 5. The spike grew to 3,371
+lines across seven modules to earn format neutrality and is still a plain
+Torch-free oracle. The next milestone is the Phase-4 strangler path:
+freeze the production schema from this candidate (builder, printer,
+canonical serializer), lower normalized CIN for the dense vertical slice,
+and promote the interpreter as the semantic oracle — with CIN-to-LoopIR
+lowering, not the schema, as the leading risk.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
@@ -23070,12 +23180,19 @@ Useful test additions:
 
 ## Recommended Next Milestone
 
-Repeat Phase 3.5 after repairing the level model. This is intentionally a broad
-milestone, not another one-node migration: the next session should address the
-parent-position, logical-domain/mode-order, and format-neutral interpreter
-boundaries together, execute non-CSR hierarchical/permuted fixtures, and conduct
-a fresh criterion-by-criterion go/no-go review. Do not start Phase 4 in the same
-session; keep the gate and its review independently auditable.
+Begin Phase 4: the LoopIR strangler path. The repeated Phase-3.5 review at
+`b2fe883` records GO for the general level-based LoopIR foundation, so the
+next session should freeze the production schema from the revised spike
+candidate (builder API, printer, canonical serializer; keep the frozen
+dataclass/tuple/side-table discipline), implement normalized-CIN-to-LoopIR
+lowering for the scalar/dense elementwise slice, add the dense
+reduction/matmul vertical slice through CxxIR, and promote the spike
+interpreter into the required test/debug semantic oracle. CIN-to-LoopIR
+lowering is the leading risk — the schema is validated, the lowering is not.
+Keep shadow compilation off in production and ordinary pytest; the spike's
+recorded fail-closed boundaries (leaf-only merges, CSR-only sparse output
+assembly, COORDINATE/SINGLETON) are Phase-5 surfaces and must not be forced
+open in Phase 4.
 
 ## Copy-Paste Prompt for a New Session/Agent
 
@@ -23104,8 +23221,10 @@ Binding architecture decisions:
   ScheduledCIN(normalized_cin, verified_loop_plan), not another IR.
 - Full internal verifiers run before/after passes in test/debug mode and are off
   by default in production JIT compilation; cheap public validation remains on.
-- Production LoopIR cannot begin until the mandatory CSR SpMV intersection plus
-  sparse elementwise-union interpreter spike passes the Phase 3.5 go/no-go gate.
+- Production LoopIR could not begin until the mandatory CSR SpMV intersection
+  plus sparse elementwise-union interpreter spike passed the Phase 3.5
+  go/no-go gate; the repeated review at b2fe883 records that GO, so Phase 4
+  may proceed from the revised spike schema.
 - Preserve the concrete compile-latency measurement/review policy and
   two-machine kernel-performance gates in the design document. Treat 1.10 as the
   default latency target and investigation threshold, not a reason to compromise
@@ -23123,64 +23242,47 @@ unrelated user changes and inspect git status before editing.
 
 Current state you must preserve:
 
-- Phase 3 is closed. Phase 3.5 is currently NO-GO for general level-based
-  LoopIR, while the canonical CSR merge-control experiment is a narrow pass.
-- The original spike commits are 71eba38, 1e30817, 1c78633, and 62e94ff.
-- Rigorous-review corrections are de1d1d7, 79c5837, 245e673, c17636a,
-  8280ad8, 5733f30, ee58ad9, 7f32141, 775a408, b59491b, 64163d8, and
-  e719be3. Read the current
-  review and final handoff section; do not rely on the superseded GO prose.
-- Nothing has been pushed by the review session. Preserve all unrelated dirty
-  and untracked GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad,
-  and tooling work. Stage explicit paths only.
+- Phase 3 is closed. The repeated Phase-3.5 review records GO for the
+  general level-based LoopIR foundation; read
+  COMPILER_IR_REFACTOR_PHASE3_5_REVIEW.md and the LAST dated handoff
+  section. Do not rely on any superseded NO-GO or initial-GO prose.
+- The revised spike commits are a3a473b (format-neutral level storage) and
+  b2fe883 (logical dimensions, physical positions, parent linkage, value
+  ownership, DCSR/CSC/CSF fixtures, 539 spike tests). They stack on the
+  correction chain ending at 587cbc1.
+- The spike is outside production imports (neutrality suite enforces it)
+  and has recorded fail-closed boundaries: merged cursors are leaf-only,
+  sparse output assembly is canonical CSR only, dense outputs are rank <= 2,
+  and COORDINATE/SINGLETON levels fail closed. These are Phase-5 surfaces;
+  do not force them open.
+- Nothing has been pushed. Preserve all unrelated dirty and untracked
+  GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, and
+  tooling work. Stage explicit paths only.
 
-Primary objective: complete the full repeat-Phase-3.5 milestone, not merely one
-micro-slice.
+Primary objective: begin Phase 4, the LoopIR strangler path, as a coherent
+milestone:
 
-1. Independently audit the corrected spike and reproduce the NO-GO
-   counterexamples before designing the replacement.
-2. Revise the candidate schema so tensors have stable logical
-   dimension/domain identities and an explicit physical-level-to-logical-mode
-   mapping. CSR and CSC must be structurally distinguishable.
-3. Add explicit level references and physical position bindings. Sparse loops
-   must bind position and coordinate separately, and a compressed child must
-   reference a dominating parent position. Do not recover positions by
-   coordinate search, rendered names, callbacks, or implicit interpreter state.
-4. Make value ownership explicit: structural/non-leaf levels cannot expose a
-   scalar CursorValue as if they were value-bearing leaves.
-5. Replace CSR storage embedded in interp.py with a small format-neutral level
-   storage interface. Keep CSR as one adapter and preserve the already-proven
-   merge semantics. The interpreter must remain Torch-free and independent of
-   the production pipeline.
-6. Integrate shape/extent compatibility with the logical dimension model.
-   Preserve the corrected sparsity-independent failures; decide whether the
-   temporary ExtentEquality node remains useful or should lower into shared
-   dimension identities.
-7. Verify merge operands share one logical coordinate domain. Do not substitute
-   equality of physical level numbers for domain identity.
-8. Execute, at minimum: the existing CSR SpMV/UNION/INTERSECTION corpus; a
-   nested-compressed DCSR or three-level CSF-like program proving parent-position
-   descent; and a permuted-mode/CSC program proving physical/logical separation.
-   Add wrong-parent, wrong-domain, wrong-mode-order, non-leaf-value, malformed
-   state, cycle, exhaustion, and empty/ragged differential cases.
-9. Explicitly disposition production LevelType.COORDINATE and SINGLETON. Support
-   them in the spike if coherent within the milestone; otherwise reject them
-   with stable verifier/interpreter diagnostics and record the exact later gate.
-10. Repeat the Phase-3.5 review against every criterion in
-    COMPILER_IR_REFACTOR_DESIGN.md. Record GO only if every criterion is actually
-    met. If any fails, keep NO-GO and explain the smallest remaining blocker.
+1. Freeze the production LoopIR schema from the spike candidate: builder
+   API, verifier, printer, and canonical serializer, keeping frozen
+   dataclasses, tuple children, ID-keyed side tables, and the fail-closed
+   single-authority verifier discipline.
+2. Implement normalized-CIN-to-LoopIR lowering for scalar/dense elementwise
+   operations; this lowering is the riskiest part, not the schema.
+3. Add the dense reduction/matmul vertical slice through target-specific
+   CxxIR and the existing ABI/codegen, without double compilation in
+   ordinary test or release JIT wall time.
+4. Promote the spike interpreter into the test/debug semantic oracle for
+   the migrated slices; keep shadow comparison curated and off by default.
+5. Keep LoopIR stage dumps deterministic and free of C++ spelling.
 
-Keep the experiment outside production imports. Do not start the Phase-4 dense
-strangler path, change public STensor behavior, alter kernel policy, or add
-analysis caching in this session. A successful repeated GO should be its own
-reviewed stopping point.
-
-Use apply_patch for edits and focused commits with descriptive bodies. Verify in
-the scorch conda environment: the complete spike suites, identity/CIN-analysis/
-LoopPlan/raw-budget adjacency, Black/Flake8/mypy parity, git diff --check, and a
-clean detached-worktree non-performance suite. Regenerate the 20-source corpus
-and 42-source grid to prove production byte non-interference; the neutrality
-suite and structural activation tests are never waived. Preserve and report the
-five protected-file hashes, import provenance, exact commit list, origin state,
-and any limitation honestly. Do not push.
+Verify in the scorch conda environment: the complete spike suites,
+identity/CIN-analysis/LoopPlan/raw-budget adjacency, Black/Flake8/mypy
+parity against the inherited baselines, git diff --check, and a clean
+detached-worktree non-performance suite. Any change that affects emitted
+code must pass the generated-kernel byte/A-B gates; byte-identical emission
+across the 20-source corpus and 42-source grid waives runtime benchmarks,
+while structural activation tests are never waived. Preserve and report the
+five protected-file hashes, import provenance, exact commit list, origin
+state, and any limitation honestly. Use focused commits with descriptive
+bodies; do not amend or reorder existing commits. Do not push.
 ```
