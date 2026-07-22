@@ -175,6 +175,14 @@ class _Interpreter:
             raise LoopIRInterpreterError(
                 "input binding keys could not be snapshotted"
             ) from error
+        if any(
+            type(symbol) is not SymbolId
+            or type(getattr(symbol, "value", None)) is not int
+            for symbol in input_keys
+        ):
+            raise LoopIRInterpreterError(
+                "input binding keys must be exact int-valued SymbolId values"
+            )
         if input_keys != set(program.inputs):
             raise LoopIRInterpreterError(
                 "input bindings must cover exactly the declared inputs"
@@ -185,6 +193,14 @@ class _Interpreter:
             raise LoopIRInterpreterError(
                 "output shape keys could not be snapshotted"
             ) from error
+        if any(
+            type(symbol) is not SymbolId
+            or type(getattr(symbol, "value", None)) is not int
+            for symbol in output_keys
+        ):
+            raise LoopIRInterpreterError(
+                "output shape keys must be exact int-valued SymbolId values"
+            )
         if output_keys != set(program.outputs):
             raise LoopIRInterpreterError(
                 "output shapes must cover exactly the declared outputs"
