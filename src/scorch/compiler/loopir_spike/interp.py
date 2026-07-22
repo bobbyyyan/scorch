@@ -1,14 +1,16 @@
 """Small plain-Python interpreter for the Phase-3.5 LoopIR spike.
 
-This is the test/debug oracle the milestone asks for: it executes verified
-spike programs over plain Python containers (nested float lists for dense
-tensors, :class:`CsrMatrix` for sparse ones) with no Torch, native code, or
-compiler-pipeline involvement.  Merge semantics are implemented exactly as
-documented on :class:`MergedSparseFor`: candidate coordinates are the minimum
-over non-exhausted cursors, aligned cursors advance by one position per step,
-UNION emits every candidate, INTERSECTION emits only fully aligned candidates
-and stops on first exhaustion.  Everything unexpected fails closed with
-:class:`LoopIRInterpreterError` rather than being coerced.
+This is the narrow CSR test/debug oracle the milestone asks for: it executes
+verified spike programs over plain Python containers (nested float lists for
+dense tensors, :class:`CsrMatrix` for sparse ones) with no Torch, native code,
+or compiler-pipeline involvement.  It is not a general level-storage runtime;
+the corrected Phase-3.5 review requires that redesign before Phase 4.  Merge
+semantics are implemented exactly as documented on :class:`MergedSparseFor`:
+candidate coordinates are the minimum over non-exhausted cursors, aligned
+cursors advance by one position per step, UNION emits every candidate,
+INTERSECTION emits only fully aligned candidates and stops on first exhaustion.
+Everything unexpected fails closed with :class:`LoopIRInterpreterError` rather
+than being coerced.
 """
 
 from __future__ import annotations
@@ -178,19 +180,22 @@ class _Interpreter:
         self.values: Dict[SymbolId, Any] = {}
         self.shapes: Dict[SymbolId, Tuple[int, ...]] = {}
         for symbol in program.inputs:
-            self._bind_input(self.decls[symbol], inputs[symbol])
+            self._register_input_shape(self.decls[symbol], inputs[symbol])
         self.builders: Dict[SymbolId, _CsrOutputBuilder] = {}
         for symbol in program.outputs:
-            self._bind_output(self.decls[symbol], output_shapes[symbol])
+            self._register_output_shape(self.decls[symbol], output_shapes[symbol])
         self._check_extent_equalities()
+        for symbol in program.inputs:
+            self._materialize_input(self.decls[symbol], inputs[symbol])
+        for symbol in program.outputs:
+            self._materialize_output(self.decls[symbol])
         self.indices: Dict[IndexId, int] = {}
         self.accums: Dict[SymbolId, Tuple[ReduceOp, float]] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
 
-    def _bind_input(self, decl: TensorDecl, value: object) -> None:
+    def _register_input_shape(self, decl: TensorDecl, value: object) -> None:
         if all(level is LevelKind.DENSE for level in decl.levels):
             shape = _dense_shape(len(decl.levels), value, f"input {decl.name}")
-            self.values[decl.symbol] = _dense_copy(value, shape, f"input {decl.name}")
             self.shapes[decl.symbol] = shape
             return
         if decl.levels == _CSR_LEVELS:
@@ -198,7 +203,6 @@ class _Interpreter:
                 raise LoopIRInterpreterError(
                     f"input {decl.name} must be bound to a CsrMatrix"
                 )
-            self.values[decl.symbol] = value
             self.shapes[decl.symbol] = (value.n_rows, value.n_cols)
             return
         raise LoopIRInterpreterError(
@@ -206,7 +210,15 @@ class _Interpreter:
             f"for input {decl.name}"
         )
 
-    def _bind_output(self, decl: TensorDecl, shape: object) -> None:
+    def _materialize_input(self, decl: TensorDecl, value: object) -> None:
+        if all(level is LevelKind.DENSE for level in decl.levels):
+            self.values[decl.symbol] = _dense_copy(
+                value, self.shapes[decl.symbol], f"input {decl.name}"
+            )
+        else:
+            self.values[decl.symbol] = value
+
+    def _register_output_shape(self, decl: TensorDecl, shape: object) -> None:
         if (
             type(shape) is not tuple
             or len(shape) != len(decl.levels)
@@ -218,22 +230,27 @@ class _Interpreter:
             )
         self.shapes[decl.symbol] = shape
         if all(level is LevelKind.DENSE for level in decl.levels):
-            if len(shape) == 1:
-                self.values[decl.symbol] = [0.0] * shape[0]
-            elif len(shape) == 2:
-                self.values[decl.symbol] = [[0.0] * shape[1] for _ in range(shape[0])]
-            else:
+            if len(shape) not in (1, 2):
                 raise LoopIRInterpreterError(
                     f"dense outputs above rank 2 are unsupported ({decl.name})"
                 )
             return
         if decl.levels == _CSR_LEVELS:
-            self.builders[decl.symbol] = _CsrOutputBuilder(decl.name, shape)
             return
         raise LoopIRInterpreterError(
             f"unsupported layout {tuple(kind.value for kind in decl.levels)} "
             f"for output {decl.name}"
         )
+
+    def _materialize_output(self, decl: TensorDecl) -> None:
+        shape = self.shapes[decl.symbol]
+        if all(level is LevelKind.DENSE for level in decl.levels):
+            if len(shape) == 1:
+                self.values[decl.symbol] = [0.0] * shape[0]
+            else:
+                self.values[decl.symbol] = [[0.0] * shape[1] for _ in range(shape[0])]
+        else:
+            self.builders[decl.symbol] = _CsrOutputBuilder(decl.name, shape)
 
     def _check_extent_equalities(self) -> None:
         for position, equality in enumerate(self.program.extent_equalities):
