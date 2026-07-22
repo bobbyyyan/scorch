@@ -753,7 +753,54 @@ def _contains_tensor_access(
     return walker.found
 
 
-def _is_operand_prefetch_guard(stmt: llir.Stmt, operand_value_array: str) -> bool:
+def _is_plain_prefetch_reference(
+    value: object, expected_name: str | None = None
+) -> bool:
+    """Whether ``value`` is one exact metadata-free P1 reference."""
+
+    if type(value) is not llir.Var:
+        return False
+    fields = vars(value)
+    name = fields.get("name")
+    return bool(
+        type(name) is str
+        and (expected_name is None or name == expected_name)
+        and fields.get("type") is llir.DataType.NO_TYPE
+        and fields.get("is_ptr") is False
+        and fields.get("is_restrict") is False
+        and fields.get("tensor_access", False) is None
+    )
+
+
+def _is_prefetch_int_literal(value: object, expected: int) -> bool:
+    if type(value) is not llir.Literal:
+        return False
+    fields = vars(value)
+    return bool(
+        type(fields.get("value")) is int
+        and fields["value"] == expected
+        and fields.get("data_type") is llir.DataType.INT
+    )
+
+
+def _prefetch_next_position(value: object) -> str | None:
+    if type(value) is not llir.Add or value.op != "+":
+        return None
+    if not _is_plain_prefetch_reference(value.left):
+        return None
+    if not _is_prefetch_int_literal(value.right, 1):
+        return None
+    return cast(llir.Var, value.left).name
+
+
+def _is_operand_prefetch_guard(
+    stmt: llir.Stmt,
+    operand_value_array: str,
+    *,
+    iterator: str | None = None,
+    end: str | None = None,
+    coordinate_array: str | None = None,
+) -> bool:
     """Exactly recognize one typed P1 guard addressing one operand value array.
 
     Recognition is structural, not textual: the statement must be the exact
@@ -764,19 +811,55 @@ def _is_operand_prefetch_guard(stmt: llir.Stmt, operand_value_array: str) -> boo
 
     if type(stmt) is not llir.GuardedCallStmt:
         return False
-    call = stmt.call
-    if type(call) is not llir.FunctionCallStmt or call.name != "__builtin_prefetch":
+    try:
+        llir._validate_guarded_call_fields(stmt)
+    except TypeError:
         return False
-    if type(call.args) is not tuple or not call.args:
+
+    condition = stmt.cond
+    if type(condition) is not llir.BinOp or condition.op != "<":
+        return False
+    matched_iterator = _prefetch_next_position(condition.left)
+    if matched_iterator is None or not _is_plain_prefetch_reference(
+        condition.right, end
+    ):
+        return False
+    if iterator is not None and matched_iterator != iterator:
+        return False
+
+    call = stmt.call
+    if (
+        type(call) is not llir.FunctionCallStmt
+        or type(call.name) is not str
+        or call.name != "__builtin_prefetch"
+        or call.template_args
+    ):
+        return False
+    if type(call.args) is not tuple or len(call.args) != 3:
+        return False
+    if not _is_prefetch_int_literal(call.args[1], 0) or not _is_prefetch_int_literal(
+        call.args[2], 1
+    ):
         return False
     address = call.args[0]
     if type(address) is not llir.AddressOf:
         return False
     operand = address.operand
-    if type(operand) is not llir.ArrayAccess:
+    if type(operand) is not llir.ArrayAccess or operand.tensor_access is not None:
         return False
-    array = operand.array
-    return type(array) is llir.Var and array.name == operand_value_array
+    if not _is_plain_prefetch_reference(operand.array, operand_value_array):
+        return False
+    product = operand.index
+    if type(product) is not llir.Mul or product.op != "*":
+        return False
+    coordinate = product.left
+    if type(coordinate) is not llir.ArrayAccess or coordinate.tensor_access is not None:
+        return False
+    if not _is_plain_prefetch_reference(coordinate.array, coordinate_array):
+        return False
+    if _prefetch_next_position(coordinate.index) != matched_iterator:
+        return False
+    return _is_plain_prefetch_reference(product.right)
 
 
 def _redirect_sparse_prefetch(
@@ -805,76 +888,79 @@ def _redirect_sparse_prefetch(
     removed = False
     retained: List[llir.Stmt] = []
     for stmt in sparse_loop.body:
-        if _is_operand_prefetch_guard(stmt, operand_value_array):
+        if _is_operand_prefetch_guard(
+            stmt,
+            operand_value_array,
+            iterator=position,
+            end=end_name,
+            coordinate_array=coordinate_name,
+        ):
             removed = True
             continue
         retained.append(stmt)
-    sparse_loop.body = retained
-    if removed:
-        staged_names = [position, end_name, packed_name, panel_var, panel_end]
-        staged_names.append(panel_tile_var)
-        if stage_row_origin is not None:
-            staged_names.append(stage_row_origin)
-        if any(
-            type(name) is not str or not name.isidentifier() for name in staged_names
-        ):
-            raise NotImplementedError(
-                "Packed relayout requires identifier spellings for the staged "
-                "prefetch guard"
-            )
+    if not removed:
+        return
 
-        def _reference(name: str) -> llir.Var:
-            return llir.Var(name=name, type=llir.DataType.NO_TYPE)
+    staged_names = [position, end_name, packed_name, panel_var, panel_end]
+    staged_names.append(panel_tile_var)
+    if stage_row_origin is not None:
+        staged_names.append(stage_row_origin)
+    if any(type(name) is not str or not name.isidentifier() for name in staged_names):
+        raise NotImplementedError(
+            "Packed relayout requires identifier spellings for the staged "
+            "prefetch guard"
+        )
 
-        def _next_coordinate() -> llir.ArrayAccess:
-            return llir.ArrayAccess(
-                array=_reference(coordinate_name),
-                index=llir.Add(
-                    _reference(position),
-                    llir.Literal(1, llir.DataType.INT),
-                ),
-            )
+    def _reference(name: str) -> llir.Var:
+        return llir.Var(name=name, type=llir.DataType.NO_TYPE)
 
-        staged_row: llir.Expr = _next_coordinate()
-        if stage_row_origin is not None:
-            staged_row = llir.BinOp("-", staged_row, _reference(stage_row_origin))
-        sparse_loop.body.insert(
-            0,
-            llir.GuardedCallStmt(
-                cond=llir.BinOp(
-                    "&&",
-                    llir.BinOp(
-                        "&&",
-                        llir.BinOp(
-                            "<",
-                            llir.Add(
-                                _reference(position),
-                                llir.Literal(1, llir.DataType.INT),
-                            ),
-                            _reference(end_name),
-                        ),
-                        llir.BinOp(">=", _next_coordinate(), _reference(panel_var)),
-                    ),
-                    llir.BinOp("<", _next_coordinate(), _reference(panel_end)),
-                ),
-                call=llir.FunctionCallStmt(
-                    "__builtin_prefetch",
-                    (
-                        llir.AddressOf(
-                            operand=llir.ArrayAccess(
-                                array=_reference(packed_name),
-                                index=llir.Mul(
-                                    staged_row,
-                                    _reference(panel_tile_var),
-                                ),
-                            )
-                        ),
-                        llir.Literal(0, llir.DataType.INT),
-                        llir.Literal(1, llir.DataType.INT),
-                    ),
-                ),
+    def _next_coordinate() -> llir.ArrayAccess:
+        return llir.ArrayAccess(
+            array=_reference(coordinate_name),
+            index=llir.Add(
+                _reference(position),
+                llir.Literal(1, llir.DataType.INT),
             ),
         )
+
+    staged_row: llir.Expr = _next_coordinate()
+    if stage_row_origin is not None:
+        staged_row = llir.BinOp("-", staged_row, _reference(stage_row_origin))
+    replacement = llir.GuardedCallStmt(
+        cond=llir.BinOp(
+            "&&",
+            llir.BinOp(
+                "&&",
+                llir.BinOp(
+                    "<",
+                    llir.Add(
+                        _reference(position),
+                        llir.Literal(1, llir.DataType.INT),
+                    ),
+                    _reference(end_name),
+                ),
+                llir.BinOp(">=", _next_coordinate(), _reference(panel_var)),
+            ),
+            llir.BinOp("<", _next_coordinate(), _reference(panel_end)),
+        ),
+        call=llir.FunctionCallStmt(
+            "__builtin_prefetch",
+            (
+                llir.AddressOf(
+                    operand=llir.ArrayAccess(
+                        array=_reference(packed_name),
+                        index=llir.Mul(
+                            staged_row,
+                            _reference(panel_tile_var),
+                        ),
+                    )
+                ),
+                llir.Literal(0, llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
+    )
+    sparse_loop.body = [replacement, *retained]
 
 
 def _remove_dense_result_zero(function: llir.Function, result: str) -> None:

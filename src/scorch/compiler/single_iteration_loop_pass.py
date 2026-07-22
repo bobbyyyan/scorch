@@ -329,12 +329,13 @@ def _rewrite_expression_references(
     path: LLIRPath,
     *,
     in_array_index: bool = False,
+    replace_exact_names: bool = False,
 ) -> llir.Expr:
     if type(expression) is llir.Var:
         variable = cast(llir.Var, expression)
         name = _checked_var_name(variable, context, path)
         changed = False
-        if in_array_index:
+        if in_array_index or replace_exact_names:
             for old, new in replacements.structured_indices:
                 if name == old:
                     name = new
@@ -345,6 +346,8 @@ def _rewrite_expression_references(
                 changed = True
         if not changed:
             return variable
+        if re.fullmatch(r"(?:0|[1-9]\d*)", name) is not None:
+            return llir.Literal(int(name), llir.DataType.INT)
         return llir.Var(
             name=name,
             type=variable.type,
@@ -361,6 +364,7 @@ def _rewrite_expression_references(
             context,
             path + ("left",),
             in_array_index=in_array_index,
+            replace_exact_names=replace_exact_names,
         )
         right = _rewrite_expression_references(
             binary.right,
@@ -368,6 +372,7 @@ def _rewrite_expression_references(
             context,
             path + ("right",),
             in_array_index=in_array_index,
+            replace_exact_names=replace_exact_names,
         )
         return llir.rebuild_binary_expression(binary, left, right)
     if type(expression) is llir.ArrayAccess:
@@ -378,6 +383,7 @@ def _rewrite_expression_references(
                 replacements,
                 context,
                 path + ("array",),
+                replace_exact_names=replace_exact_names,
             ),
             index=_rewrite_expression_references(
                 access.index,
@@ -385,6 +391,7 @@ def _rewrite_expression_references(
                 context,
                 path + ("index",),
                 in_array_index=True,
+                replace_exact_names=replace_exact_names,
             ),
             tensor_access=access.tensor_access,
         )
@@ -396,6 +403,7 @@ def _rewrite_expression_references(
             context,
             path + ("operand",),
             in_array_index=in_array_index,
+            replace_exact_names=replace_exact_names,
         )
         return llir.AddressOf(
             operand=cast(llir.AssignmentTarget, rewritten_operand),
@@ -408,6 +416,8 @@ def _rewrite_expression_sequence(
     replacements: _ReferenceReplacements,
     context: SingleIterationLoopEliminationContext,
     path: LLIRPath,
+    *,
+    replace_exact_names: bool = False,
 ) -> Sequence[llir.Expr]:
     rewritten = [
         _rewrite_expression_references(
@@ -415,6 +425,7 @@ def _rewrite_expression_sequence(
             replacements,
             context,
             path + (f"[{index}]",),
+            replace_exact_names=replace_exact_names,
         )
         for index, expression in enumerate(expressions)
     ]
@@ -495,6 +506,7 @@ def _rewrite_statement_references(
                     replacements,
                     context,
                     statement_path + ("cond",),
+                    replace_exact_names=True,
                 ),
                 call=llir.FunctionCallStmt(
                     name=name,
@@ -504,6 +516,7 @@ def _rewrite_statement_references(
                         replacements,
                         context,
                         statement_path + ("call", "args"),
+                        replace_exact_names=True,
                     ),
                 ),
             )

@@ -1096,6 +1096,10 @@ def _validate_assignment_target(target: object) -> None:
             raise TypeError("assignment Var.name must be an identifier or member path")
         if type(fields.get("type", missing)) is not DataType:
             raise TypeError("assignment Var.type must be a DataType")
+        if type(fields.get("is_ptr", missing)) is not bool:
+            raise TypeError("assignment Var.is_ptr must be a bool")
+        if type(fields.get("is_restrict", missing)) is not bool:
+            raise TypeError("assignment Var.is_restrict must be a bool")
         if fields.get("tensor_access", missing) is not None:
             raise TypeError(
                 "scalar/member Assign targets cannot carry tensor access metadata"
@@ -1117,6 +1121,8 @@ def _validate_assignment_target(target: object) -> None:
                     type(fast_name) is str
                     and fast_name.isidentifier()
                     and type(array_fast_fields.get("type")) is DataType
+                    and type(array_fast_fields.get("is_ptr")) is bool
+                    and type(array_fast_fields.get("is_restrict")) is bool
                     and array_fast_fields.get("tensor_access", False) is None
                     and _assignment_index_fast_ok(fast_fields.get("index"), 64) >= 0
                 ):
@@ -1155,6 +1161,10 @@ def _validate_assignment_target(target: object) -> None:
             raise TypeError("assignment MemberAccess root name must be an identifier")
         if type(root_fields.get("type", missing)) is not DataType:
             raise TypeError("assignment MemberAccess root type must be a DataType")
+        if type(root_fields.get("is_ptr", missing)) is not bool:
+            raise TypeError("assignment MemberAccess root is_ptr must be a bool")
+        if type(root_fields.get("is_restrict", missing)) is not bool:
+            raise TypeError("assignment MemberAccess root is_restrict must be a bool")
         if root_fields.get("tensor_access", missing) is not None:
             raise TypeError(
                 "assignment MemberAccess root cannot carry tensor access metadata"
@@ -1174,6 +1184,10 @@ def _validate_assignment_target(target: object) -> None:
         )
     if type(array_fields.get("type", missing)) is not DataType:
         raise TypeError("assignment ArrayAccess.array type must be a DataType")
+    if type(array_fields.get("is_ptr", missing)) is not bool:
+        raise TypeError("assignment ArrayAccess.array is_ptr must be a bool")
+    if type(array_fields.get("is_restrict", missing)) is not bool:
+        raise TypeError("assignment ArrayAccess.array is_restrict must be a bool")
     if array_fields.get("tensor_access", missing) is not None:
         raise TypeError(
             "assignment ArrayAccess.array cannot carry tensor access metadata"
@@ -1312,6 +1326,11 @@ class Sizeof(Expr):
 
 
 _MISSING_ADDRESS_OF_FIELD = object()
+
+# Keep recursive validation comfortably below Python's interpreter limit so a
+# forged, deeply nested tree fails at the typed boundary rather than leaking a
+# raw ``RecursionError``.
+_MAX_VALIDATED_EXPRESSION_DEPTH = 256
 
 # Shared read-only stand-in for a missing/forged ``__dict__`` so stored-field
 # reads can use one dict fetch per node on validation hot paths.
@@ -1511,6 +1530,11 @@ def _validate_address_of_index_impl(
     if expression_id in active:
         raise _AddressOfValidationError(
             f"{owner} must be acyclic",
+            path,
+        )
+    if len(active) >= _MAX_VALIDATED_EXPRESSION_DEPTH:
+        raise _AddressOfValidationError(
+            f"{owner} exceeds the maximum supported nesting depth",
             path,
         )
 
@@ -1753,6 +1777,11 @@ def _validate_guarded_call_condition(
             "GuardedCallStmt.cond must be acyclic",
             path,
         )
+    if len(active) >= _MAX_VALIDATED_EXPRESSION_DEPTH:
+        raise _GuardedCallValidationError(
+            "GuardedCallStmt.cond exceeds the maximum supported nesting depth",
+            path,
+        )
     active.add(value_id)
     try:
         if type(value) is not BinOp:
@@ -1762,6 +1791,11 @@ def _validate_guarded_call_condition(
                 path,
             )
         op = _address_of_instance_field(value, "op")
+        if type(op) is not str:
+            raise _GuardedCallValidationError(
+                "GuardedCallStmt.cond operator must be an exact string",
+                path + ("op",),
+            )
         if op == "&&":
             _validate_guarded_call_condition(
                 _address_of_instance_field(value, "left"),
@@ -1774,7 +1808,7 @@ def _validate_guarded_call_condition(
                 active=active,
             )
             return
-        if type(op) is not str or op not in _GUARDED_CALL_COMPARISON_OPS:
+        if op not in _GUARDED_CALL_COMPARISON_OPS:
             raise _GuardedCallValidationError(
                 "GuardedCallStmt.cond comparisons must use one supported "
                 "comparison operator",

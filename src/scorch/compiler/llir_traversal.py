@@ -810,14 +810,31 @@ class LLIRWalker:
                 path=path,
                 value=value,
             )
-        self._walk_expr(value, path)
+        validation_error: TypeError | None = None
         try:
             llir._validate_assignment_target(value)
         except TypeError as error:
+            validation_error = error
+        try:
+            self._walk_expr(value, path)
+        except RecursionError:
+            message = (
+                str(validation_error)
+                if validation_error is not None
+                else "assignment target exceeds the supported traversal depth"
+            )
             _raise_traversal_error(
                 self.context,
                 code="invalid_assignment_target",
-                message=str(error),
+                message=message,
+                path=path,
+                value=value,
+            )
+        if validation_error is not None:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message=str(validation_error),
                 path=path,
                 value=value,
             )
@@ -1596,7 +1613,34 @@ class LLIRRewriter:
                 path=path,
                 value=value,
             )
-        rewritten = self._rewrite_expr(value, path)
+        validation_error: TypeError | None = None
+        try:
+            llir._validate_assignment_target(value)
+        except TypeError as error:
+            validation_error = error
+        try:
+            rewritten = self._rewrite_expr(value, path)
+        except RecursionError:
+            message = (
+                str(validation_error)
+                if validation_error is not None
+                else "assignment target exceeds the supported traversal depth"
+            )
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message=message,
+                path=path,
+                value=value,
+            )
+        if validation_error is not None:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message=str(validation_error),
+                path=path,
+                value=value,
+            )
         try:
             llir._validate_assignment_target(rewritten)
         except TypeError as error:
@@ -2254,10 +2298,21 @@ class LLIRRewriter:
                 path=path + getattr(error, "field_path", ()),
                 value=node,
             )
-        return llir.GuardedCallStmt(
-            cond=self._rewrite_expr(node.cond, path + ("cond",)),
-            call=self.rewrite_function_call_stmt(node.call, path + ("call",)),
-        )
+        rewritten_cond = self._rewrite_expr(node.cond, path + ("cond",))
+        rewritten_call = self.rewrite_function_call_stmt(node.call, path + ("call",))
+        try:
+            return llir.GuardedCallStmt(
+                cond=rewritten_cond,
+                call=rewritten_call,
+            )
+        except TypeError as error:
+            _raise_traversal_error(
+                self.context,
+                code="invalid_guarded_call_stmt",
+                message=str(error),
+                path=path + getattr(error, "field_path", ()),
+                value=node,
+            )
 
     def rewrite_for_loop(self, node: llir.ForLoop, path: LLIRPath) -> llir.ForLoop:
         before = self._rewrite_optional_statements(

@@ -89,6 +89,7 @@ class LLIRLowerer:
     _POSTFIX_PRECEDENCE = 12
     _PRIMARY_PRECEDENCE = 13
     _UNARY_OPERATORS = {"+", "-", "!", "~", "*", "&", "++", "--"}
+    _MAX_CODEGEN_TREE_DEPTH = 256
 
     # Exact escape table for semantic STRING literal emission. Non-ASCII Unicode
     # scalar values are emitted as UTF-8 octal escapes so the generated source
@@ -207,6 +208,10 @@ class LLIRLowerer:
             value_id = id(value)
             if value_id in active:
                 raise CodegenError(f"{path} must be acyclic")
+            if len(active) >= cls._MAX_CODEGEN_TREE_DEPTH:
+                raise CodegenError(
+                    f"{path} exceeds the maximum supported nesting depth"
+                )
             active.add(value_id)
             try:
                 for field, child in vars(value).items():
@@ -224,6 +229,10 @@ class LLIRLowerer:
             value_id = id(value)
             if value_id in active:
                 raise CodegenError(f"{path} must be acyclic")
+            if len(active) >= cls._MAX_CODEGEN_TREE_DEPTH:
+                raise CodegenError(
+                    f"{path} exceeds the maximum supported nesting depth"
+                )
             active.add(value_id)
             try:
                 for index, child in enumerate(value):
