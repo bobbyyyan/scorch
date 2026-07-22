@@ -278,6 +278,69 @@ def test_forged_cyclic_condition_fails_with_a_controlled_boundary_error() -> Non
         LLIRLowerer().lower_llir(statement)
 
 
+@pytest.mark.parametrize(
+    "operator",
+    (
+        type("StringSubclass", (str,), {})("&&"),
+        type(
+            "ExplosiveEquality",
+            (),
+            {"__eq__": lambda self, other: (_ for _ in ()).throw(RuntimeError())},
+        )(),
+    ),
+)
+def test_forged_condition_operator_requires_an_exact_string(operator: object) -> None:
+    statement = _guarded_prefetch()
+    condition = _single_condition()
+    object.__setattr__(condition, "op", operator)
+    object.__setattr__(statement, "cond", condition)
+
+    with pytest.raises(TypeError, match="operator must be an exact string"):
+        llir._validate_guarded_call_fields(statement)
+    with pytest.raises(LLIRTraversalError) as walk_error:
+        LLIRWalker(_CONTEXT).walk(statement)
+    assert walk_error.value.diagnostic.code == "invalid_guarded_call_stmt"
+    assert walk_error.value.diagnostic.path == ("root", "cond", "op")
+    with pytest.raises(CodegenError, match="exact string|string subclass"):
+        LLIRLowerer().lower_llir(statement)
+
+
+def test_deep_guard_condition_fails_without_recursion_error() -> None:
+    condition = _single_condition()
+    for _ in range(300):
+        condition = llir.BinOp("&&", condition, _single_condition())
+    statement = object.__new__(llir.GuardedCallStmt)
+    object.__setattr__(statement, "cond", condition)
+    object.__setattr__(statement, "call", _prefetch_call())
+
+    with pytest.raises(TypeError, match="maximum supported nesting depth"):
+        llir._validate_guarded_call_fields(statement)
+    with pytest.raises(LLIRTraversalError) as walk_error:
+        LLIRWalker(_CONTEXT).walk(statement)
+    assert walk_error.value.diagnostic.code == "invalid_guarded_call_stmt"
+    assert "maximum supported nesting depth" in walk_error.value.diagnostic.message
+    with pytest.raises(CodegenError, match="maximum supported nesting depth"):
+        LLIRLowerer().lower_llir(statement)
+
+
+def test_rewriter_reports_a_guard_child_that_becomes_unrepresentable() -> None:
+    class _InvalidatingRewriter(LLIRRewriter):
+        def rewrite_var(self, node: llir.Var, path: tuple[str, ...]) -> llir.Var:
+            if node.name == "pA1" and path[:2] == ("root", "cond"):
+                return cast(
+                    llir.Var,
+                    llir.Select(_var("flag"), _var("yes"), _var("no")),
+                )
+            return super().rewrite_var(node, path)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        _InvalidatingRewriter(_CONTEXT).rewrite(_guarded_prefetch())
+
+    assert raised.value.diagnostic.code == "invalid_guarded_call_stmt"
+    assert raised.value.diagnostic.path == ("root", "cond", "left", "left")
+    assert "unsupported LLIR expression" in raised.value.diagnostic.message
+
+
 def test_rewriter_detaches_every_mutable_child() -> None:
     statement = _guarded_prefetch()
     rewritten = LLIRRewriter(_CONTEXT).rewrite(statement)

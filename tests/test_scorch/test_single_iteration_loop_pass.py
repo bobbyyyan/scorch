@@ -1007,6 +1007,83 @@ def test_guarded_call_rewrite_owns_condition_and_arguments() -> None:
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 
 
+@pytest.mark.parametrize("base", ("root", "0"))
+def test_guarded_prefetch_rewrite_matches_the_legacy_whole_statement_scope(
+    base: str,
+) -> None:
+    """Inlining rewrites both P1 condition and index, including literal zero."""
+
+    guard = llir.GuardedCallStmt(
+        cond=llir.BinOp(
+            "<",
+            llir.Add(_var("lane"), llir.Literal(1, llir.DataType.INT)),
+            _var("p_end"),
+        ),
+        call=llir.FunctionCallStmt(
+            "__builtin_prefetch",
+            (
+                llir.AddressOf(
+                    llir.ArrayAccess(
+                        _var("B_val"),
+                        llir.Mul(
+                            llir.ArrayAccess(
+                                _var("A_crd"),
+                                llir.Add(
+                                    _var("lane"),
+                                    llir.Literal(1, llir.DataType.INT),
+                                ),
+                            ),
+                            _var("stride"),
+                        ),
+                    )
+                ),
+                llir.Literal(0, llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
+    )
+    raw = llir.RawStmt(
+        "if (lane + 1 < p_end) "
+        "__builtin_prefetch(&B_val[A_crd[lane + 1] * stride], 0, 1)"
+    )
+
+    typed_output = eliminate_single_iteration_loops(
+        _program([guard], base=base),
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+    legacy_output = eliminate_single_iteration_loops(
+        _program([raw], base=base),
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert len(typed_output) == 1
+    assert len(legacy_output) == 1
+    assert LLIRLowerer().lower_llir(typed_output) == LLIRLowerer().lower_llir(
+        legacy_output
+    )
+    assert "lane" not in LLIRLowerer().lower_llir(typed_output)
+    rewritten = cast(llir.GuardedCallStmt, typed_output[0])
+    condition_left = cast(llir.Add, cast(llir.BinOp, rewritten.cond).left).left
+    coordinate = cast(
+        llir.ArrayAccess,
+        cast(
+            llir.Mul,
+            cast(
+                llir.ArrayAccess, cast(llir.AddressOf, rewritten.call.args[0]).operand
+            ).index,
+        ).left,
+    )
+    coordinate_left = cast(llir.Add, coordinate.index).left
+    if base == "0":
+        assert type(condition_left) is llir.Literal
+        assert type(coordinate_left) is llir.Literal
+        assert cast(llir.Literal, condition_left).value == 0
+        assert cast(llir.Literal, coordinate_left).value == 0
+    else:
+        assert cast(llir.Var, condition_left).name == base
+        assert cast(llir.Var, coordinate_left).name == base
+
+
 def test_function_call_rewrite_traverses_product_and_sizeof_arguments() -> None:
     call = llir.FunctionCallStmt(
         name="memset",

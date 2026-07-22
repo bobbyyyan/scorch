@@ -2196,6 +2196,40 @@ def test_forged_malformed_assignment_target_fails_at_traversal_boundary(
     assert raised.value.diagnostic.path == ("root", "var")
 
 
+@pytest.mark.parametrize("operation", ("walk", "rewrite"))
+@pytest.mark.parametrize("target_shape", ("var", "array", "member"))
+@pytest.mark.parametrize("field", ("is_ptr", "is_restrict"))
+@pytest.mark.parametrize("malformation", ("missing", "non_bool"))
+def test_assignment_root_flags_fail_closed_at_traversal_boundary(
+    operation: str,
+    target_shape: str,
+    field: str,
+    malformation: str,
+) -> None:
+    root = _var("output")
+    if target_shape == "var":
+        target: llir.AssignmentTarget = root
+    elif target_shape == "array":
+        target = llir.ArrayAccess(root, _var("index"))
+    else:
+        target = llir.MemberAccess(root, "field")
+    assignment = llir.Assign(target, llir.Literal(1))
+    if malformation == "missing":
+        del root.__dict__[field]
+    else:
+        setattr(root, field, 1)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(assignment)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(assignment)
+
+    assert raised.value.diagnostic.code == "invalid_assignment_target"
+    assert raised.value.diagnostic.path == ("root", "var")
+    assert field in raised.value.diagnostic.message
+
+
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_nested_member_assignment_target_subclass_fails_closed(
     operation: str,

@@ -1230,6 +1230,45 @@ def test_assign_rejects_forged_missing_fields_without_attribute_fallback() -> No
         llir._validate_assignment_target(access_target)
 
 
+@pytest.mark.parametrize("target_shape", ("var", "array", "member"))
+@pytest.mark.parametrize("field", ("is_ptr", "is_restrict"))
+def test_assign_and_codegen_reject_missing_root_flag_fields(
+    target_shape: str,
+    field: str,
+) -> None:
+    root = _var("values")
+    if target_shape == "var":
+        target: llir.AssignmentTarget = root
+    elif target_shape == "array":
+        target = llir.ArrayAccess(root, _var("index"))
+    else:
+        target = llir.MemberAccess(root, "field")
+    assignment = llir.Assign(target, llir.Literal(1))
+    del root.__dict__[field]
+
+    with pytest.raises(TypeError, match=field):
+        llir._validate_assignment_target(target)
+    with pytest.raises(CodegenError, match=field):
+        LLIRLowerer().lower_llir(assignment)
+
+
+def test_deep_assignment_index_fails_without_recursion_error() -> None:
+    index: llir.Expr = _var("index")
+    for _ in range(1_100):
+        index = llir.Add(index, llir.Literal(1))
+    target = llir.ArrayAccess(_var("values"), index)
+
+    with pytest.raises(TypeError, match="maximum supported nesting depth"):
+        llir._validate_assignment_index(index)
+    with pytest.raises(TypeError, match="maximum supported nesting depth"):
+        llir.Assign(target, llir.Literal(1))
+
+    forged = llir.Assign(_var("placeholder"), llir.Literal(1))
+    forged.var = target
+    with pytest.raises(CodegenError, match="maximum supported nesting depth"):
+        LLIRLowerer().lower_llir(forged)
+
+
 def test_binary_and_literal_nodes_are_frozen_typed_structural_values() -> None:
     left = _var("i")
     one = llir.Literal(1, llir.DataType.INT64)

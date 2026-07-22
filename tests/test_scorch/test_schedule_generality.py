@@ -518,7 +518,7 @@ def test_redirect_composes_with_the_typed_sparse_prefetch_producer(
     assert produced not in sparse_loop.body
     packed_guard = sparse_loop.body[0]
     assert type(packed_guard) is llir.GuardedCallStmt
-    assert _is_operand_prefetch_guard(packed_guard, "packed_B")
+    assert not _is_operand_prefetch_guard(packed_guard, "packed_B")
     assert LLIRLowerer().lower_llir(packed_guard) == (
         "if (pA1 + 1 < pA1_end && A1_crd[pA1 + 1] >= j_out && "
         "A1_crd[pA1 + 1] < j_out_end) "
@@ -531,6 +531,8 @@ def test_redirect_rejects_non_identifier_staged_guard_spellings() -> None:
         [_prefetchable_sparse_loop()], SPARSE_PREFETCH_CONTEXT
     )
     sparse_loop = cast(llir.ForLoop, output[0])
+    original_body = sparse_loop.body
+    original_statements = list(original_body)
 
     with pytest.raises(NotImplementedError, match="identifier spellings"):
         _redirect_sparse_prefetch(
@@ -543,21 +545,33 @@ def test_redirect_rejects_non_identifier_staged_guard_spellings() -> None:
             None,
         )
 
+    assert sparse_loop.body is original_body
+    assert sparse_loop.body == original_statements
+    assert all(
+        actual is expected
+        for actual, expected in zip(sparse_loop.body, original_statements)
+    )
+
 
 def test_redirect_recognition_is_structural_and_ignores_decoys() -> None:
-    """Raw text, other callees, other arrays, and bare calls stay untouched."""
+    """Only P1's complete typed shape is eligible for replacement."""
 
     def _nt(name: str) -> llir.Var:
         return llir.Var(name, llir.DataType.NO_TYPE)
 
-    def _borrow(array: str) -> llir.AddressOf:
+    def _borrow(
+        array: str,
+        *,
+        iterator: str = "pA1",
+        coordinate_array: str = "A1_crd",
+    ) -> llir.AddressOf:
         return llir.AddressOf(
             operand=llir.ArrayAccess(
                 array=_nt(array),
                 index=llir.Mul(
                     llir.ArrayAccess(
-                        _nt("A1_crd"),
-                        llir.Add(_nt("pA1"), llir.Literal(1, llir.DataType.INT)),
+                        _nt(coordinate_array),
+                        llir.Add(_nt(iterator), llir.Literal(1, llir.DataType.INT)),
                     ),
                     _nt("B1_size"),
                 ),
@@ -568,6 +582,11 @@ def test_redirect_recognition_is_structural_and_ignores_decoys() -> None:
         "<",
         llir.Add(_nt("pA1"), llir.Literal(1, llir.DataType.INT)),
         _nt("pA1_end"),
+    )
+    exact_arguments = (
+        _borrow("B_val"),
+        llir.Literal(0, llir.DataType.INT),
+        llir.Literal(1, llir.DataType.INT),
     )
     decoys: list[llir.Stmt] = [
         llir.RawStmt(
@@ -587,13 +606,85 @@ def test_redirect_recognition_is_structural_and_ignores_decoys() -> None:
             call=llir.FunctionCallStmt("__builtin_prefetch", (_borrow("C_val"),)),
         ),
         llir.FunctionCallStmt("__builtin_prefetch", (_borrow("B_val"),)),
+        llir.GuardedCallStmt(
+            cond=llir.BinOp("==", _nt("unrelated"), llir.Literal(0)),
+            call=llir.FunctionCallStmt("__builtin_prefetch", exact_arguments),
+        ),
+        llir.GuardedCallStmt(
+            cond=llir.BinOp(
+                "<",
+                llir.Add(_nt("pA1"), llir.Literal(1, llir.DataType.INT)),
+                _nt("pA1_end"),
+            ),
+            call=llir.FunctionCallStmt(
+                "__builtin_prefetch",
+                (
+                    llir.AddressOf(llir.ArrayAccess(_nt("B_val"), _nt("wrong_index"))),
+                    llir.Literal(0, llir.DataType.INT),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+            ),
+        ),
+        llir.GuardedCallStmt(
+            cond=llir.BinOp(
+                "<",
+                llir.Add(_nt("pA1"), llir.Literal(1, llir.DataType.INT)),
+                _nt("pA1_end"),
+            ),
+            call=llir.FunctionCallStmt(
+                "__builtin_prefetch",
+                (
+                    _borrow("B_val"),
+                    llir.Literal(1, llir.DataType.INT),
+                    llir.Literal(0, llir.DataType.INT),
+                    llir.Literal(99, llir.DataType.INT),
+                ),
+            ),
+        ),
+        llir.GuardedCallStmt(
+            cond=llir.BinOp(
+                "<",
+                llir.Add(_nt("pA1"), llir.Literal(1, llir.DataType.INT)),
+                _nt("pA1_end"),
+            ),
+            call=llir.FunctionCallStmt(
+                "__builtin_prefetch",
+                template_args=(llir.DataType.INT,),
+                args=exact_arguments,
+            ),
+        ),
     ]
+    other_loop_p1 = llir.GuardedCallStmt(
+        cond=llir.BinOp(
+            "<",
+            llir.Add(_nt("other"), llir.Literal(1, llir.DataType.INT)),
+            _nt("other_end"),
+        ),
+        call=llir.FunctionCallStmt(
+            "__builtin_prefetch",
+            (
+                _borrow(
+                    "B_val",
+                    iterator="other",
+                    coordinate_array="Other_crd",
+                ),
+                llir.Literal(0, llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
+    )
     sparse_loop = _prefetchable_sparse_loop()
-    sparse_loop.body = [sparse_loop.body[0], *decoys, sparse_loop.body[1]]
+    sparse_loop.body = [
+        sparse_loop.body[0],
+        *decoys,
+        other_loop_p1,
+        sparse_loop.body[1],
+    ]
     body_before = list(sparse_loop.body)
 
     for decoy in decoys:
         assert not _is_operand_prefetch_guard(decoy, "B_val")
+    assert _is_operand_prefetch_guard(other_loop_p1, "B_val")
 
     _redirect_sparse_prefetch(
         sparse_loop,
