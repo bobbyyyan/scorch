@@ -27,6 +27,7 @@ from scorch.compiler.loopir_spike.nodes import (
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PositionLoad,
     PositionValue,
     ReduceOp,
     RootPosition,
@@ -48,6 +49,8 @@ from scorch.compiler.loopir_spike.programs import (
     build_csr_spmv_program,
     build_csr_union_add_program,
     build_dcsr_spmv_program,
+    build_mixed_dense_leaf_contraction_program,
+    build_sparse_dense_spmv_program,
 )
 from scorch.compiler.loopir_spike.verifier import (
     MAX_NESTING_DEPTH,
@@ -212,6 +215,86 @@ class _DcsrSetup:
         return wrap(self.dimensions, self.tensors, (self.a,), (self.y,), stmts)
 
 
+class _DenseLeafSetup:
+    """Two rank-2 dense inputs and one vector output for position-load tests."""
+
+    def __init__(self):
+        self.di = new_dimension_id()
+        self.dj = new_dimension_id()
+        self.a = new_symbol_id()
+        self.b = new_symbol_id()
+        self.y = new_symbol_id()
+        dimensions = (self.di, self.dj)
+        levels = (lvl(DENSE, 0), lvl(DENSE, 1))
+        self.dimensions = (
+            DimensionDecl(nid(), self.di, "i"),
+            DimensionDecl(nid(), self.dj, "j"),
+        )
+        self.tensors = (
+            TensorDecl(nid(), self.a, "A", dimensions, levels),
+            TensorDecl(
+                nid(),
+                self.b,
+                "B",
+                dimensions,
+                (lvl(DENSE, 0), lvl(DENSE, 1)),
+            ),
+            TensorDecl(nid(), self.y, "y", (self.di,), (lvl(DENSE, 0),)),
+        )
+
+    def program(self, loaded_tensor=None, positioned_tensor=None, leaf_level=1):
+        loaded_tensor = self.a if loaded_tensor is None else loaded_tensor
+        positioned_tensor = self.a if positioned_tensor is None else positioned_tensor
+        i = new_index_id()
+        j = new_index_id()
+        outer_position = DensePosition(
+            nid(),
+            positioned_tensor,
+            0,
+            root(),
+            IndexValue(nid(), i),
+        )
+        position = (
+            outer_position
+            if leaf_level == 0
+            else DensePosition(
+                nid(),
+                positioned_tensor,
+                1,
+                outer_position,
+                IndexValue(nid(), j),
+            )
+        )
+        load = PositionLoad(nid(), loaded_tensor, position)
+        inner = DenseFor(
+            nid(),
+            j,
+            self.dj,
+            Block(
+                nid(),
+                (
+                    Store(
+                        nid(),
+                        self.y,
+                        (IndexValue(nid(), i),),
+                        load,
+                    ),
+                ),
+            ),
+        )
+        outer = DenseFor(nid(), i, self.di, Block(nid(), (inner,)))
+        return (
+            wrap(
+                self.dimensions,
+                self.tensors,
+                (self.a, self.b),
+                (self.y,),
+                (outer,),
+            ),
+            load,
+        )
+
+
 def test_hand_authored_fixture_programs_verify():
     verify_program(build_csr_spmv_program().program)
     verify_program(build_csr_union_add_program().program)
@@ -219,6 +302,8 @@ def test_hand_authored_fixture_programs_verify():
     verify_program(build_dcsr_spmv_program().program)
     verify_program(build_csc_spmv_program().program)
     verify_program(build_csf_row_contraction_program().program)
+    verify_program(build_sparse_dense_spmv_program().program)
+    verify_program(build_mixed_dense_leaf_contraction_program().program)
 
 
 def test_reduce_identity_table_is_read_only():
@@ -265,6 +350,25 @@ def test_dense_for_over_undeclared_dimension_rejected():
     expect_defect(
         pair.program((loop, pair.copy_loop())),
         "undefined_dimension",
+        "program.body.statements[0].dimension",
+    )
+
+
+def test_dense_for_over_declared_but_unmapped_dimension_rejected():
+    pair = _VecPair()
+    ghost = new_dimension_id()
+    dimensions = pair.dimensions + (DimensionDecl(nid(), ghost, "ghost"),)
+    loop = DenseFor(nid(), new_index_id(), ghost, Block(nid(), ()))
+    program = wrap(
+        dimensions,
+        pair.tensors,
+        (pair.x,),
+        (pair.y,),
+        (loop, pair.copy_loop()),
+    )
+    expect_defect(
+        program,
+        "unresolved_dimension",
         "program.body.statements[0].dimension",
     )
 
@@ -1230,6 +1334,58 @@ def test_leaf_cursor_value_is_accepted():
     verify_program(build_dcsr_spmv_program().program)
 
 
+def test_dense_leaf_position_load_is_accepted():
+    program, _load = _DenseLeafSetup().program()
+    verify_program(program)
+
+
+def test_position_load_rejects_a_position_from_another_tensor():
+    setup = _DenseLeafSetup()
+    program, _load = setup.program(positioned_tensor=setup.b)
+    expect_defect(program, "position_load_mismatch")
+
+
+def test_position_load_rejects_a_structural_non_leaf_position():
+    setup = _DenseLeafSetup()
+    program, _load = setup.program(leaf_level=0)
+    expect_defect(program, "non_leaf_value")
+
+
+def test_position_load_rejects_a_coordinate_typed_position():
+    program, load = _DenseLeafSetup().program()
+    object.__setattr__(load, "position", IntConst(nid(), 0))
+    expect_defect(program, "type_mismatch")
+
+
+def test_position_load_rejects_an_unbound_position_value():
+    program, load = _DenseLeafSetup().program()
+    object.__setattr__(
+        load,
+        "position",
+        PositionValue(nid(), new_position_id()),
+    )
+    expect_defect(program, "unbound_position")
+
+
+def test_position_load_rejects_output_reads_before_position_use():
+    setup = _DenseLeafSetup()
+    program, _load = setup.program(loaded_tensor=setup.y)
+    expect_defect(program, "output_read")
+
+
+def test_forged_cyclic_position_load_rejected():
+    program, load = _DenseLeafSetup().program()
+    object.__setattr__(load, "position", load)
+    expect_defect(program, "cyclic_structure")
+
+
+def test_missing_position_load_field_rejected_at_exact_path():
+    program, load = _DenseLeafSetup().program()
+    object.__delattr__(load, "position")
+    defect = expect_defect(program, "malformed_state")
+    assert defect.path.endswith(".value.position")
+
+
 # ------------------------------------------------------------------- typing
 
 
@@ -1517,6 +1673,18 @@ def test_store_reduce_verifies_on_dense_output():
         FloatConst(nid(), 2.0),
     )
     verify_program(pair.program((stmt,)))
+
+
+def test_store_reduce_mul_rejected_without_output_initialization_contract():
+    pair = _VecPair()
+    stmt = StoreReduce(
+        nid(),
+        pair.y,
+        (IntConst(nid(), 0),),
+        ReduceOp.MUL,
+        FloatConst(nid(), 2.0),
+    )
+    expect_defect(pair.program((stmt,)), "unsupported_store_reduction")
 
 
 def test_store_reduce_forged_op_rejected():

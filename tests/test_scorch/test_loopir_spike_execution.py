@@ -9,6 +9,7 @@ comparisons, where one logical matrix stored CSR, DCSR, and CSC must produce
 identical SpMV results.
 """
 
+import math
 import random
 
 import pytest
@@ -19,6 +20,7 @@ from scorch.compiler.loopir_spike.csr import CsrFormatError, CsrMatrix
 from scorch.compiler.loopir_spike.interp import LoopIRInterpreterError, run_program
 from scorch.compiler.loopir_spike.levels import (
     CompressedLevel,
+    CsrOutputBuilder,
     DenseLevel,
     LevelStorageError,
     LevelTensorStorage,
@@ -29,6 +31,7 @@ from scorch.compiler.loopir_spike.nodes import (
     Block,
     CursorValue,
     DenseFor,
+    DensePosition,
     DimensionDecl,
     FloatConst,
     IndexValue,
@@ -36,6 +39,7 @@ from scorch.compiler.loopir_spike.nodes import (
     LevelDecl,
     LevelKind,
     LoopProgram,
+    PositionLoad,
     ReduceOp,
     RootPosition,
     SparseCursorDecl,
@@ -55,6 +59,8 @@ from scorch.compiler.loopir_spike.programs import (
     build_csr_spmv_program,
     build_csr_union_add_program,
     build_dcsr_spmv_program,
+    build_mixed_dense_leaf_contraction_program,
+    build_sparse_dense_spmv_program,
 )
 
 nid = new_loop_node_id
@@ -131,6 +137,30 @@ def run_csf_row_contraction(cube, shape, x):
     fixture = build_csf_row_contraction_program()
     storage = LevelTensorStorage.from_dense(
         cube, shape, (0, 1, 2), (COMPRESSED, COMPRESSED, COMPRESSED)
+    )
+    results = run_program(
+        fixture.program,
+        {fixture.matrix: storage, fixture.vector: x},
+        {fixture.result: (shape[0],)},
+    )
+    return results[fixture.result]
+
+
+def run_sparse_dense_spmv(dense_rows, n_cols, x):
+    fixture = build_sparse_dense_spmv_program()
+    storage = matrix_storage(dense_rows, n_cols, (1, 0), (COMPRESSED, DENSE))
+    results = run_program(
+        fixture.program,
+        {fixture.matrix: storage, fixture.vector: x},
+        {fixture.result: (len(dense_rows),)},
+    )
+    return results[fixture.result]
+
+
+def run_mixed_dense_leaf_contraction(cube, shape, x):
+    fixture = build_mixed_dense_leaf_contraction_program()
+    storage = LevelTensorStorage.from_dense(
+        cube, shape, (0, 1, 2), (DENSE, COMPRESSED, DENSE)
     )
     results = run_program(
         fixture.program,
@@ -480,6 +510,45 @@ def test_csc_spmv_randomized_against_dense_and_csr(seed, shape, density):
     assert run_spmv(rows, shape[1], x) == expected
 
 
+# -------------------- sparse-dense SpMV (permuted DENSE leaf ownership)
+
+
+def test_sparse_dense_spmv_reads_dense_leaf_positions():
+    rows = [[1.0, 0.0, 2.0], [0.0, 0.0, 0.0], [3.0, 4.0, 0.0]]
+    x = [1.0, 2.0, 3.0]
+    assert run_sparse_dense_spmv(rows, 3, x) == dense_spmv(rows, x)
+
+
+def test_sparse_dense_spmv_column_positions_differ_from_coordinates():
+    # Only logical columns 1 and 3 are stored at outer positions 0 and 1.
+    # Using the column coordinate as the dense leaf's parent would select a
+    # wrong or out-of-range row block.
+    rows = [
+        [0.0, 5.0, 0.0, 7.0],
+        [0.0, 0.0, 0.0, 11.0],
+        [0.0, 13.0, 0.0, 0.0],
+    ]
+    x = [1.0, 10.0, 100.0, 1000.0]
+    assert run_sparse_dense_spmv(rows, 4, x) == [7050.0, 11000.0, 130.0]
+
+
+def test_sparse_dense_spmv_zero_shapes():
+    assert run_sparse_dense_spmv([], 3, [1.0, 2.0, 3.0]) == []
+    assert run_sparse_dense_spmv([[], []], 0, []) == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("shape", [(1, 1), (3, 7), (7, 4)])
+@pytest.mark.parametrize("density", [0.0, 0.25, 0.8])
+def test_sparse_dense_spmv_randomized_against_other_layouts(seed, shape, density):
+    rng = random.Random(17000 * seed + 10 * shape[0] + shape[1])
+    rows = random_dense(rng, shape[0], shape[1], density)
+    x = [rng.uniform(-4.0, 4.0) for _ in range(shape[1])]
+    expected = dense_spmv(rows, x)
+    assert run_sparse_dense_spmv(rows, shape[1], x) == expected
+    assert run_spmv(rows, shape[1], x) == expected
+
+
 # ------------------------------------ CSF three-level contraction (descent)
 
 
@@ -541,6 +610,64 @@ def test_csf_randomized_against_dense_reference(seed, shape, density):
     ]
     x = [rng.uniform(-4.0, 4.0) for _ in range(shape[2])]
     assert run_csf_row_contraction(cube, shape, x) == dense_csf_reference(
+        cube, shape, x
+    )
+
+
+# -------------------------- multilevel DENSE/COMPRESSED/DENSE contraction
+
+
+def test_mixed_dense_leaf_contraction_small():
+    cube = [
+        [[1.0, 0.0], [0.0, 2.0]],
+        [[0.0, 0.0], [0.0, 0.0]],
+        [[0.0, 3.0], [4.0, 0.0]],
+    ]
+    x = [10.0, 100.0]
+    assert run_mixed_dense_leaf_contraction(cube, (3, 2, 2), x) == [
+        210.0,
+        0.0,
+        340.0,
+    ]
+
+
+def test_mixed_dense_leaf_positions_differ_from_sparse_coordinates():
+    cube = [
+        [[0.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 0.0]],
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        [[7.0, 0.0, 11.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+    ]
+    x = [1.0, 10.0, 100.0]
+    assert run_mixed_dense_leaf_contraction(cube, (3, 3, 3), x) == [
+        50.0,
+        0.0,
+        1107.0,
+    ]
+
+
+def test_mixed_dense_leaf_contraction_zero_shapes():
+    assert run_mixed_dense_leaf_contraction([], (0, 2, 3), [1.0, 2.0, 3.0]) == []
+    assert run_mixed_dense_leaf_contraction([[]], (1, 0, 3), [1.0, 2.0, 3.0]) == [0.0]
+    assert run_mixed_dense_leaf_contraction([[[], []]], (1, 2, 0), []) == [0.0]
+
+
+@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("shape", [(1, 1, 1), (2, 3, 4), (4, 2, 3)])
+@pytest.mark.parametrize("density", [0.0, 0.3, 0.8])
+def test_mixed_dense_leaf_randomized_against_dense_reference(seed, shape, density):
+    rng = random.Random(19000 * seed + 100 * shape[0] + 10 * shape[1] + shape[2])
+    cube = [
+        [
+            [
+                rng.uniform(-4.0, 4.0) if rng.random() < density else 0.0
+                for _ in range(shape[2])
+            ]
+            for _ in range(shape[1])
+        ]
+        for _ in range(shape[0])
+    ]
+    x = [rng.uniform(-4.0, 4.0) for _ in range(shape[2])]
+    assert run_mixed_dense_leaf_contraction(cube, shape, x) == dense_csf_reference(
         cube, shape, x
     )
 
@@ -618,6 +745,29 @@ def test_csr_row_segment_bounds():
     assert matrix.row_segment(1) == (1, 1)
     with pytest.raises(CsrFormatError):
         matrix.row_segment(2)
+
+
+@pytest.mark.parametrize("row", (True, 0.0, "0"))
+def test_csr_row_segment_rejects_non_exact_integer_rows(row):
+    matrix = CsrMatrix.from_dense([[1.0]], 1)
+    with pytest.raises(CsrFormatError, match="exact int"):
+        matrix.row_segment(row)
+
+
+def test_csr_from_dense_rejects_unrepresentable_values():
+    with pytest.raises(CsrFormatError, match="unrepresentable numeric"):
+        CsrMatrix.from_dense([[10**10000]], 1)
+
+
+def test_csr_from_dense_rejects_sequence_subclasses_without_callbacks():
+    class HostileList(list):
+        def __iter__(self):
+            raise RuntimeError("sequence callback ran")
+
+    with pytest.raises(CsrFormatError, match="owned list or tuple"):
+        CsrMatrix.from_dense(HostileList(([1.0],)), 1)
+    with pytest.raises(CsrFormatError, match="owned list or tuple"):
+        CsrMatrix.from_dense([HostileList((1.0,))], 1)
 
 
 @pytest.mark.parametrize(
@@ -744,6 +894,73 @@ def test_level_storage_from_dense_rejects_coordinate_levels():
         LevelTensorStorage.from_dense(
             [[1.0]], (1, 1), (0, 1), (LevelKind.COORDINATE, DENSE)
         )
+
+
+@pytest.mark.parametrize(
+    "shape,modes,kinds",
+    [
+        (None, (0,), (DENSE,)),
+        ((1,), None, (DENSE,)),
+        ((1,), (0,), None),
+    ],
+)
+def test_level_storage_from_dense_rejects_non_iterable_metadata(shape, modes, kinds):
+    with pytest.raises(LevelStorageError, match="owned list or tuple"):
+        LevelTensorStorage.from_dense([1.0], shape, modes, kinds)
+
+
+def test_level_storage_rejects_sequence_subclasses_without_callbacks():
+    class HostileList(list):
+        def __iter__(self):
+            raise RuntimeError("sequence callback ran")
+
+        def __len__(self):
+            raise RuntimeError("sequence callback ran")
+
+    with pytest.raises(LevelStorageError, match="owned list or tuple"):
+        LevelTensorStorage.from_dense(
+            [1.0],
+            HostileList((1,)),
+            (0,),
+            (DENSE,),
+        )
+    with pytest.raises(LevelStorageError, match="ragged or mis-shaped"):
+        LevelTensorStorage.from_dense(
+            HostileList((1.0,)),
+            (1,),
+            (0,),
+            (DENSE,),
+        )
+
+
+@pytest.mark.parametrize("modes", ((0, 2), (0, 0), (0, -1)))
+def test_level_storage_from_dense_rejects_invalid_mode_permutations(modes):
+    with pytest.raises(LevelStorageError, match="permutation"):
+        LevelTensorStorage.from_dense(
+            [[1.0]],
+            (1, 1),
+            modes,
+            (DENSE, COMPRESSED),
+        )
+
+
+def test_level_storage_preserves_signed_zero_on_materialized_dense_leaves():
+    all_dense = LevelTensorStorage.from_dense(
+        [-0.0],
+        (1,),
+        (0,),
+        (DENSE,),
+    )
+    assert math.copysign(1.0, all_dense.leaf_value(0)) == -1.0
+
+    compressed_dense = LevelTensorStorage.from_dense(
+        [[-0.0, 2.0]],
+        (1, 2),
+        (0, 1),
+        (COMPRESSED, DENSE),
+    )
+    assert math.copysign(1.0, compressed_dense.leaf_value(0)) == -1.0
+    assert compressed_dense.leaf_value(1) == 2.0
 
 
 @pytest.mark.parametrize(
@@ -909,6 +1126,124 @@ def test_level_storage_accessor_boundaries():
     assert storage.leaf_value(1) == 2.0
 
 
+@pytest.mark.parametrize("bad", (True, 1.0, "1"))
+def test_level_storage_accessors_reject_non_exact_integer_arguments(bad):
+    storage = LevelTensorStorage.from_dense(
+        [[1.0]], (1, 1), (0, 1), (DENSE, COMPRESSED)
+    )
+    with pytest.raises(LevelStorageError, match="exact int"):
+        storage.segment(bad, 0)
+    with pytest.raises(LevelStorageError, match="exact int"):
+        storage.segment(1, bad)
+    with pytest.raises(LevelStorageError, match="exact int"):
+        storage.coordinate_at(1, bad)
+    with pytest.raises(LevelStorageError, match="exact int"):
+        storage.leaf_value(bad)
+
+
+def test_level_storage_accessors_fail_closed_on_forged_nested_state():
+    storage = LevelTensorStorage.from_dense(
+        [[1.0, 0.0], [0.0, 2.0]],
+        (2, 2),
+        (0, 1),
+        (DENSE, COMPRESSED),
+    )
+    compressed = storage.levels[1]
+    object.__setattr__(compressed, "seg_offsets", (0,))
+    with pytest.raises(LevelStorageError, match="no segment"):
+        storage.segment(1, 0)
+
+    object.__setattr__(compressed, "seg_offsets", (0, 1, 2))
+    object.__setattr__(compressed, "coords", (7, 1))
+    with pytest.raises(LevelStorageError, match="outside"):
+        storage.coordinate_at(1, 0)
+
+    object.__delattr__(compressed, "coords")
+    with pytest.raises(LevelStorageError, match="missing stored field"):
+        storage.coordinate_at(1, 0)
+
+
+def test_level_storage_snapshot_is_deep_and_revalidates_caller_state():
+    storage = LevelTensorStorage.from_dense(
+        [[2.0, 3.0], [4.0, 0.0]],
+        (2, 2),
+        (0, 1),
+        (COMPRESSED, COMPRESSED),
+    )
+    snapshot = storage.snapshot()
+    assert snapshot == storage
+    assert snapshot is not storage
+    assert all(
+        copied is not original
+        for copied, original in zip(snapshot.levels, storage.levels)
+    )
+
+    object.__setattr__(storage.levels[1], "coords", (0, 0, 0))
+    assert snapshot.to_dense() == [[2.0, 3.0], [4.0, 0.0]]
+    with pytest.raises(LevelStorageError, match="strictly increasing"):
+        storage.snapshot()
+
+
+@pytest.mark.parametrize("forged", ([0, 1], None))
+def test_level_storage_snapshot_rejects_non_tuple_nested_streams(forged):
+    storage = LevelTensorStorage.from_dense(
+        [[1.0]],
+        (1, 1),
+        (0, 1),
+        (DENSE, COMPRESSED),
+    )
+    object.__setattr__(storage.levels[1], "coords", forged)
+    with pytest.raises(LevelStorageError, match="owned tuple"):
+        storage.snapshot()
+
+
+def test_level_storage_construction_rejects_missing_nested_fields():
+    dense = DenseLevel(1)
+    object.__delattr__(dense, "extent")
+    with pytest.raises(LevelStorageError, match="missing stored field 'extent'"):
+        LevelTensorStorage(
+            shape=(1,),
+            modes=(0,),
+            levels=(dense,),
+            values=(0.0,),
+        )
+
+
+def test_level_storage_from_dense_rejects_unknown_kinds_and_unrepresentable_values():
+    with pytest.raises(LevelStorageError, match="LevelKind member"):
+        LevelTensorStorage.from_dense([[1.0]], (1, 1), (0, 1), (DENSE, "dense"))
+    with pytest.raises(LevelStorageError, match="representable"):
+        LevelTensorStorage.from_dense(
+            [[10**10000]],
+            (1, 1),
+            (0, 1),
+            (DENSE, COMPRESSED),
+        )
+
+
+@pytest.mark.parametrize(
+    "name,shape,match",
+    [
+        ("", (1, 1), "nonempty str"),
+        ("C", (1,), "rank-2 tuple"),
+        ("C", (1, True), "rank-2 tuple"),
+    ],
+)
+def test_csr_output_builder_constructor_fails_closed(name, shape, match):
+    with pytest.raises(LevelStorageError, match=match):
+        CsrOutputBuilder(name, shape)
+
+
+def test_csr_output_builder_append_fails_closed_on_bad_types():
+    builder = CsrOutputBuilder("C", (1, 1))
+    with pytest.raises(LevelStorageError, match="two exact ints"):
+        builder.append((0,), 1.0)
+    with pytest.raises(LevelStorageError, match="two exact ints"):
+        builder.append((0, True), 1.0)
+    with pytest.raises(LevelStorageError, match="exact float"):
+        builder.append((0, 0), 1)
+
+
 # --------------------------------------------------- interpreter contract
 
 
@@ -1041,6 +1376,181 @@ def test_mismatched_storage_layout_fails_closed():
         )
 
 
+def test_interpreter_snapshots_level_storage_before_execution():
+    fixture = build_dcsr_spmv_program()
+    storage = matrix_storage(
+        [[2.0, 3.0], [4.0, 0.0]],
+        2,
+        (0, 1),
+        (COMPRESSED, COMPRESSED),
+    )
+    interpreter = loopir_interp._Interpreter(
+        fixture.program,
+        {fixture.matrix: storage, fixture.vector: [10.0, 100.0]},
+        {fixture.result: (2,)},
+    )
+
+    object.__setattr__(storage.levels[1], "coords", (0, 0, 0))
+    assert interpreter.run()[fixture.result] == [320.0, 40.0]
+
+
+def test_interpreter_rejects_forged_level_storage_before_execution():
+    fixture = build_dcsr_spmv_program()
+    storage = matrix_storage(
+        [[2.0, 3.0], [4.0, 0.0]],
+        2,
+        (0, 1),
+        (COMPRESSED, COMPRESSED),
+    )
+    object.__setattr__(storage.levels[1], "coords", (0, 0, 0))
+    with pytest.raises(LoopIRInterpreterError, match="invalid level storage"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: storage, fixture.vector: [10.0, 100.0]},
+            {fixture.result: (2,)},
+        )
+
+
+@pytest.mark.parametrize("forgery", ("duplicate_indices", "missing_n_rows"))
+def test_interpreter_rejects_forged_csr_before_execution(forgery):
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[2.0, 3.0]], 2)
+    if forgery == "duplicate_indices":
+        object.__setattr__(matrix, "indices", (0, 0))
+    else:
+        object.__delattr__(matrix, "n_rows")
+    with pytest.raises(LoopIRInterpreterError, match="invalid CSR storage"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: [10.0, 100.0]},
+            {fixture.result: (1,)},
+        )
+
+
+def test_explicit_all_dense_storage_preserves_empty_outer_shape():
+    d0 = new_dimension_id()
+    d1 = new_dimension_id()
+    x = new_symbol_id()
+    y = new_symbol_id()
+    j = new_index_id()
+    program = LoopProgram(
+        nid(),
+        (DimensionDecl(nid(), d0, "empty"), DimensionDecl(nid(), d1, "inner")),
+        (
+            TensorDecl(
+                nid(),
+                x,
+                "x",
+                (d0, d1),
+                (LevelDecl(nid(), DENSE, 0), LevelDecl(nid(), DENSE, 1)),
+            ),
+            TensorDecl(nid(), y, "y", (d1,), (LevelDecl(nid(), DENSE, 0),)),
+        ),
+        (x,),
+        (y,),
+        Block(
+            nid(),
+            (
+                DenseFor(
+                    nid(),
+                    j,
+                    d1,
+                    Block(
+                        nid(),
+                        (
+                            Store(
+                                nid(),
+                                y,
+                                (IndexValue(nid(), j),),
+                                FloatConst(nid(), 1.0),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    storage = LevelTensorStorage.from_dense(
+        [],
+        (0, 3),
+        (0, 1),
+        (DENSE, DENSE),
+    )
+    assert run_program(program, {x: storage}, {y: (3,)})[y] == [1.0, 1.0, 1.0]
+
+
+def test_position_load_lazily_materializes_a_nested_dense_binding():
+    d = new_dimension_id()
+    x = new_symbol_id()
+    y = new_symbol_id()
+    i = new_index_id()
+    index = IndexValue(nid(), i)
+    program = LoopProgram(
+        nid(),
+        (DimensionDecl(nid(), d, "d"),),
+        (
+            TensorDecl(nid(), x, "x", (d,), (LevelDecl(nid(), DENSE, 0),)),
+            TensorDecl(nid(), y, "y", (d,), (LevelDecl(nid(), DENSE, 0),)),
+        ),
+        (x,),
+        (y,),
+        Block(
+            nid(),
+            (
+                DenseFor(
+                    nid(),
+                    i,
+                    d,
+                    Block(
+                        nid(),
+                        (
+                            Store(
+                                nid(),
+                                y,
+                                (IndexValue(nid(), i),),
+                                PositionLoad(
+                                    nid(),
+                                    x,
+                                    DensePosition(
+                                        nid(),
+                                        x,
+                                        0,
+                                        RootPosition(nid()),
+                                        index,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    result = run_program(program, {x: [-0.0, 3.0]}, {y: (2,)})[y]
+    assert math.copysign(1.0, result[0]) == -1.0
+    assert result[1] == 3.0
+
+
+def test_ordinary_dense_load_does_not_build_level_storage(monkeypatch):
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[2.0]], 1)
+
+    def unexpected_level_materialization(*_args, **_kwargs):
+        raise AssertionError("ordinary dense Load built physical level storage")
+
+    monkeypatch.setattr(
+        LevelTensorStorage,
+        "from_dense",
+        unexpected_level_materialization,
+    )
+    result = run_program(
+        fixture.program,
+        {fixture.matrix: matrix, fixture.vector: [3.0]},
+        {fixture.result: (1,)},
+    )
+    assert result[fixture.result] == [6.0]
+
+
 def test_non_csr_sparse_output_layout_fails_closed():
     di, dj = new_dimension_id(), new_dimension_id()
     result = new_symbol_id()
@@ -1095,6 +1605,33 @@ def test_non_numeric_dense_binding_fails_closed():
         run_program(
             fixture.program,
             {fixture.matrix: matrix, fixture.vector: ["one"]},
+            {fixture.result: (1,)},
+        )
+
+
+def test_unrepresentable_dense_binding_fails_closed():
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[1.0]], 1)
+    with pytest.raises(LoopIRInterpreterError, match="unrepresentable numeric"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: [10**10000]},
+            {fixture.result: (1,)},
+        )
+
+
+def test_dense_sequence_subclass_fails_without_callbacks():
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[1.0]], 1)
+
+    class HostileList(list):
+        def __len__(self):
+            raise RuntimeError("sequence callback ran")
+
+    with pytest.raises(LoopIRInterpreterError, match="must nest sequences"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: HostileList((1.0,))},
             {fixture.result: (1,)},
         )
 
@@ -1325,6 +1862,8 @@ def test_store_out_of_bounds_fails_closed():
 
 
 def test_unresolved_dimension_extent_fails_closed():
+    from scorch.compiler.loopir_spike.verifier import LoopIRVerificationError
+
     dy = new_dimension_id()
     unresolved = new_dimension_id()
     y = new_symbol_id()
@@ -1360,8 +1899,9 @@ def test_unresolved_dimension_extent_fails_closed():
             ),
         ),
     )
-    with pytest.raises(LoopIRInterpreterError, match="unresolved dimension extent"):
+    with pytest.raises(LoopIRVerificationError) as excinfo:
         run_program(program, {}, {y: (1,)})
+    assert excinfo.value.defect.code == "unresolved_dimension"
 
 
 def test_wrong_parent_program_is_rejected_before_execution():
