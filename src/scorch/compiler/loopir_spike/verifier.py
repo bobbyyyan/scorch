@@ -12,7 +12,7 @@ closed rather than being coerced or skipped.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum, unique
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Set, Tuple
 
@@ -31,6 +31,7 @@ from .nodes import (
     DenseFor,
     DimSize,
     Expr,
+    ExtentEquality,
     FloatConst,
     IndexValue,
     IntConst,
@@ -49,6 +50,7 @@ from .nodes import (
 )
 
 MAX_NESTING_DEPTH = 64
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -99,32 +101,57 @@ class _Context:
 
 
 def _check_node_id(node_id: object, path: str) -> LoopNodeId:
-    if type(node_id) is not LoopNodeId or type(node_id.value) is not int:
+    if (
+        type(node_id) is not LoopNodeId
+        or type(getattr(node_id, "value", _MISSING)) is not int
+    ):
         _fail("invalid_node_id", path, "node_id must be an int-valued LoopNodeId")
     return node_id
 
 
 def _check_symbol_id(value: object, path: str, what: str) -> SymbolId:
-    if type(value) is not SymbolId or type(value.value) is not int:
+    if (
+        type(value) is not SymbolId
+        or type(getattr(value, "value", _MISSING)) is not int
+    ):
         _fail("invalid_symbol_id", path, f"{what} must be an int-valued SymbolId")
     return value
 
 
 def _check_index_id(value: object, path: str, what: str) -> IndexId:
-    if type(value) is not IndexId or type(value.value) is not int:
+    if type(value) is not IndexId or type(getattr(value, "value", _MISSING)) is not int:
         _fail("invalid_index_id", path, f"{what} must be an int-valued IndexId")
     return value
 
 
 def _check_cursor_id(value: object, path: str) -> CursorId:
-    if type(value) is not CursorId or type(value.value) is not int:
+    if (
+        type(value) is not CursorId
+        or type(getattr(value, "value", _MISSING)) is not int
+    ):
         _fail("invalid_cursor_id", path, "cursor must be an int-valued CursorId")
     return value
+
+
+def _check_stored_fields(node: object, path: str) -> None:
+    """Reject a forged dataclass before any checker reads a missing field."""
+
+    state = getattr(node, "__dict__", None)
+    if type(state) is not dict:
+        _fail("malformed_state", path, "node must own dataclass field state")
+    for field in fields(type(node)):  # type: ignore[arg-type]
+        if field.name not in state:
+            _fail(
+                "malformed_state",
+                f"{path}.{field.name}",
+                f"stored field {field.name!r} is missing",
+            )
 
 
 def _enter(ctx: _Context, node: object, path: str, depth: int) -> None:
     """Aliasing, cycle, uniqueness, and depth guards for one node object."""
 
+    _check_stored_fields(node, path)
     marker = id(node)
     if marker in ctx.path_objects:
         _fail("cyclic_structure", path, "node is its own ancestor")
@@ -356,6 +383,15 @@ def _check_cursor_decl(
                 "layout_mismatch",
                 path,
                 "sparse cursors are only defined on compressed levels",
+            )
+        if decl.level != len(levels) - 1 or any(
+            level is LevelKind.COMPRESSED for level in levels[: decl.level]
+        ):
+            _fail(
+                "unsupported_sparse_hierarchy",
+                path,
+                "the spike only represents a compressed leaf below dense levels; "
+                "nested or non-leaf sparse levels need an explicit parent position",
             )
         if type(decl.outer_indices) is not tuple:
             _fail("malformed_state", path, "outer_indices must be an owned tuple")
@@ -635,6 +671,38 @@ def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> No
         _leave(ctx, decl)
 
 
+def _check_extent_equality(
+    ctx: _Context, equality: object, path: str, depth: int
+) -> None:
+    if type(equality) is not ExtentEquality:
+        _fail(
+            "malformed_state",
+            path,
+            f"expected an ExtentEquality, got {type(equality).__name__}",
+        )
+    _enter(ctx, equality, path, depth)
+    try:
+        if type(equality.dimensions) is not tuple:
+            _fail("malformed_state", path, "dimensions must be an owned tuple")
+        if len(equality.dimensions) < 2:
+            _fail(
+                "degenerate_extent_equality",
+                path,
+                "an extent equality needs at least two dimensions",
+            )
+        for position, dimension in enumerate(equality.dimensions):
+            dimension_path = f"{path}.dimensions[{position}]"
+            if type(dimension) is not DimSize:
+                _fail(
+                    "malformed_state",
+                    dimension_path,
+                    f"expected a DimSize, got {type(dimension).__name__}",
+                )
+            _check_expr(ctx, dimension, dimension_path, depth + 1)
+    finally:
+        _leave(ctx, equality)
+
+
 def verify_program(program: object) -> None:
     """Fail closed unless ``program`` is a structurally valid spike program."""
 
@@ -687,6 +755,19 @@ def verify_program(program: object) -> None:
                 "output_scope",
                 "program.tensors",
                 "every declared tensor must be an input or an output",
+            )
+        if type(program.extent_equalities) is not tuple:
+            _fail(
+                "malformed_state",
+                "program.extent_equalities",
+                "extent_equalities must be an owned tuple",
+            )
+        for position, equality in enumerate(program.extent_equalities):
+            _check_extent_equality(
+                ctx,
+                equality,
+                f"program.extent_equalities[{position}]",
+                1,
             )
         _check_body(ctx, program.body, "program.body", 1)
         unwritten = ctx.outputs - ctx.written_outputs

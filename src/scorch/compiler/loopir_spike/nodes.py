@@ -139,6 +139,19 @@ class DimSize(Expr):
 
 
 @dataclass(frozen=True)
+class ExtentEquality(LoopIRNode):
+    """A runtime precondition that two or more declared extents are equal.
+
+    This narrow spike contract makes fixture shape compatibility independent of
+    sparsity.  It deliberately does not model logical dimension identity or
+    physical mode order; those remain requirements for the revised schema.
+    """
+
+    node_id: LoopNodeId
+    dimensions: Tuple[DimSize, ...]
+
+
+@dataclass(frozen=True)
 class IndexValue(Expr):
     """The current coordinate bound by an enclosing loop (coordinate-typed)."""
 
@@ -213,7 +226,7 @@ class DenseFor(Stmt):
 
 @dataclass(frozen=True)
 class SparseCursorDecl(LoopIRNode):
-    """One sparse cursor over a compressed level of a declared input tensor.
+    """One sparse cursor over a compressed leaf of a declared input tensor.
 
     ``outer_indices`` supplies the already-bound coordinates of every level
     above ``level`` (so its length equals ``level``); together they select
@@ -221,6 +234,12 @@ class SparseCursorDecl(LoopIRNode):
     its current position, the coordinate stored at that position, its stored
     value, and whether it is exhausted; no node ever re-derives these from
     rendered names or target syntax.
+
+    This spike representation is sound only when every outer level is dense.
+    A compressed child needs its dominating parent's physical storage position,
+    which this candidate does not represent.  The verifier rejects nested and
+    non-leaf compressed cursors until the schema carries that position
+    explicitly.
     """
 
     node_id: LoopNodeId
@@ -340,3 +359,4 @@ class LoopProgram(LoopIRNode):
     inputs: Tuple[SymbolId, ...]
     outputs: Tuple[SymbolId, ...]
     body: Block
+    extent_equalities: Tuple[ExtentEquality, ...] = ()

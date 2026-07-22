@@ -182,6 +182,7 @@ class _Interpreter:
         self.builders: Dict[SymbolId, _CsrOutputBuilder] = {}
         for symbol in program.outputs:
             self._bind_output(self.decls[symbol], output_shapes[symbol])
+        self._check_extent_equalities()
         self.indices: Dict[IndexId, int] = {}
         self.accums: Dict[SymbolId, Tuple[ReduceOp, float]] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
@@ -233,6 +234,24 @@ class _Interpreter:
             f"unsupported layout {tuple(kind.value for kind in decl.levels)} "
             f"for output {decl.name}"
         )
+
+    def _check_extent_equalities(self) -> None:
+        for position, equality in enumerate(self.program.extent_equalities):
+            observed = [
+                (
+                    self.decls[dimension.tensor].name,
+                    dimension.dim,
+                    self.shapes[dimension.tensor][dimension.dim],
+                )
+                for dimension in equality.dimensions
+            ]
+            if any(extent != observed[0][2] for _, _, extent in observed[1:]):
+                detail = ", ".join(
+                    f"{name}[{dim}]={extent}" for name, dim, extent in observed
+                )
+                raise LoopIRInterpreterError(
+                    f"extent equality {position} failed: {detail}"
+                )
 
     def run(self) -> Dict[SymbolId, TensorValue]:
         self._exec_block(self.program.body)

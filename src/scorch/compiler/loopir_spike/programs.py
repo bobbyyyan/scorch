@@ -33,6 +33,7 @@ from .nodes import (
     DeclAccum,
     DenseFor,
     DimSize,
+    ExtentEquality,
     FloatConst,
     IndexValue,
     LevelKind,
@@ -151,6 +152,22 @@ def build_csr_spmv_program() -> SpmvFixture:
                 ),
             ),
         ),
+        extent_equalities=(
+            ExtentEquality(
+                new_loop_node_id(),
+                (
+                    DimSize(new_loop_node_id(), matrix, 0),
+                    DimSize(new_loop_node_id(), result, 0),
+                ),
+            ),
+            ExtentEquality(
+                new_loop_node_id(),
+                (
+                    DimSize(new_loop_node_id(), matrix, 1),
+                    DimSize(new_loop_node_id(), vector, 0),
+                ),
+            ),
+        ),
     )
     return SpmvFixture(program, matrix, vector, result)
 
@@ -227,6 +244,24 @@ def _build_elementwise_program(
                     row,
                     DimSize(new_loop_node_id(), lhs, 0),
                     Block(new_loop_node_id(), (merge,)),
+                ),
+            ),
+        ),
+        extent_equalities=(
+            ExtentEquality(
+                new_loop_node_id(),
+                (
+                    DimSize(new_loop_node_id(), lhs, 0),
+                    DimSize(new_loop_node_id(), rhs, 0),
+                    DimSize(new_loop_node_id(), result, 0),
+                ),
+            ),
+            ExtentEquality(
+                new_loop_node_id(),
+                (
+                    DimSize(new_loop_node_id(), lhs, 1),
+                    DimSize(new_loop_node_id(), rhs, 1),
+                    DimSize(new_loop_node_id(), result, 1),
                 ),
             ),
         ),
