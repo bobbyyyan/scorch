@@ -413,6 +413,32 @@ def test_missing_and_extra_bindings_fail_closed():
         )
 
 
+def test_disappearing_mapping_values_fail_closed():
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[1.0]], 1)
+
+    class VanishingValues(dict):
+        def __getitem__(self, _key):
+            raise KeyError("vanished")
+
+    with pytest.raises(
+        LoopIRInterpreterError, match="input bindings could not be snapshotted"
+    ):
+        run_program(
+            fixture.program,
+            VanishingValues({fixture.matrix: matrix, fixture.vector: [1.0]}),
+            {fixture.result: (1,)},
+        )
+    with pytest.raises(
+        LoopIRInterpreterError, match="output shapes could not be snapshotted"
+    ):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: [1.0]},
+            VanishingValues({fixture.result: (1,)}),
+        )
+
+
 def test_non_csr_sparse_binding_fails_closed():
     fixture = build_csr_spmv_program()
     with pytest.raises(LoopIRInterpreterError, match="CsrMatrix"):
