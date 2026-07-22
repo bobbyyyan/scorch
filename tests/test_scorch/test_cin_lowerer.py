@@ -3132,6 +3132,17 @@ def test_linked_list_workspace_pool_types_fail_closed_on_free_form_spellings(
         llir.DataType.linked_list_workspace_pool_type(element_spelling)
 
 
+def test_linked_list_workspace_pool_type_rejects_non_string_coercion() -> None:
+    class FloatSpelling:
+        def __str__(self) -> str:
+            return "float"
+
+    with pytest.raises(TypeError, match="must be a string"):
+        llir.DataType.linked_list_workspace_pool_type(  # type: ignore[arg-type]
+            FloatSpelling()
+        )
+
+
 @pytest.mark.parametrize(
     ("level_types", "leaf"),
     (

@@ -92,6 +92,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     known_indirect_names = {
         "accumulator_name",
         "actual_size",
+        "bound_name",
         "bound.name",
         "candidate.base",
         "candidate.stride",
@@ -180,7 +181,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("compressed_where_openmp_pass.py", "loop_bound"): 1,
         ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
         ("compressed_where_openmp_pass.py", "sparse_pos"): 1,
-        ("parallel_marking_pass.py", "bound.name"): 1,
+        ("parallel_marking_pass.py", "bound_name"): 4,
         ("parallel_marking_pass.py", "sparse_pos"): 2,
         ("parallel_marking_pass.py", "spec.extent"): 1,
         ("dense_pointer_hoist_pass.py", "candidate.base"): 1,
@@ -196,8 +197,9 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
         ("torch_cpp_abi.py", "pointer_name"): 4,
+        ("torch_cpp_abi.py", "bound_name"): 1,
     }
-    assert sum(known_indirect.values()) == 43
+    assert sum(known_indirect.values()) == 47
 
     assert totals == {
         "subscript": 9,
@@ -1006,7 +1008,7 @@ def test_atomic_work_stealing_prelude_is_structured() -> None:
 
 
 def test_hoisted_input_pointer_declaration_is_structured() -> None:
-    """Lock D1's typed template and its exact free-form raw fallback."""
+    """Lock D1's typed template and exact compatibility raw fallback."""
 
     path = _COMPILER_ROOT / "dense_pointer_hoist_pass.py"
     source = path.read_text()
@@ -1038,19 +1040,22 @@ def test_hoisted_input_pointer_declaration_is_structured() -> None:
         "ArrayAccess": 1,
         "Mul": 1,
         "const_ptr_type": 1,
+        "_is_assignment_name": 3,
         "Cast": 0,
     }
     assert {
         name: len(calls(helper, name)) for name in expected_template_inventory
     } == expected_template_inventory
 
-    # The one raw statement in this file is the deliberate free-form
-    # compatibility fallback inside the helper, guarded by the fail-closed
-    # const-pointer enum lookup; it keeps the exact legacy spelling.
+    # The one raw statement in this file is the deliberate compatibility
+    # fallback inside the helper. It covers both free-form type text and
+    # expression-bearing names outside AddressOf's grammar without parsing
+    # either, and keeps the exact legacy spelling.
     assert len(_llir_constructor_calls(path, "RawStmt")) == 1
     helper_source = ast.get_source_segment(source, helper)
     assert helper_source is not None
     assert "except ValueError" in helper_source
+    assert helper_source.count("llir._is_assignment_name(") == 3
     fallback = calls(helper, "RawStmt")[0]
     fragments = _static_string_fragments(fallback)
     assert "const " in fragments

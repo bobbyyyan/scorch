@@ -386,6 +386,46 @@ def test_core_transformation_accepts_arbitrary_names_and_c_type_spellings(
     assert len(cast(llir.ForLoop, source[0]).body) == 2
 
 
+@pytest.mark.parametrize(
+    ("base", "stride"),
+    (
+        ("parent_position + offset", "Unrelated7_size"),
+        ("parent_position", "Unrelated7_size * tile"),
+    ),
+)
+def test_expression_bearing_candidate_names_keep_the_legacy_d1_fallback(
+    base: str,
+    stride: str,
+) -> None:
+    """Typing D1 must not narrow dense-pointer v1's opaque-name contract."""
+
+    output = hoist_dense_pointers(
+        [
+            _activating_loop(
+                value_array="UnrelatedTensor_val",
+                position="pUnrelated7",
+                base=base,
+                stride=stride,
+                loop_variable="coordinate_lane",
+            )
+        ],
+        _context(("UnrelatedTensor_val", "float")),
+    )
+
+    declaration = cast(llir.RawStmt, output[0])
+    assert type(declaration) is llir.RawStmt
+    assert declaration.code == (
+        "const float* __restrict__ _UnrelatedTensor_val_ptr = "
+        f"&UnrelatedTensor_val[{base} * {stride}]"
+    )
+    assert declaration.add_semicolon is True
+    assert _declaration_codes(output) == [declaration.code]
+    assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
+    assert cast(llir.Var, assignment.value).name == (
+        "_UnrelatedTensor_val_ptr[coordinate_lane]"
+    )
+
+
 def test_every_legal_noop_is_detached_and_preserves_all_fields_and_metadata() -> None:
     metadata = llir.TensorAccessMetadata(
         access_id=AccessId(11),
@@ -1469,6 +1509,19 @@ def test_const_pointer_type_fails_closed_on_free_form_spellings(
 ) -> None:
     with pytest.raises(ValueError):
         llir.DataType.const_ptr_type(c_type)
+
+
+def test_const_pointer_type_rejects_non_string_coercion() -> None:
+    class FloatSpelling:
+        def __str__(self) -> str:
+            return "float"
+
+    class StringSubclass(str):
+        pass
+
+    for value in (FloatSpelling(), StringSubclass("float")):
+        with pytest.raises(TypeError, match="must be a string"):
+            llir.DataType.const_ptr_type(value)  # type: ignore[arg-type]
 
 
 def test_typed_declaration_survives_traversal_and_detachment() -> None:

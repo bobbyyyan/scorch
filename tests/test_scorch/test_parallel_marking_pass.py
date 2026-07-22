@@ -90,6 +90,25 @@ def _alloc_statement() -> llir.Stmt:
     )
 
 
+def _free_statement() -> llir.Stmt:
+    return llir.MemberCallStmt(
+        base=llir.Var(name="wksp", type=llir.DataType.PTR_FLOAT32),
+        member="release",
+    )
+
+
+def _mutable_llir_ids(value: object) -> set[int]:
+    mutable_ids: set[int] = set()
+    if isinstance(value, llir.Node):
+        mutable_ids.add(id(value))
+        for child in vars(value).values():
+            mutable_ids.update(_mutable_llir_ids(child))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            mutable_ids.update(_mutable_llir_ids(child))
+    return mutable_ids
+
+
 def _pool_spec() -> ParallelWorkspacePoolSpec:
     return ParallelWorkspacePoolSpec(
         name="wksp",
@@ -111,6 +130,18 @@ def test_pool_spec_and_cluster_validation_fail_closed() -> None:
             scalar_type="float",  # type: ignore[arg-type]
             extent="B1_size",
         )
+    for unsupported_scalar in (
+        llir.DataType.NO_TYPE,
+        llir.DataType.PTR_FLOAT32,
+        llir.DataType.STD_VECTOR_INT,
+        llir.DataType.TORCH_FLOAT32,
+    ):
+        with pytest.raises(TypeError, match="supported scalar DataType"):
+            ParallelWorkspacePoolSpec(
+                name="wksp",
+                scalar_type=unsupported_scalar,
+                extent="B1_size",
+            )
     with pytest.raises(TypeError, match="extent"):
         ParallelWorkspacePoolSpec(
             name="wksp",
@@ -133,6 +164,24 @@ def test_pool_spec_and_cluster_validation_fail_closed() -> None:
 
     with pytest.raises(TypeError, match="ParallelWorkspaceCluster"):
         mark_first_for_loop_parallel([_plain_dense_loop()], cluster=None)  # type: ignore[arg-type]
+
+    forged_spec = _pool_spec()
+    object.__setattr__(forged_spec, "scalar_type", llir.DataType.NO_TYPE)
+    forged_cluster = ParallelWorkspaceCluster()
+    object.__setattr__(forged_cluster, "pool_specs", (forged_spec,))
+    with pytest.raises(TypeError, match="supported scalar DataType"):
+        mark_first_for_loop_parallel([_plain_dense_loop()], forged_cluster)
+
+    missing_cluster_field = ParallelWorkspaceCluster()
+    del missing_cluster_field.__dict__["alloc"]
+    with pytest.raises(TypeError, match="alloc"):
+        mark_first_for_loop_parallel([_plain_dense_loop()], missing_cluster_field)
+
+    class UnknownStatement(llir.Stmt):
+        pass
+
+    with pytest.raises(TypeError, match="alloc"):
+        ParallelWorkspaceCluster(alloc=(UnknownStatement(),))
 
 
 def test_empty_cluster_marks_a_plain_parallel_loop() -> None:
@@ -192,7 +241,8 @@ def test_atomic_path_owns_prelude_markers_and_typed_policy() -> None:
     assert loop._loop_bound == "A0_size"
     assert loop.omp_num_threads == "scorch_nthreads(A1_pos[A0_size], A0_size)"
     assert loop.pre_parallel_body is not None
-    assert loop.pre_parallel_body[0] is alloc
+    assert loop.pre_parallel_body[0] == alloc
+    assert loop.pre_parallel_body[0] is not alloc
     nnz_init, chunk_init = loop.pre_parallel_body[1:]
     assert (
         nnz_init
@@ -248,6 +298,55 @@ def test_placed_statements_survive_traversal_and_detachment() -> None:
         detached = LLIRRewriter(context).rewrite(statement)
         assert detached == statement
         assert detached is not statement
+
+
+def test_cluster_placements_are_independently_owned_per_marking() -> None:
+    alloc = _alloc_statement()
+    free = _free_statement()
+    cluster = ParallelWorkspaceCluster(alloc=(alloc,), free=(free,))
+    first = _plain_dense_loop()
+    second = _plain_dense_loop()
+
+    mark_first_for_loop_parallel([first], cluster)
+    mark_first_for_loop_parallel([second], cluster)
+
+    assert first.pre_parallel_body is not None
+    assert first.post_parallel_body is not None
+    assert second.pre_parallel_body is not None
+    assert second.post_parallel_body is not None
+    assert first.pre_parallel_body[0] == second.pre_parallel_body[0] == alloc
+    assert first.post_parallel_body[0] == second.post_parallel_body[0] == free
+    assert _mutable_llir_ids(cluster).isdisjoint(_mutable_llir_ids(first))
+    assert _mutable_llir_ids(cluster).isdisjoint(_mutable_llir_ids(second))
+    assert _mutable_llir_ids(first).isdisjoint(_mutable_llir_ids(second))
+
+    first_alloc = cast(llir.VarInit, first.pre_parallel_body[0])
+    first_alloc.var.name = "mutated_first_workspace"
+    assert cast(llir.VarInit, cluster.alloc[0]).var.name == "wksp"
+    assert cast(llir.VarInit, second.pre_parallel_body[0]).var.name == "wksp"
+
+
+def test_atomic_prelude_validates_its_structural_name_pair() -> None:
+    bound = llir.Var(name="A0_size", type=llir.DataType.INT64)
+
+    for sparse_pos in ("A1_pos); injected(", "B1_pos", 17):
+        with pytest.raises(TypeError, match="atomic prelude"):
+            atomic_work_stealing_prelude(sparse_pos, bound)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="exact Var"):
+        atomic_work_stealing_prelude("A1_pos", object())  # type: ignore[arg-type]
+
+    forged_bound = llir.Var(name="A0_size", type=llir.DataType.INT64)
+    del forged_bound.__dict__["type"]
+    with pytest.raises(TypeError, match="complete fields"):
+        atomic_work_stealing_prelude("A1_pos", forged_bound)
+
+    pointer_bound = llir.Var(
+        name="A0_size",
+        type=llir.DataType.INT64,
+        is_ptr=True,
+    )
+    with pytest.raises(TypeError, match="metadata-free scalar Var"):
+        atomic_work_stealing_prelude("A1_pos", pointer_bound)
 
 
 def test_pool_attachment_without_typed_policy_fails_closed() -> None:
