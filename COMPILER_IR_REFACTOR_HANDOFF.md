@@ -22081,6 +22081,206 @@ D1 as a stretch goal only after that pass boundary and its stage-order/cache
 identity are gated. Preserve both W5/W14 compatibility fallbacks; do not spend
 the raw budget by silently narrowing them again.
 
+### Phase-3 C7/C12/C13, parallel-marking extraction, and typed D1 (2026-07-21)
+
+Seven commits stacked on `e696c9b` (through `ec2be56`, all local, unpushed;
+origin remained at `1714df2` throughout):
+
+- `b398925` — `refactor(compiler): type C7 reserve hint and C12/C13 atomic prelude`
+- `4ecd588` — `test(compiler): lock typed reserve-hint and atomic-prelude templates`
+- `5888c21` — `refactor(compiler): extract the parallel-marking/zero-fill pass module`
+- `4fa01f8` — `test(compiler): cover the parallel-marking pass module contract`
+- `2199c49` — `refactor(compiler): type the D1 const input-pointer declaration`
+- `b075e2a` — `test(compiler): lock the typed D1 declaration and its raw fallback`
+- `ec2be56` — `fix(compiler): discover typed D1 borrows in sparse-prefetch augmentation`
+
+The session opened with an independent inspection of the prior review range
+`d0e3342..e696c9b`: no regressions found. The template-argument threading
+through the five specialized rewriters is mechanical and complete, the
+forged-node boundaries use fail-closed `getattr` reads, the W5/W14
+compatibility restorations match their tests, and the macro-token grain
+restriction is locked by the parametrized relocation test. The recorded
+corpus/grid regeneration at `86c8ee6` was accepted as the base byte
+reference because `e696c9b` differs from it only in this handoff document.
+
+#### C7, C12, C13 (raw budget 9/8 -> 6/5)
+
+All three remaining `cin_lowerer` raw statements are typed with existing
+nodes; no new LLIR representation was needed:
+
+- **C7** — the `_dynamic_reserve` hint is a `VarInit` owning `std::min`
+  with a typed `(DataType.INT64,)` template tuple over the
+  `scorch_native::checked_product` call (qualified-callee-name precedent),
+  whose diagnostic operands are semantic STRING/BOOL literals and whose
+  shape operand reuses the prologue's declared `result_shape` type.
+- **C12/C13** — the atomic work-stealing prelude is built by the new
+  `atomic_work_stealing_prelude` helper from the same regex-validated
+  structural pieces as the retained `scorch_nthreads` pragma text
+  (`_sparse_pos_work_expr` validated both names; neither form parses the
+  other). The `_nnz` initialization owns the position lookup with a
+  metadata-free `NO_TYPE` position array and a fresh typed copy of the
+  loop-condition bound; the `_chunk` initialization owns the
+  `std::max`/`std::min` clamp whose division keeps the thread-count
+  product as an explicit right operand, so minimal parenthesization
+  reproduces the required `(omp_get_num_threads() * 128)` grouping.
+
+Every emission is byte-identical on its activating path. The Var audit now
+also tracks the relocated `bound.name`/`sparse_pos` spellings plus the
+previously untracked compressed-Where and `torch_cpp_abi` occurrences the
+widened tracking surfaced.
+
+#### Combined parallel-marking/zero-fill extraction (ownership decision)
+
+The deferred extraction was completed as a named module,
+`src/scorch/compiler/parallel_marking_pass.py`, owning the whole family:
+OpenMP loop-shape compatibility, sparse-inner-loop/position discovery, the
+typed C12/C13 prelude, the work-aware policy (pragma text and typed value
+from one construction), pre/post-parallel alloc/free placement, and the
+serial before-parallel pool construction. The hand-off is an explicit
+immutable schema — `ParallelWorkspaceCluster` with fail-closed
+`ParallelWorkspacePoolSpec` members — frozen by `lower_Where` before
+recursive producer/consumer lowering, replacing the four transient lowerer
+attributes previously read back through `getattr` defaults. The three
+invocation sites (auto/explicit marking in `lower_ForAll`, the
+schedule-selected loop in `_apply_explicit_parallel_schedule`) pass the
+cluster explicitly; `iter_lattice`'s SIMD gate imports
+`has_sparse_inner_loop` from the module instead of reaching into
+`CINLowerer`. The serial in-body memset splice stays with `lower_Where`
+because it is position-significant inside the Where statement stream, not
+a parallel-region placement.
+
+**Registration blocker (exact evidence, documented in the module
+docstring):** the family deliberately remains an in-stage transformation
+rather than an eighth registered pipeline pass, so stage-timing records
+and cache identity are unchanged (`compile_options.py` still requires all
+seven current passes in order). Full registration is blocked by two
+boundaries: (1) marking is invoked from two different compiler stages —
+`lower_ForAll` during CIN lowering, including arbitrary-depth explicit
+`ForAll.parallel` requests, and `_apply_explicit_parallel_schedule` inside
+the SCHEDULE_LOWERING stage token after `materialize_legacy_schedule` —
+and a single registered boundary cannot own both without moving
+schedule-driven marking before the schedule exists; (2) the loop-to-cluster
+association is temporal — the cluster attributes are rebound at every
+`lower_Where` and nothing in the IR records which cluster belongs to which
+loop, so one deferred pass could only recover the association by parsing
+or re-deriving lowering decisions. Recording that association in the IR is
+the Phase-3.5-adjacent schema question that would unlock registration.
+
+#### Typed D1 (representation decision)
+
+`DataType` gains const-qualified pointer members for the seven recognized
+production scalar spellings plus the fail-closed `const_ptr_type`
+classmethod (enum lookup by value, `ValueError` otherwise — the
+linked-list pool precedent; qualifier-in-type follows the existing
+`CONSTEXPR_INT`/`CONST_AUTO_REF` members). The typed declaration is a
+`VarInit` whose target owns the const-pointer type with `is_restrict=True`
+and whose value is the typed `AddressOf` of the strided value-array
+access; base/stride names come from the pass's exact-Var structural
+analysis, and operand references stay metadata-free `NO_TYPE`. Free-form
+compatibility C-type text retains the exact legacy raw statement (the
+pass's documented arbitrary-spelling contract is not narrowed), so the D1
+raw constructor remains as a deliberate compatibility fallback beside
+W5/W14.
+
+Integration is fail-closed across the audited boundaries: construction
+(enum lookup), traversal/rewriting (walker/detachment tests with
+const/restrict state preserved), codegen (byte-identical on both paths),
+specialized passes (see the prefetch correction below), and forged nodes
+(a corrupted borrow whose ArrayAccess root is no longer an exact Var fails
+at codegen; free-form spellings including `const float`/`float&` fail the
+enum lookup). The audit found one real cross-pass coupling: the
+sparse-prefetch hoisted-pointer augmentation matched only the raw D1
+declaration text, so a pre-hoisted body carrying the typed borrow would
+silently lose prefetch coverage under direct pass composition (production
+pipelines are unaffected — sparse prefetch runs before dense-pointer
+hoisting). `ec2be56` adds the structural twin of the raw regex under the
+same assignment-match gating and body order, with decoy coverage for
+const-int, non-restrict, and non-`_val`-shaped forms.
+
+#### S1/P1 audit (both deferred to one next milestone)
+
+S1 (`sparse_prefetch_pass.py`, `_prepend_prefetches`) emits
+`if ({it} + 1 < {end}) __builtin_prefetch(&{val}[{crd}[{it} + 1] * {stride}], 0, 1);`
+and P1 (`schedule_lowerer.py`, the packed-relayout prefetch) emits the
+same single-line unbraced-if guarded call with a three-conjunct condition
+and an optional parenthesized staged-row difference. Neither is
+representable byte-identically today: `IfThenElse` emits braced multi-line
+blocks, and LLIR has no single-line guarded-statement form. Both seams
+share exactly one missing representation — a deliberately narrow inline
+guarded call statement (condition expression plus one `FunctionCallStmt`
+body, the `FixedStackArrayDecl` narrowness precedent). The staged-row
+spelling is safe: `Mul(BinOp("-", crd, origin), tile)` re-derives the
+`(a - b) * c` parenthesization naturally. Landing that node across the
+traversal registry, walker/rewriter, codegen, and the registry
+exhaustiveness locks, then typing S1 and P1 together, is one coherent
+milestone and was deliberately not started at the end of this session.
+
+#### Verification and gates
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase3-c7d1-ec2be56/` with a
+self-describing README (revisions, commands, manifests, logs, JSONs,
+SHAs). Byte gates ran in clean detached worktrees at `e696c9b` and
+`ec2be56`:
+
+- **All 20 corpus sources and all 42 grid sources are byte-identical** to
+  the retained base captures (`diff -rq` empty on both directories). 21 of
+  the 42 grid kernels contain hoisted `_val_ptr` declarations, so the grid
+  is the activating byte gate for typed D1; 23 corpus+grid files carry
+  `__builtin_prefetch` (S1 untouched). The byte-waiver applies; no grid
+  runtime benchmark or object compile is required (zero source
+  differences anywhere).
+- The three activating kernels the standard corpus does not reach —
+  ds@dd atomic workspace-pool (C12/C13 + atomic marking), dd@dd dense
+  workspace-pool (plain marking with cluster placement), and the rank-2
+  dd->oo conversion (C7) — were rendered from both revisions by
+  `render_activating.py`: **byte-identical**, SHAs retained.
+- Compiler latency (5 warmups / 30 samples, base-then-candidate, same
+  session): every case inside the 1.10 target — worst p50 `1.078`
+  (csr_intersection), worst p95 `1.057` (reduction) — with identical
+  build-source hashes in all four categories. No remote/two-machine
+  evidence is required: the documented gating policy invokes it only for
+  emission changes, and there are none.
+- Focused suites at the final revision: the twelve-file compiler set
+  (cin_lowerer, codegen, llir_traversal, budget, compressed-Where,
+  dense-pointer, single-iteration, schedule generality, stage timing,
+  parallel-marking, pass manager, compile options) passes, including the
+  explicit template-argument preservation tests through all five
+  specialized rewrite paths fixed by the previous review. The full
+  non-performance suite ran from the clean detached worktree (cwd inside
+  it, `PYTHONPATH=<tree>:<tree>/src`, `scorch`/`tests`/test-module/
+  `tools.benchmark_compiler_ir` provenance asserted before launch,
+  isolated basetemp/cache/extension dirs): **2452 passed, 14 skipped,
+  2 warnings in 632.85 seconds** (2423 at the prior review plus the 29
+  tests this session added; summary retained in
+  `full-suite-summary.txt`).
+- Black clean on all eleven changed files; Flake8 shows exactly the two
+  inherited local-import F401 findings; scoped mypy is count- and
+  category-preserved (32 findings across `cin_lowerer.py`+`codegen.py` at
+  base = 28 there + the 4 legacy dynamic ForLoop-field findings relocated
+  with the moved code into `parallel_marking_pass.py`; `iter_lattice.py`
+  unchanged at 14); `git diff --check` clean before every commit. The five
+  protected tracked files hashed exactly at their recorded values before
+  every commit; no untracked user material was staged.
+
+#### Budget movement and remaining inventory
+
+Raw budgets move from **9 constructors / 8 semantic producers to 6 / 5**,
+re-pinned from actual code and locked by the budget suite. The remaining
+producers are three deliberate compatibility fallbacks — the W5 free-form
+pool, the W14 value allocation, and the new D1 free-form pointer
+declaration — plus the two genuine production seams S1 and P1. Phase 3 is
+**not** complete: S1/P1 remain, the Assign-validator hardening and the
+seven planned rewrites from the earlier inventory are untouched, and the
+exit review has not run.
+
+The next coherent milestone: introduce the narrow inline guarded-call
+statement node and type S1 and P1 together in one session (they are the
+last semantic producers), then run the Phase-3 exit review over the final
+inventory. After that, the 3.5 spike gates LoopIR. Preserve all three
+compatibility fallbacks; do not spend the budget by narrowing supported
+free-form inputs.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
