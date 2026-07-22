@@ -2230,6 +2230,57 @@ def test_assignment_root_flags_fail_closed_at_traversal_boundary(
     assert field in raised.value.diagnostic.message
 
 
+@pytest.mark.parametrize("operation", ("walk", "rewrite"))
+@pytest.mark.parametrize(
+    ("target_shape", "field"),
+    (
+        ("var", "name"),
+        ("var", "type"),
+        ("array_root", "name"),
+        ("array_root", "type"),
+        ("array", "array"),
+        ("array", "index"),
+        ("member_root", "name"),
+        ("member_root", "type"),
+        ("member", "base"),
+        ("member", "member"),
+    ),
+)
+def test_assignment_missing_required_fields_fail_closed_at_traversal_boundary(
+    operation: str,
+    target_shape: str,
+    field: str,
+) -> None:
+    root = _var("output")
+    if target_shape == "var":
+        target: llir.AssignmentTarget = root
+        owner: llir.Expr = root
+    elif target_shape == "array_root":
+        target = llir.ArrayAccess(root, _var("index"))
+        owner = root
+    elif target_shape == "array":
+        target = llir.ArrayAccess(root, _var("index"))
+        owner = target
+    elif target_shape == "member_root":
+        target = llir.MemberAccess(root, "field")
+        owner = root
+    else:
+        target = llir.MemberAccess(root, "field")
+        owner = target
+    assignment = llir.Assign(target, llir.Literal(1))
+    del owner.__dict__[field]
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(assignment)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(assignment)
+
+    assert raised.value.diagnostic.code == "invalid_assignment_target"
+    assert raised.value.diagnostic.path == ("root", "var")
+    assert field in raised.value.diagnostic.message
+
+
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_nested_member_assignment_target_subclass_fails_closed(
     operation: str,

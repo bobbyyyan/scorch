@@ -817,6 +817,16 @@ class LLIRWalker:
             validation_error = error
         try:
             self._walk_expr(value, path)
+        except AttributeError:
+            if validation_error is None:
+                raise
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message=str(validation_error),
+                path=path,
+                value=value,
+            )
         except RecursionError:
             message = (
                 str(validation_error)
@@ -1620,6 +1630,16 @@ class LLIRRewriter:
             validation_error = error
         try:
             rewritten = self._rewrite_expr(value, path)
+        except AttributeError:
+            if validation_error is None:
+                raise
+            _raise_traversal_error(
+                self.context,
+                code="invalid_assignment_target",
+                message=str(validation_error),
+                path=path,
+                value=value,
+            )
         except RecursionError:
             message = (
                 str(validation_error)

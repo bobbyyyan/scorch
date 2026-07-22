@@ -330,6 +330,7 @@ def _rewrite_expression_references(
     *,
     in_array_index: bool = False,
     replace_exact_names: bool = False,
+    rewrite_guarded_next_positions: bool = False,
 ) -> llir.Expr:
     if type(expression) is llir.Var:
         variable = cast(llir.Var, expression)
@@ -358,13 +359,27 @@ def _rewrite_expression_references(
 
     if type(expression) in _BINOP_FAMILY:
         binary = cast(llir.BinOp, expression)
+        # The migrated P1/S1 guards spell their advancing position exactly as
+        # ``iterator + 1``.  The legacy RawStmt rewrite matched the iterator
+        # there because it was followed by a space; do not broaden that token
+        # rule to terminal names or to otherwise-unrelated call arguments.
+        replace_next_position_left = (
+            rewrite_guarded_next_positions
+            and type(binary) is llir.Add
+            and type(binary.left) is llir.Var
+            and type(binary.right) is llir.Literal
+            and type(binary.right.value) is int
+            and binary.right.value == 1
+            and binary.right.data_type is llir.DataType.INT
+        )
         left = _rewrite_expression_references(
             binary.left,
             replacements,
             context,
             path + ("left",),
             in_array_index=in_array_index,
-            replace_exact_names=replace_exact_names,
+            replace_exact_names=replace_next_position_left,
+            rewrite_guarded_next_positions=rewrite_guarded_next_positions,
         )
         right = _rewrite_expression_references(
             binary.right,
@@ -372,7 +387,7 @@ def _rewrite_expression_references(
             context,
             path + ("right",),
             in_array_index=in_array_index,
-            replace_exact_names=replace_exact_names,
+            rewrite_guarded_next_positions=rewrite_guarded_next_positions,
         )
         return llir.rebuild_binary_expression(binary, left, right)
     if type(expression) is llir.ArrayAccess:
@@ -383,7 +398,7 @@ def _rewrite_expression_references(
                 replacements,
                 context,
                 path + ("array",),
-                replace_exact_names=replace_exact_names,
+                rewrite_guarded_next_positions=rewrite_guarded_next_positions,
             ),
             index=_rewrite_expression_references(
                 access.index,
@@ -391,7 +406,7 @@ def _rewrite_expression_references(
                 context,
                 path + ("index",),
                 in_array_index=True,
-                replace_exact_names=replace_exact_names,
+                rewrite_guarded_next_positions=rewrite_guarded_next_positions,
             ),
             tensor_access=access.tensor_access,
         )
@@ -403,7 +418,7 @@ def _rewrite_expression_references(
             context,
             path + ("operand",),
             in_array_index=in_array_index,
-            replace_exact_names=replace_exact_names,
+            rewrite_guarded_next_positions=rewrite_guarded_next_positions,
         )
         return llir.AddressOf(
             operand=cast(llir.AssignmentTarget, rewritten_operand),
@@ -416,8 +431,6 @@ def _rewrite_expression_sequence(
     replacements: _ReferenceReplacements,
     context: SingleIterationLoopEliminationContext,
     path: LLIRPath,
-    *,
-    replace_exact_names: bool = False,
 ) -> Sequence[llir.Expr]:
     rewritten = [
         _rewrite_expression_references(
@@ -425,7 +438,6 @@ def _rewrite_expression_sequence(
             replacements,
             context,
             path + (f"[{index}]",),
-            replace_exact_names=replace_exact_names,
         )
         for index, expression in enumerate(expressions)
     ]
@@ -506,7 +518,7 @@ def _rewrite_statement_references(
                     replacements,
                     context,
                     statement_path + ("cond",),
-                    replace_exact_names=True,
+                    rewrite_guarded_next_positions=True,
                 ),
                 call=llir.FunctionCallStmt(
                     name=name,

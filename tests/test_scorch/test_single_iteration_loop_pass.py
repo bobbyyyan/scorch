@@ -1130,6 +1130,56 @@ def test_guarded_call_rewrite_preserves_legacy_bare_argument_scope(
         assert cast(llir.Var, rewritten.call.args[0]).name == "lane"
 
 
+def test_guarded_call_rewrite_preserves_terminal_condition_reference_scope() -> None:
+    """A terminal name is not one of the legacy space/bracket token matches."""
+
+    guard = llir.GuardedCallStmt(
+        cond=llir.BinOp("<", _var("position"), _var("lane")),
+        call=llir.FunctionCallStmt("consume", (_var("position"),)),
+    )
+    raw = llir.RawStmt("if (position < lane) consume(position)")
+
+    typed_output = eliminate_single_iteration_loops(
+        _program([guard], base="0"),
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+    legacy_output = eliminate_single_iteration_loops(
+        _program([raw], base="0"),
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert LLIRLowerer().lower_llir(typed_output) == LLIRLowerer().lower_llir(
+        legacy_output
+    )
+    rewritten = cast(llir.GuardedCallStmt, typed_output[0])
+    assert cast(llir.Var, cast(llir.BinOp, rewritten.cond).right).name == "lane"
+
+
+def test_guarded_call_argument_rewrite_matches_function_call_scope() -> None:
+    """Guarding a call does not broaden its legacy expression rewrite scope."""
+
+    argument = llir.Add(_var("lane"), llir.Literal(1, llir.DataType.INT))
+    guard = llir.GuardedCallStmt(
+        cond=llir.BinOp("<", _var("position"), _var("p_end")),
+        call=llir.FunctionCallStmt("consume", (argument,)),
+    )
+    plain_call = llir.FunctionCallStmt("consume", (argument,))
+
+    guarded_output = eliminate_single_iteration_loops(
+        _program([guard], base="0"),
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+    plain_output = eliminate_single_iteration_loops(
+        _program([plain_call], base="0"),
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    rewritten_guard = cast(llir.GuardedCallStmt, guarded_output[0])
+    rewritten_plain = cast(llir.FunctionCallStmt, plain_output[0])
+    assert rewritten_guard.call.args == rewritten_plain.args
+    assert LLIRLowerer().lower_llir(rewritten_guard.call) == "consume(lane + 1);"
+
+
 def test_function_call_rewrite_traverses_product_and_sizeof_arguments() -> None:
     call = llir.FunctionCallStmt(
         name="memset",
