@@ -1,13 +1,14 @@
 """Canonical plain-Python CSR container for the Phase-3.5 LoopIR spike.
 
-The container is the spike's only sparse value representation on both the
-input and output side of the interpreter.  It is deliberately Torch-free and
-list/tuple-based so the interpreter stays an independent oracle.  Canonical
-means: exact int/float scalars, ``indptr`` of length ``n_rows + 1`` starting
-at zero and nondecreasing, per-row column indices strictly increasing and in
-range, and value/index streams of equal length.  Explicit zero values are
-permitted (a UNION add can cancel to an exact zero at an overlapping
-coordinate); ``from_dense`` never manufactures them.
+The container is the canonical CSR adapter on the interpreter's input side and
+its current sparse-output representation. Other level layouts bind through
+``LevelTensorStorage``. It is deliberately Torch-free and list/tuple-based so
+the interpreter stays an independent oracle. Canonical means: exact int/float
+scalars, ``indptr`` of length ``n_rows + 1`` starting at zero and nondecreasing,
+per-row column indices strictly increasing and in range, and value/index
+streams of equal length. Explicit zero values are permitted (a UNION add can
+cancel to an exact zero at an overlapping coordinate); ``from_dense`` never
+manufactures them.
 """
 
 from __future__ import annotations
@@ -97,16 +98,25 @@ class CsrMatrix:
         """
 
         n_cols = _expect_exact_int(n_cols, "n_cols")
+        if type(rows) not in (list, tuple):
+            raise CsrFormatError("rows must be an owned list or tuple")
         indptr: List[int] = [0]
         indices: List[int] = []
         values: List[float] = []
         for row_number, row in enumerate(rows):
+            if type(row) not in (list, tuple):
+                raise CsrFormatError(f"row {row_number} must be an owned list or tuple")
             if len(row) != n_cols:
                 raise CsrFormatError(
                     f"row {row_number} has {len(row)} columns, expected {n_cols}"
                 )
             for column, value in enumerate(row):
-                value = float(value)
+                try:
+                    value = float(value)
+                except (OverflowError, TypeError, ValueError) as error:
+                    raise CsrFormatError(
+                        f"row {row_number} holds an unrepresentable numeric entry"
+                    ) from error
                 if value != 0.0:
                     indices.append(column)
                     values.append(value)
@@ -131,6 +141,7 @@ class CsrMatrix:
     def row_segment(self, row: int) -> Tuple[int, int]:
         """Half-open stored-position range for one row."""
 
+        row = _expect_exact_int(row, "row")
         if not 0 <= row < self.n_rows:
             raise CsrFormatError(f"row {row} outside [0, {self.n_rows})")
         return self.indptr[row], self.indptr[row + 1]

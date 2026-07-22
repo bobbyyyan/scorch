@@ -10,8 +10,10 @@ remains exactly one adapter: canonical CSR-declared inputs bind a
 :class:`CsrMatrix` (adapted through :func:`levels.from_csr`) and canonical
 CSR-declared outputs assemble through :class:`levels.CsrOutputBuilder`;
 every other DENSE/COMPRESSED level composition binds a
-:class:`LevelTensorStorage` directly.  All-dense tensors bind nested float
-lists in logical mode order.
+:class:`LevelTensorStorage` directly. All-dense tensors may bind either nested
+numeric sequences in logical mode order or an explicit
+:class:`LevelTensorStorage`; the latter preserves otherwise uninferable shapes
+such as ``(0, n)``.
 
 Shape compatibility is the logical dimension model: every bound tensor
 contributes the extent of each dimension its modes store, the extents must
@@ -29,7 +31,7 @@ closed with :class:`LoopIRInterpreterError` rather than being coerced.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Tuple, Union
+from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union, cast
 
 from ..identity import IndexId, SymbolId
 from .csr import CsrMatrix
@@ -62,6 +64,7 @@ from .nodes import (
     MergedSparseFor,
     MergeMode,
     PositionId,
+    PositionLoad,
     PositionValue,
     ReduceOp,
     RootPosition,
@@ -122,31 +125,40 @@ def _dense_shape(rank: int, value: object, trail: str) -> Tuple[int, ...]:
     shape: List[int] = []
     layer: object = value
     for _level in range(rank):
-        if not isinstance(layer, (list, tuple)):
+        if type(layer) not in (list, tuple):
             raise LoopIRInterpreterError(f"{trail} must nest sequences to rank {rank}")
-        shape.append(len(layer))
+        owned_layer = cast(Sequence[object], layer)
+        shape.append(len(owned_layer))
         if len(shape) < rank and not layer:
             raise LoopIRInterpreterError(
                 f"{trail} is empty above its innermost mode; its shape "
                 "cannot be inferred"
             )
-        layer = layer[0] if layer else None
+        layer = owned_layer[0] if owned_layer else None
     return tuple(shape)
 
 
 def _dense_copy(value: object, shape: Tuple[int, ...], trail: str) -> Any:
-    if not isinstance(value, (list, tuple)) or len(value) != shape[0]:
+    if type(value) not in (list, tuple):
+        raise LoopIRInterpreterError(f"{trail} is ragged or mis-shaped")
+    owned_value = cast(Sequence[object], value)
+    if len(owned_value) != shape[0]:
         raise LoopIRInterpreterError(f"{trail} is ragged or mis-shaped")
     if len(shape) == 1:
         row: List[float] = []
-        for entry in value:
+        for entry in owned_value:
             if type(entry) is not float and type(entry) is not int:
                 raise LoopIRInterpreterError(f"{trail} holds a non-numeric entry")
-            row.append(float(entry))
+            try:
+                row.append(float(entry))
+            except (OverflowError, TypeError, ValueError) as error:
+                raise LoopIRInterpreterError(
+                    f"{trail} holds an unrepresentable numeric entry"
+                ) from error
         return row
     return [
         _dense_copy(entry, shape[1:], f"{trail}[{position}]")
-        for position, entry in enumerate(value)
+        for position, entry in enumerate(owned_value)
     ]
 
 
@@ -224,6 +236,7 @@ class _Interpreter:
             ) from error
         self.values: Dict[SymbolId, Any] = {}
         self.storages: Dict[SymbolId, LevelTensorStorage] = {}
+        self.input_storage_snapshots: Dict[SymbolId, LevelTensorStorage] = {}
         self.shapes: Dict[SymbolId, Tuple[int, ...]] = {}
         for symbol in program.inputs:
             self._register_input_shape(self.decls[symbol], input_values[symbol])
@@ -245,6 +258,28 @@ class _Interpreter:
 
     def _register_input_shape(self, decl: TensorDecl, value: object) -> None:
         if all(level.kind is LevelKind.DENSE for level in decl.levels):
+            if type(value) is LevelTensorStorage:
+                try:
+                    storage = value.snapshot()
+                except LevelStorageError as error:
+                    raise LoopIRInterpreterError(
+                        f"input {decl.name} has invalid level storage: {error}"
+                    ) from error
+                declared_modes = tuple(level.mode for level in decl.levels)
+                if (
+                    storage.kinds != tuple(LevelKind.DENSE for _ in decl.levels)
+                    or storage.modes != declared_modes
+                ):
+                    raise LoopIRInterpreterError(
+                        f"input {decl.name} storage layout "
+                        f"({tuple(kind.value for kind in storage.kinds)}, "
+                        f"modes {storage.modes}) does not match its declaration "
+                        f"({tuple(LevelKind.DENSE.value for _ in decl.levels)}, "
+                        f"modes {declared_modes})"
+                    )
+                self.input_storage_snapshots[decl.symbol] = storage
+                self.shapes[decl.symbol] = storage.shape
+                return
             shape = _dense_shape(len(decl.levels), value, f"input {decl.name}")
             self.shapes[decl.symbol] = shape
             return
@@ -253,41 +288,59 @@ class _Interpreter:
                 raise LoopIRInterpreterError(
                     f"input {decl.name} must be bound to a CsrMatrix"
                 )
-            self.shapes[decl.symbol] = (value.n_rows, value.n_cols)
+            try:
+                storage = from_csr(value)
+            except LevelStorageError as error:
+                raise LoopIRInterpreterError(
+                    f"input {decl.name} has invalid CSR storage: {error}"
+                ) from error
+            self.input_storage_snapshots[decl.symbol] = storage
+            self.shapes[decl.symbol] = storage.shape
             return
         if type(value) is not LevelTensorStorage:
             raise LoopIRInterpreterError(
                 f"input {decl.name} must be bound to a LevelTensorStorage"
             )
+        try:
+            storage = value.snapshot()
+        except LevelStorageError as error:
+            raise LoopIRInterpreterError(
+                f"input {decl.name} has invalid level storage: {error}"
+            ) from error
         declared_kinds = tuple(level.kind for level in decl.levels)
         declared_modes = tuple(level.mode for level in decl.levels)
-        if value.kinds != declared_kinds or value.modes != declared_modes:
+        if storage.kinds != declared_kinds or storage.modes != declared_modes:
             raise LoopIRInterpreterError(
                 f"input {decl.name} storage layout "
-                f"({tuple(kind.value for kind in value.kinds)}, "
-                f"modes {value.modes}) does not match its declaration "
+                f"({tuple(kind.value for kind in storage.kinds)}, "
+                f"modes {storage.modes}) does not match its declaration "
                 f"({tuple(kind.value for kind in declared_kinds)}, "
                 f"modes {declared_modes})"
             )
-        self.shapes[decl.symbol] = value.shape
+        self.input_storage_snapshots[decl.symbol] = storage
+        self.shapes[decl.symbol] = storage.shape
 
     def _materialize_input(self, decl: TensorDecl, value: object) -> None:
         if all(level.kind is LevelKind.DENSE for level in decl.levels):
-            self.values[decl.symbol] = _dense_copy(
-                value, self.shapes[decl.symbol], f"input {decl.name}"
-            )
+            storage = self.input_storage_snapshots.get(decl.symbol)
+            if storage is not None:
+                try:
+                    dense = storage.to_dense()
+                except LevelStorageError as error:
+                    raise LoopIRInterpreterError(
+                        f"input {decl.name} could not be materialized: {error}"
+                    ) from error
+            else:
+                dense = _dense_copy(
+                    value, self.shapes[decl.symbol], f"input {decl.name}"
+                )
+            self.values[decl.symbol] = dense
+            if storage is not None:
+                self.storages[decl.symbol] = storage
         elif _is_canonical_csr(decl):
-            if type(value) is not CsrMatrix:
-                raise LoopIRInterpreterError(
-                    f"input {decl.name} must be bound to a CsrMatrix"
-                )
-            self.storages[decl.symbol] = from_csr(value)
+            self.storages[decl.symbol] = self.input_storage_snapshots[decl.symbol]
         else:
-            if type(value) is not LevelTensorStorage:
-                raise LoopIRInterpreterError(
-                    f"input {decl.name} must be bound to a LevelTensorStorage"
-                )
-            self.storages[decl.symbol] = value
+            self.storages[decl.symbol] = self.input_storage_snapshots[decl.symbol]
 
     def _register_output_shape(self, decl: TensorDecl, shape: object) -> None:
         if (
@@ -398,6 +451,36 @@ class _Interpreter:
             return 0
         if type(expr) is PositionValue:
             return self.positions[expr.position]
+        if type(expr) is PositionLoad:
+            storage = self.storages.get(expr.tensor)
+            if storage is None:
+                decl = self.decls[expr.tensor]
+                dense = self.values.get(expr.tensor)
+                if dense is None:
+                    raise LoopIRInterpreterError(
+                        f"position-loaded tensor {decl.name} has no level storage"
+                    )
+                try:
+                    storage = LevelTensorStorage.from_dense(
+                        dense,
+                        self.shapes[expr.tensor],
+                        tuple(level.mode for level in decl.levels),
+                        tuple(level.kind for level in decl.levels),
+                    )
+                except LevelStorageError as error:
+                    raise LoopIRInterpreterError(
+                        f"input {decl.name} could not be position-materialized: "
+                        f"{error}"
+                    ) from error
+                self.storages[expr.tensor] = storage
+            position = self._eval_position(expr.position)
+            try:
+                return storage.leaf_value(position)
+            except LevelStorageError as error:
+                raise LoopIRInterpreterError(
+                    f"leaf value load failed on {self.decls[expr.tensor].name}: "
+                    f"{error}"
+                ) from error
         if type(expr) is DensePosition:
             return self._eval_dense_position(expr)
         if type(expr) is AccumValue:

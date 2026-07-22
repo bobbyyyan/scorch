@@ -22,14 +22,23 @@ coerced.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple, cast
 
-from .csr import CsrMatrix
+from .csr import CsrFormatError, CsrMatrix
 from .nodes import LevelKind
 
 
 class LevelStorageError(Exception):
     """A storage construction or access violated the canonical contract."""
+
+
+def _stored_field(value: object, name: str, what: str) -> object:
+    """Read one exact stored field without leaking forged-state exceptions."""
+
+    state = getattr(value, "__dict__", None)
+    if type(state) is not dict or name not in state:
+        raise LevelStorageError(f"{what} is missing stored field {name!r}")
+    return state[name]
 
 
 def _expect_exact_int(value: object, what: str) -> int:
@@ -79,6 +88,8 @@ class LevelTensorStorage:
     values: Tuple[float, ...]
 
     def __post_init__(self) -> None:
+        for field_name in ("shape", "modes", "levels", "values"):
+            _stored_field(self, field_name, "LevelTensorStorage")
         if type(self.shape) is not tuple or not self.shape:
             raise LevelStorageError("shape must be a nonempty owned tuple")
         for position, extent in enumerate(self.shape):
@@ -100,7 +111,10 @@ class LevelTensorStorage:
         for number, level in enumerate(self.levels):
             extent = self.shape[self.modes[number]]
             if type(level) is DenseLevel:
-                declared = _expect_exact_int(level.extent, f"levels[{number}].extent")
+                declared = _expect_exact_int(
+                    _stored_field(level, "extent", f"levels[{number}]"),
+                    f"levels[{number}].extent",
+                )
                 if declared != extent:
                     raise LevelStorageError(
                         f"levels[{number}] extent {declared} does not match "
@@ -108,7 +122,7 @@ class LevelTensorStorage:
                     )
                 parent_count = parent_count * extent
             elif type(level) is CompressedLevel:
-                offsets = level.seg_offsets
+                offsets = _stored_field(level, "seg_offsets", f"levels[{number}]")
                 if type(offsets) is not tuple:
                     raise LevelStorageError(
                         f"levels[{number}].seg_offsets must be an owned tuple"
@@ -133,7 +147,7 @@ class LevelTensorStorage:
                             f"levels[{number}].seg_offsets must be nondecreasing"
                         )
                     previous = offset
-                coords = level.coords
+                coords = _stored_field(level, "coords", f"levels[{number}]")
                 if type(coords) is not tuple:
                     raise LevelStorageError(
                         f"levels[{number}].coords must be an owned tuple"
@@ -178,22 +192,107 @@ class LevelTensorStorage:
                 raise LevelStorageError(f"values[{position}] must be an exact float")
         object.__setattr__(self, "_position_counts", tuple(counts))
 
+    def validate(self) -> None:
+        """Recheck canonical stored state, including deliberately forged state."""
+
+        self.__post_init__()
+
+    def snapshot(self) -> "LevelTensorStorage":
+        """Return a validated deep structural snapshot detached from its caller."""
+
+        shape = _stored_field(self, "shape", "LevelTensorStorage")
+        modes = _stored_field(self, "modes", "LevelTensorStorage")
+        levels = _stored_field(self, "levels", "LevelTensorStorage")
+        values = _stored_field(self, "values", "LevelTensorStorage")
+        for name, owned in (
+            ("shape", shape),
+            ("modes", modes),
+            ("levels", levels),
+            ("values", values),
+        ):
+            if type(owned) is not tuple:
+                raise LevelStorageError(f"{name} must be an owned tuple")
+        copied_levels: List[object] = []
+        for number, level in enumerate(cast(Tuple[object, ...], levels)):
+            if type(level) is DenseLevel:
+                copied_levels.append(
+                    DenseLevel(
+                        cast(
+                            int,
+                            _stored_field(level, "extent", f"levels[{number}]"),
+                        )
+                    )
+                )
+            else:
+                if type(level) is not CompressedLevel:
+                    raise LevelStorageError(
+                        f"levels[{number}] has unsupported storage class "
+                        f"{type(level).__name__}"
+                    )
+                offsets = _stored_field(level, "seg_offsets", f"levels[{number}]")
+                coords = _stored_field(level, "coords", f"levels[{number}]")
+                if type(offsets) is not tuple:
+                    raise LevelStorageError(
+                        f"levels[{number}].seg_offsets must be an owned tuple"
+                    )
+                if type(coords) is not tuple:
+                    raise LevelStorageError(
+                        f"levels[{number}].coords must be an owned tuple"
+                    )
+                copied_levels.append(
+                    CompressedLevel(
+                        cast(Tuple[int, ...], offsets),
+                        cast(Tuple[int, ...], coords),
+                    )
+                )
+        return LevelTensorStorage(
+            shape=cast(Tuple[int, ...], shape),
+            modes=cast(Tuple[int, ...], modes),
+            levels=tuple(copied_levels),
+            values=cast(Tuple[float, ...], values),
+        )
+
     @property
     def kinds(self) -> Tuple[LevelKind, ...]:
         """Per-physical-level kinds, for binding-time declaration checks."""
 
-        return tuple(_LEVEL_KINDS[type(level)] for level in self.levels)
+        levels = _stored_field(self, "levels", "LevelTensorStorage")
+        if type(levels) is not tuple:
+            raise LevelStorageError("levels must be an owned tuple")
+        try:
+            return tuple(_LEVEL_KINDS[type(level)] for level in levels)
+        except KeyError as error:
+            unsupported = error.args[0]
+            raise LevelStorageError(
+                f"unsupported storage class {unsupported.__name__}"
+            ) from error
 
     def _parent_count(self, level: int) -> int:
-        counts: Tuple[int, ...] = getattr(self, "_position_counts")
-        return counts[level - 1] if level > 0 else 1
+        counts = _stored_field(self, "_position_counts", "LevelTensorStorage")
+        if type(counts) is not tuple:
+            raise LevelStorageError("position counts must be an owned tuple")
+        if level == 0:
+            return 1
+        if not 0 < level <= len(counts):
+            raise LevelStorageError(
+                f"no parent-position count for physical level {level}"
+            )
+        count = _expect_exact_int(counts[level - 1], "parent-position count")
+        if count < 0:
+            raise LevelStorageError("parent-position count must be nonnegative")
+        return count
 
     def segment(self, level: int, parent_position: int) -> Tuple[int, int]:
         """Half-open child-position range one parent position dominates."""
 
-        if not 0 <= level < len(self.levels):
-            raise LevelStorageError(f"no level {level} in rank-{len(self.levels)}")
-        stored = self.levels[level]
+        level = _expect_exact_int(level, "level")
+        parent_position = _expect_exact_int(parent_position, "parent_position")
+        levels = _stored_field(self, "levels", "LevelTensorStorage")
+        if type(levels) is not tuple:
+            raise LevelStorageError("levels must be an owned tuple")
+        if not 0 <= level < len(levels):
+            raise LevelStorageError(f"no level {level} in rank-{len(levels)}")
+        stored = levels[level]
         if type(stored) is not CompressedLevel:
             raise LevelStorageError(f"level {level} has no stored segments")
         if not 0 <= parent_position < self._parent_count(level):
@@ -201,34 +300,86 @@ class LevelTensorStorage:
                 f"parent position {parent_position} outside "
                 f"[0, {self._parent_count(level)}) at level {level}"
             )
-        return (
-            stored.seg_offsets[parent_position],
-            stored.seg_offsets[parent_position + 1],
+        offsets = _stored_field(stored, "seg_offsets", f"levels[{level}]")
+        if type(offsets) is not tuple:
+            raise LevelStorageError(
+                f"levels[{level}].seg_offsets must be an owned tuple"
+            )
+        if parent_position + 1 >= len(offsets):
+            raise LevelStorageError(
+                f"levels[{level}].seg_offsets has no segment for parent "
+                f"position {parent_position}"
+            )
+        start = _expect_exact_int(
+            offsets[parent_position],
+            f"levels[{level}].seg_offsets[{parent_position}]",
         )
+        end = _expect_exact_int(
+            offsets[parent_position + 1],
+            f"levels[{level}].seg_offsets[{parent_position + 1}]",
+        )
+        coords = _stored_field(stored, "coords", f"levels[{level}]")
+        if type(coords) is not tuple:
+            raise LevelStorageError(f"levels[{level}].coords must be an owned tuple")
+        if not 0 <= start <= end <= len(coords):
+            raise LevelStorageError(
+                f"levels[{level}] segment {parent_position} has invalid bounds "
+                f"({start}, {end}) for {len(coords)} coordinates"
+            )
+        return (start, end)
 
     def coordinate_at(self, level: int, position: int) -> int:
         """The stored coordinate at one compressed-level position."""
 
-        if not 0 <= level < len(self.levels):
-            raise LevelStorageError(f"no level {level} in rank-{len(self.levels)}")
-        stored = self.levels[level]
+        level = _expect_exact_int(level, "level")
+        position = _expect_exact_int(position, "position")
+        levels = _stored_field(self, "levels", "LevelTensorStorage")
+        if type(levels) is not tuple:
+            raise LevelStorageError("levels must be an owned tuple")
+        if not 0 <= level < len(levels):
+            raise LevelStorageError(f"no level {level} in rank-{len(levels)}")
+        stored = levels[level]
         if type(stored) is not CompressedLevel:
             raise LevelStorageError(f"level {level} has no stored coordinates")
-        if not 0 <= position < len(stored.coords):
+        coords = _stored_field(stored, "coords", f"levels[{level}]")
+        if type(coords) is not tuple:
+            raise LevelStorageError(f"levels[{level}].coords must be an owned tuple")
+        if not 0 <= position < len(coords):
             raise LevelStorageError(
-                f"position {position} outside [0, {len(stored.coords)}) "
-                f"at level {level}"
+                f"position {position} outside [0, {len(coords)}) " f"at level {level}"
             )
-        return stored.coords[position]
+        coordinate = _expect_exact_int(
+            coords[position], f"levels[{level}].coords[{position}]"
+        )
+        shape = _stored_field(self, "shape", "LevelTensorStorage")
+        modes = _stored_field(self, "modes", "LevelTensorStorage")
+        if type(shape) is not tuple or type(modes) is not tuple or level >= len(modes):
+            raise LevelStorageError("shape and modes must be owned rank-matched tuples")
+        mode = _expect_exact_int(modes[level], f"modes[{level}]")
+        if not 0 <= mode < len(shape):
+            raise LevelStorageError(f"modes[{level}] is outside the logical rank")
+        extent = _expect_exact_int(shape[mode], f"shape[{mode}]")
+        if not 0 <= coordinate < extent:
+            raise LevelStorageError(
+                f"levels[{level}] coordinate {coordinate} outside [0, {extent})"
+            )
+        return coordinate
 
     def leaf_value(self, position: int) -> float:
         """The scalar the value-bearing leaf level owns at one position."""
 
-        if not 0 <= position < len(self.values):
+        position = _expect_exact_int(position, "position")
+        values = _stored_field(self, "values", "LevelTensorStorage")
+        if type(values) is not tuple:
+            raise LevelStorageError("values must be an owned tuple")
+        if not 0 <= position < len(values):
             raise LevelStorageError(
-                f"leaf position {position} outside [0, {len(self.values)})"
+                f"leaf position {position} outside [0, {len(values)})"
             )
-        return self.values[position]
+        value = values[position]
+        if type(value) is not float:
+            raise LevelStorageError(f"values[{position}] must be an exact float")
+        return value
 
     @classmethod
     def from_dense(
@@ -246,28 +397,62 @@ class LevelTensorStorage:
         ``CsrMatrix.from_dense``); dense levels materialize every child.
         """
 
+        for name, metadata in (
+            ("shape", shape),
+            ("modes", modes),
+            ("kinds", kinds),
+        ):
+            if type(metadata) not in (list, tuple):
+                raise LevelStorageError(f"{name} must be an owned list or tuple")
         shape = tuple(_expect_exact_int(extent, "shape entry") for extent in shape)
         modes = tuple(_expect_exact_int(mode, "modes entry") for mode in modes)
         kinds = tuple(kinds)
         rank = len(shape)
+        if rank == 0 or any(extent < 0 for extent in shape):
+            raise LevelStorageError("shape must contain nonnegative extents")
         if len(modes) != rank or len(kinds) != rank:
             raise LevelStorageError("shape, modes, and kinds must agree on rank")
-        entries: Dict[Tuple[int, ...], float] = {}
+        if sorted(modes) != list(range(rank)):
+            raise LevelStorageError(
+                f"modes must be a permutation of the logical modes, got {modes}"
+            )
+        for position, kind in enumerate(kinds):
+            if type(kind) is not LevelKind:
+                raise LevelStorageError(
+                    f"kinds[{position}] must be a LevelKind member, got "
+                    f"{type(kind).__name__}"
+                )
+            if kind not in (LevelKind.DENSE, LevelKind.COMPRESSED):
+                raise LevelStorageError(f"from_dense cannot build {kind.value} levels")
+        all_values: Dict[Tuple[int, ...], float] = {}
+        support: Dict[Tuple[int, ...], None] = {}
 
         def walk(layer: object, logical: Tuple[int, ...]) -> None:
             depth = len(logical)
             if depth == rank:
                 if type(layer) is not float and type(layer) is not int:
                     raise LevelStorageError("dense entries must be numeric")
-                value = float(layer)
+                try:
+                    value = float(layer)
+                except (OverflowError, TypeError, ValueError) as error:
+                    raise LevelStorageError(
+                        "dense entries must be representable numeric values"
+                    ) from error
+                physical = tuple(logical[m] for m in modes)
+                all_values[physical] = value
                 if value != 0.0:
-                    entries[tuple(logical[m] for m in modes)] = value
+                    support[physical] = None
                 return
-            if not isinstance(layer, (list, tuple)) or len(layer) != shape[depth]:
+            if type(layer) not in (list, tuple):
                 raise LevelStorageError(
                     f"dense input is ragged or mis-shaped at logical mode {depth}"
                 )
-            for coordinate, child in enumerate(layer):
+            owned_layer = cast(Sequence[object], layer)
+            if len(owned_layer) != shape[depth]:
+                raise LevelStorageError(
+                    f"dense input is ragged or mis-shaped at logical mode {depth}"
+                )
+            for coordinate, child in enumerate(owned_layer):
                 walk(child, logical + (coordinate,))
 
         walk(dense, ())
@@ -287,7 +472,7 @@ class LevelTensorStorage:
                 expanded: List[Tuple[int, ...]] = []
                 for prefix in prefixes:
                     present = sorted(
-                        {key[number] for key in entries if key[:number] == prefix}
+                        {key[number] for key in support if key[:number] == prefix}
                     )
                     expanded.extend(prefix + (coordinate,) for coordinate in present)
                     seg_offsets.append(len(expanded))
@@ -300,11 +485,13 @@ class LevelTensorStorage:
                 prefixes = expanded
             else:
                 raise LevelStorageError(f"from_dense cannot build {kind.value} levels")
-        values = tuple(entries.get(prefix, 0.0) for prefix in prefixes)
+        values = tuple(all_values[prefix] for prefix in prefixes)
         return cls(shape=shape, modes=modes, levels=tuple(levels), values=values)
 
     def to_dense(self) -> object:
         """Materialize the stored tensor as nested lists in logical order."""
+
+        self.validate()
 
         def zeros(depth: int) -> Any:
             if depth == len(self.shape) - 1:
@@ -355,14 +542,28 @@ def from_csr(matrix: CsrMatrix) -> LevelTensorStorage:
         raise LevelStorageError(
             f"from_csr needs a CsrMatrix, got {type(matrix).__name__}"
         )
+    try:
+        snapshot = CsrMatrix(
+            n_rows=cast(int, _stored_field(matrix, "n_rows", "CsrMatrix")),
+            n_cols=cast(int, _stored_field(matrix, "n_cols", "CsrMatrix")),
+            indptr=cast(Tuple[int, ...], _stored_field(matrix, "indptr", "CsrMatrix")),
+            indices=cast(
+                Tuple[int, ...], _stored_field(matrix, "indices", "CsrMatrix")
+            ),
+            values=cast(
+                Tuple[float, ...], _stored_field(matrix, "values", "CsrMatrix")
+            ),
+        )
+    except (CsrFormatError, TypeError) as error:
+        raise LevelStorageError(f"invalid CsrMatrix: {error}") from error
     return LevelTensorStorage(
-        shape=(matrix.n_rows, matrix.n_cols),
+        shape=(snapshot.n_rows, snapshot.n_cols),
         modes=(0, 1),
         levels=(
-            DenseLevel(matrix.n_rows),
-            CompressedLevel(matrix.indptr, matrix.indices),
+            DenseLevel(snapshot.n_rows),
+            CompressedLevel(snapshot.indptr, snapshot.indices),
         ),
-        values=matrix.values,
+        values=snapshot.values,
     )
 
 
@@ -370,6 +571,16 @@ class CsrOutputBuilder:
     """The CSR assembly adapter: order-checked appends into one CSR output."""
 
     def __init__(self, name: str, shape: Tuple[int, ...]) -> None:
+        if type(name) is not str or not name:
+            raise LevelStorageError("CSR output name must be a nonempty str")
+        if (
+            type(shape) is not tuple
+            or len(shape) != 2
+            or any(type(extent) is not int or extent < 0 for extent in shape)
+        ):
+            raise LevelStorageError(
+                "CSR output shape must be a rank-2 tuple of nonnegative exact ints"
+            )
         self.name = name
         self.n_rows, self.n_cols = shape
         self.rows: List[int] = []
@@ -377,6 +588,14 @@ class CsrOutputBuilder:
         self.values: List[float] = []
 
     def append(self, coords: Tuple[int, ...], value: float) -> None:
+        if (
+            type(coords) is not tuple
+            or len(coords) != 2
+            or any(type(coord) is not int for coord in coords)
+        ):
+            raise LevelStorageError("CSR append coordinates must be two exact ints")
+        if type(value) is not float:
+            raise LevelStorageError("CSR append value must be an exact float")
         row, column = coords
         if not 0 <= row < self.n_rows or not 0 <= column < self.n_cols:
             raise LevelStorageError(

@@ -19,9 +19,15 @@ written directly in the generic schema with no operation-specific nodes:
   storage (dense level stores mode 1, compressed level stores mode 0); the
   gathered coordinate is a row, and contributions scatter into the output
   through a reducing store, proving physical/logical mode separation.
+- Sparse-dense SpMV — a compressed column level above a dense row leaf;
+  :class:`PositionLoad` reads the scalar at the computed dense leaf position,
+  proving that value ownership is not restricted to compressed leaves.
 - CSF row contraction — a three-level all-compressed tensor computing
   ``y[i] = sum_jk A[i,j,k] * x[k]`` through two chained parent-position
   descents.
+- Dense-compressed-dense contraction — a three-level mixed tensor that reads
+  a dense leaf below a sparse middle level, exercising multilevel dense-leaf
+  position arithmetic.
 
 Every builder allocates fresh stable identities, so independently built
 fixtures can coexist in one test process.
@@ -55,6 +61,7 @@ from .nodes import (
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PositionLoad,
     PositionValue,
     ReduceOp,
     RootPosition,
@@ -482,6 +489,95 @@ def build_csc_spmv_program() -> SpmvFixture:
     return SpmvFixture(program, matrix, vector, result)
 
 
+def build_sparse_dense_spmv_program() -> SpmvFixture:
+    """y[i] = sum_j A[i, j] * x[j] over compressed-column/dense-row ``A``.
+
+    The compressed outer level stores logical columns. Its bound physical
+    position selects a dense row leaf, whose scalar is read through an
+    explicit :class:`PositionLoad`. This simultaneously exercises a permuted
+    physical mode order and a DENSE value-bearing leaf.
+    """
+
+    dim_i = new_dimension_id()
+    dim_j = new_dimension_id()
+    matrix = new_symbol_id()
+    vector = new_symbol_id()
+    result = new_symbol_id()
+    row = new_index_id()
+    column = new_index_id()
+    column_position = new_position_id()
+    column_cursor = new_cursor_id()
+    outer_decl = SparseCursorDecl(
+        node_id=new_loop_node_id(),
+        cursor=column_cursor,
+        tensor=matrix,
+        level=0,
+        parent=RootPosition(new_loop_node_id()),
+    )
+    leaf_position = DensePosition(
+        new_loop_node_id(),
+        matrix,
+        1,
+        PositionValue(new_loop_node_id(), column_position),
+        IndexValue(new_loop_node_id(), row),
+    )
+    inner = DenseFor(
+        new_loop_node_id(),
+        row,
+        dim_i,
+        Block(
+            new_loop_node_id(),
+            (
+                StoreReduce(
+                    new_loop_node_id(),
+                    result,
+                    (IndexValue(new_loop_node_id(), row),),
+                    ReduceOp.ADD,
+                    BinaryExpr(
+                        new_loop_node_id(),
+                        BinaryOp.MUL,
+                        PositionLoad(new_loop_node_id(), matrix, leaf_position),
+                        Load(
+                            new_loop_node_id(),
+                            vector,
+                            (IndexValue(new_loop_node_id(), column),),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    outer = SparseFor(
+        new_loop_node_id(),
+        outer_decl,
+        column_position,
+        column,
+        Block(new_loop_node_id(), (inner,)),
+    )
+    program = LoopProgram(
+        node_id=new_loop_node_id(),
+        dimensions=(
+            DimensionDecl(new_loop_node_id(), dim_i, "i"),
+            DimensionDecl(new_loop_node_id(), dim_j, "j"),
+        ),
+        tensors=(
+            TensorDecl(
+                new_loop_node_id(),
+                matrix,
+                "A",
+                (dim_i, dim_j),
+                _levels((COMPRESSED, 1), (DENSE, 0)),
+            ),
+            TensorDecl(new_loop_node_id(), vector, "x", (dim_j,), _levels((DENSE, 0))),
+            TensorDecl(new_loop_node_id(), result, "y", (dim_i,), _levels((DENSE, 0))),
+        ),
+        inputs=(matrix, vector),
+        outputs=(result,),
+        body=Block(new_loop_node_id(), (outer,)),
+    )
+    return SpmvFixture(program, matrix, vector, result)
+
+
 def build_csf_row_contraction_program() -> SpmvFixture:
     """y[i] = sum_jk A[i, j, k] * x[k] over three-level all-compressed ``A``.
 
@@ -596,6 +692,120 @@ def build_csf_row_contraction_program() -> SpmvFixture:
                 "A",
                 (dim_i, dim_j, dim_k),
                 _levels((COMPRESSED, 0), (COMPRESSED, 1), (COMPRESSED, 2)),
+            ),
+            TensorDecl(new_loop_node_id(), vector, "x", (dim_k,), _levels((DENSE, 0))),
+            TensorDecl(new_loop_node_id(), result, "y", (dim_i,), _levels((DENSE, 0))),
+        ),
+        inputs=(tensor, vector),
+        outputs=(result,),
+        body=Block(new_loop_node_id(), (outer,)),
+    )
+    return SpmvFixture(program, tensor, vector, result)
+
+
+def build_mixed_dense_leaf_contraction_program() -> SpmvFixture:
+    """y[i] = sum_jk A[i, j, k] * x[k] over DENSE/COMPRESSED/DENSE ``A``."""
+
+    dim_i = new_dimension_id()
+    dim_j = new_dimension_id()
+    dim_k = new_dimension_id()
+    tensor = new_symbol_id()
+    vector = new_symbol_id()
+    result = new_symbol_id()
+    accumulator = new_symbol_id()
+    index_i = new_index_id()
+    index_j = new_index_id()
+    index_k = new_index_id()
+    cursor_j = new_cursor_id()
+    position_j = new_position_id()
+    decl_j = SparseCursorDecl(
+        node_id=new_loop_node_id(),
+        cursor=cursor_j,
+        tensor=tensor,
+        level=1,
+        parent=DensePosition(
+            new_loop_node_id(),
+            tensor,
+            0,
+            RootPosition(new_loop_node_id()),
+            IndexValue(new_loop_node_id(), index_i),
+        ),
+    )
+    leaf_position = DensePosition(
+        new_loop_node_id(),
+        tensor,
+        2,
+        PositionValue(new_loop_node_id(), position_j),
+        IndexValue(new_loop_node_id(), index_k),
+    )
+    inner = DenseFor(
+        new_loop_node_id(),
+        index_k,
+        dim_k,
+        Block(
+            new_loop_node_id(),
+            (
+                Accumulate(
+                    new_loop_node_id(),
+                    accumulator,
+                    BinaryExpr(
+                        new_loop_node_id(),
+                        BinaryOp.MUL,
+                        PositionLoad(new_loop_node_id(), tensor, leaf_position),
+                        Load(
+                            new_loop_node_id(),
+                            vector,
+                            (IndexValue(new_loop_node_id(), index_k),),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    middle = SparseFor(
+        new_loop_node_id(),
+        decl_j,
+        position_j,
+        index_j,
+        Block(new_loop_node_id(), (inner,)),
+    )
+    outer = DenseFor(
+        new_loop_node_id(),
+        index_i,
+        dim_i,
+        Block(
+            new_loop_node_id(),
+            (
+                DeclAccum(
+                    new_loop_node_id(),
+                    accumulator,
+                    ReduceOp.ADD,
+                    FloatConst(new_loop_node_id(), 0.0),
+                ),
+                middle,
+                Store(
+                    new_loop_node_id(),
+                    result,
+                    (IndexValue(new_loop_node_id(), index_i),),
+                    AccumValue(new_loop_node_id(), accumulator),
+                ),
+            ),
+        ),
+    )
+    program = LoopProgram(
+        node_id=new_loop_node_id(),
+        dimensions=(
+            DimensionDecl(new_loop_node_id(), dim_i, "i"),
+            DimensionDecl(new_loop_node_id(), dim_j, "j"),
+            DimensionDecl(new_loop_node_id(), dim_k, "k"),
+        ),
+        tensors=(
+            TensorDecl(
+                new_loop_node_id(),
+                tensor,
+                "A",
+                (dim_i, dim_j, dim_k),
+                _levels((DENSE, 0), (COMPRESSED, 1), (DENSE, 2)),
             ),
             TensorDecl(new_loop_node_id(), vector, "x", (dim_k,), _levels((DENSE, 0))),
             TensorDecl(new_loop_node_id(), result, "y", (dim_i,), _levels((DENSE, 0))),

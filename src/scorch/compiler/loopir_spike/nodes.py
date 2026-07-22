@@ -241,6 +241,21 @@ class PositionValue(Expr):
 
 
 @dataclass(frozen=True)
+class PositionLoad(Expr):
+    """Read the scalar owned by one tensor's value-bearing leaf position.
+
+    ``position`` must be position-typed for the final physical level of
+    ``tensor``.  Unlike :class:`Load`, this is a physical level access and is
+    therefore valid for a DENSE leaf below sparse structural levels.  Unlike
+    :class:`CursorValue`, it carries no merge-alignment/default semantics; a
+    merged compressed leaf continues to use the cursor-owned form.
+    """
+
+    tensor: SymbolId
+    position: Expr
+
+
+@dataclass(frozen=True)
 class CursorValue(Expr):
     """The stored scalar at an in-scope sparse cursor's current position.
 
@@ -430,10 +445,13 @@ class StoreReduce(Stmt):
     """A coordinate-addressed read-modify-write into an all-dense output.
 
     Combines the stored element with ``value`` using ``op``
-    (``target = target op value``).  This is the target-neutral scatter
-    accumulation a permuted traversal needs (for example CSC SpMV, where one
-    output element receives contributions from several outer iterations);
-    it deliberately does not make outputs generally readable.
+    (``target = target op value``).  The spike currently admits only ADD,
+    whose identity matches dense output zero-initialization.  Other operators
+    need an explicit output-initialization contract before they are executable.
+    This is the target-neutral scatter accumulation a permuted traversal needs
+    (for example CSC SpMV, where one output element receives contributions
+    from several outer iterations); it deliberately does not make outputs
+    generally readable.
     """
 
     tensor: SymbolId

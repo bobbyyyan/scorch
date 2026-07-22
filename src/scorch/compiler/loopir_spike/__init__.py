@@ -21,6 +21,7 @@ interface with CSR as one adapter.  Modules:
 - ``levels``: the format-neutral level storage plus the CSR adapters;
 - ``interp``: the small plain-Python interpreter (test/debug oracle);
 - ``programs``: the hand-authored feasibility programs (CSR SpMV, CSR+CSR
-  union add, two-CSR intersection multiply, DCSR SpMV, CSC SpMV, and a
-  three-level CSF-like row contraction).
+  union add, two-CSR intersection multiply, DCSR SpMV, CSC SpMV,
+  compressed/dense-leaf SpMV, an all-compressed three-level contraction,
+  and a dense/compressed/dense contraction).
 """
