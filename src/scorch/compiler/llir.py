@@ -971,8 +971,11 @@ def _is_assignment_name(name: object, *, allow_member: bool) -> bool:
 
     if type(name) is not str or not name:
         return False
-    components = name.split(".") if allow_member else (name,)
-    return all(component.isidentifier() for component in components)
+    if name.isidentifier():
+        return True
+    if not allow_member:
+        return False
+    return all(component.isidentifier() for component in name.split("."))
 
 
 def _validate_assignment_metadata(
@@ -983,18 +986,78 @@ def _validate_assignment_metadata(
 ) -> None:
     if type(metadata) is not TensorAccessMetadata:
         raise TypeError(f"{owner} metadata must be TensorAccessMetadata")
-    typed_metadata = cast(TensorAccessMetadata, metadata)
-    if _address_of_instance_field(typed_metadata, "role") is not expected_role:
+    missing = _MISSING_ADDRESS_OF_FIELD
+    fields = _stored_instance_fields(metadata)
+    if fields.get("role", missing) is not expected_role:
         raise TypeError(f"{owner} metadata must have the {expected_role.name} role")
-    if type(_address_of_instance_field(typed_metadata, "access_id")) is not AccessId:
+    if type(fields.get("access_id", missing)) is not AccessId:
         raise TypeError(f"{owner} metadata access_id must be an AccessId")
-    if type(_address_of_instance_field(typed_metadata, "tensor_id")) is not SymbolId:
+    if type(fields.get("tensor_id", missing)) is not SymbolId:
         raise TypeError(f"{owner} metadata tensor_id must be a SymbolId")
-    index_ids = _address_of_instance_field(typed_metadata, "index_ids")
+    index_ids = fields.get("index_ids", missing)
     if type(index_ids) is not tuple or any(
         type(index_id) is not IndexId for index_id in index_ids
     ):
         raise TypeError(f"{owner} metadata index_ids must be a tuple of IndexId values")
+
+
+def _assignment_index_fast_ok(expression: object, budget: int) -> int:
+    """Cheaply recognize stored index states the strict validator accepts.
+
+    Returns the remaining depth budget for a provably valid subtree and ``-1``
+    for anything uncertain — member-path names, unary/cast/call/sizeof forms,
+    metadata-bearing accesses, forged state, or an exhausted budget (which any
+    forged cycle produces).  A ``-1`` never rejects: callers rerun the
+    authoritative stored-field validator, which accepts the slow-but-valid
+    shapes and raises the exact boundary diagnostics for the rest.
+    """
+
+    if budget <= 0:
+        return -1
+    expression_type = type(expression)
+    fields = getattr(expression, "__dict__", None)
+    if type(fields) is not dict:
+        return -1
+    if expression_type is Var:
+        name = fields.get("name")
+        if (
+            type(name) is str
+            and name.isidentifier()
+            and type(fields.get("type")) is DataType
+            and type(fields.get("is_ptr")) is bool
+            and type(fields.get("is_restrict")) is bool
+            and fields.get("tensor_access", False) is None
+        ):
+            return budget
+        return -1
+    if expression_type in (BinOp, Add, Mul):
+        op = fields.get("op")
+        if (
+            type(op) is not str
+            or op not in ("+", "-", "*", "/", "%")
+            or (expression_type is Add and op != "+")
+            or (expression_type is Mul and op != "*")
+        ):
+            return -1
+        budget = _assignment_index_fast_ok(fields.get("left"), budget - 1)
+        if budget < 0:
+            return -1
+        return _assignment_index_fast_ok(fields.get("right"), budget - 1)
+    if expression_type is Literal:
+        if (
+            type(fields.get("value")) is int
+            and type(fields.get("data_type")) is DataType
+        ):
+            return budget
+        return -1
+    if expression_type is ArrayAccess:
+        if fields.get("tensor_access", False) is not None:
+            return -1
+        budget = _assignment_index_fast_ok(fields.get("array"), budget - 1)
+        if budget < 0:
+            return -1
+        return _assignment_index_fast_ok(fields.get("index"), budget - 1)
+    return -1
 
 
 def _validate_assignment_index(expression: object) -> None:
@@ -1002,8 +1065,12 @@ def _validate_assignment_index(expression: object) -> None:
 
     The grammar is the shared stored-field, cycle-hardened index validator;
     only the diagnostic owner prefixes differ from the AddressOf boundary.
+    A constructor-hot-path recognizer short-circuits provably valid common
+    shapes first.
     """
 
+    if _assignment_index_fast_ok(expression, 64) >= 0:
+        return
     _validate_address_of_index(
         expression,
         path=(),
@@ -1022,45 +1089,73 @@ def _validate_assignment_target(target: object) -> None:
     blowup.
     """
 
+    missing = _MISSING_ADDRESS_OF_FIELD
     if type(target) is Var:
-        variable = cast(Var, target)
-        if not _is_assignment_name(
-            _address_of_instance_field(variable, "name"), allow_member=True
-        ):
+        fields = _stored_instance_fields(target)
+        if not _is_assignment_name(fields.get("name", missing), allow_member=True):
             raise TypeError("assignment Var.name must be an identifier or member path")
-        if type(_address_of_instance_field(variable, "type")) is not DataType:
+        if type(fields.get("type", missing)) is not DataType:
             raise TypeError("assignment Var.type must be a DataType")
-        if _address_of_instance_field(variable, "tensor_access") is not None:
+        if fields.get("tensor_access", missing) is not None:
             raise TypeError(
                 "scalar/member Assign targets cannot carry tensor access metadata"
             )
         return
+    if type(target) is ArrayAccess:
+        # Constructor hot path: provably valid common subscript stores return
+        # immediately; anything uncertain falls through to the authoritative
+        # stored-field checks below.
+        fast_fields = getattr(target, "__dict__", None)
+        if type(fast_fields) is dict:
+            fast_array = fast_fields.get("array")
+            if type(fast_array) is Var:
+                array_fast_fields = getattr(fast_array, "__dict__", None)
+                if type(array_fast_fields) is not dict:
+                    array_fast_fields = _EMPTY_INSTANCE_FIELDS
+                fast_name = array_fast_fields.get("name")
+                if (
+                    type(fast_name) is str
+                    and fast_name.isidentifier()
+                    and type(array_fast_fields.get("type")) is DataType
+                    and array_fast_fields.get("tensor_access", False) is None
+                    and _assignment_index_fast_ok(fast_fields.get("index"), 64) >= 0
+                ):
+                    fast_metadata = fast_fields.get("tensor_access", False)
+                    if fast_metadata is None:
+                        return
+                    if type(fast_metadata) is TensorAccessMetadata:
+                        _validate_assignment_metadata(
+                            fast_metadata,
+                            expected_role=TensorAccessRole.RESULT_WRITE,
+                            owner="assignment ArrayAccess",
+                        )
+                        return
     if type(target) is MemberAccess:
-        member = cast(MemberAccess, target)
         visited_members: set[int] = set()
-        base: object = member
+        base: object = target
         while type(base) is MemberAccess:
             member = cast(MemberAccess, base)
             if id(member) in visited_members:
                 raise TypeError("assignment MemberAccess chain must be acyclic")
             visited_members.add(id(member))
-            member_name = _address_of_instance_field(member, "member")
+            member_fields = _stored_instance_fields(member)
+            member_name = member_fields.get("member", missing)
             if type(member_name) is not str or not member_name.isidentifier():
                 raise TypeError("assignment MemberAccess members must be identifiers")
-            base = _address_of_instance_field(member, "base")
+            base = member_fields.get("base", missing)
         if type(base) is not Var:
             raise TypeError(
                 "assignment MemberAccess must have an exact Var root through exact "
                 "MemberAccess bases"
             )
-        root = cast(Var, base)
+        root_fields = _stored_instance_fields(base)
         if not _is_assignment_name(
-            _address_of_instance_field(root, "name"), allow_member=False
+            root_fields.get("name", missing), allow_member=False
         ):
             raise TypeError("assignment MemberAccess root name must be an identifier")
-        if type(_address_of_instance_field(root, "type")) is not DataType:
+        if type(root_fields.get("type", missing)) is not DataType:
             raise TypeError("assignment MemberAccess root type must be a DataType")
-        if _address_of_instance_field(root, "tensor_access") is not None:
+        if root_fields.get("tensor_access", missing) is not None:
             raise TypeError(
                 "assignment MemberAccess root cannot carry tensor access metadata"
             )
@@ -1068,25 +1163,23 @@ def _validate_assignment_target(target: object) -> None:
     if type(target) is not ArrayAccess:
         raise TypeError("Assign.var must be an exact Var, MemberAccess, or ArrayAccess")
 
-    access = target
-    array = _address_of_instance_field(access, "array")
+    access_fields = _stored_instance_fields(target)
+    array = access_fields.get("array", missing)
     if type(array) is not Var:
         raise TypeError("assignment ArrayAccess.array must be an exact Var")
-    typed_array = cast(Var, array)
-    if not _is_assignment_name(
-        _address_of_instance_field(typed_array, "name"), allow_member=True
-    ):
+    array_fields = _stored_instance_fields(array)
+    if not _is_assignment_name(array_fields.get("name", missing), allow_member=True):
         raise TypeError(
             "assignment ArrayAccess.array name must be an identifier or member path"
         )
-    if type(_address_of_instance_field(typed_array, "type")) is not DataType:
+    if type(array_fields.get("type", missing)) is not DataType:
         raise TypeError("assignment ArrayAccess.array type must be a DataType")
-    if _address_of_instance_field(typed_array, "tensor_access") is not None:
+    if array_fields.get("tensor_access", missing) is not None:
         raise TypeError(
             "assignment ArrayAccess.array cannot carry tensor access metadata"
         )
-    _validate_assignment_index(_address_of_instance_field(access, "index"))
-    metadata = _address_of_instance_field(access, "tensor_access")
+    _validate_assignment_index(access_fields.get("index", missing))
+    metadata = access_fields.get("tensor_access", missing)
     if metadata is not None:
         _validate_assignment_metadata(
             metadata,
@@ -1220,6 +1313,10 @@ class Sizeof(Expr):
 
 _MISSING_ADDRESS_OF_FIELD = object()
 
+# Shared read-only stand-in for a missing/forged ``__dict__`` so stored-field
+# reads can use one dict fetch per node on validation hot paths.
+_EMPTY_INSTANCE_FIELDS: dict = {}
+
 
 class _AddressOfValidationError(TypeError):
     """A typed lvalue-boundary failure with an operand-relative field path."""
@@ -1236,6 +1333,15 @@ def _address_of_instance_field(owner: object, name: str) -> object:
     if type(instance_fields) is not dict or name not in instance_fields:
         return _MISSING_ADDRESS_OF_FIELD
     return instance_fields[name]
+
+
+def _stored_instance_fields(owner: object) -> dict:
+    """All stored fields of one node, or the empty stand-in when forged away."""
+
+    instance_fields = getattr(owner, "__dict__", None)
+    if type(instance_fields) is not dict:
+        return _EMPTY_INSTANCE_FIELDS
+    return instance_fields
 
 
 def _validate_address_of_metadata(
@@ -1329,8 +1435,77 @@ def _validate_address_of_index(
 
     ``owner``/``metadata_owner`` only parameterize diagnostic prefixes; the
     defaults keep every historical AddressOf message byte-identical while the
-    same grammar backs other narrow index-expression boundaries.
+    same grammar backs other narrow index-expression boundaries.  The
+    positional implementation fetches stored fields once per node and
+    brackets only child recursion with cycle bookkeeping (leaves cannot
+    participate in a cycle), keeping the shared validator cheap on the
+    Assign construction hot path.
     """
+
+    _validate_address_of_index_impl(expression, path, active, owner, metadata_owner)
+
+
+def _validate_address_of_index_impl(
+    expression: object,
+    path: Tuple[str, ...],
+    active: set[int],
+    owner: str,
+    metadata_owner: str,
+) -> None:
+    expression_type = type(expression)
+    missing = _MISSING_ADDRESS_OF_FIELD
+    fields = getattr(expression, "__dict__", None)
+    if type(fields) is not dict:
+        fields = _EMPTY_INSTANCE_FIELDS
+
+    if expression_type is Var:
+        if not _is_assignment_name(fields.get("name", missing), allow_member=True):
+            raise _AddressOfValidationError(
+                f"{owner} Var name must be an identifier or member path",
+                path + ("name",),
+            )
+        if type(fields.get("type", missing)) is not DataType:
+            raise _AddressOfValidationError(
+                f"{owner} Var type must be a DataType",
+                path + ("type",),
+            )
+        if type(fields.get("is_ptr", missing)) is not bool:
+            raise _AddressOfValidationError(
+                f"{owner} Var is_ptr must be a bool",
+                path + ("is_ptr",),
+            )
+        if type(fields.get("is_restrict", missing)) is not bool:
+            raise _AddressOfValidationError(
+                f"{owner} Var is_restrict must be a bool",
+                path + ("is_restrict",),
+            )
+        if fields.get("tensor_access", missing) is not None:
+            raise _AddressOfValidationError(
+                f"{owner} Var cannot carry tensor access metadata",
+                path + ("tensor_access",),
+            )
+        return
+
+    if expression_type is Literal:
+        if type(fields.get("value", missing)) is not int:
+            raise _AddressOfValidationError(
+                f"{owner} Literal value must be an int",
+                path + ("value",),
+            )
+        if type(fields.get("data_type", missing)) is not DataType:
+            raise _AddressOfValidationError(
+                f"{owner} Literal data_type must be a DataType",
+                path + ("data_type",),
+            )
+        return
+
+    if expression_type is Sizeof:
+        if type(fields.get("data_type", missing)) is not DataType:
+            raise _AddressOfValidationError(
+                f"{owner} Sizeof data_type must be a DataType",
+                path + ("data_type",),
+            )
+        return
 
     expression_id = id(expression)
     if expression_id in active:
@@ -1338,203 +1513,153 @@ def _validate_address_of_index(
             f"{owner} must be acyclic",
             path,
         )
-    active.add(expression_id)
-    try:
-        expression_type = type(expression)
-        if expression_type is Var:
-            variable = cast(Var, expression)
-            name = _address_of_instance_field(variable, "name")
-            if not _is_assignment_name(name, allow_member=True):
-                raise _AddressOfValidationError(
-                    f"{owner} Var name must be an identifier or member path",
-                    path + ("name",),
-                )
-            if type(_address_of_instance_field(variable, "type")) is not DataType:
-                raise _AddressOfValidationError(
-                    f"{owner} Var type must be a DataType",
-                    path + ("type",),
-                )
-            if type(_address_of_instance_field(variable, "is_ptr")) is not bool:
-                raise _AddressOfValidationError(
-                    f"{owner} Var is_ptr must be a bool",
-                    path + ("is_ptr",),
-                )
-            if type(_address_of_instance_field(variable, "is_restrict")) is not bool:
-                raise _AddressOfValidationError(
-                    f"{owner} Var is_restrict must be a bool",
-                    path + ("is_restrict",),
-                )
-            if _address_of_instance_field(variable, "tensor_access") is not None:
-                raise _AddressOfValidationError(
-                    f"{owner} Var cannot carry tensor access metadata",
-                    path + ("tensor_access",),
-                )
-            return
 
-        if expression_type is Literal:
-            literal = cast(Literal, expression)
-            if type(_address_of_instance_field(literal, "value")) is not int:
-                raise _AddressOfValidationError(
-                    f"{owner} Literal value must be an int",
-                    path + ("value",),
-                )
-            if type(_address_of_instance_field(literal, "data_type")) is not DataType:
-                raise _AddressOfValidationError(
-                    f"{owner} Literal data_type must be a DataType",
-                    path + ("data_type",),
-                )
-            return
-
-        if expression_type is Sizeof:
-            if (
-                type(_address_of_instance_field(expression, "data_type"))
-                is not DataType
-            ):
-                raise _AddressOfValidationError(
-                    f"{owner} Sizeof data_type must be a DataType",
-                    path + ("data_type",),
-                )
-            return
-
-        if expression_type in (BinOp, Add, Mul):
-            binary = cast(BinOp, expression)
-            op = _address_of_instance_field(binary, "op")
-            if (
-                type(op) is not str
-                or op not in ("+", "-", "*", "/", "%")
-                or (expression_type is Add and op != "+")
-                or (expression_type is Mul and op != "*")
-            ):
-                raise _AddressOfValidationError(
-                    f"{owner} BinOp op must be a supported arithmetic operator",
-                    path + ("op",),
-                )
-            _validate_address_of_index(
-                _address_of_instance_field(binary, "left"),
-                path=path + ("left",),
-                active=active,
-                owner=owner,
-                metadata_owner=metadata_owner,
+    if expression_type in (BinOp, Add, Mul):
+        op = fields.get("op", missing)
+        if (
+            type(op) is not str
+            or op not in ("+", "-", "*", "/", "%")
+            or (expression_type is Add and op != "+")
+            or (expression_type is Mul and op != "*")
+        ):
+            raise _AddressOfValidationError(
+                f"{owner} BinOp op must be a supported arithmetic operator",
+                path + ("op",),
             )
-            _validate_address_of_index(
-                _address_of_instance_field(binary, "right"),
-                path=path + ("right",),
-                active=active,
-                owner=owner,
-                metadata_owner=metadata_owner,
+        active.add(expression_id)
+        try:
+            _validate_address_of_index_impl(
+                fields.get("left", missing),
+                path + ("left",),
+                active,
+                owner,
+                metadata_owner,
             )
-            return
-
-        if expression_type is UnaryOp:
-            unary = cast(UnaryOp, expression)
-            op = _address_of_instance_field(unary, "op")
-            if type(op) is not str or op not in ("+", "-"):
-                raise _AddressOfValidationError(
-                    f"{owner} UnaryOp op must be '+' or '-'",
-                    path + ("op",),
-                )
-            _validate_address_of_index(
-                _address_of_instance_field(unary, "operand"),
-                path=path + ("operand",),
-                active=active,
-                owner=owner,
-                metadata_owner=metadata_owner,
+            _validate_address_of_index_impl(
+                fields.get("right", missing),
+                path + ("right",),
+                active,
+                owner,
+                metadata_owner,
             )
-            return
+        finally:
+            active.remove(expression_id)
+        return
 
-        if expression_type is Cast:
-            typed_cast = cast(Cast, expression)
-            if (
-                type(_address_of_instance_field(typed_cast, "data_type"))
-                is not DataType
-            ):
-                raise _AddressOfValidationError(
-                    f"{owner} Cast data_type must be a DataType",
-                    path + ("data_type",),
-                )
-            _validate_address_of_index(
-                _address_of_instance_field(typed_cast, "expr"),
-                path=path + ("expr",),
-                active=active,
-                owner=owner,
-                metadata_owner=metadata_owner,
+    if expression_type is UnaryOp:
+        op = fields.get("op", missing)
+        if type(op) is not str or op not in ("+", "-"):
+            raise _AddressOfValidationError(
+                f"{owner} UnaryOp op must be '+' or '-'",
+                path + ("op",),
             )
-            return
+        active.add(expression_id)
+        try:
+            _validate_address_of_index_impl(
+                fields.get("operand", missing),
+                path + ("operand",),
+                active,
+                owner,
+                metadata_owner,
+            )
+        finally:
+            active.remove(expression_id)
+        return
 
-        if expression_type is FunctionCall:
-            call = cast(FunctionCall, expression)
-            if not _is_assignment_name(
-                _address_of_instance_field(call, "name"),
-                allow_member=True,
-            ):
-                raise _AddressOfValidationError(
-                    f"{owner} FunctionCall name must be an identifier or member path",
-                    path + ("name",),
-                )
-            template_arguments = _address_of_instance_field(call, "template_args")
-            if type(template_arguments) is not tuple or any(
-                type(argument) is not DataType for argument in template_arguments
-            ):
-                raise _AddressOfValidationError(
-                    f"{owner} FunctionCall template_args must be a tuple of "
-                    "DataType values",
-                    path + ("template_args",),
-                )
-            arguments = _address_of_instance_field(call, "args")
-            if type(arguments) is not tuple:
-                raise _AddressOfValidationError(
-                    f"{owner} FunctionCall args must be a tuple",
-                    path + ("args",),
-                )
+    if expression_type is Cast:
+        if type(fields.get("data_type", missing)) is not DataType:
+            raise _AddressOfValidationError(
+                f"{owner} Cast data_type must be a DataType",
+                path + ("data_type",),
+            )
+        active.add(expression_id)
+        try:
+            _validate_address_of_index_impl(
+                fields.get("expr", missing),
+                path + ("expr",),
+                active,
+                owner,
+                metadata_owner,
+            )
+        finally:
+            active.remove(expression_id)
+        return
+
+    if expression_type is FunctionCall:
+        if not _is_assignment_name(fields.get("name", missing), allow_member=True):
+            raise _AddressOfValidationError(
+                f"{owner} FunctionCall name must be an identifier or member path",
+                path + ("name",),
+            )
+        template_arguments = fields.get("template_args", missing)
+        if type(template_arguments) is not tuple or any(
+            type(argument) is not DataType for argument in template_arguments
+        ):
+            raise _AddressOfValidationError(
+                f"{owner} FunctionCall template_args must be a tuple of "
+                "DataType values",
+                path + ("template_args",),
+            )
+        arguments = fields.get("args", missing)
+        if type(arguments) is not tuple:
+            raise _AddressOfValidationError(
+                f"{owner} FunctionCall args must be a tuple",
+                path + ("args",),
+            )
+        active.add(expression_id)
+        try:
             for argument_index, argument in enumerate(arguments):
-                _validate_address_of_index(
+                _validate_address_of_index_impl(
                     argument,
-                    path=path + ("args", f"[{argument_index}]"),
-                    active=active,
-                    owner=owner,
-                    metadata_owner=metadata_owner,
+                    path + ("args", f"[{argument_index}]"),
+                    active,
+                    owner,
+                    metadata_owner,
                 )
-            return
+        finally:
+            active.remove(expression_id)
+        return
 
-        if expression_type is ArrayAccess:
-            access = cast(ArrayAccess, expression)
-            metadata = _address_of_instance_field(access, "tensor_access")
+    if expression_type is ArrayAccess:
+        metadata = fields.get("tensor_access", missing)
+        if metadata is not None:
             _validate_address_of_metadata(
                 metadata,
                 path=path + ("tensor_access",),
                 owner=metadata_owner,
             )
             if (
-                metadata is not None
-                and _address_of_instance_field(metadata, "role")
+                _address_of_instance_field(metadata, "role")
                 is not TensorAccessRole.INPUT_READ
             ):
                 raise _AddressOfValidationError(
                     f"{owner} metadata must have the INPUT_READ role",
                     path + ("tensor_access", "role"),
                 )
-            _validate_address_of_index(
-                _address_of_instance_field(access, "array"),
-                path=path + ("array",),
-                active=active,
-                owner=owner,
-                metadata_owner=metadata_owner,
+        active.add(expression_id)
+        try:
+            _validate_address_of_index_impl(
+                fields.get("array", missing),
+                path + ("array",),
+                active,
+                owner,
+                metadata_owner,
             )
-            _validate_address_of_index(
-                _address_of_instance_field(access, "index"),
-                path=path + ("index",),
-                active=active,
-                owner=owner,
-                metadata_owner=metadata_owner,
+            _validate_address_of_index_impl(
+                fields.get("index", missing),
+                path + ("index",),
+                active,
+                owner,
+                metadata_owner,
             )
-            return
+        finally:
+            active.remove(expression_id)
+        return
 
-        raise _AddressOfValidationError(
-            f"{owner} contains an unsupported LLIR expression",
-            path,
-        )
-    finally:
-        active.remove(expression_id)
+    raise _AddressOfValidationError(
+        f"{owner} contains an unsupported LLIR expression",
+        path,
+    )
 
 
 def _validate_address_of_operand(operand: object) -> None:
