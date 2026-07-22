@@ -22700,6 +22700,121 @@ sparse-sparse cursor synchronization, followed by the explicit go/no-go. This
 gates any LoopIR schema work. The retained compatibility surface above is the
 input inventory for post-cutover retirement, not open Phase-3 work.
 
+### Phase-3.5 sparse LoopIR feasibility spike and go/no-go review (2026-07-22)
+
+The Phase-3.5 spike is complete and the explicit go/no-go review is
+recorded in `COMPILER_IR_REFACTOR_PHASE3_5_REVIEW.md`. The verdict is
+**GO with conditions**; read that document's Limitations and Conditions
+sections before acting on the verdict. Three code commits precede the
+handoff/review docs commit; nothing was pushed and no earlier commit was
+amended or reordered:
+
+- `71eba38` — `feat(compiler): prototype sparse LoopIR schema and verifier`
+- `1e30817` — `feat(compiler): interpret sparse LoopIR programs`
+- `1c78633` — `test(compiler): execute sparse LoopIR feasibility cases`
+
+#### What was built
+
+`src/scorch/compiler/loopir_spike/` is a strictly experimental,
+target-neutral package (six modules, 1,879 lines) that no production
+module imports: frozen tuple-owned generic nodes (blocks, dense loops,
+sparse cursors, loads/values, binary expressions, scoped reductions with
+literal-identity initialization, dense stores, ordered append-based sparse
+output assembly, tensor/program declarations), a generic `MergedSparseFor`
+whose UNION/INTERSECTION semantics — minimum-coordinate selection,
+per-step advancement of aligned cursors, mode-specific emission and
+exhaustion, guaranteed progress — are intrinsic to the node; a fail-closed
+verifier (`verify_program`, stable defect codes plus lexical paths)
+covering unique node/cursor/index/symbol identities, definitions,
+dominance, lexical and cursor scope, rank/layout and coordinate/value
+typing, reduction identities including signed zero, output scope, merge
+preconditions, aliasing, forged cycles, malformed stored state, unknown
+subclasses, and a 64-level depth bound; a canonical plain-Python CSR
+container; a 436-line Torch-free interpreter that verifies then executes;
+and the three hand-authored feasibility programs (CSR SpMV with exactly
+one sparse cursor — deliberately not claimed as sparse-sparse evidence;
+CSR+CSR UNION addition; two-CSR INTERSECTION multiplication reusing the
+same merge node with no operation-specific addition).
+
+Two deliberate design departures from Phase-3 house style, both scoped to
+the spike: constructors validate nothing (the verifier is the single
+authority, which the adversarial suite depends on to build malformed
+programs directly), and `LoopNodeId`/`CursorId` are spike-local identities
+while `SymbolId`/`IndexId` are reused from production `identity.py`.
+Compressed values are reachable only through cursors (`CursorValue`);
+coordinate `Load` on a compressed tensor is a verifier error; UNION cursor
+reads require a value-typed default and non-UNION reads forbid one. Sparse
+outputs assemble exclusively from lexicographically ordered `AppendEntry`
+streams — no positions arrays, offsets, or target syntax exist anywhere in
+the package, and Torch stays outside the interpreter.
+
+#### Verification ledger
+
+Evidence is under
+`/Users/bobby/.cache/scorch-codex/phase35-loopir-spike-1c78633/`:
+
+- **Tests.** 297 focused spike tests pass (70 adversarial verifier-boundary
+  tests exercising every defect code, 221 execution/differential tests
+  covering empty inputs and rows, zero-row/zero-column shapes, ragged rows,
+  disjoint/identical/partial support, unequal lengths, one-sided and early
+  exhaustion, explicit-zero cancellation, structural intersection over a
+  stored zero, and seeded randomized grids against pure-Python dense
+  references with exact equality, and 6 automated neutrality checks: an
+  AST-level import whitelist, a subprocess closure proof that the spike
+  imports without Torch or any pipeline module, proof that `import scorch`
+  does not load the spike, a production-reference scan, and a
+  target-syntax token scan). The identity/CIN-analysis/LoopPlan/raw-budget
+  suites pass from the detached candidate worktree (125 tests). The
+  authoritative clean detached-worktree non-performance run at `1c78633`
+  passed **2,857 tests with 14 skipped, 3 perf-marked deselections, and one
+  warning in 2,071.23 seconds** (junit: 2,871 collected, 0 failures, 0
+  errors) with import provenance asserted (including the spike module) and
+  isolated caches/basetemp; `full-suite.{log,xml}` are retained.
+- **Byte gates.** All 20 corpus and 42 grid sources regenerated from clean
+  detached base (`34a1849`) and candidate (`1c78633`) worktrees are
+  byte-identical to each other and to the retained
+  `phase3-review-fix.tyJNVF` final captures; the 124-file manifest is
+  `CAPTURE_SHA256SUMS`. The byte waiver applies; no runtime kernel
+  benchmark is required.
+- **Compiler latency.** The paired 5-warmup/30-sample run (base then
+  candidate, same session) is inside the 1.10 target everywhere:
+  small_dense `0.922/0.830`, reduction `1.013/0.975`, csr_intersection
+  `0.961/0.988`, sparse_union `0.932/0.896` p50/p95
+  (`latency-compare.txt`).
+- **Static parity.** Black, Flake8, and mypy over full `src` from both
+  detached worktrees are in exact parity: the identical nine inherited
+  Flake8 findings, identical 146 inherited mypy errors in 12 files, and
+  the identical single Black finding (`prebuilt_kernels.py`) on both
+  sides; the six spike files add zero findings. `git diff --check` was
+  clean before every commit.
+- **Budgets and hygiene.** No production source, native source, public
+  API, cache, or emission spelling changed; the RawStmt 4/3, AddressOf,
+  and Var inventories are untouched. The five protected tracked files
+  hashed exactly at their recorded values before every commit; staging
+  used explicit pathspecs only; no GPU/CUDA, benchmark, packaging,
+  scheduler, research, scratchpad, or tooling material was touched. The
+  local remote-tracking ref and the live `git ls-remote` tip of
+  `origin/refactor/compiler-ir-phase3-std-move-call` both remained at
+  `1714df2`; nothing was pushed.
+
+#### Verdict and next step
+
+The go/no-go review evaluates each milestone criterion — both sparse cases
+pass differentially, the interpreter remains a simple independent oracle,
+the Phase 0-3 gates are green, latency shows no regression, and
+tile-j/tile-ijk parity remains credible as a plan with named unbuilt risks
+(affine tiles, panels/relayout, workspaces, parallel loops, and above all
+CIN-to-LoopIR lowering). The verdict is **GO with conditions**: Phase 4
+must begin by revising the schema from the spike (builder ergonomics,
+workspace/parallel/tile nodes, dtype generality, multi-level cursor
+execution), the neutrality suite must keep passing as the spike evolves
+into the Phase-4 oracle, the package stays out of production imports until
+the Milestone-4 strangler path introduces LoopIR behind its own gates, and
+Milestone-4 step 6 (tile-j/tile-ijk re-expression) remains a hard
+checkpoint that can still void the parity claim. **No Phase-4 work was
+started in this session**, and passing tests alone did not force the
+verdict — the review document records what the suites do not demonstrate.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
