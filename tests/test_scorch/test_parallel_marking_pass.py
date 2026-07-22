@@ -103,6 +103,9 @@ def _mutable_llir_ids(value: object) -> set[int]:
         mutable_ids.add(id(value))
         for child in vars(value).values():
             mutable_ids.update(_mutable_llir_ids(child))
+    elif type(value) is ParallelWorkspaceCluster:
+        for child in vars(value).values():
+            mutable_ids.update(_mutable_llir_ids(child))
     elif isinstance(value, (list, tuple)):
         for child in value:
             mutable_ids.update(_mutable_llir_ids(child))
@@ -182,6 +185,84 @@ def test_pool_spec_and_cluster_validation_fail_closed() -> None:
 
     with pytest.raises(TypeError, match="alloc"):
         ParallelWorkspaceCluster(alloc=(UnknownStatement(),))
+    with pytest.raises(TypeError, match="alloc"):
+        ParallelWorkspaceCluster(alloc=(llir.RawStmt("raw();"),))
+
+    malformed_alloc = cast(llir.VarInit, _alloc_statement())
+    del malformed_alloc.__dict__["value"]
+    with pytest.raises(TypeError, match="complete plain VarInit"):
+        ParallelWorkspaceCluster(alloc=(malformed_alloc,))
+
+    for field, invalid_value in (("op", "; injected"), ("cast", True)):
+        malformed_alloc = cast(llir.VarInit, _alloc_statement())
+        setattr(malformed_alloc, field, invalid_value)
+        with pytest.raises(TypeError, match="complete plain VarInit"):
+            ParallelWorkspaceCluster(alloc=(malformed_alloc,))
+
+    cyclic_value = llir.Add(
+        llir.Var(name="lhs", type=llir.DataType.INT64),
+        llir.Var(name="rhs", type=llir.DataType.INT64),
+    )
+    object.__setattr__(cyclic_value, "left", cyclic_value)
+    cyclic_alloc = llir.VarInit(
+        var=llir.Var(name="value", type=llir.DataType.INT64),
+        value=cyclic_value,
+    )
+    with pytest.raises(TypeError, match="acyclic"):
+        ParallelWorkspaceCluster(alloc=(cyclic_alloc,))
+
+    forged_statement = cast(llir.VarInit, _alloc_statement())
+    cluster_with_forged_child = ParallelWorkspaceCluster(alloc=(forged_statement,))
+    del forged_statement.__dict__["value"]
+    with pytest.raises(TypeError, match="complete plain VarInit"):
+        mark_first_for_loop_parallel([_plain_dense_loop()], cluster_with_forged_child)
+
+
+def test_cluster_templates_reject_unsafe_structured_spellings() -> None:
+    safe_target = llir.Var(name="wksp", type=llir.DataType.INT64)
+    safe_value = llir.Var(name="source", type=llir.DataType.INT64)
+    unsafe_templates = (
+        llir.VarInit(
+            var=llir.Var(
+                name="wksp; injected()",
+                type=llir.DataType.INT64,
+            ),
+            value=safe_value,
+        ),
+        llir.VarInit(
+            var=safe_target,
+            value=llir.Var(
+                name="source; injected()",
+                type=llir.DataType.INT64,
+            ),
+        ),
+        llir.VarInit(
+            var=llir.Var(
+                name="wksp",
+                type="int; injected",  # type: ignore[arg-type]
+            ),
+            value=safe_value,
+        ),
+        llir.VarInit(
+            var=safe_target,
+            value=llir.FunctionCall("f(); injected"),
+        ),
+        llir.MemberCallStmt(
+            base=llir.Var(
+                name="wksp; injected()",
+                type=llir.DataType.PTR_FLOAT32,
+            ),
+            member="release",
+        ),
+        llir.MemberCallStmt(
+            base=llir.Var(name="wksp", type=llir.DataType.PTR_FLOAT32),
+            member="class",
+        ),
+    )
+
+    for template in unsafe_templates:
+        with pytest.raises(TypeError, match="ParallelWorkspaceCluster"):
+            ParallelWorkspaceCluster(alloc=(template,))
 
 
 def test_empty_cluster_marks_a_plain_parallel_loop() -> None:
@@ -329,7 +410,7 @@ def test_cluster_placements_are_independently_owned_per_marking() -> None:
 def test_atomic_prelude_validates_its_structural_name_pair() -> None:
     bound = llir.Var(name="A0_size", type=llir.DataType.INT64)
 
-    for sparse_pos in ("A1_pos); injected(", "B1_pos", 17):
+    for sparse_pos in ("A1_pos); injected(", "A1_pos\n", "B1_pos", 17):
         with pytest.raises(TypeError, match="atomic prelude"):
             atomic_work_stealing_prelude(sparse_pos, bound)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="exact Var"):
@@ -347,6 +428,58 @@ def test_atomic_prelude_validates_its_structural_name_pair() -> None:
     )
     with pytest.raises(TypeError, match="metadata-free scalar Var"):
         atomic_work_stealing_prelude("A1_pos", pointer_bound)
+
+    for invalid_type in (
+        llir.DataType.BOOL,
+        llir.DataType.FLOAT32,
+        llir.DataType.VOID,
+        llir.DataType.NO_TYPE,
+        llir.DataType.PTR_FLOAT32,
+        llir.DataType.STD_VECTOR_INT,
+        llir.DataType.TORCH_TENSOR,
+    ):
+        invalid_bound = llir.Var(name="A0_size", type=invalid_type)
+        with pytest.raises(TypeError, match="metadata-free scalar Var"):
+            atomic_work_stealing_prelude("A1_pos", invalid_bound)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("name", "class"),
+        ("name", "wksp\n"),
+        ("extent", "true"),
+        ("extent", "and"),
+    ],
+)
+def test_pool_spec_rejects_non_cpp_identifiers(field: str, invalid_value: str) -> None:
+    fields = {
+        "name": "wksp",
+        "scalar_type": llir.DataType.FLOAT32,
+        "extent": "wksp_size",
+    }
+    fields[field] = invalid_value
+
+    with pytest.raises(TypeError, match=rf"ParallelWorkspacePoolSpec\.{field}"):
+        ParallelWorkspacePoolSpec(**fields)
+
+    valid_spec = _pool_spec()
+    object.__setattr__(valid_spec, field, invalid_value)
+    forged_cluster = ParallelWorkspaceCluster()
+    object.__setattr__(forged_cluster, "pool_specs", (valid_spec,))
+    with pytest.raises(TypeError, match=rf"ParallelWorkspacePoolSpec\.{field}"):
+        mark_first_for_loop_parallel([_plain_dense_loop()], forged_cluster)
+
+
+def test_pool_spec_preserves_unicode_identifier_compatibility() -> None:
+    assert (
+        ParallelWorkspacePoolSpec(
+            name="dénse",
+            scalar_type=llir.DataType.FLOAT32,
+            extent="éxtent",
+        ).extent
+        == "éxtent"
+    )
 
 
 def test_pool_attachment_without_typed_policy_fails_closed() -> None:
