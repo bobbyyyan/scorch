@@ -7,13 +7,28 @@ perform no validation, so every boundary here is checked from stored state
 with exact types: unknown node subclasses, non-tuple children, forged enum
 lookalikes, aliased or cyclic structure, and excessive nesting all fail
 closed rather than being coerced or skipped.
+
+Beyond structure and lexical scope the verifier states three families of
+invariants locally:
+
+- **Sparse parent/child dominance.**  Every sparse cursor and dense-position
+  expression names its dominating parent position explicitly; the checker
+  requires that parent to be position-typed with the (tensor, level - 1)
+  linkage of the level being entered (the root position for level 0), so a
+  compressed child cannot be reached without a dominating parent position in
+  scope.
+- **Coordinate domains.**  Every bound coordinate carries the logical
+  dimension it indexes; loads, stores, appends, dense positions, and merges
+  reject coordinates from a different domain, and a merge additionally
+  requires all cursor levels to store one shared dimension.
+- **Value ownership.**  Only a cursor over the value-bearing leaf level of
+  its tensor may expose a scalar ``CursorValue``.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
-from enum import Enum, unique
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Set, Tuple
 
 from ..identity import IndexId, SymbolId
@@ -29,28 +44,36 @@ from .nodes import (
     CursorValue,
     DeclAccum,
     DenseFor,
-    DimSize,
+    DensePosition,
+    DimensionDecl,
+    DimensionId,
     Expr,
-    ExtentEquality,
     FloatConst,
     IndexValue,
     IntConst,
+    LevelDecl,
     LevelKind,
     Load,
     LoopNodeId,
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PositionId,
+    PositionValue,
     ReduceOp,
+    RootPosition,
     SparseCursorDecl,
     SparseFor,
     Stmt,
     Store,
+    StoreReduce,
     TensorDecl,
 )
 
 MAX_NESTING_DEPTH = 64
 _MISSING = object()
+
+_EXECUTABLE_LEVEL_KINDS = (LevelKind.DENSE, LevelKind.COMPRESSED)
 
 
 @dataclass(frozen=True)
@@ -70,10 +93,32 @@ class LoopIRVerificationError(Exception):
         self.defect = defect
 
 
-@unique
-class _ValueType(Enum):
-    COORD = "coord"
-    VALUE = "value"
+class _ExprType:
+    """Base of the verifier's expression types."""
+
+
+@dataclass(frozen=True)
+class _CoordType(_ExprType):
+    """Coordinate-typed; ``dimension`` is None for domain-free literals."""
+
+    dimension: Optional[DimensionId]
+
+
+@dataclass(frozen=True)
+class _ScalarType(_ExprType):
+    """Value-typed (a stored or computed scalar)."""
+
+
+@dataclass(frozen=True)
+class _PositionType(_ExprType):
+    """Position-typed; ``tensor`` is None only for the root position."""
+
+    tensor: Optional[SymbolId]
+    level: int
+
+
+_VALUE = _ScalarType()
+_ROOT_POSITION = _PositionType(None, -1)
 
 
 def _fail(code: str, path: str, message: str) -> NoReturn:
@@ -84,12 +129,15 @@ class _Context:
     """Mutable walk state: registries, scopes, and traversal guards."""
 
     def __init__(self) -> None:
+        self.dimensions: Dict[DimensionId, DimensionDecl] = {}
         self.tensors: Dict[SymbolId, TensorDecl] = {}
         self.inputs: Set[SymbolId] = set()
         self.outputs: Set[SymbolId] = set()
         self.written_outputs: Set[SymbolId] = set()
-        self.bound_indices: Set[IndexId] = set()
+        self.bound_indices: Dict[IndexId, DimensionId] = {}
         self.ever_bound_indices: Set[IndexId] = set()
+        self.bound_positions: Dict[PositionId, Tuple[SymbolId, int]] = {}
+        self.ever_bound_positions: Set[PositionId] = set()
         self.cursors: Dict[CursorId, Tuple[SparseCursorDecl, Optional[MergeMode]]] = {}
         self.ever_cursor_ids: Set[CursorId] = set()
         self.accums: Dict[SymbolId, ReduceOp] = {}
@@ -98,6 +146,16 @@ class _Context:
         self.visited_objects: Set[int] = set()
         self.path_objects: Set[int] = set()
         self.in_cursor_default = False
+
+    def level_dimension(self, tensor: SymbolId, level: int) -> DimensionId:
+        """The logical dimension stored by one validated tensor level."""
+
+        decl = self.tensors[tensor]
+        return decl.dimensions[decl.levels[level].mode]
+
+    def dimension_name(self, dimension: DimensionId) -> str:
+        decl = self.dimensions.get(dimension)
+        return decl.name if decl is not None else f"<dimension {dimension.value}>"
 
 
 def _check_node_id(node_id: object, path: str) -> LoopNodeId:
@@ -130,6 +188,32 @@ def _check_cursor_id(value: object, path: str) -> CursorId:
         or type(getattr(value, "value", _MISSING)) is not int
     ):
         _fail("invalid_cursor_id", path, "cursor must be an int-valued CursorId")
+    return value
+
+
+def _check_dimension_id(value: object, path: str, what: str) -> DimensionId:
+    if (
+        type(value) is not DimensionId
+        or type(getattr(value, "value", _MISSING)) is not int
+    ):
+        _fail(
+            "invalid_dimension_id",
+            path,
+            f"{what} must be an int-valued DimensionId",
+        )
+    return value
+
+
+def _check_position_id(value: object, path: str, what: str) -> PositionId:
+    if (
+        type(value) is not PositionId
+        or type(getattr(value, "value", _MISSING)) is not int
+    ):
+        _fail(
+            "invalid_position_id",
+            path,
+            f"{what} must be an int-valued PositionId",
+        )
     return value
 
 
@@ -175,7 +259,31 @@ def _leave(ctx: _Context, node: object) -> None:
     ctx.path_objects.discard(id(node))
 
 
-def _check_expr(ctx: _Context, expr: object, path: str, depth: int) -> _ValueType:
+def _require_value(kind: _ExprType, path: str, what: str) -> None:
+    if type(kind) is not _ScalarType:
+        _fail("type_mismatch", path, f"{what} must be value-typed")
+
+
+def _require_coord(
+    ctx: _Context,
+    kind: _ExprType,
+    path: str,
+    what: str,
+    expected: DimensionId,
+) -> None:
+    if type(kind) is not _CoordType:
+        _fail("type_mismatch", path, f"{what} must be coordinate-typed")
+    if kind.dimension is not None and kind.dimension != expected:
+        _fail(
+            "domain_mismatch",
+            path,
+            f"{what} is a coordinate of dimension "
+            f"{ctx.dimension_name(kind.dimension)!r} but dimension "
+            f"{ctx.dimension_name(expected)!r} is required",
+        )
+
+
+def _check_expr(ctx: _Context, expr: object, path: str, depth: int) -> _ExprType:
     if not isinstance(expr, Expr):
         _fail("unknown_expr", path, f"expected an Expr node, got {type(expr).__name__}")
     kind = type(expr)
@@ -189,46 +297,126 @@ def _check_expr(ctx: _Context, expr: object, path: str, depth: int) -> _ValueTyp
         _leave(ctx, expr)
 
 
-def _check_int_const(
-    ctx: _Context, expr: IntConst, path: str, depth: int
-) -> _ValueType:
+def _check_parent_position(
+    ctx: _Context,
+    parent: object,
+    path: str,
+    depth: int,
+    tensor: SymbolId,
+    level: int,
+) -> None:
+    """The dominance rule: a level's parent is the position one level up."""
+
+    kind = _check_expr(ctx, parent, path, depth)
+    if type(kind) is not _PositionType:
+        _fail(
+            "parent_position_mismatch",
+            path,
+            "the parent must be a physical position expression",
+        )
+    if level == 0:
+        if kind.tensor is not None:
+            _fail(
+                "parent_position_mismatch",
+                path,
+                "a level-0 parent must be the root position",
+            )
+    elif kind.tensor != tensor or kind.level != level - 1:
+        _fail(
+            "parent_position_mismatch",
+            path,
+            f"level {level} needs the dominating position of level "
+            f"{level - 1} of the same tensor",
+        )
+
+
+def _check_int_const(ctx: _Context, expr: IntConst, path: str, depth: int) -> _ExprType:
     if type(expr.value) is not int:
         _fail("malformed_state", path, "IntConst.value must be an exact int")
-    return _ValueType.COORD
+    return _CoordType(None)
 
 
 def _check_float_const(
     ctx: _Context, expr: FloatConst, path: str, depth: int
-) -> _ValueType:
+) -> _ExprType:
     if type(expr.value) is not float:
         _fail("malformed_state", path, "FloatConst.value must be an exact float")
-    return _ValueType.VALUE
-
-
-def _check_dim_size(ctx: _Context, expr: DimSize, path: str, depth: int) -> _ValueType:
-    tensor = _check_symbol_id(expr.tensor, path, "DimSize.tensor")
-    if tensor not in ctx.tensors:
-        _fail("undefined_tensor", path, "DimSize references an undeclared tensor")
-    if type(expr.dim) is not int:
-        _fail("malformed_state", path, "DimSize.dim must be an exact int")
-    rank = len(ctx.tensors[tensor].levels)
-    if not 0 <= expr.dim < rank:
-        _fail("rank_mismatch", path, f"dim {expr.dim} outside rank-{rank} tensor")
-    return _ValueType.COORD
+    return _VALUE
 
 
 def _check_index_value(
     ctx: _Context, expr: IndexValue, path: str, depth: int
-) -> _ValueType:
+) -> _ExprType:
     index = _check_index_id(expr.index, path, "IndexValue.index")
     if index not in ctx.bound_indices:
         _fail("unbound_index", path, f"index {index.value} is not bound in scope")
-    return _ValueType.COORD
+    return _CoordType(ctx.bound_indices[index])
+
+
+def _check_root_position(
+    ctx: _Context, expr: RootPosition, path: str, depth: int
+) -> _ExprType:
+    return _ROOT_POSITION
+
+
+def _check_dense_position(
+    ctx: _Context, expr: DensePosition, path: str, depth: int
+) -> _ExprType:
+    tensor = _check_symbol_id(expr.tensor, path, "DensePosition.tensor")
+    if tensor not in ctx.tensors:
+        _fail(
+            "undefined_tensor",
+            path,
+            "DensePosition references an undeclared tensor",
+        )
+    if tensor not in ctx.inputs:
+        _fail("output_read", path, "positions are only formed on declared inputs")
+    decl = ctx.tensors[tensor]
+    if type(expr.level) is not int:
+        _fail("malformed_state", path, "DensePosition.level must be an exact int")
+    if not 0 <= expr.level < len(decl.levels):
+        _fail(
+            "rank_mismatch",
+            path,
+            f"level {expr.level} outside rank-{len(decl.levels)} tensor",
+        )
+    if decl.levels[expr.level].kind is not LevelKind.DENSE:
+        _fail(
+            "layout_mismatch",
+            path,
+            "dense positions are only defined on DENSE levels",
+        )
+    _check_parent_position(
+        ctx, expr.parent, f"{path}.parent", depth + 1, tensor, expr.level
+    )
+    coord_type = _check_expr(ctx, expr.coord, f"{path}.coord", depth + 1)
+    _require_coord(
+        ctx,
+        coord_type,
+        f"{path}.coord",
+        "the dense-level coordinate",
+        ctx.level_dimension(tensor, expr.level),
+    )
+    return _PositionType(tensor, expr.level)
+
+
+def _check_position_value(
+    ctx: _Context, expr: PositionValue, path: str, depth: int
+) -> _ExprType:
+    position = _check_position_id(expr.position, path, "PositionValue.position")
+    if position not in ctx.bound_positions:
+        _fail(
+            "unbound_position",
+            path,
+            f"position {position.value} is not bound in scope",
+        )
+    tensor, level = ctx.bound_positions[position]
+    return _PositionType(tensor, level)
 
 
 def _check_cursor_value(
     ctx: _Context, expr: CursorValue, path: str, depth: int
-) -> _ValueType:
+) -> _ExprType:
     if ctx.in_cursor_default:
         _fail(
             "default_contains_cursor",
@@ -238,7 +426,14 @@ def _check_cursor_value(
     cursor = _check_cursor_id(expr.cursor, path)
     if cursor not in ctx.cursors:
         _fail("unbound_cursor", path, f"cursor {cursor.value} is not in scope")
-    mode = ctx.cursors[cursor][1]
+    decl, mode = ctx.cursors[cursor]
+    if decl.level != len(ctx.tensors[decl.tensor].levels) - 1:
+        _fail(
+            "non_leaf_value",
+            path,
+            "only the value-bearing leaf level owns scalar values; "
+            f"level {decl.level} is structural",
+        )
     if mode is MergeMode.UNION:
         if expr.default is None:
             _fail(
@@ -251,7 +446,7 @@ def _check_cursor_value(
             default_type = _check_expr(ctx, expr.default, f"{path}.default", depth + 1)
         finally:
             ctx.in_cursor_default = False
-        if default_type is not _ValueType.VALUE:
+        if type(default_type) is not _ScalarType:
             _fail("type_mismatch", f"{path}.default", "default must be value-typed")
     else:
         if expr.default is not None:
@@ -260,12 +455,12 @@ def _check_cursor_value(
                 path,
                 "a default is unobservable outside a UNION merge",
             )
-    return _ValueType.VALUE
+    return _VALUE
 
 
 def _check_accum_value(
     ctx: _Context, expr: AccumValue, path: str, depth: int
-) -> _ValueType:
+) -> _ExprType:
     accumulator = _check_symbol_id(expr.accumulator, path, "AccumValue.accumulator")
     if accumulator not in ctx.accums:
         _fail(
@@ -273,17 +468,17 @@ def _check_accum_value(
             path,
             "accumulator is not declared and live in an enclosing scope",
         )
-    return _ValueType.VALUE
+    return _VALUE
 
 
-def _check_load(ctx: _Context, expr: Load, path: str, depth: int) -> _ValueType:
+def _check_load(ctx: _Context, expr: Load, path: str, depth: int) -> _ExprType:
     tensor = _check_symbol_id(expr.tensor, path, "Load.tensor")
     if tensor not in ctx.tensors:
         _fail("undefined_tensor", path, "Load references an undeclared tensor")
     if tensor not in ctx.inputs:
         _fail("output_read", path, "Load may only read declared inputs")
     decl = ctx.tensors[tensor]
-    if any(level is not LevelKind.DENSE for level in decl.levels):
+    if any(level.kind is not LevelKind.DENSE for level in decl.levels):
         _fail(
             "layout_mismatch",
             path,
@@ -299,36 +494,34 @@ def _check_load(ctx: _Context, expr: Load, path: str, depth: int) -> _ValueType:
         )
     for position, index in enumerate(expr.indices):
         index_type = _check_expr(ctx, index, f"{path}.indices[{position}]", depth + 1)
-        if index_type is not _ValueType.COORD:
-            _fail(
-                "type_mismatch",
-                f"{path}.indices[{position}]",
-                "load indices must be coordinate-typed",
-            )
-    return _ValueType.VALUE
+        _require_coord(
+            ctx,
+            index_type,
+            f"{path}.indices[{position}]",
+            "a load index",
+            decl.dimensions[position],
+        )
+    return _VALUE
 
 
 def _check_binary_expr(
     ctx: _Context, expr: BinaryExpr, path: str, depth: int
-) -> _ValueType:
+) -> _ExprType:
     if type(expr.op) is not BinaryOp:
         _fail("malformed_state", path, "BinaryExpr.op must be a BinaryOp member")
     for name, operand in (("lhs", expr.lhs), ("rhs", expr.rhs)):
         operand_type = _check_expr(ctx, operand, f"{path}.{name}", depth + 1)
-        if operand_type is not _ValueType.VALUE:
-            _fail(
-                "type_mismatch",
-                f"{path}.{name}",
-                "binary operands must be value-typed",
-            )
-    return _ValueType.VALUE
+        _require_value(operand_type, f"{path}.{name}", "a binary operand")
+    return _VALUE
 
 
-_EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ValueType]] = {
+_EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ExprType]] = {
     IntConst: _check_int_const,
     FloatConst: _check_float_const,
-    DimSize: _check_dim_size,
     IndexValue: _check_index_value,
+    RootPosition: _check_root_position,
+    DensePosition: _check_dense_position,
+    PositionValue: _check_position_value,
     CursorValue: _check_cursor_value,
     AccumValue: _check_accum_value,
     Load: _check_load,
@@ -336,7 +529,13 @@ _EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ValueType]] = {
 }
 
 
-def _bind_index(ctx: _Context, index: object, path: str, what: str) -> IndexId:
+def _bind_index(
+    ctx: _Context,
+    index: object,
+    path: str,
+    what: str,
+    dimension: DimensionId,
+) -> IndexId:
     bound = _check_index_id(index, path, what)
     if bound in ctx.ever_bound_indices:
         _fail(
@@ -345,7 +544,27 @@ def _bind_index(ctx: _Context, index: object, path: str, what: str) -> IndexId:
             f"index {bound.value} is bound more than once in the program",
         )
     ctx.ever_bound_indices.add(bound)
-    ctx.bound_indices.add(bound)
+    ctx.bound_indices[bound] = dimension
+    return bound
+
+
+def _bind_position(
+    ctx: _Context,
+    position: object,
+    path: str,
+    what: str,
+    tensor: SymbolId,
+    level: int,
+) -> PositionId:
+    bound = _check_position_id(position, path, what)
+    if bound in ctx.ever_bound_positions:
+        _fail(
+            "duplicate_position_binding",
+            path,
+            f"position {bound.value} is bound more than once in the program",
+        )
+    ctx.ever_bound_positions.add(bound)
+    ctx.bound_positions[bound] = (tensor, level)
     return bound
 
 
@@ -378,39 +597,15 @@ def _check_cursor_decl(
                 path,
                 f"level {decl.level} outside rank-{len(levels)} tensor",
             )
-        if levels[decl.level] is not LevelKind.COMPRESSED:
+        if levels[decl.level].kind is not LevelKind.COMPRESSED:
             _fail(
                 "layout_mismatch",
                 path,
-                "sparse cursors are only defined on compressed levels",
+                "sparse cursors are only defined on COMPRESSED levels",
             )
-        if decl.level != len(levels) - 1 or any(
-            level is LevelKind.COMPRESSED for level in levels[: decl.level]
-        ):
-            _fail(
-                "unsupported_sparse_hierarchy",
-                path,
-                "the spike only represents a compressed leaf below dense levels; "
-                "nested or non-leaf sparse levels need an explicit parent position",
-            )
-        if type(decl.outer_indices) is not tuple:
-            _fail("malformed_state", path, "outer_indices must be an owned tuple")
-        if len(decl.outer_indices) != decl.level:
-            _fail(
-                "rank_mismatch",
-                path,
-                f"{len(decl.outer_indices)} outer indices for level {decl.level}",
-            )
-        for position, outer in enumerate(decl.outer_indices):
-            outer_type = _check_expr(
-                ctx, outer, f"{path}.outer_indices[{position}]", depth + 1
-            )
-            if outer_type is not _ValueType.COORD:
-                _fail(
-                    "type_mismatch",
-                    f"{path}.outer_indices[{position}]",
-                    "outer indices must be coordinate-typed",
-                )
+        _check_parent_position(
+            ctx, decl.parent, f"{path}.parent", depth + 1, tensor, decl.level
+        )
         return decl
     finally:
         _leave(ctx, decl)
@@ -455,24 +650,40 @@ def _check_body(ctx: _Context, body: object, path: str, depth: int) -> None:
 
 
 def _check_dense_for(ctx: _Context, stmt: DenseFor, path: str, depth: int) -> None:
-    extent_type = _check_expr(ctx, stmt.extent, f"{path}.extent", depth + 1)
-    if extent_type is not _ValueType.COORD:
-        _fail("type_mismatch", f"{path}.extent", "extent must be coordinate-typed")
-    index = _bind_index(ctx, stmt.index, path, "DenseFor.index")
+    dimension = _check_dimension_id(
+        stmt.dimension, f"{path}.dimension", "DenseFor.dimension"
+    )
+    if dimension not in ctx.dimensions:
+        _fail(
+            "undefined_dimension",
+            f"{path}.dimension",
+            "DenseFor iterates an undeclared dimension",
+        )
+    index = _bind_index(ctx, stmt.index, path, "DenseFor.index", dimension)
     try:
         _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
     finally:
-        ctx.bound_indices.discard(index)
+        del ctx.bound_indices[index]
 
 
 def _check_sparse_for(ctx: _Context, stmt: SparseFor, path: str, depth: int) -> None:
     decl = _check_cursor_decl(ctx, stmt.cursor, f"{path}.cursor", depth + 1)
-    index = _bind_index(ctx, stmt.coord_index, path, "SparseFor.coord_index")
+    position = _bind_position(
+        ctx, stmt.position, path, "SparseFor.position", decl.tensor, decl.level
+    )
+    index = _bind_index(
+        ctx,
+        stmt.coord_index,
+        path,
+        "SparseFor.coord_index",
+        ctx.level_dimension(decl.tensor, decl.level),
+    )
     ctx.cursors[decl.cursor] = (decl, None)
     try:
         _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
     finally:
-        ctx.bound_indices.discard(index)
+        del ctx.bound_indices[index]
+        del ctx.bound_positions[position]
         del ctx.cursors[decl.cursor]
 
 
@@ -491,16 +702,36 @@ def _check_merged_sparse_for(
         )
     decls: List[SparseCursorDecl] = []
     for position, cursor in enumerate(stmt.cursors):
-        decls.append(
-            _check_cursor_decl(ctx, cursor, f"{path}.cursors[{position}]", depth + 1)
-        )
-    index = _bind_index(ctx, stmt.coord_index, path, "MergedSparseFor.coord_index")
+        cursor_path = f"{path}.cursors[{position}]"
+        decl = _check_cursor_decl(ctx, cursor, cursor_path, depth + 1)
+        if decl.level != len(ctx.tensors[decl.tensor].levels) - 1:
+            _fail(
+                "unsupported_sparse_hierarchy",
+                cursor_path,
+                "merged cursors must target the value-bearing leaf level; "
+                "hierarchical merge descent is not represented by this spike",
+            )
+        decls.append(decl)
+    merge_dimension = ctx.level_dimension(decls[0].tensor, decls[0].level)
+    for position, decl in enumerate(decls[1:], start=1):
+        cursor_dimension = ctx.level_dimension(decl.tensor, decl.level)
+        if cursor_dimension != merge_dimension:
+            _fail(
+                "merge_domain_mismatch",
+                f"{path}.cursors[{position}]",
+                "merged cursors must iterate one shared logical dimension; "
+                f"got {ctx.dimension_name(cursor_dimension)!r} beside "
+                f"{ctx.dimension_name(merge_dimension)!r}",
+            )
+    index = _bind_index(
+        ctx, stmt.coord_index, path, "MergedSparseFor.coord_index", merge_dimension
+    )
     for decl in decls:
         ctx.cursors[decl.cursor] = (decl, stmt.mode)
     try:
         _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
     finally:
-        ctx.bound_indices.discard(index)
+        del ctx.bound_indices[index]
         for decl in decls:
             del ctx.cursors[decl.cursor]
 
@@ -524,7 +755,7 @@ def _check_decl_accum(ctx: _Context, stmt: DeclAccum, path: str, depth: int) -> 
     init = stmt.init
     identity = REDUCE_IDENTITIES[stmt.op]
     init_type = _check_expr(ctx, init, f"{path}.init", depth + 1)
-    if init_type is not _ValueType.VALUE or type(init) is not FloatConst:
+    if type(init_type) is not _ScalarType or type(init) is not FloatConst:
         _fail(
             "invalid_reduction_identity",
             f"{path}.init",
@@ -551,8 +782,39 @@ def _check_accumulate(ctx: _Context, stmt: Accumulate, path: str, depth: int) ->
             "accumulator is not declared and live in an enclosing scope",
         )
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    if value_type is not _ValueType.VALUE:
-        _fail("type_mismatch", f"{path}.value", "accumulated value must be value-typed")
+    _require_value(value_type, f"{path}.value", "an accumulated value")
+
+
+def _check_dense_output_indices(
+    ctx: _Context, stmt: object, tensor: SymbolId, path: str, depth: int
+) -> None:
+    """Shared index checks for coordinate-addressed dense-output writes."""
+
+    decl = ctx.tensors[tensor]
+    if any(level.kind is not LevelKind.DENSE for level in decl.levels):
+        _fail(
+            "layout_mismatch",
+            path,
+            "coordinate stores are only defined on all-dense outputs",
+        )
+    indices = stmt.indices  # type: ignore[attr-defined]
+    if type(indices) is not tuple:
+        _fail("malformed_state", path, "indices must be an owned tuple")
+    if len(indices) != len(decl.levels):
+        _fail(
+            "rank_mismatch",
+            path,
+            f"{len(indices)} indices for rank-{len(decl.levels)} output",
+        )
+    for position, index in enumerate(indices):
+        index_type = _check_expr(ctx, index, f"{path}.indices[{position}]", depth + 1)
+        _require_coord(
+            ctx,
+            index_type,
+            f"{path}.indices[{position}]",
+            "a store index",
+            decl.dimensions[position],
+        )
 
 
 def _check_store(ctx: _Context, stmt: Store, path: str, depth: int) -> None:
@@ -561,32 +823,25 @@ def _check_store(ctx: _Context, stmt: Store, path: str, depth: int) -> None:
         _fail("undefined_tensor", path, "Store references an undeclared tensor")
     if tensor not in ctx.outputs:
         _fail("output_scope", path, "Store may only write declared outputs")
-    decl = ctx.tensors[tensor]
-    if any(level is not LevelKind.DENSE for level in decl.levels):
-        _fail(
-            "layout_mismatch",
-            path,
-            "coordinate stores are only defined on all-dense outputs",
-        )
-    if type(stmt.indices) is not tuple:
-        _fail("malformed_state", path, "Store.indices must be an owned tuple")
-    if len(stmt.indices) != len(decl.levels):
-        _fail(
-            "rank_mismatch",
-            path,
-            f"{len(stmt.indices)} indices for rank-{len(decl.levels)} output",
-        )
-    for position, index in enumerate(stmt.indices):
-        index_type = _check_expr(ctx, index, f"{path}.indices[{position}]", depth + 1)
-        if index_type is not _ValueType.COORD:
-            _fail(
-                "type_mismatch",
-                f"{path}.indices[{position}]",
-                "store indices must be coordinate-typed",
-            )
+    _check_dense_output_indices(ctx, stmt, tensor, path, depth)
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    if value_type is not _ValueType.VALUE:
-        _fail("type_mismatch", f"{path}.value", "stored value must be value-typed")
+    _require_value(value_type, f"{path}.value", "a stored value")
+    ctx.written_outputs.add(tensor)
+
+
+def _check_store_reduce(
+    ctx: _Context, stmt: StoreReduce, path: str, depth: int
+) -> None:
+    tensor = _check_symbol_id(stmt.tensor, path, "StoreReduce.tensor")
+    if tensor not in ctx.tensors:
+        _fail("undefined_tensor", path, "StoreReduce references an undeclared tensor")
+    if tensor not in ctx.outputs:
+        _fail("output_scope", path, "StoreReduce may only write declared outputs")
+    if type(stmt.op) is not ReduceOp:
+        _fail("malformed_state", path, "StoreReduce.op must be a ReduceOp member")
+    _check_dense_output_indices(ctx, stmt, tensor, path, depth)
+    value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
+    _require_value(value_type, f"{path}.value", "a combined value")
     ctx.written_outputs.add(tensor)
 
 
@@ -599,11 +854,11 @@ def _check_append_entry(
     if tensor not in ctx.outputs:
         _fail("output_scope", path, "AppendEntry may only assemble declared outputs")
     decl = ctx.tensors[tensor]
-    if all(level is not LevelKind.COMPRESSED for level in decl.levels):
+    if all(level.kind is not LevelKind.COMPRESSED for level in decl.levels):
         _fail(
             "layout_mismatch",
             path,
-            "appended assembly needs an output with a compressed level",
+            "appended assembly needs an output with a COMPRESSED level",
         )
     if type(stmt.coords) is not tuple:
         _fail("malformed_state", path, "AppendEntry.coords must be an owned tuple")
@@ -615,15 +870,15 @@ def _check_append_entry(
         )
     for position, coord in enumerate(stmt.coords):
         coord_type = _check_expr(ctx, coord, f"{path}.coords[{position}]", depth + 1)
-        if coord_type is not _ValueType.COORD:
-            _fail(
-                "type_mismatch",
-                f"{path}.coords[{position}]",
-                "appended coordinates must be coordinate-typed",
-            )
+        _require_coord(
+            ctx,
+            coord_type,
+            f"{path}.coords[{position}]",
+            "an appended coordinate",
+            decl.dimensions[position],
+        )
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    if value_type is not _ValueType.VALUE:
-        _fail("type_mismatch", f"{path}.value", "appended value must be value-typed")
+    _require_value(value_type, f"{path}.value", "an appended value")
     ctx.written_outputs.add(tensor)
 
 
@@ -635,8 +890,66 @@ _STMT_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], None]] = {
     DeclAccum: _check_decl_accum,
     Accumulate: _check_accumulate,
     Store: _check_store,
+    StoreReduce: _check_store_reduce,
     AppendEntry: _check_append_entry,
 }
+
+
+def _check_dimension_decl(ctx: _Context, decl: object, path: str, depth: int) -> None:
+    if type(decl) is not DimensionDecl:
+        _fail(
+            "malformed_state",
+            path,
+            f"expected a DimensionDecl, got {type(decl).__name__}",
+        )
+    _enter(ctx, decl, path, depth)
+    try:
+        dimension = _check_dimension_id(decl.dimension, path, "DimensionDecl.dimension")
+        if dimension in ctx.dimensions:
+            _fail(
+                "duplicate_dimension",
+                path,
+                f"dimension {dimension.value} declared more than once",
+            )
+        if type(decl.name) is not str or not decl.name:
+            _fail("malformed_state", path, "DimensionDecl.name must be a nonempty str")
+        ctx.dimensions[dimension] = decl
+    finally:
+        _leave(ctx, decl)
+
+
+def _check_level_decl(
+    ctx: _Context, decl: object, path: str, depth: int, rank: int
+) -> int:
+    if type(decl) is not LevelDecl:
+        _fail(
+            "malformed_state",
+            path,
+            f"expected a LevelDecl, got {type(decl).__name__}",
+        )
+    _enter(ctx, decl, path, depth)
+    try:
+        if type(decl.kind) is not LevelKind:
+            _fail("malformed_state", path, "LevelDecl.kind must be a LevelKind member")
+        if decl.kind not in _EXECUTABLE_LEVEL_KINDS:
+            _fail(
+                "unsupported_level_kind",
+                path,
+                f"{decl.kind.value} levels are declared production surface; "
+                "the spike fails closed on them until a later milestone "
+                "represents their iteration",
+            )
+        if type(decl.mode) is not int:
+            _fail("malformed_state", path, "LevelDecl.mode must be an exact int")
+        if not 0 <= decl.mode < rank:
+            _fail(
+                "invalid_mode_order",
+                path,
+                f"mode {decl.mode} outside the rank-{rank} logical modes",
+            )
+        return decl.mode
+    finally:
+        _leave(ctx, decl)
 
 
 def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> None:
@@ -653,54 +966,50 @@ def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> No
             _fail("duplicate_symbol", path, f"tensor symbol {symbol.value} redeclared")
         if type(decl.name) is not str or not decl.name:
             _fail("malformed_state", path, "TensorDecl.name must be a nonempty str")
+        if type(decl.dimensions) is not tuple or not decl.dimensions:
+            _fail(
+                "malformed_state",
+                path,
+                "TensorDecl.dimensions must be a nonempty owned tuple",
+            )
+        for position, dimension in enumerate(decl.dimensions):
+            dimension_path = f"{path}.dimensions[{position}]"
+            checked = _check_dimension_id(
+                dimension, dimension_path, "a tensor dimension"
+            )
+            if checked not in ctx.dimensions:
+                _fail(
+                    "undefined_dimension",
+                    dimension_path,
+                    "tensor references an undeclared dimension",
+                )
         if type(decl.levels) is not tuple or not decl.levels:
             _fail(
                 "malformed_state",
                 path,
                 "TensorDecl.levels must be a nonempty owned tuple",
             )
-        for position, level in enumerate(decl.levels):
-            if type(level) is not LevelKind:
-                _fail(
-                    "malformed_state",
-                    f"{path}.levels[{position}]",
-                    "levels must be LevelKind members",
-                )
+        rank = len(decl.dimensions)
+        if len(decl.levels) != rank:
+            _fail(
+                "rank_mismatch",
+                path,
+                f"{len(decl.levels)} levels for {rank} logical modes",
+            )
+        modes = [
+            _check_level_decl(ctx, level, f"{path}.levels[{position}]", depth + 1, rank)
+            for position, level in enumerate(decl.levels)
+        ]
+        if sorted(modes) != list(range(rank)):
+            _fail(
+                "invalid_mode_order",
+                path,
+                "level modes must be a permutation of the logical modes; "
+                f"got {tuple(modes)}",
+            )
         ctx.tensors[symbol] = decl
     finally:
         _leave(ctx, decl)
-
-
-def _check_extent_equality(
-    ctx: _Context, equality: object, path: str, depth: int
-) -> None:
-    if type(equality) is not ExtentEquality:
-        _fail(
-            "malformed_state",
-            path,
-            f"expected an ExtentEquality, got {type(equality).__name__}",
-        )
-    _enter(ctx, equality, path, depth)
-    try:
-        if type(equality.dimensions) is not tuple:
-            _fail("malformed_state", path, "dimensions must be an owned tuple")
-        if len(equality.dimensions) < 2:
-            _fail(
-                "degenerate_extent_equality",
-                path,
-                "an extent equality needs at least two dimensions",
-            )
-        for position, dimension in enumerate(equality.dimensions):
-            dimension_path = f"{path}.dimensions[{position}]"
-            if type(dimension) is not DimSize:
-                _fail(
-                    "malformed_state",
-                    dimension_path,
-                    f"expected a DimSize, got {type(dimension).__name__}",
-                )
-            _check_expr(ctx, dimension, dimension_path, depth + 1)
-    finally:
-        _leave(ctx, equality)
 
 
 def verify_program(program: object) -> None:
@@ -715,14 +1024,24 @@ def verify_program(program: object) -> None:
     ctx = _Context()
     _enter(ctx, program, "program", 0)
     try:
+        if type(program.dimensions) is not tuple:
+            _fail(
+                "malformed_state",
+                "program.dimensions",
+                "dimensions must be an owned tuple",
+            )
+        for position, dimension_decl in enumerate(program.dimensions):
+            _check_dimension_decl(
+                ctx, dimension_decl, f"program.dimensions[{position}]", 1
+            )
         if type(program.tensors) is not tuple or not program.tensors:
             _fail(
                 "malformed_state",
                 "program.tensors",
                 "tensors must be a nonempty owned tuple",
             )
-        for position, decl in enumerate(program.tensors):
-            _check_tensor_decl(ctx, decl, f"program.tensors[{position}]", 1)
+        for position, tensor_decl in enumerate(program.tensors):
+            _check_tensor_decl(ctx, tensor_decl, f"program.tensors[{position}]", 1)
         for role, symbols in (("inputs", program.inputs), ("outputs", program.outputs)):
             if type(symbols) is not tuple:
                 _fail(
@@ -755,19 +1074,6 @@ def verify_program(program: object) -> None:
                 "output_scope",
                 "program.tensors",
                 "every declared tensor must be an input or an output",
-            )
-        if type(program.extent_equalities) is not tuple:
-            _fail(
-                "malformed_state",
-                "program.extent_equalities",
-                "extent_equalities must be an owned tuple",
-            )
-        for position, equality in enumerate(program.extent_equalities):
-            _check_extent_equality(
-                ctx,
-                equality,
-                f"program.extent_equalities[{position}]",
-                1,
             )
         _check_body(ctx, program.body, "program.body", 1)
         unwritten = ctx.outputs - ctx.written_outputs

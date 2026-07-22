@@ -14,31 +14,40 @@ from scorch.compiler.loopir_spike.nodes import (
     CursorValue,
     DeclAccum,
     DenseFor,
-    DimSize,
+    DensePosition,
+    DimensionDecl,
     Expr,
-    ExtentEquality,
     FloatConst,
     IndexValue,
     IntConst,
+    LevelDecl,
     LevelKind,
     Load,
     LoopNodeId,
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PositionValue,
     ReduceOp,
+    RootPosition,
     SparseCursorDecl,
     SparseFor,
     Stmt,
     Store,
+    StoreReduce,
     TensorDecl,
     new_cursor_id,
+    new_dimension_id,
     new_loop_node_id,
+    new_position_id,
 )
 from scorch.compiler.loopir_spike.programs import (
+    build_csc_spmv_program,
+    build_csf_row_contraction_program,
     build_csr_intersection_multiply_program,
     build_csr_spmv_program,
     build_csr_union_add_program,
+    build_dcsr_spmv_program,
 )
 from scorch.compiler.loopir_spike.verifier import (
     MAX_NESTING_DEPTH,
@@ -48,15 +57,28 @@ from scorch.compiler.loopir_spike.verifier import (
 
 DENSE = LevelKind.DENSE
 COMPRESSED = LevelKind.COMPRESSED
-CSR = (DENSE, COMPRESSED)
 
 
 def nid() -> LoopNodeId:
     return new_loop_node_id()
 
 
-def wrap(tensors, inputs, outputs, stmts) -> LoopProgram:
-    return LoopProgram(nid(), tuple(tensors), inputs, outputs, Block(nid(), stmts))
+def lvl(kind, mode):
+    return LevelDecl(nid(), kind, mode)
+
+
+def csr_levels():
+    return (lvl(DENSE, 0), lvl(COMPRESSED, 1))
+
+
+def root():
+    return RootPosition(nid())
+
+
+def wrap(dimensions, tensors, inputs, outputs, stmts) -> LoopProgram:
+    return LoopProgram(
+        nid(), tuple(dimensions), tuple(tensors), inputs, outputs, Block(nid(), stmts)
+    )
 
 
 def expect_defect(program, code, path_prefix="program"):
@@ -72,11 +94,13 @@ class _VecPair:
     """One dense input vector, one dense output vector, and a copy loop."""
 
     def __init__(self):
+        self.d = new_dimension_id()
         self.x = new_symbol_id()
         self.y = new_symbol_id()
+        self.dimensions = (DimensionDecl(nid(), self.d, "d"),)
         self.tensors = (
-            TensorDecl(nid(), self.x, "x", (DENSE,)),
-            TensorDecl(nid(), self.y, "y", (DENSE,)),
+            TensorDecl(nid(), self.x, "x", (self.d,), (lvl(DENSE, 0),)),
+            TensorDecl(nid(), self.y, "y", (self.d,), (lvl(DENSE, 0),)),
         )
 
     def copy_loop(self):
@@ -84,7 +108,7 @@ class _VecPair:
         return DenseFor(
             nid(),
             i,
-            DimSize(nid(), self.x, 0),
+            self.d,
             Block(
                 nid(),
                 (
@@ -100,23 +124,30 @@ class _VecPair:
 
     def program(self, stmts=None):
         statements = (self.copy_loop(),) if stmts is None else stmts
-        return wrap(self.tensors, (self.x,), (self.y,), statements)
+        return wrap(self.dimensions, self.tensors, (self.x,), (self.y,), statements)
 
 
 class _CsrSetup:
     """One CSR input, one CSR output, and merge/cursor building blocks."""
 
     def __init__(self, second_input=False):
+        self.di = new_dimension_id()
+        self.dj = new_dimension_id()
+        self.dimensions = (
+            DimensionDecl(nid(), self.di, "i"),
+            DimensionDecl(nid(), self.dj, "j"),
+        )
         self.a = new_symbol_id()
         self.c = new_symbol_id()
+        dims = (self.di, self.dj)
         tensors = [
-            TensorDecl(nid(), self.a, "A", CSR),
-            TensorDecl(nid(), self.c, "C", CSR),
+            TensorDecl(nid(), self.a, "A", dims, csr_levels()),
+            TensorDecl(nid(), self.c, "C", dims, csr_levels()),
         ]
         inputs = [self.a]
         if second_input:
             self.b = new_symbol_id()
-            tensors.append(TensorDecl(nid(), self.b, "B", CSR))
+            tensors.append(TensorDecl(nid(), self.b, "B", dims, csr_levels()))
             inputs.append(self.b)
         self.tensors = tuple(tensors)
         self.inputs = tuple(inputs)
@@ -127,97 +158,67 @@ class _CsrSetup:
             cursor=new_cursor_id(),
             tensor=tensor,
             level=1,
-            outer_indices=(IndexValue(nid(), row_index),),
+            parent=DensePosition(
+                nid(), tensor, 0, root(), IndexValue(nid(), row_index)
+            ),
         )
 
     def program(self, stmts):
-        return wrap(self.tensors, self.inputs, (self.c,), stmts)
+        return wrap(self.dimensions, self.tensors, self.inputs, (self.c,), stmts)
+
+
+class _DcsrSetup:
+    """One doubly compressed input and one dense vector output."""
+
+    def __init__(self):
+        self.di = new_dimension_id()
+        self.dj = new_dimension_id()
+        self.dimensions = (
+            DimensionDecl(nid(), self.di, "i"),
+            DimensionDecl(nid(), self.dj, "j"),
+        )
+        self.a = new_symbol_id()
+        self.y = new_symbol_id()
+        self.tensors = (
+            TensorDecl(
+                nid(),
+                self.a,
+                "A",
+                (self.di, self.dj),
+                (lvl(COMPRESSED, 0), lvl(COMPRESSED, 1)),
+            ),
+            TensorDecl(nid(), self.y, "y", (self.di,), (lvl(DENSE, 0),)),
+        )
+
+    def outer_cursor(self):
+        return SparseCursorDecl(
+            node_id=nid(),
+            cursor=new_cursor_id(),
+            tensor=self.a,
+            level=0,
+            parent=root(),
+        )
+
+    def inner_cursor(self, parent):
+        return SparseCursorDecl(
+            node_id=nid(),
+            cursor=new_cursor_id(),
+            tensor=self.a,
+            level=1,
+            parent=parent,
+        )
+
+    def program(self, stmts):
+        return wrap(self.dimensions, self.tensors, (self.a,), (self.y,), stmts)
 
 
 def test_hand_authored_fixture_programs_verify():
     verify_program(build_csr_spmv_program().program)
     verify_program(build_csr_union_add_program().program)
     verify_program(build_csr_intersection_multiply_program().program)
-
-
-def _with_extent_equalities(program, equalities):
-    return LoopProgram(
-        program.node_id,
-        program.tensors,
-        program.inputs,
-        program.outputs,
-        program.body,
-        equalities,
-    )
-
-
-def test_valid_extent_equality_verifies():
-    pair = _VecPair()
-    equality = ExtentEquality(
-        nid(),
-        (DimSize(nid(), pair.x, 0), DimSize(nid(), pair.y, 0)),
-    )
-    verify_program(_with_extent_equalities(pair.program(), (equality,)))
-
-
-def test_extent_equalities_must_be_owned_tuple():
-    program = _VecPair().program()
-    object.__setattr__(program, "extent_equalities", [])
-    expect_defect(program, "malformed_state", "program.extent_equalities")
-
-
-def test_extent_equality_members_have_exact_type():
-    pair = _VecPair()
-    program = _with_extent_equalities(pair.program(), (IntConst(nid(), 0),))
-    expect_defect(program, "malformed_state", "program.extent_equalities[0]")
-
-
-def test_extent_equality_needs_at_least_two_dimensions():
-    pair = _VecPair()
-    equality = ExtentEquality(nid(), (DimSize(nid(), pair.x, 0),))
-    program = _with_extent_equalities(pair.program(), (equality,))
-    expect_defect(program, "degenerate_extent_equality")
-
-
-def test_extent_equality_dimensions_must_be_dimsizes():
-    pair = _VecPair()
-    equality = ExtentEquality(
-        nid(),
-        (DimSize(nid(), pair.x, 0), IntConst(nid(), 0)),
-    )
-    program = _with_extent_equalities(pair.program(), (equality,))
-    expect_defect(program, "malformed_state")
-
-
-def test_extent_equality_rejects_undefined_tensor():
-    pair = _VecPair()
-    equality = ExtentEquality(
-        nid(),
-        (
-            DimSize(nid(), pair.x, 0),
-            DimSize(nid(), new_symbol_id(), 0),
-        ),
-    )
-    program = _with_extent_equalities(pair.program(), (equality,))
-    expect_defect(program, "undefined_tensor")
-
-
-def test_extent_equality_rejects_out_of_rank_dimension():
-    pair = _VecPair()
-    equality = ExtentEquality(
-        nid(),
-        (DimSize(nid(), pair.x, 0), DimSize(nid(), pair.y, 1)),
-    )
-    program = _with_extent_equalities(pair.program(), (equality,))
-    expect_defect(program, "rank_mismatch")
-
-
-def test_extent_equality_rejects_shared_dimension_node():
-    pair = _VecPair()
-    dimension = DimSize(nid(), pair.x, 0)
-    equality = ExtentEquality(nid(), (dimension, dimension))
-    program = _with_extent_equalities(pair.program(), (equality,))
-    expect_defect(program, "shared_node")
+    verify_program(build_dcsr_spmv_program().program)
+    verify_program(build_csc_spmv_program().program)
+    verify_program(build_csf_row_contraction_program().program)
 
 
 def test_reduce_identity_table_is_read_only():
@@ -228,6 +229,202 @@ def test_reduce_identity_table_is_read_only():
 def test_fresh_ids_are_unique():
     assert len({new_loop_node_id() for _ in range(64)}) == 64
     assert len({new_cursor_id() for _ in range(64)}) == 64
+    assert len({new_dimension_id() for _ in range(64)}) == 64
+    assert len({new_position_id() for _ in range(64)}) == 64
+
+
+# ------------------------------------------------------ dimension declarations
+
+
+def test_duplicate_dimension_rejected():
+    pair = _VecPair()
+    program = wrap(
+        pair.dimensions + (DimensionDecl(nid(), pair.d, "d2"),),
+        pair.tensors,
+        (pair.x,),
+        (pair.y,),
+        (pair.copy_loop(),),
+    )
+    expect_defect(program, "duplicate_dimension", "program.dimensions[1]")
+
+
+def test_undeclared_tensor_dimension_rejected():
+    pair = _VecPair()
+    stray = new_dimension_id()
+    tensors = (
+        pair.tensors[0],
+        TensorDecl(nid(), pair.y, "y", (stray,), (lvl(DENSE, 0),)),
+    )
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (pair.copy_loop(),))
+    expect_defect(program, "undefined_dimension", "program.tensors[1].dimensions[0]")
+
+
+def test_dense_for_over_undeclared_dimension_rejected():
+    pair = _VecPair()
+    loop = DenseFor(nid(), new_index_id(), new_dimension_id(), Block(nid(), ()))
+    expect_defect(
+        pair.program((loop, pair.copy_loop())),
+        "undefined_dimension",
+        "program.body.statements[0].dimension",
+    )
+
+
+def test_forged_dimension_id_rejected():
+    pair = _VecPair()
+    program = wrap(
+        (DimensionDecl(nid(), "d", "d"),) + pair.dimensions,
+        pair.tensors,
+        (pair.x,),
+        (pair.y,),
+        (pair.copy_loop(),),
+    )
+    expect_defect(program, "invalid_dimension_id", "program.dimensions[0]")
+
+
+def test_missing_dimension_id_value_rejected():
+    pair = _VecPair()
+    object.__delattr__(pair.d, "value")
+    expect_defect(pair.program(), "invalid_dimension_id", "program.dimensions[0]")
+
+
+def test_empty_dimension_name_rejected():
+    dimension = new_dimension_id()
+    pair = _VecPair()
+    program = wrap(
+        pair.dimensions + (DimensionDecl(nid(), dimension, ""),),
+        pair.tensors,
+        (pair.x,),
+        (pair.y,),
+        (pair.copy_loop(),),
+    )
+    expect_defect(program, "malformed_state", "program.dimensions[1]")
+
+
+def test_non_dimension_decl_entry_rejected():
+    pair = _VecPair()
+    program = wrap(
+        pair.dimensions + (IntConst(nid(), 0),),
+        pair.tensors,
+        (pair.x,),
+        (pair.y,),
+        (pair.copy_loop(),),
+    )
+    expect_defect(program, "malformed_state", "program.dimensions[1]")
+
+
+def test_list_valued_program_dimensions_rejected():
+    pair = _VecPair()
+    program = pair.program()
+    object.__setattr__(program, "dimensions", list(program.dimensions))
+    expect_defect(program, "malformed_state", "program.dimensions")
+
+
+# ----------------------------------------------------------- level declarations
+
+
+@pytest.mark.parametrize("kind", (LevelKind.COORDINATE, LevelKind.SINGLETON))
+def test_coordinate_and_singleton_levels_fail_closed(kind):
+    pair = _VecPair()
+    tensors = (
+        TensorDecl(nid(), pair.x, "x", (pair.d,), (lvl(kind, 0),)),
+        pair.tensors[1],
+    )
+    stmt = Store(nid(), pair.y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0))
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (stmt,))
+    defect = expect_defect(
+        program, "unsupported_level_kind", "program.tensors[0].levels[0]"
+    )
+    assert kind.value in defect.message
+
+
+def test_non_level_decl_level_rejected():
+    pair = _VecPair()
+    tensors = (
+        TensorDecl(nid(), pair.x, "x", (pair.d,), (DENSE,)),
+        pair.tensors[1],
+    )
+    stmt = Store(nid(), pair.y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0))
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (stmt,))
+    expect_defect(program, "malformed_state", "program.tensors[0].levels[0]")
+
+
+def test_forged_level_kind_rejected():
+    pair = _VecPair()
+    tensors = (
+        TensorDecl(nid(), pair.x, "x", (pair.d,), (LevelDecl(nid(), "dense", 0),)),
+        pair.tensors[1],
+    )
+    stmt = Store(nid(), pair.y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0))
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (stmt,))
+    expect_defect(program, "malformed_state", "program.tensors[0].levels[0]")
+
+
+def test_non_int_level_mode_rejected():
+    pair = _VecPair()
+    tensors = (
+        TensorDecl(nid(), pair.x, "x", (pair.d,), (LevelDecl(nid(), DENSE, 0.0),)),
+        pair.tensors[1],
+    )
+    stmt = Store(nid(), pair.y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0))
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (stmt,))
+    expect_defect(program, "malformed_state", "program.tensors[0].levels[0]")
+
+
+def test_out_of_range_level_mode_rejected():
+    pair = _VecPair()
+    tensors = (
+        TensorDecl(nid(), pair.x, "x", (pair.d,), (lvl(DENSE, 1),)),
+        pair.tensors[1],
+    )
+    stmt = Store(nid(), pair.y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0))
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (stmt,))
+    expect_defect(program, "invalid_mode_order", "program.tensors[0].levels[0]")
+
+
+def test_duplicate_level_modes_rejected():
+    setup = _CsrSetup()
+    tensors = (
+        TensorDecl(
+            nid(),
+            setup.a,
+            "A",
+            (setup.di, setup.dj),
+            (lvl(DENSE, 0), lvl(COMPRESSED, 0)),
+        ),
+        setup.tensors[1],
+    )
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    program = wrap(setup.dimensions, tensors, (setup.a,), (setup.c,), (append,))
+    expect_defect(program, "invalid_mode_order", "program.tensors[0]")
+
+
+def test_level_count_must_match_dimension_count():
+    setup = _CsrSetup()
+    tensors = (
+        TensorDecl(nid(), setup.a, "A", (setup.di, setup.dj), (lvl(DENSE, 0),)),
+        setup.tensors[1],
+    )
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    program = wrap(setup.dimensions, tensors, (setup.a,), (setup.c,), (append,))
+    expect_defect(program, "rank_mismatch", "program.tensors[0]")
+
+
+def test_csr_and_csc_declarations_are_distinct():
+    csc = (lvl(DENSE, 1), lvl(COMPRESSED, 0))
+    csr = csr_levels()
+    assert tuple((level.kind, level.mode) for level in csr) != tuple(
+        (level.kind, level.mode) for level in csc
+    )
 
 
 # ---------------------------------------------------------------- unique IDs
@@ -240,7 +437,7 @@ def test_duplicate_node_id_rejected():
     loop = DenseFor(
         nid(),
         i,
-        DimSize(shared, pair.x, 0),
+        pair.d,
         Block(
             nid(),
             (
@@ -248,7 +445,7 @@ def test_duplicate_node_id_rejected():
                     nid(),
                     pair.y,
                     (IndexValue(shared, i),),
-                    Load(nid(), pair.x, (IndexValue(nid(), i),)),
+                    Load(nid(), pair.x, (IndexValue(shared, i),)),
                 ),
             ),
         ),
@@ -263,7 +460,7 @@ def test_shared_node_object_rejected():
     loop = DenseFor(
         nid(),
         i,
-        DimSize(nid(), pair.x, 0),
+        pair.d,
         Block(
             nid(),
             (
@@ -288,7 +485,7 @@ def test_duplicate_cursor_id_rejected():
         cursor=first.cursor,
         tensor=setup.a,
         level=1,
-        outer_indices=(IndexValue(nid(), i),),
+        parent=DensePosition(nid(), setup.a, 0, root(), IndexValue(nid(), i)),
     )
     j1, j2 = new_index_id(), new_index_id()
     body = Block(
@@ -302,14 +499,9 @@ def test_duplicate_cursor_id_rejected():
             ),
         ),
     )
-    inner = SparseFor(nid(), second, j2, body)
-    outer = SparseFor(nid(), first, j1, Block(nid(), (inner,)))
-    loop = DenseFor(
-        nid(),
-        i,
-        DimSize(nid(), setup.a, 0),
-        Block(nid(), (outer,)),
-    )
+    inner = SparseFor(nid(), second, new_position_id(), j2, body)
+    outer = SparseFor(nid(), first, new_position_id(), j1, Block(nid(), (inner,)))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (outer,)))
     expect_defect(setup.program((loop,)), "duplicate_cursor_id")
 
 
@@ -342,20 +534,31 @@ def test_accumulator_symbol_colliding_with_tensor_rejected():
 def test_duplicate_index_binding_rejected():
     pair = _VecPair()
     i = new_index_id()
-    inner = DenseFor(nid(), i, DimSize(nid(), pair.x, 0), Block(nid(), ()))
-    outer = DenseFor(
-        nid(),
-        i,
-        DimSize(nid(), pair.x, 0),
-        Block(nid(), (inner,)),
-    )
+    inner = DenseFor(nid(), i, pair.d, Block(nid(), ()))
+    outer = DenseFor(nid(), i, pair.d, Block(nid(), (inner,)))
     expect_defect(pair.program((outer, pair.copy_loop())), "duplicate_index_binding")
+
+
+def test_duplicate_position_binding_rejected():
+    setup = _DcsrSetup()
+    position = new_position_id()
+    i1, i2 = new_index_id(), new_index_id()
+    inner = SparseFor(nid(), setup.outer_cursor(), position, i2, Block(nid(), ()))
+    outer = SparseFor(nid(), setup.outer_cursor(), position, i1, Block(nid(), (inner,)))
+    store = Store(nid(), setup.y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    expect_defect(
+        setup.program((outer, store)),
+        "duplicate_position_binding",
+        "program.body.statements[0].body.statements[0]",
+    )
 
 
 def test_redeclared_tensor_symbol_rejected():
     pair = _VecPair()
-    tensors = pair.tensors + (TensorDecl(nid(), pair.x, "x2", (DENSE,)),)
-    program = wrap(tensors, (pair.x,), (pair.y,), (pair.copy_loop(),))
+    tensors = pair.tensors + (
+        TensorDecl(nid(), pair.x, "x2", (pair.d,), (lvl(DENSE, 0),)),
+    )
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (pair.copy_loop(),))
     expect_defect(program, "duplicate_symbol", "program.tensors[2]")
 
 
@@ -379,20 +582,49 @@ def test_cursor_read_after_loop_rejected():
     i = new_index_id()
     j = new_index_id()
     cursor = setup.cursor(setup.a, i)
-    sparse = SparseFor(nid(), cursor, j, Block(nid(), ()))
+    sparse = SparseFor(nid(), cursor, new_position_id(), j, Block(nid(), ()))
     late_read = AppendEntry(
         nid(),
         setup.c,
         (IndexValue(nid(), i), IntConst(nid(), 0)),
         CursorValue(nid(), cursor.cursor, None),
     )
-    loop = DenseFor(
-        nid(),
-        i,
-        DimSize(nid(), setup.a, 0),
-        Block(nid(), (sparse, late_read)),
-    )
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse, late_read)))
     expect_defect(setup.program((loop,)), "unbound_cursor")
+
+
+def test_position_read_after_loop_rejected():
+    setup = _DcsrSetup()
+    position = new_position_id()
+    i, j = new_index_id(), new_index_id()
+    outer = SparseFor(nid(), setup.outer_cursor(), position, i, Block(nid(), ()))
+    late = SparseFor(
+        nid(),
+        setup.inner_cursor(PositionValue(nid(), position)),
+        new_position_id(),
+        j,
+        Block(nid(), ()),
+    )
+    store = Store(nid(), setup.y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    expect_defect(
+        setup.program((outer, late, store)),
+        "unbound_position",
+        "program.body.statements[1].cursor.parent",
+    )
+
+
+def test_never_bound_position_rejected():
+    setup = _DcsrSetup()
+    j = new_index_id()
+    sparse = SparseFor(
+        nid(),
+        setup.inner_cursor(PositionValue(nid(), new_position_id())),
+        new_position_id(),
+        j,
+        Block(nid(), ()),
+    )
+    store = Store(nid(), setup.y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    expect_defect(setup.program((sparse, store)), "unbound_position")
 
 
 def test_accum_value_without_declaration_rejected():
@@ -446,21 +678,31 @@ def test_load_of_undeclared_tensor_rejected():
     expect_defect(pair.program((stmt,)), "undefined_tensor")
 
 
-def test_dim_size_of_undeclared_tensor_rejected():
-    pair = _VecPair()
-    i = new_index_id()
-    loop = DenseFor(
-        nid(),
-        i,
-        DimSize(nid(), new_symbol_id(), 0),
-        Block(nid(), ()),
+def test_dense_position_on_undeclared_tensor_rejected():
+    setup = _CsrSetup()
+    i, j = new_index_id(), new_index_id()
+    decl = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=setup.a,
+        level=1,
+        parent=DensePosition(nid(), new_symbol_id(), 0, root(), IndexValue(nid(), i)),
     )
-    expect_defect(pair.program((loop, pair.copy_loop())), "undefined_tensor")
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse,)))
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    expect_defect(setup.program((loop, append)), "undefined_tensor")
 
 
 def test_undeclared_input_listing_rejected():
     pair = _VecPair()
     program = wrap(
+        pair.dimensions,
         pair.tensors,
         (pair.x, new_symbol_id()),
         (pair.y,),
@@ -469,7 +711,7 @@ def test_undeclared_input_listing_rejected():
     expect_defect(program, "undefined_tensor", "program.inputs[1]")
 
 
-def test_cursor_outer_index_using_own_coordinate_rejected():
+def test_cursor_parent_using_own_coordinate_rejected():
     setup = _CsrSetup()
     j = new_index_id()
     decl = SparseCursorDecl(
@@ -477,11 +719,12 @@ def test_cursor_outer_index_using_own_coordinate_rejected():
         cursor=new_cursor_id(),
         tensor=setup.a,
         level=1,
-        outer_indices=(IndexValue(nid(), j),),
+        parent=DensePosition(nid(), setup.a, 0, root(), IndexValue(nid(), j)),
     )
     sparse = SparseFor(
         nid(),
         decl,
+        new_position_id(),
         j,
         Block(
             nid(),
@@ -507,7 +750,7 @@ def test_load_from_compressed_tensor_rejected():
     loop = DenseFor(
         nid(),
         i,
-        DimSize(nid(), setup.a, 0),
+        setup.di,
         Block(
             nid(),
             (
@@ -545,10 +788,10 @@ def test_cursor_on_dense_level_rejected():
         cursor=new_cursor_id(),
         tensor=setup.a,
         level=0,
-        outer_indices=(),
+        parent=root(),
     )
     j = new_index_id()
-    sparse = SparseFor(nid(), decl, j, Block(nid(), ()))
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
     append = AppendEntry(
         nid(),
         setup.c,
@@ -566,14 +809,14 @@ def test_cursor_level_out_of_range_rejected():
         cursor=new_cursor_id(),
         tensor=setup.a,
         level=2,
-        outer_indices=(IndexValue(nid(), i), IntConst(nid(), 0)),
+        parent=root(),
     )
     j = new_index_id()
     loop = DenseFor(
         nid(),
         i,
-        DimSize(nid(), setup.a, 0),
-        Block(nid(), (SparseFor(nid(), decl, j, Block(nid(), ())),)),
+        setup.di,
+        Block(nid(), (SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ())),)),
     )
     append = AppendEntry(
         nid(),
@@ -584,89 +827,79 @@ def test_cursor_level_out_of_range_rejected():
     expect_defect(setup.program((loop, append)), "rank_mismatch")
 
 
-def test_cursor_outer_arity_mismatch_rejected():
+def test_dense_position_on_compressed_level_rejected():
+    setup = _DcsrSetup()
+    i, j = new_index_id(), new_index_id()
+    decl = setup.inner_cursor(
+        DensePosition(nid(), setup.a, 0, root(), IndexValue(nid(), i))
+    )
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    outer = SparseFor(
+        nid(), setup.outer_cursor(), new_position_id(), i, Block(nid(), (sparse,))
+    )
+    store = Store(nid(), setup.y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    expect_defect(setup.program((outer, store)), "layout_mismatch")
+
+
+def test_dense_position_level_out_of_range_rejected():
     setup = _CsrSetup()
+    i, j = new_index_id(), new_index_id()
     decl = SparseCursorDecl(
         node_id=nid(),
         cursor=new_cursor_id(),
         tensor=setup.a,
         level=1,
-        outer_indices=(),
+        parent=DensePosition(nid(), setup.a, 5, root(), IndexValue(nid(), i)),
     )
-    j = new_index_id()
-    sparse = SparseFor(nid(), decl, j, Block(nid(), ()))
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse,)))
     append = AppendEntry(
         nid(),
         setup.c,
         (IntConst(nid(), 0), IntConst(nid(), 0)),
         FloatConst(nid(), 1.0),
     )
-    expect_defect(setup.program((sparse, append)), "rank_mismatch")
-
-
-@pytest.mark.parametrize(
-    ("levels", "cursor_level", "outer_indices"),
-    (
-        ((COMPRESSED, DENSE), 0, ()),
-        ((COMPRESSED, COMPRESSED), 1, (IntConst(nid(), 0),)),
-        (
-            (DENSE, COMPRESSED, COMPRESSED),
-            2,
-            (IntConst(nid(), 0), IntConst(nid(), 0)),
-        ),
-    ),
-)
-def test_cursor_hierarchies_without_parent_positions_rejected(
-    levels, cursor_level, outer_indices
-):
-    x, y = new_symbol_id(), new_symbol_id()
-    cursor = SparseCursorDecl(nid(), new_cursor_id(), x, cursor_level, outer_indices)
-    sparse = SparseFor(nid(), cursor, new_index_id(), Block(nid(), ()))
-    store = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
-    program = wrap(
-        (
-            TensorDecl(nid(), x, "x", levels),
-            TensorDecl(nid(), y, "y", (DENSE,)),
-        ),
-        (x,),
-        (y,),
-        (sparse, store),
-    )
-    expect_defect(program, "unsupported_sparse_hierarchy")
+    expect_defect(setup.program((loop, append)), "rank_mismatch")
 
 
 def test_dense_prefix_compressed_leaf_cursor_is_representable():
+    d1, d2, d3 = new_dimension_id(), new_dimension_id(), new_dimension_id()
+    dy = new_dimension_id()
     x, y = new_symbol_id(), new_symbol_id()
     i, j, k = new_index_id(), new_index_id(), new_index_id()
+    level0 = DensePosition(nid(), x, 0, root(), IndexValue(nid(), i))
+    level1 = DensePosition(nid(), x, 1, level0, IndexValue(nid(), j))
     cursor = SparseCursorDecl(
         nid(),
         new_cursor_id(),
         x,
         2,
-        (IndexValue(nid(), i), IndexValue(nid(), j)),
+        level1,
     )
-    sparse = SparseFor(nid(), cursor, k, Block(nid(), ()))
+    sparse = SparseFor(nid(), cursor, new_position_id(), k, Block(nid(), ()))
     loops = DenseFor(
         nid(),
         i,
-        DimSize(nid(), x, 0),
-        Block(
-            nid(),
-            (
-                DenseFor(
-                    nid(),
-                    j,
-                    DimSize(nid(), x, 1),
-                    Block(nid(), (sparse,)),
-                ),
-            ),
-        ),
+        d1,
+        Block(nid(), (DenseFor(nid(), j, d2, Block(nid(), (sparse,))),)),
     )
     store = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
     program = wrap(
         (
-            TensorDecl(nid(), x, "x", (DENSE, DENSE, COMPRESSED)),
-            TensorDecl(nid(), y, "y", (DENSE,)),
+            DimensionDecl(nid(), d1, "i"),
+            DimensionDecl(nid(), d2, "j"),
+            DimensionDecl(nid(), d3, "k"),
+            DimensionDecl(nid(), dy, "m"),
+        ),
+        (
+            TensorDecl(
+                nid(),
+                x,
+                "x",
+                (d1, d2, d3),
+                (lvl(DENSE, 0), lvl(DENSE, 1), lvl(COMPRESSED, 2)),
+            ),
+            TensorDecl(nid(), y, "y", (dy,), (lvl(DENSE, 0),)),
         ),
         (x,),
         (y,),
@@ -719,21 +952,285 @@ def test_store_arity_mismatch_rejected():
     expect_defect(pair.program((stmt,)), "rank_mismatch")
 
 
-def test_dim_size_out_of_range_rejected():
-    pair = _VecPair()
+# ---------------------------------------------------- parent-position linkage
+
+
+def test_leaf_cursor_with_root_parent_rejected():
+    setup = _CsrSetup()
+    j = new_index_id()
+    decl = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=setup.a,
+        level=1,
+        parent=root(),
+    )
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    expect_defect(
+        setup.program((sparse, append)),
+        "parent_position_mismatch",
+        "program.body.statements[0].cursor.parent",
+    )
+
+
+def test_level_zero_cursor_with_non_root_parent_rejected():
+    setup = _DcsrSetup()
+    i1, i2 = new_index_id(), new_index_id()
+    position = new_position_id()
+    inner = SparseFor(
+        nid(),
+        SparseCursorDecl(
+            node_id=nid(),
+            cursor=new_cursor_id(),
+            tensor=setup.a,
+            level=0,
+            parent=PositionValue(nid(), position),
+        ),
+        new_position_id(),
+        i2,
+        Block(nid(), ()),
+    )
+    outer = SparseFor(nid(), setup.outer_cursor(), position, i1, Block(nid(), (inner,)))
+    store = Store(nid(), setup.y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    expect_defect(setup.program((outer, store)), "parent_position_mismatch")
+
+
+def test_coordinate_typed_cursor_parent_rejected():
+    setup = _CsrSetup()
+    i, j = new_index_id(), new_index_id()
+    decl = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=setup.a,
+        level=1,
+        parent=IndexValue(nid(), i),
+    )
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse,)))
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    expect_defect(setup.program((loop, append)), "parent_position_mismatch")
+
+
+def test_wrong_tensor_parent_position_rejected():
+    di, dj = new_dimension_id(), new_dimension_id()
+    a, b, y = new_symbol_id(), new_symbol_id(), new_symbol_id()
+    dcsr = lambda: (lvl(COMPRESSED, 0), lvl(COMPRESSED, 1))  # noqa: E731
+    i, j = new_index_id(), new_index_id()
+    a_position = new_position_id()
+    outer = SparseFor(
+        nid(),
+        SparseCursorDecl(nid(), new_cursor_id(), a, 0, root()),
+        a_position,
+        i,
+        Block(
+            nid(),
+            (
+                SparseFor(
+                    nid(),
+                    SparseCursorDecl(
+                        nid(),
+                        new_cursor_id(),
+                        b,
+                        1,
+                        PositionValue(nid(), a_position),
+                    ),
+                    new_position_id(),
+                    j,
+                    Block(nid(), ()),
+                ),
+            ),
+        ),
+    )
+    store = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    program = wrap(
+        (DimensionDecl(nid(), di, "i"), DimensionDecl(nid(), dj, "j")),
+        (
+            TensorDecl(nid(), a, "A", (di, dj), dcsr()),
+            TensorDecl(nid(), b, "B", (di, dj), dcsr()),
+            TensorDecl(nid(), y, "y", (di,), (lvl(DENSE, 0),)),
+        ),
+        (a, b),
+        (y,),
+        (outer, store),
+    )
+    expect_defect(program, "parent_position_mismatch")
+
+
+def test_grandparent_position_rejected_for_leaf_descent():
+    dims = tuple(new_dimension_id() for _ in range(3))
+    a, y = new_symbol_id(), new_symbol_id()
+    i, j, k = new_index_id(), new_index_id(), new_index_id()
+    position_i = new_position_id()
+    leaf = SparseFor(
+        nid(),
+        SparseCursorDecl(
+            nid(), new_cursor_id(), a, 2, PositionValue(nid(), position_i)
+        ),
+        new_position_id(),
+        k,
+        Block(nid(), ()),
+    )
+    middle = SparseFor(
+        nid(),
+        SparseCursorDecl(
+            nid(), new_cursor_id(), a, 1, PositionValue(nid(), position_i)
+        ),
+        new_position_id(),
+        j,
+        Block(nid(), (leaf,)),
+    )
+    outer = SparseFor(
+        nid(),
+        SparseCursorDecl(nid(), new_cursor_id(), a, 0, root()),
+        position_i,
+        i,
+        Block(nid(), (middle,)),
+    )
+    store = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    program = wrap(
+        tuple(
+            DimensionDecl(nid(), dim, name) for dim, name in zip(dims, ("i", "j", "k"))
+        ),
+        (
+            TensorDecl(
+                nid(),
+                a,
+                "A",
+                dims,
+                (lvl(COMPRESSED, 0), lvl(COMPRESSED, 1), lvl(COMPRESSED, 2)),
+            ),
+            TensorDecl(nid(), y, "y", (dims[0],), (lvl(DENSE, 0),)),
+        ),
+        (a,),
+        (y,),
+        (outer, store),
+    )
+    expect_defect(program, "parent_position_mismatch")
+
+
+def test_dense_position_parent_linkage_is_checked():
+    d1, d2, d3 = new_dimension_id(), new_dimension_id(), new_dimension_id()
+    x, y = new_symbol_id(), new_symbol_id()
+    i, j, k = new_index_id(), new_index_id(), new_index_id()
+    skipped_parent = DensePosition(nid(), x, 1, root(), IndexValue(nid(), j))
+    cursor = SparseCursorDecl(nid(), new_cursor_id(), x, 2, skipped_parent)
+    sparse = SparseFor(nid(), cursor, new_position_id(), k, Block(nid(), ()))
+    loops = DenseFor(
+        nid(),
+        i,
+        d1,
+        Block(nid(), (DenseFor(nid(), j, d2, Block(nid(), (sparse,))),)),
+    )
+    store = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    program = wrap(
+        (
+            DimensionDecl(nid(), d1, "i"),
+            DimensionDecl(nid(), d2, "j"),
+            DimensionDecl(nid(), d3, "k"),
+        ),
+        (
+            TensorDecl(
+                nid(),
+                x,
+                "x",
+                (d1, d2, d3),
+                (lvl(DENSE, 0), lvl(DENSE, 1), lvl(COMPRESSED, 2)),
+            ),
+            TensorDecl(nid(), y, "y", (d1,), (lvl(DENSE, 0),)),
+        ),
+        (x,),
+        (y,),
+        (loops, store),
+    )
+    expect_defect(program, "parent_position_mismatch")
+
+
+def test_position_value_in_coordinate_slot_rejected():
+    setup = _DcsrSetup()
     i = new_index_id()
-    loop = DenseFor(nid(), i, DimSize(nid(), pair.x, 1), Block(nid(), ()))
-    expect_defect(pair.program((loop, pair.copy_loop())), "rank_mismatch")
+    position = new_position_id()
+    body = Block(
+        nid(),
+        (
+            Store(
+                nid(),
+                setup.y,
+                (PositionValue(nid(), position),),
+                FloatConst(nid(), 1.0),
+            ),
+        ),
+    )
+    outer = SparseFor(nid(), setup.outer_cursor(), position, i, body)
+    expect_defect(setup.program((outer,)), "type_mismatch")
+
+
+def test_root_position_in_value_slot_rejected():
+    pair = _VecPair()
+    accumulator = new_symbol_id()
+    stmts = (
+        DeclAccum(nid(), accumulator, ReduceOp.ADD, FloatConst(nid(), 0.0)),
+        Accumulate(nid(), accumulator, root()),
+        pair.copy_loop(),
+    )
+    expect_defect(pair.program(stmts), "type_mismatch")
+
+
+def test_forged_position_id_rejected():
+    setup = _DcsrSetup()
+    i = new_index_id()
+    outer = SparseFor(nid(), setup.outer_cursor(), "forged", i, Block(nid(), ()))
+    store = Store(nid(), setup.y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    expect_defect(setup.program((outer, store)), "invalid_position_id")
+
+
+def test_missing_position_id_value_rejected():
+    setup = _DcsrSetup()
+    i = new_index_id()
+    position = new_position_id()
+    object.__delattr__(position, "value")
+    outer = SparseFor(nid(), setup.outer_cursor(), position, i, Block(nid(), ()))
+    store = Store(nid(), setup.y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    expect_defect(setup.program((outer, store)), "invalid_position_id")
+
+
+# ---------------------------------------------------------- value ownership
+
+
+def test_non_leaf_cursor_value_rejected():
+    setup = _DcsrSetup()
+    i = new_index_id()
+    cursor = setup.outer_cursor()
+    body = Block(
+        nid(),
+        (
+            Store(
+                nid(),
+                setup.y,
+                (IndexValue(nid(), i),),
+                CursorValue(nid(), cursor.cursor, None),
+            ),
+        ),
+    )
+    outer = SparseFor(nid(), cursor, new_position_id(), i, body)
+    expect_defect(setup.program((outer,)), "non_leaf_value")
+
+
+def test_leaf_cursor_value_is_accepted():
+    verify_program(build_dcsr_spmv_program().program)
 
 
 # ------------------------------------------------------------------- typing
-
-
-def test_value_typed_extent_rejected():
-    pair = _VecPair()
-    i = new_index_id()
-    loop = DenseFor(nid(), i, FloatConst(nid(), 3.0), Block(nid(), ()))
-    expect_defect(pair.program((loop, pair.copy_loop())), "type_mismatch")
 
 
 def test_value_typed_store_index_rejected():
@@ -774,6 +1271,26 @@ def test_coordinate_typed_binary_operand_rejected():
     expect_defect(pair.program((stmt,)), "type_mismatch")
 
 
+def test_value_typed_dense_position_coordinate_rejected():
+    setup = _CsrSetup()
+    j = new_index_id()
+    decl = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=setup.a,
+        level=1,
+        parent=DensePosition(nid(), setup.a, 0, root(), FloatConst(nid(), 0.0)),
+    )
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    expect_defect(setup.program((sparse, append)), "type_mismatch")
+
+
 def test_coordinate_typed_union_default_rejected():
     setup = _CsrSetup(second_input=True)
     i = new_index_id()
@@ -802,8 +1319,134 @@ def test_coordinate_typed_union_default_rejected():
             ),
         ),
     )
-    loop = DenseFor(nid(), i, DimSize(nid(), setup.a, 0), Block(nid(), (merge,)))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (merge,)))
     expect_defect(setup.program((loop,)), "type_mismatch")
+
+
+# ------------------------------------------------------------------- domains
+
+
+def test_load_index_from_wrong_dimension_rejected():
+    setup = _CsrSetup()
+    vec = new_symbol_id()
+    tensors = setup.tensors + (
+        TensorDecl(nid(), vec, "x", (setup.dj,), (lvl(DENSE, 0),)),
+    )
+    i = new_index_id()
+    loop = DenseFor(
+        nid(),
+        i,
+        setup.di,
+        Block(
+            nid(),
+            (
+                AppendEntry(
+                    nid(),
+                    setup.c,
+                    (IndexValue(nid(), i), IntConst(nid(), 0)),
+                    Load(nid(), vec, (IndexValue(nid(), i),)),
+                ),
+            ),
+        ),
+    )
+    program = wrap(
+        setup.dimensions,
+        tensors,
+        setup.inputs + (vec,),
+        (setup.c,),
+        (loop,),
+    )
+    defect = expect_defect(program, "domain_mismatch")
+    assert "'i'" in defect.message and "'j'" in defect.message
+
+
+def test_store_index_from_wrong_dimension_rejected():
+    setup = _CsrSetup()
+    y = new_symbol_id()
+    tensors = (
+        setup.tensors[0],
+        TensorDecl(nid(), y, "y", (setup.di,), (lvl(DENSE, 0),)),
+    )
+    i, j = new_index_id(), new_index_id()
+    cursor = setup.cursor(setup.a, i)
+    sparse = SparseFor(
+        nid(),
+        cursor,
+        new_position_id(),
+        j,
+        Block(
+            nid(),
+            (
+                Store(
+                    nid(),
+                    y,
+                    (IndexValue(nid(), j),),
+                    CursorValue(nid(), cursor.cursor, None),
+                ),
+            ),
+        ),
+    )
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse,)))
+    program = wrap(setup.dimensions, tensors, setup.inputs, (y,), (loop,))
+    expect_defect(program, "domain_mismatch")
+
+
+def test_swapped_append_coordinates_rejected():
+    setup = _CsrSetup()
+    i, j = new_index_id(), new_index_id()
+    cursor = setup.cursor(setup.a, i)
+    sparse = SparseFor(
+        nid(),
+        cursor,
+        new_position_id(),
+        j,
+        Block(
+            nid(),
+            (
+                AppendEntry(
+                    nid(),
+                    setup.c,
+                    (IndexValue(nid(), j), IndexValue(nid(), i)),
+                    CursorValue(nid(), cursor.cursor, None),
+                ),
+            ),
+        ),
+    )
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse,)))
+    expect_defect(setup.program((loop,)), "domain_mismatch")
+
+
+def test_dense_position_coordinate_from_wrong_dimension_rejected():
+    setup = _CsrSetup()
+    j = new_index_id()
+    outer_j = new_index_id()
+    decl = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=setup.a,
+        level=1,
+        parent=DensePosition(nid(), setup.a, 0, root(), IndexValue(nid(), outer_j)),
+    )
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    loop = DenseFor(nid(), outer_j, setup.dj, Block(nid(), (sparse,)))
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    expect_defect(setup.program((loop, append)), "domain_mismatch")
+
+
+def test_domain_free_constant_coordinates_are_accepted():
+    setup = _CsrSetup()
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    verify_program(setup.program((append,)))
 
 
 # ------------------------------------------------------- reduction identity
@@ -861,6 +1504,57 @@ def test_mul_reduction_with_its_identity_verifies():
     verify_program(pair.program(stmts))
 
 
+# --------------------------------------------------------------- StoreReduce
+
+
+def test_store_reduce_verifies_on_dense_output():
+    pair = _VecPair()
+    stmt = StoreReduce(
+        nid(),
+        pair.y,
+        (IntConst(nid(), 0),),
+        ReduceOp.ADD,
+        FloatConst(nid(), 2.0),
+    )
+    verify_program(pair.program((stmt,)))
+
+
+def test_store_reduce_forged_op_rejected():
+    pair = _VecPair()
+    stmt = StoreReduce(
+        nid(),
+        pair.y,
+        (IntConst(nid(), 0),),
+        "add",
+        FloatConst(nid(), 2.0),
+    )
+    expect_defect(pair.program((stmt,)), "malformed_state")
+
+
+def test_store_reduce_to_input_rejected():
+    pair = _VecPair()
+    stmt = StoreReduce(
+        nid(),
+        pair.x,
+        (IntConst(nid(), 0),),
+        ReduceOp.ADD,
+        FloatConst(nid(), 2.0),
+    )
+    expect_defect(pair.program((stmt, pair.copy_loop())), "output_scope")
+
+
+def test_store_reduce_to_compressed_output_rejected():
+    setup = _CsrSetup()
+    stmt = StoreReduce(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        ReduceOp.ADD,
+        FloatConst(nid(), 2.0),
+    )
+    expect_defect(setup.program((stmt,)), "layout_mismatch")
+
+
 # ------------------------------------------------------------- output scope
 
 
@@ -911,15 +1605,36 @@ def test_cursor_over_output_rejected():
         cursor=new_cursor_id(),
         tensor=setup.c,
         level=1,
-        outer_indices=(IndexValue(nid(), i),),
+        parent=DensePosition(nid(), setup.c, 0, root(), IndexValue(nid(), i)),
     )
     j = new_index_id()
     loop = DenseFor(
         nid(),
         i,
-        DimSize(nid(), setup.a, 0),
-        Block(nid(), (SparseFor(nid(), decl, j, Block(nid(), ())),)),
+        setup.di,
+        Block(nid(), (SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ())),)),
     )
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    expect_defect(setup.program((loop, append)), "output_read")
+
+
+def test_dense_position_on_output_rejected():
+    setup = _CsrSetup()
+    i, j = new_index_id(), new_index_id()
+    decl = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=setup.a,
+        level=1,
+        parent=DensePosition(nid(), setup.c, 0, root(), IndexValue(nid(), i)),
+    )
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse,)))
     append = AppendEntry(
         nid(),
         setup.c,
@@ -931,26 +1646,31 @@ def test_cursor_over_output_rejected():
 
 def test_unwritten_output_rejected():
     pair = _VecPair()
-    program = wrap(pair.tensors, (pair.x,), (pair.y,), ())
+    program = wrap(pair.dimensions, pair.tensors, (pair.x,), (pair.y,), ())
     expect_defect(program, "unwritten_output", "program.outputs")
 
 
 def test_roleless_tensor_rejected():
     pair = _VecPair()
-    tensors = pair.tensors + (TensorDecl(nid(), new_symbol_id(), "orphan", (DENSE,)),)
-    program = wrap(tensors, (pair.x,), (pair.y,), (pair.copy_loop(),))
+    tensors = pair.tensors + (
+        TensorDecl(nid(), new_symbol_id(), "orphan", (pair.d,), (lvl(DENSE, 0),)),
+    )
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (pair.copy_loop(),))
     expect_defect(program, "output_scope", "program.tensors")
 
 
 def test_program_without_outputs_rejected():
     pair = _VecPair()
-    program = wrap(pair.tensors, (pair.x, pair.y), (), (pair.copy_loop(),))
+    program = wrap(
+        pair.dimensions, pair.tensors, (pair.x, pair.y), (), (pair.copy_loop(),)
+    )
     expect_defect(program, "output_scope", "program.outputs")
 
 
 def test_tensor_in_both_roles_rejected():
     pair = _VecPair()
     program = wrap(
+        pair.dimensions,
         pair.tensors,
         (pair.x,),
         (pair.x, pair.y),
@@ -983,7 +1703,7 @@ def _merge_program(setup, mode, cursors, body_value):
             ),
         ),
     )
-    loop = DenseFor(nid(), i, DimSize(nid(), setup.a, 0), Block(nid(), (merge,)))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (merge,)))
     return setup.program((loop,))
 
 
@@ -1048,6 +1768,7 @@ def test_sparse_for_cursor_read_with_default_rejected():
     sparse = SparseFor(
         nid(),
         decl,
+        new_position_id(),
         j,
         Block(
             nid(),
@@ -1061,7 +1782,7 @@ def test_sparse_for_cursor_read_with_default_rejected():
             ),
         ),
     )
-    loop = DenseFor(nid(), i, DimSize(nid(), setup.a, 0), Block(nid(), (sparse,)))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse,)))
     expect_defect(setup.program((loop,)), "dead_default")
 
 
@@ -1083,6 +1804,100 @@ def test_union_default_reading_a_cursor_rejected():
     expect_defect(program, "default_contains_cursor")
 
 
+def test_merged_cursors_from_different_dimensions_rejected():
+    setup = _CsrSetup()
+    transposed = new_symbol_id()
+    tensors = setup.tensors + (
+        TensorDecl(
+            nid(),
+            transposed,
+            "B",
+            (setup.di, setup.dj),
+            (lvl(DENSE, 1), lvl(COMPRESSED, 0)),
+        ),
+    )
+    i, jj, j = new_index_id(), new_index_id(), new_index_id()
+    left = setup.cursor(setup.a, i)
+    right = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=transposed,
+        level=1,
+        parent=DensePosition(nid(), transposed, 0, root(), IndexValue(nid(), jj)),
+    )
+    merge = MergedSparseFor(
+        nid(),
+        MergeMode.INTERSECTION,
+        (left, right),
+        j,
+        Block(
+            nid(),
+            (
+                AppendEntry(
+                    nid(),
+                    setup.c,
+                    (IndexValue(nid(), i), IndexValue(nid(), j)),
+                    BinaryExpr(
+                        nid(),
+                        BinaryOp.MUL,
+                        CursorValue(nid(), left.cursor, None),
+                        CursorValue(nid(), right.cursor, None),
+                    ),
+                ),
+            ),
+        ),
+    )
+    inner = DenseFor(nid(), jj, setup.dj, Block(nid(), (merge,)))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (inner,)))
+    program = wrap(
+        setup.dimensions,
+        tensors,
+        setup.inputs + (transposed,),
+        (setup.c,),
+        (loop,),
+    )
+    defect = expect_defect(
+        program,
+        "merge_domain_mismatch",
+        "program.body.statements[0].body.statements[0].body.statements[0]",
+    )
+    assert "'i'" in defect.message and "'j'" in defect.message
+
+
+def test_merged_non_leaf_cursors_rejected():
+    di, dj = new_dimension_id(), new_dimension_id()
+    a, b, y = new_symbol_id(), new_symbol_id(), new_symbol_id()
+    dcsr = ((COMPRESSED, 0), (COMPRESSED, 1))
+    i = new_index_id()
+    merge = MergedSparseFor(
+        nid(),
+        MergeMode.UNION,
+        (
+            SparseCursorDecl(nid(), new_cursor_id(), a, 0, root()),
+            SparseCursorDecl(nid(), new_cursor_id(), b, 0, root()),
+        ),
+        i,
+        Block(nid(), ()),
+    )
+    store = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 0.0))
+    program = wrap(
+        (DimensionDecl(nid(), di, "i"), DimensionDecl(nid(), dj, "j")),
+        (
+            TensorDecl(nid(), a, "A", (di, dj), tuple(lvl(k, m) for k, m in dcsr)),
+            TensorDecl(nid(), b, "B", (di, dj), tuple(lvl(k, m) for k, m in dcsr)),
+            TensorDecl(nid(), y, "y", (di,), (lvl(DENSE, 0),)),
+        ),
+        (a, b),
+        (y,),
+        (merge, store),
+    )
+    expect_defect(
+        program,
+        "unsupported_sparse_hierarchy",
+        "program.body.statements[0].cursors[0]",
+    )
+
+
 # ------------------------------------- cycles, malformed state, and depth
 
 
@@ -1090,7 +1905,13 @@ def test_forged_cyclic_block_rejected():
     pair = _VecPair()
     block = Block(nid(), ())
     object.__setattr__(block, "statements", (block,))
-    program = wrap(pair.tensors, (pair.x,), (pair.y,), (block, pair.copy_loop()))
+    program = wrap(
+        pair.dimensions,
+        pair.tensors,
+        (pair.x,),
+        (pair.y,),
+        (block, pair.copy_loop()),
+    )
     expect_defect(program, "cyclic_structure")
 
 
@@ -1104,11 +1925,40 @@ def test_forged_cyclic_expression_rejected():
     expect_defect(pair.program((stmt,)), "cyclic_structure")
 
 
+def test_forged_cyclic_dense_position_rejected():
+    setup = _CsrSetup()
+    i, j = new_index_id(), new_index_id()
+    parent = DensePosition(nid(), setup.a, 0, root(), IndexValue(nid(), i))
+    object.__setattr__(parent, "parent", parent)
+    decl = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=setup.a,
+        level=1,
+        parent=parent,
+    )
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    loop = DenseFor(nid(), i, setup.di, Block(nid(), (sparse,)))
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    expect_defect(setup.program((loop, append)), "cyclic_structure")
+
+
 def test_list_valued_block_statements_rejected():
     pair = _VecPair()
     block = Block(nid(), ())
     object.__setattr__(block, "statements", [])
-    program = wrap(pair.tensors, (pair.x,), (pair.y,), (block, pair.copy_loop()))
+    program = wrap(
+        pair.dimensions,
+        pair.tensors,
+        (pair.x,),
+        (pair.y,),
+        (block, pair.copy_loop()),
+    )
     expect_defect(program, "malformed_state")
 
 
@@ -1135,6 +1985,7 @@ def test_unregistered_stmt_subclass_rejected():
 
     pair = _VecPair()
     program = wrap(
+        pair.dimensions,
         pair.tensors,
         (pair.x,),
         (pair.y,),
@@ -1143,11 +1994,24 @@ def test_unregistered_stmt_subclass_rejected():
     expect_defect(program, "unknown_stmt")
 
 
-def test_non_expr_extent_rejected():
-    pair = _VecPair()
-    i = new_index_id()
-    loop = DenseFor(nid(), i, 42, Block(nid(), ()))
-    expect_defect(pair.program((loop, pair.copy_loop())), "unknown_expr")
+def test_non_expr_cursor_parent_rejected():
+    setup = _CsrSetup()
+    j = new_index_id()
+    decl = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=setup.a,
+        level=1,
+        parent=42,
+    )
+    sparse = SparseFor(nid(), decl, new_position_id(), j, Block(nid(), ()))
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 1.0),
+    )
+    expect_defect(setup.program((sparse, append)), "unknown_expr")
 
 
 def test_non_block_body_rejected():
@@ -1156,7 +2020,7 @@ def test_non_block_body_rejected():
     loop = DenseFor(
         nid(),
         i,
-        DimSize(nid(), pair.x, 0),
+        pair.d,
         Store(nid(), pair.y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0)),
     )
     expect_defect(pair.program((loop, pair.copy_loop())), "malformed_state")
@@ -1185,24 +2049,13 @@ def test_int_valued_float_const_rejected():
 
 
 def test_empty_tensor_name_rejected():
-    x, y = new_symbol_id(), new_symbol_id()
+    pair = _VecPair()
     tensors = (
-        TensorDecl(nid(), x, "", (DENSE,)),
-        TensorDecl(nid(), y, "y", (DENSE,)),
+        TensorDecl(nid(), pair.x, "", (pair.d,), (lvl(DENSE, 0),)),
+        pair.tensors[1],
     )
-    stmt = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0))
-    program = wrap(tensors, (x,), (y,), (stmt,))
-    expect_defect(program, "malformed_state", "program.tensors[0]")
-
-
-def test_non_level_kind_level_rejected():
-    x, y = new_symbol_id(), new_symbol_id()
-    tensors = (
-        TensorDecl(nid(), x, "x", ("dense",)),
-        TensorDecl(nid(), y, "y", (DENSE,)),
-    )
-    stmt = Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0))
-    program = wrap(tensors, (x,), (y,), (stmt,))
+    stmt = Store(nid(), pair.y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0))
+    program = wrap(pair.dimensions, tensors, (pair.x,), (pair.y,), (stmt,))
     expect_defect(program, "malformed_state", "program.tensors[0]")
 
 
@@ -1266,13 +2119,14 @@ def test_missing_cursor_id_value_rejected():
     loop = DenseFor(
         nid(),
         row,
-        DimSize(nid(), setup.a, 0),
+        setup.di,
         Block(
             nid(),
             (
                 SparseFor(
                     nid(),
                     cursor,
+                    new_position_id(),
                     new_index_id(),
                     Block(nid(), ()),
                 ),
@@ -1290,7 +2144,7 @@ def test_missing_cursor_id_value_rejected():
 
 
 @pytest.mark.parametrize(
-    "field", ("tensors", "inputs", "outputs", "body", "extent_equalities")
+    "field", ("dimensions", "tensors", "inputs", "outputs", "body")
 )
 def test_missing_program_fields_rejected_at_exact_path(field):
     program = _VecPair().program()
@@ -1305,6 +2159,30 @@ def test_missing_nested_node_field_rejected_at_exact_path():
     object.__delattr__(loop.body, "statements")
     defect = expect_defect(pair.program((loop,)), "malformed_state")
     assert defect.path == "program.body.statements[0].body.statements"
+
+
+def test_missing_cursor_parent_field_rejected_at_exact_path():
+    setup = _CsrSetup()
+    i, j = new_index_id(), new_index_id()
+    cursor = setup.cursor(setup.a, i)
+    object.__delattr__(cursor, "parent")
+    loop = DenseFor(
+        nid(),
+        i,
+        setup.di,
+        Block(
+            nid(),
+            (SparseFor(nid(), cursor, new_position_id(), j, Block(nid(), ())),),
+        ),
+    )
+    append = AppendEntry(
+        nid(),
+        setup.c,
+        (IntConst(nid(), 0), IntConst(nid(), 0)),
+        FloatConst(nid(), 0.0),
+    )
+    defect = expect_defect(setup.program((loop, append)), "malformed_state")
+    assert defect.path.endswith(".cursor.parent")
 
 
 def _nested_value(depth):

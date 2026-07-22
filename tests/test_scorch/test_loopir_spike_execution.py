@@ -1,10 +1,12 @@
 """Execution and differential coverage for the Phase-3.5 LoopIR spike.
 
-The three hand-authored feasibility programs run through the generic schema
-and interpreter over plain-Python containers, and every result is compared
+The hand-authored feasibility programs run through the generic schema and
+interpreter over plain-Python containers, and every result is compared
 against an independent pure-Python dense reference.  The accumulation order
 matches the reference exactly (adding a zero term never changes an IEEE
-partial sum), so all comparisons are exact.
+partial sum), so all comparisons are exact — including the cross-layout
+comparisons, where one logical matrix stored CSR, DCSR, and CSC must produce
+identical SpMV results.
 """
 
 import random
@@ -15,30 +17,50 @@ from scorch.compiler.loopir_spike import interp as loopir_interp
 from scorch.compiler.identity import new_index_id, new_symbol_id
 from scorch.compiler.loopir_spike.csr import CsrFormatError, CsrMatrix
 from scorch.compiler.loopir_spike.interp import LoopIRInterpreterError, run_program
+from scorch.compiler.loopir_spike.levels import (
+    CompressedLevel,
+    DenseLevel,
+    LevelStorageError,
+    LevelTensorStorage,
+    from_csr,
+)
 from scorch.compiler.loopir_spike.nodes import (
     AppendEntry,
     Block,
+    CursorValue,
     DenseFor,
-    DimSize,
+    DimensionDecl,
     FloatConst,
     IndexValue,
     IntConst,
+    LevelDecl,
     LevelKind,
     LoopProgram,
+    ReduceOp,
+    RootPosition,
     SparseCursorDecl,
     SparseFor,
     Store,
+    StoreReduce,
     TensorDecl,
     new_cursor_id,
+    new_dimension_id,
     new_loop_node_id,
+    new_position_id,
 )
 from scorch.compiler.loopir_spike.programs import (
+    build_csc_spmv_program,
+    build_csf_row_contraction_program,
     build_csr_intersection_multiply_program,
     build_csr_spmv_program,
     build_csr_union_add_program,
+    build_dcsr_spmv_program,
 )
 
 nid = new_loop_node_id
+
+DENSE = LevelKind.DENSE
+COMPRESSED = LevelKind.COMPRESSED
 
 
 def dense_spmv(rows, x):
@@ -66,6 +88,12 @@ def random_dense(rng, n_rows, n_cols, density):
     ]
 
 
+def matrix_storage(dense_rows, n_cols, modes, kinds):
+    return LevelTensorStorage.from_dense(
+        dense_rows, (len(dense_rows), n_cols), modes, kinds
+    )
+
+
 def run_spmv(dense_rows, n_cols, x):
     fixture = build_csr_spmv_program()
     matrix = CsrMatrix.from_dense(dense_rows, n_cols)
@@ -73,6 +101,41 @@ def run_spmv(dense_rows, n_cols, x):
         fixture.program,
         {fixture.matrix: matrix, fixture.vector: x},
         {fixture.result: (matrix.n_rows,)},
+    )
+    return results[fixture.result]
+
+
+def run_dcsr_spmv(dense_rows, n_cols, x):
+    fixture = build_dcsr_spmv_program()
+    storage = matrix_storage(dense_rows, n_cols, (0, 1), (COMPRESSED, COMPRESSED))
+    results = run_program(
+        fixture.program,
+        {fixture.matrix: storage, fixture.vector: x},
+        {fixture.result: (len(dense_rows),)},
+    )
+    return results[fixture.result]
+
+
+def run_csc_spmv(dense_rows, n_cols, x):
+    fixture = build_csc_spmv_program()
+    storage = matrix_storage(dense_rows, n_cols, (1, 0), (DENSE, COMPRESSED))
+    results = run_program(
+        fixture.program,
+        {fixture.matrix: storage, fixture.vector: x},
+        {fixture.result: (len(dense_rows),)},
+    )
+    return results[fixture.result]
+
+
+def run_csf_row_contraction(cube, shape, x):
+    fixture = build_csf_row_contraction_program()
+    storage = LevelTensorStorage.from_dense(
+        cube, shape, (0, 1, 2), (COMPRESSED, COMPRESSED, COMPRESSED)
+    )
+    results = run_program(
+        fixture.program,
+        {fixture.matrix: storage, fixture.vector: x},
+        {fixture.result: (shape[0],)},
     )
     return results[fixture.result]
 
@@ -143,7 +206,7 @@ def test_spmv_randomized_against_dense_reference(seed, shape, density):
 def test_spmv_short_vector_fails_closed():
     fixture = build_csr_spmv_program()
     matrix = CsrMatrix.from_dense([[0.0, 0.0, 5.0]], 3)
-    with pytest.raises(LoopIRInterpreterError, match="extent equality 1 failed"):
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
         run_program(
             fixture.program,
             {fixture.matrix: matrix, fixture.vector: [1.0, 2.0]},
@@ -318,6 +381,226 @@ def test_intersection_randomized_against_dense_reference(seed, shape, densities)
     assert out.to_dense() == dense_intersect_mul(a, b)
 
 
+# ---------------------------------------------- DCSR SpMV (nested descent)
+
+
+def test_dcsr_spmv_small_dense_reference():
+    rows = [[1.0, 0.0, 2.0], [0.0, 0.0, 0.0], [3.0, 4.0, 0.0]]
+    x = [1.0, 2.0, 3.0]
+    assert run_dcsr_spmv(rows, 3, x) == dense_spmv(rows, x)
+
+
+def test_dcsr_spmv_row_positions_differ_from_row_coordinates():
+    # Row 0 is absent, so stored row coordinates (1, 2) live at storage
+    # positions (0, 1).  Confusing the coordinate for the position would
+    # select the wrong (or no) child segment and corrupt both sums.
+    rows = [
+        [0.0, 0.0, 0.0],
+        [5.0, 6.0, 0.0],
+        [0.0, 0.0, 7.0],
+    ]
+    x = [1.0, 10.0, 100.0]
+    assert run_dcsr_spmv(rows, 3, x) == [0.0, 65.0, 700.0]
+
+
+def test_dcsr_spmv_all_zero_and_zero_shape():
+    assert run_dcsr_spmv([[0.0, 0.0], [0.0, 0.0]], 2, [1.0, 2.0]) == [0.0, 0.0]
+    assert run_dcsr_spmv([], 3, [1.0, 2.0, 3.0]) == []
+
+
+def test_dcsr_spmv_matches_csr_fixture():
+    rows = [
+        [0.0, 2.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [4.0, 0.0, 0.0, -3.0],
+    ]
+    x = [0.5, -1.5, 2.0, 8.0]
+    assert run_dcsr_spmv(rows, 4, x) == run_spmv(rows, 4, x)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("shape", [(1, 1), (3, 7), (8, 8)])
+@pytest.mark.parametrize("density", [0.0, 0.15, 0.5, 0.9])
+def test_dcsr_spmv_randomized_against_dense_and_csr(seed, shape, density):
+    rng = random.Random(3000 * seed + 10 * shape[0] + shape[1])
+    rows = random_dense(rng, shape[0], shape[1], density)
+    x = [rng.uniform(-4.0, 4.0) for _ in range(shape[1])]
+    expected = dense_spmv(rows, x)
+    assert run_dcsr_spmv(rows, shape[1], x) == expected
+    assert run_spmv(rows, shape[1], x) == expected
+
+
+# --------------------------------------- CSC SpMV (physical/logical split)
+
+
+def test_csc_spmv_small_dense_reference():
+    rows = [[1.0, 0.0, 2.0], [0.0, 0.0, 0.0], [3.0, 4.0, 0.0]]
+    x = [1.0, 2.0, 3.0]
+    assert run_csc_spmv(rows, 3, x) == dense_spmv(rows, x)
+
+
+def test_csc_spmv_is_not_transposed():
+    # A deliberately non-symmetric matrix: reading the compressed level's
+    # row coordinates as columns (the superseded schema's only option)
+    # would compute A^T @ x instead.
+    rows = [
+        [0.0, 9.0],
+        [4.0, 0.0],
+    ]
+    x = [1.0, 10.0]
+    assert run_csc_spmv(rows, 2, x) == [90.0, 4.0]
+    transposed = [[0.0, 4.0], [9.0, 0.0]]
+    assert dense_spmv(transposed, x) == [40.0, 9.0]
+
+
+def test_csc_spmv_zero_shapes():
+    assert run_csc_spmv([], 3, [1.0, 2.0, 3.0]) == []
+    assert run_csc_spmv([[], [], []], 0, []) == [0.0, 0.0, 0.0]
+
+
+def test_csc_spmv_matches_csr_fixture():
+    rows = [
+        [0.0, 2.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [4.0, 0.0, 0.0, -3.0],
+    ]
+    x = [0.5, -1.5, 2.0, 8.0]
+    assert run_csc_spmv(rows, 4, x) == run_spmv(rows, 4, x)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("shape", [(1, 1), (3, 7), (8, 8)])
+@pytest.mark.parametrize("density", [0.0, 0.15, 0.5, 0.9])
+def test_csc_spmv_randomized_against_dense_and_csr(seed, shape, density):
+    rng = random.Random(5000 * seed + 10 * shape[0] + shape[1])
+    rows = random_dense(rng, shape[0], shape[1], density)
+    x = [rng.uniform(-4.0, 4.0) for _ in range(shape[1])]
+    expected = dense_spmv(rows, x)
+    assert run_csc_spmv(rows, shape[1], x) == expected
+    assert run_spmv(rows, shape[1], x) == expected
+
+
+# ------------------------------------ CSF three-level contraction (descent)
+
+
+def dense_csf_reference(cube, shape, x):
+    return [
+        sum(
+            cube[i][j][k] * x[k]
+            for j in range(shape[1])
+            for k in range(shape[2])
+            if cube[i][j][k] != 0.0
+        )
+        for i in range(shape[0])
+    ]
+
+
+def test_csf_row_contraction_small():
+    cube = [
+        [[1.0, 0.0], [0.0, 2.0]],
+        [[0.0, 0.0], [0.0, 0.0]],
+        [[0.0, 3.0], [4.0, 0.0]],
+    ]
+    x = [10.0, 100.0]
+    assert run_csf_row_contraction(cube, (3, 2, 2), x) == [210.0, 0.0, 340.0]
+
+
+def test_csf_fiber_positions_differ_from_coordinates():
+    # Only fibers (0, 1) and (2, 0) are stored, so every stored level-1
+    # segment must be selected by the parent's storage position, and every
+    # stored level-2 segment by the level-1 position — coordinate reuse
+    # would select missing or wrong fibers.
+    cube = [
+        [[0.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 0.0]],
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        [[7.0, 0.0, 11.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+    ]
+    x = [1.0, 10.0, 100.0]
+    assert run_csf_row_contraction(cube, (3, 3, 3), x) == [50.0, 0.0, 1107.0]
+
+
+def test_csf_zero_tensor():
+    cube = [[[0.0], [0.0]], [[0.0], [0.0]]]
+    assert run_csf_row_contraction(cube, (2, 2, 1), [3.0]) == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("shape", [(1, 1, 1), (2, 3, 4), (4, 4, 4)])
+@pytest.mark.parametrize("density", [0.0, 0.2, 0.6])
+def test_csf_randomized_against_dense_reference(seed, shape, density):
+    rng = random.Random(11000 * seed + 100 * shape[0] + 10 * shape[1] + shape[2])
+    cube = [
+        [
+            [
+                rng.uniform(-4.0, 4.0) if rng.random() < density else 0.0
+                for _ in range(shape[2])
+            ]
+            for _ in range(shape[1])
+        ]
+        for _ in range(shape[0])
+    ]
+    x = [rng.uniform(-4.0, 4.0) for _ in range(shape[2])]
+    assert run_csf_row_contraction(cube, shape, x) == dense_csf_reference(
+        cube, shape, x
+    )
+
+
+# ------------------------------------------- rank-1 compressed iteration
+
+
+def test_rank_one_compressed_cursor_executes():
+    d = new_dimension_id()
+    dy = new_dimension_id()
+    x = new_symbol_id()
+    y = new_symbol_id()
+    i = new_index_id()
+    cursor = SparseCursorDecl(
+        node_id=nid(),
+        cursor=new_cursor_id(),
+        tensor=x,
+        level=0,
+        parent=RootPosition(nid()),
+    )
+    program = LoopProgram(
+        nid(),
+        (DimensionDecl(nid(), d, "d"), DimensionDecl(nid(), dy, "m")),
+        (
+            TensorDecl(nid(), x, "x", (d,), (LevelDecl(nid(), COMPRESSED, 0),)),
+            TensorDecl(nid(), y, "y", (dy,), (LevelDecl(nid(), DENSE, 0),)),
+        ),
+        (x,),
+        (y,),
+        Block(
+            nid(),
+            (
+                SparseFor(
+                    nid(),
+                    cursor,
+                    new_position_id(),
+                    i,
+                    Block(
+                        nid(),
+                        (
+                            StoreReduce(
+                                nid(),
+                                y,
+                                (IntConst(nid(), 0),),
+                                ReduceOp.ADD,
+                                CursorValue(nid(), cursor.cursor, None),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    storage = LevelTensorStorage.from_dense(
+        [0.0, 2.0, 3.0, 0.0, 4.0], (5,), (0,), (COMPRESSED,)
+    )
+    results = run_program(program, {x: storage}, {y: (1,)})
+    assert results[y] == [9.0]
+
+
 # ------------------------------------------------------------ CSR container
 
 
@@ -391,6 +674,239 @@ def test_csr_from_dense_ragged_rejected():
 def test_csr_explicit_zero_construction_allowed():
     matrix = CsrMatrix(n_rows=1, n_cols=1, indptr=(0, 1), indices=(0,), values=(0.0,))
     assert matrix.nnz == 1
+
+
+# ------------------------------------------------------- level storage
+
+
+@pytest.mark.parametrize(
+    "kinds",
+    [
+        (DENSE, DENSE),
+        (DENSE, COMPRESSED),
+        (COMPRESSED, DENSE),
+        (COMPRESSED, COMPRESSED),
+    ],
+)
+@pytest.mark.parametrize("modes", [(0, 1), (1, 0)])
+def test_level_storage_round_trips_every_rank2_layout(kinds, modes):
+    rows = [
+        [0.0, 1.5, 0.0, -2.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [2.0, 0.0, 3.0, 0.0],
+    ]
+    storage = LevelTensorStorage.from_dense(rows, (3, 4), modes, kinds)
+    assert storage.to_dense() == rows
+
+
+def test_level_storage_round_trips_zero_shapes():
+    empty_rows = LevelTensorStorage.from_dense(
+        [], (0, 3), (0, 1), (COMPRESSED, COMPRESSED)
+    )
+    assert empty_rows.to_dense() == []
+    empty_cols = LevelTensorStorage.from_dense(
+        [[], []], (2, 0), (0, 1), (DENSE, COMPRESSED)
+    )
+    assert empty_cols.to_dense() == [[], []]
+
+
+def test_level_storage_from_csr_adapter_round_trips():
+    rows = [[0.0, 1.0], [2.0, 0.0], [0.0, 0.0]]
+    matrix = CsrMatrix.from_dense(rows, 2)
+    storage = from_csr(matrix)
+    assert storage.kinds == (DENSE, COMPRESSED)
+    assert storage.modes == (0, 1)
+    assert storage.shape == (3, 2)
+    assert storage.to_dense() == rows
+    direct = LevelTensorStorage.from_dense(rows, (3, 2), (0, 1), (DENSE, COMPRESSED))
+    assert storage == direct
+
+
+def test_from_csr_rejects_non_csr_containers():
+    with pytest.raises(LevelStorageError, match="CsrMatrix"):
+        from_csr([[1.0]])
+
+
+def test_level_storage_from_dense_ragged_rejected():
+    with pytest.raises(LevelStorageError, match="ragged"):
+        LevelTensorStorage.from_dense(
+            [[1.0, 2.0], [3.0]], (2, 2), (0, 1), (DENSE, COMPRESSED)
+        )
+
+
+def test_level_storage_from_dense_non_numeric_rejected():
+    with pytest.raises(LevelStorageError, match="numeric"):
+        LevelTensorStorage.from_dense([["one"]], (1, 1), (0, 1), (DENSE, COMPRESSED))
+
+
+def test_level_storage_from_dense_rejects_coordinate_levels():
+    with pytest.raises(LevelStorageError, match="cannot build"):
+        LevelTensorStorage.from_dense(
+            [[1.0]], (1, 1), (0, 1), (LevelKind.COORDINATE, DENSE)
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 0),
+                levels=(DenseLevel(2), DenseLevel(2)),
+                values=(0.0,) * 4,
+            ),
+            "permutation",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(DenseLevel(3), DenseLevel(2)),
+                values=(0.0,) * 6,
+            ),
+            "does not match",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(
+                    DenseLevel(2),
+                    CompressedLevel((0, 1), (0, 1)),
+                ),
+                values=(0.0, 0.0),
+            ),
+            "segment offsets",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(
+                    DenseLevel(2),
+                    CompressedLevel((1, 1, 1), ()),
+                ),
+                values=(),
+            ),
+            "start at zero",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(
+                    DenseLevel(2),
+                    CompressedLevel((0, 2, 1), (0, 1)),
+                ),
+                values=(1.0, 1.0),
+            ),
+            "nondecreasing",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(
+                    DenseLevel(2),
+                    CompressedLevel((0, 1, 2), (0,)),
+                ),
+                values=(1.0,),
+            ),
+            "terminate",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(
+                    DenseLevel(2),
+                    CompressedLevel((0, 1, 2), (0, 5)),
+                ),
+                values=(1.0, 1.0),
+            ),
+            "outside",
+        ),
+        (
+            dict(
+                shape=(2, 3),
+                modes=(0, 1),
+                levels=(
+                    DenseLevel(2),
+                    CompressedLevel((0, 2, 2), (1, 0)),
+                ),
+                values=(1.0, 1.0),
+            ),
+            "strictly increasing",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(
+                    DenseLevel(2),
+                    CompressedLevel((0, 1, 1), (0,)),
+                ),
+                values=(1.0, 2.0),
+            ),
+            "leaf positions",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(
+                    DenseLevel(2),
+                    CompressedLevel((0, 1, 1), (0,)),
+                ),
+                values=(1,),
+            ),
+            "exact float",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(DenseLevel(2), "compressed"),
+                values=(0.0,) * 4,
+            ),
+            "unsupported storage class",
+        ),
+        (
+            dict(
+                shape=(2, 2),
+                modes=(0, 1),
+                levels=(DenseLevel(2),),
+                values=(0.0,) * 4,
+            ),
+            "length 2",
+        ),
+    ],
+)
+def test_level_storage_non_canonical_construction_rejected(kwargs, match):
+    with pytest.raises(LevelStorageError, match=match):
+        LevelTensorStorage(**kwargs)
+
+
+def test_level_storage_accessor_boundaries():
+    storage = LevelTensorStorage.from_dense(
+        [[1.0, 0.0], [0.0, 2.0]], (2, 2), (0, 1), (DENSE, COMPRESSED)
+    )
+    with pytest.raises(LevelStorageError, match="no stored segments"):
+        storage.segment(0, 0)
+    with pytest.raises(LevelStorageError, match="no level 5"):
+        storage.segment(5, 0)
+    with pytest.raises(LevelStorageError, match="parent position"):
+        storage.segment(1, 7)
+    with pytest.raises(LevelStorageError, match="no stored coordinates"):
+        storage.coordinate_at(0, 0)
+    with pytest.raises(LevelStorageError, match="outside"):
+        storage.coordinate_at(1, 9)
+    with pytest.raises(LevelStorageError, match="leaf position"):
+        storage.leaf_value(9)
+    assert storage.segment(1, 0) == (0, 1)
+    assert storage.coordinate_at(1, 1) == 1
+    assert storage.leaf_value(1) == 2.0
 
 
 # --------------------------------------------------- interpreter contract
@@ -492,6 +1008,74 @@ def test_non_csr_sparse_binding_fails_closed():
         )
 
 
+def test_level_storage_bound_to_csr_declaration_fails_closed():
+    fixture = build_csr_spmv_program()
+    storage = matrix_storage([[1.0]], 1, (0, 1), (DENSE, COMPRESSED))
+    with pytest.raises(LoopIRInterpreterError, match="CsrMatrix"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: storage, fixture.vector: [1.0]},
+            {fixture.result: (1,)},
+        )
+
+
+def test_csr_container_bound_to_dcsr_declaration_fails_closed():
+    fixture = build_dcsr_spmv_program()
+    matrix = CsrMatrix.from_dense([[1.0]], 1)
+    with pytest.raises(LoopIRInterpreterError, match="LevelTensorStorage"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: [1.0]},
+            {fixture.result: (1,)},
+        )
+
+
+def test_mismatched_storage_layout_fails_closed():
+    fixture = build_dcsr_spmv_program()
+    csc_storage = matrix_storage([[1.0]], 1, (1, 0), (DENSE, COMPRESSED))
+    with pytest.raises(LoopIRInterpreterError, match="does not match"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: csc_storage, fixture.vector: [1.0]},
+            {fixture.result: (1,)},
+        )
+
+
+def test_non_csr_sparse_output_layout_fails_closed():
+    di, dj = new_dimension_id(), new_dimension_id()
+    result = new_symbol_id()
+    program = LoopProgram(
+        nid(),
+        (DimensionDecl(nid(), di, "i"), DimensionDecl(nid(), dj, "j")),
+        (
+            TensorDecl(
+                nid(),
+                result,
+                "C",
+                (di, dj),
+                (LevelDecl(nid(), DENSE, 1), LevelDecl(nid(), COMPRESSED, 0)),
+            ),
+        ),
+        (),
+        (result,),
+        Block(
+            nid(),
+            (
+                AppendEntry(
+                    nid(),
+                    result,
+                    (IntConst(nid(), 0), IntConst(nid(), 0)),
+                    FloatConst(nid(), 1.0),
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(
+        LoopIRInterpreterError, match="unsupported sparse output layout"
+    ):
+        run_program(program, {}, {result: (1, 1)})
+
+
 def test_malformed_output_shape_fails_closed():
     fixture = build_csr_spmv_program()
     matrix = CsrMatrix.from_dense([[1.0]], 1)
@@ -519,7 +1103,7 @@ def test_shorter_second_operand_fails_closed():
     fixture = build_csr_union_add_program()
     a = CsrMatrix.from_dense([[1.0], [2.0], [3.0]], 1)
     b = CsrMatrix.from_dense([[1.0], [2.0]], 1)
-    with pytest.raises(LoopIRInterpreterError, match="extent equality 0 failed"):
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
         run_program(
             fixture.program,
             {fixture.lhs: a, fixture.rhs: b},
@@ -531,7 +1115,7 @@ def test_shorter_second_operand_fails_closed():
 def test_spmv_vector_extent_mismatch_is_sparsity_independent(vector):
     fixture = build_csr_spmv_program()
     matrix = CsrMatrix.from_dense([[2.0, 0.0, 0.0]], 3)
-    with pytest.raises(LoopIRInterpreterError, match="extent equality 1 failed"):
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
         run_program(
             fixture.program,
             {fixture.matrix: matrix, fixture.vector: vector},
@@ -542,11 +1126,22 @@ def test_spmv_vector_extent_mismatch_is_sparsity_independent(vector):
 def test_spmv_output_extent_mismatch_rejected_before_execution():
     fixture = build_csr_spmv_program()
     matrix = CsrMatrix.from_dense([[0.0, 0.0, 0.0]], 3)
-    with pytest.raises(LoopIRInterpreterError, match="extent equality 0 failed"):
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
         run_program(
             fixture.program,
             {fixture.matrix: matrix, fixture.vector: [0.0, 0.0, 0.0]},
             {fixture.result: (2,)},
+        )
+
+
+def test_dcsr_storage_extent_mismatch_is_sparsity_independent():
+    fixture = build_dcsr_spmv_program()
+    storage = matrix_storage([[0.0, 0.0, 0.0]], 3, (0, 1), (COMPRESSED, COMPRESSED))
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: storage, fixture.vector: [1.0, 2.0]},
+            {fixture.result: (1,)},
         )
 
 
@@ -567,7 +1162,7 @@ def test_extent_mismatch_rejected_before_any_tensor_materialization(monkeypatch)
         "_materialize_output",
         unexpected_materialization,
     )
-    with pytest.raises(LoopIRInterpreterError, match="extent equality 0 failed"):
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
         run_program(
             fixture.program,
             {fixture.matrix: matrix, fixture.vector: [0.0]},
@@ -605,7 +1200,7 @@ def test_elementwise_extra_rhs_rows_rejected_before_execution():
     fixture = build_csr_union_add_program()
     lhs = CsrMatrix.from_dense([[0.0]], 1)
     rhs = CsrMatrix.from_dense([[0.0], [9.0]], 1)
-    with pytest.raises(LoopIRInterpreterError, match="extent equality 0 failed"):
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
         run_program(
             fixture.program,
             {fixture.lhs: lhs, fixture.rhs: rhs},
@@ -617,7 +1212,7 @@ def test_elementwise_column_mismatch_rejected_with_empty_support():
     fixture = build_csr_intersection_multiply_program()
     lhs = CsrMatrix.from_dense([[0.0, 0.0, 0.0]], 3)
     rhs = CsrMatrix.from_dense([[0.0, 0.0]], 2)
-    with pytest.raises(LoopIRInterpreterError, match="extent equality 1 failed"):
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
         run_program(
             fixture.program,
             {fixture.lhs: lhs, fixture.rhs: rhs},
@@ -629,7 +1224,7 @@ def test_elementwise_output_extent_mismatch_rejected_with_empty_support():
     fixture = build_csr_union_add_program()
     lhs = CsrMatrix.from_dense([], 0)
     rhs = CsrMatrix.from_dense([], 0)
-    with pytest.raises(LoopIRInterpreterError, match="extent equality 1 failed"):
+    with pytest.raises(LoopIRInterpreterError, match="dimension extent mismatch"):
         run_program(
             fixture.program,
             {fixture.lhs: lhs, fixture.rhs: rhs},
@@ -638,6 +1233,7 @@ def test_elementwise_output_extent_mismatch_rejected_with_empty_support():
 
 
 def _append_only_program(coords_list):
+    di, dj = new_dimension_id(), new_dimension_id()
     result = new_symbol_id()
     statements = tuple(
         AppendEntry(
@@ -650,12 +1246,14 @@ def _append_only_program(coords_list):
     )
     program = LoopProgram(
         nid(),
+        (DimensionDecl(nid(), di, "i"), DimensionDecl(nid(), dj, "j")),
         (
             TensorDecl(
                 nid(),
                 result,
                 "C",
-                (LevelKind.DENSE, LevelKind.COMPRESSED),
+                (di, dj),
+                (LevelDecl(nid(), DENSE, 0), LevelDecl(nid(), COMPRESSED, 1)),
             ),
         ),
         (),
@@ -693,13 +1291,15 @@ def test_ordered_appends_assemble_canonical_output():
 
 
 def _store_at_program(index):
+    dx, dy = new_dimension_id(), new_dimension_id()
     x = new_symbol_id()
     y = new_symbol_id()
     program = LoopProgram(
         nid(),
+        (DimensionDecl(nid(), dx, "n"), DimensionDecl(nid(), dy, "m")),
         (
-            TensorDecl(nid(), x, "x", (LevelKind.DENSE,)),
-            TensorDecl(nid(), y, "y", (LevelKind.DENSE,)),
+            TensorDecl(nid(), x, "x", (dx,), (LevelDecl(nid(), DENSE, 0),)),
+            TensorDecl(nid(), y, "y", (dy,), (LevelDecl(nid(), DENSE, 0),)),
         ),
         (x,),
         (y,),
@@ -724,17 +1324,19 @@ def test_store_out_of_bounds_fails_closed():
         run_program(program, {x: [1.0]}, {y: (2,)})
 
 
-def test_negative_extent_fails_closed():
-    x = new_symbol_id()
+def test_unresolved_dimension_extent_fails_closed():
+    dy = new_dimension_id()
+    unresolved = new_dimension_id()
     y = new_symbol_id()
     i = new_index_id()
     program = LoopProgram(
         nid(),
         (
-            TensorDecl(nid(), x, "x", (LevelKind.DENSE,)),
-            TensorDecl(nid(), y, "y", (LevelKind.DENSE,)),
+            DimensionDecl(nid(), dy, "m"),
+            DimensionDecl(nid(), unresolved, "ghost"),
         ),
-        (x,),
+        (TensorDecl(nid(), y, "y", (dy,), (LevelDecl(nid(), DENSE, 0),)),),
+        (),
         (y,),
         Block(
             nid(),
@@ -742,14 +1344,14 @@ def test_negative_extent_fails_closed():
                 DenseFor(
                     nid(),
                     i,
-                    IntConst(nid(), -2),
+                    unresolved,
                     Block(
                         nid(),
                         (
                             Store(
                                 nid(),
                                 y,
-                                (IndexValue(nid(), i),),
+                                (IntConst(nid(), 0),),
                                 FloatConst(nid(), 1.0),
                             ),
                         ),
@@ -758,44 +1360,53 @@ def test_negative_extent_fails_closed():
             ),
         ),
     )
-    with pytest.raises(LoopIRInterpreterError, match="negative dense extent"):
-        run_program(program, {x: [1.0]}, {y: (1,)})
+    with pytest.raises(LoopIRInterpreterError, match="unresolved dimension extent"):
+        run_program(program, {}, {y: (1,)})
 
 
-def test_unsupported_rank_one_compressed_cursor_fails_closed():
-    x = new_symbol_id()
-    y = new_symbol_id()
+def test_wrong_parent_program_is_rejected_before_execution():
+    from scorch.compiler.loopir_spike.verifier import LoopIRVerificationError
+
+    di, dj = new_dimension_id(), new_dimension_id()
+    a, y = new_symbol_id(), new_symbol_id()
     j = new_index_id()
     cursor = SparseCursorDecl(
         node_id=nid(),
         cursor=new_cursor_id(),
-        tensor=x,
-        level=0,
-        outer_indices=(),
+        tensor=a,
+        level=1,
+        parent=RootPosition(nid()),
     )
     program = LoopProgram(
         nid(),
+        (DimensionDecl(nid(), di, "i"), DimensionDecl(nid(), dj, "j")),
         (
-            TensorDecl(nid(), x, "x", (LevelKind.COMPRESSED,)),
-            TensorDecl(nid(), y, "y", (LevelKind.DENSE,)),
+            TensorDecl(
+                nid(),
+                a,
+                "A",
+                (di, dj),
+                (LevelDecl(nid(), DENSE, 0), LevelDecl(nid(), COMPRESSED, 1)),
+            ),
+            TensorDecl(nid(), y, "y", (di,), (LevelDecl(nid(), DENSE, 0),)),
         ),
-        (x,),
+        (a,),
         (y,),
         Block(
             nid(),
             (
-                SparseFor(nid(), cursor, j, Block(nid(), ())),
-                Store(
-                    nid(),
-                    y,
-                    (IntConst(nid(), 0),),
-                    FloatConst(nid(), 1.0),
-                ),
+                SparseFor(nid(), cursor, new_position_id(), j, Block(nid(), ())),
+                Store(nid(), y, (IntConst(nid(), 0),), FloatConst(nid(), 1.0)),
             ),
         ),
     )
-    with pytest.raises(LoopIRInterpreterError, match="unsupported"):
-        run_program(program, {x: [1.0]}, {y: (1,)})
+    with pytest.raises(LoopIRVerificationError) as excinfo:
+        run_program(
+            program,
+            {a: CsrMatrix.from_dense([[1.0]], 1)},
+            {y: (1,)},
+        )
+    assert excinfo.value.defect.code == "parent_position_mismatch"
 
 
 def test_run_program_verifies_first():
@@ -804,6 +1415,7 @@ def test_run_program_verifies_first():
     program, result = _append_only_program([(0, 0)])
     forged = LoopProgram(
         program.node_id,
+        program.dimensions,
         program.tensors,
         program.inputs,
         (),
@@ -813,17 +1425,15 @@ def test_run_program_verifies_first():
         run_program(forged, {}, {})
 
 
-def test_dim_size_of_output_is_usable():
-    x = new_symbol_id()
+def test_output_shape_resolves_loop_dimension():
+    d = new_dimension_id()
     y = new_symbol_id()
     i = new_index_id()
     program = LoopProgram(
         nid(),
-        (
-            TensorDecl(nid(), x, "x", (LevelKind.DENSE,)),
-            TensorDecl(nid(), y, "y", (LevelKind.DENSE,)),
-        ),
-        (x,),
+        (DimensionDecl(nid(), d, "d"),),
+        (TensorDecl(nid(), y, "y", (d,), (LevelDecl(nid(), DENSE, 0),)),),
+        (),
         (y,),
         Block(
             nid(),
@@ -831,7 +1441,7 @@ def test_dim_size_of_output_is_usable():
                 DenseFor(
                     nid(),
                     i,
-                    DimSize(nid(), y, 0),
+                    d,
                     Block(
                         nid(),
                         (
@@ -847,5 +1457,5 @@ def test_dim_size_of_output_is_usable():
             ),
         ),
     )
-    results = run_program(program, {x: [0.0]}, {y: (3,)})
+    results = run_program(program, {}, {y: (3,)})
     assert results[y] == [2.0, 2.0, 2.0]

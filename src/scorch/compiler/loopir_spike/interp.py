@@ -1,16 +1,30 @@
 """Small plain-Python interpreter for the Phase-3.5 LoopIR spike.
 
-This is the narrow CSR test/debug oracle the milestone asks for: it executes
-verified spike programs over plain Python containers (nested float lists for
-dense tensors, :class:`CsrMatrix` for sparse ones) with no Torch, native code,
-or compiler-pipeline involvement.  It is not a general level-storage runtime;
-the corrected Phase-3.5 review requires that redesign before Phase 4.  Merge
-semantics are implemented exactly as documented on :class:`MergedSparseFor`:
-candidate coordinates are the minimum over non-exhausted cursors, aligned
-cursors advance by one position per step, UNION emits every candidate,
-INTERSECTION emits only fully aligned candidates and stops on first exhaustion.
-Everything unexpected fails closed with :class:`LoopIRInterpreterError` rather
-than being coerced.
+This is the milestone's test/debug oracle: it executes verified spike
+programs over plain Python containers with no Torch, native code, or
+compiler-pipeline involvement.  Sparse traversal is defined entirely over
+the format-neutral level interface in :mod:`levels` — the execution core
+reads segments, coordinates, and leaf values from a validated
+:class:`LevelTensorStorage` and never inspects a concrete container.  CSR
+remains exactly one adapter: canonical CSR-declared inputs bind a
+:class:`CsrMatrix` (adapted through :func:`levels.from_csr`) and canonical
+CSR-declared outputs assemble through :class:`levels.CsrOutputBuilder`;
+every other DENSE/COMPRESSED level composition binds a
+:class:`LevelTensorStorage` directly.  All-dense tensors bind nested float
+lists in logical mode order.
+
+Shape compatibility is the logical dimension model: every bound tensor
+contributes the extent of each dimension its modes store, the extents must
+agree across all inputs and outputs before anything is materialized or
+executed, and loops resolve their trip counts from those extents — so
+incompatible shapes fail independently of stored sparsity.
+
+Merge semantics are implemented exactly as documented on
+:class:`MergedSparseFor`: candidate coordinates are the minimum over
+non-exhausted cursors, aligned cursors advance by one position per step,
+UNION emits every candidate, INTERSECTION emits only fully aligned
+candidates and stops on first exhaustion.  Everything unexpected fails
+closed with :class:`LoopIRInterpreterError` rather than being coerced.
 """
 
 from __future__ import annotations
@@ -19,6 +33,12 @@ from typing import Any, Dict, List, Mapping, Tuple, Union
 
 from ..identity import IndexId, SymbolId
 from .csr import CsrMatrix
+from .levels import (
+    CsrOutputBuilder,
+    LevelStorageError,
+    LevelTensorStorage,
+    from_csr,
+)
 from .nodes import (
     Accumulate,
     AccumValue,
@@ -30,7 +50,8 @@ from .nodes import (
     CursorValue,
     DeclAccum,
     DenseFor,
-    DimSize,
+    DensePosition,
+    DimensionId,
     Expr,
     FloatConst,
     IndexValue,
@@ -40,16 +61,21 @@ from .nodes import (
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PositionId,
+    PositionValue,
     ReduceOp,
+    RootPosition,
     SparseCursorDecl,
     SparseFor,
     Stmt,
     Store,
+    StoreReduce,
     TensorDecl,
 )
 from .verifier import verify_program
 
-_CSR_LEVELS = (LevelKind.DENSE, LevelKind.COMPRESSED)
+_CSR_KINDS = (LevelKind.DENSE, LevelKind.COMPRESSED)
+_IDENTITY_MODES = (0, 1)
 
 TensorValue = Union[List[float], List[List[float]], CsrMatrix]
 
@@ -61,10 +87,18 @@ class LoopIRInterpreterError(Exception):
 class _CursorState:
     """Runtime state of one sparse cursor inside its owning loop."""
 
-    __slots__ = ("matrix", "position", "end", "aligned")
+    __slots__ = ("storage", "level", "position", "end", "aligned")
 
-    def __init__(self, matrix: CsrMatrix, start: int, end: int, aligned: bool) -> None:
-        self.matrix = matrix
+    def __init__(
+        self,
+        storage: LevelTensorStorage,
+        level: int,
+        start: int,
+        end: int,
+        aligned: bool,
+    ) -> None:
+        self.storage = storage
+        self.level = level
         self.position = start
         self.end = end
         self.aligned = aligned
@@ -75,53 +109,11 @@ class _CursorState:
 
     @property
     def coordinate(self) -> int:
-        return self.matrix.indices[self.position]
+        return self.storage.coordinate_at(self.level, self.position)
 
     @property
     def value(self) -> float:
-        return self.matrix.values[self.position]
-
-
-class _CsrOutputBuilder:
-    """Order-checked target-neutral assembly of one rank-2 CSR output."""
-
-    def __init__(self, name: str, shape: Tuple[int, ...]) -> None:
-        self.name = name
-        self.n_rows, self.n_cols = shape
-        self.rows: List[int] = []
-        self.columns: List[int] = []
-        self.values: List[float] = []
-
-    def append(self, coords: Tuple[int, ...], value: float) -> None:
-        row, column = coords
-        if not 0 <= row < self.n_rows or not 0 <= column < self.n_cols:
-            raise LoopIRInterpreterError(
-                f"append to {self.name} at {coords} escapes shape "
-                f"({self.n_rows}, {self.n_cols})"
-            )
-        if self.rows and (row, column) <= (self.rows[-1], self.columns[-1]):
-            raise LoopIRInterpreterError(
-                f"appends to {self.name} must be lexicographically increasing; "
-                f"got {coords} after ({self.rows[-1]}, {self.columns[-1]})"
-            )
-        self.rows.append(row)
-        self.columns.append(column)
-        self.values.append(value)
-
-    def finish(self) -> CsrMatrix:
-        indptr: List[int] = [0]
-        position = 0
-        for row in range(self.n_rows):
-            while position < len(self.rows) and self.rows[position] == row:
-                position += 1
-            indptr.append(position)
-        return CsrMatrix(
-            n_rows=self.n_rows,
-            n_cols=self.n_cols,
-            indptr=tuple(indptr),
-            indices=tuple(self.columns),
-            values=tuple(self.values),
-        )
+        return self.storage.leaf_value(self.position)
 
 
 def _dense_shape(rank: int, value: object, trail: str) -> Tuple[int, ...]:
@@ -158,6 +150,12 @@ def _dense_copy(value: object, shape: Tuple[int, ...], trail: str) -> Any:
     ]
 
 
+def _is_canonical_csr(decl: TensorDecl) -> bool:
+    kinds = tuple(level.kind for level in decl.levels)
+    modes = tuple(level.mode for level in decl.levels)
+    return kinds == _CSR_KINDS and modes == _IDENTITY_MODES
+
+
 class _Interpreter:
     def __init__(
         self,
@@ -168,6 +166,9 @@ class _Interpreter:
         self.program = program
         self.decls: Dict[SymbolId, TensorDecl] = {
             decl.symbol: decl for decl in program.tensors
+        }
+        self.dimension_names: Dict[DimensionId, str] = {
+            decl.dimension: decl.name for decl in program.dimensions
         }
         try:
             input_key_snapshot = tuple(inputs)
@@ -222,47 +223,71 @@ class _Interpreter:
                 "output shapes could not be snapshotted"
             ) from error
         self.values: Dict[SymbolId, Any] = {}
+        self.storages: Dict[SymbolId, LevelTensorStorage] = {}
         self.shapes: Dict[SymbolId, Tuple[int, ...]] = {}
         for symbol in program.inputs:
             self._register_input_shape(self.decls[symbol], input_values[symbol])
-        self.builders: Dict[SymbolId, _CsrOutputBuilder] = {}
+        self.builders: Dict[SymbolId, CsrOutputBuilder] = {}
         for symbol in program.outputs:
             self._register_output_shape(
                 self.decls[symbol], registered_output_shapes[symbol]
             )
-        self._check_extent_equalities()
+        self.dim_extents: Dict[DimensionId, Tuple[int, str, int]] = {}
+        self._resolve_dimension_extents()
         for symbol in program.inputs:
             self._materialize_input(self.decls[symbol], input_values[symbol])
         for symbol in program.outputs:
             self._materialize_output(self.decls[symbol])
         self.indices: Dict[IndexId, int] = {}
+        self.positions: Dict[PositionId, int] = {}
         self.accums: Dict[SymbolId, Tuple[ReduceOp, float]] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
 
     def _register_input_shape(self, decl: TensorDecl, value: object) -> None:
-        if all(level is LevelKind.DENSE for level in decl.levels):
+        if all(level.kind is LevelKind.DENSE for level in decl.levels):
             shape = _dense_shape(len(decl.levels), value, f"input {decl.name}")
             self.shapes[decl.symbol] = shape
             return
-        if decl.levels == _CSR_LEVELS:
+        if _is_canonical_csr(decl):
             if type(value) is not CsrMatrix:
                 raise LoopIRInterpreterError(
                     f"input {decl.name} must be bound to a CsrMatrix"
                 )
             self.shapes[decl.symbol] = (value.n_rows, value.n_cols)
             return
-        raise LoopIRInterpreterError(
-            f"unsupported layout {tuple(kind.value for kind in decl.levels)} "
-            f"for input {decl.name}"
-        )
+        if type(value) is not LevelTensorStorage:
+            raise LoopIRInterpreterError(
+                f"input {decl.name} must be bound to a LevelTensorStorage"
+            )
+        declared_kinds = tuple(level.kind for level in decl.levels)
+        declared_modes = tuple(level.mode for level in decl.levels)
+        if value.kinds != declared_kinds or value.modes != declared_modes:
+            raise LoopIRInterpreterError(
+                f"input {decl.name} storage layout "
+                f"({tuple(kind.value for kind in value.kinds)}, "
+                f"modes {value.modes}) does not match its declaration "
+                f"({tuple(kind.value for kind in declared_kinds)}, "
+                f"modes {declared_modes})"
+            )
+        self.shapes[decl.symbol] = value.shape
 
     def _materialize_input(self, decl: TensorDecl, value: object) -> None:
-        if all(level is LevelKind.DENSE for level in decl.levels):
+        if all(level.kind is LevelKind.DENSE for level in decl.levels):
             self.values[decl.symbol] = _dense_copy(
                 value, self.shapes[decl.symbol], f"input {decl.name}"
             )
+        elif _is_canonical_csr(decl):
+            if type(value) is not CsrMatrix:
+                raise LoopIRInterpreterError(
+                    f"input {decl.name} must be bound to a CsrMatrix"
+                )
+            self.storages[decl.symbol] = from_csr(value)
         else:
-            self.values[decl.symbol] = value
+            if type(value) is not LevelTensorStorage:
+                raise LoopIRInterpreterError(
+                    f"input {decl.name} must be bound to a LevelTensorStorage"
+                )
+            self.storages[decl.symbol] = value
 
     def _register_output_shape(self, decl: TensorDecl, shape: object) -> None:
         if (
@@ -275,46 +300,58 @@ class _Interpreter:
                 "of nonnegative ints"
             )
         self.shapes[decl.symbol] = shape
-        if all(level is LevelKind.DENSE for level in decl.levels):
+        if all(level.kind is LevelKind.DENSE for level in decl.levels):
             if len(shape) not in (1, 2):
                 raise LoopIRInterpreterError(
                     f"dense outputs above rank 2 are unsupported ({decl.name})"
                 )
             return
-        if decl.levels == _CSR_LEVELS:
+        if _is_canonical_csr(decl):
             return
         raise LoopIRInterpreterError(
-            f"unsupported layout {tuple(kind.value for kind in decl.levels)} "
-            f"for output {decl.name}"
+            f"unsupported sparse output layout for {decl.name}; only "
+            "canonical CSR outputs are assembled by this spike"
         )
 
     def _materialize_output(self, decl: TensorDecl) -> None:
         shape = self.shapes[decl.symbol]
-        if all(level is LevelKind.DENSE for level in decl.levels):
+        if all(level.kind is LevelKind.DENSE for level in decl.levels):
             if len(shape) == 1:
                 self.values[decl.symbol] = [0.0] * shape[0]
             else:
                 self.values[decl.symbol] = [[0.0] * shape[1] for _ in range(shape[0])]
         else:
-            self.builders[decl.symbol] = _CsrOutputBuilder(decl.name, shape)
+            self.builders[decl.symbol] = CsrOutputBuilder(decl.name, shape)
 
-    def _check_extent_equalities(self) -> None:
-        for position, equality in enumerate(self.program.extent_equalities):
-            observed = [
-                (
-                    self.decls[dimension.tensor].name,
-                    dimension.dim,
-                    self.shapes[dimension.tensor][dimension.dim],
-                )
-                for dimension in equality.dimensions
-            ]
-            if any(extent != observed[0][2] for _, _, extent in observed[1:]):
-                detail = ", ".join(
-                    f"{name}[{dim}]={extent}" for name, dim, extent in observed
-                )
-                raise LoopIRInterpreterError(
-                    f"extent equality {position} failed: {detail}"
-                )
+    def _resolve_dimension_extents(self) -> None:
+        """Bind every dimension's extent; disagreement fails sparsity-free."""
+
+        for decl in self.program.tensors:
+            shape = self.shapes[decl.symbol]
+            for mode, dimension in enumerate(decl.dimensions):
+                extent = shape[mode]
+                known = self.dim_extents.get(dimension)
+                if known is None:
+                    self.dim_extents[dimension] = (extent, decl.name, mode)
+                elif known[0] != extent:
+                    name = self.dimension_names.get(
+                        dimension, f"<dimension {dimension.value}>"
+                    )
+                    raise LoopIRInterpreterError(
+                        f"dimension extent mismatch for {name!r}: "
+                        f"{known[1]}[{known[2]}] is {known[0]} but "
+                        f"{decl.name}[{mode}] is {extent}"
+                    )
+
+    def _dimension_extent(self, dimension: DimensionId) -> int:
+        known = self.dim_extents.get(dimension)
+        if known is None:
+            name = self.dimension_names.get(dimension, f"<dimension {dimension.value}>")
+            raise LoopIRInterpreterError(
+                f"unresolved dimension extent for {name!r}: no bound tensor "
+                "stores this dimension"
+            )
+        return known[0]
 
     def run(self) -> Dict[SymbolId, TensorValue]:
         self._exec_block(self.program.body)
@@ -342,15 +379,27 @@ class _Interpreter:
             )
         return result
 
+    def _eval_position(self, expr: Expr) -> int:
+        result = self._eval(expr)
+        if type(result) is not int:
+            raise LoopIRInterpreterError(
+                f"position expression produced {type(result).__name__}"
+            )
+        return result
+
     def _eval(self, expr: Expr) -> object:
         if type(expr) is IntConst:
             return expr.value
         if type(expr) is FloatConst:
             return expr.value
-        if type(expr) is DimSize:
-            return self.shapes[expr.tensor][expr.dim]
         if type(expr) is IndexValue:
             return self.indices[expr.index]
+        if type(expr) is RootPosition:
+            return 0
+        if type(expr) is PositionValue:
+            return self.positions[expr.position]
+        if type(expr) is DensePosition:
+            return self._eval_dense_position(expr)
         if type(expr) is AccumValue:
             return self.accums[expr.accumulator][1]
         if type(expr) is CursorValue:
@@ -382,25 +431,34 @@ class _Interpreter:
             return lhs * rhs
         raise LoopIRInterpreterError(f"unknown expression {type(expr).__name__}")
 
-    def _segment(self, decl: SparseCursorDecl) -> Tuple[CsrMatrix, int, int]:
-        tensor_decl = self.decls[decl.tensor]
-        if tensor_decl.levels != _CSR_LEVELS or decl.level != 1:
+    def _eval_dense_position(self, expr: DensePosition) -> int:
+        parent = self._eval_position(expr.parent)
+        decl = self.decls[expr.tensor]
+        dimension = decl.dimensions[decl.levels[expr.level].mode]
+        extent = self._dimension_extent(dimension)
+        coord = self._eval_coord(expr.coord)
+        if not 0 <= coord < extent:
             raise LoopIRInterpreterError(
-                f"unsupported cursor layout on {tensor_decl.name}"
+                f"dense-level coordinate {coord} outside [0, {extent}) on "
+                f"{decl.name}"
             )
-        matrix = self.values[decl.tensor]
-        if type(matrix) is not CsrMatrix:
+        return parent * extent + coord
+
+    def _segment(self, decl: SparseCursorDecl) -> Tuple[LevelTensorStorage, int, int]:
+        storage = self.storages.get(decl.tensor)
+        if storage is None:
             raise LoopIRInterpreterError(
-                f"cursor tensor {tensor_decl.name} is not CSR-bound"
+                f"cursor tensor {self.decls[decl.tensor].name} has no level storage"
             )
-        row = self._eval_coord(decl.outer_indices[0])
-        if not 0 <= row < matrix.n_rows:
+        parent = self._eval_position(decl.parent)
+        try:
+            start, end = storage.segment(decl.level, parent)
+        except LevelStorageError as error:
             raise LoopIRInterpreterError(
-                f"cursor row {row} outside [0, {matrix.n_rows}) on "
-                f"{tensor_decl.name}"
-            )
-        start, end = matrix.row_segment(row)
-        return matrix, start, end
+                f"cursor segment selection failed on "
+                f"{self.decls[decl.tensor].name}: {error}"
+            ) from error
+        return storage, start, end
 
     def _exec_block(self, block: Block) -> None:
         declared_here: List[SymbolId] = []
@@ -416,9 +474,7 @@ class _Interpreter:
             self._exec_block(stmt)
             return
         if type(stmt) is DenseFor:
-            extent = self._eval_coord(stmt.extent)
-            if extent < 0:
-                raise LoopIRInterpreterError(f"negative dense extent {extent}")
+            extent = self._dimension_extent(stmt.dimension)
             try:
                 for coordinate in range(extent):
                     self.indices[stmt.index] = coordinate
@@ -427,16 +483,18 @@ class _Interpreter:
                 self.indices.pop(stmt.index, None)
             return
         if type(stmt) is SparseFor:
-            matrix, start, end = self._segment(stmt.cursor)
-            state = _CursorState(matrix, start, end, aligned=True)
+            storage, start, end = self._segment(stmt.cursor)
+            state = _CursorState(storage, stmt.cursor.level, start, end, aligned=True)
             self.cursors[stmt.cursor.cursor] = state
             try:
                 while not state.exhausted:
+                    self.positions[stmt.position] = state.position
                     self.indices[stmt.coord_index] = state.coordinate
                     self._exec_block(stmt.body)
                     state.position += 1
             finally:
                 self.indices.pop(stmt.coord_index, None)
+                self.positions.pop(stmt.position, None)
                 del self.cursors[stmt.cursor.cursor]
             return
         if type(stmt) is MergedSparseFor:
@@ -454,31 +512,47 @@ class _Interpreter:
             self.accums[stmt.accumulator] = (op, combined)
             return
         if type(stmt) is Store:
-            coords = [self._eval_coord(index) for index in stmt.indices]
-            value = self._eval_value(stmt.value)
-            target: Any = self.values[stmt.tensor]
-            for index in coords[:-1]:
-                if not isinstance(target, list) or not 0 <= index < len(target):
-                    raise LoopIRInterpreterError(f"store index {index} out of bounds")
-                target = target[index]
-            last = coords[-1]
-            if not isinstance(target, list) or not 0 <= last < len(target):
-                raise LoopIRInterpreterError(f"store index {last} out of bounds")
-            target[last] = value
+            target, last = self._locate_store(stmt.tensor, stmt.indices)
+            target[last] = self._eval_value(stmt.value)
+            return
+        if type(stmt) is StoreReduce:
+            target, last = self._locate_store(stmt.tensor, stmt.indices)
+            contribution = self._eval_value(stmt.value)
+            if stmt.op is ReduceOp.ADD:
+                target[last] = target[last] + contribution
+            else:
+                target[last] = target[last] * contribution
             return
         if type(stmt) is AppendEntry:
             coords_tuple = tuple(self._eval_coord(coord) for coord in stmt.coords)
             value = self._eval_value(stmt.value)
-            self.builders[stmt.tensor].append(coords_tuple, value)
+            try:
+                self.builders[stmt.tensor].append(coords_tuple, value)
+            except LevelStorageError as error:
+                raise LoopIRInterpreterError(str(error)) from error
             return
         raise LoopIRInterpreterError(f"unknown statement {type(stmt).__name__}")
+
+    def _locate_store(
+        self, tensor: SymbolId, indices: Tuple[Expr, ...]
+    ) -> Tuple[List[Any], int]:
+        coords = [self._eval_coord(index) for index in indices]
+        target: Any = self.values[tensor]
+        for index in coords[:-1]:
+            if not isinstance(target, list) or not 0 <= index < len(target):
+                raise LoopIRInterpreterError(f"store index {index} out of bounds")
+            target = target[index]
+        last = coords[-1]
+        if not isinstance(target, list) or not 0 <= last < len(target):
+            raise LoopIRInterpreterError(f"store index {last} out of bounds")
+        return target, last
 
     def _exec_merge(self, stmt: MergedSparseFor) -> None:
         states: List[_CursorState] = []
         try:
             for decl in stmt.cursors:
-                matrix, start, end = self._segment(decl)
-                state = _CursorState(matrix, start, end, aligned=False)
+                storage, start, end = self._segment(decl)
+                state = _CursorState(storage, decl.level, start, end, aligned=False)
                 self.cursors[decl.cursor] = state
                 states.append(state)
             while True:
