@@ -437,20 +437,6 @@ def _validate_cluster_fields(cluster: object) -> None:
                         f"ParallelWorkspaceCluster.{field_name}[{index}]."
                         f"args[{argument_index}]",
                     )
-            try:
-                LLIRRewriter(_PARALLEL_CLUSTER_PLACEMENT_CONTEXT).rewrite(statement)
-            except (
-                AttributeError,
-                CompilerInvariantError,
-                KeyError,
-                RecursionError,
-                TypeError,
-                ValueError,
-            ) as error:
-                raise TypeError(
-                    f"ParallelWorkspaceCluster.{field_name}[{index}] must be "
-                    "a complete acyclic LLIR statement template"
-                ) from error
     pool_specs = fields.get("pool_specs", _MISSING_PARALLEL_FIELD)
     if type(pool_specs) is not tuple or any(
         type(spec) is not ParallelWorkspacePoolSpec for spec in pool_specs
