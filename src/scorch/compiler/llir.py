@@ -984,135 +984,83 @@ def _validate_assignment_metadata(
     if type(metadata) is not TensorAccessMetadata:
         raise TypeError(f"{owner} metadata must be TensorAccessMetadata")
     typed_metadata = cast(TensorAccessMetadata, metadata)
-    if typed_metadata.role is not expected_role:
+    if _address_of_instance_field(typed_metadata, "role") is not expected_role:
         raise TypeError(f"{owner} metadata must have the {expected_role.name} role")
-    if type(typed_metadata.access_id) is not AccessId:
+    if type(_address_of_instance_field(typed_metadata, "access_id")) is not AccessId:
         raise TypeError(f"{owner} metadata access_id must be an AccessId")
-    if type(typed_metadata.tensor_id) is not SymbolId:
+    if type(_address_of_instance_field(typed_metadata, "tensor_id")) is not SymbolId:
         raise TypeError(f"{owner} metadata tensor_id must be a SymbolId")
-    if type(typed_metadata.index_ids) is not tuple or any(
-        type(index_id) is not IndexId for index_id in typed_metadata.index_ids
+    index_ids = _address_of_instance_field(typed_metadata, "index_ids")
+    if type(index_ids) is not tuple or any(
+        type(index_id) is not IndexId for index_id in index_ids
     ):
         raise TypeError(f"{owner} metadata index_ids must be a tuple of IndexId values")
 
 
 def _validate_assignment_index(expression: object) -> None:
-    """Validate the typed expression subset admitted as a subscript index."""
+    """Validate the typed expression subset admitted as a subscript index.
 
-    expression_type = type(expression)
-    if expression_type is Var:
-        var = cast(Var, expression)
-        if not _is_assignment_name(var.name, allow_member=True):
-            raise TypeError(
-                "assignment index Var names must be identifiers or member paths"
-            )
-        if type(var.type) is not DataType:
-            raise TypeError("assignment index Var.type must be a DataType")
-        if var.tensor_access is not None:
-            raise TypeError("assignment index Vars cannot carry tensor access metadata")
-        return
-    if expression_type is Literal:
-        literal = cast(Literal, expression)
-        if type(literal.value) is not int:
-            raise TypeError("assignment index Literal.value must be an int")
-        if type(literal.data_type) is not DataType:
-            raise TypeError("assignment index Literal.data_type must be a DataType")
-        return
-    if expression_type is Sizeof:
-        data_type = getattr(expression, "data_type", None)
-        if type(data_type) is not DataType:
-            raise TypeError("assignment index Sizeof.data_type must be a DataType")
-        return
-    if expression_type in (BinOp, Add, Mul):
-        binary = cast(BinOp, expression)
-        if type(binary.op) is not str or binary.op not in ("+", "-", "*", "/", "%"):
-            raise TypeError(
-                "assignment index BinOp.op must be a supported arithmetic operator"
-            )
-        _validate_assignment_index(binary.left)
-        _validate_assignment_index(binary.right)
-        return
-    if expression_type is UnaryOp:
-        unary = cast(UnaryOp, expression)
-        if type(unary.op) is not str or unary.op not in ("+", "-"):
-            raise TypeError("assignment index UnaryOp.op must be '+' or '-'")
-        _validate_assignment_index(unary.operand)
-        return
-    if expression_type is Cast:
-        typed_cast = cast(Cast, expression)
-        if type(typed_cast.data_type) is not DataType:
-            raise TypeError("assignment index Cast.data_type must be a DataType")
-        _validate_assignment_index(typed_cast.expr)
-        return
-    if expression_type is FunctionCall:
-        call = cast(FunctionCall, expression)
-        if not _is_assignment_name(call.name, allow_member=True):
-            raise TypeError(
-                "assignment index FunctionCall.name must be an identifier or "
-                "member path"
-            )
-        template_args = getattr(call, "template_args", None)
-        if type(template_args) is not tuple or any(
-            type(argument) is not DataType for argument in template_args
-        ):
-            raise TypeError(
-                "assignment index FunctionCall.template_args must be a tuple of "
-                "DataType values"
-            )
-        if type(call.args) is not tuple:
-            raise TypeError("assignment index FunctionCall.args must be a tuple")
-        for argument in call.args:
-            _validate_assignment_index(argument)
-        return
-    if expression_type is ArrayAccess:
-        access = cast(ArrayAccess, expression)
-        if access.tensor_access is not None:
-            _validate_assignment_metadata(
-                access.tensor_access,
-                expected_role=TensorAccessRole.INPUT_READ,
-                owner="assignment index ArrayAccess",
-            )
-        _validate_assignment_index(access.array)
-        _validate_assignment_index(access.index)
-        return
-    raise TypeError(
-        "assignment ArrayAccess.index contains an unsupported LLIR expression"
+    The grammar is the shared stored-field, cycle-hardened index validator;
+    only the diagnostic owner prefixes differ from the AddressOf boundary.
+    """
+
+    _validate_address_of_index(
+        expression,
+        path=(),
+        active=set(),
+        owner="assignment index",
+        metadata_owner="assignment index ArrayAccess",
     )
 
 
 def _validate_assignment_target(target: object) -> None:
-    """Validate the deliberately small lvalue subset owned by ``Assign``."""
+    """Validate the deliberately small lvalue subset owned by ``Assign``.
+
+    Every field is read from stored instance state and member chains are
+    cycle-checked, so forged dataclass state fails with a controlled
+    boundary error instead of an attribute fallback, hang, or recursion
+    blowup.
+    """
 
     if type(target) is Var:
-        var = target
-        if not _is_assignment_name(var.name, allow_member=True):
+        variable = cast(Var, target)
+        if not _is_assignment_name(
+            _address_of_instance_field(variable, "name"), allow_member=True
+        ):
             raise TypeError("assignment Var.name must be an identifier or member path")
-        if type(var.type) is not DataType:
+        if type(_address_of_instance_field(variable, "type")) is not DataType:
             raise TypeError("assignment Var.type must be a DataType")
-        if var.tensor_access is not None:
+        if _address_of_instance_field(variable, "tensor_access") is not None:
             raise TypeError(
                 "scalar/member Assign targets cannot carry tensor access metadata"
             )
         return
     if type(target) is MemberAccess:
         member = cast(MemberAccess, target)
-        while type(member.base) is MemberAccess:
-            if type(member.member) is not str or not member.member.isidentifier():
+        visited_members: set[int] = set()
+        base: object = member
+        while type(base) is MemberAccess:
+            member = cast(MemberAccess, base)
+            if id(member) in visited_members:
+                raise TypeError("assignment MemberAccess chain must be acyclic")
+            visited_members.add(id(member))
+            member_name = _address_of_instance_field(member, "member")
+            if type(member_name) is not str or not member_name.isidentifier():
                 raise TypeError("assignment MemberAccess members must be identifiers")
-            member = cast(MemberAccess, member.base)
-        if type(member.member) is not str or not member.member.isidentifier():
-            raise TypeError("assignment MemberAccess members must be identifiers")
-        if type(member.base) is not Var:
+            base = _address_of_instance_field(member, "base")
+        if type(base) is not Var:
             raise TypeError(
                 "assignment MemberAccess must have an exact Var root through exact "
                 "MemberAccess bases"
             )
-        root = cast(Var, member.base)
-        if not _is_assignment_name(root.name, allow_member=False):
+        root = cast(Var, base)
+        if not _is_assignment_name(
+            _address_of_instance_field(root, "name"), allow_member=False
+        ):
             raise TypeError("assignment MemberAccess root name must be an identifier")
-        if type(root.type) is not DataType:
+        if type(_address_of_instance_field(root, "type")) is not DataType:
             raise TypeError("assignment MemberAccess root type must be a DataType")
-        if root.tensor_access is not None:
+        if _address_of_instance_field(root, "tensor_access") is not None:
             raise TypeError(
                 "assignment MemberAccess root cannot carry tensor access metadata"
             )
@@ -1121,21 +1069,24 @@ def _validate_assignment_target(target: object) -> None:
         raise TypeError("Assign.var must be an exact Var, MemberAccess, or ArrayAccess")
 
     access = target
-    if type(access.array) is not Var:
+    array = _address_of_instance_field(access, "array")
+    if type(array) is not Var:
         raise TypeError("assignment ArrayAccess.array must be an exact Var")
-    array = access.array
-    if not _is_assignment_name(array.name, allow_member=True):
+    typed_array = cast(Var, array)
+    if not _is_assignment_name(
+        _address_of_instance_field(typed_array, "name"), allow_member=True
+    ):
         raise TypeError(
             "assignment ArrayAccess.array name must be an identifier or member path"
         )
-    if type(array.type) is not DataType:
+    if type(_address_of_instance_field(typed_array, "type")) is not DataType:
         raise TypeError("assignment ArrayAccess.array type must be a DataType")
-    if array.tensor_access is not None:
+    if _address_of_instance_field(typed_array, "tensor_access") is not None:
         raise TypeError(
             "assignment ArrayAccess.array cannot carry tensor access metadata"
         )
-    _validate_assignment_index(access.index)
-    metadata = access.tensor_access
+    _validate_assignment_index(_address_of_instance_field(access, "index"))
+    metadata = _address_of_instance_field(access, "tensor_access")
     if metadata is not None:
         _validate_assignment_metadata(
             metadata,

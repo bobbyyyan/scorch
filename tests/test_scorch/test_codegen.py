@@ -1187,7 +1187,7 @@ def test_codegen_rejects_forged_malformed_address_of_lvalue(
 def test_assign_rejects_address_of_subscript_index() -> None:
     with pytest.raises(
         TypeError,
-        match="assignment ArrayAccess.index contains an unsupported LLIR expression",
+        match="assignment index contains an unsupported LLIR expression",
     ):
         llir.Assign(
             var=llir.ArrayAccess(
@@ -1196,6 +1196,38 @@ def test_assign_rejects_address_of_subscript_index() -> None:
             ),
             value=llir.Literal(1),
         )
+
+
+def test_assign_rejects_forged_cyclic_member_chain_without_hanging() -> None:
+    root = llir.MemberAccess(_var("entry"), "first")
+    outer = llir.MemberAccess(root, "second")
+    object.__setattr__(root, "base", outer)
+
+    with pytest.raises(TypeError, match="assignment MemberAccess chain must be"):
+        llir._validate_assignment_target(outer)
+
+
+def test_assign_rejects_forged_cyclic_index_with_a_boundary_error() -> None:
+    index = llir.Add(_var("i"), llir.Literal(1))
+    object.__setattr__(index, "left", index)
+
+    with pytest.raises(TypeError, match="assignment index must be acyclic"):
+        llir._validate_assignment_index(index)
+
+
+def test_assign_rejects_forged_missing_fields_without_attribute_fallback() -> None:
+    target = _var("values")
+    del target.__dict__["name"]
+    with pytest.raises(TypeError, match="assignment Var.name must be an identifier"):
+        llir._validate_assignment_target(target)
+
+    access_target = llir.ArrayAccess(_var("values"), _var("i"))
+    del access_target.__dict__["tensor_access"]
+    with pytest.raises(
+        TypeError,
+        match="assignment ArrayAccess metadata must be TensorAccessMetadata",
+    ):
+        llir._validate_assignment_target(access_target)
 
 
 def test_binary_and_literal_nodes_are_frozen_typed_structural_values() -> None:
@@ -2757,15 +2789,15 @@ def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None
         ),
         (
             llir.ArrayAccess(_var("values"), _var("indices[j]")),
-            "assignment index Var names",
+            "assignment index Var name",
         ),
         (
             llir.ArrayAccess(_var("values"), llir.Literal("i + 1")),
-            "Literal.value must be an int",
+            "Literal value must be an int",
         ),
         (
             llir.ArrayAccess(_var("values"), llir.FunctionCall("i + 1")),
-            "FunctionCall.name must be an identifier or member path",
+            "FunctionCall name must be an identifier or member path",
         ),
         (
             llir.ArrayAccess(
