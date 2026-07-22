@@ -11,6 +11,7 @@ import random
 
 import pytest
 
+from scorch.compiler.loopir_spike import interp as loopir_interp
 from scorch.compiler.identity import new_index_id, new_symbol_id
 from scorch.compiler.loopir_spike.csr import CsrFormatError, CsrMatrix
 from scorch.compiler.loopir_spike.interp import LoopIRInterpreterError, run_program
@@ -476,6 +477,31 @@ def test_spmv_output_extent_mismatch_rejected_before_execution():
         run_program(
             fixture.program,
             {fixture.matrix: matrix, fixture.vector: [0.0, 0.0, 0.0]},
+            {fixture.result: (2,)},
+        )
+
+
+def test_extent_mismatch_rejected_before_any_tensor_materialization(monkeypatch):
+    fixture = build_csr_spmv_program()
+    matrix = CsrMatrix.from_dense([[0.0]], 1)
+
+    def unexpected_materialization(*_args, **_kwargs):
+        raise AssertionError("tensor materialized before extent validation")
+
+    monkeypatch.setattr(
+        loopir_interp._Interpreter,
+        "_materialize_input",
+        unexpected_materialization,
+    )
+    monkeypatch.setattr(
+        loopir_interp._Interpreter,
+        "_materialize_output",
+        unexpected_materialization,
+    )
+    with pytest.raises(LoopIRInterpreterError, match="extent equality 0 failed"):
+        run_program(
+            fixture.program,
+            {fixture.matrix: matrix, fixture.vector: [0.0]},
             {fixture.result: (2,)},
         )
 
