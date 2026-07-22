@@ -16,7 +16,15 @@ import scorch
 
 SRC_ROOT = Path(scorch.__file__).resolve().parent.parent
 SPIKE_DIR = SRC_ROOT / "scorch" / "compiler" / "loopir_spike"
-SPIKE_MODULES = ("__init__", "csr", "interp", "nodes", "programs", "verifier")
+SPIKE_MODULES = (
+    "__init__",
+    "csr",
+    "interp",
+    "levels",
+    "nodes",
+    "programs",
+    "verifier",
+)
 
 ALLOWED_STDLIB_ROOTS = {
     "__future__",
@@ -87,6 +95,7 @@ def test_spike_import_closure_is_torch_free_and_pipeline_free():
 
         import scorch.compiler.loopir_spike.csr
         import scorch.compiler.loopir_spike.interp
+        import scorch.compiler.loopir_spike.levels
         import scorch.compiler.loopir_spike.nodes
         import scorch.compiler.loopir_spike.programs
         import scorch.compiler.loopir_spike.verifier
@@ -103,6 +112,7 @@ def test_spike_import_closure_is_torch_free_and_pipeline_free():
             "scorch.compiler.loopir_spike",
             "scorch.compiler.loopir_spike.csr",
             "scorch.compiler.loopir_spike.interp",
+            "scorch.compiler.loopir_spike.levels",
             "scorch.compiler.loopir_spike.nodes",
             "scorch.compiler.loopir_spike.programs",
             "scorch.compiler.loopir_spike.verifier",
