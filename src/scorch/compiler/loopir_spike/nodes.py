@@ -230,10 +230,10 @@ class SparseCursorDecl(LoopIRNode):
 
     ``outer_indices`` supplies the already-bound coordinates of every level
     above ``level`` (so its length equals ``level``); together they select
-    the stored segment the cursor walks.  A cursor exposes, intrinsically,
-    its current position, the coordinate stored at that position, its stored
-    value, and whether it is exhausted; no node ever re-derives these from
-    rendered names or target syntax.
+    the stored segment the cursor walks.  Runtime cursor state internally tracks
+    a position, coordinate, value, and exhaustion.  This candidate exposes the
+    coordinate through the loop binding and the value through ``CursorValue``;
+    it has no expression or identity for the position itself.
 
     This spike representation is sound only when every outer level is dense.
     A compressed child needs its dominating parent's physical storage position,

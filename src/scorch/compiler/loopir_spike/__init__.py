@@ -7,8 +7,10 @@ JIT, public APIs, caches, LLIR, or C++ codegen, and it must stay independent of
 and callbacks into the existing lowerer.  The only production dependency it may
 reuse is the stable identity module.
 
-The schema here is a feasibility candidate, not a frozen design: Phase 4
-revises it from what this spike learns.  Modules:
+The schema here is a feasibility candidate, not a frozen design.  The initial
+go/no-go review was corrected to NO-GO for general level-based LoopIR: the spike
+must gain explicit parent positions and logical mode/domain identity, then pass
+a repeated review before Phase 4 begins.  Modules:
 
 - ``nodes``: frozen, tuple-owned generic IR nodes and their semantics;
 - ``verifier``: the fail-closed structural verifier;

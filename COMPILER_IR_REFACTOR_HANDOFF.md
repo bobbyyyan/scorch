@@ -22702,12 +22702,14 @@ input inventory for post-cutover retirement, not open Phase-3 work.
 
 ### Phase-3.5 sparse LoopIR feasibility spike and go/no-go review (2026-07-22)
 
-The Phase-3.5 spike is complete and the explicit go/no-go review is
-recorded in `COMPILER_IR_REFACTOR_PHASE3_5_REVIEW.md`. The verdict is
-**GO with conditions**; read that document's Limitations and Conditions
-sections before acting on the verdict. Three code commits precede the
-handoff/review docs commit; nothing was pushed and no earlier commit was
-amended or reordered:
+The initial Phase-3.5 spike and review are recorded here for history. The
+initial **GO with conditions** verdict at `62e94ff` is superseded by the
+rigorous-review correction below and by the current
+`COMPILER_IR_REFACTOR_PHASE3_5_REVIEW.md`: the current verdict is **NO-GO for
+the general level-based LoopIR foundation**, with a narrower pass for the
+canonical CSR merge-control experiment. Three original code commits precede
+the initial handoff/review docs commit; nothing was pushed and no earlier
+commit was amended or reordered:
 
 - `71eba38` — `feat(compiler): prototype sparse LoopIR schema and verifier`
 - `1e30817` — `feat(compiler): interpret sparse LoopIR programs`
@@ -22729,7 +22731,8 @@ covering unique node/cursor/index/symbol identities, definitions,
 dominance, lexical and cursor scope, rank/layout and coordinate/value
 typing, reduction identities including signed zero, output scope, merge
 preconditions, aliasing, forged cycles, malformed stored state, unknown
-subclasses, and a 64-level depth bound; a canonical plain-Python CSR
+subclasses, and a 64-level depth bound, subject to the review corrections
+below; a canonical plain-Python CSR
 container; a 436-line Torch-free interpreter that verifies then executes;
 and the three hand-authored feasibility programs (CSR SpMV with exactly
 one sparse cursor — deliberately not claimed as sparse-sparse evidence;
@@ -22745,8 +22748,9 @@ Compressed values are reachable only through cursors (`CursorValue`);
 coordinate `Load` on a compressed tensor is a verifier error; UNION cursor
 reads require a value-typed default and non-UNION reads forbid one. Sparse
 outputs assemble exclusively from lexicographically ordered `AppendEntry`
-streams — no positions arrays, offsets, or target syntax exist anywhere in
-the package, and Torch stays outside the interpreter.
+streams. No positions arrays, offsets, or target syntax exist in the IR nodes;
+the CSR oracle adapter does own and inspect `indptr`/row offsets, and Torch
+stays outside the interpreter.
 
 #### Verification ledger
 
@@ -22754,7 +22758,8 @@ Evidence is under
 `/Users/bobby/.cache/scorch-codex/phase35-loopir-spike-1c78633/`:
 
 - **Tests.** 297 focused spike tests pass (70 adversarial verifier-boundary
-  tests exercising every defect code, 221 execution/differential tests
+  tests exercising 27 of the original 29 defect codes, 221
+  execution/differential tests
   covering empty inputs and rows, zero-row/zero-column shapes, ragged rows,
   disjoint/identical/partial support, unequal lengths, one-sided and early
   exhaustion, explicit-zero cancellation, structural intersection over a
@@ -22797,23 +22802,129 @@ Evidence is under
   `origin/refactor/compiler-ir-phase3-std-move-call` both remained at
   `1714df2`; nothing was pushed.
 
-#### Verdict and next step
+#### Initial verdict, now superseded
 
-The go/no-go review evaluates each milestone criterion — both sparse cases
-pass differentially, the interpreter remains a simple independent oracle,
-the Phase 0-3 gates are green, latency shows no regression, and
-tile-j/tile-ijk parity remains credible as a plan with named unbuilt risks
-(affine tiles, panels/relayout, workspaces, parallel loops, and above all
-CIN-to-LoopIR lowering). The verdict is **GO with conditions**: Phase 4
-must begin by revising the schema from the spike (builder ergonomics,
-workspace/parallel/tile nodes, dtype generality, multi-level cursor
-execution), the neutrality suite must keep passing as the spike evolves
-into the Phase-4 oracle, the package stays out of production imports until
-the Milestone-4 strangler path introduces LoopIR behind its own gates, and
-Milestone-4 step 6 (tile-j/tile-ijk re-expression) remains a hard
-checkpoint that can still void the parity claim. **No Phase-4 work was
-started in this session**, and passing tests alone did not force the
-verdict — the review document records what the suites do not demonstrate.
+The initial review recorded **GO with conditions**. Rigorous follow-up found
+that this crossed a gate the design explicitly keeps inside Phase 3.5:
+`SparseCursorDecl.outer_indices` contains coordinates but not the dominating
+physical parent position required by compressed-under-compressed storage. The
+old verifier accepted such programs anyway. Because the verifier therefore
+could not state sparse parent/child dominance locally, one mandatory GO
+criterion failed. The current decision is **NO-GO; revise the spike and repeat
+the review before Phase 4**. The canonical CSR UNION/INTERSECTION result and all
+Phase 0-3 hardening remain valid.
+
+### Phase-3.5 rigorous-review correction (2026-07-22)
+
+Twelve correction commits are stacked after `62e94ff`; no original commit was
+amended or reordered:
+
+- `de1d1d7` — `fix(compiler): make sparse LoopIR spike fail closed`
+- `79c5837` — `test(compiler): cover sparse LoopIR review boundaries`
+- `245e673` — `fix(compiler): validate LoopIR extents before allocation`
+- `c17636a` — `test(compiler): lock pre-allocation extent validation`
+- `8280ad8` — `fix(compiler): snapshot LoopIR input bindings once`
+- `5733f30` — `test(compiler): cover stateful LoopIR input mappings`
+- `ee58ad9` — `fix(compiler): contain LoopIR mapping lookup failures`
+- `7f32141` — `test(compiler): cover disappearing LoopIR bindings`
+- `775a408` — `fix(compiler): validate LoopIR mapping key identities`
+- `b59491b` — `test(compiler): reject hostile LoopIR mapping keys`
+- `64163d8` — `fix(compiler): validate LoopIR keys before hashing`
+- `e719be3` — `test(compiler): cover colliding LoopIR key snapshots`
+
+#### Review findings
+
+The CSR container and fixtures are appropriate for the named Phase-3.5
+experiment. The architectural defect was the stronger claim that the candidate
+schema was already level-general:
+
+1. a compressed child segment needs its parent's physical storage position,
+   while the candidate carries only outer coordinates;
+2. no stable typed level reference/identity, position identity, parent-cursor
+   link, logical dimension identity, or physical-to-logical mode order exists;
+3. the old verifier accepted a level-1 cursor on a
+   `(COMPRESSED, COMPRESSED)` tensor with a constant outer coordinate and no
+   dominating level-0 cursor;
+4. CSR and CSC are indistinguishable in `TensorDecl`, merged cursors cannot be
+   proven to share a logical coordinate domain, and `COORDINATE`/`SINGLETON`
+   levels are absent; and
+5. the would-be semantic oracle embeds CSR storage directly in `_segment`,
+   `_CursorState`, and `_CsrOutputBuilder` instead of consuming a
+   format-neutral level interface.
+
+The merge loop itself was reviewed separately and is sound for canonical,
+strictly ordered CSR segments. UNION/INTERSECTION candidate selection,
+alignment, advancement, exhaustion, defaults, and termination were not changed.
+
+Two additional concrete correctness issues were reproduced. First, deleting
+ordinary node fields or identity `.value` fields could leak `AttributeError`
+instead of a stable verifier defect. Second, shape compatibility was
+data-dependent: sparsity could hide a short SpMV vector, an oversized result,
+or an elementwise operand with extra rows/columns and produce a plausible
+truncated/padded result.
+
+#### Corrections made
+
+- The verifier preflights every exact dataclass node's stored fields and reads
+  all identity values missing-field-safely. Malformed state now fails with
+  `LoopIRVerificationError` at an exact path.
+- Sparse cursors now fail with `unsupported_sparse_hierarchy` unless they target
+  a compressed leaf below dense outer levels. This records the candidate's
+  actual sound boundary; it does not claim to solve nested sparse traversal.
+- `ExtentEquality` supplies target-neutral program preconditions evaluated after
+  input/output shapes are registered but before input copies, output allocation,
+  or execution. The CSR fixtures declare their row/column relationships, so
+  incompatible shapes fail independently of stored support.
+- Each caller-supplied input mapping entry is snapshotted exactly once before
+  validation and materialization, so a stateful mapping cannot swap tensors
+  across that boundary. Input/output key iteration and value lookup failures are
+  translated to `LoopIRInterpreterError`. Advertised keys are first snapshotted
+  without hashing, then checked for exact int-valued `SymbolId` identity, and
+  only then placed in role sets, so foreign hash-colliding keys cannot execute
+  equality callbacks during set construction.
+- Tests now exercise all 31 current verifier defect codes. The original suite's
+  “all defect codes” statement was wrong: `invalid_index_id` and
+  `invalid_cursor_id` were previously uncovered.
+- The definitive review document now records **CSR merge-control PASS; general
+  level-based LoopIR NO-GO** and blocks Phase 4 pending a repeated spike/review.
+
+#### Review-correction verification
+
+- focused spike suites: **329 passed** (92 verifier, 231 execution, 6
+  neutrality);
+- focused spike plus identity/CIN-analysis/LoopPlan/raw-budget suites:
+  **454 passed**;
+- fresh 20-source corpus and 42-source grid captures from detached `b59491b`
+  are byte-identical to the retained `1c78633` captures and their Phase-3 chain;
+  the byte waiver applies and no runtime benchmark is required;
+  `64163d8..e719be3` touch only the isolated interpreter and its tests;
+- Black and Flake8 clean over the seven changed source/test files; mypy success
+  on all five changed production files; `git diff --check` clean;
+- the authoritative clean detached-worktree non-performance suite at exact
+  final code/test commit `e719be3`, with import provenance asserted and caches
+  isolated, passed **2,889 tests with 14 skipped, 3 perf-marked deselections,
+  and one known warning in 2,033.63 seconds**; and
+- the five protected tracked files retain their recorded SHA-256 values; no
+  protected, GPU/CUDA, benchmark, scheduler, research, scratchpad, packaging, or
+  tooling material was staged.
+
+#### Required next milestone
+
+Do not start the dense Phase-4 strangler path yet. First revise the spike with:
+
+1. stable logical dimension/domain identities and physical mode order;
+2. explicit level references and physical position bindings, including a child
+   cursor's reference to its dominating parent position;
+3. a format-neutral level-storage interface with CSR as one adapter;
+4. merge-domain and value-bearing-leaf verification;
+5. an executable nested-compressed fixture (DCSR or three-level CSF-like), a
+   permuted-mode/CSC fixture, and wrong-parent/wrong-domain adversarial cases;
+6. an explicit disposition for `COORDINATE` and `SINGLETON`; and
+7. a repeated Phase-3.5 criterion-by-criterion review.
+
+The neutrality suite must stay green, and the spike must remain outside
+production imports until that repeated review records GO. This NO-GO does not
+reopen Phase 3 or invalidate its CxxIR/ABI hardening.
 
 ## Incremental Migration Plan
 
@@ -22957,26 +23068,14 @@ Useful test additions:
 - structural pass assertions replace most generated-string substring checks;
 - differential execution remains equal to PyTorch for supported cases.
 
-## Recommended First Implementation Task
+## Recommended Next Milestone
 
-The first implementation should be deliberately smaller than the complete
-architecture:
-
-1. Add fail-closed codegen/CIN behavior and precedence-correct expression
-   emission with focused tests.
-2. Introduce stable `SymbolId`/`IndexId` values for every logical entity
-   referenced by `LoopPlan`; do not use display names or Python object identity
-   as temporary schedule identity.
-3. Introduce `LoopPlan` plus a frozen transitional
-   `ScheduledCIN(normalized_cin, loop_plan)` carrier replacing the four dynamic
-   schedule attributes while preserving the existing public `Schedule` API.
-4. Add a minimal verifier for the invariants touched by that boundary.
-5. Demonstrate that scheduling does not mutate its input, or characterize and
-   isolate any remaining mutation needed for a later milestone.
-6. Establish the Phase 0 production-mode compile-latency corpus and the existing
-   two-machine generated-kernel baseline without changing kernel behavior.
-
-Do not introduce the complete LoopIR in this first change.
+Repeat Phase 3.5 after repairing the level model. This is intentionally a broad
+milestone, not another one-node migration: the next session should address the
+parent-position, logical-domain/mode-order, and format-neutral interpreter
+boundaries together, execute non-CSR hierarchical/permuted fixtures, and conduct
+a fresh criterion-by-criterion go/no-go review. Do not start Phase 4 in the same
+session; keep the gate and its review independently auditable.
 
 ## Copy-Paste Prompt for a New Session/Agent
 
@@ -23022,37 +23121,66 @@ Binding architecture decisions:
 Do not perform a big-bang rewrite. Do not merely split CINLowerer. Preserve
 unrelated user changes and inspect git status before editing.
 
-Implement the first shippable milestone described in the handoff:
+Current state you must preserve:
 
-1. Make CIN/LLIR/codegen fail closed for unknown nodes and post-ops.
-2. Fix precedence-correct C++ expression emission and ineffective assertions,
-   with focused regression tests.
-3. Introduce stable SymbolId/IndexId values for every logical entity referenced
-   by LoopPlan. Do not use display names or Python object identity as temporary
-   schedule identity.
-4. Introduce LoopPlan and the exact frozen transitional
-   ScheduledCIN(normalized_cin, verified_loop_plan) carrier that replaces the
-   dynamic explicit_schedule, panel_bounds, relayout_plan, and result_tile_plan
-   fields currently attached to CIN. Preserve the public Schedule API and
-   generated behavior for supported cases.
-5. Add a minimal verifier covering symbol/loop references and the new scheduling
-   boundary.
-6. Add tests proving deterministic behavior and, where feasible, that scheduling
-   does not mutate its input. If legacy mutation cannot yet be removed safely,
-   isolate and document it rather than hiding it.
-7. Record the Phase 0 production-mode compile-latency corpus and the existing
-   generated-kernel baseline with its same-binary A/A noise-floor control runs.
-   Do not change kernel policy while establishing the baseline.
+- Phase 3 is closed. Phase 3.5 is currently NO-GO for general level-based
+  LoopIR, while the canonical CSR merge-control experiment is a narrow pass.
+- The original spike commits are 71eba38, 1e30817, 1c78633, and 62e94ff.
+- Rigorous-review corrections are de1d1d7, 79c5837, 245e673, c17636a,
+  8280ad8, 5733f30, ee58ad9, 7f32141, 775a408, b59491b, 64163d8, and
+  e719be3. Read the current
+  review and final handoff section; do not rely on the superseded GO prose.
+- Nothing has been pushed by the review session. Preserve all unrelated dirty
+  and untracked GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad,
+  and tooling work. Stage explicit paths only.
 
-Keep the change narrowly scoped. Do not introduce the full LoopIR yet, change
-public STensor semantics, add kernel optimizations, or attempt to clear all
-existing typing debt. Do not add an analysis cache or analysis invalidation
-protocol.
+Primary objective: complete the full repeat-Phase-3.5 milestone, not merely one
+micro-slice.
 
-Use apply_patch for edits. Run focused tests in the scorch conda environment,
-including test_cin.py, test_scheduler.py, test_schedule_api.py, and relevant
-schedule/codegen tests. Report exact commands/results, remaining legacy mutation,
-and the next recommended migration seam. Do not claim completion unless the
-supported paths are verified and no required work remains. Full verifiers are a
-test/debug requirement, not production per-pass overhead.
+1. Independently audit the corrected spike and reproduce the NO-GO
+   counterexamples before designing the replacement.
+2. Revise the candidate schema so tensors have stable logical
+   dimension/domain identities and an explicit physical-level-to-logical-mode
+   mapping. CSR and CSC must be structurally distinguishable.
+3. Add explicit level references and physical position bindings. Sparse loops
+   must bind position and coordinate separately, and a compressed child must
+   reference a dominating parent position. Do not recover positions by
+   coordinate search, rendered names, callbacks, or implicit interpreter state.
+4. Make value ownership explicit: structural/non-leaf levels cannot expose a
+   scalar CursorValue as if they were value-bearing leaves.
+5. Replace CSR storage embedded in interp.py with a small format-neutral level
+   storage interface. Keep CSR as one adapter and preserve the already-proven
+   merge semantics. The interpreter must remain Torch-free and independent of
+   the production pipeline.
+6. Integrate shape/extent compatibility with the logical dimension model.
+   Preserve the corrected sparsity-independent failures; decide whether the
+   temporary ExtentEquality node remains useful or should lower into shared
+   dimension identities.
+7. Verify merge operands share one logical coordinate domain. Do not substitute
+   equality of physical level numbers for domain identity.
+8. Execute, at minimum: the existing CSR SpMV/UNION/INTERSECTION corpus; a
+   nested-compressed DCSR or three-level CSF-like program proving parent-position
+   descent; and a permuted-mode/CSC program proving physical/logical separation.
+   Add wrong-parent, wrong-domain, wrong-mode-order, non-leaf-value, malformed
+   state, cycle, exhaustion, and empty/ragged differential cases.
+9. Explicitly disposition production LevelType.COORDINATE and SINGLETON. Support
+   them in the spike if coherent within the milestone; otherwise reject them
+   with stable verifier/interpreter diagnostics and record the exact later gate.
+10. Repeat the Phase-3.5 review against every criterion in
+    COMPILER_IR_REFACTOR_DESIGN.md. Record GO only if every criterion is actually
+    met. If any fails, keep NO-GO and explain the smallest remaining blocker.
+
+Keep the experiment outside production imports. Do not start the Phase-4 dense
+strangler path, change public STensor behavior, alter kernel policy, or add
+analysis caching in this session. A successful repeated GO should be its own
+reviewed stopping point.
+
+Use apply_patch for edits and focused commits with descriptive bodies. Verify in
+the scorch conda environment: the complete spike suites, identity/CIN-analysis/
+LoopPlan/raw-budget adjacency, Black/Flake8/mypy parity, git diff --check, and a
+clean detached-worktree non-performance suite. Regenerate the 20-source corpus
+and 42-source grid to prove production byte non-interference; the neutrality
+suite and structural activation tests are never waived. Preserve and report the
+five protected-file hashes, import provenance, exact commit list, origin state,
+and any limitation honestly. Do not push.
 ```

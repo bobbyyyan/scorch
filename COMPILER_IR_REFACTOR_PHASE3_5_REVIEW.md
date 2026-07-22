@@ -2,268 +2,275 @@
 
 Date: 2026-07-22 (America/Los_Angeles)
 
-Session commits under review (branch
-`refactor/compiler-ir-phase3-std-move-call`, stacked on the Phase-3 closure
-at `34a1849`; nothing pushed):
+This document supersedes the initial review at `62e94ff`. That review correctly
+recorded the CSR execution evidence, but drew a GO conclusion from a schema that
+does not meet one of the design's mandatory GO criteria.
+
+## Current verdict
+
+**NO-GO for the general level-based LoopIR foundation.** Do not begin Phase 4.
+Revise the spike and repeat this review first.
+
+The narrower result is positive: **the canonical CSR sparse-merge control
+algorithm is feasible**. The same target-neutral `MergedSparseFor` correctly
+executes UNION and INTERSECTION over sorted, unique CSR row segments, with
+minimum-coordinate selection, aligned-cursor advancement, correct exhaustion,
+and guaranteed progress. That result is worth retaining, but it is not the
+Phase-3.5 GO defined in `COMPILER_IR_REFACTOR_DESIGN.md`.
+
+The design requires every GO criterion to hold and says that, if one fails,
+Phases 4-8 must not start. The criterion that the verifier can state sparse
+parent/child dominance locally is not met. Calling the missing representation a
+Phase-4 revision condition would move a gating design question past its gate.
+
+## The CSR question
+
+The long-term compiler must be based on general physical levels and logical
+modes, not on CSR as its compiler model.
+
+`csr.py` and the three CSR fixture builders are appropriate: Phase 3.5
+explicitly asks for CSR SpMV and CSR union/intersection examples. The defect is
+not that CSR appears in the spike. The defect is that CSR storage assumptions
+also live inside `interp.py`, while the candidate nodes omit information that a
+format-neutral level interpreter would need:
+
+- `_CSR_LEVELS`, `_CursorState.matrix`, `_segment`, `row_segment`, `indices`,
+  `values`, and `_CsrOutputBuilder` make the interpreter CSR-specific;
+- `SparseCursorDecl.outer_indices` contains coordinates, not the dominating
+  parent storage position needed to select a compressed child segment;
+- `TensorDecl.levels` has no physical-level-to-logical-mode mapping or logical
+  coordinate-domain identity, so CSR and CSC have the same IR shape;
+- `LevelKind` omits Scorch's `COORDINATE` and `SINGLETON` level kinds; and
+- merged cursors cannot be proven to iterate the same logical domain.
+
+The CSR interpreter is therefore a useful, independent oracle for the narrow
+CSR merge experiment. It is not yet the general level-based semantic oracle
+that Phase 4 is supposed to promote.
+
+## Commits reviewed and corrections
+
+Original spike, stacked on the Phase-3 closure at `34a1849`:
 
 - `71eba38` — `feat(compiler): prototype sparse LoopIR schema and verifier`
 - `1e30817` — `feat(compiler): interpret sparse LoopIR programs`
 - `1c78633` — `test(compiler): execute sparse LoopIR feasibility cases`
+- `62e94ff` — `docs(compiler): record Phase-3.5 go-no-go review`
 
-Evidence ledger:
-`/Users/bobby/.cache/scorch-codex/phase35-loopir-spike-1c78633/`.
+Rigorous-review corrections:
 
-## Verdict
+- `de1d1d7` — `fix(compiler): make sparse LoopIR spike fail closed`
+- `79c5837` — `test(compiler): cover sparse LoopIR review boundaries`
+- `245e673` — `fix(compiler): validate LoopIR extents before allocation`
+- `c17636a` — `test(compiler): lock pre-allocation extent validation`
+- `8280ad8` — `fix(compiler): snapshot LoopIR input bindings once`
+- `5733f30` — `test(compiler): cover stateful LoopIR input mappings`
+- `ee58ad9` — `fix(compiler): contain LoopIR mapping lookup failures`
+- `7f32141` — `test(compiler): cover disappearing LoopIR bindings`
+- `775a408` — `fix(compiler): validate LoopIR mapping key identities`
+- `b59491b` — `test(compiler): reject hostile LoopIR mapping keys`
+- `64163d8` — `fix(compiler): validate LoopIR keys before hashing`
+- `e719be3` — `test(compiler): cover colliding LoopIR key snapshots`
 
-**GO**, with the explicit conditions in the final section. The verdict is
-based on the criterion-by-criterion evaluation below, not on the test count:
-the Limitations section records exactly what the passing suites do *not*
-demonstrate, and the GO stands only together with the listed Phase-4
-revision obligations. GO authorizes starting Milestone 4's schema revision;
-it does not freeze this schema, promote the spike into production, or start
-any Phase-4 work inside this session.
+Nothing in the spike or its corrections is imported by production compilation,
+JIT, public APIs, caches, LLIR, code generation, or native code.
 
-## What the spike is
+## Findings
 
-`src/scorch/compiler/loopir_spike/` is a strictly experimental, deliberately
-small package (six modules, 1,879 lines including docstrings):
+### 1. Parent/child dominance is not representable as claimed
 
-- `nodes.py` (342 lines) — frozen, tuple-owned generic IR nodes: `Block`,
-  `DenseFor`, `SparseCursorDecl`/`SparseFor`, `MergedSparseFor` with UNION
-  and INTERSECTION modes, `Load`/`CursorValue`/`IndexValue`/`DimSize`/
-  constants, `BinaryExpr`, `DeclAccum`/`Accumulate`/`AccumValue`, `Store`,
-  `AppendEntry`, `TensorDecl`, `LoopProgram`. Constructors validate
-  nothing; semantics are documented on the owning node.
-- `verifier.py` (700 lines) — `verify_program`, the fail-closed authority
-  (stable defect codes plus lexical paths).
-- `csr.py` (136 lines) — the canonical plain-Python CSR container.
-- `interp.py` (436 lines) — the plain-Python interpreter (verifies, then
-  executes; Torch-free).
-- `programs.py` (246 lines) — the three hand-authored feasibility programs.
+The original review said arity-checked `outer_indices` made sparse dominance
+structural and described DCSR/multi-level traversal as representable but
+untested. That is false for this schema.
 
-Identity reuses production `SymbolId`/`IndexId`; `LoopNodeId` and `CursorId`
-are spike-local because production `NodeId`/`AccessId` are documented as CIN
-identities and this schema is explicitly revisable. Nothing in production
-compilation, JIT, public APIs, caches, LLIR, or codegen imports the package;
-that is enforced by automated tests, not convention (see Neutrality below).
+For a compressed child, Scorch's actual level storage indexes the child's
+position array with the parent's physical storage position. A parent coordinate
+is not interchangeable with that position. Yet `SparseFor` binds only a
+coordinate, and `SparseCursorDecl` has no `LevelRef`, `PositionId`, parent cursor,
+or position expression.
 
-## Milestone criteria
+The old verifier accepted a top-level level-1 cursor on a
+`(COMPRESSED, COMPRESSED)` tensor with `outer_indices=(IntConst(0),)` and no
+level-0 cursor at all. It also accepted scalar `CursorValue` reads from
+non-leaf compressed levels. Both contradict explicit one-directional level
+lowering.
 
-### 1. CSR SpMV executes through the generic schema
+The correction now fails closed with `unsupported_sparse_hierarchy` unless a
+cursor targets a compressed leaf whose outer levels are all dense. This makes
+the current boundary honest; it does not solve hierarchical sparse iteration.
 
-`build_csr_spmv_program()` is a dense outer loop over `DimSize(A, 0)`, a
-scalar `ReduceOp.ADD` accumulator, one `SparseFor` cursor over `A`'s
-compressed level with the row bound through `outer_indices`, a
-coordinate-addressed `Load` of the dense vector at the bound sparse
-coordinate, and a dense `Store`. It passes dedicated empty/ragged/zero-shape
-cases and a 5-seed x 4-shape x 4-density randomized grid, exactly equal to a
-pure-Python dense reference (the accumulation order matches the reference
-term-for-term on stored entries, and adding a zero term never changes an
-IEEE partial sum, so exact equality is the honest comparison).
+### 2. Logical modes and merge domains are missing
 
-This case has exactly **one** sparse cursor. It demonstrates sparse
-position iteration, coordinate binding, reduction scoping, and dense output
-writes. It is *not* evidence about sparse-sparse intersection and is not
-claimed as such.
+Physical level number is not logical coordinate identity. Production Scorch
+supports mode order, so two `(DENSE, COMPRESSED)` layouts may denote CSR-like or
+CSC-like traversal depending on the mapping. The candidate cannot distinguish
+them.
 
-### 2. CSR + CSR elementwise addition via UNION
+For the same reason, `MergedSparseFor` cannot locally verify that every cursor
+produces coordinates in one shared logical domain. Adding a check that physical
+level numbers happen to match would create false confidence. The repeat spike
+needs explicit logical dimension/domain identities and physical mode order.
 
-`build_csr_union_add_program()` uses one generic `MergedSparseFor` in UNION
-mode over two cursors, appending `CursorValue(cA, default 0.0) +
-CursorValue(cB, default 0.0)` at every candidate coordinate. Covered
-differentially: disjoint, identical, and partially overlapping support;
-one-sided rows; one-sided early exhaustion (one cursor drains while the
-other continues emitting); unequal row lengths; empty operands and
-zero-row/zero-column shapes; cancellation to an explicit stored zero; and a
-5-seed randomized shape/density grid — all exactly equal to the dense
-reference. Exhausted iterators, overlapping support, and one-sided
-coordinates are therefore all exercised, which is what the milestone asked
-this case to prove.
+### 3. Fixture shape compatibility was data-dependent
 
-### 3. Two-CSR INTERSECTION genuinely synchronizes two cursors
+The original interpreter used access-time bounds checks but encoded no static
+relationship between operand and output extents. This admitted plausible wrong
+results whenever sparsity hid the mismatch. Reproduced examples included:
 
-`build_csr_intersection_multiply_program()` reuses the **same**
-`MergedSparseFor` node in INTERSECTION mode — no operation-specific node
-was added. The body runs only when both cursors carry the candidate
-coordinate; defaults are statically rejected in this mode because they are
-unobservable. Coverage: disjoint support (empty result), nested support,
-one side empty, early exhaustion, a randomized grid, and a
-structural-not-value test (an explicitly stored zero intersects; the merge
-synchronizes on stored coordinates, not on values). The union and
-intersection differences — body-emission policy and termination — are the
-node's `mode`, and the interpreter implements both from one merge loop,
-which is the concrete evidence that two-cursor synchronization is generic
-in this schema.
+- a `1 x 3` SpMV matrix storing only column 0 with a length-1 vector; and
+- UNION of a one-row left operand with a two-row right operand, where the extra
+  right row was silently ignored.
 
-### 4. Differential and adversarial coverage
+The correction adds target-neutral `ExtentEquality` program preconditions and
+checks them after all input/output shapes are registered but before input copies,
+output allocation, or execution.
+SpMV declares `A[0] == y[0]` and `A[1] == x[0]`; both elementwise fixtures
+declare `A[0] == B[0] == C[0]` and `A[1] == B[1] == C[1]`. This removes
+sparsity-dependent shape acceptance for the three fixtures. It is deliberately
+not a substitute for logical dimension IDs or mode order in the revised schema.
 
-297 focused tests: 70 verifier-boundary tests (every defect code is
-exercised from at least one adversarial construction, including forged
-cycles via `object.__setattr__`, unknown subclasses, non-tuple children,
-bool/int and int/float confusions, forged enum lookalikes and identity
-values, signed-zero reduction identities, and both sides of the nesting
-bound), 221 execution/differential tests, and 6 automated neutrality
-checks.
+### 4. Malformed stored state leaked Python exceptions
 
-### 5. No callbacks, no rendered names, no target syntax, no escape hatch
+Deleting ordinary dataclass fields such as `Block.statements` or identity
+fields such as `LoopNodeId.value` could leak `AttributeError`, despite the
+verifier being described as the single fail-closed authority.
 
-- **Merge progress** is intrinsic to `MergedSparseFor`: each step advances
-  every aligned cursor by one position, so the loop terminates after at
-  most the sum of segment lengths (the remaining-position sum strictly
-  decreases). Neither the verifier nor the interpreter consults the
-  lowerer, and nothing recognizes merge state from strings.
-- **Coordinate resolution** is the minimum over non-exhausted cursors'
-  current coordinates, bound to the loop's `IndexId`; consumers read it via
-  `IndexValue` like any dense loop index.
-- **Sparse dominance** is structural: a cursor over level `L` must bind
-  coordinates for all levels above it (`outer_indices`, arity-checked), and
-  compressed values are reachable only through `CursorValue` — coordinate
-  `Load` on a compressed tensor is a verifier error, so nothing can bypass
-  position iteration to "search" a sparse level.
-- **Output assembly** is the ordered `AppendEntry` stream; the canonical
-  container is built from coordinates alone. No positions arrays, offsets,
-  or target storage arithmetic appear in any node.
-- The automated neutrality suite enforces the import closure (stdlib +
-  `identity` only, proven in a subprocess without Torch), that production
-  never references the spike, that `import scorch` never loads it, and
-  that the sources contain no target-syntax tokens.
+The correction preflights every exact node's stored dataclass fields before a
+checker reads them and hardens all four identity readers. Missing node state now
+raises `LoopIRVerificationError` with `malformed_state` at the exact field path;
+missing or invalid identity values retain their specific `invalid_*_id` codes.
 
-## Design-criterion discussion
+The original “every defect code is tested” statement was also inaccurate:
+`invalid_index_id` and `invalid_cursor_id` had no tests. The corrected suite
+exercises all 31 current defect codes, including those two and the two new
+boundaries.
 
-**Genericity.** The schema has no operation nodes: SpMV, union add, and
-intersection multiply differ only in program shape, merge mode, and the
-`BinaryOp`/`ReduceOp` members they use. `MergedSparseFor` accepts any
-cursor count >= 2 and both modes with one semantics definition. The
-CursorValue default rule (required exactly in UNION, forbidden elsewhere)
-turns the union/intersection asymmetry into a typing rule instead of an
-escape hatch. The genericity claim is bounded by what was built — see
-Limitations.
+### 5. Position-array wording was too broad
 
-**Readability.** The schema reads well; hand-authored programs do not.
-Explicit `node_id` threading makes `programs.py` verbose (a ~40-line loop
-nest for SpMV). That is acceptable for a spike whose programs are written
-once, but Phase 4 must add a small builder layer before anyone authors
-LoopIR by hand at scale. This is an ergonomics debt, not a schema defect:
-the verbosity lives entirely in construction, not in the node definitions.
+The IR nodes contain no position arrays, offsets, target syntax, or rendered
+name recovery. The package as a whole does contain CSR positions: `CsrMatrix`
+owns `indptr`, the interpreter reads row offsets, and `_CsrOutputBuilder`
+constructs canonical CSR output. That storage belongs to the CSR oracle adapter,
+not to LoopIR nodes. Claims that no positions or offsets existed “anywhere in
+the package” are superseded by this narrower statement.
 
-**Termination.** Dense loops are bounded by evaluated extents (negative
-extents fail closed); sparse loops by finite validated segments; merges by
-the strict decrease argument above. The verifier is cycle-guarded and
-depth-bounded (64 levels, controlled diagnostic), so adversarial structure
-cannot make verification diverge, and the interpreter only runs verified
-programs.
+### 6. Caller-supplied mappings crossed the validation boundary
 
-**Interpreter independence.** 436 lines, plain Python containers, no Torch,
-no compiler-pipeline imports, no environment reads, no caching. It is
-executable documentation of the node semantics and is fit to become the
-Phase-4 semantic oracle (the milestone's step 3), subject to the same
-revision as the schema.
+The original interpreter repeatedly consulted caller-owned input mappings, so
+a stateful mapping could advertise one tensor during key validation and return
+another during materialization. Iteration and lookup exceptions also escaped as
+arbitrary Python errors. The first key-identity correction still constructed a
+set before checking key types; a foreign key colliding with an exact
+`SymbolId` could therefore run its `__eq__` callback during set construction.
 
-**Output assembly.** The append contract (lexicographically strictly
-increasing full coordinates per output) is enough for canonical CSR
-assembly in every fixture, fails closed on disorder and duplicates, and
-keeps explicit zeros (documented: UNION cancellation stores an exact zero;
-merging is structural). This matches how the current compiler's ordered
-result emission behaves and needed no target syntax.
+The corrections snapshot every mapping value once, contain iteration and
+lookup failures as `LoopIRInterpreterError`, snapshot advertised keys into a
+tuple before hashing, and reject every non-exact or malformed `SymbolId` before
+constructing role sets. Regression mappings cover changing/disappearing values,
+lookup failures, malformed keys, and a hostile key advertised beside the exact
+colliding program key.
 
-## Phase 0-3 gates at the spike commits
+## What the spike does establish
 
-- **Generated-kernel byte gates.** The 20-source corpus and 42-source grid,
-  regenerated from clean detached worktrees at base `34a1849` and candidate
-  `1c78633` with isolated caches and asserted import provenance, are
-  byte-identical to each other and to the retained Phase-3 final captures
-  (`phase3-review-fix.tyJNVF/{corpus,grid}-final`). The 124-file SHA-256
-  manifest is `CAPTURE_SHA256SUMS`. This is the expected outcome of a
-  not-imported experiment, and it held.
-- **Compiler latency.** Paired 5-warmup/30-sample run (base then candidate,
-  same session): small_dense `0.922/0.830`, reduction `1.013/0.975`,
-  csr_intersection `0.961/0.988`, sparse_union `0.932/0.896` p50/p95 —
-  inside the 1.10 target everywhere.
-- **Full suite.** The complete non-performance suite from the clean
-  detached candidate worktree (import provenance asserted for `scorch`,
-  `tests`, `tools.benchmark_compiler_ir`, and the spike; isolated
-  `TORCH_EXTENSIONS_DIR`/`XDG_CACHE_HOME`/basetemp) passes: **2,857
-  passed, 14 skipped, 3 deselected (perf-marked), 1 warning in 2,071.23 s**,
-  exit 0 (junit: 2,871 collected, 0 failures, 0 errors).
-- **Static checks.** Black, Flake8, and mypy over full `src` are in exact
-  parity between base and candidate: the identical nine inherited Flake8
-  findings, the identical 146 inherited mypy errors in 12 files, and the
-  identical single Black finding (`prebuilt_kernels.py`) on both sides —
-  the six spike files add zero findings to any tool. `git diff --check`
-  was clean before every commit.
-- **Identity/CIN/LoopPlan suites.** `test_cin.py`, `test_cin_analysis.py`,
-  `test_loop_plan.py`, and `test_llir_string_budget.py` pass from the
-  detached candidate worktree (125 tests), so the stable-identity, analysis,
-  plan, and RawStmt/AddressOf/Var budget locks are untouched — as expected,
-  since no production source was modified.
+- One generic `MergedSparseFor` control rule handles canonical CSR UNION and
+  INTERSECTION without operation-specific nodes or callbacks.
+- Candidate selection, aligned advancement, exhaustion, and the strict progress
+  argument are sound for canonical sorted CSR segments.
+- The three CSR fixtures execute differentially against independent dense
+  references across empty, disjoint, overlapping, one-sided, early-exhaustion,
+  explicit-zero, and randomized cases.
+- Ordered `AppendEntry` is sufficient to assemble canonical CSR output in the
+  tested identity-mode-order cases.
+- The spike remains Torch-free, target-syntax-free, and isolated from production
+  imports.
+- Phase 0-3 generated-code, latency, quality, and correctness gates were not
+  affected by adding the isolated experiment.
 
-## Is tile-j/tile-ijk parity still credible?
+These are useful feasibility results. They do not establish general
+hierarchical level traversal or a production-ready LoopIR schema.
 
-Credible, with named risks. What the spike adds to the argument: the
-sparse-iteration substrate that tiling transforms must preserve — position
-iteration, two-cursor merges, coordinate binding, ordered assembly — is now
-demonstrated to be structurally representable and executable without any
-lowerer callback or rendered-name recovery, which was precisely the
-capability Phase 3.5 was gating on. Loop plans already carry tile-j/tile-ijk
-decisions as immutable ID-keyed artifacts (`LoopPlan` since Phase 1), and
-the production tile-j/tile-ijk kernels iterate the same CSR structures the
-spike's cursors model, with tiling changing loop bounds, operand staging,
-and accumulation placement rather than the sparse-merge semantics.
+There is one deliverable wording ambiguity worth preserving. The design asks
+for “CSR SpMV intersection.” The fixture implements the sparse-dense
+intersection in its degenerate optimized form: one sparse cursor plus a dense
+load, so it does not exercise synchronized cursor intersection. A separate
+two-CSR elementwise multiply supplies the genuine two-cursor INTERSECTION test.
+That is strong evidence for merge control, but the repeat review must either
+justify the degenerate SpMV interpretation explicitly or add the literal mixed
+domain/intersection representation the design intended.
 
-What the spike deliberately does not show, and Phase 4 must: affine tile and
-panel/relayout region nodes (`OperandRelayout`-class staging), workspace
-allocation/lifetime as IR structure rather than a scalar accumulator,
-abstract parallel loops, and — the largest open risk — the CIN-to-LoopIR
-lowering that must produce these programs from the existing iterator
-analysis. None of these contradicts the schema shape; all of them are
-unbuilt. The parity goal therefore remains credible as a plan, not proven
-as an artifact, and Milestone 4 step 6 (re-expressing representative tile-j
-and tile-ijk schedules) remains the checkpoint where credibility converts
-to evidence or the investment case is revisited.
+## Criterion-by-criterion decision
 
-## Limitations (what passing tests must not be read as)
+| Phase-3.5 GO criterion | Result | Evidence |
+| --- | --- | --- |
+| Requested CSR examples execute correctly | Partial/pass with interpretation | SpMV and UNION execute; SpMV uses a one-cursor sparse-dense intersection, while genuine two-cursor INTERSECTION is demonstrated by a separate elementwise multiply. |
+| No C++ spelling, parsing, callbacks, or operation escape hatch | Pass | Automated import/target-syntax neutrality checks and direct source review. |
+| Verifier states sparse parent/child dominance and merge progress locally | **Fail** | Merge progress is local; compressed-parent position dominance is absent and was falsely accepted. |
+| Interpreter/lowering model can serve as an independent semantic oracle | Partial | Independent and useful for CSR; storage access is hard-coded to CSR and cannot execute general levels. |
+| Phase 0-3 gates green and parity remains credible | Pass as non-interference; unproven for LoopIR | Original byte/latency/full-suite receipts remain valid; no production path imports the spike. |
 
-1. The interpreter executes rank-1/rank-2 dense tensors and two-level
-   (dense, compressed) CSR only; the schema admits more (any compressed
-   level with bound outer levels), but nothing beyond the spike's patterns
-   has been executed. Cursors at level 0 (DCSR-style outer sparsity) and
-   three-level formats are unexecuted schema surface.
-2. Merges synchronize cursors within one dense-row context. Multi-level
-   sparse-sparse iteration (merging at an outer compressed level while
-   iterating inner levels) is representable in principle but untested.
-3. No CIN-to-LoopIR lowering exists. Feasibility of *generating* these
-   programs from `iter_lattice`/`cin_analysis` products — the Phase-4
-   strangler path — is not evidenced by this spike, only unblocked by it.
-4. Nothing here measures generated-code performance; the byte gates prove
-   non-interference, not that LoopIR-compiled kernels will match the
-   current emitter. That remains gated by Phase 4's shadow comparisons.
-5. The value system is scalar `float` with three binary and two reduction
-   operators; dtype/layout generality is a schema-revision item.
-6. Workspaces, parallel loops, tiles, panels, and relayout regions are
-   absent by design; their addition is exactly the "revise the schema from
-   the spike" step Milestone 4 begins with.
+Because one mandatory criterion fails, the overall verdict is NO-GO even though
+the merge-control subexperiment passes.
 
-## Conditions attached to GO
+## Verification
 
-1. Phase 4 begins by revising this schema (builder ergonomics, workspace
-   and parallel-loop nodes, tile/panel/relayout regions, dtype generality,
-   multi-level cursor execution) — the spike schema is input, not contract.
-2. The spike interpreter is promoted to the Phase-4 semantic oracle only
-   together with that revision, keeping its independence properties (the
-   neutrality suite must keep passing as it evolves).
-3. The package stays out of production imports until the Milestone-4
-   strangler path deliberately introduces LoopIR behind its own gates; the
-   automated isolation tests are the enforcement and must not be weakened.
-4. Milestone 4 step 6 (tile-j/tile-ijk re-expression) remains a hard
-   checkpoint: if those schedules cannot be expressed as `LoopPlan` plus
-   typed passes over the revised LoopIR, the parity claim above is void and
-   the investment case must be revisited rather than forced.
+The original evidence ledger remains at
+`/Users/bobby/.cache/scorch-codex/phase35-loopir-spike-1c78633/`. Its factual
+receipts were independently checked during this review:
 
-## Evidence index
+- 297 original focused tests pass;
+- the 20-source corpus and 42-source grid are byte-identical between detached
+  `34a1849` and `1c78633` worktrees and chain to the retained Phase-3 captures;
+- the recorded full suite contains 2,857 passed, 14 skipped, 3 perf-marked
+  deselections, and no failures/errors;
+- the recorded latency ratios are inside 1.10 everywhere; and
+- original static, import-provenance, protected-file, staging, and origin-tip
+  claims match their retained receipts.
 
-Under `/Users/bobby/.cache/scorch-codex/phase35-loopir-spike-1c78633/`:
-`corpus-{base,candidate}/`, `grid-{base,candidate}/`, `CAPTURE_SHA256SUMS`,
-`latency-{base,candidate}.{json,log}`, `latency-compare.txt`,
-`static/{black,flake8,mypy}-{base,candidate}.log`, `run_full_suite.sh`,
-`import-provenance.txt`, `full-suite.{log,xml}`, and the detached worktrees
-under `worktrees/`.
+Review-correction verification through final code/test commit `e719be3`:
+
+- focused spike suites: **329 passed** (92 verifier, 231 execution, 6
+  neutrality);
+- focused spike plus identity/CIN-analysis/LoopPlan/raw-budget suites:
+  **454 passed**;
+- fresh 20-source corpus and 42-source grid captures from detached `b59491b`
+  are byte-identical to the retained `1c78633` candidate captures, which already
+  chain byte-identically to `34a1849` and the Phase-3 finals; the byte waiver
+  therefore applies and no runtime benchmark is required; `64163d8..e719be3`
+  touch only the isolated interpreter and its tests, which the neutrality suite
+  proves are outside production imports;
+- all 31 verifier defect codes have direct regression coverage;
+- Black and Flake8 are clean on the seven changed source/test files; mypy reports
+  success on the five changed production files; and
+- `git diff --check` is clean.
+
+The authoritative clean detached-worktree non-performance run at exact final
+code/test commit `e719be3`, with import provenance asserted and caches isolated,
+passed **2,889 tests with 14 skipped, 3 perf-marked deselections, and one known
+warning in 2,033.63 seconds**. It had no failures or errors.
+
+## Requirements before repeating the review
+
+The repeat spike must resolve the failed criterion rather than relabel it as
+future work:
+
+1. Add stable logical dimension/domain identities and an explicit mapping from
+   physical levels to logical modes.
+2. Add explicit level references and physical position bindings. A compressed
+   child must reference a dominating parent position; coordinate recovery may
+   not be implicit or string-derived.
+3. Define when a cursor position owns a scalar value; non-leaf structural
+   levels must not expose leaf values.
+4. Put sparse storage behind a format-neutral level interface, with CSR as one
+   adapter rather than the interpreter's execution model.
+5. Represent and verify merge-domain compatibility and shape relationships
+   using the logical dimension model.
+6. Execute at least one nested compressed case (DCSR or a three-level CSF-like
+   fixture) and one permuted-mode case (for example CSC), in addition to the CSR
+   regressions. Include wrong-parent and wrong-domain adversarial tests.
+7. Decide and document the required Phase-4 surface for `COORDINATE` and
+   `SINGLETON`; unsupported kinds must fail explicitly.
+8. Keep the neutrality suite green and keep the package outside production
+   imports until a repeated review records GO.
+
+Only after those conditions are implemented and the explicit review is repeated
+may Phase 4 begin. Phase 0-3 remains complete and valuable regardless of this
+NO-GO; no Phase-3 work is reopened by the decision.
