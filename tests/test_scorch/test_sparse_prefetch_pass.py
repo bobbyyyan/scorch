@@ -149,12 +149,18 @@ def _sparse_loop(
     )
 
 
-def _prefetches(statements: List[llir.Stmt]) -> List[llir.RawStmt]:
+def _prefetches(statements: List[llir.Stmt]) -> List[llir.GuardedCallStmt]:
     return [
-        cast(llir.RawStmt, statement)
+        cast(llir.GuardedCallStmt, statement)
         for statement in statements
-        if type(statement) is llir.RawStmt
-        and "__builtin_prefetch" in cast(llir.RawStmt, statement).code
+        if type(statement) is llir.GuardedCallStmt
+        and cast(llir.GuardedCallStmt, statement).call.name == "__builtin_prefetch"
+    ]
+
+
+def _prefetch_codes(statements: List[llir.Stmt]) -> List[str]:
+    return [
+        LLIRLowerer().lower_llir(statement) for statement in _prefetches(statements)
     ]
 
 
@@ -201,7 +207,7 @@ def _expected_prefetch(
     return (
         f"if ({iterator} + 1 < {end}) "
         f"__builtin_prefetch(&{array}[{coordinate_array}[{iterator} + 1] * "
-        f"{stride}], 0, 1)"
+        f"{stride}], 0, 1);"
     )
 
 
@@ -249,9 +255,7 @@ def test_success_and_legal_noop_are_fully_detached_without_input_mutation() -> N
     assert _structural_snapshot(source) == source_snapshot
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
     output_loop = cast(llir.ForLoop, output[0])
-    assert [statement.code for statement in _prefetches(output_loop.body)] == [
-        _expected_prefetch()
-    ]
+    assert _prefetch_codes(output_loop.body) == [_expected_prefetch()]
 
     noop_source: List[llir.Stmt] = [llir.BlankLine()]
     noop_snapshot = _structural_snapshot(noop_source)
@@ -297,7 +301,8 @@ def test_nested_sparse_loops_are_processed_post_order_through_direct_bodies(
 
     assert insertion_order == ["pX1", "pA1"]
     output_outer = cast(llir.ForLoop, output[0])
-    assert cast(llir.RawStmt, output_outer.body[0]).code == _expected_prefetch()
+    assert type(output_outer.body[0]) is llir.GuardedCallStmt
+    assert LLIRLowerer().lower_llir(output_outer.body[0]) == _expected_prefetch()
     output_nested = next(
         cast(llir.ForLoop, statement)
         for statement in output_outer.body
@@ -305,7 +310,8 @@ def test_nested_sparse_loops_are_processed_post_order_through_direct_bodies(
         and type(cast(llir.ForLoop, statement).init) is llir.VarInit
         and cast(llir.VarInit, cast(llir.ForLoop, statement).init).var.name == "pX1"
     )
-    assert cast(llir.RawStmt, output_nested.body[0]).code == _expected_prefetch(
+    assert type(output_nested.body[0]) is llir.GuardedCallStmt
+    assert LLIRLowerer().lower_llir(output_nested.body[0]) == _expected_prefetch(
         "Y_val",
         "Y1_size",
         iterator="pX1",
@@ -349,16 +355,15 @@ def test_string_and_typed_array_accesses_collect_all_pairs_in_first_seen_order()
 
     loop = cast(llir.ForLoop, output[0])
     prefetches = _prefetches(loop.body)
-    assert [(statement.code, statement.add_semicolon) for statement in prefetches] == [
-        (_expected_prefetch("B_val", "B1_size"), True),
-        (_expected_prefetch("D_val", "D1_size"), True),
+    assert _prefetch_codes(loop.body) == [
+        _expected_prefetch("B_val", "B1_size"),
+        _expected_prefetch("D_val", "D1_size"),
     ]
     assert loop.body[:2] == prefetches
     assert LLIRLowerer().lower_llir(prefetches) == (
         _expected_prefetch("B_val", "B1_size")
-        + ";\n"
+        + "\n"
         + _expected_prefetch("D_val", "D1_size")
-        + ";"
     )
     rewritten_inner = next(
         statement for statement in loop.body if type(statement) is llir.ForLoop
@@ -382,7 +387,7 @@ def test_raw_hoisted_pointer_augments_assignment_discovery_in_body_order() -> No
     output = insert_sparse_prefetch(source, SPARSE_PREFETCH_CONTEXT)
 
     loop = cast(llir.ForLoop, output[0])
-    assert [statement.code for statement in _prefetches(loop.body)] == [
+    assert _prefetch_codes(loop.body) == [
         _expected_prefetch("B_val", "B1_size"),
         _expected_prefetch("E_val", "E1_size"),
     ]
@@ -446,7 +451,7 @@ def test_typed_hoisted_pointer_augments_discovery_like_the_raw_form() -> None:
     output = insert_sparse_prefetch(source, SPARSE_PREFETCH_CONTEXT)
 
     loop = cast(llir.ForLoop, output[0])
-    assert [statement.code for statement in _prefetches(loop.body)] == [
+    assert _prefetch_codes(loop.body) == [
         _expected_prefetch("B_val", "B1_size"),
         _expected_prefetch("E_val", "E1_size"),
     ]
@@ -469,9 +474,7 @@ def test_sparse_gate_is_structural_and_uses_the_condition_right_hand_var() -> No
     output = insert_sparse_prefetch([loop], SPARSE_PREFETCH_CONTEXT)
 
     rewritten = cast(llir.ForLoop, output[0])
-    assert [statement.code for statement in _prefetches(rewritten.body)] == [
-        _expected_prefetch(end="named_rhs_end")
-    ]
+    assert _prefetch_codes(rewritten.body) == [_expected_prefetch(end="named_rhs_end")]
 
     legacy = _sparse_loop(
         position_begin=_var("prefix_A1_pos[pA0] + suffix", llir.DataType.INT)
@@ -479,6 +482,50 @@ def test_sparse_gate_is_structural_and_uses_the_condition_right_hand_var() -> No
     legacy_output = insert_sparse_prefetch([legacy], SPARSE_PREFETCH_CONTEXT)
     assert _prefetches(cast(llir.ForLoop, legacy_output[0]).body) == []
     assert _mutable_ir_ids([legacy]).isdisjoint(_mutable_ir_ids(legacy_output))
+
+
+def test_spellings_outside_the_typed_guard_grammar_are_structural_misses() -> None:
+    """Names the typed node cannot represent skip insertion, never raise."""
+
+    expression_stride = _sparse_loop(
+        tail=[
+            _string_dense_loop(stride="B1_size * tile"),
+            _string_dense_loop(array="D_val", position="pD1", stride="D1_size"),
+        ]
+    )
+    partial = insert_sparse_prefetch([expression_stride], SPARSE_PREFETCH_CONTEXT)
+    assert _prefetch_codes(cast(llir.ForLoop, partial[0]).body) == [
+        _expected_prefetch("D_val", "D1_size")
+    ]
+
+    expression_value_array = _sparse_loop(
+        tail=[
+            _inner_loop(
+                [
+                    _position_init("pB1", "pB0", "B1_size"),
+                    llir.Assign(
+                        _access("C_val", "pC1"),
+                        llir.ArrayAccess(
+                            _var("B_val + offset"),
+                            _var("pB1", llir.DataType.INT64),
+                        ),
+                    ),
+                ]
+            )
+        ]
+    )
+    array_missed = insert_sparse_prefetch(
+        [expression_value_array], SPARSE_PREFETCH_CONTEXT
+    )
+    assert _prefetches(cast(llir.ForLoop, array_missed[0]).body) == []
+
+    expression_iterator = _sparse_loop(iterator="lane + 1")
+    iterator_source: List[llir.Stmt] = [expression_iterator]
+    snapshot = _structural_snapshot(iterator_source)
+    iterator_missed = insert_sparse_prefetch(iterator_source, SPARSE_PREFETCH_CONTEXT)
+    assert _structural_snapshot(iterator_source) == snapshot
+    assert _prefetches(cast(llir.ForLoop, iterator_missed[0]).body) == []
+    assert _mutable_ir_ids(iterator_source).isdisjoint(_mutable_ir_ids(iterator_missed))
 
 
 def _legal_noop_sources() -> List[Tuple[str, List[llir.Stmt]]]:
@@ -751,10 +798,8 @@ def test_repeated_application_preserves_non_idempotent_duplicate_insertion() -> 
     assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
     first_loop = cast(llir.ForLoop, first[0])
     second_loop = cast(llir.ForLoop, second[0])
-    assert [statement.code for statement in _prefetches(first_loop.body)] == [
-        _expected_prefetch()
-    ]
-    assert [statement.code for statement in _prefetches(second_loop.body)] == [
+    assert _prefetch_codes(first_loop.body) == [_expected_prefetch()]
+    assert _prefetch_codes(second_loop.body) == [
         _expected_prefetch(),
         _expected_prefetch(),
     ]
@@ -1399,7 +1444,7 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     assert "int pA1_end = A1_pos[pA0 + 1];" in cpp
     assert "pA1 < pA1_end; pA1++" in cpp
     assert "pA1 + 1 < pA1_end" in cpp
-    assert _expected_prefetch() + ";" in cpp
+    assert _expected_prefetch() in cpp
     assert ("const float* __restrict__ _B_val_ptr = " "&B_val[pB0 * B1_size];") in cpp
     assert [record.pass_name for record in lowerer.llir_pass_run_records] == [
         "insert_sparse_prefetch",

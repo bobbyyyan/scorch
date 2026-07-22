@@ -148,9 +148,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
+        "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 468
+    assert sum(constructor_counts.values()) == 469
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 146,
@@ -165,9 +166,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 105,
         "single_iteration_loop_pass.py": 1,
+        "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 458
+    assert sum(unclassified_counts.values()) == 459
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -196,10 +198,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("schedule_lowerer.py", "prefix_extent"): 2,
         ("schedule_lowerer.py", "zero_value"): 1,
         ("single_iteration_loop_pass.py", "name"): 1,
+        ("sparse_prefetch_pass.py", "name"): 1,
         ("torch_cpp_abi.py", "pointer_name"): 4,
         ("torch_cpp_abi.py", "bound_name"): 1,
     }
-    assert sum(known_indirect.values()) == 47
+    assert sum(known_indirect.values()) == 48
 
     assert totals == {
         "subscript": 9,
@@ -645,10 +648,9 @@ def test_raw_statement_producer_budget_remains_explicit() -> None:
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
-        "sparse_prefetch_pass.py": 1,
     }
-    assert sum(counts.values()) == 6
-    assert sum(counts.values()) - counts["llir_traversal.py"] == 5
+    assert sum(counts.values()) == 5
+    assert sum(counts.values()) - counts["llir_traversal.py"] == 4
 
 
 def test_workspace_clear_mutations_are_structured() -> None:
@@ -842,8 +844,9 @@ def test_dense_workspace_write_back_copy_is_structured() -> None:
         "dense_pointer_hoist_pass.py": 2,
         "llir_traversal.py": 1,
         "single_iteration_loop_pass.py": 1,
+        "sparse_prefetch_pass.py": 1,
     }
-    assert sum(address_of_constructors.values()) == 6
+    assert sum(address_of_constructors.values()) == 7
 
     lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
     lowerer_source = lowerer_path.read_text()

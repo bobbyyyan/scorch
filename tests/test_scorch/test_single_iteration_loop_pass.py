@@ -7,6 +7,7 @@ from typing import Callable, List, NoReturn, Sequence, Set, Tuple, cast
 import pytest
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
+from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
@@ -944,6 +945,64 @@ def test_member_call_rewrite_owns_receiver_and_arguments() -> None:
     assert cast(llir.Var, argument.array).name == "Arguments"
     assert cast(llir.Var, argument.index).name == "root"
     assert cast(llir.Var, rewritten.args[1]).name == "Payload[root]"
+    assert _snapshot(source) == before
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
+def test_guarded_call_rewrite_owns_condition_and_arguments() -> None:
+    guarded = llir.GuardedCallStmt(
+        cond=llir.BinOp(
+            "<",
+            llir.Add(_var("position"), llir.Literal(1, llir.DataType.INT)),
+            _var("position_end"),
+        ),
+        call=llir.FunctionCallStmt(
+            "__builtin_prefetch",
+            (
+                llir.AddressOf(
+                    operand=llir.ArrayAccess(
+                        array=_var("Values"),
+                        index=llir.Mul(
+                            llir.ArrayAccess(
+                                array=_var("Coordinates"),
+                                index=_var("lane", llir.DataType.INT64),
+                            ),
+                            _var("stride"),
+                        ),
+                    )
+                ),
+                llir.Literal(0, llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
+    )
+    source = _program([guarded], loop_variable="lane", base="root")
+    before = _snapshot(source)
+
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert len(output) == 1
+    rewritten = cast(llir.GuardedCallStmt, output[0])
+    assert type(rewritten) is llir.GuardedCallStmt
+    # Identifier-only guard spellings are outside the legacy compound
+    # generated-string patterns; only the exact structured array-index
+    # replacement fires.
+    condition = cast(llir.BinOp, rewritten.cond)
+    assert cast(llir.Var, cast(llir.Add, condition.left).left).name == "position"
+    assert cast(llir.Var, condition.right).name == "position_end"
+    borrowed = cast(llir.AddressOf, rewritten.call.args[0])
+    borrowed_access = cast(llir.ArrayAccess, borrowed.operand)
+    coordinate = cast(llir.ArrayAccess, cast(llir.Mul, borrowed_access.index).left)
+    assert cast(llir.Var, coordinate.index).name == "root"
+    assert rewritten.call.name == "__builtin_prefetch"
+    assert type(rewritten.call.args) is tuple
+    assert LLIRLowerer().lower_llir(rewritten) == (
+        "if (position + 1 < position_end) "
+        "__builtin_prefetch(&Values[Coordinates[root] * stride], 0, 1);"
+    )
     assert _snapshot(source) == before
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
 

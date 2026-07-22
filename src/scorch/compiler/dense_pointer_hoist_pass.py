@@ -634,6 +634,34 @@ def _rewrite_statement_references(
                     statement_path + ("args",),
                 ),
             )
+        elif type(statement) is llir.GuardedCallStmt:
+            guarded_call = cast(llir.GuardedCallStmt, statement)
+            guarded_callee = guarded_call.call
+            name = _checked_function_name(
+                guarded_callee,
+                context,
+                statement_path + ("call",),
+            )
+            for old, new in replacements.generated_strings:
+                name = name.replace(old, new)
+            rewritten_statement = llir.GuardedCallStmt(
+                cond=_rewrite_expression_references(
+                    guarded_call.cond,
+                    replacements,
+                    context,
+                    statement_path + ("cond",),
+                ),
+                call=llir.FunctionCallStmt(
+                    name=name,
+                    template_args=guarded_callee.template_args,
+                    args=_rewrite_expression_sequence(
+                        guarded_callee.args,
+                        replacements,
+                        context,
+                        statement_path + ("call", "args"),
+                    ),
+                ),
+            )
         elif type(statement) is llir.MemberCallStmt:
             member_call = cast(llir.MemberCallStmt, statement)
             rewritten_statement = llir.MemberCallStmt(

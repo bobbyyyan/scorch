@@ -24,9 +24,15 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
 )
 from scorch.compiler.schedule_lowerer import (  # type: ignore[import-untyped]
     _contains_tensor_access,
+    _is_operand_prefetch_guard,
     _matches_tensor_access,
+    _redirect_sparse_prefetch,
     _rewrite_expr_access,
     _rewrite_stmt_accesses,
+)
+from scorch.compiler.sparse_prefetch_pass import (  # type: ignore[import-untyped]
+    SPARSE_PREFETCH_CONTEXT,
+    insert_sparse_prefetch,
 )
 from scorch.compiler.scheduler import (
     Schedule,
@@ -427,6 +433,272 @@ def test_schedule_statement_access_rewrite_counts_and_clones_each_replacement():
     assert all(
         LLIRLowerer().lower_llir(statement.value) == "packed_Input[packed_position]"
         for statement in statements
+    )
+
+
+def _prefetchable_sparse_loop() -> llir.ForLoop:
+    """One canonical CSR-style position loop that activates typed P1."""
+
+    def _nt(name: str) -> llir.Var:
+        return llir.Var(name, llir.DataType.NO_TYPE)
+
+    inner = llir.ForLoop(
+        init=llir.VarInit(
+            llir.Var("j", llir.DataType.INT),
+            llir.Literal(0),
+        ),
+        cond=llir.BinOp("<", _nt("j"), _nt("B1_size")),
+        update=llir.Increment(_nt("j")),
+        body=[
+            llir.VarInit(
+                _nt("pB1"),
+                llir.Add(llir.Mul(_nt("coordinate"), _nt("B1_size")), _nt("j")),
+            ),
+            llir.Assign(
+                llir.ArrayAccess(_nt("C_val"), llir.Var("pC1", llir.DataType.INT64)),
+                _nt("B_val[pB1]"),
+            ),
+        ],
+    )
+    return llir.ForLoop(
+        init=llir.VarInit(
+            _nt("pA1"),
+            llir.ArrayAccess(
+                llir.Var("A1_pos", llir.DataType.PTR_INT),
+                llir.Var("pA0", llir.DataType.INT),
+            ),
+        ),
+        cond=llir.BinOp("<", _nt("pA1"), _nt("pA1_end")),
+        update=llir.Increment(_nt("pA1")),
+        body=[
+            llir.VarInit(
+                _nt("coordinate"),
+                llir.ArrayAccess(
+                    llir.Var("A1_crd", llir.DataType.PTR_INT),
+                    llir.Var("pA1", llir.DataType.INT),
+                ),
+            ),
+            inner,
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage_row_origin", "staged_row"),
+    (
+        (None, "A1_crd[pA1 + 1]"),
+        ("j_out", "(A1_crd[pA1 + 1] - j_out)"),
+    ),
+    ids=("no-origin", "origin"),
+)
+def test_redirect_composes_with_the_typed_sparse_prefetch_producer(
+    stage_row_origin, staged_row
+) -> None:
+    """P1's actual output is removed and replaced by the packed guard."""
+
+    output = insert_sparse_prefetch(
+        [_prefetchable_sparse_loop()], SPARSE_PREFETCH_CONTEXT
+    )
+    sparse_loop = cast(llir.ForLoop, output[0])
+    produced = sparse_loop.body[0]
+    assert type(produced) is llir.GuardedCallStmt
+    assert _is_operand_prefetch_guard(produced, "B_val")
+    assert not _is_operand_prefetch_guard(produced, "C_val")
+
+    _redirect_sparse_prefetch(
+        sparse_loop,
+        "B_val",
+        "packed_B",
+        "j_out",
+        "j_out_end",
+        "kTile_k",
+        stage_row_origin,
+    )
+
+    assert produced not in sparse_loop.body
+    assert LLIRLowerer().lower_llir(sparse_loop.body[0]) == (
+        "if (pA1 + 1 < pA1_end && A1_crd[pA1 + 1] >= j_out && "
+        "A1_crd[pA1 + 1] < j_out_end) "
+        f"__builtin_prefetch(&packed_B[{staged_row} * kTile_k], 0, 1);"
+    )
+
+
+def test_redirect_recognition_is_structural_and_ignores_decoys() -> None:
+    """Raw text, other callees, other arrays, and bare calls stay untouched."""
+
+    def _nt(name: str) -> llir.Var:
+        return llir.Var(name, llir.DataType.NO_TYPE)
+
+    def _borrow(array: str) -> llir.AddressOf:
+        return llir.AddressOf(
+            operand=llir.ArrayAccess(
+                array=_nt(array),
+                index=llir.Mul(
+                    llir.ArrayAccess(
+                        _nt("A1_crd"),
+                        llir.Add(_nt("pA1"), llir.Literal(1, llir.DataType.INT)),
+                    ),
+                    _nt("B1_size"),
+                ),
+            )
+        )
+
+    guard_condition = llir.BinOp(
+        "<",
+        llir.Add(_nt("pA1"), llir.Literal(1, llir.DataType.INT)),
+        _nt("pA1_end"),
+    )
+    decoys: list[llir.Stmt] = [
+        llir.RawStmt(
+            "if (pA1 + 1 < pA1_end) "
+            "__builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1)"
+        ),
+        llir.GuardedCallStmt(
+            cond=guard_condition,
+            call=llir.FunctionCallStmt("__builtin_expect", (_borrow("B_val"),)),
+        ),
+        llir.GuardedCallStmt(
+            cond=llir.BinOp(
+                "<",
+                llir.Add(_nt("pA1"), llir.Literal(1, llir.DataType.INT)),
+                _nt("pA1_end"),
+            ),
+            call=llir.FunctionCallStmt("__builtin_prefetch", (_borrow("C_val"),)),
+        ),
+        llir.FunctionCallStmt("__builtin_prefetch", (_borrow("B_val"),)),
+    ]
+    sparse_loop = _prefetchable_sparse_loop()
+    sparse_loop.body = [sparse_loop.body[0], *decoys, sparse_loop.body[1]]
+    body_before = list(sparse_loop.body)
+
+    for decoy in decoys:
+        assert not _is_operand_prefetch_guard(decoy, "B_val")
+
+    _redirect_sparse_prefetch(
+        sparse_loop,
+        "B_val",
+        "packed_B",
+        "j_out",
+        "j_out_end",
+        "kTile_k",
+        None,
+    )
+
+    assert sparse_loop.body == body_before
+    assert all(
+        existing is expected
+        for existing, expected in zip(sparse_loop.body, body_before)
+    )
+
+
+def test_schedule_guarded_call_statement_rewrites_condition_and_arguments() -> None:
+    tensor_id = SymbolId(31)
+    index_ids = (IndexId(32),)
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(33),
+        tensor_id=tensor_id,
+        index_ids=index_ids,
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    access = llir.ArrayAccess(
+        llir.Var("Input_val", llir.DataType.PTR_FLOAT32),
+        llir.Var("pInput", llir.DataType.INT),
+        metadata,
+    )
+    source = llir.GuardedCallStmt(
+        cond=llir.BinOp("<", access, llir.Var("bound", llir.DataType.INT)),
+        call=llir.FunctionCallStmt("__builtin_prefetch", (access,)),
+    )
+    statements: list[llir.Stmt] = [source]
+    replacement = llir.ArrayAccess(
+        llir.Var("packed_Input", llir.DataType.PTR_FLOAT32),
+        llir.Var("packed_position", llir.DataType.INT),
+    )
+
+    count = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+    first = cast(llir.GuardedCallStmt, statements[0])
+    repeated = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+    second = cast(llir.GuardedCallStmt, statements[0])
+
+    assert count == 2
+    assert repeated == 0
+    assert type(first) is llir.GuardedCallStmt
+    assert first is not source
+    assert second is not first
+    assert LLIRLowerer().lower_llir(first) == (
+        "if (packed_Input[packed_position] < bound) "
+        "__builtin_prefetch(packed_Input[packed_position]);"
+    )
+
+
+def test_schedule_untagged_guarded_call_statement_is_a_detached_pass_through() -> None:
+    tensor_id = SymbolId(41)
+    index_ids = (IndexId(42),)
+    source = llir.GuardedCallStmt(
+        cond=llir.BinOp(
+            "<",
+            llir.Add(
+                llir.Var("pA1", llir.DataType.NO_TYPE),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+            llir.Var("pA1_end", llir.DataType.NO_TYPE),
+        ),
+        call=llir.FunctionCallStmt(
+            "__builtin_prefetch",
+            (
+                llir.AddressOf(
+                    operand=llir.ArrayAccess(
+                        array=llir.Var("B_val", llir.DataType.NO_TYPE),
+                        index=llir.Mul(
+                            llir.ArrayAccess(
+                                array=llir.Var("A1_crd", llir.DataType.NO_TYPE),
+                                index=llir.Add(
+                                    llir.Var("pA1", llir.DataType.NO_TYPE),
+                                    llir.Literal(1, llir.DataType.INT),
+                                ),
+                            ),
+                            llir.Var("B1_size", llir.DataType.NO_TYPE),
+                        ),
+                    )
+                ),
+                llir.Literal(0, llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
+    )
+    statements: list[llir.Stmt] = [source]
+    replacement = llir.ArrayAccess(
+        llir.Var("packed_B", llir.DataType.PTR_FLOAT32),
+        llir.Var("packed_position", llir.DataType.INT),
+    )
+
+    count = _rewrite_stmt_accesses(
+        statements,
+        tensor_id,
+        index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        replacement,
+    )
+    rewritten = cast(llir.GuardedCallStmt, statements[0])
+
+    assert count == 0
+    assert rewritten == source
+    assert rewritten is not source
+    assert LLIRLowerer().lower_llir(rewritten) == (
+        "if (pA1 + 1 < pA1_end) "
+        "__builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1);"
     )
 
 

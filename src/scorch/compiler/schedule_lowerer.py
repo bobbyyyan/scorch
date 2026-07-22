@@ -675,6 +675,26 @@ def _rewrite_stmt_access_sequence(
                 template_args=stmt.template_args,
                 args=rewritten_args,
             )
+        elif isinstance(stmt, llir.GuardedCallStmt):
+            rewritten_cond, cond_count = _rewrite_expr_access(
+                stmt.cond, tensor_id, index_ids, role, replacement
+            )
+            count += cond_count
+            rewritten_args = []
+            for arg in stmt.call.args:
+                arg, arg_count = _rewrite_expr_access(
+                    arg, tensor_id, index_ids, role, replacement
+                )
+                rewritten_args.append(arg)
+                count += arg_count
+            rewritten_stmt = llir.GuardedCallStmt(
+                cond=rewritten_cond,
+                call=llir.FunctionCallStmt(
+                    name=stmt.call.name,
+                    template_args=stmt.call.template_args,
+                    args=rewritten_args,
+                ),
+            )
         rewritten_stmts.append(rewritten_stmt)
     rewritten_sequence: LLIRStatementSequence = (
         tuple(rewritten_stmts) if type(stmts) is tuple else rewritten_stmts
@@ -733,6 +753,32 @@ def _contains_tensor_access(
     return walker.found
 
 
+def _is_operand_prefetch_guard(stmt: llir.Stmt, operand_value_array: str) -> bool:
+    """Exactly recognize one typed P1 guard addressing one operand value array.
+
+    Recognition is structural, not textual: the statement must be the exact
+    guarded ``__builtin_prefetch`` call whose first argument borrows the
+    selected operand value array.  Raw statements that merely spell similar
+    text are decoys and stay untouched.
+    """
+
+    if type(stmt) is not llir.GuardedCallStmt:
+        return False
+    call = stmt.call
+    if type(call) is not llir.FunctionCallStmt or call.name != "__builtin_prefetch":
+        return False
+    if type(call.args) is not tuple or not call.args:
+        return False
+    address = call.args[0]
+    if type(address) is not llir.AddressOf:
+        return False
+    operand = address.operand
+    if type(operand) is not llir.ArrayAccess:
+        return False
+    array = operand.array
+    return type(array) is llir.Var and array.name == operand_value_array
+
+
 def _redirect_sparse_prefetch(
     sparse_loop: llir.ForLoop,
     operand_value_array: str,
@@ -756,11 +802,10 @@ def _redirect_sparse_prefetch(
     coordinate_array = _find_coordinate_array(sparse_loop.body, position)
     coordinate_name = coordinate_array.name
     end_name = sparse_loop.cond.right.name
-    marker = f"__builtin_prefetch(&{operand_value_array}["
     removed = False
     retained: List[llir.Stmt] = []
     for stmt in sparse_loop.body:
-        if isinstance(stmt, llir.RawStmt) and marker in stmt.code:
+        if _is_operand_prefetch_guard(stmt, operand_value_array):
             removed = True
             continue
         retained.append(stmt)

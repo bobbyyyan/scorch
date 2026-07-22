@@ -4,9 +4,13 @@ Version 1 intentionally preserves the generated-name contracts of the legacy
 ``CINLowerer`` optimization.  Sparse position loops and coordinates are
 recognized through structured ``ArrayAccess`` nodes, dense
 value accesses through ``_val`` spellings, and already-hoisted value pointers
-through the exact legacy ``RawStmt`` declaration.  The inserted target spelling
-and next-position distance are fixed as ``__builtin_prefetch(..., 0, 1)``.
-These are compatibility dependencies, not configurable policy.
+through the exact legacy ``RawStmt`` declaration.  The inserted statement is
+the typed single-line :class:`llir.GuardedCallStmt`; its target spelling and
+next-position distance remain the fixed ``__builtin_prefetch(..., 0, 1)``,
+emitted byte-identically to the historical raw text.  Referenced names that
+cannot be represented in that node's identifier/member-path grammar are
+treated as one more legal structural miss: the affected prefetch is simply
+not inserted.  These are compatibility dependencies, not configurable policy.
 
 The common LLIR boundary validates and detaches the complete input tree.  The
 semantic scan remains deliberately narrower: it follows only chains of direct
@@ -405,6 +409,50 @@ def _augment_from_hoisted_pointers(
             _append_dense_array(dense_arrays, (match.group(2), match.group(4)))
 
 
+def _prefetch_statement(
+    iterator: str,
+    end: str,
+    coordinate_array: str,
+    value_array: str,
+    stride: str,
+) -> llir.GuardedCallStmt:
+    """Build the exact legacy guarded prefetch as one typed statement.
+
+    Every referenced operand is a fresh metadata-free ``NO_TYPE`` name
+    because the surrounding generated loop owns the declarations; codegen
+    reproduces the legacy single-line spelling byte-for-byte.
+    """
+
+    def _reference(name: str) -> llir.Var:
+        return llir.Var(name=name, type=llir.DataType.NO_TYPE)
+
+    def _next_position() -> llir.Add:
+        return llir.Add(_reference(iterator), llir.Literal(1, llir.DataType.INT))
+
+    return llir.GuardedCallStmt(
+        cond=llir.BinOp("<", _next_position(), _reference(end)),
+        call=llir.FunctionCallStmt(
+            "__builtin_prefetch",
+            (
+                llir.AddressOf(
+                    operand=llir.ArrayAccess(
+                        array=_reference(value_array),
+                        index=llir.Mul(
+                            llir.ArrayAccess(
+                                array=_reference(coordinate_array),
+                                index=_next_position(),
+                            ),
+                            _reference(stride),
+                        ),
+                    )
+                ),
+                llir.Literal(0, llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
+    )
+
+
 def _prepend_prefetches(
     loop: llir.ForLoop,
     iterator: str,
@@ -412,6 +460,11 @@ def _prepend_prefetches(
     coordinate_array: str,
     dense_arrays: Sequence[_DenseArrayStride],
 ) -> None:
+    if not (
+        llir._is_assignment_name(iterator, allow_member=True)
+        and llir._is_assignment_name(end, allow_member=True)
+    ):
+        return
     prefetches: List[llir.Stmt] = []
     seen: set[_DenseArrayStride] = set()
     for value_array, stride in dense_arrays:
@@ -419,15 +472,13 @@ def _prepend_prefetches(
         if key in seen:
             continue
         seen.add(key)
+        if not (
+            value_array.isidentifier()
+            and llir._is_assignment_name(stride, allow_member=True)
+        ):
+            continue
         prefetches.append(
-            llir.RawStmt(
-                code=(
-                    f"if ({iterator} + 1 < {end}) "
-                    f"__builtin_prefetch(&{value_array}["
-                    f"{coordinate_array}[{iterator} + 1] * {stride}], 0, 1)"
-                ),
-                add_semicolon=True,
-            )
+            _prefetch_statement(iterator, end, coordinate_array, value_array, stride)
         )
 
     if type(loop.body) is list:

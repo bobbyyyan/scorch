@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from scorch.compiler import llir  # type: ignore[import-untyped]
+from scorch.compiler.codegen import LLIRLowerer  # type: ignore[import-untyped]
 import scorch.compiler.llir_pass_manager as pass_manager_module  # type: ignore[import-untyped]
 import scorch.compiler.result_write_pass as result_write_module  # type: ignore[import-untyped]
 from scorch.compiler.compile_options import CompileOptions  # type: ignore[import-untyped]
@@ -924,18 +925,18 @@ def test_mode_iterator_position_bounds_and_coordinate_read_activate_managed_pref
     once_loop = cast(llir.ForLoop, once.artifact.value[1])
     twice_loop = cast(llir.ForLoop, twice.artifact.value[1])
     once_prefetches = [
-        cast(llir.RawStmt, statement).code
+        LLIRLowerer().lower_llir(statement)
         for statement in once_loop.body
-        if type(statement) is llir.RawStmt
+        if type(statement) is llir.GuardedCallStmt
     ]
     twice_prefetches = [
-        cast(llir.RawStmt, statement).code
+        LLIRLowerer().lower_llir(statement)
         for statement in twice_loop.body
-        if type(statement) is llir.RawStmt
+        if type(statement) is llir.GuardedCallStmt
     ]
     expected_prefetch = (
         "if (pA1 + 1 < pA1_end) "
-        "__builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1)"
+        "__builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1);"
     )
     assert once_prefetches == [expected_prefetch]
     assert twice_prefetches == [expected_prefetch, expected_prefetch]

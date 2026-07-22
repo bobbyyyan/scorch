@@ -426,6 +426,64 @@ def test_expression_bearing_candidate_names_keep_the_legacy_d1_fallback(
     )
 
 
+def test_guarded_call_statements_ride_through_the_hoist_rewrite_scope() -> None:
+    """A typed prefetch guard in an activating body is detached, not altered."""
+
+    guarded = llir.GuardedCallStmt(
+        cond=llir.BinOp(
+            "<",
+            llir.Add(_var("position"), llir.Literal(1, llir.DataType.INT)),
+            _var("position_end"),
+        ),
+        call=llir.FunctionCallStmt(
+            "__builtin_prefetch",
+            (
+                llir.AddressOf(
+                    operand=llir.ArrayAccess(
+                        array=_var("Input_val"),
+                        index=llir.Mul(
+                            llir.ArrayAccess(
+                                array=_var("Input_crd"),
+                                index=llir.Add(
+                                    _var("position"),
+                                    llir.Literal(1, llir.DataType.INT),
+                                ),
+                            ),
+                            _var("stride"),
+                        ),
+                    )
+                ),
+                llir.Literal(0, llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
+    )
+    loop = _loop(
+        [
+            guarded,
+            _position_init("position", "base", "stride", "lane"),
+            llir.Assign(_var("output"), _var("Input_val[position]")),
+        ],
+        loop_variable="lane",
+    )
+    source: List[llir.Stmt] = [loop]
+
+    output = hoist_dense_pointers(source, _context(("Input_val", "float")))
+
+    declaration = cast(llir.VarInit, output[0])
+    assert type(declaration) is llir.VarInit
+    assert declaration.var.name == "_Input_val_ptr"
+    rewritten_loop = cast(llir.ForLoop, output[1])
+    rewritten_guard = cast(llir.GuardedCallStmt, rewritten_loop.body[0])
+    assert type(rewritten_guard) is llir.GuardedCallStmt
+    assert rewritten_guard == guarded
+    assert LLIRLowerer().lower_llir(rewritten_guard) == (
+        "if (position + 1 < position_end) "
+        "__builtin_prefetch(&Input_val[Input_crd[position + 1] * stride], 0, 1);"
+    )
+    assert _mutable_ir_ids(output).isdisjoint(_mutable_ir_ids(source))
+
+
 def test_every_legal_noop_is_detached_and_preserves_all_fields_and_metadata() -> None:
     metadata = llir.TensorAccessMetadata(
         access_id=AccessId(11),
