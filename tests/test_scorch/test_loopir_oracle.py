@@ -837,3 +837,67 @@ def test_shared_dimension_extent_mismatch_between_storages_fails():
             {fixture.a: a, fixture.b: b},
             {fixture.c: (1, 2)},
         )
+
+
+# -- Phase-6 affine-split execution -------------------------------------------
+
+
+def test_tiled_matvec_matches_the_unsplit_program_exactly():
+    from tests.test_scorch.test_loopir_verifier import build_tiled_matvec
+
+    rng = random.Random(626)
+    for width in (1, 2, 3, 4, 5, 9):
+        fixture = build_tiled_matvec(width=width)
+        rows, cols = 3, 5
+        matrix = [
+            [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(rows)
+        ]
+        vector = [float(rng.randrange(-3, 4)) for _ in range(cols)]
+        a, x = fixture.program.inputs
+        (y,) = fixture.program.outputs
+        results = run_program(fixture.program, {a: matrix, x: vector}, {y: (rows,)})
+        assert results[y] == reference_matvec(matrix, vector)
+
+
+def test_tiled_zero_extent_executes_nothing():
+    from tests.test_scorch.test_loopir_verifier import build_tiled_matvec
+
+    fixture = build_tiled_matvec(width=4)
+    a, x = fixture.program.inputs
+    (y,) = fixture.program.outputs
+    results = run_program(fixture.program, {a: [[], [], []], x: []}, {y: (3,)})
+    assert results[y] == [0.0, 0.0, 0.0]
+
+
+def test_tiled_visits_every_coordinate_exactly_once():
+    from tests.test_scorch.test_loopir_verifier import build_tiled_matvec
+
+    for width, cols in ((1, 5), (2, 5), (5, 5), (7, 5)):
+        fixture = build_tiled_matvec(width=width)
+        rows = 2
+        ones = [[1.0] * cols for _ in range(rows)]
+        a, x = fixture.program.inputs
+        (y,) = fixture.program.outputs
+        results = run_program(fixture.program, {a: ones, x: [1.0] * cols}, {y: (rows,)})
+        assert results[y] == [float(cols)] * rows
+
+
+def test_point_loop_outside_its_origin_fails_closed_at_runtime():
+    """Defensive boundary: the verifier's scope rule normally precludes this,
+    so the oracle's runtime guard is exercised on the raw execution state."""
+
+    from scorch.compiler.loopir.oracle import _Oracle
+    from tests.test_scorch.test_loopir_verifier import build_tiled_matvec
+
+    fixture = build_tiled_matvec(width=4)
+    a, x = fixture.program.inputs
+    (y,) = fixture.program.outputs
+    oracle = _Oracle(
+        fixture.program,
+        {a: [[1.0, 2.0]], x: [1.0, 1.0]},
+        {y: (1,)},
+    )
+    inner = fixture.inner
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(inner)
+    assert "outside its origin loop" in str(error.value)

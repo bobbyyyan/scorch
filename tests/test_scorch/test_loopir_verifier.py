@@ -27,6 +27,8 @@ from scorch.compiler.loopir.nodes import (
     ScalarType,
     Stmt,
     StoreReduce,
+    TileInnerFor,
+    TileOuterFor,
 )
 from scorch.compiler.loopir.verifier import (
     LoopIRVerificationError,
@@ -651,6 +653,13 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "default_contains_cursor",
     "non_leaf_value",
     "unsupported_sparse_output",
+    # Affine-split codes added by Phase 6.
+    "invalid_tile_id",
+    "duplicate_tile_id",
+    "unbound_tile",
+    "tile_binding_mismatch",
+    "invalid_tile_width",
+    "tile_index_conflict",
 }
 
 
@@ -1234,3 +1243,235 @@ def test_sparse_nodes_reject_cross_program_sharing():
     merged = fixture.program.body.statements[0].body.statements[0]
     forge(merged, cursors=(merged.cursors[0], merged.cursors[0]))
     expect_defect("shared_node", fixture.program)
+
+
+# -- Phase-6 affine-split subset ----------------------------------------------
+
+
+@dataclasses.dataclass
+class TiledMatvecFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    outer: TileOuterFor
+    inner: TileInnerFor
+
+
+def build_tiled_matvec(width=4, unroll=False) -> TiledMatvecFixture:
+    """y[i] += A[i, j] * x[j] with the j loop affine-split at ``width``."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a, x, y = (builder.new_symbol_id() for _ in range(3))
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        builder.dense_levels(2),
+    )
+    decl_x = builder.tensor(
+        x, "x", ScalarType.FLOAT32, (dim_j.dimension,), builder.dense_levels(1)
+    )
+    decl_y = builder.tensor(
+        y, "y", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    tile = builder.new_tile_id()
+    leaf = builder.store_reduce(
+        y,
+        (builder.index_value(row),),
+        ReduceOp.ADD,
+        builder.binary(
+            BinaryOp.MUL,
+            builder.load(a, (builder.index_value(row), builder.index_value(col))),
+            builder.load(x, (builder.index_value(col),)),
+        ),
+    )
+    inner = builder.tile_inner_for(
+        tile, col, dim_j.dimension, width, unroll, builder.block((leaf,))
+    )
+    row_loop = builder.dense_for(row, dim_i.dimension, builder.block((inner,)))
+    outer = builder.tile_outer_for(
+        tile, col, dim_j.dimension, width, builder.block((row_loop,))
+    )
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_x, decl_y),
+        (a, x),
+        (y,),
+        builder.block((outer,)),
+    )
+    assert type(outer) is TileOuterFor and type(inner) is TileInnerFor
+    return TiledMatvecFixture(builder, program, outer, inner)
+
+
+def test_tiled_program_verifies():
+    verify_program(build_tiled_matvec().program)
+    verify_program(build_tiled_matvec(width=1, unroll=True).program)
+
+
+def test_tile_ids_must_be_exact_typed_values():
+    fixture = build_tiled_matvec()
+    forge(fixture.outer, tile="tile0")
+    expect_defect("invalid_tile_id", fixture.program)
+    fixture = build_tiled_matvec()
+    from scorch.compiler.loopir.nodes import TileId
+
+    forge(fixture.inner, tile=TileId("0"))
+    expect_defect("invalid_tile_id", fixture.program)
+
+
+def test_duplicate_tile_ids_fail_closed():
+    fixture = build_tiled_matvec()
+    builder = fixture.builder
+    # Wrap the existing outer loop in a second origin loop reusing its TileId
+    # but splitting a fresh index over the same dimension.
+    other_index = builder.new_index_id()
+    duplicate = TileOuterFor(
+        LoopIRNodeId(9_000),
+        fixture.outer.tile,
+        other_index,
+        fixture.outer.dimension,
+        4,
+        builder.block((fixture.program.body.statements[0],)),
+    )
+    program = builder.program(
+        fixture.program.dimensions,
+        fixture.program.tensors,
+        fixture.program.inputs,
+        fixture.program.outputs,
+        builder.block((duplicate,)),
+    )
+    expect_defect("duplicate_tile_id", program)
+
+
+def test_point_loop_requires_a_dominating_origin_loop():
+    fixture = build_tiled_matvec()
+    outer = fixture.program.body.statements[0]
+    # Splice the origin loop out: its body becomes the program body.
+    program = fixture.builder.program(
+        fixture.program.dimensions,
+        fixture.program.tensors,
+        fixture.program.inputs,
+        fixture.program.outputs,
+        outer.body,
+    )
+    expect_defect("unbound_tile", program)
+
+
+def test_point_loop_must_agree_with_its_origin_loop():
+    fixture = build_tiled_matvec()
+    forge(fixture.inner, width=8)
+    expect_defect("tile_binding_mismatch", fixture.program)
+    fixture = build_tiled_matvec()
+    forge(fixture.inner, index=fixture.builder.new_index_id())
+    expect_defect("tile_binding_mismatch", fixture.program)
+    fixture = build_tiled_matvec()
+    forge(fixture.inner, dimension=fixture.program.dimensions[0].dimension)
+    expect_defect("tile_binding_mismatch", fixture.program)
+
+
+def test_tile_widths_must_be_positive_exact_ints():
+    fixture = build_tiled_matvec()
+    forge(fixture.outer, width=0)
+    forge(fixture.inner, width=0)
+    expect_defect("invalid_tile_width", fixture.program)
+    fixture = build_tiled_matvec()
+    forge(fixture.outer, width=True)
+    forge(fixture.inner, width=True)
+    expect_defect("invalid_tile_width", fixture.program)
+    fixture = build_tiled_matvec()
+    forge(fixture.outer, width=4.0)
+    forge(fixture.inner, width=4.0)
+    expect_defect("invalid_tile_width", fixture.program)
+
+
+def test_tile_unroll_must_be_a_bool():
+    fixture = build_tiled_matvec()
+    forge(fixture.inner, unroll=1)
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_split_index_conflicts_fail_closed():
+    # An origin loop for an index bound by an enclosing loop.
+    fixture = build_tiled_matvec()
+    row_loop = fixture.outer.body.statements[0]
+    conflicted = TileOuterFor(
+        LoopIRNodeId(9_100),
+        fixture.builder.new_tile_id(),
+        row_loop.index,
+        fixture.program.dimensions[0].dimension,
+        2,
+        fixture.inner.body,
+    )
+    forge(row_loop, body=fixture.builder.block((conflicted,)))
+    expect_defect("tile_index_conflict", fixture.program)
+
+    # A nested origin loop splitting the same index again.
+    fixture = build_tiled_matvec()
+    row_loop = fixture.outer.body.statements[0]
+    nested = TileOuterFor(
+        LoopIRNodeId(9_200),
+        fixture.builder.new_tile_id(),
+        fixture.outer.index,
+        fixture.outer.dimension,
+        2,
+        fixture.builder.block((fixture.inner,)),
+    )
+    forge(row_loop, body=fixture.builder.block((nested,)))
+    expect_defect("tile_index_conflict", fixture.program)
+
+
+def test_two_point_loops_for_one_split_rebind_the_coordinate():
+    fixture = build_tiled_matvec()
+    builder = fixture.builder
+    row_loop = fixture.outer.body.statements[0]
+    second_inner = builder.tile_inner_for(
+        fixture.inner.tile,
+        fixture.inner.index,
+        fixture.inner.dimension,
+        fixture.inner.width,
+        False,
+        builder.block(()),
+    )
+    forge(
+        row_loop.body.statements[0],
+        body=builder.block((second_inner,)),
+    )
+    expect_defect("duplicate_index_binding", fixture.program)
+
+
+def test_tile_coordinate_is_unbound_outside_the_point_loop():
+    fixture = build_tiled_matvec()
+    builder = fixture.builder
+    stray = builder.store_reduce(
+        fixture.program.outputs[0],
+        (builder.index_value(fixture.outer.index),),
+        ReduceOp.ADD,
+        builder.float_const(1.0),
+    )
+    forge(fixture.outer, body=builder.block((stray,)))
+    expect_defect("unbound_index", fixture.program)
+
+
+def test_tile_dimension_needs_a_runtime_extent_source():
+    fixture = build_tiled_matvec()
+    orphan = fixture.builder.dimension("orphan")
+    forge(fixture.outer, dimension=orphan.dimension)
+    forge(fixture.inner, dimension=orphan.dimension)
+    program = fixture.builder.program(
+        (*fixture.program.dimensions, orphan),
+        fixture.program.tensors,
+        fixture.program.inputs,
+        fixture.program.outputs,
+        fixture.program.body,
+    )
+    expect_defect("unresolved_dimension", program)
+
+
+def test_tile_nodes_reject_cycles():
+    fixture = build_tiled_matvec()
+    forge(fixture.inner, body=fixture.program.body)
+    expect_defect("cyclic_structure", fixture.program)

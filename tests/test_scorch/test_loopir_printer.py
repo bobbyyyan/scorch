@@ -118,8 +118,10 @@ def test_canonical_dump_omits_display_names():
 
 
 def test_canonical_dump_carries_schema_version():
+    # v3: Phase 6 added the affine-split node kinds and the tile identity
+    # family to the serialized schema.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v2"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v3"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
@@ -249,3 +251,73 @@ def test_sparse_dumps_are_target_neutral():
         for fragment in target_fragments:
             assert fragment not in dump
             assert fragment not in rendered
+
+
+# -- Phase-6 affine-split printing/serialization ------------------------------
+
+
+def build_tiled_matvec(width=4, unroll=False):
+    from tests.test_scorch.test_loopir_verifier import build_tiled_matvec
+
+    return build_tiled_matvec(width=width, unroll=unroll).program
+
+
+def test_tiled_printer_renders_the_split_structure():
+    text = print_program(build_tiled_matvec(width=4, unroll=True))
+    # Identity renumbering follows body traversal: the split dimension 'j'
+    # is seen first (by the origin loop), so it canonicalizes as d0.
+    assert text == (
+        "loopir.program {\n"
+        "  dimension d0 'j'\n"
+        "  dimension d1 'i'\n"
+        "  tensor t0 'A' float32 dims(d1, d0) levels(dense@0, dense@1)\n"
+        "  tensor t1 'x' float32 dims(d0) levels(dense@0)\n"
+        "  tensor t2 'y' float32 dims(d1) levels(dense@0)\n"
+        "  inputs(t0, t1)\n"
+        "  outputs(t2)\n"
+        "  body {\n"
+        "    tile_outer_for s0 x0 in d0 width 4 {\n"
+        "      for x1 in d1 {\n"
+        "        tile_inner_for s0 x0 in d0 width 4 unroll {\n"
+        "          store_reduce(add) t2[x1] = "
+        "mul(load t0[x1, x0], load t1[x0])\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+def test_tiled_canonical_dump_is_stable_across_global_id_histories():
+    first = build_tiled_matvec()
+    for _ in range(64):
+        new_symbol_id()
+        new_index_id()
+    second = build_tiled_matvec()
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+
+
+def test_tiled_canonical_dump_distinguishes_schedule_facts():
+    base = canonical_program_dump(build_tiled_matvec(width=4))
+    assert canonical_program_dump(build_tiled_matvec(width=8)) != base
+    assert canonical_program_dump(build_tiled_matvec(unroll=True)) != base
+    payload = json.loads(base)
+    outer = payload["body"]["statements"][0]
+    assert outer["kind"] == "tile_outer_for"
+    assert outer["width"] == 4
+    inner = outer["body"]["statements"][0]["body"]["statements"][0]
+    assert inner["kind"] == "tile_inner_for"
+    assert inner["tile"] == outer["tile"] == 0
+    assert inner["unroll"] is False
+
+
+def test_tiled_surfaces_reject_unverified_programs():
+    program = build_tiled_matvec()
+    inner = program.body.statements[0].body.statements[0].body.statements[0]
+    forge(inner, width=9)
+    with pytest.raises(LoopIRVerificationError):
+        canonical_program_dump(program)
+    with pytest.raises(LoopIRVerificationError):
+        print_program(program)

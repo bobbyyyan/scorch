@@ -277,6 +277,7 @@ def test_stage_identities_records_and_owner_are_typed_frozen_and_stable() -> Non
         # Strangler-path LoopIR stages: only the explicit LoopIR pipeline
         # driver begins these; every legacy stage sequence below is unchanged.
         CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+        CompilerStageId.LOOPIR_SCHEDULE_APPLICATION,
         CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
     )
     assert _FULL_STAGE_SEQUENCE == [
@@ -290,6 +291,7 @@ def test_stage_identities_records_and_owner_are_typed_frozen_and_stable() -> Non
         "llir_to_cpp_generation",
         "kernel_name_and_build_request_assembly",
         "cin_to_loopir_lowering",
+        "loopir_schedule_application",
         "loopir_to_llir_lowering",
     ]
 
