@@ -168,6 +168,15 @@ def test_valid_programs_verify():
     verify_program(build_matmul().program)
 
 
+def test_builder_owns_dimension_identity_allocation():
+    builder = LoopIRBuilder()
+    first = builder.dimension("first")
+    second = builder.dimension("second")
+    assert first.dimension != second.dimension
+    with pytest.raises(TypeError):
+        builder.dimension("injected", DimensionId(0))  # type: ignore[call-arg]
+
+
 def test_non_program_fails_closed():
     expect_defect("malformed_state", object())
     expect_defect("malformed_state", build_vector_add().program.body)

@@ -84,6 +84,19 @@ def test_canonical_dump_is_deterministic_per_program():
     assert print_program(program) == print_program(program)
 
 
+def test_declaration_registry_order_is_not_semantic():
+    program = build_matvec()
+    canonical = canonical_program_dump(program)
+    printed = print_program(program)
+    forge(
+        program,
+        dimensions=tuple(reversed(program.dimensions)),
+        tensors=tuple(reversed(program.tensors)),
+    )
+    assert canonical_program_dump(program) == canonical
+    assert print_program(program) == printed
+
+
 def test_canonical_dump_distinguishes_semantics():
     multiply = canonical_program_dump(build_matvec(BinaryOp.MUL))
     add = canonical_program_dump(build_matvec(BinaryOp.ADD))

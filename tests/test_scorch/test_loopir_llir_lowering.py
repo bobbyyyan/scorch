@@ -23,6 +23,11 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorVar,
 )
+from scorch.compiler.compilation_context import (
+    CompilationContext,
+    CompilerStageId,
+)
+from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loopir.lower_llir import (
     LoopIRTargetError,
     lower_loopir_to_llir,
@@ -265,9 +270,38 @@ def test_target_lowering_verifies_first():
         )
 
 
+def test_target_lowering_owns_supplied_context_stage_and_pass_records():
+    fixture = build_vector_add()
+    options = CompileOptions.from_environment()
+    context = CompilationContext(options)
+    lower_loopir_to_llir(
+        fixture.program,
+        input_shapes={fixture.a: (2,), fixture.b: (2,)},
+        result_shape=(2,),
+        compilation_context=context,
+    )
+    assert [record.stage_id for record in context.stage_run_records] == [
+        CompilerStageId.LOOPIR_TO_LLIR_LOWERING
+    ]
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+
+
 def test_invalid_display_name():
     program = build_matvec()
     forge(program.tensors[0], name="A values")
+    expect_target_code("invalid_display_name", program, matvec_shapes(program), (3,))
+
+
+@pytest.mark.parametrize("name", ["for", "λ"])
+def test_cpp_unsafe_display_name(name):
+    program = build_matvec()
+    forge(program.dimensions[0], name=name)
     expect_target_code("invalid_display_name", program, matvec_shapes(program), (3,))
 
 
@@ -281,6 +315,42 @@ def test_dimension_and_tensor_names_share_one_namespace():
     program = build_matvec()
     forge(program.tensors[0], name="i")
     expect_target_code("duplicate_display_name", program, matvec_shapes(program), (3,))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "name"),
+    [
+        ("dimension", "pA0"),
+        ("output", "A_val"),
+        ("input", "result"),
+    ],
+)
+def test_generated_cpp_names_cannot_collide(mutation, name):
+    program = build_matvec()
+    if mutation == "dimension":
+        forge(program.dimensions[0], name=name)
+    elif mutation == "output":
+        forge(program.tensors[-1], name=name)
+    else:
+        forge(program.tensors[0], name=name)
+    expect_target_code(
+        "generated_name_collision",
+        program,
+        matvec_shapes(program),
+        (3,),
+    )
+
+
+def test_repeated_operand_loads_fail_at_target_boundary():
+    fixture = build_vector_add()
+    store = fixture.program.body.statements[0].body.statements[0]
+    forge(store.value.rhs, tensor=fixture.a)
+    expect_target_code(
+        "unsupported_repeated_operand",
+        fixture.program,
+        {fixture.a: (2,), fixture.b: (2,)},
+        (2,),
+    )
 
 
 def test_unsupported_mode_order_at_target_boundary():

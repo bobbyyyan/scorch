@@ -10,8 +10,14 @@ import random
 import pytest
 
 from scorch.compiler.identity import SymbolId
-from scorch.compiler.loopir.nodes import BinaryOp, ScalarType
-from scorch.compiler.loopir.oracle import LoopIROracleError, run_program
+from scorch.compiler.loopir.build import LoopIRBuilder
+from scorch.compiler.loopir.nodes import BinaryOp, ReduceOp, ScalarType
+from scorch.compiler.loopir.oracle import (
+    MAX_ORACLE_RANK,
+    LoopIROracleError,
+    run_program,
+)
+from scorch.compiler.loopir.verifier import verify_program
 
 from tests.test_scorch.test_loopir_printer import build_matvec
 from tests.test_scorch.test_loopir_verifier import (
@@ -83,9 +89,8 @@ def test_matmul_matches_reference_exactly_on_random_grids():
 
 
 def test_zero_extent_shapes_execute():
-    # A zero inner extent is inferable from nested values ((2, 0)); a zero
-    # outer extent ((0, n)) is not, which is the same recorded nested-value
-    # inference boundary the Phase-3.5 spike documented.
+    # Hidden suffix extents are resolved through shared DimensionIds before
+    # the nested values are copied.
     program = build_matvec()
     a_symbol, x_symbol = program.inputs
     y_symbol = program.outputs[0]
@@ -105,15 +110,136 @@ def test_zero_extent_shapes_execute():
     assert results[fixture.c] == []
 
 
-def test_uninferable_zero_leading_extent_fails_closed():
+def test_zero_leading_extents_resolve_across_tensor_dimensions():
     fixture = build_matmul()
-    with pytest.raises(LoopIROracleError) as error:
-        run_program(
-            fixture.program,
-            {fixture.a: [], fixture.b: []},
-            {fixture.c: (0, 0)},
+    results = run_program(
+        fixture.program,
+        {fixture.a: [], fixture.b: []},
+        {fixture.c: (0, 0)},
+    )
+    assert results[fixture.c] == []
+
+
+def test_rank_three_intermediate_zero_extent_resolves_from_output():
+    builder = LoopIRBuilder()
+    dimensions = tuple(builder.dimension(name) for name in ("i", "j", "k"))
+    a, b, c = (builder.new_symbol_id() for _ in range(3))
+    dimension_ids = tuple(decl.dimension for decl in dimensions)
+    tensors = tuple(
+        builder.tensor(
+            symbol,
+            name,
+            ScalarType.FLOAT32,
+            dimension_ids,
+            builder.dense_levels(3),
         )
-    assert "cannot be inferred" in str(error.value)
+        for symbol, name in ((a, "A"), (b, "B"), (c, "C"))
+    )
+    indices = tuple(builder.new_index_id() for _ in range(3))
+
+    def access_indices():
+        return tuple(builder.index_value(index) for index in indices)
+
+    store = builder.store(
+        c,
+        access_indices(),
+        builder.binary(
+            BinaryOp.ADD,
+            builder.load(a, access_indices()),
+            builder.load(b, access_indices()),
+        ),
+    )
+    body = builder.block((store,))
+    for index, dimension in reversed(tuple(zip(indices, dimension_ids))):
+        body = builder.block((builder.dense_for(index, dimension, body),))
+    program = builder.program(dimensions, tensors, (a, b), (c,), body)
+
+    results = run_program(
+        program,
+        {a: [[], []], b: [[], []]},
+        {c: (2, 0, 3)},
+    )
+    assert results[c] == [[], []]
+
+
+def test_unresolved_hidden_zero_extent_fails_closed():
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a, y = builder.new_symbol_id(), builder.new_symbol_id()
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        builder.dense_levels(2),
+    )
+    decl_y = builder.tensor(
+        y,
+        "y",
+        ScalarType.FLOAT32,
+        (dim_i.dimension,),
+        builder.dense_levels(1),
+    )
+    index_i, index_j = builder.new_index_id(), builder.new_index_id()
+    leaf = builder.store_reduce(
+        y,
+        (builder.index_value(index_i),),
+        ReduceOp.ADD,
+        builder.load(
+            a,
+            (builder.index_value(index_i), builder.index_value(index_j)),
+        ),
+    )
+    inner = builder.dense_for(index_j, dim_j.dimension, builder.block((leaf,)))
+    outer = builder.dense_for(index_i, dim_i.dimension, builder.block((inner,)))
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_y),
+        (a,),
+        (y,),
+        builder.block((outer,)),
+    )
+    with pytest.raises(LoopIROracleError, match="cannot be inferred at mode 1"):
+        run_program(program, {a: []}, {y: (0,)})
+
+
+def test_excessive_dense_rank_fails_closed_before_recursive_storage_work():
+    rank = MAX_ORACLE_RANK + 1
+    builder = LoopIRBuilder()
+    dimension = builder.dimension("d")
+    a, c = builder.new_symbol_id(), builder.new_symbol_id()
+    dimensions = (dimension.dimension,) * rank
+    a_decl = builder.tensor(
+        a, "A", ScalarType.FLOAT32, dimensions, builder.dense_levels(rank)
+    )
+    c_decl = builder.tensor(
+        c, "C", ScalarType.FLOAT32, dimensions, builder.dense_levels(rank)
+    )
+    index = builder.new_index_id()
+
+    def access_indices():
+        return tuple(builder.index_value(index) for _ in range(rank))
+
+    store = builder.store(c, access_indices(), builder.load(a, access_indices()))
+    program = builder.program(
+        (dimension,),
+        (a_decl, c_decl),
+        (a,),
+        (c,),
+        builder.block(
+            (
+                builder.dense_for(
+                    index,
+                    dimension.dimension,
+                    builder.block((store,)),
+                ),
+            )
+        ),
+    )
+    verify_program(program)
+    with pytest.raises(LoopIROracleError, match="rank .* exceeds"):
+        run_program(program, {a: []}, {c: (0,) * rank})
 
 
 def test_outputs_are_zero_initialized_before_reduction():
@@ -235,3 +361,22 @@ def test_oracle_does_not_mutate_inputs():
     b = [3.0, 4.0]
     run_program(fixture.program, {fixture.a: a, fixture.b: b}, {fixture.c: (2,)})
     assert a == [1.0, 2.0] and b == [3.0, 4.0]
+
+
+def test_oracle_owns_inputs_before_consulting_output_shape_mapping():
+    fixture = build_vector_add()
+    a = [1.0]
+    b = [2.0]
+
+    class MutatingOutputShapes(dict):
+        def __getitem__(self, key):
+            a[0] = 10.0
+            return super().__getitem__(key)
+
+    results = run_program(
+        fixture.program,
+        {fixture.a: a, fixture.b: b},
+        MutatingOutputShapes({fixture.c: (1,)}),
+    )
+    assert results[fixture.c] == [3.0]
+    assert a == [10.0]
