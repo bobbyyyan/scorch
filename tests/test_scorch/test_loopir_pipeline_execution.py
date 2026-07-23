@@ -367,27 +367,77 @@ def test_legacy_stage_sequence_never_contains_loopir_stages():
         assert stage.name not in source
 
 
-def test_requested_schedule_fails_closed():
+def test_requested_schedules_route_through_the_strangler_entry():
+    """Phase 6 moved this boundary deliberately: requested schedules are now
+    consumed by the scheduled path instead of rejected wholesale.  Explicit
+    supported schedules compile (an identity order reproduces the
+    unscheduled source exactly); illegal orders still fail closed at the
+    shared scheduler boundary, including through the forced-schedule seam;
+    and a legacy-accepted order the migrated families cannot emit (the
+    recorded dense-ijk erratum, invalid C++ on the legacy path) fails
+    closed with the family's stable code."""
+
+    from scorch.compiler.diagnostics import InvalidSchedule
+    from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
     from scorch.compiler.scheduler import Schedule, schedule_force
 
     options = CompileOptions.from_environment(
         requested_schedule=Schedule(loop_order=["i", "j"])
     )
     cin = build_elementwise(Operation.ADD)
-    with pytest.raises(CompileSpecError):
-        compile_cin_via_loopir(
-            cin,
-            (3, 4),
-            [((3, 4), torch.float32)] * 2,
-            compile_options=options,
-        )
+    scheduled_kernel = compile_cin_via_loopir(
+        copy.deepcopy(cin),
+        (3, 4),
+        [((3, 4), torch.float32)] * 2,
+        compile_options=options,
+    )
+    assert scheduled_kernel.schedule is not None
+    assert scheduled_kernel.schedule.plan.provenance == "explicit"
+    unscheduled_kernel = compile_cin_via_loopir(
+        copy.deepcopy(cin),
+        (3, 4),
+        [((3, 4), torch.float32)] * 2,
+    )
+    assert unscheduled_kernel.schedule is None
+    assert scheduled_kernel.cpp_source == unscheduled_kernel.cpp_source
+
     with schedule_force(Schedule(loop_order=["j", "i"])):
-        with pytest.raises(CompileSpecError):
+        with pytest.raises(InvalidSchedule):
             compile_cin_via_loopir(
-                cin,
+                copy.deepcopy(cin),
                 (3, 4),
                 [((3, 4), torch.float32)] * 2,
             )
+
+    i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    a = TensorVar("A", fmt="dd")
+    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt="dd")
+    matmul = ForAll(
+        i,
+        ForAll(
+            k,
+            ForAll(
+                j,
+                TensorAssign(
+                    c[i, j],
+                    CINBinaryOp(Operation.MUL, a[i, k], b[k, j]),
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    erratum_options = CompileOptions.from_environment(
+        requested_schedule=Schedule(loop_order=["i", "j", "k"])
+    )
+    with pytest.raises(LoopIRLoweringError) as error:
+        compile_cin_via_loopir(
+            matmul,
+            (3, 4),
+            [((3, 5), torch.float32), ((5, 4), torch.float32)],
+            compile_options=erratum_options,
+        )
+    assert error.value.defect.code == "unsupported_loop_order"
 
 
 # -- Phase-5 sparse families: compiled execution differentials ----------------
