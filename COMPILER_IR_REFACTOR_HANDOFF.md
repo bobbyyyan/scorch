@@ -23722,3 +23722,121 @@ origin state, protected hashes, and limitations. If a mandatory gate fails,
 commit only the largest coherent verified subset, document the failed gate, and
 do not claim the phase complete. Do not push.
 ```
+
+
+## Phase-5 closure: sparse iteration and merge-lattice migration (2026-07-22)
+
+Phase 5 is complete and closed at commits `e71f9a7` (schema/analyses),
+`fbd89b3` (lowering/runtime), `b068c38` (tests), and the docs commit that
+records this section; `COMPILER_IR_REFACTOR_PHASE5_REVIEW.md` is the
+definitive record.  Nothing in `763b73b..d9c8305` was amended or reordered,
+and nothing was pushed — the live and remote-tracking origin tip of
+`refactor/compiler-ir-phase3-std-move-call` remained `58e8565` throughout.
+
+What is now true:
+
+- The production LoopIR schema declares the sparse level subset: root,
+  dense, and compressed physical positions; parent-position-linked sparse
+  cursors; coordinate and leaf-value access with explicit UNION defaults;
+  structured UNION/INTERSECTION merged iteration with intrinsic aligned
+  advancement/exhaustion/progress semantics; and ordered canonical-CSR
+  append assembly.  COMPRESSED levels are executable;
+  COORDINATE/SINGLETON, physical position loads (dense leaves below sparse
+  structure), accumulators, workspaces, tiles, and parallel nodes remain
+  deliberately undeclared or fail-closed.
+- Iteration-domain/merge-lattice analysis is a pure module
+  (`loopir/iterdomain.py`) over normalized CIN plus the verified LoopPlan;
+  it produces an immutable domain table and never touches the legacy
+  lowerer, lattice, or rendered names.  `lower_cin.py` materializes the
+  table; the dense construction path is unchanged.
+- The four Phase-5 vertical slices (CSR SpMV, CSR-by-dense SpMM, CSR+CSR
+  UNION/add, CSR·CSR INTERSECTION/multiply) compile to C++ that is
+  byte-identical to the untouched legacy pipeline, execute correctly on
+  real tensors, and match PyTorch, the production oracle, and (dense
+  outputs) legacy shadow execution bitwise.  The parity grid also locks
+  CSR row sums, sampled ds·dd elementwise, SpGEMM ds@ds→dd, f64 variants,
+  and (A+B)·D chains.  Sparse outputs wrap as honestly-typed ds STensors
+  on the test pipeline.
+- The oracle executes through the format-neutral level interface
+  (`loopir/levels.py`): CSR is one adapter; DCSR/CSC-style layouts bind
+  the same storage class, and the DCSR differential proves positions
+  diverge from coordinates.  Ordered appends are runtime-checked.
+- The verifier owns 44 stable defect codes (16 new sparse codes), each
+  with direct adversarial coverage; canonical serialization moved to
+  schema `scorch.loopir.canonical.v2` and stays stable across allocation
+  histories and registry permutations; stage timing reuses the two
+  Phase-4 stage identities with no legacy sequence change.
+
+Verification highlights (full detail in the Phase-5 review §6): focused
+LoopIR membership **280 passed + 4 neutrality** (126 beyond Phase 4);
+spike suites **647 passed** untouched; adjacency 666 + 89 passed; fresh
+20-source corpus and 42-source grid captures byte-identical to the sealed
+Phase-4 captures; Black/Flake8 clean on changed files; focused mypy clean;
+full-source mypy exactly the 146 inherited findings in 12 files with zero
+in `loopir/`; `git diff --check` clean; the authoritative clean detached
+worktree non-performance suite at `b068c38` with isolated caches and
+asserted import provenance: **3,491 passed, 14 skipped, 3 perf-marked deselections, one known warning, zero failures/errors in 2,281.05 seconds** (JUnit: 3,505 selected, SHA-256 `d1744f2afa5862367c43f48d710744f58dd6ac15c81d615f206ed47a4fda6926`).  Evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase5-sparse-b068c38/`.  All five
+protected tracked files retain the hashes recorded in the Phase-4 section.
+
+Recorded legacy observations (errata, not silent divergences): the legacy
+merged-nest parallel policy is row-count-only because the marker runs over
+unflattened statement lists (the LoopIR target reproduces it for byte
+parity), and legacy `lower_and_exec_cin` mis-wraps sparse results as
+`"dd"`.  The four Phase-4 errata stand unchanged.
+
+The Phase-6 stretch slice was deliberately not started: expressing even
+one affine-tile schedule as immutable scheduled LoopIR requires the
+tile/split node family and a scheduled-stage verifier that the Phase-5
+audit deliberately excluded from the schema.  That representation decision
+is Phase 6's opening move, not something to improvise at the end of a
+sparse milestone.
+
+## Copy-Paste Prompt for the Next Session/Agent (Phase 6)
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call. Begin with an independent
+read-only audit, then implement the largest coherent verified milestone the
+evidence supports.
+
+Read, in order: AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md,
+COMPILER_IR_REFACTOR_PHASE4_REVIEW.md (§7),
+COMPILER_IR_REFACTOR_PHASE5_REVIEW.md, and the final dated sections of
+COMPILER_IR_REFACTOR_HANDOFF.md. Inspect git status, the branch graph,
+origin, and the newest commits before editing. Trust no handoff claim
+without checking code and focused tests.
+
+Do not switch branches, amend/reorder existing commits, push, or stage
+broad paths. Preserve every unrelated dirty/untracked GPU, CUDA, benchmark,
+packaging, scheduler, research, scratchpad, and tooling path. Re-hash the
+five protected files recorded above before every commit.
+
+Current boundary: origin is 58e8565; Phases 0-5 are closed and local-only
+above it. Production LoopIR (src/scorch/compiler/loopir/) carries the dense
+and sparse level families end to end with byte-identical legacy parity;
+the spike (loopir_spike/) remains an untouched reference; production
+imports and release JIT stay LoopIR-neutral; kernel caching stays
+source-derived; canonical dumps omit display names and are not target
+cache keys.
+
+Primary objective — begin Phase 6, scheduling migration to LoopIR, as a
+coherent milestone: design the scheduled-LoopIR representation (tile/split
+nodes or an equivalent structured form with provenance and a
+ScheduledLoopIR verifier per the design document), a loop-reorder pass and
+an affine tiling pass with ragged tails as pure typed passes consuming a
+widened LoopPlan, and carry at least one scheduled CSR-by-dense SpMM and
+one scheduled dense matmul through compiled execution, comparing generated
+source and runtime against the legacy scheduled kernels
+(Scheduler.apply_schedule / schedule_lowerer) wherever legacy supports the
+schedule. Keep every boundary fail-closed with stable codes; extend
+printing/canonical serialization (bump the schema version) and the oracle
+for scheduled programs; keep neutrality, byte gates (fresh corpus/grid
+captures against b068c38), latency policy, static parity, and a clean
+detached-worktree suite as mandatory gates. Record legacy defects as
+errata. Stop before sparse-panel/workspace/parallel migration, selector
+integration, public Schedule-adapter cutover, or legacy deletion. If a
+mandatory gate fails, commit the largest coherent verified subset,
+document the failed gate, and do not claim the phase complete. Do not
+push.
+```
