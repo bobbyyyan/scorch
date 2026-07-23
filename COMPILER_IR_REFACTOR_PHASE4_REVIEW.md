@@ -48,13 +48,13 @@ spike's state, the production requirement, and the Phase-4 disposition.
 | Identities, ownership, construction | Global module counters allocate `LoopNodeId`/`DimensionId`; no construction API; fixtures hand-assemble nodes. | Production `LoopIRNodeId`/`DimensionId` are artifact-local, allocated deterministically by the new `LoopIRBuilder` (`build.py`), so identical construction sequences allocate identical identities regardless of process history.  Tensors/loops keep production `SymbolId`/`IndexId`; CIN lowering passes CIN identities through unchanged as provenance.  Constructors still perform no validation (adversarial tests forge nodes directly). |
 | Verifier authority and pass boundaries | Single fail-closed `verify_program` with 45 codes over the full sparse surface. | Same single-authority discipline, reduced to the dense subset: 28 stable defect codes, each with direct regression coverage, and a test locking the code surface itself.  Unknown node subclasses and forged state fail closed.  Provably dead branches (non-DENSE layouts at store sites, non-ADD `ReduceOp` members) were removed rather than left untestable. |
 | dtype/scalar typing | Untyped: Python floats only; no dtype anywhere in the schema. | `ScalarType` (FLOAT32/FLOAT64) on every `TensorDecl`; the verifier requires one uniform scalar type per program (`mixed_dtype`); the CIN boundary maps torch dtypes and fails closed on anything else (`unsupported_dtype`).  Mixed-precision programs are a recorded later surface. |
-| Rank, shape, broadcasting | Extents runtime-resolved via shared logical dimensions; shapes never stored in the IR. | Preserved: shapes remain runtime bindings.  The oracle and the LLIR boundary independently re-resolve every dimension's extent across all bound inputs and outputs and fail closed on disagreement.  Broadcast dimensions (a loop variable only in the result) are represented naturally and emit the legacy broadcast form.  Rank is bounded only by the family (1-3 exercised; the oracle's former rank-2 dense-output limit is gone — outputs are arbitrary-rank nested lists). |
+| Rank, shape, broadcasting | Extents runtime-resolved via shared logical dimensions; shapes never stored in the IR. | Preserved: shapes remain runtime bindings.  The oracle and the LLIR boundary independently re-resolve every dimension's extent across all bound inputs and outputs and fail closed on disagreement.  Broadcast dimensions (a loop variable only in the result) are represented naturally and emit the legacy broadcast form.  Ranks 1-3 are the migrated family; the oracle supports nested dense bindings through an explicit rank-64 fail-closed boundary. |
 | Aliasing and output semantics | Inputs/outputs disjoint; outputs write-only; `Store` overwrite vs `StoreReduce` ADD into zero-initialized outputs. | Preserved verbatim, and the zero-initialization contract is now explicit on the node and realized by the target lowering through the production `ResultTensorAssembler` (`scorch_zero_dense`).  In-place operands fail closed at the CIN boundary (`unsupported_inplace_operand`). |
 | Reduction identities and associativity | `DeclAccum`/`Accumulate` scalar accumulators with literal identities, plus ADD-only `StoreReduce`. | The dense slice reduces exactly the way the legacy generated kernels do — `StoreReduce` (ADD) into the zero-initialized output — so the accumulator nodes were deliberately **not** copied into the production subset ("do not invent nodes before a migrated operation needs them").  `ReduceOp` declares only ADD; adding a member requires adding its explicit output-initialization identity contract. |
-| Deterministic printing and canonical serialization | None (spike had no printer or serializer). | New `printer.py`: `print_program` (human-readable stage dump) and `canonical_program_dump` (compact JSON, schema `scorch.loopir.canonical.v1`).  Both verify first and renumber all identity families by first appearance; equivalent programs built under different global-ID histories produce byte-identical output; display names are omitted from the canonical form.  No deserializer exists, so no round-trip contract is declared. |
+| Deterministic printing and canonical serialization | None (spike had no printer or serializer). | New `printer.py`: `print_program` (human-readable stage dump) and `canonical_program_dump` (compact JSON, schema `scorch.loopir.canonical.v1`).  Both verify first and renumber identity families from semantic roles/body traversal rather than declaration-registry order; equivalent programs built under different global-ID histories or registry permutations produce byte-identical output.  Display names are omitted from the semantic canonical form.  No deserializer exists, so no round-trip contract is declared. |
 | Target separation and structured-LLIR lowering | Torch-free interpreter only; no target lowering. | The existing structured LLIR **is** the target-specific CxxIR boundary — the audit found no need for another target IR and none was introduced.  `lower_llir.py` reuses the production `TorchCppKernelABI`, `ResultTensorAssembler`, the managed LLIR pass pipeline, and the production parallel-marking policy.  LoopIR itself contains no C++ spelling; a dedicated test asserts dumps are target-neutral. |
-| Compiler-stage ownership and timing | None. | Two appended `CompilerStageId` members (`cin_to_loopir_lowering`, `loopir_to_llir_lowering`) recorded through the existing `CompilationContext`.  The legacy default path never begins them; every legacy stage-sequence lock is unchanged; downstream C++ generation and build-request assembly reuse the existing canonical stages. |
-| Semantic-oracle integration | Spike interpreter, neutrality-suite-isolated. | Promoted as a production-owned dense oracle (`oracle.py`), Torch-free and fail-closed, loaded only by dedicated tests.  Package-level neutrality is enforced by subprocess checks (plain import and a full legacy dense compilation) plus a production-source scan.  The spike package itself is untouched and remains the Phase-5 sparse reference. |
+| Compiler-stage ownership and timing | None. | Two appended `CompilerStageId` members (`cin_to_loopir_lowering`, `loopir_to_llir_lowering`) recorded through the existing `CompilationContext`, together with normalization/frontend binding and the managed LLIR pass records.  The LoopIR-to-LLIR boundary owns its complete stage, including partial-failure record preservation.  The legacy default path never begins the LoopIR stages; every legacy stage-sequence lock is unchanged. |
+| Semantic-oracle integration | Spike interpreter, neutrality-suite-isolated. | Promoted as a production-owned dense oracle (`oracle.py`), Torch-free and fail-closed, loaded only by dedicated tests.  Package-level neutrality is enforced by subprocess checks for plain import and legacy CIN lowering, plus a source scan preventing production imports of the package.  The spike package itself is untouched and remains the Phase-5 sparse reference. |
 | Cache identity and versioning | Not applicable (nothing cached). | Kernel cache identity remains source-derived and unchanged.  The migrated families generate byte-identical source, so the LoopIR path honestly shares the legacy kernel artifact (identical source is identical kernel); LoopIR-level artifacts are never cached; canonical serialization carries an explicit schema version for any future persistent use. |
 
 ## 2. What was frozen
@@ -151,7 +151,7 @@ Commits (stacked on `58e8565`; nothing amended, reordered, or pushed):
 
 Receipts:
 
-- focused LoopIR suites at the final code commit: **135 passed** (55
+- focused LoopIR suites at the original final code commit: **135 passed** (55
   verifier, 8 printer, 16 oracle, 22 CIN lowering, 26 LLIR lowering/parity,
   8 pipeline execution — the execution differentials compile and run real
   kernels) plus 4 neutrality tests;
@@ -215,13 +215,83 @@ Receipts:
   assumptions; each has a stable code and a regression test.
 - Dense SUB has no legacy comparand (legacy defect #3); its numerics are
   locked against the oracle and PyTorch instead.
-- `LoopIRBuilder` display names must be unique identifiers at the target
-  boundary (`invalid_display_name`/`duplicate_display_name`); semantic-level
-  name collisions remain legal in the IR itself.
+- `LoopIRBuilder` display names must be unique safe ASCII C++ identifiers at
+  the target boundary (`invalid_display_name`/`duplicate_display_name`), and
+  may not collide after target-owned name derivation
+  (`generated_name_collision`); semantic-level name collisions remain legal
+  in the IR itself.
 - The LLIR target lowering accepts the family's program shape (one loop nest
   over one store leaf).  Verified-but-unfamiliar LoopIR (permuted storage
   orders, multi-statement blocks) fails closed with stable codes
   (`unsupported_mode_order`, `unsupported_program_shape`).
-- The oracle infers input shapes from nested values, so a `(0, n)` leading
-  zero extent is uninferable there (inherited spike boundary, tested); the
-  compiled path takes explicit shapes and handles zero extents fully.
+- The oracle infers visible shape prefixes from owned nested values and
+  resolves hidden zero-extent suffixes through shared logical dimensions.
+  A suffix with no other extent source fails closed; ranks above 64 fail
+  before recursive storage work.  The compiled path takes explicit shapes.
+
+## 7. Rigorous-review corrections (2026-07-22)
+
+A three-way independent review of `763b73b..25472bd` reproduced the original
+gates and found correctness and ownership defects that the original review did
+not catch.  They are corrected by two focused commits stacked without amending
+the Phase-4 series:
+
+- `c881490` — `fix(compiler): close Phase-4 LoopIR review gaps`
+- `d3f4da4` — `test(compiler): lock Phase-4 LoopIR review boundaries`
+
+The correction set is part of the Phase-4 stopping point.  Specifically:
+
+- runtime execution now applies the legacy mode-order alignment/relayout plan
+  before binding the identity-layout LoopIR family; a rectangular permuted
+  dense regression locks the former silent wrong-result case;
+- runtime format mismatches fail before relayout or native work in both direct
+  and shadow execution, forced schedules cannot bypass the options gate, and
+  comparison/shadow execution route one exact `CompileOptions` snapshot;
+- direct target lowering rejects repeated input loads until it owns per-access
+  position chains, rejects C++ keywords/unsafe identifiers and every dense
+  generated-name collision, and snapshots hostile shape mappings fail-closed;
+- normalization/frontend/LoopIR/LLIR/C++ stage ownership is complete;
+  LoopIR-to-LLIR owns its own context stage and publishes the five executed
+  managed-pass records, including completed prefixes on injected failures;
+- the builder can no longer accept an external `DimensionId` that its allocator
+  might reissue; printing/canonical serialization ignore nonsemantic registry
+  order; and the oracle owns inputs before consulting external output mappings,
+  resolves hidden zero extents through `DimensionId`, and fails closed at the
+  explicit rank-64 boundary.
+
+The focused production-LoopIR membership is now **154 passed** (56 verifier,
+9 printer, 20 oracle, 22 CIN lowering, 33 LLIR lowering/parity, 14 pipeline
+execution) plus 4 neutrality tests: 19 direct regressions beyond the original
+139-test Phase-4 membership.  Fresh current-tree 20-source and 42-source
+captures are byte-identical to the sealed original Phase-4 captures (`diff -qr`
+empty for both) under
+`/Users/bobby/.cache/scorch-codex/phase4-review-25472bd/`; their sorted
+per-file manifest hashes are respectively
+`7db3eb61f96314283f5add177a21cda3fa4f3cf33923d5d9af6d79aea16c547a`
+and `3727bf4d728c4fc37c8962afc7e063e9ad27d621f8bf7f3eb8027fed721f2ae6`.
+Clean detached
+`25472bd`/`d3f4da4` worktrees also produced byte-identical normalized static
+outputs: Black SHA-256
+`e3bce888fdb7a35384d5160b9d4dc001f30676ad65f028fad833c057cb8a0008`,
+Flake8 `f09f7a637e1239b0dd382e60a5e7e7456aaaf46ff2a6211f31b9e1455c1afa15`,
+and full-source mypy
+`04c19b82a98ae84e5d449f47ca37b1de1b40ed61e6aefd4764d2ebf846e67bb9`
+(146 inherited findings in 12 files on both sides; zero in the LoopIR
+package).  The original ledger did not retain the claimed static
+logs or explicit diff transcripts, so this addendum records the independently
+reproduced comparison rather than treating their absence as evidence.
+
+The authoritative clean detached-worktree non-performance suite at exact code
+commit `d3f4da4`, with isolated pytest, Torch-extension, and temporary caches
+and import provenance asserted, completed with **3,365 passed, 14 skipped,
+3 perf-marked deselections, one known warning, and zero failures/errors in
+2,083.43 seconds**.  The JUnit reports 3,379 selected tests and has SHA-256
+`55172244724bddcae7137e1191fc28e1ae9f73629d7e9a65b94c97fafc6179d6`.
+
+Canonical dumps remain semantic LoopIR fingerprints and deliberately omit
+display names.  Because display names still affect target spelling, no future
+target-artifact cache may key on the semantic dump alone; the current kernel
+cache remains safely source-derived.  The neutrality subprocess proves plain
+import and legacy CIN lowering remain package-free; combined with the import
+source scan, it does not claim to execute a native JIT build inside that
+specific test.

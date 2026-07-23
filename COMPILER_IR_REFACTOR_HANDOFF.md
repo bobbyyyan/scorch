@@ -23528,3 +23528,197 @@ import provenance, exact commit list, origin state, and any limitation
 honestly. Use focused commits with descriptive bodies; do not amend or
 reorder existing commits. Do not push.
 ```
+
+## Phase-4 rigorous-review corrections (2026-07-22)
+
+The independent review of the Phase-4 stopping point found concrete defects;
+the Phase-4 implementation must be read together with these two correction
+commits:
+
+- `c881490` — `fix(compiler): close Phase-4 LoopIR review gaps`
+- `d3f4da4` — `test(compiler): lock Phase-4 LoopIR review boundaries`
+
+Nothing in `763b73b..25472bd` was amended or reordered, and this review pushed
+nothing.  The live and remote-tracking origin tip remained `58e8565` throughout
+the review.  The corrections close the following boundaries:
+
+- non-identity dense storage is aligned and relaid out before the identity-order
+  LoopIR family is bound; the regression is deliberately rectangular so a
+  transposed physical layout cannot hide a shape/value error;
+- runtime format mismatches fail before relayout, compilation, or native work
+  in both direct and shadow execution;
+- context- or environment-forced schedules cannot bypass the LoopIR options
+  gate, and direct/source-comparison/shadow execution share one exact immutable
+  `CompileOptions` snapshot;
+- repeated operand loads fail closed until the target owns per-access position
+  chains, and target spelling rejects unsafe/keyword display names and collisions
+  with every generated dense-family C++ identifier;
+- normalization, frontend binding, LoopIR lowering, managed LLIR passes, and C++
+  lowering now have complete `CompilationContext` ownership.  The
+  LoopIR-to-LLIR boundary owns its complete stage and retains the successfully
+  executed managed-pass prefix if a later pass fails;
+- `LoopIRBuilder` exclusively allocates its dimensions; deterministic printing
+  and canonical serialization no longer depend on declaration-registry order;
+- the oracle owns input containers before consulting hostile mappings, resolves
+  shape suffixes hidden by zero extents through shared logical dimensions, and
+  fails closed above rank 64 rather than leaking recursion failures.
+
+The corrected production-LoopIR membership is **154 tests plus 4 neutrality
+tests**, 19 direct regressions beyond the original 139-test Phase-4 membership.
+Fresh 20-source and 42-source captures are byte-identical to the sealed original
+Phase-4 captures.  Clean detached `25472bd` and `d3f4da4` worktrees have
+byte-identical normalized Black, Flake8, and full-source mypy outputs; mypy has
+the same 146 inherited findings in 12 files and zero LoopIR findings on both
+sides.  The authoritative clean detached `d3f4da4` non-performance suite passed
+**3,365 tests**, with 14 skipped, 3 perf-marked deselections, one known warning,
+and no failures/errors in 2,083.43 seconds; its JUnit SHA-256 is
+`55172244724bddcae7137e1191fc28e1ae9f73629d7e9a65b94c97fafc6179d6`.
+See §7 of `COMPILER_IR_REFACTOR_PHASE4_REVIEW.md` for the authoritative
+correction ledger and the exact limitations of the canonical dump and
+neutrality evidence.
+
+All five protected tracked files retained their recorded hashes during review:
+
+- `.gitignore` — `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`
+- `pyproject.toml` — `191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`
+- `src/scorch/__init__.py` — `5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`
+- `tests/packaging/smoke_install.py` — `f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`
+- `tests/test_scorch/test_resources.py` — `3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`
+
+The prompt below supersedes the immediately preceding Phase-5 prompt.  It is
+intentionally broad enough for a capable session to complete the coherent
+sparse milestone and, only if that milestone is genuinely closed, start one
+bounded scheduling stretch slice.
+
+## Updated Copy-Paste Prompt for the Next Session/Agent
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call. This is a production compiler
+refactor, not an isolated prototype. Begin with a rigorous read-only audit and
+then implement the largest coherent verified milestone that the evidence
+supports.
+
+Read, in order:
+
+1. /Users/bobby/scorch/AGENTS.md
+2. /Users/bobby/scorch/COMPILER_IR_REFACTOR_DESIGN.md
+3. /Users/bobby/scorch/COMPILER_IR_REFACTOR_PHASE3_5_REVIEW.md
+4. /Users/bobby/scorch/COMPILER_IR_REFACTOR_PHASE4_REVIEW.md, especially §7
+5. the final dated sections of
+   /Users/bobby/scorch/COMPILER_IR_REFACTOR_HANDOFF.md
+
+Inspect git status, the branch graph, origin, and the newest commits before
+editing. Trust no handoff claim without checking the code and focused tests.
+Do not switch branches, amend/reorder existing commits, push, or stage by broad
+path. Preserve every unrelated dirty/untracked GPU, CUDA, benchmark, packaging,
+scheduler, research, scratchpad, and tooling path. Preserve and re-hash the five
+protected tracked files listed in the final handoff section before every commit.
+
+Current stopping point:
+
+- Origin is `58e8565`; all Phase-4 work and review corrections are local-only.
+- Phase 4 is the production dense LoopIR vertical slice in
+  `src/scorch/compiler/loopir/`, corrected by `c881490` and `d3f4da4`. Do not
+  regress the rectangular non-identity-layout, pre-relayout format validation,
+  exact-options, generated-name, stage-ownership, partial-pass-failure,
+  zero-shape, rank-bound, and canonical-registry-order regressions.
+- `loopir_spike/` is a sparse semantic/design reference, not a contract to copy.
+  The production schema deliberately omitted sparse nodes until this milestone.
+- The canonical LoopIR dump is a semantic fingerprint and omits display names;
+  it is not sufficient by itself as a target-artifact cache key. Kernel caching
+  remains source-derived.
+- Default production imports and the release legacy JIT remain LoopIR-neutral.
+  Keep shadow execution curated and off by default.
+- The known legacy defects in the Phase-4 review are errata, not invitations to
+  change behavior silently.
+
+Primary objective — complete Phase 5 as a broad, coherent sparse vertical
+milestone rather than a sequence of tiny node-only slices:
+
+1. Run a responsibility audit across production dense LoopIR, the corrected
+   Phase-3.5 spike, normalized CIN, LoopPlan, legacy iteration-lattice analysis,
+   structured LLIR, ABI/codegen, and the semantic oracle. Write down the exact
+   ownership boundary before adding nodes. General level-based compilation is
+   the goal: do not bake CSR coordinates in where parent physical positions are
+   required.
+2. Extend the production schema only with the sparse concepts exercised by the
+   milestone: explicit root/dense/compressed positions, parent-position-linked
+   child cursors, coordinate/value access, iteration-domain/merge structure,
+   and ordered sparse assembly where required. Dimension/domain identity,
+   parent dominance, leaf-value ownership, exhaustion, aligned advancement, and
+   progress must be verifier-enforced with stable defect codes. Keep
+   COORDINATE/SINGLETON and non-CSR assembly fail-closed unless an implemented
+   vertical slice truly needs them.
+3. Extract a pure iteration-domain/merge-lattice analysis that consumes
+   normalized CIN plus verified planning facts and produces explicit immutable
+   LoopIR structure. It must not call back into CINLowerer, parse rendered names
+   or C++, depend on mutable phase order, or hide operation-specific callbacks.
+4. Carry a representative family end to end through normalized CIN -> verified
+   LoopIR -> existing structured LLIR/CxxIR boundary -> ABI/codegen -> compiled
+   execution. The minimum coherent family is:
+   - CSR SpMV;
+   - CSR-by-dense SpMM;
+   - CSR+CSR elementwise UNION/add;
+   - CSR/CSR INTERSECTION/multiply.
+   Include both disjoint and overlapping supports, one-sided exhaustion, empty
+   rows/inputs, ragged shapes, zero extents, and randomized cases. Where legacy
+   supports the operation, compare generated source and runtime results against
+   legacy as well as PyTorch; record legacy defects instead of accommodating
+   them invisibly.
+5. Extend the independent production oracle through a format-neutral level
+   storage interface. CSR may be an adapter, but the execution core must use
+   level/position contracts rather than a rank-2 CSR container. Differential
+   tests must demonstrate positions diverging from coordinates and wrong-parent
+   or wrong-domain programs failing closed.
+6. Extend target lowering, deterministic printing, and canonical serialization
+   for every new node. Bump the canonical schema version. Preserve semantic
+   stability across allocation histories and registry permutations, and keep
+   target-affecting names/options in the source-derived artifact identity rather
+   than pretending the semantic dump owns them.
+7. Record complete stage timing through `CompilationContext`, including partial
+   failure ownership, without changing legacy stage sequences. Keep all generic
+   LLIR rewrites structural and prove detachment/tuple ownership at each new
+   traversal boundary.
+8. Add a Phase-5 review document and handoff that states exactly which formats,
+   ranks, merge arities, output assembly forms, and scheduling facts are frozen
+   and which remain fail-closed. Do not call Phase 5 complete based only on node
+   tests or interpreter tests: at least the four named compiled vertical slices
+   and mandatory gates must pass.
+
+Stretch objective — only after Phase 5 is honestly complete and committed:
+
+- Begin one bounded Phase-6 scheduling slice for CSR-by-dense SpMM: represent a
+  single existing loop-order/affine-tile schedule as immutable scheduled LoopIR
+  plus typed passes, carry it through codegen/execution, and compare it with the
+  corresponding legacy generated kernel. Keep this in separate commits and
+  stop before broad schedule cutover, sparse panel/workspace/parallel migration,
+  selector integration, or legacy deletion. If the schedule representation
+  requires an unresolved architectural decision, document the blocker and stop
+  at the completed Phase-5 boundary instead of inventing an escape hatch.
+
+Mandatory verification:
+
+- focused production LoopIR and loopir_spike suites, including every verifier
+  defect code and adversarial forged/cyclic boundaries;
+- identity, normalized-CIN analysis, LoopPlan, raw-budget, compiler stage-timing,
+  CIN/scheduler/schedule-API, and downstream structured-LLIR adjacency;
+- real compiled numerical differentials against PyTorch for all migrated sparse
+  slices, not only interpreter execution;
+- fresh legacy 20-source corpus and 42-source grid captures against the corrected
+  starting commit. Byte-identical emission waives runtime benchmarking only for
+  unchanged paths; structural activation is never waived. For changed emitted
+  kernels, run the design document's same-session A/A-calibrated latency and
+  two-machine kernel gates as applicable and retain receipts;
+- Black, Flake8, full-source mypy baseline comparison, focused mypy success,
+  `git diff --check`, import-provenance and neutrality checks;
+- a clean detached-worktree full non-performance suite with isolated caches and
+  asserted import provenance.
+
+Use focused commits with descriptive bodies separating schema/analysis,
+lowering/runtime, tests, and review/handoff documentation. Stage explicit paths
+only. Report exact commit hashes, test membership/counts, evidence locations,
+origin state, protected hashes, and limitations. If a mandatory gate fails,
+commit only the largest coherent verified subset, document the failed gate, and
+do not claim the phase complete. Do not push.
+```
