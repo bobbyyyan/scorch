@@ -525,6 +525,28 @@ def test_spmm_csr_dense_shadow_execution_agrees_everywhere():
     )
 
 
+def test_spmm_oracle_preserves_hidden_extent_with_zero_rows():
+    cin = build_spmm_csr_dense()
+    kernel = compile_cin_via_loopir(
+        cin,
+        (0, 4),
+        [((0, 9), torch.float32), ((9, 4), torch.float32)],
+    )
+    lowering = kernel.lowering
+    sparse_symbol, dense_symbol = lowering.rhs_access_symbols
+    dense = [[float(row + column) for column in range(4)] for row in range(9)]
+    result = run_program(
+        lowering.program,
+        {
+            sparse_symbol: CsrMatrix(0, 9, (0,), (), ()),
+            dense_symbol: dense,
+        },
+        {lowering.result_symbol: (0, 4)},
+    )
+
+    assert result[lowering.result_symbol] == []
+
+
 @torch.no_grad()
 @pytest.mark.parametrize(
     "operation,reference",

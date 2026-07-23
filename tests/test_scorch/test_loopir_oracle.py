@@ -542,6 +542,26 @@ def test_union_add_stores_explicit_zero_on_cancellation():
     assert produced.values == (0.0, 1.0)
 
 
+def test_sparse_extent_mismatch_is_rejected_before_builder_allocation(monkeypatch):
+    import scorch.compiler.loopir.oracle as oracle_module
+
+    fixture = build_union_add()
+
+    def unexpected_builder(name, shape):
+        raise AssertionError(f"allocated mismatched sparse output {name} {shape}")
+
+    monkeypatch.setattr(oracle_module, "CsrOutputBuilder", unexpected_builder)
+    with pytest.raises(LoopIROracleError, match="dimension extent mismatch"):
+        run_program(
+            fixture.program,
+            {
+                fixture.a: csr_from_dense([[1.0, 0.0]]),
+                fixture.b: csr_from_dense([[0.0, 2.0]]),
+            },
+            {fixture.c: (1_000_000, 2)},
+        )
+
+
 def test_intersection_multiply_is_structural():
     fixture = build_union_add(mode=MergeMode.INTERSECTION, with_defaults=False)
     a = [
