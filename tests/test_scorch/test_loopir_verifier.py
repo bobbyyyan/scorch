@@ -373,15 +373,26 @@ def test_permuted_mode_order_is_structurally_valid():
 
 def test_unsupported_level_kind():
     fixture = build_vector_add()
-    forge(fixture.program.tensors[0].levels[0], kind=LevelKind.COMPRESSED)
+    forge(fixture.program.tensors[0].levels[0], kind=LevelKind.COORDINATE)
     defect = expect_defect("unsupported_level_kind", fixture.program)
-    assert "compressed" in defect.message
+    assert "coordinate" in defect.message
 
 
-@pytest.mark.parametrize(
-    "kind", [LevelKind.COMPRESSED, LevelKind.COORDINATE, LevelKind.SINGLETON]
-)
-def test_every_non_dense_level_kind_fails_closed(kind):
+def test_compressed_input_level_is_now_declared_executable():
+    """Phase 5 deliberately opened COMPRESSED input levels.
+
+    A compressed level no longer fails with ``unsupported_level_kind``; the
+    forged program instead fails at the coordinate load, which is only
+    defined on all-dense tensors.
+    """
+
+    fixture = build_vector_add()
+    forge(fixture.program.tensors[0].levels[0], kind=LevelKind.COMPRESSED)
+    expect_defect("layout_mismatch", fixture.program)
+
+
+@pytest.mark.parametrize("kind", [LevelKind.COORDINATE, LevelKind.SINGLETON])
+def test_every_unrepresented_level_kind_fails_closed(kind):
     fixture = build_vector_add()
     forge(fixture.program.tensors[2].levels[0], kind=kind)
     expect_defect("unsupported_level_kind", fixture.program)
@@ -593,7 +604,8 @@ def test_verifier_reports_paths():
     assert defect.path == "program.tensors[1]"
 
 
-DENSE_SUBSET_DEFECT_CODES = {
+PRODUCTION_SUBSET_DEFECT_CODES = {
+    # Dense-subset codes frozen by Phase 4.
     "malformed_state",
     "invalid_node_id",
     "duplicate_node_id",
@@ -622,10 +634,27 @@ DENSE_SUBSET_DEFECT_CODES = {
     "output_read",
     "output_scope",
     "unwritten_output",
+    # Sparse-subset codes added by Phase 5.
+    "invalid_cursor_id",
+    "invalid_position_id",
+    "duplicate_cursor_id",
+    "duplicate_position_binding",
+    "unbound_cursor",
+    "unbound_position",
+    "parent_position_mismatch",
+    "layout_mismatch",
+    "merge_domain_mismatch",
+    "degenerate_merge",
+    "unsupported_sparse_hierarchy",
+    "missing_union_default",
+    "dead_default",
+    "default_contains_cursor",
+    "non_leaf_value",
+    "unsupported_sparse_output",
 }
 
 
-def test_defect_codes_are_the_documented_dense_subset():
+def test_defect_codes_are_the_documented_production_subset():
     """Lock the stable defect-code surface of the production verifier."""
 
     import re
@@ -634,4 +663,565 @@ def test_defect_codes_are_the_documented_dense_subset():
 
     source = open(verifier_module.__file__).read()
     found = set(re.findall(r"_fail\(\s*\"([a-z_]+)\"", source))
-    assert found == DENSE_SUBSET_DEFECT_CODES
+    assert found == PRODUCTION_SUBSET_DEFECT_CODES
+
+
+# -- Phase-5 sparse subset ----------------------------------------------------
+
+
+@dataclasses.dataclass
+class CsrSpmvFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    a: SymbolId
+    x: SymbolId
+    y: SymbolId
+    row: IndexId
+    col: IndexId
+
+
+def build_csr_spmv() -> CsrSpmvFixture:
+    """y[i] += A[i, j] * x[j] with A stored as canonical CSR."""
+
+    from scorch.compiler.loopir.nodes import ReduceOp as _ReduceOp
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a, x, y = (builder.new_symbol_id() for _ in range(3))
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_x = builder.tensor(
+        x, "x", ScalarType.FLOAT32, (dim_j.dimension,), builder.dense_levels(1)
+    )
+    decl_y = builder.tensor(
+        y, "y", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    cursor = builder.new_cursor_id()
+    position = builder.new_position_id()
+    cursor_decl = builder.sparse_cursor(
+        cursor,
+        a,
+        1,
+        builder.dense_position(a, 0, builder.root_position(), builder.index_value(row)),
+    )
+    leaf = builder.store_reduce(
+        y,
+        (builder.index_value(row),),
+        _ReduceOp.ADD,
+        builder.binary(
+            BinaryOp.MUL,
+            builder.cursor_value(cursor),
+            builder.load(x, (builder.index_value(col),)),
+        ),
+    )
+    sparse_loop = builder.sparse_for(cursor_decl, position, col, builder.block((leaf,)))
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_x, decl_y),
+        (a, x),
+        (y,),
+        builder.block(
+            (builder.dense_for(row, dim_i.dimension, builder.block((sparse_loop,))),)
+        ),
+    )
+    return CsrSpmvFixture(builder, program, a, x, y, row, col)
+
+
+@dataclasses.dataclass
+class UnionAddFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    a: SymbolId
+    b: SymbolId
+    c: SymbolId
+    row: IndexId
+    col: IndexId
+    merged: object
+
+
+def build_union_add(mode=None, with_defaults=True, op=None) -> UnionAddFixture:
+    """C[i, j] = A[i, j] + B[i, j] over two CSR inputs into a CSR output."""
+
+    from scorch.compiler.loopir.nodes import MergeMode
+
+    if mode is None:
+        mode = MergeMode.UNION
+    if op is None:
+        op = BinaryOp.ADD if mode is MergeMode.UNION else BinaryOp.MUL
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a, b, c = (builder.new_symbol_id() for _ in range(3))
+    csr_levels = lambda: (  # noqa: E731
+        builder.level(LevelKind.DENSE, 0),
+        builder.level(LevelKind.COMPRESSED, 1),
+    )
+    decl_a = builder.tensor(
+        a, "A", ScalarType.FLOAT32, (dim_i.dimension, dim_j.dimension), csr_levels()
+    )
+    decl_b = builder.tensor(
+        b, "B", ScalarType.FLOAT32, (dim_i.dimension, dim_j.dimension), csr_levels()
+    )
+    decl_c = builder.tensor(
+        c, "C", ScalarType.FLOAT32, (dim_i.dimension, dim_j.dimension), csr_levels()
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    cursor_a = builder.new_cursor_id()
+    cursor_b = builder.new_cursor_id()
+
+    def parent(symbol):
+        return builder.dense_position(
+            symbol, 0, builder.root_position(), builder.index_value(row)
+        )
+
+    decl_cursor_a = builder.sparse_cursor(cursor_a, a, 1, parent(a))
+    decl_cursor_b = builder.sparse_cursor(cursor_b, b, 1, parent(b))
+    default_a = builder.float_const(0.0) if with_defaults else None
+    default_b = builder.float_const(0.0) if with_defaults else None
+    leaf = builder.append_entry(
+        c,
+        (builder.index_value(row), builder.index_value(col)),
+        builder.binary(
+            op,
+            builder.cursor_value(cursor_a, default_a),
+            builder.cursor_value(cursor_b, default_b),
+        ),
+    )
+    merged = builder.merged_sparse_for(
+        mode, (decl_cursor_a, decl_cursor_b), col, builder.block((leaf,))
+    )
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_b, decl_c),
+        (a, b),
+        (c,),
+        builder.block(
+            (builder.dense_for(row, dim_i.dimension, builder.block((merged,))),)
+        ),
+    )
+    return UnionAddFixture(builder, program, a, b, c, row, col, merged)
+
+
+def test_csr_spmv_program_verifies():
+    verify_program(build_csr_spmv().program)
+
+
+def test_union_add_program_verifies():
+    verify_program(build_union_add().program)
+
+
+def test_intersection_multiply_program_verifies():
+    from scorch.compiler.loopir.nodes import MergeMode
+
+    fixture = build_union_add(mode=MergeMode.INTERSECTION, with_defaults=False)
+    verify_program(fixture.program)
+
+
+def test_dcsr_single_cursor_descent_verifies():
+    """Compressed-under-compressed descent through bound parent positions."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a = builder.new_symbol_id()
+    y = builder.new_symbol_id()
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.COMPRESSED, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_y = builder.tensor(
+        y, "y", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    cursor_rows = builder.new_cursor_id()
+    cursor_cols = builder.new_cursor_id()
+    position_rows = builder.new_position_id()
+    position_cols = builder.new_position_id()
+    from scorch.compiler.loopir.nodes import ReduceOp as _ReduceOp
+
+    inner = builder.sparse_for(
+        builder.sparse_cursor(cursor_cols, a, 1, builder.position_value(position_rows)),
+        position_cols,
+        col,
+        builder.block(
+            (
+                builder.store_reduce(
+                    y,
+                    (builder.index_value(row),),
+                    _ReduceOp.ADD,
+                    builder.cursor_value(cursor_cols),
+                ),
+            )
+        ),
+    )
+    outer = builder.sparse_for(
+        builder.sparse_cursor(cursor_rows, a, 0, builder.root_position()),
+        position_rows,
+        row,
+        builder.block((inner,)),
+    )
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_y),
+        (a,),
+        (y,),
+        builder.block((outer,)),
+    )
+    verify_program(program)
+
+
+def test_invalid_cursor_id():
+    fixture = build_csr_spmv()
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(sparse_loop.cursor, cursor=41)
+    expect_defect("invalid_cursor_id", fixture.program)
+
+
+def test_invalid_position_id():
+    fixture = build_csr_spmv()
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(sparse_loop, position=17)
+    expect_defect("invalid_position_id", fixture.program)
+
+
+def test_duplicate_cursor_id():
+    fixture = build_union_add()
+    merged = fixture.program.body.statements[0].body.statements[0]
+    forge(merged.cursors[1], cursor=merged.cursors[0].cursor)
+    expect_defect("duplicate_cursor_id", fixture.program)
+
+
+def test_duplicate_position_binding():
+    fixture = build_csr_spmv()
+    builder = fixture.builder
+    outer = fixture.program.body.statements[0]
+    sparse_loop = outer.body.statements[0]
+    inner_cursor = builder.sparse_cursor(
+        builder.new_cursor_id(),
+        fixture.a,
+        1,
+        builder.dense_position(
+            fixture.a,
+            0,
+            builder.root_position(),
+            builder.index_value(fixture.row),
+        ),
+    )
+    nested = builder.sparse_for(
+        inner_cursor,
+        sparse_loop.position,
+        builder.new_index_id(),
+        sparse_loop.body,
+    )
+    forge(sparse_loop, body=builder.block((nested,)))
+    expect_defect("duplicate_position_binding", fixture.program)
+
+
+def test_unbound_cursor():
+    from scorch.compiler.loopir.nodes import CursorId
+
+    fixture = build_csr_spmv()
+    leaf = fixture.program.body.statements[0].body.statements[0].body.statements[0]
+    forge(leaf.value.lhs, cursor=CursorId(31_337))
+    expect_defect("unbound_cursor", fixture.program)
+
+
+def test_unbound_position():
+    fixture = build_csr_spmv()
+    builder = fixture.builder
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(
+        sparse_loop.cursor,
+        parent=builder.position_value(builder.new_position_id()),
+    )
+    expect_defect("unbound_position", fixture.program)
+
+
+def test_parent_position_mismatch_root_for_level_one():
+    fixture = build_csr_spmv()
+    builder = fixture.builder
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(sparse_loop.cursor, parent=builder.root_position())
+    expect_defect("parent_position_mismatch", fixture.program)
+
+
+def test_parent_position_mismatch_wrong_tensor():
+    fixture = build_union_add()
+    merged = fixture.program.body.statements[0].body.statements[0]
+    builder = fixture.builder
+    forge(
+        merged.cursors[0],
+        parent=builder.dense_position(
+            fixture.b,
+            0,
+            builder.root_position(),
+            builder.index_value(fixture.row),
+        ),
+    )
+    expect_defect("parent_position_mismatch", fixture.program)
+
+
+def test_parent_position_mismatch_coordinate_parent():
+    fixture = build_csr_spmv()
+    builder = fixture.builder
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(sparse_loop.cursor, parent=builder.index_value(fixture.row))
+    expect_defect("parent_position_mismatch", fixture.program)
+
+
+def test_layout_mismatch_coordinate_load_of_sparse_tensor():
+    fixture = build_csr_spmv()
+    leaf = fixture.program.body.statements[0].body.statements[0].body.statements[0]
+    builder = fixture.builder
+    forge(
+        leaf.value,
+        lhs=builder.load(
+            fixture.a,
+            (builder.index_value(fixture.row), builder.index_value(fixture.col)),
+        ),
+    )
+    expect_defect("layout_mismatch", fixture.program)
+
+
+def test_layout_mismatch_cursor_over_dense_level():
+    fixture = build_csr_spmv()
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(sparse_loop.cursor, level=0)
+    expect_defect("layout_mismatch", fixture.program)
+
+
+def test_layout_mismatch_dense_position_on_compressed_level():
+    fixture = build_csr_spmv()
+    builder = fixture.builder
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(
+        sparse_loop.cursor,
+        parent=builder.dense_position(
+            fixture.a,
+            1,
+            builder.dense_position(
+                fixture.a,
+                0,
+                builder.root_position(),
+                builder.index_value(fixture.row),
+            ),
+            builder.index_value(fixture.row),
+        ),
+    )
+    expect_defect("layout_mismatch", fixture.program)
+
+
+def test_layout_mismatch_store_into_compressed_output():
+    fixture = build_union_add()
+    builder = fixture.builder
+    merged = fixture.program.body.statements[0].body.statements[0]
+    leaf = merged.body.statements[0]
+    store = builder.store(fixture.c, leaf.coords, leaf.value)
+    forge(merged, body=builder.block((store,)))
+    expect_defect("layout_mismatch", fixture.program)
+
+
+def test_layout_mismatch_append_into_dense_output():
+    fixture = build_csr_spmv()
+    builder = fixture.builder
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    leaf = sparse_loop.body.statements[0]
+    append = builder.append_entry(
+        fixture.y, (builder.index_value(fixture.row),), leaf.value
+    )
+    forge(sparse_loop, body=builder.block((append,)))
+    expect_defect("layout_mismatch", fixture.program)
+
+
+def test_merge_domain_mismatch():
+    fixture = build_union_add()
+    decl_b = fixture.program.tensors[1]
+    dim_i = fixture.program.dimensions[0].dimension
+    # B's parent chain stays domain-correct (level 0 still stores dim_i), but
+    # its merged leaf level now iterates dim_i beside A's dim_j.
+    forge(decl_b, dimensions=(dim_i, dim_i))
+    expect_defect("merge_domain_mismatch", fixture.program)
+
+
+def test_degenerate_merge():
+    fixture = build_union_add()
+    merged = fixture.program.body.statements[0].body.statements[0]
+    forge(merged, cursors=(merged.cursors[0],))
+    expect_defect("degenerate_merge", fixture.program)
+
+
+def test_unsupported_sparse_hierarchy():
+    """Merging non-leaf cursors (hierarchical descent) fails closed."""
+
+    fixture = build_union_add()
+    decl_a = fixture.program.tensors[0]
+    decl_b = fixture.program.tensors[1]
+    for decl in (decl_a, decl_b):
+        levels = (
+            forge(decl.levels[0], kind=LevelKind.COMPRESSED),
+            forge(decl.levels[1], kind=LevelKind.COMPRESSED),
+        )
+        forge(decl, levels=levels)
+    merged = fixture.program.body.statements[0].body.statements[0]
+    builder = fixture.builder
+    forge(merged.cursors[0], level=0, parent=builder.root_position())
+    forge(merged.cursors[1], level=0, parent=builder.root_position())
+    expect_defect("unsupported_sparse_hierarchy", fixture.program)
+
+
+def test_missing_union_default():
+    fixture = build_union_add(with_defaults=False)
+    expect_defect("missing_union_default", fixture.program)
+
+
+def test_dead_default_in_sparse_for():
+    fixture = build_csr_spmv()
+    builder = fixture.builder
+    leaf = fixture.program.body.statements[0].body.statements[0].body.statements[0]
+    forge(leaf.value.lhs, default=builder.float_const(0.0))
+    expect_defect("dead_default", fixture.program)
+
+
+def test_dead_default_in_intersection():
+    from scorch.compiler.loopir.nodes import MergeMode
+
+    fixture = build_union_add(mode=MergeMode.INTERSECTION, with_defaults=True)
+    expect_defect("dead_default", fixture.program)
+
+
+def test_default_contains_cursor():
+    fixture = build_union_add()
+    builder = fixture.builder
+    merged = fixture.program.body.statements[0].body.statements[0]
+    leaf = merged.body.statements[0]
+    forge(
+        leaf.value.lhs,
+        default=builder.cursor_value(
+            merged.cursors[1].cursor, builder.float_const(0.0)
+        ),
+    )
+    expect_defect("default_contains_cursor", fixture.program)
+
+
+def test_non_leaf_value():
+    """Reading a structural (non-leaf) cursor's scalar fails closed."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a = builder.new_symbol_id()
+    y = builder.new_symbol_id()
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.COMPRESSED, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_y = builder.tensor(
+        y, "y", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    row = builder.new_index_id()
+    cursor_rows = builder.new_cursor_id()
+    position_rows = builder.new_position_id()
+    from scorch.compiler.loopir.nodes import ReduceOp as _ReduceOp
+
+    outer = builder.sparse_for(
+        builder.sparse_cursor(cursor_rows, a, 0, builder.root_position()),
+        position_rows,
+        row,
+        builder.block(
+            (
+                builder.store_reduce(
+                    y,
+                    (builder.index_value(row),),
+                    _ReduceOp.ADD,
+                    builder.cursor_value(cursor_rows),
+                ),
+            )
+        ),
+    )
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_y),
+        (a,),
+        (y,),
+        builder.block((outer,)),
+    )
+    expect_defect("non_leaf_value", program)
+
+
+def test_unsupported_sparse_output_non_csr():
+    fixture = build_union_add()
+    decl_c = fixture.program.tensors[2]
+    levels = (
+        forge(decl_c.levels[0], kind=LevelKind.COMPRESSED, mode=1),
+        forge(decl_c.levels[1], kind=LevelKind.DENSE, mode=0),
+    )
+    forge(decl_c, levels=levels)
+    expect_defect("unsupported_sparse_output", fixture.program)
+
+
+def test_unsupported_sparse_output_rank_three():
+    fixture = build_union_add()
+    builder = fixture.builder
+    dim_extra = builder.dimension("k")
+    decl_c = fixture.program.tensors[2]
+    forge(
+        decl_c,
+        dimensions=(*decl_c.dimensions, dim_extra.dimension),
+        levels=(
+            *decl_c.levels,
+            builder.level(LevelKind.COMPRESSED, 2),
+        ),
+    )
+    programs = fixture.program
+    forge(programs, dimensions=(*programs.dimensions, dim_extra))
+    expect_defect("unsupported_sparse_output", fixture.program)
+
+
+def test_float_const_must_be_exact_float():
+    fixture = build_union_add()
+    merged = fixture.program.body.statements[0].body.statements[0]
+    leaf = merged.body.statements[0]
+    forge(leaf.value.lhs.default, value=0)
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_merge_mode_member_is_enforced():
+    class ForgedMode:
+        value = "union"
+
+    fixture = build_union_add()
+    merged = fixture.program.body.statements[0].body.statements[0]
+    forge(merged, mode=ForgedMode())
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_sparse_nodes_reject_cross_program_sharing():
+    fixture = build_union_add()
+    merged = fixture.program.body.statements[0].body.statements[0]
+    forge(merged, cursors=(merged.cursors[0], merged.cursors[0]))
+    expect_defect("shared_node", fixture.program)

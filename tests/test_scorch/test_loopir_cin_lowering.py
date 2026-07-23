@@ -240,8 +240,19 @@ def test_unsupported_expression_unary():
 
 
 def test_unsupported_format():
+    # Phase 5 opened DENSE/COMPRESSED level compositions, so the recorded
+    # unsupported-format boundary moved to COORDINATE levels and to dense
+    # value-bearing leaves below compressed structure.
     i, j = IndexVar("i"), IndexVar("j")
-    a = TensorVar("A", fmt="ds")
+    a = TensorVar("A", fmt="oo")
+    c = TensorVar("C", fmt="dd")
+    assign = TensorAssign(c[i, j], a[i, j])
+    expect_code("unsupported_format", ForAll(i, ForAll(j, assign)))
+
+
+def test_unsupported_format_dense_leaf_below_compressed():
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="sd")
     c = TensorVar("C", fmt="dd")
     assign = TensorAssign(c[i, j], a[i, j])
     expect_code("unsupported_format", ForAll(i, ForAll(j, assign)))
@@ -333,3 +344,215 @@ def test_malformed_cin_fails_at_the_cin_verifier():
 def test_non_index_stmt_rejected():
     with pytest.raises(TypeError):
         lower_normalized_cin_to_loopir(object())
+
+
+# -- Phase-5 sparse families ---------------------------------------------------
+
+from scorch.compiler.loopir.nodes import (  # noqa: E402
+    AppendEntry,
+    CursorValue,
+    DensePosition,
+    FloatConst,
+    MergedSparseFor,
+    MergeMode,
+    PositionValue,
+    RootPosition,
+    SparseFor,
+)
+
+
+def build_spmv(fmt_a="ds"):
+    i, j = IndexVar("i"), IndexVar("j")
+    y = TensorVar("y", fmt="d")
+    a = TensorVar("A", fmt=fmt_a)
+    x = TensorVar("x", fmt="d")
+    assign = TensorAssign(
+        y[i], CINBinaryOp(Operation.MUL, a[i, j], x[j]), op=Operation.ADD
+    )
+    return ForAll(i, ForAll(j, assign)), (i, j), (a, x, y)
+
+
+def build_sparse_elementwise(op, fmt_out):
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt=fmt_out)
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    assign = TensorAssign(c[i, j], CINBinaryOp(op, a[i, j], b[i, j]))
+    return ForAll(i, ForAll(j, assign)), (i, j), (a, b, c)
+
+
+def test_spmv_lowering_structure():
+    cin, (i, j), (a, x, y) = build_spmv()
+    result = lower_normalized_cin_to_loopir(normalize_cin(cin))
+    program = result.program
+    outer = program.body.statements[0]
+    assert type(outer) is DenseFor
+    sparse_loop = outer.body.statements[0]
+    assert type(sparse_loop) is SparseFor
+    cursor = sparse_loop.cursor
+    assert cursor.tensor == a.symbol_id
+    assert cursor.level == 1
+    parent = cursor.parent
+    assert type(parent) is DensePosition
+    assert parent.tensor == a.symbol_id and parent.level == 0
+    assert type(parent.parent) is RootPosition
+    assert parent.coord.index == i.index_id
+    leaf = sparse_loop.body.statements[0]
+    assert type(leaf) is StoreReduce
+    assert type(leaf.value.lhs) is CursorValue
+    assert leaf.value.lhs.default is None
+    assert result.loop_plan.loop_order == (i.index_id, j.index_id)
+
+
+def test_spmm_lowering_keeps_dense_inner_loop():
+    i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="dd")
+    assign = TensorAssign(
+        c[i, j], CINBinaryOp(Operation.MUL, a[i, k], b[k, j]), op=Operation.ADD
+    )
+    cin = ForAll(i, ForAll(k, ForAll(j, assign)))
+    result = lower_normalized_cin_to_loopir(normalize_cin(cin))
+    outer = result.program.body.statements[0]
+    middle = outer.body.statements[0]
+    inner = middle.body.statements[0]
+    assert type(outer) is DenseFor
+    assert type(middle) is SparseFor
+    assert type(inner) is DenseFor
+
+
+def test_union_add_lowering_structure_and_defaults():
+    cin, (i, j), (a, b, c) = build_sparse_elementwise(Operation.ADD, "ds")
+    result = lower_normalized_cin_to_loopir(normalize_cin(cin))
+    outer = result.program.body.statements[0]
+    merged = outer.body.statements[0]
+    assert type(merged) is MergedSparseFor
+    assert merged.mode is MergeMode.UNION
+    assert [cursor.tensor for cursor in merged.cursors] == [
+        a.symbol_id,
+        b.symbol_id,
+    ]
+    leaf = merged.body.statements[0]
+    assert type(leaf) is AppendEntry
+    for side in (leaf.value.lhs, leaf.value.rhs):
+        assert type(side) is CursorValue
+        assert type(side.default) is FloatConst
+        assert side.default.value == 0.0
+
+
+def test_intersection_multiply_lowering_structure():
+    cin, (i, j), (a, b, c) = build_sparse_elementwise(Operation.MUL, "dd")
+    result = lower_normalized_cin_to_loopir(normalize_cin(cin))
+    merged = result.program.body.statements[0].body.statements[0]
+    assert type(merged) is MergedSparseFor
+    assert merged.mode is MergeMode.INTERSECTION
+    leaf = merged.body.statements[0]
+    assert type(leaf) is Store
+    for side in (leaf.value.lhs, leaf.value.rhs):
+        assert type(side) is CursorValue
+        assert side.default is None
+
+
+def test_dcsr_lowering_links_compressed_parent_positions():
+    cin, (i, j), (a, x, y) = build_spmv(fmt_a="ss")
+    result = lower_normalized_cin_to_loopir(normalize_cin(cin))
+    outer = result.program.body.statements[0]
+    assert type(outer) is SparseFor
+    assert outer.cursor.level == 0
+    assert type(outer.cursor.parent) is RootPosition
+    inner = outer.body.statements[0]
+    assert type(inner) is SparseFor
+    assert type(inner.cursor.parent) is PositionValue
+    assert inner.cursor.parent.position == outer.position
+
+
+def test_sparse_lowering_never_mutates_input():
+    cin, _, _ = build_sparse_elementwise(Operation.ADD, "ds")
+    normalized = normalize_cin(cin)
+    before = canonical_cin_dump(normalized)
+    lower_normalized_cin_to_loopir(normalized)
+    assert canonical_cin_dump(normalized) == before
+
+
+def test_sparse_lowering_is_deterministic():
+    cin, _, _ = build_sparse_elementwise(Operation.ADD, "ds")
+    first = canonical_program_dump(
+        lower_normalized_cin_to_loopir(normalize_cin(cin)).program
+    )
+    second = canonical_program_dump(
+        lower_normalized_cin_to_loopir(normalize_cin(cin)).program
+    )
+    assert first == second
+
+
+def test_unsupported_sparse_output_layout():
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    c = TensorVar("C", fmt="dss")
+    a = TensorVar("A", fmt="dss")
+    assign = TensorAssign(c[i, j, k], a[i, j, k])
+    expect_code("unsupported_sparse_output", ForAll(i, ForAll(j, ForAll(k, assign))))
+
+
+def test_unsupported_sparse_output_reduction():
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    c = TensorVar("C", fmt="ds")
+    a = TensorVar("A", fmt="dss")
+    assign = TensorAssign(c[i, j], a[i, j, k], op=Operation.ADD)
+    expect_code(
+        "unsupported_sparse_output_reduction",
+        ForAll(i, ForAll(j, ForAll(k, assign))),
+    )
+
+
+def test_unsupported_sparse_output_domain_dense_column():
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="ds")
+    a = TensorVar("A", fmt="dd")
+    b = TensorVar("B", fmt="dd")
+    assign = TensorAssign(c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]))
+    expect_code("unsupported_sparse_output_domain", ForAll(i, ForAll(j, assign)))
+
+
+def test_unsupported_sparse_output_domain_sparse_row():
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="ds")
+    a = TensorVar("A", fmt="ss")
+    assign = TensorAssign(c[i, j], a[i, j])
+    expect_code("unsupported_sparse_output_domain", ForAll(i, ForAll(j, assign)))
+
+
+def test_unsupported_merged_reduction():
+    i, j = IndexVar("i"), IndexVar("j")
+    y = TensorVar("y", fmt="d")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    assign = TensorAssign(
+        y[i], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), op=Operation.ADD
+    )
+    expect_code("unsupported_merged_reduction", ForAll(i, ForAll(j, assign)))
+
+
+def test_unsupported_merged_update():
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    assign = TensorAssign(
+        c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), op=Operation.ADD
+    )
+    expect_code("unsupported_merged_update", ForAll(i, ForAll(j, assign)))
+
+
+def test_analysis_codes_surface_through_the_lowering():
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="ds")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    sub = TensorAssign(c[i, j], CINBinaryOp(Operation.SUB, a[i, j], b[i, j]))
+    expect_code("unsupported_sparse_subtraction", ForAll(i, ForAll(j, sub)))
+
+    c2 = TensorVar("C2", fmt="dd")
+    dense_b = TensorVar("B2", fmt="dd")
+    mixed = TensorAssign(c2[i, j], CINBinaryOp(Operation.ADD, a[i, j], dense_b[i, j]))
+    expect_code("unsupported_union_with_dense", ForAll(i, ForAll(j, mixed)))

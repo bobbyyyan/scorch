@@ -431,3 +431,329 @@ def test_unsupported_program_shape_multi_statement_block():
         {fixture.a: (2,), fixture.b: (2,)},
         (2,),
     )
+
+
+# -- Phase-5 sparse families: byte parity and target boundaries ---------------
+
+from tests.test_scorch.test_loopir_verifier import (  # noqa: E402
+    build_csr_spmv,
+    build_union_add,
+    forge as _forge,
+)
+
+
+def case_spmv(dtype=F32):
+    i, j = IndexVar("i"), IndexVar("j")
+    y = TensorVar("y", fmt="d", dtype=dtype)
+    a = TensorVar("A", fmt="ds", dtype=dtype)
+    x = TensorVar("x", fmt="d", dtype=dtype)
+    assign = TensorAssign(
+        y[i], CINBinaryOp(Operation.MUL, a[i, j], x[j]), op=Operation.ADD
+    )
+    cin = ForAll(i, ForAll(j, assign))
+    return cin, (5,), [((5, 7), dtype), ((7,), dtype)]
+
+
+def case_spmv_f64():
+    return case_spmv(torch.float64)
+
+
+def case_spmm_csr_dense():
+    i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="dd")
+    assign = TensorAssign(
+        c[i, j], CINBinaryOp(Operation.MUL, a[i, k], b[k, j]), op=Operation.ADD
+    )
+    cin = ForAll(i, ForAll(k, ForAll(j, assign)))
+    return cin, (5, 4), [((5, 7), F32), ((7, 4), F32)]
+
+
+def case_sparse_elementwise(op, fmt_out):
+    def build():
+        i, j = IndexVar("i"), IndexVar("j")
+        c = TensorVar("C", fmt=fmt_out)
+        a = TensorVar("A", fmt="ds")
+        b = TensorVar("B", fmt="ds")
+        assign = TensorAssign(c[i, j], CINBinaryOp(op, a[i, j], b[i, j]))
+        cin = ForAll(i, ForAll(j, assign))
+        return cin, (5, 7), [((5, 7), F32), ((5, 7), F32)]
+
+    return build
+
+
+def case_csr_row_sum():
+    i, j = IndexVar("i"), IndexVar("j")
+    y = TensorVar("y", fmt="d")
+    a = TensorVar("A", fmt="ds")
+    assign = TensorAssign(y[i], a[i, j], op=Operation.ADD)
+    cin = ForAll(i, ForAll(j, assign))
+    return cin, (5,), [((5, 7), F32)]
+
+
+def case_sampled_elementwise_dd():
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="dd")
+    assign = TensorAssign(c[i, j], CINBinaryOp(Operation.MUL, a[i, j], b[i, j]))
+    cin = ForAll(i, ForAll(j, assign))
+    return cin, (5, 7), [((5, 7), F32), ((5, 7), F32)]
+
+
+def case_spgemm_to_dense():
+    i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    assign = TensorAssign(
+        c[i, j], CINBinaryOp(Operation.MUL, a[i, k], b[k, j]), op=Operation.ADD
+    )
+    cin = ForAll(i, ForAll(k, ForAll(j, assign)))
+    return cin, (5, 4), [((5, 7), F32), ((7, 4), F32)]
+
+
+def case_union_times_dense():
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    d = TensorVar("D", fmt="dd")
+    assign = TensorAssign(
+        c[i, j],
+        CINBinaryOp(
+            Operation.MUL, CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), d[i, j]
+        ),
+    )
+    cin = ForAll(i, ForAll(j, assign))
+    return cin, (5, 7), [((5, 7), F32)] * 3
+
+
+SPARSE_FAMILY_GRID = [
+    ("spmv_csr_f32", case_spmv),
+    ("spmv_csr_f64", case_spmv_f64),
+    ("spmm_csr_dense", case_spmm_csr_dense),
+    ("union_add_to_csr", case_sparse_elementwise(Operation.ADD, "ds")),
+    ("union_add_to_dense", case_sparse_elementwise(Operation.ADD, "dd")),
+    ("intersection_mul_to_csr", case_sparse_elementwise(Operation.MUL, "ds")),
+    ("intersection_mul_to_dense", case_sparse_elementwise(Operation.MUL, "dd")),
+    ("csr_row_sum", case_csr_row_sum),
+    ("sampled_elementwise_dd", case_sampled_elementwise_dd),
+    ("spgemm_to_dense", case_spgemm_to_dense),
+    ("union_times_dense", case_union_times_dense),
+]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [entry[1] for entry in SPARSE_FAMILY_GRID],
+    ids=[entry[0] for entry in SPARSE_FAMILY_GRID],
+)
+def test_sparse_generated_source_is_byte_identical_to_legacy(case):
+    cin, result_shape, bindings = case()
+    comparison = compare_generated_sources(cin, result_shape, bindings)
+    assert comparison.identical, (
+        "LoopIR and legacy generated sources diverged:\n"
+        + comparison.loopir_cpp
+        + "\n=== legacy ===\n"
+        + comparison.legacy_cpp
+    )
+
+
+def test_sparse_structural_activation_spmm():
+    """Prefetch, pointer hoist, position loop, and the sparse-aware parallel
+    policy must all fire on the CSR-by-dense SpMM kernel."""
+
+    cin, result_shape, bindings = case_spmm_csr_dense()
+    kernel = compile_cin_via_loopir(cin, result_shape, bindings)
+    source = kernel.cpp_source
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(A1_pos[A0_size], "
+        "A0_size)) schedule(dynamic, scorch_chunk(A0_size, A1_pos[A0_size]))"
+    ) in source
+    assert "__builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1);" in source
+    assert "const float* __restrict__ _B_val_ptr = &B_val[pB0 * B1_size];" in source
+    assert "for (int pA1 = A1_pos[pA0]; pA1 < pA1_end; pA1++)" in source
+
+
+def test_sparse_structural_activation_union_assembly():
+    """The CSR union kernel owns ordered assembly and stays serial."""
+
+    build = case_sparse_elementwise(Operation.ADD, "ds")
+    cin, result_shape, bindings = build()
+    kernel = compile_cin_via_loopir(cin, result_shape, bindings)
+    source = kernel.cpp_source
+    assert "#pragma omp parallel for" not in source
+    assert "scorch_vector_set(C1_pos, 0, 0);" in source
+    assert "while (pA1 < pA1_end && pB1 < pB1_end)" in source
+    assert "int j = std::min({j_A, j_B});" in source
+    assert "} else if (j_A == j) {" in source
+    assert "pA1 += (int)(j_A == j);" in source
+    assert "while (pA1 < pA1_end) {" in source
+    assert "while (pB1 < pB1_end) {" in source
+    assert "scorch_tensor_from_vector(std::move(C1_pos), torch::kInt);" in source
+
+
+def test_sparse_structural_activation_merged_dense_policy():
+    """Merged-into-dense kernels keep the legacy row-count-only thread cap."""
+
+    build = case_sparse_elementwise(Operation.ADD, "dd")
+    cin, result_shape, bindings = build()
+    kernel = compile_cin_via_loopir(cin, result_shape, bindings)
+    source = kernel.cpp_source
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(-1, A0_size)) "
+        "schedule(dynamic, scorch_chunk(A0_size, -1))"
+    ) in source
+    assert "if (j_A == j && j_B == j) {" in source
+
+
+def test_sparse_intersection_emits_single_alignment_case():
+    build = case_sparse_elementwise(Operation.MUL, "ds")
+    cin, result_shape, bindings = build()
+    kernel = compile_cin_via_loopir(cin, result_shape, bindings)
+    source = kernel.cpp_source
+    assert "if (j_A == j && j_B == j) {" in source
+    assert "else if" not in source
+    assert "while (pA1 < pA1_end) {" not in source.split("&&")[-1]
+
+
+def test_sparse_loopir_dumps_are_target_neutral():
+    build = case_sparse_elementwise(Operation.ADD, "ds")
+    cin, result_shape, bindings = build()
+    kernel = compile_cin_via_loopir(cin, result_shape, bindings)
+    for artifact in (kernel.program_text, kernel.program_dump):
+        for spelling in (
+            "torch",
+            "omp_",
+            "#pragma",
+            "float*",
+            "restrict",
+            "int64_t",
+            "::",
+        ):
+            assert spelling not in artifact
+
+
+def union_shapes(program):
+    a_symbol, b_symbol = program.inputs
+    return {a_symbol: (3, 4), b_symbol: (3, 4)}
+
+
+def test_level_zero_cursors_fail_at_target_boundary():
+    """DCSR descent verifies and lowers, but the target fails closed."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    y = TensorVar("y", fmt="d")
+    a = TensorVar("A", fmt="ss")
+    x = TensorVar("x", fmt="d")
+    assign = TensorAssign(
+        y[i], CINBinaryOp(Operation.MUL, a[i, j], x[j]), op=Operation.ADD
+    )
+    cin = ForAll(i, ForAll(j, assign))
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(cin, (5,), [((5, 7), F32), ((7,), F32)])
+    assert error.value.defect.code == "unsupported_program_shape"
+
+
+def test_three_cursor_merge_fails_at_target_boundary():
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="ds")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    d = TensorVar("D", fmt="ds")
+    assign = TensorAssign(
+        c[i, j],
+        CINBinaryOp(
+            Operation.ADD, CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), d[i, j]
+        ),
+    )
+    cin = ForAll(i, ForAll(j, assign))
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(cin, (5, 7), [((5, 7), F32)] * 3)
+    assert error.value.defect.code == "unsupported_program_shape"
+
+
+def test_append_without_merge_fails_at_target_boundary():
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="ds")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="dd")
+    assign = TensorAssign(c[i, j], CINBinaryOp(Operation.MUL, a[i, j], b[i, j]))
+    cin = ForAll(i, ForAll(j, assign))
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(cin, (5, 7), [((5, 7), F32), ((5, 7), F32)])
+    assert error.value.defect.code == "unsupported_program_shape"
+
+
+def test_nonzero_union_default_fails_at_target_boundary():
+    fixture = build_union_add()
+    merged = fixture.program.body.statements[0].body.statements[0]
+    leaf = merged.body.statements[0]
+    _forge(leaf.value.lhs, default=fixture.builder.float_const(1.5))
+    expect_target_code(
+        "unsupported_union_default",
+        fixture.program,
+        union_shapes(fixture.program),
+        (3, 4),
+    )
+
+
+def test_unread_input_fails_at_target_boundary():
+    fixture = build_csr_spmv()
+    leaf = fixture.program.body.statements[0].body.statements[0].body.statements[0]
+    _forge(leaf, value=leaf.value.lhs)
+    expect_target_code(
+        "unsupported_program_shape",
+        fixture.program,
+        {fixture.a: (3, 4), fixture.x: (4,)},
+        (3,),
+    )
+
+
+def test_sparse_generated_names_are_reserved():
+    # The merged coordinate temporary for input tensor 'A' spells 'j_A';
+    # a tensor claiming that display name must be rejected.
+    fixture = build_union_add()
+    decl_b = fixture.program.tensors[1]
+    _forge(decl_b, name="j_A")
+    expect_target_code(
+        "generated_name_collision",
+        fixture.program,
+        union_shapes(fixture.program),
+        (3, 4),
+    )
+
+
+def test_sparse_pos_names_are_reserved():
+    fixture = build_csr_spmv()
+    decl_x = fixture.program.tensors[1]
+    _forge(decl_x, name="A1_pos")
+    expect_target_code(
+        "generated_name_collision",
+        fixture.program,
+        {fixture.a: (3, 4), fixture.x: (4,)},
+        (3,),
+    )
+
+
+def test_sparse_target_owns_context_stage_and_pass_records():
+    """The sparse path records the same owned stage and managed-pass runs."""
+
+    cin, result_shape, bindings = case_spmm_csr_dense()
+    options = CompileOptions.from_environment(environ={})
+    context = CompilationContext(options)
+    compile_cin_via_loopir(
+        cin,
+        result_shape,
+        bindings,
+        compile_options=options,
+        compilation_context=context,
+    )
+    stage_ids = [record.stage_id for record in context.stage_run_records]
+    assert CompilerStageId.CIN_TO_LOOPIR_LOWERING in stage_ids
+    assert CompilerStageId.LOOPIR_TO_LLIR_LOWERING in stage_ids
+    pass_names = [record.pass_name for record in context.llir_pass_run_records]
+    assert "insert_sparse_prefetch" in pass_names
+    assert "hoist_dense_pointers" in pass_names

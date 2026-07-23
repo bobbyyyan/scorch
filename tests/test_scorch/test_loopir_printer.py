@@ -119,7 +119,7 @@ def test_canonical_dump_omits_display_names():
 
 def test_canonical_dump_carries_schema_version():
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v1"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v2"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
@@ -162,3 +162,90 @@ def test_both_surfaces_fail_closed_on_invalid_programs():
         canonical_program_dump(fixture.program)
     with pytest.raises(LoopIRVerificationError):
         print_program(fixture.program)
+
+
+# -- Phase-5 sparse subset ----------------------------------------------------
+
+from scorch.compiler.loopir.nodes import MergeMode  # noqa: E402
+
+from tests.test_scorch.test_loopir_verifier import (  # noqa: E402
+    build_csr_spmv,
+    build_union_add,
+)
+
+
+def test_sparse_canonical_dump_is_stable_across_global_id_histories():
+    first = canonical_program_dump(build_csr_spmv().program)
+    # Burn global identity allocations so the second construction's
+    # SymbolId/IndexId values differ.
+    for _ in range(7):
+        build_union_add()
+    second = canonical_program_dump(build_csr_spmv().program)
+    assert first == second
+
+
+def test_sparse_canonical_dump_distinguishes_merge_modes_and_defaults():
+    union = canonical_program_dump(build_union_add().program)
+    intersection = canonical_program_dump(
+        build_union_add(mode=MergeMode.INTERSECTION, with_defaults=False).program
+    )
+    assert union != intersection
+    assert '"mode":"union"' in union
+    assert '"mode":"intersection"' in intersection
+    assert '"kind":"float_const"' in union
+    assert '"default":null' in intersection
+
+
+def test_sparse_registry_permutation_is_not_semantic():
+    fixture = build_union_add()
+    baseline = canonical_program_dump(fixture.program)
+    rendered = print_program(fixture.program)
+    import dataclasses as _dataclasses
+
+    program = fixture.program
+    permuted = type(program)(
+        program.node_id,
+        tuple(reversed(program.dimensions)),
+        tuple(reversed(program.tensors)),
+        program.inputs,
+        program.outputs,
+        program.body,
+    )
+    del _dataclasses
+    assert canonical_program_dump(permuted) == baseline
+    assert print_program(permuted) == rendered
+
+
+def test_sparse_printer_renders_positions_cursors_and_appends():
+    rendered = print_program(build_csr_spmv().program)
+    assert "sparse_for" in rendered
+    assert "parent dense_pos(" in rendered
+    assert "parent root" in rendered
+    assert "value(c0)" in rendered
+    merged = print_program(build_union_add().program)
+    assert "merged_union_for" in merged
+    assert "append t" in merged
+    assert "default 0.0" in merged
+
+
+def test_sparse_dumps_are_target_neutral():
+    target_fragments = (
+        "torch",
+        "omp_",
+        "#pragma",
+        "std::",
+        "int64_t",
+        "__restrict",
+        "emplace_back",
+        "pragma",
+        "scorch_",
+        "1_pos[",
+        "1_crd[",
+        "_val[",
+    )
+    for program in (build_csr_spmv().program, build_union_add().program):
+        dump = canonical_program_dump(program)
+        rendered = print_program(program)
+        for fragment in target_fragments:
+            assert fragment not in dump
+            assert fragment not in rendered

@@ -380,3 +380,423 @@ def test_oracle_owns_inputs_before_consulting_output_shape_mapping():
     )
     assert results[fixture.c] == [3.0]
     assert a == [10.0]
+
+
+# -- Phase-5 sparse subset ----------------------------------------------------
+
+from scorch.compiler.loopir.build import LoopIRBuilder as _Builder  # noqa: E402
+from scorch.compiler.loopir.levels import (  # noqa: E402
+    CsrMatrix,
+    LevelTensorStorage,
+)
+from scorch.compiler.loopir.nodes import LevelKind  # noqa: E402
+
+from tests.test_scorch.test_loopir_verifier import (  # noqa: E402
+    build_csr_spmv,
+    build_union_add,
+)
+from scorch.compiler.loopir.nodes import MergeMode  # noqa: E402
+
+
+def csr_from_dense(dense):
+    return CsrMatrix.from_dense(dense)
+
+
+def reference_spmv_stored_order(dense, vector):
+    result = [0.0] * len(dense)
+    for i, row in enumerate(dense):
+        for j, entry in enumerate(row):
+            if entry != 0.0:
+                result[i] = result[i] + entry * vector[j]
+    return result
+
+
+def reference_union_add(a, b):
+    rows = []
+    for i in range(len(a)):
+        row_entries = []
+        for j in range(len(a[0])):
+            left, right = a[i][j], b[i][j]
+            if left != 0.0 and right != 0.0:
+                row_entries.append((j, left + right))
+            elif left != 0.0:
+                row_entries.append((j, left))
+            elif right != 0.0:
+                row_entries.append((j, right))
+        rows.append(row_entries)
+    return rows
+
+
+def reference_intersection_mul(a, b):
+    rows = []
+    for i in range(len(a)):
+        row_entries = []
+        for j in range(len(a[0])):
+            if a[i][j] != 0.0 and b[i][j] != 0.0:
+                row_entries.append((j, a[i][j] * b[i][j]))
+        rows.append(row_entries)
+    return rows
+
+
+def csr_rows(matrix):
+    rows = []
+    for i in range(matrix.n_rows):
+        rows.append(
+            [
+                (matrix.indices[p], matrix.values[p])
+                for p in range(matrix.indptr[i], matrix.indptr[i + 1])
+            ]
+        )
+    return rows
+
+
+def test_csr_spmv_matches_reference_exactly():
+    fixture = build_csr_spmv()
+    dense = [
+        [1.0, 0.0, 2.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, -3.5, 0.0, 4.0],
+    ]
+    vector = [0.5, 1.5, -2.0, 3.0]
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense(dense), fixture.x: vector},
+        {fixture.y: (3,)},
+    )
+    assert results[fixture.y] == reference_spmv_stored_order(dense, vector)
+
+
+def test_csr_spmv_accepts_equivalent_level_storage():
+    fixture = build_csr_spmv()
+    dense = [[0.0, 2.0], [3.0, 0.0]]
+    vector = [4.0, 5.0]
+    via_adapter = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense(dense), fixture.x: vector},
+        {fixture.y: (2,)},
+    )
+    fixture2 = build_csr_spmv()
+    storage = LevelTensorStorage.from_dense(
+        dense, (2, 2), (0, 1), (LevelKind.DENSE, LevelKind.COMPRESSED)
+    )
+    via_storage = run_program(
+        fixture2.program,
+        {fixture2.a: storage, fixture2.x: vector},
+        {fixture2.y: (2,)},
+    )
+    assert via_adapter[fixture.y] == via_storage[fixture2.y]
+
+
+def test_union_add_covers_disjoint_overlap_and_exhaustion():
+    fixture = build_union_add()
+    a = [
+        [1.0, 0.0, 2.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [5.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 7.0],
+    ]
+    b = [
+        [0.0, 3.0, 4.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 6.0],
+        [2.0, 0.0, 0.0, 0.0],
+    ]
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense(a), fixture.b: csr_from_dense(b)},
+        {fixture.c: (4, 4)},
+    )
+    produced = results[fixture.c]
+    assert type(produced) is CsrMatrix
+    assert csr_rows(produced) == reference_union_add(a, b)
+
+
+def test_union_add_stores_explicit_zero_on_cancellation():
+    fixture = build_union_add()
+    a = [[2.5, 0.0]]
+    b = [[-2.5, 1.0]]
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense(a), fixture.b: csr_from_dense(b)},
+        {fixture.c: (1, 2)},
+    )
+    produced = results[fixture.c]
+    assert produced.indices == (0, 1)
+    assert produced.values == (0.0, 1.0)
+
+
+def test_intersection_multiply_is_structural():
+    fixture = build_union_add(mode=MergeMode.INTERSECTION, with_defaults=False)
+    a = [
+        [1.0, 2.0, 0.0],
+        [0.0, 3.0, 0.0],
+    ]
+    b = [
+        [4.0, 0.0, 5.0],
+        [0.0, 6.0, 7.0],
+    ]
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense(a), fixture.b: csr_from_dense(b)},
+        {fixture.c: (2, 3)},
+    )
+    assert csr_rows(results[fixture.c]) == reference_intersection_mul(a, b)
+
+
+def test_sparse_families_match_references_on_random_grids():
+    rng = random.Random(20260722)
+    for rows, cols in [(1, 1), (3, 5), (6, 4), (5, 8)]:
+        a = [
+            [
+                rng.uniform(-2.0, 2.0) if rng.random() < 0.45 else 0.0
+                for _ in range(cols)
+            ]
+            for _ in range(rows)
+        ]
+        b = [
+            [
+                rng.uniform(-2.0, 2.0) if rng.random() < 0.45 else 0.0
+                for _ in range(cols)
+            ]
+            for _ in range(rows)
+        ]
+        vector = [rng.uniform(-2.0, 2.0) for _ in range(cols)]
+
+        spmv = build_csr_spmv()
+        spmv_result = run_program(
+            spmv.program,
+            {spmv.a: csr_from_dense(a), spmv.x: vector},
+            {spmv.y: (rows,)},
+        )
+        assert spmv_result[spmv.y] == reference_spmv_stored_order(a, vector)
+
+        union = build_union_add()
+        union_result = run_program(
+            union.program,
+            {union.a: csr_from_dense(a), union.b: csr_from_dense(b)},
+            {union.c: (rows, cols)},
+        )
+        assert csr_rows(union_result[union.c]) == reference_union_add(a, b)
+
+        both = build_union_add(mode=MergeMode.INTERSECTION, with_defaults=False)
+        both_result = run_program(
+            both.program,
+            {both.a: csr_from_dense(a), both.b: csr_from_dense(b)},
+            {both.c: (rows, cols)},
+        )
+        assert csr_rows(both_result[both.c]) == reference_intersection_mul(a, b)
+
+
+def test_empty_inputs_and_zero_extents_execute():
+    fixture = build_union_add()
+    empty = CsrMatrix(n_rows=0, n_cols=3, indptr=(0,), indices=(), values=())
+    results = run_program(
+        fixture.program,
+        {fixture.a: empty, fixture.b: empty},
+        {fixture.c: (0, 3)},
+    )
+    assert results[fixture.c].indptr == (0,)
+
+    spmv = build_csr_spmv()
+    no_columns = CsrMatrix(n_rows=2, n_cols=0, indptr=(0, 0, 0), indices=(), values=())
+    spmv_result = run_program(
+        spmv.program,
+        {spmv.a: no_columns, spmv.x: []},
+        {spmv.y: (2,)},
+    )
+    assert spmv_result[spmv.y] == [0.0, 0.0]
+
+
+def test_dcsr_positions_diverge_from_coordinates():
+    """Bound parent positions, not row coordinates, select DCSR segments."""
+
+    builder = _Builder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a = builder.new_symbol_id()
+    y = builder.new_symbol_id()
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.COMPRESSED, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_y = builder.tensor(
+        y, "y", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    cursor_rows = builder.new_cursor_id()
+    cursor_cols = builder.new_cursor_id()
+    position_rows = builder.new_position_id()
+    position_cols = builder.new_position_id()
+    inner = builder.sparse_for(
+        builder.sparse_cursor(cursor_cols, a, 1, builder.position_value(position_rows)),
+        position_cols,
+        col,
+        builder.block(
+            (
+                builder.store_reduce(
+                    y,
+                    (builder.index_value(row),),
+                    ReduceOp.ADD,
+                    builder.cursor_value(cursor_cols),
+                ),
+            )
+        ),
+    )
+    outer = builder.sparse_for(
+        builder.sparse_cursor(cursor_rows, a, 0, builder.root_position()),
+        position_rows,
+        row,
+        builder.block((inner,)),
+    )
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_y),
+        (a,),
+        (y,),
+        builder.block((outer,)),
+    )
+    dense = [
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [1.5, 0.0, 2.5],
+        [0.0, 0.0, 0.0],
+        [0.0, 4.0, 0.0],
+    ]
+    storage = LevelTensorStorage.from_dense(
+        dense, (5, 3), (0, 1), (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+    )
+    # Row 2 is the first stored row: its position (0) differs from its
+    # coordinate (2), which is exactly what the bound parent position keys.
+    assert storage.coordinate_at(0, 0) == 2
+    results = run_program(program, {a: storage}, {y: (5,)})
+    assert results[y] == [0.0, 0.0, 4.0, 0.0, 4.0]
+
+
+def test_out_of_order_appends_fail_closed():
+    """Appends must be lexicographically increasing at runtime."""
+
+    builder = _Builder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    x = builder.new_symbol_id()
+    c = builder.new_symbol_id()
+    decl_x = builder.tensor(
+        x,
+        "x",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        builder.dense_levels(2),
+    )
+    decl_c = builder.tensor(
+        c,
+        "C",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    append = builder.append_entry(
+        c,
+        (builder.index_value(row), builder.index_value(col)),
+        builder.load(x, (builder.index_value(row), builder.index_value(col))),
+    )
+    # The column loop is outermost, so appended rows regress between column
+    # iterations; the oracle's order-checked builder must fail closed.
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_x, decl_c),
+        (x,),
+        (c,),
+        builder.block(
+            (
+                builder.dense_for(
+                    col,
+                    dim_j.dimension,
+                    builder.block(
+                        (
+                            builder.dense_for(
+                                row,
+                                dim_i.dimension,
+                                builder.block((append,)),
+                            ),
+                        )
+                    ),
+                ),
+            )
+        ),
+    )
+    with pytest.raises(LoopIROracleError):
+        run_program(program, {x: [[1.0, 2.0], [3.0, 4.0]]}, {c: (2, 2)})
+
+
+def test_sparse_input_binding_boundaries_fail_closed():
+    fixture = build_csr_spmv()
+    with pytest.raises(LoopIROracleError):
+        run_program(
+            fixture.program,
+            {fixture.a: [[1.0, 0.0]], fixture.x: [1.0, 2.0]},
+            {fixture.y: (1,)},
+        )
+    wrong_layout = LevelTensorStorage.from_dense(
+        [[1.0, 0.0]], (1, 2), (0, 1), (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+    )
+    with pytest.raises(LoopIROracleError):
+        run_program(
+            fixture.program,
+            {fixture.a: wrong_layout, fixture.x: [1.0, 2.0]},
+            {fixture.y: (1,)},
+        )
+
+
+def test_sparse_binding_snapshots_detach_from_the_caller():
+    fixture = build_csr_spmv()
+    storage = LevelTensorStorage.from_dense(
+        [[1.0, 0.0], [0.0, 2.0]],
+        (2, 2),
+        (0, 1),
+        (LevelKind.DENSE, LevelKind.COMPRESSED),
+    )
+    results_before = run_program(
+        fixture.program,
+        {fixture.a: storage, fixture.x: [1.0, 1.0]},
+        {fixture.y: (2,)},
+    )
+    fixture2 = build_csr_spmv()
+    bound = LevelTensorStorage.from_dense(
+        [[1.0, 0.0], [0.0, 2.0]],
+        (2, 2),
+        (0, 1),
+        (LevelKind.DENSE, LevelKind.COMPRESSED),
+    )
+    # Mutating the caller's storage after binding cannot redirect execution
+    # because the oracle snapshots the validated structure first.
+    results = run_program(
+        fixture2.program,
+        {fixture2.a: bound, fixture2.x: [1.0, 1.0]},
+        {fixture2.y: (2,)},
+    )
+    object.__setattr__(bound, "values", (9.0, 9.0))
+    assert results[fixture2.y] == results_before[fixture.y]
+
+
+def test_shared_dimension_extent_mismatch_between_storages_fails():
+    fixture = build_union_add()
+    a = csr_from_dense([[1.0, 0.0]])
+    b = csr_from_dense([[1.0, 0.0, 2.0]])
+    with pytest.raises(LoopIROracleError):
+        run_program(
+            fixture.program,
+            {fixture.a: a, fixture.b: b},
+            {fixture.c: (1, 2)},
+        )
