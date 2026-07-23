@@ -1,15 +1,20 @@
-"""Production LoopIR: the Phase-4 dense vertical slice of the target design.
+"""Production LoopIR: the migrated vertical slices of the target design.
 
-This package owns the first frozen production LoopIR subset and its
-strangler-path pipeline for the migrated dense elementwise and dense
-reduction/matmul families:
+This package owns the frozen production LoopIR subset — the Phase-4 dense
+families, the Phase-5 sparse level families, and the Phase-6 scheduled
+(reordered/affine-tiled) forms — and its strangler-path pipeline:
 
-- ``nodes``: frozen, tuple-owned production LoopIR nodes (dense subset);
+- ``nodes``: frozen, tuple-owned production LoopIR nodes;
 - ``build``: the identity-allocating construction API;
 - ``verifier``: the single fail-closed structural verifier;
 - ``printer``: deterministic printing and canonical serialization;
 - ``oracle``: the production-owned test/debug semantic oracle;
-- ``lower_cin``: normalized-CIN-to-LoopIR lowering for the dense families;
+- ``lower_cin``: normalized-CIN-to-LoopIR lowering for the migrated
+  families;
+- ``iterdomain``: the pure iteration-domain/merge-lattice analysis;
+- ``levels``: the format-neutral level-storage interface and CSR adapters;
+- ``schedule_passes``: pure typed loop-reorder and affine-tiling passes
+  applying a verified ``LoopPlan`` to a verified base program;
 - ``lower_llir``: LoopIR lowering into the existing structured LLIR (the
   current target-specific CxxIR boundary) and the managed pass pipeline;
 - ``pipeline``: the test/debug compile-and-execute driver plus the curated

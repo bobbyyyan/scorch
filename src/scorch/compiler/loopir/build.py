@@ -38,6 +38,7 @@ from .nodes import (
     LevelDecl,
     LevelKind,
     Load,
+    LoopIRNode,
     LoopIRNodeId,
     LoopProgram,
     MergedSparseFor,
@@ -53,7 +54,46 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TileId,
+    TileInnerFor,
+    TileOuterFor,
 )
+
+
+def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int]:
+    """Scan one program for the next free value of every builder identity."""
+
+    next_node = 0
+    next_dimension = 0
+    next_cursor = 0
+    next_position = 0
+    next_tile = 0
+    seen: set = set()
+    pending: list = [program]
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        node_id = getattr(node, "node_id", None)
+        if type(node_id) is LoopIRNodeId and type(node_id.value) is int:
+            next_node = max(next_node, node_id.value + 1)
+        for value in vars(node).values():
+            if type(value) is DimensionId and type(value.value) is int:
+                next_dimension = max(next_dimension, value.value + 1)
+            elif type(value) is CursorId and type(value.value) is int:
+                next_cursor = max(next_cursor, value.value + 1)
+            elif type(value) is PositionId and type(value.value) is int:
+                next_position = max(next_position, value.value + 1)
+            elif type(value) is TileId and type(value.value) is int:
+                next_tile = max(next_tile, value.value + 1)
+            elif isinstance(value, LoopIRNode):
+                pending.append(value)
+            elif type(value) is tuple:
+                pending.extend(
+                    child for child in value if isinstance(child, LoopIRNode)
+                )
+    return next_node, next_dimension, next_cursor, next_position, next_tile
 
 
 class LoopIRBuilder:
@@ -64,6 +104,27 @@ class LoopIRBuilder:
         self._next_dimension_id = 0
         self._next_cursor_id = 0
         self._next_position_id = 0
+        self._next_tile_id = 0
+
+    @classmethod
+    def resuming(cls, program: LoopProgram) -> "LoopIRBuilder":
+        """A builder whose allocators continue past ``program``'s identities.
+
+        Pure typed passes rebuild changed paths of an existing artifact; the
+        nodes they create must not collide with retained identities, and the
+        continuation must be deterministic — it depends only on the stored
+        identity values, never on allocation history or object addresses.
+        """
+
+        builder = cls()
+        (
+            builder._next_node_id,
+            builder._next_dimension_id,
+            builder._next_cursor_id,
+            builder._next_position_id,
+            builder._next_tile_id,
+        ) = _max_identity_values(program)
+        return builder
 
     def _node_id(self) -> LoopIRNodeId:
         node_id = LoopIRNodeId(self._next_node_id)
@@ -90,6 +151,13 @@ class LoopIRBuilder:
         position = PositionId(self._next_position_id)
         self._next_position_id += 1
         return position
+
+    def new_tile_id(self) -> TileId:
+        """Allocate the next artifact-local affine-split identity."""
+
+        tile = TileId(self._next_tile_id)
+        self._next_tile_id += 1
+        return tile
 
     @staticmethod
     def new_symbol_id() -> SymbolId:
@@ -202,6 +270,29 @@ class LoopIRBuilder:
         self, index: IndexId, dimension: DimensionId, body: Block
     ) -> DenseFor:
         return DenseFor(self._node_id(), index, dimension, body)
+
+    def tile_outer_for(
+        self,
+        tile: TileId,
+        index: IndexId,
+        dimension: DimensionId,
+        width: int,
+        body: Block,
+    ) -> TileOuterFor:
+        return TileOuterFor(self._node_id(), tile, index, dimension, width, body)
+
+    def tile_inner_for(
+        self,
+        tile: TileId,
+        index: IndexId,
+        dimension: DimensionId,
+        width: int,
+        unroll: bool,
+        body: Block,
+    ) -> TileInnerFor:
+        return TileInnerFor(
+            self._node_id(), tile, index, dimension, width, unroll, body
+        )
 
     def store(self, tensor: SymbolId, indices: Sequence[Expr], value: Expr) -> Store:
         return Store(self._node_id(), tensor, tuple(indices), value)

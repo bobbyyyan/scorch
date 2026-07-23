@@ -46,10 +46,13 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TileId,
+    TileInnerFor,
+    TileOuterFor,
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v2"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v3"
 
 
 class _CanonicalIds:
@@ -61,6 +64,7 @@ class _CanonicalIds:
         self._indices: Dict[IndexId, int] = {}
         self._cursors: Dict[CursorId, int] = {}
         self._positions: Dict[PositionId, int] = {}
+        self._tiles: Dict[TileId, int] = {}
 
     def dimension(self, dimension: DimensionId) -> int:
         return self._dimensions.setdefault(dimension, len(self._dimensions))
@@ -76,6 +80,9 @@ class _CanonicalIds:
 
     def position(self, position: PositionId) -> int:
         return self._positions.setdefault(position, len(self._positions))
+
+    def tile(self, tile: TileId) -> int:
+        return self._tiles.setdefault(tile, len(self._tiles))
 
 
 def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
@@ -123,6 +130,12 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
             _seed_stmt_ids(child, ids)
         return
     if type(stmt) is DenseFor:
+        ids.index(stmt.index)
+        ids.dimension(stmt.dimension)
+        _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is TileOuterFor or type(stmt) is TileInnerFor:
+        ids.tile(stmt.tile)
         ids.index(stmt.index)
         ids.dimension(stmt.dimension)
         _seed_stmt_ids(stmt.body, ids)
@@ -240,6 +253,25 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "kind": "dense_for",
             "index": ids.index(stmt.index),
             "dimension": ids.dimension(stmt.dimension),
+            "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is TileOuterFor:
+        return {
+            "kind": "tile_outer_for",
+            "tile": ids.tile(stmt.tile),
+            "index": ids.index(stmt.index),
+            "dimension": ids.dimension(stmt.dimension),
+            "width": stmt.width,
+            "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is TileInnerFor:
+        return {
+            "kind": "tile_inner_for",
+            "tile": ids.tile(stmt.tile),
+            "index": ids.index(stmt.index),
+            "dimension": ids.dimension(stmt.dimension),
+            "width": stmt.width,
+            "unroll": stmt.unroll,
             "body": _serialize_stmt(stmt.body, ids),
         }
     if type(stmt) is SparseFor:
@@ -378,6 +410,25 @@ def _render_stmt(
     if type(stmt) is DenseFor:
         label = f"x{ids.index(stmt.index)}"
         lines.append(f"{pad}for {label} in d{ids.dimension(stmt.dimension)} {{")
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is TileOuterFor:
+        lines.append(
+            f"{pad}tile_outer_for s{ids.tile(stmt.tile)} "
+            f"x{ids.index(stmt.index)} in d{ids.dimension(stmt.dimension)} "
+            f"width {stmt.width} {{"
+        )
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is TileInnerFor:
+        unroll = " unroll" if stmt.unroll else ""
+        lines.append(
+            f"{pad}tile_inner_for s{ids.tile(stmt.tile)} "
+            f"x{ids.index(stmt.index)} in d{ids.dimension(stmt.dimension)} "
+            f"width {stmt.width}{unroll} {{"
+        )
         _render_stmt(stmt.body, ids, names, indent + 1, lines)
         lines.append(f"{pad}}}")
         return

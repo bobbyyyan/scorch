@@ -40,7 +40,18 @@ The invariant families stated locally for this subset:
   outputs are canonical CSR only (``unsupported_sparse_output``).
 - **Extent resolution.**  Every ``DenseFor`` dimension must be mapped by at
   least one declared tensor so its runtime extent has a source
-  (``unresolved_dimension``).
+  (``unresolved_dimension``); tile loops share the same rule.
+- **Affine splits.**  A strip-mined loop is one ``TileOuterFor`` /
+  ``TileInnerFor`` pair owning a unique ``TileId``
+  (``invalid_tile_id`` / ``duplicate_tile_id``); the point loop must run
+  inside its origin loop's scope (``unbound_tile``), agree with it on
+  index, dimension, and width (``tile_binding_mismatch``), and widths are
+  positive exact ints (``invalid_tile_width``).  A split owns its logical
+  loop: the split index may be neither bound nor split again in an
+  enclosing scope (``tile_index_conflict``), and the point loop's
+  coordinate binding participates in the ordinary
+  ``duplicate_index_binding`` discipline.  Ragged-tail coverage is
+  intrinsic ``TileInnerFor`` semantics, stated on the node.
 """
 
 from __future__ import annotations
@@ -82,6 +93,9 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TileId,
+    TileInnerFor,
+    TileOuterFor,
 )
 
 MAX_NESTING_DEPTH = 64
@@ -162,6 +176,8 @@ class _Context:
         self.ever_cursor_ids: Set[CursorId] = set()
         self.bound_positions: Dict[PositionId, Tuple[SymbolId, int]] = {}
         self.ever_bound_positions: Set[PositionId] = set()
+        self.open_tiles: Dict[TileId, TileOuterFor] = {}
+        self.ever_tile_ids: Set[TileId] = set()
         self.in_cursor_default = False
         self.program_dtype: Optional[ScalarType] = None
         self.seen_node_ids: Set[LoopIRNodeId] = set()
@@ -689,6 +705,103 @@ def _check_sparse_for(ctx: _Context, stmt: SparseFor, path: str, depth: int) -> 
         del ctx.cursors[decl.cursor]
 
 
+def _check_tile_id(value: object, path: str) -> TileId:
+    if type(value) is not TileId or type(getattr(value, "value", _MISSING)) is not int:
+        _fail("invalid_tile_id", path, "tile must be an int-valued TileId")
+    return value
+
+
+def _check_tile_loop_dimension(
+    ctx: _Context, dimension: object, path: str, what: str
+) -> DimensionId:
+    checked = _check_dimension_id(dimension, f"{path}.dimension", what)
+    if checked not in ctx.dimensions:
+        _fail(
+            "undefined_dimension",
+            f"{path}.dimension",
+            f"{what} iterates an undeclared dimension",
+        )
+    if checked not in ctx.mapped_dimensions:
+        _fail(
+            "unresolved_dimension",
+            f"{path}.dimension",
+            f"{what} dimension has no tensor-mapped runtime extent source",
+        )
+    return checked
+
+
+def _check_tile_width(width: object, path: str, what: str) -> int:
+    if type(width) is not int:
+        _fail("invalid_tile_width", path, f"{what} must be an exact int")
+    if width < 1:
+        _fail("invalid_tile_width", path, f"{what} must be at least 1")
+    return width
+
+
+def _check_tile_outer_for(
+    ctx: _Context, stmt: TileOuterFor, path: str, depth: int
+) -> None:
+    tile = _check_tile_id(stmt.tile, f"{path}.tile")
+    if tile in ctx.ever_tile_ids:
+        _fail("duplicate_tile_id", path, f"tile id {tile.value} reused")
+    ctx.ever_tile_ids.add(tile)
+    _check_tile_loop_dimension(ctx, stmt.dimension, path, "TileOuterFor")
+    index = _check_index_id(stmt.index, path, "TileOuterFor.index")
+    if index in ctx.bound_indices:
+        _fail(
+            "tile_index_conflict",
+            path,
+            f"index {index.value} is already bound in an enclosing scope; a "
+            "split must own its logical loop",
+        )
+    if any(open_tile.index == index for open_tile in ctx.open_tiles.values()):
+        _fail(
+            "tile_index_conflict",
+            path,
+            f"index {index.value} is already split by an enclosing tile",
+        )
+    _check_tile_width(stmt.width, path, "TileOuterFor.width")
+    ctx.open_tiles[tile] = stmt
+    try:
+        _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
+    finally:
+        del ctx.open_tiles[tile]
+
+
+def _check_tile_inner_for(
+    ctx: _Context, stmt: TileInnerFor, path: str, depth: int
+) -> None:
+    tile = _check_tile_id(stmt.tile, f"{path}.tile")
+    outer = ctx.open_tiles.get(tile)
+    if outer is None:
+        _fail(
+            "unbound_tile",
+            path,
+            f"tile id {tile.value} has no dominating TileOuterFor in scope",
+        )
+    dimension = _check_tile_loop_dimension(ctx, stmt.dimension, path, "TileInnerFor")
+    index = _check_index_id(stmt.index, path, "TileInnerFor.index")
+    _check_tile_width(stmt.width, path, "TileInnerFor.width")
+    if (
+        index != outer.index
+        or dimension != outer.dimension
+        or stmt.width != outer.width
+    ):
+        _fail(
+            "tile_binding_mismatch",
+            path,
+            "TileInnerFor must agree with its TileOuterFor on index, "
+            "dimension, and width",
+        )
+    if type(stmt.unroll) is not bool:
+        _fail("malformed_state", path, "TileInnerFor.unroll must be a bool")
+    bound = _bind_index(ctx, stmt.index, path, "TileInnerFor.index", dimension)
+    try:
+        _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
+    finally:
+        del ctx.bound_indices[bound]
+
+
 def _check_merged_sparse_for(
     ctx: _Context, stmt: MergedSparseFor, path: str, depth: int
 ) -> None:
@@ -848,6 +961,8 @@ def _check_append_entry(
 _STMT_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], None]] = {
     Block: _check_block,
     DenseFor: _check_dense_for,
+    TileOuterFor: _check_tile_outer_for,
+    TileInnerFor: _check_tile_inner_for,
     SparseFor: _check_sparse_for,
     MergedSparseFor: _check_merged_sparse_for,
     Store: _check_store,

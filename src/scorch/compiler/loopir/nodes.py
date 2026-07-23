@@ -6,10 +6,14 @@ with the sparse concepts the migrated level-based families exercise —
 compressed position iteration, parent-position-linked cursors, coordinate
 and leaf-value access, structured UNION/INTERSECTION merging, and ordered
 CSR output assembly — revised from the reviewed Phase-3.5 spike, not
-copied wholesale.  Concepts the migrated families
+copied wholesale.  Phase 6 adds the affine schedule subset: one structured
+:class:`TileOuterFor`/:class:`TileInnerFor` pair per strip-mined dense
+loop, linked by an artifact-local :class:`TileId`, with ragged-tail
+coverage intrinsic to the node semantics.  Concepts the migrated families
 do not exercise are deliberately *not* declared: there are no accumulators,
 integer constants, physical position loads (dense value-bearing leaves below
-sparse levels), workspaces, tiles, or parallel nodes yet.
+sparse levels), workspaces, sparse coordinate windows, or parallel nodes
+yet.
 
 Discipline carried over from the spike and the binding design decisions:
 
@@ -79,6 +83,20 @@ class CursorId:
 @dataclass(frozen=True, order=True)
 class PositionId:
     """Identity of one bound physical storage position within a program."""
+
+    value: int
+
+
+@dataclass(frozen=True, order=True)
+class TileId:
+    """Identity of one affine loop split within a LoopIR program.
+
+    A split is one schedule fact — "this logical loop is strip-mined at this
+    width" — realized structurally as a :class:`TileOuterFor` /
+    :class:`TileInnerFor` pair that shares the ``TileId``.  The identity is
+    what keeps the pair's ownership unambiguous when other loops sit between
+    the origin loop and the point loop.
+    """
 
     value: int
 
@@ -320,6 +338,50 @@ class SparseFor(Stmt):
     cursor: SparseCursorDecl
     position: PositionId
     coord_index: IndexId
+    body: Block
+
+
+@dataclass(frozen=True)
+class TileOuterFor(Stmt):
+    """The origin loop of one affine strip-mine of a dense logical loop.
+
+    Iterates the tile origins ``0, width, 2*width, ...`` of ``dimension``,
+    strictly below the dimension's runtime extent, in order.  The origin is
+    deliberately not a readable coordinate: the split's only observable
+    binding is the logical coordinate the paired :class:`TileInnerFor`
+    reconstructs, so no body expression can depend on target spelling of the
+    origin.  ``index`` records which logical loop was split (schedule
+    provenance — the same production ``IndexId`` the unscheduled loop
+    bound); the paired inner loop must agree on ``index``, ``dimension``,
+    and ``width`` and is matched by ``tile``.
+    """
+
+    tile: TileId
+    index: IndexId
+    dimension: DimensionId
+    width: int
+    body: Block
+
+
+@dataclass(frozen=True)
+class TileInnerFor(Stmt):
+    """The point loop of one affine strip-mine of a dense logical loop.
+
+    Must execute within the :class:`TileOuterFor` binding the same
+    ``tile``.  For the enclosing origin ``o`` it binds ``index`` to
+    ``o, o + 1, ..., min(o + width, extent) - 1`` in order, where ``extent``
+    is the runtime extent of ``dimension`` — the ragged tail is intrinsic
+    node semantics, not an emitted guard detail, so every coordinate of the
+    dimension is visited exactly once across the origin loop's iterations.
+    ``unroll`` is a target-independent unrolling preference carried from the
+    schedule; it never changes iteration semantics.
+    """
+
+    tile: TileId
+    index: IndexId
+    dimension: DimensionId
+    width: int
+    unroll: bool
     body: Block
 
 

@@ -15,6 +15,11 @@ Semantics (matching the node contracts exactly):
   resolves its trip count from the dimension extent;
 - dense outputs are zero-initialized before the body runs — the explicit
   contract ``StoreReduce`` (ADD) depends on;
+- affine splits execute their intrinsic node semantics: ``TileOuterFor``
+  iterates the tile origins ``0, width, 2*width, ...`` below the dimension
+  extent, and ``TileInnerFor`` binds the clamped point range
+  ``origin .. min(origin + width, extent) - 1``, so every coordinate is
+  visited exactly once across the pair;
 - sparse iteration executes over the format-neutral level interface of
   :mod:`~scorch.compiler.loopir.levels` (``segment`` / ``coordinate_at`` /
   ``leaf_value``): all-dense inputs bind nested sequences, inputs with a
@@ -70,6 +75,9 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TileId,
+    TileInnerFor,
+    TileOuterFor,
 )
 from .verifier import verify_program
 
@@ -342,6 +350,7 @@ class _Oracle:
         self.indices: Dict[IndexId, int] = {}
         self.positions: Dict[PositionId, int] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
+        self.tile_origins: Dict[TileId, int] = {}
 
     def _bind_sparse_input(self, decl: TensorDecl, bound: object) -> LevelTensorStorage:
         """Snapshot one compressed-layout input behind the level interface."""
@@ -561,6 +570,30 @@ class _Oracle:
             extent = self._dimension_extent(stmt.dimension)
             try:
                 for coordinate in range(extent):
+                    self.indices[stmt.index] = coordinate
+                    self._exec_stmt(stmt.body)
+            finally:
+                self.indices.pop(stmt.index, None)
+            return
+        if type(stmt) is TileOuterFor:
+            extent = self._dimension_extent(stmt.dimension)
+            try:
+                for origin in range(0, extent, stmt.width):
+                    self.tile_origins[stmt.tile] = origin
+                    self._exec_stmt(stmt.body)
+            finally:
+                self.tile_origins.pop(stmt.tile, None)
+            return
+        if type(stmt) is TileInnerFor:
+            bound_origin = self.tile_origins.get(stmt.tile)
+            if bound_origin is None:
+                raise LoopIROracleError(
+                    "tile point loop executed outside its origin loop"
+                )
+            origin = bound_origin
+            extent = self._dimension_extent(stmt.dimension)
+            try:
+                for coordinate in range(origin, min(origin + stmt.width, extent)):
                     self.indices[stmt.index] = coordinate
                     self._exec_stmt(stmt.body)
             finally:
