@@ -22,21 +22,33 @@ from typing import Sequence, Tuple
 
 from ..identity import IndexId, SymbolId, new_index_id, new_symbol_id
 from .nodes import (
+    AppendEntry,
     BinaryExpr,
     BinaryOp,
     Block,
+    CursorId,
+    CursorValue,
     DenseFor,
+    DensePosition,
     DimensionDecl,
     DimensionId,
     Expr,
+    FloatConst,
     IndexValue,
     LevelDecl,
     LevelKind,
     Load,
     LoopIRNodeId,
     LoopProgram,
+    MergedSparseFor,
+    MergeMode,
+    PositionId,
+    PositionValue,
     ReduceOp,
+    RootPosition,
     ScalarType,
+    SparseCursorDecl,
+    SparseFor,
     Stmt,
     Store,
     StoreReduce,
@@ -50,6 +62,8 @@ class LoopIRBuilder:
     def __init__(self) -> None:
         self._next_node_id = 0
         self._next_dimension_id = 0
+        self._next_cursor_id = 0
+        self._next_position_id = 0
 
     def _node_id(self) -> LoopIRNodeId:
         node_id = LoopIRNodeId(self._next_node_id)
@@ -62,6 +76,20 @@ class LoopIRBuilder:
         dimension = DimensionId(self._next_dimension_id)
         self._next_dimension_id += 1
         return dimension
+
+    def new_cursor_id(self) -> CursorId:
+        """Allocate the next artifact-local sparse-cursor identity."""
+
+        cursor = CursorId(self._next_cursor_id)
+        self._next_cursor_id += 1
+        return cursor
+
+    def new_position_id(self) -> PositionId:
+        """Allocate the next artifact-local bound-position identity."""
+
+        position = PositionId(self._next_position_id)
+        self._next_position_id += 1
+        return position
 
     @staticmethod
     def new_symbol_id() -> SymbolId:
@@ -113,6 +141,53 @@ class LoopIRBuilder:
 
     def index_value(self, index: IndexId) -> IndexValue:
         return IndexValue(self._node_id(), index)
+
+    def float_const(self, value: float) -> FloatConst:
+        return FloatConst(self._node_id(), value)
+
+    def root_position(self) -> RootPosition:
+        return RootPosition(self._node_id())
+
+    def dense_position(
+        self, tensor: SymbolId, level: int, parent: Expr, coord: Expr
+    ) -> DensePosition:
+        return DensePosition(self._node_id(), tensor, level, parent, coord)
+
+    def position_value(self, position: PositionId) -> PositionValue:
+        return PositionValue(self._node_id(), position)
+
+    def cursor_value(
+        self, cursor: CursorId, default: "Expr | None" = None
+    ) -> CursorValue:
+        return CursorValue(self._node_id(), cursor, default)
+
+    def sparse_cursor(
+        self, cursor: CursorId, tensor: SymbolId, level: int, parent: Expr
+    ) -> SparseCursorDecl:
+        return SparseCursorDecl(self._node_id(), cursor, tensor, level, parent)
+
+    def sparse_for(
+        self,
+        cursor: SparseCursorDecl,
+        position: PositionId,
+        coord_index: IndexId,
+        body: Block,
+    ) -> SparseFor:
+        return SparseFor(self._node_id(), cursor, position, coord_index, body)
+
+    def merged_sparse_for(
+        self,
+        mode: MergeMode,
+        cursors: Sequence[SparseCursorDecl],
+        coord_index: IndexId,
+        body: Block,
+    ) -> MergedSparseFor:
+        return MergedSparseFor(self._node_id(), mode, tuple(cursors), coord_index, body)
+
+    def append_entry(
+        self, tensor: SymbolId, coords: Sequence[Expr], value: Expr
+    ) -> AppendEntry:
+        return AppendEntry(self._node_id(), tensor, tuple(coords), value)
 
     def load(self, tensor: SymbolId, indices: Sequence[Expr]) -> Load:
         return Load(self._node_id(), tensor, tuple(indices))

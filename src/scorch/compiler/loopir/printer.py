@@ -23,14 +23,25 @@ from typing import Dict, List
 
 from ..identity import IndexId, SymbolId
 from .nodes import (
+    AppendEntry,
     BinaryExpr,
     Block,
+    CursorId,
+    CursorValue,
     DenseFor,
+    DensePosition,
     DimensionId,
     Expr,
+    FloatConst,
     IndexValue,
     Load,
     LoopProgram,
+    MergedSparseFor,
+    PositionId,
+    PositionValue,
+    RootPosition,
+    SparseCursorDecl,
+    SparseFor,
     Stmt,
     Store,
     StoreReduce,
@@ -38,7 +49,7 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v1"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v2"
 
 
 class _CanonicalIds:
@@ -48,6 +59,8 @@ class _CanonicalIds:
         self._dimensions: Dict[DimensionId, int] = {}
         self._symbols: Dict[SymbolId, int] = {}
         self._indices: Dict[IndexId, int] = {}
+        self._cursors: Dict[CursorId, int] = {}
+        self._positions: Dict[PositionId, int] = {}
 
     def dimension(self, dimension: DimensionId) -> int:
         return self._dimensions.setdefault(dimension, len(self._dimensions))
@@ -58,10 +71,33 @@ class _CanonicalIds:
     def index(self, index: IndexId) -> int:
         return self._indices.setdefault(index, len(self._indices))
 
+    def cursor(self, cursor: CursorId) -> int:
+        return self._cursors.setdefault(cursor, len(self._cursors))
+
+    def position(self, position: PositionId) -> int:
+        return self._positions.setdefault(position, len(self._positions))
+
 
 def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
     if type(expr) is IndexValue:
         ids.index(expr.index)
+        return
+    if type(expr) is FloatConst:
+        return
+    if type(expr) is RootPosition:
+        return
+    if type(expr) is DensePosition:
+        ids.symbol(expr.tensor)
+        _seed_expr_ids(expr.parent, ids)
+        _seed_expr_ids(expr.coord, ids)
+        return
+    if type(expr) is PositionValue:
+        ids.position(expr.position)
+        return
+    if type(expr) is CursorValue:
+        ids.cursor(expr.cursor)
+        if expr.default is not None:
+            _seed_expr_ids(expr.default, ids)
         return
     if type(expr) is Load:
         ids.symbol(expr.tensor)
@@ -75,6 +111,12 @@ def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
     raise TypeError(f"unsupported LoopIR expression {type(expr).__name__}")
 
 
+def _seed_cursor_ids(cursor: SparseCursorDecl, ids: _CanonicalIds) -> None:
+    ids.cursor(cursor.cursor)
+    ids.symbol(cursor.tensor)
+    _seed_expr_ids(cursor.parent, ids)
+
+
 def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
     if type(stmt) is Block:
         for child in stmt.statements:
@@ -83,6 +125,18 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
     if type(stmt) is DenseFor:
         ids.index(stmt.index)
         ids.dimension(stmt.dimension)
+        _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is SparseFor:
+        _seed_cursor_ids(stmt.cursor, ids)
+        ids.position(stmt.position)
+        ids.index(stmt.coord_index)
+        _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is MergedSparseFor:
+        for cursor in stmt.cursors:
+            _seed_cursor_ids(cursor, ids)
+        ids.index(stmt.coord_index)
         _seed_stmt_ids(stmt.body, ids)
         return
     if type(stmt) is Store:
@@ -95,6 +149,12 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
         ids.symbol(stmt.tensor)
         for index in stmt.indices:
             _seed_expr_ids(index, ids)
+        _seed_expr_ids(stmt.value, ids)
+        return
+    if type(stmt) is AppendEntry:
+        ids.symbol(stmt.tensor)
+        for coord in stmt.coords:
+            _seed_expr_ids(coord, ids)
         _seed_expr_ids(stmt.value, ids)
         return
     raise TypeError(f"unsupported LoopIR statement {type(stmt).__name__}")
@@ -120,6 +180,28 @@ def _canonical_ids(program: LoopProgram) -> _CanonicalIds:
 def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
     if type(expr) is IndexValue:
         return {"kind": "index", "index": ids.index(expr.index)}
+    if type(expr) is FloatConst:
+        return {"kind": "float_const", "value": expr.value}
+    if type(expr) is RootPosition:
+        return {"kind": "root_position"}
+    if type(expr) is DensePosition:
+        return {
+            "kind": "dense_position",
+            "tensor": ids.symbol(expr.tensor),
+            "level": expr.level,
+            "parent": _serialize_expr(expr.parent, ids),
+            "coord": _serialize_expr(expr.coord, ids),
+        }
+    if type(expr) is PositionValue:
+        return {"kind": "position_value", "position": ids.position(expr.position)}
+    if type(expr) is CursorValue:
+        return {
+            "kind": "cursor_value",
+            "cursor": ids.cursor(expr.cursor),
+            "default": (
+                None if expr.default is None else _serialize_expr(expr.default, ids)
+            ),
+        }
     if type(expr) is Load:
         return {
             "kind": "load",
@@ -136,6 +218,17 @@ def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
     raise TypeError(f"unsupported LoopIR expression {type(expr).__name__}")
 
 
+def _serialize_cursor(
+    cursor: SparseCursorDecl, ids: _CanonicalIds
+) -> Dict[str, object]:
+    return {
+        "cursor": ids.cursor(cursor.cursor),
+        "tensor": ids.symbol(cursor.tensor),
+        "level": cursor.level,
+        "parent": _serialize_expr(cursor.parent, ids),
+    }
+
+
 def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
     if type(stmt) is Block:
         return {
@@ -148,6 +241,29 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "index": ids.index(stmt.index),
             "dimension": ids.dimension(stmt.dimension),
             "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is SparseFor:
+        return {
+            "kind": "sparse_for",
+            "cursor": _serialize_cursor(stmt.cursor, ids),
+            "position": ids.position(stmt.position),
+            "coord_index": ids.index(stmt.coord_index),
+            "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is MergedSparseFor:
+        return {
+            "kind": "merged_sparse_for",
+            "mode": stmt.mode.value,
+            "cursors": [_serialize_cursor(cursor, ids) for cursor in stmt.cursors],
+            "coord_index": ids.index(stmt.coord_index),
+            "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is AppendEntry:
+        return {
+            "kind": "append_entry",
+            "tensor": ids.symbol(stmt.tensor),
+            "coords": [_serialize_expr(coord, ids) for coord in stmt.coords],
+            "value": _serialize_expr(stmt.value, ids),
         }
     if type(stmt) is Store:
         return {
@@ -203,6 +319,25 @@ def canonical_program_dump(program: LoopProgram) -> str:
 def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:
     if type(expr) is IndexValue:
         return f"x{ids.index(expr.index)}"
+    if type(expr) is FloatConst:
+        return repr(expr.value)
+    if type(expr) is RootPosition:
+        return "root"
+    if type(expr) is DensePosition:
+        return (
+            f"dense_pos(t{ids.symbol(expr.tensor)}, level {expr.level}, "
+            f"parent {_render_expr(expr.parent, ids, names)}, "
+            f"coord {_render_expr(expr.coord, ids, names)})"
+        )
+    if type(expr) is PositionValue:
+        return f"p{ids.position(expr.position)}"
+    if type(expr) is CursorValue:
+        if expr.default is None:
+            return f"value(c{ids.cursor(expr.cursor)})"
+        return (
+            f"value(c{ids.cursor(expr.cursor)}, "
+            f"default {_render_expr(expr.default, ids, names)})"
+        )
     if type(expr) is Load:
         rendered = ", ".join(_render_expr(index, ids, names) for index in expr.indices)
         return f"load t{ids.symbol(expr.tensor)}[{rendered}]"
@@ -212,6 +347,15 @@ def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:
             f"{_render_expr(expr.rhs, ids, names)})"
         )
     raise TypeError(f"unsupported LoopIR expression {type(expr).__name__}")
+
+
+def _render_cursor(
+    cursor: SparseCursorDecl, ids: _CanonicalIds, names: Dict[int, str]
+) -> str:
+    return (
+        f"c{ids.cursor(cursor.cursor)} over t{ids.symbol(cursor.tensor)} "
+        f"level {cursor.level} parent {_render_expr(cursor.parent, ids, names)}"
+    )
 
 
 def _render_stmt(
@@ -231,6 +375,33 @@ def _render_stmt(
         lines.append(f"{pad}for {label} in d{ids.dimension(stmt.dimension)} {{")
         _render_stmt(stmt.body, ids, names, indent + 1, lines)
         lines.append(f"{pad}}}")
+        return
+    if type(stmt) is SparseFor:
+        cursor = _render_cursor(stmt.cursor, ids, names)
+        lines.append(
+            f"{pad}sparse_for (p{ids.position(stmt.position)}, "
+            f"x{ids.index(stmt.coord_index)}) in {cursor} {{"
+        )
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is MergedSparseFor:
+        cursors = "; ".join(
+            _render_cursor(cursor, ids, names) for cursor in stmt.cursors
+        )
+        lines.append(
+            f"{pad}merged_{stmt.mode.value}_for x{ids.index(stmt.coord_index)} "
+            f"in ({cursors}) {{"
+        )
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is AppendEntry:
+        rendered = ", ".join(_render_expr(coord, ids, names) for coord in stmt.coords)
+        lines.append(
+            f"{pad}append t{ids.symbol(stmt.tensor)}[{rendered}] = "
+            f"{_render_expr(stmt.value, ids, names)}"
+        )
         return
     if type(stmt) is Store:
         rendered = ", ".join(_render_expr(index, ids, names) for index in stmt.indices)
