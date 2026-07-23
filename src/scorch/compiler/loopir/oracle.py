@@ -40,6 +40,7 @@ from .levels import (
     CsrOutputBuilder,
     LevelStorageError,
     LevelTensorStorage,
+    MAX_LEVEL_STORAGE_RANK,
     from_csr,
 )
 from .nodes import (
@@ -73,7 +74,7 @@ from .nodes import (
 from .verifier import verify_program
 
 TensorValue = Any
-MAX_ORACLE_RANK = 64
+MAX_ORACLE_RANK = MAX_LEVEL_STORAGE_RANK
 
 _CSR_KINDS = (LevelKind.DENSE, LevelKind.COMPRESSED)
 _CSR_MODES = (0, 1)
@@ -283,11 +284,6 @@ class _Oracle:
                     "of nonnegative ints"
                 )
             self.shapes[symbol] = shape_binding
-            if any(level.kind is not LevelKind.DENSE for level in decl.levels):
-                # The verifier admits only canonical CSR sparse outputs.
-                self.builders[symbol] = CsrOutputBuilder(decl.name, shape_binding)
-            else:
-                self.values[symbol] = _zeros(shape_binding) if shape_binding else []
 
         self.dim_extents: Dict[DimensionId, Tuple[int, str, int]] = {}
         for symbol in program.inputs:
@@ -332,6 +328,17 @@ class _Oracle:
             self.values[symbol] = _dense_copy(
                 input_values[symbol], shape, f"input {decl.name}"
             )
+        # Materialize outputs only after all shared dimensions reconcile and
+        # dense input shapes resolve.  Incompatible output extents must fail
+        # cheaply instead of allocating from an untrusted shape first.
+        for symbol in program.outputs:
+            decl = self.decls[symbol]
+            shape = self.shapes[symbol]
+            if any(level.kind is not LevelKind.DENSE for level in decl.levels):
+                # The verifier admits only canonical CSR sparse outputs.
+                self.builders[symbol] = CsrOutputBuilder(decl.name, shape)
+            else:
+                self.values[symbol] = _zeros(shape) if shape else []
         self.indices: Dict[IndexId, int] = {}
         self.positions: Dict[PositionId, int] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}

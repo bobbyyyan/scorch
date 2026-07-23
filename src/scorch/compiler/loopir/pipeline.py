@@ -1,7 +1,7 @@
 """Test/debug LoopIR strangler pipeline and curated shadow comparison.
 
-This module is the executable end of the Phase-4 dense vertical slice: it
-carries one normalized dense-family CIN program through
+This module is the executable end of the Phase-4/5 vertical slices: it
+carries one normalized supported-family CIN program through
 
 ``normalized CIN -> LoopPlan -> LoopIR -> structured LLIR -> C++ ->
 compiled kernel -> execution``
@@ -55,7 +55,7 @@ from .printer import canonical_program_dump, print_program
 
 @dataclass(frozen=True)
 class LoopIRCompiledKernel:
-    """One compiled dense-family kernel and its LoopIR provenance."""
+    """One compiled supported-family kernel and its LoopIR provenance."""
 
     lowering: LoopIRLoweringResult
     program_text: str
@@ -99,7 +99,7 @@ def _resolve_options(
         compilation_context.require_compile_options(options)
     if options.requested_schedule is not None:
         raise CompileSpecError(
-            "the LoopIR dense pipeline does not consume requested schedules"
+            "the LoopIR pipeline does not consume requested schedules"
         )
     return options
 
@@ -231,7 +231,7 @@ def compile_cin_via_loopir(
     compile_options: Optional[CompileOptions] = None,
     compilation_context: Optional[CompilationContext] = None,
 ) -> LoopIRCompiledKernel:
-    """Lower one dense-family CIN program to C++ through the LoopIR path."""
+    """Lower one supported-family CIN program to C++ through LoopIR."""
 
     options = _resolve_options(compile_options, compilation_context)
     context = compilation_context
@@ -314,9 +314,9 @@ def execute_cin_via_loopir(
 ):
     """Compile through LoopIR and execute on ``args`` (STensor inputs).
 
-    Mirrors ``scorch.ops.lower_and_exec_cin`` for the dense families: the
-    same public argument marshalling, the same JIT build/caching helpers,
-    and the same dense result wrapping.
+    Mirrors ``scorch.ops.lower_and_exec_cin`` for the migrated families:
+    the same public argument marshalling and JIT build/caching helpers,
+    with result wrapping derived from the verified LoopIR declaration.
     """
 
     from ...stensor import STensor
@@ -419,7 +419,9 @@ def execute_shadow(
     """Execute both pipelines on ``args`` for curated differential tests.
 
     Returns ``(loopir_result, legacy_result, source_comparison)``.  The
-    legacy execution uses the untouched public entry.
+    legacy execution uses the untouched low-level entry, whose result
+    wrapper supports dense outputs only.  Sparse-output comparisons must
+    use source parity plus direct LoopIR/PyTorch/oracle execution instead.
     """
 
     from ...ops import (
@@ -431,6 +433,14 @@ def execute_shadow(
 
     options = _resolve_options(compile_options)
     normalized = normalize_cin(cin_stmt, compile_options=options)
+    if any(
+        tensor_var.format is None or not tensor_var.format.is_dense()
+        for tensor_var in normalized.get_result_tensor_vars()
+    ):
+        raise CompileSpecError(
+            "execute_shadow requires dense outputs because the legacy "
+            "low-level result wrapper does not preserve sparse indices"
+        )
     _validate_runtime_formats(normalized, args)
     alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
     args = _relayout_mode_order_args(

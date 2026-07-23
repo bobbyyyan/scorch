@@ -415,11 +415,11 @@ def _validate_index_storage(
             ):
                 segment = coordinates[start:end]
                 if segment.numel() > 1 and bool(
-                    torch.any(segment[1:] < segment[:-1]).item()
+                    torch.any(segment[1:] <= segment[:-1]).item()
                 ):
                     raise TensorIndexError(
-                        f"compressed mode {mode} coordinates must be sorted "
-                        f"within parent {parent}"
+                        f"compressed mode {mode} coordinates must be strictly "
+                        f"increasing within parent {parent}"
                     )
             parent_positions = coordinates.numel()
             continue

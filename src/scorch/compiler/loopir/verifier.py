@@ -45,6 +45,7 @@ The invariant families stated locally for this subset:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Dict, NoReturn, Optional, Set, Tuple
 
@@ -331,6 +332,8 @@ def _check_float_const(
 ) -> _ExprType:
     if type(expr.value) is not float:
         _fail("malformed_state", path, "FloatConst.value must be an exact float")
+    if not math.isfinite(expr.value):
+        _fail("malformed_state", path, "FloatConst.value must be finite")
     return _VALUE
 
 

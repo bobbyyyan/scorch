@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Sequence, Tuple, cast
 
 from .nodes import LevelKind
 
+MAX_LEVEL_STORAGE_RANK = 64
+
 
 class LevelStorageError(Exception):
     """A storage construction or access violated the canonical contract."""
@@ -143,7 +145,12 @@ class CsrMatrix:
             for column, entry in enumerate(row):
                 if type(entry) is not float and type(entry) is not int:
                     raise CsrFormatError("dense entries must be numeric")
-                value = float(entry)
+                try:
+                    value = float(entry)
+                except (OverflowError, TypeError, ValueError) as error:
+                    raise CsrFormatError(
+                        "dense entries must be representable numeric values"
+                    ) from error
                 if value != 0.0:
                     indices.append(column)
                     values.append(value)
@@ -213,6 +220,11 @@ class LevelTensorStorage:
             if _expect_exact_int(extent, f"shape[{position}]") < 0:
                 raise LevelStorageError("shape extents must be nonnegative")
         rank = len(self.shape)
+        if rank > MAX_LEVEL_STORAGE_RANK:
+            raise LevelStorageError(
+                f"rank {rank} exceeds the level-storage limit "
+                f"{MAX_LEVEL_STORAGE_RANK}"
+            )
         if type(self.modes) is not tuple or len(self.modes) != rank:
             raise LevelStorageError(f"modes must be an owned tuple of length {rank}")
         for position, mode in enumerate(self.modes):
@@ -527,6 +539,11 @@ class LevelTensorStorage:
         rank = len(shape)
         if rank == 0 or any(extent < 0 for extent in shape):
             raise LevelStorageError("shape must contain nonnegative extents")
+        if rank > MAX_LEVEL_STORAGE_RANK:
+            raise LevelStorageError(
+                f"rank {rank} exceeds the level-storage limit "
+                f"{MAX_LEVEL_STORAGE_RANK}"
+            )
         if len(modes) != rank or len(kinds) != rank:
             raise LevelStorageError("shape, modes, and kinds must agree on rank")
         if sorted(modes) != list(range(rank)):

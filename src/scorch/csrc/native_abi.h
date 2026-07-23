@@ -341,9 +341,10 @@ inline CsrInputView checked_csr_view(
                   argument_name(op, argument), " coordinate ", crd[p],
                   " at position ", p, " is outside [0, ", cols, ")");
       if (require_sorted && p > start) {
-        TORCH_CHECK(crd[p - 1] <= crd[p], argument_name(op, argument),
-                    " coordinates must be sorted within each CSR row; row ", row,
-                    " decreases at position ", p);
+        TORCH_CHECK(
+            crd[p - 1] < crd[p], argument_name(op, argument),
+            " coordinates must be strictly increasing within each CSR row; row ",
+            row, " is non-increasing at position ", p);
       }
     }
     previous = end;
@@ -744,9 +745,10 @@ inline void validate_jit_tensor(
                     " at compressed level ", level, " position ", p,
                     " is outside [0, ", extent, ")");
         if (p > pos[parent]) {
-          TORCH_CHECK(crd[p - 1] <= crd[p], argument_name(op, argument),
-                      " coordinates decrease at compressed level ", level,
-                      " position ", p);
+          TORCH_CHECK(
+              crd[p - 1] < crd[p], argument_name(op, argument),
+              " coordinates must be strictly increasing at compressed level ",
+              level, " position ", p);
         }
       }
     }

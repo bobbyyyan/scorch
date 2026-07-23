@@ -313,7 +313,12 @@ def canonical_program_dump(program: LoopProgram) -> str:
         "outputs": [ids.symbol(symbol) for symbol in program.outputs],
         "body": _serialize_stmt(program.body, ids),
     }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:

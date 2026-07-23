@@ -141,6 +141,24 @@ def _merge_cursors(
     return tuple(merged)
 
 
+def _merged_domain(
+    kind: DomainKind,
+    left: Tuple[SparseLevelRef, ...],
+    right: Tuple[SparseLevelRef, ...],
+) -> _OperandDomain:
+    """Canonicalize one binary sparse-support combination.
+
+    Repeated uses of one sparse operand still have one support domain.  Keep
+    this pure analysis independent of the current kernel ABI's repeated-input
+    restriction and never publish an unmaterializable one-cursor merge.
+    """
+
+    cursors = _merge_cursors(left, right)
+    if len(cursors) == 1:
+        return _OperandDomain(DomainKind.SPARSE, cursors)
+    return _OperandDomain(kind, cursors)
+
+
 def _has_cursors(domain: _OperandDomain) -> bool:
     return domain.kind in (
         DomainKind.SPARSE,
@@ -176,7 +194,7 @@ def _unite(left: _OperandDomain, right: _OperandDomain) -> _OperandDomain:
             "unsupported_nested_merge",
             "an intersection nested inside a union is outside the migrated " "families",
         )
-    return _OperandDomain(DomainKind.UNION, _merge_cursors(left.cursors, right.cursors))
+    return _merged_domain(DomainKind.UNION, left.cursors, right.cursors)
 
 
 def _intersect(left: _OperandDomain, right: _OperandDomain) -> _OperandDomain:
@@ -194,9 +212,7 @@ def _intersect(left: _OperandDomain, right: _OperandDomain) -> _OperandDomain:
             "a union nested inside an intersection of further sparse "
             "operands is outside the migrated families",
         )
-    return _OperandDomain(
-        DomainKind.INTERSECTION, _merge_cursors(left.cursors, right.cursors)
-    )
+    return _merged_domain(DomainKind.INTERSECTION, left.cursors, right.cursors)
 
 
 def _access_domain(access: TensorAccess, index: IndexId) -> _OperandDomain:
