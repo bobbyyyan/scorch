@@ -17,7 +17,10 @@ unchanged.
 ## Verdict
 
 **Phase 5 is complete for the migrated sparse level families**, with every
-mandatory gate green:
+mandatory gate green at the original closure.  The independent review in
+§8 found and corrected additional fail-closed boundaries; its fresh
+native-runtime evidence supersedes the original byte-waiver statement where
+the shared preamble changed.
 
 - all four named vertical slices — CSR SpMV, CSR-by-dense SpMM, CSR+CSR
   UNION/add, and CSR·CSR INTERSECTION/multiply — compile and execute
@@ -36,9 +39,10 @@ mandatory gate green:
   reads rendered names; parent/child sparse dominance, merge domains, leaf
   value ownership, and default discipline are verifier-enforced with stable
   codes, each directly covered;
-- the fresh 20-source corpus and 42-source grid captures are byte-identical
-  to the sealed Phase-4 review captures, so no legacy emission changed and
-  the byte waiver applies; the retained latency receipts remain operative;
+- at the original closure, the fresh 20-source corpus and 42-source grid
+  captures were byte-identical to the sealed Phase-4 review captures, so no
+  legacy emission changed and the byte waiver applied; §8 supersedes that
+  runtime evidence for its later native-header correction;
 - production neutrality is unchanged: `import scorch`, default compilation,
   legacy correctness paths, and release JIT never load the LoopIR package.
 
@@ -110,8 +114,9 @@ executable, and the code-surface lock includes the sparse codes.
 
 ## 4. The migrated families and their recorded boundaries
 
-**Lowered and compiled with byte-identical legacy parity** (float32 and
-float64; ranks 1–2 outputs over rank-2 sparse operands; identity mode order):
+**Lowered and compiled with byte-identical legacy parity** (float32
+throughout, plus the committed float64 SpMV case; ranks 1–2 outputs over
+rank-2 sparse operands; identity mode order):
 
 1. CSR SpMV (`y[i] += A[i,j]·x[j]`) and CSR row sums;
 2. CSR-by-dense SpMM (`C[i,j] += A[i,k]·B[k,j]`), plus SpGEMM
@@ -166,7 +171,10 @@ scheduling transformations were migrated (Phase 6 surface).
    correctly.  Sparse-output runtime comparisons against legacy therefore
    ride on byte-identical sources (identical source is the identical cached
    kernel) plus PyTorch/oracle differentials; dense-output families also
-   compare via `execute_shadow` bitwise.
+   compare via `execute_shadow` bitwise.  The independent review made this
+   restriction fail closed: `execute_shadow` now rejects sparse outputs with
+   `CompileSpecError` instead of leaking the legacy wrapper's
+   `TensorIndexError`.
 3. The four Phase-4 errata are unchanged and none was silently "fixed".
 
 ## 6. Verification
@@ -195,12 +203,14 @@ Receipts:
   cin-analysis/loop-plan/stage-timing/llir-traversal/cin/scheduler/
   schedule-api **666 passed**, llir-pass-manager + string budget **89
   passed**;
-- byte gates: fresh 20-source corpus and 42-source grid captures from the
-  working tree are byte-identical to the sealed Phase-4 review captures
+- original-closure byte gates: fresh 20-source corpus and 42-source grid
+  captures from the working tree are byte-identical to the sealed Phase-4
+  review captures
   (`diff -qr` empty for both), which chain to the Phase-3 finals — no
-  legacy emission changed, the byte waiver applies, and no runtime kernel
-  benchmark is required; the new sparse kernels are byte-identical to the
-  legacy kernels they migrate, so the compiled artifacts are shared;
+  legacy emission changed, the byte waiver applied at that revision, and no
+  runtime kernel benchmark was required; the new sparse kernels are
+  byte-identical to the legacy kernels they migrate, so the compiled
+  artifacts were shared; §8 records the superseding native-header evidence;
   structural activation (prefetch, pointer hoist, position loops, ordered
   assembly, both parallel policies) is asserted directly and never waived;
 - latency: no production emission or measured legacy compiler path changed
@@ -244,3 +254,137 @@ Receipts:
 - The oracle is a Python-float semantic reference; compiled comparisons
   use the repository's standard tolerances, while oracle-versus-pure-Python
   references remain exact.
+
+## 8. Independent review corrections (2026-07-23)
+
+The post-closure review did not accept source parity as a correctness oracle.
+It found one high-severity case where LoopIR and legacy emitted the same wrong
+program, plus several fail-closed and evidence gaps.  The corrections are
+stacked without amending or reordering Phase 5:
+
+- `7fd9116` — `fix(compiler): harden Phase-5 sparse contracts`
+- `5afcd41` — `test(compiler): cover Phase-5 review corrections`
+- `5fbcaa3` — `test(compiler): close Phase-5 oracle evidence gaps`
+- the documentation commit that records this section
+
+### 8.1 Correctness and contract findings
+
+1. **Duplicate compressed coordinates silently miscomputed merged kernels
+   (high).**  Public `SparseStorage`, the specialized CSR native view, and
+   generic JIT validation all admitted nondecreasing coordinates.  For
+   `A` coordinates `[0, 0]` with values `[1, 2]` and `B` coordinates
+   `[0, 0, 0]` with values `[10, 20, 30]`, the legacy-identical
+   INTERSECTION kernel returned `40`; Scorch's logical overwrite semantics
+   make the operands `2` and `30`, so the expected value is `60`.  Source
+   identity therefore concealed rather than disproved the bug.  Canonical
+   compressed storage now requires coordinates to be **strictly increasing
+   within every parent segment** at the Python, specialized-native, and
+   generic-JIT boundaries.  Public malformed inputs and privately
+   forged/stale native state both fail before computation.
+2. **Repeated operands could produce an unmaterializable pure-analysis
+   result (medium).**  Cursor deduplication left a one-cursor
+   UNION/INTERSECTION, which the verifier correctly rejects as
+   `degenerate_merge`.  The pure iteration-domain analysis now canonicalizes
+   one unique sparse support to `DomainKind.SPARSE`; target lowering retains
+   its separate repeated-ABI-operand rejection.
+3. **Canonical JSON admitted non-finite constants (medium).**  `FloatConst`
+   accepted NaN and infinities, and `json.dumps` printed non-standard bare
+   tokens.  Verification now requires finite exact floats and the printer
+   uses `allow_nan=False` as defense in depth.
+4. **The oracle could allocate an untrusted output before detecting a shared
+   dimension mismatch (medium).**  All input/output dimension extents and
+   dense input shapes now reconcile before either dense zero allocation or
+   `CsrOutputBuilder` construction.  Separate regressions prove both
+   allocation paths stay untouched on a mismatch.
+5. **Sparse-output shadow execution leaked an uncontrolled legacy wrapper
+   error (medium).**  `execute_shadow` now rejects sparse outputs at its
+   public boundary with a stable `CompileSpecError`; sparse comparisons use
+   LoopIR/PyTorch/oracle execution plus source parity as documented.
+6. **Adapter and evidence boundaries were incomplete (low/medium).**
+   `CsrMatrix.from_dense` now wraps unrepresentable numeric conversion as
+   `CsrFormatError`; standalone level storage shares the oracle's rank-64
+   bound rather than leaking `RecursionError`; CSR-by-dense SpMM now compares
+   directly with the production oracle, including an empty-row case with a
+   hidden inner extent; and the overbroad float64 claim is narrowed to the
+   committed float64 SpMV case.
+
+### 8.2 Emission and performance evidence
+
+The native validation change affects the generated preamble, so the original
+Phase-5 byte waiver cannot cover the correction.  Fresh detached
+`dd99b80`/`5afcd41` captures establish the exact boundary:
+
+- all 19 non-preamble files in the 20-source corpus and all 21 unique grid
+  kernel bodies are byte-identical;
+- the shared preamble differs only at the two intended strict-order
+  comparisons and their diagnostics; every grid build input is 34 bytes
+  larger with unchanged compile/link flags.
+
+The one-shot two-machine runtime results are retained as **formal per-cell
+failures**, not relabeled as passes:
+
+- M5: all 42 cells were correct; candidate/base machine geomean `1.025903`
+  missed the candidate A/A band `[0.990086, 1.010013]`, and 6/42 cells
+  missed their bands.  The result is dominated by `M=512` timings
+  (`1.07308` group geomean); `M=4096` and `M=20000` were `1.00329` and
+  `1.00291`.
+- Redwood: all 42 cells were correct and the machine geomean passed
+  (`0.993640` inside `[0.972927, 1.027827]`), but 3/42 cells missed their
+  bands.  Two misses were candidate speedups (`0.863140`, only `0.000194`
+  below its lower band, and `0.957779`); the remaining noisy
+  `M=512,N=256,density=.1` cell was `1.250306`.
+
+The review accepts a narrow, explicit **assembly/measurement exception** for
+this correctness hardening; it does not claim that the written per-cell gate
+passed.  Attribution is concrete:
+
+- M5 `evaluate` has identical hot instruction count and addresses; its
+  differences are cold literal addresses.  `validate_jit_tensor` changes one
+  success-path instruction at the same address, `b.le` to `b.lt`, with the
+  same branch direction/outcome on canonical strictly increasing input;
+  remaining differences are cold diagnostics and line metadata.
+- An unchanged-base M5 position control passed at machine geomean
+  (`0.995275`) but itself missed four per-cell bands, so separate-process
+  cell comparison failed the protocol's requirement that the gate pass an
+  unchanged binary.
+- Same-process alternating attribution was neutral in paired aggregate
+  (55 paired-round ratios: geomean `1.000819`, median `1.00423`); its one
+  approximately 0.05 ms case was visibly timer-noisy.  No formal run was
+  repeated to seek a pass.
+- The candidate adds no operation, loop, load, or allocation on valid input.
+  Both machines show mixed-sign cell deltas, Redwood's machine aggregate
+  passes, and the deltas do not scale with coordinate count as a validation
+  regression would.
+
+Compiler latency was freshly paired on M5 and is inside the `1.10` target for
+all four categories: p50 ratios `0.990/0.984/0.989/1.010` and p95 ratios
+`1.025/1.028/0.965/1.005` for small-dense, reduction,
+CSR-intersection, and sparse-union respectively.
+
+### 8.3 Corrected verification ledger
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase5-review-5afcd41/`, with Redwood
+receipts mirrored under its `redwood/` subdirectory and on Redwood at
+`/scratch/bobbyy/scorch-codex/phase5-review-5afcd41-redwood/`.
+
+- focused boundary, pipeline, native-ABI, schema, analysis, lowering, and
+  storage suites passed, including the privately-forged duplicate-coordinate
+  JIT case; the two final oracle allocation/hidden-extent regressions passed
+  `2/2`;
+- the authoritative clean detached-worktree non-performance suite at
+  `5afcd41`, with import provenance asserted and caches isolated, completed
+  **3,503 passed, 14 skipped, 3 perf-deselected, one known warning, zero
+  failures in 2,327.97 seconds**; the final `5fbcaa3` commit is test-only and
+  its two added cases were then run directly;
+- all changed Python passes Black and Flake8; focused source mypy succeeds;
+  `git diff --check` is clean;
+- the five protected tracked files retain the hashes recorded in the
+  handoff, explicit pathspecs were used for every commit, no unrelated
+  dirty/untracked material was staged, and nothing was pushed.
+
+This review keeps Phase 5 closed because the discovered wrong-result path is
+now rejected at every owning boundary and the correction has no credible
+valid-input runtime regression.  It deliberately does **not** restate “all
+mandatory performance gates green”: the two first-run per-cell failures and
+the reviewed exception above are part of the permanent record.

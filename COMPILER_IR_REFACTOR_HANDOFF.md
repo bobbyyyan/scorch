@@ -23754,8 +23754,8 @@ What is now true:
   byte-identical to the untouched legacy pipeline, execute correctly on
   real tensors, and match PyTorch, the production oracle, and (dense
   outputs) legacy shadow execution bitwise.  The parity grid also locks
-  CSR row sums, sampled ds·dd elementwise, SpGEMM ds@ds→dd, f64 variants,
-  and (A+B)·D chains.  Sparse outputs wrap as honestly-typed ds STensors
+  CSR row sums, sampled ds·dd elementwise, SpGEMM ds@ds→dd, the f64 SpMV
+  case, and (A+B)·D chains.  Sparse outputs wrap as honestly-typed ds STensors
   on the test pipeline.
 - The oracle executes through the format-neutral level interface
   (`loopir/levels.py`): CSR is one adapter; DCSR/CSC-style layouts bind
@@ -23839,4 +23839,189 @@ integration, public Schedule-adapter cutover, or legacy deletion. If a
 mandatory gate fails, commit the largest coherent verified subset,
 document the failed gate, and do not claim the phase complete. Do not
 push.
+```
+
+## Phase-5 independent review corrections (2026-07-23)
+
+The post-closure review found a high-severity correctness hole that
+legacy/LoopIR source parity concealed.  Duplicate coordinates in one
+compressed parent segment were accepted by public storage and native
+validation; two-cursor merge kernels could then stop after pairing only a
+prefix of the duplicates and return the wrong value.  The concrete
+INTERSECTION repro returned `40` where Scorch's logical tensor values require
+`60`.
+
+Corrections are committed, without amending or reordering Phase 5, as:
+
+- `7fd9116` — `fix(compiler): harden Phase-5 sparse contracts`
+- `5afcd41` — `test(compiler): cover Phase-5 review corrections`
+- `5fbcaa3` — `test(compiler): close Phase-5 oracle evidence gaps`
+- this section's review/handoff documentation commit
+
+Canonical compressed coordinates are now strictly increasing at public
+`SparseStorage`, specialized CSR, and generic JIT boundaries.  The same
+review canonicalized deduplicated one-cursor iteration domains to
+`DomainKind.SPARSE`, rejected non-finite `FloatConst` values, made canonical
+JSON defensive with `allow_nan=False`, bounded standalone level storage at
+rank 64, wrapped unrepresentable CSR numeric conversion, reconciled shared
+dimensions before dense or sparse output allocation, gave sparse-output
+`execute_shadow` a stable fail-closed diagnostic, added direct production
+oracle coverage for CSR×dense SpMM (including zero rows with a hidden inner
+extent), and narrowed the evidence claim from general f64 sparse coverage to
+the committed f64 SpMV case.
+
+The native header correction invalidates the original byte waiver.  Fresh
+detached captures prove all 19 corpus kernel bodies and all 21 unique grid
+kernel bodies remain byte-identical; only the shared preamble changes at the
+two strict comparisons/diagnostics (+34 bytes per grid build input, flags
+unchanged).  Both one-shot machine comparisons remain recorded as formal
+per-cell failures:
+
+- M5: 42/42 correct, machine geomean `1.025903` outside
+  `[0.990086,1.010013]`, 6 cell misses;
+- Redwood: 42/42 correct, machine geomean `0.993640` inside
+  `[0.972927,1.027827]`, 3 cell misses, two of which are speedups.
+
+No formal run was repeated.  The correction is accepted under an explicit
+assembly/measurement exception, not described as a passing gate:
+`evaluate` is hot-instruction-identical; the validator changes one same-address
+success-path branch (`b.le`→`b.lt`) with the same outcome on canonical input;
+an unchanged-base M5 repeat itself misses four per-cell bands; alternating
+same-process paired ratios have aggregate geomean `1.000819`; deltas are
+mixed-sign and do not scale with nnz.  Full detail and every crossing are in
+`COMPILER_IR_REFACTOR_PHASE5_REVIEW.md` §8.
+
+Fresh compiler latency is green (worst p50 `1.010`, worst p95 `1.028`).
+The clean detached suite at `5afcd41` completed **3,503 passed, 14 skipped,
+3 perf-deselected, zero failures in 2,327.97 seconds**; the two final
+test-only cases at `5fbcaa3` passed directly.  Evidence:
+`/Users/bobby/.cache/scorch-codex/phase5-review-5afcd41/`, including the
+`redwood/` mirror.  The five protected files and all unrelated dirty/untracked
+work remain untouched.
+
+The prompt below supersedes the preceding Phase-6 prompt.  It is intentionally
+broader: a capable session should deliver a real scheduling vertical milestone,
+not stop after declaring one tile node.
+
+## Updated Copy-Paste Prompt for the Next Session/Agent (Phase 6)
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call. Perform an independent review of the
+current tip, then implement the largest coherent Phase-6 scheduling milestone
+that can be honestly verified. Do not limit the session to a node-only or
+single-test seam.
+
+Read, in order:
+
+1. AGENTS.md
+2. COMPILER_IR_REFACTOR_DESIGN.md
+3. COMPILER_IR_REFACTOR_PHASE4_REVIEW.md, especially §7
+4. COMPILER_IR_REFACTOR_PHASE5_REVIEW.md, especially §8
+5. the final dated sections of COMPILER_IR_REFACTOR_HANDOFF.md
+
+Inspect git status, the branch graph, origin, and commits 7fd9116, 5afcd41, and
+5fbcaa3 before editing. Reproduce focused correctness evidence rather than
+trusting the handoff. Preserve the strict canonical compressed-coordinate
+boundary, one-cursor domain canonicalization, finite canonical constants,
+rank/output-allocation guards, and sparse-shadow/oracle regressions.
+
+Do not switch branches, amend/reorder existing commits, push, or stage broad
+paths. Preserve every unrelated dirty/untracked GPU, CUDA, benchmark,
+packaging, scheduler, research, scratchpad, and tooling path. Re-hash the five
+protected tracked files recorded above before every commit. Do not rerun the
+retained Phase-5 performance commands merely to seek a pass: §8 permanently
+records their first-run failures and reviewed exception. New emitted-code
+changes still require fresh applicable gates.
+
+Primary objective — complete a substantial Phase-6 scheduled-LoopIR vertical
+milestone:
+
+1. Audit ownership across public Schedule/Scheduler, schedule_lowerer,
+   normalized CIN, LoopPlan, semantic LoopIR, legacy LLIR scheduling,
+   CompilationContext, cache identity, and the oracle. Decide and document
+   whether scheduling is a verified sidecar, a ScheduledLoopProgram layer, or
+   structured schedule nodes. Keep semantic tensor/iteration meaning separate
+   from target schedule choices and retain provenance back to the unscheduled
+   verified program.
+2. Represent, verify, print, and canonically serialize the schedule facts
+   needed by the existing CPU families: loop permutation/reorder, affine
+   split/tile factors, point/outer-loop identity, ragged-tail bounds, and
+   schedule provenance. Use artifact-local identities, immutable tuple
+   ownership, stable defect codes, cycle/depth protection, and deterministic
+   output. Bump the canonical schema version only if the semantic serialized
+   contract actually changes; canonical dumps remain fingerprints, not target
+   cache keys.
+3. Implement loop reorder and affine tiling as pure typed passes over verified
+   LoopIR/scheduled IR. They must not call legacy lowerers, parse rendered C++,
+   depend on mutable pass order, or smuggle behavior through callbacks/raw
+   strings. Verify legality (dependencies, reductions, sparse parent
+   dominance, merge alignment, tail coverage, unique ownership) both before
+   and after transformation.
+4. Carry a meaningful schedule matrix end to end, not one showcase:
+   - dense matmul/reduction in at least two legal loop orders, including one
+     ragged affine tile;
+   - CSR-by-dense SpMM in its untiled scheduled form plus at least one existing
+     affine/tile-j schedule, including N smaller than, equal to, and not
+     divisible by the tile;
+   - preserve sparse prefetch, dense-pointer hoisting, zero-fill, parallel
+     policy, and ABI/result wrapping where those legacy paths activate.
+   Compare verified scheduled IR, generated source, compiled execution, and
+   stage timing with the corresponding Scheduler.apply_schedule /
+   schedule_lowerer legacy paths. Include f32/f64 where legacy genuinely has
+   evidence, zero/ragged extents, empty sparse rows, and randomized dimensions.
+5. Widen LoopPlan only with semantic/planning facts it owns; do not turn it into
+   a bag of target strings. Extend the production oracle either to execute
+   scheduled programs directly or to verify a semantics-preserving erasure to
+   unscheduled LoopIR. Differentially prove every transformed iteration point
+   is visited exactly once and reductions retain their permitted ordering
+   semantics.
+6. Integrate one real strangler entry for migrated explicit schedules through
+   CompileOptions/CompilationContext, with exact cache identity and partial
+   failure ownership. Keep default production and unsupported schedule
+   families on the legacy route, LoopIR imports neutral by default, and
+   unsupported combinations fail closed rather than silently ignoring a
+   requested schedule.
+7. If all of the above is complete and green, use the remaining session for
+   one coherent stretch family: either (a) migrate the scheduled SpMM
+   parallel/workspace annotation into typed scheduled passes, or (b) adapt one
+   existing selector output into the verified schedule artifact. Keep stretch
+   commits separate. Do not start legacy deletion, broad selector cutover,
+   GPU scheduling, or sparse-panel formats unless the primary milestone is
+   fully closed first.
+8. Add a Phase-6 review and updated handoff that states the exact legality
+   model, supported loop/tile/sparse families, stage/cache ownership, measured
+   limitations, and the next broad milestone. Record legacy defects as errata;
+   do not silently fix or reproduce them outside an explicit compatibility
+   decision.
+
+Mandatory gates:
+
+- focused semantic and scheduled LoopIR schema/verifier/printer/oracle/pass
+  suites, including every new defect code, forged/cyclic/depth boundaries,
+  fresh ownership, deterministic identities, pass idempotence or deliberate
+  non-idempotence, and semantics-preserving erasure;
+- normalized-CIN, LoopPlan, identity, stage timing, schedule API/Scheduler,
+  legacy schedule_lowerer, LLIR traversal/pass-manager, raw-budget, cache-key,
+  import-neutrality, and Phase-3.5 spike adjacency;
+- real compiled PyTorch differentials for the dense and sparse schedule matrix,
+  plus byte-exact legacy source comparison wherever compatibility is claimed;
+- fresh 20-source corpus and 42-cell grid captures against the corrected
+  starting commit. Structural activation is never waived. Apply the design
+  policy honestly to every changed build input and retain first-run failures;
+- paired compiler latency with stage attribution, Black, Flake8, focused and
+  full-source mypy baseline comparison, git diff --check, provenance checks,
+  and a clean detached-worktree full non-performance suite with isolated
+  caches;
+- protected-file hashes before every commit and a staging audit proving no
+  unrelated material entered Git.
+
+Use focused commits with descriptive bodies separating representation/verifier,
+passes/lowering/runtime, tests, optional stretch work, and review/handoff docs.
+Report exact hashes, memberships/counts, evidence locations, origin state,
+protected hashes, and limitations. If a mandatory gate exposes a real code
+regression, fix it. If a gate has a diagnosed measurement defect, preserve the
+first result and document the attribution under the settled policy; never
+rerun-until-pass. Commit the largest coherent verified subset and do not
+overclaim Phase 6. Do not push.
 ```
