@@ -23136,6 +23136,98 @@ interpreter as the semantic oracle for migrated slices, keep shadow comparison
 curated and off by default, and leave hierarchical merge descent, non-CSR
 sparse outputs, and COORDINATE/SINGLETON behind their existing Phase-5 gates.
 
+### Phase-4 LoopIR foundation and dense vertical slice (2026-07-22)
+
+Phase 4 is complete for the migrated dense families.  The definitive record
+is `COMPILER_IR_REFACTOR_PHASE4_REVIEW.md`; this entry is the log summary.
+Seven commits stack on `58e8565`; nothing was amended, reordered, or pushed:
+
+- `763b73b` — `feat(compiler): freeze production LoopIR dense schema, builder, and verifier`
+- `fde87cf` — `feat(compiler): add deterministic LoopIR printing and canonical serialization`
+- `0959087` — `feat(compiler): promote the dense semantic oracle into production LoopIR`
+- `93444b9` — `feat(compiler): lower normalized dense-family CIN to verified LoopIR`
+- `26a84bc` — `feat(compiler): lower LoopIR through structured LLIR with legacy byte parity`
+- `788f0e6` — `feat(compiler): drive the LoopIR dense slice end to end with stage timing`
+- `6672b23` — `test(compiler): enforce LoopIR production neutrality`
+
+#### What happened
+
+1. **Audit first.**  The Phase-3.5 spike was audited against normalized CIN
+   and every production responsibility of the first dense slice; the gap
+   table is §1 of the review.  The spike was treated as design input, not a
+   contract: global ID counters became builder-owned artifact-local
+   allocation, scalar typing (`ScalarType` float32/float64, uniform per
+   program) was added, the sparse surface was *not* copied (no cursors,
+   positions, merges, accumulators — dense reduction uses ADD-only
+   `StoreReduce` into zero-initialized outputs, exactly like the legacy
+   kernels), and all four level kinds are declared with only DENSE
+   executable.
+2. **Frozen production subset.**  New package `src/scorch/compiler/loopir/`:
+   nodes, builder, single fail-closed verifier (28 covered defect codes),
+   deterministic printer + canonical serializer
+   (`scorch.loopir.canonical.v1`, ID-history-independent, display names
+   excluded), and the production-owned dense oracle promoted from the spike
+   semantics.
+3. **CIN-to-LoopIR lowering** for the dense elementwise and dense
+   reduction/matmul families (not hand fixtures), preserving
+   `SymbolId`/`IndexId` provenance and returning a verified `LoopPlan`
+   (nest order).  Everything outside the families fails closed with stable
+   codes (identity mode order only, uniform dtype, no Where/workspace, no
+   DIV/unary, storage order must match the nest, no repeated/in-place
+   operands, no `A[i,i]`).
+4. **LoopIR-to-LLIR lowering** reuses the exact production target
+   components (`TorchCppKernelABI`, `ResultTensorAssembler`, managed LLIR
+   pass pipeline, parallel marking).  The generated C++ is
+   **byte-identical to the untouched legacy pipeline** across the whole
+   comparable family grid (14 members, f32/f64, ranks 1-3, zero extents),
+   and shadow execution is bitwise-equal on real tensors.  The structured
+   LLIR remains the CxxIR boundary; no new target IR was introduced.
+5. **Stage timing**: two appended `CompilerStageId` members
+   (`cin_to_loopir_lowering`, `loopir_to_llir_lowering`) recorded through
+   the existing `CompilationContext`; the legacy default path never begins
+   them and every legacy sequence lock is unchanged.  Kernel cache identity
+   is untouched (byte-identical source shares the artifact honestly);
+   LoopIR artifacts are never cached.
+6. **Neutrality**: production never imports the package — enforced by
+   subprocess checks (plain import, full legacy dense compilation) and a
+   production-source scan; the package `__init__` imports nothing.
+7. **Legacy defects surfaced by the differential work** (recorded, not
+   changed): dense `ijk` matmul emits invalid C++ (`pB0` used before
+   declaration); `A[i,i]` accesses read the wrong position (silent wrong
+   result); dense elementwise SUB raises `NotImplementedError` in the
+   lattice (LoopIR supports SUB — the one member with no legacy comparand);
+   repeated operands (`C = A*A`) break kernel-ABI argument uniqueness.
+
+#### Verification ledger
+
+Evidence: `/Users/bobby/.cache/scorch-codex/phase4-dense-58e8565/`.
+Receipts (details in the review): 139 focused LoopIR tests; 647 spike tests
+unchanged; 120 adjacency + 82 cin/scheduler/schedule-api + 102 stage-timing
+tests; fresh 20-source corpus and 42-source grid captures byte-identical to
+the retained `phase35-repeat-b2fe883` captures (byte waiver applies;
+structural activation asserted, never waived); Black/Flake8/mypy exactly at
+the inherited baselines with zero new findings; the authoritative clean
+detached-worktree non-performance suite at exact final code commit
+`6672b23` passed **3,346 tests with 14 skipped, 3 perf-marked deselections,
+and one known warning in 2,066.14 seconds** (JUnit: 3,360 selected, 0
+failures, 0 errors — the Phase-3.5 baseline plus the 139 new LoopIR tests),
+with import provenance asserted including the LoopIR lowering, oracle, and
+pipeline modules; protected-file hashes unchanged.
+This session pushed nothing; during it the repository owner externally
+pushed the session-start HEAD `58e8565` to
+`origin/refactor/compiler-ir-phase3-std-move-call` (previously `1714df2`),
+so the seven Phase-4 commits remain local-only ahead of origin.
+
+#### Phase-5 hand-back
+
+Begin Phase 5 (sparse iteration and merge-lattice migration) from the
+frozen production subset: extend the schema deliberately with the sparse
+position/cursor/merge surface revised from the spike (which remains intact
+as the sparse reference), separate iteration analysis from lowering, and
+carry CSR SpMV and CSR-by-dense SpMM vertical slices end to end.  The
+spike's fail-closed boundaries (leaf-only merged cursors, CSR-only sparse
+output assembly, COORDINATE/SINGLETON) are the tracked Phase-5 surfaces.
+
 ## Incremental Migration Plan
 
 ### Milestone 0: safety and characterization
@@ -23280,26 +23372,25 @@ Useful test additions:
 
 ## Recommended Next Milestone
 
-Begin Phase 4: the LoopIR strangler path. The repeated Phase-3.5 review at
-`6ca14f5` records GO-with-conditions for the review-corrected general
-level-based foundation, but NO-GO to freeze or productionize the spike
-unchanged.
-The next session should first audit the candidate against production
-responsibilities and the smallest normalized-CIN dense vertical slice, revise
-it where necessary, then freeze that production subset (builder API, verifier,
-deterministic printer, canonical serializer; keep the frozen
-dataclass/tuple/side-table discipline). In the same broad milestone, implement
-normalized-CIN-to-LoopIR lowering for scalar/dense elementwise operations,
-carry representative elementwise plus dense reduction/matmul operations through
-the existing structured LLIR (the current target-specific CxxIR boundary),
-ABI/codegen, and promote the spike semantics into the required production-owned
-test/debug oracle. Schema integration and CIN-to-LoopIR lowering are co-leading
-risks; do not declare the spike schema frozen unchanged or force a subfamily
-through a representation gap discovered by the audit.
-Keep shadow compilation off in production and ordinary pytest; the spike's
-recorded fail-closed boundaries (leaf-only merges, CSR-only sparse output
-assembly, COORDINATE/SINGLETON) are Phase-5 surfaces and must not be forced
-open in Phase 4.
+Begin Phase 5: sparse iteration and merge-lattice migration.  Phase 4 froze
+the production LoopIR dense subset, lowered the dense elementwise and dense
+reduction/matmul families end to end with legacy byte parity, and promoted
+the dense oracle; `COMPILER_IR_REFACTOR_PHASE4_REVIEW.md` is the definitive
+record.  The next session should extend the frozen production schema
+deliberately with the sparse surface — explicit compressed position loops,
+coordinate resolution, cursor declarations with parent-position dominance,
+and the structured merge representation — revised from the Phase-3.5 spike
+(which remains intact in `loopir_spike/` as the proven sparse reference),
+implement iteration-domain analysis separated from lowering, and carry CSR
+SpMV and CSR-by-dense SpMM vertical slices plus sparse elementwise
+union/intersection through scheduled LoopIR, the existing structured LLIR,
+ABI/codegen, and execution, with the oracle extended (or the spike
+interpreter promoted further) as the sparse semantic reference.  Migrated
+sparse operations must match PyTorch across empty, ragged, and random
+structures, and parent/child sparse dominance must be verifier-enforced.
+Keep the same discipline: fail-closed boundaries with stable codes, byte
+gates for the legacy path, curated shadow comparison off by default, and no
+new target IR unless the audit proves it necessary.
 
 ## Copy-Paste Prompt for a New Session/Agent
 
@@ -23333,11 +23424,11 @@ Binding architecture decisions:
   ScheduledCIN(normalized_cin, verified_loop_plan), not another IR.
 - Full internal verifiers run before/after passes in test/debug mode and are off
   by default in production JIT compilation; cheap public validation remains on.
-- Production LoopIR could not begin until the mandatory CSR SpMV intersection
-  plus sparse elementwise-union interpreter spike passed the Phase 3.5
-  go/no-go gate; the review-corrected candidate at 6ca14f5 records
-  GO-with-conditions to begin Phase 4 and NO-GO to freeze or productionize the
-  spike unchanged. Proceed from it as design input, not as a frozen contract.
+- Production LoopIR began only after the mandatory Phase-3.5 sparse spike
+  passed its go/no-go gate (review-corrected candidate at 6ca14f5). Phase 4
+  then froze the production dense subset in src/scorch/compiler/loopir/ and
+  proved byte-identical legacy parity for the migrated dense families; the
+  spike remains the sparse design input, not a frozen contract.
 - Preserve the concrete compile-latency measurement/review policy and
   two-machine kernel-performance gates in the design document. Treat 1.10 as the
   default latency target and investigation threshold, not a reason to compromise
@@ -23355,84 +23446,85 @@ unrelated user changes and inspect git status before editing.
 
 Current state you must preserve:
 
-- Phase 3 is closed. The repeated Phase-3.5 review records GO-with-conditions
-  to begin Phase 4, and NO-GO to freeze or productionize the spike unchanged;
-  read COMPILER_IR_REFACTOR_PHASE3_5_REVIEW.md and the LAST dated handoff
-  section. Do not rely on any superseded NO-GO or initial-GO prose.
-- The revised spike commits are a3a473b (format-neutral level storage),
-  b2fe883 (logical dimensions, physical positions, parent linkage and the
-  initial DCSR/CSC/CSF fixtures), 7f7af51 (dense-leaf PositionLoad, detached
-  storage and fail-closed semantic corrections), aee7c1f (the corresponding
-  broad regression suite), a9610cb (exact CSR scalar inputs), and 6ca14f5
-  (final boundary tests; 647 focused spike tests). They stack on the correction
-  chain ending at 587cbc1.
-- The spike is outside production imports (neutrality suite enforces it)
-  and has recorded fail-closed boundaries: merged cursors are leaf-only,
-  sparse output assembly is canonical CSR only, and COORDINATE/SINGLETON
-  levels fail closed. These are Phase-5 surfaces; do not force them open.
-  The oracle's rank-2 dense-output limit is instead a Phase-4 gap-audit item:
-  lift it if the chosen dense family needs higher rank, or record a narrower
-  first-slice contract.
-- Nothing has been pushed. Preserve all unrelated dirty and untracked
-  GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, and
-  tooling work. Stage explicit paths only.
+- Phases 0-4 are closed. Phase 4 froze the production LoopIR dense subset in
+  src/scorch/compiler/loopir/ (commits 763b73b..6672b23 stacked on 58e8565)
+  and carried the dense elementwise and dense reduction/matmul families end
+  to end with byte-identical legacy parity; read
+  COMPILER_IR_REFACTOR_PHASE4_REVIEW.md and the LAST dated handoff section.
+  The Phase-3.5 spike in loopir_spike/ (reviewed at 6ca14f5) remains intact
+  as the proven sparse reference; do not delete or refactor it casually.
+- The production LoopIR package is outside production imports (the
+  test_loopir_neutrality suite enforces it): normal import scorch, default
+  compilation, legacy correctness paths, and release JIT never load it.
+  Preserve that neutrality until a deliberate cutover milestone.
+- The production subset is dense-only: LevelKind declares all four kinds but
+  only DENSE is executable; the verifier fails closed on the rest. The
+  spike's recorded fail-closed boundaries (leaf-only merged cursors,
+  CSR-only sparse output assembly, COORDINATE/SINGLETON iteration) are the
+  Phase-5 surfaces.
+- Known legacy defects recorded in the Phase-4 review (ijk dense matmul
+  emission, A[i,i] wrong-position reads, dense SUB NotImplementedError,
+  repeated-operand ABI collisions) are documented errata; fixing them is
+  optional dedicated work, never a silent side effect.
+- Origin (refactor/compiler-ir-phase3-std-move-call) sits at 58e8565, pushed
+  externally by the repository owner on 2026-07-22; the Phase-4 commits
+  763b73b..6672b23 are local-only ahead of it. Do not push. Preserve all
+  unrelated dirty and untracked GPU/CUDA, benchmark, packaging, scheduler,
+  research, scratchpad, and tooling work. Stage explicit paths only.
 
-Primary objective: begin Phase 4, the LoopIR strangler path, as a coherent
-milestone:
+Primary objective: begin Phase 5, sparse iteration and merge-lattice
+migration, as a coherent milestone:
 
-1. Audit the spike against normalized CIN and every production responsibility
-   needed by the first dense slice: identities/ownership, construction,
-   verifier authority, deterministic printing/serialization, pass boundaries,
-   target split, stage timing, debug-only interpretation, dtype/scalar typing,
-   rank/shape/broadcasting, alias/output semantics, and reduction
-   identity/associativity. Record the gap table before freezing anything.
-2. Revise and freeze the smallest production LoopIR subset that closes that
-   audit, keeping frozen dataclasses, tuple children, ID-keyed side tables, and
-   a fail-closed single-authority verifier. Do not copy the spike wholesale or
-   invent workspace/parallel/tile nodes before a migrated operation needs them.
-3. Implement normalized-CIN-to-LoopIR lowering for the coherent scalar/dense
-   elementwise family, not just one hand-built fixture. Differentially compare
-   normalized CIN, LoopIR dumps, interpreter results, legacy generated source,
-   and numerics across shapes/dtypes supported by that family.
-4. Complete the Phase-4 dense reduction/matmul vertical slice as well: carry
-   representative elementwise, reduction, and matmul operations end to end
-   through scheduled LoopIR, the existing structured LLIR as the current
-   target-specific CxxIR boundary, ABI/codegen, and execution. Introduce or
-   rename another target IR only if the audit proves it necessary. If a
-   subfamily hits a concrete representation blocker, finish the coherent
-   subfamilies and record that blocker precisely instead of forcing the schema.
-5. Promote the spike semantics into a production-owned test/debug oracle for
-   the migrated subset, or deliberately revise neutrality for debug-only
-   integration while still proving normal `import scorch`, default compilation,
-   legacy correctness paths, and release JIT do not implicitly load or execute
-   it; dedicated oracle tests may. Add deterministic printing and canonical
-   serialization across independently constructed equivalent programs and
-   different global-ID histories; require a round trip only if you also
-   introduce a deserializer. Keep curated shadow comparison off by default so
-   ordinary pytest and release JIT do not double compile.
-6. Integrate explicit compiler-stage ownership/timing without changing the
-   legacy default path or its cache keys. Keep an opt-in LoopIR artifact uncached
-   or key it separately by pipeline/schema/version so it cannot collide with a
-   legacy artifact. Keep LoopIR dumps target-neutral and preserve all Phase-0-3
-   fail-closed/byte/latency gates.
+1. Audit the production dense schema plus the spike's sparse surface against
+   the first sparse vertical slices (CSR SpMV, CSR-by-dense SpMM, sparse
+   elementwise union/intersection). Decide node by node what the production
+   schema gains: explicit compressed position loops, coordinate resolution,
+   cursor declarations with parent-position dominance, merged iteration, and
+   whatever value/assembly nodes the slices need. Extend the frozen schema
+   deliberately; do not copy the spike wholesale, and do not open
+   COORDINATE/SINGLETON or non-CSR sparse assembly unless a migrated slice
+   needs them.
+2. Separate iteration-domain analysis from lowering: the merge lattice
+   becomes an analysis/builder producing explicit LoopIR structure, never a
+   callback into the general lowerer or mutable lowerer state, for migrated
+   paths.
+3. Implement normalized-CIN-to-LoopIR lowering for the sparse slices and
+   carry them through scheduled LoopIR, the existing structured LLIR (the
+   target-specific CxxIR boundary), ABI/codegen, and execution. Compare
+   against the legacy pipeline's generated source and numerics wherever
+   legacy supports the case; parent/child sparse dominance must be
+   verifier-enforced; migrated operations must match PyTorch across empty,
+   ragged, and random structures.
+4. Keep the oracle discipline: extend the production oracle (or promote more
+   spike semantics) so every migrated sparse program has an independent
+   semantic reference, loaded only by dedicated tests.
+5. Preserve deterministic printing/canonical serialization across the
+   extended schema (bump the schema version when node families are added),
+   stage timing through CompilationContext without touching legacy
+   sequences, kernel cache identity, and production neutrality.
+6. Record every family boundary as a stable fail-closed code with a direct
+   regression, and record any legacy defect the differential work surfaces
+   as errata rather than silently diverging from it.
 
-This session stops at Phase 4. Do not begin Phase 5 even if the dense slice
-finishes early. Leave the closed Phase-3.5 review unchanged except for factual
-errata; create or update `COMPILER_IR_REFACTOR_PHASE4_REVIEW.md` and the final
-handoff section with the exact production subset frozen, the gaps left open,
-verification receipts, commits, and a broad next-session prompt. If semantic-
-oracle, parity, generated-kernel, latency, or other mandatory gates fail, commit
-the largest coherent verified subset, record the failed gate, and do not claim
-Phase 4 complete.
+This session stops at Phase 5. Do not begin Phase 6 scheduling migration
+even if the sparse slices finish early. Leave the closed Phase-3.5 and
+Phase-4 reviews unchanged except for factual errata; create or update
+COMPILER_IR_REFACTOR_PHASE5_REVIEW.md and the final handoff section with the
+exact schema extensions frozen, the gaps left open, verification receipts,
+commits, and a broad next-session prompt. If oracle, parity,
+generated-kernel, latency, or other mandatory gates fail, commit the largest
+coherent verified subset, record the failed gate, and do not claim Phase 5
+complete.
 
-Verify in the scorch conda environment: the complete spike suites,
-identity/CIN-analysis/LoopPlan/raw-budget adjacency, Black/Flake8/mypy
-parity against the inherited baselines, git diff --check, and a clean
-detached-worktree non-performance suite. Any change that affects emitted
-code must pass the generated-kernel byte/A-B gates; byte-identical emission
-across the 20-source corpus and 42-source grid waives runtime benchmarks,
-while structural activation tests are never waived. Preserve and report the
-five protected-file hashes, import provenance, exact commit list, origin
-state, and any limitation honestly. Use focused commits with descriptive
-bodies; do not amend or reorder existing commits. Do not push.
+Verify in the scorch conda environment: the complete LoopIR and spike
+suites, identity/CIN-analysis/LoopPlan/raw-budget adjacency,
+Black/Flake8/mypy parity against the inherited baselines, git diff --check,
+and a clean detached-worktree non-performance suite with import provenance.
+Any change that affects emitted code must pass the generated-kernel
+byte/A-B gates; byte-identical emission across the 20-source corpus and
+42-source grid waives runtime benchmarks, while structural activation tests
+are never waived. Preserve and report the five protected-file hashes,
+import provenance, exact commit list, origin state, and any limitation
+honestly. Use focused commits with descriptive bodies; do not amend or
+reorder existing commits. Do not push.
 ```
