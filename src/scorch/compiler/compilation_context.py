@@ -41,6 +41,11 @@ class CompilerStageId(Enum):
     SCHEDULE_LOWERING = "schedule_lowering"
     LLIR_TO_CPP_GENERATION = "llir_to_cpp_generation"
     KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY = "kernel_name_and_build_request_assembly"
+    # Strangler-path LoopIR stages.  The legacy default pipeline never begins
+    # these; only the explicit LoopIR pipeline driver does, so legacy stage
+    # sequences and their timing records are unchanged.
+    CIN_TO_LOOPIR_LOWERING = "cin_to_loopir_lowering"
+    LOOPIR_TO_LLIR_LOWERING = "loopir_to_llir_lowering"
 
 
 CANONICAL_COMPILER_STAGES: Tuple[CompilerStageId, ...] = tuple(CompilerStageId)

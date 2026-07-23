@@ -274,6 +274,10 @@ def test_stage_identities_records_and_owner_are_typed_frozen_and_stable() -> Non
         CompilerStageId.SCHEDULE_LOWERING,
         CompilerStageId.LLIR_TO_CPP_GENERATION,
         CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
+        # Strangler-path LoopIR stages: only the explicit LoopIR pipeline
+        # driver begins these; every legacy stage sequence below is unchanged.
+        CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+        CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
     )
     assert _FULL_STAGE_SEQUENCE == [
         "frontend_validated_operation_construction",
@@ -285,6 +289,8 @@ def test_stage_identities_records_and_owner_are_typed_frozen_and_stable() -> Non
         "schedule_lowering",
         "llir_to_cpp_generation",
         "kernel_name_and_build_request_assembly",
+        "cin_to_loopir_lowering",
+        "loopir_to_llir_lowering",
     ]
 
     record = CompilerStageRunRecord(
