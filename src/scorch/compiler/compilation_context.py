@@ -45,6 +45,7 @@ class CompilerStageId(Enum):
     # these; only the explicit LoopIR pipeline driver does, so legacy stage
     # sequences and their timing records are unchanged.
     CIN_TO_LOOPIR_LOWERING = "cin_to_loopir_lowering"
+    LOOPIR_SCHEDULE_APPLICATION = "loopir_schedule_application"
     LOOPIR_TO_LLIR_LOWERING = "loopir_to_llir_lowering"
 
 

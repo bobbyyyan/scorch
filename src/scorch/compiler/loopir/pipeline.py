@@ -1,14 +1,24 @@
 """Test/debug LoopIR strangler pipeline and curated shadow comparison.
 
-This module is the executable end of the Phase-4/5 vertical slices: it
+This module is the executable end of the Phase-4/5/6 vertical slices: it
 carries one normalized supported-family CIN program through
 
-``normalized CIN -> LoopPlan -> LoopIR -> structured LLIR -> C++ ->
-compiled kernel -> execution``
+``normalized CIN -> LoopPlan -> LoopIR -> scheduled LoopIR ->
+structured LLIR -> C++ -> compiled kernel -> execution``
 
 using the same JIT build, cache, and execution helpers as the legacy public
-entry (:func:`scorch.ops.lower_and_exec_cin`).  It exists for dedicated
-LoopIR tests and curated shadow comparison only:
+entry (:func:`scorch.ops.lower_and_exec_cin`).  When the compile options
+carry a requested :class:`~scorch.compiler.scheduler.Schedule`, the shared
+``Scheduler.apply_schedule`` boundary validates it and produces the
+verified ``LoopPlan``; the migrated explicit families (loop reorder plus
+affine ``accum='direct'`` tiles) are then applied as typed LoopIR passes,
+and every other schedule family fails closed with a stable code —
+nothing silently ignores a requested schedule.  Kernel cache identity
+remains source-derived, exactly as on the legacy path: the schedule
+affects the generated source, identical source is the identical kernel
+artifact, and no LoopIR- or plan-level artifact is ever cached.
+
+It exists for dedicated LoopIR tests and curated shadow comparison only:
 
 - production never imports it, so the legacy default path, its stage
   sequences, and its cache keys are untouched;
@@ -34,7 +44,7 @@ from __future__ import annotations
 import copy
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -47,21 +57,30 @@ from ..cin_lowerer import CINLowerer
 from ..compilation_context import CompilationContext, CompilerStageId
 from ..compile_options import CompileOptions
 from ..identity import SymbolId
+from ..loop_plan import LoopPlan, ScheduledCIN
 from .lower_cin import LoopIRLoweringResult, lower_normalized_cin_to_loopir
 from .lower_llir import lower_loopir_to_llir
-from .nodes import LevelKind as LoopIRLevelKind
+from .nodes import LevelKind as LoopIRLevelKind, LoopProgram
 from .printer import canonical_program_dump, print_program
+from .schedule_passes import ScheduledLoopIR, apply_schedule_plan
 
 
 @dataclass(frozen=True)
 class LoopIRCompiledKernel:
-    """One compiled supported-family kernel and its LoopIR provenance."""
+    """One compiled supported-family kernel and its LoopIR provenance.
+
+    For scheduled compilations ``schedule`` retains the full scheduling
+    artifact (base program, exact plan, scheduled program, provenance) and
+    ``program_text``/``program_dump`` describe the scheduled program — the
+    artifact the target lowering consumed.
+    """
 
     lowering: LoopIRLoweringResult
     program_text: str
     program_dump: str
     llir_function: llir.Function
     cpp_source: str
+    schedule: Optional[ScheduledLoopIR] = None
 
 
 @dataclass(frozen=True)
@@ -97,11 +116,92 @@ def _resolve_options(
         options = compile_options
     if compilation_context is not None:
         compilation_context.require_compile_options(options)
-    if options.requested_schedule is not None:
-        raise CompileSpecError(
-            "the LoopIR pipeline does not consume requested schedules"
-        )
     return options
+
+
+def _plan_mode_orders_to_planned_order(
+    normalized: IndexStmt,
+    args: Sequence[object],
+    plan: LoopPlan,
+):
+    """The scheduled-path twin of ``ops._plan_mode_orders_to_loop_order``.
+
+    The legacy helper reads the iteration order from the CIN's own ForAll
+    chain; a scheduled compilation iterates in the plan's logical order
+    instead, so runtime mode-order alignment must target that order — the
+    same storage-vs-iteration consistency the reorder pass and the target
+    boundary enforce.  Only the order source differs; the relayout executor
+    and CIN alignment application are the shared production helpers.
+    """
+
+    from ..loop_plan import entity_display_names
+
+    index_names, _ = entity_display_names(normalized)
+    loop_order_names = [index_names[index_id] for index_id in plan.loop_order]
+    if not loop_order_names:
+        return tuple(None for _ in args), None
+
+    rhs_accesses = normalized.get_rhs_tensor_accesses()
+    if len(rhs_accesses) != len(args):
+        return tuple(None for _ in args), None
+
+    rhs_mode_orders: List[Optional[Tuple[int, ...]]] = []
+    for access in rhs_accesses:
+        tensor_var = access.get_tensor()
+        access_names = [
+            index_var.name for index_var in access.get_index_vars()
+        ]
+        desired_names = [
+            name for name in loop_order_names if name in access_names
+        ]
+        desired = tuple(access_names.index(name) for name in desired_names)
+        mode_order = tensor_var.mode_order
+        if mode_order is None or len(desired) != len(mode_order):
+            rhs_mode_orders.append(None)
+            continue
+        rhs_mode_orders.append(desired)
+
+    lhs_mode_order: Optional[Tuple[int, ...]] = None
+    leaf: IndexStmt = normalized
+    while hasattr(leaf, "stmt"):
+        leaf = leaf.stmt
+    lhs_access = getattr(leaf, "lhs", None)
+    if lhs_access is not None:
+        lhs_tensor = lhs_access.get_tensor()
+        lhs_names = [index_var.name for index_var in lhs_access.get_index_vars()]
+        desired_names = [name for name in loop_order_names if name in lhs_names]
+        desired = tuple(lhs_names.index(name) for name in desired_names)
+        lhs_modes = lhs_tensor.mode_order
+        if lhs_modes is not None and len(desired) == len(lhs_modes):
+            lhs_mode_order = desired
+    return tuple(rhs_mode_orders), lhs_mode_order
+
+
+def _apply_requested_schedule(
+    cin_stmt: IndexStmt,
+    options: CompileOptions,
+    context: Optional[CompilationContext],
+) -> Tuple[IndexStmt, LoopPlan]:
+    """Adapt the public Schedule through the shared scheduler boundary.
+
+    ``Scheduler.apply_schedule`` is the single owner of Schedule validation
+    and Schedule-to-LoopPlan translation for both pipelines; the paths only
+    diverge downstream (legacy replays CIN tree surgery, the LoopIR path
+    applies typed passes to the verified base program).  It normalizes the
+    CIN and records the scheduling stage itself.
+    """
+
+    from ..scheduler import Scheduler
+
+    schedule = options.requested_schedule
+    assert schedule is not None
+    scheduled = Scheduler.apply_schedule(
+        cin_stmt,
+        schedule,
+        compile_options=options,
+        compilation_context=context,
+    )
+    return scheduled.normalized_cin, scheduled.verified_loop_plan
 
 
 def _bind_runtime_metadata(
@@ -165,6 +265,7 @@ def _compile_normalized_cin_via_loopir(
     options: CompileOptions,
     context: CompilationContext,
     input_formats: Optional[Sequence[object]] = None,
+    plan: Optional[LoopPlan] = None,
 ) -> LoopIRCompiledKernel:
     """Lower one owned normalized CIN program through the LoopIR path."""
 
@@ -189,13 +290,32 @@ def _compile_normalized_cin_via_loopir(
         compile_options=options,
     )
     try:
-        lowering = lower_normalized_cin_to_loopir(normalized)
-        program_text = print_program(lowering.program)
-        program_dump = canonical_program_dump(lowering.program)
+        lowering = lower_normalized_cin_to_loopir(
+            normalized,
+            planned_loop_order=None if plan is None else plan.loop_order,
+        )
     except Exception:
         context.fail_stage(lowering_token)
         raise
     context.complete_stage(lowering_token)
+
+    schedule: Optional[ScheduledLoopIR] = None
+    program: LoopProgram = lowering.program
+    if plan is not None:
+        schedule_token = context.begin_stage(
+            CompilerStageId.LOOPIR_SCHEDULE_APPLICATION,
+            compile_options=options,
+        )
+        try:
+            schedule = apply_schedule_plan(lowering.program, plan)
+        except Exception:
+            context.fail_stage(schedule_token)
+            raise
+        context.complete_stage(schedule_token)
+        program = schedule.program
+
+    program_text = print_program(program)
+    program_dump = canonical_program_dump(program)
 
     input_shapes: Dict[SymbolId, Tuple[int, ...]] = {}
     rhs_tensor_vars = normalized.get_rhs_tensor_vars()
@@ -204,7 +324,7 @@ def _compile_normalized_cin_via_loopir(
         input_shapes[tensor_var.symbol_id] = tuple(tensor_var.shape)
 
     llir_function = lower_loopir_to_llir(
-        lowering.program,
+        program,
         input_shapes=input_shapes,
         result_shape=tuple(result_shape),
         compile_options=options,
@@ -220,6 +340,7 @@ def _compile_normalized_cin_via_loopir(
         program_dump=program_dump,
         llir_function=llir_function,
         cpp_source=cpp_source,
+        schedule=schedule,
     )
 
 
@@ -237,17 +358,22 @@ def compile_cin_via_loopir(
     context = compilation_context
     if context is None:
         context = CompilationContext(options)
-    normalized = normalize_cin(
-        cin_stmt,
-        compile_options=options,
-        compilation_context=context,
-    )
+    plan: Optional[LoopPlan] = None
+    if options.requested_schedule is not None:
+        normalized, plan = _apply_requested_schedule(cin_stmt, options, context)
+    else:
+        normalized = normalize_cin(
+            cin_stmt,
+            compile_options=options,
+            compilation_context=context,
+        )
     return _compile_normalized_cin_via_loopir(
         normalized,
         result_shape,
         input_bindings,
         options=options,
         context=context,
+        plan=plan,
     )
 
 
@@ -258,14 +384,36 @@ def legacy_generated_cpp(
     *,
     compile_options: Optional[CompileOptions] = None,
 ) -> str:
-    """Generate the legacy pipeline's C++ for the same program, untouched."""
+    """Generate the legacy pipeline's C++ for the same program, untouched.
+
+    When the options carry a requested schedule, the legacy side is the
+    scheduled route production uses: ``Scheduler.apply_schedule`` followed
+    by the legacy lowering of the verified ``ScheduledCIN`` (which replays
+    the legacy tree surgery inside the lowering adapter).
+    """
 
     options = _resolve_options(compile_options)
     context = CompilationContext(options)
-    normalized = normalize_cin(cin_stmt, compile_options=options)
-    _bind_runtime_metadata(normalized, input_bindings, tuple(result_shape))
+    lowering_stmt: Union[IndexStmt, ScheduledCIN]
+    if options.requested_schedule is not None:
+        from ..scheduler import Scheduler
+
+        scheduled = Scheduler.apply_schedule(
+            cin_stmt,
+            options.requested_schedule,
+            compile_options=options,
+            compilation_context=context,
+        )
+        _bind_runtime_metadata(
+            scheduled.normalized_cin, input_bindings, tuple(result_shape)
+        )
+        lowering_stmt = scheduled
+    else:
+        normalized = normalize_cin(cin_stmt, compile_options=options)
+        _bind_runtime_metadata(normalized, input_bindings, tuple(result_shape))
+        lowering_stmt = normalized
     lowerer = CINLowerer(compile_options=options, compilation_context=context)
-    lowered = lowerer._lower_owned_IndexStmt(normalized)
+    lowered = lowerer._lower_owned_IndexStmt(lowering_stmt)
 
     from ...ops import _lower_generated_llir
 
@@ -334,18 +482,27 @@ def execute_cin_via_loopir(
     context = _compilation_context
     if context is None:
         context = CompilationContext(options)
-    normalized = normalize_cin(
-        cin_stmt,
-        compile_options=options,
-        compilation_context=context,
-    )
+    plan: Optional[LoopPlan] = None
+    if options.requested_schedule is not None:
+        normalized, plan = _apply_requested_schedule(cin_stmt, options, context)
+    else:
+        normalized = normalize_cin(
+            cin_stmt,
+            compile_options=options,
+            compilation_context=context,
+        )
     planning_token = context.begin_stage(
         CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
         compile_options=options,
     )
     try:
         _validate_runtime_formats(normalized, args)
-        alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
+        if plan is not None:
+            alignment_plan = _plan_mode_orders_to_planned_order(
+                normalized, args, plan
+            )
+        else:
+            alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
     except Exception:
         context.fail_stage(planning_token)
         raise
@@ -365,6 +522,7 @@ def execute_cin_via_loopir(
         options=options,
         context=context,
         input_formats=tuple(arg.format for arg in args),
+        plan=plan,
     )
     header_cpp_code = options.build.preamble_source
     prepared_build = _prepare_generated_kernel_build(
@@ -410,6 +568,75 @@ def execute_cin_via_loopir(
     return result, kernel
 
 
+def _execute_legacy_scheduled(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    *args,
+    compile_options: CompileOptions,
+):
+    """Execute the legacy scheduled route on ``args`` (dense outputs only).
+
+    The untouched low-level entry rejects requested schedules, so scheduled
+    shadow execution drives the same production components directly:
+    ``Scheduler.apply_schedule``, the legacy lowering of the verified
+    ``ScheduledCIN``, and the shared JIT build/cache/execution helpers,
+    with the legacy entry's dense (``"dd"``) result wrapping.
+    """
+
+    from ...stensor import STensor
+    from ...storage import TensorIndex
+    from ...ops import (
+        _finalize_generated_mode_indices,
+        _load_validated_prepared_kernel,
+        _lower_generated_llir,
+        _prepare_generated_kernel_build,
+    )
+    from ..scheduler import Scheduler
+
+    options = compile_options
+    assert options.requested_schedule is not None
+    context = CompilationContext(options)
+    scheduled = Scheduler.apply_schedule(
+        cin_stmt,
+        options.requested_schedule,
+        compile_options=options,
+        compilation_context=context,
+    )
+    _bind_runtime_metadata(
+        scheduled.normalized_cin,
+        tuple((tuple(arg.shape), arg.dtype) for arg in args),
+        tuple(result_shape),
+        tuple(arg.format for arg in args),
+    )
+    lowerer = CINLowerer(compile_options=options, compilation_context=context)
+    lowered = lowerer._lower_owned_IndexStmt(scheduled)
+    cpp_source = _lower_generated_llir(lowered, options, context)
+    prepared_build = _prepare_generated_kernel_build(
+        options.build.preamble_source,
+        cpp_source,
+        options,
+        context,
+    )
+    module = _load_validated_prepared_kernel(prepared_build)
+
+    module_args: List[object] = [result_shape]
+    for arg in args:
+        module_args.append(arg.shape)
+        module_args.append(arg._native_mode_indices())
+        module_args.append(arg.values)
+    result_cpp = module.evaluate(*module_args)
+    return STensor(
+        shape=tuple(result_shape),
+        index=TensorIndex(
+            mode_indices=_finalize_generated_mode_indices(
+                parse_format("dd"), result_cpp.storage.index.mode_indices
+            ),
+            tensor_format="dd",
+        ),
+        value=result_cpp.storage.value,
+    )
+
+
 def execute_shadow(
     cin_stmt: IndexStmt,
     result_shape: Sequence[int],
@@ -419,9 +646,11 @@ def execute_shadow(
     """Execute both pipelines on ``args`` for curated differential tests.
 
     Returns ``(loopir_result, legacy_result, source_comparison)``.  The
-    legacy execution uses the untouched low-level entry, whose result
-    wrapper supports dense outputs only.  Sparse-output comparisons must
-    use source parity plus direct LoopIR/PyTorch/oracle execution instead.
+    legacy execution uses the untouched low-level entry (or, when the
+    options request a schedule, the legacy scheduled route through
+    ``Scheduler.apply_schedule``); both wrappers support dense rank-2
+    outputs only.  Sparse-output comparisons must use source parity plus
+    direct LoopIR/PyTorch/oracle execution instead.
     """
 
     from ...ops import (
@@ -442,14 +671,18 @@ def execute_shadow(
             "low-level result wrapper does not preserve sparse indices"
         )
     _validate_runtime_formats(normalized, args)
-    alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
-    args = _relayout_mode_order_args(
-        args,
-        alignment_plan,
-        options,
-        None,
-    )
-    _apply_mode_order_alignment(normalized, alignment_plan)
+    if options.requested_schedule is None:
+        alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
+        args = _relayout_mode_order_args(
+            args,
+            alignment_plan,
+            options,
+            None,
+        )
+        _apply_mode_order_alignment(normalized, alignment_plan)
+    # On the scheduled route each executed pipeline owns its alignment: the
+    # LoopIR entry aligns to the plan's logical order, and the legacy
+    # scheduled entry consumes the runtime layouts natively.
 
     comparison = compare_generated_sources(
         normalized,
@@ -463,10 +696,18 @@ def execute_shadow(
         *args,
         compile_options=options,
     )
-    legacy_result = lower_and_exec_cin(
-        copy.deepcopy(normalized),
-        result_shape,
-        *args,
-        _compile_options=options,
-    )
+    if options.requested_schedule is not None:
+        legacy_result = _execute_legacy_scheduled(
+            copy.deepcopy(normalized),
+            result_shape,
+            *args,
+            compile_options=options,
+        )
+    else:
+        legacy_result = lower_and_exec_cin(
+            copy.deepcopy(normalized),
+            result_shape,
+            *args,
+            _compile_options=options,
+        )
     return loopir_result, legacy_result, comparison

@@ -23,9 +23,11 @@ production target components the legacy path uses:
 
 Because the raw loop-nest emission mirrors the legacy lowering
 statement-for-statement — dense position chains, sparse position loops,
-two-cursor coordinate merges with UNION tail loops, and ordered CSR
-assembly counters — the generated C++ for the migrated families is
-byte-identical to the legacy pipeline's output; the differential suites
+two-cursor coordinate merges with UNION tail loops, ordered CSR assembly
+counters, and the affine-split origin/point loops (width constants, the
+stepping origin loop, the reconstructed logical coordinate, and the
+ragged-tail overshoot break) — the generated C++ for the migrated families
+is byte-identical to the legacy pipeline's output; the differential suites
 lock that equality.  LoopIR itself contains none of these target details —
 this module is where target spelling begins.
 
@@ -37,8 +39,9 @@ Fail-closed surface: this target lowering accepts the migrated program
 shapes only.  Level-0 (root-parent) cursors, compressed-parent descent
 (DCSR), merges of more than two cursors, non-innermost merges, merged
 reductions, appends outside a dense-row/merged-column nest, nonzero merge
-defaults, and any statement shape outside the single-nest single-leaf form
-fail with :class:`LoopIRTargetError` and a stable code rather than being
+defaults, affine splits over merged iteration or ordered sparse assembly,
+and any statement shape outside the single-nest single-leaf form fail with
+:class:`LoopIRTargetError` and a stable code rather than being
 approximated.
 """
 
@@ -101,6 +104,8 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TileInnerFor,
+    TileOuterFor,
 )
 from .verifier import verify_program
 
@@ -140,6 +145,8 @@ _TARGET_RESERVED_NAMES = frozenset(
 _DENSE = "dense"
 _SPARSE = "sparse"
 _MERGED = "merged"
+_TILE_OUTER = "tile_outer"
+_TILE_INNER = "tile_inner"
 
 
 @dataclass(frozen=True)
@@ -212,6 +219,7 @@ class _TargetLowering:
         self.level_drivers = self._compute_level_drivers()
         self._validate_access_orders()
         self._reserve_merge_names()
+        self._reserve_tile_names()
 
     # -- boundary validation -------------------------------------------------
 
@@ -323,6 +331,17 @@ class _TargetLowering:
                     f"{dimension_name}_{tensor_name}",
                     f"merged coordinate of input tensor {tensor_name!r}",
                 )
+
+    def _reserve_tile_names(self) -> None:
+        """Reserve the derived loop and width names affine splits generate."""
+
+        for loop in self.loops:
+            if loop.kind is not _TILE_OUTER:
+                continue
+            name = self.dimension_names[loop.dimension]
+            owner = f"affine split of dimension {name!r}"
+            for generated in (f"{name}_out", f"{name}_in", f"kTile_{name}"):
+                self._reserve_generated_name(generated, owner)
 
     def _validate_layouts(self) -> None:
         if len(self.program.outputs) != 1:
@@ -449,6 +468,26 @@ class _TargetLowering:
                 loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
                 body = only.body
                 continue
+            if type(only) is TileOuterFor:
+                # The origin loop binds no readable coordinate, so its
+                # position key is a sentinel that can never collide with a
+                # logical IndexId; the logical index stays reachable through
+                # the node for bound resolution and the parallel gate.
+                loops.append(
+                    _Loop(
+                        _TILE_OUTER,
+                        ("tile_outer", only.tile),
+                        only.dimension,
+                        only,
+                        (),
+                    )
+                )
+                body = only.body
+                continue
+            if type(only) is TileInnerFor:
+                loops.append(_Loop(_TILE_INNER, only.index, only.dimension, only, ()))
+                body = only.body
+                continue
             if type(only) is SparseFor:
                 cursor = only.cursor
                 loops.append(
@@ -489,11 +528,30 @@ class _TargetLowering:
             )
 
     def _validate_loop_kinds(self, loops: List[_Loop], leaf: Stmt) -> None:
-        if loops[0].kind is not _DENSE:
+        if loops[0].kind not in (_DENSE, _TILE_OUTER):
             _fail(
                 "unsupported_program_shape",
-                "the migrated families require a dense outermost loop",
+                "the migrated families require a dense or tile-origin "
+                "outermost loop",
             )
+        tile_positions = [
+            position
+            for position, loop in enumerate(loops)
+            if loop.kind in (_TILE_OUTER, _TILE_INNER)
+        ]
+        if tile_positions:
+            if any(loop.kind is _MERGED for loop in loops):
+                _fail(
+                    "unsupported_program_shape",
+                    "affine splits over merged iteration are outside the "
+                    "migrated schedule families",
+                )
+            if type(leaf) is AppendEntry:
+                _fail(
+                    "unsupported_program_shape",
+                    "affine splits over ordered sparse assembly are outside "
+                    "the migrated schedule families",
+                )
         merged_positions = [
             position for position, loop in enumerate(loops) if loop.kind is _MERGED
         ]
@@ -772,27 +830,53 @@ class _TargetLowering:
             role=llir.TensorAccessRole.RESULT_WRITE,
         )
 
-    def _loop_bound_var(self, loop: _Loop) -> llir.Var:
+    def _loop_logical_index(self, loop: _Loop) -> object:
+        if loop.kind in (_TILE_OUTER, _TILE_INNER):
+            return loop.node.index
+        return loop.index
+
+    def _input_bound_var(self, loop: _Loop) -> Optional[llir.Var]:
+        lookup = self._loop_logical_index(loop)
         for symbol in self.program.inputs:
             decl = self.decls[symbol]
             per_tensor = self.level_drivers.get(symbol, {})
             for level in range(len(decl.levels)):
                 if (
-                    per_tensor.get(level) == loop.index
+                    per_tensor.get(level) == lookup
                     and decl.levels[level].kind is LevelKind.DENSE
                 ):
                     return llir.Var(
                         name=f"{decl.name}{level}_size", type=llir.DataType.INT64
                     )
+        return None
+
+    def _loop_bound_var(self, loop: _Loop) -> llir.Var:
+        bound = self._input_bound_var(loop)
+        if bound is not None:
+            return bound
         leaf_indices = self._leaf_indices()
+        lookup = self._loop_logical_index(loop)
         for level, index in enumerate(leaf_indices):
-            if self._index_of(index, "store index") == loop.index:
+            if self._index_of(index, "store index") == lookup:
                 return llir.Var(
                     name=f"{self.result_decl.name}{level}_size",
                     type=llir.DataType.INT64,
                 )
         _fail("unsupported_program_shape", "a loop variable is never used")
         raise AssertionError("unreachable")
+
+    def _tile_bound_var(self, loop: _Loop) -> llir.Var:
+        """The dimension-size spelling that bounds one affine split.
+
+        The legacy lattice resolves this bound from the first dense access
+        containing the split variable — inputs first, and the result access
+        for a broadcast coordinate the result alone drives.  That is exactly
+        the shared loop-bound policy, so the origin loop's bound, the point
+        loop's overshoot guard, and the derived parallel trip count all use
+        one spelling.
+        """
+
+        return self._loop_bound_var(loop)
 
     def _position_init(
         self,
@@ -1429,6 +1513,10 @@ class _TargetLowering:
             child = self.loops[position + 1]
             if child.kind is _DENSE:
                 return [llir.BlankLine(), self._lower_dense(position + 1)]
+            if child.kind is _TILE_OUTER:
+                return [llir.BlankLine(), self._lower_tile_outer(position + 1)]
+            if child.kind is _TILE_INNER:
+                return [llir.BlankLine(), self._lower_tile_inner(position + 1)]
             if child.kind is _SPARSE:
                 return self._lower_sparse(position + 1)
             return self._lower_merged(position + 1)
@@ -1480,12 +1568,128 @@ class _TargetLowering:
         for_loop.scorch_index_var = name
         return for_loop
 
+    def _lower_tile_outer(self, position: int) -> llir.ForLoop:
+        """The origin loop of one affine split, exactly as legacy emits it.
+
+        ``for (int64_t k_out = 0; k_out < <bound>; k_out += kTile_k)`` —
+        the origin steps by the width constant, the body carries no
+        coordinate resolves (the origin is unreadable), and the width
+        constant is declared once in the function preamble.
+        """
+
+        loop = self.loops[position]
+        name = self.dimension_names[loop.dimension]
+        bound = self._tile_bound_var(loop)
+        loop_var = llir.Var(name=f"{name}_out", type=llir.DataType.INT64)
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(var=loop_var, value=llir.Literal(0)),
+            cond=llir.BinOp(op="<", left=loop_var, right=bound),
+            update=llir.Assign(
+                var=loop_var,
+                value=llir.Var(name=f"kTile_{name}", type=llir.DataType.INT),
+                op=llir.AssignOp.ADD_ASSIGN,
+            ),
+            body=self._loop_children(position),
+        )
+        for_loop.scorch_index_var = f"{name}_out"
+        return for_loop
+
+    def _lower_tile_inner(self, position: int) -> llir.ForLoop:
+        """The point loop of one affine split, exactly as legacy emits it.
+
+        The body first reconstructs the logical coordinate
+        (``int64_t k = k_out + k_in;``), breaks past the ragged tail
+        (``if (k >= <bound>) break;``), then continues with the ordinary
+        dense-body emission for the logical loop.
+        """
+
+        loop = self.loops[position]
+        name = self.dimension_names[loop.dimension]
+        bound = self._tile_bound_var(loop)
+        input_resolves = self._input_resolves_at(loop)
+        result_resolves = self._result_resolves_at(loop)
+        loop_drives_an_input = any(
+            per_tensor.get(level) == loop.index
+            for symbol, per_tensor in self.level_drivers.items()
+            if symbol != self.result_symbol
+            for level in per_tensor
+        )
+        body: List[llir.Stmt] = [
+            llir.Comment("Resolve tiled index var"),
+            llir.VarInit(
+                var=llir.Var(name=name, type=llir.DataType.INT64),
+                value=llir.Add(
+                    left=llir.Var(name=f"{name}_out", type=llir.DataType.INT64),
+                    right=llir.Var(name=f"{name}_in", type=llir.DataType.INT64),
+                ),
+            ),
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op=">=",
+                    left=llir.Var(name=name, type=llir.DataType.INT),
+                    right=llir.Var(name=bound.name, type=llir.DataType.INT),
+                ),
+                then_body=[llir.Break()],
+            ),
+            llir.Comment("Resolve dense coordinates"),
+        ]
+        body.extend(input_resolves)
+        if not loop_drives_an_input:
+            body.extend(result_resolves)
+        elif result_resolves:
+            body.append(llir.Comment("Resolve index into dense level of values array"))
+            body.extend(result_resolves)
+        body.extend(self._loop_children(position))
+        loop_var = llir.Var(name=f"{name}_in", type=llir.DataType.INT64)
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(var=loop_var, value=llir.Literal(0)),
+            cond=llir.BinOp(
+                op="<",
+                left=loop_var,
+                right=llir.Var(name=f"kTile_{name}", type=llir.DataType.INT),
+            ),
+            update=llir.Increment(var=loop_var),
+            body=body,
+            unroll=loop.node.unroll,
+        )
+        for_loop.scorch_index_var = f"{name}_in"
+        return for_loop
+
+    def tile_size_inits(self) -> List[llir.Stmt]:
+        """Width-constant declarations, one per split, in nest order."""
+
+        tile_loops = [loop for loop in self.loops if loop.kind is _TILE_OUTER]
+        if not tile_loops:
+            return []
+        stmts: List[llir.Stmt] = [
+            llir.BlankLine(),
+            llir.Comment("Initialize tile sizes"),
+        ]
+        for loop in tile_loops:
+            name = self.dimension_names[loop.dimension]
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"kTile_{name}",
+                        type=llir.DataType.CONSTEXPR_INT,
+                    ),
+                    value=llir.Literal(loop.node.width),
+                )
+            )
+        return stmts
+
     def raw_loop_statements(self) -> List[llir.Stmt]:
         """The raw pre-pass loop-nest statements, legacy shape included."""
 
-        stmts: List[llir.Stmt] = [llir.BlankLine(), self._lower_dense(0)]
+        first = self.loops[0]
+        outer_loop = (
+            self._lower_tile_outer(0)
+            if first.kind is _TILE_OUTER
+            else self._lower_dense(0)
+        )
+        stmts: List[llir.Stmt] = [llir.BlankLine(), outer_loop]
         leaf_indices = self._leaf_indices()
-        outer_index = self.loops[0].index
+        outer_index = self._loop_logical_index(first)
         outer_in_result = any(
             self._index_of(index, "store index") == outer_index
             for index in leaf_indices
@@ -1594,6 +1798,7 @@ def _lower_loopir_to_llir_owned(
     size_stmts = lowering.result_size_inits()
     prologue_stmts = kernel_abi.emit_input_prologue()
     value_init_stmts = assembler.emit_value_array_init()
+    tile_size_stmts = lowering.tile_size_inits()
     level_indices_stmts = assembler.emit_level_indices_init()
     if level_indices_stmts:
         level_indices_stmts = [
@@ -1623,6 +1828,7 @@ def _lower_loopir_to_llir_owned(
             *level_indices_stmts,
             llir.Comment("Initialize result value array"),
             *value_init_stmts,
+            *tile_size_stmts,
             llir.BlankLine(),
             *transformed_body.statements,
             *final_assembly_stmts,
