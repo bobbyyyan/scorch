@@ -77,22 +77,37 @@ class ShadowSourceComparison:
 
 def _resolve_options(
     compile_options: Optional[CompileOptions],
+    compilation_context: Optional[CompilationContext] = None,
 ) -> CompileOptions:
+    if (
+        compilation_context is not None
+        and type(compilation_context) is not CompilationContext
+    ):
+        raise TypeError("compilation_context must be a CompilationContext")
     if compile_options is None:
-        return CompileOptions.from_environment()
-    if type(compile_options) is not CompileOptions:
+        options = (
+            compilation_context.compile_options
+            if compilation_context is not None
+            else CompileOptions.from_environment()
+        )
+    elif type(compile_options) is not CompileOptions:
         raise TypeError("compile_options must be a CompileOptions snapshot")
-    if compile_options.requested_schedule is not None:
+    else:
+        options = compile_options
+    if compilation_context is not None:
+        compilation_context.require_compile_options(options)
+    if options.requested_schedule is not None:
         raise CompileSpecError(
             "the LoopIR dense pipeline does not consume requested schedules"
         )
-    return compile_options
+    return options
 
 
 def _bind_runtime_metadata(
     cin_stmt: IndexStmt,
     input_bindings: Sequence[Tuple[Tuple[int, ...], torch.dtype]],
     result_shape: Tuple[int, ...],
+    input_formats: Optional[Sequence[object]] = None,
 ) -> None:
     """Bind shapes/dtypes exactly like the legacy public entry does."""
 
@@ -102,14 +117,109 @@ def _bind_runtime_metadata(
             f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got "
             f"{len(input_bindings)}"
         )
-    for tensor_var, (shape, dtype) in zip(rhs_tensor_vars, input_bindings):
+    if input_formats is not None and len(input_formats) != len(input_bindings):
+        raise CompileSpecError(
+            "runtime tensor formats must match the input binding count"
+        )
+    for position, (tensor_var, (shape, dtype)) in enumerate(
+        zip(rhs_tensor_vars, input_bindings)
+    ):
+        if input_formats is not None and tensor_var.format != input_formats[position]:
+            raise CompileSpecError(
+                f"CIN tensor {tensor_var.name!r} expects format "
+                f"{tensor_var.format}, got {input_formats[position]}"
+            )
         tensor_var.shape = tuple(shape)
         tensor_var.dtype = dtype
-        tensor_var.mode_order = list(range(len(shape)))
+        if tensor_var.mode_order is None:
+            tensor_var.mode_order = list(range(len(shape)))
     output_dtype = input_bindings[0][1] if input_bindings else torch.float32
     for tensor_var in cin_stmt.get_result_tensor_vars():
         tensor_var.shape = tuple(result_shape)
         tensor_var.dtype = output_dtype
+
+
+def _validate_runtime_formats(cin_stmt: IndexStmt, args: Sequence[object]) -> None:
+    """Reject storage-format mismatches before any runtime relayout work."""
+
+    rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+    if len(rhs_tensor_vars) != len(args):
+        raise CompileSpecError(
+            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got {len(args)}"
+        )
+    for tensor_var, arg in zip(rhs_tensor_vars, args):
+        actual_format = getattr(arg, "format", None)
+        if tensor_var.format != actual_format:
+            raise CompileSpecError(
+                f"CIN tensor {tensor_var.name!r} expects format "
+                f"{tensor_var.format}, got {actual_format}"
+            )
+
+
+def _compile_normalized_cin_via_loopir(
+    normalized: IndexStmt,
+    result_shape: Sequence[int],
+    input_bindings: Sequence[Tuple[Tuple[int, ...], torch.dtype]],
+    *,
+    options: CompileOptions,
+    context: CompilationContext,
+    input_formats: Optional[Sequence[object]] = None,
+) -> LoopIRCompiledKernel:
+    """Lower one owned normalized CIN program through the LoopIR path."""
+
+    binding_token = context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=options,
+    )
+    try:
+        _bind_runtime_metadata(
+            normalized,
+            input_bindings,
+            tuple(result_shape),
+            input_formats,
+        )
+    except Exception:
+        context.fail_stage(binding_token)
+        raise
+    context.complete_stage(binding_token)
+
+    lowering_token = context.begin_stage(
+        CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+        compile_options=options,
+    )
+    try:
+        lowering = lower_normalized_cin_to_loopir(normalized)
+        program_text = print_program(lowering.program)
+        program_dump = canonical_program_dump(lowering.program)
+    except Exception:
+        context.fail_stage(lowering_token)
+        raise
+    context.complete_stage(lowering_token)
+
+    input_shapes: Dict[SymbolId, Tuple[int, ...]] = {}
+    rhs_tensor_vars = normalized.get_rhs_tensor_vars()
+    for tensor_var in rhs_tensor_vars:
+        assert tensor_var.shape is not None
+        input_shapes[tensor_var.symbol_id] = tuple(tensor_var.shape)
+
+    llir_function = lower_loopir_to_llir(
+        lowering.program,
+        input_shapes=input_shapes,
+        result_shape=tuple(result_shape),
+        compile_options=options,
+        compilation_context=context,
+    )
+
+    from ...ops import _lower_generated_llir
+
+    cpp_source = _lower_generated_llir(llir_function, options, context)
+    return LoopIRCompiledKernel(
+        lowering=lowering,
+        program_text=program_text,
+        program_dump=program_dump,
+        llir_function=llir_function,
+        cpp_source=cpp_source,
+    )
 
 
 def compile_cin_via_loopir(
@@ -122,55 +232,21 @@ def compile_cin_via_loopir(
 ) -> LoopIRCompiledKernel:
     """Lower one dense-family CIN program to C++ through the LoopIR path."""
 
-    options = _resolve_options(compile_options)
+    options = _resolve_options(compile_options, compilation_context)
     context = compilation_context
     if context is None:
         context = CompilationContext(options)
-    normalized = normalize_cin(cin_stmt, compile_options=options)
-    _bind_runtime_metadata(normalized, input_bindings, tuple(result_shape))
-
-    lowering_token = context.begin_stage(
-        CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+    normalized = normalize_cin(
+        cin_stmt,
         compile_options=options,
+        compilation_context=context,
     )
-    try:
-        lowering = lower_normalized_cin_to_loopir(normalized)
-    except Exception:
-        context.fail_stage(lowering_token)
-        raise
-    context.complete_stage(lowering_token)
-
-    input_shapes: Dict[SymbolId, Tuple[int, ...]] = {}
-    rhs_tensor_vars = normalized.get_rhs_tensor_vars()
-    for tensor_var in rhs_tensor_vars:
-        assert tensor_var.shape is not None
-        input_shapes[tensor_var.symbol_id] = tuple(tensor_var.shape)
-
-    target_token = context.begin_stage(
-        CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
-        compile_options=options,
-    )
-    try:
-        llir_function = lower_loopir_to_llir(
-            lowering.program,
-            input_shapes=input_shapes,
-            result_shape=tuple(result_shape),
-            compile_options=options,
-        )
-    except Exception:
-        context.fail_stage(target_token)
-        raise
-    context.complete_stage(target_token)
-
-    from ...ops import _lower_generated_llir
-
-    cpp_source = _lower_generated_llir(llir_function, options, context)
-    return LoopIRCompiledKernel(
-        lowering=lowering,
-        program_text=print_program(lowering.program),
-        program_dump=canonical_program_dump(lowering.program),
-        llir_function=llir_function,
-        cpp_source=cpp_source,
+    return _compile_normalized_cin_via_loopir(
+        normalized,
+        result_shape,
+        input_bindings,
+        options=options,
+        context=context,
     )
 
 
@@ -208,17 +284,18 @@ def compare_generated_sources(
     semantic CIN, so neither can observe the other's working state.
     """
 
+    options = _resolve_options(compile_options)
     loopir_kernel = compile_cin_via_loopir(
         copy.deepcopy(cin_stmt),
         result_shape,
         input_bindings,
-        compile_options=compile_options,
+        compile_options=options,
     )
     legacy_cpp = legacy_generated_cpp(
         copy.deepcopy(cin_stmt),
         result_shape,
         input_bindings,
-        compile_options=compile_options,
+        compile_options=options,
     )
     return ShadowSourceComparison(
         loopir_cpp=loopir_kernel.cpp_source,
@@ -244,22 +321,49 @@ def execute_cin_via_loopir(
     from ...stensor import STensor
     from ...storage import TensorIndex
     from ...ops import (
+        _apply_mode_order_alignment,
         _finalize_generated_mode_indices,
         _load_validated_prepared_kernel,
+        _plan_mode_orders_to_loop_order,
         _prepare_generated_kernel_build,
+        _relayout_mode_order_args,
     )
 
-    options = _resolve_options(compile_options)
+    options = _resolve_options(compile_options, _compilation_context)
     context = _compilation_context
     if context is None:
         context = CompilationContext(options)
-    input_bindings = tuple((tuple(arg.shape), arg.dtype) for arg in args)
-    kernel = compile_cin_via_loopir(
+    normalized = normalize_cin(
         cin_stmt,
-        result_shape,
-        input_bindings,
         compile_options=options,
         compilation_context=context,
+    )
+    planning_token = context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=options,
+    )
+    try:
+        _validate_runtime_formats(normalized, args)
+        alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
+    except Exception:
+        context.fail_stage(planning_token)
+        raise
+    context.complete_stage(planning_token)
+    args = _relayout_mode_order_args(
+        args,
+        alignment_plan,
+        options,
+        context,
+    )
+    _apply_mode_order_alignment(normalized, alignment_plan)
+    input_bindings = tuple((tuple(arg.shape), arg.dtype) for arg in args)
+    kernel = _compile_normalized_cin_via_loopir(
+        normalized,
+        result_shape,
+        input_bindings,
+        options=options,
+        context=context,
+        input_formats=tuple(arg.format for arg in args),
     )
     header_cpp_code = options.build.preamble_source
     prepared_build = _prepare_generated_kernel_build(
@@ -310,23 +414,41 @@ def execute_shadow(
     legacy execution uses the untouched public entry.
     """
 
-    from ...ops import lower_and_exec_cin
+    from ...ops import (
+        _apply_mode_order_alignment,
+        _plan_mode_orders_to_loop_order,
+        _relayout_mode_order_args,
+        lower_and_exec_cin,
+    )
+
+    options = _resolve_options(compile_options)
+    normalized = normalize_cin(cin_stmt, compile_options=options)
+    _validate_runtime_formats(normalized, args)
+    alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
+    args = _relayout_mode_order_args(
+        args,
+        alignment_plan,
+        options,
+        None,
+    )
+    _apply_mode_order_alignment(normalized, alignment_plan)
 
     comparison = compare_generated_sources(
-        cin_stmt,
+        normalized,
         result_shape,
         tuple((tuple(arg.shape), arg.dtype) for arg in args),
-        compile_options=compile_options,
+        compile_options=options,
     )
     loopir_result, _ = execute_cin_via_loopir(
-        copy.deepcopy(cin_stmt),
+        copy.deepcopy(normalized),
         result_shape,
         *args,
-        compile_options=compile_options,
+        compile_options=options,
     )
     legacy_result = lower_and_exec_cin(
-        copy.deepcopy(cin_stmt),
+        copy.deepcopy(normalized),
         result_shape,
         *args,
+        _compile_options=options,
     )
     return loopir_result, legacy_result, comparison

@@ -12,13 +12,13 @@ programs may ask the builder for fresh ones.
 
 The builder performs no semantic validation — it only allocates identities
 and owns tuple conversion.  ``verifier.verify_program`` remains the single
-fail-closed authority; ``finish`` deliberately does not call it so
+fail-closed authority; ``program`` deliberately does not call it so
 adversarial tests can build malformed programs through the same API surface.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
+from typing import Sequence, Tuple
 
 from ..identity import IndexId, SymbolId, new_index_id, new_symbol_id
 from .nodes import (
@@ -75,12 +75,16 @@ class LoopIRBuilder:
 
         return new_index_id()
 
-    def dimension(
-        self, name: str, dimension: Optional[DimensionId] = None
-    ) -> DimensionDecl:
-        if dimension is None:
-            dimension = self.new_dimension_id()
-        return DimensionDecl(self._node_id(), dimension, name)
+    def dimension(self, name: str) -> DimensionDecl:
+        """Declare a dimension with an identity owned by this builder.
+
+        Callers that need malformed or externally identified declarations can
+        construct :class:`DimensionDecl` directly. Keeping that adversarial
+        surface out of the supported builder prevents an explicit identity
+        from being reissued later by the automatic allocator.
+        """
+
+        return DimensionDecl(self._node_id(), self.new_dimension_id(), name)
 
     def level(self, kind: LevelKind, mode: int) -> LevelDecl:
         return LevelDecl(self._node_id(), kind, mode)

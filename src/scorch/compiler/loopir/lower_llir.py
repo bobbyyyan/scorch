@@ -30,6 +30,7 @@ dimension's extent across all of them, failing closed on any disagreement.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, NoReturn, Optional, Tuple
 
@@ -39,14 +40,17 @@ from ...format import LevelType
 from ..identity import SymbolId, new_access_id
 from .. import llir
 from ..compile_options import CompileOptions
+from ..compilation_context import CompilationContext, CompilerStageId
 from ..dense_pointer_hoist_pass import DensePointerHoistContext
 from ..llir_pass_manager import (
     DensePointerHoistPassSpec,
+    LLIRPassPartialFailure,
     LLIRPassManager,
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
 )
 from ..parallel_marking_pass import (
+    _CPP_KEYWORDS,
     EMPTY_PARALLEL_WORKSPACE_CLUSTER,
     mark_first_for_loop_parallel,
 )
@@ -84,6 +88,21 @@ _BINARY_TO_CXX: Dict[BinaryOp, str] = {
     BinaryOp.SUB: "-",
     BinaryOp.MUL: "*",
 }
+
+_CPP_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_TARGET_RESERVED_NAMES = frozenset(
+    {
+        "Tensor",
+        "evaluate",
+        "result_shape",
+        "scorch_chunk",
+        "scorch_native",
+        "scorch_nthreads",
+        "scorch_zero_dense",
+        "std",
+        "torch",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -143,32 +162,87 @@ class _TargetLowering:
     # -- boundary validation -------------------------------------------------
 
     def _validate_display_names(self) -> None:
-        seen: Dict[str, str] = {}
+        display_names: Dict[str, str] = {}
         for dimension_decl in self.program.dimensions:
-            if not dimension_decl.name.isidentifier():
+            if (
+                _CPP_IDENTIFIER.fullmatch(dimension_decl.name) is None
+                or dimension_decl.name in _CPP_KEYWORDS
+            ):
                 _fail(
                     "invalid_display_name",
-                    f"dimension name {dimension_decl.name!r} is not a " "C identifier",
+                    f"dimension name {dimension_decl.name!r} is not a safe "
+                    "ASCII C++ identifier",
                 )
-            if dimension_decl.name in seen:
+            if dimension_decl.name in display_names:
                 _fail(
                     "duplicate_display_name",
                     f"display name {dimension_decl.name!r} is used more " "than once",
                 )
-            seen[dimension_decl.name] = "dimension"
+            display_names[dimension_decl.name] = "dimension"
             self.dimension_names[dimension_decl.dimension] = dimension_decl.name
         for decl in self.program.tensors:
-            if not decl.name.isidentifier():
+            if (
+                _CPP_IDENTIFIER.fullmatch(decl.name) is None
+                or decl.name in _CPP_KEYWORDS
+            ):
                 _fail(
                     "invalid_display_name",
-                    f"tensor name {decl.name!r} is not a C identifier",
+                    f"tensor name {decl.name!r} is not a safe ASCII C++ identifier",
                 )
-            if decl.name in seen:
+            if decl.name in display_names:
                 _fail(
                     "duplicate_display_name",
                     f"display name {decl.name!r} is used more than once",
                 )
-            seen[decl.name] = "tensor"
+            display_names[decl.name] = "tensor"
+
+        generated: Dict[str, str] = {
+            name: "the target runtime" for name in _TARGET_RESERVED_NAMES
+        }
+
+        def reserve(name: str, owner: str) -> None:
+            known = generated.get(name)
+            if known is not None:
+                _fail(
+                    "generated_name_collision",
+                    f"generated C++ identifier {name!r} for {owner} conflicts "
+                    f"with {known}",
+                )
+            generated[name] = owner
+
+        for dimension_decl in self.program.dimensions:
+            reserve(
+                dimension_decl.name,
+                f"dimension {dimension_decl.name!r}",
+            )
+        for symbol in self.program.inputs:
+            decl = self.decls[symbol]
+            owner = f"input tensor {decl.name!r}"
+            for name in (
+                decl.name,
+                f"{decl.name}_shape",
+                f"{decl.name}_mode_indices",
+                f"{decl.name}_values",
+                f"{decl.name}_val",
+                f"_{decl.name}_val_ptr",
+            ):
+                reserve(name, owner)
+            for level in range(len(decl.levels)):
+                reserve(f"{decl.name}{level}_size", owner)
+                reserve(f"p{decl.name}{level}", owner)
+
+        output = self.result_decl
+        output_owner = f"output tensor {output.name!r}"
+        for name in (
+            output.name,
+            f"{output.name}_capacity",
+            f"{output.name}_values",
+            f"{output.name}_values_torch",
+        ):
+            reserve(name, output_owner)
+        for level in range(len(output.levels)):
+            reserve(f"{output.name}{level}_size", output_owner)
+            reserve(f"p{output.name}{level}", output_owner)
 
     def _validate_layouts(self) -> None:
         if len(self.program.outputs) != 1:
@@ -209,7 +283,15 @@ class _TargetLowering:
         shapes: Dict[SymbolId, Tuple[int, ...]] = {}
         for symbol in self.program.inputs:
             decl = self.decls[symbol]
-            shape = input_shapes[symbol]
+            try:
+                shape = input_shapes[symbol]
+            except Exception as error:
+                raise LoopIRTargetError(
+                    LoopIRTargetDefect(
+                        "invalid_shape_binding",
+                        "input shapes could not be snapshotted",
+                    )
+                ) from error
             if (
                 type(shape) is not tuple
                 or len(shape) != len(decl.levels)
@@ -312,6 +394,16 @@ class _TargetLowering:
             )
 
         walk(self.leaf.value)  # type: ignore[attr-defined]
+        seen: set[SymbolId] = set()
+        for load in loads:
+            if load.tensor in seen:
+                _fail(
+                    "unsupported_repeated_operand",
+                    f"input tensor {self.decls[load.tensor].name!r} is loaded "
+                    "more than once; the dense target owns one physical "
+                    "position chain per input",
+                )
+            seen.add(load.tensor)
         return loads
 
     def _access_vars(self, tensor: SymbolId, indices: Tuple[Expr, ...]) -> List[object]:
@@ -592,25 +684,17 @@ class _TargetLowering:
         )
 
 
-def lower_loopir_to_llir(
+def _lower_loopir_to_llir_owned(
     program: LoopProgram,
     *,
     input_shapes: Mapping[SymbolId, Tuple[int, ...]],
     result_shape: Tuple[int, ...],
-    compile_options: Optional[CompileOptions] = None,
+    compile_options: CompileOptions,
+    compilation_context: Optional[CompilationContext],
 ) -> llir.Function:
-    """Lower one verified dense LoopIR program to a complete LLIR function.
-
-    Runtime shapes are bound and cross-checked here; the returned function is
-    the same structured-LLIR artifact the legacy path produces, ready for the
-    exhaustive C++ emitter.
-    """
+    """Execute target lowering under an already-owned timing boundary."""
 
     verify_program(program)
-    if compile_options is None:
-        compile_options = CompileOptions.from_environment()
-    elif type(compile_options) is not CompileOptions:
-        raise TypeError("compile_options must be a CompileOptions snapshot")
 
     lowering = _TargetLowering(program, input_shapes, result_shape)
     raw_statements = lowering.raw_loop_statements()
@@ -650,12 +734,91 @@ def lower_loopir_to_llir(
         return LLIRRewriteArtifact(body_stmts)
 
     manager = LLIRPassManager.from_compile_options(compile_options)
-    pipeline_result = manager.run_production_pipeline(
-        LLIRStatementListArtifact(raw_statements),
-        compressed_where_pass_spec=None,
-        dense_pointer_pass_spec=DensePointerHoistPassSpec(
-            DensePointerHoistContext(value_array_ctypes=lowering.value_array_ctypes())
-        ),
-        body_assembler=assemble_body,
-    )
+    try:
+        pipeline_result = manager.run_production_pipeline(
+            LLIRStatementListArtifact(raw_statements),
+            compressed_where_pass_spec=None,
+            dense_pointer_pass_spec=DensePointerHoistPassSpec(
+                DensePointerHoistContext(
+                    value_array_ctypes=lowering.value_array_ctypes()
+                )
+            ),
+            body_assembler=assemble_body,
+        )
+    except LLIRPassPartialFailure as failure:
+        if compilation_context is not None:
+            compilation_context.record_llir_pass_runs(
+                failure.completed_run_records,
+                compile_options=compile_options,
+                stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
+            )
+        raise failure.failure from None
+    if compilation_context is not None:
+        compilation_context.record_llir_pass_runs(
+            pipeline_result.run_records,
+            compile_options=compile_options,
+            stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
+        )
     return kernel_abi.assemble_function(pipeline_result.artifact.value)
+
+
+def lower_loopir_to_llir(
+    program: LoopProgram,
+    *,
+    input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+    result_shape: Tuple[int, ...],
+    compile_options: Optional[CompileOptions] = None,
+    compilation_context: Optional[CompilationContext] = None,
+) -> llir.Function:
+    """Lower one verified dense LoopIR program to a complete LLIR function.
+
+    Runtime shapes are bound and cross-checked here; the returned function is
+    the same structured-LLIR artifact the legacy path produces, ready for the
+    exhaustive C++ emitter.  When a compilation context is supplied, this
+    boundary owns the complete ``LOOPIR_TO_LLIR_LOWERING`` stage and its
+    managed-pass records; callers do not pre-open that stage.
+    """
+
+    if (
+        compilation_context is not None
+        and type(compilation_context) is not CompilationContext
+    ):
+        raise TypeError("compilation_context must be a CompilationContext")
+    if compile_options is None:
+        compile_options = (
+            compilation_context.compile_options
+            if compilation_context is not None
+            else CompileOptions.from_environment()
+        )
+    elif type(compile_options) is not CompileOptions:
+        raise TypeError("compile_options must be a CompileOptions snapshot")
+    if compilation_context is None:
+        return _lower_loopir_to_llir_owned(
+            program,
+            input_shapes=input_shapes,
+            result_shape=result_shape,
+            compile_options=compile_options,
+            compilation_context=None,
+        )
+
+    compilation_context.require_compile_options(
+        compile_options,
+        stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
+    )
+    token = compilation_context.begin_stage(
+        CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
+        compile_options=compile_options,
+    )
+    try:
+        lowered = _lower_loopir_to_llir_owned(
+            program,
+            input_shapes=input_shapes,
+            result_shape=result_shape,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
+        )
+    except Exception:
+        compilation_context.fail_stage(token)
+        raise
+    compilation_context.complete_stage(token)
+    return lowered

@@ -59,6 +59,64 @@ class _CanonicalIds:
         return self._indices.setdefault(index, len(self._indices))
 
 
+def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
+    if type(expr) is IndexValue:
+        ids.index(expr.index)
+        return
+    if type(expr) is Load:
+        ids.symbol(expr.tensor)
+        for index in expr.indices:
+            _seed_expr_ids(index, ids)
+        return
+    if type(expr) is BinaryExpr:
+        _seed_expr_ids(expr.lhs, ids)
+        _seed_expr_ids(expr.rhs, ids)
+        return
+    raise TypeError(f"unsupported LoopIR expression {type(expr).__name__}")
+
+
+def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
+    if type(stmt) is Block:
+        for child in stmt.statements:
+            _seed_stmt_ids(child, ids)
+        return
+    if type(stmt) is DenseFor:
+        ids.index(stmt.index)
+        ids.dimension(stmt.dimension)
+        _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is Store:
+        ids.symbol(stmt.tensor)
+        for index in stmt.indices:
+            _seed_expr_ids(index, ids)
+        _seed_expr_ids(stmt.value, ids)
+        return
+    if type(stmt) is StoreReduce:
+        ids.symbol(stmt.tensor)
+        for index in stmt.indices:
+            _seed_expr_ids(index, ids)
+        _seed_expr_ids(stmt.value, ids)
+        return
+    raise TypeError(f"unsupported LoopIR statement {type(stmt).__name__}")
+
+
+def _canonical_ids(program: LoopProgram) -> _CanonicalIds:
+    """Assign labels from semantic roles and body traversal, not registries."""
+
+    ids = _CanonicalIds()
+    for symbol in (*program.inputs, *program.outputs):
+        ids.symbol(symbol)
+    _seed_stmt_ids(program.body, ids)
+    for tensor_decl in sorted(
+        program.tensors, key=lambda item: ids.symbol(item.symbol)
+    ):
+        for dimension in tensor_decl.dimensions:
+            ids.dimension(dimension)
+    for dimension_decl in sorted(program.dimensions, key=lambda item: item.name):
+        ids.dimension(dimension_decl.dimension)
+    return ids
+
+
 def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
     if type(expr) is IndexValue:
         return {"kind": "index", "index": ids.index(expr.index)}
@@ -124,17 +182,17 @@ def canonical_program_dump(program: LoopProgram) -> str:
     """Serialize one verified program canonically, independent of ID history."""
 
     verify_program(program)
-    ids = _CanonicalIds()
-    for dimension_decl in program.dimensions:
-        ids.dimension(dimension_decl.dimension)
-    for tensor_decl in program.tensors:
-        ids.symbol(tensor_decl.symbol)
+    ids = _canonical_ids(program)
+    dimension_decls = sorted(
+        program.dimensions, key=lambda decl: ids.dimension(decl.dimension)
+    )
+    tensor_decls = sorted(program.tensors, key=lambda decl: ids.symbol(decl.symbol))
     payload = {
         "schema": CANONICAL_SCHEMA,
         "dimensions": [
-            {"dimension": ids.dimension(decl.dimension)} for decl in program.dimensions
+            {"dimension": ids.dimension(decl.dimension)} for decl in dimension_decls
         ],
-        "tensors": [_serialize_tensor(decl, ids) for decl in program.tensors],
+        "tensors": [_serialize_tensor(decl, ids) for decl in tensor_decls],
         "inputs": [ids.symbol(symbol) for symbol in program.inputs],
         "outputs": [ids.symbol(symbol) for symbol in program.outputs],
         "body": _serialize_stmt(program.body, ids),
@@ -196,14 +254,16 @@ def print_program(program: LoopProgram) -> str:
     """Render one verified program as a deterministic human-readable dump."""
 
     verify_program(program)
-    ids = _CanonicalIds()
+    ids = _canonical_ids(program)
     lines: List[str] = ["loopir.program {"]
-    for dimension_decl in program.dimensions:
+    for dimension_decl in sorted(
+        program.dimensions, key=lambda decl: ids.dimension(decl.dimension)
+    ):
         lines.append(
             f"  dimension d{ids.dimension(dimension_decl.dimension)} "
             f"{dimension_decl.name!r}"
         )
-    for decl in program.tensors:
+    for decl in sorted(program.tensors, key=lambda item: ids.symbol(item.symbol)):
         levels = ", ".join(f"{level.kind.value}@{level.mode}" for level in decl.levels)
         dimensions = ", ".join(
             f"d{ids.dimension(dimension)}" for dimension in decl.dimensions

@@ -427,27 +427,43 @@ class CompilationContext:
         records: Tuple["LLIRPassRunRecord", ...],
         *,
         compile_options: "CompileOptions",
+        stage_id: CompilerStageId = CompilerStageId.CIN_LOWERING,
     ) -> None:
         """Append existing managed-pass records to compilation-wide ownership."""
 
         from .llir_pass_manager import LLIRPassRunRecord
 
+        if type(stage_id) is not CompilerStageId or stage_id not in (
+            CompilerStageId.CIN_LOWERING,
+            CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
+        ):
+            _raise_context_error(
+                code="invalid_llir_pass_stage",
+                message=(
+                    "managed LLIR pass records require a CIN-to-LLIR or "
+                    "LoopIR-to-LLIR owner"
+                ),
+            )
         self.require_compile_options(
             compile_options,
-            stage_id=CompilerStageId.CIN_LOWERING,
+            stage_id=stage_id,
         )
         if (
             not self._active_stage_tokens
-            or self._active_stage_tokens[-1].stage_id
-            is not CompilerStageId.CIN_LOWERING
+            or self._active_stage_tokens[-1].stage_id is not stage_id
         ):
+            code = (
+                "inactive_cin_lowering"
+                if stage_id is CompilerStageId.CIN_LOWERING
+                else "inactive_loopir_to_llir_lowering"
+            )
             _raise_context_error(
-                code="inactive_cin_lowering",
+                code=code,
                 message=(
                     "managed LLIR pass records may be appended only while this "
-                    "compilation's CIN-lowering stage is current"
+                    f"compilation's {stage_id.value} stage is current"
                 ),
-                stage_id=CompilerStageId.CIN_LOWERING,
+                stage_id=stage_id,
             )
         if type(records) is not tuple or any(
             type(record) is not LLIRPassRunRecord for record in records
@@ -455,7 +471,7 @@ class CompilationContext:
             _raise_context_error(
                 code="invalid_llir_pass_records",
                 message="managed pass observations must be exact immutable records",
-                stage_id=CompilerStageId.CIN_LOWERING,
+                stage_id=stage_id,
             )
         start = len(self._llir_pass_run_records)
         appended = tuple(

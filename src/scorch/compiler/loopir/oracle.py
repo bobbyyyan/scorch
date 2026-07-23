@@ -25,7 +25,7 @@ Everything unexpected fails closed with :class:`LoopIROracleError`.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, cast
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 from ..identity import IndexId, SymbolId
 from .nodes import (
@@ -46,14 +46,30 @@ from .nodes import (
 from .verifier import verify_program
 
 TensorValue = Any
+MAX_ORACLE_RANK = 64
 
 
 class LoopIROracleError(Exception):
     """Program execution hit a state the LoopIR oracle rejects."""
 
 
-def _dense_shape(rank: int, value: object, trail: str) -> Tuple[int, ...]:
-    """Validate a nested-sequence dense binding and return its shape."""
+def _snapshot_dense(value: object, remaining_rank: int) -> object:
+    """Own every sequence container the rank-bounded dense copy may inspect."""
+
+    if remaining_rank == 0 or type(value) not in (list, tuple):
+        return value
+    owned = cast(Sequence[object], value)
+    return [_snapshot_dense(entry, remaining_rank - 1) for entry in owned]
+
+
+def _dense_shape(rank: int, value: object, trail: str) -> Tuple[Optional[int], ...]:
+    """Validate a dense binding and infer every visible prefix extent.
+
+    An empty sequence fixes its own extent at zero but carries no information
+    about deeper modes.  Those suffix extents are resolved later through the
+    program's shared :class:`DimensionId` bindings instead of rejecting a
+    semantically valid zero-extent tensor prematurely.
+    """
 
     shape: List[int] = []
     layer: object = value
@@ -62,12 +78,9 @@ def _dense_shape(rank: int, value: object, trail: str) -> Tuple[int, ...]:
             raise LoopIROracleError(f"{trail} must nest sequences to rank {rank}")
         owned_layer = cast(Sequence[object], layer)
         shape.append(len(owned_layer))
-        if len(shape) < rank and not owned_layer:
-            raise LoopIROracleError(
-                f"{trail} is empty above its innermost mode; its shape "
-                "cannot be inferred"
-            )
-        layer = owned_layer[0] if owned_layer else None
+        if not owned_layer:
+            return tuple([*shape, *([None] * (rank - len(shape)))])
+        layer = owned_layer[0]
     return tuple(shape)
 
 
@@ -133,6 +146,31 @@ class _Oracle:
             raise LoopIROracleError(
                 "input bindings must cover exactly the declared inputs"
             )
+        for decl in program.tensors:
+            rank = len(decl.levels)
+            if rank > MAX_ORACLE_RANK:
+                raise LoopIROracleError(
+                    f"tensor {decl.name!r} rank {rank} exceeds the oracle "
+                    f"limit {MAX_ORACLE_RANK}"
+                )
+
+        self.values: Dict[SymbolId, Any] = {}
+        self.shapes: Dict[SymbolId, Tuple[int, ...]] = {}
+        input_values: Dict[SymbolId, object] = {}
+        partial_input_shapes: Dict[SymbolId, Tuple[Optional[int], ...]] = {}
+        for symbol in program.inputs:
+            decl = self.decls[symbol]
+            try:
+                bound = inputs[symbol]
+            except Exception as error:
+                raise LoopIROracleError(
+                    "input bindings could not be snapshotted"
+                ) from error
+            owned_bound = _snapshot_dense(bound, len(decl.levels))
+            input_values[symbol] = owned_bound
+            partial_input_shapes[symbol] = _dense_shape(
+                len(decl.levels), owned_bound, f"input {decl.name}"
+            )
         try:
             output_key_snapshot = tuple(output_shapes)
         except Exception as error:
@@ -151,20 +189,6 @@ class _Oracle:
             raise LoopIROracleError(
                 "output shapes must cover exactly the declared outputs"
             )
-
-        self.values: Dict[SymbolId, Any] = {}
-        self.shapes: Dict[SymbolId, Tuple[int, ...]] = {}
-        for symbol in program.inputs:
-            decl = self.decls[symbol]
-            try:
-                bound = inputs[symbol]
-            except Exception as error:
-                raise LoopIROracleError(
-                    "input bindings could not be snapshotted"
-                ) from error
-            shape = _dense_shape(len(decl.levels), bound, f"input {decl.name}")
-            self.shapes[symbol] = shape
-            self.values[symbol] = _dense_copy(bound, shape, f"input {decl.name}")
         for symbol in program.outputs:
             decl = self.decls[symbol]
             try:
@@ -188,28 +212,54 @@ class _Oracle:
             self.values[symbol] = _zeros(shape_binding) if shape_binding else []
 
         self.dim_extents: Dict[DimensionId, Tuple[int, str, int]] = {}
-        self._resolve_dimension_extents()
+        for symbol in program.inputs:
+            decl = self.decls[symbol]
+            for mode, extent in enumerate(partial_input_shapes[symbol]):
+                if extent is not None:
+                    self._bind_dimension_extent(
+                        decl.dimensions[mode], extent, decl.name, mode
+                    )
+        for symbol in program.outputs:
+            decl = self.decls[symbol]
+            for mode, extent in enumerate(self.shapes[symbol]):
+                self._bind_dimension_extent(
+                    decl.dimensions[mode], extent, decl.name, mode
+                )
+
+        for symbol in program.inputs:
+            decl = self.decls[symbol]
+            resolved_shape: List[int] = []
+            for mode, extent in enumerate(partial_input_shapes[symbol]):
+                if extent is None:
+                    known = self.dim_extents.get(decl.dimensions[mode])
+                    if known is None:
+                        raise LoopIROracleError(
+                            f"input {decl.name} shape cannot be inferred at "
+                            f"mode {mode}; bind another tensor sharing that "
+                            "dimension or avoid an empty outer mode"
+                        )
+                    extent = known[0]
+                resolved_shape.append(extent)
+            shape = tuple(resolved_shape)
+            self.shapes[symbol] = shape
+            self.values[symbol] = _dense_copy(
+                input_values[symbol], shape, f"input {decl.name}"
+            )
         self.indices: Dict[IndexId, int] = {}
 
-    def _resolve_dimension_extents(self) -> None:
-        """Bind every dimension's extent before executing anything."""
-
-        for decl in self.program.tensors:
-            shape = self.shapes[decl.symbol]
-            for mode, dimension in enumerate(decl.dimensions):
-                extent = shape[mode]
-                known = self.dim_extents.get(dimension)
-                if known is None:
-                    self.dim_extents[dimension] = (extent, decl.name, mode)
-                elif known[0] != extent:
-                    name = self.dimension_names.get(
-                        dimension, f"<dimension {dimension.value}>"
-                    )
-                    raise LoopIROracleError(
-                        f"dimension extent mismatch for {name!r}: "
-                        f"{known[1]}[{known[2]}] is {known[0]} but "
-                        f"{decl.name}[{mode}] is {extent}"
-                    )
+    def _bind_dimension_extent(
+        self, dimension: DimensionId, extent: int, tensor_name: str, mode: int
+    ) -> None:
+        known = self.dim_extents.get(dimension)
+        if known is None:
+            self.dim_extents[dimension] = (extent, tensor_name, mode)
+        elif known[0] != extent:
+            name = self.dimension_names.get(dimension, f"<dimension {dimension.value}>")
+            raise LoopIROracleError(
+                f"dimension extent mismatch for {name!r}: "
+                f"{known[1]}[{known[2]}] is {known[0]} but "
+                f"{tensor_name}[{mode}] is {extent}"
+            )
 
     def _dimension_extent(self, dimension: DimensionId) -> int:
         known = self.dim_extents.get(dimension)
