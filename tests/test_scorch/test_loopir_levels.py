@@ -16,6 +16,7 @@ from scorch.compiler.loopir.levels import (
     DenseLevel,
     LevelStorageError,
     LevelTensorStorage,
+    MAX_LEVEL_STORAGE_RANK,
     from_csr,
 )
 from scorch.compiler.loopir.nodes import LevelKind
@@ -146,6 +147,25 @@ def test_csr_from_dense_prunes_zeros_and_round_trips():
     assert matrix.indptr == (0, 1, 1)
     assert matrix.indices == (1,)
     assert matrix.to_dense() == dense
+
+
+def test_csr_from_dense_wraps_unrepresentable_numeric_values():
+    with pytest.raises(CsrFormatError, match="representable numeric"):
+        CsrMatrix.from_dense([[10**10000]])
+
+
+def test_level_storage_rejects_rank_before_recursive_conversion():
+    rank = MAX_LEVEL_STORAGE_RANK + 1
+    dense = 1.0
+    for _ in range(rank):
+        dense = [dense]
+    with pytest.raises(LevelStorageError, match="exceeds the level-storage limit"):
+        LevelTensorStorage.from_dense(
+            dense,
+            (1,) * rank,
+            tuple(range(rank)),
+            (LevelKind.DENSE,) * rank,
+        )
 
 
 def test_output_builder_orders_and_finishes():

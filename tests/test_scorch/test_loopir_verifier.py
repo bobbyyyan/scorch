@@ -1210,6 +1210,15 @@ def test_float_const_must_be_exact_float():
     expect_defect("malformed_state", fixture.program)
 
 
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_float_const_must_be_finite(value):
+    fixture = build_union_add()
+    merged = fixture.program.body.statements[0].body.statements[0]
+    leaf = merged.body.statements[0]
+    forge(leaf.value.lhs.default, value=value)
+    expect_defect("malformed_state", fixture.program)
+
+
 def test_merge_mode_member_is_enforced():
     class ForgedMode:
         value = "union"

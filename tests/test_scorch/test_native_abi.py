@@ -89,6 +89,20 @@ def test_native_spmm_rejects_malformed_nested_indices_before_indexing():
         scorch_ops.spmm_csr_float_v2(*args)
 
 
+def test_native_spmm_rejects_duplicate_csr_coordinates():
+    args = list(_spmm_args())
+    args[2] = [
+        [],
+        [
+            torch.tensor([0, 2, 3], dtype=torch.int32),
+            torch.tensor([1, 1, 2], dtype=torch.int32),
+        ],
+    ]
+
+    with pytest.raises(RuntimeError, match="strictly increasing"):
+        scorch_ops.spmm_csr_float_v2(*args)
+
+
 def test_native_shape_overflow_reaches_torch_checked_boundary():
     args = list(_spmm_args())
     args[0] = [2**40, 2]

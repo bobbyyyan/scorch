@@ -513,6 +513,16 @@ def test_spmm_csr_dense_shadow_execution_agrees_everywhere():
     assert comparison.identical
     assert torch.equal(loopir_result.to_torch(), legacy_result.to_torch())
     assert_close(loopir_result.to_torch(), a_t @ b_t)
+    kernel = compile_cin_via_loopir(
+        copy.deepcopy(cin),
+        (6, 4),
+        [((6, 9), torch.float32), ((9, 4), torch.float32)],
+    )
+    oracle = sparse_oracle_reference(kernel, (a_t, b_t), ("ds", "dd"), (6, 4))
+    assert_close(
+        loopir_result.to_torch(),
+        torch.tensor(oracle[kernel.lowering.result_symbol]).to(torch.float32),
+    )
 
 
 @torch.no_grad()
@@ -567,6 +577,15 @@ def test_sparse_elementwise_to_csr_matches_oracle_structure(operation, reference
     assert coordinates == list(produced.indices)
     assert_close(values, torch.tensor(produced.values).to(torch.float32))
     assert_close(result.to_torch(), reference(a_t, b_t))
+
+
+def test_shadow_execution_rejects_sparse_outputs_at_its_public_boundary():
+    cin = build_sparse_elementwise_cin(Operation.ADD, "ds")
+    a = sparse_stensor(torch.tensor([[1.0, 0.0]]), "A")
+    b = sparse_stensor(torch.tensor([[0.0, 2.0]]), "B")
+
+    with pytest.raises(CompileSpecError, match="requires dense outputs"):
+        execute_shadow(cin, (1, 2), a, b)
 
 
 @torch.no_grad()
@@ -632,6 +651,24 @@ def test_sparse_families_match_torch_on_random_grids():
             sparse_stensor(b_t, "B"),
         )
         assert_close(multiplied.to_torch(), a_t * b_t)
+
+
+@torch.no_grad()
+def test_sparse_jit_rejects_forged_duplicate_coordinates():
+    cin = build_spmv_csr()
+    a = sparse_stensor(torch.tensor([[1.0, 2.0]]), "A")
+    # Public storage construction rejects duplicates.  Forge the owned native
+    # array afterward to lock the deeper JIT boundary against stale/corrupt
+    # runtime state.
+    a.storage._mode_indices[1][1][1] = 0
+
+    with pytest.raises(RuntimeError, match="strictly increasing"):
+        execute_cin_via_loopir(
+            cin,
+            (1,),
+            a,
+            dense_stensor(torch.ones(2), "x"),
+        )
 
 
 @torch.no_grad()

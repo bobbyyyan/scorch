@@ -84,6 +84,22 @@ def test_union_and_intersection_classification():
     assert len(intersection.cursors) == 2
 
 
+@pytest.mark.parametrize("operation", (Operation.ADD, Operation.MUL))
+def test_repeated_sparse_operand_collapses_to_one_sparse_domain(operation):
+    """Pure support analysis never publishes a one-cursor merge."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    C = TensorVar("C", fmt="dd", dtype=torch.float32)
+    A = TensorVar("A", fmt="ds", dtype=torch.float32)
+    expression = A[i, j] + A[i, j] if operation is Operation.ADD else A[i, j] * A[i, j]
+    domain = analyzed(ForAll(i, ForAll(j, TensorAssign(C[i, j], expression)))).domains[
+        1
+    ]
+
+    assert domain.kind is DomainKind.SPARSE
+    assert len(domain.cursors) == 1
+
+
 def test_cursor_order_is_rhs_occurrence_order():
     cin = elementwise_cin(Operation.ADD)
     assign = cin.stmt.stmt

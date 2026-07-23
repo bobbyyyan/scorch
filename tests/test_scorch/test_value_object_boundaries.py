@@ -287,6 +287,14 @@ def test_sparse_storage_rejects_csr_order_native_views_cannot_consume():
         )
 
 
+def test_sparse_storage_rejects_duplicate_compressed_coordinates():
+    with pytest.raises(TensorIndexError, match="strictly increasing"):
+        _csr_storage(
+            positions=torch.tensor([0, 2, 3], dtype=torch.int64),
+            coordinates=torch.tensor([1, 1, 2], dtype=torch.int64),
+        )
+
+
 def test_sparse_storage_dense_count_and_equality_include_value_dtype():
     float_storage = _dense_storage(value_dtype=torch.float32)
     int_storage = _dense_storage(value_dtype=torch.int64)

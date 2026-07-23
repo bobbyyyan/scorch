@@ -326,6 +326,23 @@ def test_output_extent_participates_in_dimension_resolution():
     assert "dimension extent mismatch" in str(error.value)
 
 
+def test_extent_mismatch_is_rejected_before_output_allocation(monkeypatch):
+    import scorch.compiler.loopir.oracle as oracle_module
+
+    fixture = build_vector_add()
+
+    def unexpected_allocation(shape):
+        raise AssertionError(f"allocated mismatched output shape {shape}")
+
+    monkeypatch.setattr(oracle_module, "_zeros", unexpected_allocation)
+    with pytest.raises(LoopIROracleError, match="dimension extent mismatch"):
+        run_program(
+            fixture.program,
+            {fixture.a: [1.0], fixture.b: [2.0]},
+            {fixture.c: (1_000_000,)},
+        )
+
+
 def test_invalid_output_shape_fails_closed():
     fixture = build_vector_add()
     with pytest.raises(LoopIROracleError):
