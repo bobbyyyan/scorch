@@ -49,6 +49,7 @@ from ..compile_options import CompileOptions
 from ..identity import SymbolId
 from .lower_cin import LoopIRLoweringResult, lower_normalized_cin_to_loopir
 from .lower_llir import lower_loopir_to_llir
+from .nodes import LevelKind as LoopIRLevelKind
 from .printer import canonical_program_dump, print_program
 
 
@@ -386,8 +387,15 @@ def execute_cin_via_loopir(
     if time_dict is not None:
         time_dict["eval_time"] = end_time - start_time
 
-    result_rank = len(tuple(result_shape))
-    result_format = "d" * result_rank
+    result_decl = next(
+        decl
+        for decl in kernel.lowering.program.tensors
+        if decl.symbol == kernel.lowering.result_symbol
+    )
+    result_format = "".join(
+        "d" if level.kind is LoopIRLevelKind.DENSE else "s"
+        for level in result_decl.levels
+    )
     result = STensor(
         shape=tuple(result_shape),
         index=TensorIndex(

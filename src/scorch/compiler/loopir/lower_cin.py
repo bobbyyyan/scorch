@@ -1,8 +1,8 @@
-"""Normalized-CIN-to-LoopIR lowering for the Phase-4 dense families.
+"""Normalized-CIN-to-LoopIR lowering for the migrated families.
 
 This is the strangler-path entry that turns one normalized CIN program into a
 verified production LoopIR program plus its verified ``LoopPlan``.  It covers
-two coherent families rather than hand-built fixtures:
+the coherent migrated families rather than hand-built fixtures:
 
 - **Dense elementwise** — a pure ``ForAll`` nest over one plain
   ``TensorAssign`` (no update operator) whose right-hand side is a
@@ -12,6 +12,15 @@ two coherent families rather than hand-built fixtures:
   operator; loop variables absent from the left-hand side are reduction
   variables realized as ``StoreReduce`` (ADD) into the zero-initialized
   dense output.
+- **Sparse level families (Phase 5)** — the same nest shapes over
+  DENSE/COMPRESSED level compositions.  The pure iteration-domain analysis
+  (:mod:`~scorch.compiler.loopir.iterdomain`) classifies every loop
+  variable as a dense loop, a single sparse cursor loop, or a structured
+  UNION/INTERSECTION merge; this module materializes that table as
+  ``SparseFor``/``MergedSparseFor`` iteration with explicit
+  parent-position-linked cursors, ``CursorValue`` leaf reads (UNION reads
+  carry the explicit additive-identity default), and either dense stores or
+  ordered ``AppendEntry`` assembly into a canonical CSR output.
 
 Everything outside the families fails closed with
 :class:`LoopIRLoweringError` and a stable code — nothing is silently
@@ -20,19 +29,21 @@ stable ``SymbolId``/``IndexId`` identities flow through unchanged as
 provenance, and each bound loop variable becomes one declared logical
 dimension.
 
-Recorded family boundaries (deliberate, fail-closed; see the Phase-4
-review): identity mode order only, one uniform float32/float64 scalar type,
-no workspaces/``Where``/derived index arithmetic/explicit parallel marks,
-``ADD`` as the only update operator and ``{ADD, SUB, MUL}`` as the only
-value operators, and every tensor's storage-order loop variables must appear
-in nest order (the position-chain order the legacy dense emission also
-requires).
+Recorded family boundaries (deliberate, fail-closed; see the Phase-4 and
+Phase-5 reviews): identity mode order only, one uniform float32/float64
+scalar type, no workspaces/``Where``/derived index arithmetic/explicit
+parallel marks, ``ADD`` as the only update operator and ``{ADD, SUB, MUL}``
+as the only value operators, every tensor's storage-order loop variables in
+nest order, DENSE/COMPRESSED level types only with compressed value-bearing
+leaves, canonical CSR as the only sparse output (no update operator, no
+merged reductions or merged updates), and no subtraction across sparse
+domains.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, NoReturn, Tuple
+from typing import Dict, List, NoReturn, Optional, Tuple
 
 import torch
 
@@ -53,11 +64,20 @@ from ..cin import (
 from ..cin_analysis import verify_cin
 from ..loop_plan import LoopPlan, verify_loop_plan
 from .build import LoopIRBuilder
+from .iterdomain import (
+    DomainKind,
+    IterationDomainError,
+    analyze_iteration_domains,
+)
 from .nodes import (
     BinaryOp,
+    CursorId,
     DimensionId,
     Expr,
+    LevelKind,
     LoopProgram,
+    MergeMode,
+    PositionId,
     ReduceOp,
     ScalarType,
     Stmt,
@@ -154,11 +174,17 @@ def _check_index_var(index_var: IndexVar) -> None:
         )
 
 
-def _check_tensor(tensor: TensorVar) -> ScalarType:
+_LEVEL_TYPE_TO_KIND: Dict[LevelType, LevelKind] = {
+    LevelType.DENSE: LevelKind.DENSE,
+    LevelType.COMPRESSED: LevelKind.COMPRESSED,
+}
+
+
+def _check_tensor(tensor: TensorVar) -> Tuple[ScalarType, Tuple[LevelType, ...]]:
     if isinstance(tensor, cin_nodes.Workspace):
         _fail(
             "unsupported_workspace",
-            f"workspace {tensor.name!r} is outside the dense families",
+            f"workspace {tensor.name!r} is outside the migrated families",
         )
     tensor_format = tensor.format
     if tensor_format is None:
@@ -166,16 +192,25 @@ def _check_tensor(tensor: TensorVar) -> ScalarType:
             "unsupported_format",
             f"tensor {tensor.name!r} declares no format",
         )
-    if any(
-        level_type is not LevelType.DENSE
-        for level_type in tensor_format.get_level_types()
+    level_types = tuple(tensor_format.get_level_types())
+    if any(level_type not in _LEVEL_TYPE_TO_KIND for level_type in level_types):
+        _fail(
+            "unsupported_format",
+            f"tensor {tensor.name!r} declares a level type outside the "
+            "migrated DENSE/COMPRESSED families",
+        )
+    if (
+        any(level_type is LevelType.COMPRESSED for level_type in level_types)
+        and level_types[-1] is not LevelType.COMPRESSED
     ):
         _fail(
             "unsupported_format",
-            f"tensor {tensor.name!r} is not all-dense",
+            f"tensor {tensor.name!r} stores a dense value-bearing leaf below "
+            "compressed structure; physical position loads are not declared "
+            "in this subset",
         )
     mode_order = tensor.mode_order
-    rank = len(tensor_format.get_level_types())
+    rank = len(level_types)
     if mode_order is not None and list(mode_order) != list(range(rank)):
         _fail(
             "unsupported_mode_order",
@@ -189,7 +224,17 @@ def _check_tensor(tensor: TensorVar) -> ScalarType:
             "float32/float64",
         )
     assert scalar_type is not None
-    return scalar_type
+    return scalar_type, level_types
+
+
+def input_symbols_of(rhs_accesses: List[TensorAccess]) -> List[SymbolId]:
+    """Deduplicated input symbols in right-hand-side occurrence order."""
+
+    symbols: List[SymbolId] = []
+    for access in rhs_accesses:
+        if access.tensor.symbol_id not in symbols:
+            symbols.append(access.tensor.symbol_id)
+    return symbols
 
 
 def _collect_rhs_accesses(expr: object, accesses: List[TensorAccess]) -> None:
@@ -300,13 +345,33 @@ def lower_normalized_cin_to_loopir(cin: IndexStmt) -> LoopIRLoweringResult:
                 "the loop nest order",
             )
 
-    scalar_types = {
+    checked_tensors = {
         access.tensor.symbol_id: _check_tensor(access.tensor) for access in all_accesses
     }
+    scalar_types = {symbol: scalar for symbol, (scalar, _) in checked_tensors.items()}
+    level_types = {symbol: levels for symbol, (_, levels) in checked_tensors.items()}
     if len(set(scalar_types.values())) > 1:
         _fail(
             "mixed_dtype",
-            "the dense families require one uniform scalar type",
+            "the migrated families require one uniform scalar type",
+        )
+
+    if any(
+        level_type is not LevelType.DENSE
+        for levels in level_types.values()
+        for level_type in levels
+    ):
+        return _lower_sparse_family(
+            cin,
+            loop_vars,
+            assign,
+            reduce_update,
+            lhs,
+            rhs_accesses,
+            input_symbols_of(rhs_accesses),
+            result_symbol,
+            scalar_types,
+            level_types,
         )
 
     builder = LoopIRBuilder()
@@ -385,6 +450,259 @@ def lower_normalized_cin_to_loopir(cin: IndexStmt) -> LoopIRLoweringResult:
 
     loop_index_ids = tuple(index_var.index_id for index_var in loop_vars)
     plan = verify_loop_plan(cin, LoopPlan(loop_order=loop_index_ids))
+
+    return LoopIRLoweringResult(
+        program=program,
+        loop_plan=plan,
+        loop_index_ids=loop_index_ids,
+        input_symbols=tuple(input_symbols),
+        rhs_access_symbols=tuple(access.tensor.symbol_id for access in rhs_accesses),
+        result_symbol=result_symbol,
+    )
+
+
+def _lower_sparse_family(
+    cin: IndexStmt,
+    loop_vars: List[IndexVar],
+    assign: TensorAssign,
+    reduce_update: bool,
+    lhs: TensorAccess,
+    rhs_accesses: List[TensorAccess],
+    input_symbols: List[SymbolId],
+    result_symbol: SymbolId,
+    scalar_types: Dict[SymbolId, ScalarType],
+    level_types: Dict[SymbolId, Tuple[LevelType, ...]],
+) -> LoopIRLoweringResult:
+    """Materialize the sparse level families from the pure domain analysis."""
+
+    loop_index_ids = tuple(index_var.index_id for index_var in loop_vars)
+    plan = verify_loop_plan(cin, LoopPlan(loop_order=loop_index_ids))
+    try:
+        table = analyze_iteration_domains(cin, plan)
+    except IterationDomainError as error:
+        raise LoopIRLoweringError(
+            LoopIRLoweringDefect(error.defect.code, error.defect.message)
+        ) from error
+    domains = {domain.index: domain for domain in table.domains}
+
+    result_levels = level_types[result_symbol]
+    result_sparse = any(
+        level_type is LevelType.COMPRESSED for level_type in result_levels
+    )
+    lhs_index_ids = tuple(lhs.index_ids)
+
+    if result_sparse:
+        if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):
+            _fail(
+                "unsupported_sparse_output",
+                f"result {lhs.tensor.name!r} declares a sparse layout other "
+                "than canonical CSR; ordered assembly is defined for "
+                "canonical CSR only in the migrated families",
+            )
+        if reduce_update:
+            _fail(
+                "unsupported_sparse_output_reduction",
+                "a canonical CSR output cannot carry the ADD update "
+                "operator in the migrated families",
+            )
+        row_domain = domains[lhs_index_ids[0]]
+        column_domain = domains[lhs_index_ids[1]]
+        if row_domain.kind is not DomainKind.DENSE:
+            _fail(
+                "unsupported_sparse_output_domain",
+                "the CSR row coordinate must iterate a dense domain in the "
+                "migrated families",
+            )
+        if column_domain.kind is DomainKind.DENSE:
+            _fail(
+                "unsupported_sparse_output_domain",
+                "the CSR column coordinate must be driven by stored sparse "
+                "coordinates; dense-domain assembly is outside the migrated "
+                "families",
+            )
+
+    for index_id in loop_index_ids:
+        domain = domains[index_id]
+        if domain.kind in (DomainKind.UNION, DomainKind.INTERSECTION):
+            if index_id not in lhs_index_ids:
+                _fail(
+                    "unsupported_merged_reduction",
+                    "reducing over a merged sparse domain is outside the "
+                    "migrated families",
+                )
+            if reduce_update:
+                _fail(
+                    "unsupported_merged_update",
+                    "combining a merged sparse domain with the ADD update "
+                    "operator is outside the migrated families",
+                )
+
+    builder = LoopIRBuilder()
+    dimension_ids: Dict[IndexId, DimensionId] = {}
+    dimension_decls = []
+    for index_var in loop_vars:
+        decl = builder.dimension(index_var.name)
+        dimension_ids[index_var.index_id] = decl.dimension
+        dimension_decls.append(decl)
+
+    tensor_decls: Dict[SymbolId, TensorDecl] = {}
+    tensor_accesses: Dict[SymbolId, TensorAccess] = {}
+
+    def declare_tensor(access: TensorAccess) -> None:
+        symbol = access.tensor.symbol_id
+        if symbol in tensor_decls:
+            return
+        tensor_accesses[symbol] = access
+        tensor_decls[symbol] = builder.tensor(
+            symbol,
+            access.tensor.name,
+            scalar_types[symbol],
+            tuple(dimension_ids[index_id] for index_id in access.index_ids),
+            tuple(
+                builder.level(_LEVEL_TYPE_TO_KIND[level_type], mode)
+                for mode, level_type in enumerate(level_types[symbol])
+            ),
+        )
+
+    for access in rhs_accesses:
+        declare_tensor(access)
+    declare_tensor(lhs)
+
+    # Allocate cursor and bound-position identities for every compressed
+    # level the domain table iterates; UNION-merged cursors read through an
+    # explicit additive-identity default.
+    cursor_ids: Dict[Tuple[SymbolId, int], CursorId] = {}
+    position_ids: Dict[Tuple[SymbolId, int], PositionId] = {}
+    union_cursors: set = set()
+    for domain in table.domains:
+        for ref in domain.cursors:
+            key = (ref.tensor, ref.level)
+            if key not in cursor_ids:
+                cursor_ids[key] = builder.new_cursor_id()
+            if domain.kind is DomainKind.SPARSE:
+                position_ids[key] = builder.new_position_id()
+            elif domain.kind is DomainKind.UNION:
+                union_cursors.add(key)
+
+    def position_expr(symbol: SymbolId, level: int) -> Expr:
+        """The dominating physical position of one tensor level."""
+
+        if level < 0:
+            return builder.root_position()
+        kind = _LEVEL_TYPE_TO_KIND[level_types[symbol][level]]
+        if kind is LevelKind.DENSE:
+            driving = tensor_accesses[symbol].index_ids[level]
+            return builder.dense_position(
+                symbol,
+                level,
+                position_expr(symbol, level - 1),
+                builder.index_value(driving),
+            )
+        bound = position_ids.get((symbol, level))
+        if bound is None:
+            _fail(
+                "unsupported_sparse_hierarchy",
+                f"tensor {tensor_decls[symbol].name!r} needs the bound "
+                f"position of compressed level {level}, which only a "
+                "single-cursor sparse loop binds; hierarchical merge "
+                "descent is outside the migrated families",
+            )
+        return builder.position_value(bound)
+
+    def lower_expr(expr: object) -> Expr:
+        if isinstance(expr, TensorAccess):
+            symbol = expr.tensor.symbol_id
+            if all(level_type is LevelType.DENSE for level_type in level_types[symbol]):
+                return builder.load(
+                    symbol,
+                    tuple(builder.index_value(index_id) for index_id in expr.index_ids),
+                )
+            leaf_level = len(level_types[symbol]) - 1
+            cursor = cursor_ids.get((symbol, leaf_level))
+            if cursor is None:
+                _fail(
+                    "unsupported_expression",
+                    f"tensor {expr.tensor.name!r} has no iterated cursor for "
+                    "its value-bearing leaf level",
+                )
+            default: Optional[Expr] = None
+            if (symbol, leaf_level) in union_cursors:
+                default = builder.float_const(0.0)
+            return builder.cursor_value(cursor, default)
+        assert isinstance(expr, CINBinaryOp)
+        return builder.binary(
+            _CIN_TO_LOOPIR_BINARY[expr.op],
+            lower_expr(expr.left),
+            lower_expr(expr.right),
+        )
+
+    value = lower_expr(assign.rhs)
+    store_indices = tuple(builder.index_value(index_id) for index_id in lhs_index_ids)
+    leaf: Stmt
+    if result_sparse:
+        leaf = builder.append_entry(result_symbol, store_indices, value)
+    elif reduce_update:
+        leaf = builder.store_reduce(result_symbol, store_indices, ReduceOp.ADD, value)
+    else:
+        leaf = builder.store(result_symbol, store_indices, value)
+
+    body = builder.block((leaf,))
+    for index_var in reversed(loop_vars):
+        domain = domains[index_var.index_id]
+        if domain.kind is DomainKind.DENSE:
+            loop: Stmt = builder.dense_for(
+                index_var.index_id,
+                dimension_ids[index_var.index_id],
+                body,
+            )
+        elif domain.kind is DomainKind.SPARSE:
+            ref = domain.cursors[0]
+            cursor_decl = builder.sparse_cursor(
+                cursor_ids[(ref.tensor, ref.level)],
+                ref.tensor,
+                ref.level,
+                position_expr(ref.tensor, ref.level - 1),
+            )
+            loop = builder.sparse_for(
+                cursor_decl,
+                position_ids[(ref.tensor, ref.level)],
+                index_var.index_id,
+                body,
+            )
+        else:
+            cursor_decls = tuple(
+                builder.sparse_cursor(
+                    cursor_ids[(ref.tensor, ref.level)],
+                    ref.tensor,
+                    ref.level,
+                    position_expr(ref.tensor, ref.level - 1),
+                )
+                for ref in domain.cursors
+            )
+            mode = (
+                MergeMode.UNION
+                if domain.kind is DomainKind.UNION
+                else MergeMode.INTERSECTION
+            )
+            loop = builder.merged_sparse_for(
+                mode,
+                cursor_decls,
+                index_var.index_id,
+                body,
+            )
+        body = builder.block((loop,))
+
+    ordered_tensor_decls = [
+        tensor_decls[symbol] for symbol in [*input_symbols, result_symbol]
+    ]
+    program = builder.program(
+        dimension_decls,
+        ordered_tensor_decls,
+        tuple(input_symbols),
+        (result_symbol,),
+        body,
+    )
+    verify_program(program)
 
     return LoopIRLoweringResult(
         program=program,
