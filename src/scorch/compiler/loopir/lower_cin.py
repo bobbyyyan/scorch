@@ -256,8 +256,20 @@ def _collect_rhs_accesses(expr: object, accesses: List[TensorAccess]) -> None:
     )
 
 
-def lower_normalized_cin_to_loopir(cin: IndexStmt) -> LoopIRLoweringResult:
-    """Lower one normalized dense-family CIN program to verified LoopIR."""
+def lower_normalized_cin_to_loopir(
+    cin: IndexStmt,
+    *,
+    planned_loop_order: Optional[Tuple[IndexId, ...]] = None,
+) -> LoopIRLoweringResult:
+    """Lower one normalized dense-family CIN program to verified LoopIR.
+
+    ``planned_loop_order`` is the scheduled path's verified plan order.  The
+    base program is always constructed in the CIN's own nest order; the plan
+    order only replaces the nest order in the storage-order family check, so
+    a schedule that permutes the nest into a storage-consistent order is not
+    rejected before the reorder pass can apply it.  The target lowering
+    re-enforces the same boundary against the program it actually emits.
+    """
 
     if not isinstance(cin, IndexStmt):
         raise TypeError("lower_normalized_cin_to_loopir expects an IndexStmt")
@@ -272,6 +284,18 @@ def lower_normalized_cin_to_loopir(cin: IndexStmt) -> LoopIRLoweringResult:
     loop_positions: Dict[IndexId, int] = {}
     for position, index_var in enumerate(loop_vars):
         loop_positions[index_var.index_id] = position
+    order_positions = loop_positions
+    if planned_loop_order is not None:
+        if set(planned_loop_order) != set(loop_positions) or len(
+            planned_loop_order
+        ) != len(loop_positions):
+            _fail(
+                "unsupported_loop_order",
+                "the planned loop order must name every nest loop exactly " "once",
+            )
+        order_positions = {
+            index_id: position for position, index_id in enumerate(planned_loop_order)
+        }
 
     if assign.op is None:
         reduce_update = False
@@ -334,10 +358,13 @@ def lower_normalized_cin_to_loopir(cin: IndexStmt) -> LoopIRLoweringResult:
             "update operator",
         )
 
-    # Every tensor's storage-order loop variables must appear in nest order,
-    # the same dependency direction the legacy dense position chains use.
+    # Every tensor's storage-order loop variables must appear in nest order
+    # (the planned order on the scheduled path), the same dependency
+    # direction the legacy dense position chains use.
     for access in all_accesses:
-        positions = [loop_positions[index_var.index_id] for index_var in access.indices]
+        positions = [
+            order_positions[index_var.index_id] for index_var in access.indices
+        ]
         if positions != sorted(positions):
             _fail(
                 "unsupported_loop_order",
