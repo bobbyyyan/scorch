@@ -63,7 +63,7 @@ production oracle.  Dispositions:
 | Scheduled representation | **Structured schedule nodes in the same LoopIR node model** — one `TileOuterFor`/`TileInnerFor` pair per split, linked by an artifact-local `TileId` — not a sidecar and not a second schema, per the design decision that `ScheduledLoopIR` is a verified state of the same node model.  Semantic meaning stays in the nodes (origin iteration plus clamped point iteration with intrinsic ragged-tail coverage); the only schedule-preference field carried is the target-independent `unroll` hint. |
 | Schedule application | **New** `loopir/schedule_passes.py`: `reorder_loops` and `apply_affine_tile` as pure typed passes; `apply_schedule_plan` consumes each plan decision exactly once and returns a frozen `ScheduledLoopIR` artifact retaining the unscheduled base program, the exact plan, the scheduled program, and per-loop `(TileId, IndexId, LoopPart)` provenance. |
 | Point/outer-loop identity | `(IndexId, LoopPart)` — the same identity scheme `LoopPlan.LoopRef` already uses — plus the owning `TileId`; no name-derived identity anywhere. |
-| Scheduled verification | `loopir/verifier.py` remains the single fail-closed authority; six new stable codes (§3). |
+| Scheduled verification | `loopir/verifier.py` verifies the semantic program, including complete affine pairs; `verify_scheduled_loopir` separately verifies the schedule carrier by deterministic replay and exact provenance (§3 and §9). |
 | Scheduled target emission | `loopir/lower_llir.py` mirrors the legacy tiled emission statement-for-statement (width constants, stepping origin loop, reconstructed logical coordinate, overshoot break, input-then-result bound resolution) and reuses the untouched managed pass pipeline and parallel policy, which is why prefetch, pointer hoisting, zero-fill, the nnz-aware row policy, and the ceil-trip-count parallel headers all match legacy byte-for-byte. |
 | Strangler entry | `loopir/pipeline.py` (test/debug only; production never imports it): `CompileOptions.requested_schedule` now routes the LoopIR pipeline through the shared scheduler boundary and the typed passes, with a new appended `LOOPIR_SCHEDULE_APPLICATION` stage owning partial failure.  Runtime mode-order alignment targets the plan's logical order (`_plan_mode_orders_to_planned_order`), the scheduled twin of the legacy nest-order helper. |
 | Cache identity | Unchanged and source-derived.  A schedule affects the generated source; identical source is the identical kernel artifact — exactly the legacy contract.  Canonical LoopIR dumps (schema v3) remain semantic fingerprints, not target cache keys; no plan- or LoopIR-level artifact is cached. |
@@ -96,9 +96,11 @@ design — each remains fail-closed at the plan gate (§4).
 
 ## 3. Verifier surface
 
-Six stable codes were added, each with direct adversarial regressions:
+Seven stable semantic-program codes were added, each with direct adversarial
+regressions:
 `invalid_tile_id`, `duplicate_tile_id` (one origin loop per `TileId`),
 `unbound_tile` (a point loop needs its dominating origin loop in scope),
+`missing_tile_inner` (every origin must contain its point loop),
 `tile_binding_mismatch` (pair agreement on index/dimension/width),
 `invalid_tile_width` (positive exact ints; `bool` and floats rejected), and
 `tile_index_conflict` (a split owns its logical loop: the index may be
@@ -106,7 +108,7 @@ neither bound nor split again in an enclosing scope).  The point loop's
 coordinate binding participates in the ordinary `duplicate_index_binding`
 discipline, tile dimensions need a tensor-mapped extent source
 (`unresolved_dimension`), and the existing cycle/aliasing/depth guards
-cover the new nodes.  The 50-code surface is locked by the source-scan
+cover the new nodes.  The 51-code surface is locked by the source-scan
 test.  Canonical serialization moved to schema
 `scorch.loopir.canonical.v3` (the serialized contract gained the two node
 kinds and the tile identity family); dumps remain deterministic under
@@ -141,12 +143,21 @@ production and empty schedules stay on legacy),
 `unsupported_schedule_parallel` (explicit parallel-loop/tile selection),
 `unsupported_schedule_accumulation` (stack/heap affine tiles).
 Pass-level legality codes: `reorder_incomplete_order`,
+`reorder_invalid_order`, `invalid_schedule_tile`, `invalid_schedule_plan`,
 `reorder_sparse_dependency` (cursor parent chains must stay dominated),
 `reorder_ordered_assembly` (append nests pin their order),
 `reorder_split_chain`, `unsupported_schedule_shape`,
-`tile_target_missing`, `tile_target_not_dense` (no windowed compressed
-iteration), `tile_target_already_split`, `tile_invalid_placement`
+`tile_target_missing`, `tile_target_not_logical`, `tile_target_not_dense`
+(no windowed compressed iteration), `tile_target_already_split`,
+`tile_invalid_placement`
 (including origin-must-dominate-point), and `tile_invalid_width`.
+
+The frozen `ScheduledLoopIR` carrier has its own fail-closed cross-field
+verification: `invalid_scheduled_artifact`, `scheduled_base_not_unscheduled`,
+`scheduled_program_mismatch`, and `scheduled_provenance_mismatch`.  The
+verifier replays the retained plan from the retained unscheduled base and
+requires exact equality with both the stored result and its owned provenance;
+the carrier is not trusted merely because its individual programs verify.
 
 **Fail-closed at the target boundary:** affine splits over merged
 iteration or ordered sparse assembly (`unsupported_program_shape`) —
@@ -185,7 +196,8 @@ Commits (stacked on `8b0955c`; nothing amended, reordered, or pushed):
   `unsupported_loop_order`)
 - (docs commit follows this review)
 
-Receipts:
+Original milestone receipts at `c263b24` (the independent corrections and
+their final receipts are recorded in §9):
 
 - scheduled byte-parity grid: **twenty schedule/program cells** generate
   C++ byte-identical to `Scheduler.apply_schedule` + legacy lowering —
@@ -297,12 +309,113 @@ Receipts:
 
 ## 8. Next broad milestone
 
-Migrate the workspace/accumulation schedule family: declare the workspace
-node family in the schema (allocation, reset, producer/consumer regions
-with verified lifetime), extend `apply_affine_tile` to stack accumulation
-(the `wksp[kTile]` producer/consumer pair legacy emits), byte-compare
-against the legacy stack-tile kernels (the `spmm-tilek-stack` shape
-captured during this milestone's exploration), and only then approach the
-panel/relayout families that `schedule_lowerer.py` owns.  Public
-Schedule-adapter cutover, selector integration, and legacy deletion remain
-out of scope until those families close.
+Complete a substantial remaining Phase-6 memory-scheduling family, not a
+schema-only seam.  The required first vertical slice is workspace
+materialization plus stack accumulation: allocation, reset, producer and
+consumer regions, verified lifetime/reduction semantics, the
+`wksp[kTile]` legacy shape, oracle execution, scheduled target lowering,
+and compiled byte/numeric parity.  Once that foundation is green, the same
+session should continue through the largest coherent adjacent family that
+fits it — preferably sparse-panel plus operand-relayout/staging together,
+because they share scope and memory-region lifetime — with heap result
+tiles or explicit parallel selection as a separately committed stretch.
+Public adapter cutover, selector integration, Phase 7 target work, and
+legacy deletion remain out of scope until the remaining Phase-6 plan
+families are genuinely closed.
+
+## 9. Independent review corrections (2026-07-23)
+
+An independent adversarial review of `1418e88..727d55c` found concrete
+contract failures that the original milestone gates did not expose.  They
+are fixed in two stacked local commits:
+
+- `e338e98` — `fix(compiler): verify scheduled LoopIR artifacts`
+- `e00facd` — `fix(compiler): preserve scheduled runtime contracts`
+
+Nothing was amended, reordered, or pushed.  Both the remote-tracking ref
+and live `git ls-remote` remained at `58e8565`; the code/test tip was 27
+commits ahead before this docs commit.
+
+### 9.1 Findings and corrections
+
+1. **An affine origin could verify without its point loop.**  The semantic
+   verifier checked a point loop's dominating origin but not the reverse.
+   `missing_tile_inner` now requires every `TileOuterFor` to contain its
+   matching `TileInnerFor`; the existing global index-binding invariant
+   independently rejects a second point loop.
+2. **The scheduled carrier was frozen but not cross-field verified.**
+   A caller could combine a valid base, plan, scheduled program, and
+   provenance that did not describe one another, and non-logical tile
+   parts or malformed placement state could reach direct pass logic.
+   `verify_scheduled_loopir` now checks exact owned carrier state, verifies
+   both programs, requires an unsplit base, deterministically reapplies the
+   structurally validated plan, and compares the stored program and
+   provenance exactly.  The exported reorder/tile passes now reject
+   malformed requests with stable diagnostics rather than leaking
+   `AttributeError` or container `TypeError`.
+3. **Oversized tile widths silently crossed a narrower target boundary.**
+   Both CPU routes emit the width as `constexpr int`; on the supported
+   compiler, `2**31` becomes a negative value.  Public `TileSpec` and
+   `RelayoutSpec`, verified `LoopPlan`, the typed schedule pass, and the
+   C++ target now enforce `width <= 2**31 - 1`.  Semantic LoopIR and its
+   oracle deliberately continue to accept arbitrary positive Python ints;
+   target representability is not misrepresented as target-independent
+   semantics.
+4. **Forged non-schema object state affected continuation identities.**
+   `LoopIRBuilder.resuming` previously scanned every `__dict__` value even
+   though verification and canonical serialization recognize declared
+   dataclass fields only.  It now scans exactly the schema fields, so a
+   non-semantic extra `TileId` cannot perturb deterministic allocation.
+5. **Tile-only legacy replay had two opposite failure modes.**  A public
+   `Schedule(loop_order=None, tiles=...)` materializes an explicit loop
+   order in its verified plan and was then rejected as conflicting during
+   private legacy replay.  The adapter now canonicalizes exactly that
+   proven-equivalent omission.  It does not overwrite an explicitly
+   conflicting requested schedule; that still raises
+   `conflicting_schedule`.
+6. **Scheduled runtime layout prerequisites were not isolated or owned
+   correctly.**  A requested schedule could leak into an auxiliary
+   mode-order-relayout compilation, while moving the work to a discarded
+   child context initially left its elapsed time unowned and its failures
+   non-terminal for the caller context.  Relayout now receives a
+   schedule-free options snapshot and independent child context while the
+   caller's frontend-binding stage remains active around it, charging the
+   prerequisite time and retiring the parent compilation on failure.
+7. **Scheduled shadow execution did not compare equivalent runtime
+   layouts.**  The legacy route consumed nonidentity physical layouts
+   without plan alignment, the result wrapper was hard-coded to rank-two
+   `"dd"`, and a tile-only shadow could reselect policy after compiler-owned
+   mode-order metadata changed.  Both routes now align to the verified
+   plan, dense result wrapping derives format/rank from CIN, and policy
+   shorthand is frozen to the first verified plan before any sub-run.
+8. **Several broad evidence claims were source-only.**  Committed compiled
+   shadows now cover `child_of`, `at_depth`, unroll, two splits, non-square
+   nonidentity layouts, rank-one dense results, f64 CSR×dense SpMM with
+   double-precision tolerances, and zero logical/result extents under a
+   tiled loop.  The stale reference to a legacy unguarded-broadcast erratum
+   was removed; direct capture had already disproved it.
+
+### 9.2 Corrected verification
+
+- Contract focus: **309 passed** across the semantic verifier, scheduling
+  passes, LoopIR target, LoopPlan, and Schedule API.
+- Full scheduled runtime/pipeline files: **80 passed**, including the
+  expanded compiled matrix and injected relayout-failure ownership.
+- Authoritative clean detached-worktree non-performance suite at
+  `e00facd`, with import provenance asserted and isolated caches:
+  **3,617 passed, 14 skipped, 3 perf-marked deselections, one known warning,
+  and zero failures/errors in 2,427.96 seconds**.  This is the original
+  Phase-6 total plus exactly the 27 correction regressions.
+- Black and `git diff --check` are clean.  Focused mypy is clean on seven
+  changed package modules; the eighth (`scheduler.py`) retains exactly its
+  two inherited `import-untyped` findings.  Flake8 has no new finding versus
+  `727d55c` (the scheduler's existing C901 remains byte-for-byte inherited).
+  Full-source mypy remains at the exact Phase-6 baseline:
+  **146 inherited findings in 12 files and zero in `loopir/`**.
+- The five protected tracked files retain the recorded SHA-256 values and
+  were never staged; unrelated dirty/untracked GPU, CUDA, benchmark,
+  packaging, scheduler, research, scratchpad, and tooling material remains
+  untouched.
+
+The same clean-suite receipt is recorded in the handoff section committed
+with this correction.

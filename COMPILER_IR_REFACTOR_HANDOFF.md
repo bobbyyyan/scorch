@@ -24043,9 +24043,10 @@ What is now true:
 - Scheduled form is a verified state of the same LoopIR node model: one
   `TileOuterFor`/`TileInnerFor` pair per affine split, linked by an
   artifact-local `TileId`, with ragged-tail coverage intrinsic to the
-  node semantics and `unroll` the only carried schedule preference.  Six
+  node semantics and `unroll` the only carried schedule preference.  Seven
   new stable verifier codes guard split identity, pair agreement, scope,
-  widths, and index ownership (50-code locked surface); canonical
+  complete origin/point ownership, widths, and index ownership (51-code
+  locked surface); canonical
   serialization moved to `scorch.loopir.canonical.v3`; dumps remain
   semantic fingerprints, never target cache keys.
 - Scheduling is applied by pure typed passes
@@ -24185,4 +24186,191 @@ full non-performance suite, protected hashes, and an explicit-pathspec
 staging audit before every commit. Commit the largest coherent verified
 subset with focused commits and descriptive bodies, document limitations
 honestly, do not overclaim, and do not push.
+```
+
+## Phase-6 independent review corrections (2026-07-23)
+
+The adversarial review of `1418e88..727d55c` is complete.  Two focused
+commits are stacked locally; no existing commit was amended or reordered
+and nothing was pushed:
+
+- `e338e98` — `fix(compiler): verify scheduled LoopIR artifacts`
+- `e00facd` — `fix(compiler): preserve scheduled runtime contracts`
+
+Both the remote-tracking ref and live remote remained at `58e8565`; the
+code/test tip was 27 commits ahead before this docs commit.
+
+The review found real gaps behind the original green milestone:
+
+- an affine origin could verify with no point loop;
+- `ScheduledLoopIR` had no cross-field replay verifier, malformed direct
+  pass requests leaked raw Python exceptions, and a forged extra field
+  could perturb continuation identities;
+- widths larger than the emitted C++ `constexpr int` silently wrapped;
+- the legacy adapter rejected tile-only `loop_order=None` shorthand, while
+  an overbroad first correction would have hidden genuine explicit
+  schedule conflicts;
+- scheduled relayout prerequisites received the parent schedule, then an
+  isolated-child correction failed to charge time/failure to the
+  caller-owned compilation;
+- shadow execution misaligned nonidentity layouts on the legacy arm,
+  hard-coded rank-two dense wrapping, and could reselect a tile-only policy
+  after mode-order metadata changed;
+- compiled evidence did not lock every claimed placement form, two splits,
+  f64 SpMM precision, or zero extents.
+
+All are corrected.  The semantic verifier now has 51 locked codes,
+including `missing_tile_inner`; the dedicated schedule-carrier verifier
+replays the retained plan and requires exact program/provenance agreement;
+the plan/pass/target boundaries enforce `INT_MAX` only where C++ requires
+it; direct pass inputs fail closed; legacy canonicalization is restricted
+to the exact omitted-order equivalence; scheduled relayout work is
+schedule-free but parent-owned; both shadow arms consume the same verified
+layout and frozen plan; and dense wrapper rank comes from CIN.  The
+expanded compiled matrix locks every placement kind, unroll, two splits,
+non-square nonidentity layouts, rank one, f64 CSR×dense SpMM shadow with
+tight tolerances, f64 dense matmul source/PyTorch/oracle parity, and zero
+extents.
+
+Verification at the exact code/test tip `e00facd`:
+
+- contract focus: **309 passed**;
+- scheduled runtime and pipeline files: **80 passed**;
+- clean detached-worktree full non-performance suite:
+  **3,617 passed, 14 skipped, 3 perf-marked deselections, one known warning,
+  zero failures/errors in 2,427.96 seconds**, with import provenance asserted
+  and caches isolated at the exact test tip;
+- Black and `git diff --check` clean; focused mypy clean on seven package
+  modules with exactly the two inherited `scheduler.py` import findings in
+  the eighth; Flake8 has no new finding versus `727d55c` (only the inherited
+  scheduler C901); full-source mypy remains exactly **146 inherited findings
+  in 12 files, zero in `loopir/`**;
+- all five protected files remain at their recorded hashes and were never
+  staged; all unrelated dirty/untracked user material remains untouched.
+
+The definitive detail is `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §9.  The
+prompt below supersedes the narrower workspace-only prompt above.  It is
+deliberately broad: a capable session should finish a meaningful memory
+scheduling family and continue into its adjacent representation once the
+primary vertical slice is truly green.
+
+## Updated Copy-Paste Prompt for the Next Session/Agent
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call. Independently review the current
+tip, then implement the largest coherent remainder of Phase 6 that can be
+honestly verified. Do not stop after adding a workspace node or one showcase
+kernel.
+
+Read, in order:
+
+1. AGENTS.md
+2. COMPILER_IR_REFACTOR_DESIGN.md, especially the Stage-3/5 memory-region
+   contracts and Phase-6 exit criteria
+3. COMPILER_IR_REFACTOR_PHASE4_REVIEW.md §7
+4. COMPILER_IR_REFACTOR_PHASE5_REVIEW.md §8
+5. COMPILER_IR_REFACTOR_PHASE6_REVIEW.md, especially §§7-9
+6. the final dated sections of COMPILER_IR_REFACTOR_HANDOFF.md
+
+Inspect git status, branch/origin, the complete Phase-6 range
+`1418e88..727d55c` (including test commits `28e1fbf` and `c263b24`), and
+corrections `e338e98`/`e00facd` plus the docs tip before editing. Reproduce
+the 309-test contract focus
+(`test_loopir_verifier.py`, `test_loopir_schedule_passes.py`,
+`test_loopir_llir_lowering.py`, `test_loop_plan.py`, `test_schedule_api.py`)
+and the 80-test runtime focus (`test_loopir_scheduled_slice.py`,
+`test_loopir_pipeline_execution.py`) instead of trusting this handoff.
+Preserve the corrected contracts: complete affine pairs; exact
+ScheduledLoopIR replay/provenance verification; declared-field-only
+continuation identities; the C++ INT_MAX width boundary; stable direct-pass
+diagnostics; exact-only omitted-order canonicalization; schedule-free but
+parent-owned relayout prerequisites; frozen shadow plans; rank-general dense
+wrapping; and tight f64 sparse/dense differentials.
+
+Do not switch branches, amend/reorder existing commits, push, or stage broad
+paths. Preserve every unrelated dirty/untracked GPU, CUDA, benchmark,
+packaging, scheduler, research, scratchpad, and tooling path. Re-hash the five
+protected tracked files before every commit and stage explicit pathspecs only.
+Do not rerun the retained Phase-5 performance commands merely to seek a pass;
+its §8 first-run failures and reviewed exception are permanent evidence. New
+emitted-code changes still require fresh applicable gates.
+
+Primary objective — complete the workspace + stack-accumulation vertical
+family end to end:
+
+1. Audit the remaining LoopPlan families (`stack`, `heap`, panel bounds,
+   operand relayout, result tiles, explicit parallel selection) against
+   normalized CIN, legacy Scheduler/schedule_lowerer/CINLowerer ownership,
+   target emission, stage/cache identity, and the oracle. Record a concrete
+   responsibility/lifetime table before choosing nodes.
+2. Add the smallest general memory-region/workspace schema that can express
+   allocation, initialization/reset, producer writes/reductions, consumer
+   reads/copy-out, scope, element type/shape, and lifetime without C++ names,
+   callbacks, dynamic fields, or target strings. Use artifact-local IDs,
+   frozen tuple ownership, canonical serialization, stable defect codes,
+   cycle/depth protection, and verifier-enforced dominance, single ownership,
+   initialization-before-use, race/reduction legality, and exact plan
+   consumption.
+3. Extend the typed scheduling passes for `accum="stack"` and lower the
+   real legacy workspace shape (`wksp[kTile]` producer/consumer) through
+   structured LLIR/C++ with byte parity wherever compatibility is claimed.
+   Extend the production oracle and erasure/equivalence checks; prove ragged
+   tails, resets, and reductions, not merely loop visitation.
+4. Carry a meaningful compiled matrix: dense reduction/matmul and CSR×dense
+   SpMM stack tiles where legacy supports them; tile width below/equal/above
+   and non-divisible extents; empty sparse rows; zero extents; f32/f64 with
+   precision-appropriate tolerances; randomized dimensions; every relevant
+   placement; prefetch/pointer-hoist/zero-fill/parallel-policy activation;
+   source parity plus bitwise legacy shadow and PyTorch/oracle agreement.
+5. Keep default production and unsupported families on legacy, preserve
+   source-derived kernel cache behavior and import neutrality, and make every
+   partial failure terminal in the correct CompilationContext stage. Do not
+   silently decline any retained LoopPlan fact.
+
+Once the complete stack/workspace family is green, continue in the same
+session through the largest coherent adjacent family rather than stopping:
+
+- preferred next family: sparse-panel tiling plus operand relayout/staging
+  together, using the new memory-region/lifetime machinery and typed access-ID
+  redirection (no name/regex discovery);
+- otherwise, if that audit proves they are genuinely separate, implement and
+  gate the larger safe one and record the exact blocker for the other;
+- optional separate stretch after those: heap result tiles or abstract
+  parallel-loop selection, but only with structural race/work estimates and
+  end-to-end evidence.
+
+Do not start Phase 7 OpenMP/target-pass migration, selector/public production
+cutover, legacy deletion, GPU scheduling, or unrelated performance work until
+the remaining Phase-6 family gates above are closed.
+
+Mandatory gates:
+
+- every new schema/verifier/printer/canonical/oracle/pass defect and
+  ownership boundary, including forged missing/extra/cyclic/deep state,
+  malformed cross-field artifacts, deterministic identities, pass purity,
+  exact plan consumption, and deliberate idempotence/non-idempotence;
+- the current LoopIR/scheduled/LoopPlan/Schedule API locks plus normalized
+  CIN, identity, stage timing, schedule_lowerer, LLIR traversal/pass manager,
+  raw budget, native ABI/cache keys, import neutrality, and Phase-3.5 spike
+  adjacency;
+- real compiled PyTorch/legacy/oracle differentials and byte-exact source
+  comparison for every compatibility claim; structural activation is never
+  waived;
+- fresh 20-source corpus and 42-cell grid captures against the correction
+  docs tip; apply the settled byte/performance policy honestly to changed
+  build inputs and preserve first failures;
+- paired compiler latency with stage attribution, Black, Flake8, focused and
+  full-source mypy baseline comparison, git diff --check, provenance checks,
+  and a clean detached-worktree full non-performance suite with isolated
+  caches;
+- protected hashes and explicit-path staging audits before every focused
+  commit.
+
+Use focused commits with descriptive bodies separating schema/verifier,
+passes/lowering/runtime, tests, optional adjacent/stretch work, and docs.
+Update the Phase-6 review and handoff with exact hashes, test memberships,
+evidence locations, origin state, limitations, and a candid Phase-6 exit
+verdict. Commit the largest coherent verified subset; do not overclaim and do
+not push.
 ```
