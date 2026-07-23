@@ -39,6 +39,7 @@ from .diagnostics import (
 )
 from .legacy_cin_adapter import validate_legacy_cin_display_names
 from .loop_plan import (
+    MAX_AFFINE_TILE_WIDTH,
     LoopPart,
     LoopPlacement,
     LoopPlan,
@@ -223,6 +224,8 @@ class TileSpec:
             raise TypeError("TileSpec.width must be an integer")
         if self.width <= 0:
             raise ValueError("TileSpec.width must be greater than zero")
+        if self.width > MAX_AFFINE_TILE_WIDTH:
+            raise ValueError("TileSpec.width must fit the C++ constexpr int target")
         if not isinstance(self.placement, str):
             raise TypeError("TileSpec.placement must be a string")
         if not isinstance(self.parallel, bool):
@@ -296,6 +299,10 @@ class RelayoutSpec:
             raise TypeError("RelayoutSpec.strip_width must be an integer")
         if self.strip_width <= 0:
             raise ValueError("RelayoutSpec.strip_width must be greater than zero")
+        if self.strip_width > MAX_AFFINE_TILE_WIDTH:
+            raise ValueError(
+                "RelayoutSpec.strip_width must fit the C++ constexpr int target"
+            )
         if self.scope_var is not None:
             if not isinstance(self.scope_var, str):
                 raise TypeError("RelayoutSpec.scope_var must be a string or None")

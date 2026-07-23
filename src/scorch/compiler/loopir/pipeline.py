@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import copy
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -148,12 +148,8 @@ def _plan_mode_orders_to_planned_order(
     rhs_mode_orders: List[Optional[Tuple[int, ...]]] = []
     for access in rhs_accesses:
         tensor_var = access.get_tensor()
-        access_names = [
-            index_var.name for index_var in access.get_index_vars()
-        ]
-        desired_names = [
-            name for name in loop_order_names if name in access_names
-        ]
+        access_names = [index_var.name for index_var in access.get_index_vars()]
+        desired_names = [name for name in loop_order_names if name in access_names]
         desired = tuple(access_names.index(name) for name in desired_names)
         mode_order = tensor_var.mode_order
         if mode_order is None or len(desired) != len(mode_order):
@@ -175,6 +171,38 @@ def _plan_mode_orders_to_planned_order(
         if lhs_modes is not None and len(desired) == len(lhs_modes):
             lhs_mode_order = desired
     return tuple(rhs_mode_orders), lhs_mode_order
+
+
+def _execute_mode_order_alignment(
+    normalized: IndexStmt,
+    args: tuple,
+    alignment_plan,
+    options: CompileOptions,
+    context: Optional[CompilationContext],
+) -> tuple:
+    """Apply one alignment without leaking a parent schedule to prerequisites.
+
+    A storage relayout may compile an auxiliary kernel.  That prerequisite is
+    not the scheduled operation, so it receives a schedule-free copy of the
+    already-resolved options and a matching independent instrumentation owner.
+    Every other build and compiler option remains identical.
+    """
+
+    from ...ops import _apply_mode_order_alignment, _relayout_mode_order_args
+
+    relayout_options = options
+    relayout_context = context
+    if options.requested_schedule is not None:
+        relayout_options = replace(options, requested_schedule=None)
+        relayout_context = CompilationContext(relayout_options)
+    aligned = _relayout_mode_order_args(
+        args,
+        alignment_plan,
+        relayout_options,
+        relayout_context,
+    )
+    _apply_mode_order_alignment(normalized, alignment_plan)
+    return aligned
 
 
 def _apply_requested_schedule(
@@ -470,12 +498,10 @@ def execute_cin_via_loopir(
     from ...stensor import STensor
     from ...storage import TensorIndex
     from ...ops import (
-        _apply_mode_order_alignment,
         _finalize_generated_mode_indices,
         _load_validated_prepared_kernel,
         _plan_mode_orders_to_loop_order,
         _prepare_generated_kernel_build,
-        _relayout_mode_order_args,
     )
 
     options = _resolve_options(compile_options, _compilation_context)
@@ -498,8 +524,18 @@ def execute_cin_via_loopir(
     try:
         _validate_runtime_formats(normalized, args)
         if plan is not None:
-            alignment_plan = _plan_mode_orders_to_planned_order(
-                normalized, args, plan
+            alignment_plan = _plan_mode_orders_to_planned_order(normalized, args, plan)
+            # A scheduled relayout executes with an independent schedule-free
+            # context, but its success or failure still belongs to this
+            # compilation's frontend binding stage.  Keep the parent token
+            # active so elapsed time includes the prerequisite and a child
+            # failure makes the caller-owned context terminal.
+            args = _execute_mode_order_alignment(
+                normalized,
+                args,
+                alignment_plan,
+                options,
+                context,
             )
         else:
             alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
@@ -507,13 +543,16 @@ def execute_cin_via_loopir(
         context.fail_stage(planning_token)
         raise
     context.complete_stage(planning_token)
-    args = _relayout_mode_order_args(
-        args,
-        alignment_plan,
-        options,
-        context,
-    )
-    _apply_mode_order_alignment(normalized, alignment_plan)
+    if plan is None:
+        # The unscheduled route shares its context with nested relayout
+        # compilation, so its root frontend stage must finish first.
+        args = _execute_mode_order_alignment(
+            normalized,
+            args,
+            alignment_plan,
+            options,
+            context,
+        )
     input_bindings = tuple((tuple(arg.shape), arg.dtype) for arg in args)
     kernel = _compile_normalized_cin_via_loopir(
         normalized,
@@ -579,8 +618,9 @@ def _execute_legacy_scheduled(
     The untouched low-level entry rejects requested schedules, so scheduled
     shadow execution drives the same production components directly:
     ``Scheduler.apply_schedule``, the legacy lowering of the verified
-    ``ScheduledCIN``, and the shared JIT build/cache/execution helpers,
-    with the legacy entry's dense (``"dd"``) result wrapping.
+    ``ScheduledCIN``, and the shared JIT build/cache/execution helpers.
+    Runtime mode-order prerequisites are aligned to the verified plan, and
+    the dense result wrapper is derived from the normalized result rank.
     """
 
     from ...stensor import STensor
@@ -601,6 +641,19 @@ def _execute_legacy_scheduled(
         options.requested_schedule,
         compile_options=options,
         compilation_context=context,
+    )
+    _validate_runtime_formats(scheduled.normalized_cin, args)
+    alignment_plan = _plan_mode_orders_to_planned_order(
+        scheduled.normalized_cin,
+        args,
+        scheduled.verified_loop_plan,
+    )
+    args = _execute_mode_order_alignment(
+        scheduled.normalized_cin,
+        args,
+        alignment_plan,
+        options,
+        context,
     )
     _bind_runtime_metadata(
         scheduled.normalized_cin,
@@ -625,13 +678,23 @@ def _execute_legacy_scheduled(
         module_args.append(arg._native_mode_indices())
         module_args.append(arg.values)
     result_cpp = module.evaluate(*module_args)
+    result_vars = scheduled.normalized_cin.get_result_tensor_vars()
+    if len(result_vars) != 1 or result_vars[0].format is None:
+        raise CompileSpecError(
+            "legacy scheduled shadow execution requires one formatted result"
+        )
+    result_format = result_vars[0].format
+    if not result_format.is_dense():
+        raise CompileSpecError(
+            "legacy scheduled shadow execution requires a dense result"
+        )
     return STensor(
         shape=tuple(result_shape),
         index=TensorIndex(
             mode_indices=_finalize_generated_mode_indices(
-                parse_format("dd"), result_cpp.storage.index.mode_indices
+                result_format, result_cpp.storage.index.mode_indices
             ),
-            tensor_format="dd",
+            tensor_format=result_format,
         ),
         value=result_cpp.storage.value,
     )
@@ -648,20 +711,43 @@ def execute_shadow(
     Returns ``(loopir_result, legacy_result, source_comparison)``.  The
     legacy execution uses the untouched low-level entry (or, when the
     options request a schedule, the legacy scheduled route through
-    ``Scheduler.apply_schedule``); both wrappers support dense rank-2
-    outputs only.  Sparse-output comparisons must use source parity plus
-    direct LoopIR/PyTorch/oracle execution instead.
+    ``Scheduler.apply_schedule``); both wrappers support dense outputs.
+    Sparse-output comparisons must use source parity plus direct
+    LoopIR/PyTorch/oracle execution instead.
     """
 
     from ...ops import (
-        _apply_mode_order_alignment,
         _plan_mode_orders_to_loop_order,
-        _relayout_mode_order_args,
         lower_and_exec_cin,
     )
 
     options = _resolve_options(compile_options)
-    normalized = normalize_cin(cin_stmt, compile_options=options)
+    shadow_plan: Optional[LoopPlan] = None
+    downstream_options = options
+    if options.requested_schedule is not None:
+        normalized, shadow_plan = _apply_requested_schedule(
+            cin_stmt,
+            options,
+            CompilationContext(options),
+        )
+        # Freeze any policy-selected shorthand (notably
+        # ``Schedule.loop_order=None``) to the verified plan before the
+        # comparison invokes either pipeline again.  Runtime alignment below
+        # may update compiler-owned mode-order metadata; it must not cause a
+        # second policy selection to reinterpret the same shadow request.
+        from ..scheduler import materialize_legacy_schedule
+
+        canonical_schedule, _, _, _ = materialize_legacy_schedule(
+            normalized,
+            shadow_plan,
+        )
+        if canonical_schedule != options.requested_schedule:
+            downstream_options = replace(
+                options,
+                requested_schedule=canonical_schedule,
+            )
+    else:
+        normalized = normalize_cin(cin_stmt, compile_options=options)
     if any(
         tensor_var.format is None or not tensor_var.format.is_dense()
         for tensor_var in normalized.get_result_tensor_vars()
@@ -671,43 +757,49 @@ def execute_shadow(
             "low-level result wrapper does not preserve sparse indices"
         )
     _validate_runtime_formats(normalized, args)
-    if options.requested_schedule is None:
+    if shadow_plan is None:
         alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
-        args = _relayout_mode_order_args(
+    else:
+        alignment_plan = _plan_mode_orders_to_planned_order(
+            normalized,
             args,
-            alignment_plan,
-            options,
-            None,
+            shadow_plan,
         )
-        _apply_mode_order_alignment(normalized, alignment_plan)
-    # On the scheduled route each executed pipeline owns its alignment: the
-    # LoopIR entry aligns to the plan's logical order, and the legacy
-    # scheduled entry consumes the runtime layouts natively.
+    # Align once before source comparison so compile-only bindings describe
+    # logical storage, then both execution routes independently observe the
+    # same already-aligned inputs.
+    args = _execute_mode_order_alignment(
+        normalized,
+        args,
+        alignment_plan,
+        downstream_options,
+        None,
+    )
 
     comparison = compare_generated_sources(
         normalized,
         result_shape,
         tuple((tuple(arg.shape), arg.dtype) for arg in args),
-        compile_options=options,
+        compile_options=downstream_options,
     )
     loopir_result, _ = execute_cin_via_loopir(
         copy.deepcopy(normalized),
         result_shape,
         *args,
-        compile_options=options,
+        compile_options=downstream_options,
     )
-    if options.requested_schedule is not None:
+    if downstream_options.requested_schedule is not None:
         legacy_result = _execute_legacy_scheduled(
             copy.deepcopy(normalized),
             result_shape,
             *args,
-            compile_options=options,
+            compile_options=downstream_options,
         )
     else:
         legacy_result = lower_and_exec_cin(
             copy.deepcopy(normalized),
             result_shape,
             *args,
-            _compile_options=options,
+            _compile_options=downstream_options,
         )
     return loopir_result, legacy_result, comparison

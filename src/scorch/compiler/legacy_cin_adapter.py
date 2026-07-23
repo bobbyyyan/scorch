@@ -10,6 +10,7 @@ normalized-CIN boundary.
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, cast
 
 from .cin import (
@@ -97,10 +98,32 @@ def _prepare_legacy_cin(
             )
         else:
             schedule, _, _, _ = materialize_legacy_schedule(cin, plan)
+            # The verified plan canonicalizes omitted public spellings such
+            # as ``Schedule.loop_order=None`` into explicit identity facts.
+            # Private replay must validate against that canonical schedule,
+            # not reject it merely because the original options retained the
+            # shorter equivalent spelling.
+            replay_options = compile_options
+            requested = compile_options.requested_schedule
+            if (
+                requested is not None
+                and requested != schedule
+                and requested.loop_order is None
+                and replace(requested, loop_order=schedule.loop_order) == schedule
+            ):
+                # ``loop_order=None`` asks the scheduler to choose an order.
+                # Once that choice is frozen in LoopPlan, materialization
+                # necessarily spells it explicitly.  Canonicalize only that
+                # one proven-equivalent difference; every other disagreement
+                # remains visible to _apply_schedule_legacy's conflict check.
+                replay_options = replace(
+                    compile_options,
+                    requested_schedule=schedule,
+                )
             replayed = Scheduler._apply_schedule_legacy(
                 working,
                 schedule,
-                compile_options=compile_options,
+                compile_options=replay_options,
             )
             working = replayed.normalized_cin
         # Schedule replay can introduce derived display names, so validate the

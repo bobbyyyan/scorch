@@ -17,7 +17,9 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
-from scorch.compiler.loop_plan import ScheduledCIN
+from scorch.compiler.diagnostics import CompileOptionsError
+from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH, ScheduledCIN
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
 from scorch.compiler.llir_traversal import (
     LLIRRewriter,
@@ -341,6 +343,24 @@ def test_tile_k_width_and_child_placement_reach_generated_cpp():
     assert "if (k >= B1_size)" in cpp
     assert "if (k >= C1_size)" in cpp
     assert cpp.index("for (int64_t i = 0") < cpp.index("k_out = 0")
+
+
+def test_legacy_replay_only_canonicalizes_an_omitted_loop_order():
+    tile_only = Schedule(tiles=(TileSpec("k", 4, accum="direct"),))
+    scheduled = Scheduler.apply_schedule(_build_spmm(), tile_only)
+
+    canonical_options = CompileOptions.from_environment(requested_schedule=tile_only)
+    CINLowerer(compile_options=canonical_options).lower_IndexStmt(scheduled)
+
+    conflicting_options = CompileOptions.from_environment(
+        requested_schedule=Schedule(
+            loop_order=("i", "k", "j"),
+            tiles=(TileSpec("k", 4, accum="direct"),),
+        )
+    )
+    with pytest.raises(CompileOptionsError) as error:
+        CINLowerer(compile_options=conflicting_options).lower_IndexStmt(scheduled)
+    assert error.value.diagnostics[0].code == "conflicting_schedule"
 
 
 def test_schedule_cache_key_is_canonical_and_complete():
@@ -914,7 +934,9 @@ def test_unsupported_or_unsafe_schedule_requests_are_rejected():
         lambda: TileSpec("k", 4, unroll=1),
         lambda: TileSpec("k", 4, placement="child_of:"),
         lambda: TileSpec("k", 4, placement="at_depth:-1"),
+        lambda: TileSpec("k", MAX_AFFINE_TILE_WIDTH + 1),
         lambda: RelayoutSpec("B", "k", True),
+        lambda: RelayoutSpec("B", "k", MAX_AFFINE_TILE_WIDTH + 1),
         lambda: RelayoutSpec("B", "k", 4, scope_var=1),
         lambda: RelayoutSpec("B", "k", 4, scope_var=""),
         lambda: Schedule(parallel_loop=1),
@@ -923,6 +945,14 @@ def test_unsupported_or_unsafe_schedule_requests_are_rejected():
 def test_schedule_constructor_validation(factory):
     with pytest.raises((TypeError, ValueError)):
         factory()
+
+
+def test_schedule_width_boundary_accepts_constexpr_int_maximum():
+    assert TileSpec("k", MAX_AFFINE_TILE_WIDTH).width == MAX_AFFINE_TILE_WIDTH
+    assert (
+        RelayoutSpec("B", "k", MAX_AFFINE_TILE_WIDTH).strip_width
+        == MAX_AFFINE_TILE_WIDTH
+    )
 
 
 def test_storage_schedule_fields_are_immutable_and_legacy_scope_is_canonical():

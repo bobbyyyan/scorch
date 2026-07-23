@@ -15,7 +15,7 @@ the legacy lowering of the verified ``ScheduledCIN``):
   schedule-application boundary and the failure owns its stage record;
 - the target lowering keeps its own fail-closed boundary for scheduled
   shapes it does not emit (splits over merged iteration or ordered
-  assembly, and the legacy unguarded-broadcast-tile erratum).
+  assembly).
 """
 
 import pytest
@@ -29,7 +29,11 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorVar,
 )
-from scorch.compiler.compilation_context import CompilationContext, CompilerStageId
+from scorch.compiler.compilation_context import (
+    CompilationContext,
+    CompilationContextError,
+    CompilerStageId,
+)
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loop_plan import LoopPart
 from scorch.compiler.loopir.lower_llir import LoopIRTargetError
@@ -40,7 +44,7 @@ from scorch.compiler.loopir.pipeline import (
     execute_shadow,
 )
 from scorch.compiler.loopir.schedule_passes import SchedulePassError
-from scorch.compiler.scheduler import Schedule, TileSpec
+from scorch.compiler.scheduler import Schedule, Scheduler, TileSpec
 from scorch.stensor import STensor
 
 F32 = torch.float32
@@ -108,6 +112,48 @@ def build_union_add_to_dense():
     c = TensorVar("C", fmt="dd")
     assign = TensorAssign(c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]))
     return ForAll(i, ForAll(j, assign))
+
+
+def build_dense_add_2d():
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="dd")
+    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt="dd")
+    return ForAll(
+        i,
+        ForAll(
+            j,
+            TensorAssign(c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j])),
+        ),
+    )
+
+
+def build_dense_add_3d():
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    a = TensorVar("A", fmt="ddd")
+    b = TensorVar("B", fmt="ddd")
+    c = TensorVar("C", fmt="ddd")
+    return ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(
+                k,
+                TensorAssign(
+                    c[i, j, k],
+                    CINBinaryOp(Operation.ADD, a[i, j, k], b[i, j, k]),
+                ),
+            ),
+        ),
+    )
+
+
+def build_vector_add():
+    i = IndexVar("i")
+    a = TensorVar("A", fmt="d")
+    b = TensorVar("B", fmt="d")
+    c = TensorVar("C", fmt="d")
+    return ForAll(i, TensorAssign(c[i], CINBinaryOp(Operation.ADD, a[i], b[i])))
 
 
 def tile(index_var, width, placement="outermost", unroll=False, accum="direct"):
@@ -486,6 +532,40 @@ def test_unscheduled_pipeline_is_unchanged_by_the_strangler_entry():
     assert comparison.identical
 
 
+def test_tile_only_schedule_spelling_replays_legacy_canonically():
+    schedule = Schedule(tiles=(tile("j", 4),))
+    comparison = compare_generated_sources(
+        build_matmul(),
+        (4, 6),
+        MATMUL_BINDINGS,
+        compile_options=scheduled_options(schedule),
+    )
+    assert comparison.identical
+
+
+def test_tile_only_shadow_freezes_the_policy_selected_order(monkeypatch):
+    original = Scheduler.select_loop_order
+    calls = []
+
+    def select_once(*args, **kwargs):
+        calls.append(None)
+        if len(calls) > 1:
+            raise AssertionError("verified shadow plan must not be selected again")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(Scheduler, "select_loop_order", select_once)
+    a = torch.randn(3, 4)
+    b = torch.randn(4, 5)
+    assert_scheduled_shadow(
+        build_matmul(),
+        Schedule(tiles=(tile("j", 3),)),
+        (3, 5),
+        (dense_stensor(a, "A"), dense_stensor(b, "B")),
+        a @ b,
+    )
+    assert len(calls) == 1
+
+
 def test_broadcast_tile_bounds_from_the_result_like_legacy():
     """A split coordinate only the result drives is bounded and guarded by
     the result's dimension size, exactly as the legacy lattice resolves it."""
@@ -529,7 +609,16 @@ def csr_stensor(tensor, name):
     return STensor.from_torch(tensor, name).to_sparse("ds")
 
 
-def assert_scheduled_shadow(cin, schedule, result_shape, args, reference):
+def assert_scheduled_shadow(
+    cin,
+    schedule,
+    result_shape,
+    args,
+    reference,
+    *,
+    atol=1e-3,
+    rtol=1e-3,
+):
     loopir_result, legacy_result, comparison = execute_shadow(
         cin,
         result_shape,
@@ -541,8 +630,8 @@ def assert_scheduled_shadow(cin, schedule, result_shape, args, reference):
     assert torch.allclose(
         loopir_result.values.reshape(result_shape),
         reference,
-        atol=1e-3,
-        rtol=1e-3,
+        atol=atol,
+        rtol=rtol,
     )
 
 
@@ -567,6 +656,41 @@ def test_matmul_reordered_shadow_execution():
         build_matmul(order=("i", "j", "k")),
         Schedule(loop_order=("i", "k", "j")),
         (5, 3),
+        (dense_stensor(a, "A"), dense_stensor(b, "B")),
+        a @ b,
+    )
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        Schedule(
+            loop_order=("i", "k", "j"),
+            tiles=(tile("j", 3, placement="child_of:i"),),
+        ),
+        Schedule(
+            loop_order=("i", "k", "j"),
+            tiles=(tile("j", 3, placement="at_depth:2"),),
+        ),
+        Schedule(
+            loop_order=("i", "k", "j"),
+            tiles=(tile("j", 3, unroll=True),),
+        ),
+        Schedule(
+            loop_order=("i", "k", "j"),
+            tiles=(tile("i", 2), tile("j", 3)),
+        ),
+    ],
+    ids=("child-of", "at-depth", "unroll", "two-splits"),
+)
+def test_matmul_schedule_placement_matrix_shadow_execution(schedule):
+    torch.manual_seed(2618)
+    a = torch.randn(3, 4)
+    b = torch.randn(4, 5)
+    assert_scheduled_shadow(
+        build_matmul(),
+        schedule,
+        (3, 5),
         (dense_stensor(a, "A"), dense_stensor(b, "B")),
         a @ b,
     )
@@ -602,8 +726,36 @@ def test_spmm_tile_i_shadow_execution():
     )
 
 
-def test_matmul_tile_f64_execution_matches_torch_and_oracle():
+def test_spmm_tile_k_float64_shadow_execution():
     torch.manual_seed(2614)
+    sparse = torch.randn(3, 4, dtype=F64)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.randn(4, 5, dtype=F64)
+    assert_scheduled_shadow(
+        build_spmm(dtype=F64),
+        Schedule(loop_order=("i", "j", "k"), tiles=(tile("k", 3),)),
+        (3, 5),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+def test_matmul_zero_tile_extent_shadow_execution():
+    a = torch.randn(3, 4)
+    b = torch.empty(4, 0)
+    assert_scheduled_shadow(
+        build_matmul(),
+        Schedule(loop_order=("i", "k", "j"), tiles=(tile("j", 4),)),
+        (3, 0),
+        (dense_stensor(a, "A"), dense_stensor(b, "B")),
+        a @ b,
+    )
+
+
+def test_matmul_tile_f64_execution_matches_torch_and_oracle():
+    torch.manual_seed(2615)
     a = torch.randn(3, 4, dtype=torch.float64)
     b = torch.randn(4, 7, dtype=torch.float64)
     schedule = Schedule(loop_order=("i", "k", "j"), tiles=(tile("j", 4),))
@@ -636,7 +788,7 @@ def test_matmul_tile_f64_execution_matches_torch_and_oracle():
 
 
 def test_randomized_scheduled_execution_matches_torch():
-    torch.manual_seed(2615)
+    torch.manual_seed(2616)
     import random as _random
 
     rng = _random.Random(20260723)
@@ -658,3 +810,120 @@ def test_randomized_scheduled_execution_matches_torch():
         assert torch.allclose(
             result.values.reshape(rows, cols), a @ b, atol=1e-3, rtol=1e-3
         )
+
+
+def test_scheduled_relayout_prerequisite_uses_schedule_free_options(monkeypatch):
+    torch.manual_seed(2617)
+    a = torch.randn(2, 3, 4)
+    b = torch.randn(2, 3, 4)
+    a_st = STensor.from_torch(a, "A", mode_order=[1, 0, 2]).to_dense()
+    b_st = STensor.from_torch(b, "B", mode_order=[1, 0, 2]).to_dense()
+    observed = []
+    original = STensor.change_mode_order
+
+    def capture_options(self, mode_order, **kwargs):
+        observed.append(
+            (
+                kwargs.get("_compile_options"),
+                kwargs.get("_compilation_context"),
+            )
+        )
+        return original(self, mode_order, **kwargs)
+
+    monkeypatch.setattr(STensor, "change_mode_order", capture_options)
+    options = scheduled_options(Schedule(loop_order=("i", "j", "k")))
+    context = CompilationContext(options)
+    result, _ = execute_cin_via_loopir(
+        build_dense_add_3d(),
+        (2, 3, 4),
+        a_st,
+        b_st,
+        compile_options=options,
+        _compilation_context=context,
+    )
+    assert torch.equal(result.to_torch(), a + b)
+    assert CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION in tuple(
+        record.stage_id for record in context.stage_run_records
+    )
+    assert observed
+    for options, context in observed:
+        assert options.requested_schedule is None
+        assert context.compile_options is options
+
+
+def test_scheduled_relayout_failure_retires_the_parent_compilation(monkeypatch):
+    a = STensor.from_torch(
+        torch.randn(2, 3, 4),
+        "A",
+        mode_order=[1, 0, 2],
+    ).to_dense()
+    b = STensor.from_torch(
+        torch.randn(2, 3, 4),
+        "B",
+        mode_order=[1, 0, 2],
+    ).to_dense()
+    options = scheduled_options(Schedule(loop_order=("i", "j", "k")))
+    context = CompilationContext(options)
+    injected = RuntimeError("injected scheduled relayout failure")
+
+    def fail_relayout(*_args, **_kwargs):
+        raise injected
+
+    monkeypatch.setattr(STensor, "change_mode_order", fail_relayout)
+    with pytest.raises(RuntimeError) as error:
+        execute_cin_via_loopir(
+            build_dense_add_3d(),
+            (2, 3, 4),
+            a,
+            b,
+            compile_options=options,
+            _compilation_context=context,
+        )
+    assert error.value is injected
+    assert CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION not in tuple(
+        record.stage_id for record in context.stage_run_records
+    )
+    with pytest.raises(CompilationContextError) as terminal:
+        context.begin_stage(
+            CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+            compile_options=options,
+        )
+    assert terminal.value.diagnostic.code == "failed_compilation"
+
+
+@pytest.mark.parametrize("shape", [(3, 3), (3, 4)])
+def test_scheduled_shadow_aligns_nonidentity_runtime_layouts(shape):
+    rows, cols = shape
+    a = torch.arange(rows * cols, dtype=F32).reshape(rows, cols)
+    b = torch.arange(rows * cols, dtype=F32).reshape(rows, cols) * 3
+    a_st = STensor.from_torch(a, "A", mode_order=[1, 0]).to_dense()
+    b_st = STensor.from_torch(b, "B", mode_order=[1, 0]).to_dense()
+    loopir, legacy, comparison = execute_shadow(
+        build_dense_add_2d(),
+        shape,
+        a_st,
+        b_st,
+        compile_options=scheduled_options(Schedule(loop_order=("i", "j"))),
+    )
+    expected = a + b
+    assert comparison.identical
+    assert torch.equal(loopir.to_torch(), expected)
+    assert torch.equal(legacy.to_torch(), expected)
+    assert torch.equal(loopir.to_torch(), legacy.to_torch())
+
+
+def test_scheduled_shadow_wraps_dense_result_rank_from_cin():
+    a = torch.arange(5, dtype=F32)
+    b = torch.arange(5, dtype=F32) * 2
+    loopir, legacy, comparison = execute_shadow(
+        build_vector_add(),
+        (5,),
+        dense_stensor(a, "A"),
+        dense_stensor(b, "B"),
+        compile_options=scheduled_options(Schedule(loop_order=("i",))),
+    )
+    assert comparison.identical
+    assert str(loopir.format) == "d"
+    assert str(legacy.format) == "d"
+    assert torch.equal(loopir.to_torch(), a + b)
+    assert torch.equal(legacy.to_torch(), a + b)
