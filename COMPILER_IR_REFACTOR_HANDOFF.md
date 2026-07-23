@@ -24025,3 +24025,164 @@ first result and document the attribution under the settled policy; never
 rerun-until-pass. Commit the largest coherent verified subset and do not
 overclaim Phase 6. Do not push.
 ```
+
+## Phase-6 milestone: explicit reorder + affine tiling on LoopIR (2026-07-23)
+
+The first Phase-6 scheduling milestone is complete and closed at commits
+`1418e88` (affine-split schema/verifier/printer/oracle), `b4069ea` (typed
+scheduling passes over the verified `LoopPlan`), `6a9f68c` (scheduled
+target emission + the strangler entry), `28e1fbf` (tests), `c263b24`
+(the moved requested-schedule boundary lock), and the docs commit that
+records this section; `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` is the
+definitive record.  Nothing in `763b73b..8b0955c` was amended or
+reordered, and nothing was pushed — origin
+`refactor/compiler-ir-phase3-std-move-call` remains `58e8565`.
+
+What is now true:
+
+- Scheduled form is a verified state of the same LoopIR node model: one
+  `TileOuterFor`/`TileInnerFor` pair per affine split, linked by an
+  artifact-local `TileId`, with ragged-tail coverage intrinsic to the
+  node semantics and `unroll` the only carried schedule preference.  Six
+  new stable verifier codes guard split identity, pair agreement, scope,
+  widths, and index ownership (50-code locked surface); canonical
+  serialization moved to `scorch.loopir.canonical.v3`; dumps remain
+  semantic fingerprints, never target cache keys.
+- Scheduling is applied by pure typed passes
+  (`loopir/schedule_passes.py`): `reorder_loops` and `apply_affine_tile`
+  consume the *existing* verified `LoopPlan` (it already owned every fact
+  these families need — it was not widened), verify legality before and
+  after every rebuild, mirror the legacy
+  `outermost`/`child_of`/`at_depth` placement semantics exactly, and
+  return a frozen `ScheduledLoopIR` artifact retaining the unscheduled
+  base program, the exact plan, and per-loop
+  `(TileId, IndexId, LoopPart)` provenance.  `erase_schedule` is the
+  verified semantics-preserving erasure; oracle counting differentials
+  prove exactly-once visitation across ragged/exact/oversized/zero
+  extents, and ADD-reduction reassociation is the family's explicit
+  contract.
+- `Scheduler.apply_schedule` is the shared Schedule boundary of both
+  pipelines; they diverge only downstream (legacy replays CIN tree
+  surgery, LoopIR applies typed passes under the appended
+  `LOOPIR_SCHEDULE_APPLICATION` stage with exact partial-failure
+  ownership).  The strangler entry honors
+  `CompileOptions.requested_schedule` in the test/debug pipeline only;
+  default production, release JIT, import neutrality, legacy stage
+  sequences, and source-derived kernel cache identity are unchanged, and
+  runtime mode-order alignment targets the plan's logical order.
+- The migrated matrix is locked by a twenty-member scheduled byte-parity
+  grid (LoopIR C++ **byte-identical** to the legacy scheduled route in
+  every cell) plus bitwise-equal compiled shadow execution: explicit
+  reorders (including repairing an out-of-family source order), dense
+  reduction in two legal orders, affine `accum="direct"` tiles at every
+  placement kind with one and two splits, unroll on/off, CSR SpMM
+  untiled/tile-k/tile-i with N below/equal/above/not divisible by the
+  width, f32/f64, zero extents, empty CSR rows, and the result-bounded
+  broadcast split.  Prefetch, pointer hoisting, zero-fill, the
+  ceil-trip-count parallel headers, and the nnz-aware row policy all
+  reproduce byte-for-byte because the raw trees match and the managed
+  passes are untouched.
+- Every unmigrated schedule family fails closed with a stable code at the
+  plan gate (`unsupported_schedule_{provenance,panel,relayout,
+  result_tile,parallel,accumulation}`); splits over merged iteration or
+  ordered assembly stay uncompiled behind the target boundary; nothing
+  silently ignores a requested schedule.
+
+Verification highlights (full detail in the Phase-6 review §5): focused
+LoopIR membership **377 passed + 4 neutrality** (97 beyond corrected
+Phase 5); combined focused adjacency sweep **1,832 passed**; fresh
+20-source corpus and 42-source grid captures byte-identical to detached
+`8b0955c` captures and, through them, to the sealed Phase-5 §8 captures
+— no legacy emission changed, the byte waiver applies, and the Phase-5
+§8 first-run failures and reviewed exception remain the permanent,
+un-rerun record; fresh paired compiler latency inside the 1.10 target
+everywhere (worst p50 ratio 1.006, worst p95 1.000); Black/Flake8 clean
+on changed files; focused mypy clean over all thirteen package modules;
+full-source mypy exactly the 146 inherited findings in the same 12
+files, zero in `loopir/`; `git diff --check` clean; the authoritative
+clean detached-worktree non-performance suite at `c263b24` with isolated
+caches and asserted import provenance: **3,590 passed, 14 skipped, 3 perf-marked deselections, one known warning, and zero failures/errors in 2,234.79 seconds** — exactly the Phase-5 corrected baseline of 3,505 selected tests plus the 85 new Phase-6 tests (JUnit: 3,604 selected, SHA-256 `cb15c37a8a4e3f81fee23f8857f4ee989d07f982441db8bf75baff4671f6c56c`).  Evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase6-scheduled-c263b24/`.  All five
+protected tracked files retain the hashes recorded in the Phase-4
+section.
+
+Recorded observations: the legacy broadcast-tile guard correctly bounds
+from the result access (an unguarded-overshoot hypothesis was disproved
+by direct capture before any code claimed it), and legacy refuses affine
+reduction tiles even for direct accumulation while the typed pass proves
+them oracle-legal — a capability boundary recorded, not silently
+widened.  The Phase-4/5 errata stand unchanged.
+
+The workspace/parallel-annotation and selector-adaptation stretch
+families were deliberately not started: stack accumulation — the
+schedule the production tile-j/regblock families actually use — needs
+the workspace node family the schema still deliberately lacks, and that
+representation decision should open the next slice rather than close
+this one.
+
+## Copy-Paste Prompt for the Next Session/Agent (Phase 6, workspace slice)
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call. Perform an independent review of
+the current tip, then implement the largest coherent Phase-6 workspace
+scheduling milestone that can be honestly verified.
+
+Read, in order: AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md,
+COMPILER_IR_REFACTOR_PHASE4_REVIEW.md (§7),
+COMPILER_IR_REFACTOR_PHASE5_REVIEW.md (§8),
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md, and the final dated sections of
+COMPILER_IR_REFACTOR_HANDOFF.md. Inspect git status, the branch graph,
+origin, and commits 1418e88, b4069ea, 6a9f68c, 28e1fbf, and c263b24 before
+editing. Reproduce focused correctness evidence rather than trusting the
+handoff: the scheduled byte-parity grid, the pass/verifier/oracle suites,
+and the plan-gate fail-closed coverage. Preserve strict canonical
+compressed-coordinate validation, one-cursor domain canonicalization,
+finite canonical constants, rank/output-allocation guards, the
+sparse-shadow/oracle regressions, and the scheduled-slice parity locks.
+
+Do not switch branches, amend/reorder existing commits, push, or stage
+broad paths. Preserve every unrelated dirty/untracked GPU, CUDA, benchmark,
+packaging, scheduler, research, scratchpad, and tooling path. Re-hash the
+five protected tracked files before every commit. Do not rerun the retained
+Phase-5 performance commands merely to seek a pass; §8 permanently records
+their first-run failures and reviewed exception. New emitted-code changes
+still require fresh applicable gates.
+
+Current boundary: origin is 58e8565; Phases 0-5 plus the first Phase-6
+scheduling milestone are closed and local-only above it. Explicit loop
+reorders and affine direct-accumulation tiles compile through scheduled
+LoopIR byte-identically to the legacy scheduled route; stack/heap
+accumulation, sparse panels, relayout, heap result tiles, and explicit
+parallel selection fail closed at the plan gate and stay on legacy.
+
+Primary objective — migrate the stack-accumulation (workspace) schedule
+family: declare the workspace node family in the schema (allocation,
+reset, producer/consumer regions with verifier-enforced lifetime and
+reduction semantics, revised from the design and the legacy emission, not
+improvised), extend the tiling pass to accum="stack" plans, lower the
+legacy wksp[kTile] producer/consumer shape with byte parity against the
+legacy stack-tile kernels (Scheduler.apply_schedule with
+TileSpec(accum="stack")), extend the oracle and the erasure/exactly-once
+proofs to workspace programs, keep every other family fail-closed, and
+carry a meaningful matrix end to end (SpMM tile-k stack across ragged/
+exact/oversized N, f32/f64 where legacy has evidence, empty rows, zero
+extents, randomized dims, compiled shadow execution bitwise against the
+legacy scheduled kernels). If all of that is complete and green, one
+coherent stretch family in separate commits: heap result tiles, or
+explicit parallel-loop selection where the automatic policy already
+matches byte-for-byte.
+
+Mandatory gates are unchanged from the Phase-6 review §5: focused suites
+including every new defect code and forged/cyclic boundaries, scheduled
+byte-parity and bitwise shadow execution, normalized-CIN/LoopPlan/
+identity/stage-timing/Schedule-Scheduler/schedule_lowerer/LLIR/raw-budget/
+cache-key/import-neutrality/spike adjacency, fresh 20-source corpus and
+42-cell grid captures against the docs tip, paired compiler latency,
+Black/Flake8/focused and full-source mypy against the 146-finding
+baseline, git diff --check, provenance checks, a clean detached-worktree
+full non-performance suite, protected hashes, and an explicit-pathspec
+staging audit before every commit. Commit the largest coherent verified
+subset with focused commits and descriptive bodies, document limitations
+honestly, do not overclaim, and do not push.
+```
