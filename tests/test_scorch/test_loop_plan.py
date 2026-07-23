@@ -24,6 +24,7 @@ from scorch.compiler.diagnostics import (
 )
 from scorch.compiler.identity import IndexId, SymbolId
 from scorch.compiler.loop_plan import (
+    MAX_AFFINE_TILE_WIDTH,
     LoopPart,
     LoopPlan,
     LoopPlacement,
@@ -335,6 +336,28 @@ def test_loop_plan_verifier_requires_complete_loop_order() -> None:
         match="loop_order must contain every bound IndexId exactly once",
     ):
         verify_scheduled_cin(ScheduledCIN(scheduled.normalized_cin, incomplete_plan))
+
+
+def test_loop_plan_verifier_rejects_unrepresentable_tile_width():
+    scheduled = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("k", 4, accum="direct"),),
+        ),
+    )
+    plan = scheduled.verified_loop_plan
+    oversized = replace(
+        plan,
+        tiles=(
+            replace(
+                plan.tiles[0],
+                width=MAX_AFFINE_TILE_WIDTH + 1,
+            ),
+        ),
+    )
+    with pytest.raises(VerificationError, match="constexpr int target"):
+        verify_loop_plan(scheduled.normalized_cin, oversized)
 
 
 def test_loop_plan_rejects_unordered_loop_order_input() -> None:

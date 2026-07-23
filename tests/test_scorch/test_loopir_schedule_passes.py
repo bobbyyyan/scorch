@@ -9,6 +9,7 @@ program is visited exactly once (exact integer-float counting) across
 ragged, exact, oversized, and zero extents.
 """
 
+from dataclasses import replace
 import random
 
 import pytest
@@ -24,6 +25,7 @@ from scorch.compiler.cin import (
 from scorch.compiler.cin_analysis import normalize_cin
 from scorch.compiler.identity import IndexId
 from scorch.compiler.loop_plan import (
+    MAX_AFFINE_TILE_WIDTH,
     LoopPart,
     LoopPlacement,
     LoopPlan,
@@ -31,11 +33,13 @@ from scorch.compiler.loop_plan import (
     LoopTile,
     PlacementKind,
 )
+from scorch.compiler.loopir.build import LoopIRBuilder
 from scorch.compiler.loopir.lower_cin import lower_normalized_cin_to_loopir
 from scorch.compiler.loopir.nodes import (
     BinaryOp as LoopIRBinaryOp,
     Block,
     DenseFor,
+    TileId,
     TileInnerFor,
     TileOuterFor,
 )
@@ -48,6 +52,7 @@ from scorch.compiler.loopir.schedule_passes import (
     apply_schedule_plan,
     erase_schedule,
     reorder_loops,
+    verify_scheduled_loopir,
 )
 from scorch.compiler.loopir.verifier import verify_program
 
@@ -212,6 +217,12 @@ def test_reorder_rejects_incomplete_and_repeated_orders():
         reorder_loops,
         lowering.program,
         (i.index_id, j.index_id, foreign),
+    )
+    expect_code(
+        "reorder_invalid_order",
+        reorder_loops,
+        lowering.program,
+        ([i.index_id.value], j.index_id, k.index_id),
     )
 
 
@@ -423,6 +434,21 @@ def test_tile_rejects_unsupported_widths_and_families():
         affine_tile(j.index_id, 0),
     )
     expect_code(
+        "tile_invalid_width",
+        apply_affine_tile,
+        lowering.program,
+        affine_tile(j.index_id, MAX_AFFINE_TILE_WIDTH + 1),
+    )
+    expect_code(
+        "tile_target_not_logical",
+        apply_affine_tile,
+        lowering.program,
+        replace(
+            affine_tile(j.index_id, 4),
+            loop=LoopRef(j.index_id, LoopPart.OUTER),
+        ),
+    )
+    expect_code(
         "unsupported_schedule_accumulation",
         apply_affine_tile,
         lowering.program,
@@ -463,6 +489,34 @@ def test_tile_rejects_unsupported_widths_and_families():
     )
 
 
+def test_direct_tile_pass_rejects_forged_fields_with_stable_diagnostics():
+    cin, (_i, _k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    missing_loop = affine_tile(j.index_id, 4)
+    object.__delattr__(missing_loop, "loop")
+    expect_code(
+        "invalid_schedule_tile",
+        apply_affine_tile,
+        lowering.program,
+        missing_loop,
+    )
+
+    malformed_parent = replace(
+        affine_tile(j.index_id, 4),
+        placement=LoopPlacement(
+            PlacementKind.CHILD_OF,
+            parent=LoopRef(j.index_id),
+        ),
+    )
+    object.__setattr__(malformed_parent.placement, "parent", "j")
+    expect_code(
+        "invalid_schedule_tile",
+        apply_affine_tile,
+        lowering.program,
+        malformed_parent,
+    )
+
+
 def test_tile_is_deterministic_and_pure():
     cin, (i, k, j) = build_matmul_ikj()
     lowering = lower(cin)
@@ -498,6 +552,138 @@ def test_apply_schedule_plan_returns_full_provenance():
         (j.index_id, LoopPart.INNER, True),
     ]
     assert scheduled.loops[0].tile == scheduled.loops[3].tile
+    verify_scheduled_loopir(scheduled)
+
+
+def test_scheduled_artifact_snapshots_and_verifies_provenance_ownership():
+    cin, (_i, _k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(affine_tile(j.index_id, 4),),
+    )
+    scheduled = apply_schedule_plan(lowering.program, plan)
+    caller_owned = list(scheduled.loops)
+    detached = ScheduledLoopIR(
+        scheduled.base_program,
+        scheduled.plan,
+        scheduled.program,
+        caller_owned,
+    )
+    caller_owned.clear()
+    assert detached.loops == scheduled.loops
+    verify_scheduled_loopir(detached)
+
+
+def test_scheduled_artifact_rejects_cross_field_mismatches():
+    cin, (_i, _k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(affine_tile(j.index_id, 4),),
+    )
+    scheduled = apply_schedule_plan(lowering.program, plan)
+
+    expect_code(
+        "scheduled_program_mismatch",
+        verify_scheduled_loopir,
+        replace(scheduled, program=scheduled.base_program),
+    )
+    expect_code(
+        "scheduled_program_mismatch",
+        verify_scheduled_loopir,
+        replace(
+            scheduled,
+            plan=replace(
+                plan,
+                tiles=(replace(plan.tiles[0], width=8),),
+            ),
+        ),
+    )
+    expect_code(
+        "scheduled_provenance_mismatch",
+        verify_scheduled_loopir,
+        replace(scheduled, loops=scheduled.loops[:-1]),
+    )
+    wrong_part = replace(scheduled.loops[0], part=LoopPart.LOGICAL)
+    expect_code(
+        "scheduled_provenance_mismatch",
+        verify_scheduled_loopir,
+        replace(scheduled, loops=(wrong_part, *scheduled.loops[1:])),
+    )
+    expect_code(
+        "scheduled_base_not_unscheduled",
+        verify_scheduled_loopir,
+        replace(scheduled, base_program=scheduled.program),
+    )
+
+
+def test_scheduled_artifact_rejects_malformed_stored_state():
+    cin, (_i, _k, _j) = build_matmul_ikj()
+    lowering = lower(cin)
+    scheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(loop_order=lowering.loop_index_ids),
+    )
+    object.__delattr__(scheduled, "loops")
+    expect_code("invalid_scheduled_artifact", verify_scheduled_loopir, scheduled)
+
+
+def test_scheduled_artifact_rejects_a_non_plan_with_artifact_diagnostic():
+    cin, (_i, _k, _j) = build_matmul_ikj()
+    lowering = lower(cin)
+    scheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(loop_order=lowering.loop_index_ids),
+    )
+    object.__setattr__(scheduled, "plan", object())
+    expect_code("invalid_scheduled_artifact", verify_scheduled_loopir, scheduled)
+
+
+def test_plan_gate_rejects_unconsumed_tile_parts_and_placement_fields():
+    cin, (i, _k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    base_tile = affine_tile(j.index_id, 4)
+    expect_code(
+        "tile_target_not_logical",
+        apply_schedule_plan,
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(
+                replace(
+                    base_tile,
+                    loop=LoopRef(j.index_id, LoopPart.OUTER),
+                ),
+            ),
+        ),
+    )
+    expect_code(
+        "tile_invalid_placement",
+        apply_schedule_plan,
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(
+                replace(
+                    base_tile,
+                    placement=LoopPlacement(
+                        PlacementKind.OUTERMOST,
+                        parent=LoopRef(i.index_id),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_resuming_ignores_non_schema_dataclass_state():
+    cin, (_i, _k, _j) = build_matmul_ikj()
+    program = lower(cin).program
+    assert LoopIRBuilder.resuming(program).new_tile_id() == TileId(0)
+    object.__setattr__(program.body, "ghost_tile", TileId(999))
+    verify_program(program)
+    assert LoopIRBuilder.resuming(program).new_tile_id() == TileId(0)
 
 
 @pytest.mark.parametrize("provenance", ["auto", "tuned", "fallback"])

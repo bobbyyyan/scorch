@@ -28,6 +28,7 @@ from scorch.compiler.compilation_context import (
     CompilerStageId,
 )
 from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH
 from scorch.compiler.loopir.lower_llir import (
     LoopIRTargetError,
     lower_loopir_to_llir,
@@ -42,6 +43,7 @@ from scorch.compiler.loopir.verifier import LoopIRVerificationError
 from tests.test_scorch.test_loopir_printer import build_matvec
 from tests.test_scorch.test_loopir_verifier import (
     build_matmul,
+    build_tiled_matvec,
     build_vector_add,
     forge,
 )
@@ -268,6 +270,17 @@ def test_target_lowering_verifies_first():
             input_shapes={fixture.a: (2,), fixture.b: (2,)},
             result_shape=(2,),
         )
+
+
+def test_target_rejects_tile_widths_that_do_not_fit_constexpr_int():
+    fixture = build_tiled_matvec(width=MAX_AFFINE_TILE_WIDTH + 1)
+    a_symbol, x_symbol = fixture.program.inputs
+    expect_target_code(
+        "unsupported_tile_width",
+        fixture.program,
+        {a_symbol: (3, 4), x_symbol: (4,)},
+        (3,),
+    )
 
 
 def test_target_lowering_owns_supplied_context_stage_and_pass_records():

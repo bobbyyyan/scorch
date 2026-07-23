@@ -44,7 +44,8 @@ The invariant families stated locally for this subset:
 - **Affine splits.**  A strip-mined loop is one ``TileOuterFor`` /
   ``TileInnerFor`` pair owning a unique ``TileId``
   (``invalid_tile_id`` / ``duplicate_tile_id``); the point loop must run
-  inside its origin loop's scope (``unbound_tile``), agree with it on
+  inside its origin loop's scope (``unbound_tile``), every origin must
+  contain its point loop (``missing_tile_inner``), the pair must agree on
   index, dimension, and width (``tile_binding_mismatch``), and widths are
   positive exact ints (``invalid_tile_width``).  A split owns its logical
   loop: the split index may be neither bound nor split again in an
@@ -177,6 +178,7 @@ class _Context:
         self.bound_positions: Dict[PositionId, Tuple[SymbolId, int]] = {}
         self.ever_bound_positions: Set[PositionId] = set()
         self.open_tiles: Dict[TileId, TileOuterFor] = {}
+        self.matched_tile_inners: Set[TileId] = set()
         self.ever_tile_ids: Set[TileId] = set()
         self.in_cursor_default = False
         self.program_dtype: Optional[ScalarType] = None
@@ -764,8 +766,16 @@ def _check_tile_outer_for(
     ctx.open_tiles[tile] = stmt
     try:
         _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
+        if tile not in ctx.matched_tile_inners:
+            _fail(
+                "missing_tile_inner",
+                path,
+                f"TileOuterFor for tile id {tile.value} has no matching "
+                "TileInnerFor in its body",
+            )
     finally:
         del ctx.open_tiles[tile]
+        ctx.matched_tile_inners.discard(tile)
 
 
 def _check_tile_inner_for(
@@ -796,6 +806,7 @@ def _check_tile_inner_for(
     if type(stmt.unroll) is not bool:
         _fail("malformed_state", path, "TileInnerFor.unroll must be a bool")
     bound = _bind_index(ctx, stmt.index, path, "TileInnerFor.index", dimension)
+    ctx.matched_tile_inners.add(tile)
     try:
         _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
     finally:

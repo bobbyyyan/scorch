@@ -66,6 +66,7 @@ from ..llir_pass_manager import (
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
 )
+from ..loop_plan import MAX_AFFINE_TILE_WIDTH
 from ..parallel_marking_pass import (
     _CPP_KEYWORDS,
     EMPTY_PARALLEL_WORKSPACE_CLUSTER,
@@ -533,6 +534,16 @@ class _TargetLowering:
                 "unsupported_program_shape",
                 "the migrated families require a dense or tile-origin "
                 "outermost loop",
+            )
+        if any(
+            loop.kind in (_TILE_OUTER, _TILE_INNER)
+            and loop.node.width > MAX_AFFINE_TILE_WIDTH
+            for loop in loops
+        ):
+            _fail(
+                "unsupported_tile_width",
+                "the C++ target emits affine tile widths as constexpr int "
+                f"and therefore requires widths <= {MAX_AFFINE_TILE_WIDTH}",
             )
         tile_positions = [
             position

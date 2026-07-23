@@ -19,6 +19,25 @@ if TYPE_CHECKING:
     from .cin import IndexStmt
 
 
+MAX_AFFINE_TILE_WIDTH = 2**31 - 1
+"""Largest affine-tile width representable by the current C++ target.
+
+The legacy and LoopIR CPU lowerings both materialize tile widths as
+``constexpr int`` values.  Keeping this limit beside the shared LoopPlan
+contract lets every schedule entry reject an unrepresentable width before
+either lowering can silently wrap it.
+"""
+
+
+def _verify_cpp_int_width(width: int, field: str) -> None:
+    """Reject a planning width the current C++ target cannot represent."""
+
+    if width > MAX_AFFINE_TILE_WIDTH:
+        raise VerificationError(
+            f"LoopPlan {field} must fit the C++ constexpr int target"
+        )
+
+
 def _tuple_snapshot(value: object, field_name: str) -> Tuple[object, ...]:
     """Detach one tuple-valued plan field from caller-owned containers."""
 
@@ -452,6 +471,7 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
             affine_tiled_ids.add(tile.loop.index_id)
         if tile.width <= 0:
             raise VerificationError("LoopPlan tile widths must be positive")
+        _verify_cpp_int_width(tile.width, "tile widths")
         if tile.placement.kind == PlacementKind.CHILD_OF:
             if tile.placement.parent is None or tile.placement.depth is not None:
                 raise VerificationError(
@@ -522,6 +542,7 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
             check_derived_loop(loop, f"relayout.{field}")
         if relayout.strip_width <= 0:
             raise VerificationError("LoopPlan relayout strip width must be positive")
+        _verify_cpp_int_width(relayout.strip_width, "relayout strip width")
         if relayout.operand_panel_level < 0 or relayout.operand_pack_level < 0:
             raise VerificationError("LoopPlan relayout levels must be non-negative")
         for position, index_id in enumerate(relayout.access_indices):

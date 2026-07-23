@@ -66,13 +66,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, NoReturn, Optional, Sequence, Set, Tuple, Union
 
+from ..diagnostics import VerificationError
 from ..identity import IndexId
 from ..loop_plan import (
+    MAX_AFFINE_TILE_WIDTH,
     LoopPart,
     LoopPlan,
     LoopPlacement,
+    LoopRef,
     LoopTile,
     PlacementKind,
+    _validate_loop_plan_structure,
 )
 from .build import LoopIRBuilder
 from .nodes import (
@@ -152,6 +156,13 @@ class ScheduledLoopIR:
     plan: LoopPlan
     program: LoopProgram
     loops: Tuple[ScheduledLoopProvenance, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.loops, (tuple, list)):
+            raise TypeError(
+                "ScheduledLoopIR.loops must be a tuple or list of provenance values"
+            )
+        object.__setattr__(self, "loops", tuple(self.loops))
 
 
 def _loop_key(node: _LoopNode) -> Tuple[IndexId, LoopPart]:
@@ -320,7 +331,21 @@ def reorder_loops(program: LoopProgram, loop_order: Sequence[IndexId]) -> LoopPr
                 "loop reorder operates on unsplit logical chains; apply it "
                 "before affine tiling",
             )
-    requested = tuple(loop_order)
+    try:
+        requested = tuple(loop_order)
+    except (TypeError, RecursionError):
+        _fail(
+            "reorder_invalid_order",
+            "requested order must be a finite sequence of IndexId values",
+        )
+    if any(
+        type(index) is not IndexId or type(getattr(index, "value", None)) is not int
+        for index in requested
+    ):
+        _fail(
+            "reorder_invalid_order",
+            "requested order must contain exact int-valued IndexId values",
+        )
     chain_keys = [_loop_key(node)[0] for node in loops]
     if len(set(requested)) != len(requested):
         _fail("reorder_incomplete_order", "requested order repeats a loop")
@@ -407,6 +432,15 @@ def apply_affine_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
     verify_program(program)
     if type(tile) is not LoopTile:
         raise TypeError("apply_affine_tile expects a LoopTile")
+    try:
+        _validate_loop_plan_structure(LoopPlan(loop_order=(), tiles=(tile,)))
+    except (VerificationError, AttributeError, TypeError, ValueError) as error:
+        _fail("invalid_schedule_tile", str(error))
+    if type(tile.loop) is not LoopRef or tile.loop.part is not LoopPart.LOGICAL:
+        _fail(
+            "tile_target_not_logical",
+            "affine tiles must target one unsplit logical loop",
+        )
     if tile.kind != "affine":
         _fail(
             "unsupported_schedule_panel",
@@ -451,8 +485,22 @@ def apply_affine_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
             "affine tiling cannot split a sparse coordinate loop; windowed "
             "compressed iteration is not represented",
         )
-    if type(tile.width) is not int or tile.width < 1:
-        _fail("tile_invalid_width", "affine tile widths must be positive ints")
+    if (
+        type(tile.width) is not int
+        or tile.width < 1
+        or tile.width > MAX_AFFINE_TILE_WIDTH
+    ):
+        _fail(
+            "tile_invalid_width",
+            "affine tile widths must be positive ints representable by the "
+            "C++ constexpr int target",
+        )
+    if type(tile.placement) is not LoopPlacement:
+        _fail(
+            "tile_invalid_placement",
+            "affine tile placement must be an exact LoopPlacement",
+        )
+    _check_placement_shape(tile.placement)
 
     depth = _placement_depth(loops, tile.placement, target_position)
 
@@ -529,6 +577,71 @@ def _check_plan_families(plan: LoopPlan) -> None:
             )
 
 
+def _check_placement_shape(placement: LoopPlacement) -> None:
+    """Reject contradictory placement fields before assert-based dispatch."""
+
+    if placement.kind is PlacementKind.OUTERMOST:
+        if placement.parent is not None or placement.depth is not None:
+            _fail(
+                "tile_invalid_placement",
+                "outermost placement cannot also name a parent or depth",
+            )
+        return
+    if placement.kind is PlacementKind.CHILD_OF:
+        if placement.parent is None or placement.depth is not None:
+            _fail(
+                "tile_invalid_placement",
+                "child_of placement requires exactly one parent loop",
+            )
+        return
+    if placement.kind is PlacementKind.AT_DEPTH:
+        if (
+            placement.parent is not None
+            or type(placement.depth) is not int
+            or placement.depth < 0
+        ):
+            _fail(
+                "tile_invalid_placement",
+                "at_depth placement requires exactly one nonnegative depth",
+            )
+        return
+    _fail("tile_invalid_placement", "placement kind is not a PlacementKind member")
+
+
+def _validate_plan_for_pass(plan: object) -> LoopPlan:
+    """Establish the LoopPlan structure this pass boundary relies on."""
+
+    if type(plan) is not LoopPlan:
+        raise TypeError("apply_schedule_plan expects a LoopPlan")
+    try:
+        checked = _validate_loop_plan_structure(plan)
+    except (VerificationError, AttributeError, TypeError, ValueError) as error:
+        _fail("invalid_schedule_plan", str(error))
+    _check_plan_families(checked)
+
+    seen_targets: Set[IndexId] = set()
+    for tile in checked.tiles:
+        if tile.loop.part is not LoopPart.LOGICAL:
+            _fail(
+                "tile_target_not_logical",
+                "LoopPlan affine tiles must target unsplit logical loops",
+            )
+        if tile.loop.index_id in seen_targets:
+            _fail(
+                "tile_target_already_split",
+                "a LoopPlan cannot split the same logical loop twice",
+            )
+        seen_targets.add(tile.loop.index_id)
+        if tile.width < 1 or tile.width > MAX_AFFINE_TILE_WIDTH:
+            _fail(
+                "tile_invalid_width",
+                "affine tile widths must be positive ints representable by "
+                "the C++ constexpr int target",
+            )
+        _check_placement_shape(tile.placement)
+    return checked
+
+
 def _chain_provenance(
     program: LoopProgram,
 ) -> Tuple[ScheduledLoopProvenance, ...]:
@@ -545,6 +658,113 @@ def _chain_provenance(
     return tuple(provenance)
 
 
+def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
+    """Apply the supported plan decisions without constructing the carrier."""
+
+    checked = _validate_plan_for_pass(plan)
+    scheduled = reorder_loops(program, checked.loop_order)
+    for tile in checked.tiles:
+        scheduled = apply_affine_tile(scheduled, tile)
+    return scheduled
+
+
+def _check_exact_carrier_state(value: object, expected: Set[str]) -> bool:
+    state = getattr(value, "__dict__", None)
+    return type(state) is dict and set(state) == expected
+
+
+def _verify_scheduled_loopir(
+    artifact: object,
+    *,
+    expected_program: Optional[LoopProgram],
+) -> None:
+    """Verify carrier ownership and exact plan consumption."""
+
+    if type(artifact) is not ScheduledLoopIR or not _check_exact_carrier_state(
+        artifact, {"base_program", "plan", "program", "loops"}
+    ):
+        _fail(
+            "invalid_scheduled_artifact",
+            "scheduled artifact must be an exact, fully stored ScheduledLoopIR",
+        )
+    base_program = artifact.base_program
+    program = artifact.program
+    if type(base_program) is not LoopProgram or type(program) is not LoopProgram:
+        _fail(
+            "invalid_scheduled_artifact",
+            "base_program and program must be exact LoopProgram values",
+        )
+    if type(artifact.loops) is not tuple:
+        _fail(
+            "invalid_scheduled_artifact",
+            "ScheduledLoopIR.loops must be an owned tuple",
+        )
+    for position, provenance in enumerate(artifact.loops):
+        if type(provenance) is not ScheduledLoopProvenance or not (
+            _check_exact_carrier_state(provenance, {"tile", "index", "part"})
+        ):
+            _fail(
+                "invalid_scheduled_artifact",
+                f"loops[{position}] must be an exact provenance value",
+            )
+        if provenance.tile is not None and (
+            type(provenance.tile) is not TileId
+            or type(provenance.tile.value) is not int
+        ):
+            _fail(
+                "invalid_scheduled_artifact",
+                f"loops[{position}].tile must be None or an int-valued TileId",
+            )
+        if (
+            type(provenance.index) is not IndexId
+            or type(provenance.index.value) is not int
+            or type(provenance.part) is not LoopPart
+        ):
+            _fail(
+                "invalid_scheduled_artifact",
+                f"loops[{position}] has malformed index or loop-part provenance",
+            )
+
+    if type(artifact.plan) is not LoopPlan:
+        _fail(
+            "invalid_scheduled_artifact",
+            "ScheduledLoopIR.plan must be an exact LoopPlan",
+        )
+    checked_plan = _validate_plan_for_pass(artifact.plan)
+    verify_program(base_program)
+    verify_program(program)
+    base_loops, _ = _decompose_chain(base_program)
+    if any(type(loop) in (TileOuterFor, TileInnerFor) for loop in base_loops):
+        _fail(
+            "scheduled_base_not_unscheduled",
+            "ScheduledLoopIR.base_program must not already contain split loops",
+        )
+
+    replayed = (
+        _apply_schedule_program(base_program, checked_plan)
+        if expected_program is None
+        else expected_program
+    )
+    if program != replayed:
+        _fail(
+            "scheduled_program_mismatch",
+            "scheduled program is not the deterministic result of applying "
+            "the retained plan to the retained base program",
+        )
+    if artifact.loops != _chain_provenance(program):
+        _fail(
+            "scheduled_provenance_mismatch",
+            "stored loop provenance does not exactly describe the scheduled "
+            "program chain",
+        )
+
+
+def verify_scheduled_loopir(artifact: object) -> None:
+    """Fail closed unless all ScheduledLoopIR fields agree exactly."""
+
+    _verify_scheduled_loopir(artifact, expected_program=None)
+
+
 def apply_schedule_plan(program: LoopProgram, plan: LoopPlan) -> ScheduledLoopIR:
     """Apply one verified explicit LoopPlan to one verified base program.
 
@@ -554,18 +774,15 @@ def apply_schedule_plan(program: LoopProgram, plan: LoopPlan) -> ScheduledLoopIR
     runs; nothing is silently ignored.
     """
 
-    if type(plan) is not LoopPlan:
-        raise TypeError("apply_schedule_plan expects a LoopPlan")
-    _check_plan_families(plan)
-    scheduled = reorder_loops(program, plan.loop_order)
-    for tile in plan.tiles:
-        scheduled = apply_affine_tile(scheduled, tile)
-    return ScheduledLoopIR(
+    scheduled = _apply_schedule_program(program, plan)
+    artifact = ScheduledLoopIR(
         base_program=program,
         plan=plan,
         program=scheduled,
         loops=_chain_provenance(scheduled),
     )
+    _verify_scheduled_loopir(artifact, expected_program=scheduled)
+    return artifact
 
 
 def erase_schedule(program: LoopProgram) -> LoopProgram:

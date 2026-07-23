@@ -18,6 +18,7 @@ adversarial tests can build malformed programs through the same API surface.
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import Sequence, Tuple
 
 from ..identity import IndexId, SymbolId, new_index_id, new_symbol_id
@@ -78,7 +79,12 @@ def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int]
         node_id = getattr(node, "node_id", None)
         if type(node_id) is LoopIRNodeId and type(node_id.value) is int:
             next_node = max(next_node, node_id.value + 1)
-        for value in vars(node).values():
+        # Only declared schema fields participate in artifact identity.
+        # A forged extra ``__dict__`` entry is neither verifier-visible
+        # semantics nor canonical serialization and therefore must not move
+        # a continuation allocator.
+        for field in fields(type(node)):
+            value = getattr(node, field.name, None)
             if type(value) is DimensionId and type(value.value) is int:
                 next_dimension = max(next_dimension, value.value + 1)
             elif type(value) is CursorId and type(value.value) is int:

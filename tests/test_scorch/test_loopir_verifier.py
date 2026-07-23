@@ -10,6 +10,7 @@ import dataclasses
 import pytest
 
 from scorch.compiler.identity import IndexId, SymbolId
+from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH
 from scorch.compiler.loopir.build import LoopIRBuilder
 from scorch.compiler.loopir.nodes import (
     BinaryOp,
@@ -657,6 +658,7 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "invalid_tile_id",
     "duplicate_tile_id",
     "unbound_tile",
+    "missing_tile_inner",
     "tile_binding_mismatch",
     "invalid_tile_width",
     "tile_index_conflict",
@@ -1361,6 +1363,22 @@ def test_point_loop_requires_a_dominating_origin_loop():
     expect_defect("unbound_tile", program)
 
 
+def test_tile_origin_requires_its_point_loop():
+    fixture = build_tiled_matvec()
+    builder = fixture.builder
+    row_loop = fixture.outer.body.statements[0]
+    constant_update = builder.store_reduce(
+        fixture.program.outputs[0],
+        (builder.index_value(row_loop.index),),
+        ReduceOp.ADD,
+        builder.float_const(1.0),
+    )
+    forge(row_loop, body=builder.block((constant_update,)))
+
+    defect = expect_defect("missing_tile_inner", fixture.program)
+    assert defect.path == "program.body.statements[0]"
+
+
 def test_point_loop_must_agree_with_its_origin_loop():
     fixture = build_tiled_matvec()
     forge(fixture.inner, width=8)
@@ -1386,6 +1404,10 @@ def test_tile_widths_must_be_positive_exact_ints():
     forge(fixture.outer, width=4.0)
     forge(fixture.inner, width=4.0)
     expect_defect("invalid_tile_width", fixture.program)
+    # Width representability is target-specific: semantic LoopIR and the
+    # oracle retain arbitrary positive Python-int widths, while the C++
+    # lowering owns its narrower constexpr-int boundary.
+    verify_program(build_tiled_matvec(width=MAX_AFFINE_TILE_WIDTH + 1).program)
 
 
 def test_tile_unroll_must_be_a_bool():
