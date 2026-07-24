@@ -118,10 +118,11 @@ def test_canonical_dump_omits_display_names():
 
 
 def test_canonical_dump_carries_schema_version():
-    # v3: Phase 6 added the affine-split node kinds and the tile identity
-    # family to the serialized schema.
+    # v4: the Phase-6 stack-accumulation slice added the workspace node
+    # kinds (region, reduce, read) and the workspace identity family to the
+    # serialized schema, after v3 added the affine-split kinds.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v3"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v4"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
@@ -321,3 +322,93 @@ def test_tiled_surfaces_reject_unverified_programs():
         canonical_program_dump(program)
     with pytest.raises(LoopIRVerificationError):
         print_program(program)
+
+
+# -- Phase-6 workspace regions ------------------------------------------------
+
+
+def build_stack_matmul(width=4):
+    from tests.test_scorch.test_loopir_verifier import build_stack_matmul
+
+    return build_stack_matmul(width=width).program
+
+
+def test_workspace_printer_renders_the_region_structure():
+    text = print_program(build_stack_matmul(width=4))
+    # Identity renumbering follows body traversal: the split dimension 'k'
+    # is seen first (by the origin loop), so it canonicalizes as d0, and the
+    # region renders its producer and consumer roles explicitly.
+    assert text == (
+        "loopir.program {\n"
+        "  dimension d0 'k'\n"
+        "  dimension d1 'i'\n"
+        "  dimension d2 'j'\n"
+        "  tensor t0 'A' float32 dims(d1, d2) levels(dense@0, dense@1)\n"
+        "  tensor t1 'B' float32 dims(d2, d0) levels(dense@0, dense@1)\n"
+        "  tensor t2 'C' float32 dims(d1, d0) levels(dense@0, dense@1)\n"
+        "  inputs(t0, t1)\n"
+        "  outputs(t2)\n"
+        "  body {\n"
+        "    tile_outer_for s0 x0 in d0 width 4 {\n"
+        "      for x1 in d1 {\n"
+        "        workspace_region w0 'wksp' float32 over s0 {\n"
+        "          producer {\n"
+        "            for x2 in d2 {\n"
+        "              tile_inner_for s0 x0 in d0 width 4 {\n"
+        "                workspace_reduce(add) w0[x0] = "
+        "mul(load t0[x1, x2], load t1[x2, x0])\n"
+        "              }\n"
+        "            }\n"
+        "          }\n"
+        "          consumer {\n"
+        "            tile_inner_for s0 x0 in d0 width 4 {\n"
+        "              store_reduce(add) t2[x1, x0] = w0[x0]\n"
+        "            }\n"
+        "          }\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+def test_workspace_canonical_dump_is_stable_across_global_id_histories():
+    first = build_stack_matmul()
+    for _ in range(64):
+        new_symbol_id()
+        new_index_id()
+    second = build_stack_matmul()
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+
+
+def test_workspace_canonical_dump_serializes_the_region_semantics():
+    base = canonical_program_dump(build_stack_matmul(width=4))
+    assert canonical_program_dump(build_stack_matmul(width=8)) != base
+    payload = json.loads(base)
+    region = payload["body"]["statements"][0]["body"]["statements"][0]["body"][
+        "statements"
+    ][0]
+    assert region["kind"] == "workspace_region"
+    assert region["workspace"] == {"workspace": 0, "dtype": "float32", "tile": 0}
+    producer_point = region["producer"]["statements"][0]["body"]["statements"][0]
+    assert producer_point["kind"] == "tile_inner_for"
+    reduce_stmt = producer_point["body"]["statements"][0]
+    assert reduce_stmt["kind"] == "workspace_reduce"
+    assert reduce_stmt["op"] == "add"
+    assert reduce_stmt["workspace"] == 0
+    consumer_point = region["consumer"]["statements"][0]
+    copy_out = consumer_point["body"]["statements"][0]
+    assert copy_out["kind"] == "store_reduce"
+    assert copy_out["value"]["kind"] == "workspace_read"
+    assert copy_out["value"]["workspace"] == 0
+
+
+def test_workspace_display_name_is_not_semantic():
+    program = build_stack_matmul()
+    renamed = build_stack_matmul()
+    region = renamed.body.statements[0].body.statements[0].body.statements[0]
+    forge(region.workspace, name="scratch")
+    assert canonical_program_dump(program) == canonical_program_dump(renamed)
+    assert print_program(program) != print_program(renamed)

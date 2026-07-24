@@ -901,3 +901,95 @@ def test_point_loop_outside_its_origin_fails_closed_at_runtime():
     with pytest.raises(LoopIROracleError) as error:
         oracle._exec_stmt(inner)
     assert "outside its origin loop" in str(error.value)
+
+
+# -- Phase-6 workspace regions ------------------------------------------------
+
+
+def stack_reference_matmul(a, b, n):
+    rows, inner = len(a), len(b)
+    return [
+        [sum(a[i][j] * b[j][k] for j in range(inner)) for k in range(n)]
+        for i in range(rows)
+    ]
+
+
+def test_workspace_region_matches_the_direct_program_exactly():
+    from tests.test_scorch.test_loopir_verifier import build_stack_matmul
+
+    rng = random.Random(627)
+    for width in (1, 2, 3, 4, 5, 9):
+        fixture = build_stack_matmul(width=width)
+        rows, inner, cols = 3, 4, 5
+        matrix_a = [
+            [float(rng.randrange(-3, 4)) for _ in range(inner)] for _ in range(rows)
+        ]
+        matrix_b = [
+            [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(inner)
+        ]
+        results = run_program(
+            fixture.program,
+            {fixture.a: matrix_a, fixture.b: matrix_b},
+            {fixture.c: (rows, cols)},
+        )
+        assert results[fixture.c] == stack_reference_matmul(matrix_a, matrix_b, cols)
+
+
+def test_workspace_region_resets_per_tile_and_per_row():
+    """A stale workspace would double-count: with all-ones counting inputs
+    every output cell must count exactly the reduction extent, for every
+    row and every tile of the ragged split."""
+
+    from tests.test_scorch.test_loopir_verifier import build_stack_matmul
+
+    for width, cols in ((1, 5), (2, 5), (4, 5), (5, 5), (9, 5)):
+        fixture = build_stack_matmul(width=width)
+        rows, inner = 3, 4
+        ones_a = [[1.0] * inner for _ in range(rows)]
+        ones_b = [[1.0] * cols for _ in range(inner)]
+        results = run_program(
+            fixture.program,
+            {fixture.a: ones_a, fixture.b: ones_b},
+            {fixture.c: (rows, cols)},
+        )
+        assert results[fixture.c] == [[float(inner)] * cols for _ in range(rows)]
+
+
+def test_workspace_region_zero_extents_execute():
+    from tests.test_scorch.test_loopir_verifier import build_stack_matmul
+
+    fixture = build_stack_matmul(width=4)
+    results = run_program(
+        fixture.program,
+        {fixture.a: [[], [], []], fixture.b: []},
+        {fixture.c: (3, 0)},
+    )
+    assert results[fixture.c] == [[], [], []]
+    fixture = build_stack_matmul(width=4)
+    results = run_program(
+        fixture.program,
+        {fixture.a: [], fixture.b: [[1.0, 2.0]]},
+        {fixture.c: (0, 2)},
+    )
+    assert results[fixture.c] == []
+
+
+def test_workspace_access_outside_region_fails_closed_at_runtime():
+    """Defensive boundary: the verifier's region scope rule normally
+    precludes this, so the oracle's runtime guard is exercised directly."""
+
+    from scorch.compiler.loopir.oracle import _Oracle
+    from tests.test_scorch.test_loopir_verifier import build_stack_matmul
+
+    fixture = build_stack_matmul(width=4)
+    oracle = _Oracle(
+        fixture.program,
+        {fixture.a: [[1.0]], fixture.b: [[1.0]]},
+        {fixture.c: (1, 1)},
+    )
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.reduce_stmt)
+    assert "outside its region" in str(error.value)
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.region)
+    assert "outside its tile's origin loop" in str(error.value)

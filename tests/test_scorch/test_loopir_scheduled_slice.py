@@ -9,6 +9,11 @@ the legacy lowering of the verified ``ScheduledCIN``):
   and affine ``accum='direct'`` tiles — every placement kind, unroll
   on/off, one and two splits, tile-i/tile-k over CSR SpMM, f32/f64, and N
   below/equal to/above/not divisible by the width, including zero extents;
+- a thirteen-member stack byte-parity grid locks the ``accum='stack'``
+  workspace family the same way — the legacy ``wksp[kTile]``
+  producer/consumer shape over CSR SpMM and dense matmul, every placement
+  kind, unroll, f32/f64, direct+stack composition, and ragged/exact/
+  oversized/non-dividing/zero extents;
 - compiled shadow execution runs both pipelines on real tensors and
   requires bitwise-equal dense results plus PyTorch agreement;
 - every unsupported schedule family fails closed with a stable code at the
@@ -434,7 +439,8 @@ def test_scheduled_stage_sequence_and_failure_ownership():
 
     failing = Schedule(
         loop_order=("i", "j", "k"),
-        tiles=(tile("k", 4, accum="stack"),),
+        tiles=(tile("k", 4, accum="heap"),),
+        parallel_loop="i",
     )
     failing_options = scheduled_options(failing)
     failing_context = CompilationContext(failing_options)
@@ -446,7 +452,7 @@ def test_scheduled_stage_sequence_and_failure_ownership():
             compile_options=failing_options,
             compilation_context=failing_context,
         )
-    assert error.value.defect.code == "unsupported_schedule_accumulation"
+    assert error.value.defect.code == "unsupported_schedule_result_tile"
     completed = [record.stage_id for record in failing_context.stage_run_records]
     assert completed[-1] is CompilerStageId.CIN_TO_LOOPIR_LOWERING
     assert CompilerStageId.LOOPIR_SCHEDULE_APPLICATION not in completed
@@ -461,13 +467,8 @@ def test_scheduled_stage_sequence_and_failure_ownership():
 @pytest.mark.parametrize(
     "schedule, code",
     [
-        (
-            Schedule(
-                loop_order=("i", "j", "k"),
-                tiles=(tile("k", 4, accum="stack"),),
-            ),
-            "unsupported_schedule_accumulation",
-        ),
+        # Stack accumulation left this list in the Phase-6 workspace slice:
+        # it is now a migrated family with its own positive parity locks.
         (
             # Legacy heap accumulation also demands the parallel row loop;
             # the heap result tile is rejected before parallel selection.
@@ -927,3 +928,312 @@ def test_scheduled_shadow_wraps_dense_result_rank_from_cin():
     assert str(legacy.format) == "d"
     assert torch.equal(loopir.to_torch(), a + b)
     assert torch.equal(legacy.to_torch(), a + b)
+
+
+# -- stack accumulation (workspace) slice -------------------------------------
+
+
+def stack(index_var, width, placement="outermost", unroll=False):
+    return tile(index_var, width, placement=placement, unroll=unroll, accum="stack")
+
+
+STACK_PARITY_GRID = [
+    (
+        "spmm stack-k ragged",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4),)),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm stack-k exact",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4),)),
+        (4, 4),
+        (((4, 5), F32), ((5, 4), F32)),
+    ),
+    (
+        "spmm stack-k width above extent",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4),)),
+        (4, 2),
+        (((4, 5), F32), ((5, 2), F32)),
+    ),
+    (
+        "spmm stack-k width not dividing extent",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4),)),
+        (4, 5),
+        (((4, 5), F32), ((5, 5), F32)),
+    ),
+    (
+        "spmm stack-k unroll",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4, unroll=True),)),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm stack-k child_of:i",
+        build_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(stack("k", 4, placement="child_of:i"),),
+        ),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm stack-k at_depth:1",
+        build_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(stack("k", 4, placement="at_depth:1"),),
+        ),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm stack-k f64",
+        lambda: build_spmm(dtype=F64),
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4),)),
+        (4, 6),
+        (((4, 5), F64), ((5, 6), F64)),
+    ),
+    (
+        "spmm stack-k zero free extent",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4),)),
+        (4, 0),
+        (((4, 5), F32), ((5, 0), F32)),
+    ),
+    (
+        "spmm stack-k zero rows",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4),)),
+        (0, 6),
+        (((0, 5), F32), ((5, 6), F32)),
+    ),
+    (
+        "matmul stack-j ragged",
+        build_matmul,
+        Schedule(loop_order=("i", "k", "j"), tiles=(stack("j", 4),)),
+        (4, 6),
+        MATMUL_BINDINGS,
+    ),
+    (
+        "matmul stack-j f64",
+        lambda: build_matmul(dtype=F64),
+        Schedule(loop_order=("i", "k", "j"), tiles=(stack("j", 4),)),
+        (4, 6),
+        MATMUL_BINDINGS_F64,
+    ),
+    (
+        "spmm direct-i plus stack-k",
+        build_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                tile("i", 2),
+                stack("k", 4, placement="child_of:i_out"),
+            ),
+        ),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "case",
+    STACK_PARITY_GRID,
+    ids=[case[0] for case in STACK_PARITY_GRID],
+)
+def test_stack_source_is_byte_identical_to_legacy(case):
+    name, build, schedule, result_shape, bindings = case
+    comparison = compare_generated_sources(
+        build(),
+        result_shape,
+        bindings,
+        compile_options=scheduled_options(schedule),
+    )
+    assert comparison.identical, f"{name} diverged from the legacy schedule"
+
+
+def test_stack_structural_activation():
+    """The stack kernels carry the exact legacy workspace structure."""
+
+    schedule = Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4, unroll=True),))
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(schedule),
+    )
+    source = kernel.cpp_source
+    # Allocation and zero-reset in one statement, per row iteration.
+    assert "constexpr int kTile_k = 4;" in source
+    assert "float wksp[kTile_k] = {};" in source
+    # Producer: input-bounded point loop accumulating into the workspace,
+    # with the sparse prefetch surviving the managed passes.
+    assert "if (k >= B1_size) {" in source
+    assert "wksp[k_in] += A_val[pA1] * B_val[pB1];" in source
+    assert "__builtin_prefetch" in source
+    # Consumer: the synthesized result-bounded copy-out loop.
+    assert "// Lower consumer CIN" in source
+    assert "if (k >= C1_size) {" in source
+    assert "int64_t pC1 = pC0 * C1_size + k;" in source
+    assert "C_values[pC1] += wksp[k_in];" in source
+    # Both point loops carry the requested unroll preference.
+    assert source.count("#pragma unroll") == 2
+    # Zero-fill and the ceil-trip-count parallel policy on the origin loop.
+    assert "scorch_zero_dense(C_values, C_capacity);" in source
+    assert (
+        "num_threads(scorch_nthreads(-1, ((B1_size + kTile_k - 1) / kTile_k)))"
+        in source
+    )
+    # The scheduling artifact retains the region chain provenance:
+    # origin, row, reduction, producer point, consumer point.
+    assert kernel.schedule is not None
+    parts = [entry.part for entry in kernel.schedule.loops]
+    assert parts == [
+        LoopPart.OUTER,
+        LoopPart.LOGICAL,
+        LoopPart.LOGICAL,
+        LoopPart.INNER,
+        LoopPart.INNER,
+    ]
+
+
+def test_stack_child_of_uses_the_nnz_aware_row_policy():
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(stack("k", 4, placement="child_of:i"),),
+    )
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(schedule),
+    )
+    assert "num_threads(scorch_nthreads(A1_pos[A0_size], A0_size))" in kernel.cpp_source
+
+
+@pytest.mark.parametrize("free_dim", [2, 4, 6])
+def test_spmm_stack_k_shadow_execution_across_tile_regimes(free_dim):
+    torch.manual_seed(2619 + free_dim)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.6] = 0.0
+    sparse[2, :] = 0.0  # an empty CSR row
+    dense = torch.randn(5, free_dim)
+    assert_scheduled_shadow(
+        build_spmm(),
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 4),)),
+        (4, free_dim),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+def test_spmm_stack_k_float64_shadow_execution():
+    torch.manual_seed(2620)
+    sparse = torch.randn(3, 4, dtype=F64)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.randn(4, 5, dtype=F64)
+    assert_scheduled_shadow(
+        build_spmm(dtype=F64),
+        Schedule(loop_order=("i", "j", "k"), tiles=(stack("k", 3),)),
+        (3, 5),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+def test_matmul_stack_shadow_execution_with_unroll():
+    torch.manual_seed(2621)
+    a = torch.randn(4, 5)
+    b = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_matmul(),
+        Schedule(loop_order=("i", "k", "j"), tiles=(stack("j", 4, unroll=True),)),
+        (4, 6),
+        (dense_stensor(a, "A"), dense_stensor(b, "B")),
+        a @ b,
+    )
+
+
+def test_stack_two_split_shadow_execution():
+    torch.manual_seed(2622)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                tile("i", 2),
+                stack("k", 4, placement="child_of:i_out"),
+            ),
+        ),
+        (4, 6),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+def test_stack_zero_extent_shadow_execution():
+    a = torch.randn(3, 4)
+    b = torch.empty(4, 0)
+    assert_scheduled_shadow(
+        build_matmul(),
+        Schedule(loop_order=("i", "k", "j"), tiles=(stack("j", 4),)),
+        (3, 0),
+        (dense_stensor(a, "A"), dense_stensor(b, "B")),
+        a @ b,
+    )
+
+
+def test_randomized_stack_execution_matches_torch_and_oracle():
+    torch.manual_seed(2623)
+    import random as _random
+
+    from scorch.compiler.loopir.oracle import run_program
+
+    rng = _random.Random(20260724)
+    for _ in range(3):
+        rows = rng.randrange(1, 7)
+        inner = rng.randrange(2, 7)
+        cols = rng.randrange(1, 9)
+        width = rng.choice((2, 3, 4))
+        a = torch.randn(rows, inner)
+        b = torch.randn(inner, cols)
+        schedule = Schedule(loop_order=("i", "k", "j"), tiles=(stack("j", width),))
+        result, kernel = execute_cin_via_loopir(
+            build_matmul(),
+            (rows, cols),
+            dense_stensor(a, "A"),
+            dense_stensor(b, "B"),
+            compile_options=scheduled_options(schedule),
+        )
+        assert torch.allclose(
+            result.values.reshape(rows, cols), a @ b, atol=1e-3, rtol=1e-3
+        )
+        assert kernel.schedule is not None
+        lowering = kernel.lowering
+        oracle_out = run_program(
+            kernel.schedule.program,
+            {
+                lowering.input_symbols[0]: a.tolist(),
+                lowering.input_symbols[1]: b.tolist(),
+            },
+            {lowering.result_symbol: (rows, cols)},
+        )[lowering.result_symbol]
+        assert torch.allclose(
+            result.values.reshape(rows, cols),
+            torch.tensor(oracle_out, dtype=torch.float32),
+            atol=1e-3,
+            rtol=1e-3,
+        )

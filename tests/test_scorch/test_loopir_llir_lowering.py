@@ -770,3 +770,138 @@ def test_sparse_target_owns_context_stage_and_pass_records():
     pass_names = [record.pass_name for record in context.llir_pass_run_records]
     assert "insert_sparse_prefetch" in pass_names
     assert "hoist_dense_pointers" in pass_names
+
+
+# -- Phase-6 workspace regions (target boundary) ------------------------------
+
+from tests.test_scorch.test_loopir_verifier import (  # noqa: E402
+    build_stack_matmul,
+)
+
+
+def stack_matmul_shapes(fixture, rows=3, inner=4, cols=5):
+    return (
+        {fixture.a: (rows, inner), fixture.b: (inner, cols)},
+        (rows, cols),
+    )
+
+
+def test_stack_region_lowers_through_the_target():
+    fixture = build_stack_matmul(width=4)
+    shapes, result_shape = stack_matmul_shapes(fixture)
+    function = lower_loopir_to_llir(
+        fixture.program, input_shapes=shapes, result_shape=result_shape
+    )
+    assert function is not None
+
+
+def test_workspace_producer_needs_a_reduction_loop():
+    """A bare point-loop producer is verifier-legal but outside the family."""
+
+    from scorch.compiler.loopir.build import LoopIRBuilder
+    from scorch.compiler.loopir.nodes import ReduceOp, ScalarType
+    from scorch.compiler.loopir.verifier import verify_program
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_k = builder.dimension("k")
+    x, c = builder.new_symbol_id(), builder.new_symbol_id()
+    decl_x = builder.tensor(
+        x, "x", ScalarType.FLOAT32, (dim_k.dimension,), builder.dense_levels(1)
+    )
+    decl_c = builder.tensor(
+        c,
+        "C",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_k.dimension),
+        builder.dense_levels(2),
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    tile = builder.new_tile_id()
+    workspace = builder.new_workspace_id()
+    decl_w = builder.workspace_decl(workspace, "wksp", ScalarType.FLOAT32, tile)
+    producer_point = builder.tile_inner_for(
+        tile,
+        col,
+        dim_k.dimension,
+        4,
+        False,
+        builder.block(
+            (
+                builder.workspace_reduce(
+                    workspace,
+                    builder.index_value(col),
+                    ReduceOp.ADD,
+                    builder.load(x, (builder.index_value(col),)),
+                ),
+            )
+        ),
+    )
+    consumer_point = builder.tile_inner_for(
+        tile,
+        col,
+        dim_k.dimension,
+        4,
+        False,
+        builder.block(
+            (
+                builder.store_reduce(
+                    c,
+                    (builder.index_value(row), builder.index_value(col)),
+                    ReduceOp.ADD,
+                    builder.workspace_read(workspace, builder.index_value(col)),
+                ),
+            )
+        ),
+    )
+    region = builder.workspace_region(
+        decl_w, builder.block((producer_point,)), builder.block((consumer_point,))
+    )
+    row_loop = builder.dense_for(row, dim_i.dimension, builder.block((region,)))
+    outer = builder.tile_outer_for(
+        tile, col, dim_k.dimension, 4, builder.block((row_loop,))
+    )
+    program = builder.program(
+        (dim_i, dim_k), (decl_x, decl_c), (x,), (c,), builder.block((outer,))
+    )
+    verify_program(program)
+    expect_target_code("unsupported_program_shape", program, {x: (5,)}, (3, 5))
+
+
+def test_workspace_consumer_must_be_the_exact_copy_out_form():
+    from scorch.compiler.loopir.build import LoopIRBuilder
+    from scorch.compiler.loopir.nodes import BinaryOp, ReduceOp
+    from scorch.compiler.loopir.verifier import verify_program
+
+    fixture = build_stack_matmul(width=4)
+    builder = LoopIRBuilder.resuming(fixture.program)
+    scaled = builder.store_reduce(
+        fixture.copy_out.tensor,
+        fixture.copy_out.indices,
+        ReduceOp.ADD,
+        builder.binary(
+            BinaryOp.ADD,
+            fixture.copy_out.value,
+            builder.float_const(0.0),
+        ),
+    )
+    forge(fixture.consumer_inner, body=builder.block((scaled,)))
+    verify_program(fixture.program)
+    shapes, result_shape = stack_matmul_shapes(fixture)
+    expect_target_code(
+        "unsupported_program_shape", fixture.program, shapes, result_shape
+    )
+
+
+def test_workspace_name_participates_in_generated_name_collisions():
+    fixture = build_stack_matmul(width=4)
+    forge(fixture.region.workspace, name="B")
+    shapes, result_shape = stack_matmul_shapes(fixture)
+    expect_target_code(
+        "generated_name_collision", fixture.program, shapes, result_shape
+    )
+    fixture = build_stack_matmul(width=4)
+    forge(fixture.region.workspace, name="for")
+    shapes, result_shape = stack_matmul_shapes(fixture)
+    expect_target_code("invalid_display_name", fixture.program, shapes, result_shape)

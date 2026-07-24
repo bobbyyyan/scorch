@@ -50,6 +50,7 @@ from scorch.compiler.loopir.schedule_passes import (
     SchedulePassError,
     apply_affine_tile,
     apply_schedule_plan,
+    apply_stack_tile,
     erase_schedule,
     reorder_loops,
     verify_scheduled_loopir,
@@ -765,7 +766,7 @@ def test_apply_schedule_plan_rejects_unmigrated_families():
         lowering.program,
         LoopPlan(
             loop_order=order,
-            tiles=(affine_tile(j.index_id, 4, accum="stack"),),
+            tiles=(affine_tile(j.index_id, 4, accum="heap"),),
         ),
     )
 
@@ -944,5 +945,381 @@ def test_scheduled_chain_shape_guard():
         "unsupported_schedule_shape",
         reorder_loops,
         forged,
+        lowering.loop_index_ids,
+    )
+
+
+# -- stack accumulation (workspace regions) -----------------------------------
+
+
+def stack_tile(index_id, width, placement=None, unroll=False):
+    return affine_tile(
+        index_id, width, placement=placement, unroll=unroll, accum="stack"
+    )
+
+
+def region_of(program):
+    from scorch.compiler.loopir.nodes import WorkspaceRegion
+
+    body = program.body
+    while isinstance(body, Block) and len(body.statements) == 1:
+        only = body.statements[0]
+        if type(only) is WorkspaceRegion:
+            return only
+        if not hasattr(only, "body"):
+            break
+        body = only.body
+    raise AssertionError("no workspace region in the chain")
+
+
+def test_apply_stack_tile_builds_the_workspace_region_shape():
+    from scorch.compiler.loopir.nodes import (
+        SparseFor,
+        StoreReduce,
+        WorkspaceRead,
+        WorkspaceReduce,
+        WorkspaceRegion,
+    )
+
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    scheduled = apply_stack_tile(lowering.program, stack_tile(k.index_id, 4))
+    verify_program(scheduled)
+    # Chain: origin loop over k, dense row loop, then the region.
+    assert chain_types(scheduled) == [TileOuterFor, DenseFor]
+    region = region_of(scheduled)
+    assert type(region) is WorkspaceRegion
+    assert region.workspace.name == "wksp"
+    assert region.workspace.tile == scheduled.body.statements[0].tile
+    producer_first = region.producer.statements[0]
+    assert type(producer_first) is SparseFor
+    producer_point = producer_first.body.statements[0]
+    assert type(producer_point) is TileInnerFor
+    reduce_leaf = producer_point.body.statements[0]
+    assert type(reduce_leaf) is WorkspaceReduce
+    assert reduce_leaf.workspace == region.workspace.workspace
+    consumer_point = region.consumer.statements[0]
+    assert type(consumer_point) is TileInnerFor
+    assert consumer_point.tile == producer_point.tile
+    copy_out = consumer_point.body.statements[0]
+    assert type(copy_out) is StoreReduce
+    assert type(copy_out.value) is WorkspaceRead
+    assert copy_out.value.workspace == region.workspace.workspace
+
+
+def test_apply_stack_tile_is_pure_and_deterministic():
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    before = canonical_program_dump(lowering.program)
+    first = apply_stack_tile(lowering.program, stack_tile(k.index_id, 4))
+    second = apply_stack_tile(lowering.program, stack_tile(k.index_id, 4))
+    assert canonical_program_dump(lowering.program) == before
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+
+
+def test_apply_stack_tile_placements_resolve_against_the_prefix():
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    outermost = apply_stack_tile(lowering.program, stack_tile(k.index_id, 4))
+    assert chain_types(outermost) == [TileOuterFor, DenseFor]
+    child = apply_stack_tile(
+        lowering.program,
+        stack_tile(
+            k.index_id,
+            4,
+            placement=LoopPlacement(PlacementKind.CHILD_OF, parent=LoopRef(i.index_id)),
+        ),
+    )
+    assert chain_types(child) == [DenseFor, TileOuterFor]
+    at_depth = apply_stack_tile(
+        lowering.program,
+        stack_tile(
+            k.index_id, 4, placement=LoopPlacement(PlacementKind.AT_DEPTH, depth=1)
+        ),
+    )
+    assert canonical_program_dump(at_depth) == canonical_program_dump(child)
+    # The prefix above the region has exactly one loop, exactly as the
+    # legacy prefix-of-Where rule: depth 2 is out of range.
+    expect_code(
+        "tile_invalid_placement",
+        apply_stack_tile,
+        lowering.program,
+        stack_tile(
+            k.index_id, 4, placement=LoopPlacement(PlacementKind.AT_DEPTH, depth=2)
+        ),
+    )
+    # child_of may not name the reduction loop (it is inside the region).
+    expect_code(
+        "tile_invalid_placement",
+        apply_stack_tile,
+        lowering.program,
+        stack_tile(
+            k.index_id,
+            4,
+            placement=LoopPlacement(PlacementKind.CHILD_OF, parent=LoopRef(j.index_id)),
+        ),
+    )
+
+
+def test_apply_stack_tile_mirrors_the_legacy_legality_boundary():
+    # A pure elementwise program has no reduction to accumulate.
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="dd")
+    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt="dd")
+    elementwise = lower(
+        ForAll(
+            i,
+            ForAll(
+                j, TensorAssign(c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]))
+            ),
+        )
+    )
+    expect_code(
+        "stack_tile_target_invalid",
+        apply_stack_tile,
+        elementwise.program,
+        stack_tile(j.index_id, 4),
+    )
+    # The target must be the single trailing free loop after the last
+    # reduction: the row loop of a matmul is not.
+    cin, (i2, k2, j2) = build_matmul_ikj()
+    matmul = lower(cin)
+    expect_code(
+        "stack_tile_target_invalid",
+        apply_stack_tile,
+        matmul.program,
+        stack_tile(i2.index_id, 4),
+    )
+    # A reduction target is not a stack target either.
+    expect_code(
+        "stack_tile_target_invalid",
+        apply_stack_tile,
+        matmul.program,
+        stack_tile(k2.index_id, 4),
+    )
+    # SpMV's trailing loop is the reduction itself: the workspace would
+    # replace the chain root, exactly the legacy refusal.
+    spmv_cin, (si, sj) = build_spmv()
+    spmv = lower(spmv_cin)
+    expect_code(
+        "stack_tile_target_invalid",
+        apply_stack_tile,
+        spmv.program,
+        stack_tile(sj.index_id, 4),
+    )
+    # C[k] += A[j, k] over order (j, k): the last reduction loop is the
+    # chain root, so the region would replace it.
+    rj, rk = IndexVar("j"), IndexVar("k")
+    ra = TensorVar("A", fmt="dd")
+    rc = TensorVar("C", fmt="d")
+    root_cin = ForAll(
+        rj, ForAll(rk, TensorAssign(rc[rk], ra[rj, rk], op=Operation.ADD))
+    )
+    root = lower(root_cin)
+    expect_code(
+        "stack_tile_root_scope",
+        apply_stack_tile,
+        root.program,
+        stack_tile(rk.index_id, 4),
+    )
+    # Direct accumulation is the other pass's family.
+    expect_code(
+        "unsupported_schedule_accumulation",
+        apply_stack_tile,
+        lower(build_spmm_ijk()[0]).program,
+        affine_tile(build_spmm_ijk()[1][2].index_id, 4),
+    )
+
+
+def test_apply_stack_tile_rejects_a_second_stack_transformation():
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    scheduled = apply_stack_tile(lowering.program, stack_tile(k.index_id, 4))
+    # A region-terminated chain refuses every further stack transformation,
+    # whatever its target: at most one stack accumulation exists.
+    expect_code(
+        "stack_tile_target_invalid",
+        apply_stack_tile,
+        scheduled,
+        stack_tile(k.index_id, 2),
+    )
+    expect_code(
+        "stack_tile_target_invalid",
+        apply_stack_tile,
+        scheduled,
+        stack_tile(i.index_id, 2),
+    )
+
+
+def test_stack_plan_applies_through_apply_schedule_plan():
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(stack_tile(k.index_id, 4),),
+    )
+    scheduled = apply_schedule_plan(lowering.program, plan)
+    verify_scheduled_loopir(scheduled)
+    assert scheduled.base_program is lowering.program
+    parts = [(entry.part, entry.tile is not None) for entry in scheduled.loops]
+    # Documented order: prefix (origin + row), producer chain (reduction +
+    # point), consumer chain (point).
+    assert parts == [
+        (LoopPart.OUTER, True),
+        (LoopPart.LOGICAL, False),
+        (LoopPart.LOGICAL, False),
+        (LoopPart.INNER, True),
+        (LoopPart.INNER, True),
+    ]
+    assert [entry.index for entry in scheduled.loops] == [
+        k.index_id,
+        i.index_id,
+        j.index_id,
+        k.index_id,
+        k.index_id,
+    ]
+
+
+def test_stack_plan_composes_with_direct_tiles():
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(
+            affine_tile(i.index_id, 2),
+            stack_tile(
+                k.index_id,
+                4,
+                placement=LoopPlacement(
+                    PlacementKind.CHILD_OF,
+                    parent=LoopRef(i.index_id, LoopPart.OUTER),
+                ),
+            ),
+        ),
+    )
+    scheduled = apply_schedule_plan(lowering.program, plan)
+    verify_scheduled_loopir(scheduled)
+    assert chain_types(scheduled.program) == [TileOuterFor, TileOuterFor, TileInnerFor]
+
+
+def test_stack_erasure_restores_the_base_program():
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    for tiles in (
+        (stack_tile(k.index_id, 4),),
+        (affine_tile(i.index_id, 2), stack_tile(k.index_id, 4)),
+    ):
+        plan = LoopPlan(loop_order=lowering.loop_index_ids, tiles=tiles)
+        scheduled = apply_schedule_plan(lowering.program, plan)
+        erased = erase_schedule(scheduled.program)
+        assert canonical_program_dump(erased) == canonical_program_dump(
+            lowering.program
+        )
+
+
+def test_stack_erasure_requires_the_exact_copy_out_form():
+    from scorch.compiler.loopir.nodes import ReduceOp
+
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    scheduled = apply_stack_tile(lowering.program, stack_tile(k.index_id, 4))
+    region = region_of(scheduled)
+    builder = LoopIRBuilder.resuming(scheduled)
+    consumer_point = region.consumer.statements[0]
+    copy_out = consumer_point.body.statements[0]
+    doubled = builder.store_reduce(
+        copy_out.tensor,
+        copy_out.indices,
+        ReduceOp.ADD,
+        builder.binary(
+            LoopIRBinaryOp.ADD,
+            copy_out.value,
+            builder.float_const(0.0),
+        ),
+    )
+    object.__setattr__(consumer_point, "body", builder.block((doubled,)))
+    verify_program(scheduled)
+    expect_code("unsupported_schedule_shape", erase_schedule, scheduled)
+
+
+def test_stack_scheduled_iteration_matches_the_base_oracle_exactly():
+    """Reset, ragged-tail, and reduction semantics — not just visitation.
+
+    All-ones counting inputs make every output cell count its contributing
+    (j, k) pairs exactly (integer floats are exact), so a missing per-tile
+    reset, a double copy-out, or a ragged-tail overshoot all change the
+    result.
+    """
+
+    from scorch.compiler.loopir.levels import CsrMatrix
+
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    dense_a = [
+        [0.0, 2.0, 0.0, 3.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 4.0],
+    ]
+    csr = CsrMatrix.from_dense(dense_a)
+    for n, width in ((2, 4), (4, 4), (6, 4), (5, 4), (0, 4), (6, 9), (6, 1)):
+        plan = LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(stack_tile(k.index_id, width),),
+        )
+        scheduled = apply_schedule_plan(lowering.program, plan)
+        b = [[float(1 + r * max(n, 1) + c) for c in range(n)] for r in range(4)]
+        inputs = {
+            lowering.input_symbols[0]: csr,
+            lowering.input_symbols[1]: b,
+        }
+        shapes = {lowering.result_symbol: (3, n)}
+        assert run_program(scheduled.program, inputs, shapes) == run_program(
+            lowering.program, inputs, shapes
+        )
+        erased = erase_schedule(scheduled.program)
+        assert run_program(erased, inputs, shapes) == run_program(
+            lowering.program, inputs, shapes
+        )
+
+
+def test_stack_scheduled_carrier_rejects_forged_region_state():
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(stack_tile(k.index_id, 4),),
+    )
+    scheduled = apply_schedule_plan(lowering.program, plan)
+    direct_plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(affine_tile(k.index_id, 4),),
+    )
+    direct = apply_schedule_plan(lowering.program, direct_plan)
+    forged = ScheduledLoopIR(
+        base_program=scheduled.base_program,
+        plan=plan,
+        program=direct.program,
+        loops=direct.loops,
+    )
+    expect_code("scheduled_program_mismatch", verify_scheduled_loopir, forged)
+    # A base program that already carries a region is not unscheduled.
+    nested = ScheduledLoopIR(
+        base_program=scheduled.program,
+        plan=plan,
+        program=scheduled.program,
+        loops=scheduled.loops,
+    )
+    expect_code("scheduled_base_not_unscheduled", verify_scheduled_loopir, nested)
+
+
+def test_reorder_rejects_region_chains():
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    scheduled = apply_stack_tile(lowering.program, stack_tile(k.index_id, 4))
+    expect_code(
+        "reorder_split_chain",
+        reorder_loops,
+        scheduled,
         lowering.loop_index_ids,
     )

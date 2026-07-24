@@ -30,6 +30,8 @@ from scorch.compiler.loopir.nodes import (
     StoreReduce,
     TileInnerFor,
     TileOuterFor,
+    WorkspaceReduce,
+    WorkspaceRegion,
 )
 from scorch.compiler.loopir.verifier import (
     LoopIRVerificationError,
@@ -662,6 +664,16 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "tile_binding_mismatch",
     "invalid_tile_width",
     "tile_index_conflict",
+    # Workspace-region codes added by the Phase-6 stack-accumulation slice.
+    "invalid_workspace_id",
+    "duplicate_workspace_id",
+    "unbound_workspace",
+    "workspace_scope_mismatch",
+    "workspace_write_scope",
+    "workspace_read_scope",
+    "workspace_coord_mismatch",
+    "workspace_output_write",
+    "workspace_dead_region",
 }
 
 
@@ -1497,3 +1509,383 @@ def test_tile_nodes_reject_cycles():
     fixture = build_tiled_matvec()
     forge(fixture.inner, body=fixture.program.body)
     expect_defect("cyclic_structure", fixture.program)
+
+
+# -- Phase-6 workspace-region subset ------------------------------------------
+
+
+@dataclasses.dataclass
+class StackMatmulFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    a: SymbolId
+    b: SymbolId
+    c: SymbolId
+    row: IndexId
+    red: IndexId
+    col: IndexId
+    outer: TileOuterFor
+    region: WorkspaceRegion
+    producer_inner: TileInnerFor
+    consumer_inner: TileInnerFor
+    reduce_stmt: WorkspaceReduce
+    copy_out: StoreReduce
+
+
+def build_stack_matmul(width=4, dtype=ScalarType.FLOAT32) -> StackMatmulFixture:
+    """C[i, k] += A[i, j] * B[j, k] with the k loop stack-accumulated.
+
+    The exact shape :func:`apply_stack_tile` produces: the origin loop over
+    ``k``, the dense row loop, and a workspace region whose producer runs the
+    reduction chain ``j -> k_in`` into the workspace and whose consumer
+    copies the tile out with a second point loop of the same split.
+    """
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    dim_k = builder.dimension("k")
+    a, b, c = (builder.new_symbol_id() for _ in range(3))
+    decl_a = builder.tensor(
+        a, "A", dtype, (dim_i.dimension, dim_j.dimension), builder.dense_levels(2)
+    )
+    decl_b = builder.tensor(
+        b, "B", dtype, (dim_j.dimension, dim_k.dimension), builder.dense_levels(2)
+    )
+    decl_c = builder.tensor(
+        c, "C", dtype, (dim_i.dimension, dim_k.dimension), builder.dense_levels(2)
+    )
+    row = builder.new_index_id()
+    red = builder.new_index_id()
+    col = builder.new_index_id()
+    tile = builder.new_tile_id()
+    workspace = builder.new_workspace_id()
+    workspace_decl = builder.workspace_decl(workspace, "wksp", dtype, tile)
+    reduce_stmt = builder.workspace_reduce(
+        workspace,
+        builder.index_value(col),
+        ReduceOp.ADD,
+        builder.binary(
+            BinaryOp.MUL,
+            builder.load(a, (builder.index_value(row), builder.index_value(red))),
+            builder.load(b, (builder.index_value(red), builder.index_value(col))),
+        ),
+    )
+    producer_inner = builder.tile_inner_for(
+        tile, col, dim_k.dimension, width, False, builder.block((reduce_stmt,))
+    )
+    producer = builder.block(
+        (builder.dense_for(red, dim_j.dimension, builder.block((producer_inner,))),)
+    )
+    copy_out = builder.store_reduce(
+        c,
+        (builder.index_value(row), builder.index_value(col)),
+        ReduceOp.ADD,
+        builder.workspace_read(workspace, builder.index_value(col)),
+    )
+    consumer_inner = builder.tile_inner_for(
+        tile, col, dim_k.dimension, width, False, builder.block((copy_out,))
+    )
+    region = builder.workspace_region(
+        workspace_decl, producer, builder.block((consumer_inner,))
+    )
+    row_loop = builder.dense_for(row, dim_i.dimension, builder.block((region,)))
+    outer = builder.tile_outer_for(
+        tile, col, dim_k.dimension, width, builder.block((row_loop,))
+    )
+    program = builder.program(
+        (dim_i, dim_j, dim_k),
+        (decl_a, decl_b, decl_c),
+        (a, b),
+        (c,),
+        builder.block((outer,)),
+    )
+    return StackMatmulFixture(
+        builder=builder,
+        program=program,
+        a=a,
+        b=b,
+        c=c,
+        row=row,
+        red=red,
+        col=col,
+        outer=outer,
+        region=region,
+        producer_inner=producer_inner,
+        consumer_inner=consumer_inner,
+        reduce_stmt=reduce_stmt,
+        copy_out=copy_out,
+    )
+
+
+def test_stack_workspace_region_verifies():
+    verify_program(build_stack_matmul().program)
+
+
+def test_sibling_point_loops_of_one_split_are_the_moved_boundary():
+    """The workspace slice deliberately legalizes sibling point loops.
+
+    The producer and consumer of a region each bind the split coordinate
+    once, in disjoint scopes; nested rebinding stays rejected (covered by
+    ``test_two_point_loops_for_one_split_rebind_the_coordinate``), and a
+    non-point binder still may not rebind a point coordinate.
+    """
+
+    fixture = build_stack_matmul()
+    verify_program(fixture.program)
+    builder = fixture.builder
+    stray = builder.dense_for(
+        fixture.col,
+        fixture.outer.dimension,
+        builder.block(
+            (
+                builder.store_reduce(
+                    fixture.c,
+                    (
+                        builder.index_value(fixture.row),
+                        builder.index_value(fixture.col),
+                    ),
+                    ReduceOp.ADD,
+                    builder.float_const(1.0),
+                ),
+            )
+        ),
+    )
+    forge(
+        fixture.region,
+        consumer=builder.block((fixture.consumer_inner, stray)),
+    )
+    expect_defect("duplicate_index_binding", fixture.program)
+
+
+def test_workspace_id_must_be_typed():
+    fixture = build_stack_matmul()
+    forge(fixture.region.workspace, workspace=7)
+    expect_defect("invalid_workspace_id", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.reduce_stmt, workspace=object())
+    expect_defect("invalid_workspace_id", fixture.program)
+
+
+def test_workspace_ids_are_declared_once():
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    # A second sibling region reusing the first region's WorkspaceId.
+    second_decl = builder.workspace_decl(
+        fixture.region.workspace.workspace,
+        "wksp2",
+        ScalarType.FLOAT32,
+        fixture.outer.tile,
+    )
+    reduce_two = builder.workspace_reduce(
+        fixture.region.workspace.workspace,
+        builder.index_value(fixture.col),
+        ReduceOp.ADD,
+        builder.float_const(1.0),
+    )
+    producer_two = builder.block(
+        (
+            builder.tile_inner_for(
+                fixture.outer.tile,
+                fixture.col,
+                fixture.outer.dimension,
+                fixture.outer.width,
+                False,
+                builder.block((reduce_two,)),
+            ),
+        )
+    )
+    copy_two = builder.store_reduce(
+        fixture.c,
+        (builder.index_value(fixture.row), builder.index_value(fixture.col)),
+        ReduceOp.ADD,
+        builder.workspace_read(
+            fixture.region.workspace.workspace, builder.index_value(fixture.col)
+        ),
+    )
+    consumer_two = builder.block(
+        (
+            builder.tile_inner_for(
+                fixture.outer.tile,
+                fixture.col,
+                fixture.outer.dimension,
+                fixture.outer.width,
+                False,
+                builder.block((copy_two,)),
+            ),
+        )
+    )
+    second_region = builder.workspace_region(second_decl, producer_two, consumer_two)
+    row_loop = fixture.outer.body.statements[0]
+    forge(row_loop, body=builder.block((fixture.region, second_region)))
+    expect_defect("duplicate_workspace_id", fixture.program)
+
+
+def test_workspace_access_requires_an_enclosing_region():
+    fixture = build_stack_matmul()
+    # Replace the region with its bare producer chain: the reduce now has
+    # no enclosing region.
+    row_loop = fixture.outer.body.statements[0]
+    forge(row_loop, body=fixture.region.producer)
+    expect_defect("unbound_workspace", fixture.program)
+
+
+def test_workspace_region_needs_its_origin_loop_in_scope():
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    foreign = builder.new_tile_id()
+    forge(fixture.region.workspace, tile=foreign)
+    expect_defect("workspace_scope_mismatch", fixture.program)
+
+
+def test_workspace_region_must_open_outside_its_point_loops():
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    # Wrap the region in a point loop of its own split.
+    row_loop = fixture.outer.body.statements[0]
+    wrapping_point = builder.tile_inner_for(
+        fixture.outer.tile,
+        fixture.col,
+        fixture.outer.dimension,
+        fixture.outer.width,
+        False,
+        builder.block((fixture.region,)),
+    )
+    forge(row_loop, body=builder.block((wrapping_point,)))
+    expect_defect("workspace_scope_mismatch", fixture.program)
+
+
+def test_workspace_writes_belong_to_the_producer():
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    stray_reduce = builder.workspace_reduce(
+        fixture.region.workspace.workspace,
+        builder.index_value(fixture.col),
+        ReduceOp.ADD,
+        builder.float_const(1.0),
+    )
+    forge(
+        fixture.consumer_inner,
+        body=builder.block((fixture.copy_out, stray_reduce)),
+    )
+    expect_defect("workspace_write_scope", fixture.program)
+
+
+def test_workspace_reads_belong_to_the_consumer():
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    forge(
+        fixture.reduce_stmt,
+        value=builder.workspace_read(
+            fixture.region.workspace.workspace, builder.index_value(fixture.col)
+        ),
+    )
+    expect_defect("workspace_read_scope", fixture.program)
+
+
+def test_workspace_cells_are_addressed_by_the_owning_point_coordinate():
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    forge(fixture.reduce_stmt, coord=builder.index_value(fixture.row))
+    expect_defect("workspace_coord_mismatch", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.copy_out.value, coord=fixture.builder.float_const(0.0))
+    expect_defect("workspace_coord_mismatch", fixture.program)
+
+
+def test_workspace_producer_must_not_write_outputs():
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    stray_store = builder.store_reduce(
+        fixture.c,
+        (builder.index_value(fixture.row), builder.index_value(fixture.col)),
+        ReduceOp.ADD,
+        builder.float_const(1.0),
+    )
+    forge(
+        fixture.producer_inner,
+        body=builder.block((fixture.reduce_stmt, stray_store)),
+    )
+    expect_defect("workspace_output_write", fixture.program)
+
+
+def test_workspace_regions_must_accumulate_and_copy_out():
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    constant_store = builder.store_reduce(
+        fixture.c,
+        (builder.index_value(fixture.row), builder.index_value(fixture.col)),
+        ReduceOp.ADD,
+        builder.float_const(1.0),
+    )
+    forge(fixture.producer_inner, body=builder.block((constant_store,)))
+    expect_defect("workspace_output_write", fixture.program)
+
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    silent_point = builder.tile_inner_for(
+        fixture.outer.tile,
+        fixture.col,
+        fixture.outer.dimension,
+        fixture.outer.width,
+        False,
+        builder.block(()),
+    )
+    forge(fixture.region, producer=builder.block((silent_point,)))
+    expect_defect("workspace_dead_region", fixture.program)
+
+    fixture = build_stack_matmul()
+    builder = fixture.builder
+    blind_copy = builder.store_reduce(
+        fixture.c,
+        (builder.index_value(fixture.row), builder.index_value(fixture.col)),
+        ReduceOp.ADD,
+        builder.float_const(1.0),
+    )
+    forge(fixture.consumer_inner, body=builder.block((blind_copy,)))
+    expect_defect("workspace_dead_region", fixture.program)
+
+
+def test_workspace_decl_state_is_typed():
+    fixture = build_stack_matmul()
+    forge(fixture.region.workspace, name="")
+    expect_defect("malformed_state", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.region.workspace, dtype="float32")
+    expect_defect("invalid_scalar_type", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.region.workspace, dtype=ScalarType.FLOAT64)
+    expect_defect("mixed_dtype", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.region.workspace, tile=17)
+    expect_defect("invalid_tile_id", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.region, workspace=fixture.reduce_stmt)
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_workspace_region_bodies_must_be_blocks():
+    fixture = build_stack_matmul()
+    forge(fixture.region, producer=fixture.reduce_stmt)
+    expect_defect("malformed_state", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.region, consumer=None)
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_workspace_reduce_state_is_typed():
+    fixture = build_stack_matmul()
+    forge(fixture.reduce_stmt, op="add")
+    expect_defect("malformed_state", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.reduce_stmt, value=fixture.builder.index_value(fixture.col))
+    expect_defect("type_mismatch", fixture.program)
+
+
+def test_workspace_region_rejects_cycles_and_shared_nodes():
+    fixture = build_stack_matmul()
+    forge(fixture.region, producer=fixture.program.body)
+    expect_defect("cyclic_structure", fixture.program)
+    fixture = build_stack_matmul()
+    forge(fixture.region, consumer=fixture.region.producer)
+    expect_defect("shared_node", fixture.program)
