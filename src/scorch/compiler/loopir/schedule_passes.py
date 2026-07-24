@@ -965,8 +965,22 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
 
 
 def _check_exact_carrier_state(value: object, expected: Set[str]) -> bool:
-    state = getattr(value, "__dict__", None)
-    return type(state) is dict and set(state) == expected
+    state = object.__getattribute__(value, "__dict__")
+    if type(state) is not dict:
+        return False
+    keys = tuple(state.keys())
+    return all(type(key) is str for key in keys) and tuple(sorted(keys)) == tuple(
+        sorted(expected)
+    )
+
+
+def _is_exact_int_identity(value: object, identity_type: type) -> bool:
+    if type(value) is not identity_type or not _check_exact_carrier_state(
+        value, {"value"}
+    ):
+        return False
+    state = object.__getattribute__(value, "__dict__")
+    return type(state["value"]) is int
 
 
 def _verify_scheduled_loopir(
@@ -1003,18 +1017,16 @@ def _verify_scheduled_loopir(
                 "invalid_scheduled_artifact",
                 f"loops[{position}] must be an exact provenance value",
             )
-        if provenance.tile is not None and (
-            type(provenance.tile) is not TileId
-            or type(provenance.tile.value) is not int
+        if provenance.tile is not None and not _is_exact_int_identity(
+            provenance.tile, TileId
         ):
             _fail(
                 "invalid_scheduled_artifact",
                 f"loops[{position}].tile must be None or an int-valued TileId",
             )
-        if (
-            type(provenance.index) is not IndexId
-            or type(provenance.index.value) is not int
-            or type(provenance.part) is not LoopPart
+        if not _is_exact_int_identity(provenance.index, IndexId) or not any(
+            provenance.part is expected
+            for expected in (LoopPart.LOGICAL, LoopPart.OUTER, LoopPart.INNER)
         ):
             _fail(
                 "invalid_scheduled_artifact",
