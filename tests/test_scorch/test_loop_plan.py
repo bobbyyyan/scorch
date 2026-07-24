@@ -1631,6 +1631,30 @@ def test_panel_plan_checks_bound_parallelism_and_placement() -> None:
     bound = plan.panel_bounds[0]
     panel_tile = plan.tiles[0]
 
+    not_unrolled = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                TileSpec(
+                    "j",
+                    4,
+                    kind="panel",
+                    accum="direct",
+                    unroll=False,
+                ),
+            ),
+            parallel_loop="i",
+        ),
+    )
+    assert verify_scheduled_cin(not_unrolled) is not_unrolled
+    assert not_unrolled.verified_loop_plan.tiles[0].unroll is False
+    not_unrolled_plan = replace(
+        plan,
+        tiles=(replace(panel_tile, unroll=False),),
+    )
+    assert verify_loop_plan(cin, not_unrolled_plan) is not_unrolled_plan
+
     duplicated_bound = replace(plan, panel_bounds=(bound, bound))
     _assert_plan_rejected(
         cin,

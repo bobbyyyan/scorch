@@ -1524,7 +1524,7 @@ from scorch.compiler.loopir.nodes import (  # noqa: E402
 from scorch.compiler.loopir.schedule_passes import apply_panel_tile  # noqa: E402
 
 
-def panel_tile(index_id, width, placement=None):
+def panel_tile(index_id, width, placement=None, unroll=True):
     # unroll=True mirrors the public TileSpec default; the legacy panel
     # lowering ignores the flag, so the typed family accepts and ignores it
     # the same way.
@@ -1535,7 +1535,7 @@ def panel_tile(index_id, width, placement=None):
         parallel=False,
         kind="panel",
         accumulation="direct",
-        unroll=True,
+        unroll=unroll,
     )
 
 
@@ -1574,6 +1574,27 @@ def test_apply_panel_tile_is_pure_and_deterministic():
     assert canonical_program_dump(lowering.program) == before
     assert canonical_program_dump(first) == canonical_program_dump(second)
     assert print_program(first) == print_program(second)
+
+
+def test_apply_panel_tile_accepts_and_consumes_both_unroll_values():
+    lowering, (_i, j, _k), _tile, bound, parallel = spmm_panel_parts(width=4)
+    unrolled = apply_panel_tile(
+        lowering.program,
+        panel_tile(j.index_id, 4, unroll=True),
+        bound,
+        parallel,
+    )
+    not_unrolled = apply_panel_tile(
+        lowering.program,
+        panel_tile(j.index_id, 4, unroll=False),
+        bound,
+        parallel,
+    )
+    verify_program(unrolled)
+    verify_program(not_unrolled)
+    # Legacy panels ignore the shared TileSpec compatibility field, so it
+    # deliberately has no scheduled-LoopIR effect.
+    assert canonical_program_dump(unrolled) == canonical_program_dump(not_unrolled)
 
 
 def test_panel_canonical_dumps_are_stable_across_identity_histories():

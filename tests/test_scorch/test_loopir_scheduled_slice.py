@@ -14,7 +14,7 @@ the legacy lowering of the verified ``ScheduledCIN``):
   producer/consumer shape over CSR SpMM and dense matmul, every placement
   kind, unroll, f32/f64, direct+stack composition, and ragged/exact/
   oversized/non-dividing/zero extents;
-- a twelve-member panel byte-parity grid locks the sparse coordinate-window
+- a thirteen-member panel byte-parity grid locks the sparse coordinate-window
   family — the legacy tile-j windowed-CSR shape with its mandatory parallel
   row loop — across widths below/equal/above/not dividing the extent, unit
   and maximum constexpr widths, f32/f64, both supported placements
@@ -1238,14 +1238,24 @@ def test_randomized_stack_execution_matches_torch_and_oracle():
 # -- sparse panel windows (Phase-6 panel slice) --------------------------------
 
 
-def panel(index_var, width, placement="outermost"):
-    return TileSpec(index_var, width, placement=placement, kind="panel", accum="direct")
+def panel(index_var, width, placement="outermost", unroll=True):
+    return TileSpec(
+        index_var,
+        width,
+        placement=placement,
+        kind="panel",
+        accum="direct",
+        unroll=unroll,
+    )
 
 
-def panel_schedule(width, tag, placement="outermost", extra_tiles=()):
+def panel_schedule(width, tag, placement="outermost", extra_tiles=(), unroll=True):
     return Schedule(
         loop_order=("i", "j", "k"),
-        tiles=(*extra_tiles, panel("j", width, placement=placement)),
+        tiles=(
+            *extra_tiles,
+            panel("j", width, placement=placement, unroll=unroll),
+        ),
         tag=tag,
         parallel_loop="i",
     )
@@ -1300,6 +1310,13 @@ PANEL_PARITY_GRID = [
         panel_schedule(3, "p-f64"),
         (4, 6),
         (((4, 5), F64), ((5, 6), F64)),
+    ),
+    (
+        "spmm panel unroll compatibility false",
+        build_spmm,
+        panel_schedule(3, "p-unroll-false", unroll=False),
+        (4, 6),
+        SPMM_BINDINGS,
     ),
     (
         "spmm panel child_of affine pack tile",
@@ -1461,6 +1478,25 @@ def test_spmm_panel_zero_free_extent_shadow_execution():
         build_spmm(),
         panel_schedule(3, "p-shadow-zero"),
         (4, 0),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sparse", "dense"),
+    (
+        (torch.empty(0, 5), torch.randn(5, 3)),
+        (torch.empty(4, 0), torch.empty(0, 3)),
+    ),
+    ids=("zero-rows", "zero-panel-extent"),
+)
+def test_spmm_panel_zero_row_and_panel_extents_shadow_execution(sparse, dense):
+    result_shape = (sparse.shape[0], dense.shape[1])
+    assert_scheduled_shadow(
+        build_spmm(),
+        panel_schedule(3, f"p-shadow-{result_shape[0]}x{sparse.shape[1]}"),
+        result_shape,
         (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
         sparse @ dense,
     )

@@ -7,7 +7,9 @@ programs serialize differently, and neither surface accepts an unverified
 program.  There is no deserializer, so no round-trip is claimed.
 """
 
+from contextlib import contextmanager
 import json
+import sys
 
 import pytest
 
@@ -19,13 +21,28 @@ from scorch.compiler.loopir.printer import (
     canonical_program_dump,
     print_program,
 )
-from scorch.compiler.loopir.verifier import LoopIRVerificationError
+from scorch.compiler.loopir.verifier import (
+    LoopIRVerificationError,
+    MAX_LOOPIR_TILE_WIDTH,
+)
 
 from tests.test_scorch.test_loopir_verifier import (
     build_matmul,
     build_vector_add,
     forge,
 )
+
+
+@contextmanager
+def minimum_int_string_digits():
+    """Temporarily select CPython's smallest decimal-conversion allowance."""
+
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(sys.int_info.str_digits_check_threshold)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
 
 
 def build_matvec(op=BinaryOp.MUL, dtype=ScalarType.FLOAT32):
@@ -507,3 +524,19 @@ def test_panel_canonical_dump_serializes_the_window_semantics():
     assert window["tile"] == 0
     assert window["cursor"]["tensor"] == 0
     assert window["cursor"]["level"] == 1
+
+
+def test_panel_max_semantic_width_is_total_at_the_minimum_digit_limit():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    assert MAX_LOOPIR_TILE_WIDTH.bit_length() == 2048
+    assert len(str(MAX_LOOPIR_TILE_WIDTH)) < sys.int_info.str_digits_check_threshold
+    with minimum_int_string_digits():
+        text = print_program(build_panel_spmm(width=MAX_LOOPIR_TILE_WIDTH).program)
+        payload = json.loads(
+            canonical_program_dump(
+                build_panel_spmm(width=MAX_LOOPIR_TILE_WIDTH).program
+            )
+        )
+    assert f"width {MAX_LOOPIR_TILE_WIDTH} " in text
+    assert payload["body"]["statements"][0]["width"] == MAX_LOOPIR_TILE_WIDTH

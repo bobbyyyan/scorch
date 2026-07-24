@@ -12,9 +12,12 @@ even though byte-identical emission already implies them; per the design,
 structural activation is never waived.
 """
 
+import copy
+
 import pytest
 import torch
 
+from scorch.compiler import llir
 from scorch.compiler.cin import (
     BinaryOp as CINBinaryOp,
     ForAll,
@@ -25,10 +28,12 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.compilation_context import (
     CompilationContext,
+    CompilationContextError,
     CompilerStageId,
 )
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH
+from scorch.compiler.llir_pass_manager import LLIRPassManager
 from scorch.compiler.loopir.lower_llir import (
     LoopIRTargetError,
     lower_loopir_to_llir,
@@ -1144,3 +1149,256 @@ def test_panel_width_beyond_constexpr_int_fails_at_target():
     fixture = build_panel_spmm(width=MAX_AFFINE_TILE_WIDTH + 1)
     shapes, result_shape = panel_spmm_shapes(fixture)
     expect_target_code("unsupported_tile_width", fixture.program, shapes, result_shape)
+
+
+def test_panel_parallel_row_must_partition_the_dense_result():
+    """A bare verified LoopProgram must not bypass the LoopPlan race gate."""
+
+    from scorch.compiler.loopir.nodes import LevelKind
+    from scorch.compiler.loopir.verifier import verify_program
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    fixture = build_panel_spmm(width=3)
+    result_decl = fixture.program.tensors[2]
+    forge(
+        result_decl,
+        dimensions=(fixture.dim_k,),
+        levels=(fixture.builder.level(LevelKind.DENSE, 0),),
+    )
+    leaf = fixture.free_loop.body.statements[0]
+    forge(
+        leaf,
+        indices=(fixture.builder.index_value(fixture.free),),
+    )
+    verify_program(fixture.program)
+    expect_target_code(
+        "unsupported_program_shape",
+        fixture.program,
+        {fixture.a: (4, 5), fixture.b: (5, 6)},
+        (6,),
+    )
+
+
+def _panel_llir_locations(statements):
+    found = []
+    for index, statement in enumerate(statements):
+        found.append((statements, index, statement))
+        if isinstance(statement, (llir.ForLoop, llir.WhileLoop, llir.ForLoopAuto)):
+            found.extend(_panel_llir_locations(statement.body))
+        elif isinstance(statement, llir.IfThenElse):
+            for body in (statement.then_body, statement.else_body):
+                if body:
+                    found.extend(_panel_llir_locations(body))
+            for body in statement.then_body_list or ():
+                found.extend(_panel_llir_locations(body))
+    return found
+
+
+def _corrupt_completed_panel_artifact(statements, corruption):
+    locations = _panel_llir_locations(statements)
+    loops = {
+        statement.scorch_index_var: (container, index, statement)
+        for container, index, statement in locations
+        if isinstance(statement, llir.ForLoop)
+    }
+    end_location = next(
+        (container, index, statement)
+        for container, index, statement in locations
+        if type(statement) is llir.VarInit and statement.var.name == "pA1_end"
+    )
+    if corruption == "row_condition":
+        row = loops["i"][2]
+        row.cond = llir.BinOp("<=", row.cond.left, row.cond.right)
+    elif corruption == "row_update":
+        loops["i"][2].update = llir.FunctionCall("advance_i", ())
+    elif corruption == "inner_loop":
+        inner = loops["k"][2]
+        loop_var = llir.Var("q", inner.init.var.type)
+        inner.init = llir.VarInit(loop_var, llir.Literal(0))
+        inner.cond = llir.BinOp("<", loop_var, inner.cond.right)
+        inner.update = llir.Increment(loop_var)
+    elif corruption == "malformed_loop_var":
+        delattr(loops["k"][2].init.var, "name")
+    elif corruption == "window_end":
+        end_location[2].value = llir.Literal(0, llir.DataType.INT)
+    elif corruption == "window_end_after_loop":
+        end_container, end_index, end_init = end_location
+        window_container, _window_index, window = loops["j"]
+        assert end_container is window_container
+        del end_container[end_index]
+        end_container.insert(end_container.index(window) + 1, end_init)
+    elif corruption == "sibling_window":
+        end_container, end_index, end_init = end_location
+        window_container, window_index, window = loops["j"]
+        assert end_container is window_container
+        for index in sorted((end_index, window_index), reverse=True):
+            del end_container[index]
+        statements.extend((end_init, window))
+    elif corruption == "extra_loop":
+        loop_var = llir.Var("q", llir.DataType.INT64)
+        statements.append(
+            llir.ForLoop(
+                llir.VarInit(loop_var, llir.Literal(0)),
+                llir.BinOp("<", loop_var, llir.Literal(1)),
+                llir.Increment(loop_var),
+                [],
+            )
+        )
+    elif corruption == "unknown_statement":
+
+        class UnknownStatement(llir.Stmt):
+            pass
+
+        statements.append(UnknownStatement())
+    elif corruption == "duplicate_window_end":
+        end_location[0].insert(end_location[1], copy.deepcopy(end_location[2]))
+    elif corruption == "malformed_neighbor_init":
+        malformed = copy.deepcopy(end_location[2])
+        delattr(malformed, "var")
+        end_location[0].insert(end_location[1], malformed)
+    elif corruption == "malformed_neighbor_var":
+        malformed = copy.deepcopy(end_location[2])
+        delattr(malformed.var, "name")
+        end_location[0].insert(end_location[1], malformed)
+    elif corruption == "malformed_window_value":
+        assert type(end_location[2].value) is llir.ArrayAccess
+        object.__delattr__(end_location[2].value, "array")
+    elif corruption == "window_value_subclass":
+
+        class ExplodingExpr(llir.Expr):
+            def __eq__(self, _other):
+                raise RuntimeError("forged equality must never run")
+
+        end_location[2].value = ExplodingExpr()
+    elif corruption == "missing_optional_header":
+        delattr(loops["k"][2], "before_parallel_body")
+    elif corruption == "atomic_marker":
+        setattr(loops["k"][2], "_use_atomic_scheduling", True)
+    elif corruption == "cyclic_loop_body":
+        row = loops["i"][2]
+        row.body = [row]
+    elif corruption == "shared_loop":
+        loops["i"][2].body.append(loops["k"][2])
+    else:
+        raise AssertionError(f"unknown test corruption {corruption!r}")
+
+
+def _install_panel_completion_corruption(monkeypatch, corruption):
+    original = LLIRPassManager.run_production_pipeline
+
+    def corrupt_after_managed_passes(manager, *args, **kwargs):
+        result = original(manager, *args, **kwargs)
+        _corrupt_completed_panel_artifact(result.artifact.value, corruption)
+        return result
+
+    monkeypatch.setattr(
+        LLIRPassManager,
+        "run_production_pipeline",
+        corrupt_after_managed_passes,
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "row_condition",
+        "row_update",
+        "inner_loop",
+        "malformed_loop_var",
+        "window_end",
+        "window_end_after_loop",
+        "sibling_window",
+        "extra_loop",
+        "unknown_statement",
+        "duplicate_window_end",
+        "malformed_neighbor_init",
+        "malformed_neighbor_var",
+        "malformed_window_value",
+        "window_value_subclass",
+        "missing_optional_header",
+        "atomic_marker",
+        "cyclic_loop_body",
+        "shared_loop",
+    ),
+)
+def test_panel_completion_fails_closed_on_post_pass_corruption(monkeypatch, corruption):
+    _install_panel_completion_corruption(monkeypatch, corruption)
+    with pytest.raises(LoopIRTargetError) as error:
+        scheduled_panel_cpp(width=3)
+    assert error.value.defect.code == "panel_completion_lost"
+
+
+def test_panel_completion_requires_the_parallel_marker_to_take_effect(monkeypatch):
+    from scorch.compiler.loopir import lower_llir as loopir_lower_llir
+
+    monkeypatch.setattr(
+        loopir_lower_llir,
+        "mark_first_for_loop_parallel",
+        lambda _statements, _cluster: None,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        scheduled_panel_cpp(width=3)
+    assert error.value.defect.code == "panel_completion_lost"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("omp_num_threads", "corrupt_policy()"),
+        ("omp_chunk_expr", "corrupt_chunk()"),
+        ("pre_parallel_body", [llir.RawStmt("corrupt();")]),
+        ("_use_atomic_scheduling", True),
+    ),
+)
+def test_panel_completion_requires_the_exact_parallel_policy(monkeypatch, field, value):
+    from scorch.compiler.loopir import lower_llir as loopir_lower_llir
+
+    original = loopir_lower_llir.mark_first_for_loop_parallel
+
+    def corrupt_marker(statements, cluster):
+        original(statements, cluster)
+        setattr(statements[0], field, value)
+
+    monkeypatch.setattr(
+        loopir_lower_llir,
+        "mark_first_for_loop_parallel",
+        corrupt_marker,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        scheduled_panel_cpp(width=3)
+    assert error.value.defect.code == "panel_completion_lost"
+
+
+def test_panel_completion_failure_owns_stage_and_keeps_completed_pass_records(
+    monkeypatch,
+):
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    _install_panel_completion_corruption(monkeypatch, "extra_loop")
+    fixture = build_panel_spmm(width=3)
+    shapes, result_shape = panel_spmm_shapes(fixture)
+    options = CompileOptions.from_environment()
+    context = CompilationContext(options)
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes=shapes,
+            result_shape=result_shape,
+            compile_options=options,
+            compilation_context=context,
+        )
+    assert error.value.defect.code == "panel_completion_lost"
+    assert context.stage_run_records == ()
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]
+    with pytest.raises(CompilationContextError) as terminal:
+        context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=options,
+        )
+    assert terminal.value.diagnostic.code == "failed_compilation"

@@ -28,6 +28,7 @@ from scorch.compiler.loopir.nodes import (
     ScalarType,
     Stmt,
     StoreReduce,
+    TileId,
     TileInnerFor,
     TileOuterFor,
     WorkspaceReduce,
@@ -35,6 +36,7 @@ from scorch.compiler.loopir.nodes import (
 )
 from scorch.compiler.loopir.verifier import (
     LoopIRVerificationError,
+    MAX_LOOPIR_TILE_WIDTH,
     verify_program,
 )
 
@@ -357,6 +359,12 @@ def test_invalid_mode_order_out_of_range():
     level = fixture.program.tensors[0].levels[0]
     forge(level, mode=3)
     expect_defect("invalid_mode_order", fixture.program)
+
+    fixture = build_vector_add()
+    level = fixture.program.tensors[0].levels[0]
+    forge(level, mode=10**5000)
+    defect = expect_defect("invalid_mode_order", fixture.program)
+    assert "<integer too large to render>" in defect.message
 
 
 def test_invalid_mode_order_not_a_permutation():
@@ -931,6 +939,22 @@ def test_invalid_position_id():
     expect_defect("invalid_position_id", fixture.program)
 
 
+def test_huge_sparse_and_dense_position_levels_fail_closed():
+    huge = 10**5000
+
+    fixture = build_csr_spmv()
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(sparse_loop.cursor, level=huge)
+    defect = expect_defect("rank_mismatch", fixture.program)
+    assert "<integer too large to render>" in defect.message
+
+    fixture = build_csr_spmv()
+    sparse_loop = fixture.program.body.statements[0].body.statements[0]
+    forge(sparse_loop.cursor.parent, level=huge)
+    defect = expect_defect("rank_mismatch", fixture.program)
+    assert "<integer too large to render>" in defect.message
+
+
 def test_duplicate_cursor_id():
     fixture = build_union_add()
     merged = fixture.program.body.statements[0].body.statements[0]
@@ -1421,10 +1445,13 @@ def test_tile_widths_must_be_positive_exact_ints():
     forge(fixture.outer, width=4.0)
     forge(fixture.inner, width=4.0)
     expect_defect("invalid_tile_width", fixture.program)
-    # Width representability is target-specific: semantic LoopIR and the
-    # oracle retain arbitrary positive Python-int widths, while the C++
-    # lowering owns its narrower constexpr-int boundary.
+    # Semantic LoopIR retains a deliberately huge target-neutral range, while
+    # the C++ lowering owns its much narrower constexpr-int boundary.
     verify_program(build_tiled_matvec(width=MAX_AFFINE_TILE_WIDTH + 1).program)
+    verify_program(build_tiled_matvec(width=MAX_LOOPIR_TILE_WIDTH).program)
+    for width in (MAX_LOOPIR_TILE_WIDTH + 1, 10**5000):
+        fixture = build_tiled_matvec(width=width)
+        expect_defect("invalid_tile_width", fixture.program)
 
 
 def test_tile_unroll_must_be_a_bool():
@@ -2074,6 +2101,51 @@ def test_panel_width_must_be_a_positive_exact_int():
         fixture = build_panel_spmm()
         forge(fixture.panel, width=width)
         expect_defect("invalid_tile_width", fixture.program)
+
+    verify_program(build_panel_spmm(width=MAX_LOOPIR_TILE_WIDTH).program)
+    for width in (MAX_LOOPIR_TILE_WIDTH + 1, 10**5000):
+        fixture = build_panel_spmm(width=width)
+        expect_defect("invalid_tile_width", fixture.program)
+
+    # Both reader surfaces verify before rendering, so an over-limit semantic
+    # integer remains a controlled LoopIR defect rather than leaking
+    # CPython's decimal-conversion ValueError.
+    from scorch.compiler.loopir.printer import (
+        canonical_program_dump,
+        print_program,
+    )
+
+    for render in (print_program, canonical_program_dump):
+        fixture = build_panel_spmm(width=10**5000)
+        with pytest.raises(LoopIRVerificationError) as error:
+            render(fixture.program)
+        assert error.value.defect.code == "invalid_tile_width"
+
+
+def test_panel_huge_integer_diagnostics_fail_closed():
+    huge = 10**5000
+
+    fixture = build_panel_spmm()
+    forge(fixture.panel, bound_level=huge)
+    defect = expect_defect("rank_mismatch", fixture.program)
+    assert "rank-2" in defect.message
+
+    fixture = build_panel_spmm()
+    forge(fixture.window, tile=TileId(huge))
+    defect = expect_defect("unbound_panel", fixture.program)
+    assert "<integer too large to render>" in defect.message
+
+    fixture = build_panel_spmm()
+    forge(fixture.panel, tile=TileId(huge))
+    plain = fixture.builder.sparse_for(
+        fixture.window.cursor,
+        fixture.window.position,
+        fixture.window.coord_index,
+        fixture.window.body,
+    )
+    forge(fixture.row_loop, body=fixture.builder.block((plain,)))
+    defect = expect_defect("missing_panel_window", fixture.program)
+    assert "<integer too large to render>" in defect.message
 
 
 def test_panel_index_conflicts_fail_closed():
