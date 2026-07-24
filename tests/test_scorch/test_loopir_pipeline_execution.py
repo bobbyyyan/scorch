@@ -764,3 +764,62 @@ def test_sparse_stage_timing_is_recorded():
     assert stage_ids.index(CompilerStageId.CIN_TO_LOOPIR_LOWERING) < stage_ids.index(
         CompilerStageId.LOOPIR_TO_LLIR_LOWERING
     )
+
+
+def test_panel_scheduled_stage_timing_is_recorded():
+    """A panel schedule owns the full scheduled stage sequence, including
+    the LoopIR schedule-application stage, and the managed pass records."""
+
+    from scorch.compiler.scheduler import Schedule, TileSpec
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt="dd")
+    spmm = ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(
+                k,
+                TensorAssign(
+                    c[i, k],
+                    CINBinaryOp(Operation.MUL, a[i, j], b[j, k]),
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(TileSpec("j", 3, kind="panel", accum="direct"),),
+        tag="panel-stages",
+        parallel_loop="i",
+    )
+    options = CompileOptions.from_environment(requested_schedule=schedule)
+    context = CompilationContext(options)
+    kernel = compile_cin_via_loopir(
+        spmm,
+        (4, 6),
+        (((4, 5), torch.float32), ((5, 6), torch.float32)),
+        compile_options=options,
+        compilation_context=context,
+    )
+    assert kernel.schedule is not None
+    recorded = [record.stage_id for record in context.stage_run_records]
+    assert recorded == [
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+        CompilerStageId.LOOPIR_SCHEDULE_APPLICATION,
+        CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
+        CompilerStageId.LLIR_TO_CPP_GENERATION,
+    ]
+    assert [record.pass_name for record in context.llir_pass_run_records] == [
+        "insert_sparse_prefetch",
+        "hoist_dense_pointers",
+        "eliminate_single_iteration_loops",
+        "hoist_loop_invariant_factors",
+        "rewrite_dynamic_vector_accesses",
+    ]

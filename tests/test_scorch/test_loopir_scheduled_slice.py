@@ -14,6 +14,12 @@ the legacy lowering of the verified ``ScheduledCIN``):
   producer/consumer shape over CSR SpMM and dense matmul, every placement
   kind, unroll, f32/f64, direct+stack composition, and ragged/exact/
   oversized/non-dividing/zero extents;
+- a twelve-member panel byte-parity grid locks the sparse coordinate-window
+  family — the legacy tile-j windowed-CSR shape with its mandatory parallel
+  row loop — across widths below/equal/above/not dividing the extent, unit
+  and maximum constexpr widths, f32/f64, both supported placements
+  (outermost and child_of an outermost affine origin, plus the
+  both-outermost composition), and zero row/panel/free extents;
 - compiled shadow execution runs both pipelines on real tensors and
   requires bitwise-equal dense results plus PyTorch agreement;
 - every unsupported schedule family fails closed with a stable code at the
@@ -467,8 +473,9 @@ def test_scheduled_stage_sequence_and_failure_ownership():
 @pytest.mark.parametrize(
     "schedule, code",
     [
-        # Stack accumulation left this list in the Phase-6 workspace slice:
-        # it is now a migrated family with its own positive parity locks.
+        # Stack accumulation left this list in the Phase-6 workspace slice,
+        # and sparse panel tiling left it in the panel slice: both are now
+        # migrated families with their own positive parity locks.
         (
             # Legacy heap accumulation also demands the parallel row loop;
             # the heap result tile is rejected before parallel selection.
@@ -478,17 +485,6 @@ def test_scheduled_stage_sequence_and_failure_ownership():
                 parallel_loop="i",
             ),
             "unsupported_schedule_result_tile",
-        ),
-        (
-            Schedule(
-                loop_order=("i", "j", "k"),
-                tiles=(
-                    tile("k", 4),
-                    TileSpec("j", 3, kind="panel", accum="direct"),
-                ),
-                parallel_loop="i",
-            ),
-            "unsupported_schedule_panel",
         ),
         (
             Schedule(loop_order=("i", "j", "k"), parallel_loop="i"),
@@ -1236,4 +1232,312 @@ def test_randomized_stack_execution_matches_torch_and_oracle():
             torch.tensor(oracle_out, dtype=torch.float32),
             atol=1e-3,
             rtol=1e-3,
+        )
+
+
+# -- sparse panel windows (Phase-6 panel slice) --------------------------------
+
+
+def panel(index_var, width, placement="outermost"):
+    return TileSpec(index_var, width, placement=placement, kind="panel", accum="direct")
+
+
+def panel_schedule(width, tag, placement="outermost", extra_tiles=()):
+    return Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(*extra_tiles, panel("j", width, placement=placement)),
+        tag=tag,
+        parallel_loop="i",
+    )
+
+
+PANEL_PARITY_GRID = [
+    (
+        "spmm panel width below extent",
+        build_spmm,
+        panel_schedule(3, "p-below"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm panel unit width",
+        build_spmm,
+        panel_schedule(1, "p-unit"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm panel width equal to extent",
+        build_spmm,
+        panel_schedule(5, "p-equal"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm panel width above extent",
+        build_spmm,
+        panel_schedule(64, "p-above"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm panel width not dividing extent",
+        build_spmm,
+        panel_schedule(2, "p-ragged"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm panel maximum constexpr width",
+        build_spmm,
+        panel_schedule(2**31 - 1, "p-max"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm panel float64",
+        lambda: build_spmm(dtype=F64),
+        panel_schedule(3, "p-f64"),
+        (4, 6),
+        (((4, 5), F64), ((5, 6), F64)),
+    ),
+    (
+        "spmm panel child_of affine pack tile",
+        build_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                TileSpec("k", 4, placement="outermost", accum="direct", unroll=False),
+                panel("j", 3, placement="child_of:k_out"),
+            ),
+            tag="p-child",
+            parallel_loop="i",
+        ),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm panel outermost over outermost affine tile",
+        build_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                TileSpec("k", 4, placement="outermost", accum="direct", unroll=False),
+                panel("j", 3),
+            ),
+            tag="p-both-outermost",
+            parallel_loop="i",
+        ),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm panel zero rows",
+        build_spmm,
+        panel_schedule(3, "p-zero-rows"),
+        (0, 6),
+        (((0, 5), F32), ((5, 6), F32)),
+    ),
+    (
+        "spmm panel zero panel extent",
+        build_spmm,
+        panel_schedule(3, "p-zero-cols"),
+        (4, 6),
+        (((4, 0), F32), ((0, 6), F32)),
+    ),
+    (
+        "spmm panel zero free extent",
+        build_spmm,
+        panel_schedule(3, "p-zero-free"),
+        (4, 0),
+        (((4, 5), F32), ((5, 0), F32)),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "case",
+    PANEL_PARITY_GRID,
+    ids=[case[0] for case in PANEL_PARITY_GRID],
+)
+def test_panel_source_is_byte_identical_to_legacy(case):
+    name, build, schedule, result_shape, bindings = case
+    comparison = compare_generated_sources(
+        build(),
+        result_shape,
+        bindings,
+        compile_options=scheduled_options(schedule),
+    )
+    assert comparison.identical, f"{name} diverged from the legacy schedule"
+
+
+def test_panel_artifact_carries_plan_and_provenance():
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(panel_schedule(3, "p-prov")),
+    )
+    scheduled = kernel.schedule
+    assert scheduled is not None
+    assert scheduled.plan.provenance == "explicit"
+    panel_tiles = [t for t in scheduled.plan.tiles if t.kind == "panel"]
+    assert len(panel_tiles) == 1 and panel_tiles[0].width == 3
+    assert len(scheduled.plan.panel_bounds) == 1
+    assert scheduled.plan.parallel_loop is not None
+    parts = [(entry.part, entry.tile is not None) for entry in scheduled.loops]
+    assert parts == [
+        (LoopPart.OUTER, True),
+        (LoopPart.LOGICAL, False),
+        (LoopPart.INNER, True),
+        (LoopPart.LOGICAL, False),
+    ]
+    from scorch.compiler.loopir.printer import canonical_program_dump
+
+    assert "panel_outer_for" not in canonical_program_dump(scheduled.base_program)
+    assert "panel_outer_for" in canonical_program_dump(scheduled.program)
+    assert "sparse_window_for" in canonical_program_dump(scheduled.program)
+
+
+@pytest.mark.parametrize("width", [1, 3, 64])
+def test_spmm_panel_shadow_execution_across_window_regimes(width):
+    torch.manual_seed(2623 + width)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.6] = 0.0
+    sparse[2, :] = 0.0  # an empty CSR row
+    dense = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_spmm(),
+        panel_schedule(width, f"p-shadow-{width}"),
+        (4, 6),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+def test_spmm_panel_float64_shadow_execution():
+    torch.manual_seed(2624)
+    sparse = torch.randn(3, 4, dtype=F64)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.randn(4, 5, dtype=F64)
+    assert_scheduled_shadow(
+        build_spmm(dtype=F64),
+        panel_schedule(3, "p-shadow-f64"),
+        (3, 5),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+def test_spmm_panel_child_of_shadow_execution():
+    torch.manual_seed(2625)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                TileSpec("k", 4, placement="outermost", accum="direct", unroll=False),
+                panel("j", 3, placement="child_of:k_out"),
+            ),
+            tag="p-shadow-child",
+            parallel_loop="i",
+        ),
+        (4, 6),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+def test_spmm_panel_zero_free_extent_shadow_execution():
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.empty(5, 0)
+    assert_scheduled_shadow(
+        build_spmm(),
+        panel_schedule(3, "p-shadow-zero"),
+        (4, 0),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+def test_panel_randomized_execution_matches_torch_and_oracle():
+    torch.manual_seed(2626)
+    import random as _random
+
+    from scorch.compiler.loopir.levels import CsrMatrix
+    from scorch.compiler.loopir.oracle import run_program
+
+    rng = _random.Random(20260724)
+    for round_index in range(3):
+        rows = rng.randrange(1, 7)
+        inner = rng.randrange(1, 7)
+        cols = rng.randrange(1, 8)
+        width = rng.choice((1, 2, 3, 5, 9))
+        sparse = torch.randn(rows, inner)
+        sparse[sparse.abs() < 0.5] = 0.0
+        dense = torch.randn(inner, cols)
+        schedule = panel_schedule(width, f"p-rand-{round_index}-{width}")
+        result, kernel = execute_cin_via_loopir(
+            build_spmm(),
+            (rows, cols),
+            csr_stensor(sparse, "A"),
+            dense_stensor(dense, "B"),
+            compile_options=scheduled_options(schedule),
+        )
+        assert torch.allclose(
+            result.values.reshape(rows, cols),
+            sparse @ dense,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        assert kernel.schedule is not None
+        lowering = kernel.lowering
+        oracle_out = run_program(
+            kernel.schedule.program,
+            {
+                lowering.input_symbols[0]: CsrMatrix.from_dense(sparse.tolist()),
+                lowering.input_symbols[1]: dense.tolist(),
+            },
+            {lowering.result_symbol: (rows, cols)},
+        )[lowering.result_symbol]
+        assert torch.allclose(
+            result.values.reshape(rows, cols),
+            torch.tensor(oracle_out, dtype=torch.float32),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+def test_panel_schedule_validation_failure_owns_its_stage():
+    """A panel schedule without its mandatory parallel row loop fails in
+    the shared Scheduler validation with a terminal scheduling stage."""
+
+    from scorch.compiler.diagnostics import InvalidSchedule, UnsupportedFeature
+
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(panel("j", 3),),
+        tag="p-invalid",
+    )
+    options = scheduled_options(schedule)
+    context = CompilationContext(options)
+    with pytest.raises((InvalidSchedule, UnsupportedFeature)):
+        compile_cin_via_loopir(
+            build_spmm(),
+            (4, 6),
+            SPMM_BINDINGS,
+            compile_options=options,
+            compilation_context=context,
+        )
+    completed = [record.stage_id for record in context.stage_run_records]
+    assert CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION not in completed
+    with pytest.raises(CompilationContextError):
+        context.begin_stage(
+            CompilerStageId.CIN_TO_LOOPIR_LOWERING, compile_options=options
         )
