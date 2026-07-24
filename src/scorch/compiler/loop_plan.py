@@ -293,6 +293,17 @@ def _validate_stored_fields(
         raise VerificationError(f"LoopPlan {path} has invalid stored fields")
 
 
+def _diagnostic_int(value: int) -> str:
+    """Render an exact int with deterministic, bounded diagnostic size."""
+
+    if value.bit_length() > 4096:
+        return "<integer too large to render>"
+    try:
+        return str(value)
+    except ValueError:
+        return "<integer too large to render>"
+
+
 def _validate_index_id(index_id: object, path: str) -> IndexId:
     if type(index_id) is not IndexId:
         raise VerificationError(f"LoopPlan {path} must be a well-formed IndexId")
@@ -317,7 +328,10 @@ def _validate_loop_ref(loop: object, path: str) -> LoopRef:
     _validate_stored_fields(loop, path, ("index_id", "part"))
     typed_loop = cast(LoopRef, loop)
     _validate_index_id(typed_loop.index_id, f"{path}.index_id")
-    if type(typed_loop.part) is not LoopPart:
+    if not any(
+        typed_loop.part is expected
+        for expected in (LoopPart.LOGICAL, LoopPart.OUTER, LoopPart.INNER)
+    ):
         raise VerificationError(f"LoopPlan {path}.part must be a LoopPart")
     return typed_loop
 
@@ -327,7 +341,14 @@ def _validate_loop_placement(placement: object, path: str) -> LoopPlacement:
         raise VerificationError(f"LoopPlan {path} must be a LoopPlacement")
     _validate_stored_fields(placement, path, ("kind", "parent", "depth"))
     typed_placement = cast(LoopPlacement, placement)
-    if type(typed_placement.kind) is not PlacementKind:
+    if not any(
+        typed_placement.kind is expected
+        for expected in (
+            PlacementKind.OUTERMOST,
+            PlacementKind.CHILD_OF,
+            PlacementKind.AT_DEPTH,
+        )
+    ):
         raise VerificationError(f"LoopPlan {path}.kind must be a PlacementKind")
     if typed_placement.parent is not None:
         _validate_loop_ref(typed_placement.parent, f"{path}.parent")
@@ -508,13 +529,16 @@ def _verify_complete_loop_order(plan: LoopPlan, indices: Dict[IndexId, str]) -> 
         if index_id not in indices:
             raise VerificationError(
                 "LoopPlan loop_order"
-                f"[{position}] references unknown IndexId {index_id.value}"
+                f"[{position}] references unknown IndexId "
+                f"{_diagnostic_int(index_id.value)}"
             )
     missing_loop_ids = tuple(
         index_id for index_id in indices if index_id not in plan.loop_order
     )
     if missing_loop_ids:
-        missing_values = ", ".join(str(index_id.value) for index_id in missing_loop_ids)
+        missing_values = ", ".join(
+            _diagnostic_int(index_id.value) for index_id in missing_loop_ids
+        )
         raise VerificationError(
             "LoopPlan.loop_order must contain every bound IndexId exactly once; "
             f"missing {missing_values}"
@@ -545,13 +569,15 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
     def check_loop(loop: LoopRef, path: str) -> None:
         if loop.index_id not in indices:
             raise VerificationError(
-                f"LoopPlan {path} references unknown IndexId {loop.index_id.value}"
+                f"LoopPlan {path} references unknown IndexId "
+                f"{_diagnostic_int(loop.index_id.value)}"
             )
 
     def check_symbol(symbol_id: SymbolId, path: str) -> None:
         if symbol_id not in symbols:
             raise VerificationError(
-                f"LoopPlan {path} references unknown SymbolId {symbol_id.value}"
+                f"LoopPlan {path} references unknown SymbolId "
+                f"{_diagnostic_int(symbol_id.value)}"
             )
 
     _verify_complete_loop_order(plan, indices)

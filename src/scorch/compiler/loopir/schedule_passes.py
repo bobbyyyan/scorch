@@ -476,8 +476,7 @@ def _placement_depth(
         if depth < 0 or depth > len(loops):
             _fail(
                 "tile_invalid_placement",
-                f"at_depth placement {depth} is outside the chain range "
-                f"0..{len(loops)}",
+                f"at_depth placement is outside the chain range 0..{len(loops)}",
             )
     if depth > target_position:
         _fail(
