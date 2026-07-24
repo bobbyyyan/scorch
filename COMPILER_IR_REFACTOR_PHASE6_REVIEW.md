@@ -1,6 +1,7 @@
 # Phase 6 Review: Scheduling Migration to LoopIR (Explicit Reorder + Affine Tiling)
 
-Date: 2026-07-23 (America/Los_Angeles)
+Date: 2026-07-23 (America/Los_Angeles); §10 (the workspace/stack milestone)
+added later the same day.
 
 This review records the first Phase-6 milestone of the compiler IR refactor:
 the ownership audit across the public Schedule surface and both pipelines,
@@ -419,3 +420,260 @@ commits ahead before this docs commit.
 
 The same clean-suite receipt is recorded in the handoff section committed
 with this correction.
+
+## 10. Workspace milestone: stack accumulation on LoopIR (2026-07-23)
+
+The second Phase-6 milestone migrates the stack-accumulation (workspace)
+schedule family — the schedule the production tile-j/regblock families
+actually use — end to end: schema, verifier, printer/serialization,
+oracle, typed pass, target lowering with byte parity, and a compiled
+matrix.  It is recorded in four stacked local commits plus the docs
+commit that records this section; nothing earlier was amended or
+reordered and nothing was pushed:
+
+- `9f431d9` — `feat(compiler): extend LoopIR with the stack workspace region schema`
+- `986c773` — `feat(compiler): materialize stack tiles as a typed workspace pass`
+- `ba87329` — `feat(compiler): lower workspace regions with legacy byte parity`
+- `72e991e` — `test(compiler): lock the Phase-6 workspace vertical slice`
+
+### 10.1 Audit and representation decision
+
+The audit (recorded before nodes were chosen, with captured legacy golden
+sources for every emission fact) walked the remaining LoopPlan families —
+stack/heap accumulation, panel bounds, operand relayout, result tiles,
+explicit parallel selection — against normalized CIN, the legacy owners
+(`Scheduler._apply_schedule_legacy` / `insert_workspace` / `add_tile` /
+`CINLowerer.lower_Where` / `lower_ConsumerIndexStmt` /
+`schedule_lowerer.py`), target emission, stage and cache identity, and
+the oracle:
+
+| Plan family | Legacy owner (validate → transform → emit) | Lifetime in emitted code | Disposition |
+| --- | --- | --- | --- |
+| Stack accumulation (`LoopTile.accumulation="stack"` — the verified plan already carried the fact; it was not widened) | `_tile_target_needs_workspace` + `_validate_stack_workspace_scope` → `insert_workspace` (a `Where{producer, consumer}` rooted at the *last* reduction ForAll with a dense 1-D `wksp`) → `add_tile` (rebinds both branch binders to the point variable; origin inserted at the placement resolved against the loop prefix *above* the Where) → `lower_Where` tiled-dense path (`float wksp[kTile] = {};`, empty parallel-workspace cluster) + producer `wksp[k_in] += value` + the synthesized result-bounded consumer loop | allocation + zero-reset per innermost-prefix-loop iteration by declaration-with-initializer; producer writes it, consumer copies out, gone at block end; no heap traffic and no per-thread pool | **migrated this milestone** |
+| Heap accumulation | the result-tile machinery in `schedule_lowerer.py` | outer-tile entry/exit heap buffer | fail-closed (`unsupported_schedule_accumulation` at the direct passes, `unsupported_schedule_result_tile` at the plan gate), unchanged |
+| Untiled/auto dense workspace | `should_insert_workspace` on the auto path; per-thread pool-owner slice + per-row memset | per-thread heap pool | not an explicit-plan fact; auto plans already fail closed (`unsupported_schedule_provenance`) |
+| Sparse (COO-hash) workspace | the `coo_workspace` heap path of `lower_Where` | loop-scoped heap container | out of family: stack requires the dense-output reduce leaf (`stack_tile_target_invalid`) |
+| Panel bounds / operand relayout | `schedule_lowerer.py` post-LLIR completion by rendered-name discovery | coordinate window / staging buffer at the scope loop | fail-closed, unchanged; §10.5 records the audit verdict |
+| Result tiles / explicit parallel selection | `schedule_lowerer.py` / `_set_explicit_parallel_loop` | — | fail-closed, unchanged |
+
+Representation: **a structured region in the same LoopIR node model** —
+exactly the design's Stage-5 workspace materialization ("allocation,
+reset, producer, and consumer regions with verified lifetime and
+reduction semantics").  `WorkspaceRegion(workspace, producer, consumer)`
+owns a `WorkspaceDecl(workspace: WorkspaceId, name, dtype, tile: TileId)`
+whose extent is intrinsic: the region buffers the point domain of one
+affine split, allocation and zero-reset (ADD's identity) are intrinsic
+region-entry semantics, teardown is region exit, and
+`WorkspaceReduce`/`WorkspaceRead` address cells by the owning split's
+point coordinate.  No C++ names, callbacks, dynamic fields, or target
+strings anywhere; dimension-extent, multi-dimensional, and sparse
+workspace forms are deliberately not declared.
+
+One boundary was deliberately moved: the region's producer and consumer
+each bind the split's point coordinate once, in disjoint sibling scopes,
+so a split may now own *several* ``TileInnerFor`` bindings of the same
+``TileId`` (each iterates the same clamped window exactly once).  Nested
+rebinding and every other binder kind keep the global once-only
+``duplicate_index_binding`` rule, and the previously locked
+nested-second-point regression still passes unchanged.
+
+### 10.2 What was frozen (schema extension)
+
+New in `loopir/nodes.py`: `WorkspaceId` (builder-allocated,
+artifact-local, scanned by the declared-field-only `resuming`
+continuation), `WorkspaceDecl`, `WorkspaceRegion`, `WorkspaceRead`, and
+`WorkspaceReduce`.  Canonical serialization moved to schema
+`scorch.loopir.canonical.v4` (the three statement/expression kinds plus
+the workspace identity family; workspace display names are omitted like
+every other display name).  The printer renders regions with explicit
+producer/consumer roles.  The oracle executes regions under the intrinsic
+semantics — fresh zeroed cells per region execution, cell = coordinate −
+current origin with hard bounds, teardown on exit — and fails closed at
+runtime on access outside a region or its origin loop.
+
+### 10.3 Verifier surface
+
+Nine stable codes were added, each with direct adversarial regressions:
+`invalid_workspace_id`, `duplicate_workspace_id`, `unbound_workspace`,
+`workspace_scope_mismatch` (a region needs its tile's origin loop in
+scope and must open outside its own point loops),
+`workspace_write_scope`, `workspace_read_scope`,
+`workspace_coord_mismatch` (cells are addressed only by the owning
+split's point coordinate bound inside the region),
+`workspace_output_write` (producers never write declared outputs), and
+`workspace_dead_region` (a region must accumulate and copy out).  The
+60-code surface is locked by the source-scan test.  Workspace dtypes join
+the uniform-dtype discipline (`mixed_dtype`) and the existing
+cycle/aliasing/forged-state/depth guards cover the new nodes.
+
+### 10.4 Passes, lowering, and the compiled matrix
+
+`apply_stack_tile` is the new pure typed pass: one fused rebuild
+mirroring the legacy `insert_workspace` + `add_tile` composition —
+producer = the reduction chain from the last reduction loop with the
+point loop reducing into the workspace; consumer = the copy-out point
+loop; origin inserted at the placement resolved against the loops that
+remain above the region (the legacy prefix-of-`Where` rule, including
+its `0..len(prefix)` `at_depth` range and prefix-only `child_of`
+parents).  The legacy legality boundary is mirrored with stable codes:
+`stack_tile_target_invalid` (the target must be the single trailing
+dense free loop after the last reduction of a dense-output ADD
+reduction; a region-terminated chain refuses further stack tiles) and
+`stack_tile_root_scope` (the region may not replace the chain root).
+`apply_schedule_plan` consumes `accum="stack"` tiles exactly once
+through the pass (`heap` still fails closed at the plan gate), direct
+tiles compose with region-terminated chains, the carrier verifier
+replays stack plans and rejects region-carrying base programs,
+provenance lists prefix → producer → consumer chains in the documented
+execution order, and `erase_schedule` erases a region to its
+direct-accumulation equivalent (defined for the exact copy-out form the
+pass produces; other verified consumers fail closed).  Erasure equality
+is proven by canonical dump against the reordered base and by exact
+integer-float oracle differentials across ragged, exact, oversized,
+non-dividing, unit, and zero extents — counting differentials that
+prove reset, lifetime, ragged-tail, and reduction semantics, not merely
+loop visitation (a missing per-tile reset, a double copy-out, or a
+tail overshoot each change the counted result).
+
+The target lowering emits the region byte-for-byte as legacy does:
+`// Initialize workspaces` + `float|double wksp[kTile_<name>] = {};`
+(allocation and reset in one `FixedStackArrayDecl` inside the innermost
+prefix loop), the producer chain with the input-bounded point loop and
+the untyped `wksp[k_in] += <value>;` leaf, then the synthesized
+`// Lower consumer CIN` copy-out loop with the consumer's own int64
+resolve spelling, the *result*-bounded overshoot break, result-write
+access metadata, and the tile's unroll preference on both point loops.
+Result positions driven by the split coordinate resolve only in the
+consumer — exactly where the legacy consumer lowering resolves them —
+so prefetch, pointer hoisting, zero-fill, and both parallel policies
+(the ceil-trip-count origin form and the nnz-aware row form) reproduce
+byte-for-byte through the untouched managed passes.  The workspace
+display name joins the target's identifier-safety and name-collision
+checks; region shapes outside the family (bare-point producers,
+non-copy-out consumers, merged producers, foreign point loops) fail
+closed with `unsupported_program_shape`.
+
+**The compiled matrix.**  A thirteen-member stack byte-parity grid locks
+generated C++ equality against `Scheduler.apply_schedule` + the legacy
+lowering in every cell: CSR SpMM stack tile-k at N below/equal to/above/
+not dividing the width, unroll, `child_of`, `at_depth`, f64, zero free
+extent, zero rows; dense matmul stack tile-j f32/f64; and the direct-i
+plus stack-k two-split.  Compiled shadow execution (both pipelines, real
+kernels) is **bitwise-equal** to the legacy scheduled kernels and
+PyTorch-close across the three tile regimes with an empty CSR row, f64
+SpMM at 1e-10 tolerances, matmul stack with unroll, the two-split
+composition, and zero extents; randomized dimensions execute against
+PyTorch and the production oracle.  Structural activation is asserted
+directly and never waived: the workspace declaration-with-reset, both
+bound spellings (`B1_size` in the producer, `C1_size` in the consumer),
+the copy-out statement, prefetch survival in the producer,
+`scorch_zero_dense`, `#pragma unroll` on both point loops, the
+ceil-trip-count origin policy, and the nnz-aware row policy on the
+`child_of` form.
+
+### 10.5 Adjacent-family audit verdict (panels + relayout)
+
+The preferred next family — sparse-panel tiling plus operand
+relayout/staging — was audited and deliberately **not** started in this
+session.  The concrete blocker: legacy completes both families *after*
+LLIR lowering (`schedule_lowerer.py` rewrites emitted position loops and
+operand accesses by rendered-name discovery), so a typed migration
+requires three representations the schema deliberately lacks — a
+coordinate-window iteration node over compressed levels (clamped
+coordinate ranges with search-derived position bounds), typed access-ID
+redirection for staged operands, and pack-loop/staging-buffer lifetime
+on top of the new region machinery.  The two families share that
+machinery and are not separable from each other; the representation
+decision is the size of this milestone's and should open the next slice
+rather than close this one, per the discipline recorded in §8.  They
+remain fail-closed at the plan gate with stable codes; nothing was
+silently declined.  Heap result tiles and abstract parallel selection
+likewise remain fail-closed stretch families.
+
+### 10.6 Verification
+
+Evidence ledger: `/Users/bobby/.cache/scorch-codex/phase6-workspace-72e991e/`.
+
+- both §9 gates were independently reproduced before any edit:
+  the 309-test contract focus and the 80-test runtime focus both passed
+  at `084ed4c`;
+- contract focus after the milestone (same five files): **341 passed** —
+  the 32 new contract regressions cover the workspace verifier codes,
+  the stack pass surface, and the target boundaries;
+- scheduled runtime focus after the milestone: **102 passed** across
+  `test_loopir_scheduled_slice.py` (74) and
+  `test_loopir_pipeline_execution.py` (28), including the thirteen
+  stack parity cells, the compiled stack shadows, and the structural
+  activation locks;
+- focused production LoopIR membership: **461 passed + 4 neutrality**
+  (119 verifier, 22 printer, 42 oracle, 16 level-storage, 16
+  iteration-domain, 37 CIN lowering, 45 schedule passes, 62 LLIR
+  lowering/parity, 74 scheduled slice, 28 pipeline execution) — the
+  full-suite delta against the §9 baseline is exactly the 62 tests this
+  milestone adds;
+- combined focused adjacency sweep (LoopIR fast suites + spike
+  verifier/execution/neutrality + CIN/CIN-analysis + stage timing +
+  LLIR pass-manager/string-budget/traversal + LoopPlan + native ABI +
+  Schedule API + Scheduler + value-object boundaries): **1,824
+  passed**, plus **332 passed** across the cin_lowerer,
+  schedule-generality, and tune-scheduler-harness compiled adjacency
+  files;
+- byte gates: fresh 20-source corpus and 42-source grid captures from
+  the working tree are **byte-identical** to detached `084ed4c` captures
+  and to the sealed Phase-6 captures (`diff -qr` empty for all
+  comparisons) — no legacy emission changed, the byte waiver applies, no
+  runtime kernel benchmark is required, and the Phase-5 §8 first-run
+  failures and reviewed exception remain the permanent, un-rerun record;
+- compiler latency: a fresh paired base(`084ed4c`)/candidate run of the
+  four-category corpus is inside the 1.10 target everywhere — p50
+  ratios `1.015/0.992/0.981/1.021`, p95 ratios `0.975/0.976/0.957/1.014`
+  (small-dense, reduction, CSR-intersection, sparse-union); the release
+  JIT path itself never enters the LoopIR stages;
+- static parity: Black clean over the package and changed tests; Flake8
+  clean over the same; focused `mypy --check-untyped-defs` over all
+  twelve package modules succeeds; full-source mypy reports exactly the
+  **146 inherited findings in 12 files, zero in `loopir/`**;
+  `git diff --check` clean before every commit;
+- the authoritative clean detached-worktree non-performance suite at the
+  exact final test commit `72e991e`, with isolated
+  pytest/Torch-extension/cache directories and import provenance
+  asserted: **3,679 passed, 14 skipped, 3 perf-marked deselections,
+  one known warning, and zero failures/errors in 2,474.73 seconds** —
+  exactly the §9 baseline of 3,617 passed plus the 62 new milestone
+  tests (JUnit: 3,693 selected, SHA-256
+  `4da4f0ed07e05cc6ebc2af6ede9ce993a54e7eb489dab786b3130647890fb163`);
+- the five protected tracked files retain their recorded SHA-256 values
+  and were never staged; staging used explicit pathspecs only; no
+  GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, or
+  tooling material was touched; origin
+  `refactor/compiler-ir-phase3-std-move-call` remains at `58e8565`
+  (live `git ls-remote` confirmed at session start) and nothing was
+  pushed.
+
+### 10.7 Limitations and the candid Phase-6 exit verdict
+
+- The migrated schedule surface is now: explicit complete loop orders,
+  affine `accum="direct"` splits, and the stack-accumulation workspace
+  family.  Sparse panels, operand relayout/staging, heap result tiles,
+  and explicit parallel selection remain fail-closed on the legacy route
+  (§10.5).  **Phase 6 is therefore not exited.**  Against the design's
+  Phase-6 deliverables: loop reorder, affine tiling/ragged tails, and
+  workspace materialization (stack + direct accumulation) are done;
+  sparse panel tiling, operand relayout/staging, heap result
+  accumulation, abstract parallel-loop selection, and the representative
+  tile-j/tile-ijk `LoopPlan` encodings are still open.  What this
+  milestone closes is the complete workspace/stack vertical family — the
+  memory-region and lifetime foundation the remaining families share.
+- The strangler entry remains test/debug-only; production dispatch,
+  release JIT, import neutrality, legacy stage sequences, and
+  source-derived kernel cache identity are unchanged and
+  subprocess-enforced.
+- The stack family's legality mirror is the legacy trailing-free-var
+  boundary; verifier-legal generalizations outside it (multi-var or
+  sparse workspaces, bare-point producers, non-copy-out consumers) stay
+  fail-closed at the pass or target boundary, never silently emitted.
+- Canonical dumps (schema v4) remain semantic fingerprints that omit
+  display names; kernel caching remains source-derived; the Phase-4
+  caution that dumps are not target cache keys stands.
+- The Phase-4/5 errata and the §6 observations stand unchanged; none
+  was silently fixed or reproduced outside the byte-parity contract.

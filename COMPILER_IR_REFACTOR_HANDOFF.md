@@ -24374,3 +24374,188 @@ evidence locations, origin state, limitations, and a candid Phase-6 exit
 verdict. Commit the largest coherent verified subset; do not overclaim and do
 not push.
 ```
+
+## Phase-6 workspace milestone: stack accumulation on LoopIR (2026-07-23)
+
+The second Phase-6 milestone is complete and closed at commits `9f431d9`
+(workspace region schema/verifier/printer/oracle), `986c773` (the typed
+stack-tile pass), `ba87329` (region target lowering + pipeline surface),
+`72e991e` (tests), and the docs commit that records this section;
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §10 is the definitive record.
+Nothing earlier was amended or reordered, and nothing was pushed — origin
+`refactor/compiler-ir-phase3-std-move-call` remains `58e8565`.  Both §9
+gates (309 contract / 80 runtime) were independently reproduced at
+`084ed4c` before any edit.
+
+What is now true:
+
+- The stack-accumulation (workspace) schedule family — the schedule the
+  production tile-j/regblock families actually use — is migrated end to
+  end.  A `WorkspaceRegion(workspace, producer, consumer)` in the same
+  node model owns a `WorkspaceDecl(WorkspaceId, name, dtype, TileId)`
+  spanning the point domain of one affine split; allocation and
+  zero-reset (ADD's identity) are intrinsic region-entry semantics,
+  teardown is region exit, producer-only `WorkspaceReduce` and
+  consumer-only `WorkspaceRead` address cells by the owning split's
+  point coordinate.  Nine new fail-closed verifier codes (60-code locked
+  surface), canonical schema v4, printer region rendering, and oracle
+  region execution with runtime guards.  One deliberately moved
+  boundary: sibling point loops of one split are now legal (the region's
+  producer and consumer each bind the coordinate once); nested rebinding
+  and all other binders keep the global once-only rule.
+- `apply_stack_tile` mirrors the legacy `insert_workspace` + `add_tile`
+  composition in one fused pure rebuild, with the legacy legality
+  boundary as stable codes (`stack_tile_target_invalid`,
+  `stack_tile_root_scope`) and placement resolved against the prefix
+  above the region (the legacy prefix-of-Where rule).
+  `apply_schedule_plan` routes stack tiles (heap still fails closed),
+  direct tiles compose with region-terminated chains, the carrier
+  verifier replays stack plans, provenance lists prefix → producer →
+  consumer, and `erase_schedule` erases regions to their
+  direct-accumulation equivalent under the ADD-reassociation contract,
+  proven by canonical dumps and exact integer-float counting
+  differentials (reset, lifetime, ragged tails, and reduction — not
+  merely visitation).
+- The target lowering emits the legacy `wksp[kTile]` shape byte-for-byte
+  (`float wksp[kTile_k] = {};` declaration-with-reset, input-bounded
+  producer point loop with `wksp[k_in] += value;`, synthesized
+  result-bounded `// Lower consumer CIN` copy-out with the consumer's
+  int64 spelling and both unroll pragmas); prefetch, zero-fill, and both
+  parallel policies reproduce through the untouched managed passes.  A
+  thirteen-member stack byte-parity grid plus bitwise compiled shadows
+  (three tile regimes with an empty CSR row, f64 at 1e-10, unroll,
+  two-split, zero extents, randomized dims with oracle agreement) lock
+  the family; structural activation is asserted directly.
+
+Verification highlights (full detail in review §10.6): contract focus
+**341 passed** (was 309), runtime focus **102 passed** (was 80), focused
+LoopIR membership **461 + 4 neutrality**, adjacency sweep **1,824
+passed** (plus 332 across cin_lowerer/schedule-generality/
+tune-scheduler-harness), fresh 20-source corpus and
+42-source grid captures byte-identical to detached `084ed4c` and the
+sealed Phase-6 captures (byte waiver applies; the Phase-5 §8 first-run
+failures and reviewed exception remain the permanent, un-rerun record),
+paired compiler latency inside the 1.10 target everywhere (worst p50
+ratio 1.021, worst p95 1.014), Black/Flake8 clean, focused mypy clean
+over all twelve package modules, full-source mypy exactly the 146
+inherited findings in 12 files (zero in `loopir/`), `git diff --check`
+clean, protected hashes verified before every commit, explicit
+pathspecs only, nothing pushed.  Clean detached-worktree full
+non-performance suite at `72e991e`, import provenance asserted and
+caches isolated: **3,679 passed, 14 skipped, 3 perf-marked
+deselections, one known warning, zero failures/errors in 2,474.73
+seconds** — exactly the §9 baseline of 3,617 plus the 62 new milestone
+tests (JUnit 3,693 selected, SHA-256
+`4da4f0ed07e05cc6ebc2af6ede9ce993a54e7eb489dab786b3130647890fb163`).
+Evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase6-workspace-72e991e/`.
+
+**Candid Phase-6 exit verdict: not exited.**  Migrated: explicit orders,
+affine direct tiles, stack workspace accumulation.  Still open from the
+design's Phase-6 deliverables: sparse panel tiling, operand
+relayout/staging, heap result accumulation, abstract parallel-loop
+selection, and the representative tile-j/tile-ijk LoopPlan encodings.
+The panels+relayout audit verdict (review §10.5): both families complete
+their decisions post-LLIR in legacy (`schedule_lowerer.py`, rendered-name
+discovery), are not separable from each other, and need a typed
+coordinate-window node family plus access-ID redirection and
+staging-buffer lifetime on top of the new region machinery — a
+representation decision that should open the next slice.
+
+## Updated Copy-Paste Prompt for the Next Session/Agent (Phase 6, panel + relayout slice)
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call. Independently review the current
+tip, then implement the largest coherent remainder of Phase 6 that can be
+honestly verified. The required next vertical family is sparse-panel tiling
+plus operand relayout/staging together (review §10.5 records why they are
+one slice); after it, heap result tiles or abstract parallel selection are
+separately committed stretch families.
+
+Read, in order: AGENTS.md; COMPILER_IR_REFACTOR_DESIGN.md (Stage-3/5
+memory-region contracts, Phase-6 exit criteria);
+COMPILER_IR_REFACTOR_PHASE4_REVIEW.md §7;
+COMPILER_IR_REFACTOR_PHASE5_REVIEW.md §8;
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md §§7-10; and the final dated sections
+of COMPILER_IR_REFACTOR_HANDOFF.md. Inspect git status, branch/origin, the
+Phase-6 ranges 1418e88..727d55c and e338e98..72e991e plus the docs tips
+before editing. Reproduce the 341-test contract focus
+(test_loopir_verifier.py, test_loopir_schedule_passes.py,
+test_loopir_llir_lowering.py, test_loop_plan.py, test_schedule_api.py) and
+the 102-test runtime focus (test_loopir_scheduled_slice.py,
+test_loopir_pipeline_execution.py) instead of trusting this handoff.
+
+Preserve the corrected contracts of §9 and the workspace contracts of §10:
+complete affine pairs; exact ScheduledLoopIR replay/provenance; the
+declared-field-only continuation; the C++ INT_MAX width boundary; stable
+direct-pass diagnostics; exact-only omitted-order canonicalization;
+schedule-free but parent-owned relayout prerequisites; frozen shadow
+plans; rank-general dense wrapping; tight f64 differentials; the region's
+intrinsic alloc/reset semantics and producer/consumer ownership; the
+sibling-point-loop binding boundary (nested rebinding stays illegal); the
+stack legality mirror (trailing-free target, root-scope refusal); the
+byte-exact legacy wksp[kTile] emission; and the region erasure contract.
+
+Do not switch branches, amend/reorder existing commits, push, or stage
+broad paths. Preserve every unrelated dirty/untracked GPU, CUDA, benchmark,
+packaging, scheduler, research, scratchpad, and tooling path. Re-hash the
+five protected tracked files before every commit and stage explicit
+pathspecs only. Do not rerun the retained Phase-5 performance commands
+merely to seek a pass; its §8 first-run failures and reviewed exception are
+permanent evidence. New emitted-code changes still require fresh applicable
+gates.
+
+Primary objective — migrate sparse-panel tiling plus operand
+relayout/staging as one verified family:
+
+1. Audit the legacy owners end to end before choosing nodes:
+   TileSpec(kind="panel") validation, PanelBound plan facts,
+   schedule_lowerer.py's post-LLIR completion (coordinate-window rewrites
+   of emitted position loops, pack-loop synthesis, access redirection by
+   rendered names), OperandRelayout plan facts, and the emitted tile-j
+   kernel shape. Record a responsibility/lifetime table with captured
+   legacy goldens before writing schema.
+2. Add the smallest typed representation that expresses coordinate
+   windows over compressed levels (clamped coordinate ranges with
+   search-derived position bounds), staged-operand memory regions with
+   pack loops, and typed access-ID redirection — no rendered-name
+   discovery, callbacks, dynamic fields, or target strings. Artifact-local
+   IDs, frozen tuple ownership, canonical serialization (bump the schema),
+   stable defect codes, cycle/depth protection, and verifier-enforced
+   dominance/lifetime/redirection-completeness.
+3. Extend the typed passes to consume PanelBound and OperandRelayout plan
+   facts exactly once; lower through structured LLIR with byte parity
+   against the legacy panel/relayout kernels wherever compatibility is
+   claimed; extend the oracle and erasure/equivalence proofs to windows
+   and staging (window coverage, pack correctness, redirection identity).
+4. Carry a meaningful compiled matrix across window widths
+   below/equal/above/not dividing extents, empty rows, zero extents,
+   f32/f64, randomized dims, placements, and pass activation, with
+   source parity plus bitwise legacy shadow and PyTorch/oracle agreement.
+5. Keep default production and unsupported families on legacy, preserve
+   cache identity and import neutrality, make partial failures terminal in
+   the correct CompilationContext stage, and never silently drop a
+   retained LoopPlan fact.
+
+Mandatory gates are review §10.6's list: every new defect/ownership
+boundary with forged/cyclic/deep adversarial coverage; the existing
+LoopIR/scheduled/workspace/LoopPlan/Schedule-API locks plus normalized
+CIN, identity, stage timing, schedule_lowerer, LLIR traversal/pass
+manager, raw budget, native ABI/cache keys, import neutrality, and
+Phase-3.5 spike adjacency; real compiled PyTorch/legacy/oracle
+differentials and byte-exact source comparison for every compatibility
+claim (structural activation never waived); fresh 20-source corpus and
+42-cell grid captures against the docs tip; paired compiler latency;
+Black/Flake8/focused and full-source mypy against the 146-finding
+baseline; git diff --check; provenance checks; a clean detached-worktree
+full non-performance suite with isolated caches; protected hashes and
+explicit-path staging audits before every focused commit.
+
+Use focused commits with descriptive bodies separating schema/verifier,
+passes/lowering/runtime, tests, optional stretch work, and docs. Update
+the Phase-6 review and handoff with exact hashes, memberships, evidence
+locations, origin state, limitations, and a candid Phase-6 exit verdict.
+Commit the largest coherent verified subset; do not overclaim and do not
+push.
+```
