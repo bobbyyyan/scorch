@@ -894,6 +894,104 @@ def test_workspace_consumer_must_be_the_exact_copy_out_form():
     )
 
 
+def test_workspace_target_rejects_distinct_indices_sharing_a_dimension():
+    """Dimension identity is not a safe C++ loop-variable identity.
+
+    The semantic IR may iterate one coordinate domain with two independent
+    binders.  This target names loop variables from the dimension, so it must
+    reject that shape instead of shadowing the reduction coordinate with the
+    tiled point coordinate.
+    """
+
+    from scorch.compiler.loopir.build import LoopIRBuilder
+    from scorch.compiler.loopir.nodes import ReduceOp
+    from scorch.compiler.loopir.verifier import verify_program
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_k = builder.dimension("k")
+    x, c = builder.new_symbol_id(), builder.new_symbol_id()
+    decl_x = builder.tensor(
+        x, "X", ScalarType.FLOAT32, (dim_k.dimension,), builder.dense_levels(1)
+    )
+    decl_c = builder.tensor(
+        c,
+        "C",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_k.dimension),
+        builder.dense_levels(2),
+    )
+    row = builder.new_index_id()
+    reduction = builder.new_index_id()
+    point = builder.new_index_id()
+    tile = builder.new_tile_id()
+    workspace = builder.new_workspace_id()
+    workspace_decl = builder.workspace_decl(workspace, "wksp", ScalarType.FLOAT32, tile)
+    producer_point = builder.tile_inner_for(
+        tile,
+        point,
+        dim_k.dimension,
+        2,
+        False,
+        builder.block(
+            (
+                builder.workspace_reduce(
+                    workspace,
+                    builder.index_value(point),
+                    ReduceOp.ADD,
+                    builder.load(x, (builder.index_value(reduction),)),
+                ),
+            )
+        ),
+    )
+    producer = builder.dense_for(
+        reduction,
+        dim_k.dimension,
+        builder.block((producer_point,)),
+    )
+    copy_out = builder.store_reduce(
+        c,
+        (builder.index_value(row), builder.index_value(point)),
+        ReduceOp.ADD,
+        builder.workspace_read(workspace, builder.index_value(point)),
+    )
+    consumer_point = builder.tile_inner_for(
+        tile,
+        point,
+        dim_k.dimension,
+        2,
+        False,
+        builder.block((copy_out,)),
+    )
+    region = builder.workspace_region(
+        workspace_decl,
+        builder.block((producer,)),
+        builder.block((consumer_point,)),
+    )
+    row_loop = builder.dense_for(row, dim_i.dimension, builder.block((region,)))
+    outer = builder.tile_outer_for(
+        tile,
+        point,
+        dim_k.dimension,
+        2,
+        builder.block((row_loop,)),
+    )
+    program = builder.program(
+        (dim_i, dim_k),
+        (decl_x, decl_c),
+        (x,),
+        (c,),
+        builder.block((outer,)),
+    )
+    verify_program(program)
+    expect_target_code(
+        "generated_name_collision",
+        program,
+        {x: (3,)},
+        (1, 3),
+    )
+
+
 def test_workspace_name_participates_in_generated_name_collisions():
     fixture = build_stack_matmul(width=4)
     forge(fixture.region.workspace, name="B")

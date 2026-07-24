@@ -1015,6 +1015,62 @@ def test_apply_stack_tile_is_pure_and_deterministic():
     second = apply_stack_tile(lowering.program, stack_tile(k.index_id, 4))
     assert canonical_program_dump(lowering.program) == before
     assert canonical_program_dump(first) == canonical_program_dump(second)
+    region = region_of(first)
+    assert LoopIRBuilder.resuming(first).new_workspace_id().value == (
+        region.workspace.workspace.value + 1
+    )
+
+
+def test_apply_stack_tile_rejects_hostile_plan_primitives_fail_closed():
+    class ExplosiveStr(str):
+        def __eq__(self, other):
+            raise RuntimeError("hostile string comparison escaped")
+
+        __hash__ = str.__hash__
+
+    class ExplosiveInt(int):
+        def __eq__(self, other):
+            raise RuntimeError("hostile integer comparison escaped")
+
+        def __lt__(self, other):
+            raise RuntimeError("hostile integer comparison escaped")
+
+        def __gt__(self, other):
+            raise RuntimeError("hostile integer comparison escaped")
+
+        __hash__ = int.__hash__
+
+    cin, (_, _, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    valid = stack_tile(k.index_id, 4)
+    malformed_tiles = (
+        replace(valid, kind=ExplosiveStr("affine")),
+        replace(valid, accumulation=ExplosiveStr("stack")),
+        replace(valid, width=ExplosiveInt(4)),
+        replace(
+            valid,
+            loop=LoopRef(IndexId(ExplosiveInt(k.index_id.value))),
+        ),
+    )
+    for malformed in malformed_tiles:
+        expect_code(
+            "invalid_schedule_tile",
+            apply_stack_tile,
+            lowering.program,
+            malformed,
+        )
+
+    malformed_plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(valid,),
+        provenance=ExplosiveStr("explicit"),
+    )
+    expect_code(
+        "invalid_schedule_plan",
+        apply_schedule_plan,
+        lowering.program,
+        malformed_plan,
+    )
 
 
 def test_apply_stack_tile_placements_resolve_against_the_prefix():

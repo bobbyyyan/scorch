@@ -955,6 +955,20 @@ def test_workspace_region_resets_per_tile_and_per_row():
         assert results[fixture.c] == [[float(inner)] * cols for _ in range(rows)]
 
 
+def test_workspace_region_does_not_eagerly_allocate_its_semantic_extent():
+    """A huge target-neutral width still touches only executed point cells."""
+
+    from tests.test_scorch.test_loopir_verifier import build_stack_matmul
+
+    fixture = build_stack_matmul(width=1 << 100)
+    results = run_program(
+        fixture.program,
+        {fixture.a: [[2.0]], fixture.b: [[3.0]]},
+        {fixture.c: (1, 1)},
+    )
+    assert results[fixture.c] == [[6.0]]
+
+
 def test_workspace_region_zero_extents_execute():
     from tests.test_scorch.test_loopir_verifier import build_stack_matmul
 

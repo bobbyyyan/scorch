@@ -383,6 +383,38 @@ def test_workspace_canonical_dump_is_stable_across_global_id_histories():
     assert print_program(first) == print_program(second)
 
 
+def test_workspace_canonical_dump_renumbers_raw_schedule_id_histories():
+    from scorch.compiler.loopir.nodes import TileId, WorkspaceId
+
+    first = build_stack_matmul()
+    second = build_stack_matmul()
+    outer = second.body.statements[0]
+    row = outer.body.statements[0]
+    region = row.body.statements[0]
+    producer_inner = region.producer.statements[0].body.statements[0]
+    consumer_inner = region.consumer.statements[0]
+    replacement_tile = TileId(97)
+    replacement_workspace = WorkspaceId(113)
+    forge(outer, tile=replacement_tile)
+    forge(producer_inner, tile=replacement_tile)
+    forge(consumer_inner, tile=replacement_tile)
+    forge(
+        region.workspace,
+        tile=replacement_tile,
+        workspace=replacement_workspace,
+    )
+    forge(
+        producer_inner.body.statements[0],
+        workspace=replacement_workspace,
+    )
+    forge(
+        consumer_inner.body.statements[0].value,
+        workspace=replacement_workspace,
+    )
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+
+
 def test_workspace_canonical_dump_serializes_the_region_semantics():
     base = canonical_program_dump(build_stack_matmul(width=4))
     assert canonical_program_dump(build_stack_matmul(width=8)) != base

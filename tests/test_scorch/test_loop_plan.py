@@ -395,6 +395,76 @@ def test_loop_plan_verifier_fails_closed_on_malformed_panel_bound() -> None:
         verify_scheduled_cin(ScheduledCIN(scheduled.normalized_cin, malformed_plan))
 
 
+def test_loop_plan_verifier_rejects_primitive_subclasses_before_dispatch() -> None:
+    """Stored plan primitives are exact values, not executable subclasses."""
+
+    class ExplosiveStr(str):
+        def __eq__(self, other):
+            raise RuntimeError("hostile string comparison escaped")
+
+        __hash__ = str.__hash__
+
+    class ExplosiveInt(int):
+        def __eq__(self, other):
+            raise RuntimeError("hostile integer comparison escaped")
+
+        def __lt__(self, other):
+            raise RuntimeError("hostile integer comparison escaped")
+
+        def __gt__(self, other):
+            raise RuntimeError("hostile integer comparison escaped")
+
+        __hash__ = int.__hash__
+
+    scheduled = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("k", 4, accum="direct"),),
+        ),
+    )
+    cin = scheduled.normalized_cin
+    plan = scheduled.verified_loop_plan
+    tile = plan.tiles[0]
+    malformed = (
+        (
+            replace(
+                plan,
+                tiles=(replace(tile, kind=ExplosiveStr("affine")),),
+            ),
+            "tile kind",
+        ),
+        (
+            replace(
+                plan,
+                tiles=(replace(tile, accumulation=ExplosiveStr("direct")),),
+            ),
+            "tile accumulation",
+        ),
+        (
+            replace(plan, tiles=(replace(tile, width=ExplosiveInt(4)),)),
+            "tile widths",
+        ),
+        (
+            replace(
+                plan,
+                tiles=(
+                    replace(
+                        tile,
+                        loop=LoopRef(IndexId(ExplosiveInt(tile.loop.index_id.value))),
+                    ),
+                ),
+            ),
+            "well-formed IndexId",
+        ),
+        (replace(plan, provenance=ExplosiveStr("explicit")), "provenance"),
+        (replace(plan, tag=ExplosiveStr("tag")), "tag"),
+    )
+    for forged, message in malformed:
+        with pytest.raises(VerificationError, match=message):
+            verify_loop_plan(cin, forged)
+
+
 def test_tuple_valued_loop_plan_inputs_are_detached_from_mutable_callers() -> None:
     scheduled = Scheduler.apply_schedule(
         _build_spmm(),
