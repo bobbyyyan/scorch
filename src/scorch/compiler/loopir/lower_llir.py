@@ -24,12 +24,16 @@ production target components the legacy path uses:
 Because the raw loop-nest emission mirrors the legacy lowering
 statement-for-statement — dense position chains, sparse position loops,
 two-cursor coordinate merges with UNION tail loops, ordered CSR assembly
-counters, and the affine-split origin/point loops (width constants, the
+counters, the affine-split origin/point loops (width constants, the
 stepping origin loop, the reconstructed logical coordinate, and the
-ragged-tail overshoot break) — the generated C++ for the migrated families
-is byte-identical to the legacy pipeline's output; the differential suites
-lock that equality.  LoopIR itself contains none of these target details —
-this module is where target spelling begins.
+ragged-tail overshoot break), and the stack workspace region (the
+``float wksp[kTile] = {};`` declaration-with-reset, the input-bounded
+producer point loop reducing into the workspace, and the synthesized
+result-bounded ``// Lower consumer CIN`` copy-out loop) — the generated
+C++ for the migrated families is byte-identical to the legacy pipeline's
+output; the differential suites lock that equality.  LoopIR itself
+contains none of these target details — this module is where target
+spelling begins.
 
 Shapes are runtime bindings, not LoopIR content: callers pass concrete input
 shapes and the result shape, and this boundary re-resolves every logical
@@ -107,6 +111,9 @@ from .nodes import (
     TensorDecl,
     TileInnerFor,
     TileOuterFor,
+    WorkspaceRead,
+    WorkspaceReduce,
+    WorkspaceRegion,
 )
 from .verifier import verify_program
 
@@ -204,6 +211,13 @@ class _TargetLowering:
         )
         self.dimension_names: Dict[DimensionId, str] = {}
         self._access_ids: Dict[SymbolId, AccessId] = {}
+        # Workspace-region state; populated by _collect_loop_nest when the
+        # chain terminates at a region instead of a store leaf.
+        self.region: Optional[WorkspaceRegion] = None
+        self.region_start = 0
+        self.producer_leaf: Optional[WorkspaceReduce] = None
+        self.consumer_point: Optional[TileInnerFor] = None
+        self._region_leaf: Optional[StoreReduce] = None
         self._validate_display_names()
         self._validate_layouts()
         self.shapes = self._validate_shapes(input_shapes, result_shape)
@@ -221,6 +235,7 @@ class _TargetLowering:
         self._validate_access_orders()
         self._reserve_merge_names()
         self._reserve_tile_names()
+        self._reserve_workspace_names()
 
     # -- boundary validation -------------------------------------------------
 
@@ -343,6 +358,19 @@ class _TargetLowering:
             owner = f"affine split of dimension {name!r}"
             for generated in (f"{name}_out", f"{name}_in", f"kTile_{name}"):
                 self._reserve_generated_name(generated, owner)
+
+    def _reserve_workspace_names(self) -> None:
+        """Reserve the workspace's emitted C++ identifier."""
+
+        if self.region is None:
+            return
+        name = self.region.workspace.name
+        if _CPP_IDENTIFIER.fullmatch(name) is None or name in _CPP_KEYWORDS:
+            _fail(
+                "invalid_display_name",
+                f"workspace name {name!r} is not a safe ASCII C++ identifier",
+            )
+        self._reserve_generated_name(name, f"workspace {name!r}")
 
     def _validate_layouts(self) -> None:
         if len(self.program.outputs) != 1:
@@ -515,6 +543,18 @@ class _TargetLowering:
                 )
                 body = only.body
                 continue
+            if type(only) is WorkspaceRegion:
+                if not loops:
+                    _fail(
+                        "unsupported_program_shape",
+                        "a workspace region requires at least one outer loop",
+                    )
+                self.region = only
+                self.region_start = len(loops)
+                loops.extend(self._collect_region_chains(only, loops))
+                assert self._region_leaf is not None
+                self._validate_loop_kinds(loops, self._region_leaf)
+                return loops
             if type(only) in (Store, StoreReduce, AppendEntry):
                 if not loops:
                     _fail(
@@ -597,7 +637,152 @@ class _TargetLowering:
                         "migrated families",
                     )
 
+    def _collect_region_chains(
+        self, region: WorkspaceRegion, prefix: List[_Loop]
+    ) -> List[_Loop]:
+        """Validate the migrated workspace shape; return the producer loops.
+
+        The supported region form is exactly the legacy ``wksp[kTile]``
+        producer/consumer shape: the producer is a dense/single-cursor
+        reduction chain whose innermost loop is the owning split's point
+        loop over one ``WorkspaceReduce``, and the consumer is one point
+        loop of the same split over one result ``StoreReduce`` whose value
+        is the plain workspace read.  Anything else fails closed.
+        """
+
+        decl = region.workspace
+        origin_positions = [
+            position
+            for position, loop in enumerate(prefix)
+            if loop.kind is _TILE_OUTER and loop.node.tile == decl.tile
+        ]
+        if not origin_positions:
+            _fail(
+                "unsupported_program_shape",
+                "a workspace region's origin loop must be part of the " "outer chain",
+            )
+
+        producer_loops: List[_Loop] = []
+        body: Stmt = region.producer
+        while True:
+            if type(body) is not Block or len(body.statements) != 1:
+                _fail(
+                    "unsupported_program_shape",
+                    "a workspace producer must be a single-statement loop "
+                    "chain over one workspace reduction",
+                )
+            only = body.statements[0]
+            if type(only) is DenseFor:
+                producer_loops.append(
+                    _Loop(_DENSE, only.index, only.dimension, only, ())
+                )
+                body = only.body
+                continue
+            if type(only) is SparseFor:
+                cursor = only.cursor
+                producer_loops.append(
+                    _Loop(
+                        _SPARSE,
+                        only.coord_index,
+                        self._level_dimension(cursor.tensor, cursor.level),
+                        only,
+                        (cursor,),
+                    )
+                )
+                body = only.body
+                continue
+            if type(only) is TileInnerFor:
+                if only.tile != decl.tile:
+                    _fail(
+                        "unsupported_program_shape",
+                        "the workspace producer's point loop must belong to "
+                        "the owning split",
+                    )
+                producer_loops.append(
+                    _Loop(_TILE_INNER, only.index, only.dimension, only, ())
+                )
+                point_body = only.body
+                if (
+                    type(point_body) is not Block
+                    or len(point_body.statements) != 1
+                    or type(point_body.statements[0]) is not WorkspaceReduce
+                ):
+                    _fail(
+                        "unsupported_program_shape",
+                        "the workspace producer's point loop must reduce "
+                        "into the workspace and nothing else",
+                    )
+                reduce_leaf = point_body.statements[0]
+                if reduce_leaf.workspace != decl.workspace:
+                    _fail(
+                        "unsupported_program_shape",
+                        "the workspace producer must reduce into the "
+                        "region's own workspace",
+                    )
+                self.producer_leaf = reduce_leaf
+                break
+            _fail(
+                "unsupported_program_shape",
+                "workspace producers support dense loops, single-cursor "
+                "sparse loops, and the owning point loop only",
+            )
+        if len(producer_loops) < 2:
+            _fail(
+                "unsupported_program_shape",
+                "a workspace producer needs at least one reduction loop "
+                "above its point loop",
+            )
+
+        consumer = region.consumer
+        if (
+            type(consumer) is not Block
+            or len(consumer.statements) != 1
+            or type(consumer.statements[0]) is not TileInnerFor
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "a workspace consumer must be exactly one point loop of the "
+                "owning split",
+            )
+        consumer_point = consumer.statements[0]
+        if consumer_point.tile != decl.tile:
+            _fail(
+                "unsupported_program_shape",
+                "a workspace consumer must be exactly one point loop of the "
+                "owning split",
+            )
+        consumer_body = consumer_point.body
+        if (
+            type(consumer_body) is not Block
+            or len(consumer_body.statements) != 1
+            or type(consumer_body.statements[0]) is not StoreReduce
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "a workspace consumer must copy the tile out with one "
+                "result reduction",
+            )
+        copy_out = consumer_body.statements[0]
+        value = copy_out.value
+        if (
+            type(value) is not WorkspaceRead
+            or value.workspace != decl.workspace
+            or type(value.coord) is not IndexValue
+            or value.coord.index != consumer_point.index
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "a workspace copy-out value must be the plain workspace "
+                "read at the point coordinate",
+            )
+        self.consumer_point = consumer_point
+        self._region_leaf = copy_out
+        return producer_loops
+
     def _collect_leaf(self) -> Stmt:
+        if self.region is not None:
+            assert self._region_leaf is not None
+            return self._region_leaf
         innermost = self.loops[-1].node.body
         return innermost.statements[0]
 
@@ -635,7 +820,13 @@ class _TargetLowering:
                 f"unsupported value expression {type(expr).__name__}",
             )
 
-        walk(self.leaf.value)  # type: ignore[attr-defined]
+        if self.region is not None:
+            # The producer's reduction value owns every input access; the
+            # consumer's value is the workspace read, not a tensor access.
+            assert self.producer_leaf is not None
+            walk(self.producer_leaf.value)
+        else:
+            walk(self.leaf.value)  # type: ignore[attr-defined]
         seen: Set[SymbolId] = set()
         for load in loads:
             if load.tensor in seen:
@@ -954,6 +1145,14 @@ class _TargetLowering:
 
     def _result_resolves_at(self, loop: _Loop) -> List[llir.Stmt]:
         stmts: List[llir.Stmt] = []
+        if (
+            self.region is not None
+            and self.loop_positions.get(loop.index, -1) >= self.region_start
+        ):
+            # Result positions driven by the split coordinate belong to the
+            # synthesized consumer loop, never to the producer chain —
+            # exactly where the legacy consumer lowering resolves them.
+            return stmts
         leaf_indices = self._leaf_indices()
         for level, index in enumerate(leaf_indices):
             if self._index_of(index, "store index") != loop.index:
@@ -1019,6 +1218,29 @@ class _TargetLowering:
         raise AssertionError("unreachable")
 
     def _lower_leaf(self) -> List[llir.Stmt]:
+        if self.region is not None:
+            # The producer chain's leaf: ``wksp[k_in] += <value>;`` exactly
+            # as the legacy dense-workspace TensorAssign lowering emits it
+            # (untyped array symbol, no access metadata).
+            assert self.producer_leaf is not None
+            assert self.consumer_point is not None
+            name = self.dimension_names[self.consumer_point.dimension]
+            return [
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=self.region.workspace.name,
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=llir.Var(
+                            name=f"{name}_in",
+                            type=llir.DataType.INT64,
+                        ),
+                    ),
+                    value=self._lower_value(self.producer_leaf.value),
+                    op=llir.AssignOp.ADD_ASSIGN,
+                )
+            ]
         leaf = self.leaf
         leaf_indices = leaf.indices  # type: ignore[attr-defined]
         rhs = self._lower_value(leaf.value)  # type: ignore[attr-defined]
@@ -1520,6 +1742,8 @@ class _TargetLowering:
     def _loop_children(self, position: int) -> List[llir.Stmt]:
         """Child-loop or leaf statements appended inside one loop's body."""
 
+        if self.region is not None and position + 1 == self.region_start:
+            return self._lower_workspace_region(position)
         if position + 1 < len(self.loops):
             child = self.loops[position + 1]
             if child.kind is _DENSE:
@@ -1532,6 +1756,160 @@ class _TargetLowering:
                 return self._lower_sparse(position + 1)
             return self._lower_merged(position + 1)
         return self._lower_leaf()
+
+    def _lower_workspace_region(self, position: int) -> List[llir.Stmt]:
+        """The legacy ``lower_Where`` stack shape at the region's position.
+
+        ``// Initialize workspaces`` + the tile-width stack array declaration
+        (allocation and zero-reset in one statement — the region's intrinsic
+        entry semantics), then the producer chain with the workspace
+        reduction as its leaf, then the synthesized consumer copy-out loop.
+        """
+
+        assert self.region is not None
+        assert self.consumer_point is not None
+        decl = self.region.workspace
+        name = self.dimension_names[self.consumer_point.dimension]
+        torch_dtype = _SCALAR_TO_TORCH[decl.dtype]
+        element_type = dtype_to_c_datatype(torch_dtype)
+        stmts: List[llir.Stmt] = [
+            llir.Comment("Initialize workspaces"),
+            llir.FixedStackArrayDecl(
+                name=decl.name,
+                element_type=element_type,
+                extent=llir.Var(
+                    name=f"kTile_{name}",
+                    type=llir.DataType.CONSTEXPR_INT,
+                ),
+                initializer=llir.Array(values=[], data_type=element_type),
+            ),
+        ]
+        producer = self.loops[position + 1]
+        if producer.kind is _DENSE:
+            stmts.extend([llir.BlankLine(), self._lower_dense(position + 1)])
+        elif producer.kind is _SPARSE:
+            stmts.extend(self._lower_sparse(position + 1))
+        else:
+            _fail(
+                "unsupported_program_shape",
+                "a workspace producer must open with a dense or "
+                "single-cursor sparse reduction loop",
+            )
+        stmts.extend(self._lower_workspace_consumer())
+        return stmts
+
+    def _lower_workspace_consumer(self) -> List[llir.Stmt]:
+        """The synthesized consumer loop, exactly as legacy emits it.
+
+        ``for (int64_t k_in = 0; k_in < kTile_k; k_in++)`` resolving the
+        logical coordinate, breaking past the *result* bound, resolving the
+        result position with the consumer's own int64 spelling, and
+        ADD-assigning the workspace cell into the result values.
+        """
+
+        assert self.region is not None
+        assert self.consumer_point is not None
+        region = self.region
+        point = self.consumer_point
+        name = self.dimension_names[point.dimension]
+        result_name = self.result_decl.name
+        leaf_indices = self._leaf_indices()
+        levels = [
+            level
+            for level, index in enumerate(leaf_indices)
+            if self._index_of(index, "store index") == point.index
+        ]
+        if len(levels) != 1 or levels[0] == 0:
+            _fail(
+                "unsupported_program_shape",
+                "the workspace copy-out coordinate must drive exactly one "
+                "trailing result level",
+            )
+        level = levels[0]
+        torch_dtype = _SCALAR_TO_TORCH[region.workspace.dtype]
+        loop_var = llir.Var(name=f"{name}_in", type=llir.DataType.INT64)
+        body: List[llir.Stmt] = [
+            llir.VarInit(
+                var=llir.Var(name=name, type=llir.DataType.INT64),
+                value=llir.Add(
+                    left=llir.Var(name=f"{name}_out", type=llir.DataType.INT64),
+                    right=llir.Var(name=f"{name}_in", type=llir.DataType.INT64),
+                ),
+            ),
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op=">=",
+                    left=llir.Var(name=name, type=llir.DataType.INT),
+                    right=llir.Var(
+                        name=f"{result_name}{level}_size",
+                        type=llir.DataType.INT,
+                    ),
+                ),
+                then_body=[llir.Break()],
+            ),
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"p{result_name}{level}",
+                    type=llir.DataType.INT64,
+                ),
+                value=llir.Add(
+                    left=llir.Mul(
+                        left=llir.Var(
+                            name=f"p{result_name}{level - 1}",
+                            type=llir.DataType.INT64,
+                        ),
+                        right=llir.Var(
+                            name=f"{result_name}{level}_size",
+                            type=llir.DataType.INT64,
+                        ),
+                    ),
+                    right=llir.Var(name=name, type=llir.DataType.INT64),
+                ),
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}_values",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=llir.Var(
+                        name=f"p{result_name}{level}",
+                        type=llir.DataType.INT64,
+                    ),
+                    tensor_access=self._result_metadata(),
+                ),
+                value=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=region.workspace.name,
+                        type=llir.DataType.ptr_type(torch_dtype),
+                    ),
+                    index=llir.Var(
+                        name=loop_var.name,
+                        type=loop_var.type,
+                    ),
+                ),
+                op=llir.AssignOp.ADD_ASSIGN,
+            ),
+        ]
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(var=loop_var, value=llir.Literal(0)),
+            cond=llir.BinOp(
+                op="<",
+                left=loop_var,
+                right=llir.Var(
+                    name=f"kTile_{name}",
+                    type=llir.DataType.INT64,
+                ),
+            ),
+            update=llir.Increment(var=loop_var),
+            body=body,
+            unroll=point.unroll,
+        )
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+            for_loop,
+        ]
 
     def _lower_dense(self, position: int) -> llir.ForLoop:
         loop = self.loops[position]

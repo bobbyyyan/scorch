@@ -10,8 +10,9 @@ using the same JIT build, cache, and execution helpers as the legacy public
 entry (:func:`scorch.ops.lower_and_exec_cin`).  When the compile options
 carry a requested :class:`~scorch.compiler.scheduler.Schedule`, the shared
 ``Scheduler.apply_schedule`` boundary validates it and produces the
-verified ``LoopPlan``; the migrated explicit families (loop reorder plus
-affine ``accum='direct'`` tiles) are then applied as typed LoopIR passes,
+verified ``LoopPlan``; the migrated explicit families (loop reorder,
+affine ``accum='direct'`` tiles, and ``accum='stack'`` workspace
+accumulation) are then applied as typed LoopIR passes,
 and every other schedule family fails closed with a stable code —
 nothing silently ignores a requested schedule.  Kernel cache identity
 remains source-derived, exactly as on the legacy path: the schedule
