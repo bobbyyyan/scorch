@@ -53,12 +53,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, NoReturn, Optional, Set, Tuple
+from enum import Enum
+from typing import Any, Dict, List, Mapping, NoReturn, Optional, Set, Tuple, cast
 
 import torch
 
 from ...format import LevelType
-from ..identity import AccessId, SymbolId, new_access_id
+from ..identity import AccessId, IndexId, SymbolId, new_access_id
 from .. import llir
 from ..compile_options import CompileOptions
 from ..compilation_context import CompilationContext, CompilerStageId
@@ -69,6 +70,11 @@ from ..llir_pass_manager import (
     LLIRPassManager,
     LLIRRewriteArtifact,
     LLIRStatementListArtifact,
+)
+from ..llir_traversal import (
+    LLIRRewriter,
+    LLIRTraversalContext,
+    SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
 )
 from ..loop_plan import MAX_AFFINE_TILE_WIDTH
 from ..parallel_marking_pass import (
@@ -232,8 +238,8 @@ class _TargetLowering:
         self.panel_position = -1
         self.window_position = -1
         self.panel_row_position = -1
-        self._emitted_loops: Dict[int, llir.ForLoop] = {}
-        self._window_end_init: Optional[llir.VarInit] = None
+        self._emitted_loop_headers: Dict[int, llir.ForLoop] = {}
+        self._window_end_snapshot: Optional[llir.VarInit] = None
         self._validate_display_names()
         self._validate_layouts()
         self.shapes = self._validate_shapes(input_shapes, result_shape)
@@ -911,6 +917,16 @@ class _TargetLowering:
                 "the panel origin must sit strictly above the parallel row "
                 "loop and the window strictly below it",
             )
+        result_indices = {
+            self._index_of(index, "the panel result access")
+            for index in self._leaf_indices()
+        }
+        if row_index not in result_indices:
+            _fail(
+                "unsupported_program_shape",
+                "the panel's selected parallel row loop must partition the "
+                "dense result access",
+            )
         self.panel = panel_node
         self.panel_position = panel_positions[0]
         self.window_position = window_positions[0]
@@ -1585,8 +1601,18 @@ class _TargetLowering:
             )
             if loop.kind is _SPARSE_WINDOW:
                 # The panel completion rewires exactly this declaration on
-                # the assembled function; retain the object, not a name.
-                self._window_end_init = end_init
+                # the assembled function.  Keep a detached pre-pass snapshot
+                # so an in-place or detaching pass cannot redefine the
+                # iterator range before structural completion.
+                self._window_end_snapshot = cast(
+                    llir.VarInit,
+                    LLIRRewriter(
+                        LLIRTraversalContext(
+                            stage="LoopIR target lowering",
+                            pass_name="snapshot_panel_window_end",
+                        )
+                    ).rewrite(end_init),
+                )
             stmts.append(end_init)
             return stmts
         for cursor in loop.cursors:
@@ -1910,7 +1936,7 @@ class _TargetLowering:
             body=body,
         )
         for_loop.scorch_index_var = dimension_name
-        self._emitted_loops[position] = for_loop
+        self._record_emitted_loop(position, for_loop)
         return [
             llir.Comment("Initialize iterators"),
             *self._iterator_inits(loop),
@@ -2141,7 +2167,7 @@ class _TargetLowering:
             body=body,
         )
         for_loop.scorch_index_var = name
-        self._emitted_loops[position] = for_loop
+        self._record_emitted_loop(position, for_loop)
         return for_loop
 
     def _lower_tile_outer(self, position: int) -> llir.ForLoop:
@@ -2168,7 +2194,7 @@ class _TargetLowering:
             body=self._loop_children(position),
         )
         for_loop.scorch_index_var = f"{name}_out"
-        self._emitted_loops[position] = for_loop
+        self._record_emitted_loop(position, for_loop)
         return for_loop
 
     def _lower_tile_inner(self, position: int) -> llir.ForLoop:
@@ -2230,7 +2256,7 @@ class _TargetLowering:
             unroll=loop.node.unroll,
         )
         for_loop.scorch_index_var = f"{name}_in"
-        self._emitted_loops[position] = for_loop
+        self._record_emitted_loop(position, for_loop)
         return for_loop
 
     def tile_size_inits(self) -> List[llir.Stmt]:
@@ -2368,18 +2394,80 @@ class _TargetLowering:
 
     # -- panel completion ----------------------------------------------------
 
+    def _record_emitted_loop(self, position: int, loop: llir.ForLoop) -> None:
+        """Snapshot one panel-chain header before managed passes can touch it."""
+
+        if self.panel is None:
+            return
+        header = llir.ForLoop(
+            init=loop.init,
+            cond=loop.cond,
+            update=loop.update,
+            body=[],
+            omp_parallel_for=loop.omp_parallel_for,
+            omp_schedule=loop.omp_schedule,
+            unroll=loop.unroll,
+            simd=loop.simd,
+            pre_parallel_body=loop.pre_parallel_body,
+            post_parallel_body=loop.post_parallel_body,
+            omp_num_threads=loop.omp_num_threads,
+            omp_chunk_expr=loop.omp_chunk_expr,
+            before_parallel_body=loop.before_parallel_body,
+        )
+        header.scorch_index_var = loop.scorch_index_var
+        snapshot = LLIRRewriter(
+            LLIRTraversalContext(
+                stage="LoopIR target lowering",
+                pass_name="snapshot_panel_loop_header",
+            )
+        ).rewrite(header)
+        if type(snapshot) is not llir.ForLoop:
+            _fail(
+                "panel_completion_lost",
+                "the panel loop-header snapshot did not remain a ForLoop",
+            )
+        self._emitted_loop_headers[position] = snapshot
+
     @staticmethod
     def _nested_statement_lists(stmt: llir.Stmt) -> List[List[llir.Stmt]]:
         lists: List[List[llir.Stmt]] = []
         if isinstance(stmt, (llir.ForLoop, llir.WhileLoop, llir.ForLoopAuto)):
-            lists.append(stmt.body)
+            state = object.__getattribute__(stmt, "__dict__")
+            if type(state) is not dict or type(state.get("body")) is not list:
+                _fail(
+                    "panel_completion_lost",
+                    "a control statement in the completed panel has malformed "
+                    "stored body state",
+                )
+            lists.append(state["body"])
         elif isinstance(stmt, llir.IfThenElse):
-            if stmt.then_body:
-                lists.append(stmt.then_body)
-            if stmt.else_body:
-                lists.append(stmt.else_body)
-            if stmt.then_body_list:
-                lists.extend(stmt.then_body_list)
+            state = object.__getattribute__(stmt, "__dict__")
+            required = ("then_body", "else_body", "then_body_list")
+            if type(state) is not dict or any(name not in state for name in required):
+                _fail(
+                    "panel_completion_lost",
+                    "a conditional in the completed panel has malformed "
+                    "stored branch state",
+                )
+            for name in ("then_body", "else_body"):
+                body = state[name]
+                if body is not None:
+                    if type(body) is not list:
+                        _fail(
+                            "panel_completion_lost",
+                            "a conditional panel branch is not an owned list",
+                        )
+                    lists.append(body)
+            branches = state["then_body_list"]
+            if branches is not None:
+                if type(branches) is not list or any(
+                    type(branch) is not list for branch in branches
+                ):
+                    _fail(
+                        "panel_completion_lost",
+                        "conditional panel branches are not owned lists",
+                    )
+                lists.extend(branches)
         return lists
 
     def _locate_statement(
@@ -2396,31 +2484,269 @@ class _TargetLowering:
                     return located
         return None
 
-    def _chain_for_loops(self, stmts: List[llir.Stmt]) -> List[llir.ForLoop]:
-        """The assembled chain loops in nesting (chain) order.
+    def _for_loops_with_owners(
+        self, stmts: List[llir.Stmt]
+    ) -> List[Tuple[llir.ForLoop, Optional[llir.Stmt]]]:
+        """Collect loops with the control statement owning their body list."""
 
-        Every managed pass rewrites through a detaching rewriter, so
-        emission-time object identity does not survive to the assembled
-        function — but the chain *skeleton* does: passes insert
-        statements and rewrite expressions, they never add, drop, or
-        reorder the nest's for-loops.  Depth-first for-loop order is
-        therefore exactly the emitted chain order, keyed by structure
-        alone.
-        """
+        found: List[Tuple[llir.ForLoop, Optional[llir.Stmt]]] = []
+        active: Set[int] = set()
+        visited: Set[int] = set()
 
-        found: List[llir.ForLoop] = []
+        def enter(value: object) -> None:
+            marker = id(value)
+            if marker in active:
+                _fail(
+                    "panel_completion_lost",
+                    "the assembled panel loop structure is cyclic",
+                )
+            if marker in visited:
+                _fail(
+                    "panel_completion_lost",
+                    "the assembled panel loop structure shares statement " "ownership",
+                )
+            active.add(marker)
+            visited.add(marker)
 
-        def walk(statements: List[llir.Stmt]) -> None:
-            for stmt in statements:
-                if isinstance(stmt, llir.ForLoop):
-                    found.append(stmt)
-                    walk(stmt.body)
-                else:
-                    for nested in self._nested_statement_lists(stmt):
-                        walk(nested)
+        def walk(
+            statements: List[llir.Stmt],
+            owner: Optional[llir.Stmt],
+            depth: int,
+        ) -> None:
+            if depth > 256:
+                _fail(
+                    "panel_completion_lost",
+                    "the assembled panel loop structure is excessively deep",
+                )
+            if type(statements) is not list:
+                _fail(
+                    "panel_completion_lost",
+                    "the assembled panel loop structure is not list-owned",
+                )
+            enter(statements)
+            try:
+                for stmt in statements:
+                    if type(stmt) not in SUPPORTED_LLIR_STATEMENT_NODE_TYPES:
+                        _fail(
+                            "panel_completion_lost",
+                            "the assembled panel contains an unknown or "
+                            "non-statement member",
+                        )
+                    enter(stmt)
+                    try:
+                        if isinstance(stmt, llir.ForLoop):
+                            found.append((stmt, owner))
+                        for nested in self._nested_statement_lists(stmt):
+                            walk(nested, stmt, depth + 1)
+                    finally:
+                        active.discard(id(stmt))
+            finally:
+                active.discard(id(statements))
 
-        walk(stmts)
+        walk(stmts, None, 0)
         return found
+
+    @classmethod
+    def _panel_loop_header_matches(
+        cls, actual: llir.ForLoop, expected: llir.ForLoop
+    ) -> bool:
+        """Whether a post-pass loop retains its complete pre-pass header."""
+
+        if type(actual) is not llir.ForLoop or type(expected) is not llir.ForLoop:
+            return False
+        field_names = (
+            "init",
+            "cond",
+            "update",
+            "omp_parallel_for",
+            "omp_schedule",
+            "unroll",
+            "simd",
+            "omp_num_threads",
+            "omp_chunk_expr",
+            "before_parallel_body",
+            "pre_parallel_body",
+            "post_parallel_body",
+            "scorch_index_var",
+        )
+        compatibility_fields = (
+            "_use_atomic_scheduling",
+            "_atomic_chunk_var",
+            "_atomic_counter_var",
+            "_loop_bound",
+        )
+        actual_state = object.__getattribute__(actual, "__dict__")
+        expected_state = object.__getattribute__(expected, "__dict__")
+        if type(actual_state) is not dict or type(expected_state) is not dict:
+            return False
+        if any(
+            field_name not in actual_state or field_name not in expected_state
+            for field_name in (*field_names, "body")
+        ):
+            return False
+        if type(actual_state["body"]) is not list:
+            return False
+        for field_name in field_names:
+            actual_value = actual_state[field_name]
+            expected_value = expected_state[field_name]
+            if not cls._exact_panel_state_matches(actual_value, expected_value):
+                return False
+        for field_name in compatibility_fields:
+            if (field_name in actual_state) != (field_name in expected_state):
+                return False
+            if field_name in actual_state:
+                actual_value = actual_state[field_name]
+                expected_value = expected_state[field_name]
+                if not cls._exact_panel_state_matches(actual_value, expected_value):
+                    return False
+        return True
+
+    @staticmethod
+    def _panel_var_state_is_valid(value: object) -> bool:
+        """Whether an exact Var owns complete, type-correct stored state."""
+
+        if type(value) is not llir.Var:
+            return False
+        state = object.__getattribute__(value, "__dict__")
+        required = ("name", "type", "is_ptr", "is_restrict", "tensor_access")
+        if type(state) is not dict or any(name not in state for name in required):
+            return False
+        if (
+            type(state["name"]) is not str
+            or not state["name"].isidentifier()
+            or type(state["type"]) is not llir.DataType
+            or type(state["is_ptr"]) is not bool
+            or type(state["is_restrict"]) is not bool
+        ):
+            return False
+        metadata = state["tensor_access"]
+        if metadata is None:
+            return True
+        if type(metadata) is not llir.TensorAccessMetadata:
+            return False
+        metadata_state = object.__getattribute__(metadata, "__dict__")
+        if type(metadata_state) is not dict:
+            return False
+        index_ids = metadata_state.get("index_ids")
+        return (
+            type(metadata_state.get("access_id")) is AccessId
+            and type(metadata_state.get("tensor_id")) is SymbolId
+            and type(index_ids) is tuple
+            and all(type(index_id) is IndexId for index_id in index_ids)
+            and type(metadata_state.get("role")) is llir.TensorAccessRole
+        )
+
+    @classmethod
+    def _exact_panel_state_matches(
+        cls,
+        actual: object,
+        expected: object,
+        active: Optional[Set[Tuple[int, int]]] = None,
+        depth: int = 0,
+    ) -> bool:
+        """Compare a captured LLIR subtree without invoking forged ``__eq__``."""
+
+        if type(actual) is not type(expected) or depth > 256:
+            return False
+        if actual is None:
+            return True
+        if type(actual) in (bool, int, float, str, llir.DataType):
+            return actual == expected
+        if isinstance(actual, Enum):
+            return actual is expected
+        if isinstance(actual, llir.Node):
+            actual_state = object.__getattribute__(actual, "__dict__")
+            expected_state = object.__getattribute__(expected, "__dict__")
+            if (
+                type(actual_state) is not dict
+                or type(expected_state) is not dict
+                or actual_state.keys() != expected_state.keys()
+            ):
+                return False
+            if active is None:
+                active = set()
+            pair = (id(actual), id(expected))
+            if pair in active:
+                return False
+            active.add(pair)
+            try:
+                return all(
+                    cls._exact_panel_state_matches(
+                        actual_state[name],
+                        expected_state[name],
+                        active,
+                        depth + 1,
+                    )
+                    for name in actual_state
+                )
+            finally:
+                active.remove(pair)
+        if type(actual) in (list, tuple):
+            actual_sequence = cast(Any, actual)
+            expected_sequence = cast(Any, expected)
+            if len(actual_sequence) != len(expected_sequence):
+                return False
+            if active is None:
+                active = set()
+            pair = (id(actual), id(expected))
+            if pair in active:
+                return False
+            active.add(pair)
+            try:
+                return all(
+                    cls._exact_panel_state_matches(
+                        actual_item,
+                        expected_item,
+                        active,
+                        depth + 1,
+                    )
+                    for actual_item, expected_item in zip(
+                        actual_sequence, expected_sequence
+                    )
+                )
+            finally:
+                active.remove(pair)
+        return False
+
+    def _completed_panel_chain(
+        self, function: llir.Function
+    ) -> Dict[int, llir.ForLoop]:
+        """Re-identify the exact direct chain represented before the passes."""
+
+        expected_positions = tuple(
+            position
+            for position, loop in enumerate(self.loops)
+            if loop.kind is not _PANEL_OUTER
+        )
+        found = self._for_loops_with_owners(function.body)
+        if len(found) != len(expected_positions):
+            _fail(
+                "panel_completion_lost",
+                "the assembled function does not carry exactly the emitted "
+                "chain loops; the structural completion refuses to guess",
+            )
+        completed: Dict[int, llir.ForLoop] = {}
+        prior: Optional[llir.ForLoop] = None
+        for position, (actual, owner) in zip(expected_positions, found):
+            snapshot = self._emitted_loop_headers.get(position)
+            if (
+                snapshot is None
+                or owner is not prior
+                or not self._panel_loop_header_matches(actual, snapshot)
+            ):
+                _fail(
+                    "panel_completion_lost",
+                    "the assembled function's direct loop chain disagrees "
+                    "with the detached pre-pass headers",
+                )
+            completed[position] = actual
+            prior = actual
+        if set(self._emitted_loop_headers) != set(expected_positions):
+            _fail(
+                "panel_completion_lost",
+                "the panel's emitted loop-header snapshots are incomplete",
+            )
+        return completed
 
     def complete_panel(self, function: llir.Function) -> llir.Function:
         """Mark, window, and wrap the panel on the assembled function.
@@ -2440,57 +2766,60 @@ class _TargetLowering:
 
         if self.panel is None:
             return function
-        end_init = self._window_end_init
-        emitted_window = self._emitted_loops.get(self.window_position)
-        emitted_row = self._emitted_loops.get(self.panel_row_position)
-        if end_init is None or emitted_window is None or emitted_row is None:
+        end_snapshot = self._window_end_snapshot
+        if end_snapshot is None:
             _fail(
                 "panel_completion_lost",
                 "the panel's emitted statements were never recorded",
             )
-
-        chain_loops = self._chain_for_loops(function.body)
-        if len(chain_loops) != len(self.loops) - 1:
+        completed = self._completed_panel_chain(function)
+        window_loop = completed[self.window_position]
+        row_loop = completed[self.panel_row_position]
+        wrapped_loop = completed[self.panel_position + 1]
+        located_window = self._locate_statement(function.body, window_loop)
+        located_wrap = self._locate_statement(function.body, wrapped_loop)
+        if located_window is None or located_wrap is None:
             _fail(
                 "panel_completion_lost",
-                "the assembled function does not carry exactly the emitted "
-                "chain loops; the structural completion refuses to guess",
+                "the verified panel chain cannot be located in the function",
             )
-
-        def ordinal(position: int) -> int:
-            return position - 1 if position > self.panel_position else position
-
-        window_loop = chain_loops[ordinal(self.window_position)]
-        row_loop = chain_loops[ordinal(self.panel_row_position)]
-        wrapped_loop = chain_loops[ordinal(self.panel_position + 1)]
-        # Cross-check the located loops against the emission records: the
-        # loop-control variables must agree exactly.
+        window_container, window_index = located_window
+        end_candidates: List[Tuple[int, llir.VarInit]] = []
+        for index, stmt in enumerate(window_container):
+            if type(stmt) is not llir.VarInit:
+                continue
+            state = object.__getattribute__(stmt, "__dict__")
+            required = ("var", "value", "op", "cast")
+            if (
+                type(state) is not dict
+                or any(field_name not in state for field_name in required)
+                or not self._panel_var_state_is_valid(state.get("var"))
+                or not isinstance(state.get("value"), llir.Expr)
+                or type(state.get("op")) is not str
+                or type(state.get("cast")) is not bool
+            ):
+                _fail(
+                    "panel_completion_lost",
+                    "a variable initialization beside the panel window has "
+                    "malformed stored state",
+                )
+            if self._exact_panel_state_matches(state["var"], end_snapshot.var):
+                end_candidates.append((index, stmt))
         if (
-            not isinstance(window_loop.init, llir.VarInit)
-            or not isinstance(emitted_window.init, llir.VarInit)
-            or window_loop.init.var != emitted_window.init.var
-            or not isinstance(row_loop.init, llir.VarInit)
-            or not isinstance(emitted_row.init, llir.VarInit)
-            or row_loop.init.var != emitted_row.init.var
+            len(end_candidates) != 1
+            or not self._exact_panel_state_matches(end_candidates[0][1], end_snapshot)
+            or end_candidates[0][0] >= window_index
+            or any(
+                type(statement) is not llir.BlankLine
+                for statement in window_container[
+                    end_candidates[0][0] + 1 : window_index
+                ]
+            )
         ):
             _fail(
                 "panel_completion_lost",
-                "the located chain loops disagree with the emission records",
-            )
-        located_window = self._locate_statement(function.body, window_loop)
-        located_wrap = self._locate_statement(function.body, wrapped_loop)
-        assert located_window is not None and located_wrap is not None
-        window_container, _window_index = located_window
-        end_candidates = [
-            (index, stmt)
-            for index, stmt in enumerate(window_container)
-            if isinstance(stmt, llir.VarInit) and stmt.var == end_init.var
-        ]
-        if len(end_candidates) != 1:
-            _fail(
-                "panel_completion_lost",
-                "the window's iterator end declaration is not uniquely "
-                "identifiable beside the window loop",
+                "the window's iterator end declaration does not exactly "
+                "precede the loop with its detached pre-pass state",
             )
         end_index, located_end_init = end_candidates[0]
         end_container = window_container
@@ -2500,7 +2829,27 @@ class _TargetLowering:
         # 1. Explicit parallel marking of the row loop, exactly as the
         # legacy explicit-parallel schedule applies it post-assembly (the
         # panel family carries no CIN workspace, so the cluster is empty).
+        expected_marked = LLIRRewriter(
+            LLIRTraversalContext(
+                stage="LoopIR target lowering",
+                pass_name="snapshot_panel_parallel_policy",
+            )
+        ).rewrite(row_loop)
+        if type(expected_marked) is not llir.ForLoop:
+            _fail(
+                "panel_completion_lost",
+                "the panel row-loop policy snapshot did not remain a ForLoop",
+            )
+        expected_marked.omp_parallel_for = True
+        expected_marked.omp_schedule = "dynamic, 64"
+        apply_parallel_policy(expected_marked)
         mark_first_for_loop_parallel([row_loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
+        if not self._panel_loop_header_matches(row_loop, expected_marked):
+            _fail(
+                "panel_completion_lost",
+                "the panel's selected row loop did not acquire the required "
+                "sparse parallel policy",
+            )
 
         # 2. Window the compressed loop: capture the row end, derive the
         # search-based panel begin/end, and start the loop at the window.
@@ -2541,7 +2890,11 @@ class _TargetLowering:
             ),
             llir.VarInit(var=end_init.var, value=upper_value),
         ]
-        assert isinstance(window_loop.init, llir.VarInit)
+        if type(window_loop.init) is not llir.VarInit:
+            _fail(
+                "panel_completion_lost",
+                "the verified panel window no longer has its iterator " "initializer",
+            )
         window_loop.init.value = llir.Var(panel_begin, end_init.var.type)
 
         # 3. Wrap the loop below the panel's chain position in the origin

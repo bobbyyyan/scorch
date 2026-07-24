@@ -746,7 +746,7 @@ def _verify_panel(
             ("tiles", str(panel_position)),
             index_id=panel.loop.index_id,
         )
-    if panel.parallel or panel.accumulation != "direct" or not panel.unroll:
+    if panel.parallel or panel.accumulation != "direct":
         _unsupported(
             "panel_policy",
             "panel tiles require the canonical serial/direct panel policy",

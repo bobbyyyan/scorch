@@ -178,7 +178,7 @@ class LoopIRBuilder:
         return position
 
     def new_tile_id(self) -> TileId:
-        """Allocate the next artifact-local affine-split identity."""
+        """Allocate the next artifact-local split or panel identity."""
 
         tile = TileId(self._next_tile_id)
         self._next_tile_id += 1

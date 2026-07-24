@@ -99,13 +99,13 @@ class PositionId:
 
 @dataclass(frozen=True, order=True)
 class TileId:
-    """Identity of one affine loop split within a LoopIR program.
+    """Identity of one scheduled loop transformation within a LoopIR program.
 
-    A split is one schedule fact — "this logical loop is strip-mined at this
-    width" — realized structurally as a :class:`TileOuterFor` /
-    :class:`TileInnerFor` pair that shares the ``TileId``.  The identity is
-    what keeps the pair's ownership unambiguous when other loops sit between
-    the origin loop and the point loop.
+    An affine split is realized as a :class:`TileOuterFor` /
+    :class:`TileInnerFor` pair, while a sparse coordinate panel is realized
+    as a :class:`PanelOuterFor` / :class:`SparseWindowFor` pair.  Each pair
+    shares one ``TileId`` so its ownership remains unambiguous when other
+    loops sit between the origin and point/window loops.
     """
 
     value: int

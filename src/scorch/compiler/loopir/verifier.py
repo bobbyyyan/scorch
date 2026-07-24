@@ -47,9 +47,10 @@ The invariant families stated locally for this subset:
   inside its origin loop's scope (``unbound_tile``), every origin must
   contain its point loop (``missing_tile_inner``), the pair must agree on
   index, dimension, and width (``tile_binding_mismatch``), and widths are
-  positive exact ints (``invalid_tile_width``).  A split owns its logical
-  loop: the split index may be neither bound nor split again in an
-  enclosing scope (``tile_index_conflict``), and the point loop's
+  positive exact ints within the target-neutral canonical-print boundary
+  (``invalid_tile_width``).  A split owns its logical loop: the split index
+  may be neither bound nor split again in an enclosing scope
+  (``tile_index_conflict``), and the point loop's
   coordinate binding participates in the ``duplicate_index_binding``
   discipline — with one deliberately moved boundary from the workspace
   family: one split may bind its point coordinate through *several*
@@ -70,9 +71,9 @@ The invariant families stated locally for this subset:
   the panel dimension (``panel_bound_mismatch``).  A panel owns its
   logical loop exactly like an affine split (``tile_index_conflict``),
   its window binds the coordinate under the global once-only discipline,
-  and window widths are positive exact ints (``invalid_tile_width``).
-  Clamped-window coverage is intrinsic ``SparseWindowFor`` semantics,
-  stated on the node.
+  and window widths are positive exact ints within the target-neutral
+  canonical-print boundary (``invalid_tile_width``).  Clamped-window
+  coverage is intrinsic ``SparseWindowFor`` semantics, stated on the node.
 - **Workspace regions.**  A stack workspace is declared by exactly one
   region (``invalid_workspace_id`` / ``duplicate_workspace_id``) and spans
   the point domain of one affine split: the region must open between that
@@ -139,6 +140,17 @@ from .nodes import (
 )
 
 MAX_NESTING_DEPTH = 64
+MAX_LOOPIR_TILE_WIDTH_BITS = 2048
+MAX_LOOPIR_TILE_WIDTH = (1 << MAX_LOOPIR_TILE_WIDTH_BITS) - 1
+"""Largest target-neutral tile width with a total canonical text form.
+
+CPython permits the decimal integer-conversion limit to be configured as low
+as 640 digits.  A positive 2048-bit integer has at most 617 decimal digits, so
+every verifier-approved width remains exactly printable and JSON-serializable
+under every supported setting.  Target lowerings may impose a much smaller
+machine-specific limit.
+"""
+
 _MISSING = object()
 
 _EXECUTABLE_LEVEL_KINDS = (LevelKind.DENSE, LevelKind.COMPRESSED)
@@ -200,6 +212,17 @@ def _fail(code: str, path: str, message: str) -> NoReturn:
     raise LoopIRVerificationError(LoopIRDefect(code, path, message))
 
 
+def _diagnostic_int(value: int) -> str:
+    """Render an exact integer without leaking Python's digit-limit error."""
+
+    if value.bit_length() > MAX_LOOPIR_TILE_WIDTH_BITS:
+        return "<integer too large to render>"
+    try:
+        return str(value)
+    except ValueError:
+        return "<integer too large to render>"
+
+
 class _WorkspaceState:
     """One open workspace region's walk state."""
 
@@ -246,7 +269,11 @@ class _Context:
 
     def dimension_name(self, dimension: DimensionId) -> str:
         decl = self.dimensions.get(dimension)
-        return decl.name if decl is not None else f"<dimension {dimension.value}>"
+        return (
+            decl.name
+            if decl is not None
+            else f"<dimension {_diagnostic_int(dimension.value)}>"
+        )
 
     def level_dimension(self, tensor: SymbolId, level: int) -> DimensionId:
         """The logical dimension stored by one validated tensor level."""
@@ -348,7 +375,11 @@ def _enter(ctx: _Context, node: object, path: str, depth: int) -> None:
     ctx.visited_objects.add(marker)
     node_id = _check_node_id(getattr(node, "node_id", None), path)
     if node_id in ctx.seen_node_ids:
-        _fail("duplicate_node_id", path, f"node_id {node_id.value} reused")
+        _fail(
+            "duplicate_node_id",
+            path,
+            f"node_id {_diagnostic_int(node_id.value)} reused",
+        )
     ctx.seen_node_ids.add(node_id)
 
 
@@ -399,7 +430,11 @@ def _check_index_value(
 ) -> _ExprType:
     index = _check_index_id(expr.index, path, "IndexValue.index")
     if index not in ctx.bound_indices:
-        _fail("unbound_index", path, f"index {index.value} is not bound in scope")
+        _fail(
+            "unbound_index",
+            path,
+            f"index {_diagnostic_int(index.value)} is not bound in scope",
+        )
     return _CoordType(ctx.bound_indices[index])
 
 
@@ -471,7 +506,8 @@ def _check_dense_position(
         _fail(
             "rank_mismatch",
             path,
-            f"level {expr.level} outside rank-{len(decl.levels)} tensor",
+            f"level {_diagnostic_int(expr.level)} outside "
+            f"rank-{len(decl.levels)} tensor",
         )
     if decl.levels[expr.level].kind is not LevelKind.DENSE:
         _fail(
@@ -501,7 +537,7 @@ def _check_position_value(
         _fail(
             "unbound_position",
             path,
-            f"position {position.value} is not bound in scope",
+            f"position {_diagnostic_int(position.value)} is not bound in scope",
         )
     tensor, level = ctx.bound_positions[position]
     return _PositionType(tensor, level)
@@ -518,7 +554,11 @@ def _check_cursor_value(
         )
     cursor = _check_cursor_id(expr.cursor, path)
     if cursor not in ctx.cursors:
-        _fail("unbound_cursor", path, f"cursor {cursor.value} is not in scope")
+        _fail(
+            "unbound_cursor",
+            path,
+            f"cursor {_diagnostic_int(cursor.value)} is not in scope",
+        )
     decl, mode = ctx.cursors[cursor]
     if decl.level != len(ctx.tensors[decl.tensor].levels) - 1:
         _fail(
@@ -639,7 +679,8 @@ def _check_workspace_read(
         _fail(
             "unbound_workspace",
             path,
-            f"workspace {workspace.value} has no enclosing region in scope",
+            f"workspace {_diagnostic_int(workspace.value)} has no enclosing "
+            "region in scope",
         )
     if state.role != "consumer":
         _fail(
@@ -687,7 +728,8 @@ def _bind_index(
         _fail(
             "duplicate_index_binding",
             path,
-            f"index {bound.value} is already bound in an enclosing scope",
+            f"index {_diagnostic_int(bound.value)} is already bound in an "
+            "enclosing scope",
         )
     if bound in ctx.ever_bound_indices and (
         point_tile is None or ctx.ever_tile_point_bindings.get(bound) != point_tile
@@ -695,7 +737,8 @@ def _bind_index(
         _fail(
             "duplicate_index_binding",
             path,
-            f"index {bound.value} is bound more than once in the program",
+            f"index {_diagnostic_int(bound.value)} is bound more than once in "
+            "the program",
         )
     ctx.ever_bound_indices.add(bound)
     if point_tile is not None:
@@ -718,7 +761,8 @@ def _bind_position(
         _fail(
             "duplicate_position_binding",
             path,
-            f"position {bound.value} is bound more than once in the program",
+            f"position {_diagnostic_int(bound.value)} is bound more than once "
+            "in the program",
         )
     ctx.ever_bound_positions.add(bound)
     ctx.bound_positions[bound] = (tensor, level)
@@ -738,7 +782,11 @@ def _check_cursor_decl(
     try:
         cursor = _check_cursor_id(decl.cursor, path)
         if cursor in ctx.ever_cursor_ids:
-            _fail("duplicate_cursor_id", path, f"cursor id {cursor.value} reused")
+            _fail(
+                "duplicate_cursor_id",
+                path,
+                f"cursor id {_diagnostic_int(cursor.value)} reused",
+            )
         ctx.ever_cursor_ids.add(cursor)
         tensor = _check_symbol_id(decl.tensor, path, "SparseCursorDecl.tensor")
         if tensor not in ctx.tensors:
@@ -752,7 +800,8 @@ def _check_cursor_decl(
             _fail(
                 "rank_mismatch",
                 path,
-                f"level {decl.level} outside rank-{len(levels)} tensor",
+                f"level {_diagnostic_int(decl.level)} outside "
+                f"rank-{len(levels)} tensor",
             )
         if levels[decl.level].kind is not LevelKind.COMPRESSED:
             _fail(
@@ -875,6 +924,12 @@ def _check_tile_width(width: object, path: str, what: str) -> int:
         _fail("invalid_tile_width", path, f"{what} must be an exact int")
     if width < 1:
         _fail("invalid_tile_width", path, f"{what} must be at least 1")
+    if width > MAX_LOOPIR_TILE_WIDTH:
+        _fail(
+            "invalid_tile_width",
+            path,
+            f"{what} exceeds the target-neutral canonical integer boundary",
+        )
     return width
 
 
@@ -883,7 +938,11 @@ def _check_tile_outer_for(
 ) -> None:
     tile = _check_tile_id(stmt.tile, f"{path}.tile")
     if tile in ctx.ever_tile_ids:
-        _fail("duplicate_tile_id", path, f"tile id {tile.value} reused")
+        _fail(
+            "duplicate_tile_id",
+            path,
+            f"tile id {_diagnostic_int(tile.value)} reused",
+        )
     ctx.ever_tile_ids.add(tile)
     _check_tile_loop_dimension(ctx, stmt.dimension, path, "TileOuterFor")
     index = _check_index_id(stmt.index, path, "TileOuterFor.index")
@@ -891,8 +950,8 @@ def _check_tile_outer_for(
         _fail(
             "tile_index_conflict",
             path,
-            f"index {index.value} is already bound in an enclosing scope; a "
-            "split must own its logical loop",
+            f"index {_diagnostic_int(index.value)} is already bound in an "
+            "enclosing scope; a split must own its logical loop",
         )
     if any(open_tile.index == index for open_tile in ctx.open_tiles.values()) or any(
         open_panel.index == index for open_panel in ctx.open_panels.values()
@@ -900,7 +959,8 @@ def _check_tile_outer_for(
         _fail(
             "tile_index_conflict",
             path,
-            f"index {index.value} is already split by an enclosing tile",
+            f"index {_diagnostic_int(index.value)} is already split by an "
+            "enclosing tile",
         )
     _check_tile_width(stmt.width, path, "TileOuterFor.width")
     ctx.open_tiles[tile] = stmt
@@ -910,8 +970,8 @@ def _check_tile_outer_for(
             _fail(
                 "missing_tile_inner",
                 path,
-                f"TileOuterFor for tile id {tile.value} has no matching "
-                "TileInnerFor in its body",
+                f"TileOuterFor for tile id {_diagnostic_int(tile.value)} has "
+                "no matching TileInnerFor in its body",
             )
     finally:
         del ctx.open_tiles[tile]
@@ -927,7 +987,8 @@ def _check_tile_inner_for(
         _fail(
             "unbound_tile",
             path,
-            f"tile id {tile.value} has no dominating TileOuterFor in scope",
+            f"tile id {_diagnostic_int(tile.value)} has no dominating "
+            "TileOuterFor in scope",
         )
     dimension = _check_tile_loop_dimension(ctx, stmt.dimension, path, "TileInnerFor")
     index = _check_index_id(stmt.index, path, "TileInnerFor.index")
@@ -961,7 +1022,11 @@ def _check_panel_outer_for(
 ) -> None:
     tile = _check_tile_id(stmt.tile, f"{path}.tile")
     if tile in ctx.ever_tile_ids:
-        _fail("duplicate_tile_id", path, f"tile id {tile.value} reused")
+        _fail(
+            "duplicate_tile_id",
+            path,
+            f"tile id {_diagnostic_int(tile.value)} reused",
+        )
     ctx.ever_tile_ids.add(tile)
     dimension = _check_tile_loop_dimension(ctx, stmt.dimension, path, "PanelOuterFor")
     index = _check_index_id(stmt.index, path, "PanelOuterFor.index")
@@ -969,8 +1034,8 @@ def _check_panel_outer_for(
         _fail(
             "tile_index_conflict",
             path,
-            f"index {index.value} is already bound in an enclosing scope; a "
-            "panel must own its logical loop",
+            f"index {_diagnostic_int(index.value)} is already bound in an "
+            "enclosing scope; a panel must own its logical loop",
         )
     if any(open_tile.index == index for open_tile in ctx.open_tiles.values()) or any(
         open_panel.index == index for open_panel in ctx.open_panels.values()
@@ -978,7 +1043,8 @@ def _check_panel_outer_for(
         _fail(
             "tile_index_conflict",
             path,
-            f"index {index.value} is already split by an enclosing tile",
+            f"index {_diagnostic_int(index.value)} is already split by an "
+            "enclosing tile",
         )
     _check_tile_width(stmt.width, path, "PanelOuterFor.width")
     bound_tensor = _check_symbol_id(
@@ -1001,7 +1067,8 @@ def _check_panel_outer_for(
         _fail(
             "rank_mismatch",
             f"{path}.bound_level",
-            f"level {stmt.bound_level} outside rank-{len(bound_levels)} tensor",
+            f"level {_diagnostic_int(stmt.bound_level)} outside "
+            f"rank-{len(bound_levels)} tensor",
         )
     if bound_levels[stmt.bound_level].kind is not LevelKind.DENSE:
         _fail(
@@ -1023,8 +1090,8 @@ def _check_panel_outer_for(
             _fail(
                 "missing_panel_window",
                 path,
-                f"PanelOuterFor for tile id {tile.value} has no matching "
-                "SparseWindowFor in its body",
+                f"PanelOuterFor for tile id {_diagnostic_int(tile.value)} has "
+                "no matching SparseWindowFor in its body",
             )
     finally:
         del ctx.open_panels[tile]
@@ -1040,7 +1107,8 @@ def _check_sparse_window_for(
         _fail(
             "unbound_panel",
             path,
-            f"tile id {tile.value} has no dominating PanelOuterFor in scope",
+            f"tile id {_diagnostic_int(tile.value)} has no dominating "
+            "PanelOuterFor in scope",
         )
     decl = _check_cursor_decl(ctx, stmt.cursor, f"{path}.cursor", depth + 1)
     coord = _check_index_id(stmt.coord_index, path, "SparseWindowFor.coord_index")
@@ -1084,7 +1152,7 @@ def _check_workspace_decl(
             _fail(
                 "duplicate_workspace_id",
                 path,
-                f"workspace id {workspace.value} reused",
+                f"workspace id {_diagnostic_int(workspace.value)} reused",
             )
         ctx.ever_workspace_ids.add(workspace)
         if type(decl.name) is not str or not decl.name:
@@ -1119,8 +1187,9 @@ def _check_workspace_region(
         _fail(
             "workspace_scope_mismatch",
             path,
-            f"workspace tile id {decl.tile.value} has no dominating "
-            "TileOuterFor in scope; a region needs a current tile origin",
+            f"workspace tile id {_diagnostic_int(decl.tile.value)} has no "
+            "dominating TileOuterFor in scope; a region needs a current "
+            "tile origin",
         )
     if outer.index in ctx.bound_indices:
         _fail(
@@ -1165,7 +1234,8 @@ def _check_workspace_reduce(
         _fail(
             "unbound_workspace",
             path,
-            f"workspace {workspace.value} has no enclosing region in scope",
+            f"workspace {_diagnostic_int(workspace.value)} has no enclosing "
+            "region in scope",
         )
     if state.role != "producer":
         _fail(
@@ -1386,7 +1456,8 @@ def _check_dimension_decl(ctx: _Context, decl: object, path: str, depth: int) ->
             _fail(
                 "duplicate_dimension",
                 path,
-                f"dimension {dimension.value} declared more than once",
+                f"dimension {_diagnostic_int(dimension.value)} declared more "
+                "than once",
             )
         if type(decl.name) is not str or not decl.name:
             _fail("malformed_state", path, "DimensionDecl.name must be a nonempty str")
@@ -1422,7 +1493,8 @@ def _check_level_decl(
             _fail(
                 "invalid_mode_order",
                 path,
-                f"mode {decl.mode} outside the rank-{rank} logical modes",
+                f"mode {_diagnostic_int(decl.mode)} outside the rank-{rank} "
+                "logical modes",
             )
         return decl.mode
     finally:
@@ -1440,7 +1512,11 @@ def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> No
     try:
         symbol = _check_symbol_id(decl.symbol, path, "TensorDecl.symbol")
         if symbol in ctx.tensors:
-            _fail("duplicate_symbol", path, f"tensor symbol {symbol.value} redeclared")
+            _fail(
+                "duplicate_symbol",
+                path,
+                f"tensor symbol {_diagnostic_int(symbol.value)} redeclared",
+            )
         if type(decl.name) is not str or not decl.name:
             _fail("malformed_state", path, "TensorDecl.name must be a nonempty str")
         if type(decl.dtype) is not ScalarType:
