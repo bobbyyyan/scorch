@@ -24738,6 +24738,167 @@ inseparable: panel is an independent prerequisite and relayout builds on it.
 Commit the largest fully verified result; do not overclaim and do not push.
 ```
 
+## 2026-07-24: sparse-panel milestone review corrections
+
+The Phase-6 sparse-panel milestone at `9423d74` received a fresh,
+adversarial review.  The review did not trust the preceding report and
+found concrete issues.  They are corrected and locked in two new local
+commits; no existing commit was amended/reordered and nothing was
+pushed:
+
+- `ab75d0f` — `fix(compiler): harden sparse panel completion`
+- `4a3e269` — `test(compiler): lock sparse panel review boundaries`
+
+The corrections are:
+
+- reject a bare LoopIR panel target unless its selected parallel row
+  coordinate partitions the dense result access (the old target could
+  compile a verifier-valid row reduction into an OpenMP data race);
+- snapshot the complete emitted direct loop chain and window-end
+  declaration before managed passes, then require exact direct
+  parent/child, header, declaration-order, and post-mark policy state;
+- make completion total over missing/extra/reordered, hostile-subclass,
+  malformed nested fields, cycles, shared ownership, excessive depth,
+  atomic compatibility markers, and corrupted pragma policy text,
+  always as `panel_completion_lost`;
+- accept and consume both `unroll` values for panels, matching legacy's
+  compatibility behavior;
+- bound affine/panel semantic widths to a target-neutral, canonically
+  printable 2,048-bit range and render huge exact-integer diagnostics
+  without leaking CPython `ValueError`;
+- execute zero-row and zero-panel-extent compiled shadows, not only
+  source comparisons.
+
+Definitive detail is in
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §13.  Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-panel-review-4a3e269/`.
+Verification: contract focus **414 passed**; compiled runtime focus
+**126 passed**; focused LoopIR membership **565 + 4 neutrality**; all
+13 panel parity cells and fresh 20-source/42-grid release captures are
+byte-identical; paired compiler latency is inside 1.10 everywhere
+(worst p50 `0.989`, worst p95 `1.014`); focused static checks are clean
+and full-source mypy stays at the inherited 146 findings; clean
+detached full suite at `4a3e269`: **3,788 passed, 14 skipped, 3
+deselected, zero failures** in 2,733.20 seconds.  Protected tracked
+files retain their recorded hashes, unrelated user material is
+untouched, live origin remains `58e8565`, and nothing was pushed.
+
+The panel slice is closed under the corrected contract.  Phase 6 is
+still open: relayout/staging, heap result tiles, target-independent
+abstract parallel selection, and the representative tile-ijk/exit
+checkpoint remain.
+
+### Superseding broad prompt for the next session
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call. First rigorously review the current
+tip, including the Phase-6 panel commits 68d7eb4..9423d74 and the panel-review
+corrections ab75d0f/4a3e269 plus the final docs commit. Read AGENTS.md,
+COMPILER_IR_REFACTOR_DESIGN.md (Stages 3-7 and Phase 6), the Phase-4/5 reviews,
+all of COMPILER_IR_REFACTOR_PHASE6_REVIEW.md (especially §§11-13), and the
+dated handoff tail. Independently reproduce the corrected focused gates and
+inspect every correction diff; do not trust this report. In particular verify:
+bounded/total exact-integer diagnostics and canonical printing; panel
+unroll=False compatibility; race rejection unless the parallel row partitions
+the dense result; fail-closed panel completion under loop/header/end-declaration
+mutation, cycles, aliases, malformed stored state, hostile subclasses,
+compatibility markers, and policy corruption; and compiled zero-row /
+zero-panel-extent behavior. Fix, test, document, and commit any concrete review
+defect before new work.
+
+Then complete the largest coherent remainder of Phase 6 through explicit,
+independently stoppable checkpoints. The primary milestone is the full operand
+relayout/staging vertical slice on the migrated panel foundation, covering both
+panel-scoped and full-pack-axis lifetimes. If and only if that slice is fully
+green, continue in separate commits with: (1) heap result-tile accumulation and
+its relayout composition; (2) target-independent abstract parallel-loop
+selection with race/reduction proofs and compatibility lowering; and (3)
+representative tile-j/tile-ijk LoopPlan encodings plus a criterion-by-criterion
+Phase-6 exit review. Do not begin Phase 7 target-policy migration, selector
+integration, default production cutover, or legacy deletion.
+
+Before choosing relayout nodes, re-audit Scheduler._validate_relayout,
+schedule_lowerer._apply_relayout, pack-loop construction, storage lifetime,
+_TensorAccessRewriter and its preflight, sparse-prefetch adaptation, both
+staging scopes, and the retained goldens under
+/Users/bobby/.cache/scorch-codex/phase6-panel-audit/ (AUDIT.md,
+relayout_panel_scope.cpp, relayout_pack_scope.cpp, relayout_heap_pack.cpp).
+Make the logical access-occurrence identity decision explicitly. LoopIR.Load
+currently has no occurrence identity and lower-LLIR AccessId is per symbol, not
+per occurrence; do not substitute target identity or rendered spelling.
+Prefer stable artifact-local access identity, or retain a deliberately narrow
+verifier-proven unique operand/index occurrence boundary and document why it is
+sufficient for the audited family.
+
+Implement a typed staging region with allocation, pack loops, lifetime, and
+staged reads. Consume every relayout fact exactly once; redirect the selected
+logical read structurally exactly once; reject residual or duplicate direct
+reads; verify dominance, shape/bounds, initialization, teardown, both scopes,
+f32/f64, deterministic identity/naming, and prefetch behavior. Extend the
+builder, verifier, canonical schema/printer, oracle, pure schedule passes,
+erasure/equivalence, ScheduledLoopIR replay/provenance, target lowering, stage
+ownership, Schedule adapter, cache identity, and neutrality locks. Relayout's
+post-assembly completion must extend the corrected panel boundary: no
+name/regex discovery, no unvalidated loop ordinal, and no dynamic tags. Use
+retained identity/provenance where possible or a complete stored structural
+snapshot that fails closed on missing/extra/reordered/shared/cyclic/malformed
+state and on managed-pass changes that could alter semantics.
+
+After relayout is independently complete, implement heap result tiling as its
+own verified memory-region family: intrinsic initialization/reset, dominance
+and lifetime, compact result-access redirection, copy-out, direct/stack/heap
+distinctions, ragged/zero extents, and composition with the retained
+relayout_heap_pack.cpp golden. Then implement abstract parallel selection over
+stable loop identities with target-independent intent, race/reduction legality,
+and consume-once plan facts. Keep OpenMP spelling and calibrated policy
+compatibility in target lowering; do not embed target policy in LoopIR or widen
+into Phase 7.
+
+Close with representative schedule checkpoints: recertify panel-only tile-j
+under the corrected contracts; encode and execute tile-ijk as affine pack tile
++ panel + relayout for both staging scopes and direct/heap accumulation wherever
+legacy supports them; exercise the public Schedule→LoopPlan adapter and
+explicit/auto schedule paths without algorithm-specific handwritten C++ in the
+new path. Audit every Phase-6 deliverable and exit criterion from the design.
+If any family, adapter route, or selector-readiness criterion remains open, say
+Phase 6 remains open.
+
+Use separately stoppable focused commits for review fixes, relayout
+schema/verifier/oracle, relayout passes/lowering, relayout tests, heap
+schema/pass/lowering/tests, parallel selection/tests, and docs. A complete
+relayout slice is an acceptable stop; schema-only work, name-based redirection,
+or a half-working stretch family is not. Never weaken an existing gate to admit
+a new representation.
+
+Mandatory evidence for every claimed family: direct tests for every new defect
+code and forged/missing/extra/hostile-subclass/cyclic/shared/over-depth state;
+artifact-local continuation and canonical determinism across unrelated identity
+histories; unique-redirection/residual-read proofs; oracle/erasure checks of
+positions, coordinates, packed contents, reset/copy/use counts; unit/exact/
+non-dividing/oversized semantic widths without eager allocation, empty rows,
+zero extents, ragged windows, f32/f64, randomized dimensions, and all supported
+placements/scopes; byte-exact legacy C++ and compiled
+PyTorch/legacy/oracle differentials with structural activation never waived;
+the existing LoopIR/workspace/panel/ScheduledLoopIR/LoopPlan/Schedule API/
+normalized-CIN/identity/stage-timing/schedule-lowerer/LLIR/pass-manager/
+raw-budget/native-ABI/cache/import-neutrality/Phase-3.5 adjacency; fresh
+corpus/grid captures; applicable paired compiler latency; Black, Flake8,
+focused and full-source mypy against the inherited baseline; git diff --check;
+provenance checks; and a clean detached-worktree full non-performance suite
+with isolated caches.
+
+Before editing and before every commit, audit git status, live origin, and the
+five protected-file hashes. Preserve all unrelated dirty/untracked GPU, CUDA,
+benchmark, packaging, scheduler, research, scratchpad, and tooling material.
+Stage explicit pathspecs only. Do not switch branches, amend/reorder existing
+commits, push, or rerun retained failed performance evidence merely to seek a
+pass. Update the Phase-6 review and handoff with exact hashes, commands,
+memberships, evidence paths, origin state, limitations, and a candid exit
+verdict. Commit the largest fully verified result; do not overclaim and do not
+push.
+```
+
 ## Phase-6 panel milestone: sparse coordinate windows on LoopIR (2026-07-24)
 
 The third Phase-6 milestone is complete and closed at commits `68d7eb4`
@@ -24933,3 +25094,13 @@ exact hashes, commands, memberships, evidence paths, origin state,
 limitations, and a candid exit verdict. Commit the largest fully verified
 result; do not overclaim and do not push.
 ```
+
+## Final routing note after the sparse-panel review
+
+The chronologically latest state is the **2026-07-24 sparse-panel
+milestone review corrections** section above and
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §13.  Its **Superseding broad
+prompt for the next session** replaces the older panel-milestone prompt
+immediately above in full.  Begin from commits `ab75d0f` / `4a3e269`
+and the docs tip; do not restart from the uncorrected `9423d74`
+boundary.

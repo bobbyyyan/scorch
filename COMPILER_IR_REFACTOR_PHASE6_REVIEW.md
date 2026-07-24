@@ -1090,3 +1090,129 @@ Evidence ledger: `/Users/bobby/.cache/scorch-codex/phase6-panel-bb97172/`
   tuple satisfies the design — the next session should decide with the
   goldens (`relayout_panel_scope.cpp` / `relayout_pack_scope.cpp` /
   `relayout_heap_pack.cpp`) in hand.
+
+## 13. Independent review of the sparse-panel milestone (2026-07-24)
+
+The panel milestone was reviewed again from the committed base
+`9423d74`, without trusting §12's report.  The review found concrete
+correctness, compatibility, and fail-closed-boundary defects.  They are
+fixed in two focused commits; no preceding commit was amended or
+reordered:
+
+- `ab75d0f` — `fix(compiler): harden sparse panel completion`
+- `4a3e269` — `test(compiler): lock sparse panel review boundaries`
+
+### 13.1 Findings and corrections
+
+1. **A verifier-valid bare LoopIR program could race.**  The target
+   accepted the panel's dense-parent row as the OpenMP loop without
+   proving that row coordinate appeared in the dense result access.
+   A program such as a row-reduced `C[k] += ...` could therefore send
+   several workers to the same result cells.  The target now requires
+   the selected row to partition the single supported dense result
+   access, independently of the stronger LoopPlan gate.
+2. **Panel completion trusted an ordinal skeleton too far.**  It counted
+   post-pass loops and compared only selected initializer variables.
+   Header mutations, same-count sibling/reordered loops, a moved or
+   changed window-end declaration, and lost compatibility fields could
+   survive until completion and be rewired as though they were the
+   emitted chain.  The lowerer now snapshots every complete emitted
+   loop header and the window-end declaration before managed passes,
+   re-identifies one exact direct parent/child chain, requires the
+   declaration to retain exact state immediately before the window
+   (apart from owned blank separators), and refuses to guess.
+3. **Malformed post-pass artifacts were not total.**  Cyclic or shared
+   statement ownership, missing nested fields, hostile subclasses, and
+   forged expression equality could leak `AttributeError`,
+   `RecursionError`, or arbitrary user exceptions from structural
+   discovery.  Completion now uses exact registered statement kinds,
+   bounded cycle/share/depth checks, direct stored-state validation, and
+   a missing-field-safe structural comparator that never calls an
+   untrusted `__eq__`.  Every such failure is the stage-owned
+   `panel_completion_lost` diagnostic.
+4. **Parallel marking was only assumed.**  A no-op or corrupted marker
+   could omit the pragma, inject atomic scheduling/pre/post bodies, or
+   substitute arbitrary `omp_num_threads` / chunk text.  Completion now
+   builds the expected policy from a detached row-loop snapshot and
+   requires exact post-mark header and compatibility-marker state,
+   while deliberately ignoring the legitimate managed-pass
+   `_hoisted_ptr_decls` payload.
+5. **`unroll=False` was rejected on only one path.**  Legacy panel
+   lowering accepts and ignores both values of the shared `TileSpec`
+   field, and the typed panel pass already had the same semantics, but
+   the LoopPlan legality gate rejected `False`.  Both values now pass
+   Scheduler, LoopPlan, the typed pass, and byte-identical lowering.
+6. **Enormous exact integers leaked CPython conversion errors.**  Widths
+   could verify and then fail in the printer/JSON serializer under
+   CPython's decimal digit limit, while huge levels and IDs could fail
+   while formatting diagnostics.  Semantic affine/panel widths now
+   have a target-neutral 2,048-bit canonical-print boundary (maximum
+   617 decimal digits, below CPython's minimum configurable 640);
+   the target retains its much smaller `INT_MAX` limit.  Diagnostic
+   rendering is bounded for all exact-integer identities and level/mode
+   fields reached by the panel family.
+7. **Two empty-domain runtime boundaries were source-only.**  Zero rows
+   and zero panel extent now compile and execute through the legacy and
+   LoopIR shadow paths, in addition to the retained zero-free-extent
+   case.
+
+The review also corrected the `TileId` / builder documentation: the
+identity space owns both affine splits and sparse panels, not affine
+splits alone.  Adversarial re-review after the fixes found no remaining
+concrete defect in the corrected completion boundary.
+
+### 13.2 Verification
+
+Evidence is retained at
+`/Users/bobby/.cache/scorch-codex/phase6-panel-review-4a3e269/`.
+
+- the five-file Phase-6 contract focus
+  (`test_loopir_verifier.py`, `test_loopir_schedule_passes.py`,
+  `test_loopir_llir_lowering.py`, `test_loop_plan.py`, and
+  `test_schedule_api.py`) passes **414 tests** (the inherited §12 count
+  plus 28 review regressions);
+- the compiled runtime focus passes **126 tests** across
+  `test_loopir_scheduled_slice.py` (97) and
+  `test_loopir_pipeline_execution.py` (29); all thirteen panel
+  source-parity cells remain byte-identical, and the two new
+  empty-domain compiled shadows pass;
+- focused production LoopIR membership is **565 passed + 4
+  neutrality**, exactly the §12 membership plus the 32 review tests;
+- fresh release-path captures are byte-identical to the sealed §12
+  captures across all **20 corpus sources and 42 grid sources**;
+- paired same-session compiler latency against `9423d74` is inside the
+  1.10 target in every category: p50 ratios
+  `0.989 / 0.987 / 0.975 / 0.969` and p95 ratios
+  `1.014 / 0.957 / 0.928 / 0.962` (small-dense, reduction,
+  CSR-intersection, sparse-union), with identical source hashes;
+- Black and Flake8 are clean over every changed module/test; focused
+  mypy is clean; full-source `mypy --check-untyped-defs` remains exactly
+  the inherited **146 findings in 12 files**, with the normalized log
+  byte-identical to §12 and zero findings in `loopir/`; `git diff
+  --check` is clean;
+- the authoritative clean detached-worktree non-performance suite at
+  exact test commit `4a3e269`, with import provenance and caches
+  isolated, passes **3,788 tests, 14 skipped, 3 perf-marked
+  deselections, one known warning, and zero failures/errors in
+  2,733.20 seconds** — exactly §12's 3,756 plus the 32 review tests.
+  The log SHA-256 is
+  `29f682e2c97c3e95967d55508dee8b566c577f956dd8de0b16adec3e1fff1383`;
+  the JUnit SHA-256 is
+  `afadef4ee0def33c7117df757820564c3e70769220ee635314eb272d85f6dba6`;
+- the five protected tracked files retain their recorded hashes and
+  were never staged; all staging used explicit pathspecs; unrelated
+  GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, and
+  tooling material remains untouched.  Live origin remains at
+  `58e8565`; nothing was pushed.
+
+### 13.3 Revised boundary and Phase-6 verdict
+
+The panel slice is now closed under the stronger contract above, but
+**Phase 6 remains open** for exactly the §12 remainder: full
+operand-relayout/staging, heap result tiles, target-independent abstract
+parallel selection, and the representative tile-ijk composition/exit
+audit.  Relayout's post-assembly work must extend this corrected
+boundary: no rendered names, regexes, dynamic tags, or bare ordinal
+matching.  It must use stable artifact identity/provenance where
+available or a complete retained structural snapshot with the same
+missing/extra/reordered/shared/cyclic/malformed fail-closed discipline.
