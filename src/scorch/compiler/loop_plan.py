@@ -272,14 +272,41 @@ def _is_non_bool_int(value: object) -> bool:
     return type(value) is int
 
 
+def _validate_stored_fields(
+    value: object, path: str, expected_fields: Tuple[str, ...]
+) -> None:
+    """Require one frozen plan carrier to own exactly its declared state.
+
+    These dataclasses are not slotted, and fields with defaults also exist as
+    class attributes.  A forged instance with a deleted field would therefore
+    otherwise fall back to that class-level default and silently change the
+    schedule being verified.
+    """
+
+    state = object.__getattribute__(value, "__dict__")
+    if type(state) is not dict:
+        raise VerificationError(f"LoopPlan {path} has invalid stored fields")
+    keys = tuple(state.keys())
+    if any(type(key) is not str for key in keys):
+        raise VerificationError(f"LoopPlan {path} has invalid stored fields")
+    if tuple(sorted(keys)) != tuple(sorted(expected_fields)):
+        raise VerificationError(f"LoopPlan {path} has invalid stored fields")
+
+
 def _validate_index_id(index_id: object, path: str) -> IndexId:
-    if type(index_id) is not IndexId or not _is_non_bool_int(index_id.value):
+    if type(index_id) is not IndexId:
+        raise VerificationError(f"LoopPlan {path} must be a well-formed IndexId")
+    _validate_stored_fields(index_id, path, ("value",))
+    if not _is_non_bool_int(index_id.value):
         raise VerificationError(f"LoopPlan {path} must be a well-formed IndexId")
     return index_id
 
 
 def _validate_symbol_id(symbol_id: object, path: str) -> SymbolId:
-    if type(symbol_id) is not SymbolId or not _is_non_bool_int(symbol_id.value):
+    if type(symbol_id) is not SymbolId:
+        raise VerificationError(f"LoopPlan {path} must be a well-formed SymbolId")
+    _validate_stored_fields(symbol_id, path, ("value",))
+    if not _is_non_bool_int(symbol_id.value):
         raise VerificationError(f"LoopPlan {path} must be a well-formed SymbolId")
     return symbol_id
 
@@ -287,6 +314,7 @@ def _validate_symbol_id(symbol_id: object, path: str) -> SymbolId:
 def _validate_loop_ref(loop: object, path: str) -> LoopRef:
     if type(loop) is not LoopRef:
         raise VerificationError(f"LoopPlan {path} must be a LoopRef")
+    _validate_stored_fields(loop, path, ("index_id", "part"))
     typed_loop = cast(LoopRef, loop)
     _validate_index_id(typed_loop.index_id, f"{path}.index_id")
     if type(typed_loop.part) is not LoopPart:
@@ -294,11 +322,41 @@ def _validate_loop_ref(loop: object, path: str) -> LoopRef:
     return typed_loop
 
 
+def _validate_loop_placement(placement: object, path: str) -> LoopPlacement:
+    if type(placement) is not LoopPlacement:
+        raise VerificationError(f"LoopPlan {path} must be a LoopPlacement")
+    _validate_stored_fields(placement, path, ("kind", "parent", "depth"))
+    typed_placement = cast(LoopPlacement, placement)
+    if type(typed_placement.kind) is not PlacementKind:
+        raise VerificationError(f"LoopPlan {path}.kind must be a PlacementKind")
+    if typed_placement.parent is not None:
+        _validate_loop_ref(typed_placement.parent, f"{path}.parent")
+    if typed_placement.depth is not None and not _is_non_bool_int(
+        typed_placement.depth
+    ):
+        raise VerificationError(f"LoopPlan {path}.depth must be an integer or None")
+    return typed_placement
+
+
 def _validate_loop_plan_structure(plan: object) -> LoopPlan:
     """Reject malformed typed fields before semantic plan verification."""
 
     if type(plan) is not LoopPlan:
         raise VerificationError("LoopPlan verifier received a non-LoopPlan value")
+    _validate_stored_fields(
+        plan,
+        "plan",
+        (
+            "loop_order",
+            "tiles",
+            "panel_bounds",
+            "relayout",
+            "result_tile",
+            "parallel_loop",
+            "provenance",
+            "tag",
+        ),
+    )
     typed_plan = cast(LoopPlan, plan)
     if type(typed_plan.loop_order) is not tuple:
         raise VerificationError("LoopPlan.loop_order must be a tuple")
@@ -309,11 +367,21 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
     for position, tile in enumerate(typed_plan.tiles):
         if type(tile) is not LoopTile:
             raise VerificationError(f"LoopPlan tiles[{position}] must be a LoopTile")
+        _validate_stored_fields(
+            tile,
+            f"tiles[{position}]",
+            (
+                "loop",
+                "width",
+                "placement",
+                "parallel",
+                "kind",
+                "accumulation",
+                "unroll",
+            ),
+        )
         _validate_loop_ref(tile.loop, f"tiles[{position}].loop")
-        if type(tile.placement) is not LoopPlacement:
-            raise VerificationError(
-                f"LoopPlan tiles[{position}].placement must be a LoopPlacement"
-            )
+        _validate_loop_placement(tile.placement, f"tiles[{position}].placement")
         if not _is_non_bool_int(tile.width):
             raise VerificationError("LoopPlan tile widths must be integers")
         if type(tile.parallel) is not bool or type(tile.unroll) is not bool:
@@ -328,15 +396,6 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             raise VerificationError(
                 "LoopPlan tile accumulation must be 'stack', 'direct', or 'heap'"
             )
-        placement = tile.placement
-        if type(placement.kind) is not PlacementKind:
-            raise VerificationError("LoopPlan placement kind must be a PlacementKind")
-        if placement.parent is not None:
-            _validate_loop_ref(placement.parent, f"tiles[{position}].placement.parent")
-        if placement.depth is not None and not _is_non_bool_int(placement.depth):
-            raise VerificationError(
-                "LoopPlan placement depth must be an integer or None"
-            )
     if type(typed_plan.panel_bounds) is not tuple:
         raise VerificationError("LoopPlan.panel_bounds must be a tuple")
     for position, bound in enumerate(typed_plan.panel_bounds):
@@ -344,6 +403,11 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             raise VerificationError(
                 f"LoopPlan panel_bounds[{position}] must be a PanelBound"
             )
+        _validate_stored_fields(
+            bound,
+            f"panel_bounds[{position}]",
+            ("loop", "tensor_id", "level"),
+        )
         _validate_loop_ref(bound.loop, f"panel_bounds[{position}].loop")
         _validate_symbol_id(bound.tensor_id, f"panel_bounds[{position}].tensor_id")
         if not _is_non_bool_int(bound.level):
@@ -354,6 +418,21 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
                 "LoopPlan.relayout must be an OperandRelayout or None"
             )
         relayout = typed_plan.relayout
+        _validate_stored_fields(
+            relayout,
+            "relayout",
+            (
+                "operand_id",
+                "pack_loop",
+                "panel_loop",
+                "scope_loop",
+                "row_loop",
+                "strip_width",
+                "access_indices",
+                "operand_panel_level",
+                "operand_pack_level",
+            ),
+        )
         _validate_symbol_id(relayout.operand_id, "relayout.operand_id")
         for field, loop in (
             ("pack_loop", relayout.pack_loop),
@@ -376,6 +455,17 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
         if type(typed_plan.result_tile) is not ResultTile:
             raise VerificationError("LoopPlan.result_tile must be a ResultTile or None")
         result_tile = typed_plan.result_tile
+        _validate_stored_fields(
+            result_tile,
+            "result_tile",
+            (
+                "result_id",
+                "tile_loop",
+                "result_level",
+                "result_prefix",
+                "access_indices",
+            ),
+        )
         _validate_symbol_id(result_tile.result_id, "result_tile.result_id")
         _validate_loop_ref(result_tile.tile_loop, "result_tile.tile_loop")
         if not _is_non_bool_int(result_tile.result_level):
@@ -581,5 +671,10 @@ def verify_scheduled_cin(scheduled: ScheduledCIN) -> ScheduledCIN:
 
     if type(scheduled) is not ScheduledCIN:
         raise VerificationError("ScheduledCIN verifier received the wrong artifact")
+    _validate_stored_fields(
+        scheduled,
+        "scheduled carrier",
+        ("normalized_cin", "verified_loop_plan"),
+    )
     verify_loop_plan(scheduled.normalized_cin, scheduled.verified_loop_plan)
     return scheduled
