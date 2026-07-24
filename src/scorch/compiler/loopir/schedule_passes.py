@@ -13,7 +13,19 @@ for the migrated schedule families:
   artifact-local :class:`~scorch.compiler.loopir.nodes.TileId`, mirroring
   the legacy placement semantics (``outermost`` / ``child_of`` /
   ``at_depth`` resolved against the current chain, applied in plan tile
-  order).
+  order);
+- :func:`apply_stack_tile` strip-mines the trailing dense free loop of a
+  reduction chain into the same origin/point pair *and* materializes the
+  legacy stack workspace as a structured
+  :class:`~scorch.compiler.loopir.nodes.WorkspaceRegion`: the reduction
+  loops move into the region's producer (accumulating into the workspace
+  through the point loop), and the consumer copies the tile out with a
+  second point loop of the same split — exactly the legacy
+  ``wksp[kTile]`` producer/consumer shape ``insert_workspace`` +
+  ``add_tile`` produce.  The workspace's extent is intrinsic to the
+  split's width; allocation and zero-reset are intrinsic region-entry
+  semantics.  Placement resolves against the loops that remain above the
+  region, mirroring the legacy prefix-of-``Where`` rule.
 
 :func:`apply_schedule_plan` drives both and returns a
 :class:`ScheduledLoopIR` artifact that retains the unscheduled base
@@ -90,6 +102,7 @@ from .nodes import (
     MergedSparseFor,
     PositionId,
     PositionValue,
+    ReduceOp,
     SparseCursorDecl,
     SparseFor,
     Stmt,
@@ -98,11 +111,15 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    WorkspaceRead,
+    WorkspaceReduce,
+    WorkspaceRegion,
 )
 from .verifier import verify_program
 
 _LoopNode = Union[DenseFor, SparseFor, MergedSparseFor, TileOuterFor, TileInnerFor]
 _LeafNode = Union[Store, StoreReduce, AppendEntry]
+_ChainEnd = Union[Store, StoreReduce, AppendEntry, WorkspaceRegion]
 
 _LOOP_TYPES = (DenseFor, SparseFor, MergedSparseFor, TileOuterFor, TileInnerFor)
 _LEAF_TYPES = (Store, StoreReduce, AppendEntry)
@@ -178,11 +195,15 @@ def _loop_key(node: _LoopNode) -> Tuple[IndexId, LoopPart]:
     return node.coord_index, LoopPart.LOGICAL
 
 
-def _decompose_chain(program: LoopProgram) -> Tuple[List[_LoopNode], _LeafNode]:
-    """Split one migrated-family program into its loop chain and leaf."""
+def _decompose_body(
+    body: Stmt,
+    *,
+    leaf_types: Tuple[type, ...],
+    allow_empty: bool,
+) -> Tuple[List[_LoopNode], Stmt]:
+    """Walk one single-statement chain of loops down to its terminator."""
 
     loops: List[_LoopNode] = []
-    body: Stmt = program.body
     while True:
         if type(body) is not Block or len(body.statements) != 1:
             _fail(
@@ -195,24 +216,58 @@ def _decompose_chain(program: LoopProgram) -> Tuple[List[_LoopNode], _LeafNode]:
             loops.append(only)  # type: ignore[arg-type]
             body = only.body  # type: ignore[attr-defined]
             continue
-        if type(only) in _LEAF_TYPES:
-            if not loops:
+        if type(only) in leaf_types:
+            if not loops and not allow_empty:
                 _fail(
                     "unsupported_schedule_shape",
                     "scheduling passes require at least one loop",
                 )
-            return loops, only  # type: ignore[return-value]
+            return loops, only
         _fail(
             "unsupported_schedule_shape",
             f"unsupported chain statement {type(only).__name__}",
         )
 
 
+def _decompose_chain(program: LoopProgram) -> Tuple[List[_LoopNode], _ChainEnd]:
+    """Split one migrated-family program into its loop chain and terminator.
+
+    The terminator is an ordinary store/append leaf, or — for programs a
+    stack tile already transformed — one :class:`WorkspaceRegion`.
+    """
+
+    loops, end = _decompose_body(
+        program.body,
+        leaf_types=(*_LEAF_TYPES, WorkspaceRegion),
+        allow_empty=False,
+    )
+    return loops, end  # type: ignore[return-value]
+
+
+def _decompose_region(
+    region: WorkspaceRegion,
+) -> Tuple[List[_LoopNode], WorkspaceReduce, List[_LoopNode], StoreReduce]:
+    """Split one workspace region into its producer and consumer chains."""
+
+    producer_loops, producer_leaf = _decompose_body(
+        region.producer, leaf_types=(WorkspaceReduce,), allow_empty=False
+    )
+    consumer_loops, consumer_leaf = _decompose_body(
+        region.consumer, leaf_types=(StoreReduce,), allow_empty=False
+    )
+    return (
+        producer_loops,
+        producer_leaf,  # type: ignore[return-value]
+        consumer_loops,
+        consumer_leaf,  # type: ignore[return-value]
+    )
+
+
 def _rebuild_program(
     program: LoopProgram,
     builder: LoopIRBuilder,
     loops: Sequence[_LoopNode],
-    leaf: _LeafNode,
+    leaf: _ChainEnd,
 ) -> LoopProgram:
     """Reassemble the chain with fresh loop/block nodes and shared subtrees."""
 
@@ -324,6 +379,12 @@ def reorder_loops(program: LoopProgram, loop_order: Sequence[IndexId]) -> LoopPr
 
     verify_program(program)
     loops, leaf = _decompose_chain(program)
+    if type(leaf) is WorkspaceRegion:
+        _fail(
+            "reorder_split_chain",
+            "loop reorder operates on unsplit logical chains; the chain "
+            "already carries a workspace region",
+        )
     for node in loops:
         if type(node) in (TileOuterFor, TileInnerFor):
             _fail(
@@ -529,6 +590,225 @@ def apply_affine_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
     return _rebuild_program(program, builder, new_chain, leaf)
 
 
+def apply_stack_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
+    """Strip-mine the trailing free loop with stack (workspace) accumulation.
+
+    Mirrors the legacy ``insert_workspace`` + ``add_tile`` composition in
+    one fused rebuild: the reduction chain from the *last* reduction loop
+    down becomes the region's producer accumulating into a width-cell
+    workspace through the point loop, the consumer copies the tile out to
+    the result with a second point loop, and the origin loop is inserted at
+    the requested placement resolved against the loops that remain above
+    the region (the legacy prefix-of-``Where`` rule).  The legacy legality
+    boundary is mirrored exactly: the target must be the single trailing
+    dense free loop after the last reduction of a dense-output ADD
+    reduction (``stack_tile_target_invalid``), and the region may not
+    replace the chain root (``stack_tile_root_scope``).
+    """
+
+    verify_program(program)
+    if type(tile) is not LoopTile:
+        raise TypeError("apply_stack_tile expects a LoopTile")
+    try:
+        _validate_loop_plan_structure(LoopPlan(loop_order=(), tiles=(tile,)))
+    except (VerificationError, AttributeError, TypeError, ValueError) as error:
+        _fail("invalid_schedule_tile", str(error))
+    if type(tile.loop) is not LoopRef or tile.loop.part is not LoopPart.LOGICAL:
+        _fail(
+            "tile_target_not_logical",
+            "affine tiles must target one unsplit logical loop",
+        )
+    if tile.kind != "affine":
+        _fail(
+            "unsupported_schedule_panel",
+            "sparse coordinate panel tiling is not a migrated schedule " "family",
+        )
+    if tile.accumulation != "stack":
+        _fail(
+            "unsupported_schedule_accumulation",
+            f"apply_stack_tile applies 'stack' accumulation only, got "
+            f"{tile.accumulation!r}",
+        )
+    if tile.parallel:
+        _fail(
+            "unsupported_schedule_parallel",
+            "explicit parallel tile selection is not a migrated schedule " "family",
+        )
+    if (
+        type(tile.width) is not int
+        or tile.width < 1
+        or tile.width > MAX_AFFINE_TILE_WIDTH
+    ):
+        _fail(
+            "tile_invalid_width",
+            "affine tile widths must be positive ints representable by the "
+            "C++ constexpr int target",
+        )
+    if type(tile.placement) is not LoopPlacement:
+        _fail(
+            "tile_invalid_placement",
+            "affine tile placement must be an exact LoopPlacement",
+        )
+    _check_placement_shape(tile.placement)
+
+    loops, leaf = _decompose_chain(program)
+    if type(leaf) is WorkspaceRegion:
+        _fail(
+            "stack_tile_target_invalid",
+            "the chain already carries a workspace region; at most one "
+            "stack accumulation exists per program",
+        )
+    if type(leaf) is not StoreReduce:
+        _fail(
+            "stack_tile_target_invalid",
+            "stack accumulation requires a dense-output ADD reduction leaf",
+        )
+    target_index = tile.loop.index_id
+    for node in loops:
+        key = _loop_key(node)
+        if key[0] == target_index and key[1] is not LoopPart.LOGICAL:
+            _fail(
+                "tile_target_already_split",
+                "the requested loop already carries an affine split",
+            )
+    target_positions = [
+        position
+        for position, node in enumerate(loops)
+        if _loop_key(node) == (target_index, LoopPart.LOGICAL)
+    ]
+    if not target_positions:
+        _fail(
+            "tile_target_missing",
+            "the requested tile loop is not part of the loop chain",
+        )
+    target_position = target_positions[0]
+    target = loops[target_position]
+
+    leaf_index_ids: Set[IndexId] = set()
+    for index in leaf.indices:
+        if type(index) is not IndexValue:
+            _fail(
+                "stack_tile_target_invalid",
+                "stack accumulation requires directly bound result " "coordinates",
+            )
+        leaf_index_ids.add(index.index)
+    reduction_positions = [
+        position
+        for position, node in enumerate(loops)
+        if _loop_key(node)[0] not in leaf_index_ids
+    ]
+    if not reduction_positions:
+        _fail(
+            "stack_tile_target_invalid",
+            "stack accumulation is only supported for a trailing dense free "
+            "dimension after a reduction",
+        )
+    last_reduction = max(reduction_positions)
+    if target_position != last_reduction + 1 or target_position != len(loops) - 1:
+        # Mirrors the legacy trailing-free-accumulator boundary: exactly one
+        # free loop follows the last reduction and it is the stack target.
+        _fail(
+            "stack_tile_target_invalid",
+            "stack accumulation is only supported for a trailing dense free "
+            "dimension after a reduction",
+        )
+    if last_reduction == 0:
+        _fail(
+            "stack_tile_root_scope",
+            "stack tiling cannot wrap a workspace inserted at the root scope",
+        )
+    if type(target) is not DenseFor:
+        _fail(
+            "tile_target_not_dense",
+            "affine tiling cannot split a sparse coordinate loop; windowed "
+            "compressed iteration is not represented",
+        )
+
+    prefix = loops[:last_reduction]
+    depth = _placement_depth(prefix, tile.placement, last_reduction)
+
+    result_symbol = program.outputs[0]
+    result_decl = next(decl for decl in program.tensors if decl.symbol == result_symbol)
+
+    builder = LoopIRBuilder.resuming(program)
+    tile_id = builder.new_tile_id()
+    workspace_id = builder.new_workspace_id()
+    workspace_decl = builder.workspace_decl(
+        workspace_id, "wksp", result_decl.dtype, tile_id
+    )
+
+    reduce_leaf = builder.workspace_reduce(
+        workspace_id,
+        builder.index_value(target.index),
+        ReduceOp.ADD,
+        leaf.value,
+    )
+    producer_body: Block = builder.block((reduce_leaf,))
+    producer_point = builder.tile_inner_for(
+        tile_id,
+        target.index,
+        target.dimension,
+        tile.width,
+        tile.unroll,
+        producer_body,
+    )
+    producer_stmt: Stmt = producer_point
+    for node in reversed(loops[last_reduction:target_position]):
+        if type(node) is DenseFor:
+            producer_stmt = builder.dense_for(
+                node.index, node.dimension, builder.block((producer_stmt,))
+            )
+        elif type(node) is SparseFor:
+            producer_stmt = builder.sparse_for(
+                node.cursor,
+                node.position,
+                node.coord_index,
+                builder.block((producer_stmt,)),
+            )
+        else:
+            # Merged reductions are analysis-rejected upstream, and a split
+            # loop between the last reduction and the target is impossible
+            # (the target immediately follows the last reduction).
+            _fail(
+                "stack_tile_target_invalid",
+                "stack accumulation supports dense and single-cursor sparse "
+                "reduction loops only",
+            )
+
+    copy_out = builder.store_reduce(
+        leaf.tensor,
+        leaf.indices,
+        leaf.op,
+        builder.workspace_read(workspace_id, builder.index_value(target.index)),
+    )
+    consumer_point = builder.tile_inner_for(
+        tile_id,
+        target.index,
+        target.dimension,
+        tile.width,
+        tile.unroll,
+        builder.block((copy_out,)),
+    )
+
+    region = builder.workspace_region(
+        workspace_decl,
+        builder.block((producer_stmt,)),
+        builder.block((consumer_point,)),
+    )
+    outer = builder.tile_outer_for(
+        tile_id,
+        target.index,
+        target.dimension,
+        tile.width,
+        # The outer body is reassembled by _rebuild_program; this placeholder
+        # block is replaced there and never enters the rebuilt tree.
+        target.body,
+    )
+    new_chain: List[_LoopNode] = list(prefix)
+    new_chain.insert(depth, outer)
+    return _rebuild_program(program, builder, new_chain, region)
+
+
 def _check_plan_families(plan: LoopPlan) -> None:
     """Fail closed on every plan fact outside the migrated schedule families."""
 
@@ -564,11 +844,12 @@ def _check_plan_families(plan: LoopPlan) -> None:
                 "unsupported_schedule_panel",
                 "sparse coordinate panel tiling is not a migrated schedule " "family",
             )
-        if tile.accumulation != "direct":
+        if tile.accumulation not in ("direct", "stack"):
             _fail(
                 "unsupported_schedule_accumulation",
-                f"{tile.accumulation!r} accumulation needs the workspace "
-                "families; only direct accumulation is migrated",
+                f"{tile.accumulation!r} accumulation needs the heap result-"
+                "tile family; only direct and stack accumulation are "
+                "migrated",
             )
         if tile.parallel:
             _fail(
@@ -642,20 +923,33 @@ def _validate_plan_for_pass(plan: object) -> LoopPlan:
     return checked
 
 
+def _loop_provenance(node: _LoopNode) -> ScheduledLoopProvenance:
+    index, part = _loop_key(node)
+    tile = (
+        node.tile  # type: ignore[union-attr]
+        if type(node) in (TileOuterFor, TileInnerFor)
+        else None
+    )
+    return ScheduledLoopProvenance(tile, index, part)
+
+
 def _chain_provenance(
     program: LoopProgram,
 ) -> Tuple[ScheduledLoopProvenance, ...]:
-    loops, _ = _decompose_chain(program)
-    provenance: List[ScheduledLoopProvenance] = []
-    for node in loops:
-        index, part = _loop_key(node)
-        tile = (
-            node.tile  # type: ignore[union-attr]
-            if type(node) in (TileOuterFor, TileInnerFor)
-            else None
-        )
-        provenance.append(ScheduledLoopProvenance(tile, index, part))
-    return tuple(provenance)
+    """The scheduled chain, outermost first.
+
+    For a workspace-region program the documented order is: the prefix
+    loops above the region, then the producer chain, then the consumer
+    chain — the region's execution order.
+    """
+
+    loops, leaf = _decompose_chain(program)
+    ordered: List[_LoopNode] = list(loops)
+    if type(leaf) is WorkspaceRegion:
+        producer_loops, _, consumer_loops, _ = _decompose_region(leaf)
+        ordered.extend(producer_loops)
+        ordered.extend(consumer_loops)
+    return tuple(_loop_provenance(node) for node in ordered)
 
 
 def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
@@ -664,7 +958,10 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
     checked = _validate_plan_for_pass(plan)
     scheduled = reorder_loops(program, checked.loop_order)
     for tile in checked.tiles:
-        scheduled = apply_affine_tile(scheduled, tile)
+        if tile.accumulation == "stack":
+            scheduled = apply_stack_tile(scheduled, tile)
+        else:
+            scheduled = apply_affine_tile(scheduled, tile)
     return scheduled
 
 
@@ -733,11 +1030,14 @@ def _verify_scheduled_loopir(
     checked_plan = _validate_plan_for_pass(artifact.plan)
     verify_program(base_program)
     verify_program(program)
-    base_loops, _ = _decompose_chain(base_program)
-    if any(type(loop) in (TileOuterFor, TileInnerFor) for loop in base_loops):
+    base_loops, base_leaf = _decompose_chain(base_program)
+    if type(base_leaf) is WorkspaceRegion or any(
+        type(loop) in (TileOuterFor, TileInnerFor) for loop in base_loops
+    ):
         _fail(
             "scheduled_base_not_unscheduled",
-            "ScheduledLoopIR.base_program must not already contain split loops",
+            "ScheduledLoopIR.base_program must not already contain split "
+            "loops or workspace regions",
         )
 
     replayed = (
@@ -791,6 +1091,18 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
     ``TileInnerFor`` becomes a plain ``DenseFor`` at the point loop's chain
     position and the paired ``TileOuterFor`` is dropped, which restores
     exactly the pre-tiling chain (splitting never moves the point loop).
+
+    A workspace region erases to its direct-accumulation equivalent: the
+    producer chain returns to the main chain with the original result
+    reduction as its leaf (the consumer's target combined with the
+    producer's value), and the consumer's copy-out loop disappears.  This
+    is semantics-preserving under the family's explicit ADD-reassociation
+    contract — accumulating into zero-initialized workspace cells and then
+    ADD-copying them out is a reassociation of the direct ADD reduction.
+    The erasure is defined for the exact copy-out form
+    :func:`apply_stack_tile` produces; other verified region consumers fail
+    closed (``unsupported_schedule_shape``).
+
     This is the semantics-preserving erasure the oracle differentials use
     to prove scheduled programs visit every iteration point exactly once.
     A program with no splits is returned unchanged.
@@ -798,15 +1110,44 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
 
     verify_program(program)
     loops, leaf = _decompose_chain(program)
-    if not any(type(node) in (TileOuterFor, TileInnerFor) for node in loops):
+    region_loops: List[_LoopNode] = []
+    erased_leaf: _ChainEnd = leaf
+    if type(leaf) is WorkspaceRegion:
+        producer_loops, producer_leaf, consumer_loops, consumer_leaf = (
+            _decompose_region(leaf)
+        )
+        workspace_id = leaf.workspace.workspace
+        copy_out_value = consumer_leaf.value
+        if (
+            len(consumer_loops) != 1
+            or type(consumer_loops[0]) is not TileInnerFor
+            or type(copy_out_value) is not WorkspaceRead
+            or copy_out_value.workspace != workspace_id
+            or producer_leaf.workspace != workspace_id
+        ):
+            _fail(
+                "unsupported_schedule_shape",
+                "workspace-region erasure is defined for the exact "
+                "stack-tile copy-out form only",
+            )
+        builder = LoopIRBuilder.resuming(program)
+        region_loops = producer_loops
+        erased_leaf = builder.store_reduce(
+            consumer_leaf.tensor,
+            consumer_leaf.indices,
+            consumer_leaf.op,
+            producer_leaf.value,
+        )
+    elif not any(type(node) in (TileOuterFor, TileInnerFor) for node in loops):
         return program
-    builder = LoopIRBuilder.resuming(program)
+    else:
+        builder = LoopIRBuilder.resuming(program)
     erased: List[_LoopNode] = []
-    for node in loops:
+    for node in (*loops, *region_loops):
         if type(node) is TileOuterFor:
             continue
         if type(node) is TileInnerFor:
             erased.append(builder.dense_for(node.index, node.dimension, node.body))
         else:
             erased.append(node)
-    return _rebuild_program(program, builder, erased, leaf)
+    return _rebuild_program(program, builder, erased, leaf=erased_leaf)
