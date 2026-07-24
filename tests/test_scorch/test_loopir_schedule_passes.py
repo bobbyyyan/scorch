@@ -752,8 +752,10 @@ def test_apply_schedule_plan_rejects_unmigrated_families():
     lowering = lower(cin)
     order = lowering.loop_index_ids
     a_symbol = lowering.input_symbols[0]
+    # Panels are a migrated family now: a bound with no panel tile to
+    # consume it is a malformed panel plan, not an unmigrated one.
     expect_code(
-        "unsupported_schedule_panel",
+        "invalid_schedule_panel",
         apply_schedule_plan,
         lowering.program,
         LoopPlan(
@@ -1509,3 +1511,767 @@ def test_reorder_rejects_region_chains():
         scheduled,
         lowering.loop_index_ids,
     )
+
+
+# -- sparse panel windows (Phase-6 panel slice) --------------------------------
+
+from scorch.compiler.loop_plan import PanelBound  # noqa: E402
+from scorch.compiler.loopir.nodes import (  # noqa: E402
+    PanelOuterFor,
+    SparseFor,
+    SparseWindowFor,
+)
+from scorch.compiler.loopir.schedule_passes import apply_panel_tile  # noqa: E402
+
+
+def panel_tile(index_id, width, placement=None):
+    # unroll=True mirrors the public TileSpec default; the legacy panel
+    # lowering ignores the flag, so the typed family accepts and ignores it
+    # the same way.
+    return LoopTile(
+        loop=LoopRef(index_id),
+        width=width,
+        placement=placement or outermost_placement(),
+        parallel=False,
+        kind="panel",
+        accumulation="direct",
+        unroll=True,
+    )
+
+
+def spmm_panel_parts(width=3, placement=None):
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    b_symbol = lowering.input_symbols[1]
+    tile = panel_tile(j.index_id, width, placement=placement)
+    bound = PanelBound(LoopRef(j.index_id), b_symbol, 0)
+    parallel = LoopRef(i.index_id)
+    return lowering, (i, j, k), tile, bound, parallel
+
+
+def test_apply_panel_tile_builds_the_window_shape():
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts(width=3)
+    windowed = apply_panel_tile(lowering.program, tile, bound, parallel)
+    verify_program(windowed)
+    assert chain_types(windowed) == [PanelOuterFor, DenseFor, SparseWindowFor, DenseFor]
+    panel = windowed.body.statements[0]
+    window = panel.body.statements[0].body.statements[0]
+    assert panel.tile == window.tile
+    assert panel.index == j.index_id == window.coord_index
+    assert panel.width == 3
+    assert panel.bound_tensor == bound.tensor_id
+    assert panel.bound_level == 0
+    base_window = lowering.program.body.statements[0].body.statements[0]
+    assert window.cursor is base_window.cursor
+    assert window.position == base_window.position
+
+
+def test_apply_panel_tile_is_pure_and_deterministic():
+    lowering, _ids, tile, bound, parallel = spmm_panel_parts(width=4)
+    before = canonical_program_dump(lowering.program)
+    first = apply_panel_tile(lowering.program, tile, bound, parallel)
+    second = apply_panel_tile(lowering.program, tile, bound, parallel)
+    assert canonical_program_dump(lowering.program) == before
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+
+
+def test_panel_canonical_dumps_are_stable_across_identity_histories():
+    from scorch.compiler.identity import new_index_id, new_symbol_id
+
+    lowering, _ids, tile, bound, parallel = spmm_panel_parts(width=5)
+    first = apply_panel_tile(lowering.program, tile, bound, parallel)
+    for _ in range(64):
+        new_symbol_id()
+        new_index_id()
+    lowering2, _ids2, tile2, bound2, parallel2 = spmm_panel_parts(width=5)
+    second = apply_panel_tile(lowering2.program, tile2, bound2, parallel2)
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+
+
+def test_apply_panel_tile_child_of_wraps_below_the_affine_origin():
+    lowering, (i, j, k), _tile, bound, parallel = spmm_panel_parts()
+    tiled = apply_affine_tile(lowering.program, affine_tile(k.index_id, 4))
+    tile = panel_tile(
+        j.index_id,
+        3,
+        placement=LoopPlacement(
+            PlacementKind.CHILD_OF, parent=LoopRef(k.index_id, LoopPart.OUTER)
+        ),
+    )
+    windowed = apply_panel_tile(tiled, tile, bound, parallel)
+    assert chain_types(windowed) == [
+        TileOuterFor,
+        PanelOuterFor,
+        DenseFor,
+        SparseWindowFor,
+        TileInnerFor,
+    ]
+
+
+def test_apply_panel_tile_target_legality_mirrors_legacy():
+    # A dense loop is not a panel target.
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    expect_code(
+        "panel_target_invalid",
+        apply_panel_tile,
+        lowering.program,
+        panel_tile(j.index_id, 3),
+        PanelBound(LoopRef(j.index_id), lowering.input_symbols[1], 1),
+        LoopRef(i.index_id),
+    )
+
+    # Ordered sparse assembly pins its nest.
+    cin, (i, j) = build_union_add_to_csr()
+    lowering = lower(cin)
+    expect_code(
+        "panel_target_invalid",
+        apply_panel_tile,
+        lowering.program,
+        panel_tile(j.index_id, 3),
+        PanelBound(LoopRef(j.index_id), lowering.input_symbols[0], 1),
+        LoopRef(i.index_id),
+    )
+
+    # A merged coordinate loop is outside the single-cursor family.
+    i2, j2 = IndexVar("i"), IndexVar("j")
+    a2 = TensorVar("A", fmt="ds")
+    b2 = TensorVar("B", fmt="ds")
+    c2 = TensorVar("C", fmt="dd")
+    union_dense = ForAll(
+        i2,
+        ForAll(
+            j2,
+            TensorAssign(
+                c2[i2, j2], CINBinaryOp(Operation.ADD, a2[i2, j2], b2[i2, j2])
+            ),
+        ),
+    )
+    lowering = lower(union_dense)
+    expect_code(
+        "panel_target_invalid",
+        apply_panel_tile,
+        lowering.program,
+        panel_tile(j2.index_id, 3),
+        PanelBound(LoopRef(j2.index_id), lowering.input_symbols[0], 1),
+        LoopRef(i2.index_id),
+    )
+
+    # A missing target and a split target keep the shared tile codes.
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    expect_code(
+        "tile_target_missing",
+        apply_panel_tile,
+        lowering.program,
+        panel_tile(IndexId(999_999), 3),
+        PanelBound(LoopRef(IndexId(999_999)), bound.tensor_id, 0),
+        parallel,
+    )
+    tiled = apply_affine_tile(lowering.program, affine_tile(k.index_id, 4))
+    expect_code(
+        "tile_target_already_split",
+        apply_panel_tile,
+        tiled,
+        panel_tile(k.index_id, 3),
+        PanelBound(LoopRef(k.index_id), bound.tensor_id, 1),
+        parallel,
+    )
+
+    # A workspace-region chain refuses panel composition.
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    stacked = apply_stack_tile(
+        lowering.program, affine_tile(k.index_id, 4, accum="stack")
+    )
+    expect_code(
+        "panel_target_invalid", apply_panel_tile, stacked, tile, bound, parallel
+    )
+
+    # A second panel refuses composition.
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    windowed = apply_panel_tile(lowering.program, tile, bound, parallel)
+    expect_code(
+        "invalid_schedule_panel", apply_panel_tile, windowed, tile, bound, parallel
+    )
+
+    # And the affine/stack passes refuse panel-scheduled chains.
+    expect_code(
+        "unsupported_schedule_shape",
+        apply_affine_tile,
+        windowed,
+        affine_tile(k.index_id, 4),
+    )
+    expect_code(
+        "unsupported_schedule_shape",
+        apply_stack_tile,
+        windowed,
+        affine_tile(k.index_id, 4, accum="stack"),
+    )
+    expect_code(
+        "reorder_split_chain",
+        reorder_loops,
+        windowed,
+        (j.index_id, i.index_id, k.index_id),
+    )
+
+
+def test_apply_panel_tile_rejects_compressed_parent_windows():
+    """DCSR: a window over a compressed-parent cursor is not migrated."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a = builder.new_symbol_id()
+    y = builder.new_symbol_id()
+    from scorch.compiler.loopir.nodes import LevelKind, ReduceOp, ScalarType
+
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.COMPRESSED, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_y = builder.tensor(
+        y, "y", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    row_cursor = builder.new_cursor_id()
+    col_cursor = builder.new_cursor_id()
+    row_position = builder.new_position_id()
+    col_position = builder.new_position_id()
+    inner = builder.sparse_for(
+        builder.sparse_cursor(col_cursor, a, 1, builder.position_value(row_position)),
+        col_position,
+        col,
+        builder.block(
+            (
+                builder.store_reduce(
+                    y,
+                    (builder.index_value(row),),
+                    ReduceOp.ADD,
+                    builder.cursor_value(col_cursor),
+                ),
+            )
+        ),
+    )
+    outer = builder.sparse_for(
+        builder.sparse_cursor(row_cursor, a, 0, builder.root_position()),
+        row_position,
+        row,
+        builder.block((inner,)),
+    )
+    program = builder.program(
+        (dim_i, dim_j), (decl_a, decl_y), (a,), (y,), builder.block((outer,))
+    )
+    expect_code(
+        "panel_nested_compressed",
+        apply_panel_tile,
+        program,
+        panel_tile(col, 3),
+        PanelBound(LoopRef(col), a, 1),
+        LoopRef(row),
+    )
+
+
+def test_apply_panel_tile_parallel_row_scope():
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    expect_code(
+        "panel_parallel_scope", apply_panel_tile, lowering.program, tile, bound, None
+    )
+    expect_code(
+        "panel_parallel_scope",
+        apply_panel_tile,
+        lowering.program,
+        tile,
+        bound,
+        LoopRef(k.index_id),
+    )
+    expect_code(
+        "panel_parallel_scope",
+        apply_panel_tile,
+        lowering.program,
+        tile,
+        bound,
+        LoopRef(i.index_id, LoopPart.OUTER),
+    )
+
+    # child_of below the row loop cannot surround the parallel row loop.
+    lowering, (i, j, k), _tile, bound, parallel = spmm_panel_parts()
+    tiled = apply_affine_tile(
+        lowering.program,
+        affine_tile(
+            k.index_id,
+            4,
+            placement=LoopPlacement(PlacementKind.CHILD_OF, parent=LoopRef(i.index_id)),
+        ),
+    )
+    below_row = panel_tile(
+        j.index_id,
+        3,
+        placement=LoopPlacement(
+            PlacementKind.CHILD_OF, parent=LoopRef(k.index_id, LoopPart.OUTER)
+        ),
+    )
+    expect_code(
+        "panel_parallel_scope", apply_panel_tile, tiled, below_row, bound, parallel
+    )
+
+
+def test_apply_panel_tile_placement_legality():
+    lowering, (i, j, k), _tile, bound, parallel = spmm_panel_parts()
+    expect_code(
+        "panel_placement_invalid",
+        apply_panel_tile,
+        lowering.program,
+        panel_tile(
+            j.index_id, 3, placement=LoopPlacement(PlacementKind.AT_DEPTH, depth=0)
+        ),
+        bound,
+        parallel,
+    )
+    expect_code(
+        "panel_placement_invalid",
+        apply_panel_tile,
+        lowering.program,
+        panel_tile(
+            j.index_id,
+            3,
+            placement=LoopPlacement(PlacementKind.CHILD_OF, parent=LoopRef(i.index_id)),
+        ),
+        bound,
+        parallel,
+    )
+    # child_of an affine origin that is not part of the chain.
+    expect_code(
+        "panel_placement_invalid",
+        apply_panel_tile,
+        lowering.program,
+        panel_tile(
+            j.index_id,
+            3,
+            placement=LoopPlacement(
+                PlacementKind.CHILD_OF, parent=LoopRef(k.index_id, LoopPart.OUTER)
+            ),
+        ),
+        bound,
+        parallel,
+    )
+
+
+def test_apply_panel_tile_consumes_a_consistent_bound():
+    from scorch.compiler.identity import SymbolId
+
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    expect_code(
+        "invalid_schedule_panel",
+        apply_panel_tile,
+        lowering.program,
+        tile,
+        PanelBound(LoopRef(k.index_id), bound.tensor_id, 0),
+        parallel,
+    )
+    expect_code(
+        "panel_bound_mismatch",
+        apply_panel_tile,
+        lowering.program,
+        tile,
+        PanelBound(LoopRef(j.index_id), SymbolId(999_998), 0),
+        parallel,
+    )
+    # A's level 1 stores j but is compressed.
+    expect_code(
+        "panel_bound_mismatch",
+        apply_panel_tile,
+        lowering.program,
+        tile,
+        PanelBound(LoopRef(j.index_id), lowering.input_symbols[0], 1),
+        parallel,
+    )
+    # B's level 1 is dense but stores k.
+    expect_code(
+        "panel_bound_mismatch",
+        apply_panel_tile,
+        lowering.program,
+        tile,
+        PanelBound(LoopRef(j.index_id), bound.tensor_id, 1),
+        parallel,
+    )
+    expect_code(
+        "panel_bound_mismatch",
+        apply_panel_tile,
+        lowering.program,
+        tile,
+        PanelBound(LoopRef(j.index_id), bound.tensor_id, 7),
+        parallel,
+    )
+
+
+def test_apply_panel_tile_rejects_malformed_tiles_and_widths():
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    expect_code(
+        "invalid_schedule_panel",
+        apply_panel_tile,
+        lowering.program,
+        affine_tile(j.index_id, 3),
+        bound,
+        parallel,
+    )
+    stack_panel = LoopTile(
+        loop=LoopRef(j.index_id),
+        width=3,
+        placement=outermost_placement(),
+        parallel=False,
+        kind="panel",
+        accumulation="stack",
+        unroll=False,
+    )
+    expect_code(
+        "invalid_schedule_panel",
+        apply_panel_tile,
+        lowering.program,
+        stack_panel,
+        bound,
+        parallel,
+    )
+    parallel_panel = LoopTile(
+        loop=LoopRef(j.index_id),
+        width=3,
+        placement=outermost_placement(),
+        parallel=True,
+        kind="panel",
+        accumulation="direct",
+        unroll=False,
+    )
+    expect_code(
+        "invalid_schedule_panel",
+        apply_panel_tile,
+        lowering.program,
+        parallel_panel,
+        bound,
+        parallel,
+    )
+    expect_code(
+        "tile_invalid_width",
+        apply_panel_tile,
+        lowering.program,
+        panel_tile(j.index_id, MAX_AFFINE_TILE_WIDTH + 1),
+        bound,
+        parallel,
+    )
+    forged = panel_tile(j.index_id, 3)
+    object.__delattr__(forged, "width")
+    expect_code(
+        "invalid_schedule_tile",
+        apply_panel_tile,
+        lowering.program,
+        forged,
+        bound,
+        parallel,
+    )
+    forged_bound = PanelBound(LoopRef(j.index_id), bound.tensor_id, 0)
+    object.__setattr__(forged_bound, "level", "0")
+    expect_code(
+        "invalid_schedule_tile",
+        apply_panel_tile,
+        lowering.program,
+        tile,
+        forged_bound,
+        parallel,
+    )
+
+
+def panel_plan(order, tile, bound, parallel):
+    return LoopPlan(
+        loop_order=order,
+        tiles=(tile,) if not isinstance(tile, tuple) else tile,
+        panel_bounds=(bound,),
+        parallel_loop=parallel,
+        provenance="explicit",
+        tag="panel",
+    )
+
+
+def test_panel_plan_applies_through_apply_schedule_plan():
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    order = lowering.loop_index_ids
+    artifact = apply_schedule_plan(
+        lowering.program, panel_plan(order, tile, bound, parallel)
+    )
+    verify_scheduled_loopir(artifact)
+    assert chain_types(artifact.program) == [
+        PanelOuterFor,
+        DenseFor,
+        SparseWindowFor,
+        DenseFor,
+    ]
+    parts = [(prov.part, prov.tile is not None) for prov in artifact.loops]
+    assert parts == [
+        (LoopPart.OUTER, True),
+        (LoopPart.LOGICAL, False),
+        (LoopPart.INNER, True),
+        (LoopPart.LOGICAL, False),
+    ]
+    assert artifact.loops[0].index == j.index_id
+    assert artifact.loops[2].index == j.index_id
+
+
+def test_panel_plan_composes_with_direct_tiles():
+    lowering, (i, j, k), _tile, bound, parallel = spmm_panel_parts()
+    order = lowering.loop_index_ids
+    plan = LoopPlan(
+        loop_order=order,
+        tiles=(
+            affine_tile(k.index_id, 4),
+            panel_tile(
+                j.index_id,
+                3,
+                placement=LoopPlacement(
+                    PlacementKind.CHILD_OF, parent=LoopRef(k.index_id, LoopPart.OUTER)
+                ),
+            ),
+        ),
+        panel_bounds=(bound,),
+        parallel_loop=parallel,
+        provenance="explicit",
+        tag="panel-child",
+    )
+    artifact = apply_schedule_plan(lowering.program, plan)
+    verify_scheduled_loopir(artifact)
+    assert chain_types(artifact.program) == [
+        TileOuterFor,
+        PanelOuterFor,
+        DenseFor,
+        SparseWindowFor,
+        TileInnerFor,
+    ]
+
+
+def test_panel_plan_gate_failures():
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    order = lowering.loop_index_ids
+
+    # Two panels.
+    two = LoopPlan(
+        loop_order=order,
+        tiles=(tile, panel_tile(k.index_id, 2)),
+        panel_bounds=(bound, PanelBound(LoopRef(k.index_id), bound.tensor_id, 1)),
+        parallel_loop=parallel,
+    )
+    expect_code("invalid_schedule_panel", apply_schedule_plan, lowering.program, two)
+
+    # Panel before an affine tile.
+    out_of_order = LoopPlan(
+        loop_order=order,
+        tiles=(tile, affine_tile(k.index_id, 4)),
+        panel_bounds=(bound,),
+        parallel_loop=parallel,
+    )
+    expect_code(
+        "invalid_schedule_panel", apply_schedule_plan, lowering.program, out_of_order
+    )
+
+    # Bound-correspondence failures.
+    for bounds in ((), (PanelBound(LoopRef(k.index_id), bound.tensor_id, 1),)):
+        broken = LoopPlan(
+            loop_order=order,
+            tiles=(tile,),
+            panel_bounds=bounds,
+            parallel_loop=parallel,
+        )
+        expect_code(
+            "invalid_schedule_panel", apply_schedule_plan, lowering.program, broken
+        )
+
+    # The mandatory parallel row loop.
+    unparallel = LoopPlan(
+        loop_order=order, tiles=(tile,), panel_bounds=(bound,), parallel_loop=None
+    )
+    expect_code(
+        "panel_parallel_scope", apply_schedule_plan, lowering.program, unparallel
+    )
+    split_parallel = LoopPlan(
+        loop_order=order,
+        tiles=(tile,),
+        panel_bounds=(bound,),
+        parallel_loop=LoopRef(i.index_id, LoopPart.OUTER),
+    )
+    expect_code(
+        "panel_parallel_scope", apply_schedule_plan, lowering.program, split_parallel
+    )
+
+    # child_of placements must name an outermost-placed affine tile.
+    nested_parent = LoopPlan(
+        loop_order=order,
+        tiles=(
+            affine_tile(
+                k.index_id,
+                4,
+                placement=LoopPlacement(
+                    PlacementKind.CHILD_OF, parent=LoopRef(i.index_id)
+                ),
+            ),
+            panel_tile(
+                j.index_id,
+                3,
+                placement=LoopPlacement(
+                    PlacementKind.CHILD_OF, parent=LoopRef(k.index_id, LoopPart.OUTER)
+                ),
+            ),
+        ),
+        panel_bounds=(bound,),
+        parallel_loop=parallel,
+    )
+    expect_code(
+        "panel_placement_invalid", apply_schedule_plan, lowering.program, nested_parent
+    )
+    at_depth = LoopPlan(
+        loop_order=order,
+        tiles=(
+            panel_tile(
+                j.index_id, 3, placement=LoopPlacement(PlacementKind.AT_DEPTH, depth=0)
+            ),
+        ),
+        panel_bounds=(bound,),
+        parallel_loop=parallel,
+    )
+    expect_code(
+        "panel_placement_invalid", apply_schedule_plan, lowering.program, at_depth
+    )
+
+
+def test_panel_erasure_restores_the_base_program():
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    windowed = apply_panel_tile(lowering.program, tile, bound, parallel)
+    erased = erase_schedule(windowed)
+    assert canonical_program_dump(erased) == canonical_program_dump(lowering.program)
+    assert chain_types(erased) == [DenseFor, SparseFor, DenseFor]
+
+    tiled = apply_affine_tile(lowering.program, affine_tile(k.index_id, 4))
+    both = apply_panel_tile(
+        tiled,
+        panel_tile(
+            j.index_id,
+            3,
+            placement=LoopPlacement(
+                PlacementKind.CHILD_OF, parent=LoopRef(k.index_id, LoopPart.OUTER)
+            ),
+        ),
+        bound,
+        parallel,
+    )
+    erased_both = erase_schedule(both)
+    assert canonical_program_dump(erased_both) == canonical_program_dump(
+        lowering.program
+    )
+
+
+def test_panel_scheduled_iteration_matches_the_base_oracle_exactly():
+    """Exact integer-float counting across ragged, unit, exact, oversized,
+    and huge widths, with an empty CSR row and disjoint supports: a missed
+    or doubled window entry changes the counted result."""
+
+    from scorch.compiler.loopir.levels import CsrMatrix
+
+    a_dense = [
+        [1.0, 0.0, 2.0, 0.0, 3.0],
+        [0.0] * 5,
+        [4.0, 5.0, 0.0, 0.0, 6.0],
+        [0.0, 0.0, 0.0, 7.0, 0.0],
+    ]
+    b_dense = [[float(1 + r * 6 + c) for c in range(6)] for r in range(5)]
+    for width in (1, 2, 3, 5, 7, MAX_AFFINE_TILE_WIDTH):
+        lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts(width=width)
+        base_out = run_program(
+            lowering.program,
+            {
+                lowering.input_symbols[0]: CsrMatrix.from_dense(a_dense),
+                lowering.input_symbols[1]: b_dense,
+            },
+            {lowering.result_symbol: (4, 6)},
+        )
+        windowed = apply_panel_tile(lowering.program, tile, bound, parallel)
+        panel_out = run_program(
+            windowed,
+            {
+                lowering.input_symbols[0]: CsrMatrix.from_dense(a_dense),
+                lowering.input_symbols[1]: b_dense,
+            },
+            {lowering.result_symbol: (4, 6)},
+        )
+        assert panel_out == base_out
+
+
+def test_panel_scheduled_oracle_matches_base_on_randomized_dimensions():
+    from scorch.compiler.loopir.levels import CsrMatrix
+
+    rng = random.Random(629)
+    for _ in range(6):
+        rows = rng.randrange(1, 6)
+        inner = rng.randrange(1, 7)
+        cols = rng.randrange(1, 5)
+        width = rng.randrange(1, inner + 3)
+        a_dense = [
+            [
+                float(rng.randrange(-3, 4)) if rng.random() < 0.5 else 0.0
+                for _ in range(inner)
+            ]
+            for _ in range(rows)
+        ]
+        b_dense = [
+            [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(inner)
+        ]
+        lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts(width=width)
+        inputs = {
+            lowering.input_symbols[0]: CsrMatrix.from_dense(a_dense),
+            lowering.input_symbols[1]: b_dense,
+        }
+        shapes = {lowering.result_symbol: (rows, cols)}
+        base_out = run_program(lowering.program, inputs, shapes)
+        windowed = apply_panel_tile(lowering.program, tile, bound, parallel)
+        assert run_program(windowed, inputs, shapes) == base_out
+
+
+def test_panel_scheduled_carrier_rejects_forged_panel_state():
+    lowering, (i, j, k), tile, bound, parallel = spmm_panel_parts()
+    order = lowering.loop_index_ids
+    artifact = apply_schedule_plan(
+        lowering.program, panel_plan(order, tile, bound, parallel)
+    )
+
+    # Forged provenance: the panel origin's tile deleted.
+    forged_loops = (
+        replace(artifact.loops[0], tile=None),
+        *artifact.loops[1:],
+    )
+    forged = ScheduledLoopIR(
+        base_program=artifact.base_program,
+        plan=artifact.plan,
+        program=artifact.program,
+        loops=forged_loops,
+    )
+    expect_code("scheduled_provenance_mismatch", verify_scheduled_loopir, forged)
+
+    # A base program that already carries the panel is not unscheduled.
+    forged_base = ScheduledLoopIR(
+        base_program=artifact.program,
+        plan=artifact.plan,
+        program=artifact.program,
+        loops=artifact.loops,
+    )
+    expect_code("scheduled_base_not_unscheduled", verify_scheduled_loopir, forged_base)
+
+    # A plan whose panel width disagrees with the program cannot replay.
+    wrong_plan = panel_plan(order, panel_tile(j.index_id, 9), bound, parallel)
+    mismatched = ScheduledLoopIR(
+        base_program=artifact.base_program,
+        plan=wrong_plan,
+        program=artifact.program,
+        loops=artifact.loops,
+    )
+    expect_code("scheduled_program_mismatch", verify_scheduled_loopir, mismatched)

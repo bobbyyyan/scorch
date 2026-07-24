@@ -1,9 +1,9 @@
 """Pure typed scheduling passes over verified production LoopIR.
 
 Phase 6 applies a verified :class:`~scorch.compiler.loop_plan.LoopPlan` to a
-verified unscheduled LoopIR program through exactly two typed
-transformations, replacing the legacy scheduler's private CIN tree surgery
-for the migrated schedule families:
+verified unscheduled LoopIR program through pure typed transformations,
+replacing the legacy scheduler's private CIN tree surgery for the migrated
+schedule families:
 
 - :func:`reorder_loops` permutes a single-chain loop nest into the plan's
   logical loop order;
@@ -25,7 +25,15 @@ for the migrated schedule families:
   ``add_tile`` produce.  The workspace's extent is intrinsic to the
   split's width; allocation and zero-reset are intrinsic region-entry
   semantics.  Placement resolves against the loops that remain above the
-  region, mirroring the legacy prefix-of-``Where`` rule.
+  region, mirroring the legacy prefix-of-``Where`` rule;
+- :func:`apply_panel_tile` windows one single-cursor compressed
+  coordinate loop into a :class:`~scorch.compiler.loopir.nodes.PanelOuterFor`
+  / :class:`~scorch.compiler.loopir.nodes.SparseWindowFor` pair,
+  mirroring the legacy sparse-panel family: the CSR dense-parent row loop
+  is the plan-mandated parallel loop, the panel origin is inserted
+  strictly above it (``outermost`` or ``child_of`` an outermost affine
+  origin loop), and the plan's ``PanelBound`` is materialized into the
+  panel's structural (tensor, level) extent source.
 
 :func:`apply_schedule_plan` drives both and returns a
 :class:`ScheduledLoopIR` artifact that retains the unscheduled base
@@ -87,6 +95,7 @@ from ..loop_plan import (
     LoopPlacement,
     LoopRef,
     LoopTile,
+    PanelBound,
     PlacementKind,
     _validate_loop_plan_structure,
 )
@@ -98,13 +107,16 @@ from .nodes import (
     DensePosition,
     Expr,
     IndexValue,
+    LevelKind,
     LoopProgram,
     MergedSparseFor,
+    PanelOuterFor,
     PositionId,
     PositionValue,
     ReduceOp,
     SparseCursorDecl,
     SparseFor,
+    SparseWindowFor,
     Stmt,
     Store,
     StoreReduce,
@@ -117,12 +129,29 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-_LoopNode = Union[DenseFor, SparseFor, MergedSparseFor, TileOuterFor, TileInnerFor]
+_LoopNode = Union[
+    DenseFor,
+    SparseFor,
+    MergedSparseFor,
+    TileOuterFor,
+    TileInnerFor,
+    PanelOuterFor,
+    SparseWindowFor,
+]
 _LeafNode = Union[Store, StoreReduce, AppendEntry]
 _ChainEnd = Union[Store, StoreReduce, AppendEntry, WorkspaceRegion]
 
-_LOOP_TYPES = (DenseFor, SparseFor, MergedSparseFor, TileOuterFor, TileInnerFor)
+_LOOP_TYPES = (
+    DenseFor,
+    SparseFor,
+    MergedSparseFor,
+    TileOuterFor,
+    TileInnerFor,
+    PanelOuterFor,
+    SparseWindowFor,
+)
 _LEAF_TYPES = (Store, StoreReduce, AppendEntry)
+_PANEL_TYPES = (PanelOuterFor, SparseWindowFor)
 
 
 @dataclass(frozen=True)
@@ -189,6 +218,10 @@ def _loop_key(node: _LoopNode) -> Tuple[IndexId, LoopPart]:
         return node.index, LoopPart.OUTER
     if type(node) is TileInnerFor:
         return node.index, LoopPart.INNER
+    if type(node) is PanelOuterFor:
+        return node.index, LoopPart.OUTER
+    if type(node) is SparseWindowFor:
+        return node.coord_index, LoopPart.INNER
     if type(node) is SparseFor:
         return node.coord_index, LoopPart.LOGICAL
     assert type(node) is MergedSparseFor
@@ -289,6 +322,20 @@ def _rebuild_program(
                 node.unroll,
                 body,
             )
+        elif type(node) is PanelOuterFor:
+            loop = builder.panel_outer_for(
+                node.tile,
+                node.index,
+                node.dimension,
+                node.width,
+                node.bound_tensor,
+                node.bound_level,
+                body,
+            )
+        elif type(node) is SparseWindowFor:
+            loop = builder.sparse_window_for(
+                node.tile, node.cursor, node.position, node.coord_index, body
+            )
         elif type(node) is SparseFor:
             loop = builder.sparse_for(
                 node.cursor, node.position, node.coord_index, body
@@ -386,11 +433,11 @@ def reorder_loops(program: LoopProgram, loop_order: Sequence[IndexId]) -> LoopPr
             "already carries a workspace region",
         )
     for node in loops:
-        if type(node) in (TileOuterFor, TileInnerFor):
+        if type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES):
             _fail(
                 "reorder_split_chain",
                 "loop reorder operates on unsplit logical chains; apply it "
-                "before affine tiling",
+                "before affine or panel tiling",
             )
     try:
         requested = tuple(loop_order)
@@ -519,6 +566,12 @@ def apply_affine_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
         )
 
     loops, leaf = _decompose_chain(program)
+    if any(type(node) in _PANEL_TYPES for node in loops):
+        _fail(
+            "unsupported_schedule_shape",
+            "affine tiling over a panel-scheduled chain is not migrated; "
+            "the panel tile applies after every affine tile",
+        )
     target_index = tile.loop.index_id
     for node in loops:
         key = _loop_key(node)
@@ -543,7 +596,7 @@ def apply_affine_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
         _fail(
             "tile_target_not_dense",
             "affine tiling cannot split a sparse coordinate loop; windowed "
-            "compressed iteration is not represented",
+            "compressed iteration is the panel family's job",
         )
     if (
         type(tile.width) is not int
@@ -651,6 +704,12 @@ def apply_stack_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
     _check_placement_shape(tile.placement)
 
     loops, leaf = _decompose_chain(program)
+    if any(type(node) in _PANEL_TYPES for node in loops):
+        _fail(
+            "unsupported_schedule_shape",
+            "stack tiling over a panel-scheduled chain is not migrated; "
+            "the panel tile applies after every affine tile",
+        )
     if type(leaf) is WorkspaceRegion:
         _fail(
             "stack_tile_target_invalid",
@@ -808,19 +867,280 @@ def apply_stack_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
     return _rebuild_program(program, builder, new_chain, region)
 
 
+def apply_panel_tile(
+    program: LoopProgram,
+    tile: LoopTile,
+    bound: PanelBound,
+    parallel_loop: Optional[LoopRef],
+) -> LoopProgram:
+    """Window one compressed coordinate loop of a verified single-chain nest.
+
+    Mirrors the legacy sparse-panel family exactly: the target must be a
+    single-cursor compressed coordinate loop whose dominating parent is a
+    dense position (the CSR form — a compressed-parent window is the
+    ``panel_nested_compressed`` boundary), the plan's ``parallel_loop``
+    must name that dense parent row loop (``panel_parallel_scope`` — the
+    fact has no degrees of freedom, so validating it consumes it), and the
+    panel origin is inserted strictly above the row loop: ``outermost``
+    wraps the chain root, ``child_of`` wraps the loop below the named
+    affine origin loop, and ``at_depth`` is not a supported panel
+    placement (``panel_placement_invalid``).  The ``PanelBound`` fact is
+    consumed by materializing it into the ``PanelOuterFor``'s structural
+    (tensor, level) extent source after verifying it names a DENSE level
+    of the window coordinate's own dimension (``panel_bound_mismatch``).
+    """
+
+    verify_program(program)
+    if type(tile) is not LoopTile:
+        raise TypeError("apply_panel_tile expects a LoopTile")
+    try:
+        _validate_loop_plan_structure(
+            LoopPlan(
+                loop_order=(),
+                tiles=(tile,),
+                panel_bounds=(bound,),
+                parallel_loop=parallel_loop,
+            )
+        )
+    except (VerificationError, AttributeError, TypeError, ValueError) as error:
+        _fail("invalid_schedule_tile", str(error))
+    if type(tile.loop) is not LoopRef or tile.loop.part is not LoopPart.LOGICAL:
+        _fail(
+            "tile_target_not_logical",
+            "panel tiles must target one unsplit logical loop",
+        )
+    if tile.kind != "panel":
+        _fail(
+            "invalid_schedule_panel",
+            "apply_panel_tile applies sparse panel tiles only",
+        )
+    if tile.accumulation != "direct":
+        _fail(
+            "invalid_schedule_panel",
+            "sparse panel tiles require accumulation='direct'",
+        )
+    if tile.parallel:
+        _fail(
+            "invalid_schedule_panel",
+            "sparse panel origin loops are serial; select the row loop "
+            "through the plan's parallel_loop",
+        )
+    if (
+        type(tile.width) is not int
+        or tile.width < 1
+        or tile.width > MAX_AFFINE_TILE_WIDTH
+    ):
+        _fail(
+            "tile_invalid_width",
+            "panel widths must be positive ints representable by the "
+            "C++ constexpr int target",
+        )
+    if type(tile.placement) is not LoopPlacement:
+        _fail(
+            "tile_invalid_placement",
+            "panel placement must be an exact LoopPlacement",
+        )
+    _check_placement_shape(tile.placement)
+    if tile.placement.kind is PlacementKind.AT_DEPTH:
+        _fail(
+            "panel_placement_invalid",
+            "sparse panel tiles support outermost or child_of placement only",
+        )
+    if bound.loop != tile.loop:
+        _fail(
+            "invalid_schedule_panel",
+            "the PanelBound must reference exactly the panel tile's loop",
+        )
+    if parallel_loop is None:
+        _fail(
+            "panel_parallel_scope",
+            "sparse panel tiling requires its CSR dense-parent row loop as "
+            "the plan's parallel_loop",
+        )
+    if type(parallel_loop) is not LoopRef or parallel_loop.part is not LoopPart.LOGICAL:
+        _fail(
+            "panel_parallel_scope",
+            "the panel's parallel row loop must be one logical loop",
+        )
+
+    loops, leaf = _decompose_chain(program)
+    if any(type(node) in _PANEL_TYPES for node in loops):
+        _fail(
+            "invalid_schedule_panel",
+            "the chain already carries a panel; at most one sparse panel "
+            "exists per program",
+        )
+    if type(leaf) is WorkspaceRegion:
+        _fail(
+            "panel_target_invalid",
+            "panel tiling over a workspace region is not a migrated " "composition",
+        )
+    if type(leaf) is AppendEntry:
+        _fail(
+            "panel_target_invalid",
+            "panel tiling requires a dense result; ordered sparse assembly "
+            "pins its nest",
+        )
+    target_index = tile.loop.index_id
+    for node in loops:
+        key = _loop_key(node)
+        if key[0] == target_index and key[1] is not LoopPart.LOGICAL:
+            _fail(
+                "tile_target_already_split",
+                "the requested loop already carries an affine split",
+            )
+    target_positions = [
+        position
+        for position, node in enumerate(loops)
+        if _loop_key(node) == (target_index, LoopPart.LOGICAL)
+    ]
+    if not target_positions:
+        _fail(
+            "tile_target_missing",
+            "the requested panel loop is not part of the loop chain",
+        )
+    target_position = target_positions[0]
+    target = loops[target_position]
+    if type(target) is not SparseFor:
+        _fail(
+            "panel_target_invalid",
+            "panel tiling windows a single-cursor compressed coordinate "
+            "loop; dense and merged loops are outside the family",
+        )
+    cursor = target.cursor
+    parent = cursor.parent
+    if type(parent) is PositionValue:
+        _fail(
+            "panel_nested_compressed",
+            "panel tiling requires a CSR-style compressed level with a "
+            "dense parent; compressed-parent windows are not migrated",
+        )
+    if type(parent) is not DensePosition or type(parent.coord) is not IndexValue:
+        _fail(
+            "panel_target_invalid",
+            "panel tiling requires the window cursor's dominating parent "
+            "to be a dense position over a directly bound row coordinate",
+        )
+    row_index = parent.coord.index
+    if parallel_loop.index_id != row_index:
+        _fail(
+            "panel_parallel_scope",
+            "the plan's parallel_loop must be the window cursor's dense "
+            "parent row loop",
+        )
+    row_positions = [
+        position
+        for position, node in enumerate(loops)
+        if _loop_key(node) == (row_index, LoopPart.LOGICAL) and type(node) is DenseFor
+    ]
+    if not row_positions:
+        _fail(
+            "panel_parallel_scope",
+            "the panel's parallel row loop must be one plain dense chain "
+            "loop; a split row loop is not migrated",
+        )
+    row_position = row_positions[0]
+
+    if tile.placement.kind is PlacementKind.OUTERMOST:
+        depth = 0
+    else:
+        assert tile.placement.kind is PlacementKind.CHILD_OF
+        placement_parent = tile.placement.parent
+        assert placement_parent is not None
+        if placement_parent.part is not LoopPart.OUTER:
+            _fail(
+                "panel_placement_invalid",
+                "a child_of panel placement must name an affine origin loop",
+            )
+        parent_positions = [
+            position
+            for position, node in enumerate(loops)
+            if type(node) is TileOuterFor
+            and _loop_key(node) == (placement_parent.index_id, LoopPart.OUTER)
+        ]
+        if not parent_positions:
+            _fail(
+                "panel_placement_invalid",
+                "a child_of panel placement must name an affine origin loop "
+                "of the current chain",
+            )
+        parent_position = parent_positions[0]
+        if parent_position >= row_position:
+            _fail(
+                "panel_parallel_scope",
+                "a sparse panel loop must surround the selected parallel " "row loop",
+            )
+        depth = parent_position + 1
+
+    decls = {decl.symbol: decl for decl in program.tensors}
+    cursor_decl_tensor = decls[cursor.tensor]
+    dimension = cursor_decl_tensor.dimensions[
+        cursor_decl_tensor.levels[cursor.level].mode
+    ]
+    bound_decl = decls.get(bound.tensor_id)
+    if bound_decl is None:
+        _fail(
+            "panel_bound_mismatch",
+            "the PanelBound tensor is not declared by the program",
+        )
+    if not 0 <= bound.level < len(bound_decl.levels):
+        _fail(
+            "panel_bound_mismatch",
+            "the PanelBound level is outside its tensor's rank",
+        )
+    if bound_decl.levels[bound.level].kind is not LevelKind.DENSE:
+        _fail(
+            "panel_bound_mismatch",
+            "the PanelBound must name a DENSE storage level",
+        )
+    if bound_decl.dimensions[bound_decl.levels[bound.level].mode] != dimension:
+        _fail(
+            "panel_bound_mismatch",
+            "the PanelBound level must store the window coordinate's own " "dimension",
+        )
+
+    builder = LoopIRBuilder.resuming(program)
+    tile_id = builder.new_tile_id()
+    window = builder.sparse_window_for(
+        tile_id,
+        target.cursor,
+        target.position,
+        target.coord_index,
+        target.body,
+    )
+    panel = builder.panel_outer_for(
+        tile_id,
+        target.coord_index,
+        dimension,
+        tile.width,
+        bound.tensor_id,
+        bound.level,
+        # The panel body is reassembled by _rebuild_program; this
+        # placeholder block is replaced there and never enters the tree.
+        target.body,
+    )
+    new_chain: List[_LoopNode] = list(loops)
+    new_chain[target_position] = window
+    new_chain.insert(depth, panel)
+    return _rebuild_program(program, builder, new_chain, leaf)
+
+
 def _check_plan_families(plan: LoopPlan) -> None:
-    """Fail closed on every plan fact outside the migrated schedule families."""
+    """Fail closed on every plan fact outside the migrated schedule families.
+
+    The sparse-panel family admits exactly the legacy plan shape: at most
+    one panel tile, listed after every affine tile, with direct serial
+    accumulation, exactly one corresponding ``PanelBound``, and the
+    mandatory parallel row loop.  ``parallel_loop`` remains an unmigrated
+    family on every plan without a panel tile — the panel form is the one
+    shape whose row selection has no degrees of freedom.
+    """
 
     if plan.provenance != "explicit":
         _fail(
             "unsupported_schedule_provenance",
             f"{plan.provenance!r} scheduling stays on the legacy path; only "
             "explicit schedules are migrated",
-        )
-    if plan.panel_bounds:
-        _fail(
-            "unsupported_schedule_panel",
-            "sparse coordinate panel tiling is not a migrated schedule " "family",
         )
     if plan.relayout is not None:
         _fail(
@@ -832,17 +1152,80 @@ def _check_plan_families(plan: LoopPlan) -> None:
             "unsupported_schedule_result_tile",
             "heap result tiling is not a migrated schedule family",
         )
-    if plan.parallel_loop is not None:
+    panel_tiles = [tile for tile in plan.tiles if tile.kind == "panel"]
+    if len(panel_tiles) > 1:
+        _fail(
+            "invalid_schedule_panel",
+            "at most one sparse panel tile is supported per plan",
+        )
+    if panel_tiles and plan.tiles[-1].kind != "panel":
+        _fail(
+            "invalid_schedule_panel",
+            "a sparse panel tile must follow every affine tile in the plan",
+        )
+    if plan.panel_bounds and not panel_tiles:
+        _fail(
+            "invalid_schedule_panel",
+            "panel bounds require a panel tile to consume them",
+        )
+    if panel_tiles:
+        panel_tile = panel_tiles[0]
+        if panel_tile.accumulation != "direct":
+            _fail(
+                "invalid_schedule_panel",
+                "sparse panel tiles require accumulation='direct'",
+            )
+        if panel_tile.parallel:
+            _fail(
+                "invalid_schedule_panel",
+                "sparse panel origin loops are serial; select the row loop "
+                "through the plan's parallel_loop",
+            )
+        if len(plan.panel_bounds) != 1 or plan.panel_bounds[0].loop != panel_tile.loop:
+            _fail(
+                "invalid_schedule_panel",
+                "a panel plan carries exactly one PanelBound referencing "
+                "the panel tile's loop",
+            )
+        if plan.parallel_loop is None:
+            _fail(
+                "panel_parallel_scope",
+                "sparse panel tiling requires its CSR dense-parent row loop "
+                "as the plan's parallel_loop",
+            )
+        if plan.parallel_loop.part is not LoopPart.LOGICAL:
+            _fail(
+                "panel_parallel_scope",
+                "the panel's parallel row loop must be one logical loop",
+            )
+        if panel_tile.placement.kind is PlacementKind.AT_DEPTH:
+            _fail(
+                "panel_placement_invalid",
+                "sparse panel tiles support outermost or child_of placement " "only",
+            )
+        if panel_tile.placement.kind is PlacementKind.CHILD_OF:
+            placement_parent = panel_tile.placement.parent
+            assert placement_parent is not None
+            outermost_affine = any(
+                tile.kind == "affine"
+                and tile.loop.index_id == placement_parent.index_id
+                and tile.placement.kind is PlacementKind.OUTERMOST
+                for tile in plan.tiles
+            )
+            if placement_parent.part is not LoopPart.OUTER or not outermost_affine:
+                _fail(
+                    "panel_placement_invalid",
+                    "a child_of panel placement must name the origin loop of "
+                    "an outermost-placed affine tile of the same plan",
+                )
+    elif plan.parallel_loop is not None:
         _fail(
             "unsupported_schedule_parallel",
             "explicit parallel-loop selection is not a migrated schedule " "family",
         )
     for tile in plan.tiles:
-        if tile.kind != "affine":
-            _fail(
-                "unsupported_schedule_panel",
-                "sparse coordinate panel tiling is not a migrated schedule " "family",
-            )
+        if tile.kind == "panel":
+            continue
         if tile.accumulation not in ("direct", "stack"):
             _fail(
                 "unsupported_schedule_accumulation",
@@ -926,7 +1309,7 @@ def _loop_provenance(node: _LoopNode) -> ScheduledLoopProvenance:
     index, part = _loop_key(node)
     tile = (
         node.tile  # type: ignore[union-attr]
-        if type(node) in (TileOuterFor, TileInnerFor)
+        if type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES)
         else None
     )
     return ScheduledLoopProvenance(tile, index, part)
@@ -952,12 +1335,28 @@ def _chain_provenance(
 
 
 def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
-    """Apply the supported plan decisions without constructing the carrier."""
+    """Apply the supported plan decisions without constructing the carrier.
+
+    Plan tiles apply in plan order; the family gate has already required
+    any panel tile to be last, so the panel windows the fully affine-tiled
+    chain exactly as the legacy lowering sequences it.  Each plan fact is
+    consumed exactly once: the order by the reorder pass, each tile by its
+    pass, the ``PanelBound`` by materialization into the panel node, and
+    the panel-mandated ``parallel_loop`` by exact validation against the
+    window's dense-parent row loop (the fact has no other legal value).
+    """
 
     checked = _validate_plan_for_pass(plan)
     scheduled = reorder_loops(program, checked.loop_order)
     for tile in checked.tiles:
-        if tile.accumulation == "stack":
+        if tile.kind == "panel":
+            scheduled = apply_panel_tile(
+                scheduled,
+                tile,
+                checked.panel_bounds[0],
+                checked.parallel_loop,
+            )
+        elif tile.accumulation == "stack":
             scheduled = apply_stack_tile(scheduled, tile)
         else:
             scheduled = apply_affine_tile(scheduled, tile)
@@ -1043,12 +1442,12 @@ def _verify_scheduled_loopir(
     verify_program(program)
     base_loops, base_leaf = _decompose_chain(base_program)
     if type(base_leaf) is WorkspaceRegion or any(
-        type(loop) in (TileOuterFor, TileInnerFor) for loop in base_loops
+        type(loop) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for loop in base_loops
     ):
         _fail(
             "scheduled_base_not_unscheduled",
             "ScheduledLoopIR.base_program must not already contain split "
-            "loops or workspace regions",
+            "loops, panels, or workspace regions",
         )
 
     replayed = (
@@ -1097,11 +1496,17 @@ def apply_schedule_plan(program: LoopProgram, plan: LoopPlan) -> ScheduledLoopIR
 
 
 def erase_schedule(program: LoopProgram) -> LoopProgram:
-    """Erase every affine split back to its unscheduled point loop.
+    """Erase every affine split and panel back to its unscheduled loop.
 
     ``TileInnerFor`` becomes a plain ``DenseFor`` at the point loop's chain
     position and the paired ``TileOuterFor`` is dropped, which restores
     exactly the pre-tiling chain (splitting never moves the point loop).
+    A ``SparseWindowFor`` likewise becomes the plain ``SparseFor`` it
+    windowed (same cursor, position, and coordinate bindings) and its
+    ``PanelOuterFor`` is dropped: across the origin loop's iterations the
+    window visits exactly the stored entries the unwindowed loop visits,
+    so under the family's ADD-reassociation contract the erasure preserves
+    semantics.
 
     A workspace region erases to its direct-accumulation equivalent: the
     producer chain returns to the main chain with the original result
@@ -1149,16 +1554,24 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
             consumer_leaf.op,
             producer_leaf.value,
         )
-    elif not any(type(node) in (TileOuterFor, TileInnerFor) for node in loops):
+    elif not any(
+        type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for node in loops
+    ):
         return program
     else:
         builder = LoopIRBuilder.resuming(program)
     erased: List[_LoopNode] = []
     for node in (*loops, *region_loops):
-        if type(node) is TileOuterFor:
+        if type(node) in (TileOuterFor, PanelOuterFor):
             continue
         if type(node) is TileInnerFor:
             erased.append(builder.dense_for(node.index, node.dimension, node.body))
+        elif type(node) is SparseWindowFor:
+            erased.append(
+                builder.sparse_for(
+                    node.cursor, node.position, node.coord_index, node.body
+                )
+            )
         else:
             erased.append(node)
     return _rebuild_program(program, builder, erased, leaf=erased_leaf)
