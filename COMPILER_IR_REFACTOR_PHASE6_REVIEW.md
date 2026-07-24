@@ -1,7 +1,8 @@
 # Phase 6 Review: Scheduling Migration to LoopIR (Explicit Reorder + Affine Tiling)
 
 Date: 2026-07-23 (America/Los_Angeles); §10 (the workspace/stack milestone)
-added later the same day.
+and §11 (its review) added later the same day; §12 (the panel milestone)
+added 2026-07-24.
 
 This review records the first Phase-6 milestone of the compiler IR refactor:
 the ownership audit across the public Schedule surface and both pipelines,
@@ -783,3 +784,309 @@ same logical review are under the preceding
   order is a complete standalone sparse-panel vertical slice, then
   relayout/staging on that foundation, with heap result tiles and
   abstract parallel selection as separately gated stretch families.
+
+## 12. Panel milestone: sparse coordinate windows on LoopIR (2026-07-24)
+
+The third Phase-6 milestone migrates the sparse-panel schedule family —
+the SpMM tile-j coordinate window, the family relayout builds on — end to
+end: schema, verifier, printer/serialization, oracle, typed pass, target
+lowering with byte parity, and a compiled matrix.  It is recorded in four
+stacked local commits plus the docs commit that records this section;
+nothing earlier was amended or reordered and nothing was pushed:
+
+- `68d7eb4` — `feat(compiler): extend LoopIR with the sparse panel window schema`
+- `cae69dd` — `feat(compiler): apply sparse panel plans as a typed scheduling pass`
+- `57fff36` — `feat(compiler): lower panel windows with legacy byte parity`
+- `bb97172` — `test(compiler): lock the Phase-6 panel vertical slice`
+
+Both §11 gates were independently reproduced at `a880e86` before any
+edit: the five-file contract focus passed **352** and the compiled
+runtime focus passed **102** (446.87 s).  The audit, the captured legacy
+goldens (nine sources: five panel forms, both relayout staging scopes,
+the heap composition, and the unpaneled explicit reference), and the
+responsibility/lifetime table classifying every fact as semantic,
+scheduled, target-specific, or compatibility-only were recorded under
+`/Users/bobby/.cache/scorch-codex/phase6-panel-audit/` *before* any
+schema was written.
+
+### 12.1 Audit and representation decision
+
+The audit walked the complete legacy responsibility chain:
+`TileSpec(kind="panel")` validation in `_apply_schedule_legacy`
+(single panel, listed last, dense result, serial, `accum="direct"`,
+exactly one compressed access with a dense CSR parent, the mandatory
+`parallel_loop` equal to that dense-parent row var, row before panel var
+in logical order, `outermost`/`child_of:<outermost-affine>_out`
+placement only), the `PanelBound` fact built from the *first dense
+access* containing the panel var and rendered as
+``f"{tensor}{level}_size"`` at `materialize_legacy_schedule`, and the
+post-LLIR completion in `schedule_lowerer._apply_panel_tile`
+(tag-discovered target loop, marked-parallel ancestor requirement,
+`match_mode_position_bounds` row-bound re-derivation, `_crd`-name
+coordinate-array scan, `lower_bound` window derivation, origin-loop wrap,
+top-of-function width constant).  Two pipeline-position facts govern
+byte parity and are confirmed by the goldens: the legacy managed passes
+run on the *unpaneled, unmarked* function (explicit parallel selection
+suppresses the emission-time auto gate;
+`CINLowerer._apply_explicit_parallel_schedule` marks the row loop on the
+assembled function, before `apply_schedule_to_llir` windows and wraps
+it), and pass behavior is decided there — the dense-pointer hoist fires
+in the panel-only golden but not in the child_of golden, and the sparse
+prefetch guard fires on the canonical loop shape and survives the
+windowing only because the end spelling is reused.
+
+Representation: **a structured origin/window pair in the same LoopIR
+node model**, exactly the design's Stage-5 sparse-panel-tiling pass
+("a coordinate window over structured level/coordinate facts, never
+name/regex discovery").  `PanelOuterFor(tile, index, dimension, width,
+bound_tensor, bound_level, body)` iterates the clamped window origins of
+the compressed coordinate's dimension (the origin is not a readable
+coordinate, like the affine origin); `SparseWindowFor(tile, cursor,
+position, coord_index, body)` visits, in storage order, exactly the
+stored entries whose coordinate falls inside
+``[origin, min(origin + width, extent))`` — the clamped coordinate
+window is intrinsic node semantics, and how the position sub-range is
+found (coordinate search on a canonical sorted segment) is a target
+concern with no spelling in the node.  The pair shares the
+artifact-local `TileId` space with affine splits.  One deliberate
+redundancy: the plan's `PanelBound` fact is materialized structurally as
+the panel's `(bound_tensor, bound_level)` DENSE extent source.  It is
+semantically redundant with the dimension identity (extent equality is
+the `DimensionId` contract) but required for the exact legacy bound
+spelling at the target, so the verifier enforces its consistency
+(declared tensor, in-rank DENSE level, storing the panel's own
+dimension) instead of trusting it.
+
+### 12.2 What was frozen (schema extension)
+
+New in `loopir/nodes.py`: `PanelOuterFor` and `SparseWindowFor`
+(builder methods `panel_outer_for`/`sparse_window_for`; the
+declared-field-only `resuming` continuation covers them through the
+generic field scan).  Canonical serialization moved to schema
+`scorch.loopir.canonical.v5` with the two new statement kinds; the
+printer renders the pair with its bound (`panel_outer_for s0 x0 in d0
+width 3 bound t1@0`); canonical dumps remain stable across unrelated
+global identity histories and renumber raw schedule identities.  The
+oracle executes the intrinsic window semantics — panel widths are
+semantic integers, never allocation requests; a window executed outside
+its panel's origin loop fails closed at runtime — and counting
+differentials prove each stored entry is visited exactly once across
+ragged windows, empty rows, zero extents, and disjoint supports.
+
+### 12.3 Verifier surface
+
+Four stable codes were added, each with direct adversarial regressions:
+`unbound_panel` (a window with no dominating open `PanelOuterFor` of its
+tile — an affine origin does not open a panel scope),
+`missing_panel_window` (an origin whose body never binds its window),
+`panel_binding_mismatch` (pair disagreement: the window must bind the
+panel's logical index over a cursor level storing the panel's
+dimension), and `panel_bound_mismatch` (a declared bound level that is
+not DENSE or stores another dimension; undeclared tensors and
+out-of-rank levels keep `undefined_tensor`/`rank_mismatch`).  The pair
+reuses the shared tile discipline — `duplicate_tile_id` across both
+families, `tile_index_conflict` in both directions (a panel owns its
+logical loop against enclosing binders and open splits; an affine origin
+may not split an index an open panel owns), `invalid_tile_width` — and
+the existing cursor, once-only binding, forged-state, hostile-subclass,
+cycle, aliasing, and depth guards cover the new nodes.  A `TileInnerFor`
+cannot bind a panel's tile (`unbound_tile`), and a second window of one
+panel is `duplicate_index_binding`: the sibling-rebinding boundary stays
+owned by the workspace point family.  The locked source-scan surface
+grows from 60 to **64** codes.
+
+### 12.4 Passes, lowering, and the compiled matrix
+
+`apply_panel_tile(program, tile, bound, parallel_loop)` is the new pure
+typed pass, operating only on cursor, level, position, and dimension
+identities.  Its legality mirror of the legacy family: the target must
+be a `SparseFor` whose cursor's dominating parent is a dense position
+over a directly bound row coordinate (compressed-parent windows fail
+closed as `panel_nested_compressed`; dense, merged, append-assembly,
+region-terminated, and already-split targets keep stable codes); the
+plan's `parallel_loop` is mandatory and must name that dense-parent row
+loop (`panel_parallel_scope`) — the legacy family admits no other value,
+so exact validation is the fact's consumption; placement resolves as in
+legacy `_apply_panel_tile` (`outermost` wraps the chain root, `child_of`
+wraps the loop below the named affine origin and must stay strictly
+above the row loop, `at_depth` is `panel_placement_invalid`); and the
+`PanelBound` is consumed by materialization after compatibility checks.
+The plan gate admits exactly the legacy panel plan shape — at most one
+panel tile, listed last, direct serial accumulation, exactly one
+corresponding bound, mandatory logical `parallel_loop`, `child_of`
+parents restricted to outermost-placed affine tiles of the same plan
+(`invalid_schedule_panel`/`panel_parallel_scope`/
+`panel_placement_invalid`) — and `parallel_loop` remains an unmigrated
+family (`unsupported_schedule_parallel`) on every plan without a panel.
+The chain machinery covers the new nodes end to end: decomposition,
+rebuild, loop keys (origin = OUTER, window = INNER, matching the legacy
+`_out` rendering), `ScheduledLoopIR` provenance and replay, the
+scheduled-base purity check, reorder/affine/stack refusal of
+panel-scheduled chains (panels apply last, as in legacy), and
+`erase_schedule`, which drops the origin and restores the plain
+`SparseFor` under the family's ADD-reassociation contract, proven by
+canonical-dump equality and exact oracle counting differentials across
+unit/ragged/exact/oversized/maximum widths with an empty CSR row plus
+randomized dimensions.
+
+The target lowering reproduces the legacy pipeline position exactly:
+`raw_loop_statements` emits the unpaneled nest with marking suppressed,
+the untouched managed passes run, the function is assembled, and
+`complete_panel` then (1) marks the structurally identified row loop
+with the same `mark_first_for_loop_parallel` call and empty cluster,
+(2) rewrites the window bounds (`p*_row_end` capture, `lower_bound`
+begin/end through the schedule lowerer's shared typed constructor —
+one source for that spelling), (3) wraps the origin loop with its
+clamped `std::min` end, and (4) prepends the width constant.  Because
+every managed pass returns a *detached* tree, emission-object identity
+cannot survive to the assembled function; the completion instead
+navigates the preserved loop skeleton — depth-first for-loop order is
+exactly the emitted chain order — and cross-checks each located loop
+against the retained emission records, failing closed as
+`panel_completion_lost` on any disagreement.  No `scorch_index_var`
+tags, rendered-name scans, or regexes are consulted.  The target
+boundary rejects everything outside the migrated shape (one pair only,
+dense result, CSR cursor form, row strictly between origin and window)
+and panel-derived names join the collision discipline.
+
+**The compiled matrix.**  A twelve-member panel byte-parity grid locks
+generated C++ equality against `Scheduler.apply_schedule` + the legacy
+lowering in every cell: CSR SpMM panel widths below/equal to/above/not
+dividing the coordinate extent, the unit width, the maximum
+constexpr-int width (`2^31 - 1`), f64, `child_of` below an outermost
+affine pack tile, the panel-outermost-over-affine-outermost composition,
+and zero rows / zero panel extent / zero free extent.  Compiled shadow
+execution (both pipelines, real kernels) is **bitwise-equal** to the
+legacy scheduled kernels and PyTorch-close across the three window
+regimes with an empty CSR row, f64 at 1e-10 tolerances, the
+affine+panel composition, and a zero free extent; randomized dimensions
+execute against PyTorch and the production oracle.  Structural
+activation is asserted directly and never waived: the top-of-function
+width constant, the serial origin loop over the declared dense bound
+(`B0_size`), the clamped `j_out_end`, both `lower_bound`-derived
+position bounds, the windowed loop start (`pA1 = pA1_panel_begin`),
+exactly one nnz-aware row pragma placed between origin and row loop,
+prefetch survival inside the window, and the hoisted operand pointer.
+
+### 12.5 Verification
+
+Evidence ledger: `/Users/bobby/.cache/scorch-codex/phase6-panel-bb97172/`
+(audit and goldens under `phase6-panel-audit/`).
+
+- both §11 gates were independently reproduced before any edit: the
+  352-test contract focus and the 102-test runtime focus both passed at
+  `a880e86`;
+- contract focus after the milestone (same five files): **386 passed** —
+  the 34 new contract regressions cover the panel verifier codes (12),
+  the panel pass surface (17), and the target boundaries (5);
+- scheduled runtime focus after the milestone: **123 passed** across
+  `test_loopir_scheduled_slice.py` (94) and
+  `test_loopir_pipeline_execution.py` (29), including the twelve panel
+  parity cells, the compiled panel shadows, the panel stage-timing
+  sequence, and the structural activation locks;
+- focused production LoopIR membership: **533 passed + 4 neutrality**
+  (131 verifier, 27 printer, 48 oracle, 16 level-storage, 16
+  iteration-domain, 37 CIN lowering, 67 schedule passes, 68 LLIR
+  lowering/parity, 94 scheduled slice, 29 pipeline execution);
+- combined focused adjacency sweep (LoopIR fast suites + spike
+  verifier/execution/neutrality + CIN/CIN-analysis + stage timing +
+  LLIR pass-manager/string-budget/traversal + LoopPlan + native ABI +
+  Schedule API + Scheduler + value-object boundaries): **1,880
+  passed**, plus **332 passed** across the cin_lowerer,
+  schedule-generality, and tune-scheduler-harness compiled adjacency
+  files;
+- byte gates: fresh 20-source corpus and 42-source grid captures from
+  the working tree are **byte-identical** to detached `a880e86` captures
+  and to the sealed Phase-6 captures (`diff -qr` empty for all
+  comparisons) — no legacy emission changed, the byte waiver applies, no
+  runtime kernel benchmark is required, and the Phase-5 §8 first-run
+  failures and reviewed exception remain the permanent, un-rerun record;
+- compiler latency: a fresh paired base(`a880e86`)/candidate run of the
+  four-category corpus is inside the 1.10 target everywhere — p50
+  ratios `1.006/1.000/1.020/0.983`, p95 ratios `1.009/1.009/1.018/0.981`
+  (small-dense, reduction, CSR-intersection, sparse-union), with
+  identical per-case source hashes; the release JIT path itself never
+  enters the LoopIR stages;
+- static parity: Black clean over every changed module and test; Flake8
+  clean over the same; focused `mypy --check-untyped-defs` over all
+  twelve package modules succeeds; full-source mypy reports exactly the
+  **146 inherited findings in 12 files, zero in `loopir/`**, with the
+  finding log identical to the §11 baseline; `git diff --check` clean
+  before every commit (the one package-wide Black finding,
+  `prebuilt_kernels.py`, and the nine package-wide Flake8 findings
+  pre-exist identically at `a880e86` and are untouched inherited state);
+- the authoritative clean detached-worktree non-performance suite at the
+  exact final test commit `bb97172`, with isolated
+  pytest/Torch-extension/cache directories and import provenance
+  asserted: **3,756 passed, 14 skipped, 3 perf-marked deselections, one
+  known warning, and zero failures/errors in 2,514.26 seconds** —
+  exactly the §11 baseline of 3,692 passed plus the 64 new milestone
+  tests (JUnit: 3,770 selected, zero failures/errors; log SHA-256
+  `cd3af12b791f092b00771e089cf5a40629b118faf9c346f2c96ea87703d7f341`,
+  JUnit SHA-256
+  `c5e8e275211112d017f3cf21a49dc23a7cac5b4a1e9562d1af6f22eb566ad608`);
+- the five protected tracked files retain their recorded SHA-256 values
+  and were never staged; staging used explicit pathspecs only; no
+  GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, or
+  tooling material was touched; origin
+  `refactor/compiler-ir-phase3-std-move-call` remains at `58e8565`
+  (live `git ls-remote` confirmed at session start) and nothing was
+  pushed.
+
+### 12.6 Limitations and the candid Phase-6 exit verdict
+
+- The migrated schedule surface is now: explicit complete loop orders,
+  affine `accum="direct"` splits, the stack-accumulation workspace
+  family, and sparse panel tiling with its mandatory parallel row loop.
+  Operand relayout/staging, heap result tiles, and general explicit
+  parallel selection remain fail-closed on the legacy route.  **Phase 6
+  is therefore not exited.**  Against the design's Phase-6 deliverables:
+  loop reorder, affine tiling/ragged tails, workspace materialization,
+  and sparse panel tiling are done; operand relayout/staging, heap
+  result accumulation, abstract parallel-loop selection, and the
+  representative tile-j/tile-ijk `LoopPlan` encodings are still open
+  (the panel-only tile-j *schedule* is now fully migrated; the
+  tile-ijk relayout composition is not).
+- `parallel_loop` is migrated only in its panel-mandated form, where the
+  legacy family fixes its value; validating it against the window's
+  dense-parent row loop is therefore its complete consumption.  General
+  abstract parallel selection (a free choice of loop) remains the
+  fail-closed stretch family.
+- A panel tile's `unroll` flag is accepted with both values and has no
+  emission effect, exactly as in legacy (`_apply_panel_tile` never reads
+  it); the flag is a compatibility field of the shared `TileSpec`
+  surface, not a dropped fact.
+- The panel completion relies on a structural invariant of the managed
+  pass pipeline — passes insert statements and rewrite expressions but
+  never add, drop, or reorder the nest's for-loops — and enforces it
+  with a fail-closed count and per-loop cross-checks
+  (`panel_completion_lost`).  If a future managed pass restructures
+  loops, panel compilation fails loudly at that boundary rather than
+  emitting divergent bytes.
+- Panel composition boundaries are explicit and fail closed: panels do
+  not compose with workspace regions (`panel_target_invalid` — legacy
+  requires `accum="direct"` for the panel itself, and the stack+panel
+  composition has no parity reference), and windows over
+  compressed-parent (DCSR) cursors remain `panel_nested_compressed`.
+- The strangler entry remains test/debug-only; production dispatch,
+  release JIT, import neutrality, legacy stage sequences, and
+  source-derived kernel cache identity are unchanged and
+  subprocess-enforced.
+- Canonical dumps (schema v5) remain semantic fingerprints that omit
+  display names; kernel caching remains source-derived; the Phase-4
+  caution that dumps are not target cache keys stands.
+- The §6 observations and the Phase-4/5 errata stand unchanged; the §11
+  residual boundaries (INT_MAX stack widths, forged-CIN identity
+  hardening) remain open and are unchanged by this milestone.
+- For the relayout slice, the §11 access-identity requirement stands
+  unresolved and must be decided before nodes are chosen: production
+  LoopIR `Load` has no occurrence identity and the target's per-symbol
+  `AccessId` is not a substitute.  The audited legacy relayout family is
+  deliberately narrow (exactly the packed tile-ijk contraction with one
+  rank-2 dense operand packed on its last level, `width == strip_width`,
+  and scope ∈ {panel var, pack var}); within it, the staged operand is
+  read by exactly one access occurrence, so *either* an artifact-local
+  access identity *or* a verifier-proven unique operand/access-index
+  tuple satisfies the design — the next session should decide with the
+  goldens (`relayout_panel_scope.cpp` / `relayout_pack_scope.cpp` /
+  `relayout_heap_pack.cpp`) in hand.
