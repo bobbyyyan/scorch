@@ -573,6 +573,77 @@ def test_scheduled_cin_verifier_requires_exact_stored_carrier_fields() -> None:
         verify_scheduled_cin(missing_plan)
 
 
+def test_loop_plan_verifier_rejects_forged_enum_members() -> None:
+    scheduled = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("k", 4, accum="direct"),),
+        ),
+    )
+    cin = scheduled.normalized_cin
+    source = scheduled.verified_loop_plan
+    source_tile = source.tiles[0]
+
+    forged_part = object.__new__(LoopPart)
+    object.__setattr__(forged_part, "_name_", "FORGED")
+    object.__setattr__(forged_part, "_value_", "forged")
+    forged_loop = LoopRef(source_tile.loop.index_id, forged_part)
+    with pytest.raises(VerificationError, match="part must be a LoopPart"):
+        verify_loop_plan(cin, replace(source, parallel_loop=forged_loop))
+
+    forged_kind = object.__new__(PlacementKind)
+    object.__setattr__(forged_kind, "_name_", "FORGED")
+    object.__setattr__(forged_kind, "_value_", "forged")
+    forged_placement = LoopPlacement(forged_kind)
+    with pytest.raises(VerificationError, match="kind must be a PlacementKind"):
+        verify_loop_plan(
+            cin,
+            replace(
+                source,
+                tiles=(replace(source_tile, placement=forged_placement),),
+            ),
+        )
+
+
+def test_loop_plan_diagnostics_handle_unrenderably_large_identities() -> None:
+    scheduled = Scheduler.apply_schedule(_build_spmm(), Schedule())
+    source = scheduled.verified_loop_plan
+    huge = 10**5000
+
+    with pytest.raises(
+        VerificationError,
+        match="unknown IndexId <integer too large to render>",
+    ):
+        verify_loop_plan(
+            scheduled.normalized_cin,
+            replace(source, loop_order=(IndexId(huge),) + source.loop_order[1:]),
+        )
+
+    bound = PanelBound(
+        LoopRef(source.loop_order[0]),
+        SymbolId(huge),
+        0,
+    )
+    panel = LoopTile(
+        loop=LoopRef(source.loop_order[0]),
+        width=4,
+        placement=LoopPlacement(PlacementKind.OUTERMOST),
+        parallel=False,
+        kind="panel",
+        accumulation="direct",
+        unroll=False,
+    )
+    with pytest.raises(
+        VerificationError,
+        match="unknown SymbolId <integer too large to render>",
+    ):
+        verify_loop_plan(
+            scheduled.normalized_cin,
+            replace(source, tiles=(panel,), panel_bounds=(bound,)),
+        )
+
+
 def test_tuple_valued_loop_plan_inputs_are_detached_from_mutable_callers() -> None:
     scheduled = Scheduler.apply_schedule(
         _build_spmm(),

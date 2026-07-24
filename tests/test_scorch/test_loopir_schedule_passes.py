@@ -1091,6 +1091,77 @@ def test_schedule_pass_rejects_deleted_plan_state_instead_of_erasing_tiles():
     )
 
 
+def test_schedule_pass_rejects_forged_enum_members_before_dispatch():
+    cin, (_, _, k) = build_spmm_ijk()
+    lowering = lower(cin)
+
+    forged_part = object.__new__(LoopPart)
+    object.__setattr__(forged_part, "_name_", "FORGED")
+    object.__setattr__(forged_part, "_value_", "forged")
+    expect_code(
+        "invalid_schedule_tile",
+        apply_stack_tile,
+        lowering.program,
+        replace(
+            stack_tile(k.index_id, 4),
+            loop=LoopRef(k.index_id, forged_part),
+        ),
+    )
+
+    forged_kind = object.__new__(PlacementKind)
+    object.__setattr__(forged_kind, "_name_", "FORGED")
+    object.__setattr__(forged_kind, "_value_", "forged")
+    expect_code(
+        "invalid_schedule_tile",
+        apply_stack_tile,
+        lowering.program,
+        replace(
+            stack_tile(k.index_id, 4),
+            placement=LoopPlacement(forged_kind),
+        ),
+    )
+
+
+def test_schedule_pass_diagnostics_handle_unrenderably_large_depths():
+    huge_depth = 10**5000
+
+    dense_cin, (_i, _k, j) = build_matmul_ikj()
+    dense_lowering = lower(dense_cin)
+    expect_code(
+        "tile_invalid_placement",
+        apply_affine_tile,
+        dense_lowering.program,
+        affine_tile(
+            j.index_id,
+            4,
+            placement=LoopPlacement(PlacementKind.AT_DEPTH, depth=huge_depth),
+        ),
+    )
+
+    sparse_cin, (_, _, k) = build_spmm_ijk()
+    sparse_lowering = lower(sparse_cin)
+    plan = LoopPlan(
+        loop_order=sparse_lowering.loop_index_ids,
+        tiles=(
+            stack_tile(
+                k.index_id,
+                4,
+                placement=LoopPlacement(
+                    PlacementKind.AT_DEPTH,
+                    depth=huge_depth,
+                ),
+            ),
+        ),
+        provenance="explicit",
+    )
+    expect_code(
+        "tile_invalid_placement",
+        apply_schedule_plan,
+        sparse_lowering.program,
+        plan,
+    )
+
+
 def test_apply_stack_tile_placements_resolve_against_the_prefix():
     cin, (i, j, k) = build_spmm_ijk()
     lowering = lower(cin)
