@@ -24455,23 +24455,24 @@ affine direct tiles, stack workspace accumulation.  Still open from the
 design's Phase-6 deliverables: sparse panel tiling, operand
 relayout/staging, heap result accumulation, abstract parallel-loop
 selection, and the representative tile-j/tile-ijk LoopPlan encodings.
-The panels+relayout audit verdict (review §10.5): both families complete
-their decisions post-LLIR in legacy (`schedule_lowerer.py`, rendered-name
-discovery), are not separable from each other, and need a typed
-coordinate-window node family plus access-ID redirection and
-staging-buffer lifetime on top of the new region machinery — a
-representation decision that should open the next slice.
+The panels+relayout audit verdict is corrected by review §11: both
+families complete their lowering post-LLIR in legacy
+(`schedule_lowerer.py`, rendered-name discovery) and share typed
+coordinate-window machinery, but they are separable.  Panel-only
+schedules are supported independently; relayout has a one-way dependency
+on one matching panel.  The next slice should close panels first, then
+layer access redirection and staging-buffer lifetime on that foundation.
 
-## Updated Copy-Paste Prompt for the Next Session/Agent (Phase 6, panel + relayout slice)
+## Updated Copy-Paste Prompt for the Next Session/Agent (Phase 6, panel then relayout)
 
 ```text
 Work in /Users/bobby/scorch on branch
 refactor/compiler-ir-phase3-std-move-call. Independently review the current
 tip, then implement the largest coherent remainder of Phase 6 that can be
-honestly verified. The required next vertical family is sparse-panel tiling
-plus operand relayout/staging together (review §10.5 records why they are
-one slice); after it, heap result tiles or abstract parallel selection are
-separately committed stretch families.
+honestly verified. The required next vertical work is sparse-panel tiling
+first, followed by operand relayout/staging on that foundation (review §11
+corrects their dependency); after them, heap result tiles or abstract parallel
+selection are separately committed stretch families.
 
 Read, in order: AGENTS.md; COMPILER_IR_REFACTOR_DESIGN.md (Stage-3/5
 memory-region contracts, Phase-6 exit criteria);
@@ -24506,8 +24507,8 @@ merely to seek a pass; its §8 first-run failures and reviewed exception are
 permanent evidence. New emitted-code changes still require fresh applicable
 gates.
 
-Primary objective — migrate sparse-panel tiling plus operand
-relayout/staging as one verified family:
+Primary objective — migrate sparse-panel tiling as a complete standalone
+family, then operand relayout/staging as a separately stoppable layer:
 
 1. Audit the legacy owners end to end before choosing nodes:
    TileSpec(kind="panel") validation, PanelBound plan facts,
@@ -24558,4 +24559,181 @@ the Phase-6 review and handoff with exact hashes, memberships, evidence
 locations, origin state, limitations, and a candid Phase-6 exit verdict.
 Commit the largest coherent verified subset; do not overclaim and do not
 push.
+```
+
+## Independent Phase-6 workspace review corrections (2026-07-23)
+
+The rigorous follow-up review of `9f431d9..c0ef584` is complete at the
+following local code/test commits; no earlier commit was amended or
+reordered and nothing was pushed:
+
+- `bd1cb94` / `b2371b6` — reject target loop-name collisions, make
+  semantic workspace storage nonallocating for huge widths, reject
+  hostile plan primitive subclasses, and lock identity continuation,
+  canonicalization, oracle, and target regressions;
+- `6f86a5b` / `fc163cd` — require exact stored ownership for `LoopPlan`,
+  every nested plan carrier/identity, and `ScheduledCIN`, preventing
+  deleted defaults from erasing tiles or changing provenance;
+- `1e55973` / `c423167` — require canonical schedule enums and bound
+  integer diagnostics so forged enums and enormous IDs/depths fail with
+  stable compiler diagnostics;
+- `08b0b6d` / `6ab6a21` — require exact nested identity state and
+  canonical loop parts in `ScheduledLoopIR` provenance.
+
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §11 is the definitive record.
+The five-file contract focus is **352 passed**, the compiled runtime
+focus is **102 passed**, and paired compiler latency is inside the 1.10
+target everywhere (worst p50 1.009, worst p95 1.044).  The authoritative
+clean detached suite at `6ab6a21` is **3,692 passed, 14 skipped, 3
+perf-marked deselections, one known warning, zero failures in 2,554.39
+seconds**.  Receipts are sealed at
+`/Users/bobby/.cache/scorch-codex/phase6-workspace-review-6ab6a21/`.
+Fresh source captures remain byte-identical and full-source mypy remains
+at the inherited 146 findings.  The protected files and all unrelated
+dirty/untracked material remain untouched; origin remains `58e8565`.
+
+The review corrects one handoff claim: panel tiling and relayout are not
+inseparable.  Panel-only schedules work independently; relayout requires
+one matching panel.  The next capable session should close panels as one
+standalone vertical slice, then continue into relayout in the same broad
+milestone if the panel gates are green.  Relayout must make an explicit
+logical-access identity decision: current production LoopIR `Load` has
+no occurrence ID, and the target's per-symbol LLIR `AccessId` is not a
+substitute.
+
+Two honest residual boundaries are recorded, not silently narrowed:
+fixed-size C++ stack workspaces still accept legacy-compatible widths up
+to `INT_MAX`, which needs a future resource-policy decision, and hostile
+identity internals in forged normalized CIN remain a separate
+CIN-analysis hardening seam.  Phase 6 remains open.
+
+## Superseding Copy-Paste Prompt for the Next Session/Agent
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call. First rigorously review the current
+tip, including the Phase-6 workspace milestone, correction commits
+bd1cb94..6ab6a21, and the final docs commit. Independently reproduce the
+documented focused gates; do not trust the handoff. Fix, test, document, and
+commit any concrete review defects before beginning new work.
+
+Then complete the largest coherent remainder of Phase 6. The primary milestone
+is two ordered vertical slices:
+
+1. Migrate sparse-panel tiling as a complete standalone family.
+2. Once panel tiling is green, migrate operand relayout/staging on top of it.
+
+Panel tiling is independently supported by legacy today; relayout requires a
+panel, but the reverse is false. Keep their commits and stopping points
+separable even if they share coordinate-window and region machinery. If both
+are complete and fully gated, continue with separately committed stretch work:
+heap result tiles first, then abstract parallel-loop selection, and close the
+representative tile-j/tile-ijk LoopPlan encodings where those families unblock
+them. Do not begin Phase 7 target-policy migration, public production cutover,
+selector integration, or legacy deletion.
+
+Read AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md (Stage 3, Stage 5, and Phase 6),
+the Phase-4/5 reviews, the complete Phase-6 review including §11, and the dated
+handoff tail. Audit git status, live origin, protected-file hashes, and the
+complete Phase-6 commit ranges before editing. Preserve all unrelated
+dirty/untracked GPU, CUDA, benchmark, packaging, scheduler, research,
+scratchpad, and tooling material. Use explicit pathspecs, do not amend or
+reorder existing commits, do not switch branches, and do not push.
+
+Preserve every established correction contract:
+
+- exact built-in LoopPlan primitives; exact stored ownership for LoopPlan,
+  every nested carrier/identity, ScheduledCIN, and ScheduledLoopIR provenance;
+  canonical enum membership; malformed state must fail before comparison,
+  hashing, default fallback, replay, or pass dispatch;
+- complete affine split pairs, declared-field-only continuation, exact schedule
+  replay/provenance, and consume-each-plan-fact-once behavior;
+- target INT_MAX representation checks, while semantic oracles must not eagerly
+  allocate from an untrusted tile or region extent;
+- identity is not spelling: distinct logical IndexIds sharing one DimensionId
+  remain semantically legal but must fail current C++ lowering with
+  generated_name_collision until target binder naming is identity-safe;
+- artifact-local TileId/WorkspaceId allocation, continuation, and canonical
+  renumbering;
+- workspace intrinsic allocation/reset, producer/consumer ownership, sibling
+  point-loop legality with nested rebinding forbidden, stack legality, exact
+  legacy emission, and erasure semantics;
+- schedule-free but parent-owned relayout prerequisites, frozen shadow plans,
+  rank-general result wrapping, terminal stage-owned failures, import
+  neutrality, stage timing, and source-derived cache identity.
+
+Before choosing nodes, audit and capture the complete legacy responsibility
+chain for PanelBound, panel TileSpec validation and placement,
+schedule_lowerer sparse-loop windowing, OperandRelayout validation, both
+panel-scoped and full-axis staging lifetimes, pack-loop construction, prefetch
+adaptation, access redirection, and emitted tile-j/tile-ijk kernels. Record
+which facts are semantic, scheduled, target-specific, or compatibility-only.
+
+For the panel slice:
+
+- represent a compressed-level coordinate window structurally in LoopIR,
+  including clamped coordinate bounds and search-derived position bounds;
+- operate on cursor/level identities and dominating positions, never generated
+  names, regexes, or C++ storage-field spellings;
+- consume each PanelBound and panel LoopTile exactly once;
+- enforce parent-position dominance, level/domain compatibility, placement,
+  parallel-row scope, empty-segment behavior, and nested-compressed-format
+  boundaries explicitly;
+- extend builder, verifier, printer/canonical schema, oracle, scheduling
+  passes, erasure/equivalence, target lowering, and pipeline activation;
+- prove panel-only schedules work without constructing relayout state.
+
+For relayout/staging:
+
+- add the smallest typed memory-region representation for allocation, pack
+  loops, lifetime, and staged reads at panel or full-axis scope;
+- make an explicit design decision for logical access identity. Production
+  LoopIR Load currently has no access ID and lower_llir's AccessId is per
+  SymbolId, not per occurrence. Do not treat that target ID or rendered names
+  as sufficient. Either introduce stable artifact-local access identity or
+  preserve a deliberately narrow boundary whose verifier proves the selected
+  operand/access-index tuple is unique;
+- redirect the selected access structurally, prove every required read was
+  redirected exactly once, reject residual direct reads, and preserve access
+  provenance through all rewrites;
+- verify staging-buffer dominance, bounds, initialization, teardown, pack-loop
+  coverage, panel/full-axis scope, f32/f64 typing, prefetch behavior, and
+  deterministic naming;
+- lower byte-identically to legacy wherever parity is claimed.
+
+Use focused commits separating schema/verifier/oracle, panel passes/lowering,
+relayout passes/lowering, runtime/tests, optional stretch families, and docs.
+A partial but complete panel vertical slice is acceptable; a schema-only seam,
+a relayout implemented through post-LLIR name discovery, or an atomic
+half-working panel+relayout change is not.
+
+Mandatory verification:
+
+- direct coverage for every new defect code plus missing/extra/forged, aliased,
+  cyclic, over-depth, hostile-subclass, invalid-ID, dominance, lifetime, and
+  redirection-completeness cases;
+- canonical/resuming determinism across unrelated identity histories;
+- panel widths below/equal/above/not dividing extents, unit and huge semantic
+  widths, empty rows, zero extents, ragged windows, disjoint supports,
+  nested-position divergence, f32/f64, randomized dimensions, every supported
+  placement, and both staging scopes;
+- oracle equivalence and erasure proofs that check coordinates, positions,
+  pack contents, resets, and copy/use counts—not only loop visitation;
+- byte-exact legacy source comparison and compiled PyTorch/legacy/oracle
+  differentials for every compatibility claim, with structural activation
+  never waived;
+- existing LoopIR, workspace, ScheduledLoopIR, LoopPlan, Schedule API,
+  normalized-CIN, identity, stage-timing, schedule_lowerer, LLIR traversal/pass
+  manager, raw-budget, native ABI/cache, import-neutrality, and Phase-3.5
+  adjacency suites;
+- fresh corpus/grid captures, applicable compiler latency measurements,
+  Black, Flake8, focused and full-source mypy against the inherited baseline,
+  git diff --check, provenance checks, and a clean detached-worktree full
+  non-performance suite with isolated caches.
+
+Update the Phase-6 review and handoff with exact commit hashes, commands,
+memberships, evidence paths, origin state, limitations, and a candid exit
+verdict. Correct any remaining old claim that panels and relayout are
+inseparable: panel is an independent prerequisite and relayout builds on it.
+Commit the largest fully verified result; do not overclaim and do not push.
 ```

@@ -573,19 +573,27 @@ ceil-trip-count origin policy, and the nnz-aware row policy on the
 
 ### 10.5 Adjacent-family audit verdict (panels + relayout)
 
-The preferred next family — sparse-panel tiling plus operand
+The preferred next family — sparse-panel tiling followed by operand
 relayout/staging — was audited and deliberately **not** started in this
-session.  The concrete blocker: legacy completes both families *after*
-LLIR lowering (`schedule_lowerer.py` rewrites emitted position loops and
-operand accesses by rendered-name discovery), so a typed migration
-requires three representations the schema deliberately lacks — a
-coordinate-window iteration node over compressed levels (clamped
-coordinate ranges with search-derived position bounds), typed access-ID
-redirection for staged operands, and pack-loop/staging-buffer lifetime
-on top of the new region machinery.  The two families share that
-machinery and are not separable from each other; the representation
-decision is the size of this milestone's and should open the next slice
-rather than close this one, per the discipline recorded in §8.  They
+session.  Legacy completes their lowering *after* LLIR construction
+(`schedule_lowerer.py` rewrites emitted position loops and operand
+accesses by rendered-name discovery), so typed migration needs three
+representations the schema deliberately lacks — a coordinate-window
+iteration node over compressed levels (clamped coordinate ranges with
+search-derived position bounds), typed access redirection for staged
+operands, and pack-loop/staging-buffer lifetime on top of the new region
+machinery.
+
+The original milestone wording incorrectly called the two families
+inseparable.  They share machinery, but the dependency is one-way:
+panel-only schedules are a supported legacy family and
+`_apply_panel_tile` runs whether or not relayout exists; relayout, in
+contrast, requires exactly one matching panel.  The next milestone may
+therefore close and commit a complete panel vertical slice before
+layering relayout on it.  Relayout still needs an explicit logical-access
+identity decision: production LoopIR `Load` has no occurrence identity,
+while the current LLIR target's access map is per tensor symbol and must
+not be mistaken for the design's logical access ID.  Both families
 remain fail-closed at the plan gate with stable codes; nothing was
 silently declined.  Heap result tiles and abstract parallel selection
 likewise remain fail-closed stretch families.
@@ -677,3 +685,101 @@ Evidence ledger: `/Users/bobby/.cache/scorch-codex/phase6-workspace-72e991e/`.
   caution that dumps are not target cache keys stands.
 - The Phase-4/5 errata and the §6 observations stand unchanged; none
   was silently fixed or reproduced outside the byte-parity contract.
+
+## 11. Independent workspace-milestone review corrections (2026-07-23)
+
+The post-milestone review independently read and probed
+`9f431d9..c0ef584` rather than accepting §10's evidence at face value.
+The workspace representation, stack transformation, erasure model, and
+legacy byte-parity lowering were otherwise sound, but the review found
+and fixed five concrete trust-boundary defects:
+
+1. `bd1cb94` rejects target loop-variable name aliasing.  Distinct
+   logical `IndexId` binders may legitimately share a `DimensionId`, but
+   the current C++ target names binders from the dimension.  Previously
+   that could silently shadow one loop and change a workspace reduction;
+   target lowering now raises `generated_name_collision` while preserving
+   the legal affine outer/inner reuse of one logical index.
+2. `bd1cb94` also makes the semantic oracle's workspace storage sparse.
+   A verified semantic tile width is any positive integer, so eagerly
+   allocating `[0.0] * width` let a valid huge width raise `OverflowError`
+   or exhaust memory even when execution touched one cell.  The oracle
+   now stores only touched cells with implicit zero, retaining intrinsic
+   reset, bounds, and accumulation semantics.
+3. `bd1cb94` / `b2371b6` reject executable `int`/`str` subclasses in
+   `LoopPlan`, lock artifact-local `TileId`/`WorkspaceId` continuation and
+   canonical renumbering, and cover the target/oracle regressions above.
+4. `6f86a5b` / `fc163cd` require exact stored field ownership for
+   `LoopPlan`, every nested plan carrier and identity, and `ScheduledCIN`.
+   Deleting a default-backed field previously let instance lookup fall
+   through to the dataclass class default: a stack plan could lose all
+   `tiles`, and an `"auto"` plan could become `"explicit"`.  Missing,
+   extra, and malformed state now fails before semantic replay or direct
+   pass dispatch.
+5. `1e55973` / `c423167` and `08b0b6d` / `6ab6a21` require canonical
+   enum members, bound untrusted integer diagnostics, and exact
+   `ScheduledLoopIR` provenance identities.  Forged exact-type enums,
+   deleted identity payloads, extra state, and enormous IDs/depths now
+   reach stable compiler diagnostics instead of `AssertionError`,
+   `AttributeError`, Python digit-limit `ValueError`, or incidental
+   provenance behavior.
+
+The review also corrected §10.5's architectural record: sparse panels
+and operand relayout share coordinate-window machinery, but are not
+inseparable.  Panel-only schedules are supported independently; relayout
+has a one-way dependency on one matching panel.  Relayout must still
+decide how a specific logical access occurrence is identified — the
+target's existing per-symbol LLIR `AccessId` is not that identity.
+
+### 11.1 Review verification
+
+Final review evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-workspace-review-6ab6a21/`;
+the fresh source captures and full-source mypy log produced during the
+same logical review are under the preceding
+`phase6-workspace-review-c0ef584/` ledger.
+
+- the five-file Phase-6 contract focus passes **352 tests**;
+- the compiled scheduled/runtime focus passes **102 tests** in 456.48
+  seconds;
+- the authoritative clean detached-worktree non-performance suite at
+  `6ab6a21` passes **3,692 tests, 14 skipped, 3 perf-marked
+  deselections, one known warning, and zero failures/errors in 2,554.39
+  seconds**, with isolated caches and import provenance asserted; this is
+  exactly the §10 baseline of 3,679 plus the 13 review regressions
+  (log SHA-256 `e7ad5dbeeb7503f59ed8fcfb4834b9b07812938af3cefd7860503228f8cf1808`,
+  JUnit SHA-256
+  `68da0d7ec41e9f6bf8c23c555c9c64068fa9276931a60f1aba667a96f1a75c5b`);
+- fresh 20-source corpus and 42-source grid captures remain byte-identical
+  to `084ed4c` and the sealed Phase-6 captures; valid workspace C++
+  remains byte-identical, while the new malformed cases fail before
+  emission;
+- paired compiler latency for base `c0ef584` versus candidate `6ab6a21`
+  is inside the 1.10 target in every category and percentile: p50 ratios
+  `0.994/0.997/1.009/0.985`, p95 ratios
+  `1.033/0.969/1.012/1.044` (small-dense, reduction,
+  CSR-intersection, sparse-union), with identical source hashes;
+- Black, scoped Flake8, focused mypy, and `git diff --check` are clean;
+  full-source mypy remains exactly the inherited **146 findings in 12
+  files**, with the finding log byte-identical to the review baseline
+  apart from `conda run`'s trailing exit wrapper;
+- the five protected tracked files retain their recorded hashes, staging
+  used explicit pathspecs, no unrelated dirty/untracked material entered
+  a commit, origin remains `58e8565`, and nothing was pushed.
+
+### 11.2 Remaining boundaries and verdict
+
+- The C++ compatibility target still accepts a stack tile width up to
+  `INT_MAX` and emits a fixed-size stack array.  That mirrors legacy and
+  was not narrowed during a byte-parity review, but widths large enough
+  to overflow practical thread stacks remain a real policy boundary for
+  a future schedule-resource gate.
+- Exact carrier validation now covers the plan and scheduled LoopIR
+  artifacts reviewed here.  The older normalized-CIN analyzer still
+  trusts the internals of exact identity objects during hashing; hostile
+  forged CIN identity payloads are a separate CIN-analysis hardening
+  slice and are not claimed fixed by this review.
+- The Phase-6 exit verdict remains **not exited**.  The next coherent
+  order is a complete standalone sparse-panel vertical slice, then
+  relayout/staging on that foundation, with heap result tiles and
+  abstract parallel selection as separately gated stretch families.
