@@ -630,6 +630,47 @@ def test_scheduled_artifact_rejects_malformed_stored_state():
     expect_code("invalid_scheduled_artifact", verify_scheduled_loopir, scheduled)
 
 
+def test_scheduled_artifact_requires_exact_provenance_identities_and_enums():
+    cin, (_i, _k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    scheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(affine_tile(j.index_id, 4),),
+        ),
+    )
+    position = next(
+        position
+        for position, provenance in enumerate(scheduled.loops)
+        if provenance.tile is not None
+    )
+    source = scheduled.loops[position]
+    assert source.tile is not None
+
+    missing_tile_value = TileId(source.tile.value)
+    object.__delattr__(missing_tile_value, "value")
+    missing_tile = replace(source, tile=missing_tile_value)
+
+    extra_index_state = IndexId(source.index.value)
+    object.__setattr__(extra_index_state, "shadow_value", source.index.value)
+    extra_index = replace(source, index=extra_index_state)
+
+    forged_part = object.__new__(LoopPart)
+    object.__setattr__(forged_part, "_name_", "FORGED")
+    object.__setattr__(forged_part, "_value_", "forged")
+    noncanonical_part = replace(source, part=forged_part)
+
+    for malformed in (missing_tile, extra_index, noncanonical_part):
+        loops = list(scheduled.loops)
+        loops[position] = malformed
+        expect_code(
+            "invalid_scheduled_artifact",
+            verify_scheduled_loopir,
+            replace(scheduled, loops=tuple(loops)),
+        )
+
+
 def test_scheduled_artifact_rejects_a_non_plan_with_artifact_diagnostic():
     cin, (_i, _k, _j) = build_matmul_ikj()
     lowering = lower(cin)
