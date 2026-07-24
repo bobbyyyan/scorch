@@ -9,11 +9,16 @@ CSR output assembly — revised from the reviewed Phase-3.5 spike, not
 copied wholesale.  Phase 6 adds the affine schedule subset: one structured
 :class:`TileOuterFor`/:class:`TileInnerFor` pair per strip-mined dense
 loop, linked by an artifact-local :class:`TileId`, with ragged-tail
-coverage intrinsic to the node semantics.  Concepts the migrated families
-do not exercise are deliberately *not* declared: there are no accumulators,
-integer constants, physical position loads (dense value-bearing leaves below
-sparse levels), workspaces, sparse coordinate windows, or parallel nodes
-yet.
+coverage intrinsic to the node semantics, and — for the stack-accumulation
+schedule family — the structured workspace region: one
+:class:`WorkspaceRegion` owning a :class:`WorkspaceDecl` whose extent is
+the point domain of one affine split, with allocation and zero-reset
+intrinsic to region entry, producer-only :class:`WorkspaceReduce` writes,
+and consumer-only :class:`WorkspaceRead` reads.  Concepts the migrated
+families do not exercise are deliberately *not* declared: there are no
+accumulators, integer constants, physical position loads (dense
+value-bearing leaves below sparse levels), dimension-extent or sparse
+(hashed) workspaces, sparse coordinate windows, or parallel nodes yet.
 
 Discipline carried over from the spike and the binding design decisions:
 
@@ -96,6 +101,20 @@ class TileId:
     :class:`TileInnerFor` pair that shares the ``TileId``.  The identity is
     what keeps the pair's ownership unambiguous when other loops sit between
     the origin loop and the point loop.
+    """
+
+    value: int
+
+
+@dataclass(frozen=True, order=True)
+class WorkspaceId:
+    """Identity of one scoped accumulation workspace within a program.
+
+    A workspace is one schedule fact — "this region accumulates into a
+    scratch buffer instead of final storage" — realized structurally as a
+    :class:`WorkspaceRegion` whose :class:`WorkspaceDecl` owns the identity.
+    Reads and reductions name the workspace by this identity, never by a
+    rendered C++ name.
     """
 
     value: int
@@ -383,6 +402,91 @@ class TileInnerFor(Stmt):
     width: int
     unroll: bool
     body: Block
+
+
+@dataclass(frozen=True)
+class WorkspaceDecl(LoopIRNode):
+    """One scoped stack workspace spanning the point domain of one split.
+
+    ``tile`` names the affine split whose point domain this workspace
+    buffers: the workspace has exactly ``width`` cells (the split's width),
+    of scalar type ``dtype``, and the cell addressed by a point coordinate
+    ``c`` is ``c - origin`` for the current origin of that split — always in
+    ``[0, width)`` because point coordinates are clamped to the tile.
+    ``name`` is presentation only, like every other display name.  There is
+    deliberately no dimension-extent, multi-dimensional, or sparse (hashed)
+    workspace form in this subset; those remain legacy-only families.
+    """
+
+    node_id: LoopIRNodeId
+    workspace: WorkspaceId
+    name: str
+    dtype: ScalarType
+    tile: TileId
+
+
+@dataclass(frozen=True)
+class WorkspaceRegion(Stmt):
+    """Structured allocation/reset, producer, and consumer of one workspace.
+
+    Region semantics are intrinsic to the node (the oracle and any target
+    lowering must implement exactly this):
+
+    - on entry a fresh workspace of ``width`` cells is allocated with every
+      cell zero — the explicit reset whose value is ADD's identity, which is
+      what makes :class:`WorkspaceReduce` well-defined without a separate
+      initialization statement;
+    - ``producer`` runs first and owns all writes: :class:`WorkspaceReduce`
+      into this workspace is legal only inside it, and it must not write
+      declared outputs;
+    - ``consumer`` runs second and owns all reads: :class:`WorkspaceRead`
+      of this workspace is legal only inside it (copy-out to the output is
+      an ordinary store of a read value);
+    - the workspace ceases to exist at region exit — its lifetime is exactly
+      the region, so a fresh zeroed buffer is observed on every execution of
+      the region (once per iteration of the enclosing scope).
+
+    The region must execute between its tile's origin loop and point loops:
+    it needs a current tile origin (so cells are addressable) and must not
+    sit inside a point loop of its own tile (a per-point workspace would
+    never accumulate).
+    """
+
+    workspace: WorkspaceDecl
+    producer: Block
+    consumer: Block
+
+
+@dataclass(frozen=True)
+class WorkspaceRead(Expr):
+    """The value stored at one cell of an in-scope workspace (consumer side).
+
+    ``coord`` must be the owning tile's point coordinate bound by a
+    :class:`TileInnerFor` inside the owning region's consumer; the cell read
+    is ``coord - origin``.  The result is value-typed with the workspace's
+    scalar type.
+    """
+
+    workspace: WorkspaceId
+    coord: Expr
+
+
+@dataclass(frozen=True)
+class WorkspaceReduce(Stmt):
+    """A read-modify-write into one cell of an in-scope workspace.
+
+    Combines the cell with ``value`` using ``op`` (``cell = cell op value``).
+    Only ADD is admitted, and its identity is exactly the zero the owning
+    region's entry reset established — this is the reduction-legality
+    contract, stated structurally.  ``coord`` must be the owning tile's
+    point coordinate bound by a :class:`TileInnerFor` inside the owning
+    region's producer; the cell written is ``coord - origin``.
+    """
+
+    workspace: WorkspaceId
+    coord: Expr
+    op: ReduceOp
+    value: Expr
 
 
 @dataclass(frozen=True)

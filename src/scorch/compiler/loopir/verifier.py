@@ -50,9 +50,26 @@ The invariant families stated locally for this subset:
   positive exact ints (``invalid_tile_width``).  A split owns its logical
   loop: the split index may be neither bound nor split again in an
   enclosing scope (``tile_index_conflict``), and the point loop's
-  coordinate binding participates in the ordinary
-  ``duplicate_index_binding`` discipline.  Ragged-tail coverage is
-  intrinsic ``TileInnerFor`` semantics, stated on the node.
+  coordinate binding participates in the ``duplicate_index_binding``
+  discipline — with one deliberately moved boundary from the workspace
+  family: one split may bind its point coordinate through *several*
+  ``TileInnerFor`` loops of the same ``TileId`` in disjoint sibling scopes
+  (a workspace region's producer and consumer each iterate the clamped
+  window once); nested rebinding and every other binder kind keep the
+  global once-only rule.  Ragged-tail coverage is intrinsic
+  ``TileInnerFor`` semantics, stated on the node.
+- **Workspace regions.**  A stack workspace is declared by exactly one
+  region (``invalid_workspace_id`` / ``duplicate_workspace_id``) and spans
+  the point domain of one affine split: the region must open between that
+  split's origin loop and its point loops (``workspace_scope_mismatch``).
+  Allocation and zero-reset are intrinsic region-entry semantics, the
+  producer owns writes and the consumer owns reads
+  (``workspace_write_scope`` / ``workspace_read_scope`` /
+  ``unbound_workspace``), a producer must not write declared outputs
+  (``workspace_output_write``), cells are addressed only by the owning
+  split's point coordinate bound inside the region
+  (``workspace_coord_mismatch``), and a region must actually accumulate
+  and copy out (``workspace_dead_region``).
 """
 
 from __future__ import annotations
@@ -97,6 +114,11 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    WorkspaceDecl,
+    WorkspaceId,
+    WorkspaceRead,
+    WorkspaceReduce,
+    WorkspaceRegion,
 )
 
 MAX_NESTING_DEPTH = 64
@@ -161,6 +183,18 @@ def _fail(code: str, path: str, message: str) -> NoReturn:
     raise LoopIRVerificationError(LoopIRDefect(code, path, message))
 
 
+class _WorkspaceState:
+    """One open workspace region's walk state."""
+
+    __slots__ = ("decl", "role", "produced", "consumed")
+
+    def __init__(self, decl: WorkspaceDecl) -> None:
+        self.decl = decl
+        self.role: Optional[str] = None
+        self.produced = False
+        self.consumed = False
+
+
 class _Context:
     """Mutable walk state: registries, scopes, and traversal guards."""
 
@@ -173,6 +207,8 @@ class _Context:
         self.written_outputs: Set[SymbolId] = set()
         self.bound_indices: Dict[IndexId, DimensionId] = {}
         self.ever_bound_indices: Set[IndexId] = set()
+        self.tile_point_bindings: Dict[IndexId, TileId] = {}
+        self.ever_tile_point_bindings: Dict[IndexId, TileId] = {}
         self.cursors: Dict[CursorId, Tuple[SparseCursorDecl, Optional[MergeMode]]] = {}
         self.ever_cursor_ids: Set[CursorId] = set()
         self.bound_positions: Dict[PositionId, Tuple[SymbolId, int]] = {}
@@ -180,6 +216,9 @@ class _Context:
         self.open_tiles: Dict[TileId, TileOuterFor] = {}
         self.matched_tile_inners: Set[TileId] = set()
         self.ever_tile_ids: Set[TileId] = set()
+        self.open_workspaces: Dict[WorkspaceId, _WorkspaceState] = {}
+        self.ever_workspace_ids: Set[WorkspaceId] = set()
+        self.producer_depth = 0
         self.in_cursor_default = False
         self.program_dtype: Optional[ScalarType] = None
         self.seen_node_ids: Set[LoopIRNodeId] = set()
@@ -536,6 +575,64 @@ def _check_binary_expr(
     return _VALUE
 
 
+def _check_workspace_id(value: object, path: str) -> WorkspaceId:
+    if (
+        type(value) is not WorkspaceId
+        or type(getattr(value, "value", _MISSING)) is not int
+    ):
+        _fail(
+            "invalid_workspace_id",
+            path,
+            "workspace must be an int-valued WorkspaceId",
+        )
+    return value
+
+
+def _check_workspace_coord(
+    ctx: _Context,
+    state: _WorkspaceState,
+    coord: object,
+    path: str,
+    depth: int,
+) -> None:
+    """Cells are addressed only by the owning split's in-region coordinate."""
+
+    _check_expr(ctx, coord, path, depth)
+    if (
+        type(coord) is not IndexValue
+        or ctx.tile_point_bindings.get(coord.index) != state.decl.tile
+    ):
+        _fail(
+            "workspace_coord_mismatch",
+            path,
+            "a workspace cell is addressed by the owning split's point "
+            "coordinate, bound by a TileInnerFor of that tile inside the "
+            "region",
+        )
+
+
+def _check_workspace_read(
+    ctx: _Context, expr: WorkspaceRead, path: str, depth: int
+) -> _ExprType:
+    workspace = _check_workspace_id(expr.workspace, path)
+    state = ctx.open_workspaces.get(workspace)
+    if state is None:
+        _fail(
+            "unbound_workspace",
+            path,
+            f"workspace {workspace.value} has no enclosing region in scope",
+        )
+    if state.role != "consumer":
+        _fail(
+            "workspace_read_scope",
+            path,
+            "a workspace is readable only inside its region's consumer",
+        )
+    _check_workspace_coord(ctx, state, expr.coord, f"{path}.coord", depth + 1)
+    state.consumed = True
+    return _VALUE
+
+
 _EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ExprType]] = {
     IndexValue: _check_index_value,
     FloatConst: _check_float_const,
@@ -545,6 +642,7 @@ _EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ExprType]] = {
     CursorValue: _check_cursor_value,
     Load: _check_load,
     BinaryExpr: _check_binary_expr,
+    WorkspaceRead: _check_workspace_read,
 }
 
 
@@ -554,15 +652,36 @@ def _bind_index(
     path: str,
     what: str,
     dimension: DimensionId,
+    point_tile: Optional[TileId] = None,
 ) -> IndexId:
+    """Bind one loop coordinate under the once-only discipline.
+
+    ``point_tile`` marks a ``TileInnerFor`` binding: a split's point
+    coordinate may be rebound by sibling point loops of the *same* tile
+    (each iterates the same clamped window exactly once — the workspace
+    producer/consumer shape).  Nested rebinding and every other repeated
+    binding remain ``duplicate_index_binding``.
+    """
+
     bound = _check_index_id(index, path, what)
-    if bound in ctx.ever_bound_indices:
+    if bound in ctx.bound_indices:
+        _fail(
+            "duplicate_index_binding",
+            path,
+            f"index {bound.value} is already bound in an enclosing scope",
+        )
+    if bound in ctx.ever_bound_indices and (
+        point_tile is None or ctx.ever_tile_point_bindings.get(bound) != point_tile
+    ):
         _fail(
             "duplicate_index_binding",
             path,
             f"index {bound.value} is bound more than once in the program",
         )
     ctx.ever_bound_indices.add(bound)
+    if point_tile is not None:
+        ctx.ever_tile_point_bindings[bound] = point_tile
+        ctx.tile_point_bindings[bound] = point_tile
     ctx.bound_indices[bound] = dimension
     return bound
 
@@ -805,12 +924,131 @@ def _check_tile_inner_for(
         )
     if type(stmt.unroll) is not bool:
         _fail("malformed_state", path, "TileInnerFor.unroll must be a bool")
-    bound = _bind_index(ctx, stmt.index, path, "TileInnerFor.index", dimension)
+    bound = _bind_index(
+        ctx, stmt.index, path, "TileInnerFor.index", dimension, point_tile=tile
+    )
     ctx.matched_tile_inners.add(tile)
     try:
         _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
     finally:
         del ctx.bound_indices[bound]
+        del ctx.tile_point_bindings[bound]
+
+
+def _check_workspace_decl(
+    ctx: _Context, decl: object, path: str, depth: int
+) -> WorkspaceDecl:
+    if type(decl) is not WorkspaceDecl:
+        _fail(
+            "malformed_state",
+            path,
+            f"expected a WorkspaceDecl, got {type(decl).__name__}",
+        )
+    _enter(ctx, decl, path, depth)
+    try:
+        workspace = _check_workspace_id(decl.workspace, path)
+        if workspace in ctx.ever_workspace_ids:
+            _fail(
+                "duplicate_workspace_id",
+                path,
+                f"workspace id {workspace.value} reused",
+            )
+        ctx.ever_workspace_ids.add(workspace)
+        if type(decl.name) is not str or not decl.name:
+            _fail("malformed_state", path, "WorkspaceDecl.name must be a nonempty str")
+        if type(decl.dtype) is not ScalarType:
+            _fail(
+                "invalid_scalar_type",
+                path,
+                "WorkspaceDecl.dtype must be a ScalarType member",
+            )
+        if ctx.program_dtype is None:
+            ctx.program_dtype = decl.dtype
+        elif decl.dtype is not ctx.program_dtype:
+            _fail(
+                "mixed_dtype",
+                path,
+                "this subset requires one uniform scalar type per program; "
+                f"got {decl.dtype.value} beside {ctx.program_dtype.value}",
+            )
+        _check_tile_id(decl.tile, f"{path}.tile")
+        return decl
+    finally:
+        _leave(ctx, decl)
+
+
+def _check_workspace_region(
+    ctx: _Context, stmt: WorkspaceRegion, path: str, depth: int
+) -> None:
+    decl = _check_workspace_decl(ctx, stmt.workspace, f"{path}.workspace", depth + 1)
+    outer = ctx.open_tiles.get(decl.tile)
+    if outer is None:
+        _fail(
+            "workspace_scope_mismatch",
+            path,
+            f"workspace tile id {decl.tile.value} has no dominating "
+            "TileOuterFor in scope; a region needs a current tile origin",
+        )
+    if outer.index in ctx.bound_indices:
+        _fail(
+            "workspace_scope_mismatch",
+            path,
+            "a workspace region must open outside its own split's point "
+            "loops; a per-point workspace could never accumulate",
+        )
+    state = _WorkspaceState(decl)
+    ctx.open_workspaces[decl.workspace] = state
+    try:
+        state.role = "producer"
+        ctx.producer_depth += 1
+        try:
+            _check_body(ctx, stmt.producer, f"{path}.producer", depth + 1)
+        finally:
+            ctx.producer_depth -= 1
+        state.role = "consumer"
+        _check_body(ctx, stmt.consumer, f"{path}.consumer", depth + 1)
+        if not state.produced:
+            _fail(
+                "workspace_dead_region",
+                path,
+                "a region's producer must reduce into its workspace",
+            )
+        if not state.consumed:
+            _fail(
+                "workspace_dead_region",
+                path,
+                "a region's consumer must read its workspace",
+            )
+    finally:
+        del ctx.open_workspaces[decl.workspace]
+
+
+def _check_workspace_reduce(
+    ctx: _Context, stmt: WorkspaceReduce, path: str, depth: int
+) -> None:
+    workspace = _check_workspace_id(stmt.workspace, path)
+    state = ctx.open_workspaces.get(workspace)
+    if state is None:
+        _fail(
+            "unbound_workspace",
+            path,
+            f"workspace {workspace.value} has no enclosing region in scope",
+        )
+    if state.role != "producer":
+        _fail(
+            "workspace_write_scope",
+            path,
+            "a workspace is writable only inside its region's producer",
+        )
+    if type(stmt.op) is not ReduceOp:
+        # ADD is the only declared ReduceOp member; its identity is exactly
+        # the zero the region-entry reset established.  Adding a member
+        # requires adding its explicit reset-identity contract here.
+        _fail("malformed_state", path, "WorkspaceReduce.op must be a ReduceOp member")
+    _check_workspace_coord(ctx, state, stmt.coord, f"{path}.coord", depth + 1)
+    value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
+    _require_value(value_type, f"{path}.value", "a combined value")
+    state.produced = True
 
 
 def _check_merged_sparse_for(
@@ -863,6 +1101,18 @@ def _check_merged_sparse_for(
             del ctx.cursors[decl.cursor]
 
 
+def _require_outside_producer(ctx: _Context, path: str) -> None:
+    """A region's producer owns its workspace; output writes are consumer work."""
+
+    if ctx.producer_depth > 0:
+        _fail(
+            "workspace_output_write",
+            path,
+            "declared outputs must not be written inside a workspace "
+            "region's producer",
+        )
+
+
 def _check_output_write_indices(
     ctx: _Context, stmt: object, tensor: SymbolId, path: str, depth: int
 ) -> None:
@@ -905,6 +1155,7 @@ def _check_store(ctx: _Context, stmt: Store, path: str, depth: int) -> None:
         _fail("undefined_tensor", path, "Store references an undeclared tensor")
     if tensor not in ctx.outputs:
         _fail("output_scope", path, "Store may only write declared outputs")
+    _require_outside_producer(ctx, path)
     _require_dense_store_target(ctx, tensor, path)
     _check_output_write_indices(ctx, stmt, tensor, path, depth)
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
@@ -920,6 +1171,7 @@ def _check_store_reduce(
         _fail("undefined_tensor", path, "StoreReduce references an undeclared tensor")
     if tensor not in ctx.outputs:
         _fail("output_scope", path, "StoreReduce may only write declared outputs")
+    _require_outside_producer(ctx, path)
     if type(stmt.op) is not ReduceOp:
         # ADD is the only declared ReduceOp member, so an exact member check
         # is the whole reduction-operator contract; adding a member requires
@@ -940,6 +1192,7 @@ def _check_append_entry(
         _fail("undefined_tensor", path, "AppendEntry references an undeclared tensor")
     if tensor not in ctx.outputs:
         _fail("output_scope", path, "AppendEntry may only assemble declared outputs")
+    _require_outside_producer(ctx, path)
     decl = ctx.tensors[tensor]
     if all(level.kind is not LevelKind.COMPRESSED for level in decl.levels):
         _fail(
@@ -976,6 +1229,8 @@ _STMT_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], None]] = {
     TileInnerFor: _check_tile_inner_for,
     SparseFor: _check_sparse_for,
     MergedSparseFor: _check_merged_sparse_for,
+    WorkspaceRegion: _check_workspace_region,
+    WorkspaceReduce: _check_workspace_reduce,
     Store: _check_store,
     StoreReduce: _check_store_reduce,
     AppendEntry: _check_append_entry,

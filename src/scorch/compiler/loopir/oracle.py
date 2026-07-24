@@ -78,6 +78,10 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    WorkspaceId,
+    WorkspaceRead,
+    WorkspaceReduce,
+    WorkspaceRegion,
 )
 from .verifier import verify_program
 
@@ -351,6 +355,29 @@ class _Oracle:
         self.positions: Dict[PositionId, int] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
         self.tile_origins: Dict[TileId, int] = {}
+        self.workspaces: Dict[WorkspaceId, Tuple[TileId, List[float]]] = {}
+        self._tile_widths: Dict[TileId, int] = {}
+
+    def _workspace_cell(
+        self, workspace: WorkspaceId, coord: Expr
+    ) -> Tuple[List[float], int]:
+        """Resolve one workspace access to its live cells and cell index."""
+
+        state = self.workspaces.get(workspace)
+        if state is None:
+            raise LoopIROracleError("workspace accessed outside its region's execution")
+        tile, cells = state
+        origin = self.tile_origins.get(tile)
+        if origin is None:
+            raise LoopIROracleError("workspace accessed outside its tile's origin loop")
+        coordinate = self._eval_coord(coord)
+        cell = coordinate - origin
+        if not 0 <= cell < len(cells):
+            raise LoopIROracleError(
+                f"workspace cell {cell} outside [0, {len(cells)}) for "
+                f"coordinate {coordinate} at origin {origin}"
+            )
+        return cells, cell
 
     def _bind_sparse_input(self, decl: TensorDecl, bound: object) -> LevelTensorStorage:
         """Snapshot one compressed-layout input behind the level interface."""
@@ -476,6 +503,9 @@ class _Oracle:
             if expr.default is None:
                 raise LoopIROracleError("unaligned cursor read without a default")
             return self._eval_value(expr.default)
+        if type(expr) is WorkspaceRead:
+            cells, cell = self._workspace_cell(expr.workspace, expr.coord)
+            return cells[cell]
         if type(expr) is Load:
             current: Any = self.values[expr.tensor]
             for position, index_expr in enumerate(expr.indices):
@@ -577,12 +607,14 @@ class _Oracle:
             return
         if type(stmt) is TileOuterFor:
             extent = self._dimension_extent(stmt.dimension)
+            self._tile_widths[stmt.tile] = stmt.width
             try:
                 for origin in range(0, extent, stmt.width):
                     self.tile_origins[stmt.tile] = origin
                     self._exec_stmt(stmt.body)
             finally:
                 self.tile_origins.pop(stmt.tile, None)
+                self._tile_widths.pop(stmt.tile, None)
             return
         if type(stmt) is TileInnerFor:
             bound_origin = self.tile_origins.get(stmt.tile)
@@ -598,6 +630,36 @@ class _Oracle:
                     self._exec_stmt(stmt.body)
             finally:
                 self.indices.pop(stmt.index, None)
+            return
+        if type(stmt) is WorkspaceRegion:
+            decl = stmt.workspace
+            region_origin = self.tile_origins.get(decl.tile)
+            if region_origin is None:
+                raise LoopIROracleError(
+                    "workspace region executed outside its tile's origin loop"
+                )
+            width = self._tile_widths.get(decl.tile)
+            if width is None:
+                raise LoopIROracleError(
+                    "workspace region's tile has no executing origin loop"
+                )
+            if decl.workspace in self.workspaces:
+                raise LoopIROracleError(
+                    "workspace region re-entered while already executing"
+                )
+            # Intrinsic region-entry semantics: a fresh buffer of one cell
+            # per tile point, every cell zero (ADD's identity).
+            self.workspaces[decl.workspace] = (decl.tile, [0.0] * width)
+            try:
+                self._exec_stmt(stmt.producer)
+                self._exec_stmt(stmt.consumer)
+            finally:
+                del self.workspaces[decl.workspace]
+            return
+        if type(stmt) is WorkspaceReduce:
+            cells, cell = self._workspace_cell(stmt.workspace, stmt.coord)
+            contribution = self._eval_value(stmt.value)
+            cells[cell] = cells[cell] + contribution
             return
         if type(stmt) is SparseFor:
             storage, start, end = self._segment(stmt.cursor)

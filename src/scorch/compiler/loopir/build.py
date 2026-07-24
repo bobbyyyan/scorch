@@ -58,10 +58,15 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    WorkspaceDecl,
+    WorkspaceId,
+    WorkspaceRead,
+    WorkspaceReduce,
+    WorkspaceRegion,
 )
 
 
-def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int]:
+def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int, int]:
     """Scan one program for the next free value of every builder identity."""
 
     next_node = 0
@@ -69,6 +74,7 @@ def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int]
     next_cursor = 0
     next_position = 0
     next_tile = 0
+    next_workspace = 0
     seen: set = set()
     pending: list = [program]
     while pending:
@@ -93,13 +99,22 @@ def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int]
                 next_position = max(next_position, value.value + 1)
             elif type(value) is TileId and type(value.value) is int:
                 next_tile = max(next_tile, value.value + 1)
+            elif type(value) is WorkspaceId and type(value.value) is int:
+                next_workspace = max(next_workspace, value.value + 1)
             elif isinstance(value, LoopIRNode):
                 pending.append(value)
             elif type(value) is tuple:
                 pending.extend(
                     child for child in value if isinstance(child, LoopIRNode)
                 )
-    return next_node, next_dimension, next_cursor, next_position, next_tile
+    return (
+        next_node,
+        next_dimension,
+        next_cursor,
+        next_position,
+        next_tile,
+        next_workspace,
+    )
 
 
 class LoopIRBuilder:
@@ -111,6 +126,7 @@ class LoopIRBuilder:
         self._next_cursor_id = 0
         self._next_position_id = 0
         self._next_tile_id = 0
+        self._next_workspace_id = 0
 
     @classmethod
     def resuming(cls, program: LoopProgram) -> "LoopIRBuilder":
@@ -129,6 +145,7 @@ class LoopIRBuilder:
             builder._next_cursor_id,
             builder._next_position_id,
             builder._next_tile_id,
+            builder._next_workspace_id,
         ) = _max_identity_values(program)
         return builder
 
@@ -164,6 +181,13 @@ class LoopIRBuilder:
         tile = TileId(self._next_tile_id)
         self._next_tile_id += 1
         return tile
+
+    def new_workspace_id(self) -> WorkspaceId:
+        """Allocate the next artifact-local workspace identity."""
+
+        workspace = WorkspaceId(self._next_workspace_id)
+        self._next_workspace_id += 1
+        return workspace
 
     @staticmethod
     def new_symbol_id() -> SymbolId:
@@ -299,6 +323,35 @@ class LoopIRBuilder:
         return TileInnerFor(
             self._node_id(), tile, index, dimension, width, unroll, body
         )
+
+    def workspace_decl(
+        self,
+        workspace: WorkspaceId,
+        name: str,
+        dtype: ScalarType,
+        tile: TileId,
+    ) -> WorkspaceDecl:
+        return WorkspaceDecl(self._node_id(), workspace, name, dtype, tile)
+
+    def workspace_region(
+        self,
+        workspace: WorkspaceDecl,
+        producer: Block,
+        consumer: Block,
+    ) -> WorkspaceRegion:
+        return WorkspaceRegion(self._node_id(), workspace, producer, consumer)
+
+    def workspace_read(self, workspace: WorkspaceId, coord: Expr) -> WorkspaceRead:
+        return WorkspaceRead(self._node_id(), workspace, coord)
+
+    def workspace_reduce(
+        self,
+        workspace: WorkspaceId,
+        coord: Expr,
+        op: ReduceOp,
+        value: Expr,
+    ) -> WorkspaceReduce:
+        return WorkspaceReduce(self._node_id(), workspace, coord, op, value)
 
     def store(self, tensor: SymbolId, indices: Sequence[Expr], value: Expr) -> Store:
         return Store(self._node_id(), tensor, tuple(indices), value)

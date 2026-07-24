@@ -49,10 +49,14 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    WorkspaceId,
+    WorkspaceRead,
+    WorkspaceReduce,
+    WorkspaceRegion,
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v3"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v4"
 
 
 class _CanonicalIds:
@@ -65,6 +69,7 @@ class _CanonicalIds:
         self._cursors: Dict[CursorId, int] = {}
         self._positions: Dict[PositionId, int] = {}
         self._tiles: Dict[TileId, int] = {}
+        self._workspaces: Dict[WorkspaceId, int] = {}
 
     def dimension(self, dimension: DimensionId) -> int:
         return self._dimensions.setdefault(dimension, len(self._dimensions))
@@ -83,6 +88,9 @@ class _CanonicalIds:
 
     def tile(self, tile: TileId) -> int:
         return self._tiles.setdefault(tile, len(self._tiles))
+
+    def workspace(self, workspace: WorkspaceId) -> int:
+        return self._workspaces.setdefault(workspace, len(self._workspaces))
 
 
 def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
@@ -110,6 +118,10 @@ def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
         ids.symbol(expr.tensor)
         for index in expr.indices:
             _seed_expr_ids(index, ids)
+        return
+    if type(expr) is WorkspaceRead:
+        ids.workspace(expr.workspace)
+        _seed_expr_ids(expr.coord, ids)
         return
     if type(expr) is BinaryExpr:
         _seed_expr_ids(expr.lhs, ids)
@@ -151,6 +163,17 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
             _seed_cursor_ids(cursor, ids)
         ids.index(stmt.coord_index)
         _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is WorkspaceRegion:
+        ids.workspace(stmt.workspace.workspace)
+        ids.tile(stmt.workspace.tile)
+        _seed_stmt_ids(stmt.producer, ids)
+        _seed_stmt_ids(stmt.consumer, ids)
+        return
+    if type(stmt) is WorkspaceReduce:
+        ids.workspace(stmt.workspace)
+        _seed_expr_ids(stmt.coord, ids)
+        _seed_expr_ids(stmt.value, ids)
         return
     if type(stmt) is Store:
         ids.symbol(stmt.tensor)
@@ -221,6 +244,12 @@ def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
             "tensor": ids.symbol(expr.tensor),
             "indices": [_serialize_expr(index, ids) for index in expr.indices],
         }
+    if type(expr) is WorkspaceRead:
+        return {
+            "kind": "workspace_read",
+            "workspace": ids.workspace(expr.workspace),
+            "coord": _serialize_expr(expr.coord, ids),
+        }
     if type(expr) is BinaryExpr:
         return {
             "kind": "binary",
@@ -289,6 +318,25 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "cursors": [_serialize_cursor(cursor, ids) for cursor in stmt.cursors],
             "coord_index": ids.index(stmt.coord_index),
             "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is WorkspaceRegion:
+        return {
+            "kind": "workspace_region",
+            "workspace": {
+                "workspace": ids.workspace(stmt.workspace.workspace),
+                "dtype": stmt.workspace.dtype.value,
+                "tile": ids.tile(stmt.workspace.tile),
+            },
+            "producer": _serialize_stmt(stmt.producer, ids),
+            "consumer": _serialize_stmt(stmt.consumer, ids),
+        }
+    if type(stmt) is WorkspaceReduce:
+        return {
+            "kind": "workspace_reduce",
+            "workspace": ids.workspace(stmt.workspace),
+            "op": stmt.op.value,
+            "coord": _serialize_expr(stmt.coord, ids),
+            "value": _serialize_expr(stmt.value, ids),
         }
     if type(stmt) is AppendEntry:
         return {
@@ -378,6 +426,11 @@ def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:
     if type(expr) is Load:
         rendered = ", ".join(_render_expr(index, ids, names) for index in expr.indices)
         return f"load t{ids.symbol(expr.tensor)}[{rendered}]"
+    if type(expr) is WorkspaceRead:
+        return (
+            f"w{ids.workspace(expr.workspace)}"
+            f"[{_render_expr(expr.coord, ids, names)}]"
+        )
     if type(expr) is BinaryExpr:
         return (
             f"{expr.op.value}({_render_expr(expr.lhs, ids, names)}, "
@@ -451,6 +504,28 @@ def _render_stmt(
         )
         _render_stmt(stmt.body, ids, names, indent + 1, lines)
         lines.append(f"{pad}}}")
+        return
+    if type(stmt) is WorkspaceRegion:
+        decl = stmt.workspace
+        lines.append(
+            f"{pad}workspace_region w{ids.workspace(decl.workspace)} "
+            f"{decl.name!r} {decl.dtype.value} over s{ids.tile(decl.tile)} {{"
+        )
+        lines.append(f"{pad}  producer {{")
+        _render_stmt(stmt.producer, ids, names, indent + 2, lines)
+        lines.append(f"{pad}  }}")
+        lines.append(f"{pad}  consumer {{")
+        _render_stmt(stmt.consumer, ids, names, indent + 2, lines)
+        lines.append(f"{pad}  }}")
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is WorkspaceReduce:
+        lines.append(
+            f"{pad}workspace_reduce({stmt.op.value}) "
+            f"w{ids.workspace(stmt.workspace)}"
+            f"[{_render_expr(stmt.coord, ids, names)}] = "
+            f"{_render_expr(stmt.value, ids, names)}"
+        )
         return
     if type(stmt) is AppendEntry:
         rendered = ", ".join(_render_expr(coord, ids, names) for coord in stmt.coords)
