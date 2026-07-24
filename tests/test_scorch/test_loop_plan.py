@@ -465,6 +465,114 @@ def test_loop_plan_verifier_rejects_primitive_subclasses_before_dispatch() -> No
             verify_loop_plan(cin, forged)
 
 
+def test_loop_plan_verifier_requires_exact_stored_carrier_fields() -> None:
+    """Deleted defaults may not silently erase or reinterpret a schedule."""
+
+    scheduled = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("k", 4, accum="direct"),),
+        ),
+    )
+    cin = scheduled.normalized_cin
+    source = scheduled.verified_loop_plan
+    source_tile = source.tiles[0]
+
+    def reject_missing(plan, carrier, field):
+        object.__delattr__(carrier, field)
+        with pytest.raises(VerificationError, match="invalid stored fields"):
+            verify_loop_plan(cin, plan)
+
+    missing_tiles = replace(source)
+    reject_missing(missing_tiles, missing_tiles, "tiles")
+
+    missing_provenance = replace(source, provenance="auto")
+    reject_missing(missing_provenance, missing_provenance, "provenance")
+
+    missing_loop_order = replace(source)
+    reject_missing(missing_loop_order, missing_loop_order, "loop_order")
+
+    tile = replace(source_tile)
+    reject_missing(replace(source, tiles=(tile,)), tile, "accumulation")
+
+    loop = replace(source_tile.loop)
+    reject_missing(
+        replace(source, tiles=(replace(source_tile, loop=loop),)),
+        loop,
+        "part",
+    )
+
+    placement = replace(source_tile.placement)
+    reject_missing(
+        replace(source, tiles=(replace(source_tile, placement=placement),)),
+        placement,
+        "parent",
+    )
+
+    bound = PanelBound(LoopRef(source.loop_order[0]), SymbolId(100), 0)
+    reject_missing(replace(source, panel_bounds=(bound,)), bound, "level")
+
+    relayout = OperandRelayout(
+        operand_id=SymbolId(101),
+        pack_loop=LoopRef(source.loop_order[0]),
+        panel_loop=LoopRef(source.loop_order[1]),
+        scope_loop=LoopRef(source.loop_order[0]),
+        row_loop=LoopRef(source.loop_order[0]),
+        strip_width=4,
+        access_indices=source.loop_order,
+        operand_panel_level=0,
+        operand_pack_level=1,
+    )
+    reject_missing(replace(source, relayout=relayout), relayout, "access_indices")
+
+    result_tile = ResultTile(
+        result_id=SymbolId(102),
+        tile_loop=LoopRef(source.loop_order[-1]),
+        result_level=1,
+        result_prefix=source.loop_order[:1],
+        access_indices=source.loop_order,
+    )
+    reject_missing(
+        replace(source, result_tile=result_tile),
+        result_tile,
+        "result_prefix",
+    )
+
+    index_id = IndexId(103)
+    index_loop = LoopRef(index_id)
+    reject_missing(
+        replace(source, tiles=(replace(source_tile, loop=index_loop),)),
+        index_id,
+        "value",
+    )
+
+    symbol_id = SymbolId(104)
+    symbol_bound = PanelBound(LoopRef(source.loop_order[0]), symbol_id, 0)
+    reject_missing(
+        replace(source, panel_bounds=(symbol_bound,)),
+        symbol_id,
+        "value",
+    )
+
+    extra_state = replace(source)
+    object.__setattr__(extra_state, "shadow_tiles", source.tiles)
+    with pytest.raises(VerificationError, match="invalid stored fields"):
+        verify_loop_plan(cin, extra_state)
+
+
+def test_scheduled_cin_verifier_requires_exact_stored_carrier_fields() -> None:
+    scheduled = Scheduler.apply_schedule(_build_spmm(), Schedule())
+    missing_plan = ScheduledCIN(
+        scheduled.normalized_cin,
+        scheduled.verified_loop_plan,
+    )
+    object.__delattr__(missing_plan, "verified_loop_plan")
+
+    with pytest.raises(VerificationError, match="invalid stored fields"):
+        verify_scheduled_cin(missing_plan)
+
+
 def test_tuple_valued_loop_plan_inputs_are_detached_from_mutable_callers() -> None:
     scheduled = Scheduler.apply_schedule(
         _build_spmm(),

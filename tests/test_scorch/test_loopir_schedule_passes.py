@@ -1073,6 +1073,24 @@ def test_apply_stack_tile_rejects_hostile_plan_primitives_fail_closed():
     )
 
 
+def test_schedule_pass_rejects_deleted_plan_state_instead_of_erasing_tiles():
+    cin, (_, _, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(stack_tile(k.index_id, 4),),
+        provenance="explicit",
+    )
+    object.__delattr__(plan, "tiles")
+
+    expect_code(
+        "invalid_schedule_plan",
+        apply_schedule_plan,
+        lowering.program,
+        plan,
+    )
+
+
 def test_apply_stack_tile_placements_resolve_against_the_prefix():
     cin, (i, j, k) = build_spmm_ijk()
     lowering = lower(cin)
