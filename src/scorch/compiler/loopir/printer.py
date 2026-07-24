@@ -37,11 +37,13 @@ from .nodes import (
     Load,
     LoopProgram,
     MergedSparseFor,
+    PanelOuterFor,
     PositionId,
     PositionValue,
     RootPosition,
     SparseCursorDecl,
     SparseFor,
+    SparseWindowFor,
     Stmt,
     Store,
     StoreReduce,
@@ -56,7 +58,7 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v4"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v5"
 
 
 class _CanonicalIds:
@@ -150,6 +152,20 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
         ids.tile(stmt.tile)
         ids.index(stmt.index)
         ids.dimension(stmt.dimension)
+        _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is PanelOuterFor:
+        ids.tile(stmt.tile)
+        ids.index(stmt.index)
+        ids.dimension(stmt.dimension)
+        ids.symbol(stmt.bound_tensor)
+        _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is SparseWindowFor:
+        ids.tile(stmt.tile)
+        _seed_cursor_ids(stmt.cursor, ids)
+        ids.position(stmt.position)
+        ids.index(stmt.coord_index)
         _seed_stmt_ids(stmt.body, ids)
         return
     if type(stmt) is SparseFor:
@@ -301,6 +317,26 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "dimension": ids.dimension(stmt.dimension),
             "width": stmt.width,
             "unroll": stmt.unroll,
+            "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is PanelOuterFor:
+        return {
+            "kind": "panel_outer_for",
+            "tile": ids.tile(stmt.tile),
+            "index": ids.index(stmt.index),
+            "dimension": ids.dimension(stmt.dimension),
+            "width": stmt.width,
+            "bound_tensor": ids.symbol(stmt.bound_tensor),
+            "bound_level": stmt.bound_level,
+            "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is SparseWindowFor:
+        return {
+            "kind": "sparse_window_for",
+            "tile": ids.tile(stmt.tile),
+            "cursor": _serialize_cursor(stmt.cursor, ids),
+            "position": ids.position(stmt.position),
+            "coord_index": ids.index(stmt.coord_index),
             "body": _serialize_stmt(stmt.body, ids),
         }
     if type(stmt) is SparseFor:
@@ -481,6 +517,26 @@ def _render_stmt(
             f"{pad}tile_inner_for s{ids.tile(stmt.tile)} "
             f"x{ids.index(stmt.index)} in d{ids.dimension(stmt.dimension)} "
             f"width {stmt.width}{unroll} {{"
+        )
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is PanelOuterFor:
+        lines.append(
+            f"{pad}panel_outer_for s{ids.tile(stmt.tile)} "
+            f"x{ids.index(stmt.index)} in d{ids.dimension(stmt.dimension)} "
+            f"width {stmt.width} "
+            f"bound t{ids.symbol(stmt.bound_tensor)}@{stmt.bound_level} {{"
+        )
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is SparseWindowFor:
+        cursor = _render_cursor(stmt.cursor, ids, names)
+        lines.append(
+            f"{pad}sparse_window_for s{ids.tile(stmt.tile)} "
+            f"(p{ids.position(stmt.position)}, "
+            f"x{ids.index(stmt.coord_index)}) in {cursor} {{"
         )
         _render_stmt(stmt.body, ids, names, indent + 1, lines)
         lines.append(f"{pad}}}")

@@ -1007,3 +1007,122 @@ def test_workspace_access_outside_region_fails_closed_at_runtime():
     with pytest.raises(LoopIROracleError) as error:
         oracle._exec_stmt(fixture.region)
     assert "outside its tile's origin loop" in str(error.value)
+
+
+# -- Phase-6 sparse coordinate panels -----------------------------------------
+
+
+def panel_reference_spmm(a_dense, b_dense, cols):
+    rows = len(a_dense)
+    inner = len(b_dense)
+    return [
+        [sum(a_dense[i][j] * b_dense[j][k] for j in range(inner)) for k in range(cols)]
+        for i in range(rows)
+    ]
+
+
+def test_panel_spmm_matches_the_unwindowed_reference_exactly():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    rng = random.Random(628)
+    rows, inner, cols = 4, 5, 3
+    for width in (1, 2, 3, 5, 7, 64):
+        fixture = build_panel_spmm(width=width)
+        a_dense = [
+            [
+                float(rng.randrange(-3, 4)) if rng.random() < 0.6 else 0.0
+                for _ in range(inner)
+            ]
+            for _ in range(rows)
+        ]
+        b_dense = [
+            [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(inner)
+        ]
+        results = run_program(
+            fixture.program,
+            {fixture.a: csr_from_dense(a_dense), fixture.b: b_dense},
+            {fixture.c: (rows, cols)},
+        )
+        assert results[fixture.c] == panel_reference_spmm(a_dense, b_dense, cols)
+
+
+def test_panel_visits_each_stored_entry_exactly_once():
+    """Counting differential: with all-ones inputs each output cell must
+    count exactly its row's stored entries, across ragged windows, empty
+    rows, and disjoint per-row supports."""
+
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    inner, cols = 7, 2
+    a_dense = [
+        [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        [0.0] * inner,
+        [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        [1.0] * inner,
+    ]
+    stored_counts = [4.0, 0.0, 3.0, 7.0]
+    for width in (1, 2, 3, 4, 7, 9):
+        fixture = build_panel_spmm(width=width)
+        ones_b = [[1.0] * cols for _ in range(inner)]
+        results = run_program(
+            fixture.program,
+            {fixture.a: csr_from_dense(a_dense), fixture.b: ones_b},
+            {fixture.c: (len(a_dense), cols)},
+        )
+        assert results[fixture.c] == [[count] * cols for count in stored_counts]
+
+
+def test_panel_zero_extents_execute():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    # Zero panel dimension: the origin loop runs no windows.
+    fixture = build_panel_spmm(width=4)
+    empty_cols = CsrMatrix(
+        n_rows=3, n_cols=0, indptr=(0, 0, 0, 0), indices=(), values=()
+    )
+    results = run_program(
+        fixture.program,
+        {fixture.a: empty_cols, fixture.b: []},
+        {fixture.c: (3, 2)},
+    )
+    assert results[fixture.c] == [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+
+    # Zero rows: the row loop under the panel runs nothing.
+    fixture = build_panel_spmm(width=4)
+    no_rows = CsrMatrix(n_rows=0, n_cols=2, indptr=(0,), indices=(), values=())
+    results = run_program(
+        fixture.program,
+        {fixture.a: no_rows, fixture.b: [[1.0], [1.0]]},
+        {fixture.c: (0, 1)},
+    )
+    assert results[fixture.c] == []
+
+
+def test_panel_width_is_semantic_not_an_allocation_request():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    fixture = build_panel_spmm(width=1 << 100)
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense([[2.0]]), fixture.b: [[3.0]]},
+        {fixture.c: (1, 1)},
+    )
+    assert results[fixture.c] == [[6.0]]
+
+
+def test_window_outside_its_panel_fails_closed_at_runtime():
+    """Defensive boundary: the verifier's panel scope rule normally
+    precludes this, so the oracle's runtime guard is exercised directly."""
+
+    from scorch.compiler.loopir.oracle import _Oracle
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    fixture = build_panel_spmm(width=4)
+    oracle = _Oracle(
+        fixture.program,
+        {fixture.a: csr_from_dense([[1.0]]), fixture.b: [[1.0]]},
+        {fixture.c: (1, 1)},
+    )
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.row_loop)
+    assert "outside its panel's origin loop" in str(error.value)

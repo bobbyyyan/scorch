@@ -44,6 +44,7 @@ from .nodes import (
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PanelOuterFor,
     PositionId,
     PositionValue,
     ReduceOp,
@@ -51,6 +52,7 @@ from .nodes import (
     ScalarType,
     SparseCursorDecl,
     SparseFor,
+    SparseWindowFor,
     Stmt,
     Store,
     StoreReduce,
@@ -322,6 +324,39 @@ class LoopIRBuilder:
     ) -> TileInnerFor:
         return TileInnerFor(
             self._node_id(), tile, index, dimension, width, unroll, body
+        )
+
+    def panel_outer_for(
+        self,
+        tile: TileId,
+        index: IndexId,
+        dimension: DimensionId,
+        width: int,
+        bound_tensor: SymbolId,
+        bound_level: int,
+        body: Block,
+    ) -> PanelOuterFor:
+        return PanelOuterFor(
+            self._node_id(),
+            tile,
+            index,
+            dimension,
+            width,
+            bound_tensor,
+            bound_level,
+            body,
+        )
+
+    def sparse_window_for(
+        self,
+        tile: TileId,
+        cursor: SparseCursorDecl,
+        position: PositionId,
+        coord_index: IndexId,
+        body: Block,
+    ) -> SparseWindowFor:
+        return SparseWindowFor(
+            self._node_id(), tile, cursor, position, coord_index, body
         )
 
     def workspace_decl(

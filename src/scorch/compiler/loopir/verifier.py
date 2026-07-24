@@ -58,6 +58,21 @@ The invariant families stated locally for this subset:
   window once); nested rebinding and every other binder kind keep the
   global once-only rule.  Ragged-tail coverage is intrinsic
   ``TileInnerFor`` semantics, stated on the node.
+- **Sparse coordinate panels.**  A panel is one ``PanelOuterFor`` /
+  ``SparseWindowFor`` pair owning a unique ``TileId`` drawn from the same
+  identity space as affine splits (``duplicate_tile_id``); the window must
+  run inside its origin loop's scope (``unbound_panel``), every panel
+  origin must contain its window (``missing_panel_window``), and the pair
+  must agree on the bound coordinate and its domain — the window's
+  coordinate index is the panel's logical index and the window's cursor
+  level stores the panel's dimension (``panel_binding_mismatch``).  The
+  panel's declared bound must be a DENSE level whose logical mode stores
+  the panel dimension (``panel_bound_mismatch``).  A panel owns its
+  logical loop exactly like an affine split (``tile_index_conflict``),
+  its window binds the coordinate under the global once-only discipline,
+  and window widths are positive exact ints (``invalid_tile_width``).
+  Clamped-window coverage is intrinsic ``SparseWindowFor`` semantics,
+  stated on the node.
 - **Workspace regions.**  A stack workspace is declared by exactly one
   region (``invalid_workspace_id`` / ``duplicate_workspace_id``) and spans
   the point domain of one affine split: the region must open between that
@@ -100,6 +115,7 @@ from .nodes import (
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PanelOuterFor,
     PositionId,
     PositionValue,
     ReduceOp,
@@ -107,6 +123,7 @@ from .nodes import (
     ScalarType,
     SparseCursorDecl,
     SparseFor,
+    SparseWindowFor,
     Stmt,
     Store,
     StoreReduce,
@@ -216,6 +233,8 @@ class _Context:
         self.open_tiles: Dict[TileId, TileOuterFor] = {}
         self.matched_tile_inners: Set[TileId] = set()
         self.ever_tile_ids: Set[TileId] = set()
+        self.open_panels: Dict[TileId, PanelOuterFor] = {}
+        self.matched_panel_windows: Set[TileId] = set()
         self.open_workspaces: Dict[WorkspaceId, _WorkspaceState] = {}
         self.ever_workspace_ids: Set[WorkspaceId] = set()
         self.producer_depth = 0
@@ -875,7 +894,9 @@ def _check_tile_outer_for(
             f"index {index.value} is already bound in an enclosing scope; a "
             "split must own its logical loop",
         )
-    if any(open_tile.index == index for open_tile in ctx.open_tiles.values()):
+    if any(open_tile.index == index for open_tile in ctx.open_tiles.values()) or any(
+        open_panel.index == index for open_panel in ctx.open_panels.values()
+    ):
         _fail(
             "tile_index_conflict",
             path,
@@ -933,6 +954,118 @@ def _check_tile_inner_for(
     finally:
         del ctx.bound_indices[bound]
         del ctx.tile_point_bindings[bound]
+
+
+def _check_panel_outer_for(
+    ctx: _Context, stmt: PanelOuterFor, path: str, depth: int
+) -> None:
+    tile = _check_tile_id(stmt.tile, f"{path}.tile")
+    if tile in ctx.ever_tile_ids:
+        _fail("duplicate_tile_id", path, f"tile id {tile.value} reused")
+    ctx.ever_tile_ids.add(tile)
+    dimension = _check_tile_loop_dimension(ctx, stmt.dimension, path, "PanelOuterFor")
+    index = _check_index_id(stmt.index, path, "PanelOuterFor.index")
+    if index in ctx.bound_indices:
+        _fail(
+            "tile_index_conflict",
+            path,
+            f"index {index.value} is already bound in an enclosing scope; a "
+            "panel must own its logical loop",
+        )
+    if any(open_tile.index == index for open_tile in ctx.open_tiles.values()) or any(
+        open_panel.index == index for open_panel in ctx.open_panels.values()
+    ):
+        _fail(
+            "tile_index_conflict",
+            path,
+            f"index {index.value} is already split by an enclosing tile",
+        )
+    _check_tile_width(stmt.width, path, "PanelOuterFor.width")
+    bound_tensor = _check_symbol_id(
+        stmt.bound_tensor, f"{path}.bound_tensor", "PanelOuterFor.bound_tensor"
+    )
+    if bound_tensor not in ctx.tensors:
+        _fail(
+            "undefined_tensor",
+            f"{path}.bound_tensor",
+            "panel bound references an undeclared tensor",
+        )
+    if type(stmt.bound_level) is not int:
+        _fail(
+            "malformed_state",
+            f"{path}.bound_level",
+            "PanelOuterFor.bound_level must be an exact int",
+        )
+    bound_levels = ctx.tensors[bound_tensor].levels
+    if not 0 <= stmt.bound_level < len(bound_levels):
+        _fail(
+            "rank_mismatch",
+            f"{path}.bound_level",
+            f"level {stmt.bound_level} outside rank-{len(bound_levels)} tensor",
+        )
+    if bound_levels[stmt.bound_level].kind is not LevelKind.DENSE:
+        _fail(
+            "panel_bound_mismatch",
+            f"{path}.bound_level",
+            "the panel bound must name a DENSE storage level; the clamp "
+            "extent is a declared dense dimension bound",
+        )
+    if ctx.level_dimension(bound_tensor, stmt.bound_level) != dimension:
+        _fail(
+            "panel_bound_mismatch",
+            f"{path}.bound_level",
+            "the panel bound level must store the panel's own dimension",
+        )
+    ctx.open_panels[tile] = stmt
+    try:
+        _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
+        if tile not in ctx.matched_panel_windows:
+            _fail(
+                "missing_panel_window",
+                path,
+                f"PanelOuterFor for tile id {tile.value} has no matching "
+                "SparseWindowFor in its body",
+            )
+    finally:
+        del ctx.open_panels[tile]
+        ctx.matched_panel_windows.discard(tile)
+
+
+def _check_sparse_window_for(
+    ctx: _Context, stmt: SparseWindowFor, path: str, depth: int
+) -> None:
+    tile = _check_tile_id(stmt.tile, f"{path}.tile")
+    panel = ctx.open_panels.get(tile)
+    if panel is None:
+        _fail(
+            "unbound_panel",
+            path,
+            f"tile id {tile.value} has no dominating PanelOuterFor in scope",
+        )
+    decl = _check_cursor_decl(ctx, stmt.cursor, f"{path}.cursor", depth + 1)
+    coord = _check_index_id(stmt.coord_index, path, "SparseWindowFor.coord_index")
+    coord_dimension = ctx.level_dimension(decl.tensor, decl.level)
+    if coord != panel.index or coord_dimension != panel.dimension:
+        _fail(
+            "panel_binding_mismatch",
+            path,
+            "SparseWindowFor must bind its panel's logical index over a "
+            "cursor level storing the panel's dimension",
+        )
+    position = _bind_position(
+        ctx, stmt.position, path, "SparseWindowFor.position", decl.tensor, decl.level
+    )
+    index = _bind_index(
+        ctx, stmt.coord_index, path, "SparseWindowFor.coord_index", coord_dimension
+    )
+    ctx.cursors[decl.cursor] = (decl, None)
+    ctx.matched_panel_windows.add(tile)
+    try:
+        _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
+    finally:
+        del ctx.bound_indices[index]
+        del ctx.bound_positions[position]
+        del ctx.cursors[decl.cursor]
 
 
 def _check_workspace_decl(
@@ -1227,6 +1360,8 @@ _STMT_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], None]] = {
     DenseFor: _check_dense_for,
     TileOuterFor: _check_tile_outer_for,
     TileInnerFor: _check_tile_inner_for,
+    PanelOuterFor: _check_panel_outer_for,
+    SparseWindowFor: _check_sparse_window_for,
     SparseFor: _check_sparse_for,
     MergedSparseFor: _check_merged_sparse_for,
     WorkspaceRegion: _check_workspace_region,

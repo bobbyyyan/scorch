@@ -14,11 +14,16 @@ schedule family — the structured workspace region: one
 :class:`WorkspaceRegion` owning a :class:`WorkspaceDecl` whose extent is
 the point domain of one affine split, with allocation and zero-reset
 intrinsic to region entry, producer-only :class:`WorkspaceReduce` writes,
-and consumer-only :class:`WorkspaceRead` reads.  Concepts the migrated
-families do not exercise are deliberately *not* declared: there are no
-accumulators, integer constants, physical position loads (dense
-value-bearing leaves below sparse levels), dimension-extent or sparse
-(hashed) workspaces, sparse coordinate windows, or parallel nodes yet.
+and consumer-only :class:`WorkspaceRead` reads.  The sparse-panel slice
+adds the coordinate-window pair: one :class:`PanelOuterFor` iterating the
+clamped window origins of a compressed coordinate's dimension, paired by
+the same artifact-local :class:`TileId` with one :class:`SparseWindowFor`
+that visits exactly the stored entries whose coordinate falls inside the
+current window.  Concepts the migrated families do not exercise are
+deliberately *not* declared: there are no accumulators, integer
+constants, physical position loads (dense value-bearing leaves below
+sparse levels), dimension-extent or sparse (hashed) workspaces, or
+parallel nodes yet.
 
 Discipline carried over from the spike and the binding design decisions:
 
@@ -401,6 +406,61 @@ class TileInnerFor(Stmt):
     dimension: DimensionId
     width: int
     unroll: bool
+    body: Block
+
+
+@dataclass(frozen=True)
+class PanelOuterFor(Stmt):
+    """The origin loop of one sparse coordinate panel (window).
+
+    Iterates the window origins ``0, width, 2*width, ...`` of ``dimension``,
+    strictly below the dimension's runtime extent, in order.  Like an
+    affine origin loop, the origin is deliberately not a readable
+    coordinate: the panel's only observable binding is the stored
+    coordinate the paired :class:`SparseWindowFor` binds.  ``index``
+    records which logical compressed-coordinate loop was panel-tiled
+    (schedule provenance); the paired window loop is matched by ``tile``
+    and must bind exactly that index.
+
+    ``bound_tensor``/``bound_level`` name one declared DENSE storage level
+    whose logical mode stores ``dimension`` — the plan's ``PanelBound``
+    fact, materialized structurally.  It is semantically redundant with
+    the dimension identity (extent equality is the dimension contract) and
+    exists so a target lowering can reproduce the exact bound the legacy
+    panel loop reads; the verifier enforces its consistency.
+    """
+
+    tile: TileId
+    index: IndexId
+    dimension: DimensionId
+    width: int
+    bound_tensor: SymbolId
+    bound_level: int
+    body: Block
+
+
+@dataclass(frozen=True)
+class SparseWindowFor(Stmt):
+    """Windowed position iteration over one sparse cursor's segment.
+
+    Must execute within the :class:`PanelOuterFor` binding the same
+    ``tile``.  For the enclosing window origin ``o`` it visits, in storage
+    order, exactly the stored entries of the cursor's selected segment
+    whose coordinate ``c`` satisfies ``o <= c < min(o + width, extent)``
+    (``extent`` is the runtime extent of the panel's dimension) — the
+    clamped coordinate window is intrinsic node semantics, so every stored
+    entry of the segment is visited exactly once across the origin loop's
+    iterations.  Each visit binds ``position`` to the entry's physical
+    storage position and ``coord_index`` to its stored coordinate, exactly
+    like :class:`SparseFor`.  How the position sub-range is found (for a
+    canonical sorted segment it is derivable by coordinate search) is a
+    target concern; no search spelling appears in the node.
+    """
+
+    tile: TileId
+    cursor: SparseCursorDecl
+    position: PositionId
+    coord_index: IndexId
     body: Block
 
 

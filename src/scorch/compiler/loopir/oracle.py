@@ -20,6 +20,13 @@ Semantics (matching the node contracts exactly):
   extent, and ``TileInnerFor`` binds the clamped point range
   ``origin .. min(origin + width, extent) - 1``, so every coordinate is
   visited exactly once across the pair;
+- sparse coordinate panels execute the same way: ``PanelOuterFor``
+  iterates the window origins of its dimension, and ``SparseWindowFor``
+  visits, in storage order, exactly the stored entries of its cursor's
+  segment whose coordinate falls inside the current clamped window
+  ``[origin, min(origin + width, extent))`` — panel widths are semantic
+  integers, never allocation requests, and a window executed outside its
+  panel's origin loop fails closed at runtime;
 - sparse iteration executes over the format-neutral level interface of
   :mod:`~scorch.compiler.loopir.levels` (``segment`` / ``coordinate_at`` /
   ``leaf_value``): all-dense inputs bind nested sequences, inputs with a
@@ -66,11 +73,13 @@ from .nodes import (
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PanelOuterFor,
     PositionId,
     PositionValue,
     RootPosition,
     SparseCursorDecl,
     SparseFor,
+    SparseWindowFor,
     Stmt,
     Store,
     StoreReduce,
@@ -362,6 +371,8 @@ class _Oracle:
         # verifier-approved (target-neutral) tile width.
         self.workspaces: Dict[WorkspaceId, Tuple[TileId, int, Dict[int, float]]] = {}
         self._tile_widths: Dict[TileId, int] = {}
+        self.panel_origins: Dict[TileId, int] = {}
+        self._panel_widths: Dict[TileId, int] = {}
 
     def _workspace_cell(
         self, workspace: WorkspaceId, coord: Expr
@@ -665,6 +676,47 @@ class _Oracle:
             cells, cell = self._workspace_cell(stmt.workspace, stmt.coord)
             contribution = self._eval_value(stmt.value)
             cells[cell] = cells.get(cell, 0.0) + contribution
+            return
+        if type(stmt) is PanelOuterFor:
+            extent = self._dimension_extent(stmt.dimension)
+            self._panel_widths[stmt.tile] = stmt.width
+            try:
+                for origin in range(0, extent, stmt.width):
+                    self.panel_origins[stmt.tile] = origin
+                    self._exec_stmt(stmt.body)
+            finally:
+                self.panel_origins.pop(stmt.tile, None)
+                self._panel_widths.pop(stmt.tile, None)
+            return
+        if type(stmt) is SparseWindowFor:
+            bound_origin = self.panel_origins.get(stmt.tile)
+            width = self._panel_widths.get(stmt.tile)
+            if bound_origin is None or width is None:
+                raise LoopIROracleError(
+                    "sparse window executed outside its panel's origin loop"
+                )
+            origin = bound_origin
+            cursor_decl = self.decls[stmt.cursor.tensor]
+            dimension = cursor_decl.dimensions[
+                cursor_decl.levels[stmt.cursor.level].mode
+            ]
+            extent = self._dimension_extent(dimension)
+            window_end = min(origin + width, extent)
+            storage, start, end = self._segment(stmt.cursor)
+            state = _CursorState(storage, stmt.cursor.level, start, end, aligned=True)
+            self.cursors[stmt.cursor.cursor] = state
+            try:
+                while not state.exhausted:
+                    coordinate = state.coordinate
+                    if origin <= coordinate < window_end:
+                        self.positions[stmt.position] = state.position
+                        self.indices[stmt.coord_index] = coordinate
+                        self._exec_stmt(stmt.body)
+                    state.position += 1
+            finally:
+                self.indices.pop(stmt.coord_index, None)
+                self.positions.pop(stmt.position, None)
+                del self.cursors[stmt.cursor.cursor]
             return
         if type(stmt) is SparseFor:
             storage, start, end = self._segment(stmt.cursor)

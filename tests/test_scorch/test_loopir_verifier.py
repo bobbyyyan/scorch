@@ -664,6 +664,11 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "tile_binding_mismatch",
     "invalid_tile_width",
     "tile_index_conflict",
+    # Sparse-panel codes added by the Phase-6 panel slice.
+    "unbound_panel",
+    "missing_panel_window",
+    "panel_binding_mismatch",
+    "panel_bound_mismatch",
     # Workspace-region codes added by the Phase-6 stack-accumulation slice.
     "invalid_workspace_id",
     "duplicate_workspace_id",
@@ -1889,3 +1894,407 @@ def test_workspace_region_rejects_cycles_and_shared_nodes():
     fixture = build_stack_matmul()
     forge(fixture.region, consumer=fixture.region.producer)
     expect_defect("shared_node", fixture.program)
+
+
+# -- Phase-6 sparse coordinate panels -----------------------------------------
+
+
+@dataclasses.dataclass
+class PanelSpmmFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    a: SymbolId
+    b: SymbolId
+    c: SymbolId
+    dim_i: DimensionId
+    dim_j: DimensionId
+    dim_k: DimensionId
+    row: IndexId
+    col: IndexId
+    free: IndexId
+    panel: object
+    window: object
+    row_loop: object
+    free_loop: object
+
+
+def build_panel_spmm(width=3, dtype=ScalarType.FLOAT32) -> PanelSpmmFixture:
+    """C[i, k] += A[i, j] * B[j, k] with a width-``width`` panel over j.
+
+    A is canonical CSR, B and C are dense; the panel origin loop wraps the
+    dense row loop and the window replaces the compressed coordinate loop —
+    the legacy SpMM tile-j shape.
+    """
+
+    from scorch.compiler.loopir.nodes import ReduceOp as _ReduceOp
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    dim_k = builder.dimension("k")
+    a, b, c = (builder.new_symbol_id() for _ in range(3))
+    decl_a = builder.tensor(
+        a,
+        "A",
+        dtype,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_b = builder.tensor(
+        b,
+        "B",
+        dtype,
+        (dim_j.dimension, dim_k.dimension),
+        builder.dense_levels(2),
+    )
+    decl_c = builder.tensor(
+        c,
+        "C",
+        dtype,
+        (dim_i.dimension, dim_k.dimension),
+        builder.dense_levels(2),
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    free = builder.new_index_id()
+    cursor = builder.new_cursor_id()
+    position = builder.new_position_id()
+    tile = builder.new_tile_id()
+    cursor_decl = builder.sparse_cursor(
+        cursor,
+        a,
+        1,
+        builder.dense_position(a, 0, builder.root_position(), builder.index_value(row)),
+    )
+    leaf = builder.store_reduce(
+        c,
+        (builder.index_value(row), builder.index_value(free)),
+        _ReduceOp.ADD,
+        builder.binary(
+            BinaryOp.MUL,
+            builder.cursor_value(cursor),
+            builder.load(b, (builder.index_value(col), builder.index_value(free))),
+        ),
+    )
+    free_loop = builder.dense_for(free, dim_k.dimension, builder.block((leaf,)))
+    window = builder.sparse_window_for(
+        tile, cursor_decl, position, col, builder.block((free_loop,))
+    )
+    row_loop = builder.dense_for(row, dim_i.dimension, builder.block((window,)))
+    panel = builder.panel_outer_for(
+        tile,
+        col,
+        dim_j.dimension,
+        width,
+        b,
+        0,
+        builder.block((row_loop,)),
+    )
+    program = builder.program(
+        (dim_i, dim_j, dim_k),
+        (decl_a, decl_b, decl_c),
+        (a, b),
+        (c,),
+        builder.block((panel,)),
+    )
+    return PanelSpmmFixture(
+        builder,
+        program,
+        a,
+        b,
+        c,
+        dim_i.dimension,
+        dim_j.dimension,
+        dim_k.dimension,
+        row,
+        col,
+        free,
+        panel,
+        window,
+        row_loop,
+        free_loop,
+    )
+
+
+def test_panel_spmm_fixture_verifies():
+    verify_program(build_panel_spmm().program)
+    verify_program(build_panel_spmm(width=1).program)
+    verify_program(build_panel_spmm(width=10**9).program)
+
+
+def test_panel_tile_identity_is_typed_and_unique():
+    fixture = build_panel_spmm()
+    forge(fixture.panel, tile=7)
+    expect_defect("invalid_tile_id", fixture.program)
+
+    fixture = build_panel_spmm()
+    forge(fixture.window, tile="0")
+    expect_defect("invalid_tile_id", fixture.program)
+
+    # A second panel (or an affine split) may not reuse the panel's TileId:
+    # panels draw from the same identity space as affine splits.
+    fixture = build_panel_spmm()
+    duplicate = fixture.builder.panel_outer_for(
+        fixture.panel.tile,
+        fixture.builder.new_index_id(),
+        fixture.dim_j,
+        4,
+        fixture.b,
+        0,
+        fixture.builder.block(()),
+    )
+    forge(
+        fixture.program,
+        body=fixture.builder.block((fixture.panel, duplicate)),
+    )
+    defect = expect_defect("duplicate_tile_id", fixture.program)
+    assert "reused" in defect.message
+
+    fixture = build_panel_spmm()
+    inner = TileInnerFor(
+        LoopIRNodeId(10_000),
+        fixture.panel.tile,
+        fixture.free,
+        fixture.dim_k,
+        3,
+        False,
+        fixture.builder.block(()),
+    )
+    forge(fixture.free_loop, body=fixture.builder.block((inner,)))
+    # An affine point loop cannot bind a panel's tile: panels are not open
+    # affine splits.
+    expect_defect("unbound_tile", fixture.program)
+
+
+def test_panel_width_must_be_a_positive_exact_int():
+    for width in (0, -3, True, 2.0, None):
+        fixture = build_panel_spmm()
+        forge(fixture.panel, width=width)
+        expect_defect("invalid_tile_width", fixture.program)
+
+
+def test_panel_index_conflicts_fail_closed():
+    # The panel's logical index is already bound by an enclosing loop.
+    fixture = build_panel_spmm()
+    wrapper = fixture.builder.dense_for(
+        fixture.builder.new_index_id(), fixture.dim_j, fixture.builder.block(())
+    )
+    forge(wrapper, index=fixture.col, body=fixture.builder.block((fixture.panel,)))
+    forge(fixture.program, body=fixture.builder.block((wrapper,)))
+    expect_defect("tile_index_conflict", fixture.program)
+
+    # An affine origin loop may not split an index a panel already owns.
+    fixture = build_panel_spmm()
+    outer = TileOuterFor(
+        LoopIRNodeId(10_001),
+        fixture.builder.new_tile_id(),
+        fixture.col,
+        fixture.dim_j,
+        2,
+        fixture.builder.block((fixture.window,)),
+    )
+    forge(fixture.row_loop, body=fixture.builder.block((outer,)))
+    expect_defect("tile_index_conflict", fixture.program)
+
+
+def test_panel_bound_must_name_a_declared_dense_level_of_its_dimension():
+    fixture = build_panel_spmm()
+    forge(fixture.panel, bound_tensor=SymbolId(999_999))
+    expect_defect("undefined_tensor", fixture.program)
+
+    fixture = build_panel_spmm()
+    forge(fixture.panel, bound_tensor="B")
+    expect_defect("invalid_symbol_id", fixture.program)
+
+    fixture = build_panel_spmm()
+    forge(fixture.panel, bound_level=2)
+    expect_defect("rank_mismatch", fixture.program)
+
+    fixture = build_panel_spmm()
+    forge(fixture.panel, bound_level=True)
+    expect_defect("malformed_state", fixture.program)
+
+    # A's level 1 stores dimension j but is COMPRESSED: the bound must be a
+    # dense extent source.
+    fixture = build_panel_spmm()
+    forge(fixture.panel, bound_tensor=fixture.a, bound_level=1)
+    expect_defect("panel_bound_mismatch", fixture.program)
+
+    # B's level 1 is dense but stores dimension k, not the panel dimension.
+    fixture = build_panel_spmm()
+    forge(fixture.panel, bound_level=1)
+    expect_defect("panel_bound_mismatch", fixture.program)
+
+
+def test_panel_origin_requires_its_window():
+    fixture = build_panel_spmm()
+    plain = fixture.builder.sparse_for(
+        fixture.window.cursor,
+        fixture.window.position,
+        fixture.window.coord_index,
+        fixture.window.body,
+    )
+    forge(fixture.row_loop, body=fixture.builder.block((plain,)))
+    expect_defect("missing_panel_window", fixture.program)
+
+
+def test_window_requires_its_dominating_panel():
+    # No panel at all: the window's tile is unbound.
+    fixture = build_panel_spmm()
+    forge(fixture.program, body=fixture.builder.block((fixture.row_loop,)))
+    expect_defect("unbound_panel", fixture.program)
+
+    # A window under a different panel's scope is still unbound.
+    fixture = build_panel_spmm()
+    forge(fixture.window, tile=fixture.builder.new_tile_id())
+    expect_defect("unbound_panel", fixture.program)
+
+    # An affine origin loop does not open a panel scope.
+    fixture = build_panel_spmm()
+    affine_tile = fixture.builder.new_tile_id()
+    forge(fixture.window, tile=affine_tile)
+    inner_body = fixture.builder.block((fixture.row_loop,))
+    outer = TileOuterFor(
+        LoopIRNodeId(10_002),
+        affine_tile,
+        fixture.builder.new_index_id(),
+        fixture.dim_j,
+        3,
+        inner_body,
+    )
+    forge(fixture.program, body=fixture.builder.block((outer,)))
+    expect_defect("unbound_panel", fixture.program)
+
+
+def test_window_must_agree_with_its_panel():
+    # The window must bind the panel's logical index.
+    fixture = build_panel_spmm()
+    forge(fixture.panel, index=fixture.builder.new_index_id())
+    expect_defect("panel_binding_mismatch", fixture.program)
+
+    # The window's cursor level must store the panel's dimension.
+    fixture = build_panel_spmm()
+    forge(
+        fixture.panel,
+        dimension=fixture.dim_i,
+        bound_tensor=fixture.a,
+        bound_level=0,
+    )
+    expect_defect("panel_binding_mismatch", fixture.program)
+
+
+def test_window_binds_coordinate_and_position_once_only():
+    # A second window of the same panel would rebind the coordinate: the
+    # sibling-rebinding boundary stays owned by the workspace point family.
+    fixture = build_panel_spmm()
+    second_cursor = fixture.builder.sparse_cursor(
+        fixture.builder.new_cursor_id(),
+        fixture.a,
+        1,
+        fixture.builder.dense_position(
+            fixture.a,
+            0,
+            fixture.builder.root_position(),
+            fixture.builder.index_value(fixture.row),
+        ),
+    )
+    second = fixture.builder.sparse_window_for(
+        fixture.panel.tile,
+        second_cursor,
+        fixture.builder.new_position_id(),
+        fixture.col,
+        fixture.builder.block(()),
+    )
+    forge(
+        fixture.row_loop,
+        body=fixture.builder.block((fixture.window, second)),
+    )
+    expect_defect("duplicate_index_binding", fixture.program)
+
+    # A nested window reusing the outer window's PositionId is rejected
+    # before its (would-be duplicate) coordinate binding.
+    fixture = build_panel_spmm()
+    duplicate_position = fixture.builder.sparse_window_for(
+        fixture.panel.tile,
+        fixture.builder.sparse_cursor(
+            fixture.builder.new_cursor_id(),
+            fixture.a,
+            1,
+            fixture.builder.dense_position(
+                fixture.a,
+                0,
+                fixture.builder.root_position(),
+                fixture.builder.index_value(fixture.row),
+            ),
+        ),
+        fixture.window.position,
+        fixture.col,
+        fixture.builder.block(()),
+    )
+    forge(fixture.free_loop, body=fixture.builder.block((duplicate_position,)))
+    defect = expect_defect("duplicate_position_binding", fixture.program)
+    assert "bound more than once" in defect.message
+
+
+def test_window_cursor_inherits_the_cursor_discipline():
+    fixture = build_panel_spmm()
+    forge(fixture.window.cursor, level=0)
+    expect_defect("layout_mismatch", fixture.program)
+
+    fixture = build_panel_spmm()
+    forge(fixture.window, cursor=fixture.builder.index_value(fixture.col))
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_panel_nodes_reject_hostile_subclasses_and_cycles():
+    from scorch.compiler.loopir.nodes import PanelOuterFor, SparseWindowFor
+
+    class HostilePanel(PanelOuterFor):
+        pass
+
+    fixture = build_panel_spmm()
+    hostile = HostilePanel(
+        LoopIRNodeId(10_003),
+        fixture.panel.tile,
+        fixture.col,
+        fixture.dim_j,
+        3,
+        fixture.b,
+        0,
+        fixture.builder.block(()),
+    )
+    forge(fixture.program, body=fixture.builder.block((hostile,)))
+    expect_defect("unknown_stmt", fixture.program)
+
+    class HostileWindow(SparseWindowFor):
+        pass
+
+    fixture = build_panel_spmm()
+    hostile_window = HostileWindow(
+        LoopIRNodeId(10_004),
+        fixture.window.tile,
+        fixture.window.cursor,
+        fixture.window.position,
+        fixture.window.coord_index,
+        fixture.window.body,
+    )
+    forge(fixture.row_loop, body=fixture.builder.block((hostile_window,)))
+    expect_defect("unknown_stmt", fixture.program)
+
+    fixture = build_panel_spmm()
+    forge(fixture.panel, body=fixture.program.body)
+    expect_defect("cyclic_structure", fixture.program)
+
+    fixture = build_panel_spmm()
+    forge(fixture.program, body=fixture.builder.block((fixture.panel, fixture.panel)))
+    expect_defect("shared_node", fixture.program)
+
+
+def test_panel_defect_paths_are_reported():
+    fixture = build_panel_spmm()
+    forge(fixture.panel, bound_level=1)
+    defect = expect_defect("panel_bound_mismatch", fixture.program)
+    assert defect.path == "program.body.statements[0].bound_level"

@@ -118,11 +118,11 @@ def test_canonical_dump_omits_display_names():
 
 
 def test_canonical_dump_carries_schema_version():
-    # v4: the Phase-6 stack-accumulation slice added the workspace node
-    # kinds (region, reduce, read) and the workspace identity family to the
-    # serialized schema, after v3 added the affine-split kinds.
+    # v5: the Phase-6 panel slice added the sparse coordinate-window kinds
+    # (panel_outer_for, sparse_window_for), after v4 added the workspace
+    # node kinds and v3 the affine-split kinds.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v4"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v5"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
@@ -444,3 +444,66 @@ def test_workspace_display_name_is_not_semantic():
     forge(region.workspace, name="scratch")
     assert canonical_program_dump(program) == canonical_program_dump(renamed)
     assert print_program(program) != print_program(renamed)
+
+
+# -- Phase-6 sparse coordinate panels -----------------------------------------
+
+
+def test_panel_printer_renders_the_window_structure():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    text = print_program(build_panel_spmm(width=3).program)
+    assert "panel_outer_for s0 x0 in d0 width 3 bound t1@0 {" in text
+    assert (
+        "sparse_window_for s0 (p0, x0) in c0 over t0 level 1 "
+        "parent dense_pos(t0, level 0, parent root, coord x1) {"
+    ) in text
+    # The window replaces the plain sparse loop spelling entirely.
+    assert "sparse_for (" not in text
+
+
+def test_panel_canonical_dump_is_stable_across_global_id_histories():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    first = build_panel_spmm().program
+    for _ in range(64):
+        new_symbol_id()
+        new_index_id()
+    second = build_panel_spmm().program
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+
+
+def test_panel_canonical_dump_renumbers_raw_schedule_id_histories():
+    from scorch.compiler.loopir.nodes import TileId
+
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    first = build_panel_spmm()
+    second = build_panel_spmm()
+    replacement = TileId(151)
+    forge(second.panel, tile=replacement)
+    forge(second.window, tile=replacement)
+    assert canonical_program_dump(first.program) == canonical_program_dump(
+        second.program
+    )
+    assert print_program(first.program) == print_program(second.program)
+
+
+def test_panel_canonical_dump_serializes_the_window_semantics():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    base = canonical_program_dump(build_panel_spmm(width=4).program)
+    assert canonical_program_dump(build_panel_spmm(width=8).program) != base
+    payload = json.loads(base)
+    panel = payload["body"]["statements"][0]
+    assert panel["kind"] == "panel_outer_for"
+    assert panel["tile"] == 0
+    assert panel["width"] == 4
+    assert panel["bound_tensor"] == 1
+    assert panel["bound_level"] == 0
+    window = panel["body"]["statements"][0]["body"]["statements"][0]
+    assert window["kind"] == "sparse_window_for"
+    assert window["tile"] == 0
+    assert window["cursor"]["tensor"] == 0
+    assert window["cursor"]["level"] == 1
