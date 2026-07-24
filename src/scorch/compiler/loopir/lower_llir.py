@@ -77,6 +77,7 @@ from ..parallel_marking_pass import (
     apply_parallel_policy,
     mark_first_for_loop_parallel,
 )
+from ..schedule_lowerer import _panel_bound_expression
 from ..torch_cpp_abi import (
     KernelTensorABI,
     ResultTensorAssembler,
@@ -101,10 +102,12 @@ from .nodes import (
     LoopProgram,
     MergedSparseFor,
     MergeMode,
+    PanelOuterFor,
     RootPosition,
     ScalarType,
     SparseCursorDecl,
     SparseFor,
+    SparseWindowFor,
     Stmt,
     Store,
     StoreReduce,
@@ -155,6 +158,8 @@ _SPARSE = "sparse"
 _MERGED = "merged"
 _TILE_OUTER = "tile_outer"
 _TILE_INNER = "tile_inner"
+_PANEL_OUTER = "panel_outer"
+_SPARSE_WINDOW = "sparse_window"
 
 
 @dataclass(frozen=True)
@@ -218,6 +223,17 @@ class _TargetLowering:
         self.producer_leaf: Optional[WorkspaceReduce] = None
         self.consumer_point: Optional[TileInnerFor] = None
         self._region_leaf: Optional[StoreReduce] = None
+        # Sparse-panel state; populated by _validate_panel_shape when the
+        # chain carries a coordinate-window pair.  The panel is completed
+        # on the assembled function (marking, windowing, wrap) at exactly
+        # the pipeline position the legacy schedule lowering uses, driven
+        # by the emitted-object records below instead of name discovery.
+        self.panel: Optional[PanelOuterFor] = None
+        self.panel_position = -1
+        self.window_position = -1
+        self.panel_row_position = -1
+        self._emitted_loops: Dict[int, llir.ForLoop] = {}
+        self._window_end_init: Optional[llir.VarInit] = None
         self._validate_display_names()
         self._validate_layouts()
         self.shapes = self._validate_shapes(input_shapes, result_shape)
@@ -227,6 +243,7 @@ class _TargetLowering:
             loop.index: position for position, loop in enumerate(self.loops)
         }
         self.leaf = self._collect_leaf()
+        self._validate_panel_shape()
         self.cursor_loops: Dict[CursorId, int] = {}
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
@@ -237,6 +254,7 @@ class _TargetLowering:
         self._reserve_merge_names()
         self._reserve_tile_names()
         self._reserve_workspace_names()
+        self._reserve_panel_names()
 
     # -- boundary validation -------------------------------------------------
 
@@ -518,6 +536,34 @@ class _TargetLowering:
                 loops.append(_Loop(_TILE_INNER, only.index, only.dimension, only, ()))
                 body = only.body
                 continue
+            if type(only) is PanelOuterFor:
+                # Like the affine origin, the panel origin binds no readable
+                # coordinate; its position key is a sentinel and the node
+                # keeps the logical index and bound reachable.
+                loops.append(
+                    _Loop(
+                        _PANEL_OUTER,
+                        ("panel_outer", only.tile),
+                        only.dimension,
+                        only,
+                        (),
+                    )
+                )
+                body = only.body
+                continue
+            if type(only) is SparseWindowFor:
+                cursor = only.cursor
+                loops.append(
+                    _Loop(
+                        _SPARSE_WINDOW,
+                        only.coord_index,
+                        self._level_dimension(cursor.tensor, cursor.level),
+                        only,
+                        (cursor,),
+                    )
+                )
+                body = only.body
+                continue
             if type(only) is SparseFor:
                 cursor = only.cursor
                 loops.append(
@@ -570,14 +616,14 @@ class _TargetLowering:
             )
 
     def _validate_loop_kinds(self, loops: List[_Loop], leaf: Stmt) -> None:
-        if loops[0].kind not in (_DENSE, _TILE_OUTER):
+        if loops[0].kind not in (_DENSE, _TILE_OUTER, _PANEL_OUTER):
             _fail(
                 "unsupported_program_shape",
-                "the migrated families require a dense or tile-origin "
-                "outermost loop",
+                "the migrated families require a dense, tile-origin, or "
+                "panel-origin outermost loop",
             )
         if any(
-            loop.kind in (_TILE_OUTER, _TILE_INNER)
+            loop.kind in (_TILE_OUTER, _TILE_INNER, _PANEL_OUTER)
             and loop.node.width > MAX_AFFINE_TILE_WIDTH
             for loop in loops
         ):
@@ -786,6 +832,106 @@ class _TargetLowering:
             return self._region_leaf
         innermost = self.loops[-1].node.body
         return innermost.statements[0]
+
+    def _validate_panel_shape(self) -> None:
+        """Establish the supported panel form and record its chain anatomy.
+
+        The migrated shape is exactly the legacy tile-j family: one panel
+        origin, one window over a dense-parented (CSR) cursor, the dense
+        row loop strictly between them, a dense result store leaf, and no
+        merged, append-assembly, or workspace-region coexistence.
+        """
+
+        panel_positions = [
+            position
+            for position, loop in enumerate(self.loops)
+            if loop.kind is _PANEL_OUTER
+        ]
+        window_positions = [
+            position
+            for position, loop in enumerate(self.loops)
+            if loop.kind is _SPARSE_WINDOW
+        ]
+        if not panel_positions and not window_positions:
+            return
+        if len(panel_positions) != 1 or len(window_positions) != 1:
+            _fail(
+                "unsupported_program_shape",
+                "this target lowering supports exactly one sparse panel "
+                "(one origin loop and one window)",
+            )
+        panel_node = self.loops[panel_positions[0]].node
+        window_node = self.loops[window_positions[0]].node
+        if window_node.tile != panel_node.tile:
+            _fail(
+                "unsupported_program_shape",
+                "the panel origin and window must share one tile identity",
+            )
+        if self.region is not None:
+            _fail(
+                "unsupported_program_shape",
+                "sparse panels do not compose with workspace regions in the "
+                "migrated families",
+            )
+        if any(loop.kind is _MERGED for loop in self.loops):
+            _fail(
+                "unsupported_program_shape",
+                "sparse panels over merged iteration are outside the "
+                "migrated families",
+            )
+        if not self.result_is_dense or type(self.leaf) is AppendEntry:
+            _fail(
+                "unsupported_program_shape",
+                "sparse panels require a dense result store leaf",
+            )
+        cursor = window_node.cursor
+        parent = cursor.parent
+        if type(parent) is not DensePosition or type(parent.coord) is not IndexValue:
+            _fail(
+                "unsupported_program_shape",
+                "the panel window's cursor must be dominated by a dense "
+                "position over a directly bound row coordinate (the CSR "
+                "form)",
+            )
+        row_index = parent.coord.index
+        row_positions = [
+            position
+            for position, loop in enumerate(self.loops)
+            if loop.kind is _DENSE and loop.index == row_index
+        ]
+        if not row_positions:
+            _fail(
+                "unsupported_program_shape",
+                "the panel window's row coordinate must be bound by a plain "
+                "dense chain loop",
+            )
+        if not panel_positions[0] < row_positions[0] < window_positions[0]:
+            _fail(
+                "unsupported_program_shape",
+                "the panel origin must sit strictly above the parallel row "
+                "loop and the window strictly below it",
+            )
+        self.panel = panel_node
+        self.panel_position = panel_positions[0]
+        self.window_position = window_positions[0]
+        self.panel_row_position = row_positions[0]
+
+    def _reserve_panel_names(self) -> None:
+        """Reserve the derived loop, bound, and search names panels generate."""
+
+        if self.panel is None:
+            return
+        name = self.dimension_names[self.panel.dimension]
+        owner = f"sparse panel of dimension {name!r}"
+        for generated in (f"{name}_out", f"{name}_out_end", f"kTile_{name}"):
+            self._reserve_generated_name(generated, owner)
+        cursor = self.loops[self.window_position].cursors[0]
+        position_name = self._cursor_position_name(cursor)
+        for generated in (
+            f"{position_name}_row_end",
+            f"{position_name}_panel_begin",
+        ):
+            self._reserve_generated_name(generated, owner)
 
     def _index_of(self, expr: Expr, path: str) -> object:
         if type(expr) is not IndexValue:
@@ -1062,7 +1208,7 @@ class _TargetLowering:
         )
 
     def _loop_logical_index(self, loop: _Loop) -> object:
-        if loop.kind in (_TILE_OUTER, _TILE_INNER):
+        if loop.kind in (_TILE_OUTER, _TILE_INNER, _PANEL_OUTER):
             return loop.node.index
         return loop.index
 
@@ -1216,7 +1362,7 @@ class _TargetLowering:
         if type(expr) is CursorValue:
             cursor = self._cursor_decl(expr.cursor)
             loop = self.loops[self.cursor_loops[expr.cursor]]
-            if loop.kind is not _SPARSE:
+            if loop.kind not in (_SPARSE, _SPARSE_WINDOW):
                 _fail(
                     "unsupported_program_shape",
                     "merged cursor values are lowered per alignment case, "
@@ -1422,23 +1568,26 @@ class _TargetLowering:
         """The legacy ``Initialize iterators`` group for one sparse loop."""
 
         stmts: List[llir.Stmt] = []
-        if loop.kind is _SPARSE:
+        if loop.kind in (_SPARSE, _SPARSE_WINDOW):
             cursor = loop.cursors[0]
-            stmts.append(
-                llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self._cursor_position_name(cursor)}_end",
-                        type=llir.DataType.INT,
+            end_init = llir.VarInit(
+                var=llir.Var(
+                    name=f"{self._cursor_position_name(cursor)}_end",
+                    type=llir.DataType.INT,
+                ),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=llir.Add(
+                        left=self._cursor_parent_var(cursor),
+                        right=llir.Literal(1, llir.DataType.INT),
                     ),
-                    value=llir.ArrayAccess(
-                        array=self._cursor_pos_array(cursor),
-                        index=llir.Add(
-                            left=self._cursor_parent_var(cursor),
-                            right=llir.Literal(1, llir.DataType.INT),
-                        ),
-                    ),
-                )
+                ),
             )
+            if loop.kind is _SPARSE_WINDOW:
+                # The panel completion rewires exactly this declaration on
+                # the assembled function; retain the object, not a name.
+                self._window_end_init = end_init
+            stmts.append(end_init)
             return stmts
         for cursor in loop.cursors:
             stmts.append(
@@ -1761,6 +1910,7 @@ class _TargetLowering:
             body=body,
         )
         for_loop.scorch_index_var = dimension_name
+        self._emitted_loops[position] = for_loop
         return [
             llir.Comment("Initialize iterators"),
             *self._iterator_inits(loop),
@@ -1775,13 +1925,20 @@ class _TargetLowering:
             return self._lower_workspace_region(position)
         if position + 1 < len(self.loops):
             child = self.loops[position + 1]
+            if child.kind is _PANEL_OUTER:
+                # The panel origin is applied to the assembled function by
+                # complete_panel, exactly where the legacy schedule
+                # lowering wraps it; the raw statements stay unpaneled so
+                # every managed pass sees the same trees it sees on the
+                # legacy path.
+                return self._loop_children(position + 1)
             if child.kind is _DENSE:
                 return [llir.BlankLine(), self._lower_dense(position + 1)]
             if child.kind is _TILE_OUTER:
                 return [llir.BlankLine(), self._lower_tile_outer(position + 1)]
             if child.kind is _TILE_INNER:
                 return [llir.BlankLine(), self._lower_tile_inner(position + 1)]
-            if child.kind is _SPARSE:
+            if child.kind in (_SPARSE, _SPARSE_WINDOW):
                 return self._lower_sparse(position + 1)
             return self._lower_merged(position + 1)
         return self._lower_leaf()
@@ -1984,6 +2141,7 @@ class _TargetLowering:
             body=body,
         )
         for_loop.scorch_index_var = name
+        self._emitted_loops[position] = for_loop
         return for_loop
 
     def _lower_tile_outer(self, position: int) -> llir.ForLoop:
@@ -2010,6 +2168,7 @@ class _TargetLowering:
             body=self._loop_children(position),
         )
         for_loop.scorch_index_var = f"{name}_out"
+        self._emitted_loops[position] = for_loop
         return for_loop
 
     def _lower_tile_inner(self, position: int) -> llir.ForLoop:
@@ -2071,6 +2230,7 @@ class _TargetLowering:
             unroll=loop.node.unroll,
         )
         for_loop.scorch_index_var = f"{name}_in"
+        self._emitted_loops[position] = for_loop
         return for_loop
 
     def tile_size_inits(self) -> List[llir.Stmt]:
@@ -2097,15 +2257,27 @@ class _TargetLowering:
         return stmts
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
-        """The raw pre-pass loop-nest statements, legacy shape included."""
+        """The raw pre-pass loop-nest statements, legacy shape included.
 
-        first = self.loops[0]
+        Panel programs emit the *unpaneled* nest with no parallel marking:
+        the legacy explicit-parallel route suppresses the emission-time
+        auto gate and marks the selected row loop on the assembled
+        function, and the panel wrap/windowing follow it there — so both
+        happen in :meth:`complete_panel`, after the managed passes.
+        """
+
+        first_position = 0
+        while self.loops[first_position].kind is _PANEL_OUTER:
+            first_position += 1
+        first = self.loops[first_position]
         outer_loop = (
-            self._lower_tile_outer(0)
+            self._lower_tile_outer(first_position)
             if first.kind is _TILE_OUTER
-            else self._lower_dense(0)
+            else self._lower_dense(first_position)
         )
         stmts: List[llir.Stmt] = [llir.BlankLine(), outer_loop]
+        if self.panel is not None:
+            return stmts
         leaf_indices = self._leaf_indices()
         outer_index = self._loop_logical_index(first)
         outer_in_result = any(
@@ -2194,6 +2366,239 @@ class _TargetLowering:
             for symbol in self.program.inputs
         )
 
+    # -- panel completion ----------------------------------------------------
+
+    @staticmethod
+    def _nested_statement_lists(stmt: llir.Stmt) -> List[List[llir.Stmt]]:
+        lists: List[List[llir.Stmt]] = []
+        if isinstance(stmt, (llir.ForLoop, llir.WhileLoop, llir.ForLoopAuto)):
+            lists.append(stmt.body)
+        elif isinstance(stmt, llir.IfThenElse):
+            if stmt.then_body:
+                lists.append(stmt.then_body)
+            if stmt.else_body:
+                lists.append(stmt.else_body)
+            if stmt.then_body_list:
+                lists.extend(stmt.then_body_list)
+        return lists
+
+    def _locate_statement(
+        self, stmts: List[llir.Stmt], target: llir.Stmt
+    ) -> Optional[Tuple[List[llir.Stmt], int]]:
+        """Find one statement object by identity within nested lists."""
+
+        for index, stmt in enumerate(stmts):
+            if stmt is target:
+                return stmts, index
+            for nested in self._nested_statement_lists(stmt):
+                located = self._locate_statement(nested, target)
+                if located is not None:
+                    return located
+        return None
+
+    def _chain_for_loops(self, stmts: List[llir.Stmt]) -> List[llir.ForLoop]:
+        """The assembled chain loops in nesting (chain) order.
+
+        Every managed pass rewrites through a detaching rewriter, so
+        emission-time object identity does not survive to the assembled
+        function — but the chain *skeleton* does: passes insert
+        statements and rewrite expressions, they never add, drop, or
+        reorder the nest's for-loops.  Depth-first for-loop order is
+        therefore exactly the emitted chain order, keyed by structure
+        alone.
+        """
+
+        found: List[llir.ForLoop] = []
+
+        def walk(statements: List[llir.Stmt]) -> None:
+            for stmt in statements:
+                if isinstance(stmt, llir.ForLoop):
+                    found.append(stmt)
+                    walk(stmt.body)
+                else:
+                    for nested in self._nested_statement_lists(stmt):
+                        walk(nested)
+
+        walk(stmts)
+        return found
+
+    def complete_panel(self, function: llir.Function) -> llir.Function:
+        """Mark, window, and wrap the panel on the assembled function.
+
+        This runs at exactly the legacy pipeline position: the managed
+        passes transformed the unpaneled, unmarked statements, the
+        function is assembled, and only then does the legacy route mark
+        the explicit parallel row loop
+        (``CINLowerer._apply_explicit_parallel_schedule``), rewrite the
+        compressed loop's bounds to the coordinate window, wrap the panel
+        origin loop, and prepend the width constant
+        (``schedule_lowerer._apply_panel_tile``).  Rewrite targets are
+        located by chain position over the preserved loop skeleton and
+        cross-checked against the retained emission records; any
+        disagreement fails closed instead of guessing.
+        """
+
+        if self.panel is None:
+            return function
+        end_init = self._window_end_init
+        emitted_window = self._emitted_loops.get(self.window_position)
+        emitted_row = self._emitted_loops.get(self.panel_row_position)
+        if end_init is None or emitted_window is None or emitted_row is None:
+            _fail(
+                "panel_completion_lost",
+                "the panel's emitted statements were never recorded",
+            )
+
+        chain_loops = self._chain_for_loops(function.body)
+        if len(chain_loops) != len(self.loops) - 1:
+            _fail(
+                "panel_completion_lost",
+                "the assembled function does not carry exactly the emitted "
+                "chain loops; the structural completion refuses to guess",
+            )
+
+        def ordinal(position: int) -> int:
+            return position - 1 if position > self.panel_position else position
+
+        window_loop = chain_loops[ordinal(self.window_position)]
+        row_loop = chain_loops[ordinal(self.panel_row_position)]
+        wrapped_loop = chain_loops[ordinal(self.panel_position + 1)]
+        # Cross-check the located loops against the emission records: the
+        # loop-control variables must agree exactly.
+        if (
+            not isinstance(window_loop.init, llir.VarInit)
+            or not isinstance(emitted_window.init, llir.VarInit)
+            or window_loop.init.var != emitted_window.init.var
+            or not isinstance(row_loop.init, llir.VarInit)
+            or not isinstance(emitted_row.init, llir.VarInit)
+            or row_loop.init.var != emitted_row.init.var
+        ):
+            _fail(
+                "panel_completion_lost",
+                "the located chain loops disagree with the emission records",
+            )
+        located_window = self._locate_statement(function.body, window_loop)
+        located_wrap = self._locate_statement(function.body, wrapped_loop)
+        assert located_window is not None and located_wrap is not None
+        window_container, _window_index = located_window
+        end_candidates = [
+            (index, stmt)
+            for index, stmt in enumerate(window_container)
+            if isinstance(stmt, llir.VarInit) and stmt.var == end_init.var
+        ]
+        if len(end_candidates) != 1:
+            _fail(
+                "panel_completion_lost",
+                "the window's iterator end declaration is not uniquely "
+                "identifiable beside the window loop",
+            )
+        end_index, located_end_init = end_candidates[0]
+        end_container = window_container
+        located_end = (end_container, end_index)
+        end_init = located_end_init
+
+        # 1. Explicit parallel marking of the row loop, exactly as the
+        # legacy explicit-parallel schedule applies it post-assembly (the
+        # panel family carries no CIN workspace, so the cluster is empty).
+        mark_first_for_loop_parallel([row_loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
+
+        # 2. Window the compressed loop: capture the row end, derive the
+        # search-based panel begin/end, and start the loop at the window.
+        cursor = self.loops[self.window_position].cursors[0]
+        position_name = self._cursor_position_name(cursor)
+        dimension_name = self.dimension_names[self.panel.dimension]
+        panel_var = f"{dimension_name}_out"
+        panel_end_var = f"{panel_var}_end"
+        row_end = f"{position_name}_row_end"
+        panel_begin = f"{position_name}_panel_begin"
+        row_end_value = llir.Var(row_end, end_init.var.type)
+        panel_begin_value = llir.Var(panel_begin, end_init.var.type)
+        row_begin = llir.ArrayAccess(
+            array=self._cursor_pos_array(cursor),
+            index=self._cursor_parent_var(cursor),
+        )
+        lower_value = _panel_bound_expression(
+            self._cursor_crd_array(cursor),
+            row_begin,
+            row_end_value,
+            llir.Var(panel_var, llir.DataType.INT64),
+        )
+        upper_value = _panel_bound_expression(
+            self._cursor_crd_array(cursor),
+            panel_begin_value,
+            row_end_value,
+            llir.Var(panel_end_var, llir.DataType.INT64),
+        )
+        end_container, end_index = located_end
+        end_container[end_index : end_index + 1] = [
+            llir.VarInit(
+                var=llir.Var(row_end, end_init.var.type),
+                value=end_init.value,
+            ),
+            llir.VarInit(
+                var=llir.Var(panel_begin, end_init.var.type),
+                value=lower_value,
+            ),
+            llir.VarInit(var=end_init.var, value=upper_value),
+        ]
+        assert isinstance(window_loop.init, llir.VarInit)
+        window_loop.init.value = llir.Var(panel_begin, end_init.var.type)
+
+        # 3. Wrap the loop below the panel's chain position in the origin
+        # loop, with the clamped window end declared at its head.
+        bound_name = (
+            f"{self.decls[self.panel.bound_tensor].name}"
+            f"{self.panel.bound_level}_size"
+        )
+        tile_var = f"kTile_{dimension_name}"
+        panel_loop = llir.ForLoop(
+            init=llir.VarInit(
+                var=llir.Var(panel_var, llir.DataType.INT64),
+                value=llir.Literal(0),
+            ),
+            cond=llir.BinOp(
+                op="<",
+                left=llir.Var(panel_var, llir.DataType.INT64),
+                right=llir.Var(bound_name, llir.DataType.INT64),
+            ),
+            update=llir.Assign(
+                var=llir.Var(panel_var, llir.DataType.INT64),
+                value=llir.Var(tile_var, llir.DataType.INT64),
+                op=llir.AssignOp.ADD_ASSIGN,
+            ),
+            body=[
+                llir.VarInit(
+                    var=llir.Var(panel_end_var, llir.DataType.INT64),
+                    value=llir.FunctionCall(
+                        name="std::min",
+                        args=[
+                            llir.Add(
+                                llir.Var(panel_var, llir.DataType.INT64),
+                                llir.Var(tile_var, llir.DataType.INT64),
+                            ),
+                            llir.Var(bound_name, llir.DataType.INT64),
+                        ],
+                    ),
+                ),
+                wrapped_loop,
+            ],
+        )
+        panel_loop.scorch_index_var = panel_var
+        wrap_container, wrap_index = located_wrap
+        wrap_container[wrap_index] = panel_loop
+
+        # 4. The width constant at the top of the function body, exactly
+        # where the legacy pass prepends it.
+        function.body[0:0] = [
+            llir.Comment(f"Initialize {dimension_name} panel tile size"),
+            llir.VarInit(
+                var=llir.Var(tile_var, llir.DataType.CONSTEXPR_INT),
+                value=llir.Literal(self.panel.width),
+            ),
+            llir.BlankLine(),
+        ]
+        return function
+
 
 def _lower_loopir_to_llir_owned(
     program: LoopProgram,
@@ -2279,7 +2684,8 @@ def _lower_loopir_to_llir_owned(
             compile_options=compile_options,
             stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
         )
-    return kernel_abi.assemble_function(pipeline_result.artifact.value)
+    assembled = kernel_abi.assemble_function(pipeline_result.artifact.value)
+    return lowering.complete_panel(assembled)
 
 
 def lower_loopir_to_llir(

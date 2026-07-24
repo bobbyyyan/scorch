@@ -1003,3 +1003,144 @@ def test_workspace_name_participates_in_generated_name_collisions():
     forge(fixture.region.workspace, name="for")
     shapes, result_shape = stack_matmul_shapes(fixture)
     expect_target_code("invalid_display_name", fixture.program, shapes, result_shape)
+
+
+# -- Phase-6 sparse panel windows ---------------------------------------------
+
+
+def panel_spmm_shapes(fixture):
+    return {fixture.a: (4, 5), fixture.b: (5, 6)}, (4, 6)
+
+
+def scheduled_panel_cpp(width=3, dtype=F32):
+    from scorch.compiler.scheduler import Schedule, TileSpec
+
+    ivs = {name: IndexVar(name) for name in ("i", "j", "k")}
+    c = TensorVar("C", fmt="dd", dtype=dtype)
+    a = TensorVar("A", fmt="ds", dtype=dtype)
+    b = TensorVar("B", fmt="dd", dtype=dtype)
+    stmt = TensorAssign(
+        c[ivs["i"], ivs["k"]],
+        CINBinaryOp(Operation.MUL, a[ivs["i"], ivs["j"]], b[ivs["j"], ivs["k"]]),
+        op=Operation.ADD,
+    )
+    for name in reversed(("i", "j", "k")):
+        stmt = ForAll(ivs[name], stmt)
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(TileSpec("j", width, kind="panel", accum="direct"),),
+        tag="panel-activation",
+        parallel_loop="i",
+    )
+    options = CompileOptions.from_environment(requested_schedule=schedule)
+    bindings = (((4, 5), dtype), ((5, 6), dtype))
+    return compile_cin_via_loopir(
+        stmt, (4, 6), bindings, compile_options=options
+    ).cpp_source
+
+
+def test_panel_structural_activation_is_never_waived():
+    """The emitted panel kernel must engage every legacy panel component:
+    the top-of-function width constant, the serial origin loop over the
+    declared dense bound, the clamped window end, both lower_bound-derived
+    position bounds, the windowed loop start, the nnz-aware parallel row
+    policy, prefetch survival inside the window, and the hoisted operand
+    pointer."""
+
+    cpp = scheduled_panel_cpp(width=3)
+    body_start = cpp.index("{")
+    prologue = cpp[body_start : cpp.index("scorch_native::validate_jit_result_shape")]
+    assert "// Initialize j panel tile size" in prologue
+    assert "constexpr int kTile_j = 3;" in prologue
+    assert "for (int64_t j_out = 0; j_out < B0_size; j_out += kTile_j) {" in cpp
+    assert "int64_t j_out_end = std::min(j_out + kTile_j, B0_size);" in cpp
+    assert "int pA1_row_end = A1_pos[pA0 + 1];" in cpp
+    assert (
+        "int pA1_panel_begin = (int)(std::lower_bound(A1_crd + A1_pos[pA0], "
+        "A1_crd + pA1_row_end, j_out) - A1_crd);"
+    ) in cpp
+    assert (
+        "int pA1_end = (int)(std::lower_bound(A1_crd + pA1_panel_begin, "
+        "A1_crd + pA1_row_end, j_out_end) - A1_crd);"
+    ) in cpp
+    assert "for (int pA1 = pA1_panel_begin; pA1 < pA1_end; pA1++) {" in cpp
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(A1_pos[A0_size], "
+        "A0_size)) schedule(dynamic, scorch_chunk(A0_size, A1_pos[A0_size]))"
+    ) in cpp
+    assert "__builtin_prefetch" in cpp
+    assert "_B_val_ptr" in cpp
+    # The serial origin loop carries no parallel pragma of its own.
+    origin_at = cpp.index("for (int64_t j_out")
+    preceding = cpp[:origin_at].rstrip().rsplit("\n", 1)[-1]
+    assert "#pragma" not in preceding
+
+
+def test_panel_row_loop_is_marked_after_the_managed_passes():
+    """The row policy must be the legacy explicit form: exactly one
+    parallel pragma, attached to the row loop inside the origin loop."""
+
+    cpp = scheduled_panel_cpp(width=2)
+    assert cpp.count("#pragma omp parallel for") == 1
+    pragma_at = cpp.index("#pragma omp parallel for")
+    origin_at = cpp.index("for (int64_t j_out")
+    row_at = cpp.index("for (int64_t i = 0;")
+    assert origin_at < pragma_at < row_at
+
+
+def test_panel_row_must_sit_between_origin_and_window():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    fixture = build_panel_spmm(width=3)
+    builder = fixture.builder
+    # Rebuild with the row loop OUTSIDE the panel: verifier-legal, but not
+    # the migrated emission shape.
+    window = builder.sparse_window_for(
+        fixture.panel.tile,
+        fixture.window.cursor,
+        fixture.window.position,
+        fixture.window.coord_index,
+        fixture.window.body,
+    )
+    panel = builder.panel_outer_for(
+        fixture.panel.tile,
+        fixture.panel.index,
+        fixture.panel.dimension,
+        3,
+        fixture.panel.bound_tensor,
+        fixture.panel.bound_level,
+        builder.block((window,)),
+    )
+    row_loop = builder.dense_for(fixture.row, fixture.dim_i, builder.block((panel,)))
+    program = builder.program(
+        fixture.program.dimensions,
+        fixture.program.tensors,
+        fixture.program.inputs,
+        fixture.program.outputs,
+        builder.block((row_loop,)),
+    )
+    from scorch.compiler.loopir.verifier import verify_program
+
+    verify_program(program)
+    shapes, result_shape = panel_spmm_shapes(fixture)
+    expect_target_code("unsupported_program_shape", program, shapes, result_shape)
+
+
+def test_panel_names_participate_in_generated_name_collisions():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    for stolen in ("j_out", "j_out_end", "kTile_j"):
+        fixture = build_panel_spmm(width=3)
+        forge(fixture.program.dimensions[2], name=stolen)
+        shapes, result_shape = panel_spmm_shapes(fixture)
+        expect_target_code(
+            "generated_name_collision", fixture.program, shapes, result_shape
+        )
+
+
+def test_panel_width_beyond_constexpr_int_fails_at_target():
+    from tests.test_scorch.test_loopir_verifier import build_panel_spmm
+
+    fixture = build_panel_spmm(width=MAX_AFFINE_TILE_WIDTH + 1)
+    shapes, result_shape = panel_spmm_shapes(fixture)
+    expect_target_code("unsupported_tile_width", fixture.program, shapes, result_shape)
