@@ -222,6 +222,7 @@ class _TargetLowering:
         self._validate_layouts()
         self.shapes = self._validate_shapes(input_shapes, result_shape)
         self.loops = self._collect_loop_nest()
+        self._validate_loop_variable_names()
         self.loop_positions: Dict[object, int] = {
             loop.index: position for position, loop in enumerate(self.loops)
         }
@@ -995,6 +996,34 @@ class _TargetLowering:
                         "unsupported_program_shape",
                         f"input {self.decls[symbol].name!r} is never read",
                     )
+
+    def _validate_loop_variable_names(self) -> None:
+        """Reject distinct coordinates that the target would spell alike.
+
+        LoopIR dimensions identify coordinate domains, not loop binders: two
+        distinct logical indices may legally iterate the same dimension.
+        This C++ target currently derives a loop variable's spelling from the
+        dimension display name, however, so lowering both indices would
+        silently shadow one coordinate with the other.  The outer/inner nodes
+        of one affine split remain legal because they share the same logical
+        ``IndexId`` after normalization through ``_loop_logical_index``.
+        """
+
+        index_by_dimension: Dict[DimensionId, object] = {}
+        for loop in self.loops:
+            logical_index = self._loop_logical_index(loop)
+            known = index_by_dimension.get(loop.dimension)
+            if known is None:
+                index_by_dimension[loop.dimension] = logical_index
+                continue
+            if known != logical_index:
+                name = self.dimension_names[loop.dimension]
+                _fail(
+                    "generated_name_collision",
+                    f"distinct logical loop coordinates share dimension "
+                    f"{name!r}; this target would spell both C++ variables "
+                    f"as {name!r}",
+                )
 
     # -- emission ------------------------------------------------------------
 

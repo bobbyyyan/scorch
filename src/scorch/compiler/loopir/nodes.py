@@ -29,8 +29,8 @@ Discipline carried over from the spike and the binding design decisions:
 - identity is never spelling: tensors are identified by production
   ``SymbolId`` values and bound loop coordinates by production ``IndexId``
   values, so CIN provenance survives lowering; ``LoopIRNodeId``,
-  ``DimensionId``, ``CursorId``, and ``PositionId`` are
-  LoopIR-artifact-local identities allocated by
+  ``DimensionId``, ``CursorId``, ``PositionId``, ``TileId``, and
+  ``WorkspaceId`` are LoopIR-artifact-local identities allocated by
   :class:`~scorch.compiler.loopir.build.LoopIRBuilder`;
 - no C++ spelling, Torch storage field, rendered name, or target policy
   appears in any node; target lowering owns those exclusively.

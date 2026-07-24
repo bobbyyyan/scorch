@@ -355,26 +355,31 @@ class _Oracle:
         self.positions: Dict[PositionId, int] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
         self.tile_origins: Dict[TileId, int] = {}
-        self.workspaces: Dict[WorkspaceId, Tuple[TileId, List[float]]] = {}
+        # Workspace extents are semantic integers, not allocation requests
+        # to the Python oracle.  Keep only written cells and treat every
+        # absent entry as ADD's zero identity.  This preserves fresh/reset
+        # semantics without eagerly allocating an attacker-sized list for a
+        # verifier-approved (target-neutral) tile width.
+        self.workspaces: Dict[WorkspaceId, Tuple[TileId, int, Dict[int, float]]] = {}
         self._tile_widths: Dict[TileId, int] = {}
 
     def _workspace_cell(
         self, workspace: WorkspaceId, coord: Expr
-    ) -> Tuple[List[float], int]:
+    ) -> Tuple[Dict[int, float], int]:
         """Resolve one workspace access to its live cells and cell index."""
 
         state = self.workspaces.get(workspace)
         if state is None:
             raise LoopIROracleError("workspace accessed outside its region's execution")
-        tile, cells = state
+        tile, width, cells = state
         origin = self.tile_origins.get(tile)
         if origin is None:
             raise LoopIROracleError("workspace accessed outside its tile's origin loop")
         coordinate = self._eval_coord(coord)
         cell = coordinate - origin
-        if not 0 <= cell < len(cells):
+        if not 0 <= cell < width:
             raise LoopIROracleError(
-                f"workspace cell {cell} outside [0, {len(cells)}) for "
+                f"workspace cell {cell} outside [0, {width}) for "
                 f"coordinate {coordinate} at origin {origin}"
             )
         return cells, cell
@@ -505,7 +510,7 @@ class _Oracle:
             return self._eval_value(expr.default)
         if type(expr) is WorkspaceRead:
             cells, cell = self._workspace_cell(expr.workspace, expr.coord)
-            return cells[cell]
+            return cells.get(cell, 0.0)
         if type(expr) is Load:
             current: Any = self.values[expr.tensor]
             for position, index_expr in enumerate(expr.indices):
@@ -649,7 +654,7 @@ class _Oracle:
                 )
             # Intrinsic region-entry semantics: a fresh buffer of one cell
             # per tile point, every cell zero (ADD's identity).
-            self.workspaces[decl.workspace] = (decl.tile, [0.0] * width)
+            self.workspaces[decl.workspace] = (decl.tile, width, {})
             try:
                 self._exec_stmt(stmt.producer)
                 self._exec_stmt(stmt.consumer)
@@ -659,7 +664,7 @@ class _Oracle:
         if type(stmt) is WorkspaceReduce:
             cells, cell = self._workspace_cell(stmt.workspace, stmt.coord)
             contribution = self._eval_value(stmt.value)
-            cells[cell] = cells[cell] + contribution
+            cells[cell] = cells.get(cell, 0.0) + contribution
             return
         if type(stmt) is SparseFor:
             storage, start, end = self._segment(stmt.cursor)

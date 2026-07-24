@@ -261,7 +261,15 @@ def entity_display_names(
 
 
 def _is_non_bool_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+    """Whether ``value`` is an exact stored integer plan primitive.
+
+    Plan verification performs comparisons and identity lookups on these
+    values.  Accepting an ``int`` subclass would let adversarial comparison
+    or hashing methods escape the fail-closed boundary before the plan has
+    been established as trustworthy.
+    """
+
+    return type(value) is int
 
 
 def _validate_index_id(index_id: object, path: str) -> IndexId:
@@ -310,9 +318,9 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             raise VerificationError("LoopPlan tile widths must be integers")
         if type(tile.parallel) is not bool or type(tile.unroll) is not bool:
             raise VerificationError("LoopPlan tile policy flags must be bool values")
-        if not isinstance(tile.kind, str) or tile.kind not in ("affine", "panel"):
+        if type(tile.kind) is not str or tile.kind not in ("affine", "panel"):
             raise VerificationError("LoopPlan tile kind must be 'affine' or 'panel'")
-        if not isinstance(tile.accumulation, str) or tile.accumulation not in (
+        if type(tile.accumulation) is not str or tile.accumulation not in (
             "stack",
             "direct",
             "heap",
@@ -382,9 +390,9 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
                 _validate_index_id(index_id, f"result_tile.{field}[{position}]")
     if typed_plan.parallel_loop is not None:
         _validate_loop_ref(typed_plan.parallel_loop, "parallel_loop")
-    if not isinstance(typed_plan.provenance, str) or not typed_plan.provenance:
+    if type(typed_plan.provenance) is not str or not typed_plan.provenance:
         raise VerificationError("LoopPlan.provenance must be a non-empty string")
-    if not isinstance(typed_plan.tag, str):
+    if type(typed_plan.tag) is not str:
         raise VerificationError("LoopPlan.tag must be a string")
     return typed_plan
 
