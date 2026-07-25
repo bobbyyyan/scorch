@@ -2081,6 +2081,8 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
         "unowned_physical_write",
         "unowned_top_level_write",
         "opaque_physical_write",
+        "structured_tensor_alias",
+        "structured_tensor_mutation",
         "malformed_top_level",
     ],
 )
@@ -2123,6 +2125,44 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                 function.body.append(duplicate)
         elif mutation == "opaque_physical_write":
             function.body.append(llir.RawStmt("C_values[0] = 123"))
+        elif mutation in ("structured_tensor_alias", "structured_tensor_mutation"):
+            final_assembly = next(
+                index
+                for index, stmt in enumerate(function.body)
+                if type(stmt) is llir.Comment and stmt.value == "Assemble final result"
+            )
+            if mutation == "structured_tensor_alias":
+                pointer_init = next(
+                    stmt
+                    for stmt in function.body
+                    if type(stmt) is llir.VarInit
+                    and type(stmt.var) is llir.Var
+                    and stmt.var.name == "C_values"
+                )
+                alias_init = copy.deepcopy(pointer_init)
+                alias_init.var.name = "C_values_alias"
+                alias_write = llir.Assign(
+                    llir.ArrayAccess(
+                        llir.Var("C_values_alias", alias_init.var.type),
+                        llir.Literal(0, llir.DataType.INT64),
+                    ),
+                    llir.Literal(123.0, llir.DataType.FLOAT32),
+                )
+                function.body[final_assembly:final_assembly] = [
+                    alias_init,
+                    alias_write,
+                ]
+            else:
+                function.body.insert(
+                    final_assembly,
+                    llir.MemberCallStmt(
+                        base=llir.Var(
+                            "C_values_torch",
+                            llir.DataType.TORCH_TENSOR,
+                        ),
+                        member="zero_",
+                    ),
+                )
         else:
             malformed = next(
                 stmt for stmt in function.body if type(stmt) is llir.VarInit
