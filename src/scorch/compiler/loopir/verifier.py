@@ -121,7 +121,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Dict, NoReturn, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, NoReturn, Optional, Set, Tuple
 
 from ..identity import IndexId, SymbolId
 from .nodes import (
@@ -329,6 +329,10 @@ class _Context:
         self.seen_node_ids: Set[LoopIRNodeId] = set()
         self.visited_objects: Set[int] = set()
         self.path_objects: Set[int] = set()
+        # Exact statement ancestry, including Block nodes.  Region lifetime
+        # checks use object identity here rather than reconstructing ownership
+        # from lexical path strings.
+        self.statement_stack: List[Stmt] = []
 
     def dimension_name(self, dimension: DimensionId) -> str:
         decl = self.dimensions.get(dimension)
@@ -984,9 +988,12 @@ def _check_stmt(ctx: _Context, stmt: object, path: str, depth: int) -> None:
     if checker is None:
         _fail("unknown_stmt", path, f"unregistered Stmt subclass {kind.__name__}")
     _enter(ctx, stmt, path, depth)
+    ctx.statement_stack.append(stmt)
     try:
         checker(ctx, stmt, path, depth)
     finally:
+        popped = ctx.statement_stack.pop()
+        assert popped is stmt
         _leave(ctx, stmt)
 
 
@@ -1550,6 +1557,25 @@ def _check_result_tile_region(
             path,
             "a result-tile region must open outside its own split's point "
             "loops; a per-point compact tile could never accumulate",
+        )
+    # Entry reset and whole-prefix copy-out happen once per pack origin.
+    # Therefore the pack origin must be the root computation statement and
+    # this region must be a direct child of its body.  An intervening or
+    # enclosing repeating loop would reset/copy the complete prefix space
+    # several times and erase contributions from earlier iterations.
+    ancestry = ctx.statement_stack
+    if (
+        len(ancestry) != 4
+        or type(ancestry[0]) is not Block
+        or ancestry[-3] is not pack
+        or ancestry[-2] is not pack.body
+        or ancestry[-1] is not stmt
+    ):
+        _fail(
+            "result_tile_scope_mismatch",
+            path,
+            "a result-tile region must execute exactly once per outermost "
+            "pack origin as a direct statement of that origin's body",
         )
     if decl.result in ctx.open_result_tile_results:
         _fail(

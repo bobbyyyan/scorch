@@ -101,8 +101,19 @@ Legality model of this subset:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, NoReturn, Optional, Sequence, Set, Tuple, Union
+from dataclasses import dataclass, fields
+from typing import (
+    Any,
+    Dict,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
 from ..diagnostics import VerificationError
 from ..identity import IndexId
@@ -131,6 +142,7 @@ from .nodes import (
     IndexValue,
     LevelKind,
     Load,
+    LoopIRNode,
     LoopProgram,
     MergedSparseFor,
     PanelOuterFor,
@@ -1195,24 +1207,42 @@ def apply_panel_tile(
     return _rebuild_program(program, builder, new_chain, leaf)
 
 
-def _collect_operand_loads(root: Stmt, operand: object) -> List[Load]:
-    """Every ``Load`` of one tensor anywhere in a verified subtree."""
+def _walk_schema_nodes(root: LoopIRNode) -> List[LoopIRNode]:
+    """Return the declared LoopIR nodes in ``root`` exactly once.
 
-    found: List[Load] = []
-    pending: List[object] = [root]
+    Verified nodes may carry verifier-invisible extra ``__dict__`` state.
+    Scheduling decisions, canonical identity, and continuation allocation
+    deliberately ignore that state, so pass-side discovery must do the same.
+    Walking dataclass fields also keeps a forged extra alias/cycle from
+    hanging discovery or counting one semantic occurrence twice.
+    """
+
+    found: List[LoopIRNode] = []
+    pending: List[LoopIRNode] = [root]
+    seen: Set[int] = set()
     while pending:
         node = pending.pop()
+        marker = id(node)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        found.append(node)
+        for field in fields(cast(Any, node)):
+            child = object.__getattribute__(node, field.name)
+            if isinstance(child, LoopIRNode):
+                pending.append(child)
+            elif type(child) is tuple:
+                pending.extend(item for item in child if isinstance(item, LoopIRNode))
+    return found
+
+
+def _collect_operand_loads(root: Stmt, operand: object) -> List[Load]:
+    """Every schema-owned ``Load`` of one tensor in a verified subtree."""
+
+    found = []
+    for node in _walk_schema_nodes(root):
         if type(node) is Load and node.tensor == operand:
             found.append(node)
-        for attribute in vars(node).values():
-            if isinstance(attribute, (Expr, Stmt, SparseCursorDecl)):
-                pending.append(attribute)
-            elif type(attribute) is tuple:
-                pending.extend(
-                    child
-                    for child in attribute
-                    if isinstance(child, (Expr, Stmt, SparseCursorDecl))
-                )
     return found
 
 
@@ -1519,18 +1549,12 @@ def apply_relayout(program: LoopProgram, relayout: OperandRelayout) -> LoopProgr
 
 
 def _collect_result_writes(root: Stmt, result: object) -> List[Stmt]:
-    """Every direct Store/StoreReduce of ``result`` in one verified tree."""
+    """Every schema-owned direct write of ``result`` in one verified tree."""
 
     writes: List[Stmt] = []
-    pending: List[object] = [root]
-    while pending:
-        value = pending.pop()
+    for value in _walk_schema_nodes(root):
         if type(value) in (Store, StoreReduce) and value.tensor == result:  # type: ignore[attr-defined]
             writes.append(value)  # type: ignore[arg-type]
-        if isinstance(value, (Stmt, Expr)):
-            pending.extend(vars(value).values())
-        elif type(value) is tuple:
-            pending.extend(value)
     return writes
 
 
@@ -1823,6 +1847,36 @@ def _check_heap_plan_family(plan: LoopPlan) -> None:
         _fail(
             "invalid_schedule_result_tile",
             "the heap tile must target the plan's innermost logical loop",
+        )
+    if other_tiles:
+        panel_tile = other_tiles[0]
+        expected_order = (
+            result_tile.result_prefix[0],
+            panel_tile.loop.index_id,
+            result_tile.tile_loop.index_id,
+        )
+        expected_parent = LoopRef(
+            result_tile.tile_loop.index_id,
+            LoopPart.OUTER,
+        )
+        if (
+            plan.loop_order != expected_order
+            or panel_tile.placement.kind is not PlacementKind.CHILD_OF
+            or panel_tile.placement.parent != expected_parent
+        ):
+            _fail(
+                "invalid_schedule_result_tile",
+                "a heap-panel plan requires the exact prefix, panel, pack "
+                "logical order and places the panel directly below the "
+                "heap pack origin",
+            )
+    elif (
+        len(plan.loop_order) != 3 or plan.loop_order[0] != result_tile.result_prefix[0]
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "a heap-only plan requires the exact dense-prefix, reduction, "
+            "pack logical order",
         )
     if plan.parallel_loop is None or (
         plan.parallel_loop.part is not LoopPart.LOGICAL

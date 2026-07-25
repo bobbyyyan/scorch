@@ -751,34 +751,35 @@ class _Oracle:
         extent = self._dimension_extent(result_decl.dimensions[trailing_mode])
         window_end = min(origin + width, extent)
 
+        copied_cells: set[Tuple[int, ...]] = set()
+
         def copy_out(prefix: Tuple[int, ...], value: Any, mode: int) -> None:
             if not isinstance(value, list):
                 raise LoopIROracleError(
                     "result-tile copy-out target is not a dense axis"
                 )
-            if mode == trailing_mode:
+            positions = (
+                range(origin, window_end)
+                if mode == trailing_mode
+                else range(len(value))
+            )
+            for position in positions:
+                if not 0 <= position < len(value):
+                    raise LoopIROracleError(
+                        f"result-tile copy-out coordinate {position} out of bounds "
+                        f"at mode {mode}"
+                    )
+                key_coord = position - origin if mode == trailing_mode else position
+                key = prefix + (key_coord,)
                 if mode == len(result_decl.levels) - 1:
-                    for column in range(origin, window_end):
-                        if not 0 <= column < len(value):
-                            raise LoopIROracleError(
-                                f"result-tile copy-out column {column} out " "of bounds"
-                            )
-                        value[column] = cells.get(prefix + (column - origin,), 0.0)
-                    return
-                for column in range(origin, window_end):
-                    if not 0 <= column < len(value):
+                    if key in copied_cells:
                         raise LoopIROracleError(
-                            f"result-tile copy-out column {column} out of " "bounds"
+                            "result-tile copied one compact cell more than once"
                         )
-                    copy_out(prefix + (column - origin,), value[column], mode + 1)
-                return
-            if mode == len(result_decl.levels) - 1:
-                raise LoopIROracleError(
-                    "result-tile copy-out reached the innermost axis before "
-                    "the pack window axis"
-                )
-            for position, child in enumerate(value):
-                copy_out(prefix + (position,), child, mode + 1)
+                    copied_cells.add(key)
+                    value[position] = cells.get(key, 0.0)
+                else:
+                    copy_out(key, value[position], mode + 1)
 
         copy_out((), self.values[decl.result], 0)
 

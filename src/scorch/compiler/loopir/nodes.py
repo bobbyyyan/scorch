@@ -732,13 +732,13 @@ class ResultTileRegion(Stmt):
       result's whole-tensor zero-initialization contract: cells that
       received no accumulation copy the entry zero.
 
-    The region must execute directly inside its pack split's origin loop
-    (the compact columns need a current pack origin, and copy-out coverage
-    needs exactly one region execution per origin iteration) and never
-    inside a point loop of its own split.  How the compact copy is realized
-    (buffer reuse across iterations, parallel init/copy loops, capacity
-    arithmetic) is a target concern; only the accumulated contents,
-    freshness, and copy-out are semantics.
+    The region must execute directly inside its pack split's outermost
+    origin loop (the compact columns need a current pack origin, and
+    copy-out coverage needs exactly one region execution per origin
+    iteration) and never inside a point loop or another repeating scope.
+    How the compact copy is realized (buffer reuse across iterations,
+    parallel init/copy loops, capacity arithmetic) is a target concern;
+    only the accumulated contents, freshness, and copy-out are semantics.
     """
 
     decl: ResultTileDecl

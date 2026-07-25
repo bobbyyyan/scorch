@@ -3538,6 +3538,78 @@ def _relayout_access_candidates(
     return collector.matches
 
 
+def _result_tile_assign_owners(
+    statements: List[llir.Stmt],
+    target: llir.Expr,
+) -> List[llir.Assign]:
+    """Find exact assignments whose lvalue is ``target`` by identity."""
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_result_tile_write_owner",
+                )
+            )
+            self.matches: List[llir.Assign] = []
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if type(node) is llir.Assign and node.var is target:
+                self.matches.append(cast(llir.Assign, node))
+
+    collector = _Collector()
+    collector.walk(cast(Any, statements))
+    return collector.matches
+
+
+def _named_var_candidates(
+    statements: List[llir.Stmt],
+    name: str,
+) -> List[llir.Var]:
+    """Collect every exact physical occurrence of one validated C++ Var."""
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_result_tile_physical_accesses",
+                )
+            )
+            self.matches: List[llir.Var] = []
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if type(node) is llir.Var and node.name == name:
+                self.matches.append(cast(llir.Var, node))
+
+    collector = _Collector()
+    collector.walk(cast(Any, statements))
+    return collector.matches
+
+
+def _dense_zero_candidates(function: llir.Function) -> List[llir.FunctionCallStmt]:
+    """Collect every validated dense-zero call recursively."""
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_result_tile_dense_zero",
+                )
+            )
+            self.matches: List[llir.FunctionCallStmt] = []
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if type(node) is llir.FunctionCallStmt and node.name == "scorch_zero_dense":
+                self.matches.append(cast(llir.FunctionCallStmt, node))
+
+    collector = _Collector()
+    collector.walk(function)
+    return collector.matches
+
+
 def _direct_prefetch_targets_array(stmt: llir.Stmt, array_name: str) -> bool:
     """Whether one validated guard directly prefetches ``array_name[...]``."""
 
@@ -3608,6 +3680,26 @@ def _complete_result_tile_impl(
             _RESULT_TILE_LOST,
             "the result tile's emitted statements were never recorded",
         )
+    try:
+        # Completion runs after the managed pass pipeline and panel
+        # completion.  Validate the complete assembled function before any
+        # name discovery or mutation so forged top-level state cannot escape
+        # the stage-owned diagnostic.
+        LLIRWalker(
+            LLIRTraversalContext(
+                stage="LoopIR target lowering",
+                pass_name="validate_result_tile_completion_input",
+            )
+        ).walk(function)
+    except (
+        LLIRTraversalError,
+        AttributeError,
+        RecursionError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RESULT_TILE_LOST, str(error))
 
     # 1. Re-identify the chain.  A panel chain hands over the loops its
     # completion already re-identified (retained object identity); the bare
@@ -3641,9 +3733,10 @@ def _complete_result_tile_impl(
                     _RESULT_TILE_LOST,
                     "the heap row-loop policy snapshot did not remain a " "ForLoop",
                 )
-            expected_marked.omp_parallel_for = True
-            expected_marked.omp_schedule = "dynamic, 64"
-            apply_parallel_policy(expected_marked)
+            mark_first_for_loop_parallel(
+                [expected_marked],
+                EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+            )
             mark_first_for_loop_parallel([row_loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
         except (
             LLIRTraversalError,
@@ -3675,16 +3768,25 @@ def _complete_result_tile_impl(
     else:
         scalar_type = llir.DataType.FLOAT64
         zero_value = "0.0"
-    (
-        compact_name,
-        storage_name,
-        init_prefix,
-        init_inner,
-        init_logical,
-        copy_prefix,
-        copy_inner,
-        copy_logical,
-    ) = _heap_result_tile_names(function, result_name, pack_dimension_name)
+    try:
+        (
+            compact_name,
+            storage_name,
+            init_prefix,
+            init_inner,
+            init_logical,
+            copy_prefix,
+            copy_inner,
+            copy_logical,
+        ) = _heap_result_tile_names(function, result_name, pack_dimension_name)
+    except (
+        AttributeError,
+        RecursionError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RESULT_TILE_LOST, str(error))
     trailing_bound = f"{result_name}{last_level}_size"
     prefix_dimension_names = tuple(
         f"{result_name}{level}_size" for level in range(last_level)
@@ -3698,21 +3800,53 @@ def _complete_result_tile_impl(
     metadata = lowering._result_metadata()
     try:
         write_candidates = _relayout_access_candidates(tile_loop.body, metadata)
+        result_vars = _named_var_candidates(
+            tile_loop.body,
+            f"{result_name}_values",
+        )
     except (
         LLIRTraversalError,
         AttributeError,
         RecursionError,
+        RuntimeError,
         TypeError,
         ValueError,
     ) as error:
         _fail(_RESULT_TILE_LOST, str(error))
-    if len(write_candidates) != 1 or not lowering._exact_panel_state_matches(
-        write_candidates[0], write_snapshot
+    if (
+        len(write_candidates) != 1
+        or type(write_candidates[0]) is not llir.ArrayAccess
+        or not lowering._exact_panel_state_matches(write_candidates[0], write_snapshot)
     ):
         _fail(
             _RESULT_TILE_LOST,
             "the compacted result's physical emitted write does not retain "
             "exactly its detached pre-pass state",
+        )
+    write_candidate = write_candidates[0]
+    try:
+        owners = _result_tile_assign_owners(tile_loop.body, write_candidate)
+    except (
+        LLIRTraversalError,
+        AttributeError,
+        RecursionError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RESULT_TILE_LOST, str(error))
+    candidate_array = write_candidate.array
+    if (
+        len(owners) != 1
+        or owners[0].op is not llir.AssignOp.ADD_ASSIGN
+        or type(candidate_array) is not llir.Var
+        or len(result_vars) != 1
+        or result_vars[0] is not candidate_array
+    ):
+        _fail(
+            _RESULT_TILE_LOST,
+            "the compacted result access must remain the sole physical "
+            "result occurrence and the lvalue of one additive assignment",
         )
     compact_access = _heap_compact_access(
         compact_name=compact_name,
@@ -3736,28 +3870,121 @@ def _complete_result_tile_impl(
             metadata.index_ids,
             llir.TensorAccessRole.RESULT_WRITE,
         )
+        physical_residual = _named_var_candidates(
+            tile_loop.body,
+            f"{result_name}_values",
+        )
     except (
         LLIRTraversalError,
         AttributeError,
         RecursionError,
+        RuntimeError,
         TypeError,
         ValueError,
     ) as error:
         _fail(_RESULT_TILE_LOST, str(error))
-    if rewritten != 1 or residual:
+    if rewritten != 1 or residual or physical_residual:
         _fail(
             _RESULT_TILE_LOST,
-            "the compacted result's emitted write was not redirected " "exactly once",
+            "the compacted result's emitted write was not redirected "
+            "exactly once or an unowned physical result access survived",
         )
 
     # 4. The exactly-once copy-out coverage replaces the whole-result zero
-    # fill; a missing or duplicated generated zero fails closed.
+    # fill.  Require the one exact ABI-generated top-level call and reject
+    # every nested or altered physical zero effect before invoking the
+    # unchanged legacy compatibility remover.
+    expected_zero = llir.FunctionCallStmt(
+        name="scorch_zero_dense",
+        args=(
+            llir.Var(f"{result_name}_values", pointer_type),
+            llir.Var(f"{result_name}_capacity", llir.DataType.INT64),
+        ),
+    )
+    expected_result_pointer_init = llir.VarInit(
+        var=llir.Var(
+            f"{result_name}_values",
+            pointer_type,
+            is_restrict=True,
+        ),
+        value=llir.MemberCall(
+            base=llir.Var(
+                f"{result_name}_values_torch",
+                llir.DataType.TORCH_TENSOR,
+            ),
+            member="data_ptr",
+            template_args=(scalar_type,),
+        ),
+    )
     try:
+        result_pointer_inits = [
+            stmt
+            for stmt in function.body
+            if type(stmt) is llir.VarInit
+            and type(stmt.var) is llir.Var
+            and stmt.var.name == f"{result_name}_values"
+        ]
+        if len(result_pointer_inits) != 1 or not lowering._exact_panel_state_matches(
+            result_pointer_inits[0],
+            expected_result_pointer_init,
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "heap accumulation requires exactly one canonical generated "
+                "dense-result pointer declaration",
+            )
+        zero_candidates = _dense_zero_candidates(function)
+        if len(zero_candidates) != 1 or not lowering._exact_panel_state_matches(
+            zero_candidates[0], expected_zero
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "heap accumulation requires exactly one canonical generated "
+                "dense-result zero at function scope",
+            )
+        physical_before_zero_removal = _named_var_candidates(
+            function.body,
+            f"{result_name}_values",
+        )
+        if len(physical_before_zero_removal) != 2 or {
+            id(value) for value in physical_before_zero_removal
+        } != {
+            id(result_pointer_inits[0].var),
+            id(zero_candidates[0].args[0]),
+        }:
+            _fail(
+                _RESULT_TILE_LOST,
+                "an unowned physical result access survived compact-write "
+                "redirection",
+            )
+        located_zero = lowering._locate_statement(function.body, zero_candidates[0])
+        if located_zero is None or located_zero[0] is not function.body:
+            _fail(
+                _RESULT_TILE_LOST,
+                "the canonical generated dense-result zero moved out of "
+                "function scope",
+            )
         _remove_dense_result_zero(function, result_name)
+        remaining_physical = _named_var_candidates(
+            function.body,
+            f"{result_name}_values",
+        )
+        if (
+            _dense_zero_candidates(function)
+            or len(remaining_physical) != 1
+            or remaining_physical[0] is not result_pointer_inits[0].var
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "a dense-result zero or unowned physical result effect "
+                "survived heap completion",
+            )
     except (
+        LLIRTraversalError,
         NotImplementedError,
         AttributeError,
         RecursionError,
+        RuntimeError,
         TypeError,
         ValueError,
     ) as error:
