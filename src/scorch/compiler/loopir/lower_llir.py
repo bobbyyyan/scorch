@@ -1146,12 +1146,16 @@ class _TargetLowering:
         """Establish the supported heap result-tile form and its anatomy.
 
         The migrated shape is exactly the audited legacy family on the
-        rank-2 trailing-axis result: the outermost pack origin whose whole
-        body the region wraps, the parallel dense row loop, one reduction
-        loop (or the panel window pair), and the pack point loop, with the
-        compute leaf accumulating through exactly one TiledReduce of the
-        region.  The leaf was recorded as a synthetic direct StoreReduce
-        view by the nest walk; the compact redirection happens in
+        rank>=2 trailing-axis result: the outermost pack origin whose whole
+        body the region wraps, the result's dense prefix loops in logical
+        mode order (the outermost of which carries the parallel policy),
+        one reduction loop (or the panel window pair), and the pack point
+        loop, with the compute leaf accumulating through exactly one
+        TiledReduce of the region.  A multi-prefix result contributes one
+        dense loop per prefix axis at a derived chain position; the sparse
+        panel composition stays at its audited single-prefix shape.  The
+        leaf was recorded as a synthetic direct StoreReduce view by the
+        nest walk; the compact redirection happens in
         :meth:`complete_result_tile` on the assembled function, exactly
         where the legacy schedule lowering performs it.
         """
@@ -1165,12 +1169,19 @@ class _TargetLowering:
                 "a result-tile region requires the tiled-reduce compute "
                 "leaf of its own region",
             )
+        result_decl = self.result_decl
+        rank = len(result_decl.levels)
+        prefix_rank = rank - 1
         kinds = [loop.kind for loop in self.loops]
-        heap_alone = kinds in (
-            [_TILE_OUTER, _DENSE, _SPARSE, _TILE_INNER],
-            [_TILE_OUTER, _DENSE, _DENSE, _TILE_INNER],
+        heap_alone = (
+            rank >= 2
+            and len(kinds) == rank + 2
+            and kinds[0] == _TILE_OUTER
+            and all(kind == _DENSE for kind in kinds[1:rank])
+            and kinds[rank] in (_DENSE, _SPARSE)
+            and kinds[-1] == _TILE_INNER
         )
-        heap_panel = kinds == [
+        heap_panel = rank == 2 and kinds == [
             _TILE_OUTER,
             _PANEL_OUTER,
             _DENSE,
@@ -1181,8 +1192,9 @@ class _TargetLowering:
             _fail(
                 "unsupported_program_shape",
                 "heap accumulation supports exactly the audited chains: "
-                "the pack origin over the parallel row, one reduction loop "
-                "or the panel window pair, and the pack point loop",
+                "the pack origin over the result's dense prefix loops, one "
+                "reduction loop or the single-prefix panel window pair, and "
+                "the pack point loop",
             )
         if self.result_tile_depth != 1:
             _fail(
@@ -1197,31 +1209,39 @@ class _TargetLowering:
                 "the result-tile region must name the chain's pack split " "pair",
             )
         row_position = 2 if heap_panel else 1
-        row_node = self.loops[row_position].node
-        result_decl = self.result_decl
+        prefix_nodes = [
+            self.loops[row_position + offset].node for offset in range(prefix_rank)
+        ]
         if (
             decl.result != self.result_symbol
-            or len(result_decl.levels) != 2
             or any(level.kind is not LevelKind.DENSE for level in result_decl.levels)
-            or result_decl.dimensions[result_decl.levels[0].mode] != row_node.dimension
-            or result_decl.dimensions[result_decl.levels[1].mode] != pack_node.dimension
+            or any(
+                result_decl.dimensions[result_decl.levels[mode].mode]
+                != prefix_nodes[mode].dimension
+                for mode in range(prefix_rank)
+            )
+            or result_decl.dimensions[result_decl.levels[prefix_rank].mode]
+            != pack_node.dimension
         ):
             _fail(
                 "unsupported_program_shape",
-                "the compacted result must be the declared rank-2 dense "
-                "output storing the row then pack dimensions",
+                "the compacted result must be the declared all-dense output "
+                "storing its prefix dimensions then the pack dimension",
             )
         tiled = self._tiled_leaf
         if (
-            len(tiled.indices) != 2
-            or self._index_of(tiled.indices[0], "the compacted row index")
-            != row_node.index
-            or self._index_of(tiled.indices[1], "the compacted column index")
+            len(tiled.indices) != rank
+            or any(
+                self._index_of(tiled.indices[mode], "the compacted prefix index")
+                != prefix_nodes[mode].index
+                for mode in range(prefix_rank)
+            )
+            or self._index_of(tiled.indices[prefix_rank], "the compacted column index")
             != point_node.index
         ):
             _fail(
                 "unsupported_program_shape",
-                "the tiled reduce must be indexed by the row coordinate "
+                "the tiled reduce must be indexed by the prefix coordinates "
                 "and the pack point coordinate",
             )
         self.result_tile_row_position = row_position

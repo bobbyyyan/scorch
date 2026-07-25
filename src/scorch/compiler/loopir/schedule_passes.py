@@ -1558,17 +1558,55 @@ def _collect_result_writes(root: Stmt, result: object) -> List[Stmt]:
     return writes
 
 
+def _result_tile_prefix_rank(result_tile: ResultTile) -> int:
+    """Admit one rank>=2 heap result-tile fact and return its prefix rank.
+
+    The compacted result's dense prefix is exactly ``result_prefix``; its
+    trailing storage level is the packed free axis.  Everything downstream
+    — chain length, prefix loop positions, the compact linearization, and
+    the copy-out extent — is derived from this one number, so the family
+    admits rank-2 and the audited multi-prefix ranks by the same rule
+    rather than by enumerating shapes.
+    """
+
+    prefix_rank = (
+        len(result_tile.result_prefix)
+        if type(result_tile.result_prefix) is tuple
+        else -1
+    )
+    if (
+        prefix_rank < 1
+        or type(result_tile.access_indices) is not tuple
+        or len(result_tile.access_indices) != prefix_rank + 1
+        or result_tile.access_indices[-1] != result_tile.tile_loop.index_id
+        or result_tile.access_indices[:-1] != result_tile.result_prefix
+        or result_tile.result_level != prefix_rank
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the migrated heap family compacts an all-dense result of rank "
+            "at least two whose trailing storage level is the tiled free "
+            "axis and whose remaining logical axes are the tile's dense "
+            "prefix, in order",
+        )
+    return prefix_rank
+
+
 def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProgram:
     """Accumulate one dense result's trailing strip behind a typed region.
 
     Mirrors the audited legacy heap result-tile family exactly, on
-    identities only, for the migrated rank-2 trailing-axis shape.  The
+    identities only, for the migrated rank>=2 trailing-axis shape.  The
     scheduled chain must be one of the admitted forms — the outermost
-    affine pack origin over the dense row loop, one reduction loop, and
-    the pack point loop (heap alone), or the packed tile-ijk five-loop
-    chain with an optional relayout stage already applied (the pass runs
-    after :func:`apply_relayout`) — with a direct dense-result reduction
-    leaf.  Every result-tile fact is consumed exactly once: ``tile_loop``
+    affine pack origin over the result's dense prefix loops, one reduction
+    loop, and the pack point loop (heap alone), or the packed tile-ijk
+    five-loop chain on a single-prefix result with an optional relayout
+    stage already applied (the pass runs after :func:`apply_relayout`) —
+    with a direct dense-result reduction leaf.  A multi-prefix result
+    contributes one dense loop per prefix axis at a derived chain position;
+    no spelling of any particular kernel is special-cased.
+
+    Every result-tile fact is consumed exactly once: ``tile_loop``
     selects the pack schedule pair, ``access_indices`` select the
     redirected write, and ``result_prefix``/``result_level`` are
     validation-is-consumption against the result declaration (the
@@ -1603,18 +1641,7 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
             "invalid_schedule_result_tile",
             "the result tile's tile_loop must name one logical loop",
         )
-    if (
-        len(result_tile.access_indices) != 2
-        or len(result_tile.result_prefix) != 1
-        or result_tile.access_indices[-1] != result_tile.tile_loop.index_id
-        or result_tile.access_indices[:-1] != result_tile.result_prefix
-        or result_tile.result_level != 1
-    ):
-        _fail(
-            "invalid_schedule_result_tile",
-            "the migrated heap family compacts a rank-2 dense result whose "
-            "trailing storage level is the tiled free axis",
-        )
+    prefix_rank = _result_tile_prefix_rank(result_tile)
 
     relayout_stages: List[RelayoutStage] = []
     loops, leaf = _decompose_chain(program, relayout_sink=relayout_stages)
@@ -1624,11 +1651,18 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
             "heap accumulation requires a direct dense-result reduction leaf",
         )
     kinds = tuple(type(node) for node in loops)
-    heap_alone = kinds in (
-        (TileOuterFor, DenseFor, SparseFor, TileInnerFor),
-        (TileOuterFor, DenseFor, DenseFor, TileInnerFor),
+    # One pack origin, the result's dense prefix loops in logical order, one
+    # reduction loop, and the pack point loop.  ``prefix_rank`` is fixed by
+    # the already-admitted result-tile fact, so the chain length and every
+    # loop position below are derived, never searched.
+    heap_alone = (
+        len(kinds) == prefix_rank + 3
+        and kinds[0] is TileOuterFor
+        and all(kind is DenseFor for kind in kinds[1 : prefix_rank + 1])
+        and kinds[prefix_rank + 1] in (DenseFor, SparseFor)
+        and kinds[-1] is TileInnerFor
     )
-    heap_panel = kinds == (
+    heap_panel = prefix_rank == 1 and kinds == (
         TileOuterFor,
         PanelOuterFor,
         DenseFor,
@@ -1639,8 +1673,9 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
         _fail(
             "invalid_schedule_result_tile",
             "heap accumulation requires the audited chain: the pack origin "
-            "over the dense row loop, one reduction loop, and the pack "
-            "point loop, optionally windowed by one sparse panel",
+            "over the dense result-prefix loops, one reduction loop, and the "
+            "pack point loop, optionally windowed by one sparse panel on the "
+            "single-prefix result",
         )
     if len(relayout_stages) > 1 or (relayout_stages and not heap_panel):
         _fail(
@@ -1650,10 +1685,11 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
         )
     pack_origin = loops[0]
     pack_point = loops[-1]
-    row_loop = loops[2] if heap_panel else loops[1]
+    prefix_start = 2 if heap_panel else 1
+    prefix_loops = loops[prefix_start : prefix_start + prefix_rank]
     assert type(pack_origin) is TileOuterFor
     assert type(pack_point) is TileInnerFor
-    assert type(row_loop) is DenseFor
+    assert all(type(loop) is DenseFor for loop in prefix_loops)
     if (
         pack_origin.index != result_tile.tile_loop.index_id
         or pack_point.index != result_tile.tile_loop.index_id
@@ -1674,10 +1710,14 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
                 "invalid_schedule_result_tile",
                 "the composed panel origin and window must be one schedule " "pair",
             )
-    if row_loop.index != result_tile.result_prefix[0]:
+    if (
+        tuple(cast(DenseFor, loop).index for loop in prefix_loops)
+        != result_tile.result_prefix
+    ):
         _fail(
             "invalid_schedule_result_tile",
-            "the result tile's dense prefix loop must be the chain's row " "loop",
+            "the result tile's dense prefix loops must be the chain's "
+            "prefix loops in the result's logical mode order",
         )
 
     decls = {decl.symbol: decl for decl in program.tensors}
@@ -1685,12 +1725,13 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
     if (
         result_decl is None
         or result_tile.result_id not in program.outputs
-        or len(result_decl.levels) != 2
+        or len(result_decl.levels) != prefix_rank + 1
         or any(level.kind is not LevelKind.DENSE for level in result_decl.levels)
     ):
         _fail(
             "invalid_schedule_result_tile",
-            "the compacted result must be a declared rank-2 all-dense output",
+            "the compacted result must be a declared all-dense output whose "
+            "rank is one more than the tile's dense prefix",
         )
 
     def _write_index_ids(write: Stmt) -> Optional[Tuple[IndexId, ...]]:
@@ -1831,18 +1872,7 @@ def _check_heap_plan_family(plan: LoopPlan) -> None:
             "invalid_schedule_result_tile",
             "a heap plan composes with at most one sparse panel tile",
         )
-    if (
-        len(result_tile.access_indices) != 2
-        or len(result_tile.result_prefix) != 1
-        or result_tile.access_indices[-1] != result_tile.tile_loop.index_id
-        or result_tile.access_indices[:-1] != result_tile.result_prefix
-        or result_tile.result_level != 1
-    ):
-        _fail(
-            "invalid_schedule_result_tile",
-            "the migrated heap family compacts a rank-2 dense result "
-            "whose trailing storage level is the tiled free axis",
-        )
+    prefix_rank = _result_tile_prefix_rank(result_tile)
     if not plan.loop_order or plan.loop_order[-1] != result_tile.tile_loop.index_id:
         _fail(
             "invalid_schedule_result_tile",
@@ -1850,6 +1880,12 @@ def _check_heap_plan_family(plan: LoopPlan) -> None:
         )
     if other_tiles:
         panel_tile = other_tiles[0]
+        if prefix_rank != 1:
+            _fail(
+                "invalid_schedule_result_tile",
+                "the migrated heap family composes a sparse panel only with "
+                "the audited single-prefix result",
+            )
         expected_order = (
             result_tile.result_prefix[0],
             panel_tile.loop.index_id,
@@ -1871,21 +1907,31 @@ def _check_heap_plan_family(plan: LoopPlan) -> None:
                 "heap pack origin",
             )
     elif (
-        len(plan.loop_order) != 3 or plan.loop_order[0] != result_tile.result_prefix[0]
+        len(plan.loop_order) != prefix_rank + 2
+        or plan.loop_order[:prefix_rank] != result_tile.result_prefix
     ):
         _fail(
             "invalid_schedule_result_tile",
             "a heap-only plan requires the exact dense-prefix, reduction, "
             "pack logical order",
         )
+    # Race legality: every compact cell is addressed by the linearized dense
+    # prefix position and the pack point, so distinct iterations of any
+    # prefix loop write disjoint cells and the reduction loop is enclosed by
+    # all of them.  Target lowering realizes the parallel policy structurally
+    # on the outermost prefix loop, so the plan's selection is pinned there
+    # until abstract parallel-loop selection carries an inner-prefix anchor
+    # into LoopIR; a non-outermost anchor fails closed rather than silently
+    # parallelizing a different loop than the plan names.
     if plan.parallel_loop is None or (
         plan.parallel_loop.part is not LoopPart.LOGICAL
-        or plan.parallel_loop.index_id not in result_tile.result_prefix
+        or plan.parallel_loop.index_id != result_tile.result_prefix[0]
     ):
         _fail(
             "invalid_schedule_result_tile",
-            "heap accumulation requires an explicit parallel dense "
-            "result-prefix loop so the shared origin loop stays serial",
+            "heap accumulation requires the outermost dense result-prefix "
+            "loop as the explicit parallel loop so the shared origin loop "
+            "stays serial",
         )
 
 
