@@ -1902,3 +1902,251 @@ def test_relayout_completion_requires_one_sparse_prefetch(monkeypatch, mutation)
         relayout_shapes(fixture),
         (4, 6),
     )
+
+
+# -- heap result-tile target boundary -----------------------------------------
+
+
+def heap_program(strip=3, dtype=None):
+    from scorch.compiler.loopir.nodes import ScalarType as _ScalarType
+
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    return build_heap_spmm(
+        strip=strip,
+        dtype=dtype if dtype is not None else _ScalarType.FLOAT32,
+    )
+
+
+def heap_shapes(fixture):
+    return {fixture.a: (4, 5), fixture.b: (5, 6)}
+
+
+def test_heap_target_emits_the_legacy_compact_source():
+    """Direct structural activation on a bare verified LoopIR program."""
+
+    fixture = heap_program()
+    lowered = lower_loopir_to_llir(
+        fixture.program,
+        input_shapes=heap_shapes(fixture),
+        result_shape=(4, 6),
+    )
+    from scorch.compiler.codegen import LLIRLowerer
+
+    source = LLIRLowerer().lower_llir(lowered)
+    assert (
+        "std::vector<float> tiled_C_storage((size_t)C0_size * (size_t)kTile_k);"
+        in source
+    )
+    assert "float* __restrict__ tiled_C = tiled_C_storage.data();" in source
+    assert "// Initialize compact result tile for C" in source
+    assert "// Copy compact result tile to C" in source
+    assert "tiled_C[C_tile_init * kTile_k + k_tile_init] = 0.0f;" in source
+    assert (
+        "C_values[C_tile_copy * C1_size + k_copy_logical] = "
+        "tiled_C[C_tile_copy * kTile_k + k_tile_copy];"
+    ) in source
+    assert "tiled_C[pC0 * kTile_k + k_in] += A_val[pA1] * B_val[pB1];" in source
+    assert "scorch_zero_dense(C_values" not in source
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(A1_pos[A0_size], "
+        "A0_size)) schedule(dynamic, scorch_chunk(A0_size, A1_pos[A0_size]))"
+    ) in source
+
+
+def test_heap_completion_anchors_metadata_to_the_physical_write(monkeypatch):
+    """Valid metadata moved to the wrong access cannot redirect that access."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def swapping(self, function):
+        completed = original(self, function)
+        accesses = [
+            node
+            for node in relayout_llir_nodes(function.body)
+            if isinstance(node, llir.Expr)
+            and type(getattr(node, "tensor_access", None)) is llir.TensorAccessMetadata
+        ]
+        write = next(
+            node
+            for node in accesses
+            if node.tensor_access.role is llir.TensorAccessRole.RESULT_WRITE
+        )
+        other = next(
+            node
+            for node in accesses
+            if node.tensor_access.role is llir.TensorAccessRole.INPUT_READ
+        )
+        write_metadata = write.tensor_access
+        other_metadata = other.tensor_access
+        object.__setattr__(write, "tensor_access", other_metadata)
+        object.__setattr__(other, "tensor_access", write_metadata)
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", swapping)
+    expect_target_code(
+        "result_tile_completion_lost",
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+
+
+def test_heap_completion_owns_a_detached_metadata_fingerprint(monkeypatch):
+    """In-place provenance mutation cannot mutate the retained fingerprint."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def mutating(self, function):
+        completed = original(self, function)
+        write = next(
+            node
+            for node in relayout_llir_nodes(function.body)
+            if isinstance(node, llir.Expr)
+            and type(getattr(node, "tensor_access", None)) is llir.TensorAccessMetadata
+            and node.tensor_access.role is llir.TensorAccessRole.RESULT_WRITE
+        )
+        metadata = write.tensor_access
+        object.__setattr__(
+            metadata.access_id,
+            "value",
+            metadata.access_id.value + 1,
+        )
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", mutating)
+    expect_target_code(
+        "result_tile_completion_lost",
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong_type", "missing_field", "hostile_identity", "cyclic"],
+)
+def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
+    """Malformed post-pass write state stays inside the target diagnostic."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def corrupting(self, function):
+        completed = original(self, function)
+        write = next(
+            node
+            for node in relayout_llir_nodes(function.body)
+            if isinstance(node, llir.Expr)
+            and type(getattr(node, "tensor_access", None)) is llir.TensorAccessMetadata
+            and node.tensor_access.role is llir.TensorAccessRole.RESULT_WRITE
+        )
+        if mutation == "wrong_type":
+            object.__setattr__(write, "tensor_access", object())
+        elif mutation == "missing_field":
+            metadata = write.tensor_access
+            object.__delattr__(metadata, "tensor_id")
+        elif mutation == "hostile_identity":
+            metadata = write.tensor_access
+            hostile = SymbolId(0)
+            object.__setattr__(hostile, "value", object())
+            object.__setattr__(metadata, "tensor_id", hostile)
+        else:
+            assert type(write) is llir.ArrayAccess
+            object.__setattr__(write, "index", write)
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", corrupting)
+    expect_target_code(
+        "result_tile_completion_lost",
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate"])
+def test_heap_completion_requires_exactly_one_generated_zero(monkeypatch, mutation):
+    """The copy-out coverage proof requires exactly one dense-result zero."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def mutating(self, function):
+        completed = original(self, function)
+        zero_calls = [
+            (index, stmt)
+            for index, stmt in enumerate(function.body)
+            if isinstance(stmt, llir.FunctionCallStmt)
+            and stmt.name == "scorch_zero_dense"
+        ]
+        assert len(zero_calls) == 1
+        index, stmt = zero_calls[0]
+        if mutation == "missing":
+            del function.body[index]
+        else:
+            function.body.insert(index, copy.deepcopy(stmt))
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", mutating)
+    expect_target_code(
+        "result_tile_completion_lost",
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+
+
+def test_heap_completion_rejects_a_corrupted_chain(monkeypatch):
+    """A post-pass header mutation of the pack origin fails re-identification."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def corrupting(self, function):
+        completed = original(self, function)
+        outer = next(stmt for stmt in function.body if isinstance(stmt, llir.ForLoop))
+        outer.omp_schedule = "static"
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", corrupting)
+    expect_target_code(
+        "result_tile_completion_lost",
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+
+
+def test_heap_target_rejects_a_misplaced_region():
+    """A verifier-legal region below the pack origin's body stays outside
+    the migrated family."""
+
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    fixture = heap_program()
+    # Move the region below the row loop: region(body=[sparse chain]) sits
+    # inside the row loop instead of wrapping the pack origin's body.
+    row_loop = fixture.region.body.statements[0]
+    inner_region = fixture.builder.result_tile_region(fixture.decl, row_loop.body)
+    forge(row_loop, body=fixture.builder.block((inner_region,)))
+    forge(fixture.pack, body=fixture.builder.block((row_loop,)))
+    expect_target_code(
+        "unsupported_program_shape",
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
