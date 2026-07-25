@@ -3089,6 +3089,28 @@ def test_result_tile_region_scope_discipline():
     forge(fixture.sparse, body=fixture.builder.block((fixture.pack_point,)))
     expect_defect("result_tile_scope_mismatch", fixture.program)
 
+    # A region below the row loop resets and copies the complete row-prefix
+    # space once per row.  That shape used to verify even though the oracle
+    # demonstrably erased rows that were copied by earlier iterations.
+    fixture = build_heap_spmm()
+    inner_region = fixture.builder.result_tile_region(
+        fixture.decl, fixture.row_loop.body
+    )
+    forge(fixture.row_loop, body=fixture.builder.block((inner_region,)))
+    forge(fixture.pack, body=fixture.builder.block((fixture.row_loop,)))
+    expect_defect("result_tile_scope_mismatch", fixture.program)
+
+    # Nor may the pack/region pair itself repeat under another loop: region
+    # entry and copy-out are once-per-pack-origin whole-prefix semantics.
+    fixture = build_heap_spmm()
+    wrapper = fixture.builder.dense_for(
+        fixture.builder.new_index_id(),
+        fixture.dim_i,
+        fixture.builder.block((fixture.pack,)),
+    )
+    forge(fixture.program, body=fixture.builder.block((wrapper,)))
+    expect_defect("result_tile_scope_mismatch", fixture.program)
+
     # Nested regions of one result conflict at copy-out.
     fixture = build_heap_spmm()
     inner_decl = fixture.builder.result_tile_decl(

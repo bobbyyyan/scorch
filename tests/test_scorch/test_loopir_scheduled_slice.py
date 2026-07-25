@@ -1925,6 +1925,17 @@ def heap_schedule(tag, strip=3):
     )
 
 
+def dense_heap_schedule(tag, strip=3):
+    return Schedule(
+        loop_order=("i", "k", "j"),
+        tiles=(
+            TileSpec("j", strip, placement="outermost", accum="heap", unroll=False),
+        ),
+        tag=tag,
+        parallel_loop="i",
+    )
+
+
 def heap_relayout_schedule(scope, tag, width=3, strip=4):
     from scorch.compiler.scheduler import RelayoutSpec
 
@@ -1953,6 +1964,13 @@ def heap_panel_schedule(tag, width=3, strip=4):
 
 
 HEAP_PARITY_GRID = [
+    (
+        "dense matmul heap",
+        build_matmul,
+        dense_heap_schedule("h-dense", strip=4),
+        (4, 6),
+        MATMUL_BINDINGS,
+    ),
     (
         "spmm heap exact strip",
         build_spmm,
@@ -2171,6 +2189,21 @@ def test_spmm_heap_shadow_execution_across_strip_regimes(width):
         (4, 6),
         (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
         sparse @ dense,
+    )
+
+
+def test_dense_matmul_heap_shadow_execution():
+    """Dense prefixes use the same legacy-derived parallel policy contract."""
+
+    torch.manual_seed(2913)
+    a = torch.randn(4, 5)
+    b = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_matmul(),
+        dense_heap_schedule("h-dense-shadow", strip=4),
+        (4, 6),
+        (dense_stensor(a, "A"), dense_stensor(b, "B")),
+        a @ b,
     )
 
 

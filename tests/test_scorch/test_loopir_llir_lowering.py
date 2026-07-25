@@ -2074,7 +2074,71 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
     )
 
 
-@pytest.mark.parametrize("mutation", ["missing", "duplicate"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_assignment_op",
+        "unowned_physical_write",
+        "unowned_top_level_write",
+        "malformed_top_level",
+    ],
+)
+def test_heap_completion_owns_the_write_effect_and_function_state(
+    monkeypatch, mutation
+):
+    """Completion recognizes the complete effect, not just access metadata."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def corrupting(self, function):
+        completed = original(self, function)
+        write = next(
+            node
+            for node in relayout_llir_nodes(function.body)
+            if type(node) is llir.ArrayAccess
+            and type(getattr(node, "tensor_access", None)) is llir.TensorAccessMetadata
+            and node.tensor_access.role is llir.TensorAccessRole.RESULT_WRITE
+        )
+        owner = next(
+            node
+            for node in relayout_llir_nodes(function.body)
+            if type(node) is llir.Assign and node.var is write
+        )
+        if mutation == "wrong_assignment_op":
+            owner.op = llir.AssignOp.ASSIGN
+        elif mutation in ("unowned_physical_write", "unowned_top_level_write"):
+            duplicate = copy.deepcopy(owner)
+            assert type(duplicate.var) is llir.ArrayAccess
+            object.__setattr__(duplicate.var, "tensor_access", None)
+            if mutation == "unowned_physical_write":
+                located = self._locate_statement(function.body, owner)
+                assert located is not None
+                body, position = located
+                body.insert(position + 1, duplicate)
+            else:
+                function.body.append(duplicate)
+        else:
+            malformed = next(
+                stmt for stmt in function.body if type(stmt) is llir.VarInit
+            )
+            object.__delattr__(malformed, "var")
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", corrupting)
+    expect_target_code(
+        "result_tile_completion_lost",
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "duplicate", "moved", "wrong_arguments"]
+)
 def test_heap_completion_requires_exactly_one_generated_zero(monkeypatch, mutation):
     """The copy-out coverage proof requires exactly one dense-result zero."""
 
@@ -2095,8 +2159,22 @@ def test_heap_completion_requires_exactly_one_generated_zero(monkeypatch, mutati
         index, stmt = zero_calls[0]
         if mutation == "missing":
             del function.body[index]
-        else:
+        elif mutation == "duplicate":
             function.body.insert(index, copy.deepcopy(stmt))
+        elif mutation == "moved":
+            del function.body[index]
+            outer = next(
+                candidate
+                for candidate in function.body
+                if type(candidate) is llir.ForLoop
+            )
+            outer.body.append(stmt)
+        else:
+            object.__setattr__(
+                stmt,
+                "args",
+                (stmt.args[0], llir.Literal(1, llir.DataType.INT64)),
+            )
         return completed
 
     monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", mutating)
@@ -2132,8 +2210,7 @@ def test_heap_completion_rejects_a_corrupted_chain(monkeypatch):
 
 
 def test_heap_target_rejects_a_misplaced_region():
-    """A verifier-legal region below the pack origin's body stays outside
-    the migrated family."""
+    """A repeating result-tile lifetime is rejected by the shared verifier."""
 
     from tests.test_scorch.test_loopir_verifier import forge
 
@@ -2144,9 +2221,10 @@ def test_heap_target_rejects_a_misplaced_region():
     inner_region = fixture.builder.result_tile_region(fixture.decl, row_loop.body)
     forge(row_loop, body=fixture.builder.block((inner_region,)))
     forge(fixture.pack, body=fixture.builder.block((row_loop,)))
-    expect_target_code(
-        "unsupported_program_shape",
-        fixture.program,
-        heap_shapes(fixture),
-        (4, 6),
-    )
+    with pytest.raises(LoopIRVerificationError) as captured:
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes=heap_shapes(fixture),
+            result_shape=(4, 6),
+        )
+    assert captured.value.defect.code == "result_tile_scope_mismatch"

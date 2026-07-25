@@ -2539,7 +2539,10 @@ def test_apply_relayout_requires_the_exact_family_shape():
 
 
 def test_apply_relayout_redirection_is_unique_and_complete():
-    from scorch.compiler.loopir.schedule_passes import apply_relayout
+    from scorch.compiler.loopir.schedule_passes import (
+        _collect_operand_loads,
+        apply_relayout,
+    )
     from scorch.compiler.loopir.nodes import Load
     from dataclasses import replace as dc_replace
 
@@ -2574,6 +2577,14 @@ def test_apply_relayout_redirection_is_unique_and_complete():
     leaf = point.body.statements[0]
     b_load = leaf.value.rhs
     assert type(b_load) is Load
+    # Extra instance state is outside the verified/canonical schema.  An
+    # alias there must not turn one semantic read into two pass candidates.
+    object.__setattr__(prescheduled.body, "ghost_load", b_load)
+    verify_program(prescheduled)
+    found_loads = _collect_operand_loads(prescheduled.body, b_load.tensor)
+    assert len(found_loads) == 1 and found_loads[0] is b_load
+    verify_program(apply_relayout(prescheduled, relayout))
+
     builder = LoopIRBuilder.resuming(prescheduled)
     second_load = builder.load(
         b_load.tensor,
@@ -2964,6 +2975,10 @@ def test_apply_result_tile_is_pure_and_deterministic():
     second = apply_result_tile(prescheduled, fact)
     assert canonical_program_dump(prescheduled) == before
     assert canonical_program_dump(first) == canonical_program_dump(second)
+    region = first.body.statements[0].body.statements[0]
+    assert LoopIRBuilder.resuming(first).new_result_tile_id().value == (
+        region.decl.result_tile.value + 1
+    )
     # Reapplying to an already-compacted chain fails closed: the region is
     # not a chain element for scheduling passes.
     expect_code("unsupported_schedule_shape", apply_result_tile, first, fact)
@@ -3060,6 +3075,12 @@ def test_apply_result_tile_redirection_is_unique_and_complete():
     writes = _collect_result_writes(prescheduled.body, lowering.result_symbol)
     assert len(writes) == 1
     assert _collect_result_writes(prescheduled.body, lowering.input_symbols[0]) == []
+    # Verifier-invisible instance state is not semantic pass input.  A
+    # hidden alias of the write must neither create ambiguity nor be walked.
+    object.__setattr__(prescheduled.body, "ghost_write", writes[0])
+    verify_program(prescheduled)
+    found_writes = _collect_result_writes(prescheduled.body, lowering.result_symbol)
+    assert len(found_writes) == 1 and found_writes[0] is writes[0]
     # After the pass, no direct write of the result survives anywhere.
     compacted = apply_result_tile(prescheduled, fact)
     assert _collect_result_writes(compacted.body, lowering.result_symbol) == []
@@ -3087,6 +3108,21 @@ def test_heap_plan_gate_requires_the_exact_family():
                     placement=LoopPlacement(PlacementKind.AT_DEPTH, depth=1),
                     accum="heap",
                 ),
+            ),
+        ),
+    )
+    # Keeping the heap loop innermost is insufficient: the dense result
+    # prefix must remain the first logical loop, before the reduction.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(
+            plan,
+            loop_order=(
+                lowering.loop_index_ids[1],
+                lowering.loop_index_ids[0],
+                lowering.loop_index_ids[2],
             ),
         ),
     )
@@ -3154,6 +3190,34 @@ def test_heap_plan_gate_requires_the_exact_family():
             plan,
             tiles=(*plan.tiles, affine_tile(i.index_id, 2)),
         ),
+    )
+
+    # In the composed family, the panel is exactly the pack origin's child.
+    # Check this before replay so a broader panel pass cannot accidentally
+    # admit a heap lifetime that the target cannot complete.
+    from scorch.compiler.loopir.schedule_passes import _check_heap_plan_family
+
+    (
+        panel_lowering,
+        (panel_i, _panel_j, panel_k),
+        pack,
+        panel_tile,
+        bound,
+        relayout,
+    ) = spmm_relayout_parts()
+    misplaced_panel_plan = heap_relayout_plan(
+        panel_lowering,
+        pack,
+        replace(panel_tile, placement=outermost_placement()),
+        bound,
+        relayout,
+        LoopRef(panel_i.index_id),
+        heap_result_tile_fact(panel_lowering, panel_i, panel_k),
+    )
+    expect_code(
+        "invalid_schedule_result_tile",
+        _check_heap_plan_family,
+        misplaced_panel_plan,
     )
 
 

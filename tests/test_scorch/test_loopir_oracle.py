@@ -1359,9 +1359,12 @@ def test_heap_result_tile_matches_the_direct_reference_exactly():
 
 
 def test_heap_result_tile_copies_out_fresh_strips_exactly_once():
-    """Freshness/copy-count proof: with all-ones inputs every output cell is
-    the row's stored count, and a stale (unreset) compact tile or a second
-    copy-out would double cells in earlier strips."""
+    """Freshness/coverage proof: every strip is reset and every cell copied.
+
+    The oracle's duplicate-key guard separately enforces at-most-once
+    copy-out within one region execution; repeated assignment itself would
+    be idempotent and therefore is not inferred from these numeric values.
+    """
 
     from tests.test_scorch.test_loopir_verifier import build_heap_spmm
 
@@ -1382,6 +1385,47 @@ def test_heap_result_tile_copies_out_fresh_strips_exactly_once():
             {fixture.c: (len(a_dense), cols)},
         )
         assert results[fixture.c] == [[count] * cols for count in stored_counts]
+
+
+def test_heap_result_tile_copy_out_respects_physical_mode_permutations():
+    """The compact axis is the final physical level, not logical rank-1."""
+
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    fixture = build_heap_spmm(strip=2)
+    result_decl = fixture.program.tensors[2]
+    forge(
+        result_decl,
+        dimensions=(fixture.dim_k, fixture.dim_i),
+        levels=(
+            fixture.builder.level(
+                result_decl.levels[0].kind,
+                1,
+            ),
+            fixture.builder.level(
+                result_decl.levels[1].kind,
+                0,
+            ),
+        ),
+    )
+    forge(
+        fixture.leaf,
+        indices=(
+            fixture.builder.index_value(fixture.free),
+            fixture.builder.index_value(fixture.row),
+        ),
+    )
+    verify_program(fixture.program)
+
+    a_dense = [[1.0, 0.0, 2.0], [0.0, 3.0, 4.0]]
+    b_dense = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+    ordinary = panel_reference_spmm(a_dense, b_dense, 2)
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense(a_dense), fixture.b: b_dense},
+        {fixture.c: (2, 2)},
+    )
+    assert results[fixture.c] == [list(column) for column in zip(*ordinary)]
 
 
 def test_heap_result_tile_zero_extents_execute():
