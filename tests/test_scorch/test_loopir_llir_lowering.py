@@ -2080,6 +2080,7 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
         "wrong_assignment_op",
         "unowned_physical_write",
         "unowned_top_level_write",
+        "opaque_physical_write",
         "malformed_top_level",
     ],
 )
@@ -2120,6 +2121,8 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                 body.insert(position + 1, duplicate)
             else:
                 function.body.append(duplicate)
+        elif mutation == "opaque_physical_write":
+            function.body.append(llir.RawStmt("C_values[0] = 123"))
         else:
             malformed = next(
                 stmt for stmt in function.body if type(stmt) is llir.VarInit
