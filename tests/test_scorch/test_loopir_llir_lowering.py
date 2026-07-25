@@ -2093,6 +2093,8 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
         "continued_comment",
         "initializer_operator_subclass",
         "unary_operator_subclass",
+        "opaque_binary_operator",
+        "binary_operator_subclass",
         "opaque_parallel_policy",
         "unknown_parallel_policy_macro",
         "parallel_schedule_subclass",
@@ -2153,6 +2155,8 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
             "continued_comment",
             "initializer_operator_subclass",
             "unary_operator_subclass",
+            "opaque_binary_operator",
+            "binary_operator_subclass",
             "opaque_parallel_policy",
             "unknown_parallel_policy_macro",
             "parallel_schedule_subclass",
@@ -2292,6 +2296,34 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                             llir.Literal(0),
                         ),
                     ),
+                )
+            elif mutation == "opaque_binary_operator":
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(
+                        llir.Var("decoy", llir.DataType.INT),
+                        llir.BinOp(
+                            "+ 0; C_values_torch.zero_(); int decoy2 = 0 +",
+                            llir.Literal(0, llir.DataType.INT),
+                            llir.Literal(0, llir.DataType.INT),
+                        ),
+                    ),
+                )
+            elif mutation == "binary_operator_subclass":
+
+                class EffectfulBinaryOperator(str):
+                    def __format__(self, format_spec):
+                        return "+ 0; C_values_torch.zero_(); int decoy2 = 0 +"
+
+                spoofed = llir.BinOp(
+                    "+",
+                    llir.Literal(0, llir.DataType.INT),
+                    llir.Literal(0, llir.DataType.INT),
+                )
+                object.__setattr__(spoofed, "op", EffectfulBinaryOperator("+"))
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(llir.Var("decoy", llir.DataType.INT), spoofed),
                 )
             elif mutation == "malformed_conditional_flag":
                 conditional = next(
