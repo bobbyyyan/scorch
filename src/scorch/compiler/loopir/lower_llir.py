@@ -3610,6 +3610,28 @@ def _dense_zero_candidates(function: llir.Function) -> List[llir.FunctionCallStm
     return collector.matches
 
 
+def _raw_stmt_candidates(function: llir.Function) -> List[llir.RawStmt]:
+    """Collect opaque statements that cannot participate in effect proofs."""
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_result_tile_opaque_statements",
+                )
+            )
+            self.matches: List[llir.RawStmt] = []
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if type(node) is llir.RawStmt:
+                self.matches.append(cast(llir.RawStmt, node))
+
+    collector = _Collector()
+    collector.walk(function)
+    return collector.matches
+
+
 def _direct_prefetch_targets_array(stmt: llir.Stmt, array_name: str) -> bool:
     """Whether one validated guard directly prefetches ``array_name[...]``."""
 
@@ -3691,6 +3713,12 @@ def _complete_result_tile_impl(
                 pass_name="validate_result_tile_completion_input",
             )
         ).walk(function)
+        if _raw_stmt_candidates(function):
+            _fail(
+                _RESULT_TILE_LOST,
+                "heap result-tile completion requires fully structured LLIR; "
+                "an opaque statement could hide an unowned result effect",
+            )
     except (
         LLIRTraversalError,
         AttributeError,
