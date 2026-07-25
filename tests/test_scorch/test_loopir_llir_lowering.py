@@ -32,7 +32,7 @@ from scorch.compiler.compilation_context import (
     CompilerStageId,
 )
 from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.identity import AccessId, SymbolId
+from scorch.compiler.identity import SymbolId
 from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH
 from scorch.compiler.llir_pass_manager import LLIRPassManager
 from scorch.compiler.loopir.lower_llir import (
@@ -1771,9 +1771,9 @@ def test_relayout_completion_owns_a_detached_metadata_fingerprint(monkeypatch):
         metadata = staged.tensor_access
         assert type(metadata) is llir.TensorAccessMetadata
         object.__setattr__(
-            metadata,
-            "access_id",
-            AccessId(metadata.access_id.value + 1),
+            metadata.access_id,
+            "value",
+            metadata.access_id.value + 1,
         )
         return completed
 
