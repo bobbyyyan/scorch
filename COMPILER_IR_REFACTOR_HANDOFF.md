@@ -25434,3 +25434,367 @@ review corrections** section above and
 every older prompt in this handoff.  Begin from `6ac5704` / `e4cfa50` /
 `bba935e` and the review-correction docs tip; §§13–15 are all binding,
 with §15 controlling on conflict.
+
+## Phase-6 heap result-tile milestone: originating report, superseded by the review below (2026-07-25)
+
+The originating session reported the fifth Phase-6 milestone complete
+at commits `39ffa7a`
+(heap region schema/verifier/printer/oracle, canonical v7, 79-code locked
+surface), `087f04e` (the typed `apply_result_tile` pass, exact plan gate,
+erasure, loop-only provenance, carrier purity), `f7d3af6` (byte-parity
+target lowering with `complete_result_tile` between the panel and
+relayout completions — the legacy panel→heap→relayout order), `34b933c`
+(the completion-boundary adversarial lock), `554a1eb` (the moved
+remaining boundary locks), and the docs commit that records this
+section; `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §16 is its historical
+record and §17 below is controlling.  Nothing was amended, reordered,
+or pushed; origin
+`refactor/compiler-ir-phase3-std-move-call` remains `58e8565`.
+
+The §15 review-correction commits were independently reviewed first: the
+452/435/150/45 gates reproduced at the docs tip and four independent
+adversarial probes (duplicated coordinate-context decoy, in-place
+IndexId payload mutation, physical array-spelling mutation, valid-path
+both-scope lowering) all failed closed or lowered correctly.  **No
+concrete §15 defect was found.**
+
+What the originating report claimed (superseded where §17 conflicts):
+
+- A rank-2 trailing-axis implementation subset of the audited rank>=2
+  `_apply_heap_result_tile` family was migrated end to end:
+  `ResultTileDecl(result_tile, result, pack)` +
+  `ResultTileRegion(decl, body)` own intrinsic fresh-zero entry,
+  `TiledReduce` accumulation, and exactly-once clamped-window copy-out
+  at exit — which discharges the result's zero-init contract on the
+  heap route.  The access-identity decision mirrors relayout: no
+  occurrence identity on `StoreReduce`; the pass proves the unique
+  write occurrence and the exact fact admission subsumes the scan
+  (retained as defense in depth).
+- `apply_result_tile` runs last in `apply_schedule_plan` (after
+  relayout), wrapping the pack origin's whole body; the plan gate
+  admits exactly the audited family (`invalid_schedule_result_tile`;
+  `unsupported_schedule_result_tile` no longer exists) with the
+  mandatory parallel dense result-prefix loop (race legality; one
+  prefix level ⇒ no degrees of freedom); the heap pack tile in the
+  relayout composition requires the matching result-tile fact;
+  `erase_schedule` restores the direct reduction, proven by canonical
+  dumps and counting differentials in both composition scopes.
+- The target records the tiled leaf as a synthetic direct StoreReduce
+  view (managed passes byte-neutral), snapshots the emitted write with
+  independently rebuilt identity payloads (§15 discipline), suppresses
+  the emission-time auto parallel gate for heap chains, and completes
+  post-assembly: chain re-identification (retained panel objects or the
+  recorded emitted headers + legacy row marking), exact-one compact
+  redirection with residual re-check, exactly-one generated-zero proof
+  before removal, and init/copy/storage groups via helpers extracted
+  byte-neutrally from the legacy `_apply_heap_result_tile` (all eleven
+  cases defined by the available heap audit generator regenerate
+  byte-identically; no separate 20-case generator exists; the
+  string-budget lock follows the moved owner).  Failures are stage-owned
+  `result_tile_completion_lost`.
+
+Verification highlights (full detail in review §16.5): contract focus
+**485** (was 452), traversal **435**, membership **530 + 4 neutrality**,
+runtime focus **not completed by the originating session** (superseded
+by the §17 review's 177-test run), generality **45**, a fourteen-cell
+heap byte-parity grid (heap alone exact/ragged/unit/oversized, f32/f64,
+heap+panel, heap+relayout both scopes incl. f64, three zero-extent
+boundaries, larger shapes) plus bitwise compiled shadows and randomized
+torch/oracle differentials, fresh 20-corpus/42-grid captures
+byte-identical to detached base `4abc8fa`, clean base/candidate
+full-source mypy identical at 146 findings in 12 files (zero in
+`loopir/`; the §15-recorded 140 clean-tree count did not reproduce on
+either side in this session's environment — equality is the binding
+gate).  Latency and the authoritative clean detached-worktree suite
+were **not completed by the originating session** and are superseded
+by the §17 review receipts at `b201e47`.  Evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase6-heap-34b933c/` (audit +
+goldens under `phase6-heap-audit/`).
+
+**Candid Phase-6 exit verdict: not exited.**  Migrated: explicit
+orders, affine direct tiles, stack workspace, sparse panels, operand
+relayout (both scopes), and heap result tiles — including the
+representative tile-j, direct-accumulation tile-ijk, and
+heap-accumulation tile-ijk kernels through the public Schedule adapter,
+byte-locked.  Still open, none started this session: (1)
+target-independent abstract parallel-loop selection beyond the
+panel/heap no-degrees-of-freedom rows, with consume-once parallel_loop
+facts and race/reduction legality across direct/stack/workspace/panel/
+relayout/heap routes; (2) intended automatic-plan provenance through
+the typed schedule path (the blanket unsupported_schedule_provenance
+rejection stands); (3) canonical LoopPlan schedule cache identity for
+the strangler route; (4) the criterion-by-criterion Phase-6 exit audit.
+TTM-style multi-prefix heap plans remain legacy-only at the typed gate,
+a recorded boundary.
+
+## Historical heap-milestone prompt (superseded by the §17 prompt)
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip (the
+heap-milestone docs commit above 554a1eb). Do not push, switch branches,
+amend, squash, or reorder commits. Read AGENTS.md,
+COMPILER_IR_REFACTOR_DESIGN.md (Stages 3–7 and Phase 6), the Phase-4/5
+reviews, all of COMPILER_IR_REFACTOR_PHASE6_REVIEW.md — especially
+§§13–16 — and this handoff tail. §15 supersedes §14 and §16 records the
+heap boundary.
+
+First rigorously review the heap milestone commits
+39ffa7a/087f04e/f7d3af6/34b933c/554a1eb and the docs commit; do not
+trust their report. Reproduce the exact corrected gates (the 485-test
+five-file contract focus, the 435-test traversal file, the compiled
+runtime focus, the 45-test generality file, the fourteen-cell heap
+parity grid, the eleven available regenerated audit goldens) and adversarially
+verify: the exact pre-replay heap family admission and its 1:1 heap
+tile/result-tile pairing; the unique-write proof and its
+defense-in-depth scan; the intrinsic fresh-zero/accumulate/exactly-once
+copy-out semantics and the zero-init discharge; the synthetic
+StoreReduce view leaving managed passes byte-neutral; the detached
+write snapshot with independently rebuilt payloads; the
+panel→heap→relayout completion order and retained-object discipline;
+the suppressed emission-time parallel gate and completion-time row
+marking; result_tile_completion_lost totality for malformed, missing,
+duplicated, swapped, cyclic, or hostile state; and unchanged valid C++
+for heap alone and both composition scopes. Fix, test, document, and
+commit any concrete review defect before new work.
+
+Then complete the largest coherent remainder of Phase 6, in separately
+reviewable commits, in this order:
+
+1. Target-independent abstract parallel-loop selection over stable loop
+identities. Consume each parallel_loop plan fact exactly once and prove
+race/reduction legality structurally for direct, stack, workspace,
+panel, relayout, and heap routes; cover explicit and automatic
+schedules; reject unsafe reductions and shared heap/workspace storage
+before lowering. Keep OpenMP spelling, calibrated thread policy,
+prefetch/restrict/SIMD, and pointer-hoisting policy in target lowering
+(Phase 7). The panel/heap families' row marking and the emission-time
+auto parallel gate in lower_llir are the seams to generalize.
+
+2. Intended automatic-plan provenance through the typed schedule path.
+The blanket unsupported_schedule_provenance rejection of every
+non-explicit plan is not a Phase-6 exit; migrate the automatically
+selected LoopPlan families the design requires or record and justify a
+formal criterion revision.
+
+3. Canonical LoopPlan schedule cache identity for the strangler route:
+deterministic across fresh builders for equivalent plans, distinct for
+semantically distinct schedules; preserve the source-derived release
+cache; no default production cutover.
+
+4. Only after 1–3 close, the criterion-by-criterion Phase-6 exit audit
+across every deliverable and route (reorder, affine ragged tiling,
+workspace, panels, relayout, direct/stack/heap accumulation, abstract
+parallel selection, the public Schedule→LoopPlan adapter, canonical
+cache identity, no name/regex discovery, explicit and automatic
+structural/numerical differentials, representative tile-j and direct-
+and heap-accumulation tile-ijk kernels), tracing every supported route
+from public adapter through verified LoopPlan, typed passes, target
+emission, compiled execution, stage timing, and cache identity. Close
+Phase 6 only if every required route is proved; otherwise state exactly
+what remains. Do not start Phase 7, selector integration, default
+production cutover, or legacy deletion.
+
+Preserve every established contract of reviews §9–§16: exact
+stored-field/type validation; forged/missing/extra/hostile/cyclic/
+shared/depth adversaries; stable owned diagnostics; deterministic
+canonical serialization and builder continuation; pure oracle and
+erasure proofs; no rendered-name, regex, tag, or metadata-only
+discovery; no target spelling in LoopIR; structural activation never
+waived; byte waivers only via fresh corpus/grid equality. Run the
+focused contract and compiled runtime memberships, adjacency sweeps,
+fresh corpus/grid captures, paired sequential compiler latency, Black,
+Flake8, focused and clean-tree full-source mypy against the inherited
+baseline (146 findings in 12 files reproduced identically on base and
+candidate this session), git diff --check, and an authoritative clean
+detached-worktree non-performance suite with isolated caches and import
+provenance asserted.
+
+Before editing and before every commit, inspect git status, live
+origin, and the five protected-file hashes. Preserve all unrelated
+dirty or untracked GPU, CUDA, benchmark, packaging, scheduler,
+research, scratchpad, and tooling work. Stage explicit pathspecs only.
+Use focused commits with descriptive bodies, update the Phase-6 review
+and handoff with exact receipts and limitations, and commit the largest
+fully verified result without overclaiming.
+```
+
+## Historical routing note after the heap milestone (superseded)
+
+This was the originating session's routing note.  It is retained only
+for provenance; review §17 and the prompt after it now supersede §16
+and this note.
+
+## Phase-6 heap milestone rigorous review corrections (2026-07-25)
+
+The inherited heap milestone had seven classes of concrete soundness
+failure. They are fixed and locked in twelve local commits:
+
+- `95ba436` — `fix(compiler): close heap result-tile soundness gaps`
+- `c6f465c` — `test(compiler): lock heap result-tile review fixes`
+- `2a281b9` — `fix(compiler): reject opaque heap completion effects`
+- `1b891d8` — `test(compiler): cover opaque heap completion effects`
+- `3ebe0cd` — `fix(compiler): own heap result storage aliases`
+- `b201e47` — `test(compiler): cover structured heap result aliases`
+- `286fd84` — `fix(compiler): close rendered heap effect routes`
+- `fad6c90` — `test(compiler): cover rendered heap effect routes`
+- `9e0f770` — `fix(compiler): harden residual heap text fields`
+- `99b667d` — `test(compiler): cover residual heap text fields`
+- `59760ca` — `fix(compiler): finish heap text boundary audit`
+- `f162ddf` — `test(compiler): lock final heap text boundaries`
+
+The corrected contracts are recorded in
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §17.  In short: result-tile
+lifetimes are now exactly once per root pack origin; oracle copy-out
+respects physical-to-logical mode permutations; pass scans ignore
+non-schema instance state; the plan family is rejected before replay
+unless its complete order and panel placement match; and target
+completion owns the exact additive assignment, ABI result pointer,
+generated zero, canonical Torch allocation/final assembly, and every
+owned physical result occurrence under a full-function validation
+boundary. The final review also closes every LLIR field codegen emits
+directly as text: names and DataTypes, initializer/unary operators,
+raw literal text, comment line-splicing, OpenMP policy/schedule text,
+dynamic atomic names, and codegen-active loop/conditional flags.
+Opaque `RawStmt` effects, extra structured Torch-storage aliases,
+string-subclass formatting, unknown macros, nested calls, and
+result-owned policy names are rejected because they cannot participate
+in that proof. Dense-matmul heap is now covered by byte parity and
+compiled execution.
+
+Verified at exact final code/test tip `f162ddf`: five-file contract
+**509**, supplementary LoopIR contract **486**, compiled runtime
+**177** in 754.24 s including all 16 activating heap parity/shadow
+cases, legacy schedule generality **45** in 195.57 s, and fresh
+20-corpus/42-grid/11-golden byte identity across detached `554a1eb`,
+`b201e47`, and `f162ddf` worktrees. The combined 73-source manifest is
+`b78b355ed9b6d6a39cabc3912269312edd98ea144dc12fe79ec37521fe407f5b`.
+Changed-file Black/Flake8 are clean, focused production mypy is clean
+(the test file's 26 findings are byte-identical to `b201e47`), and
+clean base/candidate Flake8 and full-source mypy logs are identical
+(nine and 146 inherited findings respectively). The authoritative
+clean detached suite passed **3,983**, skipped 14, performance-deselected
+3, and failed 0 in 46:03 with isolated caches and asserted provenance.
+Paired `554a1eb`/`f162ddf` compiler latency is inside the 1.10 target
+for all four cases and both percentiles (worst **1.032 p95**) with
+identical source hashes. The complete receipts are in review §17.3 and
+the evidence ledger
+`/Users/bobby/.cache/scorch-codex/phase6-heap-review-f162ddf/`
+(with predecessor receipts retained).
+
+**Phase 6 remains open.**  In particular, the heap audit retained a
+live rank-3 TTM multi-prefix reference while the typed pass deliberately
+rejects multi-prefix results.  The rank-2 slice is corrected, but the
+larger general heap criterion is not closed.
+
+## Superseding broad prompt after the heap review
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip (the
+heap-review docs commit above f162ddf). Do not push, switch branches,
+amend, squash, or reorder commits. Read AGENTS.md,
+COMPILER_IR_REFACTOR_DESIGN.md (Stages 3–7 and every Phase-6 exit
+criterion), the Phase-4/5 reviews, all of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md — especially §§13–17 — and the
+latest handoff tail. §17 supersedes §16 wherever the inherited heap
+report conflicts with the rigorous review.
+
+First independently review 95ba436, c6f465c, 2a281b9, 1b891d8,
+3ebe0cd, b201e47, 286fd84, fad6c90, 9e0f770, 99b667d,
+59760ca, f162ddf, and the docs commit. Reproduce the 509-test exact
+contract membership, the 177-test compiled runtime membership, the
+45-test legacy generality file, the 11 available heap audit goldens,
+and the clean-worktree receipts. Probe
+the corrected once-per-pack region lifetime, physical-mode copy-out,
+schema-only pass discovery, exact pre-replay family gate, dense and
+sparse completion policies, complete additive-write/ABI-pointer/zero/
+Torch-storage ownership, the complete codegen-emitted text boundary,
+and result_tile_completion_lost totality. Fix, test, document, and
+commit any concrete regression before new work.
+
+Then aim to close the entire remaining Phase 6 in separately reviewable
+commits, not just one tiny seam. Continue through the following
+milestones while each preceding gate remains green:
+
+1. Generalize heap result tiling from the corrected rank-2 emitted slice
+   to the audited rank>=2 multi-prefix family. The required
+   representative is the retained rank-3 TTM heap kernel. Preserve and
+   fully exercise the existing rank-general ResultTile schema/verifier;
+   generalize LoopPlan, typed passes, and target lowering, adding
+   lifetime invariants only as needed. Compute compact prefix
+   linearization structurally; prove
+   once-per-pack reset/copy-out, race legality, erasure, oracle
+   equivalence, public Schedule→LoopPlan routing, byte-identical legacy
+   C++, and compiled PyTorch/legacy shadows for ragged, zero-extent,
+   f32/f64, and physical-mode-permuted cases. Do not special-case TTM
+   spellings. If the design intentionally excludes multi-prefix heap,
+   stop and record a formal Phase-6 criterion revision with evidence
+   instead of calling the family complete.
+
+2. Implement target-independent abstract parallel-loop selection over
+   stable loop identities. Consume each parallel_loop fact exactly
+   once and prove race/reduction legality structurally across direct,
+   stack/workspace, panel, relayout, and all supported heap prefix-rank
+   routes. Cover explicit and intended automatic plans; reject unsafe
+   reductions and shared storage before target lowering. Leave OpenMP
+   spelling, thread/chunk policy, prefetch, SIMD, and pointer hoisting
+   in target lowering for Phase 7.
+
+3. Route the intended automatic-plan provenance through the typed
+   scheduling path rather than retaining a blanket rejection. Inventory
+   every current automatic LoopPlan family, migrate those required by
+   the Phase-6 design, prove exact fact consumption and numerical/source
+   parity, and fail closed on the rest with a documented criterion
+   decision.
+
+4. Add canonical LoopPlan schedule cache identity for the strangler
+   path: deterministic across fresh builders and equivalent plans,
+   distinct for every semantic schedule difference, insensitive to
+   incidental identity history, and collision-tested. Preserve the
+   source-derived release cache and do not enable default production
+   cutover.
+
+5. Perform the criterion-by-criterion Phase-6 exit audit only after
+   1–4. Trace every supported route from public Schedule/automatic
+   adapter through verified LoopPlan, pure typed passes, oracle and
+   erasure, LLIR/C++ emission, compiled execution, stage timing, and
+   cache identity. Include reorder, ragged affine tiling, workspace,
+   panels, both relayout scopes, direct/stack/heap accumulation,
+   abstract parallel selection, representative tile-j, direct
+   tile-ijk, rank-2 heap tile-ijk, and rank-3 multi-prefix heap. Close
+   Phase 6 only if every required criterion is proved; otherwise state
+   the exact remaining boundary. Do not start Phase 7, selector
+   integration, default production cutover, or legacy deletion.
+
+Preserve all §§9–17 contracts: exact stored-field/type validation;
+forged/missing/extra/hostile/cyclic/shared/depth adversaries; stable
+owned diagnostics; deterministic canonical serialization and builder
+continuation; pure typed passes, oracle differentials, and erasure
+proofs; no rendered-name, regex, tag, or metadata-only discovery; no
+target spelling in LoopIR; structural activation never waived; byte
+waivers only through fresh corpus/grid equality. Run the exact focused
+and compiled memberships, adjacency and traversal sweeps, legacy
+generality, fresh corpus/grid and activating captures, paired
+same-session latency with order controls when needed, Black, Flake8,
+focused and clean-tree full-source mypy against the inherited baseline,
+git diff --check, and an authoritative clean detached-worktree
+non-performance suite with isolated caches and asserted import
+provenance.
+
+Before editing and before every commit, inspect git status, live origin,
+and the five protected-file hashes. Preserve all unrelated dirty and
+untracked GPU/CUDA, benchmark, packaging, scheduler, research,
+scratchpad, and tooling work. Stage explicit pathspecs only. Use
+focused commits with descriptive bodies, update the Phase-6 review and
+handoff with exact receipts and limitations, and commit the largest
+fully verified result without overclaiming.
+```
+
+## Final routing note after rigorous heap review
+
+The chronologically latest state is review §17 and the “Phase-6 heap
+milestone rigorous review corrections” section above.  Its superseding
+prompt replaces every older prompt.  Start from the twelve review commits
+and the docs tip; do not trust the incomplete §16 evidence placeholders
+or its rank-2-completeness implication.

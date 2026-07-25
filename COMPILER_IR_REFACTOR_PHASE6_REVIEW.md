@@ -1662,3 +1662,474 @@ heap-relayout tile-ijk composition, target-independent abstract
 parallel-loop selection, intended automatic-plan provenance, canonical
 LoopPlan schedule cache identity, and the criterion-by-criterion exit
 audit remain.  Phase 7 policy/pass migration has not started.
+
+## 16. Heap result-tile milestone: originating report, superseded by §17 (2026-07-25)
+
+The originating report claimed that the fifth Phase-6 milestone
+migrated a rank-2 trailing-axis subset of the audited rank>=2 legacy
+`_apply_heap_result_tile` family end to end: schema, verifier,
+printer/serialization, oracle, typed pass, plan gate, erasure,
+provenance, target lowering with byte parity, and a compiled matrix
+covering heap alone and the heap tile-ijk composition (pack + panel +
+relayout) at **both** staging scopes.  Five stacked local commits plus
+the docs commit that records this section; nothing earlier was amended
+or reordered and nothing was pushed:
+
+- `39ffa7a` — `feat(compiler): extend LoopIR with the heap result-tile region schema`
+- `087f04e` — `feat(compiler): apply heap result-tile plans as a typed accumulation pass`
+- `f7d3af6` — `feat(compiler): lower heap result tiles with legacy byte parity`
+- `34b933c` — `test(compiler): lock the heap result-tile completion boundaries`
+- `554a1eb` — `test(compiler): move the remaining heap boundary locks`
+
+The session first independently reviewed the §15 correction commits
+(`6ac5704`/`e4cfa50`/`bba935e`/`4abc8fa`): the exact contract focus
+(**452**), common traversal (**435**), compiled runtime focus (**150**),
+and schedule generality (**45**) all reproduced at the docs tip, and four
+independent adversarial probes beyond the committed lock — a duplicated
+coordinate-context decoy, an in-place `IndexId` payload mutation, a
+post-pass physical array-spelling mutation, and valid-path both-scope
+lowering — all behaved as §15 claims.  **No concrete §15 defect was
+found**; no fix commit was needed.
+
+### 16.1 Audit and boundary decisions
+
+The heap audit was recorded under
+`/Users/bobby/.cache/scorch-codex/phase6-heap-audit/AUDIT.md` **before
+any schema was written**: the responsibility/lifetime table for
+`Scheduler._validate_heap_result_tile`, `_ResultTilePlan`,
+`_apply_heap_result_tile`, `_remove_dense_result_zero`, the compact
+access rewriting, allocation/reset/copy-out, parallel-prefix legality,
+and the `relayout_heap_pack.cpp` composition, plus eleven fresh legacy
+goldens (exact/ragged/unit/oversized/f64 heap-alone, the rank-3 TTM
+multi-prefix reference, heap+panel, and heap+relayout at both scopes in
+f32 and f64), with `relayout_heap_pack.cpp` byte-identical to the
+§12/§13 retained copy.
+
+Recorded boundary decisions:
+
+- **No occurrence identity on `StoreReduce`** — the identical decision
+  to the relayout `Load` boundary.  The pass proves the result's unique
+  write occurrence and the region identity anchors everything
+  downstream.  Unlike operand reads, result writes are statements the
+  verifier's coordinate model fully pins within this family, so the
+  exact fact admission subsumes the scan; it is retained as
+  checked-property defense in depth.
+- **Region nesting**: `ResultTileRegion` wraps the pack origin's entire
+  body (after relayout), one uniform shape for heap-alone, heap+panel,
+  and both relayout scopes; the PACK_AXIS staging region sits *inside*
+  the result-tile region.  The oracle's region-entry order (fresh
+  compact tile, then staging) differs from the emitted C++ order (pack
+  loop, then init loop) — a deliberate observational equivalence:
+  staging reads only the operand and the init writes only the compact
+  tile, so the entries commute.
+- **The typed implementation is a rank-2 subset of the audited rank>=2
+  family** (one dense prefix loop).  Multi-prefix heap (the TTM shape)
+  remains legacy-only and
+  fails closed at the plan gate as `invalid_schedule_result_tile` —
+  a recorded boundary, never a silent emission.  The dense-reduction
+  heap-alone chain (dense matmul tile-j heap) is admitted by the pass
+  and the target but is not in the byte-locked compiled matrix.
+- **Parallel-prefix race legality**: the plan gate requires the
+  parallel loop to be a LOGICAL dense result-prefix loop; with one
+  prefix level the selection has no degrees of freedom (the panel
+  precedent), so heap plans admit `parallel_loop` without a panel and
+  the typed target marks the row loop at completion exactly as the
+  legacy explicit-parallel schedule does.  The emission-time auto
+  parallel gate is suppressed for heap chains, mirroring the panel
+  suppression, so raw emission and every managed pass keep seeing the
+  legacy unmarked tree.
+
+### 16.2 What was frozen (schema extension)
+
+New in `loopir/nodes.py`: `ResultTileId` (builder-allocated,
+artifact-local, covered by the declared-field-only `resuming` scan),
+`ResultTileDecl(result_tile, result, pack)`, the region statement
+`ResultTileRegion(decl, body)`, and `TiledReduce(result_tile, indices,
+op, value)` — the staged twin of `StoreReduce`.  Region semantics are
+intrinsic: a fresh all-zero compact tile per pack-origin iteration (one
+cell per dense prefix position and clamped window column — ADD's
+identity, the reduction-legality contract), accumulation through
+`TiledReduce` only, and exactly-once copy-out of every clamped-window
+cell at region exit — which is what discharges the result's
+whole-tensor zero-initialization contract on the heap route (cells that
+received no accumulation copy the entry zero, covering empty rows).
+Canonical serialization moved to schema `scorch.loopir.canonical.v7`;
+the printer renders `result_tile_region h0 t2 pack s0` and
+`tiled_reduce(add) h0[x1, x0]`, stable across unrelated identity
+histories with raw `ResultTileId` renumbering.  The verifier grows
+eight stable codes (`invalid_result_tile_id`, `duplicate_result_tile_id`,
+`unbound_result_tile`, `result_tile_scope_mismatch`,
+`result_tile_result_mismatch`, `result_tile_write_mismatch`,
+`result_tile_residual_write`, `result_tile_dead_region`), each with
+direct adversarial regressions (hostile subclasses, forged and
+huge-integer identity payloads, missing fields, cycles, nested
+same-result regions, per-point regions, rebound trailing coordinates,
+residual direct writes while a region is open); the locked source-scan
+surface grows from 71 to **79** codes.  The oracle executes the
+intrinsic semantics with fail-closed guards (region outside its pack
+origin, re-entry, reduces outside the region or the compact window
+domain), keeps only written cells so verifier-approved widths never
+become allocation requests, and copy-out enumerates the
+caller-allocated result.
+
+### 16.3 Pass, plan gate, erasure, and provenance
+
+`apply_result_tile(program, result_tile)` is the new pure typed pass,
+applied by `apply_schedule_plan` **last** — after `apply_relayout`, so
+the region wraps the fully staged chain.  Each `ResultTile` fact is
+consumed exactly once: `tile_loop` selects the pack schedule pair,
+`access_indices` select the redirected write, and
+`result_prefix`/`result_level` are validation-is-consumption against
+the result declaration.  The pass admits exactly the audited chains
+(the pack origin over the dense row loop, one sparse or dense reduction
+loop, and the pack point loop — optionally windowed by one panel with
+at most one relayout stage), proves the unique `StoreReduce`
+occurrence, replaces it with a `TiledReduce` carrying the fresh region
+identity, wraps the pack origin's body in the region, and re-checks
+that no residual direct write survived.
+
+The plan gate replaces the blanket `unsupported_schedule_result_tile`
+rejection with the exact family admission
+(`invalid_schedule_result_tile`): one serial outermost heap-accumulation
+affine tile targeting the plan's innermost logical loop, paired
+one-to-one with the `result_tile` fact compacting a rank-2 dense result
+on its trailing storage level, at most one composed panel tile, and the
+mandatory parallel dense result-prefix loop.  A heap pack tile in the
+relayout composition now requires the matching result-tile fact
+(previously `unsupported_schedule_accumulation`).  Chain decomposition
+gains a result-tile sink for provenance, erasure, and carrier purity;
+the carrier's base-purity check explicitly rejects result-tile regions
+and tiled-reduce leaves; provenance stays loop-only across both
+transparent regions.  `erase_schedule` restores the plain result
+reduction (the region's fresh-zero/copy-out semantics are an ADD
+reassociation), proven by canonical-dump equality and all-ones counting
+differentials across exact/ragged/unit/oversized strips for heap alone
+and both composition scopes.
+
+### 16.4 Target lowering and the post-assembly completion
+
+The nest walk accepts the region and its `TiledReduce` compute leaf and
+records the leaf as a synthetic direct `StoreReduce` view, so raw
+emission — including the result-write metadata — and **every managed
+pass** see byte-for-byte the tree the legacy pipeline transforms.  The
+emitted result write is snapshotted with independently rebuilt
+`AccessId`/`SymbolId`/`IndexId` payloads — the §15 detached-fingerprint
+discipline.
+
+`complete_result_tile` runs on the assembled function **between**
+`complete_panel` and `complete_relayout` — exactly the legacy
+`apply_schedule_to_llir` order (panel, heap, relayout).  Panel chains
+consume the panel completion's retained loop objects; the bare heap
+chain re-identifies its direct loops against the detached pre-pass
+headers and marks the parallel row with the same
+policy/marking/verification block the panel completion uses, under
+owned-diagnostic totality.  Completion requires exactly one metadata
+candidate whose entire physical subtree matches the detached snapshot,
+redirects the write to compact storage exactly once with a residual
+re-check, re-proves exactly one generated dense-result zero before
+removing it (the exactly-once copy-out coverage proof), and places the
+init/copy groups and reusable storage through helpers extracted
+byte-neutrally from the legacy `_apply_heap_result_tile`
+(`_heap_result_tile_names`, `_heap_compact_access`,
+`_heap_result_init_group`, `_heap_result_copy_group`,
+`_heap_result_storage_statements` — one source per spelling; all eleven
+goldens defined by the available heap audit generator regenerate
+byte-identically; no separate 20-case generator exists, as corrected
+in §17; the raw-string-budget lock follows the moved storage owner).
+The originating report claimed every disagreement became the
+stage-owned `result_tile_completion_lost` diagnostic.  Section 17
+disproves that claim and records the corrected ownership boundary,
+including repeating lifetimes, assignment ownership, hidden effects,
+Torch-storage aliases, and malformed top-level state.
+
+**The compiled matrix.**  A fourteen-cell heap byte-parity grid locks
+generated C++ equality against `Scheduler.apply_schedule` + the legacy
+lowering in every cell: heap alone at exact/ragged/unit/oversized
+strips, f32/f64, heap+panel without relayout, the heap tile-ijk
+relayout composition at both staging scopes including f64, all three
+zero-extent boundaries, and larger non-square shapes.  Structural
+activation is asserted directly and never waived: the reusable
+`tiled_C` storage and restrict pointer, both init/copy groups with the
+legacy `scorch_nthreads((C0_size) * kTile_k, (C0_size))` static policy,
+the redirected compute write, the removed `scorch_zero_dense`, the
+retained dead `pC1` resolve, and the legacy sparse dynamic policy on
+the marked row loop.  Compiled shadow execution is **bitwise-equal** to
+the legacy scheduled kernels and PyTorch-close across strip regimes
+with an empty CSR row, both relayout scopes, f64 at 1e-10, and all
+three zero-extent boundaries; randomized heap and composition rounds
+execute against PyTorch and the production oracle.
+
+### 16.5 Verification
+
+Evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase6-heap-34b933c/` (audit and
+goldens under `phase6-heap-audit/`).
+
+- §15 gates reproduced before any edit: contract 452, traversal 435,
+  runtime 150, generality 45, plus the four independent probes above;
+- exact five-file contract focus after the milestone: **485 passed**
+  (the §15 lock plus 33 heap contract regressions across the verifier,
+  the pass surface, the plan gate, and the target boundaries);
+- common LLIR traversal file: **435 passed** (unchanged);
+- focused production LoopIR membership (verifier, printer, oracle,
+  schedule passes, LLIR lowering, CIN lowering, levels, iterdomain):
+  **530 passed + 4 neutrality**;
+- scheduled compiled runtime focus
+  (`test_loopir_scheduled_slice.py` + `test_loopir_pipeline_execution.py`):
+  **not completed by the originating session**; the rigorous review in
+  §17 supersedes this missing receipt with an exact 177-test rerun,
+  including the expanded heap parity cells, compiled shadows, and
+  structural activation locks;
+- full legacy schedule-generality file: **45 passed** (the legacy heap
+  path is byte-unchanged under the helper extraction);
+- byte gates: fresh 20-source corpus and 42-source grid captures from
+  detached `554a1eb`-lineage and detached base `4abc8fa` worktrees are
+  **byte-identical** (`diff -qr` empty).  The available heap audit
+  generator's eleven cases regenerate byte-identically; the originating
+  session's claimed separate nine-case addition was not reproducible
+  from any retained generator and is superseded by §17;
+- compiler latency: **not completed by the originating session**; the
+  paired clean-tree review measurement in §17 supersedes this missing
+  receipt;
+- static parity: Black clean over every changed module and test (the
+  single repo-level `black --check src` finding, `prebuilt_kernels.py`,
+  is byte-identical at base and candidate and predates the milestone —
+  an environment-level Black/Python parsing quirk in an untouched
+  file); Flake8 diff between clean base and candidate worktrees is
+  empty; focused mypy clean over the changed modules; clean detached
+  base and candidate full-source `mypy --check-untyped-defs src` are
+  **identical at 146 findings in 12 files, zero in `loopir/`** (the
+  §15-recorded 140-in-11 clean-tree count did not reproduce in this
+  session's environment on either side; equality between base and
+  candidate is the binding no-new-findings gate);
+- the authoritative clean detached-worktree non-performance suite at
+  the final test tip `554a1eb` was **not completed by the originating
+  session**; §17 records the clean-suite result at the corrected test
+  tip instead;
+- `git diff --check` clean before every commit; the five protected
+  tracked files retain their recorded SHA-256 values and were never
+  staged; staging used explicit pathspecs only; no GPU/CUDA, benchmark,
+  packaging, scheduler, research, scratchpad, or tooling material was
+  touched; live origin `refactor/compiler-ir-phase3-std-move-call`
+  remains at `58e8565` and nothing was pushed.
+
+### 16.6 Limitations and the candid Phase-6 exit verdict
+
+- The migrated schedule surface is now: explicit complete loop orders,
+  affine `accum="direct"` splits, stack workspace accumulation, sparse
+  panel tiling, operand relayout/staging at both scopes, and heap
+  result-tile accumulation for the rank-2 trailing-axis family — heap
+  alone and the heap tile-ijk composition (pack + panel + relayout,
+  both staging scopes) through the public Schedule → verified LoopPlan
+  adapter, byte-locked.  **Phase 6 is therefore still not exited.**
+- Still open, in the order the superseding prompt requires:
+  target-independent abstract parallel-loop selection (beyond the
+  panel/heap families whose row has no degrees of freedom), intended
+  automatic-plan provenance through the typed schedule path (the
+  blanket `unsupported_schedule_provenance` rejection stands), canonical
+  LoopPlan schedule cache identity for the strangler route, and the
+  criterion-by-criterion Phase-6 exit audit.  None of these were
+  started in this session.
+- The emitted heap slice is the originating implementation's rank-2
+  subset of the audited rank>=2 legacy family; TTM-style multi-prefix
+  heap plans stay fail-closed at the typed plan gate and continue to
+  work through the legacy pipeline.
+- The heap completion relies on the managed passes preserving the
+  emitted result write and pack-origin header byte-for-byte (true
+  today); a future pass that legally rewrites either fails loudly as
+  `result_tile_completion_lost` — the §13/§15 snapshot posture.
+- The strangler entry remains test/debug-only; production dispatch,
+  release JIT, import neutrality, legacy stage sequences, and
+  source-derived kernel cache identity are unchanged.
+
+## 17. Heap result-tile rigorous review and soundness corrections (2026-07-25)
+
+The inherited heap milestone was not sound as committed.  This review
+audited commits `39ffa7a` through `554a1eb` independently, reproduced
+concrete wrong results and incomplete target ownership checks, fixed
+them in twelve focused commits, and did not start the remaining Phase-6
+features:
+
+- `95ba436` — `fix(compiler): close heap result-tile soundness gaps`
+- `c6f465c` — `test(compiler): lock heap result-tile review fixes`
+- `2a281b9` — `fix(compiler): reject opaque heap completion effects`
+- `1b891d8` — `test(compiler): cover opaque heap completion effects`
+- `3ebe0cd` — `fix(compiler): own heap result storage aliases`
+- `b201e47` — `test(compiler): cover structured heap result aliases`
+- `286fd84` — `fix(compiler): close rendered heap effect routes`
+- `fad6c90` — `test(compiler): cover rendered heap effect routes`
+- `9e0f770` — `fix(compiler): harden residual heap text fields`
+- `99b667d` — `test(compiler): cover residual heap text fields`
+- `59760ca` — `fix(compiler): finish heap text boundary audit`
+- `f162ddf` — `test(compiler): lock final heap text boundaries`
+
+Nothing was pushed, amended, squashed, or reordered.
+
+### 17.1 Findings reproduced before the fix
+
+1. **Verifier-approved repeating region lifetimes produced wrong
+   results.**  A `ResultTileRegion` nested below the dense row loop
+   verified, yet each row invocation reset and copied the entire prefix
+   space.  A two-row probe returned `[[0, 0], [6, 8]]` instead of
+   `[[3, 4], [6, 8]]`.  The same lifetime could repeat with the whole
+   pack/region pair under another loop.
+2. **Oracle copy-out confused physical and logical mode order.**  The
+   verifier correctly allowed the pack dimension on the final physical
+   level even when that level mapped to logical mode zero, but the
+   oracle assumed the packed mode was logical rank minus one and failed
+   on the verified permutation.
+3. **Pass discovery walked verifier-invisible instance state.**
+   `_collect_operand_loads` and `_collect_result_writes` traversed
+   `vars()`, so a hidden alias could manufacture ambiguity and a hidden
+   cycle could make the pass non-terminating even though canonical
+   serialization, builder continuation, and verification all ignored
+   that state.
+4. **The “exact pre-replay” heap gate was not exact.**  It admitted
+   wrong logical orders and panel placements, performed schedule
+   rewrites, and rejected only after replay.
+5. **Target completion fingerprinted an access, not the complete
+   effect.**  A valid dense-matmul heap route failed because completion
+   hard-coded the sparse row policy; changing the owning result
+   assignment from `+=` to `=` passed and generated wrong code;
+   metadata-free physical writes and nested result zeros survived; and
+   malformed top-level LLIR could leak `AttributeError` instead of
+   `result_tile_completion_lost`.  A final adversarial probe also proved
+   that a raw `C_values[0] = ...` compatibility statement could hide a
+   result effect from every structured ownership check.
+6. **Structured Torch-storage aliases escaped the physical effect
+   proof.**  A second `C_values_torch.data_ptr<float>()` alias could
+   write through the result after copy-out; a direct
+   `C_values_torch.zero_()` mutation was likewise accepted.
+7. **Structured-node checks did not close codegen's verbatim fields.**
+   Even after `RawStmt` and structured aliases were rejected, forged
+   function-call names and `VarInit.op` could emit complete result
+   mutations without creating a structured `C_values_torch` use.
+   Independent follow-up probes found the same class in variable names
+   and types, non-STRING literal text, comment line splicing, unary
+   operators, OpenMP policy/schedule fields, and codegen-active loop and
+   conditional flags.  Several equality-spoofing objects rendered
+   different text from the value accepted by the completion check.
+
+The review also corrected two evidence claims.  Repeating assignment
+cannot be inferred from an all-ones copy-out differential because the
+copy is idempotent; exactly-once coverage is now a structural oracle
+invariant.  And the retained heap audit generator defines **11** heap
+goldens, not a standalone 20-case heap generator; this review reports
+only the cases it could actually regenerate.
+
+### 17.2 Corrected contracts
+
+- The verifier tracks exact statement ancestry and requires the region
+  to be a direct statement of the root, outermost pack origin's body.
+  Reset and whole-prefix copy-out therefore execute exactly once per
+  pack origin.  The schema documentation states the same lifetime.
+- Oracle copy-out traverses logical output axes and applies the clamped
+  pack window wherever the final physical level maps.  It tracks copied
+  compact keys and rejects duplicate coverage.
+- Pass discovery now walks only declared dataclass fields, once per
+  node identity.  Extra instance aliases and cycles are non-semantic,
+  matching verification, canonical identity, and
+  `LoopIRBuilder.resuming`.
+- The heap gate pins the complete rank-2 family before replay:
+  prefix/reduction/pack order for heap-alone and
+  prefix/panel/pack plus `CHILD_OF(pack OUTER)` for the composed route.
+- Completion derives the expected row policy by applying the shared
+  structured parallel marker to a detached snapshot.  It validates the
+  entire assembled LLIR first, then requires the exact additive
+  assignment owner, sole metadata write, canonical ABI result-pointer
+  declaration, canonical top-level generated zero, and no other
+  physical result occurrence.  It also reconstructs and matches the
+  canonical Torch allocation and terminal result assembly, then permits
+  exactly the three owned `C_values_torch` occurrences: allocation,
+  canonical `data_ptr`, and final storage transfer.  Because opaque
+  text cannot take part in such an effect proof, completion now validates
+  every LLIR field emitted directly as C++ before reasoning about
+  ownership: exact ASCII variable/function/call names and DataTypes,
+  non-mutating unary and initializer operators, numeric-only raw
+  literal text, non-splicing one-line comments, structured-only
+  statements, exact codegen-active flags, and token-bounded OpenMP
+  policies over declared non-result identifiers and the sole
+  compiler-owned grain macro.  `RawStmt`, nested/effectful policy text,
+  string subclasses, unknown macros, and result-owned policy names fail
+  closed.  Removal is followed by a residual effect check; every
+  malformed, moved, duplicated, hostile, opaque, or aliased case is
+  owned as `result_tile_completion_lost`.
+- The compiled matrix now includes the previously omitted dense-matmul
+  heap route, source-byte-identical to legacy and bitwise-equal in a
+  real shadow execution.
+
+### 17.3 Verification
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-heap-review-f162ddf/`
+(receipts at `phase6-heap-review-c6f465c/` and
+`phase6-heap-review-1b891d8/` and
+`phase6-heap-review-b201e47/` are retained as predecessor evidence).
+
+- exact five-file Phase-6 contract focus
+  (`test_loopir_verifier.py`, `test_loopir_schedule_passes.py`,
+  `test_loopir_llir_lowering.py`, `test_loop_plan.py`,
+  `test_schedule_api.py`): **509 passed**;
+- supplementary verifier/printer/oracle/pass/target membership:
+  **486 passed**;
+- scheduled compiled runtime focus at exact final code/test tip `f162ddf`
+  (`test_loopir_scheduled_slice.py` plus
+  `test_loopir_pipeline_execution.py`): **177 passed** in 754.24 s;
+  this includes all **16** activating heap source-parity and
+  compiled-shadow cases;
+- full legacy schedule-generality file: **45 passed** in 195.57 s;
+- fresh **20-source corpus** and **42-source grid** are byte-identical
+  across clean detached `554a1eb`, `b201e47`, and exact-final
+  `f162ddf` worktrees and to the retained heap captures.  Manifest
+  SHA-256 values are respectively
+  `7e4a9c436e5ed1005874e9ece56847ea4ef88dd6f5a04c4d657c3ca5b37cd6c4`
+  and
+  `65e68ba19510ab240cf85574aa6be272dd6e5b0fdd7e799f7bcfe9db6d06c094`;
+- all **11 available heap audit goldens** regenerate byte-identically
+  at all three clean revisions and against the retained copies (manifest
+  `aa8be2229bea130833461d6dcf789722837f1a100f2da2a74de9cc4b2dcb4f72`);
+  the combined 73-source manifest is
+  `b78b355ed9b6d6a39cabc3912269312edd98ea144dc12fe79ec37521fe407f5b`;
+- Black and Flake8 pass both newly changed Python files.  Focused
+  production mypy is clean; the two-file production/test invocation
+  preserves 26 byte-identical inherited test findings against
+  `b201e47`.  Clean-tree full-source base/candidate Flake8 logs are
+  byte-identical at nine inherited findings, and mypy logs are
+  byte-identical at 146 inherited findings in 12 files, with zero new
+  LoopIR findings;
+- paired same-machine compiler latency at exact detached `554a1eb`
+  versus `f162ddf` revisions (5 warmups/30 samples) is inside the 1.10
+  threshold for every case and percentile: `small_dense`
+  **0.977/0.965**, `reduction` **1.008/0.941**,
+  `csr_intersection` **1.009/1.032**, and `sparse_union`
+  **1.010/0.958** (p50/p95 candidate/base; worst **1.032**).
+  Every base/candidate generated-source hash is identical.  A first
+  launch with the wrong working directory was rejected by the
+  provenance guard before producing samples or JSON; the retained
+  second invocation is the complete successful comparison;
+- authoritative clean detached-worktree non-performance suite at exact
+  test commit `f162ddf`: **3,983 passed, 14 skipped, 3
+  performance-deselected, one known warning, zero failures/errors,
+  exit 0** in 2,763.48 s (46:03), with import provenance asserted and
+  fresh isolated Torch/XDG/pytest caches.  The log and JUnit SHA-256
+  values are
+  `7d3516e28d86386f0dcfad73b94a12c49f9a509be0de45f9a38dd189a6f9c89c`
+  and
+  `055d8ad40c30a262020dd28063326bdbdfb45e4c9b2708ba8c428883e72e7552`;
+- `git diff --check` is clean, all five protected tracked files retain
+  their recorded hashes, and unrelated GPU/CUDA, benchmark, packaging,
+  scheduler, research, scratchpad, and tooling material remains
+  untouched.
+
+### 17.4 Scope verdict after review
+
+The corrected rank-2 heap slice is sound under the gates above, but
+**Phase 6 remains open**.  The originating audit captured a live
+rank-3 TTM multi-prefix heap kernel while the typed pass deliberately
+rejects every multi-prefix result; that is an explicit incomplete
+boundary, not a completed general heap milestone.  Multi-prefix heap,
+target-independent parallel selection, intended automatic-plan
+provenance, canonical LoopPlan cache identity, and the
+criterion-by-criterion Phase-6 exit audit remain.  Phase 7 must not
+start until those Phase-6 decisions are closed or the design criteria
+are formally revised.
