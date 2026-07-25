@@ -1161,11 +1161,23 @@ def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
     assert "llir.RawStmt(" not in heap_result
     assert "storage_declaration = _heap_result_storage_declaration(" in heap_result
 
+    # The packed-storage owner moved into the shared helper the legacy
+    # _apply_relayout and the typed LoopIR relayout completion both call;
+    # the typed DirectInit owner remains the single source of the spelling.
+    relayout_storage = schedule_source.split("def _relayout_storage_statements", 1)[
+        1
+    ].split("def _apply_relayout", 1)[0]
+    assert "llir.RawStmt(" not in relayout_storage
+    assert "packed_storage = _packed_storage_declaration(" in relayout_storage
+
     relayout = schedule_source.split("def _apply_relayout", 1)[1].split(
         "def apply_schedule_to_llir", 1
     )[0]
     assert "llir.RawStmt(" not in relayout
-    assert "packed_storage = _packed_storage_declaration(" in relayout
+    assert (
+        "pack_container[pack_index:pack_index] = _relayout_storage_statements("
+        in relayout
+    )
 
     torch_abi_source = (_COMPILER_ROOT / "torch_cpp_abi.py").read_text()
     level_initialization = torch_abi_source.split("def emit_level_indices_init", 1)[

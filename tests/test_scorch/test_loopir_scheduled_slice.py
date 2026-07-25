@@ -1577,3 +1577,340 @@ def test_panel_schedule_validation_failure_owns_its_stage():
         context.begin_stage(
             CompilerStageId.CIN_TO_LOOPIR_LOWERING, compile_options=options
         )
+
+
+# -- the staged-operand relayout slice ----------------------------------------
+
+
+def relayout_schedule(scope, tag, width=3, strip=4, accum="direct"):
+    from scorch.compiler.scheduler import RelayoutSpec
+
+    return Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec("k", strip, placement="outermost", accum=accum, unroll=False),
+            panel("j", width, placement="child_of:k_out"),
+        ),
+        relayout=RelayoutSpec("B", "k", strip, scope_var=scope),
+        tag=tag,
+        parallel_loop="i",
+    )
+
+
+RELAYOUT_PARITY_GRID = [
+    (
+        "spmm relayout panel scope",
+        build_spmm,
+        relayout_schedule("j", "r-panel"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm relayout pack scope",
+        build_spmm,
+        relayout_schedule("k", "r-pack"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm relayout unit panel and strip",
+        build_spmm,
+        relayout_schedule("j", "r-unit", width=1, strip=1),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm relayout panel width above extent",
+        build_spmm,
+        relayout_schedule("j", "r-wide", width=64, strip=8),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm relayout strips not dividing extents",
+        build_spmm,
+        relayout_schedule("k", "r-ragged", width=2, strip=4),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm relayout float64 panel scope",
+        lambda: build_spmm(dtype=F64),
+        relayout_schedule("j", "r-f64"),
+        (4, 6),
+        (((4, 5), F64), ((5, 6), F64)),
+    ),
+    (
+        "spmm relayout float64 pack scope",
+        lambda: build_spmm(dtype=F64),
+        relayout_schedule("k", "r-f64-pack"),
+        (4, 6),
+        (((4, 5), F64), ((5, 6), F64)),
+    ),
+    (
+        "spmm relayout zero rows",
+        build_spmm,
+        relayout_schedule("j", "r-zero-rows"),
+        (0, 6),
+        (((0, 5), F32), ((5, 6), F32)),
+    ),
+    (
+        "spmm relayout zero panel extent",
+        build_spmm,
+        relayout_schedule("k", "r-zero-cols"),
+        (4, 6),
+        (((4, 0), F32), ((0, 6), F32)),
+    ),
+    (
+        "spmm relayout zero free extent",
+        build_spmm,
+        relayout_schedule("j", "r-zero-free"),
+        (4, 0),
+        (((4, 5), F32), ((5, 0), F32)),
+    ),
+    (
+        "spmm relayout larger shapes pack scope",
+        build_spmm,
+        relayout_schedule("k", "r-large", width=5, strip=8),
+        (7, 16),
+        (((7, 9), F32), ((9, 16), F32)),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "case",
+    RELAYOUT_PARITY_GRID,
+    ids=[case[0] for case in RELAYOUT_PARITY_GRID],
+)
+def test_relayout_source_is_byte_identical_to_legacy(case):
+    name, build, schedule, result_shape, bindings = case
+    comparison = compare_generated_sources(
+        build(),
+        result_shape,
+        bindings,
+        compile_options=scheduled_options(schedule),
+    )
+    assert comparison.identical, f"{name} diverged from the legacy schedule"
+
+
+def test_relayout_artifact_carries_plan_and_provenance():
+    from scorch.compiler.loopir.printer import canonical_program_dump
+
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(relayout_schedule("j", "r-prov")),
+    )
+    scheduled = kernel.schedule
+    assert scheduled is not None
+    assert scheduled.plan.relayout is not None
+    assert scheduled.plan.relayout.strip_width == 4
+    parts = [(entry.part, entry.tile is not None) for entry in scheduled.loops]
+    assert parts == [
+        (LoopPart.OUTER, True),
+        (LoopPart.OUTER, True),
+        (LoopPart.LOGICAL, False),
+        (LoopPart.INNER, True),
+        (LoopPart.INNER, True),
+    ]
+    base_dump = canonical_program_dump(scheduled.base_program)
+    scheduled_dump = canonical_program_dump(scheduled.program)
+    assert "relayout_stage" not in base_dump and "staged_read" not in base_dump
+    assert "relayout_stage" in scheduled_dump
+    assert "staged_read" in scheduled_dump
+    assert '"scope":"panel"' in scheduled_dump
+
+
+def test_relayout_structural_activation_is_direct():
+    """Every packed-storage component must be present in the generated
+    source, asserted directly and never inferred from byte equality."""
+
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(relayout_schedule("j", "r-act")),
+    )
+    source = kernel.cpp_source
+    assert (
+        "std::vector<float> packed_B_storage((size_t)kTile_j * (size_t)kTile_k);"
+        in source
+    )
+    assert "float* __restrict__ packed_B = packed_B_storage.data();" in source
+    assert "// Pack B j panel into contiguous j-major storage" in source
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads((j_out_end - "
+        "j_out) * kTile_k, (j_out_end - j_out))) schedule(static)"
+    ) in source
+    assert (
+        "packed_B[(j_pack - j_out) * kTile_k + k_pack] = "
+        "B_val[j_pack * B1_size + k_packed];"
+    ) in source
+    assert "if (j < j_out || j >= j_out_end) {" in source
+    assert "C_values[pC1] += A_val[pA1] * packed_B[(j - j_out) * kTile_k + k_in];" in (
+        source
+    )
+    assert (
+        "if (pA1 + 1 < pA1_end && A1_crd[pA1 + 1] >= j_out && "
+        "A1_crd[pA1 + 1] < j_out_end) "
+        "__builtin_prefetch(&packed_B[(A1_crd[pA1 + 1] - j_out) * kTile_k], 0, 1);"
+    ) in source
+    assert "B_val[pB1]" not in source
+
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(relayout_schedule("k", "r-act-pack")),
+    )
+    source = kernel.cpp_source
+    assert (
+        "std::vector<float> packed_B_storage((size_t)B0_size * (size_t)kTile_k);"
+        in source
+    )
+    assert "// Pack B full j axis into contiguous j-major storage" in source
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(B0_size * kTile_k, "
+        "B0_size)) schedule(static)"
+    ) in source
+    assert "packed_B[j_pack * kTile_k + k_pack] = " in source
+    assert "C_values[pC1] += A_val[pA1] * packed_B[j * kTile_k + k_in];" in source
+    assert "__builtin_prefetch(&packed_B[A1_crd[pA1 + 1] * kTile_k], 0, 1);" in source
+    assert "B_val[pB1]" not in source
+
+
+@pytest.mark.parametrize("scope", ["j", "k"])
+@pytest.mark.parametrize("width", [1, 3, 64])
+def test_spmm_relayout_shadow_execution_across_window_regimes(scope, width):
+    torch.manual_seed(2723 + width)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.6] = 0.0
+    sparse[2, :] = 0.0  # an empty CSR row
+    dense = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_spmm(),
+        relayout_schedule(scope, f"r-shadow-{scope}-{width}", width=width),
+        (4, 6),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+def test_spmm_relayout_float64_shadow_execution():
+    torch.manual_seed(2724)
+    sparse = torch.randn(3, 4, dtype=F64)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.randn(4, 5, dtype=F64)
+    assert_scheduled_shadow(
+        build_spmm(dtype=F64),
+        relayout_schedule("k", "r-shadow-f64", width=2, strip=3),
+        (3, 5),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+@pytest.mark.parametrize("scope", ["j", "k"])
+def test_spmm_relayout_zero_extent_shadow_execution(scope):
+    # Zero rows.
+    dense = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_spmm(),
+        relayout_schedule(scope, f"r-shadow-zr-{scope}"),
+        (0, 6),
+        (csr_stensor(torch.zeros(0, 5), "A"), dense_stensor(dense, "B")),
+        torch.zeros(0, 6),
+    )
+    # Zero panel extent.
+    assert_scheduled_shadow(
+        build_spmm(),
+        relayout_schedule(scope, f"r-shadow-zp-{scope}"),
+        (4, 6),
+        (
+            csr_stensor(torch.zeros(4, 0), "A"),
+            dense_stensor(torch.zeros(0, 6), "B"),
+        ),
+        torch.zeros(4, 6),
+    )
+    # Zero free extent.
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.5] = 0.0
+    assert_scheduled_shadow(
+        build_spmm(),
+        relayout_schedule(scope, f"r-shadow-zf-{scope}"),
+        (4, 0),
+        (csr_stensor(sparse, "A"), dense_stensor(torch.zeros(5, 0), "B")),
+        torch.zeros(4, 0),
+    )
+
+
+def test_relayout_randomized_execution_matches_torch_and_oracle():
+    torch.manual_seed(2726)
+    import random as _random
+
+    from scorch.compiler.loopir.levels import CsrMatrix
+    from scorch.compiler.loopir.oracle import run_program
+
+    rng = _random.Random(20260725)
+    for round_index in range(3):
+        rows = rng.randrange(1, 7)
+        inner = rng.randrange(1, 7)
+        cols = rng.randrange(1, 8)
+        width = rng.choice((1, 2, 3, 5, 9))
+        strip = rng.choice((1, 2, 4, 7))
+        scope = rng.choice(("j", "k"))
+        sparse = torch.randn(rows, inner)
+        sparse[sparse.abs() < 0.5] = 0.0
+        dense = torch.randn(inner, cols)
+        schedule = relayout_schedule(
+            scope, f"r-rand-{round_index}-{scope}", width=width, strip=strip
+        )
+        result, kernel = execute_cin_via_loopir(
+            build_spmm(),
+            (rows, cols),
+            csr_stensor(sparse, "A"),
+            dense_stensor(dense, "B"),
+            compile_options=scheduled_options(schedule),
+        )
+        assert torch.allclose(
+            result.values.reshape(rows, cols),
+            sparse @ dense,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        assert kernel.schedule is not None
+        lowering = kernel.lowering
+        oracle_out = run_program(
+            kernel.schedule.program,
+            {
+                lowering.input_symbols[0]: CsrMatrix.from_dense(sparse.tolist()),
+                lowering.input_symbols[1]: dense.tolist(),
+            },
+            {lowering.result_symbol: (rows, cols)},
+        )[lowering.result_symbol]
+        assert torch.allclose(
+            result.values.reshape(rows, cols),
+            torch.tensor(oracle_out, dtype=torch.float32),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+def test_relayout_heap_composition_stays_fail_closed():
+    """The heap-accumulation relayout composition remains the unmigrated
+    heap result-tile family."""
+
+    with pytest.raises(SchedulePassError) as error:
+        compile_cin_via_loopir(
+            build_spmm(),
+            (4, 6),
+            SPMM_BINDINGS,
+            compile_options=scheduled_options(
+                relayout_schedule("k", "r-heap", accum="heap")
+            ),
+        )
+    assert error.value.defect.code == "unsupported_schedule_result_tile"
