@@ -3610,26 +3610,221 @@ def _dense_zero_candidates(function: llir.Function) -> List[llir.FunctionCallStm
     return collector.matches
 
 
-def _raw_stmt_candidates(function: llir.Function) -> List[llir.RawStmt]:
-    """Collect opaque statements that cannot participate in effect proofs."""
+_RESULT_TILE_POLICY_TOKEN = re.compile(
+    r"""
+    (?P<space>\s+)
+    |(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)
+    |(?P<integer>[0-9]+)
+    |(?P<operator>&&|\|\||==|!=|<=|>=|::|[()[\],+\-*/%?:<>])
+    """,
+    re.ASCII | re.VERBOSE,
+)
+_RESULT_TILE_POLICY_MACRO = re.compile(r"[A-Z_][A-Z0-9_]*\Z", re.ASCII)
 
-    class _Collector(LLIRWalker):
+
+def _safe_cpp_qualified_name(name: object) -> bool:
+    """Whether ``name`` is one or more exact ASCII C++ identifiers."""
+
+    if type(name) is not str:
+        return False
+    parts = name.split("::")
+    return bool(parts) and all(
+        _CPP_IDENTIFIER.fullmatch(part) is not None and part not in _CPP_KEYWORDS
+        for part in parts
+    )
+
+
+def _result_tile_policy_tokens(value: str) -> List[Tuple[str, str]]:
+    """Tokenize one legacy OpenMP policy expression without accepting C++ text."""
+
+    tokens: List[Tuple[str, str]] = []
+    position = 0
+    while position < len(value):
+        match = _RESULT_TILE_POLICY_TOKEN.match(value, position)
+        if match is None:
+            raise ValueError("heap result-tile policy contains unsupported text")
+        position = match.end()
+        if match.lastgroup != "space":
+            assert match.lastgroup is not None
+            tokens.append((match.lastgroup, match.group()))
+    return tokens
+
+
+def _validate_result_tile_policy(
+    value: object,
+    *,
+    helper: str,
+    known_names: Set[str],
+    protected_names: Set[str],
+) -> None:
+    """Validate one compiler-owned legacy OpenMP helper expression.
+
+    These fields predate typed pragma expressions and codegen emits them
+    verbatim.  Heap completion may therefore reason about result ownership only
+    after proving that the retained text is a single helper call over
+    non-mutating arithmetic, subscripts, and identifiers already present in the
+    structured function.  Nested calls, statement punctuation, member access,
+    assignment, increment/decrement, and result-owned identifiers are excluded.
+    """
+
+    if type(value) is not str or not value:
+        raise ValueError("heap result-tile policy must be a non-empty string")
+    if "\n" in value or "\r" in value or "++" in value or "--" in value:
+        raise ValueError("heap result-tile policy contains effectful text")
+    tokens = _result_tile_policy_tokens(value)
+    if len(tokens) < 3 or tokens[:2] != [
+        ("identifier", helper),
+        ("operator", "("),
+    ]:
+        raise ValueError(f"heap result-tile policy must call {helper}")
+
+    delimiters: List[str] = []
+    for index, (kind, token) in enumerate(tokens):
+        if token in ("(", "["):
+            delimiters.append(token)
+        elif token in (")", "]"):
+            expected = "(" if token == ")" else "["
+            if not delimiters or delimiters.pop() != expected:
+                raise ValueError("heap result-tile policy delimiters are unbalanced")
+            if not delimiters and index != len(tokens) - 1:
+                raise ValueError(
+                    "heap result-tile policy contains text after its helper call"
+                )
+        if kind != "identifier":
+            continue
+        if token in protected_names:
+            raise ValueError("heap result-tile policy references result-owned storage")
+        if token in _CPP_KEYWORDS and token != "long":
+            raise ValueError("heap result-tile policy contains a C++ keyword")
+        if (
+            index + 1 < len(tokens)
+            and tokens[index + 1] == ("operator", "(")
+            and index != 0
+        ):
+            raise ValueError("heap result-tile policy contains a nested call")
+        if (
+            token != helper
+            and token != "long"
+            and token not in known_names
+            and _RESULT_TILE_POLICY_MACRO.fullmatch(token) is None
+        ):
+            raise ValueError(
+                "heap result-tile policy references an undeclared identifier"
+            )
+    if delimiters:
+        raise ValueError("heap result-tile policy delimiters are unbalanced")
+
+
+def _validate_result_tile_rendered_text(
+    function: llir.Function,
+    *,
+    protected_names: Set[str],
+) -> None:
+    """Close every verbatim-text route before proving heap result ownership."""
+
+    class _Validator(LLIRWalker):
         def __init__(self) -> None:
             super().__init__(
                 LLIRTraversalContext(
                     stage="LoopIR target lowering",
-                    pass_name="locate_result_tile_opaque_statements",
+                    pass_name="validate_result_tile_rendered_text",
                 )
             )
-            self.matches: List[llir.RawStmt] = []
+            self.known_names: Set[str] = set()
+            self.policies: List[Tuple[object, str]] = []
+
+        @staticmethod
+        def _identifier(value: object, owner: str) -> str:
+            if (
+                type(value) is not str
+                or _CPP_IDENTIFIER.fullmatch(value) is None
+                or value in _CPP_KEYWORDS
+            ):
+                raise ValueError(f"{owner} must be a safe ASCII C++ identifier")
+            return value
 
         def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
-            if type(node) is llir.RawStmt:
-                self.matches.append(cast(llir.RawStmt, node))
+            if type(node) is llir.Var:
+                name = self._identifier(getattr(node, "name", None), "Var.name")
+                if type(getattr(node, "type", None)) is not llir.DataType:
+                    raise ValueError("Var.type must be a DataType")
+                if type(getattr(node, "is_ptr", None)) is not bool:
+                    raise ValueError("Var.is_ptr must be a bool")
+                if type(getattr(node, "is_restrict", None)) is not bool:
+                    raise ValueError("Var.is_restrict must be a bool")
+                self.known_names.add(name)
+            elif type(node) in (llir.FunctionCall, llir.FunctionCallStmt):
+                if not _safe_cpp_qualified_name(getattr(node, "name", None)):
+                    raise ValueError(
+                        f"{type(node).__name__}.name must be a qualified C++ name"
+                    )
+            elif type(node) is llir.VarInit:
+                if getattr(node, "op", None) != "=":
+                    raise ValueError("VarInit.op must remain '='")
+                if type(getattr(node, "cast", None)) is not bool:
+                    raise ValueError("VarInit.cast must be a bool")
+            elif type(node) is llir.Comment:
+                value = getattr(node, "value", None)
+                if type(value) is not str or "\n" in value or "\r" in value:
+                    raise ValueError("Comment.value must be a single-line string")
+            elif type(node) is llir.RawStmt:
+                raise ValueError(
+                    "heap result-tile completion requires fully structured LLIR"
+                )
+            elif type(node) is llir.Function:
+                self._identifier(getattr(node, "name", None), "Function.name")
+                if type(getattr(node, "return_type", None)) is not llir.DataType:
+                    raise ValueError("Function.return_type must be a DataType")
+                args = getattr(node, "args", None)
+                if type(args) not in (list, tuple):
+                    raise ValueError("Function.args must contain exact Var nodes")
+                if any(type(arg) is not llir.Var for arg in cast(Any, args)):
+                    raise ValueError("Function.args must contain exact Var nodes")
+            elif type(node) is llir.ForLoop:
+                schedule = getattr(node, "omp_schedule", None)
+                if schedule not in (
+                    None,
+                    "static",
+                    "dynamic",
+                    "dynamic, 16",
+                    "dynamic, 64",
+                ):
+                    raise ValueError(
+                        "ForLoop.omp_schedule is not a recognized compiler policy"
+                    )
+                for field, helper in (
+                    ("omp_num_threads", "scorch_nthreads"),
+                    ("omp_chunk_expr", "scorch_chunk"),
+                ):
+                    value = getattr(node, field, None)
+                    if value is not None:
+                        self.policies.append((value, helper))
+                atomic = getattr(node, "_use_atomic_scheduling", False)
+                if type(atomic) is not bool:
+                    raise ValueError("ForLoop._use_atomic_scheduling must be a bool")
+                if atomic:
+                    for field in (
+                        "_atomic_chunk_var",
+                        "_atomic_counter_var",
+                        "_loop_bound",
+                    ):
+                        self._identifier(
+                            getattr(node, field, None),
+                            f"ForLoop.{field}",
+                        )
 
-    collector = _Collector()
-    collector.walk(function)
-    return collector.matches
+        def validate_policies(self) -> None:
+            for value, helper in self.policies:
+                _validate_result_tile_policy(
+                    value,
+                    helper=helper,
+                    known_names=self.known_names,
+                    protected_names=protected_names,
+                )
+
+    validator = _Validator()
+    validator.walk(function)
+    validator.validate_policies()
 
 
 def _direct_prefetch_targets_array(stmt: llir.Stmt, array_name: str) -> bool:
@@ -3713,12 +3908,28 @@ def _complete_result_tile_impl(
                 pass_name="validate_result_tile_completion_input",
             )
         ).walk(function)
-        if _raw_stmt_candidates(function):
-            _fail(
-                _RESULT_TILE_LOST,
-                "heap result-tile completion requires fully structured LLIR; "
-                "an opaque statement could hide an unowned result effect",
+        result_name = lowering.result_decl.name
+        protected_names = {
+            result_name,
+            f"{result_name}_values",
+            f"{result_name}_values_torch",
+            f"{result_name}_capacity",
+            f"{result_name}_shape",
+            f"{result_name}_mode_indices",
+        }
+        for level in range(len(lowering.result_decl.levels)):
+            protected_names.update(
+                {
+                    f"{result_name}{level}_size",
+                    f"{result_name}{level}_pos",
+                    f"{result_name}{level}_crd",
+                    f"p{result_name}{level}",
+                }
             )
+        _validate_result_tile_rendered_text(
+            function,
+            protected_names=protected_names,
+        )
     except (
         LLIRTraversalError,
         AttributeError,
