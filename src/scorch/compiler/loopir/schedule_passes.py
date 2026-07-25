@@ -43,7 +43,15 @@ schedule families:
   :class:`~scorch.compiler.loopir.nodes.StagedRead` carrying the fresh
   region identity — the recorded access-identity decision: no occurrence
   identity is added to ``Load`` because the audited family admits exactly
-  one occurrence and the pass proves it before redirecting.
+  one occurrence and the pass proves it before redirecting;
+- :func:`apply_result_tile` compacts the heap-accumulation result behind a
+  typed :class:`~scorch.compiler.loopir.nodes.ResultTileRegion` wrapping
+  the pack origin's entire body (fresh zeroed tile per strip, exactly-once
+  copy-out at exit) and structurally replaces the result's verifier-proven
+  **unique** ``StoreReduce`` occurrence with a
+  :class:`~scorch.compiler.loopir.nodes.TiledReduce` carrying the fresh
+  region identity — the same no-occurrence-identity decision, applied
+  after :func:`apply_relayout` so the region wraps the fully staged chain.
 
 :func:`apply_schedule_plan` drives both and returns a
 :class:`ScheduledLoopIR` artifact that retains the unscheduled base
@@ -108,6 +116,7 @@ from ..loop_plan import (
     OperandRelayout,
     PanelBound,
     PlacementKind,
+    ResultTile,
     _validate_loop_plan_structure,
 )
 from .build import LoopIRBuilder
@@ -130,6 +139,7 @@ from .nodes import (
     ReduceOp,
     RelayoutScope,
     RelayoutStage,
+    ResultTileRegion,
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
@@ -137,6 +147,7 @@ from .nodes import (
     Stmt,
     Store,
     StoreReduce,
+    TiledReduce,
     TileId,
     TileInnerFor,
     TileOuterFor,
@@ -156,7 +167,7 @@ _LoopNode = Union[
     SparseWindowFor,
 ]
 _LeafNode = Union[Store, StoreReduce, AppendEntry]
-_ChainEnd = Union[Store, StoreReduce, AppendEntry, WorkspaceRegion]
+_ChainEnd = Union[Store, StoreReduce, AppendEntry, TiledReduce, WorkspaceRegion]
 
 _LOOP_TYPES = (
     DenseFor,
@@ -251,13 +262,16 @@ def _decompose_body(
     leaf_types: Tuple[type, ...],
     allow_empty: bool,
     relayout_sink: Optional[List[RelayoutStage]] = None,
+    result_tile_sink: Optional[List[ResultTileRegion]] = None,
 ) -> Tuple[List[_LoopNode], Stmt]:
     """Walk one single-statement chain of loops down to its terminator.
 
-    A :class:`RelayoutStage` wrapper is a chain element only for callers
-    that pass a ``relayout_sink`` (provenance and erasure, which must read
-    relayout-scheduled programs); every scheduling pass keeps the default
-    and therefore refuses already-relayouted chains with a stable code.
+    A :class:`RelayoutStage` or :class:`ResultTileRegion` wrapper is a
+    chain element only for callers that pass the matching sink (provenance
+    and erasure, which must read already-scheduled programs, and the heap
+    pass, which composes after relayout); every other scheduling pass keeps
+    the defaults and therefore refuses already-staged chains with a stable
+    code.
     """
 
     loops: List[_LoopNode] = []
@@ -277,6 +291,10 @@ def _decompose_body(
             relayout_sink.append(only)
             body = only.body
             continue
+        if type(only) is ResultTileRegion and result_tile_sink is not None:
+            result_tile_sink.append(only)
+            body = only.body
+            continue
         if type(only) in leaf_types:
             if not loops and not allow_empty:
                 _fail(
@@ -294,18 +312,23 @@ def _decompose_chain(
     program: LoopProgram,
     *,
     relayout_sink: Optional[List[RelayoutStage]] = None,
+    result_tile_sink: Optional[List[ResultTileRegion]] = None,
 ) -> Tuple[List[_LoopNode], _ChainEnd]:
     """Split one migrated-family program into its loop chain and terminator.
 
-    The terminator is an ordinary store/append leaf, or — for programs a
-    stack tile already transformed — one :class:`WorkspaceRegion`.
+    The terminator is an ordinary store/append leaf, one
+    :class:`WorkspaceRegion` for programs a stack tile already transformed,
+    or one :class:`TiledReduce` for programs the heap pass already
+    transformed (the verifier guarantees a reduce implies its region, so a
+    sink-less caller fails on the region wrapper before reaching it).
     """
 
     loops, end = _decompose_body(
         program.body,
-        leaf_types=(*_LEAF_TYPES, WorkspaceRegion),
+        leaf_types=(*_LEAF_TYPES, WorkspaceRegion, TiledReduce),
         allow_empty=False,
         relayout_sink=relayout_sink,
+        result_tile_sink=result_tile_sink,
     )
     return loops, end  # type: ignore[return-value]
 
@@ -596,12 +619,16 @@ def apply_affine_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
             "unsupported_schedule_panel",
             "sparse coordinate panel tiling is not a migrated schedule " "family",
         )
-    if tile.accumulation != "direct":
+    if tile.accumulation not in ("direct", "heap"):
         _fail(
             "unsupported_schedule_accumulation",
             f"{tile.accumulation!r} accumulation needs the workspace "
-            "families; only direct accumulation is migrated",
+            "families; only direct and heap accumulation are migrated",
         )
+    # The split itself is accumulation-neutral: a "heap" tile's origin/point
+    # geometry is exactly the direct split, and the heap accumulation fact
+    # is consumed afterwards by apply_result_tile (the plan gate requires
+    # the pairing, so no heap fact is silently dropped on the plan route).
     if tile.parallel:
         _fail(
             "unsupported_schedule_parallel",
@@ -1491,6 +1518,323 @@ def apply_relayout(program: LoopProgram, relayout: OperandRelayout) -> LoopProgr
     return rebuilt
 
 
+def _collect_result_writes(root: Stmt, result: object) -> List[Stmt]:
+    """Every direct Store/StoreReduce of ``result`` in one verified tree."""
+
+    writes: List[Stmt] = []
+    pending: List[object] = [root]
+    while pending:
+        value = pending.pop()
+        if type(value) in (Store, StoreReduce) and value.tensor == result:  # type: ignore[attr-defined]
+            writes.append(value)  # type: ignore[arg-type]
+        if isinstance(value, (Stmt, Expr)):
+            pending.extend(vars(value).values())
+        elif type(value) is tuple:
+            pending.extend(value)
+    return writes
+
+
+def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProgram:
+    """Accumulate one dense result's trailing strip behind a typed region.
+
+    Mirrors the audited legacy heap result-tile family exactly, on
+    identities only, for the migrated rank-2 trailing-axis shape.  The
+    scheduled chain must be one of the admitted forms — the outermost
+    affine pack origin over the dense row loop, one reduction loop, and
+    the pack point loop (heap alone), or the packed tile-ijk five-loop
+    chain with an optional relayout stage already applied (the pass runs
+    after :func:`apply_relayout`) — with a direct dense-result reduction
+    leaf.  Every result-tile fact is consumed exactly once: ``tile_loop``
+    selects the pack schedule pair, ``access_indices`` select the
+    redirected write, and ``result_prefix``/``result_level`` are
+    validation-is-consumption against the result declaration (the
+    ``PanelBound`` precedent).
+
+    The redirected write is the result's **unique** ``StoreReduce``
+    occurrence — the pass proves uniqueness (``result_tile_target_missing``
+    / ``result_tile_ambiguous_write``) and replaces it structurally with a
+    :class:`TiledReduce` carrying the fresh region identity, then wraps the
+    pack origin's entire body in the :class:`ResultTileRegion`, so no
+    occurrence identity, rendered name, or dynamic tag is ever needed;
+    residual direct writes are re-checked after the rebuild.  Unlike
+    operand reads, result writes are statements the verifier's coordinate
+    model fully pins within this family, so the exact fact admission above
+    subsumes the scan; it is retained as checked-property defense in depth
+    (the assumption stays a checked invariant if the coordinate model ever
+    widens).
+    """
+
+    verify_program(program)
+    if type(result_tile) is not ResultTile:
+        raise TypeError("apply_result_tile expects a ResultTile")
+    try:
+        _validate_loop_plan_structure(LoopPlan(loop_order=(), result_tile=result_tile))
+    except (VerificationError, AttributeError, TypeError, ValueError) as error:
+        _fail("invalid_schedule_result_tile", str(error))
+    if (
+        type(result_tile.tile_loop) is not LoopRef
+        or result_tile.tile_loop.part is not LoopPart.LOGICAL
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the result tile's tile_loop must name one logical loop",
+        )
+    if (
+        len(result_tile.access_indices) != 2
+        or len(result_tile.result_prefix) != 1
+        or result_tile.access_indices[-1] != result_tile.tile_loop.index_id
+        or result_tile.access_indices[:-1] != result_tile.result_prefix
+        or result_tile.result_level != 1
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the migrated heap family compacts a rank-2 dense result whose "
+            "trailing storage level is the tiled free axis",
+        )
+
+    relayout_stages: List[RelayoutStage] = []
+    loops, leaf = _decompose_chain(program, relayout_sink=relayout_stages)
+    if type(leaf) is not StoreReduce:
+        _fail(
+            "invalid_schedule_result_tile",
+            "heap accumulation requires a direct dense-result reduction leaf",
+        )
+    kinds = tuple(type(node) for node in loops)
+    heap_alone = kinds in (
+        (TileOuterFor, DenseFor, SparseFor, TileInnerFor),
+        (TileOuterFor, DenseFor, DenseFor, TileInnerFor),
+    )
+    heap_panel = kinds == (
+        TileOuterFor,
+        PanelOuterFor,
+        DenseFor,
+        SparseWindowFor,
+        TileInnerFor,
+    )
+    if not heap_alone and not heap_panel:
+        _fail(
+            "invalid_schedule_result_tile",
+            "heap accumulation requires the audited chain: the pack origin "
+            "over the dense row loop, one reduction loop, and the pack "
+            "point loop, optionally windowed by one sparse panel",
+        )
+    if len(relayout_stages) > 1 or (relayout_stages and not heap_panel):
+        _fail(
+            "invalid_schedule_result_tile",
+            "heap accumulation composes with at most one relayout stage on "
+            "the packed tile-ijk chain",
+        )
+    pack_origin = loops[0]
+    pack_point = loops[-1]
+    row_loop = loops[2] if heap_panel else loops[1]
+    assert type(pack_origin) is TileOuterFor
+    assert type(pack_point) is TileInnerFor
+    assert type(row_loop) is DenseFor
+    if (
+        pack_origin.index != result_tile.tile_loop.index_id
+        or pack_point.index != result_tile.tile_loop.index_id
+        or pack_origin.tile != pack_point.tile
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the result tile's pack loop must be the chain's outermost "
+            "origin/point schedule pair",
+        )
+    if heap_panel:
+        panel_origin = loops[1]
+        window = loops[3]
+        assert type(panel_origin) is PanelOuterFor
+        assert type(window) is SparseWindowFor
+        if panel_origin.tile != window.tile:
+            _fail(
+                "invalid_schedule_result_tile",
+                "the composed panel origin and window must be one schedule " "pair",
+            )
+    if row_loop.index != result_tile.result_prefix[0]:
+        _fail(
+            "invalid_schedule_result_tile",
+            "the result tile's dense prefix loop must be the chain's row " "loop",
+        )
+
+    decls = {decl.symbol: decl for decl in program.tensors}
+    result_decl = decls.get(result_tile.result_id)
+    if (
+        result_decl is None
+        or result_tile.result_id not in program.outputs
+        or len(result_decl.levels) != 2
+        or any(level.kind is not LevelKind.DENSE for level in result_decl.levels)
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the compacted result must be a declared rank-2 all-dense output",
+        )
+
+    def _write_index_ids(write: Stmt) -> Optional[Tuple[IndexId, ...]]:
+        indices = write.indices  # type: ignore[attr-defined]
+        if type(indices) is not tuple or any(
+            type(index) is not IndexValue for index in indices
+        ):
+            return None
+        return tuple(index.index for index in indices if type(index) is IndexValue)
+
+    writes = _collect_result_writes(program.body, result_tile.result_id)
+    matching = [
+        write
+        for write in writes
+        if _write_index_ids(write) == result_tile.access_indices
+    ]
+    if not matching:
+        _fail(
+            "result_tile_target_missing",
+            "the result tile's access indices select no direct reduction "
+            "of the compacted result",
+        )
+    if len(matching) > 1 or len(writes) > 1 or matching[0] is not leaf:
+        _fail(
+            "result_tile_ambiguous_write",
+            "the compacted result must have exactly one write occurrence; "
+            "redirection would be ambiguous",
+        )
+
+    builder = LoopIRBuilder.resuming(program)
+    result_tile_id = builder.new_result_tile_id()
+    new_leaf = builder.tiled_reduce(result_tile_id, leaf.indices, leaf.op, leaf.value)
+
+    def _rebuild_stmt(stmt: Stmt) -> Stmt:
+        if stmt is leaf:
+            return new_leaf
+        if type(stmt) is RelayoutStage:
+            return builder.relayout_stage(stmt.decl, _rebuild_block(stmt.body))
+        if type(stmt) in _LOOP_TYPES:
+            wrapped = _wrap_loops(
+                builder,
+                (stmt,),  # type: ignore[arg-type]
+                _rebuild_block(stmt.body),  # type: ignore[attr-defined]
+            )
+            return wrapped.statements[0]
+        _fail(
+            "invalid_schedule_result_tile",
+            f"unsupported chain statement {type(stmt).__name__}",
+        )
+
+    def _rebuild_block(block: Block) -> Block:
+        return builder.block(
+            tuple(_rebuild_stmt(statement) for statement in block.statements)
+        )
+
+    region_decl = builder.result_tile_decl(
+        result_tile_id, result_tile.result_id, pack_origin.tile
+    )
+    region = builder.result_tile_region(region_decl, _rebuild_block(pack_origin.body))
+    new_origin = builder.tile_outer_for(
+        pack_origin.tile,
+        pack_origin.index,
+        pack_origin.dimension,
+        pack_origin.width,
+        builder.block((region,)),
+    )
+    rebuilt = builder.program(
+        program.dimensions,
+        program.tensors,
+        program.inputs,
+        program.outputs,
+        builder.block((new_origin,)),
+    )
+    if _collect_result_writes(rebuilt.body, result_tile.result_id):
+        _fail(
+            "result_tile_ambiguous_write",
+            "redirection left a residual direct write of the compacted " "result",
+        )
+    verify_program(rebuilt)
+    return rebuilt
+
+
+def _check_heap_plan_family(plan: LoopPlan) -> None:
+    """Exact pre-replay admission of the heap result-tile plan family.
+
+    The heap family admits exactly the audited legacy shape: one serial
+    outermost heap-accumulation affine tile targeting the plan's innermost
+    logical loop, paired one-to-one with the plan's ``result_tile`` fact
+    compacting a rank-2 dense result on its trailing storage level, at most
+    one composed sparse panel tile, and the mandatory parallel dense
+    result-prefix loop (the race-legality proof: any prefix loop partitions
+    compact rows, and with one prefix level the selection has no degrees of
+    freedom).
+    """
+
+    heap_tiles = [
+        tile
+        for tile in plan.tiles
+        if tile.kind == "affine" and tile.accumulation == "heap"
+    ]
+    if plan.result_tile is None:
+        if heap_tiles:
+            _fail(
+                "invalid_schedule_result_tile",
+                "a heap-accumulation tile requires the plan's result-tile " "fact",
+            )
+        return
+    result_tile = plan.result_tile
+    if len(heap_tiles) != 1:
+        _fail(
+            "invalid_schedule_result_tile",
+            "a heap result tile requires exactly one heap-accumulation " "affine tile",
+        )
+    heap_tile = heap_tiles[0]
+    if (
+        result_tile.tile_loop.part is not LoopPart.LOGICAL
+        or heap_tile.loop != result_tile.tile_loop
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the result tile must compact the heap tile's logical loop",
+        )
+    if heap_tile.placement.kind is not PlacementKind.OUTERMOST:
+        _fail(
+            "invalid_schedule_result_tile",
+            "the heap tile must be outermost so the compact result "
+            "spans every enclosed reduction",
+        )
+    if heap_tile.parallel:
+        _fail(
+            "invalid_schedule_result_tile",
+            "a heap-backed result tile uses shared reusable storage; "
+            "its origin loop is serial",
+        )
+    other_tiles = [tile for tile in plan.tiles if tile is not heap_tile]
+    if len(other_tiles) > 1 or any(tile.kind != "panel" for tile in other_tiles):
+        _fail(
+            "invalid_schedule_result_tile",
+            "a heap plan composes with at most one sparse panel tile",
+        )
+    if (
+        len(result_tile.access_indices) != 2
+        or len(result_tile.result_prefix) != 1
+        or result_tile.access_indices[-1] != result_tile.tile_loop.index_id
+        or result_tile.access_indices[:-1] != result_tile.result_prefix
+        or result_tile.result_level != 1
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the migrated heap family compacts a rank-2 dense result "
+            "whose trailing storage level is the tiled free axis",
+        )
+    if not plan.loop_order or plan.loop_order[-1] != result_tile.tile_loop.index_id:
+        _fail(
+            "invalid_schedule_result_tile",
+            "the heap tile must target the plan's innermost logical loop",
+        )
+    if plan.parallel_loop is None or (
+        plan.parallel_loop.part is not LoopPart.LOGICAL
+        or plan.parallel_loop.index_id not in result_tile.result_prefix
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "heap accumulation requires an explicit parallel dense "
+            "result-prefix loop so the shared origin loop stays serial",
+        )
+
+
 def _check_plan_families(plan: LoopPlan) -> None:
     """Fail closed on every plan fact outside the migrated schedule families.
 
@@ -1498,8 +1842,9 @@ def _check_plan_families(plan: LoopPlan) -> None:
     one panel tile, listed after every affine tile, with direct serial
     accumulation, exactly one corresponding ``PanelBound``, and the
     mandatory parallel row loop.  ``parallel_loop`` remains an unmigrated
-    family on every plan without a panel tile — the panel form is the one
-    shape whose row selection has no degrees of freedom.
+    family on every plan without a panel tile or heap result tile — the
+    panel and heap forms are the shapes whose row selection has no degrees
+    of freedom.
     """
 
     if plan.provenance != "explicit":
@@ -1508,11 +1853,7 @@ def _check_plan_families(plan: LoopPlan) -> None:
             f"{plan.provenance!r} scheduling stays on the legacy path; only "
             "explicit schedules are migrated",
         )
-    if plan.result_tile is not None:
-        _fail(
-            "unsupported_schedule_result_tile",
-            "heap result tiling is not a migrated schedule family",
-        )
+    _check_heap_plan_family(plan)
     panel_tiles = [tile for tile in plan.tiles if tile.kind == "panel"]
     if plan.relayout is not None:
         relayout = plan.relayout
@@ -1571,12 +1912,22 @@ def _check_plan_families(plan: LoopPlan) -> None:
                 "the relayout's pack tile must be the outermost affine "
                 "split of its pack loop at the strip width",
             )
-        if pack_tile.accumulation != "direct":
+        if pack_tile.accumulation == "heap":
+            if (
+                plan.result_tile is None
+                or plan.result_tile.tile_loop != relayout.pack_loop
+            ):
+                _fail(
+                    "invalid_schedule_result_tile",
+                    "a heap-accumulation pack tile requires the plan's "
+                    "result tile to compact the same pack loop",
+                )
+        elif pack_tile.accumulation != "direct":
             _fail(
                 "unsupported_schedule_accumulation",
-                "operand relayout currently composes only with direct "
-                "accumulation; stack and heap result tiles remain separate "
-                "schedule families",
+                "operand relayout composes with direct or heap "
+                "accumulation; stack result tiles remain a separate "
+                "schedule family",
             )
         if panel_tile.loop != relayout.panel_loop:
             _fail(
@@ -1668,7 +2019,7 @@ def _check_plan_families(plan: LoopPlan) -> None:
                     "a child_of panel placement must name the origin loop of "
                     "an outermost-placed affine tile of the same plan",
                 )
-    elif plan.parallel_loop is not None:
+    elif plan.parallel_loop is not None and plan.result_tile is None:
         _fail(
             "unsupported_schedule_parallel",
             "explicit parallel-loop selection is not a migrated schedule " "family",
@@ -1676,12 +2027,11 @@ def _check_plan_families(plan: LoopPlan) -> None:
     for tile in plan.tiles:
         if tile.kind == "panel":
             continue
-        if tile.accumulation not in ("direct", "stack"):
+        if tile.accumulation not in ("direct", "stack", "heap"):
             _fail(
                 "unsupported_schedule_accumulation",
-                f"{tile.accumulation!r} accumulation needs the heap result-"
-                "tile family; only direct and stack accumulation are "
-                "migrated",
+                f"{tile.accumulation!r} accumulation is not a migrated "
+                "schedule family",
             )
         if tile.parallel:
             _fail(
@@ -1772,14 +2122,19 @@ def _chain_provenance(
 
     For a workspace-region program the documented order is: the prefix
     loops above the region, then the producer chain, then the consumer
-    chain — the region's execution order.  A relayout staging region is
-    transparent here: it binds no loop, so provenance lists exactly the
-    chain loops and the region's placement is covered by the carrier's
-    deterministic replay equality.
+    chain — the region's execution order.  A relayout staging region or a
+    heap result-tile region is transparent here: each binds no loop, so
+    provenance lists exactly the chain loops and every region's placement
+    is covered by the carrier's deterministic replay equality.
     """
 
     relayout_stages: List[RelayoutStage] = []
-    loops, leaf = _decompose_chain(program, relayout_sink=relayout_stages)
+    result_tile_regions: List[ResultTileRegion] = []
+    loops, leaf = _decompose_chain(
+        program,
+        relayout_sink=relayout_stages,
+        result_tile_sink=result_tile_regions,
+    )
     ordered: List[_LoopNode] = list(loops)
     if type(leaf) is WorkspaceRegion:
         producer_loops, _, consumer_loops, _ = _decompose_region(leaf)
@@ -1818,6 +2173,8 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
             scheduled = apply_affine_tile(scheduled, tile)
     if checked.relayout is not None:
         scheduled = apply_relayout(scheduled, checked.relayout)
+    if checked.result_tile is not None:
+        scheduled = apply_result_tile(scheduled, checked.result_tile)
     return scheduled
 
 
@@ -1899,10 +2256,17 @@ def _verify_scheduled_loopir(
     verify_program(base_program)
     verify_program(program)
     base_relayouts: List[RelayoutStage] = []
-    base_loops, base_leaf = _decompose_chain(base_program, relayout_sink=base_relayouts)
+    base_result_tiles: List[ResultTileRegion] = []
+    base_loops, base_leaf = _decompose_chain(
+        base_program,
+        relayout_sink=base_relayouts,
+        result_tile_sink=base_result_tiles,
+    )
     if (
         base_relayouts
+        or base_result_tiles
         or type(base_leaf) is WorkspaceRegion
+        or type(base_leaf) is TiledReduce
         or any(
             type(loop) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES)
             for loop in base_loops
@@ -1911,7 +2275,8 @@ def _verify_scheduled_loopir(
         _fail(
             "scheduled_base_not_unscheduled",
             "ScheduledLoopIR.base_program must not already contain split "
-            "loops, panels, workspace regions, or staging regions",
+            "loops, panels, workspace regions, staging regions, or "
+            "result-tile regions",
         )
 
     replayed = (
@@ -1989,6 +2354,14 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
     expressions) — staging copies values exactly, so the erasure is an
     identity on the computed result.
 
+    A heap result-tile region erases to its direct-accumulation
+    equivalent: the region wrapper is dropped and its :class:`TiledReduce`
+    leaf becomes the plain result :class:`StoreReduce` it redirected —
+    accumulating into a fresh zeroed compact tile per strip and copying
+    every clamped cell out exactly once is a reassociation of the direct
+    ADD reduction into the zero-initialized result, the same explicit
+    contract the workspace erasure relies on.
+
     This is the semantics-preserving erasure the oracle differentials use
     to prove scheduled programs visit every iteration point exactly once.
     A program with no splits is returned unchanged.
@@ -1996,9 +2369,15 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
 
     verify_program(program)
     relayout_stages: List[RelayoutStage] = []
-    loops, leaf = _decompose_chain(program, relayout_sink=relayout_stages)
+    result_tile_regions: List[ResultTileRegion] = []
+    loops, leaf = _decompose_chain(
+        program,
+        relayout_sink=relayout_stages,
+        result_tile_sink=result_tile_regions,
+    )
     if (
         not relayout_stages
+        and not result_tile_regions
         and type(leaf) is not WorkspaceRegion
         and not any(
             type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for node in loops
@@ -2008,6 +2387,20 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
     builder = LoopIRBuilder.resuming(program)
     region_loops: List[_LoopNode] = []
     erased_leaf: _ChainEnd = leaf
+    tiled_results = {
+        region.decl.result_tile: region.decl.result for region in result_tile_regions
+    }
+    if type(leaf) is TiledReduce:
+        if leaf.result_tile not in tiled_results:
+            _fail(
+                "unsupported_schedule_shape",
+                "tiled-reduce erasure requires the leaf's enclosing "
+                "result-tile region on the chain",
+            )
+        leaf = builder.store_reduce(
+            tiled_results[leaf.result_tile], leaf.indices, leaf.op, leaf.value
+        )
+        erased_leaf = leaf
     staged_operands = {
         stage.decl.relayout: stage.decl.operand for stage in relayout_stages
     }

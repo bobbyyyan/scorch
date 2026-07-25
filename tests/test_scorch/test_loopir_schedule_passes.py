@@ -455,11 +455,14 @@ def test_tile_rejects_unsupported_widths_and_families():
         lowering.program,
         affine_tile(j.index_id, 4, accum="stack"),
     )
-    expect_code(
-        "unsupported_schedule_accumulation",
-        apply_affine_tile,
-        lowering.program,
-        affine_tile(j.index_id, 4, accum="heap"),
+    # A "heap" tile's split geometry is the direct split; the heap
+    # accumulation fact is consumed by apply_result_tile, and the plan
+    # gate refuses a heap tile with no result-tile fact to pair it.
+    heap_split = apply_affine_tile(
+        lowering.program, affine_tile(j.index_id, 4, accum="heap")
+    )
+    assert chain_types(heap_split) == chain_types(
+        apply_affine_tile(lowering.program, affine_tile(j.index_id, 4))
     )
     panel = LoopTile(
         loop=LoopRef(j.index_id),
@@ -785,8 +788,12 @@ def test_apply_schedule_plan_rejects_unmigrated_families():
             ),
         ),
     )
+    # Heap result tiles are a migrated family now: a result-tile fact
+    # without its heap tile to consume it is a malformed heap plan, not an
+    # unmigrated one — and a heap tile without its result-tile fact is
+    # equally malformed.
     expect_code(
-        "unsupported_schedule_result_tile",
+        "invalid_schedule_result_tile",
         apply_schedule_plan,
         lowering.program,
         LoopPlan(
@@ -807,12 +814,23 @@ def test_apply_schedule_plan_rejects_unmigrated_families():
         LoopPlan(loop_order=order, parallel_loop=LoopRef(i.index_id)),
     )
     expect_code(
-        "unsupported_schedule_accumulation",
+        "invalid_schedule_result_tile",
         apply_schedule_plan,
         lowering.program,
         LoopPlan(
             loop_order=order,
             tiles=(affine_tile(j.index_id, 4, accum="heap"),),
+        ),
+    )
+    # An accumulation kind outside the declared plan vocabulary fails the
+    # structural gate before any family dispatch.
+    expect_code(
+        "invalid_schedule_plan",
+        apply_schedule_plan,
+        lowering.program,
+        LoopPlan(
+            loop_order=order,
+            tiles=(affine_tile(j.index_id, 4, accum="hashed"),),
         ),
     )
 
@@ -2768,9 +2786,10 @@ def test_relayout_plan_gate_requires_the_exact_family():
             parallel,
         ),
     )
-    # Heap accumulation on the pack tile stays the unmigrated heap family.
+    # Heap accumulation on the pack tile is migrated but requires the
+    # plan's result-tile fact to compact the same pack loop.
     expect_code(
-        "unsupported_schedule_accumulation",
+        "invalid_schedule_result_tile",
         apply_schedule_plan,
         lowering.program,
         relayout_plan(
@@ -2782,3 +2801,437 @@ def test_relayout_plan_gate_requires_the_exact_family():
             parallel,
         ),
     )
+
+
+# -- the heap result-tile pass ------------------------------------------------
+
+from tests.test_scorch.test_loopir_oracle import csr_from_dense  # noqa: E402
+
+
+def heap_result_tile_fact(lowering, prefix, pack):
+    from scorch.compiler.loop_plan import ResultTile
+
+    return ResultTile(
+        result_id=lowering.result_symbol,
+        tile_loop=LoopRef(pack.index_id),
+        result_level=1,
+        result_prefix=(prefix.index_id,),
+        access_indices=(prefix.index_id, pack.index_id),
+    )
+
+
+def heap_alone_plan(lowering, i, k, width=3):
+    return LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(affine_tile(k.index_id, width, accum="heap"),),
+        result_tile=heap_result_tile_fact(lowering, i, k),
+        parallel_loop=LoopRef(i.index_id),
+        provenance="explicit",
+        tag="heap-alone",
+    )
+
+
+def scheduled_heap_alone(width=3):
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    plan = heap_alone_plan(lowering, i, k, width)
+    artifact = apply_schedule_plan(lowering.program, plan)
+    return lowering, (i, j, k), plan, artifact
+
+
+def heap_relayout_plan(lowering, pack, panel, bound, relayout, parallel, result_tile):
+    return LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(replace(pack, accumulation="heap"), panel),
+        panel_bounds=(bound,),
+        relayout=relayout,
+        result_tile=result_tile,
+        parallel_loop=parallel,
+        provenance="explicit",
+        tag="heap-relayout",
+    )
+
+
+def test_heap_plan_applies_through_apply_schedule_plan():
+    from scorch.compiler.loopir.nodes import ResultTileRegion, TiledReduce
+
+    lowering, (i, j, k), plan, artifact = scheduled_heap_alone()
+    verify_scheduled_loopir(artifact)
+    pack = artifact.program.body.statements[0]
+    assert type(pack) is TileOuterFor
+    region = pack.body.statements[0]
+    assert type(region) is ResultTileRegion
+    assert region.decl.result == lowering.result_symbol
+    assert region.decl.pack == pack.tile
+    row = region.body.statements[0]
+    assert type(row) is DenseFor and row.index == i.index_id
+    point = row.body.statements[0].body.statements[0]
+    assert type(point) is TileInnerFor and point.tile == pack.tile
+    leaf = point.body.statements[0]
+    assert type(leaf) is TiledReduce
+    assert leaf.result_tile == region.decl.result_tile
+    assert tuple(index.index for index in leaf.indices) == (
+        i.index_id,
+        k.index_id,
+    )
+    # The region binds no loop: provenance lists exactly the chain loops.
+    assert [(prov.index, prov.part) for prov in artifact.loops] == [
+        (k.index_id, LoopPart.OUTER),
+        (i.index_id, LoopPart.LOGICAL),
+        (j.index_id, LoopPart.LOGICAL),
+        (k.index_id, LoopPart.INNER),
+    ]
+
+
+@pytest.mark.parametrize("scope", ["panel", "pack"])
+def test_heap_relayout_plan_applies_at_both_scopes(scope):
+    from scorch.compiler.loopir.nodes import (
+        PanelOuterFor,
+        RelayoutStage,
+        ResultTileRegion,
+        TiledReduce,
+    )
+
+    lowering, (i, j, k), pack, panel, bound, relayout = spmm_relayout_parts(scope)
+    plan = heap_relayout_plan(
+        lowering,
+        pack,
+        panel,
+        bound,
+        relayout,
+        LoopRef(i.index_id),
+        heap_result_tile_fact(lowering, i, k),
+    )
+    artifact = apply_schedule_plan(lowering.program, plan)
+    verify_scheduled_loopir(artifact)
+    origin = artifact.program.body.statements[0]
+    assert type(origin) is TileOuterFor
+    region = origin.body.statements[0]
+    assert type(region) is ResultTileRegion
+    inner = region.body.statements[0]
+    if scope == "pack":
+        # PACK_AXIS: the staging region sits inside the result-tile region.
+        assert type(inner) is RelayoutStage
+        assert type(inner.body.statements[0]) is PanelOuterFor
+    else:
+        # PANEL: the staging region sits inside the panel origin.
+        assert type(inner) is PanelOuterFor
+        assert type(inner.body.statements[0]) is RelayoutStage
+    leaves = [
+        node for node in walk_stmts(artifact.program.body) if type(node) is TiledReduce
+    ]
+    assert len(leaves) == 1
+    assert leaves[0].result_tile == region.decl.result_tile
+    # Provenance stays loop-only across both transparent regions.
+    assert [(prov.index, prov.part) for prov in artifact.loops] == [
+        (k.index_id, LoopPart.OUTER),
+        (j.index_id, LoopPart.OUTER),
+        (i.index_id, LoopPart.LOGICAL),
+        (j.index_id, LoopPart.INNER),
+        (k.index_id, LoopPart.INNER),
+    ]
+
+
+def walk_stmts(root):
+    from scorch.compiler.loopir.nodes import LoopIRNode
+
+    pending = [root]
+    while pending:
+        value = pending.pop()
+        yield value
+        for child in vars(value).values():
+            if isinstance(child, LoopIRNode):
+                pending.append(child)
+            elif type(child) is tuple:
+                pending.extend(item for item in child if isinstance(item, LoopIRNode))
+
+
+def test_apply_result_tile_is_pure_and_deterministic():
+    from scorch.compiler.loopir.schedule_passes import apply_result_tile
+
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    prescheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(affine_tile(k.index_id, 3),),
+        ),
+    ).program
+    fact = heap_result_tile_fact(lowering, i, k)
+    before = canonical_program_dump(prescheduled)
+    first = apply_result_tile(prescheduled, fact)
+    second = apply_result_tile(prescheduled, fact)
+    assert canonical_program_dump(prescheduled) == before
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    # Reapplying to an already-compacted chain fails closed: the region is
+    # not a chain element for scheduling passes.
+    expect_code("unsupported_schedule_shape", apply_result_tile, first, fact)
+
+
+def test_apply_result_tile_requires_the_exact_family_shape():
+    from dataclasses import replace as dc_replace
+
+    from scorch.compiler.loopir.schedule_passes import apply_result_tile
+
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    fact = heap_result_tile_fact(lowering, i, k)
+
+    # An unsplit chain has no pack origin/point pair.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_result_tile,
+        lowering.program,
+        fact,
+    )
+    # A wrong tile loop cannot be the chain's schedule pair.
+    prescheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(affine_tile(k.index_id, 3),),
+        ),
+    ).program
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_result_tile,
+        prescheduled,
+        dc_replace(fact, tile_loop=LoopRef(j.index_id)),
+    )
+    # The prefix fact must be the chain's row loop.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_result_tile,
+        prescheduled,
+        dc_replace(
+            fact,
+            result_prefix=(j.index_id,),
+            access_indices=(j.index_id, k.index_id),
+        ),
+    )
+    # Multi-prefix facts are outside the migrated rank-2 family.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_result_tile,
+        prescheduled,
+        dc_replace(
+            fact,
+            result_prefix=(i.index_id, j.index_id),
+            access_indices=(i.index_id, j.index_id, k.index_id),
+            result_level=2,
+        ),
+    )
+    # A non-fact type fails before anything runs.
+    with pytest.raises(TypeError):
+        apply_result_tile(prescheduled, object())
+
+
+def test_apply_result_tile_redirection_is_unique_and_complete():
+    from dataclasses import replace as dc_replace
+
+    from scorch.compiler.loopir.schedule_passes import (
+        _collect_result_writes,
+        apply_result_tile,
+    )
+
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    prescheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(affine_tile(k.index_id, 3),),
+        ),
+    ).program
+    fact = heap_result_tile_fact(lowering, i, k)
+    # Swapped access indices are caught by the exact fact pin before the
+    # write scan: unlike operand reads, result writes are statements the
+    # verifier's coordinate model fully pins, so the unique-occurrence
+    # scan behind the pin is checked-property defense in depth.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_result_tile,
+        prescheduled,
+        dc_replace(fact, access_indices=(k.index_id, i.index_id)),
+    )
+    # The scan itself sees exactly the one leaf write in the verified
+    # chain and nothing else.
+    writes = _collect_result_writes(prescheduled.body, lowering.result_symbol)
+    assert len(writes) == 1
+    assert _collect_result_writes(prescheduled.body, lowering.input_symbols[0]) == []
+    # After the pass, no direct write of the result survives anywhere.
+    compacted = apply_result_tile(prescheduled, fact)
+    assert _collect_result_writes(compacted.body, lowering.result_symbol) == []
+
+
+def test_heap_plan_gate_requires_the_exact_family():
+    from dataclasses import replace as dc_replace
+
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    plan = heap_alone_plan(lowering, i, k)
+    fact = plan.result_tile
+
+    # The heap tile must be outermost and serial.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(
+            plan,
+            tiles=(
+                affine_tile(
+                    k.index_id,
+                    3,
+                    placement=LoopPlacement(PlacementKind.AT_DEPTH, depth=1),
+                    accum="heap",
+                ),
+            ),
+        ),
+    )
+    parallel_heap = LoopTile(
+        loop=LoopRef(k.index_id),
+        width=3,
+        placement=outermost_placement(),
+        parallel=True,
+        kind="affine",
+        accumulation="heap",
+        unroll=False,
+    )
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(plan, tiles=(parallel_heap,)),
+    )
+    # The result tile must compact the heap tile's loop.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(plan, result_tile=dc_replace(fact, tile_loop=LoopRef(j.index_id))),
+    )
+    # The heap tile targets the innermost logical loop.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(
+            plan,
+            loop_order=(
+                lowering.loop_index_ids[0],
+                lowering.loop_index_ids[2],
+                lowering.loop_index_ids[1],
+            ),
+        ),
+    )
+    # The mandatory parallel anchor must be a dense result-prefix loop.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(plan, parallel_loop=None),
+    )
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(plan, parallel_loop=LoopRef(j.index_id)),
+    )
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(plan, parallel_loop=LoopRef(k.index_id, LoopPart.OUTER)),
+    )
+    # A second non-panel tile is outside the audited compositions.
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        replace(
+            plan,
+            tiles=(*plan.tiles, affine_tile(i.index_id, 2)),
+        ),
+    )
+
+
+def test_heap_scheduled_iteration_counts_and_erases_exactly():
+    """Counting differential + erasure: all-ones inputs count stored
+    entries per output cell across exact/ragged/unit/oversized strips, and
+    erasure restores the base canonical dump."""
+
+    inner, cols = 7, 5
+    a_dense = [
+        [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        [0.0] * inner,
+        [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        [1.0] * inner,
+    ]
+    stored_counts = [4.0, 0.0, 3.0, 7.0]
+    for width in (1, 2, 3, 5, 8):
+        lowering, (i, j, k), plan, artifact = scheduled_heap_alone(width)
+        inputs = {
+            lowering.input_symbols[0]: csr_from_dense(a_dense),
+            lowering.input_symbols[1]: [[1.0] * cols for _ in range(inner)],
+        }
+        shapes = {lowering.result_symbol: (len(a_dense), cols)}
+        counted = run_program(artifact.program, inputs, shapes)
+        assert counted[lowering.result_symbol] == [
+            [count] * cols for count in stored_counts
+        ]
+        erased = erase_schedule(artifact.program)
+        assert canonical_program_dump(erased) == canonical_program_dump(
+            artifact.base_program
+        )
+
+
+@pytest.mark.parametrize("scope", ["panel", "pack"])
+def test_heap_relayout_composition_counts_and_erases_exactly(scope):
+    inner, cols = 7, 5
+    a_dense = [
+        [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        [0.0] * inner,
+        [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        [1.0] * inner,
+    ]
+    stored_counts = [4.0, 0.0, 3.0, 7.0]
+    for width, strip in ((1, 2), (2, 5), (3, 3), (9, 8)):
+        lowering, (i, j, k), pack, panel, bound, relayout = spmm_relayout_parts(
+            scope, width, strip
+        )
+        plan = heap_relayout_plan(
+            lowering,
+            pack,
+            panel,
+            bound,
+            relayout,
+            LoopRef(i.index_id),
+            heap_result_tile_fact(lowering, i, k),
+        )
+        artifact = apply_schedule_plan(lowering.program, plan)
+        inputs = {
+            lowering.input_symbols[0]: csr_from_dense(a_dense),
+            lowering.input_symbols[1]: [[1.0] * cols for _ in range(inner)],
+        }
+        shapes = {lowering.result_symbol: (len(a_dense), cols)}
+        counted = run_program(artifact.program, inputs, shapes)
+        assert counted[lowering.result_symbol] == [
+            [count] * cols for count in stored_counts
+        ]
+        erased = erase_schedule(artifact.program)
+        assert canonical_program_dump(erased) == canonical_program_dump(
+            artifact.base_program
+        )
+
+
+def test_scheduled_carrier_rejects_result_tile_region_bases():
+    lowering, (i, j, k), plan, artifact = scheduled_heap_alone()
+    forged = ScheduledLoopIR(
+        base_program=artifact.program,
+        plan=plan,
+        program=artifact.program,
+        loops=artifact.loops,
+    )
+    expect_code("scheduled_base_not_unscheduled", verify_scheduled_loopir, forged)
