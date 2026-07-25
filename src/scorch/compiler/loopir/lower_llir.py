@@ -3625,6 +3625,30 @@ _RESULT_TILE_NUMERIC_LITERAL = re.compile(
     re.ASCII,
 )
 _RESULT_TILE_UNARY_OPERATORS = {"+", "-", "!", "~", "*", "&"}
+# ``BinOp.op`` is interpolated into the emitted C++ verbatim, exactly like the
+# unary operator above.  Only these non-mutating spellings may separate two
+# operands; assignment, compound assignment, comma, and statement punctuation
+# would splice a fresh effect between the proven result accesses.
+_RESULT_TILE_BINARY_OPERATORS = {
+    "||",
+    "&&",
+    "|",
+    "^",
+    "&",
+    "==",
+    "!=",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "<<",
+    ">>",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+}
 
 
 def _safe_cpp_qualified_name(name: object) -> bool:
@@ -3728,6 +3752,176 @@ def _validate_result_tile_policy(
         raise ValueError("heap result-tile policy delimiters are unbalanced")
 
 
+class _ResultTileTextValidator(LLIRWalker):
+    """Reject every verbatim-text route the C++ target emits directly.
+
+    Lifted to module scope so each per-node checker is an independently
+    measurable unit; the walked function's result-owned storage names are
+    supplied once at construction.
+    """
+
+    def __init__(self, protected_names: Set[str]) -> None:
+        super().__init__(
+            LLIRTraversalContext(
+                stage="LoopIR target lowering",
+                pass_name="validate_result_tile_rendered_text",
+            )
+        )
+        self.protected_names = protected_names
+        self.known_names: Set[str] = set()
+        self.policies: List[Tuple[object, str]] = []
+
+    @staticmethod
+    def _identifier(value: object, owner: str) -> str:
+        if (
+            type(value) is not str
+            or _CPP_IDENTIFIER.fullmatch(value) is None
+            or value in _CPP_KEYWORDS
+        ):
+            raise ValueError(f"{owner} must be a safe ASCII C++ identifier")
+        return value
+
+    def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+        # Exact-type dispatch, never isinstance: a node type with no
+        # verbatim-text field of its own is fully pinned by the common
+        # walker this validator extends.
+        checker = self._CHECKERS.get(type(node))
+        if checker is not None:
+            checker(self, node)
+
+    def _check_var(self, node: llir.Node) -> None:
+        name = self._identifier(getattr(node, "name", None), "Var.name")
+        if type(getattr(node, "type", None)) is not llir.DataType:
+            raise ValueError("Var.type must be a DataType")
+        if type(getattr(node, "is_ptr", None)) is not bool:
+            raise ValueError("Var.is_ptr must be a bool")
+        if type(getattr(node, "is_restrict", None)) is not bool:
+            raise ValueError("Var.is_restrict must be a bool")
+        self.known_names.add(name)
+
+    def _check_unary_op(self, node: llir.Node) -> None:
+        operator = getattr(node, "op", None)
+        if type(operator) is not str or operator not in _RESULT_TILE_UNARY_OPERATORS:
+            raise ValueError("UnaryOp.op must be a non-mutating unary operator")
+
+    def _check_binary_op(self, node: llir.Node) -> None:
+        operator = getattr(node, "op", None)
+        if type(operator) is not str or operator not in _RESULT_TILE_BINARY_OPERATORS:
+            raise ValueError(
+                "binary expression operators must be non-mutating "
+                "C++ binary operators"
+            )
+
+    def _check_call_name(self, node: llir.Node) -> None:
+        if not _safe_cpp_qualified_name(getattr(node, "name", None)):
+            raise ValueError(f"{type(node).__name__}.name must be a qualified C++ name")
+
+    def _check_literal(self, node: llir.Node) -> None:
+        value = getattr(node, "value", None)
+        data_type = getattr(node, "data_type", None)
+        if (
+            type(value) is str
+            and data_type is not llir.DataType.STRING
+            and _RESULT_TILE_NUMERIC_LITERAL.fullmatch(value) is None
+        ):
+            raise ValueError("non-STRING Literal text must be a numeric C++ literal")
+
+    def _check_var_init(self, node: llir.Node) -> None:
+        operator = getattr(node, "op", None)
+        if type(operator) is not str or operator != "=":
+            raise ValueError("VarInit.op must remain '='")
+        if type(getattr(node, "cast", None)) is not bool:
+            raise ValueError("VarInit.cast must be a bool")
+
+    def _check_comment(self, node: llir.Node) -> None:
+        value = getattr(node, "value", None)
+        if (
+            type(value) is not str
+            or "\n" in value
+            or "\r" in value
+            or "\\" in value
+            or "??/" in value
+        ):
+            raise ValueError("Comment.value must be a single-line string")
+
+    def _check_raw_stmt(self, node: llir.Node) -> None:
+        raise ValueError("heap result-tile completion requires fully structured LLIR")
+
+    def _check_if_then_else(self, node: llir.Node) -> None:
+        if type(getattr(node, "make_last_case_else", None)) is not bool:
+            raise ValueError("IfThenElse.make_last_case_else must be a bool")
+
+    def _check_function(self, node: llir.Node) -> None:
+        self._identifier(getattr(node, "name", None), "Function.name")
+        if type(getattr(node, "return_type", None)) is not llir.DataType:
+            raise ValueError("Function.return_type must be a DataType")
+        args = getattr(node, "args", None)
+        if type(args) not in (list, tuple):
+            raise ValueError("Function.args must contain exact Var nodes")
+        if any(type(arg) is not llir.Var for arg in cast(Any, args)):
+            raise ValueError("Function.args must contain exact Var nodes")
+
+    def _check_for_loop(self, node: llir.Node) -> None:
+        schedule = getattr(node, "omp_schedule", None)
+        if schedule is not None and (
+            type(schedule) is not str
+            or schedule not in ("static", "dynamic", "dynamic, 16", "dynamic, 64")
+        ):
+            raise ValueError("ForLoop.omp_schedule is not a recognized compiler policy")
+        for field in ("omp_parallel_for", "unroll", "simd"):
+            if type(getattr(node, field, None)) is not bool:
+                raise ValueError(f"ForLoop.{field} must be a bool")
+        for field, helper in (
+            ("omp_num_threads", "scorch_nthreads"),
+            ("omp_chunk_expr", "scorch_chunk"),
+        ):
+            value = getattr(node, field, None)
+            if value is not None:
+                self.policies.append((value, helper))
+        atomic = getattr(node, "_use_atomic_scheduling", False)
+        if type(atomic) is not bool:
+            raise ValueError("ForLoop._use_atomic_scheduling must be a bool")
+        if not atomic:
+            return
+        for field in (
+            "_atomic_chunk_var",
+            "_atomic_counter_var",
+            "_loop_bound",
+        ):
+            atomic_name = self._identifier(
+                getattr(node, field, None),
+                f"ForLoop.{field}",
+            )
+            if atomic_name in self.protected_names:
+                raise ValueError(f"ForLoop.{field} references result-owned storage")
+
+    _CHECKERS = {
+        llir.Var: _check_var,
+        llir.UnaryOp: _check_unary_op,
+        llir.BinOp: _check_binary_op,
+        llir.Add: _check_binary_op,
+        llir.Mul: _check_binary_op,
+        llir.FunctionCall: _check_call_name,
+        llir.FunctionCallStmt: _check_call_name,
+        llir.Literal: _check_literal,
+        llir.VarInit: _check_var_init,
+        llir.Comment: _check_comment,
+        llir.RawStmt: _check_raw_stmt,
+        llir.IfThenElse: _check_if_then_else,
+        llir.Function: _check_function,
+        llir.ForLoop: _check_for_loop,
+    }
+
+    def validate_policies(self) -> None:
+        for value, helper in self.policies:
+            _validate_result_tile_policy(
+                value,
+                helper=helper,
+                known_names=self.known_names,
+                protected_names=self.protected_names,
+            )
+
+
 def _validate_result_tile_rendered_text(
     function: llir.Function,
     *,
@@ -3735,140 +3929,7 @@ def _validate_result_tile_rendered_text(
 ) -> None:
     """Close every verbatim-text route before proving heap result ownership."""
 
-    class _Validator(LLIRWalker):
-        def __init__(self) -> None:
-            super().__init__(
-                LLIRTraversalContext(
-                    stage="LoopIR target lowering",
-                    pass_name="validate_result_tile_rendered_text",
-                )
-            )
-            self.known_names: Set[str] = set()
-            self.policies: List[Tuple[object, str]] = []
-
-        @staticmethod
-        def _identifier(value: object, owner: str) -> str:
-            if (
-                type(value) is not str
-                or _CPP_IDENTIFIER.fullmatch(value) is None
-                or value in _CPP_KEYWORDS
-            ):
-                raise ValueError(f"{owner} must be a safe ASCII C++ identifier")
-            return value
-
-        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
-            if type(node) is llir.Var:
-                name = self._identifier(getattr(node, "name", None), "Var.name")
-                if type(getattr(node, "type", None)) is not llir.DataType:
-                    raise ValueError("Var.type must be a DataType")
-                if type(getattr(node, "is_ptr", None)) is not bool:
-                    raise ValueError("Var.is_ptr must be a bool")
-                if type(getattr(node, "is_restrict", None)) is not bool:
-                    raise ValueError("Var.is_restrict must be a bool")
-                self.known_names.add(name)
-            elif type(node) is llir.UnaryOp:
-                operator = getattr(node, "op", None)
-                if (
-                    type(operator) is not str
-                    or operator not in _RESULT_TILE_UNARY_OPERATORS
-                ):
-                    raise ValueError("UnaryOp.op must be a non-mutating unary operator")
-            elif type(node) in (llir.FunctionCall, llir.FunctionCallStmt):
-                if not _safe_cpp_qualified_name(getattr(node, "name", None)):
-                    raise ValueError(
-                        f"{type(node).__name__}.name must be a qualified C++ name"
-                    )
-            elif type(node) is llir.Literal:
-                value = getattr(node, "value", None)
-                data_type = getattr(node, "data_type", None)
-                if (
-                    type(value) is str
-                    and data_type is not llir.DataType.STRING
-                    and _RESULT_TILE_NUMERIC_LITERAL.fullmatch(value) is None
-                ):
-                    raise ValueError(
-                        "non-STRING Literal text must be a numeric C++ literal"
-                    )
-            elif type(node) is llir.VarInit:
-                operator = getattr(node, "op", None)
-                if type(operator) is not str or operator != "=":
-                    raise ValueError("VarInit.op must remain '='")
-                if type(getattr(node, "cast", None)) is not bool:
-                    raise ValueError("VarInit.cast must be a bool")
-            elif type(node) is llir.Comment:
-                value = getattr(node, "value", None)
-                if (
-                    type(value) is not str
-                    or "\n" in value
-                    or "\r" in value
-                    or "\\" in value
-                    or "??/" in value
-                ):
-                    raise ValueError("Comment.value must be a single-line string")
-            elif type(node) is llir.RawStmt:
-                raise ValueError(
-                    "heap result-tile completion requires fully structured LLIR"
-                )
-            elif type(node) is llir.IfThenElse:
-                if type(getattr(node, "make_last_case_else", None)) is not bool:
-                    raise ValueError("IfThenElse.make_last_case_else must be a bool")
-            elif type(node) is llir.Function:
-                self._identifier(getattr(node, "name", None), "Function.name")
-                if type(getattr(node, "return_type", None)) is not llir.DataType:
-                    raise ValueError("Function.return_type must be a DataType")
-                args = getattr(node, "args", None)
-                if type(args) not in (list, tuple):
-                    raise ValueError("Function.args must contain exact Var nodes")
-                if any(type(arg) is not llir.Var for arg in cast(Any, args)):
-                    raise ValueError("Function.args must contain exact Var nodes")
-            elif type(node) is llir.ForLoop:
-                schedule = getattr(node, "omp_schedule", None)
-                if schedule is not None and (
-                    type(schedule) is not str
-                    or schedule
-                    not in ("static", "dynamic", "dynamic, 16", "dynamic, 64")
-                ):
-                    raise ValueError(
-                        "ForLoop.omp_schedule is not a recognized compiler policy"
-                    )
-                for field in ("omp_parallel_for", "unroll", "simd"):
-                    if type(getattr(node, field, None)) is not bool:
-                        raise ValueError(f"ForLoop.{field} must be a bool")
-                for field, helper in (
-                    ("omp_num_threads", "scorch_nthreads"),
-                    ("omp_chunk_expr", "scorch_chunk"),
-                ):
-                    value = getattr(node, field, None)
-                    if value is not None:
-                        self.policies.append((value, helper))
-                atomic = getattr(node, "_use_atomic_scheduling", False)
-                if type(atomic) is not bool:
-                    raise ValueError("ForLoop._use_atomic_scheduling must be a bool")
-                if atomic:
-                    for field in (
-                        "_atomic_chunk_var",
-                        "_atomic_counter_var",
-                        "_loop_bound",
-                    ):
-                        atomic_name = self._identifier(
-                            getattr(node, field, None),
-                            f"ForLoop.{field}",
-                        )
-                        if atomic_name in protected_names:
-                            raise ValueError(
-                                f"ForLoop.{field} references result-owned storage"
-                            )
-
-        def validate_policies(self) -> None:
-            for value, helper in self.policies:
-                _validate_result_tile_policy(
-                    value,
-                    helper=helper,
-                    known_names=self.known_names,
-                    protected_names=protected_names,
-                )
-
-    validator = _Validator()
+    validator = _ResultTileTextValidator(protected_names)
     validator.walk(function)
     validator.validate_policies()
 
