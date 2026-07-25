@@ -3945,6 +3945,61 @@ def _complete_result_tile_impl(
         ),
     )
     try:
+        expected_value_init = lowering.result_assembler().emit_value_array_init()
+        expected_result_tensor_inits = [
+            stmt
+            for stmt in expected_value_init
+            if type(stmt) is llir.VarInit
+            and type(stmt.var) is llir.Var
+            and stmt.var.name == f"{result_name}_values_torch"
+        ]
+        expected_final_assembly = lowering.result_assembler().emit_final_assembly()
+        expected_storage_positions = [
+            index
+            for index, stmt in enumerate(expected_final_assembly)
+            if type(stmt) is llir.Assign
+            and type(stmt.value) is llir.Var
+            and stmt.value.name == f"{result_name}_values_torch"
+        ]
+        if (
+            len(expected_result_tensor_inits) != 1
+            or len(expected_storage_positions) != 1
+            or len(function.body) < len(expected_final_assembly)
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "the dense result assembler no longer has one canonical "
+                "Torch allocation and final storage owner",
+            )
+        actual_final_assembly = function.body[-len(expected_final_assembly) :]
+        if not lowering._exact_panel_state_matches(
+            actual_final_assembly,
+            expected_final_assembly,
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "the dense result's final assembly no longer retains its "
+                "canonical terminal state",
+            )
+        actual_storage_assign = actual_final_assembly[expected_storage_positions[0]]
+        assert type(actual_storage_assign) is llir.Assign
+        assert type(actual_storage_assign.value) is llir.Var
+        result_tensor_inits = [
+            stmt
+            for stmt in function.body
+            if type(stmt) is llir.VarInit
+            and type(stmt.var) is llir.Var
+            and stmt.var.name == f"{result_name}_values_torch"
+        ]
+        if len(result_tensor_inits) != 1 or not lowering._exact_panel_state_matches(
+            result_tensor_inits[0],
+            expected_result_tensor_inits[0],
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "heap accumulation requires exactly one canonical generated "
+                "dense-result Torch allocation",
+            )
         result_pointer_inits = [
             stmt
             for stmt in function.body
@@ -3960,6 +4015,35 @@ def _complete_result_tile_impl(
                 _RESULT_TILE_LOST,
                 "heap accumulation requires exactly one canonical generated "
                 "dense-result pointer declaration",
+            )
+        pointer_value = result_pointer_inits[0].value
+        if (
+            type(pointer_value) is not llir.MemberCall
+            or type(pointer_value.base) is not llir.Var
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "the canonical dense-result pointer lost its Torch storage " "owner",
+            )
+        result_tensor_vars = _named_var_candidates(
+            function.body,
+            f"{result_name}_values_torch",
+        )
+        owned_result_tensor_vars = (
+            result_tensor_inits[0].var,
+            pointer_value.base,
+            actual_storage_assign.value,
+        )
+        if (
+            len(result_tensor_vars) != 3
+            or len({id(value) for value in owned_result_tensor_vars}) != 3
+            or {id(value) for value in result_tensor_vars}
+            != {id(value) for value in owned_result_tensor_vars}
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "an unowned use of the dense result's Torch storage "
+                "survived heap completion",
             )
         zero_candidates = _dense_zero_candidates(function)
         if len(zero_candidates) != 1 or not lowering._exact_panel_state_matches(
