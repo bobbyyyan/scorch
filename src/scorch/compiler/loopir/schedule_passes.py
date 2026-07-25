@@ -1525,6 +1525,31 @@ def _check_plan_families(plan: LoopPlan) -> None:
             )
         pack_tile = affine_tiles[0]
         panel_tile = panel_tiles[0]
+        expected_order = (
+            relayout.row_loop.index_id,
+            relayout.panel_loop.index_id,
+            relayout.pack_loop.index_id,
+        )
+        if plan.loop_order != expected_order:
+            _fail(
+                "invalid_schedule_relayout",
+                "packed relayout requires the exact logical row, panel, "
+                "pack loop order",
+            )
+        if (
+            relayout.access_indices
+            != (
+                relayout.panel_loop.index_id,
+                relayout.pack_loop.index_id,
+            )
+            or relayout.operand_panel_level != 0
+            or relayout.operand_pack_level != 1
+        ):
+            _fail(
+                "invalid_schedule_relayout",
+                "packed relayout requires the rank-2 panel/pack access and "
+                "physical levels 0/1",
+            )
         for what, reference in (
             ("pack_loop", relayout.pack_loop),
             ("panel_loop", relayout.panel_loop),
@@ -1545,6 +1570,13 @@ def _check_plan_families(plan: LoopPlan) -> None:
                 "invalid_schedule_relayout",
                 "the relayout's pack tile must be the outermost affine "
                 "split of its pack loop at the strip width",
+            )
+        if pack_tile.accumulation != "direct":
+            _fail(
+                "unsupported_schedule_accumulation",
+                "operand relayout currently composes only with direct "
+                "accumulation; stack and heap result tiles remain separate "
+                "schedule families",
             )
         if panel_tile.loop != relayout.panel_loop:
             _fail(

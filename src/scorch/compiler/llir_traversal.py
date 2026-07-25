@@ -174,10 +174,32 @@ def _validate_tensor_access_metadata(
             value=metadata,
         )
     typed_metadata = cast(llir.TensorAccessMetadata, metadata)
+    metadata_state = object.__getattribute__(typed_metadata, "__dict__")
+    expected_fields = ("access_id", "index_ids", "role", "tensor_id")
+    if type(metadata_state) is not dict:
+        _raise_traversal_error(
+            context,
+            code="invalid_tensor_access_metadata",
+            message="TensorAccessMetadata must own exact stored fields",
+            path=path,
+            value=metadata,
+        )
+    metadata_fields = tuple(metadata_state)
+    if (
+        any(type(field_name) is not str for field_name in metadata_fields)
+        or tuple(sorted(cast(Tuple[str, ...], metadata_fields))) != expected_fields
+    ):
+        _raise_traversal_error(
+            context,
+            code="invalid_tensor_access_metadata",
+            message="TensorAccessMetadata must own exactly its declared fields",
+            path=path,
+            value=metadata,
+        )
     fields = (
-        ("access_id", typed_metadata.access_id, AccessId),
-        ("tensor_id", typed_metadata.tensor_id, SymbolId),
-        ("role", typed_metadata.role, llir.TensorAccessRole),
+        ("access_id", metadata_state["access_id"], AccessId),
+        ("tensor_id", metadata_state["tensor_id"], SymbolId),
+        ("role", metadata_state["role"], llir.TensorAccessRole),
     )
     for field_name, value, expected_type in fields:
         if type(value) is not expected_type:
@@ -191,15 +213,37 @@ def _validate_tensor_access_metadata(
                 path=path + (field_name,),
                 value=value,
             )
-    if type(typed_metadata.index_ids) is not tuple:
+        if expected_type in (AccessId, SymbolId):
+            identity_state = object.__getattribute__(value, "__dict__")
+            identity_fields = (
+                tuple(identity_state) if type(identity_state) is dict else ()
+            )
+            if (
+                type(identity_state) is not dict
+                or any(type(name) is not str for name in identity_fields)
+                or identity_fields != ("value",)
+                or type(identity_state["value"]) is not int
+            ):
+                _raise_traversal_error(
+                    context,
+                    code="invalid_tensor_access_metadata",
+                    message=(
+                        f"TensorAccessMetadata.{field_name} must own one "
+                        "exact integer value"
+                    ),
+                    path=path + (field_name, "value"),
+                    value=value,
+                )
+    index_ids = metadata_state["index_ids"]
+    if type(index_ids) is not tuple:
         _raise_traversal_error(
             context,
             code="invalid_tensor_access_metadata",
             message="TensorAccessMetadata.index_ids must be a tuple of IndexId values",
             path=path + ("index_ids",),
-            value=typed_metadata.index_ids,
+            value=index_ids,
         )
-    for index, index_id in enumerate(typed_metadata.index_ids):
+    for index, index_id in enumerate(index_ids):
         if type(index_id) is not IndexId:
             _raise_traversal_error(
                 context,
@@ -208,6 +252,24 @@ def _validate_tensor_access_metadata(
                     "TensorAccessMetadata.index_ids must contain only IndexId values"
                 ),
                 path=path + ("index_ids", f"[{index}]"),
+                value=index_id,
+            )
+        identity_state = object.__getattribute__(index_id, "__dict__")
+        identity_fields = tuple(identity_state) if type(identity_state) is dict else ()
+        if (
+            type(identity_state) is not dict
+            or any(type(name) is not str for name in identity_fields)
+            or identity_fields != ("value",)
+            or type(identity_state["value"]) is not int
+        ):
+            _raise_traversal_error(
+                context,
+                code="invalid_tensor_access_metadata",
+                message=(
+                    "TensorAccessMetadata.index_ids members must own one "
+                    "exact integer value"
+                ),
+                path=path + ("index_ids", f"[{index}]", "value"),
                 value=index_id,
             )
 

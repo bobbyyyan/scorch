@@ -73,7 +73,9 @@ from ..llir_pass_manager import (
 )
 from ..llir_traversal import (
     LLIRRewriter,
+    LLIRTraversalError,
     LLIRTraversalContext,
+    LLIRWalker,
     SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
 )
 from ..loop_plan import MAX_AFFINE_TILE_WIDTH
@@ -263,7 +265,10 @@ class _TargetLowering:
         self.relayout: Optional[RelayoutDecl] = None
         self.relayout_depth = -1
         self._staged_views: Dict[int, Load] = {}
-        self._window_coord_snapshot: Optional[llir.VarInit] = None
+        self._staged_access_snapshot: Optional[llir.ArrayAccess] = None
+        self._window_coord_snapshot: Optional[
+            Tuple[llir.Comment, llir.VarInit, llir.BlankLine]
+        ] = None
         self._panel_completion: Optional[
             Tuple[llir.ForLoop, llir.ForLoop, llir.ForLoop, llir.ForLoop]
         ] = None
@@ -1522,7 +1527,54 @@ class _TargetLowering:
                     "a StagedRead outside the validated staging region is "
                     "not lowerable",
                 )
-            return self._lower_value(view)
+            lowered = self._lower_value(view)
+            if type(lowered) is not llir.ArrayAccess:
+                _fail(
+                    "unsupported_program_shape",
+                    "the staged operand must lower to one direct array access",
+                )
+            if self._staged_access_snapshot is not None:
+                _fail(
+                    "unsupported_program_shape",
+                    "the staged operand was lowered more than once",
+                )
+            snapshot = LLIRRewriter(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="snapshot_relayout_operand_access",
+                )
+            ).rewrite(lowered)
+            if type(snapshot) is not llir.ArrayAccess:
+                _fail(
+                    "unsupported_program_shape",
+                    "the staged operand snapshot did not remain an array access",
+                )
+            metadata = snapshot.tensor_access
+            if type(metadata) is not llir.TensorAccessMetadata:
+                _fail(
+                    "unsupported_program_shape",
+                    "the staged operand snapshot did not retain typed access "
+                    "metadata",
+                )
+            # LLIRRewriter detaches nodes, but intentionally preserves the
+            # frozen provenance value object.  Rebuild every identity as a
+            # separate value so an in-place forged metadata mutation after
+            # the managed passes cannot also mutate this review boundary's
+            # supposedly detached snapshot.
+            detached_metadata = llir.TensorAccessMetadata(
+                access_id=AccessId(metadata.access_id.value),
+                tensor_id=SymbolId(metadata.tensor_id.value),
+                index_ids=tuple(
+                    IndexId(index_id.value) for index_id in metadata.index_ids
+                ),
+                role=metadata.role,
+            )
+            self._staged_access_snapshot = llir.ArrayAccess(
+                array=snapshot.array,
+                index=snapshot.index,
+                tensor_access=detached_metadata,
+            )
+            return lowered
         if type(expr) is Load:
             decl = self.decls[expr.tensor]
             if len(expr.indices) == 1:
@@ -2074,16 +2126,30 @@ class _TargetLowering:
         if loop.kind is _SPARSE_WINDOW and self.relayout is not None:
             # The relayout completion inserts the compatibility range guard
             # directly after exactly this declaration on the assembled
-            # function; keep a detached pre-pass snapshot so it can be
-            # re-identified fail-closed after the managed passes.
+            # function.  Snapshot its complete local skeleton so an
+            # unchanged declaration moved after a dependent statement is
+            # rejected instead of being accepted by content alone.
+            context_snapshot = LLIRRewriter(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="snapshot_relayout_window_coord",
+                )
+            ).rewrite(tuple(body))
+            if (
+                type(context_snapshot) is not tuple
+                or len(context_snapshot) != 3
+                or type(context_snapshot[0]) is not llir.Comment
+                or type(context_snapshot[1]) is not llir.VarInit
+                or type(context_snapshot[2]) is not llir.BlankLine
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "the staged relayout coordinate context could not be "
+                    "snapshotted",
+                )
             self._window_coord_snapshot = cast(
-                llir.VarInit,
-                LLIRRewriter(
-                    LLIRTraversalContext(
-                        stage="LoopIR target lowering",
-                        pass_name="snapshot_relayout_window_coord",
-                    )
-                ).rewrite(body[1]),
+                Tuple[llir.Comment, llir.VarInit, llir.BlankLine],
+                context_snapshot,
             )
         input_resolves = self._input_resolves_at(loop)
         result_resolves = self._result_resolves_at(loop)
@@ -2756,10 +2822,12 @@ class _TargetLowering:
         )
         actual_state = object.__getattribute__(actual, "__dict__")
         expected_state = object.__getattribute__(expected, "__dict__")
-        if type(actual_state) is not dict or type(expected_state) is not dict:
+        actual_names = cls._exact_state_field_names(actual_state)
+        expected_names = cls._exact_state_field_names(expected_state)
+        if actual_names is None or expected_names is None:
             return False
         if any(
-            field_name not in actual_state or field_name not in expected_state
+            field_name not in actual_names or field_name not in expected_names
             for field_name in (*field_names, "body")
         ):
             return False
@@ -2771,9 +2839,9 @@ class _TargetLowering:
             if not cls._exact_panel_state_matches(actual_value, expected_value):
                 return False
         for field_name in compatibility_fields:
-            if (field_name in actual_state) != (field_name in expected_state):
+            if (field_name in actual_names) != (field_name in expected_names):
                 return False
-            if field_name in actual_state:
+            if field_name in actual_names:
                 actual_value = actual_state[field_name]
                 expected_value = expected_state[field_name]
                 if not cls._exact_panel_state_matches(actual_value, expected_value):
@@ -2781,14 +2849,26 @@ class _TargetLowering:
         return True
 
     @staticmethod
-    def _panel_var_state_is_valid(value: object) -> bool:
+    def _exact_state_field_names(value: object) -> Optional[Tuple[str, ...]]:
+        """Return sorted exact-string keys without invoking forged equality."""
+
+        if type(value) is not dict:
+            return None
+        names = tuple(value)
+        if any(type(name) is not str for name in names):
+            return None
+        return tuple(sorted(cast(Tuple[str, ...], names)))
+
+    @classmethod
+    def _panel_var_state_is_valid(cls, value: object) -> bool:
         """Whether an exact Var owns complete, type-correct stored state."""
 
         if type(value) is not llir.Var:
             return False
         state = object.__getattribute__(value, "__dict__")
         required = ("name", "type", "is_ptr", "is_restrict", "tensor_access")
-        if type(state) is not dict or any(name not in state for name in required):
+        state_names = cls._exact_state_field_names(state)
+        if state_names is None or any(name not in state_names for name in required):
             return False
         if (
             type(state["name"]) is not str
@@ -2833,13 +2913,55 @@ class _TargetLowering:
             return actual == expected
         if isinstance(actual, Enum):
             return actual is expected
+        if type(actual) in (AccessId, SymbolId, IndexId):
+            actual_state = object.__getattribute__(actual, "__dict__")
+            expected_state = object.__getattribute__(expected, "__dict__")
+            actual_names = cls._exact_state_field_names(actual_state)
+            expected_names = cls._exact_state_field_names(expected_state)
+            return bool(
+                actual_names == ("value",)
+                and expected_names == ("value",)
+                and type(actual_state["value"]) is int
+                and type(expected_state["value"]) is int
+                and actual_state["value"] == expected_state["value"]
+            )
+        if type(actual) is llir.TensorAccessMetadata:
+            actual_state = object.__getattribute__(actual, "__dict__")
+            expected_state = object.__getattribute__(expected, "__dict__")
+            field_names = ("access_id", "tensor_id", "index_ids", "role")
+            expected_field_names = tuple(sorted(field_names))
+            if (
+                cls._exact_state_field_names(actual_state) != expected_field_names
+                or cls._exact_state_field_names(expected_state) != expected_field_names
+            ):
+                return False
+            if active is None:
+                active = set()
+            pair = (id(actual), id(expected))
+            if pair in active:
+                return False
+            active.add(pair)
+            try:
+                return all(
+                    cls._exact_panel_state_matches(
+                        actual_state[field_name],
+                        expected_state[field_name],
+                        active,
+                        depth + 1,
+                    )
+                    for field_name in field_names
+                )
+            finally:
+                active.remove(pair)
         if isinstance(actual, llir.Node):
             actual_state = object.__getattribute__(actual, "__dict__")
             expected_state = object.__getattribute__(expected, "__dict__")
+            actual_names = cls._exact_state_field_names(actual_state)
+            expected_names = cls._exact_state_field_names(expected_state)
             if (
-                type(actual_state) is not dict
-                or type(expected_state) is not dict
-                or actual_state.keys() != expected_state.keys()
+                actual_names is None
+                or expected_names is None
+                or actual_names != expected_names
             ):
                 return False
             if active is None:
@@ -2856,7 +2978,7 @@ class _TargetLowering:
                         active,
                         depth + 1,
                     )
-                    for name in actual_state
+                    for name in actual_names
                 )
             finally:
                 active.remove(pair)
@@ -3159,6 +3281,104 @@ class _TargetLowering:
 _RELAYOUT_LOST = "relayout_completion_lost"
 
 
+def _relayout_access_candidates(
+    statements: List[llir.Stmt],
+    metadata: llir.TensorAccessMetadata,
+) -> List[llir.Expr]:
+    """Collect the exact logical access before relayout redirection."""
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_relayout_operand_access",
+                )
+            )
+            self.matches: List[llir.Expr] = []
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            # Match only after the common walker has validated the complete
+            # node.  Forged exact TensorAccessMetadata instances can own
+            # hostile or missing fields; consulting those fields from
+            # enter_node would run before visit_var/visit_array_access can
+            # reject them.
+            expression: llir.Var | llir.ArrayAccess
+            if type(node) is llir.Var:
+                expression = cast(llir.Var, node)
+            elif type(node) is llir.ArrayAccess:
+                expression = cast(llir.ArrayAccess, node)
+            else:
+                return
+            node_metadata = expression.tensor_access
+            if (
+                node_metadata is not None
+                and not _TargetLowering._exact_panel_state_matches(
+                    node_metadata, node_metadata
+                )
+            ):
+                raise ValueError(
+                    "tensor access metadata does not retain exact stored "
+                    "identity state"
+                )
+            if _TargetLowering._exact_panel_state_matches(node_metadata, metadata):
+                self.matches.append(expression)
+
+    collector = _Collector()
+    collector.walk(cast(Any, statements))
+    return collector.matches
+
+
+def _direct_prefetch_targets_array(stmt: llir.Stmt, array_name: str) -> bool:
+    """Whether one validated guard directly prefetches ``array_name[...]``."""
+
+    if type(stmt) is not llir.GuardedCallStmt:
+        return False
+    call = stmt.call
+    if (
+        type(call) is not llir.FunctionCallStmt
+        or type(call.name) is not str
+        or call.name != "__builtin_prefetch"
+        or type(call.args) is not tuple
+        or not call.args
+    ):
+        return False
+    address = call.args[0]
+    if type(address) is not llir.AddressOf:
+        return False
+    operand = address.operand
+    if type(operand) is not llir.ArrayAccess:
+        return False
+    array = operand.array
+    return (
+        type(array) is llir.Var and type(array.name) is str and array.name == array_name
+    )
+
+
+def _count_direct_prefetches(statements: List[llir.Stmt], array_name: str) -> int:
+    """Count direct array prefetches recursively after common validation."""
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_residual_relayout_prefetches",
+                )
+            )
+            self.count = 0
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if isinstance(node, llir.Stmt) and _direct_prefetch_targets_array(
+                node, array_name
+            ):
+                self.count += 1
+
+    collector = _Collector()
+    collector.walk(cast(Any, statements))
+    return collector.count
+
+
 def _complete_relayout_impl(
     lowering: "_TargetLowering", function: llir.Function
 ) -> llir.Function:
@@ -3179,7 +3399,13 @@ def _complete_relayout_impl(
     assert decl is not None
     state = lowering._panel_completion
     coord_snapshot = lowering._window_coord_snapshot
-    if state is None or coord_snapshot is None or lowering.panel is None:
+    access_snapshot = lowering._staged_access_snapshot
+    if (
+        state is None
+        or coord_snapshot is None
+        or access_snapshot is None
+        or lowering.panel is None
+    ):
         _fail(
             _RELAYOUT_LOST,
             "the relayout's emitted statements were never recorded",
@@ -3237,23 +3463,51 @@ def _complete_relayout_impl(
         ),
     )
     metadata = lowering._input_metadata(decl.operand)
-    rewritten_body, rewritten = _rewrite_stmt_access_sequence(
-        cast(Any, row_loop.body),
-        decl.operand,
-        metadata.index_ids,
-        llir.TensorAccessRole.INPUT_READ,
-        packed_read,
-    )
-    row_loop.body = cast(List[llir.Stmt], rewritten_body)
-    if rewritten != 1 or _contains_tensor_access(
-        row_loop.body,
-        decl.operand,
-        metadata.index_ids,
-        llir.TensorAccessRole.INPUT_READ,
+    try:
+        access_candidates = _relayout_access_candidates(row_loop.body, metadata)
+    except (
+        LLIRTraversalError,
+        AttributeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RELAYOUT_LOST, str(error))
+    if len(access_candidates) != 1 or not lowering._exact_panel_state_matches(
+        access_candidates[0], access_snapshot
     ):
         _fail(
             _RELAYOUT_LOST,
-            "the staged operand's emitted read was not redirected exactly " "once",
+            "the staged operand's physical emitted access does not retain "
+            "exactly its detached pre-pass state",
+        )
+    try:
+        rewritten_body, rewritten = _rewrite_stmt_access_sequence(
+            cast(Any, row_loop.body),
+            decl.operand,
+            metadata.index_ids,
+            llir.TensorAccessRole.INPUT_READ,
+            packed_read,
+        )
+        row_loop.body = cast(List[llir.Stmt], rewritten_body)
+        residual = _contains_tensor_access(
+            row_loop.body,
+            decl.operand,
+            metadata.index_ids,
+            llir.TensorAccessRole.INPUT_READ,
+        )
+    except (
+        LLIRTraversalError,
+        AttributeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RELAYOUT_LOST, str(error))
+    if rewritten != 1 or residual:
+        _fail(
+            _RELAYOUT_LOST,
+            "the staged operand's emitted read was not redirected exactly once",
         )
 
     # 2. Adapt the sparse prefetch to the packed storage, passing this
@@ -3261,7 +3515,7 @@ def _complete_relayout_impl(
     # never runs.
     cursor = lowering.loops[lowering.window_position].cursors[0]
     try:
-        _redirect_sparse_prefetch(
+        redirected_prefetches = _redirect_sparse_prefetch(
             window_loop,
             operand_value_array,
             packed_name,
@@ -3273,23 +3527,54 @@ def _complete_relayout_impl(
         )
     except NotImplementedError as error:
         _fail(_RELAYOUT_LOST, str(error))
-
-    # 3. Insert the compatibility range guard directly after the window's
-    # resolved coordinate, re-identified against its detached pre-pass
-    # snapshot.
-    coord_candidates = [
-        (index, stmt)
-        for index, stmt in enumerate(window_loop.body)
-        if type(stmt) is llir.VarInit
-        and lowering._exact_panel_state_matches(stmt, coord_snapshot)
-    ]
-    if len(coord_candidates) != 1:
+    if redirected_prefetches != 1:
         _fail(
             _RELAYOUT_LOST,
-            "the window's resolved coordinate does not retain exactly its "
-            "detached pre-pass state",
+            "the staged operand requires exactly one canonical sparse "
+            "prefetch guard",
         )
-    coord_index = coord_candidates[0][0]
+    try:
+        residual_operand_prefetches = _count_direct_prefetches(
+            window_loop.body, operand_value_array
+        )
+    except (
+        LLIRTraversalError,
+        AttributeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RELAYOUT_LOST, str(error))
+    if residual_operand_prefetches:
+        _fail(
+            _RELAYOUT_LOST,
+            "the staged operand retains a noncanonical sparse prefetch guard",
+        )
+
+    # 3. Insert the compatibility range guard directly after the window's
+    # complete resolved-coordinate skeleton, re-identified against its
+    # detached pre-pass snapshot at the canonical lexical position directly
+    # after the rewritten prefetch.  Content equality alone is insufficient:
+    # moving either the declaration or its whole context below a use must fail
+    # closed.
+    coord_candidates = [
+        index + 1
+        for index in range(len(window_loop.body) - 2)
+        if all(
+            lowering._exact_panel_state_matches(actual, expected)
+            for actual, expected in zip(
+                window_loop.body[index : index + 3],
+                coord_snapshot,
+            )
+        )
+    ]
+    if coord_candidates != [2]:
+        _fail(
+            _RELAYOUT_LOST,
+            "the window's resolved coordinate does not retain its exact "
+            "contiguous pre-pass context and lexical position",
+        )
+    coord_index = coord_candidates[0]
     window_loop.body.insert(
         coord_index + 1,
         _panel_range_guard(panel_dim_name, panel_outer_name, panel_end),

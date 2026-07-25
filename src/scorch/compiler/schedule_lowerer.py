@@ -871,13 +871,16 @@ def _redirect_sparse_prefetch(
     panel_tile_var: str,
     stage_row_origin: Optional[str],
     coordinate_array_name: Optional[str] = None,
-) -> None:
+) -> int:
     """Replace the operand prefetch guard with its packed-storage twin.
 
     The legacy caller leaves ``coordinate_array_name`` unset and the
     coordinate array is discovered by the compatibility name scan; the
     typed LoopIR completion passes its own emission-record spelling so no
-    name discovery runs on that path.
+    name discovery runs on that path.  The number of removed canonical
+    guards is returned so typed callers can enforce exact cardinality;
+    the compatibility caller deliberately preserves its historical
+    best-effort behavior by ignoring the result.
     """
 
     if not isinstance(sparse_loop.init, llir.VarInit):
@@ -897,7 +900,7 @@ def _redirect_sparse_prefetch(
         else _find_coordinate_array(sparse_loop.body, position).name
     )
     end_name = sparse_loop.cond.right.name
-    removed = False
+    removed = 0
     retained: List[llir.Stmt] = []
     for stmt in sparse_loop.body:
         if _is_operand_prefetch_guard(
@@ -907,13 +910,20 @@ def _redirect_sparse_prefetch(
             end=end_name,
             coordinate_array=coordinate_name,
         ):
-            removed = True
+            removed += 1
             continue
         retained.append(stmt)
     if not removed:
-        return
+        return 0
 
-    staged_names = [position, end_name, packed_name, panel_var, panel_end]
+    staged_names = [
+        position,
+        end_name,
+        coordinate_name,
+        packed_name,
+        panel_var,
+        panel_end,
+    ]
     staged_names.append(panel_tile_var)
     if stage_row_origin is not None:
         staged_names.append(stage_row_origin)
@@ -973,6 +983,7 @@ def _redirect_sparse_prefetch(
         ),
     )
     sparse_loop.body = [replacement, *retained]
+    return removed
 
 
 def _remove_dense_result_zero(function: llir.Function, result: str) -> None:
