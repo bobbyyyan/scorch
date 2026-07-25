@@ -2092,9 +2092,12 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
         "multiline_comment",
         "continued_comment",
         "initializer_operator_subclass",
+        "unary_operator_subclass",
         "opaque_parallel_policy",
+        "unknown_parallel_policy_macro",
         "parallel_schedule_subclass",
         "malformed_loop_flag",
+        "malformed_conditional_flag",
         "malformed_top_level",
     ],
 )
@@ -2149,9 +2152,12 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
             "multiline_comment",
             "continued_comment",
             "initializer_operator_subclass",
+            "unary_operator_subclass",
             "opaque_parallel_policy",
+            "unknown_parallel_policy_macro",
             "parallel_schedule_subclass",
             "malformed_loop_flag",
+            "malformed_conditional_flag",
         ):
             final_assembly = next(
                 index
@@ -2271,6 +2277,29 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                         op=EffectfulOperator("="),
                     ),
                 )
+            elif mutation == "unary_operator_subclass":
+
+                class EffectfulUnaryOperator(str):
+                    def __format__(self, format_spec):
+                        return "- 0; C_values_torch.zero_(); int decoy2 ="
+
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(
+                        llir.Var("decoy", llir.DataType.INT),
+                        llir.UnaryOp(
+                            EffectfulUnaryOperator("-"),
+                            llir.Literal(0),
+                        ),
+                    ),
+                )
+            elif mutation == "malformed_conditional_flag":
+                conditional = next(
+                    stmt
+                    for stmt in relayout_llir_nodes(function.body)
+                    if type(stmt) is llir.IfThenElse
+                )
+                conditional.make_last_case_else = object()
             else:
                 loop = next(
                     stmt
@@ -2282,6 +2311,8 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                     loop.omp_num_threads = (
                         "scorch_nthreads((C_values_torch.zero_(), 1), 1)"
                     )
+                elif mutation == "unknown_parallel_policy_macro":
+                    loop.omp_num_threads = "scorch_nthreads(UNKNOWN_EFFECT, A0_size)"
                 elif mutation == "parallel_schedule_subclass":
 
                     class EffectfulSchedule(str):
