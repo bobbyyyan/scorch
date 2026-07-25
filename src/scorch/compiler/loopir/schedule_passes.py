@@ -33,7 +33,17 @@ schedule families:
   is the plan-mandated parallel loop, the panel origin is inserted
   strictly above it (``outermost`` or ``child_of`` an outermost affine
   origin loop), and the plan's ``PanelBound`` is materialized into the
-  panel's structural (tensor, level) extent source.
+  panel's structural (tensor, level) extent source;
+- :func:`apply_relayout` stages the packed tile-ijk contraction's dense
+  operand behind a typed
+  :class:`~scorch.compiler.loopir.nodes.RelayoutStage` region at the
+  plan-selected scope (the panel's window rows or the whole panel axis)
+  and structurally replaces the operand's verifier-proven **unique**
+  ``Load`` occurrence with a
+  :class:`~scorch.compiler.loopir.nodes.StagedRead` carrying the fresh
+  region identity — the recorded access-identity decision: no occurrence
+  identity is added to ``Load`` because the audited family admits exactly
+  one occurrence and the pass proves it before redirecting.
 
 :func:`apply_schedule_plan` drives both and returns a
 :class:`ScheduledLoopIR` artifact that retains the unscheduled base
@@ -95,6 +105,7 @@ from ..loop_plan import (
     LoopPlacement,
     LoopRef,
     LoopTile,
+    OperandRelayout,
     PanelBound,
     PlacementKind,
     _validate_loop_plan_structure,
@@ -102,21 +113,27 @@ from ..loop_plan import (
 from .build import LoopIRBuilder
 from .nodes import (
     AppendEntry,
+    BinaryExpr,
     Block,
+    CursorValue,
     DenseFor,
     DensePosition,
     Expr,
     IndexValue,
     LevelKind,
+    Load,
     LoopProgram,
     MergedSparseFor,
     PanelOuterFor,
     PositionId,
     PositionValue,
     ReduceOp,
+    RelayoutScope,
+    RelayoutStage,
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    StagedRead,
     Stmt,
     Store,
     StoreReduce,
@@ -233,8 +250,15 @@ def _decompose_body(
     *,
     leaf_types: Tuple[type, ...],
     allow_empty: bool,
+    relayout_sink: Optional[List[RelayoutStage]] = None,
 ) -> Tuple[List[_LoopNode], Stmt]:
-    """Walk one single-statement chain of loops down to its terminator."""
+    """Walk one single-statement chain of loops down to its terminator.
+
+    A :class:`RelayoutStage` wrapper is a chain element only for callers
+    that pass a ``relayout_sink`` (provenance and erasure, which must read
+    relayout-scheduled programs); every scheduling pass keeps the default
+    and therefore refuses already-relayouted chains with a stable code.
+    """
 
     loops: List[_LoopNode] = []
     while True:
@@ -249,6 +273,10 @@ def _decompose_body(
             loops.append(only)  # type: ignore[arg-type]
             body = only.body  # type: ignore[attr-defined]
             continue
+        if type(only) is RelayoutStage and relayout_sink is not None:
+            relayout_sink.append(only)
+            body = only.body
+            continue
         if type(only) in leaf_types:
             if not loops and not allow_empty:
                 _fail(
@@ -262,7 +290,11 @@ def _decompose_body(
         )
 
 
-def _decompose_chain(program: LoopProgram) -> Tuple[List[_LoopNode], _ChainEnd]:
+def _decompose_chain(
+    program: LoopProgram,
+    *,
+    relayout_sink: Optional[List[RelayoutStage]] = None,
+) -> Tuple[List[_LoopNode], _ChainEnd]:
     """Split one migrated-family program into its loop chain and terminator.
 
     The terminator is an ordinary store/append leaf, or — for programs a
@@ -273,6 +305,7 @@ def _decompose_chain(program: LoopProgram) -> Tuple[List[_LoopNode], _ChainEnd]:
         program.body,
         leaf_types=(*_LEAF_TYPES, WorkspaceRegion),
         allow_empty=False,
+        relayout_sink=relayout_sink,
     )
     return loops, end  # type: ignore[return-value]
 
@@ -296,15 +329,13 @@ def _decompose_region(
     )
 
 
-def _rebuild_program(
-    program: LoopProgram,
+def _wrap_loops(
     builder: LoopIRBuilder,
     loops: Sequence[_LoopNode],
-    leaf: _ChainEnd,
-) -> LoopProgram:
-    """Reassemble the chain with fresh loop/block nodes and shared subtrees."""
+    body: Block,
+) -> Block:
+    """Wrap fresh copies of ``loops`` (innermost last) around one body."""
 
-    body = builder.block((leaf,))
     for node in reversed(tuple(loops)):
         loop: Stmt
         if type(node) is DenseFor:
@@ -346,6 +377,18 @@ def _rebuild_program(
                 node.mode, node.cursors, node.coord_index, body
             )
         body = builder.block((loop,))
+    return body
+
+
+def _rebuild_program(
+    program: LoopProgram,
+    builder: LoopIRBuilder,
+    loops: Sequence[_LoopNode],
+    leaf: _ChainEnd,
+) -> LoopProgram:
+    """Reassemble the chain with fresh loop/block nodes and shared subtrees."""
+
+    body = _wrap_loops(builder, loops, builder.block((leaf,)))
     rebuilt = builder.program(
         program.dimensions,
         program.tensors,
@@ -1125,6 +1168,329 @@ def apply_panel_tile(
     return _rebuild_program(program, builder, new_chain, leaf)
 
 
+def _collect_operand_loads(root: Stmt, operand: object) -> List[Load]:
+    """Every ``Load`` of one tensor anywhere in a verified subtree."""
+
+    found: List[Load] = []
+    pending: List[object] = [root]
+    while pending:
+        node = pending.pop()
+        if type(node) is Load and node.tensor == operand:
+            found.append(node)
+        for attribute in vars(node).values():
+            if isinstance(attribute, (Expr, Stmt, SparseCursorDecl)):
+                pending.append(attribute)
+            elif type(attribute) is tuple:
+                pending.extend(
+                    child
+                    for child in attribute
+                    if isinstance(child, (Expr, Stmt, SparseCursorDecl))
+                )
+    return found
+
+
+def _replace_expr(
+    expr: Expr,
+    target: Expr,
+    replacement: Expr,
+    builder: LoopIRBuilder,
+) -> Expr:
+    """Rebuild the path to one child expression, sharing unchanged subtrees."""
+
+    if expr is target:
+        return replacement
+    if type(expr) is BinaryExpr:
+        lhs = _replace_expr(expr.lhs, target, replacement, builder)
+        rhs = _replace_expr(expr.rhs, target, replacement, builder)
+        if lhs is expr.lhs and rhs is expr.rhs:
+            return expr
+        return builder.binary(expr.op, lhs, rhs)
+    if type(expr) is Load:
+        indices = tuple(
+            _replace_expr(index, target, replacement, builder) for index in expr.indices
+        )
+        if all(new is old for new, old in zip(indices, expr.indices)):
+            return expr
+        return builder.load(expr.tensor, indices)
+    if type(expr) is StagedRead:
+        indices = tuple(
+            _replace_expr(index, target, replacement, builder) for index in expr.indices
+        )
+        if all(new is old for new, old in zip(indices, expr.indices)):
+            return expr
+        return builder.staged_read(expr.relayout, indices)
+    if type(expr) is CursorValue and expr.default is not None:
+        default = _replace_expr(expr.default, target, replacement, builder)
+        if default is expr.default:
+            return expr
+        return builder.cursor_value(expr.cursor, default)
+    if type(expr) is DensePosition:
+        parent = _replace_expr(expr.parent, target, replacement, builder)
+        coord = _replace_expr(expr.coord, target, replacement, builder)
+        if parent is expr.parent and coord is expr.coord:
+            return expr
+        return builder.dense_position(expr.tensor, expr.level, parent, coord)
+    if type(expr) is WorkspaceRead:
+        coord = _replace_expr(expr.coord, target, replacement, builder)
+        if coord is expr.coord:
+            return expr
+        return builder.workspace_read(expr.workspace, coord)
+    return expr
+
+
+def apply_relayout(program: LoopProgram, relayout: OperandRelayout) -> LoopProgram:
+    """Stage one dense operand's pack strip behind a typed relayout region.
+
+    Mirrors the audited legacy packed tile-ijk family exactly, on
+    identities only.  The scheduled chain must be the five-loop shape the
+    plan gate admits — the outermost affine pack origin, the panel origin
+    directly below it, the parallel dense row loop, the panel's window,
+    and the pack point loop — with a direct-accumulation dense-result
+    leaf.  Every relayout fact is consumed exactly once: ``pack_loop`` /
+    ``panel_loop`` select the two schedule pairs, ``scope_loop`` selects
+    the region scope, ``row_loop`` is validated against the window's
+    dense-parent row coordinate (the fact has no other legal value),
+    ``strip_width`` against the pack split's width, the two operand
+    levels against the operand declaration's dimension structure, and
+    ``access_indices`` select the redirected read.
+
+    The redirected read is the operand's **unique** ``Load`` occurrence —
+    the pass proves uniqueness (``relayout_target_missing`` /
+    ``relayout_ambiguous_access``) and replaces it structurally with a
+    :class:`StagedRead` carrying the fresh region identity, so no
+    occurrence identity, rendered name, or dynamic tag is ever needed;
+    residual direct reads are re-checked after the rebuild.
+    """
+
+    verify_program(program)
+    if type(relayout) is not OperandRelayout:
+        raise TypeError("apply_relayout expects an OperandRelayout")
+    try:
+        _validate_loop_plan_structure(LoopPlan(loop_order=(), relayout=relayout))
+    except (VerificationError, AttributeError, TypeError, ValueError) as error:
+        _fail("invalid_schedule_relayout", str(error))
+    for what, reference in (
+        ("pack_loop", relayout.pack_loop),
+        ("panel_loop", relayout.panel_loop),
+        ("scope_loop", relayout.scope_loop),
+        ("row_loop", relayout.row_loop),
+    ):
+        if type(reference) is not LoopRef or reference.part is not LoopPart.LOGICAL:
+            _fail(
+                "invalid_schedule_relayout",
+                f"the relayout's {what} must name one logical loop",
+            )
+    if relayout.scope_loop not in (relayout.panel_loop, relayout.pack_loop):
+        _fail(
+            "invalid_schedule_relayout",
+            "the relayout scope must be the panel loop or the pack loop",
+        )
+
+    loops, leaf = _decompose_chain(program)
+    if type(leaf) is not StoreReduce:
+        _fail(
+            "invalid_schedule_relayout",
+            "packed relayout requires a direct dense-result reduction leaf",
+        )
+
+    def _single_position(description: str, positions: List[int]) -> int:
+        if len(positions) != 1:
+            _fail(
+                "invalid_schedule_relayout",
+                f"packed relayout requires exactly one {description} in the "
+                "scheduled chain",
+            )
+        return positions[0]
+
+    pack_position = _single_position(
+        "pack origin loop",
+        [
+            position
+            for position, node in enumerate(loops)
+            if type(node) is TileOuterFor and node.index == relayout.pack_loop.index_id
+        ],
+    )
+    panel_position = _single_position(
+        "panel origin loop",
+        [
+            position
+            for position, node in enumerate(loops)
+            if type(node) is PanelOuterFor
+            and node.index == relayout.panel_loop.index_id
+        ],
+    )
+    row_position = _single_position(
+        "parallel row loop",
+        [
+            position
+            for position, node in enumerate(loops)
+            if type(node) is DenseFor and node.index == relayout.row_loop.index_id
+        ],
+    )
+    window_position = _single_position(
+        "panel window loop",
+        [
+            position
+            for position, node in enumerate(loops)
+            if type(node) is SparseWindowFor
+            and node.coord_index == relayout.panel_loop.index_id
+        ],
+    )
+    point_position = _single_position(
+        "pack point loop",
+        [
+            position
+            for position, node in enumerate(loops)
+            if type(node) is TileInnerFor and node.index == relayout.pack_loop.index_id
+        ],
+    )
+    if (
+        len(loops) != 5
+        or (pack_position, panel_position, row_position) != (0, 1, 2)
+        or (window_position, point_position) != (3, 4)
+    ):
+        _fail(
+            "invalid_schedule_relayout",
+            "packed relayout requires exactly the audited chain: pack "
+            "origin, panel origin, parallel row, panel window, pack point",
+        )
+    pack_origin = loops[0]
+    panel_origin = loops[1]
+    window = loops[3]
+    pack_point = loops[4]
+    assert type(pack_origin) is TileOuterFor
+    assert type(panel_origin) is PanelOuterFor
+    assert type(window) is SparseWindowFor
+    assert type(pack_point) is TileInnerFor
+    if pack_origin.tile != pack_point.tile or panel_origin.tile != window.tile:
+        _fail(
+            "invalid_schedule_relayout",
+            "the relayout's pack and panel loops must be schedule pairs of "
+            "the current chain",
+        )
+    window_parent = window.cursor.parent
+    if (
+        type(window_parent) is not DensePosition
+        or type(window_parent.coord) is not IndexValue
+        or window_parent.coord.index != relayout.row_loop.index_id
+    ):
+        _fail(
+            "invalid_schedule_relayout",
+            "the relayout's row loop must be the panel window's dense-"
+            "parent row loop",
+        )
+    if pack_origin.width != relayout.strip_width:
+        _fail(
+            "invalid_schedule_relayout",
+            "the relayout strip width must match the pack split's width",
+        )
+
+    decls = {decl.symbol: decl for decl in program.tensors}
+    operand_decl = decls.get(relayout.operand_id)
+    if (
+        operand_decl is None
+        or relayout.operand_id not in program.inputs
+        or len(operand_decl.levels) != 2
+        or any(level.kind is not LevelKind.DENSE for level in operand_decl.levels)
+    ):
+        _fail(
+            "invalid_schedule_relayout",
+            "the staged operand must be a declared rank-2 all-dense input",
+        )
+
+    def _level_storing(dimension: object, description: str) -> int:
+        positions = [
+            level_position
+            for level_position, level in enumerate(operand_decl.levels)
+            if operand_decl.dimensions[level.mode] == dimension
+        ]
+        if len(positions) != 1:
+            _fail(
+                "invalid_schedule_relayout",
+                f"the staged operand must store the {description} dimension "
+                "on exactly one level",
+            )
+        return positions[0]
+
+    if _level_storing(panel_origin.dimension, "panel") != 0 or (
+        relayout.operand_panel_level != 0
+    ):
+        _fail(
+            "invalid_schedule_relayout",
+            "the staged operand's first storage level must store the "
+            "panel dimension",
+        )
+    if _level_storing(pack_origin.dimension, "pack") != 1 or (
+        relayout.operand_pack_level != 1
+    ):
+        _fail(
+            "invalid_schedule_relayout",
+            "the staged operand's contiguous last storage level must store "
+            "the pack dimension",
+        )
+
+    def _load_index_ids(load: Load) -> Optional[Tuple[IndexId, ...]]:
+        if type(load.indices) is not tuple or any(
+            type(index) is not IndexValue for index in load.indices
+        ):
+            return None
+        return tuple(index.index for index in load.indices if type(index) is IndexValue)
+
+    loads = _collect_operand_loads(program.body, relayout.operand_id)
+    matching = [
+        load for load in loads if _load_index_ids(load) == relayout.access_indices
+    ]
+    if not matching:
+        _fail(
+            "relayout_target_missing",
+            "the relayout's access indices select no direct read of the "
+            "staged operand",
+        )
+    if len(matching) > 1 or len(loads) > 1:
+        _fail(
+            "relayout_ambiguous_access",
+            "the staged operand must have exactly one read occurrence; "
+            "redirection would be ambiguous",
+        )
+    target_load = matching[0]
+
+    scope = (
+        RelayoutScope.PANEL
+        if relayout.scope_loop == relayout.panel_loop
+        else RelayoutScope.PACK_AXIS
+    )
+    builder = LoopIRBuilder.resuming(program)
+    relayout_id = builder.new_relayout_id()
+    staged = builder.staged_read(relayout_id, target_load.indices)
+    new_value = _replace_expr(leaf.value, target_load, staged, builder)
+    new_leaf = builder.store_reduce(leaf.tensor, leaf.indices, leaf.op, new_value)
+    region_decl = builder.relayout_decl(
+        relayout_id,
+        relayout.operand_id,
+        panel_origin.tile,
+        pack_origin.tile,
+        scope,
+    )
+    stage_depth = 2 if scope is RelayoutScope.PANEL else 1
+    inner = _wrap_loops(builder, loops[stage_depth:], builder.block((new_leaf,)))
+    stage = builder.relayout_stage(region_decl, inner)
+    body = _wrap_loops(builder, loops[:stage_depth], builder.block((stage,)))
+    rebuilt = builder.program(
+        program.dimensions,
+        program.tensors,
+        program.inputs,
+        program.outputs,
+        body,
+    )
+    if _collect_operand_loads(rebuilt.body, relayout.operand_id):
+        _fail(
+            "relayout_ambiguous_access",
+            "redirection left a residual direct read of the staged operand",
+        )
+    verify_program(rebuilt)
+    return rebuilt
+
+
 def _check_plan_families(plan: LoopPlan) -> None:
     """Fail closed on every plan fact outside the migrated schedule families.
 
@@ -1142,17 +1508,69 @@ def _check_plan_families(plan: LoopPlan) -> None:
             f"{plan.provenance!r} scheduling stays on the legacy path; only "
             "explicit schedules are migrated",
         )
-    if plan.relayout is not None:
-        _fail(
-            "unsupported_schedule_relayout",
-            "operand relayout/staging is not a migrated schedule family",
-        )
     if plan.result_tile is not None:
         _fail(
             "unsupported_schedule_result_tile",
             "heap result tiling is not a migrated schedule family",
         )
     panel_tiles = [tile for tile in plan.tiles if tile.kind == "panel"]
+    if plan.relayout is not None:
+        relayout = plan.relayout
+        affine_tiles = [tile for tile in plan.tiles if tile.kind == "affine"]
+        if len(plan.tiles) != 2 or len(affine_tiles) != 1 or len(panel_tiles) != 1:
+            _fail(
+                "invalid_schedule_relayout",
+                "packed relayout requires exactly one affine pack tile and "
+                "one sparse panel tile",
+            )
+        pack_tile = affine_tiles[0]
+        panel_tile = panel_tiles[0]
+        for what, reference in (
+            ("pack_loop", relayout.pack_loop),
+            ("panel_loop", relayout.panel_loop),
+            ("scope_loop", relayout.scope_loop),
+            ("row_loop", relayout.row_loop),
+        ):
+            if reference.part is not LoopPart.LOGICAL:
+                _fail(
+                    "invalid_schedule_relayout",
+                    f"the relayout's {what} must name one logical loop",
+                )
+        if (
+            pack_tile.loop != relayout.pack_loop
+            or pack_tile.width != relayout.strip_width
+            or pack_tile.placement.kind is not PlacementKind.OUTERMOST
+        ):
+            _fail(
+                "invalid_schedule_relayout",
+                "the relayout's pack tile must be the outermost affine "
+                "split of its pack loop at the strip width",
+            )
+        if panel_tile.loop != relayout.panel_loop:
+            _fail(
+                "invalid_schedule_relayout",
+                "the relayout's panel tile must window its panel loop",
+            )
+        expected_parent = LoopRef(relayout.pack_loop.index_id, LoopPart.OUTER)
+        if (
+            panel_tile.placement.kind is not PlacementKind.CHILD_OF
+            or panel_tile.placement.parent != expected_parent
+        ):
+            _fail(
+                "invalid_schedule_relayout",
+                "the relayout's panel must be placed directly below the "
+                "pack origin loop",
+            )
+        if plan.parallel_loop != relayout.row_loop:
+            _fail(
+                "invalid_schedule_relayout",
+                "the relayout's row loop must be the plan's parallel loop",
+            )
+        if relayout.scope_loop not in (relayout.panel_loop, relayout.pack_loop):
+            _fail(
+                "invalid_schedule_relayout",
+                "the relayout scope must be the panel loop or the pack loop",
+            )
     if len(panel_tiles) > 1:
         _fail(
             "invalid_schedule_panel",
@@ -1322,10 +1740,14 @@ def _chain_provenance(
 
     For a workspace-region program the documented order is: the prefix
     loops above the region, then the producer chain, then the consumer
-    chain — the region's execution order.
+    chain — the region's execution order.  A relayout staging region is
+    transparent here: it binds no loop, so provenance lists exactly the
+    chain loops and the region's placement is covered by the carrier's
+    deterministic replay equality.
     """
 
-    loops, leaf = _decompose_chain(program)
+    relayout_stages: List[RelayoutStage] = []
+    loops, leaf = _decompose_chain(program, relayout_sink=relayout_stages)
     ordered: List[_LoopNode] = list(loops)
     if type(leaf) is WorkspaceRegion:
         producer_loops, _, consumer_loops, _ = _decompose_region(leaf)
@@ -1341,9 +1763,11 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
     any panel tile to be last, so the panel windows the fully affine-tiled
     chain exactly as the legacy lowering sequences it.  Each plan fact is
     consumed exactly once: the order by the reorder pass, each tile by its
-    pass, the ``PanelBound`` by materialization into the panel node, and
-    the panel-mandated ``parallel_loop`` by exact validation against the
-    window's dense-parent row loop (the fact has no other legal value).
+    pass, the ``PanelBound`` by materialization into the panel node, the
+    panel-mandated ``parallel_loop`` by exact validation against the
+    window's dense-parent row loop (the fact has no other legal value),
+    and the relayout fact — last, on the fully scheduled chain, exactly
+    where the legacy lowering completes it — by :func:`apply_relayout`.
     """
 
     checked = _validate_plan_for_pass(plan)
@@ -1360,6 +1784,8 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
             scheduled = apply_stack_tile(scheduled, tile)
         else:
             scheduled = apply_affine_tile(scheduled, tile)
+    if checked.relayout is not None:
+        scheduled = apply_relayout(scheduled, checked.relayout)
     return scheduled
 
 
@@ -1440,14 +1866,20 @@ def _verify_scheduled_loopir(
     checked_plan = _validate_plan_for_pass(artifact.plan)
     verify_program(base_program)
     verify_program(program)
-    base_loops, base_leaf = _decompose_chain(base_program)
-    if type(base_leaf) is WorkspaceRegion or any(
-        type(loop) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for loop in base_loops
+    base_relayouts: List[RelayoutStage] = []
+    base_loops, base_leaf = _decompose_chain(base_program, relayout_sink=base_relayouts)
+    if (
+        base_relayouts
+        or type(base_leaf) is WorkspaceRegion
+        or any(
+            type(loop) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES)
+            for loop in base_loops
+        )
     ):
         _fail(
             "scheduled_base_not_unscheduled",
             "ScheduledLoopIR.base_program must not already contain split "
-            "loops, panels, or workspace regions",
+            "loops, panels, workspace regions, or staging regions",
         )
 
     replayed = (
@@ -1519,15 +1951,66 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
     :func:`apply_stack_tile` produces; other verified region consumers fail
     closed (``unsupported_schedule_shape``).
 
+    A relayout staging region erases to the direct operand read: the
+    region wrapper is dropped and every :class:`StagedRead` of it becomes
+    the plain :class:`Load` it redirected (same operand, same index
+    expressions) — staging copies values exactly, so the erasure is an
+    identity on the computed result.
+
     This is the semantics-preserving erasure the oracle differentials use
     to prove scheduled programs visit every iteration point exactly once.
     A program with no splits is returned unchanged.
     """
 
     verify_program(program)
-    loops, leaf = _decompose_chain(program)
+    relayout_stages: List[RelayoutStage] = []
+    loops, leaf = _decompose_chain(program, relayout_sink=relayout_stages)
+    if (
+        not relayout_stages
+        and type(leaf) is not WorkspaceRegion
+        and not any(
+            type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for node in loops
+        )
+    ):
+        return program
+    builder = LoopIRBuilder.resuming(program)
     region_loops: List[_LoopNode] = []
     erased_leaf: _ChainEnd = leaf
+    staged_operands = {
+        stage.decl.relayout: stage.decl.operand for stage in relayout_stages
+    }
+    if relayout_stages and type(leaf) in _LEAF_TYPES:
+
+        def _erase_staged(expr: Expr) -> Expr:
+            if type(expr) is StagedRead and expr.relayout in staged_operands:
+                return builder.load(staged_operands[expr.relayout], expr.indices)
+            if type(expr) is BinaryExpr:
+                lhs = _erase_staged(expr.lhs)
+                rhs = _erase_staged(expr.rhs)
+                if lhs is expr.lhs and rhs is expr.rhs:
+                    return expr
+                return builder.binary(expr.op, lhs, rhs)
+            if type(expr) is CursorValue and expr.default is not None:
+                default = _erase_staged(expr.default)
+                if default is expr.default:
+                    return expr
+                return builder.cursor_value(expr.cursor, default)
+            return expr
+
+        erased_value = _erase_staged(leaf.value)  # type: ignore[union-attr]
+        if erased_value is not leaf.value:  # type: ignore[union-attr]
+            if type(leaf) is StoreReduce:
+                leaf = builder.store_reduce(
+                    leaf.tensor, leaf.indices, leaf.op, erased_value
+                )
+            elif type(leaf) is Store:
+                leaf = builder.store(leaf.tensor, leaf.indices, erased_value)
+            else:
+                _fail(
+                    "unsupported_schedule_shape",
+                    "staged-read erasure is defined for dense store leaves",
+                )
+            erased_leaf = leaf
     if type(leaf) is WorkspaceRegion:
         producer_loops, producer_leaf, consumer_loops, consumer_leaf = (
             _decompose_region(leaf)
@@ -1546,7 +2029,6 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
                 "workspace-region erasure is defined for the exact "
                 "stack-tile copy-out form only",
             )
-        builder = LoopIRBuilder.resuming(program)
         region_loops = producer_loops
         erased_leaf = builder.store_reduce(
             consumer_leaf.tensor,
@@ -1554,12 +2036,6 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
             consumer_leaf.op,
             producer_leaf.value,
         )
-    elif not any(
-        type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for node in loops
-    ):
-        return program
-    else:
-        builder = LoopIRBuilder.resuming(program)
     erased: List[_LoopNode] = []
     for node in (*loops, *region_loops):
         if type(node) in (TileOuterFor, PanelOuterFor):

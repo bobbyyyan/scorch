@@ -763,8 +763,11 @@ def test_apply_schedule_plan_rejects_unmigrated_families():
             panel_bounds=(PanelBound(LoopRef(j.index_id), a_symbol, 1),),
         ),
     )
+    # Relayout is a migrated family now: a relayout fact without its pack
+    # and panel tiles to consume it is a malformed relayout plan, not an
+    # unmigrated one.
     expect_code(
-        "unsupported_schedule_relayout",
+        "invalid_schedule_relayout",
         apply_schedule_plan,
         lowering.program,
         LoopPlan(
@@ -2296,3 +2299,425 @@ def test_panel_scheduled_carrier_rejects_forged_panel_state():
         loops=artifact.loops,
     )
     expect_code("scheduled_program_mismatch", verify_scheduled_loopir, mismatched)
+
+
+# -- the staged-operand relayout pass -----------------------------------------
+
+
+def child_of_pack_placement(index_id):
+    return LoopPlacement(
+        PlacementKind.CHILD_OF, parent=LoopRef(index_id, LoopPart.OUTER)
+    )
+
+
+def spmm_relayout_parts(scope="panel", width=3, strip=4):
+    from scorch.compiler.loop_plan import OperandRelayout
+
+    cin, (i, j, k) = build_spmm_ijk()
+    lowering = lower(cin)
+    b_symbol = lowering.input_symbols[1]
+    pack = affine_tile(k.index_id, strip)
+    panel = panel_tile(j.index_id, width, placement=child_of_pack_placement(k.index_id))
+    bound = PanelBound(LoopRef(j.index_id), b_symbol, 0)
+    scope_id = j.index_id if scope == "panel" else k.index_id
+    relayout = OperandRelayout(
+        operand_id=b_symbol,
+        pack_loop=LoopRef(k.index_id),
+        panel_loop=LoopRef(j.index_id),
+        scope_loop=LoopRef(scope_id),
+        row_loop=LoopRef(i.index_id),
+        strip_width=strip,
+        access_indices=(j.index_id, k.index_id),
+        operand_panel_level=0,
+        operand_pack_level=1,
+    )
+    return lowering, (i, j, k), pack, panel, bound, relayout
+
+
+def relayout_plan(lowering, pack, panel, bound, relayout, parallel):
+    return LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(pack, panel),
+        panel_bounds=(bound,),
+        relayout=relayout,
+        parallel_loop=parallel,
+        provenance="explicit",
+        tag="relayout",
+    )
+
+
+def scheduled_relayout(scope="panel", width=3, strip=4):
+    lowering, (i, j, k), pack, panel, bound, relayout = spmm_relayout_parts(
+        scope, width, strip
+    )
+    plan = relayout_plan(lowering, pack, panel, bound, relayout, LoopRef(i.index_id))
+    artifact = apply_schedule_plan(lowering.program, plan)
+    return lowering, (i, j, k), plan, artifact
+
+
+def relayout_chain_parts(program, scope):
+    from scorch.compiler.loopir.nodes import (
+        PanelOuterFor,
+        RelayoutStage,
+        SparseWindowFor,
+    )
+
+    pack = program.body.statements[0]
+    assert type(pack) is TileOuterFor
+    if scope == "panel":
+        panel = pack.body.statements[0]
+        assert type(panel) is PanelOuterFor
+        stage = panel.body.statements[0]
+        row = stage.body.statements[0]
+    else:
+        stage = pack.body.statements[0]
+        panel = stage.body.statements[0]
+        assert type(panel) is PanelOuterFor
+        row = panel.body.statements[0]
+    assert type(stage) is RelayoutStage
+    assert type(row) is DenseFor
+    window = row.body.statements[0]
+    assert type(window) is SparseWindowFor
+    point = window.body.statements[0]
+    assert type(point) is TileInnerFor
+    leaf = point.body.statements[0]
+    return pack, panel, stage, row, window, point, leaf
+
+
+@pytest.mark.parametrize("scope", ["panel", "pack"])
+def test_relayout_plan_applies_through_apply_schedule_plan(scope):
+    from scorch.compiler.loopir.nodes import RelayoutScope, StagedRead
+
+    lowering, (i, j, k), plan, artifact = scheduled_relayout(scope)
+    verify_scheduled_loopir(artifact)
+    pack, panel, stage, row, window, point, leaf = relayout_chain_parts(
+        artifact.program, scope
+    )
+    expected_scope = (
+        RelayoutScope.PANEL if scope == "panel" else RelayoutScope.PACK_AXIS
+    )
+    assert stage.decl.scope is expected_scope
+    assert stage.decl.operand == plan.relayout.operand_id
+    assert stage.decl.panel == panel.tile == window.tile
+    assert stage.decl.pack == pack.tile == point.tile
+    staged = leaf.value.rhs
+    assert type(staged) is StagedRead
+    assert staged.relayout == stage.decl.relayout
+    assert tuple(index.index for index in staged.indices) == (
+        j.index_id,
+        k.index_id,
+    )
+    # The staging region binds no loop: provenance lists exactly the five
+    # chain loops in execution order.
+    assert [(prov.index, prov.part) for prov in artifact.loops] == [
+        (k.index_id, LoopPart.OUTER),
+        (j.index_id, LoopPart.OUTER),
+        (i.index_id, LoopPart.LOGICAL),
+        (j.index_id, LoopPart.INNER),
+        (k.index_id, LoopPart.INNER),
+    ]
+
+
+def test_apply_relayout_is_pure_and_deterministic():
+    from scorch.compiler.loopir.build import LoopIRBuilder
+    from scorch.compiler.loopir.schedule_passes import apply_relayout
+
+    lowering, (i, j, k), pack, panel, bound, relayout = spmm_relayout_parts()
+    plan = relayout_plan(lowering, pack, panel, bound, relayout, LoopRef(i.index_id))
+    prescheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(
+            loop_order=plan.loop_order,
+            tiles=plan.tiles,
+            panel_bounds=plan.panel_bounds,
+            parallel_loop=plan.parallel_loop,
+            provenance="explicit",
+        ),
+    ).program
+    before = canonical_program_dump(prescheduled)
+    first = apply_relayout(prescheduled, relayout)
+    second = apply_relayout(prescheduled, relayout)
+    assert canonical_program_dump(prescheduled) == before
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+    # The fresh region identity continues deterministically.
+    stage = relayout_chain_parts(first, "panel")[2]
+    assert LoopIRBuilder.resuming(first).new_relayout_id().value == (
+        stage.decl.relayout.value + 1
+    )
+
+
+def test_apply_relayout_requires_the_exact_family_shape():
+    from scorch.compiler.loopir.schedule_passes import apply_relayout
+    from dataclasses import replace as dc_replace
+
+    lowering, (i, j, k), pack, panel, bound, relayout = spmm_relayout_parts()
+    prescheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(pack, panel),
+            panel_bounds=(bound,),
+            parallel_loop=LoopRef(i.index_id),
+            provenance="explicit",
+        ),
+    ).program
+
+    with pytest.raises(TypeError):
+        apply_relayout(prescheduled, object())
+
+    # An unscheduled chain has no pack origin to stage against.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_relayout,
+        lowering.program,
+        relayout,
+    )
+    # The strip width must match the pack split.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_relayout,
+        prescheduled,
+        dc_replace(relayout, strip_width=8),
+    )
+    # The row loop must be the window's dense parent.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_relayout,
+        prescheduled,
+        dc_replace(relayout, row_loop=LoopRef(k.index_id)),
+    )
+    # The scope must be the panel or pack loop.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_relayout,
+        prescheduled,
+        dc_replace(relayout, scope_loop=LoopRef(i.index_id)),
+    )
+    # Derived loop parts are not logical loops.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_relayout,
+        prescheduled,
+        dc_replace(relayout, pack_loop=LoopRef(k.index_id, LoopPart.OUTER)),
+    )
+    # The operand levels are validated against the declaration.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_relayout,
+        prescheduled,
+        dc_replace(relayout, operand_pack_level=0),
+    )
+    # The staged operand must be the dense rank-2 input.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_relayout,
+        prescheduled,
+        dc_replace(relayout, operand_id=lowering.input_symbols[0]),
+    )
+    # A malformed fact fails structurally before any chain work.
+    hostile = dc_replace(relayout, access_indices=(j.index_id, object()))
+    expect_code("invalid_schedule_relayout", apply_relayout, prescheduled, hostile)
+
+
+def test_apply_relayout_redirection_is_unique_and_complete():
+    from scorch.compiler.loopir.schedule_passes import apply_relayout
+    from scorch.compiler.loopir.nodes import Load
+    from dataclasses import replace as dc_replace
+
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    lowering, (i, j, k), pack, panel, bound, relayout = spmm_relayout_parts()
+    prescheduled = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(pack, panel),
+            panel_bounds=(bound,),
+            parallel_loop=LoopRef(i.index_id),
+            provenance="explicit",
+        ),
+    ).program
+
+    # Access indices that select nothing leave no read to redirect.
+    expect_code(
+        "relayout_target_missing",
+        apply_relayout,
+        prescheduled,
+        dc_replace(relayout, access_indices=(k.index_id, j.index_id)),
+    )
+
+    # A second read occurrence of the operand makes redirection ambiguous.
+    from scorch.compiler.loopir.build import LoopIRBuilder
+
+    point = prescheduled.body.statements[0].body.statements[0]
+    while not isinstance(point, TileInnerFor):
+        point = point.body.statements[0]
+    leaf = point.body.statements[0]
+    b_load = leaf.value.rhs
+    assert type(b_load) is Load
+    builder = LoopIRBuilder.resuming(prescheduled)
+    second_load = builder.load(
+        b_load.tensor,
+        tuple(builder.index_value(index.index) for index in b_load.indices),
+    )
+    forge(
+        leaf,
+        value=builder.binary(
+            LoopIRBinaryOp.MUL,
+            leaf.value,
+            second_load,
+        ),
+    )
+    expect_code("relayout_ambiguous_access", apply_relayout, prescheduled, relayout)
+
+
+@pytest.mark.parametrize("scope", ["panel", "pack"])
+def test_relayout_erases_to_the_reordered_base(scope):
+    lowering, _ids, _plan, artifact = scheduled_relayout(scope)
+    erased = erase_schedule(artifact.program)
+    assert canonical_program_dump(erased) == canonical_program_dump(lowering.program)
+
+
+def test_relayout_oracle_differential_is_exact():
+    import random
+
+    from scorch.compiler.loopir.levels import CsrMatrix
+
+    rng = random.Random(20260724)
+    for scope in ("panel", "pack"):
+        for width, strip in ((1, 1), (2, 3), (3, 4), (5, 7)):
+            lowering, _ids, _plan, artifact = scheduled_relayout(
+                scope, width=width, strip=strip
+            )
+            rows = rng.randrange(1, 6)
+            inner = rng.randrange(1, 7)
+            cols = rng.randrange(1, 8)
+            a_dense = [
+                [
+                    float(rng.randrange(-3, 4)) if rng.random() < 0.5 else 0.0
+                    for _ in range(inner)
+                ]
+                for _ in range(rows)
+            ]
+            b_dense = [
+                [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(inner)
+            ]
+            bindings = {
+                lowering.input_symbols[0]: CsrMatrix.from_dense(a_dense),
+                lowering.input_symbols[1]: b_dense,
+            }
+            shapes = {lowering.result_symbol: (rows, cols)}
+            scheduled_result = run_program(artifact.program, bindings, shapes)
+            base_result = run_program(lowering.program, bindings, shapes)
+            assert scheduled_result == base_result
+
+
+def test_scheduling_passes_refuse_relayouted_chains():
+    lowering, (i, j, k), _plan, artifact = scheduled_relayout("panel")
+    expect_code(
+        "unsupported_schedule_shape",
+        reorder_loops,
+        artifact.program,
+        (i.index_id, j.index_id, k.index_id),
+    )
+    expect_code(
+        "unsupported_schedule_shape",
+        apply_affine_tile,
+        artifact.program,
+        affine_tile(i.index_id, 2),
+    )
+    expect_code(
+        "unsupported_schedule_shape",
+        apply_stack_tile,
+        artifact.program,
+        affine_tile(i.index_id, 2, accum="stack"),
+    )
+
+
+def test_relayouted_base_program_is_not_unscheduled():
+    lowering, _ids, plan, artifact = scheduled_relayout("panel")
+    forged = ScheduledLoopIR(
+        base_program=artifact.program,
+        plan=artifact.plan,
+        program=artifact.program,
+        loops=artifact.loops,
+    )
+    expect_code("scheduled_base_not_unscheduled", verify_scheduled_loopir, forged)
+
+
+def test_relayout_plan_gate_requires_the_exact_family():
+    from dataclasses import replace as dc_replace
+
+    lowering, (i, j, k), pack, panel, bound, relayout = spmm_relayout_parts()
+    parallel = LoopRef(i.index_id)
+
+    # Both tiles are required to consume the fact.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_schedule_plan,
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(pack,),
+            relayout=relayout,
+            parallel_loop=parallel,
+            provenance="explicit",
+        ),
+    )
+    # The pack tile must sit at the strip width.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_schedule_plan,
+        lowering.program,
+        relayout_plan(
+            lowering,
+            affine_tile(k.index_id, 8),
+            panel,
+            bound,
+            relayout,
+            parallel,
+        ),
+    )
+    # The panel must be placed directly below the pack origin.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_schedule_plan,
+        lowering.program,
+        relayout_plan(
+            lowering,
+            pack,
+            panel_tile(j.index_id, 3),
+            bound,
+            relayout,
+            parallel,
+        ),
+    )
+    # The parallel loop must be the relayout's row loop.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_schedule_plan,
+        lowering.program,
+        relayout_plan(
+            lowering,
+            pack,
+            panel,
+            bound,
+            dc_replace(relayout, row_loop=LoopRef(j.index_id)),
+            parallel,
+        ),
+    )
+    # Heap accumulation on the pack tile stays the unmigrated heap family.
+    expect_code(
+        "unsupported_schedule_accumulation",
+        apply_schedule_plan,
+        lowering.program,
+        relayout_plan(
+            lowering,
+            affine_tile(k.index_id, 4, accum="heap"),
+            panel,
+            bound,
+            relayout,
+            parallel,
+        ),
+    )
