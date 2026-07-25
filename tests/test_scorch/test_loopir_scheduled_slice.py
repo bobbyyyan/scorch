@@ -1900,17 +1900,400 @@ def test_relayout_randomized_execution_matches_torch_and_oracle():
         )
 
 
-def test_relayout_heap_composition_stays_fail_closed():
-    """The heap-accumulation relayout composition remains the unmigrated
-    heap result-tile family."""
+def test_relayout_heap_composition_is_migrated():
+    """The heap-accumulation relayout composition now routes through the
+    typed heap family end to end (the boundary the earlier fail-closed
+    lock guarded has moved; the heap parity grid below owns its bytes)."""
 
-    with pytest.raises(SchedulePassError) as error:
-        compile_cin_via_loopir(
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(
+            relayout_schedule("k", "r-heap", accum="heap")
+        ),
+    )
+    scheduled = kernel.schedule
+    assert scheduled is not None
+    assert scheduled.plan.result_tile is not None
+    assert scheduled.plan.relayout is not None
+    assert "tiled_C" in kernel.cpp_source
+    assert "packed_B" in kernel.cpp_source
+
+
+# -- the heap result-tile slice -----------------------------------------------
+
+
+def heap_schedule(tag, strip=3):
+    return Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec("k", strip, placement="outermost", accum="heap", unroll=False),
+        ),
+        tag=tag,
+        parallel_loop="i",
+    )
+
+
+def heap_relayout_schedule(scope, tag, width=3, strip=4):
+    from scorch.compiler.scheduler import RelayoutSpec
+
+    return Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec("k", strip, placement="outermost", accum="heap", unroll=False),
+            panel("j", width, placement="child_of:k_out"),
+        ),
+        relayout=RelayoutSpec("B", "k", strip, scope_var=scope),
+        tag=tag,
+        parallel_loop="i",
+    )
+
+
+def heap_panel_schedule(tag, width=3, strip=4):
+    return Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(
+            TileSpec("k", strip, placement="outermost", accum="heap", unroll=False),
+            panel("j", width, placement="child_of:k_out"),
+        ),
+        tag=tag,
+        parallel_loop="i",
+    )
+
+
+HEAP_PARITY_GRID = [
+    (
+        "spmm heap exact strip",
+        build_spmm,
+        heap_schedule("h-exact", strip=3),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap ragged strip",
+        build_spmm,
+        heap_schedule("h-ragged", strip=4),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap unit strip",
+        build_spmm,
+        heap_schedule("h-unit", strip=1),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap oversized strip",
+        build_spmm,
+        heap_schedule("h-wide", strip=64),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap float64",
+        lambda: build_spmm(dtype=F64),
+        heap_schedule("h-f64", strip=4),
+        (4, 6),
+        (((4, 5), F64), ((5, 6), F64)),
+    ),
+    (
+        "spmm heap panel no relayout",
+        build_spmm,
+        heap_panel_schedule("h-panel"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap relayout panel scope",
+        build_spmm,
+        heap_relayout_schedule("j", "h-r-panel"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap relayout pack scope",
+        build_spmm,
+        heap_relayout_schedule("k", "h-r-pack"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap relayout float64 panel scope",
+        lambda: build_spmm(dtype=F64),
+        heap_relayout_schedule("j", "h-r-f64"),
+        (4, 6),
+        (((4, 5), F64), ((5, 6), F64)),
+    ),
+    (
+        "spmm heap relayout float64 pack scope",
+        lambda: build_spmm(dtype=F64),
+        heap_relayout_schedule("k", "h-r-f64-pack"),
+        (4, 6),
+        (((4, 5), F64), ((5, 6), F64)),
+    ),
+    (
+        "spmm heap zero rows",
+        build_spmm,
+        heap_schedule("h-zero-rows", strip=2),
+        (0, 6),
+        (((0, 5), F32), ((5, 6), F32)),
+    ),
+    (
+        "spmm heap zero reduction extent",
+        build_spmm,
+        heap_schedule("h-zero-red", strip=2),
+        (4, 6),
+        (((4, 0), F32), ((0, 6), F32)),
+    ),
+    (
+        "spmm heap zero free extent",
+        build_spmm,
+        heap_schedule("h-zero-free", strip=3),
+        (4, 0),
+        (((4, 5), F32), ((5, 0), F32)),
+    ),
+    (
+        "spmm heap relayout larger shapes",
+        build_spmm,
+        heap_relayout_schedule("k", "h-r-large", width=5, strip=8),
+        (7, 16),
+        (((7, 9), F32), ((9, 16), F32)),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "case",
+    HEAP_PARITY_GRID,
+    ids=[case[0] for case in HEAP_PARITY_GRID],
+)
+def test_heap_source_is_byte_identical_to_legacy(case):
+    name, build, schedule, result_shape, bindings = case
+    comparison = compare_generated_sources(
+        build(),
+        result_shape,
+        bindings,
+        compile_options=scheduled_options(schedule),
+    )
+    assert comparison.identical, f"{name} diverged from the legacy schedule"
+
+
+def test_heap_artifact_carries_plan_and_provenance():
+    from scorch.compiler.loopir.printer import canonical_program_dump
+
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(heap_schedule("h-prov")),
+    )
+    scheduled = kernel.schedule
+    assert scheduled is not None
+    assert scheduled.plan.result_tile is not None
+    assert scheduled.plan.result_tile.result_level == 1
+    parts = [(entry.part, entry.tile is not None) for entry in scheduled.loops]
+    assert parts == [
+        (LoopPart.OUTER, True),
+        (LoopPart.LOGICAL, False),
+        (LoopPart.LOGICAL, False),
+        (LoopPart.INNER, True),
+    ]
+    base_dump = canonical_program_dump(scheduled.base_program)
+    scheduled_dump = canonical_program_dump(scheduled.program)
+    assert "result_tile_region" not in base_dump
+    assert "tiled_reduce" not in base_dump
+    assert "result_tile_region" in scheduled_dump
+    assert "tiled_reduce" in scheduled_dump
+
+
+def test_heap_structural_activation_is_direct():
+    """Every compact-tile component must be present in the generated
+    source, asserted directly and never inferred from byte equality."""
+
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(heap_schedule("h-act", strip=3)),
+    )
+    source = kernel.cpp_source
+    assert (
+        "std::vector<float> tiled_C_storage((size_t)C0_size * (size_t)kTile_k);"
+        in source
+    )
+    assert "float* __restrict__ tiled_C = tiled_C_storage.data();" in source
+    assert "// Initialize compact result tile for C" in source
+    assert "// Copy compact result tile to C" in source
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads((C0_size) * "
+        "kTile_k, (C0_size))) schedule(static)"
+    ) in source
+    assert "tiled_C[C_tile_init * kTile_k + k_tile_init] = 0.0f;" in source
+    assert (
+        "C_values[C_tile_copy * C1_size + k_copy_logical] = "
+        "tiled_C[C_tile_copy * kTile_k + k_tile_copy];"
+    ) in source
+    assert "tiled_C[pC0 * kTile_k + k_in] += A_val[pA1] * B_val[pB1];" in source
+    # The exactly-once copy-out discharges the whole-result zero fill.
+    assert "scorch_zero_dense(C_values" not in source
+    # The parallel row keeps the legacy explicit-parallel policy.
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(A1_pos[A0_size], "
+        "A0_size)) schedule(dynamic, scorch_chunk(A0_size, A1_pos[A0_size]))"
+    ) in source
+    # The dead position resolve stays in place, exactly as legacy leaves it.
+    assert "int pC1 = pC0 * C1_size + k;" in source
+
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=scheduled_options(heap_relayout_schedule("k", "h-act-pack")),
+    )
+    source = kernel.cpp_source
+    assert (
+        "std::vector<float> tiled_C_storage((size_t)C0_size * (size_t)kTile_k);"
+        in source
+    )
+    assert (
+        "std::vector<float> packed_B_storage((size_t)B0_size * (size_t)kTile_k);"
+        in source
+    )
+    assert "tiled_C[pC0 * kTile_k + k_in] += A_val[pA1] * packed_B[j * kTile_k" in (
+        source
+    )
+    assert "scorch_zero_dense(C_values" not in source
+    assert "B_val[pB1]" not in source
+
+
+@pytest.mark.parametrize("width", [1, 3, 64])
+def test_spmm_heap_shadow_execution_across_strip_regimes(width):
+    torch.manual_seed(2911 + width)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.6] = 0.0
+    sparse[2, :] = 0.0  # an empty CSR row
+    dense = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_spmm(),
+        heap_schedule(f"h-shadow-{width}", strip=width),
+        (4, 6),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+@pytest.mark.parametrize("scope", ["j", "k"])
+def test_spmm_heap_relayout_shadow_execution(scope):
+    torch.manual_seed(2917)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.6] = 0.0
+    sparse[2, :] = 0.0  # an empty CSR row
+    dense = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_spmm(),
+        heap_relayout_schedule(scope, f"h-r-shadow-{scope}", width=2, strip=4),
+        (4, 6),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+def test_spmm_heap_float64_shadow_execution():
+    torch.manual_seed(2919)
+    sparse = torch.randn(4, 5, dtype=torch.float64)
+    sparse[sparse.abs() < 0.6] = 0.0
+    dense = torch.randn(5, 6, dtype=torch.float64)
+    assert_scheduled_shadow(
+        build_spmm(dtype=F64),
+        heap_schedule("h-shadow-f64", strip=4),
+        (4, 6),
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+@pytest.mark.parametrize(
+    ("result_shape", "bindings", "sparse_shape", "dense_shape"),
+    [
+        ((0, 6), (((0, 5), F32), ((5, 6), F32)), (0, 5), (5, 6)),
+        ((4, 6), (((4, 0), F32), ((0, 6), F32)), (4, 0), (0, 6)),
+        ((4, 0), (((4, 5), F32), ((5, 0), F32)), (4, 5), (5, 0)),
+    ],
+    ids=["zero-rows", "zero-reduction", "zero-free"],
+)
+def test_spmm_heap_zero_extent_shadow_execution(
+    result_shape, bindings, sparse_shape, dense_shape
+):
+    torch.manual_seed(2921)
+    sparse = torch.randn(*sparse_shape)
+    if sparse.numel():
+        sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.randn(*dense_shape)
+    assert_scheduled_shadow(
+        build_spmm(),
+        heap_schedule(f"h-zero-{result_shape}", strip=2),
+        result_shape,
+        (csr_stensor(sparse, "A"), dense_stensor(dense, "B")),
+        sparse @ dense,
+    )
+
+
+def test_heap_randomized_execution_matches_torch_and_oracle():
+    torch.manual_seed(2929)
+    import random as _random
+
+    from scorch.compiler.loopir.levels import CsrMatrix
+    from scorch.compiler.loopir.oracle import run_program
+
+    rng = _random.Random(20260726)
+    for round_index in range(3):
+        rows = rng.randrange(1, 7)
+        inner = rng.randrange(1, 7)
+        cols = rng.randrange(1, 8)
+        strip = rng.choice((1, 2, 4, 7))
+        composed = rng.random() < 0.5
+        sparse = torch.randn(rows, inner)
+        sparse[sparse.abs() < 0.5] = 0.0
+        dense = torch.randn(inner, cols)
+        if composed:
+            schedule = heap_relayout_schedule(
+                rng.choice(("j", "k")),
+                f"h-rand-{round_index}",
+                width=rng.choice((1, 2, 3, 9)),
+                strip=strip,
+            )
+        else:
+            schedule = heap_schedule(f"h-rand-{round_index}", strip=strip)
+        result, kernel = execute_cin_via_loopir(
             build_spmm(),
-            (4, 6),
-            SPMM_BINDINGS,
-            compile_options=scheduled_options(
-                relayout_schedule("k", "r-heap", accum="heap")
-            ),
+            (rows, cols),
+            csr_stensor(sparse, "A"),
+            dense_stensor(dense, "B"),
+            compile_options=scheduled_options(schedule),
         )
-    assert error.value.defect.code == "unsupported_schedule_result_tile"
+        assert torch.allclose(
+            result.values.reshape(rows, cols),
+            sparse @ dense,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        assert kernel.schedule is not None
+        lowering = kernel.lowering
+        oracle_out = run_program(
+            kernel.schedule.program,
+            {
+                lowering.input_symbols[0]: CsrMatrix.from_dense(sparse.tolist()),
+                lowering.input_symbols[1]: dense.tolist(),
+            },
+            {lowering.result_symbol: (rows, cols)},
+        )[lowering.result_symbol]
+        assert torch.allclose(
+            result.values.reshape(rows, cols),
+            torch.tensor(oracle_out, dtype=torch.float32),
+            atol=1e-4,
+            rtol=1e-4,
+        )

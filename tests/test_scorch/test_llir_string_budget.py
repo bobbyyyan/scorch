@@ -1155,11 +1155,24 @@ def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
     assert sum(counts.values()) == 6
 
     schedule_source = (_COMPILER_ROOT / "schedule_lowerer.py").read_text()
+    # The compact-storage owner moved into the shared helper the legacy
+    # _apply_heap_result_tile and the typed LoopIR heap completion both
+    # call; the typed DirectInit owner remains the single source of the
+    # spelling.
+    heap_storage = schedule_source.split("def _heap_result_storage_statements", 1)[
+        1
+    ].split("def _apply_heap_result_tile", 1)[0]
+    assert "llir.RawStmt(" not in heap_storage
+    assert "storage_declaration = _heap_result_storage_declaration(" in heap_storage
+
     heap_result = schedule_source.split("def _apply_heap_result_tile", 1)[1].split(
         "def _packed_storage_declaration", 1
     )[0]
     assert "llir.RawStmt(" not in heap_result
-    assert "storage_declaration = _heap_result_storage_declaration(" in heap_result
+    assert (
+        "tile_container[tile_index:tile_index] = _heap_result_storage_statements("
+        in heap_result
+    )
 
     # The packed-storage owner moved into the shared helper the legacy
     # _apply_relayout and the typed LoopIR relayout completion both call;

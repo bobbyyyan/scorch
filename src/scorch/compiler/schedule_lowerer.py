@@ -1041,77 +1041,43 @@ def _heap_result_storage_declaration(
     )
 
 
-def _apply_heap_result_tile(
-    function: llir.Function,
-    schedule: Schedule,
-    plan: _ResultTilePlan,
-) -> None:
-    """Redirect a dense result tile to compact storage and copy it out once."""
-    tile = next(
-        (
-            candidate
-            for candidate in schedule.tiles
-            if candidate.index_var == plan.tile_var
-            and candidate.kind == "affine"
-            and candidate.accum == "heap"
-        ),
-        None,
-    )
-    if tile is None:
-        raise ValueError("Missing heap TileSpec for a derived result-tile plan")
-
-    tile_outer_name = f"{plan.tile_var}_out"
-    tile_inner_name = f"{plan.tile_var}_in"
-    tile_size_name = f"kTile_{plan.tile_var}"
-    tile_location, tile_ancestors = _find_tagged_loop(function.body, tile_outer_name)
-    if tile_ancestors or tile_location[0] is not function.body:
-        raise NotImplementedError(
-            "Heap accumulation requires the affine result tile to be outermost"
-        )
-    tile_loop = tile_location[2]
-
-    result_values = f"{plan.result}_values"
-    result_value_init = _find_var_init(function.body, result_values)
-    pointer_type = result_value_init.var.type
-    if pointer_type.value == "float*":
-        scalar_type = llir.DataType.FLOAT32
-        zero_value = "0.0f"
-    elif pointer_type.value == "double*":
-        scalar_type = llir.DataType.FLOAT64
-        zero_value = "0.0"
-    else:
-        raise NotImplementedError(
-            "Heap accumulation supports generated float or double result pointers"
-        )
+def _heap_result_tile_names(
+    function: llir.Function, result: str, tile_var: str
+) -> Tuple[str, str, str, str, str, str, str, str]:
+    """The deterministic generated-name family of one compact result tile."""
 
     used_names = _declared_names(function)
-    compact_name = _unique_name(f"tiled_{plan.result}", used_names)
+    compact_name = _unique_name(f"tiled_{result}", used_names)
     storage_name = _unique_name(f"{compact_name}_storage", used_names)
-    init_prefix = _unique_name(f"{plan.result}_tile_init", used_names)
-    init_inner = _unique_name(f"{plan.tile_var}_tile_init", used_names)
-    init_logical = _unique_name(f"{plan.tile_var}_tile_logical", used_names)
-    copy_prefix = _unique_name(f"{plan.result}_tile_copy", used_names)
-    copy_inner = _unique_name(f"{plan.tile_var}_tile_copy", used_names)
-    copy_logical = _unique_name(f"{plan.tile_var}_copy_logical", used_names)
-
-    trailing_bound = f"{plan.result}{plan.result_level}_size"
-    prefix_dimension_names = tuple(
-        f"{plan.result}{level}_size" for level in range(plan.result_level)
+    init_prefix = _unique_name(f"{result}_tile_init", used_names)
+    init_inner = _unique_name(f"{tile_var}_tile_init", used_names)
+    init_logical = _unique_name(f"{tile_var}_tile_logical", used_names)
+    copy_prefix = _unique_name(f"{result}_tile_copy", used_names)
+    copy_inner = _unique_name(f"{tile_var}_tile_copy", used_names)
+    copy_logical = _unique_name(f"{tile_var}_copy_logical", used_names)
+    return (
+        compact_name,
+        storage_name,
+        init_prefix,
+        init_inner,
+        init_logical,
+        copy_prefix,
+        copy_inner,
+        copy_logical,
     )
-    prefix_extent = " * ".join(prefix_dimension_names)
-    if not prefix_extent:
-        raise NotImplementedError(
-            "Heap accumulation requires at least one dense result prefix level"
-        )
-    storage_declaration = _heap_result_storage_declaration(
-        storage_name=storage_name,
-        scalar_type=scalar_type,
-        prefix_dimension_names=prefix_dimension_names,
-        tile_size_name=tile_size_name,
-    )
-    LLIRWalker(_HEAP_RESULT_STORAGE_CONTEXT).walk(storage_declaration)
 
-    compact_access = llir.ArrayAccess(
+
+def _heap_compact_access(
+    *,
+    compact_name: str,
+    pointer_type: llir.DataType,
+    prefix_position_name: str,
+    tile_size_name: str,
+    tile_inner_name: str,
+) -> llir.ArrayAccess:
+    """The compact-storage twin of the redirected dense result write."""
+
+    return llir.ArrayAccess(
         array=llir.Var(
             name=compact_name,
             type=pointer_type,
@@ -1119,7 +1085,7 @@ def _apply_heap_result_tile(
         index=llir.Add(
             llir.Mul(
                 llir.Var(
-                    name=f"p{plan.result}{plan.result_level - 1}",
+                    name=prefix_position_name,
                     type=llir.DataType.INT64,
                 ),
                 llir.Var(name=tile_size_name, type=llir.DataType.INT64),
@@ -1127,27 +1093,24 @@ def _apply_heap_result_tile(
             llir.Var(name=tile_inner_name, type=llir.DataType.INT64),
         ),
     )
-    rewritten_body, rewritten = _rewrite_stmt_access_sequence(
-        cast(LLIRStatementSequence, tile_loop.body),
-        plan.result_id,
-        plan.access_index_ids,
-        llir.TensorAccessRole.RESULT_WRITE,
-        compact_access,
-    )
-    tile_loop.body = cast(List[llir.Stmt], rewritten_body)
-    if rewritten == 0:
-        raise NotImplementedError(
-            "Cannot redirect the selected logical result access to compact storage"
-        )
-    if _contains_tensor_access(
-        tile_loop.body,
-        plan.result_id,
-        plan.access_index_ids,
-        llir.TensorAccessRole.RESULT_WRITE,
-    ):
-        raise NotImplementedError(
-            "Heap accumulation left a direct result write in the compute region"
-        )
+
+
+def _heap_result_init_group(
+    *,
+    result: str,
+    compact_name: str,
+    pointer_type: llir.DataType,
+    scalar_type: llir.DataType,
+    zero_value: str,
+    tile_outer_name: str,
+    tile_size_name: str,
+    trailing_bound: str,
+    prefix_extent: str,
+    init_prefix: str,
+    init_inner: str,
+    init_logical: str,
+) -> List[llir.Stmt]:
+    """The per-strip compact-tile zero-initialization group."""
 
     init_inner_loop = llir.ForLoop(
         init=llir.VarInit(
@@ -1210,7 +1173,29 @@ def _apply_heap_result_tile(
             f"({prefix_extent}))"
         ),
     )
-    init_loop.scorch_index_var = f"init:{plan.result}"
+    init_loop.scorch_index_var = f"init:{result}"
+    return [
+        llir.Comment(f"Initialize compact result tile for {result}"),
+        init_loop,
+        llir.BlankLine(),
+    ]
+
+
+def _heap_result_copy_group(
+    *,
+    result: str,
+    result_values: str,
+    compact_name: str,
+    pointer_type: llir.DataType,
+    tile_outer_name: str,
+    tile_size_name: str,
+    trailing_bound: str,
+    prefix_extent: str,
+    copy_prefix: str,
+    copy_inner: str,
+    copy_logical: str,
+) -> List[llir.Stmt]:
+    """The exactly-once strip copy-out group at pack-origin exit."""
 
     copy_inner_loop = llir.ForLoop(
         init=llir.VarInit(
@@ -1282,29 +1267,35 @@ def _apply_heap_result_tile(
             f"({prefix_extent}))"
         ),
     )
-    copy_loop.scorch_index_var = f"copy:{plan.result}"
-
-    _remove_dense_result_zero(function, plan.result)
-    tile_loop.body[0:0] = [
-        llir.Comment(f"Initialize compact result tile for {plan.result}"),
-        init_loop,
+    copy_loop.scorch_index_var = f"copy:{result}"
+    return [
         llir.BlankLine(),
+        llir.Comment(f"Copy compact result tile to {result}"),
+        copy_loop,
     ]
-    tile_loop.body.extend(
-        [
-            llir.BlankLine(),
-            llir.Comment(f"Copy compact result tile to {plan.result}"),
-            copy_loop,
-        ]
-    )
 
-    # Removing the default zero shifts top-level positions, so resolve the tagged
-    # tile location again before inserting its reusable allocation.
-    (tile_container, tile_index, _), _ = _find_tagged_loop(
-        function.body, tile_outer_name
+
+def _heap_result_storage_statements(
+    *,
+    result: str,
+    storage_name: str,
+    compact_name: str,
+    pointer_type: llir.DataType,
+    scalar_type: llir.DataType,
+    prefix_dimension_names: Tuple[str, ...],
+    tile_size_name: str,
+) -> List[llir.Stmt]:
+    """The reusable compact-storage declaration block above the pack origin."""
+
+    storage_declaration = _heap_result_storage_declaration(
+        storage_name=storage_name,
+        scalar_type=scalar_type,
+        prefix_dimension_names=prefix_dimension_names,
+        tile_size_name=tile_size_name,
     )
-    tile_container[tile_index:tile_index] = [
-        llir.Comment(f"Allocate reusable compact result tile for {plan.result}"),
+    LLIRWalker(_HEAP_RESULT_STORAGE_CONTEXT).walk(storage_declaration)
+    return [
+        llir.Comment(f"Allocate reusable compact result tile for {result}"),
         storage_declaration,
         llir.VarInit(
             var=llir.Var(compact_name, pointer_type, is_restrict=True),
@@ -1318,6 +1309,146 @@ def _apply_heap_result_tile(
         ),
         llir.BlankLine(),
     ]
+
+
+def _apply_heap_result_tile(
+    function: llir.Function,
+    schedule: Schedule,
+    plan: _ResultTilePlan,
+) -> None:
+    """Redirect a dense result tile to compact storage and copy it out once."""
+    tile = next(
+        (
+            candidate
+            for candidate in schedule.tiles
+            if candidate.index_var == plan.tile_var
+            and candidate.kind == "affine"
+            and candidate.accum == "heap"
+        ),
+        None,
+    )
+    if tile is None:
+        raise ValueError("Missing heap TileSpec for a derived result-tile plan")
+
+    tile_outer_name = f"{plan.tile_var}_out"
+    tile_inner_name = f"{plan.tile_var}_in"
+    tile_size_name = f"kTile_{plan.tile_var}"
+    tile_location, tile_ancestors = _find_tagged_loop(function.body, tile_outer_name)
+    if tile_ancestors or tile_location[0] is not function.body:
+        raise NotImplementedError(
+            "Heap accumulation requires the affine result tile to be outermost"
+        )
+    tile_loop = tile_location[2]
+
+    result_values = f"{plan.result}_values"
+    result_value_init = _find_var_init(function.body, result_values)
+    pointer_type = result_value_init.var.type
+    if pointer_type.value == "float*":
+        scalar_type = llir.DataType.FLOAT32
+        zero_value = "0.0f"
+    elif pointer_type.value == "double*":
+        scalar_type = llir.DataType.FLOAT64
+        zero_value = "0.0"
+    else:
+        raise NotImplementedError(
+            "Heap accumulation supports generated float or double result pointers"
+        )
+
+    (
+        compact_name,
+        storage_name,
+        init_prefix,
+        init_inner,
+        init_logical,
+        copy_prefix,
+        copy_inner,
+        copy_logical,
+    ) = _heap_result_tile_names(function, plan.result, plan.tile_var)
+
+    trailing_bound = f"{plan.result}{plan.result_level}_size"
+    prefix_dimension_names = tuple(
+        f"{plan.result}{level}_size" for level in range(plan.result_level)
+    )
+    prefix_extent = " * ".join(prefix_dimension_names)
+    if not prefix_extent:
+        raise NotImplementedError(
+            "Heap accumulation requires at least one dense result prefix level"
+        )
+
+    compact_access = _heap_compact_access(
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        prefix_position_name=f"p{plan.result}{plan.result_level - 1}",
+        tile_size_name=tile_size_name,
+        tile_inner_name=tile_inner_name,
+    )
+    rewritten_body, rewritten = _rewrite_stmt_access_sequence(
+        cast(LLIRStatementSequence, tile_loop.body),
+        plan.result_id,
+        plan.access_index_ids,
+        llir.TensorAccessRole.RESULT_WRITE,
+        compact_access,
+    )
+    tile_loop.body = cast(List[llir.Stmt], rewritten_body)
+    if rewritten == 0:
+        raise NotImplementedError(
+            "Cannot redirect the selected logical result access to compact storage"
+        )
+    if _contains_tensor_access(
+        tile_loop.body,
+        plan.result_id,
+        plan.access_index_ids,
+        llir.TensorAccessRole.RESULT_WRITE,
+    ):
+        raise NotImplementedError(
+            "Heap accumulation left a direct result write in the compute region"
+        )
+
+    _remove_dense_result_zero(function, plan.result)
+    tile_loop.body[0:0] = _heap_result_init_group(
+        result=plan.result,
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        scalar_type=scalar_type,
+        zero_value=zero_value,
+        tile_outer_name=tile_outer_name,
+        tile_size_name=tile_size_name,
+        trailing_bound=trailing_bound,
+        prefix_extent=prefix_extent,
+        init_prefix=init_prefix,
+        init_inner=init_inner,
+        init_logical=init_logical,
+    )
+    tile_loop.body.extend(
+        _heap_result_copy_group(
+            result=plan.result,
+            result_values=result_values,
+            compact_name=compact_name,
+            pointer_type=pointer_type,
+            tile_outer_name=tile_outer_name,
+            tile_size_name=tile_size_name,
+            trailing_bound=trailing_bound,
+            prefix_extent=prefix_extent,
+            copy_prefix=copy_prefix,
+            copy_inner=copy_inner,
+            copy_logical=copy_logical,
+        )
+    )
+
+    # Removing the default zero shifts top-level positions, so resolve the tagged
+    # tile location again before inserting its reusable allocation.
+    (tile_container, tile_index, _), _ = _find_tagged_loop(
+        function.body, tile_outer_name
+    )
+    tile_container[tile_index:tile_index] = _heap_result_storage_statements(
+        result=plan.result,
+        storage_name=storage_name,
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        scalar_type=scalar_type,
+        prefix_dimension_names=prefix_dimension_names,
+        tile_size_name=tile_size_name,
+    )
 
 
 def _packed_storage_declaration(

@@ -88,11 +88,17 @@ from ..parallel_marking_pass import (
 from ..schedule_lowerer import (
     _contains_tensor_access,
     _declared_names,
+    _heap_compact_access,
+    _heap_result_copy_group,
+    _heap_result_init_group,
+    _heap_result_storage_statements,
+    _heap_result_tile_names,
     _panel_bound_expression,
     _panel_range_guard,
     _redirect_sparse_prefetch,
     _relayout_pack_loop,
     _relayout_storage_statements,
+    _remove_dense_result_zero,
     _rewrite_stmt_access_sequence,
     _unique_name,
 )
@@ -125,6 +131,8 @@ from .nodes import (
     RelayoutDecl,
     RelayoutScope,
     RelayoutStage,
+    ResultTileDecl,
+    ResultTileRegion,
     RootPosition,
     ScalarType,
     SparseCursorDecl,
@@ -135,6 +143,7 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TiledReduce,
     TileInnerFor,
     TileOuterFor,
     WorkspaceRead,
@@ -266,6 +275,18 @@ class _TargetLowering:
         self.relayout_depth = -1
         self._staged_views: Dict[int, Load] = {}
         self._staged_access_snapshot: Optional[llir.ArrayAccess] = None
+        # Heap result-tile state; populated by _collect_loop_nest and
+        # _validate_result_tile_shape when the chain carries an accumulation
+        # region.  The compact redirection, init/copy groups, storage, and
+        # zero-fill removal are completed on the assembled function between
+        # the panel and relayout completions — exactly the legacy
+        # apply_schedule_to_llir order (panel, heap, relayout).
+        self.result_tile: Optional[ResultTileDecl] = None
+        self.result_tile_depth = -1
+        self.result_tile_row_position = -1
+        self._tiled_leaf: Optional[TiledReduce] = None
+        self._tiled_view: Optional[StoreReduce] = None
+        self._tiled_write_snapshot: Optional[llir.ArrayAccess] = None
         self._window_coord_snapshot: Optional[
             Tuple[llir.Comment, llir.VarInit, llir.BlankLine]
         ] = None
@@ -283,6 +304,7 @@ class _TargetLowering:
         self.leaf = self._collect_leaf()
         self._validate_panel_shape()
         self._validate_relayout_shape()
+        self._validate_result_tile_shape()
         self.cursor_loops: Dict[CursorId, int] = {}
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
@@ -640,6 +662,46 @@ class _TargetLowering:
                 self.relayout_depth = len(loops)
                 body = only.body
                 continue
+            if type(only) is ResultTileRegion:
+                if self.result_tile is not None:
+                    _fail(
+                        "unsupported_program_shape",
+                        "this target lowering supports exactly one result-"
+                        "tile region",
+                    )
+                self.result_tile = only.decl
+                self.result_tile_depth = len(loops)
+                body = only.body
+                continue
+            if type(only) is TiledReduce:
+                if not loops:
+                    _fail(
+                        "unsupported_program_shape",
+                        "this target lowering requires at least one loop",
+                    )
+                if self.result_tile is None or only.result_tile != (
+                    self.result_tile.result_tile
+                ):
+                    _fail(
+                        "unsupported_program_shape",
+                        "a TiledReduce outside the validated result-tile "
+                        "region is not lowerable",
+                    )
+                # The compute leaf is recorded as a synthetic direct
+                # StoreReduce view so raw emission and every managed pass
+                # see byte-for-byte the tree the legacy pipeline
+                # transforms; the compact redirection happens in
+                # complete_result_tile on the assembled function.
+                self._tiled_leaf = only
+                self._tiled_view = StoreReduce(
+                    LoopIRNodeId(-1),
+                    self.result_tile.result,
+                    only.indices,
+                    only.op,
+                    only.value,
+                )
+                self._validate_loop_kinds(loops, self._tiled_view)
+                return loops
             if type(only) is WorkspaceRegion:
                 if not loops:
                     _fail(
@@ -880,6 +942,8 @@ class _TargetLowering:
         if self.region is not None:
             assert self._region_leaf is not None
             return self._region_leaf
+        if self._tiled_view is not None:
+            return self._tiled_view
         innermost = self.loops[-1].node.body
         return innermost.statements[0]
 
@@ -1077,6 +1141,90 @@ class _TargetLowering:
         self._staged_views[id(staged)] = Load(
             LoopIRNodeId(-1), decl.operand, staged.indices
         )
+
+    def _validate_result_tile_shape(self) -> None:
+        """Establish the supported heap result-tile form and its anatomy.
+
+        The migrated shape is exactly the audited legacy family on the
+        rank-2 trailing-axis result: the outermost pack origin whose whole
+        body the region wraps, the parallel dense row loop, one reduction
+        loop (or the panel window pair), and the pack point loop, with the
+        compute leaf accumulating through exactly one TiledReduce of the
+        region.  The leaf was recorded as a synthetic direct StoreReduce
+        view by the nest walk; the compact redirection happens in
+        :meth:`complete_result_tile` on the assembled function, exactly
+        where the legacy schedule lowering performs it.
+        """
+
+        if self.result_tile is None:
+            return
+        decl = self.result_tile
+        if self._tiled_leaf is None:
+            _fail(
+                "unsupported_program_shape",
+                "a result-tile region requires the tiled-reduce compute "
+                "leaf of its own region",
+            )
+        kinds = [loop.kind for loop in self.loops]
+        heap_alone = kinds in (
+            [_TILE_OUTER, _DENSE, _SPARSE, _TILE_INNER],
+            [_TILE_OUTER, _DENSE, _DENSE, _TILE_INNER],
+        )
+        heap_panel = kinds == [
+            _TILE_OUTER,
+            _PANEL_OUTER,
+            _DENSE,
+            _SPARSE_WINDOW,
+            _TILE_INNER,
+        ]
+        if not heap_alone and not heap_panel:
+            _fail(
+                "unsupported_program_shape",
+                "heap accumulation supports exactly the audited chains: "
+                "the pack origin over the parallel row, one reduction loop "
+                "or the panel window pair, and the pack point loop",
+            )
+        if self.result_tile_depth != 1:
+            _fail(
+                "unsupported_program_shape",
+                "the result-tile region must wrap the pack origin's " "entire body",
+            )
+        pack_node = self.loops[0].node
+        point_node = self.loops[-1].node
+        if pack_node.tile != point_node.tile or decl.pack != pack_node.tile:
+            _fail(
+                "unsupported_program_shape",
+                "the result-tile region must name the chain's pack split " "pair",
+            )
+        row_position = 2 if heap_panel else 1
+        row_node = self.loops[row_position].node
+        result_decl = self.result_decl
+        if (
+            decl.result != self.result_symbol
+            or len(result_decl.levels) != 2
+            or any(level.kind is not LevelKind.DENSE for level in result_decl.levels)
+            or result_decl.dimensions[result_decl.levels[0].mode] != row_node.dimension
+            or result_decl.dimensions[result_decl.levels[1].mode] != pack_node.dimension
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the compacted result must be the declared rank-2 dense "
+                "output storing the row then pack dimensions",
+            )
+        tiled = self._tiled_leaf
+        if (
+            len(tiled.indices) != 2
+            or self._index_of(tiled.indices[0], "the compacted row index")
+            != row_node.index
+            or self._index_of(tiled.indices[1], "the compacted column index")
+            != point_node.index
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the tiled reduce must be indexed by the row coordinate "
+                "and the pack point coordinate",
+            )
+        self.result_tile_row_position = row_position
 
     def _reserve_panel_names(self) -> None:
         """Reserve the derived loop, bound, and search names panels generate."""
@@ -1663,6 +1811,48 @@ class _TargetLowering:
             ),
             tensor_access=self._result_metadata(),
         )
+        if self._tiled_leaf is not None:
+            if self._tiled_write_snapshot is not None:
+                _fail(
+                    "unsupported_program_shape",
+                    "the compacted result write was lowered more than once",
+                )
+            snapshot = LLIRRewriter(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="snapshot_result_tile_write",
+                )
+            ).rewrite(target)
+            if type(snapshot) is not llir.ArrayAccess:
+                _fail(
+                    "unsupported_program_shape",
+                    "the compacted result snapshot did not remain an array " "access",
+                )
+            metadata = snapshot.tensor_access
+            if type(metadata) is not llir.TensorAccessMetadata:
+                _fail(
+                    "unsupported_program_shape",
+                    "the compacted result snapshot did not retain typed "
+                    "access metadata",
+                )
+            # LLIRRewriter detaches nodes but intentionally preserves the
+            # frozen provenance value object; rebuild every identity as a
+            # separate value so an in-place forged metadata mutation after
+            # the managed passes cannot also mutate this detached snapshot
+            # (the reviewed relayout boundary's discipline).
+            detached_metadata = llir.TensorAccessMetadata(
+                access_id=AccessId(metadata.access_id.value),
+                tensor_id=SymbolId(metadata.tensor_id.value),
+                index_ids=tuple(
+                    IndexId(index_id.value) for index_id in metadata.index_ids
+                ),
+                role=metadata.role,
+            )
+            self._tiled_write_snapshot = llir.ArrayAccess(
+                array=snapshot.array,
+                index=snapshot.index,
+                tensor_access=detached_metadata,
+            )
         if type(leaf) is StoreReduce:
             return [llir.Assign(var=target, value=rhs, op=llir.AssignOp.ADD_ASSIGN)]
         return [llir.Assign(var=target, value=rhs)]
@@ -2530,11 +2720,13 @@ class _TargetLowering:
     def raw_loop_statements(self) -> List[llir.Stmt]:
         """The raw pre-pass loop-nest statements, legacy shape included.
 
-        Panel programs emit the *unpaneled* nest with no parallel marking:
-        the legacy explicit-parallel route suppresses the emission-time
-        auto gate and marks the selected row loop on the assembled
-        function, and the panel wrap/windowing follow it there — so both
-        happen in :meth:`complete_panel`, after the managed passes.
+        Panel and heap programs emit the *unpaneled, uncompacted* nest with
+        no parallel marking: the legacy explicit-parallel route suppresses
+        the emission-time auto gate and marks the selected row loop on the
+        assembled function, and the panel wrap/windowing and heap
+        compaction follow it there — so all of it happens in
+        :meth:`complete_panel` / :meth:`complete_result_tile`, after the
+        managed passes.
         """
 
         first_position = 0
@@ -2547,7 +2739,7 @@ class _TargetLowering:
             else self._lower_dense(first_position)
         )
         stmts: List[llir.Stmt] = [llir.BlankLine(), outer_loop]
-        if self.panel is not None:
+        if self.panel is not None or self.result_tile is not None:
             return stmts
         leaf_indices = self._leaf_indices()
         outer_index = self._loop_logical_index(first)
@@ -2640,9 +2832,9 @@ class _TargetLowering:
     # -- panel completion ----------------------------------------------------
 
     def _record_emitted_loop(self, position: int, loop: llir.ForLoop) -> None:
-        """Snapshot one panel-chain header before managed passes can touch it."""
+        """Snapshot one chain-loop header before managed passes can touch it."""
 
-        if self.panel is None:
+        if self.panel is None and self.result_tile is None:
             return
         header = llir.ForLoop(
             init=loop.init,
@@ -3251,12 +3443,12 @@ class _TargetLowering:
             ),
             llir.BlankLine(),
         ]
-        if self.relayout is not None:
-            # The relayout completion runs next on this same assembled
-            # function and consumes the loops this completion has already
-            # re-identified and created — retained object identity, never a
-            # second discovery pass.  The validated relayout chain places
-            # the pack origin at chain position 0.
+        if self.relayout is not None or self.result_tile is not None:
+            # The heap and relayout completions run next on this same
+            # assembled function and consume the loops this completion has
+            # already re-identified and created — retained object identity,
+            # never a second discovery pass.  The validated heap/relayout
+            # chains place the pack origin at chain position 0.
             self._panel_completion = (
                 completed[0],
                 panel_loop,
@@ -3277,8 +3469,25 @@ class _TargetLowering:
             return function
         return _complete_relayout_impl(self, function)
 
+    def complete_result_tile(self, function: llir.Function) -> llir.Function:
+        """Compact the heap result tile on the assembled function.
+
+        A no-op without a validated accumulation region; otherwise the full
+        legacy heap completion — parallel row marking for the bare chain,
+        the exact-one compact redirection, zero-fill removal, per-strip
+        init and copy-out groups, and the reusable storage block — between
+        the panel and relayout completions, exactly the legacy
+        ``apply_schedule_to_llir`` order (see
+        ``_complete_result_tile_impl``).
+        """
+
+        if self.result_tile is None:
+            return function
+        return _complete_result_tile_impl(self, function)
+
 
 _RELAYOUT_LOST = "relayout_completion_lost"
+_RESULT_TILE_LOST = "result_tile_completion_lost"
 
 
 def _relayout_access_candidates(
@@ -3377,6 +3586,231 @@ def _count_direct_prefetches(statements: List[llir.Stmt], array_name: str) -> in
     collector = _Collector()
     collector.walk(cast(Any, statements))
     return collector.count
+
+
+def _complete_result_tile_impl(
+    lowering: "_TargetLowering", function: llir.Function
+) -> llir.Function:
+    """Complete one heap result tile on the assembled function.
+
+    Mirrors the legacy ``_apply_heap_result_tile`` exactly, driven by the
+    retained completion objects and the target's own emission-record
+    spellings — no name, tag, or ordinal discovery.  Every disagreement
+    with the recorded pre-pass state is the stage-owned
+    ``result_tile_completion_lost`` diagnostic.
+    """
+
+    decl = lowering.result_tile
+    assert decl is not None
+    write_snapshot = lowering._tiled_write_snapshot
+    if write_snapshot is None:
+        _fail(
+            _RESULT_TILE_LOST,
+            "the result tile's emitted statements were never recorded",
+        )
+
+    # 1. Re-identify the chain.  A panel chain hands over the loops its
+    # completion already re-identified (retained object identity); the bare
+    # heap chain re-identifies its direct loops against the detached
+    # pre-pass headers and marks the parallel row exactly as the legacy
+    # explicit-parallel schedule does before its heap transformation.
+    if lowering.panel is not None:
+        state = lowering._panel_completion
+        if state is None:
+            _fail(
+                _RESULT_TILE_LOST,
+                "the panel completion did not retain the heap chain's loops",
+            )
+        tile_loop = state[0]
+    else:
+        try:
+            completed = lowering._completed_panel_chain(function)
+        except LoopIRTargetError as error:
+            _fail(_RESULT_TILE_LOST, error.defect.message)
+        tile_loop = completed[0]
+        row_loop = completed[lowering.result_tile_row_position]
+        try:
+            expected_marked = LLIRRewriter(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="snapshot_result_tile_parallel_policy",
+                )
+            ).rewrite(row_loop)
+            if type(expected_marked) is not llir.ForLoop:
+                _fail(
+                    _RESULT_TILE_LOST,
+                    "the heap row-loop policy snapshot did not remain a " "ForLoop",
+                )
+            expected_marked.omp_parallel_for = True
+            expected_marked.omp_schedule = "dynamic, 64"
+            apply_parallel_policy(expected_marked)
+            mark_first_for_loop_parallel([row_loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
+        except (
+            LLIRTraversalError,
+            AttributeError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(_RESULT_TILE_LOST, str(error))
+        if not lowering._panel_loop_header_matches(row_loop, expected_marked):
+            _fail(
+                _RESULT_TILE_LOST,
+                "the heap chain's selected row loop did not acquire the "
+                "required parallel policy",
+            )
+
+    # 2. The target's own spellings for the compact family.
+    result_name = lowering.result_decl.name
+    last_level = len(lowering.result_decl.levels) - 1
+    pack_dimension_name = lowering.dimension_names[lowering.loops[0].node.dimension]
+    tile_outer_name = f"{pack_dimension_name}_out"
+    tile_inner_name = f"{pack_dimension_name}_in"
+    tile_size_name = f"kTile_{pack_dimension_name}"
+    torch_dtype = _SCALAR_TO_TORCH[lowering.result_decl.dtype]
+    pointer_type = llir.DataType.ptr_type(torch_dtype)
+    if lowering.result_decl.dtype is ScalarType.FLOAT32:
+        scalar_type = llir.DataType.FLOAT32
+        zero_value = "0.0f"
+    else:
+        scalar_type = llir.DataType.FLOAT64
+        zero_value = "0.0"
+    (
+        compact_name,
+        storage_name,
+        init_prefix,
+        init_inner,
+        init_logical,
+        copy_prefix,
+        copy_inner,
+        copy_logical,
+    ) = _heap_result_tile_names(function, result_name, pack_dimension_name)
+    trailing_bound = f"{result_name}{last_level}_size"
+    prefix_dimension_names = tuple(
+        f"{result_name}{level}_size" for level in range(last_level)
+    )
+    prefix_extent = " * ".join(prefix_dimension_names)
+
+    # 3. Redirect the emitted result write to compact storage: exactly one
+    # metadata candidate whose entire physical subtree matches the detached
+    # pre-pass snapshot, then the exact-one rewrite with a residual
+    # re-check — the reviewed relayout boundary's discipline.
+    metadata = lowering._result_metadata()
+    try:
+        write_candidates = _relayout_access_candidates(tile_loop.body, metadata)
+    except (
+        LLIRTraversalError,
+        AttributeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RESULT_TILE_LOST, str(error))
+    if len(write_candidates) != 1 or not lowering._exact_panel_state_matches(
+        write_candidates[0], write_snapshot
+    ):
+        _fail(
+            _RESULT_TILE_LOST,
+            "the compacted result's physical emitted write does not retain "
+            "exactly its detached pre-pass state",
+        )
+    compact_access = _heap_compact_access(
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        prefix_position_name=f"p{result_name}{last_level - 1}",
+        tile_size_name=tile_size_name,
+        tile_inner_name=tile_inner_name,
+    )
+    try:
+        rewritten_body, rewritten = _rewrite_stmt_access_sequence(
+            cast(Any, tile_loop.body),
+            lowering.result_symbol,
+            metadata.index_ids,
+            llir.TensorAccessRole.RESULT_WRITE,
+            compact_access,
+        )
+        tile_loop.body = cast(List[llir.Stmt], rewritten_body)
+        residual = _contains_tensor_access(
+            tile_loop.body,
+            lowering.result_symbol,
+            metadata.index_ids,
+            llir.TensorAccessRole.RESULT_WRITE,
+        )
+    except (
+        LLIRTraversalError,
+        AttributeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RESULT_TILE_LOST, str(error))
+    if rewritten != 1 or residual:
+        _fail(
+            _RESULT_TILE_LOST,
+            "the compacted result's emitted write was not redirected " "exactly once",
+        )
+
+    # 4. The exactly-once copy-out coverage replaces the whole-result zero
+    # fill; a missing or duplicated generated zero fails closed.
+    try:
+        _remove_dense_result_zero(function, result_name)
+    except (
+        NotImplementedError,
+        AttributeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RESULT_TILE_LOST, str(error))
+
+    # 5. The per-strip init and copy-out groups inside the pack origin, and
+    # the reusable storage block directly above it at function scope.
+    tile_loop.body[0:0] = _heap_result_init_group(
+        result=result_name,
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        scalar_type=scalar_type,
+        zero_value=zero_value,
+        tile_outer_name=tile_outer_name,
+        tile_size_name=tile_size_name,
+        trailing_bound=trailing_bound,
+        prefix_extent=prefix_extent,
+        init_prefix=init_prefix,
+        init_inner=init_inner,
+        init_logical=init_logical,
+    )
+    tile_loop.body.extend(
+        _heap_result_copy_group(
+            result=result_name,
+            result_values=f"{result_name}_values",
+            compact_name=compact_name,
+            pointer_type=pointer_type,
+            tile_outer_name=tile_outer_name,
+            tile_size_name=tile_size_name,
+            trailing_bound=trailing_bound,
+            prefix_extent=prefix_extent,
+            copy_prefix=copy_prefix,
+            copy_inner=copy_inner,
+            copy_logical=copy_logical,
+        )
+    )
+    located = lowering._locate_statement(function.body, tile_loop)
+    if located is None or located[0] is not function.body:
+        _fail(
+            _RESULT_TILE_LOST,
+            "the pack origin loop cannot be located at function scope",
+        )
+    tile_container, tile_index = located
+    tile_container[tile_index:tile_index] = _heap_result_storage_statements(
+        result=result_name,
+        storage_name=storage_name,
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        scalar_type=scalar_type,
+        prefix_dimension_names=prefix_dimension_names,
+        tile_size_name=tile_size_name,
+    )
+    return function
 
 
 def _complete_relayout_impl(
@@ -3740,7 +4174,9 @@ def _lower_loopir_to_llir_owned(
             stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
         )
     assembled = kernel_abi.assemble_function(pipeline_result.artifact.value)
-    return lowering.complete_relayout(lowering.complete_panel(assembled))
+    return lowering.complete_relayout(
+        lowering.complete_result_tile(lowering.complete_panel(assembled))
+    )
 
 
 def lower_loopir_to_llir(
