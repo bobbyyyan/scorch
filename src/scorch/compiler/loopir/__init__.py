@@ -2,8 +2,9 @@
 
 This package owns the frozen production LoopIR subset — the Phase-4 dense
 families, the Phase-5 sparse level families, and the Phase-6 scheduled
-forms (reorders, affine direct tiles, and stack-accumulation workspace
-regions) — and its strangler-path pipeline:
+forms (reorders, affine direct tiles, stack-accumulation workspace
+regions, sparse panels, and staged operand relayouts) — and its
+strangler-path pipeline:
 
 - ``nodes``: frozen, tuple-owned production LoopIR nodes;
 - ``build``: the identity-allocating construction API;
@@ -14,9 +15,9 @@ regions) — and its strangler-path pipeline:
   families;
 - ``iterdomain``: the pure iteration-domain/merge-lattice analysis;
 - ``levels``: the format-neutral level-storage interface and CSR adapters;
-- ``schedule_passes``: pure typed loop-reorder, affine-tiling, and
-  stack-workspace passes applying a verified ``LoopPlan`` to a verified
-  base program;
+- ``schedule_passes``: pure typed loop-reorder, affine-tiling,
+  stack-workspace, sparse-panel, and staged-relayout passes applying a
+  verified ``LoopPlan`` to a verified base program;
 - ``lower_llir``: LoopIR lowering into the existing structured LLIR (the
   current target-specific CxxIR boundary) and the managed pass pipeline;
 - ``pipeline``: the test/debug compile-and-execute driver plus the curated

@@ -39,8 +39,8 @@ Discipline carried over from the spike and the binding design decisions:
   ``SymbolId`` values and bound loop coordinates by production ``IndexId``
   values, so CIN provenance survives lowering; ``LoopIRNodeId``,
   ``DimensionId``, ``CursorId``, ``PositionId``, ``TileId``, and
-  ``WorkspaceId`` are LoopIR-artifact-local identities allocated by
-  :class:`~scorch.compiler.loopir.build.LoopIRBuilder`;
+  ``WorkspaceId``/``RelayoutId`` are LoopIR-artifact-local identities
+  allocated by :class:`~scorch.compiler.loopir.build.LoopIRBuilder`;
 - no C++ spelling, Torch storage field, rendered name, or target policy
   appears in any node; target lowering owns those exclusively.
 
@@ -185,9 +185,10 @@ class RelayoutScope(Enum):
 
     ``PANEL`` stages exactly the owning panel's current clamped window rows
     (the region must execute inside the panel's origin loop); ``PACK_AXIS``
-    stages every row of the operand's panel axis once per pack origin.  In
-    both scopes the staged columns are the pack split's current clamped
-    point window.
+    stages every row of the operand's panel axis whenever the region is
+    entered.  The typed schedule pass places that region once per pack
+    origin.  In both scopes the staged columns are the pack split's current
+    clamped point window.
     """
 
     PANEL = "panel"

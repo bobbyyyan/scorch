@@ -25268,3 +25268,169 @@ section above and `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §14.  Its
 superseding prompt replaces every older prompt in this handoff.  Begin
 from the relayout commits and this docs tip; the §13 panel boundary and
 the §14 relayout boundary are both binding.
+
+## Phase-6 relayout independent-review corrections (2026-07-24)
+
+The §14 milestone was rigorously reviewed and corrected in `6ac5704`
+(`fix(compiler): harden staged relayout completion`), `e4cfa50`
+(`test(compiler): lock relayout completion boundaries`), and `bba935e`
+(`test(compiler): isolate relayout identity snapshots`).  Nothing was
+amended, reordered, or pushed.  `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md`
+§15 is the definitive record and supersedes §14 wherever it strengthens
+the boundary.
+
+The high-severity finding was a real wrong-code route: swapping valid
+metadata between the staged B read and another input caused completion
+to redirect the wrong physical access.  Completion now requires an
+independently detached, full physical-access fingerprint.  The review
+also fixed incomplete pre-replay family admission, declaration-context
+relocation/use-before-declaration, missing/duplicate/nested
+noncanonical operand prefetches, identity payloads shared with the
+supposedly detached metadata snapshot, and raw malformed/cyclic/hostile
+provenance escapes.  Common LLIR traversal now validates exact stored
+identity payloads before semantic matching.
+
+Verification at `bba935e`: exact contract **452**, common traversal
+**435**, scheduled runtime **150**, schedule generality **45**, eleven
+relayout source-parity cells and all nine audit goldens byte-identical,
+fresh 20-source corpus and 42-source grid captures byte-identical, and
+clean detached base/candidate full-source mypy logs identical at 140
+inherited findings in 11 files (zero in `loopir/`).  The first
+base-then-candidate latency run had two p95-only crossings; the required
+candidate-then-base control passed every cell (worst p50 `1.028`, worst
+p95 `1.021`) with identical emitted-source hashes, attributing the first
+tails to session position.  The authoritative isolated suite at
+`bba935e` passed **3,888**, skipped 14, deselected 3, and failed 0 in
+44:13; its log SHA-256 is
+`c521f4e64219b35c2fb91182c278da54835805fa7cc350f68894ebd102a34f0a`.
+Evidence:
+`/Users/bobby/.cache/scorch-codex/phase6-relayout-review-e4cfa50/`.
+
+The corrected verdict is unchanged: direct relayout at both scopes is
+closed under the stronger §15 contract, while Phase 6 remains open for
+heap result tiles/the heap tile-ijk relayout composition, abstract
+parallel-loop selection, intended automatic-plan provenance, canonical
+LoopPlan schedule cache identity, and the exit audit.
+
+## Superseding broad prompt for the next session
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip (the
+relayout-review correction docs commit above bba935e). Do not push. Read
+AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md (Stages 3–7 and Phase 6), the
+Phase-4/5 reviews, all of COMPILER_IR_REFACTOR_PHASE6_REVIEW.md—especially
+§§13–15—and the latest handoff tail. Treat §15 as superseding §14 wherever
+it strengthens relayout completion.
+
+First independently review and reproduce the relayout-review correction
+commits; do not trust their report. Re-run the exact corrected contract and
+runtime gates and adversarially verify: exact pre-replay relayout family
+admission; physical staged-access anchoring rather than metadata-triple
+identity; independently detached identity payloads; exact-one rewrite,
+residual, and prefetch cardinality (including nested noncanonical decoys);
+canonical lexical dominance of the resolved coordinate; malformed, cyclic,
+shared, and hostile post-pass state always becoming the stage-owned
+relayout_completion_lost; and unchanged valid C++ for both staging scopes.
+Fix, test, document, and commit any concrete defect before new work.
+
+Then complete the largest coherent remainder of Phase 6. The mandatory
+primary milestone is heap result-tile accumulation as a full vertical
+memory-region family, not a schema-only patch. Before freezing
+representation, audit and retain a responsibility/lifetime table and
+legacy goldens for Scheduler._validate_heap_result_tile, _ResultTilePlan,
+_apply_heap_result_tile, _remove_dense_result_zero, compact access
+rewriting, allocation/reset/copy-out, parallel-prefix legality, and the
+existing relayout_heap_pack.cpp composition. Define intrinsic typed
+semantics for reusable heap storage, zero initialization at the pack-origin
+lifetime, accumulation, ragged compact indexing, and exactly-once copy-out;
+enforce dominance, ownership, result/access identity, dtype, level/prefix,
+race, and zero-extent rules fail-closed.
+
+Extend every required layer: builder, verifier/adversarial surface,
+canonical printer/serialization, production oracle, pure scheduling pass,
+erasure/equivalence, ScheduledLoopIR carrier/replay/provenance, plan gate,
+public Schedule adapter, target lowering/completion, stage timing,
+cache/neutrality locks, and tests. Preserve the strengthened §§13–15
+snapshot/occurrence discipline: no rendered-name, regex, dynamic-tag, or
+metadata-only discovery. Prove direct, stack, and heap are distinct,
+consume-once plan families.
+
+Cover heap alone and the representative heap tile-ijk composition
+(pack + panel + relayout) at BOTH relayout staging scopes, including the
+retained relayout_heap_pack.cpp golden. Exercise f32/f64, empty rows, zero
+dimensions, unit/exact/ragged/oversized tile widths, randomized
+shapes/sparsity, reset freshness, copy-out completeness, and unsafe
+parallel anchors. Require byte-exact legacy C++ wherever compatibility is
+claimed, compiled legacy/LoopIR/PyTorch/oracle differentials, and direct
+structural activation.
+
+If and only if heap is fully green and separately committed, continue in
+separate commits with target-independent abstract parallel-loop selection
+over stable loop identities. Keep this Phase-6 scoped: represent selection
+and race/reduction legality structurally and consume the parallel_loop plan
+fact exactly once, but leave OpenMP spelling, calibrated thread-count
+policy, prefetch/restrict/SIMD/pointer-hoisting migration, policy
+versioning, and other target-policy work to Phase 7. Cover explicit and
+automatic schedules and every intended dense/sparse/panel/relayout/
+workspace/heap route; reject unsafe reductions or shared heap storage
+before lowering.
+
+If heap and abstract selection both close, resolve two remaining cross-route
+Phase-6 criteria in separately reviewable commits before attempting the
+exit audit. First migrate the intended automatically selected LoopPlans and
+their provenance through the typed schedule path (current
+unsupported_schedule_provenance for every non-explicit plan is not an exit);
+cover every auto dense/sparse family the design requires, or record and
+justify a formal criterion revision rather than silently excluding it.
+Second define and implement canonical LoopPlan schedule cache identity for
+the strangler route, with deterministic identity across fresh builders and
+distinct identities for semantically distinct plans, while preserving the
+source-derived release cache and avoiding a default production cutover.
+
+Only after heap, abstract selection, automatic-plan provenance, and
+canonical schedule identity all close, perform the criterion-by-criterion
+Phase-6 exit audit against every design deliverable and exit criterion:
+reorder; affine ragged tiling; workspace; sparse panels; relayout;
+direct/stack/heap accumulation; abstract parallel selection; public
+Schedule→LoopPlan adapter; canonical LoopPlan cache identity; no name/regex
+discovery; explicit and automatic structural/numerical differentials;
+representative tile-j and direct- and heap-accumulation tile-ijk variants.
+Trace every supported route from public adapter through verified LoopPlan,
+typed passes, target emission, compiled execution, and cache/stage identity.
+Close Phase 6 only if every required route is proved; otherwise state
+exactly what remains. Do not start Phase 7, selector integration, default
+production cutover, or legacy deletion.
+
+For every new node/code/path require exact-type/stored-field validation,
+constructor plus forged/missing/extra/hostile/cyclic/shared/depth
+adversaries, stable owned diagnostics, deterministic canonical
+serialization and builder continuation, pure erasure/oracle proofs, and no
+C++ spelling in LoopIR. Structural activation is never waived. Byte waivers
+require fresh corpus/grid equality. Run focused contract and compiled
+runtime memberships, adjacency sweeps, fresh corpus/grid captures, paired
+sequential compiler latency, Black, Flake8, focused and clean-tree
+full-source mypy against the inherited baseline, git diff --check, and an
+authoritative clean detached-worktree non-performance suite with isolated
+caches and import provenance. Run remote/x86 evidence only if the binding
+policy actually requires it; report machine limits honestly.
+
+Before editing and before every commit, inspect git status, live origin, and
+the five protected-file hashes. Preserve all unrelated dirty/untracked GPU,
+CUDA, benchmark, packaging, scheduler, research, scratchpad, and tooling
+work. Stage explicit pathspecs only. Do not switch branches, amend, squash,
+reorder, or push. Use focused commits with descriptive bodies for review
+fixes, heap schema/pass/lowering/tests, parallel selection/tests, and docs.
+Update the Phase-6 review and handoff with exact commands, counts, hashes,
+evidence paths, origin state, limitations, and a candid exit verdict; commit
+the largest fully verified result without overclaiming.
+```
+
+## Final routing note after the relayout review
+
+The chronologically latest state is the **Phase-6 relayout independent-
+review corrections** section above and
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §15.  Its broad prompt replaces
+every older prompt in this handoff.  Begin from `6ac5704` / `e4cfa50` /
+`bba935e` and the review-correction docs tip; §§13–15 are all binding,
+with §15 controlling on conflict.

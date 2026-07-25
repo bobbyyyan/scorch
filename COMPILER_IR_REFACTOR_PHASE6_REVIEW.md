@@ -1,8 +1,8 @@
 # Phase 6 Review: Scheduling Migration to LoopIR (Explicit Reorder + Affine Tiling)
 
 Date: 2026-07-23 (America/Los_Angeles); §10 (the workspace/stack milestone)
-and §11 (its review) added later the same day; §12 (the panel milestone)
-added 2026-07-24.
+and §11 (its review) added later the same day; §§12–15 (the panel and
+relayout milestones plus their independent reviews) added 2026-07-24.
 
 This review records the first Phase-6 milestone of the compiler IR refactor:
 the ownership audit across the public Schedule surface and both pipelines,
@@ -1532,3 +1532,133 @@ identity decision under `phase6-relayout-audit/`).
 - The §6 observations, the Phase-4/5 errata, and the §11 residual
   boundaries (INT_MAX stack widths, forged-CIN identity hardening)
   stand unchanged.
+
+## 15. Independent review corrections to the relayout milestone (2026-07-24)
+
+Commits `6ac5704` (production fixes), `e4cfa50` (regression lock), and
+`bba935e` (independent identity-snapshot lock) follow the §14 milestone
+without amending or reordering it.  This review did not change the
+LoopIR schema, canonical-v6 serialization, or the 71-code verifier
+surface.  It did find several concrete gaps in the post-assembly
+compatibility boundary, including one wrong-code path.  This section
+supersedes §14 wherever it strengthens the completion contract.
+
+### 15.1 Findings and corrections
+
+1. **The plan gate did not own the exact admitted family.**
+   `_check_plan_families` admitted a wrong logical loop order, swapped
+   access axes/physical levels, and stack accumulation.  Some invalid
+   plans therefore ran multiple typed passes before failing under an
+   unrelated late diagnostic.  Relayout preflight now requires the
+   exact `(row, panel, pack)` order, `(panel, pack)` operand access,
+   physical levels `0/1`, and direct accumulation before replay begins.
+2. **The metadata triple was not a physical-occurrence identity.**
+   Swapping two individually valid A/B `TensorAccessMetadata` values
+   after panel completion made the old code redirect A's physical access
+   as though it were B's, leaving the real B read direct.  The resulting
+   C++ contained a packed-B read multiplied by `B_val[...]` and was
+   accepted instead of failing.
+   Target lowering now retains a detached snapshot of the exact emitted
+   `ArrayAccess`, including independently rebuilt `AccessId`, `SymbolId`,
+   and `IndexId` values.  Completion requires exactly one metadata
+   candidate whose entire physical subtree matches that snapshot before
+   the existing exact-one rewrite/residual checks run.  This keeps the
+   deliberately narrow no-`Load`-occurrence-ID decision while making its
+   emitted-side proof real.
+3. **The coordinate snapshot did not prove dominance.**  Matching only
+   the detached `VarInit` accepted moving the declaration below a use;
+   matching the first correction's three-statement context alone still
+   accepted moving that whole context.  Completion now re-identifies the
+   exact `(Comment, VarInit, BlankLine)` skeleton at its canonical lexical
+   position immediately after the rewritten prefetch.  Moving either the
+   declaration or the intact context fails as
+   `relayout_completion_lost`.
+4. **Prefetch cardinality was best-effort on the typed path.**  No
+   canonical guard was silently accepted, duplicate canonical guards
+   were collapsed, and a nested noncanonical guard for the original
+   operand could survive beside the packed guard.  The shared legacy
+   helper now reports the number removed (its compatibility caller still
+   intentionally ignores that result); typed completion requires exactly
+   one and recursively rejects every residual direct prefetch of the
+   unstaged operand.
+5. **Malformed provenance could escape the stage boundary.**  Candidate
+   discovery previously consulted dataclass equality before full
+   validation, allowing missing, cyclic, or hostile identity state to
+   leak `AttributeError`, `RecursionError`, or user equality behavior.
+   Common LLIR traversal now validates the exact stored fields and exact
+   integer payload of every tensor-access `AccessId`, `SymbolId`, and
+   `IndexId`.  Completion matches only after that validation and compares
+   exact-string state keys without invoking forged equality.  Malformed,
+   extra-key, hostile-value, cyclic, and shared-snapshot adversaries all
+   terminate under the owned diagnostic.
+
+The regression review also corrected three evidence/documentation issues:
+the purported “after region exit” verifier case was still inside the
+region and now has a real sibling-after-exit adversary; the all-ones oracle
+case proves compute visitation, not physical staging freshness; and the
+package/node documentation now includes panels, relayout, `RelayoutId`,
+and the distinction between intrinsic PACK_AXIS entry semantics and the
+typed pass's placement.
+
+### 15.2 Verification
+
+Evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase6-relayout-review-e4cfa50/`.
+
+- exact five-file contract focus at committed test tip `bba935e`:
+  **452 passed** (the §14 lock plus 12 new relayout cases);
+- common LLIR traversal file: **435 passed**, including 28 new
+  walk/rewrite cases over all three identity carriers and missing,
+  boolean, hostile-value, and hostile-extra-key state;
+- scheduled compiled runtime focus
+  (`test_loopir_scheduled_slice.py` plus
+  `test_loopir_pipeline_execution.py`): **150 passed**; both relayout
+  scopes still lower and execute through the unchanged valid route;
+- full legacy schedule-generality file: **45 passed**; the eleven-cell
+  relayout source-parity matrix remains byte-identical, and all nine
+  retained panel/relayout audit goldens (including
+  `relayout_heap_pack.cpp`) regenerated with an empty diff;
+- fresh candidate captures contain 20 corpus sources and 42 grid
+  sources, each byte-identical to the sealed §14 candidate captures;
+  structural relayout activation remains directly tested and is not
+  waived;
+- Black and Flake8 are clean over every changed production/test file;
+  focused mypy is clean.  Fresh clean detached base/candidate
+  full-source mypy logs are line-normalized byte-identical at **140
+  inherited findings in 11 files, zero in `loopir/`**.  This clean
+  committed-tree comparison supersedes §14's stale 146-finding count;
+- paired sequential compiler latency retained both execution orders.  The
+  first base-then-candidate run kept every p50 inside the 1.10 target but
+  crossed at p95 for `csr_intersection` (`1.222`) and `sparse_union`
+  (`1.143`).  The required candidate-then-base control did not reproduce
+  either crossing: all cells passed, with worst p50 `1.028` and worst p95
+  `1.021`.  Source hashes were identical at both revisions, so the
+  order-dependent p95 tails are attributed to session-position machine
+  drift, not the correction.  Both complete JSON pairs, comparison logs,
+  and `latency-attribution.md` are retained;
+- the authoritative isolated clean-worktree suite at `bba935e`:
+  **3,888 passed, 14 skipped, 3 deselected, 1 known warning, 0 failed**
+  in 2,653.72 seconds, with import provenance asserted.  The log SHA-256
+  is `c521f4e64219b35c2fb91182c278da54835805fa7cc350f68894ebd102a34f0a`
+  and the JUnit SHA-256 is
+  `0035bd451789c850dcc53abd4b29e639688ea8273a1caf0385bf8caff7fb401d`;
+- `git diff --check` is clean.  The five protected tracked files retain
+  their recorded SHA-256 values; only explicit pathspecs were staged;
+  unrelated GPU/CUDA, benchmark, packaging, scheduler, research,
+  scratchpad, and tooling material remains untouched.  Live origin
+  remains `58e8565`; no commit was pushed.
+
+### 15.3 Corrected boundary and Phase-6 verdict
+
+The direct-accumulation relayout slice remains closed, but only under
+the stronger exact-family, physical-occurrence, independent-snapshot,
+lexical-dominance, exact-prefetch-cardinality, and traversal-totality
+contract above.  No occurrence identity was added to `Load`; the
+single-occurrence pass proof plus the exact physical LLIR fingerprint is
+the deliberately narrow boundary.
+
+**Phase 6 remains open.**  Heap result-tile accumulation and its
+heap-relayout tile-ijk composition, target-independent abstract
+parallel-loop selection, intended automatic-plan provenance, canonical
+LoopPlan schedule cache identity, and the criterion-by-criterion exit
+audit remain.  Phase 7 policy/pass migration has not started.
