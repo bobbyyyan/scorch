@@ -3620,6 +3620,10 @@ _RESULT_TILE_POLICY_TOKEN = re.compile(
     re.ASCII | re.VERBOSE,
 )
 _RESULT_TILE_POLICY_MACRO = re.compile(r"[A-Z_][A-Z0-9_]*\Z", re.ASCII)
+_RESULT_TILE_NUMERIC_LITERAL = re.compile(
+    r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)" r"(?:[eE][+-]?[0-9]+)?)(?:[fFlLuU]*)\Z",
+    re.ASCII,
+)
 
 
 def _safe_cpp_qualified_name(name: object) -> bool:
@@ -3758,14 +3762,31 @@ def _validate_result_tile_rendered_text(
                     raise ValueError(
                         f"{type(node).__name__}.name must be a qualified C++ name"
                     )
+            elif type(node) is llir.Literal:
+                value = getattr(node, "value", None)
+                data_type = getattr(node, "data_type", None)
+                if (
+                    type(value) is str
+                    and data_type is not llir.DataType.STRING
+                    and _RESULT_TILE_NUMERIC_LITERAL.fullmatch(value) is None
+                ):
+                    raise ValueError(
+                        "non-STRING Literal text must be a numeric C++ literal"
+                    )
             elif type(node) is llir.VarInit:
-                if getattr(node, "op", None) != "=":
+                operator = getattr(node, "op", None)
+                if type(operator) is not str or operator != "=":
                     raise ValueError("VarInit.op must remain '='")
                 if type(getattr(node, "cast", None)) is not bool:
                     raise ValueError("VarInit.cast must be a bool")
             elif type(node) is llir.Comment:
                 value = getattr(node, "value", None)
-                if type(value) is not str or "\n" in value or "\r" in value:
+                if (
+                    type(value) is not str
+                    or "\n" in value
+                    or "\r" in value
+                    or "\\" in value
+                ):
                     raise ValueError("Comment.value must be a single-line string")
             elif type(node) is llir.RawStmt:
                 raise ValueError(
@@ -3782,16 +3803,17 @@ def _validate_result_tile_rendered_text(
                     raise ValueError("Function.args must contain exact Var nodes")
             elif type(node) is llir.ForLoop:
                 schedule = getattr(node, "omp_schedule", None)
-                if schedule not in (
-                    None,
-                    "static",
-                    "dynamic",
-                    "dynamic, 16",
-                    "dynamic, 64",
+                if schedule is not None and (
+                    type(schedule) is not str
+                    or schedule
+                    not in ("static", "dynamic", "dynamic, 16", "dynamic, 64")
                 ):
                     raise ValueError(
                         "ForLoop.omp_schedule is not a recognized compiler policy"
                     )
+                for field in ("omp_parallel_for", "unroll", "simd"):
+                    if type(getattr(node, field, None)) is not bool:
+                        raise ValueError(f"ForLoop.{field} must be a bool")
                 for field, helper in (
                     ("omp_num_threads", "scorch_nthreads"),
                     ("omp_chunk_expr", "scorch_chunk"),
