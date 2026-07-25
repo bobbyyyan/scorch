@@ -1126,3 +1126,204 @@ def test_window_outside_its_panel_fails_closed_at_runtime():
     with pytest.raises(LoopIROracleError) as error:
         oracle._exec_stmt(fixture.row_loop)
     assert "outside its panel's origin loop" in str(error.value)
+
+
+def test_relayout_spmm_matches_the_unstaged_reference_exactly():
+    from scorch.compiler.loopir.nodes import RelayoutScope
+
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    rng = random.Random(1729)
+    rows, inner, cols = 4, 5, 6
+    for scope in (RelayoutScope.PANEL, RelayoutScope.PACK_AXIS):
+        for width, strip in ((1, 1), (2, 3), (3, 4), (5, 6), (7, 9)):
+            fixture = build_relayout_spmm(scope, width=width, strip=strip)
+            a_dense = [
+                [
+                    float(rng.randrange(-3, 4)) if rng.random() < 0.6 else 0.0
+                    for _ in range(inner)
+                ]
+                for _ in range(rows)
+            ]
+            b_dense = [
+                [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(inner)
+            ]
+            results = run_program(
+                fixture.program,
+                {fixture.a: csr_from_dense(a_dense), fixture.b: b_dense},
+                {fixture.c: (rows, cols)},
+            )
+            assert results[fixture.c] == panel_reference_spmm(a_dense, b_dense, cols)
+
+
+def test_relayout_counts_each_stored_entry_and_column_exactly_once():
+    """Counting differential: all-ones inputs count row nnz per output cell
+    across ragged panel windows and ragged pack strips in both scopes; a
+    stale or doubly staged strip would change the counted result."""
+
+    from scorch.compiler.loopir.nodes import RelayoutScope
+
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    inner, cols = 7, 5
+    a_dense = [
+        [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        [0.0] * inner,
+        [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        [1.0] * inner,
+    ]
+    stored_counts = [4.0, 0.0, 3.0, 7.0]
+    ones_b = [[1.0] * cols for _ in range(inner)]
+    for scope in (RelayoutScope.PANEL, RelayoutScope.PACK_AXIS):
+        for width, strip in ((1, 2), (2, 5), (3, 3), (9, 8)):
+            fixture = build_relayout_spmm(scope, width=width, strip=strip)
+            results = run_program(
+                fixture.program,
+                {fixture.a: csr_from_dense(a_dense), fixture.b: ones_b},
+                {fixture.c: (len(a_dense), cols)},
+            )
+            assert results[fixture.c] == [[count] * cols for count in stored_counts]
+
+
+def test_relayout_zero_extents_execute():
+    from scorch.compiler.loopir.nodes import RelayoutScope
+
+    for scope in (RelayoutScope.PANEL, RelayoutScope.PACK_AXIS):
+        from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+        # Zero panel dimension: no windows, no staged strips.
+        fixture = build_relayout_spmm(scope, width=4, strip=2)
+        empty_cols = CsrMatrix(
+            n_rows=3, n_cols=0, indptr=(0, 0, 0, 0), indices=(), values=()
+        )
+        results = run_program(
+            fixture.program,
+            {fixture.a: empty_cols, fixture.b: []},
+            {fixture.c: (3, 2)},
+        )
+        assert results[fixture.c] == [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+
+        # Zero rows.
+        fixture = build_relayout_spmm(scope, width=4, strip=2)
+        no_rows = CsrMatrix(n_rows=0, n_cols=2, indptr=(0,), indices=(), values=())
+        results = run_program(
+            fixture.program,
+            {fixture.a: no_rows, fixture.b: [[1.0, 2.0], [3.0, 4.0]]},
+            {fixture.c: (0, 2)},
+        )
+        assert results[fixture.c] == []
+
+        # Zero free (pack) dimension: the pack origin loop runs nothing.
+        fixture = build_relayout_spmm(scope, width=2, strip=3)
+        results = run_program(
+            fixture.program,
+            {fixture.a: csr_from_dense([[1.0]]), fixture.b: [[]]},
+            {fixture.c: (1, 0)},
+        )
+        assert results[fixture.c] == [[]]
+
+
+def test_relayout_widths_are_semantic_not_allocation_requests():
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    fixture = build_relayout_spmm(width=1 << 100, strip=1 << 90)
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense([[2.0]]), fixture.b: [[3.0]]},
+        {fixture.c: (1, 1)},
+    )
+    assert results[fixture.c] == [[6.0]]
+
+
+def test_staged_read_outside_its_region_fails_closed_at_runtime():
+    """Defensive boundary: the verifier normally precludes these, so the
+    oracle's runtime guards are exercised directly."""
+
+    from scorch.compiler.loopir.nodes import RelayoutScope
+    from scorch.compiler.loopir.oracle import _Oracle
+
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    fixture = build_relayout_spmm(RelayoutScope.PANEL, width=2, strip=2)
+    oracle = _Oracle(
+        fixture.program,
+        {fixture.a: csr_from_dense([[1.0]]), fixture.b: [[1.0]]},
+        {fixture.c: (1, 1)},
+    )
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._eval(fixture.staged)
+    assert "outside its relayout region's execution" in str(error.value)
+
+    # A region executed outside its pack origin fails closed.
+    oracle = _Oracle(
+        fixture.program,
+        {fixture.a: csr_from_dense([[1.0]]), fixture.b: [[1.0]]},
+        {fixture.c: (1, 1)},
+    )
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.panel)
+    assert "outside its pack split's origin loop" in str(error.value)
+
+    # A PANEL-scoped region outside its panel origin fails closed.
+    oracle = _Oracle(
+        fixture.program,
+        {fixture.a: csr_from_dense([[1.0]]), fixture.b: [[1.0]]},
+        {fixture.c: (1, 1)},
+    )
+    oracle.tile_origins[fixture.pack_tile] = 0
+    oracle._tile_widths[fixture.pack_tile] = 2
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.stage)
+    assert "outside its panel's origin loop" in str(error.value)
+
+    # Re-entering an executing region fails closed.
+    oracle = _Oracle(
+        fixture.program,
+        {fixture.a: csr_from_dense([[1.0]]), fixture.b: [[1.0]]},
+        {fixture.c: (1, 1)},
+    )
+    oracle.tile_origins[fixture.pack_tile] = 0
+    oracle._tile_widths[fixture.pack_tile] = 2
+    oracle.panel_origins[fixture.panel_tile] = 0
+    oracle._panel_widths[fixture.panel_tile] = 2
+    oracle.staged_relayouts[fixture.relayout] = fixture.decl
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.stage)
+    assert "re-entered" in str(error.value)
+
+
+def test_staged_read_outside_the_staged_domain_fails_closed_at_runtime():
+    from scorch.compiler.loopir.nodes import RelayoutScope
+    from scorch.compiler.loopir.oracle import _Oracle
+
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    # Column outside the current pack window.
+    fixture = build_relayout_spmm(RelayoutScope.PANEL, width=4, strip=2)
+    oracle = _Oracle(
+        fixture.program,
+        {
+            fixture.a: csr_from_dense([[1.0, 1.0, 1.0, 1.0]]),
+            fixture.b: [[1.0] * 6 for _ in range(4)],
+        },
+        {fixture.c: (1, 6)},
+    )
+    oracle.staged_relayouts[fixture.relayout] = fixture.decl
+    oracle.tile_origins[fixture.pack_tile] = 0
+    oracle._tile_widths[fixture.pack_tile] = 2
+    oracle.panel_origins[fixture.panel_tile] = 0
+    oracle._panel_widths[fixture.panel_tile] = 4
+    oracle.indices[fixture.col] = 0
+    oracle.indices[fixture.free] = 3  # outside pack window [0, 2)
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._eval(fixture.staged)
+    assert "outside the current pack window" in str(error.value)
+
+    # Row outside the current panel window (PANEL scope).
+    oracle.indices[fixture.free] = 1
+    oracle.panel_origins[fixture.panel_tile] = 0
+    oracle._panel_widths[fixture.panel_tile] = 1
+    oracle.indices[fixture.col] = 2  # outside panel window [0, 1)
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._eval(fixture.staged)
+    assert "outside the current panel window" in str(error.value)

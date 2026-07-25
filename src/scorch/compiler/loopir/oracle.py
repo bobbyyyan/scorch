@@ -27,6 +27,13 @@ Semantics (matching the node contracts exactly):
   ``[origin, min(origin + width, extent))`` — panel widths are semantic
   integers, never allocation requests, and a window executed outside its
   panel's origin loop fails closed at runtime;
+- staged relayout regions execute their intrinsic strip semantics:
+  ``RelayoutStage`` records the operand strip staged for the current
+  scope iteration, ``StagedRead`` observes exactly the staged cells
+  (staging copies, so values are served from the operand under
+  fail-closed window-domain checks with nothing eagerly allocated), and
+  a staged read outside its region, its pack origin, or the staged
+  row/column domain fails closed at runtime;
 - sparse iteration executes over the format-neutral level interface of
   :mod:`~scorch.compiler.loopir.levels` (``segment`` / ``coordinate_at`` /
   ``leaf_value``): all-dense inputs bind nested sequences, inputs with a
@@ -76,10 +83,15 @@ from .nodes import (
     PanelOuterFor,
     PositionId,
     PositionValue,
+    RelayoutDecl,
+    RelayoutId,
+    RelayoutScope,
+    RelayoutStage,
     RootPosition,
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    StagedRead,
     Stmt,
     Store,
     StoreReduce,
@@ -373,6 +385,12 @@ class _Oracle:
         self._tile_widths: Dict[TileId, int] = {}
         self.panel_origins: Dict[TileId, int] = {}
         self._panel_widths: Dict[TileId, int] = {}
+        # A staged relayout strip is served lazily from the operand it
+        # copies: staging preserves values exactly, so the region records
+        # only which strip is live and every read is domain-checked against
+        # the current window arithmetic.  Nothing is eagerly allocated from
+        # a verifier-approved (target-neutral) width.
+        self.staged_relayouts: Dict[RelayoutId, RelayoutDecl] = {}
 
     def _workspace_cell(
         self, workspace: WorkspaceId, coord: Expr
@@ -534,6 +552,8 @@ class _Oracle:
             if type(current) is not float:
                 raise LoopIROracleError("load did not resolve to a scalar")
             return current
+        if type(expr) is StagedRead:
+            return self._eval_staged_read(expr)
         if type(expr) is BinaryExpr:
             lhs = self._eval_value(expr.lhs)
             rhs = self._eval_value(expr.rhs)
@@ -543,6 +563,60 @@ class _Oracle:
                 return lhs - rhs
             return lhs * rhs
         raise LoopIROracleError(f"unknown expression {type(expr).__name__}")
+
+    def _eval_staged_read(self, expr: StagedRead) -> float:
+        """Serve one staged read under the intrinsic strip-domain semantics."""
+
+        decl = self.staged_relayouts.get(expr.relayout)
+        if decl is None:
+            raise LoopIROracleError(
+                "staged read outside its relayout region's execution"
+            )
+        operand_decl = self.decls[decl.operand]
+        coords = [self._eval_coord(index) for index in expr.indices]
+        pack_origin = self.tile_origins.get(decl.pack)
+        pack_width = self._tile_widths.get(decl.pack)
+        if pack_origin is None or pack_width is None:
+            raise LoopIROracleError("staged read outside its pack split's origin loop")
+        row_mode = operand_decl.levels[0].mode
+        pack_mode = operand_decl.levels[1].mode
+        row = coords[row_mode]
+        column = coords[pack_mode]
+        pack_extent = self._dimension_extent(operand_decl.dimensions[pack_mode])
+        if not pack_origin <= column < min(pack_origin + pack_width, pack_extent):
+            raise LoopIROracleError(
+                f"staged read column {column} outside the current pack "
+                f"window [{pack_origin}, "
+                f"{min(pack_origin + pack_width, pack_extent)})"
+            )
+        row_extent = self._dimension_extent(operand_decl.dimensions[row_mode])
+        if decl.scope is RelayoutScope.PANEL:
+            panel_origin = self.panel_origins.get(decl.panel)
+            panel_width = self._panel_widths.get(decl.panel)
+            if panel_origin is None or panel_width is None:
+                raise LoopIROracleError(
+                    "panel-scoped staged read outside its panel's origin loop"
+                )
+            window_end = min(panel_origin + panel_width, row_extent)
+            if not panel_origin <= row < window_end:
+                raise LoopIROracleError(
+                    f"staged read row {row} outside the current panel "
+                    f"window [{panel_origin}, {window_end})"
+                )
+        elif not 0 <= row < row_extent:
+            raise LoopIROracleError(
+                f"staged read row {row} outside the staged axis " f"[0, {row_extent})"
+            )
+        current: Any = self.values[decl.operand]
+        for position, index in enumerate(coords):
+            if not isinstance(current, list) or not 0 <= index < len(current):
+                raise LoopIROracleError(
+                    f"staged read index {index} out of bounds at mode {position}"
+                )
+            current = current[index]
+        if type(current) is not float:
+            raise LoopIROracleError("staged read did not resolve to a scalar")
+        return current
 
     def _locate_store(
         self, tensor: SymbolId, indices: Tuple[Expr, ...]
@@ -573,6 +647,33 @@ class _Oracle:
                 f"{self.decls[decl.tensor].name}: {error}"
             ) from error
         return storage, start, end
+
+    def _exec_relayout_stage(self, stmt: RelayoutStage) -> None:
+        decl = stmt.decl
+        if self.tile_origins.get(decl.pack) is None:
+            raise LoopIROracleError(
+                "relayout region executed outside its pack split's origin loop"
+            )
+        if (
+            decl.scope is RelayoutScope.PANEL
+            and self.panel_origins.get(decl.panel) is None
+        ):
+            raise LoopIROracleError(
+                "panel-scoped relayout region executed outside its "
+                "panel's origin loop"
+            )
+        if decl.relayout in self.staged_relayouts:
+            raise LoopIROracleError(
+                "relayout region re-entered while already executing"
+            )
+        # Intrinsic region-entry semantics: the operand's current strip is
+        # staged and stays valid throughout the body; teardown at exit
+        # means the next scope iteration observes a fresh strip.
+        self.staged_relayouts[decl.relayout] = decl
+        try:
+            self._exec_stmt(stmt.body)
+        finally:
+            del self.staged_relayouts[decl.relayout]
 
     def _exec_merge(self, stmt: MergedSparseFor) -> None:
         states: List[_CursorState] = []
@@ -676,6 +777,9 @@ class _Oracle:
             cells, cell = self._workspace_cell(stmt.workspace, stmt.coord)
             contribution = self._eval_value(stmt.value)
             cells[cell] = cells.get(cell, 0.0) + contribution
+            return
+        if type(stmt) is RelayoutStage:
+            self._exec_relayout_stage(stmt)
             return
         if type(stmt) is PanelOuterFor:
             extent = self._dimension_extent(stmt.dimension)

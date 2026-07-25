@@ -19,11 +19,15 @@ adds the coordinate-window pair: one :class:`PanelOuterFor` iterating the
 clamped window origins of a compressed coordinate's dimension, paired by
 the same artifact-local :class:`TileId` with one :class:`SparseWindowFor`
 that visits exactly the stored entries whose coordinate falls inside the
-current window.  Concepts the migrated families do not exercise are
-deliberately *not* declared: there are no accumulators, integer
-constants, physical position loads (dense value-bearing leaves below
-sparse levels), dimension-extent or sparse (hashed) workspaces, or
-parallel nodes yet.
+current window.  The operand-relayout slice adds the staging region: one
+:class:`RelayoutStage` owning a :class:`RelayoutDecl` that stages a dense
+operand's current pack strip (panel-window rows or the whole panel axis)
+at region entry, with :class:`StagedRead` — the staged twin of
+:class:`Load` — reading the operand through the region.  Concepts the
+migrated families do not exercise are deliberately *not* declared: there
+are no accumulators, integer constants, physical position loads (dense
+value-bearing leaves below sparse levels), dimension-extent or sparse
+(hashed) workspaces, or parallel nodes yet.
 
 Discipline carried over from the spike and the binding design decisions:
 
@@ -125,6 +129,23 @@ class WorkspaceId:
     value: int
 
 
+@dataclass(frozen=True, order=True)
+class RelayoutId:
+    """Identity of one staged-operand relayout region within a program.
+
+    A relayout is one schedule fact — "this dense operand's current pack
+    strip is read through contiguous staged storage instead of its
+    declared layout" — realized structurally as a :class:`RelayoutStage`
+    whose :class:`RelayoutDecl` owns the identity.  Staged reads name the
+    relayout by this identity, never by a rendered C++ name; after the
+    typed staging pass redirects the operand's unique read occurrence,
+    this identity is the stable anchor and nothing downstream re-identifies
+    the original access.
+    """
+
+    value: int
+
+
 @unique
 class ScalarType(Enum):
     """Scalar value type of a declared tensor, target-neutrally."""
@@ -156,6 +177,21 @@ class MergeMode(Enum):
 
     UNION = "union"
     INTERSECTION = "intersection"
+
+
+@unique
+class RelayoutScope(Enum):
+    """Row coverage of one staged-operand relayout region.
+
+    ``PANEL`` stages exactly the owning panel's current clamped window rows
+    (the region must execute inside the panel's origin loop); ``PACK_AXIS``
+    stages every row of the operand's panel axis once per pack origin.  In
+    both scopes the staged columns are the pack split's current clamped
+    point window.
+    """
+
+    PANEL = "panel"
+    PACK_AXIS = "pack_axis"
 
 
 @unique
@@ -547,6 +583,86 @@ class WorkspaceReduce(Stmt):
     coord: Expr
     op: ReduceOp
     value: Expr
+
+
+@dataclass(frozen=True)
+class RelayoutDecl(LoopIRNode):
+    """One staged copy of a dense operand's current pack strip.
+
+    ``operand`` names a rank-2 all-dense declared input whose *last*
+    physical storage level stores the pack split's dimension and whose
+    first stores the panel's dimension — the audited legacy family's
+    contiguous-last-level fact, verified structurally.  ``panel`` names the
+    sparse-panel pair whose window rows are staged and ``pack`` names the
+    affine split whose clamped point window is the staged column range;
+    both are the same artifact-local :class:`TileId` space the pairs
+    already own.  ``scope`` selects the staged row coverage
+    (:class:`RelayoutScope`).  There is deliberately no display name, C++
+    buffer spelling, or level index in the node: the staged storage's
+    naming, capacity arithmetic, and pack-loop emission are target
+    concerns with no degrees of freedom given these identities.
+    """
+
+    node_id: LoopIRNodeId
+    relayout: RelayoutId
+    operand: SymbolId
+    panel: TileId
+    pack: TileId
+    scope: RelayoutScope
+
+
+@dataclass(frozen=True)
+class RelayoutStage(Stmt):
+    """Structured staging region of one relayout declaration.
+
+    Region semantics are intrinsic to the node (the oracle and any target
+    lowering must implement exactly this):
+
+    - on entry the operand's current strip is staged: for every row ``r``
+      of the scope's row coverage (``PANEL``: the owning panel's current
+      clamped window ``[origin, min(origin + width, extent))``;
+      ``PACK_AXIS``: the whole panel axis ``[0, extent)``) and every
+      column ``c`` of the pack split's current clamped point window, the
+      staged cell ``(r, c)`` holds exactly ``operand[r, c]``;
+    - ``body`` runs with the staged strip valid throughout; a
+      :class:`StagedRead` of this region is legal only inside it and
+      observes exactly the staged cells;
+    - the staged strip ceases to exist at region exit — its lifetime is
+      exactly the region, so re-entering the region (the next scope
+      iteration) observes a freshly staged strip.
+
+    The region must execute inside its pack split's origin loop (the
+    staged columns need a current pack origin), and a ``PANEL``-scoped
+    region additionally inside its panel's origin loop.  How the staging
+    copy is realized (buffer reuse across iterations, parallel pack
+    loops, capacity arithmetic) is a target concern; only the staged
+    contents and lifetime are semantics.
+    """
+
+    decl: RelayoutDecl
+    body: Block
+
+
+@dataclass(frozen=True)
+class StagedRead(Expr):
+    """A staged read of an in-scope relayout region's operand.
+
+    The staged twin of :class:`Load`: ``indices`` are given in the
+    operand's logical mode order and domain-checked identically, and the
+    value read is exactly ``operand[indices]`` — served through the
+    enclosing region's staged strip.  The row index (the operand's
+    panel-axis mode) must be the panel's window coordinate bound by the
+    owning :class:`SparseWindowFor`, and the column index (the pack-axis
+    mode) must be the pack split's point coordinate bound by its
+    :class:`TileInnerFor`, which is what keeps every staged read inside
+    the staged strip by construction.  The typed staging pass produces
+    this node by replacing the operand's verifier-proven unique ``Load``
+    occurrence; no occurrence identity is needed because the region
+    identity is the anchor from then on.
+    """
+
+    relayout: RelayoutId
+    indices: Tuple[Expr, ...]
 
 
 @dataclass(frozen=True)

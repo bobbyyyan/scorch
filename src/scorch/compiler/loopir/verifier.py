@@ -86,6 +86,19 @@ The invariant families stated locally for this subset:
   split's point coordinate bound inside the region
   (``workspace_coord_mismatch``), and a region must actually accumulate
   and copy out (``workspace_dead_region``).
+- **Staged-operand relayout regions.**  A relayout is declared by exactly
+  one region (``invalid_relayout_id`` / ``duplicate_relayout_id``) staging
+  one rank-2 all-dense input whose first level stores the panel's
+  dimension and whose last level stores the pack split's dimension
+  (``relayout_operand_mismatch``).  The region must open inside its pack
+  split's origin loop, a PANEL-scoped region inside its panel's origin
+  loop, and a PACK_AXIS-scoped region outside it
+  (``relayout_scope_mismatch``).  Staging and teardown are intrinsic
+  region semantics; ``StagedRead`` is legal only inside the region
+  (``unbound_relayout``), its row index must be the panel's window
+  coordinate and its column index the pack split's point coordinate
+  (``relayout_read_mismatch``), and a region must actually be read
+  (``relayout_dead_region``).
 """
 
 from __future__ import annotations
@@ -120,11 +133,16 @@ from .nodes import (
     PositionId,
     PositionValue,
     ReduceOp,
+    RelayoutDecl,
+    RelayoutId,
+    RelayoutScope,
+    RelayoutStage,
     RootPosition,
     ScalarType,
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    StagedRead,
     Stmt,
     Store,
     StoreReduce,
@@ -235,6 +253,16 @@ class _WorkspaceState:
         self.consumed = False
 
 
+class _RelayoutState:
+    """One open staged-relayout region's walk state."""
+
+    __slots__ = ("decl", "read")
+
+    def __init__(self, decl: RelayoutDecl) -> None:
+        self.decl = decl
+        self.read = False
+
+
 class _Context:
     """Mutable walk state: registries, scopes, and traversal guards."""
 
@@ -260,6 +288,8 @@ class _Context:
         self.matched_panel_windows: Set[TileId] = set()
         self.open_workspaces: Dict[WorkspaceId, _WorkspaceState] = {}
         self.ever_workspace_ids: Set[WorkspaceId] = set()
+        self.open_relayouts: Dict[RelayoutId, _RelayoutState] = {}
+        self.ever_relayout_ids: Set[RelayoutId] = set()
         self.producer_depth = 0
         self.in_cursor_default = False
         self.program_dtype: Optional[ScalarType] = None
@@ -693,6 +723,88 @@ def _check_workspace_read(
     return _VALUE
 
 
+def _check_relayout_id(value: object, path: str) -> RelayoutId:
+    if (
+        type(value) is not RelayoutId
+        or type(getattr(value, "value", _MISSING)) is not int
+    ):
+        _fail(
+            "invalid_relayout_id",
+            path,
+            "relayout must be an int-valued RelayoutId",
+        )
+    return value
+
+
+def _check_staged_read(
+    ctx: _Context, expr: StagedRead, path: str, depth: int
+) -> _ExprType:
+    relayout = _check_relayout_id(expr.relayout, path)
+    state = ctx.open_relayouts.get(relayout)
+    if state is None:
+        _fail(
+            "unbound_relayout",
+            path,
+            f"relayout {_diagnostic_int(relayout.value)} has no enclosing "
+            "staging region in scope",
+        )
+    decl = state.decl
+    operand_decl = ctx.tensors[decl.operand]
+    if type(expr.indices) is not tuple:
+        _fail("malformed_state", path, "StagedRead.indices must be an owned tuple")
+    if len(expr.indices) != len(operand_decl.levels):
+        _fail(
+            "rank_mismatch",
+            path,
+            f"{len(expr.indices)} indices for rank-{len(operand_decl.levels)} "
+            "operand",
+        )
+    panel = ctx.open_panels.get(decl.panel)
+    if panel is None:
+        _fail(
+            "relayout_read_mismatch",
+            path,
+            "a staged read needs its panel's origin loop in scope: the "
+            "staged row is the panel's window coordinate",
+        )
+    if ctx.level_dimension(decl.operand, 0) != panel.dimension:
+        _fail(
+            "relayout_operand_mismatch",
+            path,
+            "the staged operand's first storage level must store the "
+            "panel's dimension",
+        )
+    for position, index in enumerate(expr.indices):
+        index_type = _check_expr(ctx, index, f"{path}.indices[{position}]", depth + 1)
+        _require_coord(
+            ctx,
+            index_type,
+            f"{path}.indices[{position}]",
+            "a staged read index",
+            operand_decl.dimensions[position],
+        )
+    row_index = expr.indices[operand_decl.levels[0].mode]
+    pack_index = expr.indices[operand_decl.levels[1].mode]
+    if type(row_index) is not IndexValue or row_index.index != panel.index:
+        _fail(
+            "relayout_read_mismatch",
+            path,
+            "the staged row index must be the panel's window coordinate",
+        )
+    if (
+        type(pack_index) is not IndexValue
+        or ctx.tile_point_bindings.get(pack_index.index) != decl.pack
+    ):
+        _fail(
+            "relayout_read_mismatch",
+            path,
+            "the staged column index must be the pack split's point "
+            "coordinate, bound by its TileInnerFor",
+        )
+    state.read = True
+    return _VALUE
+
+
 _EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ExprType]] = {
     IndexValue: _check_index_value,
     FloatConst: _check_float_const,
@@ -703,6 +815,7 @@ _EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ExprType]] = {
     Load: _check_load,
     BinaryExpr: _check_binary_expr,
     WorkspaceRead: _check_workspace_read,
+    StagedRead: _check_staged_read,
 }
 
 
@@ -1225,6 +1338,115 @@ def _check_workspace_region(
         del ctx.open_workspaces[decl.workspace]
 
 
+def _check_relayout_decl(
+    ctx: _Context, decl: object, path: str, depth: int
+) -> RelayoutDecl:
+    if type(decl) is not RelayoutDecl:
+        _fail(
+            "malformed_state",
+            path,
+            f"expected a RelayoutDecl, got {type(decl).__name__}",
+        )
+    _enter(ctx, decl, path, depth)
+    try:
+        relayout = _check_relayout_id(decl.relayout, path)
+        if relayout in ctx.ever_relayout_ids:
+            _fail(
+                "duplicate_relayout_id",
+                path,
+                f"relayout id {_diagnostic_int(relayout.value)} reused",
+            )
+        ctx.ever_relayout_ids.add(relayout)
+        operand = _check_symbol_id(decl.operand, path, "RelayoutDecl.operand")
+        if operand not in ctx.tensors:
+            _fail(
+                "undefined_tensor",
+                path,
+                "RelayoutDecl references an undeclared tensor",
+            )
+        if operand not in ctx.inputs:
+            _fail("output_read", path, "staged operands must be declared inputs")
+        if type(decl.scope) is not RelayoutScope:
+            _fail(
+                "malformed_state",
+                path,
+                "RelayoutDecl.scope must be a RelayoutScope member",
+            )
+        _check_tile_id(decl.panel, f"{path}.panel")
+        _check_tile_id(decl.pack, f"{path}.pack")
+        return decl
+    finally:
+        _leave(ctx, decl)
+
+
+def _check_relayout_stage(
+    ctx: _Context, stmt: RelayoutStage, path: str, depth: int
+) -> None:
+    decl = _check_relayout_decl(ctx, stmt.decl, f"{path}.decl", depth + 1)
+    pack = ctx.open_tiles.get(decl.pack)
+    if pack is None:
+        _fail(
+            "relayout_scope_mismatch",
+            path,
+            f"relayout pack tile id {_diagnostic_int(decl.pack.value)} has "
+            "no dominating TileOuterFor in scope; the staged columns are "
+            "the split's current point window",
+        )
+    if decl.scope is RelayoutScope.PANEL and decl.panel not in ctx.open_panels:
+        _fail(
+            "relayout_scope_mismatch",
+            path,
+            "a PANEL-scoped relayout region must open inside its panel's "
+            "origin loop; the staged rows are the panel's current window",
+        )
+    if decl.scope is RelayoutScope.PACK_AXIS and decl.panel in ctx.open_panels:
+        _fail(
+            "relayout_scope_mismatch",
+            path,
+            "a PACK_AXIS-scoped relayout region stages every panel row "
+            "once per pack origin and must open outside its panel's "
+            "origin loop",
+        )
+    operand_decl = ctx.tensors[decl.operand]
+    if len(operand_decl.levels) != 2 or any(
+        level.kind is not LevelKind.DENSE for level in operand_decl.levels
+    ):
+        _fail(
+            "relayout_operand_mismatch",
+            path,
+            "a staged operand must be a rank-2 all-dense tensor",
+        )
+    if ctx.level_dimension(decl.operand, 1) != pack.dimension:
+        _fail(
+            "relayout_operand_mismatch",
+            path,
+            "the staged operand's last storage level must store the pack "
+            "split's dimension",
+        )
+    if decl.scope is RelayoutScope.PANEL:
+        panel = ctx.open_panels[decl.panel]
+        if ctx.level_dimension(decl.operand, 0) != panel.dimension:
+            _fail(
+                "relayout_operand_mismatch",
+                path,
+                "the staged operand's first storage level must store the "
+                "panel's dimension",
+            )
+    state = _RelayoutState(decl)
+    ctx.open_relayouts[decl.relayout] = state
+    try:
+        _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
+        if not state.read:
+            _fail(
+                "relayout_dead_region",
+                path,
+                "a relayout region's body must read its staged operand "
+                "through StagedRead",
+            )
+    finally:
+        del ctx.open_relayouts[decl.relayout]
+
+
 def _check_workspace_reduce(
     ctx: _Context, stmt: WorkspaceReduce, path: str, depth: int
 ) -> None:
@@ -1436,6 +1658,7 @@ _STMT_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], None]] = {
     MergedSparseFor: _check_merged_sparse_for,
     WorkspaceRegion: _check_workspace_region,
     WorkspaceReduce: _check_workspace_reduce,
+    RelayoutStage: _check_relayout_stage,
     Store: _check_store,
     StoreReduce: _check_store_reduce,
     AppendEntry: _check_append_entry,

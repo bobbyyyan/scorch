@@ -40,10 +40,13 @@ from .nodes import (
     PanelOuterFor,
     PositionId,
     PositionValue,
+    RelayoutId,
+    RelayoutStage,
     RootPosition,
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    StagedRead,
     Stmt,
     Store,
     StoreReduce,
@@ -58,7 +61,7 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v5"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v6"
 
 
 class _CanonicalIds:
@@ -72,6 +75,7 @@ class _CanonicalIds:
         self._positions: Dict[PositionId, int] = {}
         self._tiles: Dict[TileId, int] = {}
         self._workspaces: Dict[WorkspaceId, int] = {}
+        self._relayouts: Dict[RelayoutId, int] = {}
 
     def dimension(self, dimension: DimensionId) -> int:
         return self._dimensions.setdefault(dimension, len(self._dimensions))
@@ -93,6 +97,9 @@ class _CanonicalIds:
 
     def workspace(self, workspace: WorkspaceId) -> int:
         return self._workspaces.setdefault(workspace, len(self._workspaces))
+
+    def relayout(self, relayout: RelayoutId) -> int:
+        return self._relayouts.setdefault(relayout, len(self._relayouts))
 
 
 def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
@@ -124,6 +131,11 @@ def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
     if type(expr) is WorkspaceRead:
         ids.workspace(expr.workspace)
         _seed_expr_ids(expr.coord, ids)
+        return
+    if type(expr) is StagedRead:
+        ids.relayout(expr.relayout)
+        for index in expr.indices:
+            _seed_expr_ids(index, ids)
         return
     if type(expr) is BinaryExpr:
         _seed_expr_ids(expr.lhs, ids)
@@ -190,6 +202,13 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
         ids.workspace(stmt.workspace)
         _seed_expr_ids(stmt.coord, ids)
         _seed_expr_ids(stmt.value, ids)
+        return
+    if type(stmt) is RelayoutStage:
+        ids.relayout(stmt.decl.relayout)
+        ids.symbol(stmt.decl.operand)
+        ids.tile(stmt.decl.panel)
+        ids.tile(stmt.decl.pack)
+        _seed_stmt_ids(stmt.body, ids)
         return
     if type(stmt) is Store:
         ids.symbol(stmt.tensor)
@@ -265,6 +284,12 @@ def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
             "kind": "workspace_read",
             "workspace": ids.workspace(expr.workspace),
             "coord": _serialize_expr(expr.coord, ids),
+        }
+    if type(expr) is StagedRead:
+        return {
+            "kind": "staged_read",
+            "relayout": ids.relayout(expr.relayout),
+            "indices": [_serialize_expr(index, ids) for index in expr.indices],
         }
     if type(expr) is BinaryExpr:
         return {
@@ -374,6 +399,18 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "coord": _serialize_expr(stmt.coord, ids),
             "value": _serialize_expr(stmt.value, ids),
         }
+    if type(stmt) is RelayoutStage:
+        return {
+            "kind": "relayout_stage",
+            "relayout": {
+                "relayout": ids.relayout(stmt.decl.relayout),
+                "operand": ids.symbol(stmt.decl.operand),
+                "panel": ids.tile(stmt.decl.panel),
+                "pack": ids.tile(stmt.decl.pack),
+                "scope": stmt.decl.scope.value,
+            },
+            "body": _serialize_stmt(stmt.body, ids),
+        }
     if type(stmt) is AppendEntry:
         return {
             "kind": "append_entry",
@@ -467,6 +504,9 @@ def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:
             f"w{ids.workspace(expr.workspace)}"
             f"[{_render_expr(expr.coord, ids, names)}]"
         )
+    if type(expr) is StagedRead:
+        rendered = ", ".join(_render_expr(index, ids, names) for index in expr.indices)
+        return f"staged r{ids.relayout(expr.relayout)}[{rendered}]"
     if type(expr) is BinaryExpr:
         return (
             f"{expr.op.value}({_render_expr(expr.lhs, ids, names)}, "
@@ -582,6 +622,18 @@ def _render_stmt(
             f"[{_render_expr(stmt.coord, ids, names)}] = "
             f"{_render_expr(stmt.value, ids, names)}"
         )
+        return
+    if type(stmt) is RelayoutStage:
+        relayout_decl = stmt.decl
+        lines.append(
+            f"{pad}relayout_stage r{ids.relayout(relayout_decl.relayout)} "
+            f"t{ids.symbol(relayout_decl.operand)} "
+            f"panel s{ids.tile(relayout_decl.panel)} "
+            f"pack s{ids.tile(relayout_decl.pack)} "
+            f"scope {relayout_decl.scope.value} {{"
+        )
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
         return
     if type(stmt) is AppendEntry:
         rendered = ", ".join(_render_expr(coord, ids, names) for coord in stmt.coords)

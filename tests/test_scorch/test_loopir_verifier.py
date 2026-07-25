@@ -25,7 +25,11 @@ from scorch.compiler.loopir.nodes import (
     LoopIRNodeId,
     LoopProgram,
     ReduceOp,
+    RelayoutId,
+    RelayoutScope,
+    RelayoutStage,
     ScalarType,
+    StagedRead,
     Stmt,
     StoreReduce,
     TileId,
@@ -687,6 +691,14 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "workspace_coord_mismatch",
     "workspace_output_write",
     "workspace_dead_region",
+    # Staged-relayout codes added by the Phase-6 relayout slice.
+    "invalid_relayout_id",
+    "duplicate_relayout_id",
+    "unbound_relayout",
+    "relayout_scope_mismatch",
+    "relayout_operand_mismatch",
+    "relayout_read_mismatch",
+    "relayout_dead_region",
 }
 
 
@@ -2370,3 +2382,458 @@ def test_panel_defect_paths_are_reported():
     forge(fixture.panel, bound_level=1)
     defect = expect_defect("panel_bound_mismatch", fixture.program)
     assert defect.path == "program.body.statements[0].bound_level"
+
+
+# -- Phase-6 staged-operand relayout regions ----------------------------------
+
+
+@dataclasses.dataclass
+class RelayoutSpmmFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    a: SymbolId
+    b: SymbolId
+    c: SymbolId
+    dim_i: DimensionId
+    dim_j: DimensionId
+    dim_k: DimensionId
+    row: IndexId
+    col: IndexId
+    free: IndexId
+    pack_tile: TileId
+    panel_tile: TileId
+    relayout: RelayoutId
+    decl: object
+    stage: object
+    staged: object
+    pack: object
+    panel: object
+    window: object
+    row_loop: object
+    pack_point: object
+    leaf: object
+
+
+def build_relayout_spmm(
+    scope=RelayoutScope.PANEL,
+    width=3,
+    strip=4,
+    dtype=ScalarType.FLOAT32,
+) -> RelayoutSpmmFixture:
+    """C[i, k] += A[i, j] * staged B[j, k] — the packed tile-ijk shape.
+
+    An outermost affine pack tile over ``k``, a sparse panel over ``j``
+    directly inside it, and one staging region at the requested scope
+    reading B through :class:`StagedRead` in the compute leaf.
+    """
+
+    from scorch.compiler.loopir.nodes import ReduceOp as _ReduceOp
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    dim_k = builder.dimension("k")
+    a, b, c = (builder.new_symbol_id() for _ in range(3))
+    decl_a = builder.tensor(
+        a,
+        "A",
+        dtype,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_b = builder.tensor(
+        b,
+        "B",
+        dtype,
+        (dim_j.dimension, dim_k.dimension),
+        builder.dense_levels(2),
+    )
+    decl_c = builder.tensor(
+        c,
+        "C",
+        dtype,
+        (dim_i.dimension, dim_k.dimension),
+        builder.dense_levels(2),
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    free = builder.new_index_id()
+    cursor = builder.new_cursor_id()
+    position = builder.new_position_id()
+    pack_tile = builder.new_tile_id()
+    panel_tile = builder.new_tile_id()
+    relayout = builder.new_relayout_id()
+    cursor_decl = builder.sparse_cursor(
+        cursor,
+        a,
+        1,
+        builder.dense_position(a, 0, builder.root_position(), builder.index_value(row)),
+    )
+    staged = builder.staged_read(
+        relayout, (builder.index_value(col), builder.index_value(free))
+    )
+    leaf = builder.store_reduce(
+        c,
+        (builder.index_value(row), builder.index_value(free)),
+        _ReduceOp.ADD,
+        builder.binary(BinaryOp.MUL, builder.cursor_value(cursor), staged),
+    )
+    pack_point = builder.tile_inner_for(
+        pack_tile, free, dim_k.dimension, strip, False, builder.block((leaf,))
+    )
+    window = builder.sparse_window_for(
+        panel_tile, cursor_decl, position, col, builder.block((pack_point,))
+    )
+    row_loop = builder.dense_for(row, dim_i.dimension, builder.block((window,)))
+    decl = builder.relayout_decl(relayout, b, panel_tile, pack_tile, scope)
+    if scope is RelayoutScope.PANEL:
+        stage = builder.relayout_stage(decl, builder.block((row_loop,)))
+        panel = builder.panel_outer_for(
+            panel_tile, col, dim_j.dimension, width, b, 0, builder.block((stage,))
+        )
+        pack = builder.tile_outer_for(
+            pack_tile, free, dim_k.dimension, strip, builder.block((panel,))
+        )
+    else:
+        panel = builder.panel_outer_for(
+            panel_tile, col, dim_j.dimension, width, b, 0, builder.block((row_loop,))
+        )
+        stage = builder.relayout_stage(decl, builder.block((panel,)))
+        pack = builder.tile_outer_for(
+            pack_tile, free, dim_k.dimension, strip, builder.block((stage,))
+        )
+    program = builder.program(
+        (dim_i, dim_j, dim_k),
+        (decl_a, decl_b, decl_c),
+        (a, b),
+        (c,),
+        builder.block((pack,)),
+    )
+    return RelayoutSpmmFixture(
+        builder,
+        program,
+        a,
+        b,
+        c,
+        dim_i.dimension,
+        dim_j.dimension,
+        dim_k.dimension,
+        row,
+        col,
+        free,
+        pack_tile,
+        panel_tile,
+        relayout,
+        decl,
+        stage,
+        staged,
+        pack,
+        panel,
+        window,
+        row_loop,
+        pack_point,
+        leaf,
+    )
+
+
+def test_relayout_fixture_verifies_in_both_scopes():
+    verify_program(build_relayout_spmm(RelayoutScope.PANEL).program)
+    verify_program(build_relayout_spmm(RelayoutScope.PACK_AXIS).program)
+    verify_program(build_relayout_spmm(width=1, strip=1).program)
+    verify_program(build_relayout_spmm(dtype=ScalarType.FLOAT64).program)
+    verify_program(
+        build_relayout_spmm(width=MAX_LOOPIR_TILE_WIDTH, strip=10**9).program
+    )
+
+
+def test_relayout_identity_is_typed_and_unique():
+    fixture = build_relayout_spmm()
+    forge(fixture.decl, relayout=7)
+    expect_defect("invalid_relayout_id", fixture.program)
+
+    fixture = build_relayout_spmm()
+    forge(fixture.staged, relayout="0")
+    expect_defect("invalid_relayout_id", fixture.program)
+
+    class HostileRelayoutId(RelayoutId):
+        pass
+
+    fixture = build_relayout_spmm()
+    forge(fixture.decl, relayout=HostileRelayoutId(fixture.relayout.value))
+    expect_defect("invalid_relayout_id", fixture.program)
+
+    fixture = build_relayout_spmm()
+    forge(fixture.decl, relayout=RelayoutId(True))
+    expect_defect("invalid_relayout_id", fixture.program)
+
+    # A second region may not reuse an already-declared relayout identity.
+    fixture = build_relayout_spmm()
+    inner_decl = fixture.builder.relayout_decl(
+        fixture.relayout,
+        fixture.b,
+        fixture.panel_tile,
+        fixture.pack_tile,
+        RelayoutScope.PANEL,
+    )
+    inner_stage = fixture.builder.relayout_stage(inner_decl, fixture.stage.body)
+    forge(fixture.stage, body=fixture.builder.block((inner_stage,)))
+    expect_defect("duplicate_relayout_id", fixture.program)
+
+
+def test_staged_read_requires_an_enclosing_region():
+    # The staged read sits under the panel but no region is open.
+    fixture = build_relayout_spmm()
+    forge(fixture.panel, body=fixture.stage.body)
+    expect_defect("unbound_relayout", fixture.program)
+
+    # A sibling region's identity does not leak: reads after region exit
+    # fail closed even though the region executed earlier in the block.
+    fixture = build_relayout_spmm()
+    stray = fixture.builder.staged_read(
+        fixture.relayout,
+        (
+            fixture.builder.index_value(fixture.col),
+            fixture.builder.index_value(fixture.free),
+        ),
+    )
+    stray_leaf = fixture.builder.store_reduce(
+        fixture.c,
+        (
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(fixture.free),
+        ),
+        ReduceOp.ADD,
+        stray,
+    )
+    forge(
+        fixture.pack_point,
+        body=fixture.builder.block((fixture.leaf, stray_leaf)),
+    )
+    verify_program(fixture.program)  # still inside the region: legal
+    fixture = build_relayout_spmm()
+    huge = RelayoutId(10**5000)
+    forge(fixture.staged, relayout=huge)
+    defect = expect_defect("unbound_relayout", fixture.program)
+    assert "too large" in defect.message
+
+
+def test_relayout_region_scope_discipline():
+    # The pack split's origin loop must be open.
+    fixture = build_relayout_spmm()
+    forge(fixture.decl, pack=fixture.builder.new_tile_id())
+    expect_defect("relayout_scope_mismatch", fixture.program)
+
+    # PANEL scope outside the panel origin fails closed.
+    fixture = build_relayout_spmm(RelayoutScope.PACK_AXIS)
+    forge(fixture.decl, scope=RelayoutScope.PANEL)
+    expect_defect("relayout_scope_mismatch", fixture.program)
+
+    # PACK_AXIS scope inside the panel origin fails closed.
+    fixture = build_relayout_spmm(RelayoutScope.PANEL)
+    forge(fixture.decl, scope=RelayoutScope.PACK_AXIS)
+    expect_defect("relayout_scope_mismatch", fixture.program)
+
+    # A panel identity that names an affine split is not a panel scope.
+    fixture = build_relayout_spmm(RelayoutScope.PANEL)
+    forge(fixture.decl, panel=fixture.pack_tile)
+    expect_defect("relayout_scope_mismatch", fixture.program)
+
+
+def test_relayout_operand_structure_is_verified():
+    # Rank-1 operands are outside the family.
+    fixture = build_relayout_spmm()
+    operand_decl = fixture.program.tensors[1]
+    forge(
+        operand_decl,
+        dimensions=(fixture.dim_j,),
+        levels=(fixture.builder.level(LevelKind.DENSE, 0),),
+    )
+    expect_defect("relayout_operand_mismatch", fixture.program)
+
+    # A compressed level is outside the family.
+    fixture = build_relayout_spmm()
+    operand_decl = fixture.program.tensors[1]
+    forge(
+        operand_decl,
+        levels=(
+            fixture.builder.level(LevelKind.DENSE, 0),
+            fixture.builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    expect_defect("relayout_operand_mismatch", fixture.program)
+
+    # The last storage level must store the pack dimension.  (The panel's
+    # own bound consistency is checked first on the shared operand, so the
+    # forge changes the mode-1 dimension, not the level order.)
+    fixture = build_relayout_spmm()
+    operand_decl = fixture.program.tensors[1]
+    forge(operand_decl, dimensions=(fixture.dim_j, fixture.dim_j))
+    expect_defect("relayout_operand_mismatch", fixture.program)
+
+    # The operand must be a declared input.
+    fixture = build_relayout_spmm()
+    forge(fixture.decl, operand=fixture.builder.new_symbol_id())
+    expect_defect("undefined_tensor", fixture.program)
+    fixture = build_relayout_spmm()
+    forge(fixture.decl, operand=fixture.c)
+    expect_defect("output_read", fixture.program)
+
+
+def test_staged_read_binder_discipline():
+    # The row index must be the panel's window coordinate.
+    fixture = build_relayout_spmm()
+    forge(
+        fixture.staged,
+        indices=(
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(fixture.free),
+        ),
+    )
+    expect_defect("domain_mismatch", fixture.program)
+
+    # A coordinate of the right dimension bound by the wrong loop still
+    # fails: the row must be the window coordinate itself.
+    fixture = build_relayout_spmm()
+    inner_row = fixture.builder.new_index_id()
+    rebind = fixture.builder.dense_for(
+        inner_row, fixture.dim_j, fixture.builder.block((fixture.leaf,))
+    )
+    forge(
+        fixture.staged,
+        indices=(
+            fixture.builder.index_value(inner_row),
+            fixture.builder.index_value(fixture.free),
+        ),
+    )
+    forge(fixture.pack_point, body=fixture.builder.block((rebind,)))
+    expect_defect("relayout_read_mismatch", fixture.program)
+
+    # The column index must be the pack split's point coordinate.
+    fixture = build_relayout_spmm()
+    forge(
+        fixture.staged,
+        indices=(
+            fixture.builder.index_value(fixture.col),
+            fixture.builder.index_value(fixture.col),
+        ),
+    )
+    expect_defect("domain_mismatch", fixture.program)
+
+    # A non-IndexValue coordinate expression is rejected even when its
+    # domain checks out.
+    fixture = build_relayout_spmm()
+    forge(
+        fixture.staged,
+        indices=(fixture.window.cursor.parent.coord, fixture.staged.indices[1]),
+    )
+    expect_defect("shared_node", fixture.program)
+
+    # Arity is the operand's rank.
+    fixture = build_relayout_spmm()
+    forge(fixture.staged, indices=(fixture.builder.index_value(fixture.col),))
+    expect_defect("rank_mismatch", fixture.program)
+    fixture = build_relayout_spmm()
+    forge(fixture.staged, indices=[])
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_staged_read_outside_its_panel_window_fails():
+    # A staged read lexically inside the region but outside the window has
+    # no window coordinate to read.
+    fixture = build_relayout_spmm(RelayoutScope.PACK_AXIS)
+    outside = fixture.builder.staged_read(
+        fixture.relayout,
+        (
+            fixture.builder.index_value(fixture.col),
+            fixture.builder.index_value(fixture.free),
+        ),
+    )
+    outside_point = fixture.builder.tile_inner_for(
+        fixture.pack_tile,
+        fixture.free,
+        fixture.dim_k,
+        4,
+        False,
+        fixture.builder.block(
+            (
+                fixture.builder.store_reduce(
+                    fixture.c,
+                    (
+                        fixture.builder.index_value(fixture.row),
+                        fixture.builder.index_value(fixture.free),
+                    ),
+                    ReduceOp.ADD,
+                    outside,
+                ),
+            )
+        ),
+    )
+    row_loop = fixture.builder.dense_for(
+        fixture.row, fixture.dim_i, fixture.builder.block((outside_point,))
+    )
+    forge(fixture.stage, body=fixture.builder.block((row_loop,)))
+    expect_defect("relayout_read_mismatch", fixture.program)
+
+
+def test_relayout_region_must_be_read():
+    fixture = build_relayout_spmm()
+    forge(
+        fixture.leaf,
+        value=fixture.builder.cursor_value(fixture.window.cursor.cursor),
+    )
+    expect_defect("relayout_dead_region", fixture.program)
+
+
+def test_relayout_forged_state_fails_closed():
+    # A missing stored field on the decl fails before any checker reads it.
+    fixture = build_relayout_spmm()
+    object.__delattr__(fixture.decl, "scope")
+    expect_defect("malformed_state", fixture.program)
+
+    # A non-member scope is rejected exactly.
+    class HostileScope:
+        value = "panel"
+
+    fixture = build_relayout_spmm()
+    forge(fixture.decl, scope=HostileScope())
+    expect_defect("malformed_state", fixture.program)
+
+    # A hostile RelayoutStage subclass is not a registered statement.
+    class HostileStage(RelayoutStage):
+        pass
+
+    fixture = build_relayout_spmm(RelayoutScope.PACK_AXIS)
+    hostile = HostileStage(LoopIRNodeId(10_005), fixture.decl, fixture.stage.body)
+    forge(fixture.pack, body=fixture.builder.block((hostile,)))
+    expect_defect("unknown_stmt", fixture.program)
+
+    # A hostile StagedRead subclass is not a registered expression.
+    class HostileRead(StagedRead):
+        pass
+
+    fixture = build_relayout_spmm()
+    hostile_read = HostileRead(
+        LoopIRNodeId(10_006), fixture.relayout, fixture.staged.indices
+    )
+    forge(fixture.leaf, value=hostile_read)
+    expect_defect("unknown_expr", fixture.program)
+
+    # A decl that is not an exact RelayoutDecl fails closed.
+    fixture = build_relayout_spmm()
+    forge(fixture.stage, decl=object())
+    expect_defect("malformed_state", fixture.program)
+
+    # Cyclic region bodies are caught by the shared structure guards.
+    fixture = build_relayout_spmm()
+    forge(fixture.stage, body=fixture.program.body)
+    expect_defect("cyclic_structure", fixture.program)
+
+
+def test_relayout_defect_paths_are_reported():
+    fixture = build_relayout_spmm()
+    forge(fixture.decl, scope=RelayoutScope.PACK_AXIS)
+    defect = expect_defect("relayout_scope_mismatch", fixture.program)
+    assert "statements[0]" in defect.path

@@ -48,11 +48,16 @@ from .nodes import (
     PositionId,
     PositionValue,
     ReduceOp,
+    RelayoutDecl,
+    RelayoutId,
+    RelayoutScope,
+    RelayoutStage,
     RootPosition,
     ScalarType,
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    StagedRead,
     Stmt,
     Store,
     StoreReduce,
@@ -68,7 +73,9 @@ from .nodes import (
 )
 
 
-def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int, int]:
+def _max_identity_values(
+    program: LoopProgram,
+) -> Tuple[int, int, int, int, int, int, int]:
     """Scan one program for the next free value of every builder identity."""
 
     next_node = 0
@@ -77,6 +84,7 @@ def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int,
     next_position = 0
     next_tile = 0
     next_workspace = 0
+    next_relayout = 0
     seen: set = set()
     pending: list = [program]
     while pending:
@@ -103,6 +111,8 @@ def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int,
                 next_tile = max(next_tile, value.value + 1)
             elif type(value) is WorkspaceId and type(value.value) is int:
                 next_workspace = max(next_workspace, value.value + 1)
+            elif type(value) is RelayoutId and type(value.value) is int:
+                next_relayout = max(next_relayout, value.value + 1)
             elif isinstance(value, LoopIRNode):
                 pending.append(value)
             elif type(value) is tuple:
@@ -116,6 +126,7 @@ def _max_identity_values(program: LoopProgram) -> Tuple[int, int, int, int, int,
         next_position,
         next_tile,
         next_workspace,
+        next_relayout,
     )
 
 
@@ -129,6 +140,7 @@ class LoopIRBuilder:
         self._next_position_id = 0
         self._next_tile_id = 0
         self._next_workspace_id = 0
+        self._next_relayout_id = 0
 
     @classmethod
     def resuming(cls, program: LoopProgram) -> "LoopIRBuilder":
@@ -148,6 +160,7 @@ class LoopIRBuilder:
             builder._next_position_id,
             builder._next_tile_id,
             builder._next_workspace_id,
+            builder._next_relayout_id,
         ) = _max_identity_values(program)
         return builder
 
@@ -190,6 +203,13 @@ class LoopIRBuilder:
         workspace = WorkspaceId(self._next_workspace_id)
         self._next_workspace_id += 1
         return workspace
+
+    def new_relayout_id(self) -> RelayoutId:
+        """Allocate the next artifact-local staged-relayout identity."""
+
+        relayout = RelayoutId(self._next_relayout_id)
+        self._next_relayout_id += 1
+        return relayout
 
     @staticmethod
     def new_symbol_id() -> SymbolId:
@@ -387,6 +407,22 @@ class LoopIRBuilder:
         value: Expr,
     ) -> WorkspaceReduce:
         return WorkspaceReduce(self._node_id(), workspace, coord, op, value)
+
+    def relayout_decl(
+        self,
+        relayout: RelayoutId,
+        operand: SymbolId,
+        panel: TileId,
+        pack: TileId,
+        scope: RelayoutScope,
+    ) -> RelayoutDecl:
+        return RelayoutDecl(self._node_id(), relayout, operand, panel, pack, scope)
+
+    def relayout_stage(self, decl: RelayoutDecl, body: Block) -> RelayoutStage:
+        return RelayoutStage(self._node_id(), decl, body)
+
+    def staged_read(self, relayout: RelayoutId, indices: Sequence[Expr]) -> StagedRead:
+        return StagedRead(self._node_id(), relayout, tuple(indices))
 
     def store(self, tensor: SymbolId, indices: Sequence[Expr], value: Expr) -> Store:
         return Store(self._node_id(), tensor, tuple(indices), value)

@@ -135,11 +135,12 @@ def test_canonical_dump_omits_display_names():
 
 
 def test_canonical_dump_carries_schema_version():
-    # v5: the Phase-6 panel slice added the sparse coordinate-window kinds
-    # (panel_outer_for, sparse_window_for), after v4 added the workspace
-    # node kinds and v3 the affine-split kinds.
+    # v6: the Phase-6 relayout slice added the staged-operand kinds
+    # (relayout_stage, staged_read), after v5 added the sparse
+    # coordinate-window kinds, v4 the workspace node kinds, and v3 the
+    # affine-split kinds.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v5"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v6"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
@@ -540,3 +541,75 @@ def test_panel_max_semantic_width_is_total_at_the_minimum_digit_limit():
         )
     assert f"width {MAX_LOOPIR_TILE_WIDTH} " in text
     assert payload["body"]["statements"][0]["width"] == MAX_LOOPIR_TILE_WIDTH
+
+
+def test_relayout_printer_renders_the_region_structure():
+    from scorch.compiler.loopir.nodes import RelayoutScope
+
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    text = print_program(build_relayout_spmm(RelayoutScope.PANEL).program)
+    assert "relayout_stage r0 t1 panel s1 pack s0 scope panel {" in text
+    assert "staged r0[x1, x0]" in text
+    # The staged read replaces the direct load spelling entirely.
+    assert "load t1[" not in text
+
+    text = print_program(build_relayout_spmm(RelayoutScope.PACK_AXIS).program)
+    assert "relayout_stage r0 t1 panel s1 pack s0 scope pack_axis {" in text
+
+
+def test_relayout_canonical_dump_is_stable_across_global_id_histories():
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    first = build_relayout_spmm().program
+    for _ in range(64):
+        new_symbol_id()
+        new_index_id()
+    second = build_relayout_spmm().program
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+
+
+def test_relayout_canonical_dump_renumbers_raw_schedule_id_histories():
+    from scorch.compiler.loopir.nodes import RelayoutId
+
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    first = build_relayout_spmm()
+    second = build_relayout_spmm()
+    replacement = RelayoutId(151)
+    forge(second.decl, relayout=replacement)
+    forge(second.staged, relayout=replacement)
+    assert canonical_program_dump(first.program) == canonical_program_dump(
+        second.program
+    )
+    assert print_program(first.program) == print_program(second.program)
+
+
+def test_relayout_canonical_dump_serializes_the_region_semantics():
+    from scorch.compiler.loopir.nodes import RelayoutScope
+
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    base = canonical_program_dump(build_relayout_spmm(RelayoutScope.PANEL).program)
+    assert (
+        canonical_program_dump(build_relayout_spmm(RelayoutScope.PACK_AXIS).program)
+        != base
+    )
+    payload = json.loads(base)
+    stage = payload["body"]["statements"][0]["body"]["statements"][0]["body"][
+        "statements"
+    ][0]
+    assert stage["kind"] == "relayout_stage"
+    assert stage["relayout"]["relayout"] == 0
+    assert stage["relayout"]["operand"] == 1
+    assert stage["relayout"]["scope"] == "panel"
+    assert stage["relayout"]["panel"] == 1
+    assert stage["relayout"]["pack"] == 0
+    leaf = stage["body"]["statements"][0]["body"]["statements"][0]["body"][
+        "statements"
+    ][0]["body"]["statements"][0]
+    read = leaf["value"]["rhs"]
+    assert read["kind"] == "staged_read"
+    assert read["relayout"] == 0
+    assert [index["kind"] for index in read["indices"]] == ["index", "index"]
