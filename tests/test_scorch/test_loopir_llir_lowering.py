@@ -2083,6 +2083,13 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
         "opaque_physical_write",
         "structured_tensor_alias",
         "structured_tensor_mutation",
+        "opaque_call_name",
+        "opaque_call_expression_name",
+        "opaque_initializer_operator",
+        "opaque_variable_name",
+        "opaque_variable_type",
+        "multiline_comment",
+        "opaque_parallel_policy",
         "malformed_top_level",
     ],
 )
@@ -2125,7 +2132,17 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                 function.body.append(duplicate)
         elif mutation == "opaque_physical_write":
             function.body.append(llir.RawStmt("C_values[0] = 123"))
-        elif mutation in ("structured_tensor_alias", "structured_tensor_mutation"):
+        elif mutation in (
+            "structured_tensor_alias",
+            "structured_tensor_mutation",
+            "opaque_call_name",
+            "opaque_call_expression_name",
+            "opaque_initializer_operator",
+            "opaque_variable_name",
+            "opaque_variable_type",
+            "multiline_comment",
+            "opaque_parallel_policy",
+        ):
             final_assembly = next(
                 index
                 for index, stmt in enumerate(function.body)
@@ -2152,7 +2169,7 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                     alias_init,
                     alias_write,
                 ]
-            else:
+            elif mutation == "structured_tensor_mutation":
                 function.body.insert(
                     final_assembly,
                     llir.MemberCallStmt(
@@ -2163,6 +2180,65 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                         member="zero_",
                     ),
                 )
+            elif mutation == "opaque_call_name":
+                function.body.insert(
+                    final_assembly,
+                    llir.FunctionCallStmt("C_values_torch.zero_"),
+                )
+            elif mutation == "opaque_call_expression_name":
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(
+                        llir.Var("decoy", llir.DataType.NO_TYPE),
+                        llir.FunctionCall("C_values_torch.zero_"),
+                    ),
+                )
+            elif mutation == "opaque_initializer_operator":
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(
+                        llir.Var("decoy", llir.DataType.INT),
+                        llir.Literal(0),
+                        op="= 0; C_values_torch.zero_(); int decoy2 =",
+                    ),
+                )
+            elif mutation == "opaque_variable_name":
+                function.body[final_assembly:final_assembly] = [
+                    llir.VarInit(
+                        llir.Var("decoy", llir.DataType.INT),
+                        llir.Literal(0),
+                    ),
+                    llir.Assign(
+                        llir.Var("decoy", llir.DataType.INT),
+                        llir.Var(
+                            "0; C_values_torch.zero_(); decoy",
+                            llir.DataType.INT,
+                        ),
+                    ),
+                ]
+            elif mutation == "opaque_variable_type":
+                forged_type = type(
+                    "ForgedDataType",
+                    (),
+                    {"value": ("int decoy; C_values_torch.zero_(); int")},
+                )()
+                function.body.insert(
+                    final_assembly,
+                    llir.VarDecl(llir.Var("decoy2", forged_type)),
+                )
+            elif mutation == "multiline_comment":
+                function.body.insert(
+                    final_assembly,
+                    llir.Comment("decoy\nC_values_torch.zero_();"),
+                )
+            else:
+                loop = next(
+                    stmt
+                    for stmt in relayout_llir_nodes(function.body)
+                    if type(stmt) is llir.ForLoop
+                )
+                loop.omp_parallel_for = True
+                loop.omp_num_threads = "scorch_nthreads((C_values_torch.zero_(), 1), 1)"
         else:
             malformed = next(
                 stmt for stmt in function.body if type(stmt) is llir.VarInit
