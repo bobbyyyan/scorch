@@ -2088,8 +2088,13 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
         "opaque_initializer_operator",
         "opaque_variable_name",
         "opaque_variable_type",
+        "opaque_literal_text",
         "multiline_comment",
+        "continued_comment",
+        "initializer_operator_subclass",
         "opaque_parallel_policy",
+        "parallel_schedule_subclass",
+        "malformed_loop_flag",
         "malformed_top_level",
     ],
 )
@@ -2140,8 +2145,13 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
             "opaque_initializer_operator",
             "opaque_variable_name",
             "opaque_variable_type",
+            "opaque_literal_text",
             "multiline_comment",
+            "continued_comment",
+            "initializer_operator_subclass",
             "opaque_parallel_policy",
+            "parallel_schedule_subclass",
+            "malformed_loop_flag",
         ):
             final_assembly = next(
                 index
@@ -2226,10 +2236,40 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                     final_assembly,
                     llir.VarDecl(llir.Var("decoy2", forged_type)),
                 )
+            elif mutation == "opaque_literal_text":
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(
+                        llir.Var("decoy", llir.DataType.INT),
+                        llir.Literal(
+                            "0; C_values_torch.zero_(); int decoy2 = 0",
+                            llir.DataType.INT,
+                        ),
+                    ),
+                )
             elif mutation == "multiline_comment":
                 function.body.insert(
                     final_assembly,
                     llir.Comment("decoy\nC_values_torch.zero_();"),
+                )
+            elif mutation == "continued_comment":
+                located = self._locate_statement(function.body, owner)
+                assert located is not None
+                body, position = located
+                body.insert(position, llir.Comment("suppress result write \\"))
+            elif mutation == "initializer_operator_subclass":
+
+                class EffectfulOperator(str):
+                    def __format__(self, format_spec):
+                        return "= 0; C_values_torch.zero_(); int decoy2 ="
+
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(
+                        llir.Var("decoy", llir.DataType.INT),
+                        llir.Literal(0),
+                        op=EffectfulOperator("="),
+                    ),
                 )
             else:
                 loop = next(
@@ -2238,7 +2278,19 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                     if type(stmt) is llir.ForLoop
                 )
                 loop.omp_parallel_for = True
-                loop.omp_num_threads = "scorch_nthreads((C_values_torch.zero_(), 1), 1)"
+                if mutation == "opaque_parallel_policy":
+                    loop.omp_num_threads = (
+                        "scorch_nthreads((C_values_torch.zero_(), 1), 1)"
+                    )
+                elif mutation == "parallel_schedule_subclass":
+
+                    class EffectfulSchedule(str):
+                        def __format__(self, format_spec):
+                            return "static)\nC_values_torch.zero_();\n#pragma omp for"
+
+                    loop.omp_schedule = EffectfulSchedule("static")
+                else:
+                    loop.simd = 1
         else:
             malformed = next(
                 stmt for stmt in function.body if type(stmt) is llir.VarInit
