@@ -25104,3 +25104,167 @@ prompt for the next session** replaces the older panel-milestone prompt
 immediately above in full.  Begin from commits `ab75d0f` / `4a3e269`
 and the docs tip; do not restart from the uncorrected `9423d74`
 boundary.
+
+## Phase-6 relayout milestone: staged operand packing on LoopIR (2026-07-24)
+
+The fourth Phase-6 milestone is complete and closed at commits `075255f`
+(staging region schema/verifier/printer/oracle, canonical v6, 71-code
+locked surface), `3aa9ec1` (the typed `apply_relayout` pass, exact plan
+gate, erasure, loop-only provenance), `e8dd924` (byte-parity target
+lowering with the post-assembly `complete_relayout` extending the §13
+snapshot boundary), `61b68be` (the slice's test lock), and the docs
+commit that records this section;
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §14 is the definitive record.
+Process disclosure, recorded candidly: the test-lock commit was created
+as `85e666c` and immediately amended in place to `61b68be` (an
+accidental `--amend` in a shell chain) to fold in the raw-string-budget
+lock update its refactor required; the amended commit was this
+session's own unpushed seconds-old tip, no pre-existing commit was
+touched, and every gate ran at `61b68be`.  Origin
+`refactor/compiler-ir-phase3-std-move-call` remains `58e8565`; nothing
+was pushed.
+
+Both §13 gates were reproduced at `f41fbf7` before any edit (contract
+414, runtime 126), four independent adversarial probes of the §13
+boundaries passed, and the relayout audit plus the access-identity
+decision were recorded under
+`/Users/bobby/.cache/scorch-codex/phase6-relayout-audit/` BEFORE any
+schema was written.
+
+What is now true:
+
+- The operand-relayout/staging family (the packed tile-ijk
+  contraction's staged dense operand) is migrated end to end for BOTH
+  staging scopes.  `RelayoutDecl(relayout, operand, panel, pack,
+  scope)` + `RelayoutStage(decl, body)` own intrinsic strip
+  staging/teardown semantics; `StagedRead(relayout, indices)` is the
+  staged twin of `Load`.  **The access-identity decision:** no
+  occurrence identity on `Load` — the pass proves the staged operand's
+  unique read occurrence (`relayout_target_missing` /
+  `relayout_ambiguous_access`) and the region identity anchors
+  everything downstream; the per-symbol LLIR `AccessId` is never used
+  as occurrence identity.
+- `apply_relayout` consumes every `OperandRelayout` fact exactly once
+  on the fully scheduled five-loop chain; the plan gate admits exactly
+  the audited family (`invalid_schedule_relayout`;
+  `unsupported_schedule_relayout` no longer exists — the family is
+  migrated); heap-accum composition stays fail-closed
+  (`unsupported_schedule_result_tile` via the Scheduler);
+  `erase_schedule` restores the plain operand read, proven by canonical
+  dumps and exact oracle counting differentials in both scopes.
+- The target records the staged read as a synthetic direct-Load view so
+  the managed passes see the legacy tree byte-for-byte, then
+  `complete_relayout` runs right after `complete_panel` on the
+  assembled function using retained completion objects, the typed
+  metadata-triple redirection (exactly once + residual re-check), a
+  detached snapshot re-identification of the window coordinate, and
+  shared helpers extracted byte-neutrally from the legacy
+  `_apply_relayout` (all nine audit goldens regenerate
+  byte-identically).  Failures are stage-owned
+  `relayout_completion_lost`.
+
+Verification highlights (full detail in review §14.6): contract focus
+**440** (was 414), runtime focus **150** in 622.80 s (was 126), focused
+membership **625 + 4 neutrality**, adjacency **1,945** plus **332**
+compiled, an eleven-cell byte-parity grid plus bitwise compiled shadows
+for both scopes (window regimes with an empty CSR row, f64 at 1e-10,
+all three zero-extent boundaries, randomized dims vs PyTorch and the
+production oracle), fresh 20-corpus/42-grid captures byte-identical to
+detached `f41fbf7`, paired sequential compiler latency inside the 1.10
+target everywhere (worst p50 0.991, worst p95 1.033), Black/Flake8
+clean, focused mypy clean over thirteen modules, full-source mypy at
+exactly the inherited 146 findings (zero in `loopir/`), and
+a clean
+detached-worktree full non-performance suite at `61b68be` with import
+provenance asserted and isolated caches: **3,848 passed, 14 skipped, 3
+perf-marked deselections, one known warning, zero failures/errors in
+2,538.08 seconds** (log SHA-256 `74e6961b…`, JUnit `0a14d814…`).  Evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase6-relayout-61b68be/`.
+
+**Candid Phase-6 exit verdict: not exited.**  Migrated: explicit
+orders, affine direct tiles, stack workspace accumulation, sparse panel
+tiling, and operand relayout/staging (both scopes, direct
+accumulation).  The panel-only tile-j schedule and the
+direct-accumulation tile-ijk composition (pack + panel + relayout,
+both staging scopes, through the public Schedule adapter) are migrated
+and byte-locked.  Still open: heap result-tile accumulation (and with
+it the heap-accum tile-ijk variant and the `relayout_heap_pack.cpp`
+golden composition), target-independent abstract parallel-loop
+selection, and the criterion-by-criterion Phase-6 exit audit.
+
+## Superseding Copy-Paste Prompt for the Next Session/Agent
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip (the
+relayout docs commit above 61b68be). Do not push. First rigorously review the
+relayout milestone commits 075255f/3aa9ec1/e8dd924/61b68be and this docs
+commit. Read AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md (Stages 3-7 and Phase
+6), the Phase-4/5 reviews, all of COMPILER_IR_REFACTOR_PHASE6_REVIEW.md —
+especially §§13-14 — and this handoff tail. Independently reproduce the
+corrected focused gates (the 440-test five-file contract focus and the
+150-test compiled runtime focus); do not trust the report. Verify in
+particular: the consume-once relayout plan gate; unique-occurrence
+redirection and residual rejection at pass and completion; the synthetic
+direct-Load view leaving managed passes byte-neutral; complete_relayout's
+retained-object and snapshot discipline (relayout_completion_lost totality);
+byte parity for both staging scopes; and the oracle's fail-closed strip
+domains. Fix, test, document, and commit any concrete review defect before
+new work.
+
+Then complete the largest coherent remainder of Phase 6. The primary
+milestone is heap result-tile accumulation as its own verified memory-region
+family: intrinsic initialization/reset at the pack-origin scope, dominance
+and lifetime, structural result-access redirection into compact storage,
+copy-out at scope exit, ragged and zero extents, f32/f64, the
+_apply_heap_result_tile legacy audit (including _remove_dense_result_zero's
+proof obligation), byte parity against the retained relayout_heap_pack.cpp
+golden, and the heap-accum tile-ijk composition with relayout at both
+staging scopes. Extend every required layer (builder, verifier, canonical
+schema/printer, oracle, pure passes, erasure/equivalence, ScheduledLoopIR
+replay/provenance, target lowering extending the corrected completion
+boundary, plan gate, cache identity, import neutrality). Audit the legacy
+heap chain and record it in the ledger BEFORE freezing schema.
+
+If and only if heap is fully green and separately committed, continue with:
+(1) target-independent abstract parallel-loop selection over stable loop
+identities with race/reduction legality proofs and consume-once plan facts,
+keeping OpenMP spelling and calibrated policy compatibility in target
+lowering; then (2) the criterion-by-criterion Phase-6 exit review across
+every deliverable and route, with a candid verdict — if any family or
+required route remains open, say Phase 6 remains open. Do not begin Phase 7
+policy migration, selector integration, default production cutover, or
+legacy deletion.
+
+Preserve every established contract of reviews §9-§14 (exact stored
+ownership, malformed state failing before dispatch, consume-once plan facts,
+intrinsic region semantics, snapshot-based post-assembly completion, byte
+waivers only via fresh corpus/grid capture equality, structural activation
+never waived). Mandatory evidence mirrors §14.6: adversarial coverage for
+every new defect code and forged/hostile/cyclic/shared state, canonical and
+continuation determinism, redirection completeness, oracle and erasure
+proofs with content/reset/copy counting, ragged/zero domains, f32/f64,
+randomized dimensions, byte-exact legacy C++ with compiled
+PyTorch/legacy/oracle differentials, the full adjacency sweeps, fresh
+corpus/grid captures, paired sequential compiler latency, Black, Flake8,
+focused and full-source mypy against the inherited 146-finding baseline,
+git diff --check, and a clean detached-worktree full non-performance suite
+with isolated caches and import provenance asserted.
+
+Before editing and before every commit, audit git status, live origin, and
+the five protected-file hashes. Preserve all unrelated dirty/untracked GPU,
+CUDA, benchmark, packaging, scheduler, research, scratchpad, and tooling
+material. Stage explicit pathspecs only. Do not switch branches, do not
+amend or reorder any existing commit (including your own — the 85e666c ->
+61b68be amend recorded above is the cautionary precedent), and do not push.
+Update the Phase-6 review and handoff with exact evidence and a candid exit
+verdict. Commit the largest fully verified result without overclaiming.
+```
+
+## Final routing note after the relayout milestone
+
+The chronologically latest state is the **Phase-6 relayout milestone**
+section above and `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §14.  Its
+superseding prompt replaces every older prompt in this handoff.  Begin
+from the relayout commits and this docs tip; the §13 panel boundary and
+the §14 relayout boundary are both binding.

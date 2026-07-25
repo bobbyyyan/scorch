@@ -1216,3 +1216,319 @@ boundary: no rendered names, regexes, dynamic tags, or bare ordinal
 matching.  It must use stable artifact identity/provenance where
 available or a complete retained structural snapshot with the same
 missing/extra/reordered/shared/cyclic/malformed fail-closed discipline.
+
+## 14. Relayout milestone: staged operand packing on LoopIR (2026-07-24)
+
+The fourth Phase-6 milestone migrates the operand-relayout/staging
+schedule family — the packed tile-ijk contraction's staged dense
+operand, the family the audited legacy `_apply_relayout` completes — end
+to end for **both staging scopes**: schema, verifier,
+printer/serialization, oracle, typed pass, plan gate, erasure,
+provenance, target lowering with byte parity, and a compiled matrix.
+Four stacked local commits plus the docs commit that records this
+section; nothing earlier was amended or reordered and nothing was
+pushed:
+
+- `075255f` — `feat(compiler): extend LoopIR with the operand staging region schema`
+- `3aa9ec1` — `feat(compiler): apply operand relayout plans as a typed staging pass`
+- `e8dd924` — `feat(compiler): lower staged operand relayout with legacy byte parity`
+- `61b68be` — `test(compiler): lock the Phase-6 relayout vertical slice`
+
+One candid process note: the test-lock commit was first created as
+`85e666c` and, within minutes and before any gate ran against it, was
+amended in place to `61b68be` to fold in the string-budget lock update
+its own refactor required (an accidental `--amend` in a shell chain,
+disclosed rather than repaired with further history surgery).  The
+amended commit was this session's own unpushed tip; no pre-existing
+commit of the reviewed history was touched, and every §14 gate below ran
+at `61b68be`.
+
+Both §13 gates were independently reproduced at `f41fbf7` before any
+edit — the five-file contract focus passed **414** and the compiled
+runtime focus passed **126** (531.87 s) — the §13 correction diffs were
+read in full, and four independent adversarial probes (the maximum
+2,048-bit width verifying and canonically printing at CPython's minimum
+640-digit limit, the width boundary+1 failing `invalid_tile_width` with
+a total message, a huge forged identity rendering a bounded diagnostic,
+and the bare-program row-reduction race gate) all passed.  No concrete
+§13 defect was found.
+
+### 14.1 Audit and the access-occurrence identity decision
+
+The relayout re-audit and the identity decision were recorded under
+`/Users/bobby/.cache/scorch-codex/phase6-relayout-audit/AUDIT.md`
+**before any schema was written**, with the nine panel/relayout goldens
+re-read and the legacy chain re-checked at this tip
+(`Scheduler._validate_relayout`, `_apply_relayout`,
+`_packed_storage_declaration`, `_TensorAccessRewriter` and its
+preflight, `_redirect_sparse_prefetch`, both staging lifetimes, and the
+`apply_schedule_to_llir` ordering: panel → heap → relayout on the
+assembled function).
+
+**The decision: no occurrence identity is added to `Load`.  The typed
+pass proves, and re-proves after rebuilding, that the staged operand has
+exactly one read occurrence — the deliberately narrow verifier-proven
+unique operand/index occurrence boundary the §11/§12 reviews permit.**
+Rationale, recorded before schema freeze: (1) within the audited family
+the staged operand is read by exactly one access occurrence
+(`_validate_relayout` admits exactly two RHS accesses in one
+multiplicative contraction), and the pass makes that a checked property
+(`relayout_target_missing` / `relayout_ambiguous_access`), never an
+assumption; (2) the redirected read is structural — `StagedRead`
+carries an artifact-local `RelayoutId`, so after the pass the *region*
+identity is the stable anchor and nothing downstream re-identifies the
+original occurrence; (3) per-occurrence `Load` identity would be a
+schema-wide change (every builder call site, canonical serialization,
+continuation, goldens) serving one consumer whose family is proven
+single-occurrence, and can be introduced later without breaking this
+design if a multi-occurrence family ever needs it; (4) the lower-LLIR
+per-symbol `AccessId` is used nowhere as a logical occurrence identity —
+the emitted-side redirection consumes the typed
+`(tensor_id, index_ids, role)` metadata triple exactly as the audited
+legacy rewriter does, made unambiguous by the LoopIR-side proof.
+
+### 14.2 What was frozen (schema extension)
+
+New in `loopir/nodes.py`: `RelayoutId` (builder-allocated,
+artifact-local, covered by the declared-field-only `resuming` scan),
+`RelayoutScope` (`PANEL` | `PACK_AXIS`), `RelayoutDecl(relayout,
+operand, panel: TileId, pack: TileId, scope)`, the region statement
+`RelayoutStage(decl, body)`, and `StagedRead(relayout, indices)` — the
+staged twin of `Load`.  Region semantics are intrinsic: at entry the
+operand's current strip is staged (PANEL: the panel's current clamped
+window rows; PACK_AXIS: the whole panel axis; columns always the pack
+split's current clamped point window), the staged cells hold exactly
+`operand[r, c]`, the strip is valid throughout the body, and teardown at
+exit means every scope iteration observes a fresh strip.  Buffer
+naming, capacity arithmetic, reuse, and pack-loop emission are target
+concerns with no spelling in the nodes.  Canonical serialization moved
+to schema `scorch.loopir.canonical.v6`; the printer renders the region
+(`relayout_stage r0 t1 panel s1 pack s0 scope panel`) and staged reads
+(`staged r0[x1, x0]`); dumps stay stable across unrelated global
+identity histories and renumber raw relayout identities.  The oracle
+executes the intrinsic semantics with fail-closed runtime guards —
+region outside its pack origin, PANEL region outside its panel origin,
+re-entry, staged reads outside the region or outside the staged
+row/column domains — serving values lazily from the operand (staging
+copies exactly), so nothing is eagerly allocated from verifier-approved
+widths.
+
+### 14.3 Verifier surface
+
+Seven stable codes were added, each with direct adversarial
+regressions: `invalid_relayout_id`, `duplicate_relayout_id`,
+`unbound_relayout` (a staged read with no enclosing region in scope,
+including huge-identity diagnostic totality),
+`relayout_scope_mismatch` (no dominating pack origin; PANEL outside its
+panel origin; PACK_AXIS inside it; a panel identity naming an affine
+split), `relayout_operand_mismatch` (wrong rank/kind or level dimensions
+against the panel/pack dimensions), `relayout_read_mismatch` (the row
+index must be the panel's window coordinate and the column index the
+pack split's point coordinate — a rebound same-dimension coordinate is
+rejected), and `relayout_dead_region`.  Hostile
+`RelayoutStage`/`StagedRead`/`RelayoutId` subclasses, missing stored
+fields, non-member scopes, cyclic bodies, and shared nodes fail through
+the existing guards.  The locked source-scan surface grows from 64 to
+**71** codes.
+
+### 14.4 Pass, plan gate, erasure, and provenance
+
+`apply_relayout(program, relayout)` is the new pure typed pass,
+operating on identities only, applied by `apply_schedule_plan` **after**
+every tile — the fully scheduled chain, exactly where the legacy
+lowering completes relayout.  Each `OperandRelayout` fact is consumed
+exactly once: `pack_loop`/`panel_loop` select the chain's two schedule
+pairs, `scope_loop` selects the region scope, `row_loop` is validated
+against the window's dense-parent row coordinate (the fact has no other
+legal value — the panel `parallel_loop` precedent), `strip_width`
+against the pack split's width, the two operand levels against the
+declaration's dimension structure, and `access_indices` select the
+redirected read.  The pass requires exactly the audited five-loop chain
+(pack origin, panel origin directly below it, parallel row, window,
+pack point) with a direct dense-result leaf, proves the operand's
+unique `Load` occurrence, replaces it structurally with a `StagedRead`
+carrying the fresh region identity, wraps the row loop (PANEL) or the
+panel origin (PACK_AXIS) in the region, and re-checks that no residual
+direct read survived the rebuild.
+
+The plan gate replaces the unconditional `unsupported_schedule_relayout`
+rejection with the exact family admission (`invalid_schedule_relayout`:
+exactly one outermost affine pack tile at the strip width plus one
+panel placed `child_of` the pack origin, `parallel_loop` equal to the
+relayout row, scope in the pair, logical loop refs); the
+heap-accumulation composition stays fail-closed as the unmigrated heap
+family (`unsupported_schedule_result_tile` through the Scheduler's
+plan, `unsupported_schedule_accumulation` on a direct plan).
+`_decompose_body` treats the region as a chain element only for callers
+that pass a relayout sink (provenance, erasure, the carrier's
+base-purity check — which now rejects staging regions explicitly);
+every scheduling pass keeps the default and refuses already-relayouted
+chains with `unsupported_schedule_shape`.  Provenance stays loop-only
+(five entries; the region binds no loop) with the region's placement
+covered by the carrier's deterministic replay equality.
+`erase_schedule` drops the region and restores the plain operand
+`Load`, proven equal to the reordered base by canonical dump for both
+scopes and by exact oracle differentials (all-ones counting across
+ragged panel windows and ragged pack strips in both scopes, randomized
+dimensions, zero extents).
+
+### 14.5 Target lowering and the post-assembly completion
+
+The target accepts the staging region on exactly the audited chain
+(`_validate_relayout_shape`: the five-loop kinds, shared tile
+identities, the scope-consistent region depth, the operand's dimension
+structure, and exactly one `StagedRead` of the region in the compute
+leaf indexed by the window and point coordinates).  The staged read is
+recorded as a synthetic direct-`Load` view, so raw emission — position
+resolves, drivers, bounds, metadata — and **every managed pass** see
+byte-for-byte the tree the legacy pipeline transforms; the dead
+`pB1` resolve and the direct `B_val` read the passes decided on are
+byte-preserved.
+
+`complete_relayout` runs on the assembled function immediately after
+`complete_panel` — the legacy `apply_schedule_to_llir` order — and
+extends the corrected §13 completion boundary: it consumes the panel
+completion's retained, already re-identified loop objects (the pack
+origin from the verified chain, the created panel origin, the row loop,
+the window — never a second discovery pass); redirects the emitted
+operand read by the typed metadata triple exactly once with a residual
+re-check; adapts the sparse prefetch through the schedule lowerer's
+shared constructor while passing the target's own coordinate-array
+spelling so the legacy `_find_coordinate_array` name scan never runs on
+the typed path; re-identifies the window's resolved coordinate against
+a detached pre-pass snapshot (the §13 `_exact_panel_state_matches`
+comparator) before inserting the compatibility range guard; and places
+the pack loop and reusable storage through helpers extracted from the
+legacy `_apply_relayout` (`_panel_range_guard`, `_relayout_pack_loop`,
+`_relayout_storage_statements`, plus the widened
+`_redirect_sparse_prefetch`) — one source per spelling, the extraction
+proven byte-neutral by regenerating all nine retained audit goldens
+byte-identically.  Every disagreement is the stage-owned
+`relayout_completion_lost` diagnostic, including a lost completion
+record and a corrupted coordinate declaration.  The raw-string-budget
+lock follows the moved `_packed_storage_declaration` owner into the
+shared helper.
+
+**The compiled matrix.**  An eleven-cell relayout byte-parity grid
+locks generated C++ equality against `Scheduler.apply_schedule` + the
+legacy lowering in every cell: both staging scopes, unit widths, a
+panel width above the extent, strips not dividing the extents, f32/f64
+in both scopes, zero rows, zero panel extent, zero free extent, and
+larger non-square shapes (a ten-cell independent probe sweep during
+development also passed byte-identically, including width 64/strip 32).
+Compiled shadow execution (both pipelines, real kernels) is
+**bitwise-equal** to the legacy scheduled kernels and PyTorch-close for
+both scopes across the three window regimes with an empty CSR row, f64
+at 1e-10 tolerances, and all three zero-extent boundaries; randomized
+dimensions, widths, strips, and scopes execute against PyTorch and the
+production oracle.  Structural activation is asserted directly and
+never waived: the reusable packed storage and restrict pointer for both
+capacities (`(size_t)kTile_j * (size_t)kTile_k` and
+`(size_t)B0_size * (size_t)kTile_k`), both scope-specific pack pragmas
+and destination spellings, the compatibility range guard, the
+redirected compute read, the packed prefetch for both scopes, and the
+absence of any residual `B_val[pB1]` read.
+
+### 14.6 Verification
+
+Evidence ledger:
+`/Users/bobby/.cache/scorch-codex/phase6-relayout-61b68be/` (audit and
+identity decision under `phase6-relayout-audit/`).
+
+- both §13 gates were independently reproduced before any edit: the
+  414-test contract focus and the 126-test runtime focus at `f41fbf7`;
+- contract focus after the milestone (same five files): **440 passed** —
+  the 26 new contract regressions cover the relayout verifier codes,
+  the pass surface, the plan gate, and the target boundaries;
+- scheduled runtime focus after the milestone: **150 passed** in
+  622.80 s across `test_loopir_scheduled_slice.py` (121) and
+  `test_loopir_pipeline_execution.py` (29), including the eleven relayout parity cells, the compiled
+  relayout shadows, and the structural activation locks;
+- focused production LoopIR membership: **625 passed + 4 neutrality**
+  (the §13 membership plus the 60 milestone tests across verifier,
+  printer, oracle, schedule passes, LLIR lowering, and the scheduled
+  slice);
+- combined focused adjacency sweep (LoopIR fast suites + spike
+  verifier/execution/neutrality + CIN/CIN-analysis + stage timing +
+  LLIR pass-manager/string-budget/traversal + LoopPlan + native ABI +
+  Schedule API + Scheduler + value-object boundaries): **1,945
+  passed**, plus **332 passed** across the cin_lowerer,
+  schedule-generality, and tune-scheduler-harness compiled adjacency
+  files;
+- byte gates: fresh 20-source corpus and 42-source grid captures from
+  the working tree are **byte-identical** to detached `f41fbf7`
+  captures (`diff -qr` empty), and all nine retained panel/relayout
+  audit goldens regenerate byte-identically after the schedule-lowerer
+  helper extraction — no legacy emission changed, the byte waiver
+  applies, no runtime kernel benchmark is required, and the Phase-5 §8
+  first-run failures and reviewed exception remain the permanent,
+  un-rerun record;
+- compiler latency: a fresh paired base(`f41fbf7`)/candidate run of the
+  four-category corpus, measured sequentially on a quiet machine, is
+  inside the 1.10 target everywhere — p50 ratios
+  `0.978/0.991/0.981/0.973`, p95 ratios `0.933/1.033/0.966/0.998`
+  (small-dense, reduction, CSR-intersection, sparse-union), with
+  identical per-case source hashes; the release JIT path itself never
+  enters the LoopIR stages;
+- static parity: Black clean over every changed module and test; Flake8
+  clean over the same; focused `mypy --check-untyped-defs` clean over
+  all thirteen package modules including `schedule_lowerer.py`;
+  full-source mypy reports exactly the **146 inherited findings in 12
+  files, zero in `loopir/`**; `git diff --check` clean before every
+  commit;
+- the authoritative clean detached-worktree non-performance suite at
+  the exact final test commit `61b68be`, with isolated
+  pytest/Torch-extension/cache directories and import provenance
+  asserted: **3,848 passed, 14 skipped, 3 perf-marked
+  deselections, one known warning, and zero failures/errors in
+  2,538.08 seconds** — exactly the §13 baseline of 3,788 passed plus
+  the 60 new milestone tests (JUnit: 3,862 selected; log SHA-256
+  `74e6961b50ca9a60cd0ff9b59fbbb4769ef1714219d60673551403b098effda8`,
+  JUnit SHA-256
+  `0a14d814abd0a024f1f86baeea22dbcd256e7e72e6a156ffcae10e7a8156cbfa`);
+- the five protected tracked files retain their recorded SHA-256 values
+  and were never staged; staging used explicit pathspecs only; no
+  GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, or
+  tooling material was touched; origin
+  `refactor/compiler-ir-phase3-std-move-call` remains at `58e8565`
+  (live `git ls-remote` confirmed at session start) and nothing was
+  pushed.
+
+### 14.7 Limitations and the candid Phase-6 exit verdict
+
+- The migrated schedule surface is now: explicit complete loop orders,
+  affine `accum="direct"` splits, the stack-accumulation workspace
+  family, sparse panel tiling with its mandatory parallel row loop, and
+  operand relayout/staging at **both** scopes with direct accumulation.
+  Heap result tiles and general abstract parallel selection remain
+  fail-closed on the legacy route.  **Phase 6 is therefore not
+  exited.**  Against the design's Phase-6 deliverables: loop reorder,
+  affine tiling/ragged tails, workspace materialization, sparse panel
+  tiling, and operand relayout/staging are done; heap/stack/direct
+  result accumulation is done only for stack and direct (heap open);
+  abstract parallel-loop selection is open; of the representative
+  encodings, panel-only tile-j and the direct-accumulation tile-ijk
+  composition (pack + panel + relayout, both staging scopes, through
+  the public Schedule → verified LoopPlan adapter) are now migrated and
+  byte-locked — the heap-accumulation tile-ijk variant needs the heap
+  family first.
+- The relayout family is exactly the audited legacy shape: one rank-2
+  all-dense operand packed on its contiguous last level under one CSR
+  input and a dense `(row, pack)` result.  Verifier-legal
+  generalizations (other ranks, permuted levels, multiple regions,
+  regions at other depths) stay fail-closed at the pass or target
+  boundary, never silently emitted.
+- The completion's coordinate re-identification relies on the managed
+  passes preserving the window's resolved-coordinate declaration
+  byte-for-byte (true today; the prefetch pass inserts above it).  A
+  future pass that legally rewrites that declaration will fail loudly
+  as `relayout_completion_lost` at this boundary rather than emit
+  divergent bytes — the same posture as the §13 panel snapshot.
+- The strangler entry remains test/debug-only; production dispatch,
+  release JIT, import neutrality, legacy stage sequences, and
+  source-derived kernel cache identity are unchanged.
+- Canonical dumps (schema v6) remain semantic fingerprints that omit
+  display names; kernel caching remains source-derived.
+- The §6 observations, the Phase-4/5 errata, and the §11 residual
+  boundaries (INT_MAX stack widths, forged-CIN identity hardening)
+  stand unchanged.
