@@ -3619,11 +3619,12 @@ _RESULT_TILE_POLICY_TOKEN = re.compile(
     """,
     re.ASCII | re.VERBOSE,
 )
-_RESULT_TILE_POLICY_MACRO = re.compile(r"[A-Z_][A-Z0-9_]*\Z", re.ASCII)
+_RESULT_TILE_POLICY_MACROS = {"SCORCH_GRAIN_CODEGEN_SPGEMM"}
 _RESULT_TILE_NUMERIC_LITERAL = re.compile(
     r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)" r"(?:[eE][+-]?[0-9]+)?)(?:[fFlLuU]*)\Z",
     re.ASCII,
 )
+_RESULT_TILE_UNARY_OPERATORS = {"+", "-", "!", "~", "*", "&"}
 
 
 def _safe_cpp_qualified_name(name: object) -> bool:
@@ -3673,7 +3674,15 @@ def _validate_result_tile_policy(
 
     if type(value) is not str or not value:
         raise ValueError("heap result-tile policy must be a non-empty string")
-    if "\n" in value or "\r" in value or "++" in value or "--" in value:
+    if (
+        "\n" in value
+        or "\r" in value
+        or "++" in value
+        or "--" in value
+        or "//" in value
+        or "/*" in value
+        or "*/" in value
+    ):
         raise ValueError("heap result-tile policy contains effectful text")
     tokens = _result_tile_policy_tokens(value)
     if len(tokens) < 3 or tokens[:2] != [
@@ -3710,7 +3719,7 @@ def _validate_result_tile_policy(
             token != helper
             and token != "long"
             and token not in known_names
-            and _RESULT_TILE_POLICY_MACRO.fullmatch(token) is None
+            and token not in _RESULT_TILE_POLICY_MACROS
         ):
             raise ValueError(
                 "heap result-tile policy references an undeclared identifier"
@@ -3757,6 +3766,13 @@ def _validate_result_tile_rendered_text(
                 if type(getattr(node, "is_restrict", None)) is not bool:
                     raise ValueError("Var.is_restrict must be a bool")
                 self.known_names.add(name)
+            elif type(node) is llir.UnaryOp:
+                operator = getattr(node, "op", None)
+                if (
+                    type(operator) is not str
+                    or operator not in _RESULT_TILE_UNARY_OPERATORS
+                ):
+                    raise ValueError("UnaryOp.op must be a non-mutating unary operator")
             elif type(node) in (llir.FunctionCall, llir.FunctionCallStmt):
                 if not _safe_cpp_qualified_name(getattr(node, "name", None)):
                     raise ValueError(
@@ -3786,12 +3802,16 @@ def _validate_result_tile_rendered_text(
                     or "\n" in value
                     or "\r" in value
                     or "\\" in value
+                    or "??/" in value
                 ):
                     raise ValueError("Comment.value must be a single-line string")
             elif type(node) is llir.RawStmt:
                 raise ValueError(
                     "heap result-tile completion requires fully structured LLIR"
                 )
+            elif type(node) is llir.IfThenElse:
+                if type(getattr(node, "make_last_case_else", None)) is not bool:
+                    raise ValueError("IfThenElse.make_last_case_else must be a bool")
             elif type(node) is llir.Function:
                 self._identifier(getattr(node, "name", None), "Function.name")
                 if type(getattr(node, "return_type", None)) is not llir.DataType:
@@ -3830,10 +3850,14 @@ def _validate_result_tile_rendered_text(
                         "_atomic_counter_var",
                         "_loop_bound",
                     ):
-                        self._identifier(
+                        atomic_name = self._identifier(
                             getattr(node, field, None),
                             f"ForLoop.{field}",
                         )
+                        if atomic_name in protected_names:
+                            raise ValueError(
+                                f"ForLoop.{field} references result-owned storage"
+                            )
 
         def validate_policies(self) -> None:
             for value, helper in self.policies:
