@@ -445,7 +445,6 @@ def test_scheduled_stage_sequence_and_failure_ownership():
 
     failing = Schedule(
         loop_order=("i", "j", "k"),
-        tiles=(tile("k", 4, accum="heap"),),
         parallel_loop="i",
     )
     failing_options = scheduled_options(failing)
@@ -458,7 +457,7 @@ def test_scheduled_stage_sequence_and_failure_ownership():
             compile_options=failing_options,
             compilation_context=failing_context,
         )
-    assert error.value.defect.code == "unsupported_schedule_result_tile"
+    assert error.value.defect.code == "unsupported_schedule_parallel"
     completed = [record.stage_id for record in failing_context.stage_run_records]
     assert completed[-1] is CompilerStageId.CIN_TO_LOOPIR_LOWERING
     assert CompilerStageId.LOOPIR_SCHEDULE_APPLICATION not in completed
@@ -474,18 +473,9 @@ def test_scheduled_stage_sequence_and_failure_ownership():
     "schedule, code",
     [
         # Stack accumulation left this list in the Phase-6 workspace slice,
-        # and sparse panel tiling left it in the panel slice: both are now
-        # migrated families with their own positive parity locks.
-        (
-            # Legacy heap accumulation also demands the parallel row loop;
-            # the heap result tile is rejected before parallel selection.
-            Schedule(
-                loop_order=("i", "j", "k"),
-                tiles=(tile("k", 4, accum="heap"),),
-                parallel_loop="i",
-            ),
-            "unsupported_schedule_result_tile",
-        ),
+        # sparse panel tiling left it in the panel slice, and heap result
+        # tiles left it in the heap slice: all are now migrated families
+        # with their own positive parity locks.
         (
             Schedule(loop_order=("i", "j", "k"), parallel_loop="i"),
             "unsupported_schedule_parallel",
