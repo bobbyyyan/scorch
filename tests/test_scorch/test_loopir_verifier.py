@@ -3004,11 +3004,168 @@ def build_heap_spmm(strip=4, dtype=ScalarType.FLOAT32) -> HeapSpmmFixture:
     )
 
 
+@dataclasses.dataclass
+class HeapTtmFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    core: SymbolId
+    factor: SymbolId
+    projected: SymbolId
+    dim_a: DimensionId
+    dim_b: DimensionId
+    dim_c: DimensionId
+    dim_d: DimensionId
+    batch: IndexId
+    row: IndexId
+    red: IndexId
+    free: IndexId
+    pack_tile: TileId
+    result_tile: ResultTileId
+    decl: object
+    region: ResultTileRegion
+    pack: TileOuterFor
+    batch_loop: DenseFor
+    row_loop: DenseFor
+    sparse: Stmt
+    pack_point: TileInnerFor
+    leaf: TiledReduce
+
+
+def build_heap_ttm(strip=3, dtype=ScalarType.FLOAT32) -> HeapTtmFixture:
+    """``Projected[a, b, d] += Core[a, b, c] * Factor[c, d]`` on a heap tile.
+
+    The multi-prefix representative of the heap result-tile family: the
+    compacted result is rank-3 all-dense, so the tile's dense prefix is the
+    two logical axes ``a`` and ``b`` and the compact tile linearizes both.
+    Mirrors the retained legacy ``heap_ttm_multi_prefix`` audit golden
+    (``Core`` is ``dds``, so the reduction is the sparse level-2 loop).
+    """
+
+    builder = LoopIRBuilder()
+    dim_a = builder.dimension("a")
+    dim_b = builder.dimension("b")
+    dim_c = builder.dimension("c")
+    dim_d = builder.dimension("d")
+    core, factor, projected = (builder.new_symbol_id() for _ in range(3))
+    decl_core = builder.tensor(
+        core,
+        "Core",
+        dtype,
+        (dim_a.dimension, dim_b.dimension, dim_c.dimension),
+        (
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.DENSE, 1),
+            builder.level(LevelKind.COMPRESSED, 2),
+        ),
+    )
+    decl_factor = builder.tensor(
+        factor,
+        "Factor",
+        dtype,
+        (dim_c.dimension, dim_d.dimension),
+        builder.dense_levels(2),
+    )
+    decl_projected = builder.tensor(
+        projected,
+        "Projected",
+        dtype,
+        (dim_a.dimension, dim_b.dimension, dim_d.dimension),
+        builder.dense_levels(3),
+    )
+    batch = builder.new_index_id()
+    row = builder.new_index_id()
+    red = builder.new_index_id()
+    free = builder.new_index_id()
+    cursor = builder.new_cursor_id()
+    position = builder.new_position_id()
+    pack_tile = builder.new_tile_id()
+    result_tile = builder.new_result_tile_id()
+    cursor_decl = builder.sparse_cursor(
+        cursor,
+        core,
+        2,
+        builder.dense_position(
+            core,
+            1,
+            builder.dense_position(
+                core, 0, builder.root_position(), builder.index_value(batch)
+            ),
+            builder.index_value(row),
+        ),
+    )
+    leaf = builder.tiled_reduce(
+        result_tile,
+        (
+            builder.index_value(batch),
+            builder.index_value(row),
+            builder.index_value(free),
+        ),
+        ReduceOp.ADD,
+        builder.binary(
+            BinaryOp.MUL,
+            builder.cursor_value(cursor),
+            builder.load(factor, (builder.index_value(red), builder.index_value(free))),
+        ),
+    )
+    pack_point = builder.tile_inner_for(
+        pack_tile, free, dim_d.dimension, strip, False, builder.block((leaf,))
+    )
+    sparse = builder.sparse_for(
+        cursor_decl, position, red, builder.block((pack_point,))
+    )
+    row_loop = builder.dense_for(row, dim_b.dimension, builder.block((sparse,)))
+    batch_loop = builder.dense_for(batch, dim_a.dimension, builder.block((row_loop,)))
+    decl = builder.result_tile_decl(result_tile, projected, pack_tile)
+    region = builder.result_tile_region(decl, builder.block((batch_loop,)))
+    pack = builder.tile_outer_for(
+        pack_tile, free, dim_d.dimension, strip, builder.block((region,))
+    )
+    program = builder.program(
+        (dim_a, dim_b, dim_c, dim_d),
+        (decl_core, decl_factor, decl_projected),
+        (core, factor),
+        (projected,),
+        builder.block((pack,)),
+    )
+    return HeapTtmFixture(
+        builder,
+        program,
+        core,
+        factor,
+        projected,
+        dim_a.dimension,
+        dim_b.dimension,
+        dim_c.dimension,
+        dim_d.dimension,
+        batch,
+        row,
+        red,
+        free,
+        pack_tile,
+        result_tile,
+        decl,
+        region,
+        pack,
+        batch_loop,
+        row_loop,
+        sparse,
+        pack_point,
+        leaf,
+    )
+
+
 def test_heap_fixture_verifies():
     verify_program(build_heap_spmm().program)
     verify_program(build_heap_spmm(strip=1).program)
     verify_program(build_heap_spmm(dtype=ScalarType.FLOAT64).program)
     verify_program(build_heap_spmm(strip=MAX_LOOPIR_TILE_WIDTH).program)
+
+
+def test_multi_prefix_heap_fixture_verifies():
+    verify_program(build_heap_ttm().program)
+    verify_program(build_heap_ttm(strip=1).program)
+    verify_program(build_heap_ttm(dtype=ScalarType.FLOAT64).program)
+    verify_program(build_heap_ttm(strip=MAX_LOOPIR_TILE_WIDTH).program)
 
 
 def test_result_tile_identity_is_typed_and_unique():

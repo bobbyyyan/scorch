@@ -1963,6 +1963,45 @@ def heap_panel_schedule(tag, width=3, strip=4):
     )
 
 
+def build_ttm(dtype=F32):
+    """``Projected[a, b, d] += Core[a, b, c] * Factor[c, d]``.
+
+    The multi-prefix heap representative: a rank-3 all-dense result whose
+    compact tile linearizes two dense prefix axes.
+    """
+
+    ivs = {name: IndexVar(name) for name in ("a", "b", "c", "d")}
+    out = TensorVar("Projected", fmt="ddd", dtype=dtype)
+    core = TensorVar("Core", fmt="dds", dtype=dtype)
+    factor = TensorVar("Factor", fmt="dd", dtype=dtype)
+    stmt = TensorAssign(
+        out[ivs["a"], ivs["b"], ivs["d"]],
+        CINBinaryOp(
+            Operation.MUL,
+            core[ivs["a"], ivs["b"], ivs["c"]],
+            factor[ivs["c"], ivs["d"]],
+        ),
+        op=Operation.ADD,
+    )
+    for name in reversed(("a", "b", "c", "d")):
+        stmt = ForAll(ivs[name], stmt)
+    return stmt
+
+
+def ttm_heap_schedule(tag, strip=3):
+    return Schedule(
+        loop_order=("a", "b", "c", "d"),
+        tiles=(
+            TileSpec("d", strip, placement="outermost", accum="heap", unroll=False),
+        ),
+        tag=tag,
+        parallel_loop="a",
+    )
+
+
+TTM_BINDINGS = (((3, 4, 5), F32), ((5, 6), F32))
+TTM_BINDINGS_F64 = (((3, 4, 5), F64), ((5, 6), F64))
+
 HEAP_PARITY_GRID = [
     (
         "dense matmul heap",
@@ -1970,6 +2009,69 @@ HEAP_PARITY_GRID = [
         dense_heap_schedule("h-dense", strip=4),
         (4, 6),
         MATMUL_BINDINGS,
+    ),
+    (
+        "ttm multi-prefix heap exact strip",
+        build_ttm,
+        ttm_heap_schedule("h-ttm-exact", strip=3),
+        (3, 4, 6),
+        TTM_BINDINGS,
+    ),
+    (
+        "ttm multi-prefix heap ragged strip",
+        build_ttm,
+        ttm_heap_schedule("h-ttm-ragged", strip=4),
+        (3, 4, 6),
+        TTM_BINDINGS,
+    ),
+    (
+        "ttm multi-prefix heap unit strip",
+        build_ttm,
+        ttm_heap_schedule("h-ttm-unit", strip=1),
+        (3, 4, 6),
+        TTM_BINDINGS,
+    ),
+    (
+        "ttm multi-prefix heap oversized strip",
+        build_ttm,
+        ttm_heap_schedule("h-ttm-over", strip=64),
+        (3, 4, 6),
+        TTM_BINDINGS,
+    ),
+    (
+        "ttm multi-prefix heap f64",
+        lambda: build_ttm(dtype=F64),
+        ttm_heap_schedule("h-ttm-f64", strip=4),
+        (3, 4, 6),
+        TTM_BINDINGS_F64,
+    ),
+    (
+        "ttm multi-prefix heap zero outer prefix",
+        build_ttm,
+        ttm_heap_schedule("h-ttm-zero-outer", strip=2),
+        (0, 4, 6),
+        (((0, 4, 5), F32), ((5, 6), F32)),
+    ),
+    (
+        "ttm multi-prefix heap zero inner prefix",
+        build_ttm,
+        ttm_heap_schedule("h-ttm-zero-inner", strip=2),
+        (3, 0, 6),
+        (((3, 0, 5), F32), ((5, 6), F32)),
+    ),
+    (
+        "ttm multi-prefix heap zero reduction extent",
+        build_ttm,
+        ttm_heap_schedule("h-ttm-zero-red", strip=2),
+        (3, 4, 6),
+        (((3, 4, 0), F32), ((0, 6), F32)),
+    ),
+    (
+        "ttm multi-prefix heap zero free extent",
+        build_ttm,
+        ttm_heap_schedule("h-ttm-zero-free", strip=3),
+        (3, 4, 0),
+        (((3, 4, 5), F32), ((5, 0), F32)),
     ),
     (
         "spmm heap exact strip",
@@ -2205,6 +2307,116 @@ def test_dense_matmul_heap_shadow_execution():
         (dense_stensor(a, "A"), dense_stensor(b, "B")),
         a @ b,
     )
+
+
+def ttm_stensor(tensor, name):
+    """Bind a ``dds`` operand: two dense levels over one compressed leaf.
+
+    Built directly rather than through ``STensor.to_sparse('dds')``, whose
+    rank-3 filter-zeros kernel emits a leaf position array sized for the
+    innermost parent only (a pre-existing public-conversion defect outside
+    this milestone; see the Phase-6 review's limitations).
+    """
+
+    from scorch.storage import TensorIndex, TensorStorage
+
+    outer, inner, reduction = tensor.shape
+    flat = tensor.reshape(outer * inner, reduction)
+    stored = flat != 0
+    positions = torch.zeros(outer * inner + 1, dtype=torch.int32)
+    positions[1:] = torch.cumsum(stored.sum(1), 0).to(torch.int32)
+    coordinates = torch.nonzero(stored)[:, 1].to(torch.int32)
+    index = TensorIndex("dds", [[], [], [positions, coordinates]])
+    storage = TensorStorage(
+        index=index,
+        value=flat[stored].contiguous(),
+        shape=(outer, inner, reduction),
+    )
+    return STensor(name=name, storage=storage)
+
+
+@pytest.mark.parametrize("width", [1, 3, 4, 64])
+def test_ttm_multi_prefix_heap_shadow_execution(width):
+    """The rank-3 compact tile agrees bitwise with legacy and with Torch."""
+
+    torch.manual_seed(2941 + width)
+    core = torch.randn(3, 4, 5)
+    core[core.abs() < 0.6] = 0.0
+    core[1, 2, :] = 0.0  # an empty stored segment
+    factor = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_ttm(),
+        ttm_heap_schedule(f"h-ttm-shadow-{width}", strip=width),
+        (3, 4, 6),
+        (ttm_stensor(core, "Core"), dense_stensor(factor, "Factor")),
+        torch.einsum("abc,cd->abd", core, factor),
+    )
+
+
+def test_ttm_multi_prefix_heap_float64_shadow_execution():
+    torch.manual_seed(2949)
+    core = torch.randn(3, 4, 5, dtype=F64)
+    core[core.abs() < 0.6] = 0.0
+    factor = torch.randn(5, 6, dtype=F64)
+    assert_scheduled_shadow(
+        build_ttm(dtype=F64),
+        ttm_heap_schedule("h-ttm-shadow-f64", strip=4),
+        (3, 4, 6),
+        (ttm_stensor(core, "Core"), dense_stensor(factor, "Factor")),
+        torch.einsum("abc,cd->abd", core, factor),
+        atol=1e-9,
+        rtol=1e-9,
+    )
+
+
+def test_ttm_multi_prefix_heap_structural_activation_is_direct():
+    """Every rank-3 compact-tile component is asserted directly."""
+
+    kernel = compile_cin_via_loopir(
+        build_ttm(),
+        (3, 4, 6),
+        TTM_BINDINGS,
+        compile_options=scheduled_options(ttm_heap_schedule("h-ttm-act", strip=3)),
+    )
+    source = kernel.cpp_source
+    # The compact extent is the product of *both* dense prefix levels.
+    assert (
+        "std::vector<float> tiled_Projected_storage("
+        "(size_t)(Projected0_size * Projected1_size) * (size_t)kTile_d);" in source
+    )
+    assert (
+        "float* __restrict__ tiled_Projected = tiled_Projected_storage.data();"
+        in source
+    )
+    assert "// Initialize compact result tile for Projected" in source
+    assert "// Copy compact result tile to Projected" in source
+    # The compact row is the linearized prefix position of the *last*
+    # prefix level, not a rank-2 spelling.
+    assert (
+        "tiled_Projected[pProjected1 * kTile_d + d_in] += "
+        "Core_val[pCore2] * Factor_val[pFactor1];" in source
+    )
+    assert (
+        "Projected_values[Projected_tile_copy * Projected2_size + d_copy_logical] = "
+        "tiled_Projected[Projected_tile_copy * kTile_d + d_tile_copy];" in source
+    )
+    assert (
+        "for (int64_t Projected_tile_init = 0; "
+        "Projected_tile_init < Projected0_size * Projected1_size; "
+        "Projected_tile_init++) {" in source
+    )
+    # The exactly-once copy-out discharges the whole-result zero fill.
+    assert "scorch_zero_dense(Projected_values" not in source
+    # The parallel policy lands on the outermost dense prefix loop.
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(-1, Core0_size)) "
+        "schedule(dynamic, scorch_chunk(Core0_size, -1))" in source
+    )
+    scheduled = kernel.schedule
+    assert scheduled is not None
+    assert scheduled.plan.result_tile is not None
+    assert scheduled.plan.result_tile.result_level == 2
+    assert len(scheduled.plan.result_tile.result_prefix) == 2
 
 
 @pytest.mark.parametrize("scope", ["j", "k"])

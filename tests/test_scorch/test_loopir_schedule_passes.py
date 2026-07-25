@@ -2850,6 +2850,87 @@ def scheduled_heap_alone(width=3):
     return lowering, (i, j, k), plan, artifact
 
 
+def build_ttm_abcd():
+    """``Projected[a, b, d] += Core[a, b, c] * Factor[c, d]`` — rank-3 result.
+
+    The multi-prefix heap representative: the compacted result has two
+    dense prefix axes, so the family's derived chain gains one dense loop
+    and the compact tile linearizes both prefix positions.
+    """
+
+    a, b, c, d = IndexVar("a"), IndexVar("b"), IndexVar("c"), IndexVar("d")
+    core = TensorVar("Core", fmt="dds")
+    factor = TensorVar("Factor", fmt="dd")
+    out = TensorVar("Projected", fmt="ddd")
+    assign = TensorAssign(
+        out[a, b, d],
+        CINBinaryOp(Operation.MUL, core[a, b, c], factor[c, d]),
+        op=Operation.ADD,
+    )
+    return ForAll(a, ForAll(b, ForAll(c, ForAll(d, assign)))), (a, b, c, d)
+
+
+def dds_storage(rows_dense, batch, rows, inner):
+    """Bind a ``dds`` operand: two dense levels over one compressed leaf."""
+
+    from scorch.compiler.loopir.levels import (
+        CompressedLevel,
+        DenseLevel,
+        LevelTensorStorage,
+    )
+
+    offsets = [0]
+    coords = []
+    values = []
+    for row in rows_dense:
+        for column, entry in enumerate(row):
+            if entry != 0.0:
+                coords.append(column)
+                values.append(entry)
+        offsets.append(len(coords))
+    return LevelTensorStorage(
+        shape=(batch, rows, inner),
+        modes=(0, 1, 2),
+        levels=(
+            DenseLevel(batch),
+            DenseLevel(rows),
+            CompressedLevel(tuple(offsets), tuple(coords)),
+        ),
+        values=tuple(values),
+    )
+
+
+def multi_prefix_result_tile_fact(lowering, prefix, pack):
+    from scorch.compiler.loop_plan import ResultTile
+
+    return ResultTile(
+        result_id=lowering.result_symbol,
+        tile_loop=LoopRef(pack.index_id),
+        result_level=len(prefix),
+        result_prefix=tuple(index.index_id for index in prefix),
+        access_indices=tuple(index.index_id for index in prefix) + (pack.index_id,),
+    )
+
+
+def multi_prefix_heap_plan(lowering, prefix, pack, width=3):
+    return LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(affine_tile(pack.index_id, width, accum="heap"),),
+        result_tile=multi_prefix_result_tile_fact(lowering, prefix, pack),
+        parallel_loop=LoopRef(prefix[0].index_id),
+        provenance="explicit",
+        tag="heap-multi-prefix",
+    )
+
+
+def scheduled_multi_prefix_heap(width=3):
+    cin, (a, b, c, d) = build_ttm_abcd()
+    lowering = lower(cin)
+    plan = multi_prefix_heap_plan(lowering, (a, b), d, width)
+    artifact = apply_schedule_plan(lowering.program, plan)
+    return lowering, (a, b, c, d), plan, artifact
+
+
 def heap_relayout_plan(lowering, pack, panel, bound, relayout, parallel, result_tile):
     return LoopPlan(
         loop_order=lowering.loop_index_ids,
@@ -2892,6 +2973,148 @@ def test_heap_plan_applies_through_apply_schedule_plan():
         (j.index_id, LoopPart.LOGICAL),
         (k.index_id, LoopPart.INNER),
     ]
+
+
+def test_multi_prefix_heap_plan_applies_through_apply_schedule_plan():
+    """A rank-3 result yields one dense loop per prefix axis, in order."""
+
+    from scorch.compiler.loopir.nodes import ResultTileRegion, TiledReduce
+
+    lowering, (a, b, c, d), plan, artifact = scheduled_multi_prefix_heap()
+    verify_scheduled_loopir(artifact)
+    pack = artifact.program.body.statements[0]
+    assert type(pack) is TileOuterFor
+    region = pack.body.statements[0]
+    assert type(region) is ResultTileRegion
+    assert region.decl.result == lowering.result_symbol
+    assert region.decl.pack == pack.tile
+    batch = region.body.statements[0]
+    assert type(batch) is DenseFor and batch.index == a.index_id
+    row = batch.body.statements[0]
+    assert type(row) is DenseFor and row.index == b.index_id
+    point = row.body.statements[0].body.statements[0]
+    assert type(point) is TileInnerFor and point.tile == pack.tile
+    leaf = point.body.statements[0]
+    assert type(leaf) is TiledReduce
+    assert leaf.result_tile == region.decl.result_tile
+    assert tuple(index.index for index in leaf.indices) == (
+        a.index_id,
+        b.index_id,
+        d.index_id,
+    )
+    assert [(prov.index, prov.part) for prov in artifact.loops] == [
+        (d.index_id, LoopPart.OUTER),
+        (a.index_id, LoopPart.LOGICAL),
+        (b.index_id, LoopPart.LOGICAL),
+        (c.index_id, LoopPart.LOGICAL),
+        (d.index_id, LoopPart.INNER),
+    ]
+
+
+def test_multi_prefix_heap_erases_to_the_reordered_base():
+    lowering, _ids, _plan, artifact = scheduled_multi_prefix_heap()
+    erased = erase_schedule(artifact.program)
+    assert canonical_program_dump(erased) == canonical_program_dump(lowering.program)
+
+
+def test_multi_prefix_heap_oracle_differential_is_exact():
+    """The compact rank-3 tile computes exactly the direct reduction."""
+
+    import random
+
+    rng = random.Random(20260725)
+    for width in (1, 2, 3, 5, 8):
+        lowering, _ids, _plan, artifact = scheduled_multi_prefix_heap(width)
+        batch = rng.randrange(1, 4)
+        rows = rng.randrange(1, 4)
+        inner = rng.randrange(1, 6)
+        cols = rng.randrange(1, 7)
+        # ``Core`` is ``dds``: the compressed leaf's segments enumerate the
+        # (a, b) parent positions in row-major order.
+        core_dense = [
+            [
+                float(rng.randrange(-3, 4)) if rng.random() < 0.5 else 0.0
+                for _ in range(inner)
+            ]
+            for _ in range(batch * rows)
+        ]
+        factor = [
+            [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(inner)
+        ]
+        bindings = {
+            lowering.input_symbols[0]: dds_storage(core_dense, batch, rows, inner),
+            lowering.input_symbols[1]: factor,
+        }
+        shapes = {lowering.result_symbol: (batch, rows, cols)}
+        scheduled_result = run_program(artifact.program, bindings, shapes)
+        erased_result = run_program(erase_schedule(artifact.program), bindings, shapes)
+        assert scheduled_result == erased_result
+        reference = [
+            [
+                [
+                    sum(
+                        core_dense[index * rows + row][red] * factor[red][col]
+                        for red in range(inner)
+                        if core_dense[index * rows + row][red] != 0.0
+                    )
+                    for col in range(cols)
+                ]
+                for row in range(rows)
+            ]
+            for index in range(batch)
+        ]
+        assert scheduled_result[lowering.result_symbol] == reference
+
+
+def test_multi_prefix_heap_rejects_an_inner_prefix_parallel_anchor():
+    """Target lowering realizes the outermost prefix; anything else fails."""
+
+    from dataclasses import replace as dataclass_replace
+
+    cin, (a, b, c, d) = build_ttm_abcd()
+    lowering = lower(cin)
+    plan = multi_prefix_heap_plan(lowering, (a, b), d)
+    inner_anchor = dataclass_replace(plan, parallel_loop=LoopRef(b.index_id))
+    defect = expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        inner_anchor,
+    )
+    assert "outermost dense result-prefix loop" in defect.message
+
+
+def test_multi_prefix_heap_rejects_a_composed_sparse_panel():
+    """The audited panel composition stays at its single-prefix shape."""
+
+    cin, (a, b, c, d) = build_ttm_abcd()
+    lowering = lower(cin)
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(
+            affine_tile(d.index_id, 3, accum="heap"),
+            panel_tile(
+                c.index_id,
+                2,
+                placement=LoopPlacement(
+                    PlacementKind.CHILD_OF,
+                    parent=LoopRef(d.index_id, LoopPart.OUTER),
+                ),
+            ),
+        ),
+        panel_bounds=(PanelBound(LoopRef(c.index_id), lowering.input_symbols[0], 2),),
+        result_tile=multi_prefix_result_tile_fact(lowering, (a, b), d),
+        parallel_loop=LoopRef(a.index_id),
+        provenance="explicit",
+        tag="heap-multi-prefix-panel",
+    )
+    defect = expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        plan,
+    )
+    assert "single-prefix result" in defect.message
 
 
 @pytest.mark.parametrize("scope", ["panel", "pack"])

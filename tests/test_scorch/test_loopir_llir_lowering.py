@@ -2443,6 +2443,93 @@ def test_heap_completion_rejects_a_corrupted_chain(monkeypatch):
     )
 
 
+def multi_prefix_heap_program(strip=3, dtype=None):
+    from scorch.compiler.loopir.nodes import ScalarType as _ScalarType
+
+    from tests.test_scorch.test_loopir_verifier import build_heap_ttm
+
+    return build_heap_ttm(
+        strip=strip,
+        dtype=dtype if dtype is not None else _ScalarType.FLOAT32,
+    )
+
+
+def multi_prefix_heap_shapes(fixture):
+    return {fixture.core: (3, 4, 5), fixture.factor: (5, 6)}
+
+
+def test_multi_prefix_heap_target_emits_the_legacy_compact_source():
+    """Direct structural activation on a bare verified rank-3 program."""
+
+    fixture = multi_prefix_heap_program()
+    lowered = lower_loopir_to_llir(
+        fixture.program,
+        input_shapes=multi_prefix_heap_shapes(fixture),
+        result_shape=(3, 4, 6),
+    )
+    from scorch.compiler.codegen import LLIRLowerer
+
+    source = LLIRLowerer().lower_llir(lowered)
+    # The compact extent is the product of every dense prefix level.
+    assert (
+        "std::vector<float> tiled_Projected_storage("
+        "(size_t)(Projected0_size * Projected1_size) * (size_t)kTile_d);" in source
+    )
+    assert (
+        "float* __restrict__ tiled_Projected = tiled_Projected_storage.data();"
+        in source
+    )
+    assert "// Initialize compact result tile for Projected" in source
+    assert "// Copy compact result tile to Projected" in source
+    # The compact row is the linearized position of the last prefix level.
+    assert (
+        "tiled_Projected[pProjected1 * kTile_d + d_in] += "
+        "Core_val[pCore2] * Factor_val[pFactor1];" in source
+    )
+    assert (
+        "tiled_Projected[Projected_tile_init * kTile_d + d_tile_init] = 0.0f;" in source
+    )
+    assert (
+        "Projected_values[Projected_tile_copy * Projected2_size + d_copy_logical] = "
+        "tiled_Projected[Projected_tile_copy * kTile_d + d_tile_copy];" in source
+    )
+    assert "scorch_zero_dense(Projected_values" not in source
+    # The parallel policy lands on the outermost dense prefix loop.
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(-1, Core0_size)) "
+        "schedule(dynamic, scorch_chunk(Core0_size, -1))" in source
+    )
+
+
+def test_multi_prefix_heap_target_rejects_a_permuted_prefix_chain():
+    """The prefix loops must appear in the result's logical mode order."""
+
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    fixture = multi_prefix_heap_program()
+    result_decl = fixture.program.tensors[2]
+    # Swap the result's two dense prefix dimensions without moving the
+    # chain: the loop at prefix position 0 no longer stores mode 0.
+    forge(
+        result_decl,
+        dimensions=(fixture.dim_b, fixture.dim_a, fixture.dim_d),
+    )
+    forge(
+        fixture.leaf,
+        indices=(
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(fixture.batch),
+            fixture.builder.index_value(fixture.free),
+        ),
+    )
+    expect_target_code(
+        "unsupported_program_shape",
+        fixture.program,
+        multi_prefix_heap_shapes(fixture),
+        (4, 3, 6),
+    )
+
+
 def test_heap_target_rejects_a_misplaced_region():
     """A repeating result-tile lifetime is rejected by the shared verifier."""
 
