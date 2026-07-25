@@ -2589,8 +2589,7 @@ def test_staged_read_requires_an_enclosing_region():
     forge(fixture.panel, body=fixture.stage.body)
     expect_defect("unbound_relayout", fixture.program)
 
-    # A sibling region's identity does not leak: reads after region exit
-    # fail closed even though the region executed earlier in the block.
+    # A second read while the region remains open is legal.
     fixture = build_relayout_spmm()
     stray = fixture.builder.staged_read(
         fixture.relayout,
@@ -2612,7 +2611,39 @@ def test_staged_read_requires_an_enclosing_region():
         fixture.pack_point,
         body=fixture.builder.block((fixture.leaf, stray_leaf)),
     )
-    verify_program(fixture.program)  # still inside the region: legal
+    verify_program(fixture.program)
+
+    # A next sibling after the region exits may not reuse its identity.
+    # Move the region down around the original leaf so the point/window
+    # binders remain live when the stray sibling is checked.
+    fixture = build_relayout_spmm()
+    stray = fixture.builder.staged_read(
+        fixture.relayout,
+        (
+            fixture.builder.index_value(fixture.col),
+            fixture.builder.index_value(fixture.free),
+        ),
+    )
+    stray_leaf = fixture.builder.store_reduce(
+        fixture.c,
+        (
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(fixture.free),
+        ),
+        ReduceOp.ADD,
+        stray,
+    )
+    local_stage = fixture.builder.relayout_stage(
+        fixture.decl,
+        fixture.builder.block((fixture.leaf,)),
+    )
+    forge(
+        fixture.pack_point,
+        body=fixture.builder.block((local_stage, stray_leaf)),
+    )
+    forge(fixture.panel, body=fixture.stage.body)
+    expect_defect("unbound_relayout", fixture.program)
+
     fixture = build_relayout_spmm()
     huge = RelayoutId(10**5000)
     forge(fixture.staged, relayout=huge)

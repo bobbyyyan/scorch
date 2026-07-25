@@ -32,6 +32,7 @@ from scorch.compiler.compilation_context import (
     CompilerStageId,
 )
 from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.identity import AccessId, SymbolId
 from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH
 from scorch.compiler.llir_pass_manager import LLIRPassManager
 from scorch.compiler.loopir.lower_llir import (
@@ -1423,6 +1424,27 @@ def relayout_shapes(fixture):
     return {fixture.a: (4, 5), fixture.b: (5, 6)}
 
 
+def relayout_llir_nodes(root):
+    """Walk one ordinary test-owned LLIR tree without invoking equality."""
+
+    pending = [root]
+    seen = set()
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        yield value
+        if isinstance(value, llir.Node):
+            pending.extend(
+                child
+                for child in vars(value).values()
+                if isinstance(child, (llir.Node, list, tuple))
+            )
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+
+
 def test_relayout_target_emits_the_legacy_packed_source():
     """Direct structural activation on a bare verified LoopIR program."""
 
@@ -1447,8 +1469,10 @@ def test_relayout_target_emits_the_legacy_packed_source():
         "#pragma omp parallel for num_threads(scorch_nthreads((j_out_end - "
         "j_out) * kTile_k, (j_out_end - j_out))) schedule(static)" in source
     )
-    assert "packed_B[(j_pack - j_out) * kTile_k + k_pack] = "
-    assert "B_val[j_pack * B1_size + k_packed];" in source
+    assert (
+        "packed_B[(j_pack - j_out) * kTile_k + k_pack] = "
+        "B_val[j_pack * B1_size + k_packed];"
+    ) in source
     assert "if (j < j_out || j >= j_out_end) {" in source
     assert "packed_B[(j - j_out) * kTile_k + k_in];" in source
     assert (
@@ -1611,6 +1635,267 @@ def test_relayout_completion_requires_the_window_coordinate(monkeypatch):
         return completed
 
     monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", corrupting)
+    expect_target_code(
+        "relayout_completion_lost",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+
+def test_relayout_completion_rejects_relocated_window_coordinate(monkeypatch):
+    """An unchanged declaration moved below its uses is not re-identified."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def relocating(self, function):
+        completed = original(self, function)
+        _pack, _panel, _row, window = self._panel_completion
+        index, coordinate = next(
+            (index, statement)
+            for index, statement in enumerate(window.body)
+            if type(statement) is llir.VarInit and statement.var.name == "j"
+        )
+        del window.body[index]
+        window.body.append(coordinate)
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", relocating)
+    expect_target_code(
+        "relayout_completion_lost",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+
+def test_relayout_completion_rejects_relocated_coordinate_context(monkeypatch):
+    """Moving the intact context below its uses does not preserve dominance."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def relocating(self, function):
+        completed = original(self, function)
+        _pack, _panel, _row, window = self._panel_completion
+        coordinate_index = next(
+            index
+            for index, statement in enumerate(window.body)
+            if type(statement) is llir.VarInit and statement.var.name == "j"
+        )
+        context = window.body[coordinate_index - 1 : coordinate_index + 2]
+        assert [type(statement) for statement in context] == [
+            llir.Comment,
+            llir.VarInit,
+            llir.BlankLine,
+        ]
+        del window.body[coordinate_index - 1 : coordinate_index + 2]
+        window.body.extend(context)
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", relocating)
+    expect_target_code(
+        "relayout_completion_lost",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+
+def test_relayout_completion_anchors_metadata_to_the_physical_access(monkeypatch):
+    """Valid metadata moved to the wrong operand cannot redirect that operand."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def swapping(self, function):
+        completed = original(self, function)
+        _pack, _panel, row, _window = self._panel_completion
+        accesses = [
+            node
+            for node in relayout_llir_nodes(row.body)
+            if isinstance(node, llir.Expr)
+            and type(getattr(node, "tensor_access", None)) is llir.TensorAccessMetadata
+            and node.tensor_access.role is llir.TensorAccessRole.INPUT_READ
+        ]
+        staged = next(
+            node
+            for node in accesses
+            if node.tensor_access.tensor_id == self.relayout.operand
+        )
+        other = next(
+            node
+            for node in accesses
+            if node.tensor_access.tensor_id != self.relayout.operand
+        )
+        staged_metadata = staged.tensor_access
+        other_metadata = other.tensor_access
+        object.__setattr__(staged, "tensor_access", other_metadata)
+        object.__setattr__(other, "tensor_access", staged_metadata)
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", swapping)
+    expect_target_code(
+        "relayout_completion_lost",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+
+def test_relayout_completion_owns_a_detached_metadata_fingerprint(monkeypatch):
+    """In-place provenance mutation cannot mutate the retained fingerprint."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def mutating(self, function):
+        completed = original(self, function)
+        _pack, _panel, row, _window = self._panel_completion
+        staged = next(
+            node
+            for node in relayout_llir_nodes(row.body)
+            if isinstance(node, llir.Expr)
+            and type(getattr(node, "tensor_access", None)) is llir.TensorAccessMetadata
+            and node.tensor_access.tensor_id == self.relayout.operand
+        )
+        metadata = staged.tensor_access
+        assert type(metadata) is llir.TensorAccessMetadata
+        object.__setattr__(
+            metadata,
+            "access_id",
+            AccessId(metadata.access_id.value + 1),
+        )
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", mutating)
+    expect_target_code(
+        "relayout_completion_lost",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_type",
+        "missing_field",
+        "hostile_identity",
+        "hostile_extra_key",
+        "cyclic",
+    ],
+)
+def test_relayout_completion_owns_malformed_access_state(monkeypatch, mutation):
+    """Malformed post-pass access state stays inside the target diagnostic."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def corrupting(self, function):
+        completed = original(self, function)
+        _pack, _panel, row, _window = self._panel_completion
+        staged = next(
+            node
+            for node in relayout_llir_nodes(row.body)
+            if isinstance(node, llir.Expr)
+            and type(getattr(node, "tensor_access", None)) is llir.TensorAccessMetadata
+            and node.tensor_access.tensor_id == self.relayout.operand
+        )
+        if mutation == "wrong_type":
+            object.__setattr__(staged, "tensor_access", object())
+        elif mutation == "missing_field":
+            metadata = staged.tensor_access
+            assert type(metadata) is llir.TensorAccessMetadata
+            object.__delattr__(metadata, "tensor_id")
+        elif mutation == "hostile_identity":
+            metadata = staged.tensor_access
+            assert type(metadata) is llir.TensorAccessMetadata
+            hostile = SymbolId(0)
+            object.__setattr__(hostile, "value", object())
+            object.__setattr__(metadata, "tensor_id", hostile)
+        elif mutation == "hostile_extra_key":
+
+            class HostileKey:
+                def __init__(self):
+                    self.armed = False
+
+                def __hash__(self):
+                    return hash("array")
+
+                def __eq__(self, other):
+                    if self.armed:
+                        raise RuntimeError("hostile access-key equality")
+                    return False
+
+            key = HostileKey()
+            object.__getattribute__(staged, "__dict__")[key] = None
+            key.armed = True
+        else:
+            assert type(staged) is llir.ArrayAccess
+            object.__setattr__(staged, "index", staged)
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", corrupting)
+    expect_target_code(
+        "relayout_completion_lost",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "noncanonical_duplicate"])
+def test_relayout_completion_requires_one_sparse_prefetch(monkeypatch, mutation):
+    """The typed completion never silently drops or deduplicates its prefetch."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def mutating(self, function):
+        completed = original(self, function)
+        _pack, _panel, _row, window = self._panel_completion
+        guards = [
+            statement
+            for statement in window.body
+            if type(statement) is llir.GuardedCallStmt
+        ]
+        assert len(guards) == 1
+        if mutation == "missing":
+            window.body.remove(guards[0])
+        elif mutation == "duplicate":
+            window.body.insert(0, copy.deepcopy(guards[0]))
+        else:
+            decoy = copy.deepcopy(guards[0])
+            call = decoy.call
+            object.__setattr__(
+                call,
+                "args",
+                (*call.args[:-1], llir.Literal(2, llir.DataType.INT)),
+            )
+            nested = next(
+                node
+                for node in relayout_llir_nodes(window.body)
+                if type(node) is llir.ForLoop
+            )
+            nested.body.append(decoy)
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", mutating)
     expect_target_code(
         "relayout_completion_lost",
         fixture.program,

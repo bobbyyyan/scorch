@@ -2707,6 +2707,67 @@ def test_relayout_plan_gate_requires_the_exact_family():
             parallel,
         ),
     )
+    # Relayout preflight owns the exact logical row/panel/pack order.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_schedule_plan,
+        lowering.program,
+        LoopPlan(
+            loop_order=(i.index_id, k.index_id, j.index_id),
+            tiles=(pack, panel),
+            panel_bounds=(bound,),
+            relayout=relayout,
+            parallel_loop=parallel,
+            provenance="explicit",
+        ),
+    )
+    # The rank-2 access and its physical levels are plan facts, so they
+    # must fail before any scheduling pass begins replay.
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_schedule_plan,
+        lowering.program,
+        relayout_plan(
+            lowering,
+            pack,
+            panel,
+            bound,
+            dc_replace(
+                relayout,
+                access_indices=(k.index_id, j.index_id),
+            ),
+            parallel,
+        ),
+    )
+    expect_code(
+        "invalid_schedule_relayout",
+        apply_schedule_plan,
+        lowering.program,
+        relayout_plan(
+            lowering,
+            pack,
+            panel,
+            bound,
+            dc_replace(relayout, operand_panel_level=1),
+            parallel,
+        ),
+    )
+    # Stack accumulation is a separate workspace family.  It previously
+    # passed this gate, ran the stack pass, and failed later as a panel
+    # target error.
+    expect_code(
+        "unsupported_schedule_accumulation",
+        apply_schedule_plan,
+        lowering.program,
+        relayout_plan(
+            lowering,
+            affine_tile(k.index_id, 4, accum="stack"),
+            panel,
+            bound,
+            relayout,
+            parallel,
+        ),
+    )
     # Heap accumulation on the pack tile stays the unmigrated heap family.
     expect_code(
         "unsupported_schedule_accumulation",

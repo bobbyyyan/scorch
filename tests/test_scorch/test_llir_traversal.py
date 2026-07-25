@@ -2415,6 +2415,115 @@ def test_forged_exact_metadata_fields_fail_at_common_traversal_boundary(
 
 
 @pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize(
+    ("field", "expected_path"),
+    (
+        ("access_id", ("access_id", "value")),
+        ("tensor_id", ("tensor_id", "value")),
+        ("index_id", ("index_ids", "[0]", "value")),
+    ),
+)
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "bool", "hostile_value", "hostile_extra_key"),
+)
+def test_forged_metadata_identity_state_fails_without_running_hostile_equality(
+    operation: str,
+    field: str,
+    expected_path: Tuple[str, ...],
+    mutation: str,
+) -> None:
+    class Hostile:
+        def __init__(self) -> None:
+            self.armed = False
+
+        def __hash__(self) -> int:
+            return hash("value")
+
+        def __eq__(self, other: object) -> bool:
+            if self.armed:
+                raise RuntimeError("hostile identity equality")
+            return False
+
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(1),
+        tensor_id=SymbolId(2),
+        index_ids=(IndexId(3),),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    identity = (
+        metadata.access_id
+        if field == "access_id"
+        else metadata.tensor_id if field == "tensor_id" else metadata.index_ids[0]
+    )
+    if mutation == "missing":
+        object.__delattr__(identity, "value")
+    elif mutation == "bool":
+        object.__setattr__(identity, "value", True)
+    elif mutation == "hostile_value":
+        object.__setattr__(identity, "value", Hostile())
+    else:
+        key = Hostile()
+        object.__getattribute__(identity, "__dict__")[key] = 0
+        key.armed = True
+    node = llir.ArrayAccess(_var("array"), _var("index"), metadata)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(node)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(node)
+
+    assert raised.value.diagnostic.code == "invalid_tensor_access_metadata"
+    assert raised.value.diagnostic.path == (
+        "root",
+        "tensor_access",
+        *expected_path,
+    )
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
+@pytest.mark.parametrize("mutation", ["missing", "hostile_extra_key"])
+def test_forged_metadata_stored_fields_fail_closed(
+    operation: str, mutation: str
+) -> None:
+    class HostileKey:
+        def __init__(self) -> None:
+            self.armed = False
+
+        def __hash__(self) -> int:
+            return hash("tensor_id")
+
+        def __eq__(self, other: object) -> bool:
+            if self.armed:
+                raise RuntimeError("hostile metadata-key equality")
+            return False
+
+    metadata = llir.TensorAccessMetadata(
+        access_id=AccessId(1),
+        tensor_id=SymbolId(2),
+        index_ids=(IndexId(3),),
+        role=llir.TensorAccessRole.INPUT_READ,
+    )
+    if mutation == "missing":
+        object.__delattr__(metadata, "tensor_id")
+    else:
+        key = HostileKey()
+        object.__getattribute__(metadata, "__dict__")[key] = SymbolId(4)
+        key.armed = True
+    node = llir.ArrayAccess(_var("array"), _var("index"), metadata)
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk(node)
+        else:
+            LLIRRewriter(_CONTEXT).rewrite(node)
+
+    assert raised.value.diagnostic.code == "invalid_tensor_access_metadata"
+    assert raised.value.diagnostic.path == ("root", "tensor_access")
+
+
+@pytest.mark.parametrize("operation", ["walk", "rewrite"])
 def test_unknown_subclass_of_supported_statement_fails_closed(
     operation: str,
 ) -> None:

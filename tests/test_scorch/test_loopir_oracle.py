@@ -1158,8 +1158,12 @@ def test_relayout_spmm_matches_the_unstaged_reference_exactly():
 
 def test_relayout_counts_each_stored_entry_and_column_exactly_once():
     """Counting differential: all-ones inputs count row nnz per output cell
-    across ragged panel windows and ragged pack strips in both scopes; a
-    stale or doubly staged strip would change the counted result."""
+    across ragged panel windows and ragged pack strips in both scopes.
+
+    The oracle serves immutable staged inputs lazily, so this locks compute
+    visitation rather than physical copy frequency; compiled target tests
+    own staging-placement and freshness evidence.
+    """
 
     from scorch.compiler.loopir.nodes import RelayoutScope
 
