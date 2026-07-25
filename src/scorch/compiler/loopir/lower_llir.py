@@ -83,7 +83,17 @@ from ..parallel_marking_pass import (
     apply_parallel_policy,
     mark_first_for_loop_parallel,
 )
-from ..schedule_lowerer import _panel_bound_expression
+from ..schedule_lowerer import (
+    _contains_tensor_access,
+    _declared_names,
+    _panel_bound_expression,
+    _panel_range_guard,
+    _redirect_sparse_prefetch,
+    _relayout_pack_loop,
+    _relayout_storage_statements,
+    _rewrite_stmt_access_sequence,
+    _unique_name,
+)
 from ..torch_cpp_abi import (
     KernelTensorABI,
     ResultTensorAssembler,
@@ -105,15 +115,20 @@ from .nodes import (
     IndexValue,
     LevelKind,
     Load,
+    LoopIRNodeId,
     LoopProgram,
     MergedSparseFor,
     MergeMode,
     PanelOuterFor,
+    RelayoutDecl,
+    RelayoutScope,
+    RelayoutStage,
     RootPosition,
     ScalarType,
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    StagedRead,
     Stmt,
     Store,
     StoreReduce,
@@ -240,6 +255,18 @@ class _TargetLowering:
         self.panel_row_position = -1
         self._emitted_loop_headers: Dict[int, llir.ForLoop] = {}
         self._window_end_snapshot: Optional[llir.VarInit] = None
+        # Staged-relayout state; populated by _collect_loop_nest and
+        # _validate_relayout_shape when the chain carries a staging region.
+        # The relayout is completed on the assembled function immediately
+        # after the panel completion — exactly the legacy pipeline order —
+        # consuming the panel completion's retained objects.
+        self.relayout: Optional[RelayoutDecl] = None
+        self.relayout_depth = -1
+        self._staged_views: Dict[int, Load] = {}
+        self._window_coord_snapshot: Optional[llir.VarInit] = None
+        self._panel_completion: Optional[
+            Tuple[llir.ForLoop, llir.ForLoop, llir.ForLoop, llir.ForLoop]
+        ] = None
         self._validate_display_names()
         self._validate_layouts()
         self.shapes = self._validate_shapes(input_shapes, result_shape)
@@ -250,6 +277,7 @@ class _TargetLowering:
         }
         self.leaf = self._collect_leaf()
         self._validate_panel_shape()
+        self._validate_relayout_shape()
         self.cursor_loops: Dict[CursorId, int] = {}
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
@@ -596,6 +624,17 @@ class _TargetLowering:
                 )
                 body = only.body
                 continue
+            if type(only) is RelayoutStage:
+                if self.relayout is not None:
+                    _fail(
+                        "unsupported_program_shape",
+                        "this target lowering supports exactly one staged "
+                        "relayout region",
+                    )
+                self.relayout = only.decl
+                self.relayout_depth = len(loops)
+                body = only.body
+                continue
             if type(only) is WorkspaceRegion:
                 if not loops:
                     _fail(
@@ -932,6 +971,108 @@ class _TargetLowering:
         self.window_position = window_positions[0]
         self.panel_row_position = row_positions[0]
 
+    def _validate_relayout_shape(self) -> None:
+        """Establish the supported relayout form and its staged read view.
+
+        The migrated shape is exactly the audited legacy packed tile-ijk
+        family: the outermost affine pack origin, the panel origin directly
+        below it, the parallel dense row loop, the panel window, and the
+        pack point loop, with the staging region opened at the plan scope
+        and the leaf reading the operand through exactly one StagedRead.
+        The staged read is recorded as a synthetic direct-Load view so raw
+        emission and every managed pass see byte-for-byte the tree the
+        legacy pipeline transforms; the redirection to packed storage
+        happens in :meth:`complete_relayout` on the assembled function,
+        exactly where the legacy schedule lowering performs it.
+        """
+
+        if self.relayout is None:
+            return
+        decl = self.relayout
+        if self.panel is None:
+            _fail(
+                "unsupported_program_shape",
+                "a staged relayout region requires the sparse panel family",
+            )
+        kinds = [loop.kind for loop in self.loops]
+        if kinds != [_TILE_OUTER, _PANEL_OUTER, _DENSE, _SPARSE_WINDOW, _TILE_INNER]:
+            _fail(
+                "unsupported_program_shape",
+                "staged relayout supports exactly the packed tile-ijk "
+                "chain: pack origin, panel origin, parallel row, panel "
+                "window, pack point",
+            )
+        pack_node = self.loops[0].node
+        panel_node = self.loops[1].node
+        point_node = self.loops[4].node
+        if (
+            pack_node.tile != point_node.tile
+            or decl.pack != pack_node.tile
+            or decl.panel != panel_node.tile
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the staging region must name the chain's pack split and " "panel pair",
+            )
+        expected_depth = 2 if decl.scope is RelayoutScope.PANEL else 1
+        if self.relayout_depth != expected_depth:
+            _fail(
+                "unsupported_program_shape",
+                "the staging region must open directly below its scope "
+                "loop: the panel origin for PANEL scope, the pack origin "
+                "for PACK_AXIS scope",
+            )
+        operand_decl = self.decls.get(decl.operand)
+        if (
+            operand_decl is None
+            or decl.operand not in self.program.inputs
+            or len(operand_decl.levels) != 2
+            or any(level.kind is not LevelKind.DENSE for level in operand_decl.levels)
+            or operand_decl.dimensions[operand_decl.levels[0].mode]
+            != panel_node.dimension
+            or operand_decl.dimensions[operand_decl.levels[1].mode]
+            != pack_node.dimension
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the staged operand must be the declared rank-2 dense "
+                "input storing the panel then pack dimensions",
+            )
+
+        staged_reads: List[StagedRead] = []
+
+        def walk(expr: Expr) -> None:
+            if type(expr) is StagedRead:
+                staged_reads.append(expr)
+                return
+            if type(expr) is BinaryExpr:
+                walk(expr.lhs)
+                walk(expr.rhs)
+
+        walk(self.leaf.value)  # type: ignore[attr-defined]
+        if len(staged_reads) != 1 or staged_reads[0].relayout != decl.relayout:
+            _fail(
+                "unsupported_program_shape",
+                "staged relayout requires exactly one StagedRead of its "
+                "region in the compute leaf",
+            )
+        staged = staged_reads[0]
+        if (
+            len(staged.indices) != 2
+            or self._index_of(staged.indices[0], "the staged row index")
+            != panel_node.index
+            or self._index_of(staged.indices[1], "the staged column index")
+            != point_node.index
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the staged read must be indexed by the panel window "
+                "coordinate and the pack point coordinate",
+            )
+        self._staged_views[id(staged)] = Load(
+            LoopIRNodeId(-1), decl.operand, staged.indices
+        )
+
     def _reserve_panel_names(self) -> None:
         """Reserve the derived loop, bound, and search names panels generate."""
 
@@ -964,6 +1105,21 @@ class _TargetLowering:
         def walk(expr: Expr) -> None:
             if type(expr) is Load:
                 loads.append(expr)
+                return
+            if type(expr) is StagedRead:
+                # The staged read's direct-Load view participates in the
+                # access machinery exactly like the read it redirected, so
+                # drivers, bounds, and raw emission match the unstaged
+                # program byte-for-byte; complete_relayout redirects the
+                # emitted value expression afterwards.
+                view = self._staged_views.get(id(expr))
+                if view is None:
+                    _fail(
+                        "unsupported_program_shape",
+                        "a StagedRead outside the validated staging region "
+                        "is not lowerable",
+                    )
+                loads.append(view)
                 return
             if type(expr) is CursorValue:
                 cursor_values.append(expr)
@@ -1358,6 +1514,15 @@ class _TargetLowering:
         return stmts
 
     def _lower_value(self, expr: Expr) -> llir.Expr:
+        if type(expr) is StagedRead:
+            view = self._staged_views.get(id(expr))
+            if view is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "a StagedRead outside the validated staging region is "
+                    "not lowerable",
+                )
+            return self._lower_value(view)
         if type(expr) is Load:
             decl = self.decls[expr.tensor]
             if len(expr.indices) == 1:
@@ -1906,6 +2071,20 @@ class _TargetLowering:
             ),
             llir.BlankLine(),
         ]
+        if loop.kind is _SPARSE_WINDOW and self.relayout is not None:
+            # The relayout completion inserts the compatibility range guard
+            # directly after exactly this declaration on the assembled
+            # function; keep a detached pre-pass snapshot so it can be
+            # re-identified fail-closed after the managed passes.
+            self._window_coord_snapshot = cast(
+                llir.VarInit,
+                LLIRRewriter(
+                    LLIRTraversalContext(
+                        stage="LoopIR target lowering",
+                        pass_name="snapshot_relayout_window_coord",
+                    )
+                ).rewrite(body[1]),
+            )
         input_resolves = self._input_resolves_at(loop)
         result_resolves = self._result_resolves_at(loop)
         if input_resolves:
@@ -2950,7 +3129,245 @@ class _TargetLowering:
             ),
             llir.BlankLine(),
         ]
+        if self.relayout is not None:
+            # The relayout completion runs next on this same assembled
+            # function and consumes the loops this completion has already
+            # re-identified and created — retained object identity, never a
+            # second discovery pass.  The validated relayout chain places
+            # the pack origin at chain position 0.
+            self._panel_completion = (
+                completed[0],
+                panel_loop,
+                row_loop,
+                window_loop,
+            )
         return function
+
+    def complete_relayout(self, function: llir.Function) -> llir.Function:
+        """Stage the packed operand on the assembled function.
+
+        A no-op without a validated staging region; otherwise the full
+        legacy relayout completion, driven by retained completion objects
+        and typed emission spellings (see ``_complete_relayout_impl``).
+        """
+
+        if self.relayout is None:
+            return function
+        return _complete_relayout_impl(self, function)
+
+
+_RELAYOUT_LOST = "relayout_completion_lost"
+
+
+def _complete_relayout_impl(
+    lowering: "_TargetLowering", function: llir.Function
+) -> llir.Function:
+    """Stage the packed operand on the assembled, panel-completed function.
+
+    Runs immediately after :meth:`_TargetLowering.complete_panel` — the
+    legacy ``apply_schedule_to_llir`` order — consuming the panel
+    completion's retained, already re-identified loop objects.  Every
+    spelling comes from this lowering's own typed emission records or the
+    schedule lowerer's shared constructors (one source per spelling); no
+    rendered-name discovery, regexes, dynamic tags, or bare ordinals are
+    consulted, and every re-identified auxiliary statement is cross-checked
+    against its detached pre-pass snapshot, failing closed as
+    ``relayout_completion_lost``.
+    """
+
+    decl = lowering.relayout
+    assert decl is not None
+    state = lowering._panel_completion
+    coord_snapshot = lowering._window_coord_snapshot
+    if state is None or coord_snapshot is None or lowering.panel is None:
+        _fail(
+            _RELAYOUT_LOST,
+            "the relayout's emitted statements were never recorded",
+        )
+    pack_loop, panel_loop, row_loop, window_loop = state
+    operand_decl = lowering.decls[decl.operand]
+    operand_name = operand_decl.name
+    panel_dim_name = lowering.dimension_names[lowering.panel.dimension]
+    pack_dim_name = lowering.dimension_names[lowering.loops[0].dimension]
+    panel_outer_name = f"{panel_dim_name}_out"
+    panel_end = f"{panel_outer_name}_end"
+    pack_outer_name = f"{pack_dim_name}_out"
+    pack_inner_name = f"{pack_dim_name}_in"
+    pack_tile_var = f"kTile_{pack_dim_name}"
+    panel_tile_var = f"kTile_{panel_dim_name}"
+    operand_value_array = f"{operand_name}_val"
+    # The validated relayout family stores the panel dimension on level 0
+    # and the pack dimension on the contiguous level 1 of the operand.
+    panel_axis_bound = f"{operand_name}0_size"
+    pack_axis_bound = f"{operand_name}1_size"
+    torch_dtype = _SCALAR_TO_TORCH[operand_decl.dtype]
+    pointer_type = llir.DataType.ptr_type(torch_dtype)
+    scalar_type = (
+        llir.DataType.FLOAT32
+        if operand_decl.dtype is ScalarType.FLOAT32
+        else llir.DataType.FLOAT64
+    )
+    panel_scoped = decl.scope is RelayoutScope.PANEL
+    used_names = _declared_names(function)
+    packed_name = _unique_name(f"packed_{operand_name}", used_names)
+    storage_name = _unique_name(f"{packed_name}_storage", used_names)
+    stage_row_origin = panel_outer_name if panel_scoped else None
+
+    # 1. Redirect the emitted operand read to packed storage — the same
+    # typed (tensor, index identities, role) metadata triple the legacy
+    # rewriter consumes, made unambiguous by the pass-level single-
+    # occurrence proof.
+    staged_read_row: llir.Expr = (
+        llir.BinOp(
+            op="-",
+            left=llir.Var(panel_dim_name, llir.DataType.INT64),
+            right=llir.Var(panel_outer_name, llir.DataType.INT64),
+        )
+        if panel_scoped
+        else llir.Var(panel_dim_name, llir.DataType.INT64)
+    )
+    packed_read = llir.ArrayAccess(
+        array=llir.Var(packed_name, pointer_type),
+        index=llir.Add(
+            llir.Mul(
+                staged_read_row,
+                llir.Var(pack_tile_var, llir.DataType.INT64),
+            ),
+            llir.Var(pack_inner_name, llir.DataType.INT64),
+        ),
+    )
+    metadata = lowering._input_metadata(decl.operand)
+    rewritten_body, rewritten = _rewrite_stmt_access_sequence(
+        cast(Any, row_loop.body),
+        decl.operand,
+        metadata.index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+        packed_read,
+    )
+    row_loop.body = cast(List[llir.Stmt], rewritten_body)
+    if rewritten != 1 or _contains_tensor_access(
+        row_loop.body,
+        decl.operand,
+        metadata.index_ids,
+        llir.TensorAccessRole.INPUT_READ,
+    ):
+        _fail(
+            _RELAYOUT_LOST,
+            "the staged operand's emitted read was not redirected exactly " "once",
+        )
+
+    # 2. Adapt the sparse prefetch to the packed storage, passing this
+    # lowering's own coordinate-array spelling so the legacy name scan
+    # never runs.
+    cursor = lowering.loops[lowering.window_position].cursors[0]
+    try:
+        _redirect_sparse_prefetch(
+            window_loop,
+            operand_value_array,
+            packed_name,
+            panel_outer_name,
+            panel_end,
+            pack_tile_var,
+            stage_row_origin,
+            coordinate_array_name=lowering._cursor_crd_array(cursor).name,
+        )
+    except NotImplementedError as error:
+        _fail(_RELAYOUT_LOST, str(error))
+
+    # 3. Insert the compatibility range guard directly after the window's
+    # resolved coordinate, re-identified against its detached pre-pass
+    # snapshot.
+    coord_candidates = [
+        (index, stmt)
+        for index, stmt in enumerate(window_loop.body)
+        if type(stmt) is llir.VarInit
+        and lowering._exact_panel_state_matches(stmt, coord_snapshot)
+    ]
+    if len(coord_candidates) != 1:
+        _fail(
+            _RELAYOUT_LOST,
+            "the window's resolved coordinate does not retain exactly its "
+            "detached pre-pass state",
+        )
+    coord_index = coord_candidates[0][0]
+    window_loop.body.insert(
+        coord_index + 1,
+        _panel_range_guard(panel_dim_name, panel_outer_name, panel_end),
+    )
+
+    # 4. Build and place the staging (pack) loop at the scope position.
+    pack_row = _unique_name(f"{panel_dim_name}_pack", used_names)
+    pack_col = _unique_name(f"{pack_dim_name}_pack", used_names)
+    logical_pack_col = _unique_name(f"{pack_dim_name}_packed", used_names)
+    pack_outer = _relayout_pack_loop(
+        panel_scoped=panel_scoped,
+        pack_row=pack_row,
+        pack_col=pack_col,
+        logical_pack_col=logical_pack_col,
+        packed_name=packed_name,
+        pointer_type=pointer_type,
+        operand_value_array=operand_value_array,
+        pack_outer_name=pack_outer_name,
+        pack_tile_var=pack_tile_var,
+        pack_axis_bound=pack_axis_bound,
+        panel_axis_bound=panel_axis_bound,
+        panel_outer_name=panel_outer_name,
+        panel_end=panel_end,
+    )
+    pack_outer.scorch_index_var = f"pack:{operand_name}"
+    scope_description = (
+        f"{panel_dim_name} panel" if panel_scoped else f"full {panel_dim_name} axis"
+    )
+    stage_statements: List[llir.Stmt] = [
+        llir.Comment(
+            f"Pack {operand_name} {scope_description} into contiguous "
+            f"{panel_dim_name}-major storage"
+        ),
+        pack_outer,
+        llir.BlankLine(),
+    ]
+    if panel_scoped:
+        stage_container = panel_loop.body
+        stage_positions = [
+            index for index, stmt in enumerate(stage_container) if stmt is row_loop
+        ]
+        if len(stage_positions) != 1:
+            _fail(
+                _RELAYOUT_LOST,
+                "the completed panel no longer owns its row loop; the "
+                "staging region cannot be placed",
+            )
+        stage_index = stage_positions[0]
+    else:
+        stage_container = pack_loop.body
+        stage_index = 0
+    stage_container[stage_index:stage_index] = stage_statements
+
+    # 5. Allocate the reusable packed storage directly above the pack
+    # origin loop, located by retained object identity.
+    located_pack = lowering._locate_statement(function.body, pack_loop)
+    if located_pack is None:
+        _fail(
+            _RELAYOUT_LOST,
+            "the retained pack origin loop cannot be located in the "
+            "assembled function",
+        )
+    pack_container, pack_index = located_pack
+    stage_rows = panel_tile_var if panel_scoped else panel_axis_bound
+    stage_rows_type = (
+        llir.DataType.CONSTEXPR_INT if panel_scoped else llir.DataType.INT64
+    )
+    pack_container[pack_index:pack_index] = _relayout_storage_statements(
+        operand=operand_name,
+        storage_name=storage_name,
+        packed_name=packed_name,
+        pointer_type=pointer_type,
+        scalar_type=scalar_type,
+        stage_rows=stage_rows,
+        stage_rows_type=stage_rows_type,
+        pack_tile_var=pack_tile_var,
+    )
+    return function
 
 
 def _lower_loopir_to_llir_owned(
@@ -3038,7 +3455,7 @@ def _lower_loopir_to_llir_owned(
             stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
         )
     assembled = kernel_abi.assemble_function(pipeline_result.artifact.value)
-    return lowering.complete_panel(assembled)
+    return lowering.complete_relayout(lowering.complete_panel(assembled))
 
 
 def lower_loopir_to_llir(

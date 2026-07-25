@@ -1402,3 +1402,218 @@ def test_panel_completion_failure_owns_stage_and_keeps_completed_pass_records(
             compile_options=options,
         )
     assert terminal.value.diagnostic.code == "failed_compilation"
+
+
+# -- staged-relayout target boundaries ---------------------------------------
+
+
+def relayout_program(scope=None, width=3, strip=4):
+    from scorch.compiler.loopir.nodes import RelayoutScope
+
+    from tests.test_scorch.test_loopir_verifier import build_relayout_spmm
+
+    return build_relayout_spmm(
+        scope if scope is not None else RelayoutScope.PANEL,
+        width=width,
+        strip=strip,
+    )
+
+
+def relayout_shapes(fixture):
+    return {fixture.a: (4, 5), fixture.b: (5, 6)}
+
+
+def test_relayout_target_emits_the_legacy_packed_source():
+    """Direct structural activation on a bare verified LoopIR program."""
+
+    from scorch.compiler.loopir.nodes import RelayoutScope
+
+    fixture = relayout_program(RelayoutScope.PANEL)
+    lowered = lower_loopir_to_llir(
+        fixture.program,
+        input_shapes=relayout_shapes(fixture),
+        result_shape=(4, 6),
+    )
+    from scorch.compiler.codegen import LLIRLowerer
+
+    source = LLIRLowerer().lower_llir(lowered)
+    assert (
+        "std::vector<float> packed_B_storage((size_t)kTile_j * (size_t)kTile_k);"
+        in source
+    )
+    assert "float* __restrict__ packed_B = packed_B_storage.data();" in source
+    assert "// Pack B j panel into contiguous j-major storage" in source
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads((j_out_end - "
+        "j_out) * kTile_k, (j_out_end - j_out))) schedule(static)" in source
+    )
+    assert "packed_B[(j_pack - j_out) * kTile_k + k_pack] = "
+    assert "B_val[j_pack * B1_size + k_packed];" in source
+    assert "if (j < j_out || j >= j_out_end) {" in source
+    assert "packed_B[(j - j_out) * kTile_k + k_in];" in source
+    assert (
+        "__builtin_prefetch(&packed_B[(A1_crd[pA1 + 1] - j_out) * kTile_k], 0, 1)"
+        in source
+    )
+    # The direct operand read is fully redirected.
+    assert "B_val[pB1]" not in source
+
+    fixture = relayout_program(RelayoutScope.PACK_AXIS)
+    lowered = lower_loopir_to_llir(
+        fixture.program,
+        input_shapes=relayout_shapes(fixture),
+        result_shape=(4, 6),
+    )
+    source = LLIRLowerer().lower_llir(lowered)
+    assert (
+        "std::vector<float> packed_B_storage((size_t)B0_size * (size_t)kTile_k);"
+        in source
+    )
+    assert "// Pack B full j axis into contiguous j-major storage" in source
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(B0_size * "
+        "kTile_k, B0_size)) schedule(static)" in source
+    )
+    assert "packed_B[j_pack * kTile_k + k_pack] = " in source
+    assert "packed_B[j * kTile_k + k_in];" in source
+    assert "__builtin_prefetch(&packed_B[A1_crd[pA1 + 1] * kTile_k], 0, 1)" in source
+    assert "B_val[pB1]" not in source
+
+
+def test_relayout_target_requires_the_exact_chain_shape():
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    # A second staging region is outside the family.  Both regions are
+    # read so the program stays verifier-legal; the target's collect gate
+    # rejects the second region before validation.
+    from scorch.compiler.loopir.nodes import BinaryOp as LoopIRBinaryOp
+
+    fixture = relayout_program()
+    inner_decl = fixture.builder.relayout_decl(
+        fixture.builder.new_relayout_id(),
+        fixture.b,
+        fixture.panel_tile,
+        fixture.pack_tile,
+        fixture.decl.scope,
+    )
+    inner_stage = fixture.builder.relayout_stage(inner_decl, fixture.stage.body)
+    inner_read = fixture.builder.staged_read(
+        inner_decl.relayout,
+        (
+            fixture.builder.index_value(fixture.col),
+            fixture.builder.index_value(fixture.free),
+        ),
+    )
+    forge(
+        fixture.leaf,
+        value=fixture.builder.binary(
+            LoopIRBinaryOp.MUL, fixture.leaf.value, inner_read
+        ),
+    )
+    forge(fixture.stage, body=fixture.builder.block((inner_stage,)))
+    expect_target_code(
+        "unsupported_program_shape",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+    # A verifier-legal PANEL-scope region nested inside the row loop is
+    # outside the audited placement: the region must open directly below
+    # its scope loop.  (A region naming a foreign pack or panel identity
+    # cannot verify at all — the verifier's relayout_scope_mismatch owns
+    # that boundary.)
+    fixture = relayout_program()
+    nested_stage = fixture.builder.relayout_stage(fixture.decl, fixture.row_loop.body)
+    nested_row = fixture.builder.dense_for(
+        fixture.row, fixture.dim_i, fixture.builder.block((nested_stage,))
+    )
+    forge(fixture.panel, body=fixture.builder.block((nested_row,)))
+    expect_target_code(
+        "unsupported_program_shape",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+    # A region at the wrong depth for its scope.
+    from scorch.compiler.loopir.nodes import RelayoutScope
+
+    fixture = relayout_program(RelayoutScope.PACK_AXIS)
+    forge(fixture.decl, scope=RelayoutScope.PANEL)
+    # Verifier-level scope discipline fires first; bypass it by forging
+    # a PANEL region at the PACK_AXIS position is verifier-invalid, so
+    # this boundary is unreachable through verified programs — the
+    # verifier's relayout_scope_mismatch owns it.
+    with pytest.raises(LoopIRVerificationError):
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes=relayout_shapes(fixture),
+            result_shape=(4, 6),
+        )
+
+
+def test_relayout_target_requires_the_panel_family():
+    """A staging region without its panel pair cannot reach emission."""
+
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    fixture = relayout_program()
+    # Erase the panel pair from the region body: the window becomes a
+    # plain sparse loop and the panel origin disappears; the staged read
+    # then has no window coordinate, so verification fails closed before
+    # the target boundary is consulted.
+    forge(fixture.decl, panel=fixture.builder.new_tile_id())
+    with pytest.raises(LoopIRVerificationError):
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes=relayout_shapes(fixture),
+            result_shape=(4, 6),
+        )
+
+
+def test_relayout_completion_requires_recorded_state(monkeypatch):
+    """A lost panel-completion record fails closed, never guesses."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def forgetful(self, function):
+        completed = original(self, function)
+        self._panel_completion = None
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", forgetful)
+    expect_target_code(
+        "relayout_completion_lost",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+
+
+def test_relayout_completion_requires_the_window_coordinate(monkeypatch):
+    """A corrupted resolved-coordinate declaration fails closed."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def corrupting(self, function):
+        completed = original(self, function)
+        _pack, _panel, _row, window = self._panel_completion
+        for statement in window.body:
+            if type(statement) is llir.VarInit and statement.var.name == "j":
+                statement.var = llir.Var("j_forged", statement.var.type)
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", corrupting)
+    expect_target_code(
+        "relayout_completion_lost",
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )

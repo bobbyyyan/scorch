@@ -870,7 +870,16 @@ def _redirect_sparse_prefetch(
     panel_end: str,
     panel_tile_var: str,
     stage_row_origin: Optional[str],
+    coordinate_array_name: Optional[str] = None,
 ) -> None:
+    """Replace the operand prefetch guard with its packed-storage twin.
+
+    The legacy caller leaves ``coordinate_array_name`` unset and the
+    coordinate array is discovered by the compatibility name scan; the
+    typed LoopIR completion passes its own emission-record spelling so no
+    name discovery runs on that path.
+    """
+
     if not isinstance(sparse_loop.init, llir.VarInit):
         raise NotImplementedError(
             "Packed relayout requires a canonical compressed iterator"
@@ -882,8 +891,11 @@ def _redirect_sparse_prefetch(
             "Packed relayout requires a named compressed iterator end"
         )
     position = sparse_loop.init.var.name
-    coordinate_array = _find_coordinate_array(sparse_loop.body, position)
-    coordinate_name = coordinate_array.name
+    coordinate_name = (
+        coordinate_array_name
+        if coordinate_array_name is not None
+        else _find_coordinate_array(sparse_loop.body, position).name
+    )
     end_name = sparse_loop.cond.right.name
     removed = False
     retained: List[llir.Stmt] = []
@@ -1327,6 +1339,182 @@ def _packed_storage_declaration(
     )
 
 
+def _panel_range_guard(
+    panel_var: str,
+    panel_outer_name: str,
+    panel_end: str,
+) -> llir.IfThenElse:
+    """The compatibility continue-guard the packed compute loop retains."""
+
+    return llir.IfThenElse(
+        cond=llir.BinOp(
+            op="||",
+            left=llir.BinOp(
+                op="<",
+                left=llir.Var(panel_var, llir.DataType.INT64),
+                right=llir.Var(panel_outer_name, llir.DataType.INT64),
+            ),
+            right=llir.BinOp(
+                op=">=",
+                left=llir.Var(panel_var, llir.DataType.INT64),
+                right=llir.Var(panel_end, llir.DataType.INT64),
+            ),
+        ),
+        then_body=[llir.Continue()],
+    )
+
+
+def _relayout_pack_loop(
+    *,
+    panel_scoped: bool,
+    pack_row: str,
+    pack_col: str,
+    logical_pack_col: str,
+    packed_name: str,
+    pointer_type: llir.DataType,
+    operand_value_array: str,
+    pack_outer_name: str,
+    pack_tile_var: str,
+    pack_axis_bound: str,
+    panel_axis_bound: str,
+    panel_outer_name: str,
+    panel_end: str,
+) -> llir.ForLoop:
+    """Build the parallel staging (pack) loop for one relayout scope."""
+
+    destination_row: llir.Expr = (
+        llir.BinOp(
+            op="-",
+            left=llir.Var(pack_row, llir.DataType.INT64),
+            right=llir.Var(panel_outer_name, llir.DataType.INT64),
+        )
+        if panel_scoped
+        else llir.Var(pack_row, llir.DataType.INT64)
+    )
+    destination_index = llir.Add(
+        llir.Mul(
+            destination_row,
+            llir.Var(pack_tile_var, llir.DataType.INT64),
+        ),
+        llir.Var(pack_col, llir.DataType.INT64),
+    )
+    pack_inner = llir.ForLoop(
+        init=llir.VarInit(
+            var=llir.Var(pack_col, llir.DataType.INT64),
+            value=llir.Literal(0),
+        ),
+        cond=llir.BinOp(
+            op="<",
+            left=llir.Var(pack_col, llir.DataType.INT64),
+            right=llir.Var(pack_tile_var, llir.DataType.INT64),
+        ),
+        update=llir.Increment(llir.Var(pack_col, llir.DataType.INT64)),
+        body=[
+            llir.VarInit(
+                var=llir.Var(logical_pack_col, llir.DataType.INT64),
+                value=llir.Add(
+                    llir.Var(pack_outer_name, llir.DataType.INT64),
+                    llir.Var(pack_col, llir.DataType.INT64),
+                ),
+            ),
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op=">=",
+                    left=llir.Var(logical_pack_col, llir.DataType.INT64),
+                    right=llir.Var(pack_axis_bound, llir.DataType.INT64),
+                ),
+                then_body=[llir.Break()],
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(packed_name, pointer_type),
+                    index=destination_index,
+                ),
+                value=llir.ArrayAccess(
+                    array=llir.Var(operand_value_array, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(pack_row, llir.DataType.INT64),
+                            llir.Var(pack_axis_bound, llir.DataType.INT64),
+                        ),
+                        llir.Var(logical_pack_col, llir.DataType.INT64),
+                    ),
+                ),
+            ),
+        ],
+    )
+    return llir.ForLoop(
+        init=llir.VarInit(
+            var=llir.Var(pack_row, llir.DataType.INT64),
+            value=(
+                llir.Var(panel_outer_name, llir.DataType.INT64)
+                if panel_scoped
+                else llir.Literal(0)
+            ),
+        ),
+        cond=llir.BinOp(
+            op="<",
+            left=llir.Var(pack_row, llir.DataType.INT64),
+            right=llir.Var(
+                panel_end if panel_scoped else panel_axis_bound,
+                llir.DataType.INT64,
+            ),
+        ),
+        update=llir.Increment(llir.Var(pack_row, llir.DataType.INT64)),
+        body=[pack_inner],
+        omp_parallel_for=True,
+        omp_schedule="static",
+        omp_num_threads=(
+            "scorch_nthreads("
+            + (
+                f"({panel_end} - {panel_outer_name}) * {pack_tile_var}, "
+                f"({panel_end} - {panel_outer_name})"
+                if panel_scoped
+                else f"{panel_axis_bound} * {pack_tile_var}, {panel_axis_bound}"
+            )
+            + ")"
+        ),
+    )
+
+
+def _relayout_storage_statements(
+    *,
+    operand: str,
+    storage_name: str,
+    packed_name: str,
+    pointer_type: llir.DataType,
+    scalar_type: llir.DataType,
+    stage_rows: str,
+    stage_rows_type: llir.DataType,
+    pack_tile_var: str,
+) -> List[llir.Stmt]:
+    """The reusable packed-storage declaration block above the pack origin."""
+
+    packed_storage = _packed_storage_declaration(
+        storage_name=storage_name,
+        scalar_type=scalar_type,
+        stage_rows=stage_rows,
+        stage_rows_type=stage_rows_type,
+        pack_tile_var=pack_tile_var,
+    )
+    LLIRWalker(_PACKED_STORAGE_CONTEXT).walk(packed_storage)
+    return [
+        llir.Comment(f"Allocate reusable packed storage for {operand}"),
+        packed_storage,
+        llir.VarInit(
+            var=llir.Var(packed_name, pointer_type, is_restrict=True),
+            value=llir.MemberCall(
+                base=llir.Var(
+                    storage_name,
+                    llir.DataType.std_vector_type(scalar_type),
+                ),
+                member="data",
+            ),
+        ),
+        llir.BlankLine(),
+    ]
+
+
 def _apply_relayout(
     function: llir.Function,
     schedule: Schedule,
@@ -1442,22 +1630,7 @@ def _apply_relayout(
         )
     sparse_loop.body.insert(
         panel_coordinate_index + 1,
-        llir.IfThenElse(
-            cond=llir.BinOp(
-                op="||",
-                left=llir.BinOp(
-                    op="<",
-                    left=llir.Var(plan.panel_var, llir.DataType.INT64),
-                    right=llir.Var(panel_outer_name, llir.DataType.INT64),
-                ),
-                right=llir.BinOp(
-                    op=">=",
-                    left=llir.Var(plan.panel_var, llir.DataType.INT64),
-                    right=llir.Var(panel_end, llir.DataType.INT64),
-                ),
-            ),
-            then_body=[llir.Continue()],
-        ),
+        _panel_range_guard(plan.panel_var, panel_outer_name, panel_end),
     )
     if _contains_tensor_access(
         row_loop.body,
@@ -1472,98 +1645,20 @@ def _apply_relayout(
     pack_row = _unique_name(f"{plan.panel_var}_pack", used_names)
     pack_col = _unique_name(f"{plan.pack_var}_pack", used_names)
     logical_pack_col = _unique_name(f"{plan.pack_var}_packed", used_names)
-    destination_row: llir.Expr = (
-        llir.BinOp(
-            op="-",
-            left=llir.Var(pack_row, llir.DataType.INT64),
-            right=llir.Var(panel_outer_name, llir.DataType.INT64),
-        )
-        if panel_scoped
-        else llir.Var(pack_row, llir.DataType.INT64)
-    )
-    destination_index = llir.Add(
-        llir.Mul(
-            destination_row,
-            llir.Var(pack_tile_var, llir.DataType.INT64),
-        ),
-        llir.Var(pack_col, llir.DataType.INT64),
-    )
-    pack_inner = llir.ForLoop(
-        init=llir.VarInit(
-            var=llir.Var(pack_col, llir.DataType.INT64),
-            value=llir.Literal(0),
-        ),
-        cond=llir.BinOp(
-            op="<",
-            left=llir.Var(pack_col, llir.DataType.INT64),
-            right=llir.Var(pack_tile_var, llir.DataType.INT64),
-        ),
-        update=llir.Increment(llir.Var(pack_col, llir.DataType.INT64)),
-        body=[
-            llir.VarInit(
-                var=llir.Var(logical_pack_col, llir.DataType.INT64),
-                value=llir.Add(
-                    llir.Var(pack_outer_name, llir.DataType.INT64),
-                    llir.Var(pack_col, llir.DataType.INT64),
-                ),
-            ),
-            llir.IfThenElse(
-                cond=llir.BinOp(
-                    op=">=",
-                    left=llir.Var(logical_pack_col, llir.DataType.INT64),
-                    right=llir.Var(pack_axis_bound, llir.DataType.INT64),
-                ),
-                then_body=[llir.Break()],
-            ),
-            llir.Assign(
-                var=llir.ArrayAccess(
-                    array=llir.Var(packed_name, pointer_type),
-                    index=destination_index,
-                ),
-                value=llir.ArrayAccess(
-                    array=llir.Var(operand_value_array, pointer_type),
-                    index=llir.Add(
-                        llir.Mul(
-                            llir.Var(pack_row, llir.DataType.INT64),
-                            llir.Var(pack_axis_bound, llir.DataType.INT64),
-                        ),
-                        llir.Var(logical_pack_col, llir.DataType.INT64),
-                    ),
-                ),
-            ),
-        ],
-    )
-    pack_outer = llir.ForLoop(
-        init=llir.VarInit(
-            var=llir.Var(pack_row, llir.DataType.INT64),
-            value=(
-                llir.Var(panel_outer_name, llir.DataType.INT64)
-                if panel_scoped
-                else llir.Literal(0)
-            ),
-        ),
-        cond=llir.BinOp(
-            op="<",
-            left=llir.Var(pack_row, llir.DataType.INT64),
-            right=llir.Var(
-                panel_end if panel_scoped else panel_axis_bound,
-                llir.DataType.INT64,
-            ),
-        ),
-        update=llir.Increment(llir.Var(pack_row, llir.DataType.INT64)),
-        body=[pack_inner],
-        omp_parallel_for=True,
-        omp_schedule="static",
-        omp_num_threads=(
-            "scorch_nthreads("
-            + (
-                f"({panel_end} - {panel_outer_name}) * {pack_tile_var}, "
-                f"({panel_end} - {panel_outer_name})"
-                if panel_scoped
-                else f"{panel_axis_bound} * {pack_tile_var}, {panel_axis_bound}"
-            )
-            + ")"
-        ),
+    pack_outer = _relayout_pack_loop(
+        panel_scoped=panel_scoped,
+        pack_row=pack_row,
+        pack_col=pack_col,
+        logical_pack_col=logical_pack_col,
+        packed_name=packed_name,
+        pointer_type=pointer_type,
+        operand_value_array=operand_value_array,
+        pack_outer_name=pack_outer_name,
+        pack_tile_var=pack_tile_var,
+        pack_axis_bound=pack_axis_bound,
+        panel_axis_bound=panel_axis_bound,
+        panel_outer_name=panel_outer_name,
+        panel_end=panel_end,
     )
     pack_outer.scorch_index_var = f"pack:{plan.operand}"
 
@@ -1597,29 +1692,16 @@ def _apply_relayout(
     stage_rows_type = (
         llir.DataType.CONSTEXPR_INT if panel_scoped else llir.DataType.INT64
     )
-    packed_storage = _packed_storage_declaration(
+    pack_container[pack_index:pack_index] = _relayout_storage_statements(
+        operand=plan.operand,
         storage_name=storage_name,
+        packed_name=packed_name,
+        pointer_type=pointer_type,
         scalar_type=scalar_type,
         stage_rows=stage_rows,
         stage_rows_type=stage_rows_type,
         pack_tile_var=pack_tile_var,
     )
-    LLIRWalker(_PACKED_STORAGE_CONTEXT).walk(packed_storage)
-    pack_container[pack_index:pack_index] = [
-        llir.Comment(f"Allocate reusable packed storage for {plan.operand}"),
-        packed_storage,
-        llir.VarInit(
-            var=llir.Var(packed_name, pointer_type, is_restrict=True),
-            value=llir.MemberCall(
-                base=llir.Var(
-                    storage_name,
-                    llir.DataType.std_vector_type(scalar_type),
-                ),
-                member="data",
-            ),
-        ),
-        llir.BlankLine(),
-    ]
 
 
 def apply_schedule_to_llir(
