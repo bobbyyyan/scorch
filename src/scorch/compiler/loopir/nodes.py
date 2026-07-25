@@ -39,8 +39,9 @@ Discipline carried over from the spike and the binding design decisions:
   ``SymbolId`` values and bound loop coordinates by production ``IndexId``
   values, so CIN provenance survives lowering; ``LoopIRNodeId``,
   ``DimensionId``, ``CursorId``, ``PositionId``, ``TileId``, and
-  ``WorkspaceId``/``RelayoutId`` are LoopIR-artifact-local identities
-  allocated by :class:`~scorch.compiler.loopir.build.LoopIRBuilder`;
+  ``WorkspaceId``/``RelayoutId``/``ResultTileId`` are LoopIR-artifact-local
+  identities allocated by
+  :class:`~scorch.compiler.loopir.build.LoopIRBuilder`;
 - no C++ spelling, Torch storage field, rendered name, or target policy
   appears in any node; target lowering owns those exclusively.
 
@@ -141,6 +142,23 @@ class RelayoutId:
     typed staging pass redirects the operand's unique read occurrence,
     this identity is the stable anchor and nothing downstream re-identifies
     the original access.
+    """
+
+    value: int
+
+
+@dataclass(frozen=True, order=True)
+class ResultTileId:
+    """Identity of one heap-backed compact result-tile region within a program.
+
+    A result tile is one schedule fact — "this dense result's current
+    trailing-axis strip accumulates into reusable compact storage and is
+    copied out exactly once at strip exit" — realized structurally as a
+    :class:`ResultTileRegion` whose :class:`ResultTileDecl` owns the
+    identity.  Tiled reductions name the result tile by this identity,
+    never by a rendered C++ name; after the typed accumulation pass
+    redirects the result's unique write occurrence, this identity is the
+    stable anchor and nothing downstream re-identifies the original write.
     """
 
     value: int
@@ -664,6 +682,93 @@ class StagedRead(Expr):
 
     relayout: RelayoutId
     indices: Tuple[Expr, ...]
+
+
+@dataclass(frozen=True)
+class ResultTileDecl(LoopIRNode):
+    """One heap-backed compact result tile over a pack split's point window.
+
+    ``result`` names a declared all-dense output of rank at least two whose
+    *last* physical storage level stores the pack split's dimension — the
+    audited legacy trailing-free-axis fact, verified structurally.  ``pack``
+    names the affine split whose clamped point window is the compact
+    column range; it is the same artifact-local :class:`TileId` space the
+    split pair already owns.  The compact tile spans every dense
+    result-prefix position and one clamped strip of the trailing axis.
+    There is deliberately no display name, C++ buffer spelling, or level
+    index in the node: the compact storage's naming, capacity arithmetic,
+    and init/copy loop emission are target concerns with no degrees of
+    freedom given these identities.
+    """
+
+    node_id: LoopIRNodeId
+    result_tile: ResultTileId
+    result: SymbolId
+    pack: TileId
+
+
+@dataclass(frozen=True)
+class ResultTileRegion(Stmt):
+    """Structured accumulation region of one heap result-tile declaration.
+
+    Region semantics are intrinsic to the node (the oracle and any target
+    lowering must implement exactly this):
+
+    - on entry a fresh compact tile is observed with every cell zero — one
+      cell per (dense result-prefix position, clamped pack-window column),
+      the explicit reset whose value is ADD's identity, which is what makes
+      :class:`TiledReduce` well-defined without a separate initialization
+      statement;
+    - ``body`` runs with the compact tile live throughout: a
+      :class:`TiledReduce` of this region is legal only inside it and
+      accumulates into the addressed compact cell; the declared result is
+      not written directly inside the region;
+    - at region exit every compact cell is copied to the declared result
+      exactly once — ``result[prefix, c] = tile[prefix, c - origin]`` for
+      every dense prefix position and every clamped-window column ``c`` —
+      and the compact tile ceases to exist.  Because the region executes
+      once per pack origin and the origin loop covers the whole trailing
+      axis in strips, this exactly-once copy-out is what discharges the
+      result's whole-tensor zero-initialization contract: cells that
+      received no accumulation copy the entry zero.
+
+    The region must execute directly inside its pack split's origin loop
+    (the compact columns need a current pack origin, and copy-out coverage
+    needs exactly one region execution per origin iteration) and never
+    inside a point loop of its own split.  How the compact copy is realized
+    (buffer reuse across iterations, parallel init/copy loops, capacity
+    arithmetic) is a target concern; only the accumulated contents,
+    freshness, and copy-out are semantics.
+    """
+
+    decl: ResultTileDecl
+    body: Block
+
+
+@dataclass(frozen=True)
+class TiledReduce(Stmt):
+    """A read-modify-write into one cell of an in-scope compact result tile.
+
+    The staged twin of :class:`StoreReduce`: ``indices`` are the declared
+    result's access indices in logical mode order and domain-checked
+    identically, and the cell combined is the one addressing
+    ``result[indices]`` through the enclosing region's compact tile.
+    Combines the cell with ``value`` using ``op`` (``cell = cell op
+    value``).  Only ADD is admitted, and its identity is exactly the zero
+    the owning region's entry reset established — the reduction-legality
+    contract, stated structurally.  The trailing index (the result's
+    pack-axis mode) must be the pack split's point coordinate bound by its
+    :class:`TileInnerFor`, which is what keeps every reduce inside the
+    live compact strip by construction.  The typed accumulation pass
+    produces this node by replacing the result's verifier-proven unique
+    :class:`StoreReduce` occurrence; no occurrence identity is needed
+    because the region identity is the anchor from then on.
+    """
+
+    result_tile: ResultTileId
+    indices: Tuple[Expr, ...]
+    op: ReduceOp
+    value: Expr
 
 
 @dataclass(frozen=True)

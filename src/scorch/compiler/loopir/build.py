@@ -52,6 +52,9 @@ from .nodes import (
     RelayoutId,
     RelayoutScope,
     RelayoutStage,
+    ResultTileDecl,
+    ResultTileId,
+    ResultTileRegion,
     RootPosition,
     ScalarType,
     SparseCursorDecl,
@@ -62,6 +65,7 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TiledReduce,
     TileId,
     TileInnerFor,
     TileOuterFor,
@@ -75,7 +79,7 @@ from .nodes import (
 
 def _max_identity_values(
     program: LoopProgram,
-) -> Tuple[int, int, int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int, int, int]:
     """Scan one program for the next free value of every builder identity."""
 
     next_node = 0
@@ -85,6 +89,7 @@ def _max_identity_values(
     next_tile = 0
     next_workspace = 0
     next_relayout = 0
+    next_result_tile = 0
     seen: set = set()
     pending: list = [program]
     while pending:
@@ -113,6 +118,8 @@ def _max_identity_values(
                 next_workspace = max(next_workspace, value.value + 1)
             elif type(value) is RelayoutId and type(value.value) is int:
                 next_relayout = max(next_relayout, value.value + 1)
+            elif type(value) is ResultTileId and type(value.value) is int:
+                next_result_tile = max(next_result_tile, value.value + 1)
             elif isinstance(value, LoopIRNode):
                 pending.append(value)
             elif type(value) is tuple:
@@ -127,6 +134,7 @@ def _max_identity_values(
         next_tile,
         next_workspace,
         next_relayout,
+        next_result_tile,
     )
 
 
@@ -141,6 +149,7 @@ class LoopIRBuilder:
         self._next_tile_id = 0
         self._next_workspace_id = 0
         self._next_relayout_id = 0
+        self._next_result_tile_id = 0
 
     @classmethod
     def resuming(cls, program: LoopProgram) -> "LoopIRBuilder":
@@ -161,6 +170,7 @@ class LoopIRBuilder:
             builder._next_tile_id,
             builder._next_workspace_id,
             builder._next_relayout_id,
+            builder._next_result_tile_id,
         ) = _max_identity_values(program)
         return builder
 
@@ -210,6 +220,13 @@ class LoopIRBuilder:
         relayout = RelayoutId(self._next_relayout_id)
         self._next_relayout_id += 1
         return relayout
+
+    def new_result_tile_id(self) -> ResultTileId:
+        """Allocate the next artifact-local heap result-tile identity."""
+
+        result_tile = ResultTileId(self._next_result_tile_id)
+        self._next_result_tile_id += 1
+        return result_tile
 
     @staticmethod
     def new_symbol_id() -> SymbolId:
@@ -423,6 +440,26 @@ class LoopIRBuilder:
 
     def staged_read(self, relayout: RelayoutId, indices: Sequence[Expr]) -> StagedRead:
         return StagedRead(self._node_id(), relayout, tuple(indices))
+
+    def result_tile_decl(
+        self,
+        result_tile: ResultTileId,
+        result: SymbolId,
+        pack: TileId,
+    ) -> ResultTileDecl:
+        return ResultTileDecl(self._node_id(), result_tile, result, pack)
+
+    def result_tile_region(self, decl: ResultTileDecl, body: Block) -> ResultTileRegion:
+        return ResultTileRegion(self._node_id(), decl, body)
+
+    def tiled_reduce(
+        self,
+        result_tile: ResultTileId,
+        indices: Sequence[Expr],
+        op: ReduceOp,
+        value: Expr,
+    ) -> TiledReduce:
+        return TiledReduce(self._node_id(), result_tile, tuple(indices), op, value)
 
     def store(self, tensor: SymbolId, indices: Sequence[Expr], value: Expr) -> Store:
         return Store(self._node_id(), tensor, tuple(indices), value)

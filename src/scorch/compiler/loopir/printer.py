@@ -42,6 +42,8 @@ from .nodes import (
     PositionValue,
     RelayoutId,
     RelayoutStage,
+    ResultTileId,
+    ResultTileRegion,
     RootPosition,
     SparseCursorDecl,
     SparseFor,
@@ -51,6 +53,7 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TiledReduce,
     TileId,
     TileInnerFor,
     TileOuterFor,
@@ -61,7 +64,7 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v6"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v7"
 
 
 class _CanonicalIds:
@@ -76,6 +79,7 @@ class _CanonicalIds:
         self._tiles: Dict[TileId, int] = {}
         self._workspaces: Dict[WorkspaceId, int] = {}
         self._relayouts: Dict[RelayoutId, int] = {}
+        self._result_tiles: Dict[ResultTileId, int] = {}
 
     def dimension(self, dimension: DimensionId) -> int:
         return self._dimensions.setdefault(dimension, len(self._dimensions))
@@ -100,6 +104,9 @@ class _CanonicalIds:
 
     def relayout(self, relayout: RelayoutId) -> int:
         return self._relayouts.setdefault(relayout, len(self._relayouts))
+
+    def result_tile(self, result_tile: ResultTileId) -> int:
+        return self._result_tiles.setdefault(result_tile, len(self._result_tiles))
 
 
 def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
@@ -209,6 +216,18 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
         ids.tile(stmt.decl.panel)
         ids.tile(stmt.decl.pack)
         _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is ResultTileRegion:
+        ids.result_tile(stmt.decl.result_tile)
+        ids.symbol(stmt.decl.result)
+        ids.tile(stmt.decl.pack)
+        _seed_stmt_ids(stmt.body, ids)
+        return
+    if type(stmt) is TiledReduce:
+        ids.result_tile(stmt.result_tile)
+        for index in stmt.indices:
+            _seed_expr_ids(index, ids)
+        _seed_expr_ids(stmt.value, ids)
         return
     if type(stmt) is Store:
         ids.symbol(stmt.tensor)
@@ -410,6 +429,24 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
                 "scope": stmt.decl.scope.value,
             },
             "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is ResultTileRegion:
+        return {
+            "kind": "result_tile_region",
+            "result_tile": {
+                "result_tile": ids.result_tile(stmt.decl.result_tile),
+                "result": ids.symbol(stmt.decl.result),
+                "pack": ids.tile(stmt.decl.pack),
+            },
+            "body": _serialize_stmt(stmt.body, ids),
+        }
+    if type(stmt) is TiledReduce:
+        return {
+            "kind": "tiled_reduce",
+            "result_tile": ids.result_tile(stmt.result_tile),
+            "op": stmt.op.value,
+            "indices": [_serialize_expr(index, ids) for index in stmt.indices],
+            "value": _serialize_expr(stmt.value, ids),
         }
     if type(stmt) is AppendEntry:
         return {
@@ -634,6 +671,25 @@ def _render_stmt(
         )
         _render_stmt(stmt.body, ids, names, indent + 1, lines)
         lines.append(f"{pad}}}")
+        return
+    if type(stmt) is ResultTileRegion:
+        result_tile_decl = stmt.decl
+        lines.append(
+            f"{pad}result_tile_region "
+            f"h{ids.result_tile(result_tile_decl.result_tile)} "
+            f"t{ids.symbol(result_tile_decl.result)} "
+            f"pack s{ids.tile(result_tile_decl.pack)} {{"
+        )
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is TiledReduce:
+        rendered = ", ".join(_render_expr(index, ids, names) for index in stmt.indices)
+        lines.append(
+            f"{pad}tiled_reduce({stmt.op.value}) "
+            f"h{ids.result_tile(stmt.result_tile)}[{rendered}] = "
+            f"{_render_expr(stmt.value, ids, names)}"
+        )
         return
     if type(stmt) is AppendEntry:
         rendered = ", ".join(_render_expr(coord, ids, names) for coord in stmt.coords)

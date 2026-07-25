@@ -28,10 +28,13 @@ from scorch.compiler.loopir.nodes import (
     RelayoutId,
     RelayoutScope,
     RelayoutStage,
+    ResultTileId,
+    ResultTileRegion,
     ScalarType,
     StagedRead,
     Stmt,
     StoreReduce,
+    TiledReduce,
     TileId,
     TileInnerFor,
     TileOuterFor,
@@ -699,6 +702,15 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "relayout_operand_mismatch",
     "relayout_read_mismatch",
     "relayout_dead_region",
+    # Heap result-tile codes added by the Phase-6 heap slice.
+    "invalid_result_tile_id",
+    "duplicate_result_tile_id",
+    "unbound_result_tile",
+    "result_tile_scope_mismatch",
+    "result_tile_result_mismatch",
+    "result_tile_write_mismatch",
+    "result_tile_residual_write",
+    "result_tile_dead_region",
 }
 
 
@@ -2867,4 +2879,426 @@ def test_relayout_defect_paths_are_reported():
     fixture = build_relayout_spmm()
     forge(fixture.decl, scope=RelayoutScope.PACK_AXIS)
     defect = expect_defect("relayout_scope_mismatch", fixture.program)
+    assert "statements[0]" in defect.path
+
+
+# -- Phase-6 heap result-tile subset ------------------------------------------
+
+
+@dataclasses.dataclass
+class HeapSpmmFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    a: SymbolId
+    b: SymbolId
+    c: SymbolId
+    dim_i: DimensionId
+    dim_j: DimensionId
+    dim_k: DimensionId
+    row: IndexId
+    col: IndexId
+    free: IndexId
+    pack_tile: TileId
+    result_tile: ResultTileId
+    decl: object
+    region: ResultTileRegion
+    pack: TileOuterFor
+    row_loop: DenseFor
+    sparse: Stmt
+    pack_point: TileInnerFor
+    leaf: TiledReduce
+
+
+def build_heap_spmm(strip=4, dtype=ScalarType.FLOAT32) -> HeapSpmmFixture:
+    """C[i, k] += A[i, j] * B[j, k] with a heap-backed compact result tile.
+
+    An outermost affine pack tile over ``k`` whose whole body is one
+    :class:`ResultTileRegion`; the compute leaf accumulates through
+    :class:`TiledReduce` instead of a direct result reduction.
+    """
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    dim_k = builder.dimension("k")
+    a, b, c = (builder.new_symbol_id() for _ in range(3))
+    decl_a = builder.tensor(
+        a,
+        "A",
+        dtype,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_b = builder.tensor(
+        b, "B", dtype, (dim_j.dimension, dim_k.dimension), builder.dense_levels(2)
+    )
+    decl_c = builder.tensor(
+        c, "C", dtype, (dim_i.dimension, dim_k.dimension), builder.dense_levels(2)
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    free = builder.new_index_id()
+    cursor = builder.new_cursor_id()
+    position = builder.new_position_id()
+    pack_tile = builder.new_tile_id()
+    result_tile = builder.new_result_tile_id()
+    cursor_decl = builder.sparse_cursor(
+        cursor,
+        a,
+        1,
+        builder.dense_position(a, 0, builder.root_position(), builder.index_value(row)),
+    )
+    leaf = builder.tiled_reduce(
+        result_tile,
+        (builder.index_value(row), builder.index_value(free)),
+        ReduceOp.ADD,
+        builder.binary(
+            BinaryOp.MUL,
+            builder.cursor_value(cursor),
+            builder.load(b, (builder.index_value(col), builder.index_value(free))),
+        ),
+    )
+    pack_point = builder.tile_inner_for(
+        pack_tile, free, dim_k.dimension, strip, False, builder.block((leaf,))
+    )
+    sparse = builder.sparse_for(
+        cursor_decl, position, col, builder.block((pack_point,))
+    )
+    row_loop = builder.dense_for(row, dim_i.dimension, builder.block((sparse,)))
+    decl = builder.result_tile_decl(result_tile, c, pack_tile)
+    region = builder.result_tile_region(decl, builder.block((row_loop,)))
+    pack = builder.tile_outer_for(
+        pack_tile, free, dim_k.dimension, strip, builder.block((region,))
+    )
+    program = builder.program(
+        (dim_i, dim_j, dim_k),
+        (decl_a, decl_b, decl_c),
+        (a, b),
+        (c,),
+        builder.block((pack,)),
+    )
+    return HeapSpmmFixture(
+        builder,
+        program,
+        a,
+        b,
+        c,
+        dim_i.dimension,
+        dim_j.dimension,
+        dim_k.dimension,
+        row,
+        col,
+        free,
+        pack_tile,
+        result_tile,
+        decl,
+        region,
+        pack,
+        row_loop,
+        sparse,
+        pack_point,
+        leaf,
+    )
+
+
+def test_heap_fixture_verifies():
+    verify_program(build_heap_spmm().program)
+    verify_program(build_heap_spmm(strip=1).program)
+    verify_program(build_heap_spmm(dtype=ScalarType.FLOAT64).program)
+    verify_program(build_heap_spmm(strip=MAX_LOOPIR_TILE_WIDTH).program)
+
+
+def test_result_tile_identity_is_typed_and_unique():
+    fixture = build_heap_spmm()
+    forge(fixture.decl, result_tile=7)
+    expect_defect("invalid_result_tile_id", fixture.program)
+
+    fixture = build_heap_spmm()
+    forge(fixture.leaf, result_tile="0")
+    expect_defect("invalid_result_tile_id", fixture.program)
+
+    class HostileResultTileId(ResultTileId):
+        pass
+
+    fixture = build_heap_spmm()
+    forge(fixture.decl, result_tile=HostileResultTileId(fixture.result_tile.value))
+    expect_defect("invalid_result_tile_id", fixture.program)
+
+    fixture = build_heap_spmm()
+    forge(fixture.decl, result_tile=ResultTileId(True))
+    expect_defect("invalid_result_tile_id", fixture.program)
+
+    # A second region may not reuse an already-declared identity.
+    fixture = build_heap_spmm()
+    inner_decl = fixture.builder.result_tile_decl(
+        fixture.result_tile, fixture.c, fixture.pack_tile
+    )
+    inner_region = fixture.builder.result_tile_region(inner_decl, fixture.region.body)
+    forge(fixture.region, body=fixture.builder.block((inner_region,)))
+    expect_defect("duplicate_result_tile_id", fixture.program)
+
+
+def test_tiled_reduce_requires_an_enclosing_region():
+    # The reduce sits under the pack origin but no region is open.
+    fixture = build_heap_spmm()
+    forge(fixture.pack, body=fixture.region.body)
+    expect_defect("unbound_result_tile", fixture.program)
+
+    # A next sibling after the region exits may not reuse its identity.
+    fixture = build_heap_spmm()
+    stray = fixture.builder.tiled_reduce(
+        fixture.result_tile,
+        (
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(fixture.free),
+        ),
+        ReduceOp.ADD,
+        fixture.builder.float_const(1.0),
+    )
+    local_region = fixture.builder.result_tile_region(
+        fixture.decl, fixture.builder.block((fixture.leaf,))
+    )
+    forge(fixture.pack_point, body=fixture.builder.block((local_region, stray)))
+    forge(fixture.pack, body=fixture.region.body)
+    # The nested region now opens inside its own split's point loop.
+    expect_defect("result_tile_scope_mismatch", fixture.program)
+
+    fixture = build_heap_spmm()
+    huge = ResultTileId(10**5000)
+    forge(fixture.leaf, result_tile=huge)
+    defect = expect_defect("unbound_result_tile", fixture.program)
+    assert "too large" in defect.message
+
+
+def test_result_tile_region_scope_discipline():
+    # The pack split's origin loop must be open.
+    fixture = build_heap_spmm()
+    forge(fixture.decl, pack=fixture.builder.new_tile_id())
+    expect_defect("result_tile_scope_mismatch", fixture.program)
+
+    # A region inside its own split's point loop can never accumulate.
+    fixture = build_heap_spmm()
+    inner_region = fixture.builder.result_tile_region(
+        fixture.decl, fixture.builder.block((fixture.leaf,))
+    )
+    forge(fixture.pack_point, body=fixture.builder.block((inner_region,)))
+    forge(fixture.pack, body=fixture.builder.block((fixture.row_loop,)))
+    forge(fixture.sparse, body=fixture.builder.block((fixture.pack_point,)))
+    expect_defect("result_tile_scope_mismatch", fixture.program)
+
+    # Nested regions of one result conflict at copy-out.
+    fixture = build_heap_spmm()
+    inner_decl = fixture.builder.result_tile_decl(
+        fixture.builder.new_result_tile_id(), fixture.c, fixture.pack_tile
+    )
+    inner_region = fixture.builder.result_tile_region(inner_decl, fixture.region.body)
+    forge(fixture.region, body=fixture.builder.block((inner_region,)))
+    expect_defect("result_tile_scope_mismatch", fixture.program)
+
+
+def test_result_tile_result_structure_is_verified():
+    # The accumulated tensor must be a declared output.
+    fixture = build_heap_spmm()
+    forge(fixture.decl, result=fixture.b)
+    expect_defect("result_tile_result_mismatch", fixture.program)
+
+    # A rank-one result has no dense prefix to compact.
+    fixture = build_heap_spmm()
+    forge(
+        fixture.program.tensors[2],
+        levels=(fixture.builder.level(LevelKind.DENSE, 0),),
+        dimensions=(fixture.dim_k,),
+    )
+    forge(fixture.leaf, indices=(fixture.builder.index_value(fixture.free),))
+    expect_defect("result_tile_result_mismatch", fixture.program)
+
+    # A compressed result level is outside the compact family.
+    fixture = build_heap_spmm()
+    forge(
+        fixture.program.tensors[2],
+        levels=(
+            fixture.builder.level(LevelKind.DENSE, 0),
+            fixture.builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    expect_defect("result_tile_result_mismatch", fixture.program)
+
+    # The trailing storage level must store the pack split's dimension.
+    fixture = build_heap_spmm()
+    forge(
+        fixture.program.tensors[2],
+        levels=(
+            fixture.builder.level(LevelKind.DENSE, 1),
+            fixture.builder.level(LevelKind.DENSE, 0),
+        ),
+    )
+    expect_defect("result_tile_result_mismatch", fixture.program)
+
+
+def test_tiled_reduce_binder_discipline():
+    # The trailing index must be the pack split's point coordinate; the
+    # sparse reduction coordinate iterates another dimension entirely.
+    fixture = build_heap_spmm()
+    forge(
+        fixture.leaf,
+        indices=(
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(fixture.col),
+        ),
+    )
+    expect_defect("domain_mismatch", fixture.program)
+
+    # A dense-bound rebinding of the same dimension is rejected exactly.
+    fixture = build_heap_spmm()
+    rebound = fixture.builder.new_index_id()
+    dense_k = fixture.builder.dense_for(
+        rebound, fixture.dim_k, fixture.builder.block((fixture.leaf,))
+    )
+    forge(
+        fixture.leaf,
+        indices=(
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(rebound),
+        ),
+    )
+    forge(fixture.pack_point, body=fixture.builder.block((dense_k,)))
+    expect_defect("result_tile_write_mismatch", fixture.program)
+
+    # A non-IndexValue trailing index is rejected.
+    fixture = build_heap_spmm()
+    forge(
+        fixture.leaf,
+        indices=(
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.binary(
+                BinaryOp.ADD,
+                fixture.builder.index_value(fixture.free),
+                fixture.builder.index_value(fixture.free),
+            ),
+        ),
+    )
+    expect_defect("type_mismatch", fixture.program)
+
+    # Rank and op discipline.
+    fixture = build_heap_spmm()
+    forge(fixture.leaf, indices=(fixture.builder.index_value(fixture.row),))
+    expect_defect("rank_mismatch", fixture.program)
+
+    fixture = build_heap_spmm()
+    forge(fixture.leaf, op="add")
+    expect_defect("malformed_state", fixture.program)
+
+    fixture = build_heap_spmm()
+    forge(fixture.leaf, indices=[fixture.builder.index_value(fixture.row)])
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_result_tile_rejects_residual_direct_writes():
+    fixture = build_heap_spmm()
+    residual = fixture.builder.store_reduce(
+        fixture.c,
+        (
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(fixture.free),
+        ),
+        ReduceOp.ADD,
+        fixture.builder.float_const(1.0),
+    )
+    forge(fixture.pack_point, body=fixture.builder.block((fixture.leaf, residual)))
+    expect_defect("result_tile_residual_write", fixture.program)
+
+
+def test_result_tile_region_must_accumulate():
+    fixture = build_heap_spmm()
+    plain = fixture.builder.store_reduce(
+        fixture.c,
+        (
+            fixture.builder.index_value(fixture.row),
+            fixture.builder.index_value(fixture.free),
+        ),
+        ReduceOp.ADD,
+        fixture.builder.float_const(1.0),
+    )
+    # Replace the tiled reduce with a direct write outside any region: the
+    # region then never accumulates.
+    forge(fixture.pack_point, body=fixture.builder.block((plain,)))
+    expect_defect("result_tile_residual_write", fixture.program)
+
+    fixture = build_heap_spmm()
+    forge(
+        fixture.pack_point,
+        body=fixture.builder.block(
+            (
+                fixture.builder.workspace_reduce(
+                    fixture.builder.new_workspace_id(),
+                    fixture.builder.index_value(fixture.free),
+                    ReduceOp.ADD,
+                    fixture.builder.float_const(0.0),
+                ),
+            )
+        ),
+    )
+    expect_defect("unbound_workspace", fixture.program)
+
+
+def test_result_tile_dead_region_is_rejected():
+    fixture = build_heap_spmm()
+    stray_output = fixture.builder.new_symbol_id()
+    # An empty-bodied region (no reduce anywhere) is dead.
+    del stray_output
+    forge(
+        fixture.pack_point,
+        body=fixture.builder.block(()),
+    )
+    expect_defect("result_tile_dead_region", fixture.program)
+
+
+def test_result_tile_forged_state_fails_closed():
+    # A missing stored field on the decl fails before any checker reads it.
+    fixture = build_heap_spmm()
+    object.__delattr__(fixture.decl, "pack")
+    expect_defect("malformed_state", fixture.program)
+
+    # A decl that is not an exact ResultTileDecl fails closed.
+    fixture = build_heap_spmm()
+    forge(fixture.region, decl=object())
+    expect_defect("malformed_state", fixture.program)
+
+    # A hostile ResultTileRegion subclass is not a registered statement.
+    class HostileRegion(ResultTileRegion):
+        pass
+
+    fixture = build_heap_spmm()
+    hostile = HostileRegion(LoopIRNodeId(10_007), fixture.decl, fixture.region.body)
+    forge(fixture.pack, body=fixture.builder.block((hostile,)))
+    expect_defect("unknown_stmt", fixture.program)
+
+    # A hostile TiledReduce subclass is not a registered statement.
+    class HostileReduce(TiledReduce):
+        pass
+
+    fixture = build_heap_spmm()
+    hostile_reduce = HostileReduce(
+        LoopIRNodeId(10_008),
+        fixture.result_tile,
+        fixture.leaf.indices,
+        ReduceOp.ADD,
+        fixture.builder.float_const(0.0),
+    )
+    forge(fixture.pack_point, body=fixture.builder.block((hostile_reduce,)))
+    expect_defect("unknown_stmt", fixture.program)
+
+    # Cyclic region bodies are caught by the shared structure guards.
+    fixture = build_heap_spmm()
+    forge(fixture.region, body=fixture.program.body)
+    expect_defect("cyclic_structure", fixture.program)
+
+
+def test_result_tile_defect_paths_are_reported():
+    fixture = build_heap_spmm()
+    forge(fixture.decl, pack=fixture.builder.new_tile_id())
+    defect = expect_defect("result_tile_scope_mismatch", fixture.program)
     assert "statements[0]" in defect.path

@@ -1331,3 +1331,167 @@ def test_staged_read_outside_the_staged_domain_fails_closed_at_runtime():
     with pytest.raises(LoopIROracleError) as error:
         oracle._eval(fixture.staged)
     assert "outside the current panel window" in str(error.value)
+
+
+def test_heap_result_tile_matches_the_direct_reference_exactly():
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    rng = random.Random(2027)
+    rows, inner, cols = 4, 5, 6
+    for strip in (1, 2, 3, 4, 6, 9):
+        fixture = build_heap_spmm(strip=strip)
+        a_dense = [
+            [
+                float(rng.randrange(-3, 4)) if rng.random() < 0.6 else 0.0
+                for _ in range(inner)
+            ]
+            for _ in range(rows)
+        ]
+        b_dense = [
+            [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(inner)
+        ]
+        results = run_program(
+            fixture.program,
+            {fixture.a: csr_from_dense(a_dense), fixture.b: b_dense},
+            {fixture.c: (rows, cols)},
+        )
+        assert results[fixture.c] == panel_reference_spmm(a_dense, b_dense, cols)
+
+
+def test_heap_result_tile_copies_out_fresh_strips_exactly_once():
+    """Freshness/copy-count proof: with all-ones inputs every output cell is
+    the row's stored count, and a stale (unreset) compact tile or a second
+    copy-out would double cells in earlier strips."""
+
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    inner, cols = 7, 5
+    a_dense = [
+        [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        [0.0] * inner,
+        [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        [1.0] * inner,
+    ]
+    stored_counts = [4.0, 0.0, 3.0, 7.0]
+    ones_b = [[1.0] * cols for _ in range(inner)]
+    for strip in (1, 2, 3, 5, 8):
+        fixture = build_heap_spmm(strip=strip)
+        results = run_program(
+            fixture.program,
+            {fixture.a: csr_from_dense(a_dense), fixture.b: ones_b},
+            {fixture.c: (len(a_dense), cols)},
+        )
+        assert results[fixture.c] == [[count] * cols for count in stored_counts]
+
+
+def test_heap_result_tile_zero_extents_execute():
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    # Zero reduction dimension: stored entries never fire, copy-out still
+    # writes zeros across every strip.
+    fixture = build_heap_spmm(strip=2)
+    empty_cols = CsrMatrix(
+        n_rows=3, n_cols=0, indptr=(0, 0, 0, 0), indices=(), values=()
+    )
+    results = run_program(
+        fixture.program,
+        {fixture.a: empty_cols, fixture.b: []},
+        {fixture.c: (3, 2)},
+    )
+    assert results[fixture.c] == [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+
+    # Zero rows: an empty prefix space; copy-out enumerates nothing.
+    fixture = build_heap_spmm(strip=2)
+    no_rows = CsrMatrix(n_rows=0, n_cols=2, indptr=(0,), indices=(), values=())
+    results = run_program(
+        fixture.program,
+        {fixture.a: no_rows, fixture.b: [[1.0, 2.0], [3.0, 4.0]]},
+        {fixture.c: (0, 2)},
+    )
+    assert results[fixture.c] == []
+
+    # Zero free (pack) dimension: the pack origin loop runs nothing.
+    fixture = build_heap_spmm(strip=3)
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense([[1.0]]), fixture.b: [[]]},
+        {fixture.c: (1, 0)},
+    )
+    assert results[fixture.c] == [[]]
+
+
+def test_heap_result_tile_widths_are_semantic_not_allocation_requests():
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    fixture = build_heap_spmm(strip=1 << 100)
+    results = run_program(
+        fixture.program,
+        {fixture.a: csr_from_dense([[2.0]]), fixture.b: [[3.0]]},
+        {fixture.c: (1, 1)},
+    )
+    assert results[fixture.c] == [[6.0]]
+
+
+def test_tiled_reduce_outside_its_region_fails_closed_at_runtime():
+    """Defensive boundary: the verifier normally precludes these, so the
+    oracle's runtime guards are exercised directly."""
+
+    from scorch.compiler.loopir.oracle import _Oracle
+
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    fixture = build_heap_spmm(strip=2)
+    oracle = _Oracle(
+        fixture.program,
+        {fixture.a: csr_from_dense([[1.0]]), fixture.b: [[1.0]]},
+        {fixture.c: (1, 1)},
+    )
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.leaf)
+    assert "outside its result-tile region's execution" in str(error.value)
+
+    # The region itself outside its pack origin fails closed.
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.region)
+    assert "outside its pack split's origin loop" in str(error.value)
+
+    # Re-entering the live region fails closed.
+    oracle.tile_origins[fixture.pack_tile] = 0
+    oracle._tile_widths[fixture.pack_tile] = 2
+    oracle.result_tiles[fixture.result_tile] = (fixture.decl, {})
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(fixture.region)
+    assert "re-entered" in str(error.value)
+
+
+def test_tiled_reduce_outside_the_compact_domain_fails_closed_at_runtime():
+    from scorch.compiler.loopir.oracle import _Oracle
+
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    fixture = build_heap_spmm(strip=2)
+    oracle = _Oracle(
+        fixture.program,
+        {
+            fixture.a: csr_from_dense([[1.0, 1.0, 1.0, 1.0]]),
+            fixture.b: [[1.0] * 6 for _ in range(4)],
+        },
+        {fixture.c: (1, 6)},
+    )
+    oracle.result_tiles[fixture.result_tile] = (fixture.decl, {})
+    oracle.tile_origins[fixture.pack_tile] = 0
+    oracle._tile_widths[fixture.pack_tile] = 2
+    oracle.indices[fixture.row] = 0
+    oracle.indices[fixture.col] = 0
+    oracle.positions.clear()
+    oracle.indices[fixture.free] = 3  # outside pack window [0, 2)
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_tiled_reduce(fixture.leaf)
+    assert "outside the current pack window" in str(error.value)
+
+    # A prefix coordinate outside the result's dimension extent.
+    oracle.indices[fixture.free] = 1
+    oracle.indices[fixture.row] = 5
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_tiled_reduce(fixture.leaf)
+    assert "out of bounds" in str(error.value)

@@ -34,6 +34,17 @@ Semantics (matching the node contracts exactly):
   fail-closed window-domain checks with nothing eagerly allocated), and
   a staged read outside its region, its pack origin, or the staged
   row/column domain fails closed at runtime;
+- heap result-tile regions execute their intrinsic accumulation
+  semantics: ``ResultTileRegion`` observes a fresh all-zero compact tile
+  at entry (only written cells are kept, so nothing is eagerly allocated
+  from a verifier-approved width), ``TiledReduce`` combines into the
+  addressed cell under fail-closed window-domain checks, and region exit
+  copies every clamped-window cell of every dense prefix position to the
+  declared result exactly once — cells that received no accumulation
+  copy the entry zero, which is what discharges the result's
+  zero-initialization contract on the heap route; a tiled reduce outside
+  its region, its pack origin, or the compact domain fails closed at
+  runtime;
 - sparse iteration executes over the format-neutral level interface of
   :mod:`~scorch.compiler.loopir.levels` (``segment`` / ``coordinate_at`` /
   ``leaf_value``): all-dense inputs bind nested sequences, inputs with a
@@ -87,6 +98,9 @@ from .nodes import (
     RelayoutId,
     RelayoutScope,
     RelayoutStage,
+    ResultTileDecl,
+    ResultTileId,
+    ResultTileRegion,
     RootPosition,
     SparseCursorDecl,
     SparseFor,
@@ -96,6 +110,7 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TiledReduce,
     TileId,
     TileInnerFor,
     TileOuterFor,
@@ -391,6 +406,14 @@ class _Oracle:
         # the current window arithmetic.  Nothing is eagerly allocated from
         # a verifier-approved (target-neutral) width.
         self.staged_relayouts: Dict[RelayoutId, RelayoutDecl] = {}
+        # A heap result tile keeps only written cells (absent cells are
+        # ADD's zero identity), preserving fresh/reset semantics without
+        # eagerly allocating from a verifier-approved (target-neutral)
+        # width; copy-out at region exit enumerates the caller-allocated
+        # result, never the width.
+        self.result_tiles: Dict[
+            ResultTileId, Tuple[ResultTileDecl, Dict[Tuple[int, ...], float]]
+        ] = {}
 
     def _workspace_cell(
         self, workspace: WorkspaceId, coord: Expr
@@ -675,6 +698,128 @@ class _Oracle:
         finally:
             del self.staged_relayouts[decl.relayout]
 
+    def _exec_workspace_region(self, stmt: WorkspaceRegion) -> None:
+        decl = stmt.workspace
+        region_origin = self.tile_origins.get(decl.tile)
+        if region_origin is None:
+            raise LoopIROracleError(
+                "workspace region executed outside its tile's origin loop"
+            )
+        width = self._tile_widths.get(decl.tile)
+        if width is None:
+            raise LoopIROracleError(
+                "workspace region's tile has no executing origin loop"
+            )
+        if decl.workspace in self.workspaces:
+            raise LoopIROracleError(
+                "workspace region re-entered while already executing"
+            )
+        # Intrinsic region-entry semantics: a fresh buffer of one cell
+        # per tile point, every cell zero (ADD's identity).
+        self.workspaces[decl.workspace] = (decl.tile, width, {})
+        try:
+            self._exec_stmt(stmt.producer)
+            self._exec_stmt(stmt.consumer)
+        finally:
+            del self.workspaces[decl.workspace]
+
+    def _exec_result_tile_region(self, stmt: ResultTileRegion) -> None:
+        decl = stmt.decl
+        origin = self.tile_origins.get(decl.pack)
+        width = self._tile_widths.get(decl.pack)
+        if origin is None or width is None:
+            raise LoopIROracleError(
+                "result-tile region executed outside its pack split's " "origin loop"
+            )
+        if decl.result_tile in self.result_tiles:
+            raise LoopIROracleError(
+                "result-tile region re-entered while already executing"
+            )
+        # Intrinsic region-entry semantics: a fresh compact tile with every
+        # cell zero (ADD's identity); only written cells are kept.
+        cells: Dict[Tuple[int, ...], float] = {}
+        self.result_tiles[decl.result_tile] = (decl, cells)
+        try:
+            self._exec_stmt(stmt.body)
+        finally:
+            del self.result_tiles[decl.result_tile]
+        # Intrinsic region-exit semantics: every clamped-window cell of
+        # every dense prefix position is copied to the result exactly once;
+        # unwritten cells copy the entry zero.
+        result_decl = self.decls[decl.result]
+        trailing_mode = result_decl.levels[-1].mode
+        extent = self._dimension_extent(result_decl.dimensions[trailing_mode])
+        window_end = min(origin + width, extent)
+
+        def copy_out(prefix: Tuple[int, ...], value: Any, mode: int) -> None:
+            if not isinstance(value, list):
+                raise LoopIROracleError(
+                    "result-tile copy-out target is not a dense axis"
+                )
+            if mode == trailing_mode:
+                if mode == len(result_decl.levels) - 1:
+                    for column in range(origin, window_end):
+                        if not 0 <= column < len(value):
+                            raise LoopIROracleError(
+                                f"result-tile copy-out column {column} out " "of bounds"
+                            )
+                        value[column] = cells.get(prefix + (column - origin,), 0.0)
+                    return
+                for column in range(origin, window_end):
+                    if not 0 <= column < len(value):
+                        raise LoopIROracleError(
+                            f"result-tile copy-out column {column} out of " "bounds"
+                        )
+                    copy_out(prefix + (column - origin,), value[column], mode + 1)
+                return
+            if mode == len(result_decl.levels) - 1:
+                raise LoopIROracleError(
+                    "result-tile copy-out reached the innermost axis before "
+                    "the pack window axis"
+                )
+            for position, child in enumerate(value):
+                copy_out(prefix + (position,), child, mode + 1)
+
+        copy_out((), self.values[decl.result], 0)
+
+    def _exec_tiled_reduce(self, stmt: TiledReduce) -> None:
+        state = self.result_tiles.get(stmt.result_tile)
+        if state is None:
+            raise LoopIROracleError(
+                "tiled reduce outside its result-tile region's execution"
+            )
+        decl, cells = state
+        origin = self.tile_origins.get(decl.pack)
+        width = self._tile_widths.get(decl.pack)
+        if origin is None or width is None:
+            raise LoopIROracleError("tiled reduce outside its pack split's origin loop")
+        result_decl = self.decls[decl.result]
+        coords = [self._eval_coord(index) for index in stmt.indices]
+        trailing_mode = result_decl.levels[-1].mode
+        column = coords[trailing_mode]
+        extent = self._dimension_extent(result_decl.dimensions[trailing_mode])
+        window_end = min(origin + width, extent)
+        if not origin <= column < window_end:
+            raise LoopIROracleError(
+                f"tiled reduce column {column} outside the current pack "
+                f"window [{origin}, {window_end})"
+            )
+        for position, coordinate in enumerate(coords):
+            if position == trailing_mode:
+                continue
+            prefix_extent = self._dimension_extent(result_decl.dimensions[position])
+            if not 0 <= coordinate < prefix_extent:
+                raise LoopIROracleError(
+                    f"tiled reduce index {coordinate} out of bounds at "
+                    f"mode {position}"
+                )
+        key = tuple(
+            column - origin if position == trailing_mode else coordinate
+            for position, coordinate in enumerate(coords)
+        )
+        contribution = self._eval_value(stmt.value)
+        cells[key] = cells.get(key, 0.0) + contribution
+
     def _exec_merge(self, stmt: MergedSparseFor) -> None:
         states: List[_CursorState] = []
         try:
@@ -749,29 +894,7 @@ class _Oracle:
                 self.indices.pop(stmt.index, None)
             return
         if type(stmt) is WorkspaceRegion:
-            decl = stmt.workspace
-            region_origin = self.tile_origins.get(decl.tile)
-            if region_origin is None:
-                raise LoopIROracleError(
-                    "workspace region executed outside its tile's origin loop"
-                )
-            width = self._tile_widths.get(decl.tile)
-            if width is None:
-                raise LoopIROracleError(
-                    "workspace region's tile has no executing origin loop"
-                )
-            if decl.workspace in self.workspaces:
-                raise LoopIROracleError(
-                    "workspace region re-entered while already executing"
-                )
-            # Intrinsic region-entry semantics: a fresh buffer of one cell
-            # per tile point, every cell zero (ADD's identity).
-            self.workspaces[decl.workspace] = (decl.tile, width, {})
-            try:
-                self._exec_stmt(stmt.producer)
-                self._exec_stmt(stmt.consumer)
-            finally:
-                del self.workspaces[decl.workspace]
+            self._exec_workspace_region(stmt)
             return
         if type(stmt) is WorkspaceReduce:
             cells, cell = self._workspace_cell(stmt.workspace, stmt.coord)
@@ -780,6 +903,12 @@ class _Oracle:
             return
         if type(stmt) is RelayoutStage:
             self._exec_relayout_stage(stmt)
+            return
+        if type(stmt) is ResultTileRegion:
+            self._exec_result_tile_region(stmt)
+            return
+        if type(stmt) is TiledReduce:
+            self._exec_tiled_reduce(stmt)
             return
         if type(stmt) is PanelOuterFor:
             extent = self._dimension_extent(stmt.dimension)

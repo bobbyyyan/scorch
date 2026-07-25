@@ -99,6 +99,22 @@ The invariant families stated locally for this subset:
   coordinate and its column index the pack split's point coordinate
   (``relayout_read_mismatch``), and a region must actually be read
   (``relayout_dead_region``).
+- **Heap result-tile regions.**  A compact result tile is declared by
+  exactly one region (``invalid_result_tile_id`` /
+  ``duplicate_result_tile_id``) accumulating one all-dense declared output
+  of rank at least two whose last storage level stores the pack split's
+  dimension (``result_tile_result_mismatch``).  The region must open
+  inside its pack split's origin loop, outside the split's point loops,
+  and never nested inside another region of the same result
+  (``result_tile_scope_mismatch``).  Fresh zero entry, accumulation, and
+  exactly-once copy-out at exit are intrinsic region semantics;
+  ``TiledReduce`` is legal only inside the region
+  (``unbound_result_tile``), its indices must be the result's access
+  indices with the trailing index the pack split's point coordinate
+  (``result_tile_write_mismatch``), the declared result must not be
+  written directly while its region is open
+  (``result_tile_residual_write``), and a region must actually accumulate
+  (``result_tile_dead_region``).
 """
 
 from __future__ import annotations
@@ -137,6 +153,9 @@ from .nodes import (
     RelayoutId,
     RelayoutScope,
     RelayoutStage,
+    ResultTileDecl,
+    ResultTileId,
+    ResultTileRegion,
     RootPosition,
     ScalarType,
     SparseCursorDecl,
@@ -147,6 +166,7 @@ from .nodes import (
     Store,
     StoreReduce,
     TensorDecl,
+    TiledReduce,
     TileId,
     TileInnerFor,
     TileOuterFor,
@@ -263,6 +283,16 @@ class _RelayoutState:
         self.read = False
 
 
+class _ResultTileState:
+    """One open heap result-tile region's walk state."""
+
+    __slots__ = ("decl", "reduced")
+
+    def __init__(self, decl: ResultTileDecl) -> None:
+        self.decl = decl
+        self.reduced = False
+
+
 class _Context:
     """Mutable walk state: registries, scopes, and traversal guards."""
 
@@ -290,6 +320,9 @@ class _Context:
         self.ever_workspace_ids: Set[WorkspaceId] = set()
         self.open_relayouts: Dict[RelayoutId, _RelayoutState] = {}
         self.ever_relayout_ids: Set[RelayoutId] = set()
+        self.open_result_tiles: Dict[ResultTileId, _ResultTileState] = {}
+        self.open_result_tile_results: Set[SymbolId] = set()
+        self.ever_result_tile_ids: Set[ResultTileId] = set()
         self.producer_depth = 0
         self.in_cursor_default = False
         self.program_dtype: Optional[ScalarType] = None
@@ -732,6 +765,19 @@ def _check_relayout_id(value: object, path: str) -> RelayoutId:
             "invalid_relayout_id",
             path,
             "relayout must be an int-valued RelayoutId",
+        )
+    return value
+
+
+def _check_result_tile_id(value: object, path: str) -> ResultTileId:
+    if (
+        type(value) is not ResultTileId
+        or type(getattr(value, "value", _MISSING)) is not int
+    ):
+        _fail(
+            "invalid_result_tile_id",
+            path,
+            "result_tile must be an int-valued ResultTileId",
         )
     return value
 
@@ -1447,6 +1493,159 @@ def _check_relayout_stage(
         del ctx.open_relayouts[decl.relayout]
 
 
+def _check_result_tile_decl(
+    ctx: _Context, decl: object, path: str, depth: int
+) -> ResultTileDecl:
+    if type(decl) is not ResultTileDecl:
+        _fail(
+            "malformed_state",
+            path,
+            f"expected a ResultTileDecl, got {type(decl).__name__}",
+        )
+    _enter(ctx, decl, path, depth)
+    try:
+        result_tile = _check_result_tile_id(decl.result_tile, path)
+        if result_tile in ctx.ever_result_tile_ids:
+            _fail(
+                "duplicate_result_tile_id",
+                path,
+                f"result tile id {_diagnostic_int(result_tile.value)} reused",
+            )
+        ctx.ever_result_tile_ids.add(result_tile)
+        result = _check_symbol_id(decl.result, path, "ResultTileDecl.result")
+        if result not in ctx.tensors:
+            _fail(
+                "undefined_tensor",
+                path,
+                "ResultTileDecl references an undeclared tensor",
+            )
+        if result not in ctx.outputs:
+            _fail(
+                "result_tile_result_mismatch",
+                path,
+                "a compact result tile accumulates a declared output",
+            )
+        _check_tile_id(decl.pack, f"{path}.pack")
+        return decl
+    finally:
+        _leave(ctx, decl)
+
+
+def _check_result_tile_region(
+    ctx: _Context, stmt: ResultTileRegion, path: str, depth: int
+) -> None:
+    decl = _check_result_tile_decl(ctx, stmt.decl, f"{path}.decl", depth + 1)
+    pack = ctx.open_tiles.get(decl.pack)
+    if pack is None:
+        _fail(
+            "result_tile_scope_mismatch",
+            path,
+            f"result tile pack id {_diagnostic_int(decl.pack.value)} has "
+            "no dominating TileOuterFor in scope; the compact columns are "
+            "the split's current point window",
+        )
+    if pack.index in ctx.bound_indices:
+        _fail(
+            "result_tile_scope_mismatch",
+            path,
+            "a result-tile region must open outside its own split's point "
+            "loops; a per-point compact tile could never accumulate",
+        )
+    if decl.result in ctx.open_result_tile_results:
+        _fail(
+            "result_tile_scope_mismatch",
+            path,
+            "a result already accumulates through an open result-tile "
+            "region; nested regions of one result conflict at copy-out",
+        )
+    result_decl = ctx.tensors[decl.result]
+    if len(result_decl.levels) < 2 or any(
+        level.kind is not LevelKind.DENSE for level in result_decl.levels
+    ):
+        _fail(
+            "result_tile_result_mismatch",
+            path,
+            "a compact result tile requires an all-dense result of rank "
+            "at least two",
+        )
+    if ctx.level_dimension(decl.result, len(result_decl.levels) - 1) != pack.dimension:
+        _fail(
+            "result_tile_result_mismatch",
+            path,
+            "the compact result's last storage level must store the pack "
+            "split's dimension",
+        )
+    state = _ResultTileState(decl)
+    ctx.open_result_tiles[decl.result_tile] = state
+    ctx.open_result_tile_results.add(decl.result)
+    try:
+        _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
+        if not state.reduced:
+            _fail(
+                "result_tile_dead_region",
+                path,
+                "a result-tile region's body must accumulate through " "TiledReduce",
+            )
+    finally:
+        del ctx.open_result_tiles[decl.result_tile]
+        ctx.open_result_tile_results.discard(decl.result)
+
+
+def _check_tiled_reduce(
+    ctx: _Context, stmt: TiledReduce, path: str, depth: int
+) -> None:
+    result_tile = _check_result_tile_id(stmt.result_tile, path)
+    state = ctx.open_result_tiles.get(result_tile)
+    if state is None:
+        _fail(
+            "unbound_result_tile",
+            path,
+            f"result tile {_diagnostic_int(result_tile.value)} has no "
+            "enclosing region in scope",
+        )
+    decl = state.decl
+    _require_outside_producer(ctx, path)
+    if type(stmt.op) is not ReduceOp:
+        # ADD is the only declared ReduceOp member, and its identity is
+        # exactly the zero the owning region's entry reset established —
+        # the reduction-legality contract.  Adding a member requires adding
+        # its explicit reset-identity contract here.
+        _fail("malformed_state", path, "TiledReduce.op must be a ReduceOp member")
+    result_decl = ctx.tensors[decl.result]
+    if type(stmt.indices) is not tuple:
+        _fail("malformed_state", path, "TiledReduce.indices must be an owned tuple")
+    if len(stmt.indices) != len(result_decl.levels):
+        _fail(
+            "rank_mismatch",
+            path,
+            f"{len(stmt.indices)} indices for rank-{len(result_decl.levels)} " "result",
+        )
+    for position, index in enumerate(stmt.indices):
+        index_type = _check_expr(ctx, index, f"{path}.indices[{position}]", depth + 1)
+        _require_coord(
+            ctx,
+            index_type,
+            f"{path}.indices[{position}]",
+            "a tiled reduce index",
+            result_decl.dimensions[position],
+        )
+    point_index = stmt.indices[result_decl.levels[-1].mode]
+    if (
+        type(point_index) is not IndexValue
+        or ctx.tile_point_bindings.get(point_index.index) != decl.pack
+    ):
+        _fail(
+            "result_tile_write_mismatch",
+            path,
+            "the tiled reduce's trailing index must be the pack split's "
+            "point coordinate, bound by its TileInnerFor",
+        )
+    value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
+    _require_value(value_type, f"{path}.value", "a combined value")
+    state.reduced = True
+    ctx.written_outputs.add(decl.result)
+
+
 def _check_workspace_reduce(
     ctx: _Context, stmt: WorkspaceReduce, path: str, depth: int
 ) -> None:
@@ -1574,6 +1773,19 @@ def _require_dense_store_target(ctx: _Context, tensor: SymbolId, path: str) -> N
         )
 
 
+def _require_no_open_result_tile(ctx: _Context, tensor: SymbolId, path: str) -> None:
+    """Direct writes conflict with an open region's exactly-once copy-out."""
+
+    if tensor in ctx.open_result_tile_results:
+        _fail(
+            "result_tile_residual_write",
+            path,
+            "a result accumulating through an open result-tile region must "
+            "not also be written directly; copy-out would overwrite the "
+            "direct write",
+        )
+
+
 def _check_store(ctx: _Context, stmt: Store, path: str, depth: int) -> None:
     tensor = _check_symbol_id(stmt.tensor, path, "Store.tensor")
     if tensor not in ctx.tensors:
@@ -1581,6 +1793,7 @@ def _check_store(ctx: _Context, stmt: Store, path: str, depth: int) -> None:
     if tensor not in ctx.outputs:
         _fail("output_scope", path, "Store may only write declared outputs")
     _require_outside_producer(ctx, path)
+    _require_no_open_result_tile(ctx, tensor, path)
     _require_dense_store_target(ctx, tensor, path)
     _check_output_write_indices(ctx, stmt, tensor, path, depth)
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
@@ -1597,6 +1810,7 @@ def _check_store_reduce(
     if tensor not in ctx.outputs:
         _fail("output_scope", path, "StoreReduce may only write declared outputs")
     _require_outside_producer(ctx, path)
+    _require_no_open_result_tile(ctx, tensor, path)
     if type(stmt.op) is not ReduceOp:
         # ADD is the only declared ReduceOp member, so an exact member check
         # is the whole reduction-operator contract; adding a member requires
@@ -1659,6 +1873,8 @@ _STMT_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], None]] = {
     WorkspaceRegion: _check_workspace_region,
     WorkspaceReduce: _check_workspace_reduce,
     RelayoutStage: _check_relayout_stage,
+    ResultTileRegion: _check_result_tile_region,
+    TiledReduce: _check_tiled_reduce,
     Store: _check_store,
     StoreReduce: _check_store_reduce,
     AppendEntry: _check_append_entry,

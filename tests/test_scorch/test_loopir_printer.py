@@ -135,12 +135,12 @@ def test_canonical_dump_omits_display_names():
 
 
 def test_canonical_dump_carries_schema_version():
-    # v6: the Phase-6 relayout slice added the staged-operand kinds
-    # (relayout_stage, staged_read), after v5 added the sparse
-    # coordinate-window kinds, v4 the workspace node kinds, and v3 the
-    # affine-split kinds.
+    # v7: the Phase-6 heap slice added the compact result-tile kinds
+    # (result_tile_region, tiled_reduce), after v6 added the
+    # staged-operand kinds, v5 the sparse coordinate-window kinds, v4 the
+    # workspace node kinds, and v3 the affine-split kinds.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v6"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v7"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
@@ -613,3 +613,61 @@ def test_relayout_canonical_dump_serializes_the_region_semantics():
     assert read["kind"] == "staged_read"
     assert read["relayout"] == 0
     assert [index["kind"] for index in read["indices"]] == ["index", "index"]
+
+
+def test_result_tile_printer_renders_the_region_structure():
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    text = print_program(build_heap_spmm().program)
+    assert "result_tile_region h0 t2 pack s0 {" in text
+    assert "tiled_reduce(add) h0[x1, x0]" in text
+    # The tiled reduce replaces the direct result-store spelling entirely.
+    assert "store_reduce" not in text
+
+
+def test_result_tile_canonical_dump_is_stable_across_global_id_histories():
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    first = build_heap_spmm().program
+    for _ in range(64):
+        new_symbol_id()
+        new_index_id()
+    second = build_heap_spmm().program
+    assert canonical_program_dump(first) == canonical_program_dump(second)
+    assert print_program(first) == print_program(second)
+
+
+def test_result_tile_canonical_dump_renumbers_raw_schedule_id_histories():
+    from scorch.compiler.loopir.nodes import ResultTileId
+
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    first = build_heap_spmm()
+    second = build_heap_spmm()
+    replacement = ResultTileId(151)
+    forge(second.decl, result_tile=replacement)
+    forge(second.leaf, result_tile=replacement)
+    assert canonical_program_dump(first.program) == canonical_program_dump(
+        second.program
+    )
+    assert print_program(first.program) == print_program(second.program)
+
+
+def test_result_tile_canonical_dump_serializes_the_region_semantics():
+    from tests.test_scorch.test_loopir_verifier import build_heap_spmm
+
+    base = canonical_program_dump(build_heap_spmm().program)
+    assert canonical_program_dump(build_heap_spmm(strip=5).program) != base
+    payload = json.loads(base)
+    region = payload["body"]["statements"][0]["body"]["statements"][0]
+    assert region["kind"] == "result_tile_region"
+    assert region["result_tile"]["result_tile"] == 0
+    assert region["result_tile"]["result"] == 2
+    assert region["result_tile"]["pack"] == 0
+    leaf = region["body"]["statements"][0]["body"]["statements"][0]["body"][
+        "statements"
+    ][0]["body"]["statements"][0]
+    assert leaf["kind"] == "tiled_reduce"
+    assert leaf["result_tile"] == 0
+    assert leaf["op"] == "add"
+    assert [index["kind"] for index in leaf["indices"]] == ["index", "index"]
