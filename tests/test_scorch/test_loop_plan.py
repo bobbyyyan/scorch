@@ -2157,6 +2157,16 @@ def test_complete_auto_plan_helper_requires_exact_owned_sinks() -> None:
             plan_workspace=[],
             require_complete_plan=True,
         )
+    shared_sinks = []
+    with pytest.raises(TypeError, match="needs empty exact plan"):
+        Scheduler._apply_auto_order_owned(
+            normalized,
+            [],
+            options,
+            plan_tiles=shared_sinks,
+            plan_workspace=shared_sinks,
+            require_complete_plan=True,
+        )
 
 
 def test_auto_workspace_fact_must_equal_the_derived_decision() -> None:
