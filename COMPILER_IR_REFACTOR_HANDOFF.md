@@ -26248,3 +26248,208 @@ commands/receipts/limitations, retain evidence outside Git, push nothing,
 and finish the largest fully verified coherent result without
 overclaiming.
 ```
+
+## Phase-6 abstract parallel-selection milestone (2026-07-26, supersedes the §20 routing note)
+
+This section is chronologically latest.  Its copy-paste prompt replaces
+every older prompt, including the one after the §20 review.
+
+### What happened
+
+The session first re-reviewed the inherited §§18–20 state without
+trusting it: all §20.4 gates were reproduced exactly at clean detached
+`5ef0401` (548 contract, 196 compiled, 73/73 captures, the static
+baselines, and the literal full suite at 4,041 passed / 14 skipped /
+3 deselected / 1 warning), and adversarial probing found two concrete
+boundary escapes — the name-only `validate_jit_result_shape` allowlist
+and unchecked member-call arguments — plus four evidence gaps and one
+stale docstring, all fixed and locked (`f46c5c9`, `1eefb2d`).
+
+It then implemented the first §20.5 milestone end to end:
+target-independent abstract parallel-loop selection.
+
+- `f4e459c` / `0b75481` — the schema slice: intrinsic optional
+  `LoopProgram.parallel` carrying `ParallelSelection` (stable
+  `(IndexId, part)` identity restricted to LOGICAL/OUTER, a
+  `ParallelWork` estimate with an optional compressed
+  `SparseWorkSource`, the re-proved `ParallelDiscipline`, and the
+  `EXPLICIT` intent); four verifier codes
+  (`invalid_parallel_selection`, `parallel_target_missing`,
+  `parallel_work_mismatch`, `parallel_race`; ambiguity is provably
+  impossible on verified programs and deliberately has no code);
+  canonical schema v8; erasure strips the selection; the scheduled
+  carrier rejects a parallel base.
+- `c9dca93` / `4cf57f1` / `758ae63` / `6242da8` — consumption and
+  realization: `select_parallel_loop` consumes every explicit fact
+  exactly once at the end of `apply_schedule_plan`; the target resolves
+  the selection, suppresses the auto gate on direct/stack chains, and
+  marks the selected loop post-assembly in the new `complete_parallel`
+  step (legacy pipeline position, snapshot-compared, stage-owned
+  `parallel_completion_lost`); the heap route adopts any dense-prefix
+  anchor and the composed heap+panel chain generalizes to rank >= 2.
+  Both §18.4 boundaries are lifted with measured byte parity: rank-3
+  TTM heap anchors a (5,160 B) and b (5,200 B, the inner prefix), and
+  the rank-3 heap+panel composition with the dense-parent anchor
+  (5,764 B), plus direct/stack/redirect anchors — an eleven-cell parity
+  grid and four subprocess compiled shadows lock it.  Admission is
+  deliberately narrowed to dense logical loops and affine origin loops
+  (compressed/merged/panel-origin anchors have no measured legacy
+  comparand); parallel tiles remain `unsupported_schedule_parallel`.
+
+See `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §21 for the full account
+and receipts.  Origin is still `58e8565`; everything is local-only; the
+five protected files and all unrelated dirty/untracked material are
+untouched.
+
+### Verification receipts at the milestone tip
+
+Final evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-parallel-533de08/` (gate
+battery, latency, statics, `EVIDENCE_SHA256SUMS`), with the
+corrected-tip captures under `phase6-parallel-6242da8/captures/` (the
+tip's one additional commit is test-only, so the source captures carry
+over unchanged), the inherited-gate reproduction under
+`phase6-repro-5ef0401/`, and the anchor survey, parity harness, and
+working notes under `phase6-parallel-selection/`.
+
+- exact five-file Phase-6 contract focus at clean detached `533de08`:
+  **600 passed** (the inherited 548 plus 13 review locks, 31 schema
+  locks, and 8 consumption/lift locks);
+- exact scheduled runtime focus: **212 passed** in **771.74 s**
+  (log SHA-256
+  `111056f21dc5720267b46ffd1c32b65b17f62154e945692dadcdf345435cd4fa`,
+  JUnit SHA-256
+  `638a0ab6a4fd3b6643c76949bd667d10fa918f7b7ff4a2f97e87b83334fe7df8`),
+  including the eleven-cell anchor parity grid and the four
+  subprocess-isolated anchor shadows;
+- full legacy schedule-generality file: **45 passed** in 179.76 s;
+- fresh 20-source corpus, 42-cell grid, and 11 heap goldens:
+  **73/73 byte-identical** to the retained
+  `phase6-multiprefix-review-a24c0c1` finals — no legacy emission and
+  no unselected LoopIR emission moved;
+- static comparison: every changed file is Black/Flake8-clean and the
+  changed production files are focused-mypy-clean; full-source Black
+  reproduces only the inherited `prebuilt_kernels.py` finding,
+  full-source Flake8 is normalized byte-identical at nine inherited
+  findings, and normalized full-source mypy is byte-identical at
+  **146 findings in 12 files** over 60 source files;
+- paired same-session compiler latency (5 warmups / 30 samples, clean
+  detached `5ef0401` base versus `533de08` candidate, per-case
+  generated-source SHA-256 identical): `small_dense` **0.976/0.988**,
+  `reduction` **1.012/1.055**, `csr_intersection` **0.976/0.971**,
+  `sparse_union` **0.982/0.973** (p50/p95 candidate/base; worst
+  **1.055**, no 1.10 crossing, no control run required);
+- literal unpartitioned clean detached-worktree non-performance suite
+  at `533de08` with isolated caches and asserted import provenance:
+  **4,111 passed, 14 skipped, 3 performance tests deselected, one known
+  sparse-invariant warning, and zero failures** in **2,684.23 s**
+  (log SHA-256
+  `d99ead73cb0d60b4fdba53918202888a98c73307f03819cd148b95384b35cdfc`,
+  JUnit SHA-256
+  `7fa857ba8d9378de9977c4cdc6266ef481f54151cb9eaf19810e582d962a982b`)
+  — the inherited 4,041 selection plus exactly the 70 tests this
+  session added;
+- `git diff --check` clean; live origin still `58e8565`; all five
+  protected tracked files at their recorded hashes; no unrelated
+  tracked or untracked material staged.
+
+### What remains for Phase 6
+
+Milestones 2–4 of the §20.5 sequence, unchanged in intent:
+
+1. Route intended automatic schedules through verified LoopPlan and the
+   LoopIR scheduling path (inventory every automatic/fallback/tuned
+   family first; `unsupported_schedule_provenance` still guards the
+   gate; keep release dispatch untouched).
+2. Canonical LoopPlan schedule identity for the strangler path (content
+   -derived, collision-tested, deterministic; the parallel selection now
+   carries `intent` for the provenance-relevant part of that key).
+3. The criterion-by-criterion Phase-6 exit audit (only after 1–2; the
+   §21.7 admission boundaries are recorded criteria inputs).
+
+## Updated Copy-Paste Prompt for the Next Session/Agent
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip (the
+documentation commit stacked on the abstract parallel-selection
+milestone). Do not push, switch branches, amend, squash, or reorder
+commits.
+
+Read AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md (Stages 3-7 and the
+Phase-6 exit criteria), the Phase-4 and Phase-5 reviews, all of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md through §21, and the latest tail
+of COMPILER_IR_REFACTOR_HANDOFF.md. Section 21 and this prompt
+supersede §§18-20 and every older routing note wherever they conflict.
+
+First independently review, rather than trust, this session's commits:
+  f46c5c9 1eefb2d f4e459c 0b75481 c9dca93 4cf57f1 758ae63 6242da8
+  533de08 and the docs commit stacked above them.
+Reproduce the §21.6 receipts: the contract focus, the compiled runtime
+focus, the 45-test legacy generality file, the 73 capture comparisons,
+the static baselines (one inherited Black finding, nine Flake8
+findings, 146 mypy findings in 12 files), the paired latency result,
+and the literal unpartitioned full suite. Adversarially probe the new
+surfaces: selection enum identity, work-fact truthfulness, race
+disciplines on every route, exactly-once consumption, the OUTER
+redirect, auto-gate suppression, snapshot re-identification in
+complete_parallel, heap anchor adoption, and the composed rank-3 row
+coherence. Fix and commit any concrete issue before new work.
+
+Then pursue the remaining Phase 6 as separately reviewable milestones
+while the gates stay green:
+
+1. Route intended automatic schedules through verified LoopPlan and the
+   LoopIR scheduling path. Inventory every automatic, fallback, and
+   tuned-plan family before editing; migrate the families the Phase-6
+   design requires with exact fact consumption, stage records,
+   oracle/erasure proofs, source parity, and compiled execution; keep
+   release production dispatch unchanged and fail closed on the rest.
+   Automatic parallel facts must arrive as ParallelSelection with a new
+   intent member, never as target-side derivation for migrated plans.
+2. Implement canonical LoopPlan schedule identity for the strangler
+   path from canonical semantic plan content only. Equal keys across
+   fresh builders and equivalent plans; distinct keys for every
+   semantic difference including parallel selection and relevant
+   provenance; malformed-state, collision, deterministic-serialization,
+   cache-request, and stage-timing tests. Preserve the release cache.
+3. Perform the criterion-by-criterion Phase-6 exit audit only after
+   milestones 1-2, covering every §20.5/§21.7 boundary, and close
+   Phase 6 only with evidence for every criterion; otherwise record the
+   exact remaining boundary and leave it open.
+4. Stretch, only after a genuine Phase-6 GO: begin Phase 7 with a
+   read-only ownership/dependency audit and the smallest complete
+   structured parallel/target-lowering vertical slice. No legacy
+   deletion, no production cutover, no Phase 8.
+
+Preserve every contract from reviews §§9-21: exact stored-field/type
+validation, forged/missing/extra/hostile/cyclic/shared/depth
+adversaries, stable stage-owned diagnostics, deterministic builders and
+canonical serialization, pure typed passes, oracle and erasure proofs,
+no rendered-name/regex/tag discovery, no target spelling in LoopIR,
+structural activation never waived, and byte parity wherever legacy is
+the comparand — including the §21.5 anchor grid.
+
+Run the exact focused memberships, compiled shadows, legacy generality,
+fresh corpus/grid/heap captures, paired same-session latency, Black,
+Flake8, focused and full-source mypy against the inherited baseline,
+git diff --check, and a literal unpartitioned clean detached-worktree
+non-performance suite with isolated caches and asserted import
+provenance. Isolate new JIT-heavy cases in subprocesses with exact
+semantic assertions (the §19.3/§21.5 discipline).
+
+Before editing and before every commit, inspect git status, live
+origin, and the five protected-file hashes. Preserve every unrelated
+dirty or untracked GPU/CUDA, benchmark, packaging, scheduler, research,
+scratchpad, and tooling file. Stage explicit pathspecs only, write
+focused commits with descriptive bodies, retain evidence outside Git,
+update the review and handoff with exact receipts, push nothing, and
+finish the largest fully verified coherent result without overclaiming.
+```
+
+## Final routing note after the abstract parallel-selection milestone
+
+The chronologically latest state is review §21 and this section.  Its
+copy-paste prompt replaces every older prompt.  Phase 6 is **not**
+closed: intended automatic-plan routing, canonical LoopPlan schedule
+identity, and the criterion-by-criterion exit audit remain.

@@ -2711,3 +2711,290 @@ C++ target globally rejects unsupported nonidentity layouts.
 target-independent parallel-loop selection (including inner-prefix and
 rank-3 panel anchors), intended automatic-plan routing, canonical
 `LoopPlan` schedule identity, and the criterion-by-criterion exit audit.
+
+## 21. Abstract parallel-loop selection milestone (2026-07-26)
+
+This session first re-reviewed the inherited multi-prefix heap state
+(§§18–20) without trusting its reports, closed the concrete gaps that
+review found, and then implemented the first §20.5 milestone:
+target-independent abstract parallel-loop selection, lifting both §18.4
+boundaries with measured legacy byte parity.  Ten focused commits,
+nothing pushed, amended, squashed, or reordered:
+
+- `f46c5c9` — `fix(compiler): pin heap allowlist calls and member-call arguments`
+- `1eefb2d` — `test(compiler): lock heap allowlist pins and review evidence gaps`
+- `f4e459c` — `feat(compiler): declare the abstract parallel-selection schema`
+- `0b75481` — `test(compiler): lock the abstract parallel-selection schema`
+- `c9dca93` — `feat(compiler): consume and realize explicit parallel selection`
+- `4cf57f1` — `test(compiler): lock explicit parallel-selection consumption`
+- `758ae63` — `test(compiler): lock explicit-anchor parity, activation, and completion`
+- `6242da8` — `fix(compiler): restrict explicit anchors to measured loop kinds`
+- `533de08` — `test(compiler): re-anchor fail-closed vehicles on parallel tiles`
+- (docs commit follows this review)
+
+### 21.1 Independent review of §§18–20 and the gaps it closed
+
+The inherited gates were reproduced exactly at clean detached `5ef0401`:
+the 548-test contract focus, the 196-test compiled focus, all 73
+corpus/grid/heap captures byte-identical to the retained
+`phase6-multiprefix-review-a24c0c1` finals, the static baselines
+(one inherited Black finding, nine Flake8 findings, 146 mypy findings in
+12 files), and the literal unpartitioned full suite (4,041 passed,
+14 skipped, 3 deselected, 1 warning), matching the §20.4 receipts.
+Adversarial probing (31 pass-level probes, 28 completion-level probes,
+and a claim-by-claim test-evidence audit) confirmed the §19.1
+physical/logical correction, the declaration/lexical ownership model,
+and the §20.2 effect boundary — and found:
+
+1. **A real allowlist hole (fixed).**  The binding validator admitted
+   `scorch_native::validate_jit_result_shape` by name alone.  A forged
+   wrong-arity call over the protected `result_shape` argument rode the
+   allowlist into non-compiling C++ that surfaced as an unowned JIT
+   failure, and an exact duplicate of the canonical validation compiled
+   cleanly while changing runtime behavior.  Completion now pins the name
+   to exactly one canonical ABI-generated occurrence at function scope,
+   structurally matched against a freshly reconstructed
+   `kernel_abi().emit_validation()` statement — the `scorch_zero_dense`
+   precedent.  Locks: `forged_result_shape_validation` and
+   `duplicate_result_shape_validation`, both failing without the fix.
+2. **Member-call arguments escaped the effect boundary (fixed).**
+   Function, expression, and guarded calls checked their arguments for
+   protected uses; `MemberCall`/`MemberCallStmt` arguments were only
+   bound for visibility, so an unknown member call on an unprotected
+   receiver could receive protected result state (a potential
+   non-const-reference mutation route).  The text validator now rejects
+   protected uses in member-call arguments; the canonical owned
+   `data_ptr` acquisition carries no arguments, so no production spelling
+   changed.  Locks: `member_call_protected_argument` and
+   `member_call_expression_protected_argument`, both failing without the
+   fix.
+3. **Evidence gaps (locked).**  §20.2's guarded-call rejection had no
+   test (`guarded_call_protected_argument`, a checked property); the
+   atomic emission-order model had only positive coverage
+   (`test_heap_binding_rejects_atomic_names_before_declaration` covers
+   both hidden names in the negative direction); the rank-3 kernel had no
+   mutation-matrix members of its own
+   (`test_multi_prefix_heap_completion_owns_protected_state`, four
+   mutations); §19.5's "retained rank-4 source probe" citation was
+   dangling (no such test existed —
+   `test_rank_four_heap_plan_derives_three_prefix_loops` now supplies the
+   evidence); and no test executed a non-identity-layout heap program
+   (`test_rank_two_nonidentity_heap_oracle_differential_is_exact` runs a
+   (1, 0) physical rank-2 result whose packed axis is logical mode zero
+   at four widths).
+4. **One stale docstring (fixed).**  `_validate_result_tile_shape` still
+   said "prefix loops in logical mode order" — the exact wording §19.9
+   retired in `schedule_passes`; the code matches physical storage order.
+
+Probes A and B confirmed everything else holds: 31/31 admission probes
+(forged, permuted, over/under-ranked, non-dense, subclassed,
+duplicate-mode prefixes; non-identity execution at two layouts) and
+26/28 completion probes passed as contracts, with the two findings above
+the only escapes.  The mutation-matrix, alias-census, policy, and
+atomic-conversion boundaries all held.
+
+### 21.2 Representation decision
+
+The §18.5 constraint is decisive: `lower_loopir_to_llir` consumes a bare
+`LoopProgram` and the structural-activation locks exercise bare verified
+programs, so a fact stored only on `ScheduledLoopIR` cannot reach target
+lowering.  The selection is therefore **intrinsic optional program
+state**: `LoopProgram.parallel: Optional[ParallelSelection]`.
+
+`ParallelSelection` names the selected loop by the same
+`(IndexId, part)` identity `_loop_key` already uses, restricted to
+`ParallelPart.LOGICAL` and `ParallelPart.OUTER` — a split's point loop
+carries the ragged-tail clamp and is deliberately unrepresentable,
+matching the legacy rejection of `*_in` anchors.  It carries the three
+target-independent fact families the design's Stage-5 abstract
+parallelization requires:
+
+- `ParallelWork(rows, nnz)` — the selected loop's declared trip-count
+  dimension plus an optional `SparseWorkSource(tensor, level)` naming the
+  compressed level whose stored entries measure one iteration's work;
+- `ParallelDiscipline` — the race-freedom argument class the verifier
+  re-proves (`RESULT_PARTITION` or `COMPACT_PARTITION`);
+- `ParallelIntent` — schedule provenance (`EXPLICIT` only, until the
+  automatic-plan migration widens the member set).
+
+No OpenMP spelling, thread count, chunk policy, or rendered name appears
+anywhere in the schema; canonical serialization moved to
+`scorch.loopir.canonical.v8` with the selection as owned payload, and
+`print_program` renders one `parallel` line.
+
+### 21.3 Verifier surface
+
+Four codes (83 total), each with direct adversarial regressions:
+`invalid_parallel_selection` (exact stored fields, enum members compared
+by identity so forged same-type instances fail, work-fact typing,
+undeclared rows dimension, dense/bool/out-of-range work levels),
+`parallel_target_missing`, `parallel_work_mismatch` (the rows fact must
+restate the resolved loop's dimension; a named sparse work source must
+actually be iterated inside it), and `parallel_race` (result writes must
+carry the selected coordinate; ordered append assembly is rejected;
+workspace state must be private to one selected iteration;
+`RESULT_PARTITION` refuses heap-region programs; `COMPACT_PARTITION`
+requires the unique region, membership inside it, and compact-cell
+addressing by the selected coordinate).  A
+`parallel_target_ambiguous` code was deliberately **not** added:
+`duplicate_index_binding` and the split-ownership rules already make the
+identity unique on any verified program, and a regression documents that
+reasoning instead of shipping unreachable code.  A deleted
+`parallel` field is `malformed_state` (the stored-field walk), so the
+§11-style default-fallback downgrade is closed.  Erasure strips the
+selection (schedule state, not base semantics), structural pass rebuilds
+carry it, `verify_scheduled_loopir` rejects a base program that carries
+one, the oracle executes selection-carrying programs unchanged, and the
+builder continuation scans the new nodes through the declared-field
+walk.
+
+### 21.4 Consumption and target realization
+
+`select_parallel_loop` runs last in `apply_schedule_plan` and consumes
+every explicit `parallel_loop` fact exactly once — the typed twin of
+`CINLowerer._apply_explicit_parallel_schedule`, which marks the named
+loop on the assembled function after every structural transformation.
+Legacy anchor semantics are reproduced on identities: a LOGICAL anchor
+naming an affine-split variable selects the split's origin loop (the
+`{var}_out` redirect), point loops and sparse results fail closed, the
+anchor must resolve to exactly one scheduled loop, and only dense
+logical loops and affine origin loops are admissible — compressed,
+merged, and panel-origin anchors have no measured legacy comparand
+(legacy's tag search finds for-loops only and raises an unowned
+`ValueError` on a merged anchor), so they stay outside the migrated
+family with a stable code.  The pass derives the work facts (the loop's
+dimension; the first document-order compressed source under it, matching
+the emission-order derivation the target's policy helper performs) and
+the discipline (compact for heap plans), stamps the program, and
+re-verifies it, so the verifier's race and work obligations gate every
+admitted anchor.  Plan-gate changes: plain explicit-parallel plans left
+the `unsupported_schedule_parallel` boundary (parallel **tiles** remain
+unmigrated there); the heap gate widened from the outermost-prefix pin
+to membership in the dense prefix (the exact legacy envelope
+`result_names[:-1]`); the composed sparse panel dropped its
+single-prefix restriction with the exact `(*prefix, panel, pack)` order.
+
+Target lowering resolves a present selection to its chain position,
+requires the work estimate to restate the resolved loop's dimension, and
+routes marking by family. Direct and stack chains suppress the
+emission-time auto gate and mark the selected loop on the assembled
+function through the new `complete_parallel` step — first among the
+completions, exactly the legacy pipeline position — under
+detached-header re-identification (single-loop matching, because
+workspace regions emit loops outside the direct chain), a structural
+work-source cross-check against `find_sparse_pos_array`, and a detached
+snapshot policy comparison, all owned as `parallel_completion_lost`.
+Panel and relayout routes keep their completion-owned marking and only
+prove the selection names the row they mark.  The heap route adopts the
+selected prefix position as its parallel row; the composed chain is
+generalized to rank ≥ 2 (prefix loops between the panel origin and the
+window; `apply_panel_tile` and `_validate_panel_shape` were already
+rank-general) with its default anchor at the window's dense parent — the
+only anchor legacy admits.  A missing selection preserves every existing
+derivation byte-for-byte, so bare verified programs keep direct
+structural activation and all retained captures are unchanged.
+
+### 21.5 Both §18.4 boundaries lifted, with measured parity
+
+The lifted envelope was measured against the live legacy route before
+implementation (anchor survey over 22 schedule/anchor cells) and locked
+as an eleven-cell byte-parity grid plus compiled shadows:
+
+- **inner-prefix heap anchor** (`ttm_heap_anchor_b`): legacy emits
+  `scorch_nthreads(Core2_pos[Core1_size], Core1_size)` with the dynamic
+  chunk at 5,200 bytes versus anchor `a`'s `scorch_nthreads(-1,
+  Core0_size)` at 5,160 bytes; the LoopIR route reproduces both
+  byte-for-byte, and the strip init/copy policies stay
+  anchor-independent;
+- **rank-3 heap+panel composition** (`ttm_heap_panel_anchor_b`): legacy
+  admits only the window's dense parent (`b`, the innermost prefix) and
+  emits 5,764 bytes; the LoopIR route is byte-identical, and the
+  outermost anchor still fails closed (`panel_parallel_scope`), exactly
+  as legacy rejects it;
+- direct, stack, and redirect anchors: dense-matmul anchors `i`/`j`,
+  SpMM anchors `i`/`k`, the stack row anchor (3,038 bytes versus the
+  auto route's origin marking at 3,066 bytes — the suppression
+  differential), and the affine `j`→`j_out` redirect at both public
+  spellings — all byte-identical, plus an f64 inner-anchor variant;
+- four subprocess-isolated compiled shadows (inner-prefix heap, composed
+  heap+panel, SpMM free-axis anchor, stack row anchor) assert bitwise
+  equality against the legacy kernels and Torch agreement while keeping
+  the pytest parent at its inherited native-extension footprint
+  (§19.3 discipline).
+
+Reduction anchors, pack-loop anchors, missing heap anchors, and
+non-prefix anchors keep failing closed with the heap family's message;
+`tile.parallel` remains `unsupported_schedule_parallel`.
+
+### 21.6 Verification
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-parallel-6242da8/` (gate
+battery, captures, statics) with the inherited-gate reproduction under
+`phase6-repro-5ef0401/` and the working notes under
+`phase6-parallel-selection/`.
+
+Final evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-parallel-533de08/` (gate
+battery, latency, statics, `EVIDENCE_SHA256SUMS`), with the
+corrected-tip captures under `phase6-parallel-6242da8/captures/` (the
+tip's one additional commit is test-only, so the source captures carry
+over unchanged), the inherited-gate reproduction under
+`phase6-repro-5ef0401/`, and the anchor survey, parity harness, and
+working notes under `phase6-parallel-selection/`.
+
+- exact five-file Phase-6 contract focus at clean detached `533de08`:
+  **600 passed** (the inherited 548 plus 13 review locks, 31 schema
+  locks, and 8 consumption/lift locks);
+- exact scheduled runtime focus: **212 passed** in **771.74 s**
+  (log SHA-256
+  `111056f21dc5720267b46ffd1c32b65b17f62154e945692dadcdf345435cd4fa`,
+  JUnit SHA-256
+  `638a0ab6a4fd3b6643c76949bd667d10fa918f7b7ff4a2f97e87b83334fe7df8`),
+  including the eleven-cell anchor parity grid and the four
+  subprocess-isolated anchor shadows;
+- full legacy schedule-generality file: **45 passed** in 179.76 s;
+- fresh 20-source corpus, 42-cell grid, and 11 heap goldens:
+  **73/73 byte-identical** to the retained
+  `phase6-multiprefix-review-a24c0c1` finals — no legacy emission and
+  no unselected LoopIR emission moved;
+- static comparison: every changed file is Black/Flake8-clean and the
+  changed production files are focused-mypy-clean; full-source Black
+  reproduces only the inherited `prebuilt_kernels.py` finding,
+  full-source Flake8 is normalized byte-identical at nine inherited
+  findings, and normalized full-source mypy is byte-identical at
+  **146 findings in 12 files** over 60 source files;
+- paired same-session compiler latency (5 warmups / 30 samples, clean
+  detached `5ef0401` base versus `533de08` candidate, per-case
+  generated-source SHA-256 identical): `small_dense` **0.976/0.988**,
+  `reduction` **1.012/1.055**, `csr_intersection` **0.976/0.971**,
+  `sparse_union` **0.982/0.973** (p50/p95 candidate/base; worst
+  **1.055**, no 1.10 crossing, no control run required);
+- literal unpartitioned clean detached-worktree non-performance suite
+  at `533de08` with isolated caches and asserted import provenance:
+  **4,111 passed, 14 skipped, 3 performance tests deselected, one known
+  sparse-invariant warning, and zero failures** in **2,684.23 s**
+  (log SHA-256
+  `d99ead73cb0d60b4fdba53918202888a98c73307f03819cd148b95384b35cdfc`,
+  JUnit SHA-256
+  `7fa857ba8d9378de9977c4cdc6266ef481f54151cb9eaf19810e582d962a982b`)
+  — the inherited 4,041 selection plus exactly the 70 tests this
+  session added;
+- `git diff --check` clean; live origin still `58e8565`; all five
+  protected tracked files at their recorded hashes; no unrelated
+  tracked or untracked material staged.
+
+### 21.7 Scope verdict and remaining Phase-6 boundaries
+
+Milestone 1 of the §20.5 sequence is complete: every explicit
+`parallel_loop` fact is consumed exactly once into a verified,
+target-independent selection, both §18.4 boundaries are lifted with
+byte parity, and unsupported anchors fail closed with stable owned
+diagnostics.  **Phase 6 remains open.**  Intended automatic-plan routing
+through verified `LoopPlan` (milestone 2), canonical `LoopPlan` schedule
+identity for the strangler path (milestone 3), and the
+criterion-by-criterion exit audit (milestone 4) remain; production
+dispatch, selector integration, cutover, and legacy deletion stay out of
+scope.  The admission envelope deliberately excludes compressed, merged,
+and panel-origin anchors (no measured legacy comparand) and parallel
+tiles; widening either requires fresh legacy measurement first.
