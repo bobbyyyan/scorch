@@ -3303,6 +3303,7 @@ class Scheduler:
         if require_complete_plan and (
             type(plan_tiles) is not list
             or type(plan_workspace) is not list
+            or plan_tiles is plan_workspace
             or plan_tiles
             or plan_workspace
         ):
