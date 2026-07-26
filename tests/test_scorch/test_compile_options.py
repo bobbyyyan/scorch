@@ -651,6 +651,45 @@ def test_invalid_option_combinations_fail_closed() -> None:
     )
 
 
+def test_hostile_options_are_rejected_before_protocol_calls() -> None:
+    class HostileValue:
+        calls = 0
+
+        def __eq__(self, other):
+            self.calls += 1
+            raise RuntimeError("caller-controlled equality")
+
+        def __hash__(self):
+            self.calls += 1
+            raise RuntimeError("caller-controlled hash")
+
+    base = _default_options()
+    hostile_pass = HostileValue()
+    with pytest.raises(CompileOptionsError) as pass_error:
+        replace(base, enabled_llir_passes=(hostile_pass,))
+    _assert_compile_options_error(
+        pass_error,
+        code="unsupported_pass_pipeline",
+        field="enabled_llir_passes",
+    )
+    assert hostile_pass.calls == 0
+
+    hostile_wrapper = HostileValue()
+    with pytest.raises(CompileOptionsError) as wrapper_error:
+        replace(
+            base.build,
+            compiler_wrapper_policy=CompilerWrapperPolicy.AUTO,
+            compiler_wrapper_name=hostile_wrapper,
+            compiler_wrapper_path="/tmp/ccache",
+        )
+    _assert_compile_options_error(
+        wrapper_error,
+        code="invalid_type",
+        field="build.compiler_wrapper_name",
+    )
+    assert hostile_wrapper.calls == 0
+
+
 def test_environment_mutation_after_snapshot_does_not_change_compilation() -> None:
     environ = {"SCORCH_REGBLOCK": "0", "SCORCH_REGBLOCK_T": "4"}
     snapshot = CompileOptions.from_environment(
