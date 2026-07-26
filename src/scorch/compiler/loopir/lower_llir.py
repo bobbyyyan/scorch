@@ -1147,8 +1147,8 @@ class _TargetLowering:
 
         The migrated shape is exactly the audited legacy family on the
         rank>=2 trailing-axis result: the outermost pack origin whose whole
-        body the region wraps, the result's dense prefix loops in logical
-        mode order (the outermost of which carries the parallel policy),
+        body the region wraps, the result's dense prefix loops in physical
+        storage order (the outermost of which carries the parallel policy),
         one reduction loop (or the panel window pair), and the pack point
         loop, with the compute leaf accumulating through exactly one
         TiledReduce of the region.  A multi-prefix result contributes one
@@ -3614,26 +3614,70 @@ def _named_var_candidates(
     return collector.matches
 
 
-def _dense_zero_candidates(function: llir.Function) -> List[llir.FunctionCallStmt]:
-    """Collect every validated dense-zero call recursively."""
+def _named_call_candidates(
+    function: llir.Function, call_name: str
+) -> List[llir.FunctionCallStmt]:
+    """Collect every validated call statement of one exact name recursively."""
 
     class _Collector(LLIRWalker):
         def __init__(self) -> None:
             super().__init__(
                 LLIRTraversalContext(
                     stage="LoopIR target lowering",
-                    pass_name="locate_result_tile_dense_zero",
+                    pass_name="locate_result_tile_named_call",
                 )
             )
             self.matches: List[llir.FunctionCallStmt] = []
 
         def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
-            if type(node) is llir.FunctionCallStmt and node.name == "scorch_zero_dense":
+            if type(node) is llir.FunctionCallStmt and node.name == call_name:
                 self.matches.append(cast(llir.FunctionCallStmt, node))
 
     collector = _Collector()
     collector.walk(function)
     return collector.matches
+
+
+def _dense_zero_candidates(function: llir.Function) -> List[llir.FunctionCallStmt]:
+    """Collect every validated dense-zero call recursively."""
+
+    return _named_call_candidates(function, "scorch_zero_dense")
+
+
+def _require_canonical_result_shape_validation(
+    lowering: "_TargetLowering", function: llir.Function
+) -> None:
+    """Pin the ABI result-shape validation to its one canonical occurrence.
+
+    The binding validator's protected-argument allowlist admits the ABI's
+    result-shape validation by name; a forged or duplicated validation over
+    the protected ``result_shape`` argument would otherwise ride that
+    allowlist into non-compiling or behavior-changing C++ (the
+    ``scorch_zero_dense`` precedent).
+    """
+
+    expected_validation = lowering.kernel_abi().emit_validation()[0]
+    validation_candidates = _named_call_candidates(
+        function,
+        "scorch_native::validate_jit_result_shape",
+    )
+    if len(validation_candidates) != 1 or not lowering._exact_panel_state_matches(
+        validation_candidates[0], expected_validation
+    ):
+        _fail(
+            _RESULT_TILE_LOST,
+            "heap accumulation requires exactly one canonical ABI "
+            "result-shape validation",
+        )
+    located_validation = lowering._locate_statement(
+        function.body,
+        validation_candidates[0],
+    )
+    if located_validation is None or located_validation[0] is not function.body:
+        _fail(
+            _RESULT_TILE_LOST,
+            "the canonical ABI result-shape validation moved out of function scope",
+        )
 
 
 _RESULT_TILE_POLICY_TOKEN = re.compile(
@@ -3934,6 +3978,20 @@ class _ResultTileTextValidator(LLIRWalker):
         )
         if type(node) is llir.MemberAccess:
             return
+        # A member call is an unknown callee exactly like a free function:
+        # protected result state may not escape through its arguments even
+        # when the receiver itself is unprotected (a non-const reference
+        # parameter could mutate the forwarded state).  The canonical owned
+        # ``data_ptr`` acquisition carries no arguments, so no production
+        # spelling is affected.
+        if _result_tile_protected_uses(
+            getattr(node, "args", None),
+            self.protected_names,
+        ):
+            raise ValueError(
+                f"{type(node).__name__} exposes protected result state to "
+                "an unowned call"
+            )
         root_name = _result_tile_expression_root_name(getattr(node, "base", None))
         if root_name not in self.protected_names:
             return
@@ -5076,6 +5134,7 @@ def _complete_result_tile_impl(
                 "an unowned use of the dense result's Torch storage "
                 "survived heap completion",
             )
+        _require_canonical_result_shape_validation(lowering, function)
         zero_candidates = _dense_zero_candidates(function)
         if len(zero_candidates) != 1 or not lowering._exact_panel_state_matches(
             zero_candidates[0], expected_zero
