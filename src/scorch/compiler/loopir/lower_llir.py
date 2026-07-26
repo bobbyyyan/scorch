@@ -1318,11 +1318,17 @@ class _TargetLowering:
             )
         self.parallel_position = position
         selected = self.loops[position]
-        if type(selected.node) in (DenseFor, TileOuterFor, PanelOuterFor):
-            loop_dimension = selected.node.dimension
-        else:
-            cursor = selected.cursors[0]
-            loop_dimension = self._level_dimension(cursor.tensor, cursor.level)
+        if type(selected.node) not in (DenseFor, TileOuterFor):
+            # The legacy explicit route marks tagged for-loops only;
+            # compressed, merged, and panel-origin anchors have no measured
+            # comparand, so this target refuses them rather than inventing
+            # a policy.
+            _fail(
+                "unsupported_parallel_selection",
+                "this target realizes parallel selections on dense logical "
+                "loops and affine origin loops only",
+            )
+        loop_dimension = selected.node.dimension
         if selection.work.rows != loop_dimension:
             _fail(
                 "unsupported_parallel_selection",

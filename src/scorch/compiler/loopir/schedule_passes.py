@@ -1961,16 +1961,16 @@ def select_parallel_loop(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
             "the plan's parallel loop must resolve to exactly one " "scheduled loop",
         )
     target = matches[0]
-    if type(target) in (DenseFor, TileOuterFor, PanelOuterFor):
-        rows = cast(DenseFor, target).dimension
-    elif type(target) is SparseFor:
-        cursor = target.cursor
-        decl = decls[cursor.tensor]
-        rows = decl.dimensions[decl.levels[cursor.level].mode]
-    else:
-        cursor = cast(MergedSparseFor, target).cursors[0]
-        decl = decls[cursor.tensor]
-        rows = decl.dimensions[decl.levels[cursor.level].mode]
+    if type(target) not in (DenseFor, TileOuterFor):
+        # Legacy explicit selection finds tagged for-loops only; compressed,
+        # merged, and panel-origin anchors have no measured legacy comparand
+        # and stay outside the migrated family.
+        _fail(
+            "invalid_schedule_parallel",
+            "explicit parallel selection is migrated for dense logical "
+            "loops and affine origin loops only",
+        )
+    rows = cast(DenseFor, target).dimension
     nnz_source: Optional[Tuple[SymbolId, int]] = None
     for node in _ordered_schema_nodes(target):
         if type(node) in (SparseFor, SparseWindowFor):
