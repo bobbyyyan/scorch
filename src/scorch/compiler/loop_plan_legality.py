@@ -28,6 +28,7 @@ from .loop_plan import (
     LoopRef,
     OperandRelayout,
     PlacementKind,
+    WorkspaceInsertion,
 )
 from ..format import LevelType
 
@@ -347,6 +348,29 @@ def _assignment_is_additive(assignment: AssignmentInfo) -> bool:
     return assignment.update_op in (None, Operation.ADD)
 
 
+def _verify_auto_workspace_decision(
+    facts: LoopPlanLegalityFacts,
+    plan: LoopPlan,
+    derived: Optional[WorkspaceInsertion],
+) -> None:
+    """Require the stored automatic workspace fact to equal the derived one.
+
+    The workspace insertion an automatic plan replays is program-derived
+    state, never an unchecked recorded choice: the stored fact (including
+    ``None``) must equal the decision this trust boundary re-derives from the
+    analyzed CIN, the plan order, and the recorded tiles, exactly.
+    """
+
+    del facts
+    if plan.workspace != derived:
+        _invalid(
+            "auto_workspace_decision",
+            "the recorded automatic workspace insertion must equal the "
+            "derived replay decision exactly",
+            ("workspace",),
+        )
+
+
 def _verify_tiling_capabilities(
     facts: LoopPlanLegalityFacts,
     plan: LoopPlan,
@@ -416,6 +440,7 @@ def _verify_tiling_capabilities(
                     index_id=tile.loop.index_id,
                 )
         if not affine_tiles and not sparse_workspace:
+            _verify_auto_workspace_decision(facts, plan, None)
             return False
         if not workspace_domain:
             _invalid(
@@ -437,7 +462,31 @@ def _verify_tiling_capabilities(
                 "auto workspace tiling supports additive reductions only",
                 ("analysis", "assignments"),
             )
+        derived_workspace: Optional[WorkspaceInsertion] = None
+        if not source_has_workspace:
+            derived_workspace = WorkspaceInsertion(
+                reduction_loop=LoopRef(
+                    plan.loop_order[
+                        max(
+                            facts.loop_positions[index_id]
+                            for index_id in facts.reduction_index_ids
+                        )
+                    ]
+                ),
+                axis_loops=tuple(LoopRef(index_id) for index_id in workspace_domain),
+                dense=_all_dense_results(facts),
+            )
+        _verify_auto_workspace_decision(facts, plan, derived_workspace)
         return True
+
+    if plan.workspace is not None:
+        _invalid(
+            "workspace_provenance",
+            "workspace insertion is an automatic-provenance decision; "
+            "explicit schedules express accumulator lifetime through tile "
+            "accumulation",
+            ("workspace",),
+        )
 
     if affine_tiles and not _all_dense_results(facts):
         _unsupported(

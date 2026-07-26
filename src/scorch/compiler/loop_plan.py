@@ -113,6 +113,36 @@ class OperandRelayout:
 
 
 @dataclass(frozen=True)
+class WorkspaceInsertion:
+    """The automatic scheduler's standalone workspace decision, made explicit.
+
+    The legacy auto scheduler inserts an accumulation workspace at the last
+    reduction loop before applying its tiling heuristics; replay previously
+    re-derived that hidden decision from scheduler policy instead of reading
+    it from the plan.  This fact records the decision itself: the reduction
+    loop the region wraps, the trailing free axis loops whose cells the
+    workspace stores (in loop order), and whether the materialized workspace
+    is the 1-D dense accumulator or the sparse fallback representation.  It
+    is an automatic-provenance decision only; explicit schedules express
+    workspace lifetime through tile accumulation instead.
+    """
+
+    reduction_loop: LoopRef
+    axis_loops: Tuple[LoopRef, ...]
+    dense: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "axis_loops",
+            cast(
+                Tuple[LoopRef, ...],
+                _tuple_snapshot(self.axis_loops, "WorkspaceInsertion.axis_loops"),
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class ResultTile:
     result_id: SymbolId
     tile_loop: LoopRef
@@ -149,6 +179,7 @@ class LoopPlan:
     relayout: Optional[OperandRelayout] = None
     result_tile: Optional[ResultTile] = None
     parallel_loop: Optional[LoopRef] = None
+    workspace: Optional[WorkspaceInsertion] = None
     provenance: str = "explicit"
     tag: str = ""
 
@@ -374,6 +405,7 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             "relayout",
             "result_tile",
             "parallel_loop",
+            "workspace",
             "provenance",
             "tag",
         ),
@@ -501,6 +533,30 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
                 _validate_index_id(index_id, f"result_tile.{field}[{position}]")
     if typed_plan.parallel_loop is not None:
         _validate_loop_ref(typed_plan.parallel_loop, "parallel_loop")
+    if typed_plan.workspace is not None:
+        if type(typed_plan.workspace) is not WorkspaceInsertion:
+            raise VerificationError(
+                "LoopPlan.workspace must be a WorkspaceInsertion or None"
+            )
+        workspace = typed_plan.workspace
+        _validate_stored_fields(
+            workspace,
+            "workspace",
+            ("reduction_loop", "axis_loops", "dense"),
+        )
+        _validate_loop_ref(workspace.reduction_loop, "workspace.reduction_loop")
+        if type(workspace.axis_loops) is not tuple or not workspace.axis_loops:
+            raise VerificationError(
+                "LoopPlan workspace.axis_loops must be a non-empty tuple"
+            )
+        for position, axis in enumerate(workspace.axis_loops):
+            _validate_loop_ref(axis, f"workspace.axis_loops[{position}]")
+        if type(workspace.dense) is not bool:
+            raise VerificationError("LoopPlan workspace.dense must be a bool")
+        if workspace.dense and len(workspace.axis_loops) != 1:
+            raise VerificationError(
+                "LoopPlan dense workspace insertion stores exactly one axis"
+            )
     if type(typed_plan.provenance) is not str or not typed_plan.provenance:
         raise VerificationError("LoopPlan.provenance must be a non-empty string")
     if type(typed_plan.tag) is not str:
@@ -516,6 +572,7 @@ def _verify_empty_loop_plan(plan: LoopPlan) -> None:
         or plan.relayout is not None
         or plan.result_tile is not None
         or plan.parallel_loop is not None
+        or plan.workspace is not None
     ):
         raise VerificationError(
             "LoopPlan references loops but normalized CIN defines none"

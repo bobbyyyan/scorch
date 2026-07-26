@@ -35,6 +35,7 @@ from scorch.compiler.loop_plan import (
     PlacementKind,
     ResultTile,
     ScheduledCIN,
+    WorkspaceInsertion,
     verify_loop_plan,
     verify_scheduled_cin,
 )
@@ -1207,6 +1208,11 @@ def test_parallel_post_reduction_workspace_scope_is_rejected() -> None:
             ),
         ),
         parallel_loop=LoopRef(ids["k"]),
+        workspace=WorkspaceInsertion(
+            reduction_loop=LoopRef(ids["j"]),
+            axis_loops=(LoopRef(ids["k"]),),
+            dense=True,
+        ),
         provenance="auto",
     )
 
@@ -1470,6 +1476,11 @@ def test_root_workspace_scope_rejects_tiling_replay() -> None:
                 LoopPlacement(PlacementKind.OUTERMOST),
             ),
         ),
+        workspace=WorkspaceInsertion(
+            reduction_loop=LoopRef(ids["j"]),
+            axis_loops=(LoopRef(ids["k"]),),
+            dense=True,
+        ),
         provenance="auto",
     )
     _assert_plan_rejected(
@@ -1483,13 +1494,14 @@ def test_root_workspace_scope_rejects_tiling_replay() -> None:
         replace(
             base,
             tiles=(replace(base.tiles[0], accumulation="stack"),),
+            workspace=None,
             provenance="explicit",
         ),
         UnsupportedFeature,
         "root_workspace_tiling",
     )
 
-    direct = replace(base, tiles=())
+    direct = replace(base, tiles=(), workspace=None)
     assert verify_loop_plan(cin, direct) is direct
     assert not legacy_cin_working_copy(cin, direct).inserted_workspace
 

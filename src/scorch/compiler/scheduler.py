@@ -50,6 +50,7 @@ from .loop_plan import (
     PlacementKind,
     ResultTile,
     ScheduledCIN,
+    WorkspaceInsertion,
     entity_display_names,
     verify_loop_plan,
 )
@@ -1529,6 +1530,61 @@ class Scheduler:
         )
 
     @staticmethod
+    def _workspace_insertion_record(cin: CIN) -> Optional[WorkspaceInsertion]:
+        """Derive the workspace decision :meth:`insert_workspace` will apply.
+
+        This is the recording twin of the derivation inside
+        :meth:`insert_workspace` — the last in-order reduction variable, the
+        trailing free variables after it, and the dense-versus-sparse
+        representation (dense only for a single all-dense trailing axis).  It
+        is computed on the pre-insertion nest so the automatic scheduler can
+        record its standalone workspace decision as an explicit, replayable
+        ``LoopPlan`` fact instead of hidden policy state.  Returns ``None``
+        when insertion would not materialize a workspace.
+        """
+
+        if not isinstance(cin, ForAll):
+            return None
+        cin_ivar_getter = CINIndexVariablesGetter()
+        cin_ivar_getter.visit(cin)
+        result_tensor_accesses = cin.get_result_tensor_accesses()
+        if not result_tensor_accesses:
+            return None
+        result_tensor_access = result_tensor_accesses[0]
+        reduction_vars = cin_ivar_getter.get_reduction_vars()
+        free_vars = cin_ivar_getter.get_free_vars()
+        index_vars_ordered = cin.loop_order
+        reduction_vars_todo = [
+            var for var in reduction_vars if var in index_vars_ordered
+        ]
+        if not reduction_vars_todo:
+            return None
+        next_reduction_var = reduction_vars_todo[-1]
+        last_reduction_var_index = index_vars_ordered.index(next_reduction_var)
+        vars_after_last_reduction = index_vars_ordered[last_reduction_var_index + 1 :]
+        free_vars_after_last_reduction = [
+            var for var in vars_after_last_reduction if var in free_vars
+        ]
+        if not free_vars_after_last_reduction:
+            return None
+        level_types = [
+            result_tensor_access.level_type_of_index_var(var)
+            for var in free_vars_after_last_reduction
+        ]
+        are_all_dense_levels = all(
+            level_type == LevelType.DENSE for level_type in level_types
+        )
+        if are_all_dense_levels and len(free_vars_after_last_reduction) > 1:
+            are_all_dense_levels = False
+        return WorkspaceInsertion(
+            reduction_loop=LoopRef(next_reduction_var.index_id),
+            axis_loops=tuple(
+                LoopRef(var.index_id) for var in free_vars_after_last_reduction
+            ),
+            dense=are_all_dense_levels,
+        )
+
+    @staticmethod
     def _find_index_var_by_name(cin: CIN, name: str) -> IndexVar:
         matches = [index_var for index_var in cin.index_vars if index_var.name == name]
         if not matches:
@@ -2918,10 +2974,12 @@ class Scheduler:
                 costs=costs,
             )
             auto_tiles: List[LoopTile] = []
+            auto_workspace: List[WorkspaceInsertion] = []
             scheduled_cin = Scheduler._apply_auto_order_owned(
                 cin,
                 logical_order,
                 plan_tiles=auto_tiles,
+                plan_workspace=auto_workspace,
                 compile_options=options,
             )
             plan = verify_loop_plan(
@@ -2929,6 +2987,7 @@ class Scheduler:
                 LoopPlan(
                     loop_order=tuple(index_var.index_id for index_var in logical_order),
                     tiles=tuple(auto_tiles),
+                    workspace=auto_workspace[0] if auto_workspace else None,
                     provenance="auto",
                     tag=schedule.tag,
                 ),
@@ -3234,6 +3293,7 @@ class Scheduler:
         compile_options: CompileOptions,
         scheduler_policy: Optional[SchedulerPolicy] = None,
         plan_tiles: Optional[List[LoopTile]] = None,
+        plan_workspace: Optional[List[WorkspaceInsertion]] = None,
     ) -> CIN:
         """Apply selected auto decisions on a CIN owned by the scheduler."""
 
@@ -3244,6 +3304,8 @@ class Scheduler:
 
         cin = Scheduler._rebuild_loop_nest(cin, loop_order)
 
+        recorded: Optional[WorkspaceInsertion] = None
+        dense_output = Scheduler._has_dense_output(cin)
         if Scheduler.should_insert_workspace(cin, loop_order):
             # For dense outputs the workspace only exists to support tiling.
             # If nothing will be tiled, the workspace is pure overhead
@@ -3251,18 +3313,43 @@ class Scheduler:
             will_tile = (
                 len(Scheduler._select_index_vars_to_tile(cin, scheduler_policy)) > 0
             )
-            if not Scheduler._has_dense_output(cin) or will_tile:
+            if not dense_output or will_tile:
+                recorded = Scheduler._workspace_insertion_record(cin)
                 cin = Scheduler.insert_workspace(cin, allow_dense=True)
+                if plan_workspace is not None:
+                    materialized = {
+                        (access.tensor.symbol_id, access.tensor.dense)
+                        for access in cin.get_workspace_accesses()
+                    }
+                    if (
+                        recorded is None
+                        or not cin.inserted_workspace
+                        or len(materialized) != 1
+                        or next(iter(materialized))[1] is not recorded.dense
+                    ):
+                        raise VerificationError(
+                            "stage=auto plan recording: the workspace "
+                            "insertion decision did not materialize as derived"
+                        )
 
-        if not isinstance(cin, ForAll):
-            return cin
-
-        cin = Scheduler._apply_tiling_heuristics(
-            cin,
-            compile_options,
-            scheduler_policy,
-            plan_tiles=plan_tiles,
-        )
+        if isinstance(cin, ForAll):
+            cin = Scheduler._apply_tiling_heuristics(
+                cin,
+                compile_options,
+                scheduler_policy,
+                plan_tiles=plan_tiles,
+            )
+        if plan_workspace is not None and recorded is not None:
+            # The recorded fact is the plan's replay contract, not a diary of
+            # the private surgery: a dense-output workspace whose candidate
+            # tiles never materialized (a root-scope insertion demotes the
+            # nest root to a Where, so the tiling heuristics bail) is pure
+            # overhead that replay deliberately omits.  Recording ``None``
+            # keeps replay byte-compatible with the established
+            # ``ScheduledCIN`` behavior; the surgery-versus-replay divergence
+            # it papers over is documented as a legacy observation.
+            if not dense_output or (plan_tiles is not None and plan_tiles):
+                plan_workspace.append(recorded)
         return cin
 
     @staticmethod
@@ -3272,6 +3359,7 @@ class Scheduler:
         costs: Optional[_CostModelConstants] = None,
         scheduler_policy: Optional[SchedulerPolicy] = None,
         plan_tiles: Optional[List[LoopTile]] = None,
+        plan_workspace: Optional[List[WorkspaceInsertion]] = None,
     ) -> CIN:
         """Select policy once, then mutate only scheduler-owned CIN."""
 
@@ -3291,6 +3379,7 @@ class Scheduler:
             compile_options,
             scheduler_policy=scheduler_policy,
             plan_tiles=plan_tiles,
+            plan_workspace=plan_workspace,
         )
 
     @staticmethod
@@ -3327,11 +3416,23 @@ class Scheduler:
         ]
         cin = Scheduler._rebuild_loop_nest(cin, logical_order)
 
-        loop_order, _ = Scheduler._extract_loop_chain(cin)
-        if Scheduler.should_insert_workspace(cin, loop_order) and (
-            not Scheduler._has_dense_output(cin) or bool(plan.tiles)
-        ):
+        # Replay consumes the recorded workspace decision instead of
+        # re-deriving hidden scheduler-policy state; the plan verifier has
+        # already proved the stored fact equals the derived decision, and the
+        # replayed nest is cross-checked against it before materialization.
+        if plan.workspace is not None:
+            derived = Scheduler._workspace_insertion_record(cin)
+            if derived != plan.workspace:
+                raise VerificationError(
+                    "stage=legacy auto replay: the recorded workspace "
+                    "insertion does not match the replayed nest"
+                )
             cin = Scheduler.insert_workspace(cin, allow_dense=True)
+            if not cin.inserted_workspace:
+                raise VerificationError(
+                    "stage=legacy auto replay: the recorded workspace "
+                    "insertion did not materialize"
+                )
 
         for tile in plan.tiles:
             if tile.loop.part != LoopPart.LOGICAL or tile.kind != "affine":
@@ -3369,6 +3470,96 @@ class Scheduler:
             options.scheduler,
             compilation_context=compilation_context,
         )
+
+    @staticmethod
+    def auto_schedule_plan(
+        cin: CIN,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
+        compilation_context: Optional[CompilationContext] = None,
+        *,
+        regblock_enabled: Optional[bool] = None,
+    ) -> ScheduledCIN:
+        """Originate a verified automatic LoopPlan at the auto boundary.
+
+        The plan-producing twin of :meth:`auto_schedule` and one regblock
+        arm of the internal dual-path algorithm: the same policy selects the
+        loop order, workspace insertion, and heuristic tiles, but every
+        decision is recorded as an explicit fact of one verified
+        ``provenance="auto"`` LoopPlan instead of surviving only as private
+        tree surgery.  The mutable surgery result is discarded exactly as
+        :meth:`apply_schedule` discards it; release dispatch does not consume
+        this entry yet.
+        """
+
+        options, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        _validate_requested_schedule(options, None)
+        scheduler_policy = options.scheduler
+        if regblock_enabled is not None:
+            if type(regblock_enabled) is not bool:
+                raise TypeError("regblock_enabled must be an exact bool")
+            scheduler_policy = replace(
+                scheduler_policy,
+                regblock_enabled=regblock_enabled,
+            )
+            costs = scheduler_policy.cost_model
+        if isinstance(cin, IndexStmt):
+            validate_legacy_cin_display_names(cin)
+        normalized = (
+            normalize_cin(
+                cin,
+                compile_options=options,
+                compilation_context=compilation_context,
+            )
+            if isinstance(cin, IndexStmt)
+            else copy.deepcopy(cin)
+        )
+        stage_token = (
+            compilation_context.begin_stage(
+                CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+                compile_options=options,
+            )
+            if compilation_context is not None
+            else None
+        )
+        try:
+            working = copy.deepcopy(normalized)
+            if not isinstance(working, ForAll):
+                plan = verify_loop_plan(
+                    normalized,
+                    LoopPlan(loop_order=(), provenance="auto"),
+                )
+            else:
+                logical_order = Scheduler.select_loop_order(working, costs=costs)
+                auto_tiles: List[LoopTile] = []
+                auto_workspace: List[WorkspaceInsertion] = []
+                Scheduler._apply_auto_order_owned(
+                    working,
+                    logical_order,
+                    options,
+                    scheduler_policy=scheduler_policy,
+                    plan_tiles=auto_tiles,
+                    plan_workspace=auto_workspace,
+                )
+                plan = verify_loop_plan(
+                    normalized,
+                    LoopPlan(
+                        loop_order=tuple(
+                            index_var.index_id for index_var in logical_order
+                        ),
+                        tiles=tuple(auto_tiles),
+                        workspace=auto_workspace[0] if auto_workspace else None,
+                        provenance="auto",
+                    ),
+                )
+            scheduled = ScheduledCIN(normalized, plan)
+        except Exception:
+            if stage_token is not None and compilation_context is not None:
+                compilation_context.fail_stage(stage_token)
+            raise
+        if stage_token is not None and compilation_context is not None:
+            compilation_context.complete_stage(stage_token)
+        return scheduled
 
     @staticmethod
     def _auto_schedule_regblock_arm(
