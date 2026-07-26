@@ -16,6 +16,7 @@ from scorch.compiler.cin import (
     TensorVar,
 )
 from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.compilation_context import CompilationContext, CompilerStageId
 from scorch.compiler.diagnostics import VerificationError
 from scorch.compiler.loop_plan import LoopRef, WorkspaceInsertion
 from scorch.compiler.loopir.plan_identity import (
@@ -26,13 +27,14 @@ from scorch.compiler.loopir.plan_identity import (
     loopir_request_identity,
     plan_schedule_digest,
 )
-from scorch.compiler.scheduler import Schedule, Scheduler, TileSpec
+from scorch.compiler.scheduler import RelayoutSpec, Schedule, Scheduler, TileSpec
 from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
 
 F32 = torch.float32
 MATMUL_BINDINGS = (((4, 5), F32), ((5, 6), F32))
 ELEMENTWISE_BINDINGS = (((4, 5), F32), ((4, 5), F32))
 SPMM_BINDINGS = (((4, 5), F32), ((5, 6), F32))
+IDENTITY_OPTIONS = CompileOptions.from_environment()
 
 
 def build_matmul():
@@ -92,12 +94,18 @@ def scheduled(build, schedule):
     return Scheduler.apply_schedule(build(), schedule)
 
 
-def request_identity(artifact, result_shape=(4, 6), bindings=MATMUL_BINDINGS):
+def request_identity(
+    artifact,
+    result_shape=(4, 6),
+    bindings=MATMUL_BINDINGS,
+    compile_options=IDENTITY_OPTIONS,
+):
     return loopir_request_identity(
         artifact.normalized_cin,
         artifact.verified_loop_plan,
         result_shape,
         bindings,
+        compile_options=compile_options,
     )
 
 
@@ -185,7 +193,7 @@ def test_each_semantic_decision_changes_the_identity(name, schedule) -> None:
     ) != plan_schedule_digest(base.normalized_cin, base.verified_loop_plan), name
 
 
-def test_panel_relayout_result_tile_and_parallel_change_the_identity() -> None:
+def test_panel_relayout_result_tile_and_parallel_enter_the_identity() -> None:
     """The sparse scheduling decisions all reach the canonical form."""
 
     reorder = scheduled(build_spmm, Schedule(loop_order=("i", "j", "k")))
@@ -201,17 +209,83 @@ def test_panel_relayout_result_tile_and_parallel_change_the_identity() -> None:
         build_spmm,
         Schedule(loop_order=("i", "j", "k"), parallel_loop="i"),
     )
+    relayout = scheduled(
+        build_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                TileSpec(
+                    "k",
+                    4,
+                    placement="outermost",
+                    accum="direct",
+                    unroll=False,
+                ),
+                TileSpec(
+                    "j",
+                    3,
+                    placement="child_of:k_out",
+                    kind="panel",
+                    accum="direct",
+                ),
+            ),
+            relayout=RelayoutSpec("B", "k", 4, scope_var="j"),
+            parallel_loop="i",
+        ),
+    )
+    heap = scheduled(
+        build_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                TileSpec(
+                    "k",
+                    4,
+                    placement="outermost",
+                    accum="heap",
+                    unroll=False,
+                ),
+            ),
+            parallel_loop="i",
+        ),
+    )
     identities = {
         request_identity(reorder),
         request_identity(panel),
         request_identity(anchored),
+        request_identity(relayout),
+        request_identity(heap),
     }
-    assert len(identities) == 3
+    assert len(identities) == 5
     panel_payload = json.loads(
         canonical_plan_dump(panel.normalized_cin, panel.verified_loop_plan)
     )
     assert panel_payload["panel_bounds"], "panel bound must enter the dump"
     assert panel_payload["parallel_loop"] is not None
+    relayout_payload = json.loads(
+        canonical_plan_dump(relayout.normalized_cin, relayout.verified_loop_plan)
+    )
+    assert relayout_payload["relayout"] == {
+        "access_indices": [1, 2],
+        "operand": 2,
+        "operand_pack_level": 1,
+        "operand_panel_level": 0,
+        "pack_loop": {"index": 2, "part": "logical"},
+        "panel_loop": {"index": 1, "part": "logical"},
+        "row_loop": {"index": 0, "part": "logical"},
+        "scope_loop": {"index": 1, "part": "logical"},
+        "strip_width": 4,
+    }
+    heap_payload = json.loads(
+        canonical_plan_dump(heap.normalized_cin, heap.verified_loop_plan)
+    )
+    assert heap_payload["result_tile"] == {
+        "access_indices": [0, 2],
+        "result": 0,
+        "result_level": 1,
+        "result_prefix": [0],
+        "tile_loop": {"index": 2, "part": "logical"},
+    }
 
 
 def test_workspace_fact_changes_the_identity() -> None:
@@ -286,7 +360,11 @@ def test_request_identity_covers_shapes_bindings_and_plan_presence() -> None:
         != base
     )
     unscheduled = loopir_request_identity(
-        artifact.normalized_cin, None, (4, 6), MATMUL_BINDINGS
+        artifact.normalized_cin,
+        None,
+        (4, 6),
+        MATMUL_BINDINGS,
+        compile_options=IDENTITY_OPTIONS,
     )
     assert unscheduled != base
 
@@ -313,11 +391,138 @@ def test_malformed_and_hostile_state_fails_closed() -> None:
         canonical_plan_dump(cin, foreign_axis)
 
     with pytest.raises(VerificationError):
-        loopir_request_dump(cin, plan, (4, True), MATMUL_BINDINGS)
+        loopir_request_dump(
+            cin,
+            plan,
+            (4, True),
+            MATMUL_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        )
     with pytest.raises(VerificationError):
-        loopir_request_dump(cin, plan, (4, 6), (((4, "x"), F32), ((5, 6), F32)))
+        loopir_request_dump(
+            cin,
+            plan,
+            (4, 6),
+            (((4, "x"), F32), ((5, 6), F32)),
+            compile_options=IDENTITY_OPTIONS,
+        )
     with pytest.raises(VerificationError):
-        loopir_request_dump(object(), plan, (4, 6), MATMUL_BINDINGS)
+        loopir_request_dump(
+            object(),
+            plan,
+            (4, 6),
+            MATMUL_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        )
+
+
+def test_request_dtype_identity_is_exact_and_never_calls_str() -> None:
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+
+    class AliasDtype:
+        calls = 0
+
+        def __str__(self):
+            self.calls += 1
+            return "torch.float32"
+
+    alias = AliasDtype()
+    with pytest.raises(VerificationError, match="exact supported torch.dtype"):
+        loopir_request_dump(
+            artifact.normalized_cin,
+            artifact.verified_loop_plan,
+            (4, 6),
+            (((4, 5), alias), ((5, 6), F32)),
+            compile_options=IDENTITY_OPTIONS,
+        )
+    assert alias.calls == 0
+    with pytest.raises(VerificationError, match="exact supported torch.dtype"):
+        loopir_request_dump(
+            artifact.normalized_cin,
+            artifact.verified_loop_plan,
+            (4, 6),
+            (((4, 5), torch.int32), ((5, 6), torch.int32)),
+            compile_options=IDENTITY_OPTIONS,
+        )
+
+
+@pytest.mark.parametrize(
+    "extent",
+    [-1, 2**63, 1 << 20000],
+    ids=("negative", "above-int64", "hostile-huge"),
+)
+def test_request_extent_identity_is_bounded_before_json(extent) -> None:
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+    with pytest.raises(VerificationError, match="nonnegative int64"):
+        loopir_request_dump(
+            artifact.normalized_cin,
+            artifact.verified_loop_plan,
+            (extent, 6),
+            MATMUL_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        )
+
+
+def test_request_identity_rejects_cyclic_unscheduled_cin() -> None:
+    cyclic = build_elementwise()
+    cyclic.stmt = cyclic
+    with pytest.raises(VerificationError, match="contains a cycle"):
+        loopir_request_dump(
+            cyclic,
+            None,
+            (4, 5),
+            ELEMENTWISE_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        )
+
+
+def test_compile_options_are_part_of_the_request_identity() -> None:
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+    comments = IDENTITY_OPTIONS
+    no_comments = replace(comments, emit_comments=False)
+    assert request_identity(artifact, compile_options=comments) != request_identity(
+        artifact, compile_options=no_comments
+    )
+
+    schedule = Schedule(loop_order=("i", "j"))
+    comments = replace(comments, requested_schedule=schedule)
+    no_comments = replace(no_comments, requested_schedule=schedule)
+    first = compile_cin_via_loopir(
+        build_elementwise(),
+        (4, 5),
+        ELEMENTWISE_BINDINGS,
+        compile_options=comments,
+    )
+    second = compile_cin_via_loopir(
+        build_elementwise(),
+        (4, 5),
+        ELEMENTWISE_BINDINGS,
+        compile_options=no_comments,
+    )
+    assert first.cpp_source != second.cpp_source
+    assert first.request_dump != second.request_dump
+    assert first.request_identity != second.request_identity
+
+
+def test_identity_failure_is_owned_by_the_frontend_request_stage() -> None:
+    context = CompilationContext(IDENTITY_OPTIONS)
+    huge = 1 << 20000
+    with pytest.raises(VerificationError, match="nonnegative int64"):
+        compile_cin_via_loopir(
+            build_elementwise(),
+            (huge, 5),
+            (((huge, 5), F32), ((huge, 5), F32)),
+            compile_options=IDENTITY_OPTIONS,
+            compilation_context=context,
+        )
+    assert (
+        context._failed_stage_id
+        is CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION
+    )
+    assert context._active_stage_tokens == ()
+    assert [record.stage_id for record in context.stage_run_records] == [
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+    ]
 
 
 def test_identity_is_the_hash_of_the_retained_dump() -> None:
@@ -329,6 +534,7 @@ def test_identity_is_the_hash_of_the_retained_dump() -> None:
         artifact.verified_loop_plan,
         (4, 6),
         MATMUL_BINDINGS,
+        compile_options=IDENTITY_OPTIONS,
     )
     payload = json.loads(dump)
     assert payload["schema"] == CANONICAL_REQUEST_SCHEMA
@@ -339,11 +545,6 @@ def test_identity_is_the_hash_of_the_retained_dump() -> None:
 
 def test_pipeline_owns_the_request_identity_at_the_compile_boundary() -> None:
     """Repeated strangler builds carry equal identities; stages unchanged."""
-
-    from scorch.compiler.compilation_context import (
-        CompilationContext,
-        CompilerStageId,
-    )
 
     options = CompileOptions.from_environment(
         requested_schedule=Schedule(loop_order=("i", "j", "k"))
@@ -401,3 +602,5 @@ def test_pipeline_owns_the_request_identity_at_the_compile_boundary() -> None:
         first.request_identity,
         unscheduled.request_identity,
     )
+    with pytest.raises(TypeError, match="must hash the retained request_dump"):
+        replace(first, request_identity="0" * 64)
