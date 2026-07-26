@@ -2144,14 +2144,14 @@ def _check_plan_families(plan: LoopPlan) -> None:
     can prove a supported dense logical or affine-origin anchor and its race
     and work contracts.
 
-    Automatic plans are admitted for exactly the recorded tile-free family:
-    a cost-model loop order and nothing else.  The tiled automatic family
-    (heuristic strip-mines composed with the standalone workspace insertion,
-    including strip-mined reduction loops with a reduce-out consumer) has no
-    typed emission twin yet — the legacy explicit route itself rejects
-    reduction tiling, so those shapes exist only through the auto heuristics
-    and stay on the legacy path until their own measured migration.  Every
-    other provenance fails closed.
+    Automatic plans are admitted for the tile-free auto-replay contract: one
+    already verified logical order and no other decision.  ``provenance="auto"``
+    identifies that replay contract; it is not an attestation that an arbitrary
+    directly constructed plan was originated by the current cost model.  The
+    plan-free root-workspace and tiled automatic families have no typed
+    emission twin yet and stay fail-closed until scheduler origin/policy and
+    every workspace/tile decision are represented and re-derived.  Every other
+    provenance fails closed.
     """
 
     if plan.provenance == "auto":
@@ -2165,9 +2165,9 @@ def _check_plan_families(plan: LoopPlan) -> None:
         ):
             _fail(
                 "unsupported_schedule_auto_family",
-                "automatic plans are migrated for the tile-free cost-model "
-                "loop order only; the heuristic tile/workspace family stays "
-                "on the legacy path",
+                "automatic plans are migrated for the tile-free replay "
+                "contract only; root-workspace and heuristic tile/workspace "
+                "families stay on the legacy path",
             )
         return
     if plan.provenance != "explicit":

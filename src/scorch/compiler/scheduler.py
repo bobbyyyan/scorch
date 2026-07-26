@@ -3294,11 +3294,14 @@ class Scheduler:
         scheduler_policy: Optional[SchedulerPolicy] = None,
         plan_tiles: Optional[List[LoopTile]] = None,
         plan_workspace: Optional[List[WorkspaceInsertion]] = None,
+        require_complete_plan: bool = False,
     ) -> CIN:
         """Apply selected auto decisions on a CIN owned by the scheduler."""
 
         if not isinstance(cin, ForAll):
             return cin
+        if type(require_complete_plan) is not bool:
+            raise TypeError("require_complete_plan must be an exact bool")
         if scheduler_policy is None:
             scheduler_policy = compile_options.scheduler
 
@@ -3314,7 +3317,11 @@ class Scheduler:
                 len(Scheduler._select_index_vars_to_tile(cin, scheduler_policy)) > 0
             )
             if not dense_output or will_tile:
-                recorded = Scheduler._workspace_insertion_record(cin)
+                # Recording is a plan-construction concern.  Ordinary release
+                # auto-scheduling owns only the legacy mutation and must not
+                # depend on this helper when no recording sink was requested.
+                if plan_workspace is not None:
+                    recorded = Scheduler._workspace_insertion_record(cin)
                 cin = Scheduler.insert_workspace(cin, allow_dense=True)
                 if plan_workspace is not None:
                     materialized = {
@@ -3350,6 +3357,19 @@ class Scheduler:
             # it papers over is documented as a legacy observation.
             if not dense_output or (plan_tiles is not None and plan_tiles):
                 plan_workspace.append(recorded)
+            elif require_complete_plan:
+                # A dense root reduction is the one established legacy
+                # divergence: plan-free auto inserts a pure-overhead workspace,
+                # while Schedule()/ScheduledCIN replay intentionally elides it.
+                # Returning workspace=None here would falsely claim that the
+                # plan is a complete recording of production auto decisions.
+                # Fail closed until that materialize-vs-elide decision has its
+                # own typed representation and measured LoopIR lowering.
+                raise UnsupportedFeature(
+                    "stage=auto plan recording: dense root-workspace "
+                    "materialization is not represented by the current "
+                    "automatic LoopPlan replay contract"
+                )
         return cin
 
     @staticmethod
@@ -3489,7 +3509,10 @@ class Scheduler:
         ``provenance="auto"`` LoopPlan instead of surviving only as private
         tree surgery.  The mutable surgery result is discarded exactly as
         :meth:`apply_schedule` discards it; release dispatch does not consume
-        this entry yet.
+        this entry yet.  The established dense root-workspace insertion cannot
+        yet be represented without changing the empty-Schedule replay contract,
+        so this entry fails closed on that family rather than returning an
+        incomplete plan.
         """
 
         options, costs = _scheduler_costs_at_boundary(costs, compile_options)
@@ -3540,6 +3563,7 @@ class Scheduler:
                     scheduler_policy=scheduler_policy,
                     plan_tiles=auto_tiles,
                     plan_workspace=auto_workspace,
+                    require_complete_plan=True,
                 )
                 plan = verify_loop_plan(
                     normalized,
