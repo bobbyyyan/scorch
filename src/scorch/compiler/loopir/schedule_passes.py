@@ -1561,12 +1561,17 @@ def _collect_result_writes(root: Stmt, result: object) -> List[Stmt]:
 def _result_tile_prefix_rank(result_tile: ResultTile) -> int:
     """Admit one rank>=2 heap result-tile fact and return its prefix rank.
 
-    The compacted result's dense prefix is exactly ``result_prefix``; its
-    trailing storage level is the packed free axis.  Everything downstream
-    — chain length, prefix loop positions, the compact linearization, and
-    the copy-out extent — is derived from this one number, so the family
-    admits rank-2 and the audited multi-prefix ranks by the same rule
-    rather than by enumerating shapes.
+    ``result_prefix`` is expressed in physical storage order while
+    ``access_indices`` is expressed in logical mode order.  Their exact
+    correspondence therefore needs the result declaration's level-to-mode
+    mapping and is checked in :func:`apply_result_tile` (and by the
+    normalized-CIN plan verifier).  This helper owns only the declaration-
+    independent rank relationship.
+
+    Everything downstream — chain length, prefix loop positions, the compact
+    linearization, and the copy-out extent — is derived from this one number,
+    so the family admits rank-2 and the audited multi-prefix ranks by the same
+    rule rather than by enumerating shapes.
     """
 
     prefix_rank = (
@@ -1578,16 +1583,14 @@ def _result_tile_prefix_rank(result_tile: ResultTile) -> int:
         prefix_rank < 1
         or type(result_tile.access_indices) is not tuple
         or len(result_tile.access_indices) != prefix_rank + 1
-        or result_tile.access_indices[-1] != result_tile.tile_loop.index_id
-        or result_tile.access_indices[:-1] != result_tile.result_prefix
         or result_tile.result_level != prefix_rank
     ):
         _fail(
             "invalid_schedule_result_tile",
             "the migrated heap family compacts an all-dense result of rank "
             "at least two whose trailing storage level is the tiled free "
-            "axis and whose remaining logical axes are the tile's dense "
-            "prefix, in order",
+            "axis and whose remaining physical levels are the tile's dense "
+            "prefix",
         )
     return prefix_rank
 
@@ -1710,16 +1713,6 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
                 "invalid_schedule_result_tile",
                 "the composed panel origin and window must be one schedule " "pair",
             )
-    if (
-        tuple(cast(DenseFor, loop).index for loop in prefix_loops)
-        != result_tile.result_prefix
-    ):
-        _fail(
-            "invalid_schedule_result_tile",
-            "the result tile's dense prefix loops must be the chain's "
-            "prefix loops in the result's logical mode order",
-        )
-
     decls = {decl.symbol: decl for decl in program.tensors}
     result_decl = decls.get(result_tile.result_id)
     if (
@@ -1732,6 +1725,30 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
             "invalid_schedule_result_tile",
             "the compacted result must be a declared all-dense output whose "
             "rank is one more than the tile's dense prefix",
+        )
+    assert result_decl is not None
+    physical_prefix = tuple(
+        result_tile.access_indices[level.mode]
+        for level in result_decl.levels[:prefix_rank]
+    )
+    packed_index = result_tile.access_indices[result_decl.levels[prefix_rank].mode]
+    if (
+        physical_prefix != result_tile.result_prefix
+        or packed_index != result_tile.tile_loop.index_id
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the result tile's physical prefix and trailing packed loop must "
+            "match its logical access through the result's level-to-mode map",
+        )
+    if (
+        tuple(cast(DenseFor, loop).index for loop in prefix_loops)
+        != result_tile.result_prefix
+    ):
+        _fail(
+            "invalid_schedule_result_tile",
+            "the result tile's dense prefix loops must be the chain's "
+            "prefix loops in physical storage order",
         )
 
     def _write_index_ids(write: Stmt) -> Optional[Tuple[IndexId, ...]]:
