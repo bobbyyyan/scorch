@@ -745,8 +745,8 @@ def test_apply_schedule_plan_provenance_gate(provenance):
     )
 
 
-def test_apply_schedule_plan_admits_the_tile_free_auto_family():
-    """A tile-free cost-model order is a migrated automatic plan now."""
+def test_apply_schedule_plan_admits_the_tile_free_auto_replay_contract():
+    """A verified tile-free auto-replay order is a migrated plan family."""
 
     cin, (i, k, j) = build_matmul_ikj()
     lowering = lower(cin)

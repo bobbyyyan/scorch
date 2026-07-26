@@ -2059,6 +2059,29 @@ def test_root_workspace_auto_plan_records_the_replay_contract() -> None:
     assert str(replayed) != str(surgery)
 
 
+def test_plan_free_root_workspace_origin_fails_closed() -> None:
+    """F4 must not return a plan that silently drops a real workspace decision."""
+
+    with pytest.raises(
+        UnsupportedFeature,
+        match="dense root-workspace materialization is not represented",
+    ):
+        Scheduler.auto_schedule_plan(_build_root_reduction())
+
+
+def test_release_auto_schedule_does_not_depend_on_plan_recording() -> None:
+    """The ordinary release mutation path must not call recording-only helpers."""
+
+    expected = Scheduler.auto_schedule(_build_dense_matmul())
+    with patch.object(
+        Scheduler,
+        "_workspace_insertion_record",
+        side_effect=AssertionError("release scheduling must not record a plan"),
+    ):
+        actual = Scheduler.auto_schedule(_build_dense_matmul())
+    assert str(actual) == str(expected)
+
+
 def test_auto_schedule_plan_originates_the_production_decisions() -> None:
     """The F4 origination replays identically to the plan-free scheduler."""
 
@@ -2092,13 +2115,9 @@ def test_auto_schedule_plan_originates_the_production_decisions() -> None:
 
 
 def test_auto_schedule_plan_scalar_cin_records_the_empty_plan() -> None:
-    i = IndexVar("i")
-    result = TensorVar("C", fmt="d")
-    source = TensorVar("A", fmt="d")
-    result[i] = source[i]
-    loop_free = Scheduler.auto_schedule_plan(ForAll(i, result._assignment))
+    loop_free = Scheduler.auto_schedule_plan(_build_scalar_assignment())
     assert loop_free.verified_loop_plan.provenance == "auto"
-    assert len(loop_free.verified_loop_plan.loop_order) == 1
+    assert loop_free.verified_loop_plan.loop_order == ()
 
 
 def test_auto_workspace_fact_must_equal_the_derived_decision() -> None:
