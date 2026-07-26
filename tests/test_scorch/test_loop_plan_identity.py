@@ -3,6 +3,7 @@
 import hashlib
 import json
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from scorch.compiler.cin import (
     Operation,
     TensorAssign,
     TensorVar,
+    UnaryOp,
 )
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.compilation_context import CompilationContext, CompilerStageId
@@ -493,6 +495,31 @@ def test_request_identity_rejects_cyclic_index_expression() -> None:
         )
 
 
+def test_request_identity_counts_unary_rhs_without_legacy_recursion() -> None:
+    unary = build_elementwise()
+    assert isinstance(unary.stmt, ForAll)
+    assignment = unary.stmt.stmt
+    assert isinstance(assignment, TensorAssign)
+    assignment.rhs = UnaryOp(Operation.ADD, assignment.rhs)
+
+    dump = loopir_request_dump(
+        unary,
+        None,
+        (4, 5),
+        ELEMENTWISE_BINDINGS,
+        compile_options=IDENTITY_OPTIONS,
+    )
+    assert json.loads(dump)["schema"] == CANONICAL_REQUEST_SCHEMA
+    with pytest.raises(VerificationError, match="cover every declared input"):
+        loopir_request_dump(
+            unary,
+            None,
+            (4, 5),
+            ELEMENTWISE_BINDINGS[:1],
+            compile_options=IDENTITY_OPTIONS,
+        )
+
+
 @pytest.mark.parametrize("forgery", ("nan", "wrong-type", "ghost"))
 def test_request_identity_revalidates_nested_compile_options(forgery) -> None:
     artifact = scheduled(build_matmul, BASE_SCHEDULE)
@@ -507,6 +534,102 @@ def test_request_identity_revalidates_nested_compile_options(forgery) -> None:
 
     with pytest.raises(VerificationError):
         request_identity(artifact, compile_options=options)
+
+
+@pytest.mark.parametrize(
+    ("owner", "field_name"),
+    (
+        ("options", "enabled_llir_passes"),
+        ("build", "extra_cflags"),
+        ("build", "direct_extension_cflags"),
+        ("build", "special_kernel_cflags"),
+        ("build", "extra_ldflags"),
+        ("build", "torch_include_paths"),
+    ),
+)
+def test_request_identity_rejects_constructor_normalized_lists(
+    owner,
+    field_name,
+) -> None:
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+    options = CompileOptions.from_environment()
+    carrier = options if owner == "options" else options.build
+    object.__setattr__(carrier, field_name, list(getattr(carrier, field_name)))
+
+    with pytest.raises(VerificationError, match="stored as an exact tuple"):
+        request_identity(artifact, compile_options=options)
+
+
+def test_request_identity_does_not_consume_forged_option_iterators() -> None:
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+    options = CompileOptions.from_environment()
+    original = options.build.extra_cflags
+    forged = iter(original)
+    object.__setattr__(options.build, "extra_cflags", forged)
+
+    with pytest.raises(VerificationError, match="stored as an exact tuple"):
+        request_identity(artifact, compile_options=options)
+    assert tuple(forged) == original
+
+
+def test_request_identity_does_not_reprobe_darwin_snapshot() -> None:
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+    options = CompileOptions.from_environment()
+    if options.build.darwin_toolchain is None:
+        pytest.skip("Darwin snapshot required for the host-probe regression")
+
+    with patch(
+        "scorch.compiler.compile_options.os.path.isdir",
+        side_effect=AssertionError("identity must not re-probe the host"),
+    ):
+        request_identity(artifact, compile_options=options)
+
+
+def test_request_identity_rejects_hostile_container_subclasses_without_calls() -> None:
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+
+    class HostileList(list):
+        calls = 0
+
+        def __iter__(self):
+            self.calls += 1
+            raise RuntimeError("caller-controlled iteration")
+
+        def __len__(self):
+            self.calls += 1
+            raise RuntimeError("caller-controlled length")
+
+    hostile_result = HostileList((4, 6))
+    hostile_bindings = HostileList(MATMUL_BINDINGS)
+    hostile_pair = HostileList(MATMUL_BINDINGS[0])
+    hostile_shape = HostileList((4, 5))
+    probes = (
+        (hostile_result, MATMUL_BINDINGS),
+        ((4, 6), hostile_bindings),
+        ((4, 6), (hostile_pair, MATMUL_BINDINGS[1])),
+        ((4, 6), ((hostile_shape, F32), MATMUL_BINDINGS[1])),
+    )
+    for result_shape, bindings in probes:
+        with pytest.raises(VerificationError):
+            loopir_request_dump(
+                artifact.normalized_cin,
+                artifact.verified_loop_plan,
+                result_shape,
+                bindings,
+                compile_options=IDENTITY_OPTIONS,
+            )
+    assert (
+        sum(
+            probe.calls
+            for probe in (
+                hostile_result,
+                hostile_bindings,
+                hostile_pair,
+                hostile_shape,
+            )
+        )
+        == 0
+    )
 
 
 def test_compile_options_are_part_of_the_request_identity() -> None:
