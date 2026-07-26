@@ -177,11 +177,45 @@ def _verify_identity_cin(cin: object) -> IndexStmt:
     return cin
 
 
+def _rhs_binding_count(cin: IndexStmt) -> int:
+    """Count ABI input occurrences without the legacy recursive visitor.
+
+    The established ABI visits only the producer of a ``Where`` so its
+    consumer-side workspace read does not become a runtime input.  Mirror that
+    occurrence contract structurally while handling every verifier-supported
+    expression kind, including ``UnaryOp``.
+    """
+
+    def count_expr(expr: IndexExpr) -> int:
+        if isinstance(expr, TensorAccess):
+            return 1
+        if isinstance(expr, BinaryOp):
+            return count_expr(expr.left) + count_expr(expr.right)
+        if isinstance(expr, UnaryOp):
+            return count_expr(expr.expr)
+        raise VerificationError(
+            "loopir request identity received an unsupported RHS expression"
+        )
+
+    def count_stmt(stmt: IndexStmt) -> int:
+        if isinstance(stmt, ForAll):
+            return count_stmt(stmt.stmt)
+        if isinstance(stmt, Where):
+            return count_stmt(stmt.producer)
+        if isinstance(stmt, TensorAssign):
+            return count_expr(stmt.rhs)
+        raise VerificationError(
+            "loopir request identity received an unsupported CIN statement"
+        )
+
+    return count_stmt(cin)
+
+
 def _shape_payload(value: object, owner: str) -> List[int]:
-    if not isinstance(value, (tuple, list)):
+    if type(value) not in (tuple, list):
         raise VerificationError(f"{owner} must be a tuple or list of exact ints")
     result: List[int] = []
-    for extent in value:
+    for extent in cast(Sequence[object], value):
         if (
             type(extent) is not int
             or isinstance(extent, bool)
@@ -265,33 +299,40 @@ def _compile_options_payload(options: object) -> object:
             "DarwinToolchainOptions",
         )
 
-    # Frozen dataclasses can still be forged through ``object.__setattr__``.
-    # Rebuild every carrier from its exact stored fields so each existing
-    # constructor remains the one authority for primitive and cross-field
-    # invariants instead of trusting a previously validated outer shell.
-    cost_model = replace(typed_options.scheduler.cost_model)
-    scheduler = replace(typed_options.scheduler, cost_model=cost_model)
-    pass_options = replace(typed_options.verification.llir_pass_options)
-    verification = replace(
-        typed_options.verification,
-        llir_pass_options=pass_options,
-    )
-    darwin_toolchain = (
-        None
-        if typed_options.build.darwin_toolchain is None
-        else replace(typed_options.build.darwin_toolchain)
-    )
-    build = replace(
-        typed_options.build,
-        darwin_toolchain=darwin_toolchain,
-    )
-    return replace(
-        typed_options,
-        requested_schedule=None,
-        scheduler=scheduler,
-        verification=verification,
-        build=build,
-    ).cache_key
+    for owner, value in (
+        ("CompileOptions.enabled_llir_passes", typed_options.enabled_llir_passes),
+        ("KernelBuildOptions.extra_cflags", typed_options.build.extra_cflags),
+        (
+            "KernelBuildOptions.direct_extension_cflags",
+            typed_options.build.direct_extension_cflags,
+        ),
+        (
+            "KernelBuildOptions.special_kernel_cflags",
+            typed_options.build.special_kernel_cflags,
+        ),
+        ("KernelBuildOptions.extra_ldflags", typed_options.build.extra_ldflags),
+        (
+            "KernelBuildOptions.torch_include_paths",
+            typed_options.build.torch_include_paths,
+        ),
+    ):
+        if type(value) is not tuple:
+            raise VerificationError(
+                f"loopir request identity {owner} must be stored as an exact tuple"
+            )
+
+    # Frozen carriers can still be forged through ``object.__setattr__``.
+    # Re-run the pure stored-state validators without reconstructing their
+    # constructor inputs: reconstruction would normalize/consume hostile
+    # iterables and Darwin construction would improperly probe the host again.
+    typed_options.scheduler.cost_model.__post_init__()
+    typed_options.scheduler.__post_init__()
+    typed_options.verification.__post_init__()
+    if typed_options.build.darwin_toolchain is not None:
+        typed_options.build.darwin_toolchain._validate_stored_policy()
+    typed_options.build.__post_init__()
+    typed_options.__post_init__()
+    return replace(typed_options, requested_schedule=None).cache_key
 
 
 def _entity_maps(
@@ -537,11 +578,11 @@ def loopir_request_dump(
 
     verified_cin = _verify_identity_cin(cin)
     shape_payload = _shape_payload(result_shape, "loopir request result shape")
-    if not isinstance(input_bindings, (tuple, list)):
+    if type(input_bindings) not in (tuple, list):
         raise VerificationError("loopir request input bindings must be a tuple or list")
     bindings_payload: List[object] = []
     for position, binding in enumerate(input_bindings):
-        if not isinstance(binding, (tuple, list)) or len(binding) != 2:
+        if type(binding) not in (tuple, list) or len(binding) != 2:
             raise VerificationError(
                 f"loopir request input binding {position} must be a shape/dtype pair"
             )
@@ -554,7 +595,7 @@ def loopir_request_dump(
                 "dtype": _dtype_token(dtype),
             }
         )
-    if len(bindings_payload) != len(verified_cin.get_rhs_tensor_vars()):
+    if len(bindings_payload) != _rhs_binding_count(verified_cin):
         raise VerificationError(
             "loopir request input bindings must cover every declared input exactly"
         )

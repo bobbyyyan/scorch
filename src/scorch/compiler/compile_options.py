@@ -228,7 +228,9 @@ class DarwinToolchainOptions:
     sdk_root: str = _DARWIN_SDK_ROOT
     deployment_target: Optional[str] = None
 
-    def __post_init__(self) -> None:
+    def _validate_stored_policy(self) -> None:
+        """Validate immutable policy values without probing the host again."""
+
         if type(self.developer_dir) is not str:
             _raise_options_error(
                 "invalid_type",
@@ -253,18 +255,6 @@ class DarwinToolchainOptions:
                 "build.darwin_toolchain.sdk_root",
                 "the SDK must match the emitted CommandLineTools libc++ path",
             )
-        if not os.path.isdir(self.developer_dir):
-            _raise_options_error(
-                "darwin_toolchain_not_found",
-                "build.darwin_toolchain.developer_dir",
-                "the CommandLineTools developer directory does not exist",
-            )
-        if not os.path.isdir(self.sdk_root) or not os.path.isdir(_DARWIN_CXX_INCLUDE):
-            _raise_options_error(
-                "darwin_toolchain_not_found",
-                "build.darwin_toolchain.sdk_root",
-                "the CommandLineTools SDK or its libc++ headers do not exist",
-            )
         if self.deployment_target is not None:
             if type(self.deployment_target) is not str:
                 _raise_options_error(
@@ -281,6 +271,21 @@ class DarwinToolchainOptions:
                     "build.darwin_toolchain.deployment_target",
                     "expected a numeric macOS version with at most three components",
                 )
+
+    def __post_init__(self) -> None:
+        self._validate_stored_policy()
+        if not os.path.isdir(self.developer_dir):
+            _raise_options_error(
+                "darwin_toolchain_not_found",
+                "build.darwin_toolchain.developer_dir",
+                "the CommandLineTools developer directory does not exist",
+            )
+        if not os.path.isdir(self.sdk_root) or not os.path.isdir(_DARWIN_CXX_INCLUDE):
+            _raise_options_error(
+                "darwin_toolchain_not_found",
+                "build.darwin_toolchain.sdk_root",
+                "the CommandLineTools SDK or its libc++ headers do not exist",
+            )
 
     @property
     def cache_key(self) -> tuple[object, ...]:
