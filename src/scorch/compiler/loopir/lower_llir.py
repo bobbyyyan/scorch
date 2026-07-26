@@ -3778,6 +3778,57 @@ def _validate_result_tile_policy(
         raise ValueError("heap result-tile policy delimiters are unbalanced")
 
 
+def _result_tile_expression_root_name(expr: object) -> Optional[str]:
+    """Return the exact C++ root identifier of one structured access."""
+
+    current = expr
+    visited: Set[int] = set()
+    while type(current) in (llir.ArrayAccess, llir.MemberAccess, llir.AddressOf):
+        if id(current) in visited:
+            raise ValueError("heap result-tile access root must be acyclic")
+        visited.add(id(current))
+        if type(current) is llir.ArrayAccess:
+            current = cast(llir.ArrayAccess, current).array
+        elif type(current) is llir.MemberAccess:
+            current = cast(llir.MemberAccess, current).base
+        else:
+            current = cast(llir.AddressOf, current).operand
+    if type(current) is llir.Var:
+        name = cast(llir.Var, current).name
+        if type(name) is str:
+            return name
+    return None
+
+
+def _result_tile_protected_uses(
+    value: object,
+    protected_names: Set[str],
+) -> Set[str]:
+    """Collect protected exact-Var uses from one validated LLIR value."""
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_result_tile_protected_uses",
+                )
+            )
+            self.names: Set[str] = set()
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if type(node) is llir.Var and node.name in protected_names:
+                self.names.add(node.name)
+
+    collector = _Collector()
+    if type(value) in (list, tuple):
+        for item in cast(Any, value):
+            collector.walk(item)
+    else:
+        collector.walk(cast(Any, value))
+    return collector.names
+
+
 class _ResultTileTextValidator(LLIRWalker):
     """Reject every verbatim-text route the C++ target emits directly.
 
@@ -3854,8 +3905,20 @@ class _ResultTileTextValidator(LLIRWalker):
             )
 
     def _check_call_name(self, node: llir.Node) -> None:
-        if not _safe_cpp_qualified_name(getattr(node, "name", None)):
+        name = getattr(node, "name", None)
+        if not _safe_cpp_qualified_name(name):
             raise ValueError(f"{type(node).__name__}.name must be a qualified C++ name")
+        if (
+            type(node) is llir.FunctionCall
+            and _result_tile_protected_uses(
+                getattr(node, "args", None),
+                self.protected_names,
+            )
+            and name != "torch::empty"
+        ):
+            raise ValueError(
+                "FunctionCall exposes protected result state to an unowned call"
+            )
 
     def _check_qualified_name(self, node: llir.Node) -> None:
         self._identifier(
@@ -3865,10 +3928,32 @@ class _ResultTileTextValidator(LLIRWalker):
         self._identifier(getattr(node, "name", None), "QualifiedName.name")
 
     def _check_member_name(self, node: llir.Node) -> None:
-        self._identifier(
+        member = self._identifier(
             getattr(node, "member", None),
             f"{type(node).__name__}.member",
         )
+        if type(node) is llir.MemberAccess:
+            return
+        root_name = _result_tile_expression_root_name(getattr(node, "base", None))
+        if root_name not in self.protected_names:
+            return
+        data_pointer_roots = {
+            name for name in self.protected_names if name.endswith("_values_torch")
+        }
+        if (
+            type(node) is llir.MemberCall
+            and member == "data_ptr"
+            and root_name in data_pointer_roots
+        ):
+            return
+        raise ValueError(
+            f"{type(node).__name__} mutates or calls protected result state"
+        )
+
+    def _check_address_of(self, node: llir.Node) -> None:
+        root_name = _result_tile_expression_root_name(getattr(node, "operand", None))
+        if root_name in self.protected_names:
+            raise ValueError("AddressOf exposes protected result state")
 
     def _check_literal(self, node: llir.Node) -> None:
         value = getattr(node, "value", None)
@@ -3920,6 +4005,19 @@ class _ResultTileTextValidator(LLIRWalker):
     def _check_if_then_else(self, node: llir.Node) -> None:
         if type(getattr(node, "make_last_case_else", None)) is not bool:
             raise ValueError("IfThenElse.make_last_case_else must be a bool")
+        cond = getattr(node, "cond", None)
+        then_body = getattr(node, "then_body", None)
+        cond_list = getattr(node, "cond_list", None)
+        then_body_list = getattr(node, "then_body_list", None)
+        if cond_list:
+            if not then_body_list:
+                raise ValueError("IfThenElse with cond_list requires then_body_list")
+            if len(cond_list) != len(then_body_list):
+                raise ValueError("IfThenElse condition and body counts must match")
+        elif cond is None:
+            raise ValueError("IfThenElse requires a condition")
+        elif not then_body:
+            raise ValueError("IfThenElse requires a then body")
 
     def _check_function(self, node: llir.Node) -> None:
         self._identifier(getattr(node, "name", None), "Function.name")
@@ -3990,6 +4088,7 @@ class _ResultTileTextValidator(LLIRWalker):
         llir.MemberAccess: _check_member_name,
         llir.MemberCall: _check_member_name,
         llir.MemberCallStmt: _check_member_name,
+        llir.AddressOf: _check_address_of,
         llir.Literal: _check_literal,
         llir.VarInit: _check_var_init,
         llir.VarDecl: _check_var_decl,
@@ -4044,8 +4143,14 @@ class _ResultTileBindingValidator:
     declarations that are not explicit statement nodes.
     """
 
-    def __init__(self, protected_names: Set[str]) -> None:
+    def __init__(
+        self,
+        protected_names: Set[str],
+        *,
+        result_name: Optional[str],
+    ) -> None:
         self.protected_names = protected_names
+        self.result_name = result_name
 
     @staticmethod
     def _name(var: object, owner: str) -> str:
@@ -4090,15 +4195,29 @@ class _ResultTileBindingValidator:
             protected_names=self.protected_names,
         )
 
-    def _bind_sequence(self, statements: object, visible_names: Set[str]) -> None:
+    def _bind_sequence(
+        self,
+        statements: object,
+        visible_names: Set[str],
+        *,
+        loop_depth: int,
+    ) -> None:
         if type(statements) not in (list, tuple):
             raise ValueError("statement scope must be a list or tuple")
         for statement in cast(Any, statements):
             if type(statement) in (list, tuple):
                 # Nested containers emit no braces and therefore share scope.
-                self._bind_sequence(statement, visible_names)
+                self._bind_sequence(
+                    statement,
+                    visible_names,
+                    loop_depth=loop_depth,
+                )
             elif isinstance(statement, llir.Stmt):
-                self._bind_statement(statement, visible_names)
+                self._bind_statement(
+                    statement,
+                    visible_names,
+                    loop_depth=loop_depth,
+                )
             else:
                 raise ValueError("statement scope contains a non-statement value")
 
@@ -4124,22 +4243,51 @@ class _ResultTileBindingValidator:
         visible_names: Set[str],
     ) -> None:
         if type(statement) is llir.FunctionCallStmt:
+            protected_uses = _result_tile_protected_uses(
+                statement.args,
+                self.protected_names,
+            )
+            allowed_calls = {
+                "scorch_native::validate_jit_result_shape",
+                "scorch_zero_dense",
+            }
+            if protected_uses and statement.name not in allowed_calls:
+                raise ValueError(
+                    "FunctionCallStmt exposes protected result state to an "
+                    "unowned call"
+                )
             self._bind_expressions(statement.args, visible_names)
             return
         if type(statement) is llir.MemberCallStmt:
+            # The text validator rejects protected receivers before binding.
             self._bind_expression(statement.base, visible_names)
             self._bind_expressions(statement.args, visible_names)
             return
         if type(statement) is llir.GuardedCallStmt:
+            if _result_tile_protected_uses(
+                statement.call.args,
+                self.protected_names,
+            ):
+                raise ValueError("GuardedCallStmt exposes protected result state")
             self._bind_expression(statement.cond, visible_names)
             self._bind_expressions(statement.call.args, visible_names)
             return
         raise ValueError("expected one exact LLIR call statement")
 
-    def _bind_for_loop(self, loop: llir.ForLoop, visible_names: Set[str]) -> None:
+    def _bind_for_loop(
+        self,
+        loop: llir.ForLoop,
+        visible_names: Set[str],
+        *,
+        loop_depth: int,
+    ) -> None:
         before = loop.before_parallel_body
         if before:
-            self._bind_sequence(before, visible_names)
+            self._bind_sequence(
+                before,
+                visible_names,
+                loop_depth=loop_depth,
+            )
 
         atomic = getattr(loop, "_use_atomic_scheduling", False)
         has_split_region = bool(
@@ -4151,6 +4299,15 @@ class _ResultTileBindingValidator:
             raise ValueError(
                 "ForLoop.before_parallel_body would not be emitted by codegen"
             )
+
+        if atomic:
+            counter_name = _ResultTileTextValidator._identifier(
+                getattr(loop, "_atomic_counter_var", None),
+                "ForLoop._atomic_counter_var",
+            )
+            # Codegen emits the atomic counter after before_parallel_body and
+            # before the parallel pragma, so the policy can refer to it.
+            self._declare_name(counter_name, visible_names)
 
         if loop.omp_num_threads is not None:
             if not atomic and not loop.omp_parallel_for:
@@ -4182,34 +4339,51 @@ class _ResultTileBindingValidator:
                 raise ValueError(
                     "atomic ForLoop.omp_chunk_expr would not be emitted by codegen"
                 )
-            counter_name = _ResultTileTextValidator._identifier(
-                getattr(loop, "_atomic_counter_var", None),
-                "ForLoop._atomic_counter_var",
-            )
-            self._declare_name(counter_name, visible_names)
             parallel_names = set(visible_names)
             if loop.pre_parallel_body:
-                self._bind_sequence(loop.pre_parallel_body, parallel_names)
-            for field in ("_atomic_chunk_var", "_loop_bound"):
-                required_name = _ResultTileTextValidator._identifier(
-                    getattr(loop, field, None),
-                    f"ForLoop.{field}",
+                self._bind_sequence(
+                    loop.pre_parallel_body,
+                    parallel_names,
+                    loop_depth=loop_depth,
                 )
-                if required_name not in parallel_names:
-                    raise ValueError(
-                        f"ForLoop.{field} references {required_name!r} "
-                        "before a visible declaration"
-                    )
-            inner_names = set(parallel_names)
-            inner_names.update(("_start", "_end"))
+            chunk_name = _ResultTileTextValidator._identifier(
+                getattr(loop, "_atomic_chunk_var", None),
+                "ForLoop._atomic_chunk_var",
+            )
+            if chunk_name not in parallel_names:
+                raise ValueError(
+                    "ForLoop._atomic_chunk_var references "
+                    f"{chunk_name!r} before a visible declaration"
+                )
+            after_start_names = set(parallel_names)
+            after_start_names.add("_start")
+            bound_name = _ResultTileTextValidator._identifier(
+                getattr(loop, "_loop_bound", None),
+                "ForLoop._loop_bound",
+            )
+            if bound_name not in after_start_names:
+                raise ValueError(
+                    f"ForLoop._loop_bound references {bound_name!r} "
+                    "before a visible declaration"
+                )
+            inner_names = set(after_start_names)
+            inner_names.add("_end")
             if loop.init is None:
                 loop_name = "i"
             else:
                 loop_name = self._name(loop.init.var, "ForLoop.init.var")
             inner_names.add(loop_name)
-            self._bind_sequence(loop.body, inner_names)
+            self._bind_sequence(
+                loop.body,
+                inner_names,
+                loop_depth=loop_depth + 1,
+            )
             if loop.post_parallel_body:
-                self._bind_sequence(loop.post_parallel_body, parallel_names)
+                self._bind_sequence(
+                    loop.post_parallel_body,
+                    parallel_names,
+                    loop_depth=loop_depth,
+                )
             return
 
         if loop.omp_chunk_expr is not None and not loop.omp_parallel_for:
@@ -4218,7 +4392,11 @@ class _ResultTileBindingValidator:
         if has_split_region:
             parallel_names = set(visible_names)
             if loop.pre_parallel_body:
-                self._bind_sequence(loop.pre_parallel_body, parallel_names)
+                self._bind_sequence(
+                    loop.pre_parallel_body,
+                    parallel_names,
+                    loop_depth=loop_depth,
+                )
             if loop.omp_chunk_expr is not None:
                 self._bind_policy(
                     loop.omp_chunk_expr,
@@ -4232,10 +4410,27 @@ class _ResultTileBindingValidator:
             if type(loop.update) is llir.FunctionCall:
                 self._bind_expression(loop.update, loop_names)
             else:
-                self._bind_statement(cast(llir.Stmt, loop.update), loop_names)
-            self._bind_sequence(loop.body, set(loop_names))
+                self._bind_statement(
+                    cast(llir.Stmt, loop.update),
+                    loop_names,
+                    loop_depth=loop_depth,
+                    loop_update_name=(
+                        self._name(loop.init.var, "ForLoop.init.var")
+                        if loop.init is not None
+                        else None
+                    ),
+                )
+            self._bind_sequence(
+                loop.body,
+                set(loop_names),
+                loop_depth=loop_depth + 1,
+            )
             if loop.post_parallel_body:
-                self._bind_sequence(loop.post_parallel_body, parallel_names)
+                self._bind_sequence(
+                    loop.post_parallel_body,
+                    parallel_names,
+                    loop_depth=loop_depth,
+                )
             return
 
         if loop.omp_chunk_expr is not None:
@@ -4251,27 +4446,61 @@ class _ResultTileBindingValidator:
         if type(loop.update) is llir.FunctionCall:
             self._bind_expression(loop.update, loop_names)
         else:
-            self._bind_statement(cast(llir.Stmt, loop.update), loop_names)
-        self._bind_sequence(loop.body, set(loop_names))
+            self._bind_statement(
+                cast(llir.Stmt, loop.update),
+                loop_names,
+                loop_depth=loop_depth,
+                loop_update_name=(
+                    self._name(loop.init.var, "ForLoop.init.var")
+                    if loop.init is not None
+                    else None
+                ),
+            )
+        self._bind_sequence(
+            loop.body,
+            set(loop_names),
+            loop_depth=loop_depth + 1,
+        )
 
     def _bind_if_then_else(
         self,
         conditional: llir.IfThenElse,
         visible_names: Set[str],
+        *,
+        loop_depth: int,
     ) -> None:
         if conditional.cond is not None:
             self._bind_expression(conditional.cond, visible_names)
         if conditional.then_body is not None:
-            self._bind_sequence(conditional.then_body, set(visible_names))
+            self._bind_sequence(
+                conditional.then_body,
+                set(visible_names),
+                loop_depth=loop_depth,
+            )
         if conditional.cond_list is not None:
             self._bind_expressions(conditional.cond_list, visible_names)
         if conditional.then_body_list is not None:
             for branch in conditional.then_body_list:
-                self._bind_sequence(branch, set(visible_names))
+                self._bind_sequence(
+                    branch,
+                    set(visible_names),
+                    loop_depth=loop_depth,
+                )
         if conditional.else_body is not None:
-            self._bind_sequence(conditional.else_body, set(visible_names))
+            self._bind_sequence(
+                conditional.else_body,
+                set(visible_names),
+                loop_depth=loop_depth,
+            )
 
-    def _bind_statement(self, statement: llir.Stmt, visible_names: Set[str]) -> None:
+    def _bind_statement(
+        self,
+        statement: llir.Stmt,
+        visible_names: Set[str],
+        *,
+        loop_depth: int,
+        loop_update_name: Optional[str] = None,
+    ) -> None:
         statement_type = type(statement)
         if statement_type in (
             llir.VarInit,
@@ -4282,10 +4511,45 @@ class _ResultTileBindingValidator:
             self._bind_declaration(statement, visible_names)
         elif statement_type is llir.Assign:
             assignment = cast(llir.Assign, statement)
+            target_root = _result_tile_expression_root_name(assignment.var)
+            if target_root in self.protected_names:
+                metadata = getattr(assignment.var, "tensor_access", None)
+                owns_result_write = bool(
+                    type(assignment.var) is llir.ArrayAccess
+                    and type(metadata) is llir.TensorAccessMetadata
+                    and metadata.role is llir.TensorAccessRole.RESULT_WRITE
+                )
+                owns_terminal_assembly = bool(
+                    type(assignment.var) is llir.MemberAccess
+                    and target_root == self.result_name
+                )
+                owns_position_update = bool(
+                    target_root == loop_update_name
+                    and self.result_name is not None
+                    and target_root is not None
+                    and target_root.startswith(f"p{self.result_name}")
+                )
+                if not (
+                    owns_result_write or owns_terminal_assembly or owns_position_update
+                ):
+                    raise ValueError(
+                        f"Assign mutates protected result state {target_root!r}"
+                    )
             self._bind_expression(assignment.var, visible_names)
             self._bind_expression(assignment.value, visible_names)
         elif statement_type is llir.Increment:
             increment = cast(llir.Increment, statement)
+            target_root = _result_tile_expression_root_name(increment.var)
+            owns_position_update = bool(
+                target_root == loop_update_name
+                and self.result_name is not None
+                and target_root is not None
+                and target_root.startswith(f"p{self.result_name}")
+            )
+            if target_root in self.protected_names and not owns_position_update:
+                raise ValueError(
+                    f"Increment mutates protected result state {target_root!r}"
+                )
             self._bind_expression(increment.var, visible_names)
         elif statement_type is llir.Return:
             return_statement = cast(llir.Return, statement)
@@ -4297,31 +4561,47 @@ class _ResultTileBindingValidator:
         ):
             self._bind_call_statement(statement, visible_names)
         elif statement_type is llir.ForLoop:
-            self._bind_for_loop(cast(llir.ForLoop, statement), visible_names)
+            self._bind_for_loop(
+                cast(llir.ForLoop, statement),
+                visible_names,
+                loop_depth=loop_depth,
+            )
         elif statement_type is llir.ForLoopAuto:
             loop = cast(llir.ForLoopAuto, statement)
             self._bind_expression(loop.array, visible_names)
             loop_names = set(visible_names)
             self._declare_var(loop.var, "ForLoopAuto.var", loop_names)
-            self._bind_sequence(loop.body, loop_names)
+            self._bind_sequence(
+                loop.body,
+                loop_names,
+                loop_depth=loop_depth + 1,
+            )
         elif statement_type is llir.WhileLoop:
             while_loop = cast(llir.WhileLoop, statement)
             self._bind_expression(while_loop.cond, visible_names)
-            self._bind_sequence(while_loop.body, set(visible_names))
+            self._bind_sequence(
+                while_loop.body,
+                set(visible_names),
+                loop_depth=loop_depth + 1,
+            )
         elif statement_type is llir.IfThenElse:
             self._bind_if_then_else(
                 cast(llir.IfThenElse, statement),
                 visible_names,
+                loop_depth=loop_depth,
             )
         elif statement_type is llir.Function:
             raise ValueError("nested LLIR Function definitions are not supported")
         elif statement_type in (
             llir.Comment,
             llir.BlankLine,
-            llir.Continue,
-            llir.Break,
         ):
             return
+        elif statement_type in (llir.Continue, llir.Break):
+            if loop_depth < 1:
+                raise ValueError(
+                    f"{statement_type.__name__} requires an enclosing loop"
+                )
         elif statement_type is llir.RawStmt:
             # The text validator owns the more specific structured-only error.
             raise ValueError("heap result-tile completion requires structured LLIR")
@@ -4334,20 +4614,25 @@ class _ResultTileBindingValidator:
         visible_names: Set[str] = set()
         for argument in function.args:
             self._declare_var(argument, "Function.args", visible_names)
-        self._bind_sequence(function.body, visible_names)
+        self._bind_sequence(function.body, visible_names, loop_depth=0)
 
 
 def _validate_result_tile_rendered_text(
     function: llir.Function,
     *,
     protected_names: Set[str],
-) -> None:
+    result_name: Optional[str] = None,
+) -> Set[str]:
     """Close every verbatim-text route before proving heap result ownership."""
 
     validator = _ResultTileTextValidator(protected_names)
     validator.walk(function)
-    _ResultTileBindingValidator(protected_names).validate(function)
+    _ResultTileBindingValidator(
+        protected_names,
+        result_name=result_name,
+    ).validate(function)
     validator.validate_policies()
+    return set(validator.declared_names)
 
 
 def _direct_prefetch_targets_array(stmt: llir.Stmt, array_name: str) -> bool:
@@ -4434,6 +4719,7 @@ def _complete_result_tile_impl(
         result_name = lowering.result_decl.name
         protected_names = {
             result_name,
+            "result_shape",
             f"{result_name}_values",
             f"{result_name}_values_torch",
             f"{result_name}_capacity",
@@ -4452,6 +4738,7 @@ def _complete_result_tile_impl(
         _validate_result_tile_rendered_text(
             function,
             protected_names=protected_names,
+            result_name=result_name,
         )
     except (
         LLIRTraversalError,
@@ -4540,8 +4827,18 @@ def _complete_result_tile_impl(
             copy_prefix,
             copy_inner,
             copy_logical,
-        ) = _heap_result_tile_names(function, result_name, pack_dimension_name)
+        ) = _heap_result_tile_names(
+            function,
+            result_name,
+            pack_dimension_name,
+            reserved_names=_validate_result_tile_rendered_text(
+                function,
+                protected_names=protected_names,
+                result_name=result_name,
+            ),
+        )
     except (
+        LLIRTraversalError,
         AttributeError,
         RecursionError,
         RuntimeError,

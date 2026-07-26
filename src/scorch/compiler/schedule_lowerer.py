@@ -1042,11 +1042,17 @@ def _heap_result_storage_declaration(
 
 
 def _heap_result_tile_names(
-    function: llir.Function, result: str, tile_var: str
+    function: llir.Function,
+    result: str,
+    tile_var: str,
+    *,
+    reserved_names: Optional[set[str]] = None,
 ) -> Tuple[str, str, str, str, str, str, str, str]:
     """The deterministic generated-name family of one compact result tile."""
 
     used_names = _declared_names(function)
+    if reserved_names is not None:
+        used_names.update(reserved_names)
     compact_name = _unique_name(f"tiled_{result}", used_names)
     storage_name = _unique_name(f"{compact_name}_storage", used_names)
     init_prefix = _unique_name(f"{result}_tile_init", used_names)

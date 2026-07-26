@@ -1654,7 +1654,8 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
             "heap accumulation requires a direct dense-result reduction leaf",
         )
     kinds = tuple(type(node) for node in loops)
-    # One pack origin, the result's dense prefix loops in logical order, one
+    # One pack origin, the result's dense prefix loops in physical storage
+    # order, one
     # reduction loop, and the pack point loop.  ``prefix_rank`` is fixed by
     # the already-admitted result-tile fact, so the chain length and every
     # loop position below are derived, never searched.
