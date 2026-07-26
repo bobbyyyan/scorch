@@ -130,6 +130,28 @@ def build_union_add_to_dense():
     return ForAll(i, ForAll(j, assign))
 
 
+def build_dense_driver_before_csr():
+    """C[i,k,j] = X[i,k] * A[i,j], with X owning the row-bound spelling."""
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    x = TensorVar("X", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    c = TensorVar("C", fmt="ddd")
+    return ForAll(
+        i,
+        ForAll(
+            k,
+            ForAll(
+                j,
+                TensorAssign(
+                    c[i, k, j],
+                    CINBinaryOp(Operation.MUL, x[i, k], a[i, j]),
+                ),
+            ),
+        ),
+    )
+
+
 def build_dense_add_2d():
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="dd")
@@ -2774,6 +2796,58 @@ def test_anchor_source_is_byte_identical_to_legacy(case):
         compile_options=scheduled_options(schedule),
     )
     assert comparison.identical, f"{name} diverged from the legacy anchor"
+
+
+def test_merged_outer_anchor_keeps_the_legacy_row_only_policy():
+    """Merged iterator state is deliberately invisible to work discovery."""
+
+    comparison = compare_generated_sources(
+        build_union_add_to_dense(),
+        (4, 5),
+        (((4, 5), F32), ((4, 5), F32)),
+        compile_options=scheduled_options(
+            Schedule(
+                loop_order=("i", "j"),
+                parallel_loop="i",
+                tag="anch-merged-row",
+            )
+        ),
+    )
+    assert comparison.identical
+    expected = (
+        "num_threads(scorch_nthreads(-1, A0_size)) "
+        "schedule(dynamic, scorch_chunk(A0_size, -1))"
+    )
+    assert expected in comparison.legacy_cpp
+    assert expected in comparison.loopir_cpp
+
+
+def test_sparse_work_requires_the_exact_legacy_dense_bound_driver():
+    """An equal logical extent cannot substitute a different bound spelling."""
+
+    comparison = compare_generated_sources(
+        build_dense_driver_before_csr(),
+        (4, 5, 6),
+        (((4, 5), F32), ((4, 6), F32)),
+        compile_options=scheduled_options(
+            Schedule(
+                loop_order=("i", "k", "j"),
+                parallel_loop="i",
+                tag="anch-dense-driver",
+            )
+        ),
+    )
+    assert comparison.identical
+    expected = (
+        "num_threads(scorch_nthreads(-1, X0_size)) "
+        "schedule(dynamic, scorch_chunk(X0_size, -1))"
+    )
+    assert expected in comparison.legacy_cpp
+    assert expected in comparison.loopir_cpp
+    pragma = next(
+        line for line in comparison.loopir_cpp.splitlines() if "scorch_nthreads" in line
+    )
+    assert "A1_pos" not in pragma
 
 
 def test_ttm_heap_inner_anchor_structural_activation():

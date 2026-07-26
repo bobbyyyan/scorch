@@ -683,25 +683,22 @@ def test_canonical_dump_owns_the_parallel_selection():
         attach_selection,
         build_csr_spmv,
         build_stack_matmul,
+        build_vector_add,
     )
 
-    def spmv_with_selection(nnz_level):
+    def spmv_with_selection():
         fixture = build_csr_spmv()
         dim_i = fixture.program.tensors[2].dimensions[0]
         attach_selection(
             fixture,
             fixture.row,
             rows=dim_i,
-            nnz=(
-                None
-                if nnz_level is None
-                else fixture.builder.sparse_work_source(fixture.a, nnz_level)
-            ),
+            nnz=fixture.builder.sparse_work_source(fixture.a, 1),
         )
         return fixture.program
 
     bare = build_csr_spmv().program
-    selected = spmv_with_selection(1)
+    selected = spmv_with_selection()
     payload = json.loads(canonical_program_dump(selected))
     assert json.loads(canonical_program_dump(bare))["parallel"] is None
     assert payload["parallel"] == {
@@ -711,15 +708,17 @@ def test_canonical_dump_owns_the_parallel_selection():
         "work": {"rows": 0, "nnz": {"tensor": 0, "level": 1}},
         "intent": "explicit",
     }
-    # Deterministic across fresh builders and distinct from the bare and
-    # uniform-work forms.
+    # Deterministic across fresh builders and distinct from the bare form.
     assert canonical_program_dump(selected) == canonical_program_dump(
-        spmv_with_selection(1)
+        spmv_with_selection()
     )
     assert canonical_program_dump(selected) != canonical_program_dump(bare)
-    assert canonical_program_dump(selected) != canonical_program_dump(
-        spmv_with_selection(None)
-    )
+    dense = build_vector_add()
+    attach_selection(dense, dense.index, rows=dense.dim)
+    assert json.loads(canonical_program_dump(dense.program))["parallel"]["work"] == {
+        "rows": 0,
+        "nnz": None,
+    }
     outer = build_stack_matmul()
     dim_k = outer.program.tensors[2].dimensions[1]
     attach_selection(outer, outer.col, part=ParallelPart.OUTER, rows=dim_k)
@@ -747,3 +746,17 @@ def test_printer_renders_the_parallel_selection():
         "work(d0, nnz(t0@1)) intent=explicit\n"
     ) in rendered
     assert "parallel" not in print_program(build_csr_spmv().program)
+
+
+def test_printer_names_a_source_free_parallel_policy_row_only():
+    from scorch.compiler.loopir.verifier import verify_program
+
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_vector_add,
+    )
+
+    fixture = build_vector_add()
+    attach_selection(fixture, fixture.index, rows=fixture.dim)
+    verify_program(fixture.program)
+    assert "work(d0, row_only)" in print_program(fixture.program)

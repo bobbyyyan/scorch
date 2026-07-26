@@ -53,6 +53,7 @@ from scorch.compiler.loopir.schedule_passes import (
     apply_stack_tile,
     erase_schedule,
     reorder_loops,
+    select_parallel_loop,
     verify_scheduled_loopir,
 )
 from scorch.compiler.loopir.verifier import verify_program
@@ -2467,6 +2468,8 @@ def test_apply_relayout_is_pure_and_deterministic():
     assert canonical_program_dump(prescheduled) == before
     assert canonical_program_dump(first) == canonical_program_dump(second)
     assert print_program(first) == print_program(second)
+    assert prescheduled.parallel is not None
+    assert first.parallel == prescheduled.parallel
     # The fresh region identity continues deterministically.
     stage = relayout_chain_parts(first, "panel")[2]
     assert LoopIRBuilder.resuming(first).new_relayout_id().value == (
@@ -3200,6 +3203,12 @@ def test_multi_prefix_heap_admits_every_prefix_parallel_anchor():
         assert stamped.index == anchor.index_id
         assert stamped.part is ParallelPart.LOGICAL
         assert stamped.discipline is ParallelDiscipline.COMPACT_PARTITION
+        if anchor is a:
+            assert stamped.work.nnz is None
+        else:
+            assert stamped.work.nnz is not None
+            assert stamped.work.nnz.tensor == lowering.input_symbols[0]
+            assert stamped.work.nnz.level == 2
     reduction_anchor = dataclass_replace(plan, parallel_loop=LoopRef(c.index_id))
     defect = expect_code(
         "invalid_schedule_result_tile",
@@ -3413,6 +3422,21 @@ def test_apply_result_tile_requires_the_exact_family_shape():
             tiles=(affine_tile(k.index_id, 3),),
         ),
     ).program
+    preselected = apply_schedule_plan(
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            tiles=(affine_tile(k.index_id, 3),),
+            parallel_loop=LoopRef(i.index_id),
+        ),
+    ).program
+    defect = expect_code(
+        "invalid_schedule_result_tile",
+        apply_result_tile,
+        preselected,
+        fact,
+    )
+    assert "parallel selection must run after" in defect.message
     expect_code(
         "invalid_schedule_result_tile",
         apply_result_tile,
@@ -3430,7 +3454,7 @@ def test_apply_result_tile_requires_the_exact_family_shape():
             access_indices=(j.index_id, k.index_id),
         ),
     )
-    # Multi-prefix facts are outside the migrated rank-2 family.
+    # A multi-prefix fact is incompatible with this rank-2 program shape.
     expect_code(
         "invalid_schedule_result_tile",
         apply_result_tile,
@@ -3835,6 +3859,26 @@ def test_erase_schedule_drops_a_parallel_selection():
     assert erase_schedule(bare.program) is bare.program
 
 
+def test_parallel_selection_cannot_be_paired_with_a_fact_free_plan():
+    """A carried selection may not silently survive a contradictory plan."""
+
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_vector_add,
+    )
+
+    fixture = build_vector_add()
+    attach_selection(fixture, fixture.index, rows=fixture.dim)
+    plan = LoopPlan(loop_order=(fixture.index,), provenance="explicit")
+    defect = expect_code(
+        "invalid_schedule_parallel",
+        select_parallel_loop,
+        fixture.program,
+        plan,
+    )
+    assert "has no parallel-loop fact" in defect.message
+
+
 def test_scheduled_carrier_rejects_a_parallel_base():
     """A base program carrying a selection is not an unscheduled base."""
 
@@ -3855,7 +3899,10 @@ def test_scheduled_carrier_rejects_a_parallel_base():
         i.index_id,
         ParallelPart.LOGICAL,
         ParallelDiscipline.RESULT_PARTITION,
-        builder.parallel_work(row_dimension, None),
+        builder.parallel_work(
+            row_dimension,
+            builder.sparse_work_source(lowering.input_symbols[0], 1),
+        ),
         ParallelIntent.EXPLICIT,
     )
     forge(base, parallel=selection)

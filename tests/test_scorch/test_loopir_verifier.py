@@ -3526,10 +3526,10 @@ def test_parallel_selection_verifies_result_partition():
         nnz=fixture.builder.sparse_work_source(fixture.a, 1),
     )
     verify_program(fixture.program)
-    uniform = build_csr_spmv()
-    dim_i = uniform.program.tensors[2].dimensions[0]
-    attach_selection(uniform, uniform.row, rows=dim_i)
-    verify_program(uniform.program)
+    missing_source = build_csr_spmv()
+    dim_i = missing_source.program.tensors[2].dimensions[0]
+    attach_selection(missing_source, missing_source.row, rows=dim_i)
+    expect_defect("parallel_work_mismatch", missing_source.program)
 
 
 def test_parallel_selection_verifies_compact_partition():
@@ -3792,13 +3792,86 @@ def test_parallel_selection_work_nnz_not_iterated():
     expect_defect("parallel_work_mismatch", program)
 
 
-def test_parallel_selection_rejects_reduction_race():
-    """Selecting a loop the result does not address is a data race."""
+def test_parallel_work_uses_the_first_sparse_sibling_in_source_order():
+    """The canonical work source follows emitted statement order, not LIFO."""
+
+    fixture = build_csr_spmv()
+    builder = fixture.builder
+    decl_a = fixture.program.tensors[0]
+    b = builder.new_symbol_id()
+    z = builder.new_symbol_id()
+    decl_b = builder.tensor(
+        b,
+        "B",
+        ScalarType.FLOAT32,
+        decl_a.dimensions,
+        (
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_z = builder.tensor(
+        z,
+        "z",
+        ScalarType.FLOAT32,
+        (decl_a.dimensions[0],),
+        builder.dense_levels(1),
+    )
+    col = builder.new_index_id()
+    cursor = builder.new_cursor_id()
+    cursor_decl = builder.sparse_cursor(
+        cursor,
+        b,
+        1,
+        builder.dense_position(
+            b,
+            0,
+            builder.root_position(),
+            builder.index_value(fixture.row),
+        ),
+    )
+    second = builder.sparse_for(
+        cursor_decl,
+        builder.new_position_id(),
+        col,
+        builder.block(
+            (
+                builder.store_reduce(
+                    z,
+                    (builder.index_value(fixture.row),),
+                    ReduceOp.ADD,
+                    builder.cursor_value(cursor),
+                ),
+            )
+        ),
+    )
+    outer = fixture.program.body.statements[0]
+    assert type(outer) is DenseFor
+    forge(outer.body, statements=outer.body.statements + (second,))
+    forge(
+        fixture.program,
+        tensors=fixture.program.tensors + (decl_b, decl_z),
+        inputs=fixture.program.inputs + (b,),
+        outputs=fixture.program.outputs + (z,),
+    )
+    selection = attach_selection(
+        fixture,
+        fixture.row,
+        rows=decl_a.dimensions[0],
+        nnz=builder.sparse_work_source(fixture.a, 1),
+    )
+    verify_program(fixture.program)
+    forge(selection.work, nnz=builder.sparse_work_source(b, 1))
+    expect_defect("parallel_work_mismatch", fixture.program)
+
+
+def test_parallel_selection_rejects_unrepresented_sparse_trip_count():
+    """Sparse position loops need a richer trip-count representation."""
 
     fixture = build_csr_spmv()
     dim_j = fixture.program.tensors[1].dimensions[0]
     attach_selection(fixture, fixture.col, rows=dim_j)
-    expect_defect("parallel_race", fixture.program)
+    expect_defect("parallel_work_mismatch", fixture.program)
 
 
 def test_parallel_selection_rejects_ordered_assembly():
@@ -3819,7 +3892,12 @@ def test_parallel_selection_rejects_shared_workspace():
 
 def test_parallel_selection_result_partition_rejects_heap_regions():
     fixture = build_heap_spmm()
-    attach_selection(fixture, fixture.row, rows=fixture.dim_i)
+    attach_selection(
+        fixture,
+        fixture.row,
+        rows=fixture.dim_i,
+        nnz=fixture.builder.sparse_work_source(fixture.a, 1),
+    )
     expect_defect("parallel_race", fixture.program)
 
 
@@ -3831,6 +3909,7 @@ def test_parallel_selection_compact_requires_the_heap_region():
         fixture.row,
         discipline=ParallelDiscipline.COMPACT_PARTITION,
         rows=dim_i,
+        nnz=fixture.builder.sparse_work_source(fixture.a, 1),
     )
     expect_defect("parallel_race", fixture.program)
 
@@ -3850,7 +3929,7 @@ def test_parallel_selection_compact_rejects_the_shared_pack_origin():
 
 
 def test_parallel_selection_compact_rejects_an_unaddressed_loop():
-    """A reduction loop inside the region does not partition compact cells."""
+    """A sparse reduction loop lacks a representable position trip count."""
 
     fixture = build_heap_spmm()
     attach_selection(
@@ -3859,4 +3938,4 @@ def test_parallel_selection_compact_rejects_an_unaddressed_loop():
         discipline=ParallelDiscipline.COMPACT_PARTITION,
         rows=fixture.dim_j,
     )
-    expect_defect("parallel_race", fixture.program)
+    expect_defect("parallel_work_mismatch", fixture.program)

@@ -1370,6 +1370,28 @@ def test_panel_completion_requires_the_exact_parallel_policy(monkeypatch, field,
     assert error.value.defect.code == "panel_completion_lost"
 
 
+def test_panel_completion_revalidates_the_owned_work_fact(monkeypatch):
+    from scorch.compiler.loopir import lower_llir as loopir_lower_llir
+
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    original = loopir_lower_llir._TargetLowering.complete_panel
+
+    def mutate_work(self, function):
+        assert self.parallel is not None
+        forge(self.parallel.work, nnz=None)
+        return original(self, function)
+
+    monkeypatch.setattr(
+        loopir_lower_llir._TargetLowering,
+        "complete_panel",
+        mutate_work,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        scheduled_panel_cpp(width=3)
+    assert error.value.defect.code == "panel_completion_lost"
+
+
 def test_panel_completion_failure_owns_stage_and_keeps_completed_pass_records(
     monkeypatch,
 ):
@@ -2181,6 +2203,9 @@ _HEAP_REVIEW_CONTROL_AND_EFFECT_MUTATIONS = {
     "member_call_expression_protected_argument",
     "forged_result_shape_validation",
     "duplicate_result_shape_validation",
+    "late_result_shape_validation",
+    "late_input_validation",
+    "extra_protected_torch_empty",
 }
 
 
@@ -2346,6 +2371,46 @@ def _apply_heap_review_control_or_effect_mutation(
             and statement.name == "scorch_native::validate_jit_result_shape"
         )
         function.body.insert(final_assembly, copy.deepcopy(canonical))
+    elif mutation == "late_result_shape_validation":
+        validation_index = next(
+            index
+            for index, statement in enumerate(function.body)
+            if type(statement) is llir.FunctionCallStmt
+            and statement.name == "scorch_native::validate_jit_result_shape"
+        )
+        validation = function.body.pop(validation_index)
+        adjusted_final = final_assembly - int(validation_index < final_assembly)
+        function.body.insert(adjusted_final, validation)
+    elif mutation == "late_input_validation":
+        validation_index = next(
+            index
+            for index, statement in enumerate(function.body)
+            if type(statement) is llir.FunctionCallStmt
+            and statement.name == "scorch_native::validate_jit_tensor"
+        )
+        validation = function.body.pop(validation_index)
+        adjusted_final = final_assembly - int(validation_index < final_assembly)
+        function.body.insert(adjusted_final, validation)
+    elif mutation == "extra_protected_torch_empty":
+        function.body.insert(
+            final_assembly,
+            llir.VarInit(
+                llir.Var("review_tensor", llir.DataType.TORCH_TENSOR),
+                llir.FunctionCall(
+                    "torch::empty",
+                    (
+                        llir.Var(
+                            "result_shape",
+                            llir.DataType.STD_VECTOR_INT,
+                        ),
+                        llir.Var(
+                            "result_shape",
+                            llir.DataType.STD_VECTOR_INT,
+                        ),
+                    ),
+                ),
+            ),
+        )
     else:
         assert mutation == "unowned_result_pointer_call"
         function.body.insert(
@@ -2408,6 +2473,9 @@ def _apply_heap_review_control_or_effect_mutation(
         "member_call_expression_protected_argument",
         "forged_result_shape_validation",
         "duplicate_result_shape_validation",
+        "late_result_shape_validation",
+        "late_input_validation",
+        "extra_protected_torch_empty",
         "hidden_pre_parallel_declaration",
         "residual_structured_hoist",
         "policy_declaration_after_loop",
@@ -3203,6 +3271,123 @@ def test_bare_heap_selection_adopts_the_inner_prefix_anchor():
     assert "num_threads(scorch_nthreads(-1, Core0_size))" not in source
 
 
+def test_heap_completion_revalidates_the_owned_work_fact(monkeypatch):
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.loopir.nodes import ParallelDiscipline
+
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_heap_ttm,
+        forge,
+    )
+
+    fixture = build_heap_ttm()
+    attach_selection(
+        fixture,
+        fixture.row,
+        discipline=ParallelDiscipline.COMPACT_PARTITION,
+        rows=fixture.dim_b,
+        nnz=fixture.builder.sparse_work_source(fixture.core, 2),
+    )
+    original = lower_llir_module._TargetLowering.complete_result_tile
+
+    def mutate_work(self, function):
+        assert self.parallel is not None
+        forge(self.parallel.work, nnz=None)
+        return original(self, function)
+
+    monkeypatch.setattr(
+        lower_llir_module._TargetLowering,
+        "complete_result_tile",
+        mutate_work,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes={fixture.core: (3, 4, 5), fixture.factor: (5, 6)},
+            result_shape=(3, 4, 6),
+        )
+    assert error.value.defect.code == "result_tile_completion_lost"
+
+
+@pytest.mark.parametrize("mutation", ["work_fact", "retained_row_policy"])
+def test_heap_panel_handoff_revalidates_parallel_state(monkeypatch, mutation):
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.loopir.schedule_passes import apply_schedule_plan
+
+    from tests.test_scorch.test_loopir_schedule_passes import (
+        build_ttm_abcd,
+        lower,
+        multi_prefix_heap_panel_plan,
+    )
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    cin, (a, b, c, d) = build_ttm_abcd()
+    lowering = lower(cin)
+    plan = multi_prefix_heap_panel_plan(lowering, a, b, c, d, anchor=b)
+    artifact = apply_schedule_plan(lowering.program, plan)
+    original = lower_llir_module._TargetLowering.complete_result_tile
+
+    def corrupt_handoff(self, function):
+        assert self.parallel is not None
+        assert self._panel_completion is not None
+        if mutation == "work_fact":
+            forge(self.parallel.work, nnz=None)
+        else:
+            row_loop = self._panel_completion[2]
+            row_loop.omp_num_threads = "scorch_nthreads(-1, Core1_size)"
+            row_loop.omp_chunk_expr = "scorch_chunk(Core1_size, -1)"
+        return original(self, function)
+
+    monkeypatch.setattr(
+        lower_llir_module._TargetLowering,
+        "complete_result_tile",
+        corrupt_handoff,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            artifact.program,
+            input_shapes={
+                lowering.input_symbols[0]: (3, 4, 5),
+                lowering.input_symbols[1]: (5, 6),
+            },
+            result_shape=(3, 4, 6),
+        )
+    assert error.value.defect.code == "result_tile_completion_lost"
+
+
+def test_relayout_handoff_revalidates_the_panel_row_policy(monkeypatch):
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    from tests.test_scorch.test_loopir_schedule_passes import scheduled_relayout
+
+    lowering, _indices, _plan, artifact = scheduled_relayout()
+    original = lower_llir_module._TargetLowering.complete_relayout
+
+    def corrupt_handoff(self, function):
+        assert self._panel_completion is not None
+        row_loop = self._panel_completion[2]
+        row_loop.omp_num_threads = "scorch_nthreads(-1, A0_size)"
+        row_loop.omp_chunk_expr = "scorch_chunk(A0_size, -1)"
+        return original(self, function)
+
+    monkeypatch.setattr(
+        lower_llir_module._TargetLowering,
+        "complete_relayout",
+        corrupt_handoff,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            artifact.program,
+            input_shapes={
+                lowering.input_symbols[0]: (4, 5),
+                lowering.input_symbols[1]: (5, 6),
+            },
+            result_shape=(4, 6),
+        )
+    assert error.value.defect.code == "relayout_completion_lost"
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -3210,6 +3395,11 @@ def test_bare_heap_selection_adopts_the_inner_prefix_anchor():
         "missing_selection_snapshot",
         "mutated_selection_header",
         "forged_work_source",
+        "undeclared_work_source",
+        "relocated_selection",
+        "premarked_nonselected",
+        "atomic_nonselected",
+        "mutated_ancestor_header",
     ],
 )
 def test_parallel_completion_owns_the_selected_loop(monkeypatch, mutation):
@@ -3230,6 +3420,16 @@ def test_parallel_completion_owns_the_selected_loop(monkeypatch, mutation):
                 self.parallel.work,
                 nnz=fixture.builder.sparse_work_source(fixture.program.inputs[0], 1),
             )
+        elif mutation == "undeclared_work_source":
+            from tests.test_scorch.test_loopir_verifier import forge
+
+            forge(
+                self.parallel.work,
+                nnz=fixture.builder.sparse_work_source(
+                    fixture.builder.new_symbol_id(),
+                    1,
+                ),
+            )
         else:
             target = None
             for node in relayout_llir_nodes(function.body):
@@ -3243,6 +3443,48 @@ def test_parallel_completion_owns_the_selected_loop(monkeypatch, mutation):
             assert target is not None
             if mutation == "premarked_selection":
                 target.omp_parallel_for = True
+            elif mutation == "relocated_selection":
+                located = self._locate_statement(function.body, target)
+                assert located is not None and located[0] is not function.body
+                owner, position = located
+                del owner[position]
+                final_assembly = next(
+                    index
+                    for index, statement in enumerate(function.body)
+                    if type(statement) is llir.Comment
+                    and statement.value == "Assemble final result"
+                )
+                function.body.insert(final_assembly, target)
+            elif mutation == "premarked_nonselected":
+                reduction = next(
+                    node
+                    for node in relayout_llir_nodes(function.body)
+                    if type(node) is llir.ForLoop
+                    and type(node.init) is llir.VarInit
+                    and type(node.init.var) is llir.Var
+                    and node.init.var.name == "k"
+                )
+                reduction.omp_parallel_for = True
+            elif mutation == "atomic_nonselected":
+                reduction = next(
+                    node
+                    for node in relayout_llir_nodes(function.body)
+                    if type(node) is llir.ForLoop
+                    and type(node.init) is llir.VarInit
+                    and type(node.init.var) is llir.Var
+                    and node.init.var.name == "k"
+                )
+                reduction._use_atomic_scheduling = True
+            elif mutation == "mutated_ancestor_header":
+                ancestor = next(
+                    node
+                    for node in relayout_llir_nodes(function.body)
+                    if type(node) is llir.ForLoop
+                    and type(node.init) is llir.VarInit
+                    and type(node.init.var) is llir.Var
+                    and node.init.var.name == "i"
+                )
+                ancestor.init.var.name = "i_review"
             else:
                 assert mutation == "mutated_selection_header"
                 target.init.var.name = "j_review"
