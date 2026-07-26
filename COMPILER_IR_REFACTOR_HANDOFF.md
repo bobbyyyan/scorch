@@ -26453,3 +26453,46 @@ The chronologically latest state is review §21 and this section.  Its
 copy-paste prompt replaces every older prompt.  Phase 6 is **not**
 closed: intended automatic-plan routing, canonical LoopPlan schedule
 identity, and the criterion-by-criterion exit audit remain.
+
+## Milestone-2 input: automatic-plan family inventory (2026-07-26, read-only)
+
+Measured this session so the next session's "inventory first" step starts
+from facts rather than re-derivation; verify line numbers still hold
+before editing.  Exactly two provenance values exist in the tree:
+`"explicit"` and `"auto"` (no `"tuned"`, no `"fallback"`).
+
+- **F1 auto-scalar** — `scheduler.py:2721-2725`, loop-free CIN with an
+  empty Schedule; plan carries `loop_order=()` + tag only.  Trivial;
+  migrate alongside F2.
+- **F2 identity-schedule auto plan** — `scheduler.py:2913-2934`:
+  cost-model `select_loop_order` (`scheduler.py:2059`) plus heuristic
+  affine tiles from `_apply_tiling_heuristics` (`scheduler.py:3175-3229`,
+  candidates from `_select_index_vars_to_tile` `scheduler.py:3090`).
+  A verified `provenance="auto"` LoopPlan already exists here;
+  `loop_plan_legality.py:398-408`/`:688-694` forbid panel/relayout/
+  result-tile/parallel facts on it, and `schedule_passes.py` rejects it
+  at the provenance gate.  This is the narrow first migration.
+- **F3 explicit plans** — `scheduler.py:3020-3029`; already the migrated
+  strangler family.
+- **F4 plan-free production auto scheduling — the real gap** —
+  `Scheduler.auto_schedule`/`_auto_schedule_regblock_arm`/
+  `_auto_schedule_boundary_owned` (`scheduler.py:3355/3374/3401`) mutate
+  the CIN and never produce a plan; consumed by `ops.py:2278/2288` and
+  both regblock dual arms (`ops.py:1573/1579`).  A LoopPlan must
+  *originate* here (thread `plan_tiles`/`logical_order` out of
+  `_apply_auto_order_owned`, `scheduler.py:3231`, exactly as F2 does)
+  before any gate can be relaxed.  Automatic workspace insertion
+  (`scheduler.py:1468/1851`, re-derived on replay at
+  `scheduler.py:3331-3334`) is currently an unrecorded decision and must
+  become an explicit plan fact or a typed pass.
+- **Outside the JIT (do not migrate):** `tiling.maybe_dispatch` and the
+  prebuilt tile-j/tile-ijk kernels (`tiling.py:722/1248`, `ops.py:951`),
+  the autotune-level machinery, cache, and learned model — kernel
+  choices, not schedules.  `tiling.schedule_from_tuner_choice`
+  (`tiling.py:613`) already produces an explicit-provenance tile-ijk
+  Schedule; its tile-j arm returns `None` (`tiling.py:663-665`), so a
+  compiler tile-j schedule would have to be authored, not re-provenanced.
+- `materialize_legacy_schedule` (`scheduler.py:595-673`) drops
+  provenance; `legacy_cin_adapter.py:93` branches on it beforehand.
+  `CINLowerer` applies no independent scheduling (`loop_plan` only ever
+  set from a `ScheduledCIN`, `cin_lowerer.py:2035`).
