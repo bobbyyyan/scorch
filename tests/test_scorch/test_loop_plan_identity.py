@@ -11,6 +11,7 @@ from scorch.compiler.cin import (
     BinaryOp,
     ForAll,
     IndexVar,
+    IndexVarAdd,
     Operation,
     TensorAssign,
     TensorVar,
@@ -474,6 +475,38 @@ def test_request_identity_rejects_cyclic_unscheduled_cin() -> None:
             ELEMENTWISE_BINDINGS,
             compile_options=IDENTITY_OPTIONS,
         )
+
+
+def test_request_identity_rejects_cyclic_index_expression() -> None:
+    cyclic = build_elementwise()
+    outer = cyclic.index_var
+    assert isinstance(cyclic.stmt, ForAll)
+    inner = cyclic.stmt.index_var
+    outer._expr = IndexVarAdd(outer, inner)
+    with pytest.raises(VerificationError, match="contains a cycle"):
+        loopir_request_dump(
+            cyclic,
+            None,
+            (4, 5),
+            ELEMENTWISE_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        )
+
+
+@pytest.mark.parametrize("forgery", ("nan", "wrong-type", "ghost"))
+def test_request_identity_revalidates_nested_compile_options(forgery) -> None:
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+    options = CompileOptions.from_environment()
+    cost_model = options.scheduler.cost_model
+    if forgery == "nan":
+        object.__setattr__(cost_model, "alpha", float("nan"))
+    elif forgery == "wrong-type":
+        object.__setattr__(cost_model, "alpha", "2.975")
+    else:
+        object.__setattr__(cost_model, "ghost", True)
+
+    with pytest.raises(VerificationError):
+        request_identity(artifact, compile_options=options)
 
 
 def test_compile_options_are_part_of_the_request_identity() -> None:
