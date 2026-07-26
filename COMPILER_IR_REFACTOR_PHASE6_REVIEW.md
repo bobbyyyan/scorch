@@ -2133,3 +2133,581 @@ provenance, canonical LoopPlan cache identity, and the
 criterion-by-criterion Phase-6 exit audit remain.  Phase 7 must not
 start until those Phase-6 decisions are closed or the design criteria
 are formally revised.
+
+## 18. Independent re-review of §17 and the multi-prefix heap milestone (2026-07-25)
+
+This session independently audited the twelve §17 correction commits plus
+the §17 documentation commit (`95ba436` … `b21d78e`), reproduced all four
+focused gates, found and fixed one concrete contract gap, and implemented
+the identity-storage multi-prefix heap slice §17.4 left open.  A later
+rigorous review found additional gaps; §19 supersedes the completion and
+evidence claims here.  Four focused commits:
+
+- `3b1611f` — `fix(compiler): own heap binary-operator text`
+- `58a22b5` — `test(compiler): cover heap binary-operator text`
+- `52c79fe` — `feat(compiler): generalize heap result tiles to the multi-prefix family`
+- `3f17ec6` — `test(compiler): lock the multi-prefix heap result-tile family`
+
+Nothing was pushed, amended, squashed, or reordered.  Origin remains
+`58e8565`; all work is local-only.
+
+### 18.1 What the re-review confirmed
+
+The §17 corrections were re-derived from the code, not accepted from the
+report.  Each of the seven §17.1 findings has a real fix in the tree:
+
+1. **Lifetime.** `_check_result_tile_region` tracks exact statement
+   ancestry through `_Context.statement_stack` (object identity, not
+   lexical paths) and requires ancestry `[root Block, pack origin,
+   pack.body, region]`.  Any intervening or enclosing repeating scope —
+   including a region wrapped one Block deeper, or a pack origin nested
+   under another loop — makes the ancestry length wrong and fails closed
+   with `result_tile_scope_mismatch`.
+2. **Permuted copy-out.** The oracle's `copy_out` walks logical output
+   axes, applies the clamped pack window wherever `levels[-1].mode`
+   lands, and records copied compact keys to reject duplicate coverage.
+   Compact keys are built in logical mode order on both sides
+   (`_exec_tiled_reduce` and `copy_out`), so they agree by construction.
+3. **Schema-only discovery.** `_walk_schema_nodes` walks declared
+   dataclass fields once per node identity, via
+   `object.__getattribute__`; extra `__dict__` aliases and cycles are
+   ignored and cannot hang or double-count.
+4. **Pre-replay admission.** The heap gate pins the family before replay.
+   Independently re-derived: `loop_order[-1] == tile_loop` plus the
+   heap-only length/prefix constraint leaves exactly one position for the
+   reduction, so the "exact order" claim holds rather than only pinning
+   position 0.
+5–7. **Completion ownership.** The assembled function is validated
+   before any name discovery; the row policy is derived structurally from
+   a detached snapshot; and ownership requires the exact additive
+   assignment owner, the sole metadata write, the canonical ABI pointer
+   declaration, the canonical top-level zero, the reconstructed Torch
+   allocation and terminal assembly, and exactly the three owned
+   `C_values_torch` occurrences.
+
+The common `LLIRWalker` was independently confirmed to dispatch on exact
+type (`type(node) not in SUPPORTED_…` → `unknown_llir_node`), so node
+subclasses cannot slip past the per-type checks the completion adds, and
+`_validate_literal_fields` already rejects `str` subclasses.
+
+Eight adversarial probes were run beyond the retained matrix: a Torch
+storage alias through `AddressOf(&C_values[0])`, a Torch member
+expression, a `MemberCallStmt` mutation, a `QualifiedName`, a hostile
+statement in `ForLoop.pre_parallel_body`, one in `_hoisted_ptr_decls`, a
+`GuardedCallStmt` prefetch of the result, and a forged `BinOp` operator.
+All but the last were already owned as `result_tile_completion_lost`.
+
+### 18.2 The one gap found: `BinOp.op`
+
+`BinOp.op` is interpolated into the emitted C++ verbatim
+(`f"{left} {binary.op} {right}"`), exactly like the unary operator beside
+it, and the common walker constrains it only to "a non-empty string" —
+`Add` and `Mul` are pinned to `+`/`*`, a plain `BinOp` was not.  A forged
+exact-`str` operator
+`"+ 0; C_values_torch.zero_(); int decoy2 = 0 +"` inserted at function
+scope passed completion's ownership proof untouched and surfaced only
+later as an unowned `CodegenError` from the codegen precedence table.
+
+This is a **diagnostic-ownership gap, not a soundness gap**: codegen's
+closed `_BINARY_PRECEDENCE` table rejects every unsupported spelling, so
+no wrong C++ could be emitted through this route.  But §17.2's claim that
+completion "validates every LLIR field emitted directly as C++" was not
+yet true.  Completion now validates `BinOp`/`Add`/`Mul` against the exact
+set of non-mutating binary spellings, mirroring the
+`_RESULT_TILE_UNARY_OPERATORS` precedent (which likewise excludes the
+mutating `++`/`--` codegen accepts elsewhere).
+
+The two new matrix members are honest about what each proves:
+`opaque_binary_operator` **fails without the fix** and is the regression
+lock; `binary_operator_subclass` passes both before and after (the
+walker's exact-`str` requirement already covered it) and is retained as a
+checked property.
+
+To keep the growing audit under the repository `max-complexity` limit,
+the per-node validator moved from a closure-nested class to module-scope
+`_ResultTileTextValidator` with one method per node type.  Dispatch is
+still exact-type, never `isinstance`.
+
+Two §17 evidence claims were re-checked and stand: the 11 retained heap
+goldens regenerate byte-identically, and repeated-assignment coverage is
+a structural oracle invariant rather than a numeric inference.
+
+### 18.3 Multi-prefix heap: originating identity-storage slice
+
+§17.4 recorded that the originating audit captured a live rank-3 TTM
+multi-prefix heap kernel while the typed pass rejected every multi-prefix
+result.  This slice admitted the identity-storage form structurally rather
+than special-casing the TTM spelling.  It did **not** correctly preserve the
+distinction between physical storage-prefix order and logical tensor-access
+order; §19 records and fixes that defect.
+
+The family derives from one number — the result tile's dense prefix rank —
+admitted at a single point.  Chain length, prefix loop positions, compact
+linearization, and copy-out extent are computed from it.  At this revision,
+however, `_result_tile_prefix_rank` equated `result_prefix` (a physical
+storage-level fact) with `access_indices[:-1]` (a logical-mode fact), and
+the pass and target repeated that assumption.  Identity-storage programs
+therefore worked, while a verifier-valid permuted level order was rejected
+for the wrong reason.  §19 replaces that admission rule with an explicit
+level-to-mode mapping.
+
+**No change was needed in LLIR completion, the oracle, erasure, or the
+verifier.**  The compact linearization already used the last prefix
+level's position variable (`p{result}{last_level-1}`) and the product of
+every prefix extent; the oracle's copy-out already walked logical output
+axes; erasure is rank-agnostic; the verifier already required rank >= 2.
+Generalizing admission was sufficient — which is itself evidence that the
+§17 corrections were the right shape.
+
+Proved for the rank-3 representative:
+
+- **Byte-identical legacy C++.** The LoopIR route reproduces the retained
+  `heap_ttm_multi_prefix` golden byte-for-byte (5,160 bytes), and the
+  public `Schedule` route is byte-identical to the production legacy
+  route across nine grid members: exact/ragged/unit/oversized strips,
+  f32/f64, and zero outer-prefix, inner-prefix, reduction, and free
+  extents.
+- **Once-per-pack reset/copy-out and race legality.** The verifier's
+  ancestry rule is rank-independent.  Every compact cell is addressed by
+  the linearized dense prefix position and the pack point, so distinct
+  iterations of any prefix loop write disjoint cells and the reduction
+  loop is enclosed by all of them.
+- **Oracle differential.** A five-width randomized differential proves
+  scheduled == erased == an independent reference over randomized shapes
+  and sparsity; erasure restores the reordered base dump exactly.
+- **Compiled shadows.** Five compiled cases (strips 1/3/4/64 in f32 plus
+  f64, including an empty stored segment) require bitwise-equal dense
+  results against legacy and PyTorch agreement.
+- **Public routing.** The artifact carries `result_level == 2` and a
+  two-element `result_prefix`.
+
+### 18.4 Two boundaries deliberately left closed, with reasons
+
+These are recorded as **criterion boundaries, not completions**:
+
+1. **The composed sparse panel keeps its audited single-prefix shape.**
+   Legacy *does* admit a rank-3 heap+panel chain, but only with the CSR
+   dense-parent row (`b`, the **inner** prefix) as `parallel_loop`; with
+   `a` it raises `InvalidSchedule`.  The LoopIR target still derives its
+   parallel row as a fixed chain position, so it cannot express that
+   anchor.  A multi-prefix panel plan now fails closed with
+   `invalid_schedule_result_tile`.
+2. **The heap parallel anchor is pinned to the outermost dense prefix
+   loop.**  Legacy accepts any prefix loop and emits materially different
+   source per anchor — measured on the rank-3 TTM kernel, anchor `a`
+   gives `scorch_nthreads(-1, Core0_size)` at 5,160 bytes and anchor `b`
+   gives `scorch_nthreads(Core2_pos[Core1_size], Core1_size)` at 5,200
+   bytes.  Accepting an inner-prefix anchor without an abstract selection
+   would silently parallelize a loop the plan does not name, so it is now
+   rejected instead.  **The rank-2 family is unaffected** — a single
+   prefix has no degrees of freedom, so this pin is exactly the previous
+   `in result_prefix` test there.
+
+Both boundaries are lifted by the same next milestone: abstract
+parallel-loop selection.
+
+### 18.5 Design constraints established for abstract parallel-loop selection
+
+Recorded here because they were derived by measurement this session and
+materially change how that milestone must be built:
+
+- **LoopIR currently carries no parallel fact at all.**  The target
+  derives it structurally in three places: the generic rule
+  (`result_is_dense and outer_in_result` → mark the first for-loop, with
+  a merged-nest special case that deliberately passes an empty statement
+  list so the applied policy is the row-count-only
+  `scorch_nthreads(-1, rows)` form), the panel route (chain position 2),
+  and the heap route (`result_tile_row_position`).
+- **`lower_loopir_to_llir` takes a bare `LoopProgram`, not the scheduled
+  artifact**, and several tests assert direct structural activation on a
+  bare verified program.  The next representation audit must decide whether
+  parallel selection is intrinsic LoopIR, a verified target-analysis side
+  table passed explicitly to lowering, or another typed carrier that preserves
+  bare-program activation.  The evidence rules out silently storing the fact
+  only on `ScheduledLoopIR`; it does not by itself prove that adding a schema
+  node is the sole valid design.
+- **`_loop_key(node) -> (IndexId, LoopPart)` already exists** in
+  `schedule_passes` and is the stable loop identity such a fact should
+  name.
+- **The byte-parity constraint is the hard part.**  For every already
+  migrated route with no explicit plan fact, the abstract selection must
+  reproduce legacy's implicit rule exactly, or the 20-source corpus, the
+  42-source grid, and the 11 heap goldens all move.  Either the fact is
+  optional and the target keeps its derivation when absent (routes opt
+  in), or every route gains the fact at once and the derivation is
+  deleted — the second is cleaner but must be proved against all three
+  capture sets in one step.
+
+### 18.6 Verification
+
+Evidence retained under
+`/Users/bobby/.cache/scorch-codex/phase6-multiprefix-3f17ec6/`.
+
+- exact five-file Phase-6 contract focus (`test_loopir_verifier.py`,
+  `test_loopir_schedule_passes.py`, `test_loopir_llir_lowering.py`,
+  `test_loop_plan.py`, `test_schedule_api.py`): **519 passed** (509
+  inherited + 2 binary-operator + 8 multi-prefix);
+- the originating report claimed **308** supplementary tests, but did not
+  retain the exact commands/logs and the named six files collect only 170;
+  this count is therefore withdrawn rather than treated as evidence;
+- scheduled compiled runtime focus (`test_loopir_scheduled_slice.py`
+  plus `test_loopir_pipeline_execution.py`): **192 passed** in 738.41 s
+  (177 inherited + 15 multi-prefix), including all activating heap
+  source-parity and compiled-shadow cases;
+- full legacy schedule-generality file: **45 passed** in 183.35 s, both
+  before and after the milestone;
+- all **11 available heap audit goldens** regenerate byte-identically at
+  clean detached `b21d78e` and `3f17ec6` and against the retained
+  `phase6-heap-review-f162ddf` copies; manifest SHA-256
+  `7072ca461f94c3268884de76ba3aaaa434745f25f3a79cc69787fb7f7cd76df7`;
+- fresh **20-source corpus** and **42-source grid** are byte-identical
+  across clean detached `b21d78e` and `3f17ec6`; manifest SHA-256 values
+  `e240b53cf646f8380433e64d3bdfb534833ea9480eda447e58a2f44780bc9b0c`
+  and
+  `3d48634508bbb54c3d2b16578ecb52ef96c6934c2a8642eaf8f03498037d5024`;
+- clean-tree full-source base/candidate mypy logs are **byte-identical**
+  at 146 inherited findings in 12 files over 60 source files, and flake8
+  logs are **byte-identical** at nine inherited findings.  Black over
+  `src` reports exactly one file, `src/scorch/prebuilt_kernels.py`, at
+  **both** revisions — an inherited finding this milestone neither
+  introduced nor touched; every changed `loopir/` file is Black-clean;
+- paired same-machine compiler latency at clean detached `b21d78e`
+  versus `3f17ec6` is inside the 1.10 threshold for every case and
+  percentile: `small_dense` **0.968/1.038**, `reduction`
+  **0.992/0.928**, `csr_intersection` **1.006/1.017**, `sparse_union`
+  **0.997/0.992** (p50/p95 candidate/base; worst **1.038**);
+- no green literal full-suite result exists at `3f17ec6`: two unpartitioned
+  attempts reached 4,007 passes and then aborted in a later unrelated COO JIT
+  test with macOS libomp `OMP: Error #179` / `pthread_key_create failed`.
+  The clean `b21d78e` control passed 3,983 tests; the 25 added tests moved the
+  same long-lived Python process past that process-local resource ceiling.
+  A later non-overlapping partition passed, but is not represented as an
+  authoritative full-suite substitute.  §19 isolates the added native tests
+  and reruns the literal suite.
+- `git diff --check` is clean, all five protected tracked files retain
+  their recorded hashes, and unrelated GPU/CUDA, benchmark, packaging,
+  scheduler, research, scratchpad, and tooling material remains
+  untouched.
+
+### 18.7 Scope verdict
+
+**Phase 6 remains open.**  This revision proves the identity-storage
+multi-prefix heap representative, not the whole rank>=2 level-permutation
+family.  The physical/logical admission correction and two boundaries of
+§18.4 are recorded in §19.
+Abstract parallel-loop selection, intended automatic-plan provenance,
+canonical LoopPlan cache identity, and the criterion-by-criterion Phase-6
+exit audit remain.  Phase 7, selector integration, production cutover,
+and legacy deletion must not start until those are closed or the design
+criteria are formally revised.
+
+### 18.8 Limitation recorded outside Phase 6
+
+`STensor.to_sparse("dds")` produces a malformed rank-3 storage: the
+compressed leaf's position array is sized for the innermost parent only
+(5 entries where 13 are required for a 3x4 dense prefix), so the
+conversion raises `TensorIndexError` on its own output.  This is a
+pre-existing defect in the public conversion path, independent of the
+compiler refactor; it was found because the multi-prefix shadow test
+needed a `dds` operand.  That test builds the storage directly and says
+so; the defect is **not** fixed here and remains open.
+
+## 19. Rigorous review of the multi-prefix heap slice (2026-07-25)
+
+The next session treated §18 as an untrusted handoff, audited the four
+commits and retained evidence independently, reproduced the literal
+full-suite failure, and found two correctness defects plus two evidence
+gaps.  The corrections are:
+
+- `4234a95` — `fix(compiler): close multi-prefix heap review gaps`
+- `858c898` — `test(compiler): lock multi-prefix heap review fixes`
+- `2fe8fa3` — `fix(compiler): type narrow heap binding dispatch`
+- `539784f` — `refactor(compiler): retire flat heap name inventory`
+
+Nothing was pushed, amended, squashed, or reordered.  The five protected
+tracked files retained their session-start hashes and every unrelated
+GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, and
+tooling path remained untouched.
+
+### 19.1 Physical storage order is not logical access order
+
+The central §18 admission rule was wrong for the level-based model.
+`ResultTile.result_prefix` names the leading **physical storage levels**;
+`ResultTile.access_indices` names tensor coordinates in **logical mode
+order**.  Equating `access_indices[:-1]` with `result_prefix` works only
+when every `LevelDecl.mode` is the identity permutation.
+
+An adversarial rank-3 result with physical modes `(1, 0, 2)` made the
+problem concrete: the canonical physical prefix is `(b, a)`, while the
+logical access remains `(a, b, d)`.  The old rank gate rejected the valid
+fact, and a differently forged fact could satisfy that gate without
+describing the result's physical prefix.  Production target lowering
+still rejected every non-identity tensor globally as
+`unsupported_mode_order`, so this did not silently emit a wrong kernel,
+but the pass contract and §18's general-family claim were false.
+
+The correction keeps `_result_tile_prefix_rank` responsible only for
+declaration-independent arity.  `apply_result_tile` now maps every
+logical access coordinate through the output declaration's
+`LevelDecl.mode` values, proves that the resulting physical prefix equals
+`result_prefix`, proves that the final physical level is the packed loop,
+and matches the loop chain in physical order.  Target shape validation
+uses the same mapping.  A complete pass-level regression constructs the
+`(1, 0, 2)` output, reorders the loop chain to `(b, a, c, d)`, applies the
+heap plan, and verifies the scheduled artifact.  The C++ target's
+pre-existing global non-identity-layout refusal remains explicit and is
+not misrepresented as migrated support.
+
+### 19.2 Heap completion now owns declarations and lexical binding
+
+The assembled-function ownership proof validated text spellings and exact
+result occurrences, but did not own C++ declaration identity.  A managed
+pass could insert a nested declaration of `kTile_d`; completion would
+then advance the pack origin by the canonical width while compact
+initialization, compute, and copy-out read the shadowing width.  Likewise,
+a nested fixed array named `Projected_values` could shadow the canonical
+result pointer.  Both mutations passed completion before this review and
+can emit valid C++ with wrong result coverage.
+
+The old flat `known_names` set was also not a binding model: it contained
+every `Var` occurrence, not declarations.  Completion accepted an
+undeclared variable, a use before its later declaration, a branch-local
+declaration used after the branch, and a nested `llir.Function` that
+codegen rendered as an invalid function definition inside `evaluate`.
+It also counted declarations in non-emitted `pre_parallel_body` or
+`_hoisted_ptr_decls` compatibility fields.
+
+The review adds two heap-specific, fail-closed layers before any compact
+rewrite:
+
+1. function-wide declaration ownership across arguments, ordinary/direct
+   declarations, fixed arrays, loop variables, and codegen-synthesized
+   atomic names; and
+2. emission-order lexical resolution across sequential statement lists,
+   branches, ordinary loops, range loops, while loops, split OpenMP
+   regions, and atomic work-stealing scopes.
+
+The no-shadow rule is intentionally stronger than general C++ and remains
+local to the heap soundness proof.  An independent inventory of all 24
+admitted heap parity cells found globally unique declarations in every
+case (39 dense, 41 SpMM, 46 rank-3 TTM, 46 panel, and 51 relayout
+declarations, each count fully unique), with no unresolved or out-of-scope
+variable.  Common LLIR/codegen may eventually gain a general lexical
+verifier, but that rollout is separate: the completed legacy-compatible
+heap helper groups still carry typed-to-be-migrated pseudo-`Var` text for
+`0.0f` and prefix products.
+
+Regression coverage now includes both semantic shadowing cases,
+undeclared and use-before-declaration variables, branch leakage, nested
+functions, later-only policy declarations, and declarations stranded in
+non-emitted compatibility fields.  Every mutation is owned as
+`result_tile_completion_lost`.
+
+### 19.3 Missing zero-extent semantics and the macOS full-suite regression
+
+§18's nine source-parity cells included four zero extents, but its oracle
+randomization sampled only positive dimensions and all five compiled
+shadows were nonzero.  The review adds independent scheduled/erased/reference
+oracle checks and compiled LoopIR/legacy/PyTorch shadows for zero outer
+prefix, zero inner prefix, zero reduction, and zero free extent.
+
+The literal `3f17ec6` suite failure was not random machine load.  Both
+unpartitioned attempts aborted after 4,007 passes with macOS libomp
+`pthread_key_create failed`; the clean predecessor completed 3,983 tests.
+The five new rank-3 JIT shadows had raised the number of native extensions
+loaded by one long-lived pytest process past a process-local pthread-key
+ceiling.  Partitioning the suite proved test behavior but did not make the
+canonical gate green.
+
+The corrected tests execute each added rank-3 native differential in a
+short-lived subprocess.  This preserves the exact compiled comparison,
+keeps the pytest parent at its inherited native-resource footprint, and
+lets the literal unpartitioned suite remain the authoritative gate.  Four
+compiled zero-extent cases are isolated by the same mechanism.
+
+### 19.4 Verification
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-multiprefix-review-539784f/`
+(with the superseded `858c898` static audit retained separately).
+
+- exact five-file Phase-6 contract focus: **533 passed** (the §18 total
+  plus 14 review regressions);
+- direct targeted native proof during repair: one ordinary rank-3 shadow
+  plus the zero-reduction shadow, **2 passed**;
+- the scheduled runtime and literal full-suite reruns at `539784f` were
+  superseded when the independent final audit found the §20 blockers;
+- 20-source corpus, 42-cell grid, and 11 heap audit goldens:
+  **73/73 byte-identical** between clean `3f17ec6` and `539784f`
+  worktrees (combined manifest SHA-256
+  `b78b355ed9b6076c336141180c6784c36f83fe359712796162174d8343a05d2b`);
+- changed-file and full-source static comparison:
+  all five changed Python files Black/Flake8-clean; focused mypy clean;
+  full-source Black reproduces only the inherited
+  `prebuilt_kernels.py` finding, Flake8 is exactly nine inherited
+  findings, and full-source mypy is normalized byte-identical at
+  **146 findings in 12 files**;
+- no latency result is claimed for the superseded `539784f` candidate;
+- the literal unpartitioned suite at `539784f` was stopped while healthy
+  at roughly 35 percent after the §20 review made that candidate stale;
+- `git diff --check` clean; live origin and protected hashes unchanged.
+
+### 19.5 Candid scope verdict
+
+The identity-storage rank-3 TTM path is byte-compatible, and the scheduling
+contract now remains correct for a physical mode permutation even though
+the current C++ target deliberately refuses that broader layout family.
+Arbitrary positive prefix rank is derived rather than enumerated; the
+retained rank-4 source probe is useful supporting evidence, not a claim
+that every level permutation compiles.
+
+**Phase 6 remains open.**  Abstract parallel-loop selection, the
+multi-prefix panel and inner-prefix heap anchors it unlocks, intended
+automatic-plan routing, canonical `LoopPlan` schedule identity, and the
+criterion-by-criterion exit audit remain.  Phase 7 must not begin unless
+those Phase-6 criteria are genuinely closed or the design is explicitly
+revised.
+
+## 20. Final adversarial review of heap completion (2026-07-25)
+
+An independent read-only audit of the §19 corrections found that the new
+validation model and the generated-name allocator still had different
+views of the emitted function, and that lexical validity alone did not
+close result-state effects.  The stale `539784f` full-suite run was
+stopped immediately; no receipt from that run is represented as final.
+The corrections are committed, local-only, as:
+
+- `909fb91` — `fix(compiler): close heap completion ownership gaps`
+- `a24c0c1` — `test(compiler): cover heap completion ownership boundaries`
+
+### 20.1 Generated declarations and exact emission order
+
+`_heap_result_tile_names` still consulted the legacy `_declared_names`
+inventory.  That inventory does not see declarations in flattened nested
+statement containers, `before_parallel_body` / `pre_parallel_body` /
+`post_parallel_body`, or codegen-synthesized atomic names.  The §19
+validator did see those declarations, but threw its complete inventory
+away.  A retained pre-parallel declaration or atomic counter named
+`tiled_C` could therefore pass validation and collide with the compact
+pointer selected moments later, producing invalid C++ or shadowing the
+storage used by the rewritten result update.
+
+The validator now returns its exhaustive declaration set after the
+target-owned parallel marking step, and the allocator unions it with the
+legacy inventory before choosing every compact/init/copy spelling.
+Regression tests cover flattened containers, split OpenMP declarations,
+atomic counters, and the counter's use in `omp_num_threads`.
+
+The emission-order model also now matches three codegen boundaries it
+previously approximated:
+
+- `break` and `continue` are legal only in an actual loop body, not at
+  function scope or in pre/post parallel regions;
+- `IfThenElse` mirrors codegen's required condition/body pairing and
+  condition-list/body-list cardinality; and
+- an atomic counter is visible to the parallel policy, `_start` is visible
+  to the loop-bound expression, and neither synthetic name is visible
+  before codegen declares it.
+
+### 20.2 Result-state effects, not only variable visibility
+
+The §19 binding proof resolved names but did not constrain what a valid
+statement did with them.  In particular, an assignment to `C0_size`, an
+extra increment of `pC1` beside the result write, or
+`result_shape.clear()` passed every check and could compile into a
+silently incomplete or misallocated result.  The actual mutable ABI
+argument is named `result_shape`; the earlier protected set accidentally
+named only a nonexistent `C_shape`.
+
+Heap completion now protects the real shape argument plus result extents,
+positions, storage, capacity, assembly object, and tensor.  It rejects
+unowned assignments/increments, mutating member calls, address escape,
+`std::move`, guarded calls, and unknown calls receiving protected state.
+The allowlist is deliberately structural and narrow:
+
+- the unique metadata-fingerprinted result `StoreReduce` write;
+- a loop's own declared result-position induction update;
+- the already fingerprinted terminal result assembly;
+- `scorch_native::validate_jit_result_shape`;
+- the exact dense zero later removed by completion;
+- `torch::empty` over the validated scalar capacity; and
+- the canonical tensor `data_ptr` acquisition.
+
+Tests inject each mutation before the declaration, loop, copy, or
+assembly operation it would corrupt, rather than relying on a later C++
+compile failure.
+
+### 20.3 Deliberately recorded broader LLIR debt
+
+Two adversarial observations are not silently promoted into claims:
+
+1. the heap lexical environment binds C++ names, not full C++ types.
+   Existing valid LLIR intentionally spells the same variable with
+   `NO_TYPE`, pointer/restrict, `INT`/`INT64`, and
+   `CONSTEXPR_INT`/`INT` metadata at different uses.  Exact signature
+   equality would reject production.  A future general LLIR type checker
+   must classify use form and declaration category rather than compare
+   `Var` objects literally;
+2. legacy OpenMP policy text is token-, delimiter-, name-, and
+   effect-checked but is not parsed as a complete C++ expression grammar.
+   Malformed compiler-owned arithmetic can therefore remain a compile
+   failure.  It cannot inject punctuation, nested calls, result-owned
+   names, or an unbound identifier through this boundary.
+
+Neither limitation permits the result-state mutations or name collisions
+closed above.  They remain explicit compatibility debt for the eventual
+typed-policy/general-LLIR validation work.
+
+### 20.4 Verification
+
+Final evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-multiprefix-review-a24c0c1/`.
+
+- exact five-file Phase-6 contract focus: **548 passed**;
+- exact scheduled runtime focus at `a24c0c1`: **196 passed** in
+  **784.97 s** (log SHA-256
+  `a2f8270152542211d1a4b9562626a2b2db53cbc3629175bdbfbfe02da44241f6`,
+  JUnit SHA-256
+  `9141da71af719553eb997d53e01ee72091854a2ce70a7a34e662889c07acf8b7`);
+- fresh 20-source corpus, 42-cell grid, and 11 heap audit goldens:
+  **73/73 byte-identical** between clean `3f17ec6` and `a24c0c1`
+  worktrees (combined manifest SHA-256
+  `b78b355ed9b6076c336141180c6784c36f83fe359712796162174d8343a05d2b`);
+- changed-file and full-source static comparison: all six changed Python
+  files are Black/Flake8-clean and the three production files are
+  focused-mypy-clean; full-source Black reproduces only the inherited
+  `prebuilt_kernels.py` finding, Flake8 is exactly nine inherited
+  findings, and normalized full-source mypy is byte-identical at
+  **146 findings in 12 files**;
+- paired same-session compiler latency (5 warmups / 30 samples) is inside
+  the 1.10 threshold for every category and percentile: `small_dense`
+  **1.008/1.032**, `reduction` **1.025/1.011**,
+  `csr_intersection` **1.018/1.000**, and `sparse_union`
+  **1.015/0.989** (p50/p95 candidate/base; worst **1.032**), with
+  identical generated-source hashes;
+- literal unpartitioned clean detached-worktree non-performance suite at
+  `a24c0c1`, with isolated caches and asserted import provenance:
+  **4,041 passed, 14 skipped, 3 performance tests deselected, one known
+  sparse-invariant warning, and zero failures** in **2,723.92 s**
+  (log SHA-256
+  `49cf58338ee10f625de26c49f26541a5717769e157b94dca8d0a134715c7da88`,
+  JUnit SHA-256
+  `a05b3487c3bc2bd03dbfe188432690de9b423a7c0613864e326faebd63ebe7d8`);
+  the literal process crossed the former 4,007-pass libomp abort region
+  and exited with no lingering compiler or test process;
+- `git diff --check` clean; import provenance, live origin, and all five
+  protected hashes verified; no unrelated tracked or untracked material
+  staged.
+
+### 20.5 Scope verdict
+
+The final verdict remains intentionally narrow: identity-order rank-3 TTM
+and the existing rank-2/panel/relayout heap families retain byte parity;
+arbitrary positive prefix rank is derived rather than enumerated; and the
+schedule pass represents physical mode permutations while the current
+C++ target globally rejects unsupported nonidentity layouts.
+
+**Phase 6 remains open.**  The next work is still the broad sequence of
+target-independent parallel-loop selection (including inner-prefix and
+rank-3 panel anchors), intended automatic-plan routing, canonical
+`LoopPlan` schedule identity, and the criterion-by-criterion exit audit.
