@@ -1954,6 +1954,95 @@ def test_heap_target_emits_the_legacy_compact_source():
     ) in source
 
 
+def test_heap_generated_names_reserve_flattened_container_declarations():
+    """Name allocation uses every declaration in the emitted C++ scope."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.schedule_lowerer import _heap_result_tile_names
+
+    # Codegen flattens nested statement containers without adding a scope.
+    function = llir.Function(
+        llir.DataType.VOID,
+        "evaluate",
+        (),
+        [
+            [
+                llir.VarInit(
+                    llir.Var("tiled_C", llir.DataType.INT),
+                    llir.Literal(0),
+                )
+            ]
+        ],
+    )
+    reserved_names = lower_llir_module._validate_result_tile_rendered_text(
+        function,
+        protected_names=set(),
+    )
+    names = _heap_result_tile_names(
+        function,
+        "C",
+        "k",
+        reserved_names=reserved_names,
+    )
+    assert names[0] == "tiled_C_1"
+
+
+@pytest.mark.parametrize("declaration_owner", ["split_pre_body", "atomic_counter"])
+def test_heap_generated_names_reserve_codegen_declarations(declaration_owner):
+    """Auxiliary OpenMP declarations participate in compact-name allocation."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.schedule_lowerer import _heap_result_tile_names
+
+    chunk = llir.Var("chunk", llir.DataType.INT)
+    bound = llir.Var("bound", llir.DataType.INT)
+    loop = llir.ForLoop(
+        init=llir.VarInit(
+            llir.Var("i", llir.DataType.INT),
+            llir.Literal(0),
+        ),
+        cond=llir.BinOp(
+            "<",
+            llir.Var("i", llir.DataType.INT),
+            bound,
+        ),
+        update=llir.Increment(llir.Var("i", llir.DataType.INT)),
+        body=[llir.Continue()],
+    )
+    if declaration_owner == "split_pre_body":
+        loop.omp_parallel_for = True
+        loop.pre_parallel_body = [
+            llir.VarInit(
+                llir.Var("tiled_C", llir.DataType.INT),
+                llir.Literal(0),
+            )
+        ]
+    else:
+        loop._use_atomic_scheduling = True
+        loop._atomic_counter_var = "tiled_C"
+        loop._atomic_chunk_var = "chunk"
+        # Codegen declares _start before consulting the loop bound.
+        loop._loop_bound = "_start"
+        loop.omp_num_threads = "scorch_nthreads(tiled_C, bound)"
+    function = llir.Function(
+        llir.DataType.VOID,
+        "evaluate",
+        (chunk, bound),
+        [loop],
+    )
+    reserved_names = lower_llir_module._validate_result_tile_rendered_text(
+        function,
+        protected_names=set(),
+    )
+    names = _heap_result_tile_names(
+        function,
+        "C",
+        "k",
+        reserved_names=reserved_names,
+    )
+    assert names[0] == "tiled_C_1"
+
+
 def test_heap_completion_anchors_metadata_to_the_physical_write(monkeypatch):
     """Valid metadata moved to the wrong access cannot redirect that access."""
 
@@ -2074,6 +2163,144 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
     )
 
 
+_HEAP_REVIEW_CONTROL_AND_EFFECT_MUTATIONS = {
+    "top_level_break",
+    "top_level_continue",
+    "missing_conditional_condition",
+    "empty_conditional_then",
+    "missing_conditional_branches",
+    "mismatched_conditional_branches",
+    "mutate_result_extent",
+    "mutate_result_position",
+    "mutate_result_shape",
+    "move_result_shape",
+    "escape_result_shape_address",
+    "unowned_result_pointer_call",
+}
+
+
+def _apply_heap_review_control_or_effect_mutation(
+    lowering,
+    function,
+    owner,
+    final_assembly,
+    mutation,
+):
+    """Inject one review-only malformed control/effect boundary."""
+
+    if mutation == "top_level_break":
+        function.body.insert(final_assembly, llir.Break())
+    elif mutation == "top_level_continue":
+        function.body.insert(final_assembly, llir.Continue())
+    elif mutation == "missing_conditional_condition":
+        function.body.insert(final_assembly, llir.IfThenElse())
+    elif mutation == "empty_conditional_then":
+        function.body.insert(
+            final_assembly,
+            llir.IfThenElse(
+                cond=llir.Literal(True),
+                then_body=[],
+            ),
+        )
+    elif mutation == "missing_conditional_branches":
+        function.body.insert(
+            final_assembly,
+            llir.IfThenElse(
+                cond_list=[llir.Literal(True)],
+            ),
+        )
+    elif mutation == "mismatched_conditional_branches":
+        function.body.insert(
+            final_assembly,
+            llir.IfThenElse(
+                cond_list=[
+                    llir.Literal(True),
+                    llir.Literal(False),
+                ],
+                then_body_list=[[llir.BlankLine()]],
+            ),
+        )
+    elif mutation == "mutate_result_extent":
+        extent_declaration = next(
+            index
+            for index, statement in enumerate(function.body)
+            if type(statement) is llir.VarInit and statement.var.name == "C0_size"
+        )
+        function.body.insert(
+            extent_declaration + 1,
+            llir.Assign(
+                llir.Var("C0_size", llir.DataType.INT64),
+                llir.Literal(0, llir.DataType.INT64),
+            ),
+        )
+    elif mutation == "mutate_result_position":
+        located = lowering._locate_statement(function.body, owner)
+        assert located is not None
+        body, position = located
+        body.insert(
+            position,
+            llir.Increment(llir.Var("pC1", llir.DataType.INT)),
+        )
+    elif mutation == "mutate_result_shape":
+        function.body.insert(
+            1,
+            llir.MemberCallStmt(
+                base=llir.Var(
+                    "result_shape",
+                    llir.DataType.STD_VECTOR_INT,
+                ),
+                member="clear",
+            ),
+        )
+    elif mutation == "move_result_shape":
+        function.body.insert(
+            1,
+            llir.VarInit(
+                llir.Var("review_shape", llir.DataType.STD_VECTOR_INT),
+                llir.FunctionCall(
+                    "std::move",
+                    (
+                        llir.Var(
+                            "result_shape",
+                            llir.DataType.STD_VECTOR_INT,
+                        ),
+                    ),
+                ),
+            ),
+        )
+    elif mutation == "escape_result_shape_address":
+        function.body.insert(
+            final_assembly,
+            llir.FunctionCallStmt(
+                "review_mutate",
+                (
+                    llir.AddressOf(
+                        llir.Var(
+                            "result_shape",
+                            llir.DataType.STD_VECTOR_INT,
+                        )
+                    ),
+                ),
+            ),
+        )
+    else:
+        assert mutation == "unowned_result_pointer_call"
+        function.body.insert(
+            final_assembly,
+            llir.FunctionCallStmt(
+                "memset",
+                (
+                    llir.Var(
+                        "C_values",
+                        llir.DataType.PTR_FLOAT32,
+                    ),
+                    llir.Literal(0),
+                    llir.Var("C_capacity", llir.DataType.INT64),
+                ),
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -2101,6 +2328,18 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
         "use_before_declaration",
         "branch_local_variable_escape",
         "nested_function",
+        "top_level_break",
+        "top_level_continue",
+        "missing_conditional_condition",
+        "empty_conditional_then",
+        "missing_conditional_branches",
+        "mismatched_conditional_branches",
+        "mutate_result_extent",
+        "mutate_result_position",
+        "mutate_result_shape",
+        "move_result_shape",
+        "escape_result_shape_address",
+        "unowned_result_pointer_call",
         "hidden_pre_parallel_declaration",
         "residual_structured_hoist",
         "policy_declaration_after_loop",
@@ -2172,6 +2411,18 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
             "use_before_declaration",
             "branch_local_variable_escape",
             "nested_function",
+            "top_level_break",
+            "top_level_continue",
+            "missing_conditional_condition",
+            "empty_conditional_then",
+            "missing_conditional_branches",
+            "mismatched_conditional_branches",
+            "mutate_result_extent",
+            "mutate_result_position",
+            "mutate_result_shape",
+            "move_result_shape",
+            "escape_result_shape_address",
+            "unowned_result_pointer_call",
             "hidden_pre_parallel_declaration",
             "residual_structured_hoist",
             "policy_declaration_after_loop",
@@ -2418,6 +2669,14 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                         (),
                         [],
                     ),
+                )
+            elif mutation in _HEAP_REVIEW_CONTROL_AND_EFFECT_MUTATIONS:
+                _apply_heap_review_control_or_effect_mutation(
+                    self,
+                    function,
+                    owner,
+                    final_assembly,
+                    mutation,
                 )
             elif mutation == "hidden_pre_parallel_declaration":
                 loop = next(
