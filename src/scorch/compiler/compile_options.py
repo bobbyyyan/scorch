@@ -544,6 +544,12 @@ class KernelBuildOptions:
                     "wrapper name and path must both be present or both be absent",
                 )
             if self.compiler_wrapper_name is not None:
+                if type(self.compiler_wrapper_name) is not str:
+                    _raise_options_error(
+                        "invalid_type",
+                        "build.compiler_wrapper_name",
+                        "expected an exact string or None",
+                    )
                 if self.compiler_wrapper_name not in {"ccache", "sccache"}:
                     _raise_options_error(
                         "unsupported_compiler_wrapper",
@@ -785,8 +791,9 @@ class CompileOptions:
                 "expected the ordered current pass sequence",
             )
         object.__setattr__(self, "enabled_llir_passes", enabled_passes)
-        if enabled_passes != CURRENT_LLIR_PASSES or any(
-            type(pass_id) is not LLIRPassId for pass_id in enabled_passes
+        if (
+            any(type(pass_id) is not LLIRPassId for pass_id in enabled_passes)
+            or enabled_passes != CURRENT_LLIR_PASSES
         ):
             _raise_options_error(
                 "unsupported_pass_pipeline",
