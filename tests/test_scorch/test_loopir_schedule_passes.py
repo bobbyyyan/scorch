@@ -807,12 +807,21 @@ def test_apply_schedule_plan_rejects_unmigrated_families():
             ),
         ),
     )
-    expect_code(
-        "unsupported_schedule_parallel",
-        apply_schedule_plan,
+    # Explicit parallel-loop plans are a migrated family: the fact is
+    # consumed into the scheduled program's abstract selection.
+    from scorch.compiler.loopir.nodes import ParallelIntent, ParallelPart
+
+    parallel_artifact = apply_schedule_plan(
         lowering.program,
         LoopPlan(loop_order=order, parallel_loop=LoopRef(i.index_id)),
     )
+    verify_scheduled_loopir(parallel_artifact)
+    stamped = parallel_artifact.program.parallel
+    assert stamped is not None
+    assert stamped.index == i.index_id
+    assert stamped.part is ParallelPart.LOGICAL
+    assert stamped.intent is ParallelIntent.EXPLICIT
+    assert parallel_artifact.base_program.parallel is None
     expect_code(
         "invalid_schedule_result_tile",
         apply_schedule_plan,
@@ -3167,30 +3176,51 @@ def test_multi_prefix_heap_keeps_physical_and_logical_orders_distinct():
     assert type(physical_a) is DenseFor and physical_a.index == a.index_id
 
 
-def test_multi_prefix_heap_rejects_an_inner_prefix_parallel_anchor():
-    """Target lowering realizes the outermost prefix; anything else fails."""
+def test_multi_prefix_heap_admits_every_prefix_parallel_anchor():
+    """Any dense prefix loop is a legal heap anchor — the legacy envelope.
+
+    The former outermost-prefix pin (§18.4 boundary 2) is lifted by the
+    abstract selection: each admitted anchor is consumed into the
+    scheduled program and a non-prefix anchor still fails closed.
+    """
 
     from dataclasses import replace as dataclass_replace
+
+    from scorch.compiler.loopir.nodes import ParallelDiscipline, ParallelPart
 
     cin, (a, b, c, d) = build_ttm_abcd()
     lowering = lower(cin)
     plan = multi_prefix_heap_plan(lowering, (a, b), d)
-    inner_anchor = dataclass_replace(plan, parallel_loop=LoopRef(b.index_id))
+    for anchor in (a, b):
+        anchored = dataclass_replace(plan, parallel_loop=LoopRef(anchor.index_id))
+        artifact = apply_schedule_plan(lowering.program, anchored)
+        verify_scheduled_loopir(artifact)
+        stamped = artifact.program.parallel
+        assert stamped is not None
+        assert stamped.index == anchor.index_id
+        assert stamped.part is ParallelPart.LOGICAL
+        assert stamped.discipline is ParallelDiscipline.COMPACT_PARTITION
+    reduction_anchor = dataclass_replace(plan, parallel_loop=LoopRef(c.index_id))
     defect = expect_code(
         "invalid_schedule_result_tile",
         apply_schedule_plan,
         lowering.program,
-        inner_anchor,
+        reduction_anchor,
     )
-    assert "outermost dense result-prefix loop" in defect.message
+    assert "dense result-prefix loop" in defect.message
+    pack_anchor = dataclass_replace(plan, parallel_loop=LoopRef(d.index_id))
+    expect_code(
+        "invalid_schedule_result_tile",
+        apply_schedule_plan,
+        lowering.program,
+        pack_anchor,
+    )
 
 
-def test_multi_prefix_heap_rejects_a_composed_sparse_panel():
-    """The audited panel composition stays at its single-prefix shape."""
+def multi_prefix_heap_panel_plan(lowering, a, b, c, d, *, anchor):
+    """The rank-3 TTM heap chain composed with a window over ``c``."""
 
-    cin, (a, b, c, d) = build_ttm_abcd()
-    lowering = lower(cin)
-    plan = LoopPlan(
+    return LoopPlan(
         loop_order=lowering.loop_index_ids,
         tiles=(
             affine_tile(d.index_id, 3, accum="heap"),
@@ -3203,19 +3233,70 @@ def test_multi_prefix_heap_rejects_a_composed_sparse_panel():
                 ),
             ),
         ),
-        panel_bounds=(PanelBound(LoopRef(c.index_id), lowering.input_symbols[0], 2),),
+        panel_bounds=(PanelBound(LoopRef(c.index_id), lowering.input_symbols[1], 0),),
         result_tile=multi_prefix_result_tile_fact(lowering, (a, b), d),
-        parallel_loop=LoopRef(a.index_id),
+        parallel_loop=LoopRef(anchor.index_id),
         provenance="explicit",
         tag="heap-multi-prefix-panel",
     )
+
+
+def test_multi_prefix_heap_composes_a_sparse_panel():
+    """The rank-3 heap+panel chain applies with the dense-parent row anchor.
+
+    Lifts §18.4 boundary 1: legacy admits the composition only with the
+    window's CSR dense-parent row (the innermost prefix) as the parallel
+    anchor, which the abstract selection can now express.  Any other
+    prefix anchor keeps failing closed exactly as legacy does.
+    """
+
+    from scorch.compiler.loopir.nodes import (
+        DenseFor as _DenseFor,
+        PanelOuterFor,
+        ParallelDiscipline,
+        ParallelPart,
+        ResultTileRegion,
+        SparseWindowFor,
+        TileInnerFor,
+        TileOuterFor,
+    )
+
+    cin, (a, b, c, d) = build_ttm_abcd()
+    lowering = lower(cin)
+    plan = multi_prefix_heap_panel_plan(lowering, a, b, c, d, anchor=b)
+    artifact = apply_schedule_plan(lowering.program, plan)
+    verify_scheduled_loopir(artifact)
+    stamped = artifact.program.parallel
+    assert stamped is not None
+    assert stamped.index == b.index_id
+    assert stamped.part is ParallelPart.LOGICAL
+    assert stamped.discipline is ParallelDiscipline.COMPACT_PARTITION
+    pack = artifact.program.body.statements[0]
+    assert type(pack) is TileOuterFor
+    region = pack.body.statements[0]
+    assert type(region) is ResultTileRegion
+    panel = region.body.statements[0]
+    assert type(panel) is PanelOuterFor
+    loop_a = panel.body.statements[0]
+    loop_b = loop_a.body.statements[0]
+    window = loop_b.body.statements[0]
+    point = window.body.statements[0]
+    assert type(loop_a) is _DenseFor and loop_a.index == a.index_id
+    assert type(loop_b) is _DenseFor and loop_b.index == b.index_id
+    assert type(window) is SparseWindowFor
+    assert type(point) is TileInnerFor
+    erased = erase_schedule(artifact.program)
+    assert canonical_program_dump(erased) == canonical_program_dump(
+        artifact.base_program
+    )
+    outer_anchor = multi_prefix_heap_panel_plan(lowering, a, b, c, d, anchor=a)
     defect = expect_code(
-        "invalid_schedule_result_tile",
+        "panel_parallel_scope",
         apply_schedule_plan,
         lowering.program,
-        plan,
+        outer_anchor,
     )
-    assert "single-prefix result" in defect.message
+    assert "dense" in defect.message
 
 
 @pytest.mark.parametrize("scope", ["panel", "pack"])
