@@ -3729,3 +3729,108 @@ def test_rank_two_nonidentity_heap_oracle_differential_is_exact():
             for row in range(rows)
         ]
         assert scheduled_result[lowering.result_symbol] == reference
+
+
+def test_erase_schedule_drops_a_parallel_selection():
+    """The selection is schedule state; erasure restores the bare base."""
+
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_csr_spmv,
+    )
+
+    bare = build_csr_spmv()
+    selected = build_csr_spmv()
+    dim_i = selected.program.tensors[2].dimensions[0]
+    attach_selection(
+        selected,
+        selected.row,
+        rows=dim_i,
+        nnz=selected.builder.sparse_work_source(selected.a, 1),
+    )
+    erased = erase_schedule(selected.program)
+    assert erased.parallel is None
+    assert canonical_program_dump(erased) == canonical_program_dump(bare.program)
+    assert erase_schedule(bare.program) is bare.program
+
+
+def test_scheduled_carrier_rejects_a_parallel_base():
+    """A base program carrying a selection is not an unscheduled base."""
+
+    from scorch.compiler.loopir.nodes import (
+        ParallelDiscipline,
+        ParallelIntent,
+        ParallelPart,
+    )
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    lowering, (i, j, k), plan, artifact = scheduled_heap_alone()
+    base = artifact.base_program
+    builder = LoopIRBuilder.resuming(base)
+    row_dimension = next(
+        decl for decl in base.tensors if decl.symbol == lowering.result_symbol
+    ).dimensions[0]
+    selection = builder.parallel_selection(
+        i.index_id,
+        ParallelPart.LOGICAL,
+        ParallelDiscipline.RESULT_PARTITION,
+        builder.parallel_work(row_dimension, None),
+        ParallelIntent.EXPLICIT,
+    )
+    forge(base, parallel=selection)
+    expect_code("scheduled_base_not_unscheduled", verify_scheduled_loopir, artifact)
+
+
+def test_parallel_selection_is_execution_neutral():
+    """The selection has no execution semantics; the oracle ignores it."""
+
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_csr_spmv,
+    )
+    from tests.test_scorch.test_loopir_verifier import CsrSpmvFixture
+
+    def run(fixture: CsrSpmvFixture):
+        dense = [
+            [1.0, 0.0, 2.0],
+            [0.0, 3.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [4.0, 0.0, 5.0],
+        ]
+        bindings = {
+            fixture.a: csr_from_dense(dense),
+            fixture.x: [1.0, 2.0, 3.0],
+        }
+        shapes = {fixture.y: (4,)}
+        return run_program(fixture.program, bindings, shapes)[fixture.y]
+
+    bare = build_csr_spmv()
+    selected = build_csr_spmv()
+    dim_i = selected.program.tensors[2].dimensions[0]
+    attach_selection(
+        selected,
+        selected.row,
+        rows=dim_i,
+        nnz=selected.builder.sparse_work_source(selected.a, 1),
+    )
+    assert run(selected) == run(bare)
+
+
+def test_resuming_continues_past_selection_identities():
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_csr_spmv,
+    )
+
+    fixture = build_csr_spmv()
+    dim_i = fixture.program.tensors[2].dimensions[0]
+    selection = attach_selection(
+        fixture,
+        fixture.row,
+        rows=dim_i,
+        nnz=fixture.builder.sparse_work_source(fixture.a, 1),
+    )
+    continued = LoopIRBuilder.resuming(fixture.program)
+    fresh = continued.block(())
+    assert fresh.node_id.value > selection.node_id.value
+    assert fresh.node_id.value > selection.work.node_id.value

@@ -24,6 +24,9 @@ from scorch.compiler.loopir.nodes import (
     Load,
     LoopIRNodeId,
     LoopProgram,
+    ParallelDiscipline,
+    ParallelIntent,
+    ParallelPart,
     ReduceOp,
     RelayoutId,
     RelayoutScope,
@@ -711,6 +714,11 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "result_tile_write_mismatch",
     "result_tile_residual_write",
     "result_tile_dead_region",
+    # Abstract parallel-selection codes added by the Phase-6 parallel slice.
+    "invalid_parallel_selection",
+    "parallel_target_missing",
+    "parallel_work_mismatch",
+    "parallel_race",
 }
 
 
@@ -3481,3 +3489,374 @@ def test_result_tile_defect_paths_are_reported():
     forge(fixture.decl, pack=fixture.builder.new_tile_id())
     defect = expect_defect("result_tile_scope_mismatch", fixture.program)
     assert "statements[0]" in defect.path
+
+
+# -- Phase-6 abstract parallel selection --------------------------------------
+
+
+def attach_selection(
+    fixture,
+    index,
+    *,
+    part=ParallelPart.LOGICAL,
+    discipline=ParallelDiscipline.RESULT_PARTITION,
+    rows,
+    nnz=None,
+    intent=ParallelIntent.EXPLICIT,
+):
+    """Stamp one parallel selection onto a fixture's frozen program."""
+
+    work = fixture.builder.parallel_work(rows, nnz)
+    selection = fixture.builder.parallel_selection(
+        index, part, discipline, work, intent
+    )
+    forge(fixture.program, parallel=selection)
+    return selection
+
+
+def test_parallel_selection_verifies_result_partition():
+    """A row selection over the CSR SpMV chain is race free and exact."""
+
+    fixture = build_csr_spmv()
+    dim_i = fixture.program.tensors[2].dimensions[0]
+    attach_selection(
+        fixture,
+        fixture.row,
+        rows=dim_i,
+        nnz=fixture.builder.sparse_work_source(fixture.a, 1),
+    )
+    verify_program(fixture.program)
+    uniform = build_csr_spmv()
+    dim_i = uniform.program.tensors[2].dimensions[0]
+    attach_selection(uniform, uniform.row, rows=dim_i)
+    verify_program(uniform.program)
+
+
+def test_parallel_selection_verifies_compact_partition():
+    """A dense prefix selection inside the heap region partitions the tile."""
+
+    fixture = build_heap_spmm()
+    attach_selection(
+        fixture,
+        fixture.row,
+        discipline=ParallelDiscipline.COMPACT_PARTITION,
+        rows=fixture.dim_i,
+        nnz=fixture.builder.sparse_work_source(fixture.a, 1),
+    )
+    verify_program(fixture.program)
+
+
+def test_parallel_selection_verifies_outer_part():
+    """An OUTER selection names a split origin; region state stays private."""
+
+    fixture = build_stack_matmul()
+    dim_k = fixture.program.tensors[2].dimensions[1]
+    attach_selection(fixture, fixture.col, part=ParallelPart.OUTER, rows=dim_k)
+    verify_program(fixture.program)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "not_a_selection",
+        "forged_part",
+        "string_discipline",
+        "string_intent",
+        "work_not_typed",
+        "rows_not_dimension",
+        "rows_undeclared",
+        "nnz_not_typed",
+        "nnz_undeclared_tensor",
+        "nnz_dense_level",
+        "nnz_bool_level",
+        "nnz_out_of_range_level",
+    ],
+)
+def test_parallel_selection_rejects_malformed_state(mutation):
+    fixture = build_csr_spmv()
+    dim_i = fixture.program.tensors[2].dimensions[0]
+    selection = attach_selection(fixture, fixture.row, rows=dim_i)
+    builder = fixture.builder
+    if mutation == "not_a_selection":
+        forge(fixture.program, parallel=object())
+    elif mutation == "forged_part":
+        forged = object.__new__(ParallelPart)
+        object.__setattr__(forged, "_name_", "LOGICAL")
+        object.__setattr__(forged, "_value_", "logical")
+        forge(selection, part=forged)
+    elif mutation == "string_discipline":
+        forge(selection, discipline="result_partition")
+    elif mutation == "string_intent":
+        forge(selection, intent="explicit")
+    elif mutation == "work_not_typed":
+        forge(selection, work=object())
+    elif mutation == "rows_not_dimension":
+        forge(selection.work, rows=7)
+        expect_defect("invalid_dimension_id", fixture.program)
+        return
+    elif mutation == "rows_undeclared":
+        forge(selection.work, rows=DimensionId(4096))
+    elif mutation == "nnz_not_typed":
+        forge(selection.work, nnz=object())
+    elif mutation == "nnz_undeclared_tensor":
+        from scorch.compiler.identity import new_symbol_id
+
+        forge(selection.work, nnz=builder.sparse_work_source(new_symbol_id(), 1))
+    elif mutation == "nnz_dense_level":
+        forge(selection.work, nnz=builder.sparse_work_source(fixture.a, 0))
+    elif mutation == "nnz_bool_level":
+        forge(selection.work, nnz=builder.sparse_work_source(fixture.a, True))
+    else:
+        assert mutation == "nnz_out_of_range_level"
+        forge(selection.work, nnz=builder.sparse_work_source(fixture.a, 2))
+    expect_defect("invalid_parallel_selection", fixture.program)
+
+
+def test_parallel_selection_missing_stored_field_is_malformed():
+    fixture = build_csr_spmv()
+    dim_i = fixture.program.tensors[2].dimensions[0]
+    selection = attach_selection(fixture, fixture.row, rows=dim_i)
+    object.__delattr__(selection, "discipline")
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_parallel_selection_deleted_program_field_is_malformed():
+    fixture = build_csr_spmv()
+    object.__delattr__(fixture.program, "parallel")
+    expect_defect("malformed_state", fixture.program)
+
+
+def test_parallel_selection_target_missing():
+    fixture = build_csr_spmv()
+    dim_i = fixture.program.tensors[2].dimensions[0]
+    attach_selection(fixture, fixture.builder.new_index_id(), rows=dim_i)
+    expect_defect("parallel_target_missing", fixture.program)
+    outer = build_csr_spmv()
+    dim_i = outer.program.tensors[2].dimensions[0]
+    attach_selection(outer, outer.row, part=ParallelPart.OUTER, rows=dim_i)
+    expect_defect("parallel_target_missing", outer.program)
+
+
+def test_parallel_selection_identity_is_unique_by_binding_discipline():
+    """Sibling rebinding fails first, so a selection target is unique."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    x, y = (builder.new_symbol_id() for _ in range(2))
+    decl_x = builder.tensor(
+        x, "x", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    decl_y = builder.tensor(
+        y, "y", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    index = builder.new_index_id()
+    first = builder.dense_for(
+        index,
+        dim_i.dimension,
+        builder.block(
+            (
+                builder.store(
+                    y,
+                    (builder.index_value(index),),
+                    builder.load(x, (builder.index_value(index),)),
+                ),
+            )
+        ),
+    )
+    second = builder.dense_for(
+        index,
+        dim_i.dimension,
+        builder.block(
+            (
+                builder.store(
+                    y,
+                    (builder.index_value(index),),
+                    builder.load(x, (builder.index_value(index),)),
+                ),
+            )
+        ),
+    )
+    work = builder.parallel_work(dim_i.dimension, None)
+    selection = builder.parallel_selection(
+        index,
+        ParallelPart.LOGICAL,
+        ParallelDiscipline.RESULT_PARTITION,
+        work,
+        ParallelIntent.EXPLICIT,
+    )
+    program = builder.program(
+        (dim_i,),
+        (decl_x, decl_y),
+        (x,),
+        (y,),
+        builder.block((first, second)),
+        selection,
+    )
+    expect_defect("duplicate_index_binding", program)
+
+
+def test_parallel_selection_work_rows_mismatch():
+    fixture = build_csr_spmv()
+    dim_j = fixture.program.tensors[1].dimensions[0]
+    attach_selection(fixture, fixture.row, rows=dim_j)
+    expect_defect("parallel_work_mismatch", fixture.program)
+
+
+def test_parallel_selection_work_nnz_not_iterated():
+    """A sparse work source outside the selected loop is a false estimate."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a, x, y, z = (builder.new_symbol_id() for _ in range(4))
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.COMPRESSED, 1),
+        ),
+    )
+    decl_x = builder.tensor(
+        x, "x", ScalarType.FLOAT32, (dim_j.dimension,), builder.dense_levels(1)
+    )
+    decl_y = builder.tensor(
+        y, "y", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    decl_z = builder.tensor(
+        z, "z", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    other = builder.new_index_id()
+    cursor = builder.new_cursor_id()
+    position = builder.new_position_id()
+    cursor_decl = builder.sparse_cursor(
+        cursor,
+        a,
+        1,
+        builder.dense_position(a, 0, builder.root_position(), builder.index_value(row)),
+    )
+    spmv_leaf = builder.store_reduce(
+        y,
+        (builder.index_value(row),),
+        ReduceOp.ADD,
+        builder.binary(
+            BinaryOp.MUL,
+            builder.cursor_value(cursor),
+            builder.load(x, (builder.index_value(col),)),
+        ),
+    )
+    spmv_chain = builder.dense_for(
+        row,
+        dim_i.dimension,
+        builder.block(
+            (
+                builder.sparse_for(
+                    cursor_decl, position, col, builder.block((spmv_leaf,))
+                ),
+            )
+        ),
+    )
+    dense_chain = builder.dense_for(
+        other,
+        dim_i.dimension,
+        builder.block(
+            (
+                builder.store(
+                    z,
+                    (builder.index_value(other),),
+                    builder.float_const(1.0),
+                ),
+            )
+        ),
+    )
+    work = builder.parallel_work(dim_i.dimension, builder.sparse_work_source(a, 1))
+    selection = builder.parallel_selection(
+        other,
+        ParallelPart.LOGICAL,
+        ParallelDiscipline.RESULT_PARTITION,
+        work,
+        ParallelIntent.EXPLICIT,
+    )
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_x, decl_y, decl_z),
+        (a, x),
+        (y, z),
+        builder.block((spmv_chain, dense_chain)),
+        selection,
+    )
+    expect_defect("parallel_work_mismatch", program)
+
+
+def test_parallel_selection_rejects_reduction_race():
+    """Selecting a loop the result does not address is a data race."""
+
+    fixture = build_csr_spmv()
+    dim_j = fixture.program.tensors[1].dimensions[0]
+    attach_selection(fixture, fixture.col, rows=dim_j)
+    expect_defect("parallel_race", fixture.program)
+
+
+def test_parallel_selection_rejects_ordered_assembly():
+    fixture = build_union_add()
+    dim_i = fixture.program.tensors[0].dimensions[0]
+    attach_selection(fixture, fixture.row, rows=dim_i)
+    expect_defect("parallel_race", fixture.program)
+
+
+def test_parallel_selection_rejects_shared_workspace():
+    """A loop inside the producer shares the workspace across iterations."""
+
+    fixture = build_stack_matmul()
+    dim_j = fixture.program.tensors[0].dimensions[1]
+    attach_selection(fixture, fixture.red, rows=dim_j)
+    expect_defect("parallel_race", fixture.program)
+
+
+def test_parallel_selection_result_partition_rejects_heap_regions():
+    fixture = build_heap_spmm()
+    attach_selection(fixture, fixture.row, rows=fixture.dim_i)
+    expect_defect("parallel_race", fixture.program)
+
+
+def test_parallel_selection_compact_requires_the_heap_region():
+    fixture = build_csr_spmv()
+    dim_i = fixture.program.tensors[2].dimensions[0]
+    attach_selection(
+        fixture,
+        fixture.row,
+        discipline=ParallelDiscipline.COMPACT_PARTITION,
+        rows=dim_i,
+    )
+    expect_defect("parallel_race", fixture.program)
+
+
+def test_parallel_selection_compact_rejects_the_shared_pack_origin():
+    """The pack origin lies outside the region and shares compact storage."""
+
+    fixture = build_heap_spmm()
+    attach_selection(
+        fixture,
+        fixture.free,
+        part=ParallelPart.OUTER,
+        discipline=ParallelDiscipline.COMPACT_PARTITION,
+        rows=fixture.dim_k,
+    )
+    expect_defect("parallel_race", fixture.program)
+
+
+def test_parallel_selection_compact_rejects_an_unaddressed_loop():
+    """A reduction loop inside the region does not partition compact cells."""
+
+    fixture = build_heap_spmm()
+    attach_selection(
+        fixture,
+        fixture.col,
+        discipline=ParallelDiscipline.COMPACT_PARTITION,
+        rows=fixture.dim_j,
+    )
+    expect_defect("parallel_race", fixture.program)

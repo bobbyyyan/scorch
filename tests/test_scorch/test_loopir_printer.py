@@ -135,12 +135,13 @@ def test_canonical_dump_omits_display_names():
 
 
 def test_canonical_dump_carries_schema_version():
-    # v7: the Phase-6 heap slice added the compact result-tile kinds
-    # (result_tile_region, tiled_reduce), after v6 added the
-    # staged-operand kinds, v5 the sparse coordinate-window kinds, v4 the
-    # workspace node kinds, and v3 the affine-split kinds.
+    # v8: the Phase-6 parallel slice added the program-level abstract
+    # parallel selection, after v7 added the compact result-tile kinds
+    # (result_tile_region, tiled_reduce), v6 the staged-operand kinds, v5
+    # the sparse coordinate-window kinds, v4 the workspace node kinds, and
+    # v3 the affine-split kinds.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v7"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v8"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
@@ -671,3 +672,78 @@ def test_result_tile_canonical_dump_serializes_the_region_semantics():
     assert leaf["result_tile"] == 0
     assert leaf["op"] == "add"
     assert [index["kind"] for index in leaf["indices"]] == ["index", "index"]
+
+
+def test_canonical_dump_owns_the_parallel_selection():
+    """The selection is semantic program state with a deterministic dump."""
+
+    from scorch.compiler.loopir.nodes import ParallelPart
+
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_csr_spmv,
+        build_stack_matmul,
+    )
+
+    def spmv_with_selection(nnz_level):
+        fixture = build_csr_spmv()
+        dim_i = fixture.program.tensors[2].dimensions[0]
+        attach_selection(
+            fixture,
+            fixture.row,
+            rows=dim_i,
+            nnz=(
+                None
+                if nnz_level is None
+                else fixture.builder.sparse_work_source(fixture.a, nnz_level)
+            ),
+        )
+        return fixture.program
+
+    bare = build_csr_spmv().program
+    selected = spmv_with_selection(1)
+    payload = json.loads(canonical_program_dump(selected))
+    assert json.loads(canonical_program_dump(bare))["parallel"] is None
+    assert payload["parallel"] == {
+        "index": 0,
+        "part": "logical",
+        "discipline": "result_partition",
+        "work": {"rows": 0, "nnz": {"tensor": 0, "level": 1}},
+        "intent": "explicit",
+    }
+    # Deterministic across fresh builders and distinct from the bare and
+    # uniform-work forms.
+    assert canonical_program_dump(selected) == canonical_program_dump(
+        spmv_with_selection(1)
+    )
+    assert canonical_program_dump(selected) != canonical_program_dump(bare)
+    assert canonical_program_dump(selected) != canonical_program_dump(
+        spmv_with_selection(None)
+    )
+    outer = build_stack_matmul()
+    dim_k = outer.program.tensors[2].dimensions[1]
+    attach_selection(outer, outer.col, part=ParallelPart.OUTER, rows=dim_k)
+    outer_payload = json.loads(canonical_program_dump(outer.program))
+    assert outer_payload["parallel"]["part"] == "outer"
+
+
+def test_printer_renders_the_parallel_selection():
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_csr_spmv,
+    )
+
+    fixture = build_csr_spmv()
+    dim_i = fixture.program.tensors[2].dimensions[0]
+    attach_selection(
+        fixture,
+        fixture.row,
+        rows=dim_i,
+        nnz=fixture.builder.sparse_work_source(fixture.a, 1),
+    )
+    rendered = print_program(fixture.program)
+    assert (
+        "  parallel x0 part=logical discipline=result_partition "
+        "work(d0, nnz(t0@1)) intent=explicit\n"
+    ) in rendered
+    assert "parallel" not in print_program(build_csr_spmv().program)
