@@ -4283,12 +4283,15 @@ class _ResultTileBindingValidator:
         ):
             self._bind_declaration(statement, visible_names)
         elif statement_type is llir.Assign:
-            self._bind_expression(statement.var, visible_names)
-            self._bind_expression(statement.value, visible_names)
+            assignment = cast(llir.Assign, statement)
+            self._bind_expression(assignment.var, visible_names)
+            self._bind_expression(assignment.value, visible_names)
         elif statement_type is llir.Increment:
-            self._bind_expression(statement.var, visible_names)
+            increment = cast(llir.Increment, statement)
+            self._bind_expression(increment.var, visible_names)
         elif statement_type is llir.Return:
-            self._bind_expression(statement.value, visible_names)
+            return_statement = cast(llir.Return, statement)
+            self._bind_expression(return_statement.value, visible_names)
         elif statement_type in (
             llir.FunctionCallStmt,
             llir.MemberCallStmt,
@@ -4304,9 +4307,9 @@ class _ResultTileBindingValidator:
             self._declare_var(loop.var, "ForLoopAuto.var", loop_names)
             self._bind_sequence(loop.body, loop_names)
         elif statement_type is llir.WhileLoop:
-            loop = cast(llir.WhileLoop, statement)
-            self._bind_expression(loop.cond, visible_names)
-            self._bind_sequence(loop.body, set(visible_names))
+            while_loop = cast(llir.WhileLoop, statement)
+            self._bind_expression(while_loop.cond, visible_names)
+            self._bind_sequence(while_loop.body, set(visible_names))
         elif statement_type is llir.IfThenElse:
             self._bind_if_then_else(
                 cast(llir.IfThenElse, statement),
