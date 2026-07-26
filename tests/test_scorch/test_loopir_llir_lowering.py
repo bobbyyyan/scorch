@@ -2176,6 +2176,11 @@ _HEAP_REVIEW_CONTROL_AND_EFFECT_MUTATIONS = {
     "move_result_shape",
     "escape_result_shape_address",
     "unowned_result_pointer_call",
+    "guarded_call_protected_argument",
+    "member_call_protected_argument",
+    "member_call_expression_protected_argument",
+    "forged_result_shape_validation",
+    "duplicate_result_shape_validation",
 }
 
 
@@ -2283,6 +2288,64 @@ def _apply_heap_review_control_or_effect_mutation(
                 ),
             ),
         )
+    elif mutation == "guarded_call_protected_argument":
+        # A guarded single-line call is an unknown callee exactly like a free
+        # call statement; protected state may not ride its argument grammar.
+        function.body.insert(
+            final_assembly,
+            llir.GuardedCallStmt(
+                cond=llir.BinOp(
+                    "<",
+                    llir.Literal(0, llir.DataType.INT64),
+                    llir.Literal(1, llir.DataType.INT64),
+                ),
+                call=llir.FunctionCallStmt(
+                    "review_probe",
+                    (llir.Var("C_capacity", llir.DataType.INT64),),
+                ),
+            ),
+        )
+    elif mutation == "member_call_protected_argument":
+        function.body[final_assembly:final_assembly] = [
+            llir.VarDecl(llir.Var("review_sink_vec", llir.DataType.STD_VECTOR_INT)),
+            llir.MemberCallStmt(
+                base=llir.Var("review_sink_vec", llir.DataType.STD_VECTOR_INT),
+                member="push_back",
+                args=(llir.Var("C_capacity", llir.DataType.INT64),),
+            ),
+        ]
+    elif mutation == "member_call_expression_protected_argument":
+        function.body[final_assembly:final_assembly] = [
+            llir.VarDecl(llir.Var("review_sink_vec", llir.DataType.STD_VECTOR_INT)),
+            llir.VarInit(
+                llir.Var("review_sink", llir.DataType.INT64),
+                llir.MemberCall(
+                    base=llir.Var("review_sink_vec", llir.DataType.STD_VECTOR_INT),
+                    member="take",
+                    args=(llir.Var("C_capacity", llir.DataType.INT64),),
+                ),
+            ),
+        ]
+    elif mutation == "forged_result_shape_validation":
+        # A wrong-arity forged validation would ride the binding validator's
+        # name allowlist into non-compiling C++ without the census pin.
+        function.body.insert(
+            final_assembly,
+            llir.FunctionCallStmt(
+                "scorch_native::validate_jit_result_shape",
+                (llir.Var("result_shape", llir.DataType.STD_VECTOR_INT),),
+            ),
+        )
+    elif mutation == "duplicate_result_shape_validation":
+        # An exact second copy of the canonical validation compiles and
+        # changes behavior only through its count; the census must reject it.
+        canonical = next(
+            statement
+            for statement in function.body
+            if type(statement) is llir.FunctionCallStmt
+            and statement.name == "scorch_native::validate_jit_result_shape"
+        )
+        function.body.insert(final_assembly, copy.deepcopy(canonical))
     else:
         assert mutation == "unowned_result_pointer_call"
         function.body.insert(
@@ -2340,6 +2403,11 @@ def _apply_heap_review_control_or_effect_mutation(
         "move_result_shape",
         "escape_result_shape_address",
         "unowned_result_pointer_call",
+        "guarded_call_protected_argument",
+        "member_call_protected_argument",
+        "member_call_expression_protected_argument",
+        "forged_result_shape_validation",
+        "duplicate_result_shape_validation",
         "hidden_pre_parallel_declaration",
         "residual_structured_hoist",
         "policy_declaration_after_loop",
@@ -2423,6 +2491,11 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
             "move_result_shape",
             "escape_result_shape_address",
             "unowned_result_pointer_call",
+            "guarded_call_protected_argument",
+            "member_call_protected_argument",
+            "member_call_expression_protected_argument",
+            "forged_result_shape_validation",
+            "duplicate_result_shape_validation",
             "hidden_pre_parallel_declaration",
             "residual_structured_hoist",
             "policy_declaration_after_loop",
@@ -2943,3 +3016,115 @@ def test_heap_target_rejects_a_misplaced_region():
             result_shape=(4, 6),
         )
     assert captured.value.defect.code == "result_tile_scope_mismatch"
+
+
+@pytest.mark.parametrize("hidden_name", ["atomic_chunk", "atomic_bound"])
+def test_heap_binding_rejects_atomic_names_before_declaration(hidden_name):
+    """Synthetic atomic names are invisible until codegen declares them."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    chunk = llir.Var("chunk", llir.DataType.INT)
+    bound = llir.Var("bound", llir.DataType.INT)
+    loop = llir.ForLoop(
+        init=llir.VarInit(llir.Var("i", llir.DataType.INT), llir.Literal(0)),
+        cond=llir.BinOp("<", llir.Var("i", llir.DataType.INT), bound),
+        update=llir.Increment(llir.Var("i", llir.DataType.INT)),
+        body=[llir.Continue()],
+    )
+    loop._use_atomic_scheduling = True
+    loop._atomic_counter_var = "counter"
+    if hidden_name == "atomic_chunk":
+        loop._atomic_chunk_var = "review_ghost_chunk"
+        loop._loop_bound = "_start"
+        expected = "ForLoop._atomic_chunk_var references 'review_ghost_chunk'"
+    else:
+        loop._atomic_chunk_var = "chunk"
+        loop._loop_bound = "review_ghost_bound"
+        expected = "ForLoop._loop_bound references 'review_ghost_bound'"
+    loop.omp_num_threads = "scorch_nthreads(counter, bound)"
+    function = llir.Function(
+        llir.DataType.VOID,
+        "evaluate",
+        (chunk, bound),
+        [loop],
+    )
+    with pytest.raises(ValueError) as captured:
+        lower_llir_module._validate_result_tile_rendered_text(
+            function,
+            protected_names=set(),
+        )
+    assert expected in str(captured.value)
+    assert "before a visible declaration" in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "prefix_position_increment",
+        "inner_position_assign",
+        "comment_splice",
+        "undeclared_variable",
+    ],
+)
+def test_multi_prefix_heap_completion_owns_protected_state(monkeypatch, mutation):
+    """The rank-3 kernel's own position and text boundaries are owned."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = multi_prefix_heap_program()
+    original = lower_llir_module._TargetLowering.complete_panel
+
+    def corrupting(self, function):
+        completed = original(self, function)
+        write = next(
+            node
+            for node in relayout_llir_nodes(function.body)
+            if type(node) is llir.ArrayAccess
+            and type(getattr(node, "tensor_access", None)) is llir.TensorAccessMetadata
+            and node.tensor_access.role is llir.TensorAccessRole.RESULT_WRITE
+        )
+        owner = next(
+            node
+            for node in relayout_llir_nodes(function.body)
+            if type(node) is llir.Assign and node.var is write
+        )
+        located = self._locate_statement(function.body, owner)
+        assert located is not None
+        body, position = located
+        if mutation == "prefix_position_increment":
+            body.insert(
+                position,
+                llir.Increment(llir.Var("pProjected1", llir.DataType.INT)),
+            )
+        elif mutation == "inner_position_assign":
+            body.insert(
+                position,
+                llir.Assign(
+                    llir.Var("pProjected2", llir.DataType.INT),
+                    llir.Literal(0, llir.DataType.INT),
+                ),
+            )
+        elif mutation == "comment_splice":
+            body.insert(
+                position,
+                llir.Comment("decoy\nProjected_values_torch.zero_();"),
+            )
+        else:
+            assert mutation == "undeclared_variable"
+            body.insert(
+                position,
+                llir.VarInit(
+                    llir.Var("review_sink", llir.DataType.INT),
+                    llir.Var("review_ghost", llir.DataType.INT),
+                ),
+            )
+        return completed
+
+    monkeypatch.setattr(lower_llir_module._TargetLowering, "complete_panel", corrupting)
+    expect_target_code(
+        "result_tile_completion_lost",
+        fixture.program,
+        multi_prefix_heap_shapes(fixture),
+        (3, 4, 6),
+    )

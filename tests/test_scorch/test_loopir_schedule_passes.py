@@ -3623,3 +3623,109 @@ def test_scheduled_carrier_rejects_result_tile_region_bases():
         loops=artifact.loops,
     )
     expect_code("scheduled_base_not_unscheduled", verify_scheduled_loopir, forged)
+
+
+def test_rank_four_heap_plan_derives_three_prefix_loops():
+    """Arbitrary positive prefix rank is derived, never enumerated."""
+
+    a, b, c, d, e = (IndexVar(name) for name in "abcde")
+    core = TensorVar("Core4", fmt="ddds")
+    factor = TensorVar("Factor", fmt="dd")
+    out = TensorVar("Out4", fmt="dddd")
+    assign = TensorAssign(
+        out[a, b, c, e],
+        CINBinaryOp(Operation.MUL, core[a, b, c, d], factor[d, e]),
+        op=Operation.ADD,
+    )
+    cin = ForAll(a, ForAll(b, ForAll(c, ForAll(d, ForAll(e, assign)))))
+    lowering = lower(cin)
+    from scorch.compiler.loop_plan import ResultTile
+
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=(affine_tile(e.index_id, 3, accum="heap"),),
+        result_tile=ResultTile(
+            result_id=lowering.result_symbol,
+            tile_loop=LoopRef(e.index_id),
+            result_level=3,
+            result_prefix=(a.index_id, b.index_id, c.index_id),
+            access_indices=(a.index_id, b.index_id, c.index_id, e.index_id),
+        ),
+        parallel_loop=LoopRef(a.index_id),
+        provenance="explicit",
+        tag="heap-rank4",
+    )
+    artifact = apply_schedule_plan(lowering.program, plan)
+    verify_scheduled_loopir(artifact)
+    erased = erase_schedule(artifact.program)
+    assert canonical_program_dump(erased) == canonical_program_dump(lowering.program)
+
+
+def test_rank_two_nonidentity_heap_oracle_differential_is_exact():
+    """A (1, 0) physical result packs logical mode zero; execution is exact.
+
+    The packed axis is the trailing physical level but logical mode zero, so
+    the oracle's compact addressing and copy-out must key logical coordinates
+    rather than nesting depth.
+    """
+
+    from scorch.compiler.loop_plan import ResultTile
+    from scorch.compiler.loopir.nodes import LevelKind
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    rng = random.Random(4321)
+    for width in (1, 2, 3, 5):
+        cin, (i, k, j) = build_matmul_ikj()
+        lowering = lower(cin)
+        result_decl = next(
+            decl
+            for decl in lowering.program.tensors
+            if decl.symbol == lowering.result_symbol
+        )
+        builder = LoopIRBuilder.resuming(lowering.program)
+        forge(
+            result_decl,
+            levels=(
+                builder.level(LevelKind.DENSE, 1),
+                builder.level(LevelKind.DENSE, 0),
+            ),
+        )
+        plan = LoopPlan(
+            loop_order=(j.index_id, k.index_id, i.index_id),
+            tiles=(affine_tile(i.index_id, width, accum="heap"),),
+            result_tile=ResultTile(
+                result_id=lowering.result_symbol,
+                tile_loop=LoopRef(i.index_id),
+                result_level=1,
+                result_prefix=(j.index_id,),
+                access_indices=(i.index_id, j.index_id),
+            ),
+            parallel_loop=LoopRef(j.index_id),
+            provenance="explicit",
+            tag="heap-col-major",
+        )
+        artifact = apply_schedule_plan(lowering.program, plan)
+        verify_scheduled_loopir(artifact)
+        rows, inner, cols = 4, 3, 5
+        a_values = [
+            [float(rng.randrange(-3, 4)) for _ in range(inner)] for _ in range(rows)
+        ]
+        b_values = [
+            [float(rng.randrange(-3, 4)) for _ in range(cols)] for _ in range(inner)
+        ]
+        bindings = {
+            lowering.input_symbols[0]: a_values,
+            lowering.input_symbols[1]: b_values,
+        }
+        shapes = {lowering.result_symbol: (rows, cols)}
+        scheduled_result = run_program(artifact.program, bindings, shapes)
+        erased_result = run_program(erase_schedule(artifact.program), bindings, shapes)
+        assert scheduled_result == erased_result
+        reference = [
+            [
+                sum(a_values[row][red] * b_values[red][col] for red in range(inner))
+                for col in range(cols)
+            ]
+            for row in range(rows)
+        ]
+        assert scheduled_result[lowering.result_symbol] == reference
