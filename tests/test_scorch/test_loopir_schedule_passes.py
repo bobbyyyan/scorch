@@ -3915,3 +3915,24 @@ def test_resuming_continues_past_selection_identities():
     fresh = continued.block(())
     assert fresh.node_id.value > selection.node_id.value
     assert fresh.node_id.value > selection.work.node_id.value
+
+
+def test_parallel_selection_rejects_unmigrated_anchor_kinds():
+    """Merged and compressed coordinate anchors stay outside the family."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    c = TensorVar("C", fmt="dd")
+    assign = TensorAssign(c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]))
+    lowering = lower(ForAll(i, ForAll(j, assign)))
+    defect = expect_code(
+        "invalid_schedule_parallel",
+        apply_schedule_plan,
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            parallel_loop=LoopRef(j.index_id),
+        ),
+    )
+    assert "dense logical loops and affine origin loops" in defect.message

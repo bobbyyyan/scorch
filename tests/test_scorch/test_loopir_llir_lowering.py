@@ -3128,3 +3128,133 @@ def test_multi_prefix_heap_completion_owns_protected_state(monkeypatch, mutation
         multi_prefix_heap_shapes(fixture),
         (3, 4, 6),
     )
+
+
+# -- Abstract parallel selection on bare programs ------------------------------
+
+
+def bare_matmul_with_selection():
+    """The verifier matmul fixture with an explicit selection of ``j``."""
+
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_matmul as build_bare_matmul,
+    )
+
+    fixture = build_bare_matmul()
+    loop_i = fixture.program.body.statements[0]
+    loop_k = loop_i.body.statements[0]
+    loop_j = loop_k.body.statements[0]
+    attach_selection(fixture, loop_j.index, rows=loop_j.dimension)
+    return fixture
+
+
+def bare_matmul_shapes(fixture):
+    a_symbol, b_symbol = fixture.program.inputs
+    return {a_symbol: (4, 5), b_symbol: (5, 6)}
+
+
+def test_bare_parallel_selection_marks_the_selected_loop():
+    """Direct structural activation: the selection marks ``j``, not the row."""
+
+    from scorch.compiler.codegen import LLIRLowerer
+
+    fixture = bare_matmul_with_selection()
+    lowered = lower_loopir_to_llir(
+        fixture.program,
+        input_shapes=bare_matmul_shapes(fixture),
+        result_shape=(4, 6),
+    )
+    source = LLIRLowerer().lower_llir(lowered)
+    assert (
+        "#pragma omp parallel for num_threads(scorch_nthreads(-1, B1_size)) "
+        "schedule(dynamic, scorch_chunk(B1_size, -1))"
+    ) in source
+    # The auto gate stayed suppressed: the row loop carries no policy.
+    assert "scorch_nthreads(-1, A0_size)" not in source
+
+
+def test_bare_heap_selection_adopts_the_inner_prefix_anchor():
+    """A bare rank-3 heap program realizes the lifted inner-prefix anchor."""
+
+    from scorch.compiler.codegen import LLIRLowerer
+    from scorch.compiler.loopir.nodes import ParallelDiscipline
+
+    from tests.test_scorch.test_loopir_verifier import (
+        attach_selection,
+        build_heap_ttm,
+    )
+
+    fixture = build_heap_ttm()
+    attach_selection(
+        fixture,
+        fixture.row,
+        discipline=ParallelDiscipline.COMPACT_PARTITION,
+        rows=fixture.dim_b,
+        nnz=fixture.builder.sparse_work_source(fixture.core, 2),
+    )
+    lowered = lower_loopir_to_llir(
+        fixture.program,
+        input_shapes={fixture.core: (3, 4, 5), fixture.factor: (5, 6)},
+        result_shape=(3, 4, 6),
+    )
+    source = LLIRLowerer().lower_llir(lowered)
+    assert "num_threads(scorch_nthreads(Core2_pos[Core1_size], Core1_size))" in source
+    assert "num_threads(scorch_nthreads(-1, Core0_size))" not in source
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "premarked_selection",
+        "missing_selection_snapshot",
+        "mutated_selection_header",
+        "forged_work_source",
+    ],
+)
+def test_parallel_completion_owns_the_selected_loop(monkeypatch, mutation):
+    """Post-assembly loss of the selection is stage-owned, never guessed."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = bare_matmul_with_selection()
+    original = lower_llir_module._TargetLowering.complete_parallel
+
+    def corrupting(self, function):
+        if mutation == "missing_selection_snapshot":
+            self._emitted_loop_headers.clear()
+        elif mutation == "forged_work_source":
+            from tests.test_scorch.test_loopir_verifier import forge
+
+            forge(
+                self.parallel.work,
+                nnz=fixture.builder.sparse_work_source(fixture.program.inputs[0], 1),
+            )
+        else:
+            target = None
+            for node in relayout_llir_nodes(function.body):
+                if (
+                    type(node) is llir.ForLoop
+                    and node.init is not None
+                    and type(node.init.var) is llir.Var
+                    and node.init.var.name == "j"
+                ):
+                    target = node
+            assert target is not None
+            if mutation == "premarked_selection":
+                target.omp_parallel_for = True
+            else:
+                assert mutation == "mutated_selection_header"
+                target.init.var.name = "j_review"
+        return original(self, function)
+
+    monkeypatch.setattr(
+        lower_llir_module._TargetLowering, "complete_parallel", corrupting
+    )
+    with pytest.raises(LoopIRTargetError) as captured:
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes=bare_matmul_shapes(fixture),
+            result_shape=(4, 6),
+        )
+    assert captured.value.defect.code == "parallel_completion_lost"

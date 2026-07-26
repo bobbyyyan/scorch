@@ -2617,3 +2617,259 @@ def test_heap_randomized_execution_matches_torch_and_oracle():
             atol=1e-4,
             rtol=1e-4,
         )
+
+
+# -- Explicit parallel anchors ------------------------------------------------
+
+
+def ttm_heap_anchor_schedule(tag, anchor, strip=3, dtype_tag=""):
+    return Schedule(
+        loop_order=("a", "b", "c", "d"),
+        tiles=(
+            TileSpec("d", strip, placement="outermost", accum="heap", unroll=False),
+        ),
+        tag=tag,
+        parallel_loop=anchor,
+    )
+
+
+def ttm_heap_panel_schedule(tag, anchor, width=2, strip=3):
+    return Schedule(
+        loop_order=("a", "b", "c", "d"),
+        tiles=(
+            TileSpec("d", strip, placement="outermost", accum="heap", unroll=False),
+            panel("c", width, placement="child_of:d_out", unroll=False),
+        ),
+        tag=tag,
+        parallel_loop=anchor,
+    )
+
+
+ANCHOR_PARITY_GRID = [
+    (
+        "matmul anchor i matches the auto row",
+        build_matmul,
+        Schedule(loop_order=("i", "k", "j"), parallel_loop="i", tag="anch-mm-i"),
+        (4, 6),
+        MATMUL_BINDINGS,
+    ),
+    (
+        "matmul anchor j marks the inner free loop",
+        build_matmul,
+        Schedule(loop_order=("i", "k", "j"), parallel_loop="j", tag="anch-mm-j"),
+        (4, 6),
+        MATMUL_BINDINGS,
+    ),
+    (
+        "spmm anchor i keeps the nnz-aware row policy",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), parallel_loop="i", tag="anch-sp-i"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm anchor k marks the dense free loop",
+        build_spmm,
+        Schedule(loop_order=("i", "j", "k"), parallel_loop="k", tag="anch-sp-k"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "stack anchor i suppresses the origin auto gate",
+        build_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(stack("k", 4),),
+            parallel_loop="i",
+            tag="anch-st-i",
+        ),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "tile-j anchor i marks the row over the origin",
+        build_matmul,
+        Schedule(
+            loop_order=("i", "k", "j"),
+            tiles=(tile("j", 4),),
+            parallel_loop="i",
+            tag="anch-tj-i",
+        ),
+        (4, 6),
+        MATMUL_BINDINGS,
+    ),
+    (
+        "tile-j anchor j redirects to the split origin",
+        build_matmul,
+        Schedule(
+            loop_order=("i", "k", "j"),
+            tiles=(tile("j", 4),),
+            parallel_loop="j",
+            tag="anch-tj-j",
+        ),
+        (4, 6),
+        MATMUL_BINDINGS,
+    ),
+    (
+        "ttm heap outer prefix anchor",
+        build_ttm,
+        ttm_heap_anchor_schedule("anch-ttm-a", "a"),
+        (3, 4, 6),
+        TTM_BINDINGS,
+    ),
+    (
+        "ttm heap inner prefix anchor",
+        build_ttm,
+        ttm_heap_anchor_schedule("anch-ttm-b", "b"),
+        (3, 4, 6),
+        TTM_BINDINGS,
+    ),
+    (
+        "ttm heap inner prefix anchor f64",
+        lambda: build_ttm(dtype=F64),
+        ttm_heap_anchor_schedule("anch-ttm-b64", "b"),
+        (3, 4, 6),
+        TTM_BINDINGS_F64,
+    ),
+    (
+        "ttm heap panel dense-parent anchor",
+        build_ttm,
+        ttm_heap_panel_schedule("anch-ttm-pb", "b"),
+        (3, 4, 6),
+        TTM_BINDINGS,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ANCHOR_PARITY_GRID,
+    ids=[case[0] for case in ANCHOR_PARITY_GRID],
+)
+def test_anchor_source_is_byte_identical_to_legacy(case):
+    """Every admitted explicit anchor reproduces the legacy route's bytes."""
+
+    name, build, schedule, result_shape, bindings = case
+    comparison = compare_generated_sources(
+        build(),
+        result_shape,
+        bindings,
+        compile_options=scheduled_options(schedule),
+    )
+    assert comparison.identical, f"{name} diverged from the legacy anchor"
+
+
+def test_ttm_heap_inner_anchor_structural_activation():
+    """The lifted inner-prefix anchor moves the nnz-aware policy to ``b``."""
+
+    comparison = compare_generated_sources(
+        build_ttm(),
+        (3, 4, 6),
+        TTM_BINDINGS,
+        compile_options=scheduled_options(
+            ttm_heap_anchor_schedule("anch-ttm-act", "b")
+        ),
+    )
+    source = comparison.loopir_cpp
+    assert "num_threads(scorch_nthreads(Core2_pos[Core1_size], Core1_size))" in source
+    assert "schedule(dynamic, scorch_chunk(Core1_size, Core2_pos[Core1_size]))" in (
+        source
+    )
+    # The strip init/copy groups keep their anchor-independent static policy.
+    assert (
+        source.count(
+            "scorch_nthreads((Projected0_size * Projected1_size) * kTile_d, "
+            "(Projected0_size * Projected1_size))"
+        )
+        == 2
+    )
+    outer = compare_generated_sources(
+        build_ttm(),
+        (3, 4, 6),
+        TTM_BINDINGS,
+        compile_options=scheduled_options(
+            ttm_heap_anchor_schedule("anch-ttm-act-a", "a")
+        ),
+    ).loopir_cpp
+    assert "num_threads(scorch_nthreads(-1, Core0_size))" in outer
+    assert outer != source
+
+
+def _assert_explicit_anchor_shadow(*, kind, seed):
+    """Run one native explicit-anchor differential in an isolated process."""
+
+    torch.manual_seed(seed)
+    if kind in ("ttm_heap_b", "ttm_heap_panel_b"):
+        core = torch.randn(3, 4, 5, dtype=F32)
+        core[core.abs() < 0.6] = 0.0
+        core[1, 2, :] = 0.0
+        factor = torch.randn(5, 6, dtype=F32)
+        schedule = (
+            ttm_heap_anchor_schedule("anch-sh-ttm-b", "b")
+            if kind == "ttm_heap_b"
+            else ttm_heap_panel_schedule("anch-sh-ttm-pb", "b")
+        )
+        assert_scheduled_shadow(
+            build_ttm(),
+            schedule,
+            (3, 4, 6),
+            (ttm_stensor(core, "Core"), dense_stensor(factor, "Factor")),
+            torch.einsum("abc,cd->abd", core, factor),
+        )
+        return
+    a_dense = torch.randn(4, 5, dtype=F32)
+    a_dense[a_dense.abs() < 0.5] = 0.0
+    a_dense[2, :] = 0.0
+    b_dense = torch.randn(5, 6, dtype=F32)
+    if kind == "spmm_k":
+        schedule = Schedule(
+            loop_order=("i", "j", "k"), parallel_loop="k", tag="anch-sh-sp-k"
+        )
+    else:
+        assert kind == "stack_i"
+        schedule = Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(stack("k", 4),),
+            parallel_loop="i",
+            tag="anch-sh-st-i",
+        )
+    assert_scheduled_shadow(
+        build_spmm(),
+        schedule,
+        (4, 6),
+        (csr_stensor(a_dense, "A"), dense_stensor(b_dense, "B")),
+        a_dense @ b_dense,
+    )
+
+
+def _run_explicit_anchor_shadow_in_subprocess(**kwargs):
+    """Keep each added native anchor case out of the long-lived parent."""
+
+    invocation = (
+        "from tests.test_scorch.test_loopir_scheduled_slice import "
+        "_assert_explicit_anchor_shadow as run\n"
+        f"run(**{kwargs!r})\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", invocation],
+        cwd=Path(__file__).resolve().parents[2],
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        "isolated explicit-anchor differential failed\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["ttm_heap_b", "ttm_heap_panel_b", "spmm_k", "stack_i"],
+)
+def test_explicit_anchor_shadow_execution(kind):
+    """Each lifted or newly admitted anchor executes bitwise-equal to legacy."""
+
+    _run_explicit_anchor_shadow_in_subprocess(kind=kind, seed=2026)
