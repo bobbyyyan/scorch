@@ -545,15 +545,17 @@ def test_unsupported_schedule_families_fail_closed(schedule, code):
     assert error.value.defect.code == code, error.value.defect
 
 
-def test_empty_schedule_stays_on_the_auto_family_and_fails_closed():
+def test_empty_schedule_tiled_auto_family_fails_closed():
+    """The heuristic tile/workspace automatic family stays on the legacy path."""
+
     with pytest.raises(SchedulePassError) as error:
         compile_cin_via_loopir(
-            build_spmm(),
+            build_matmul(),
             (4, 6),
-            SPMM_BINDINGS,
+            MATMUL_BINDINGS,
             compile_options=scheduled_options(Schedule()),
         )
-    assert error.value.defect.code == "unsupported_schedule_provenance"
+    assert error.value.defect.code == "unsupported_schedule_auto_family"
 
 
 def test_unscheduled_pipeline_is_unchanged_by_the_strangler_entry():
@@ -2964,3 +2966,132 @@ def test_explicit_anchor_shadow_execution(kind):
     """Each lifted or newly admitted anchor executes bitwise-equal to legacy."""
 
     _run_explicit_anchor_shadow_in_subprocess(kind=kind, seed=2026)
+
+
+# ---------------------------------------------------------------------------
+# Automatic routing: the migrated tile-free cost-model family
+# ---------------------------------------------------------------------------
+
+AUTO_PARITY_GRID = [
+    ("spmm", build_spmm, (4, 6), SPMM_BINDINGS),
+    (
+        "two reduction",
+        build_two_reduction,
+        (4,),
+        (((4, 5), F32), ((4, 6), F32)),
+    ),
+    (
+        "broadcast row",
+        build_broadcast_row,
+        (4, 5),
+        (((4,), F32),),
+    ),
+    (
+        "union add to dense",
+        build_union_add_to_dense,
+        (4, 5),
+        (((4, 5), F32), ((4, 5), F32)),
+    ),
+    (
+        "dense add 2d",
+        build_dense_add_2d,
+        (4, 5),
+        (((4, 5), F32), ((4, 5), F32)),
+    ),
+    (
+        "dense add 3d",
+        build_dense_add_3d,
+        (3, 4, 5),
+        (((3, 4, 5), F32), ((3, 4, 5), F32)),
+    ),
+    ("vector add", build_vector_add, (6,), (((6,), F32), ((6,), F32))),
+]
+
+
+@pytest.mark.parametrize(
+    "case",
+    AUTO_PARITY_GRID,
+    ids=[entry[0].replace(" ", "-") for entry in AUTO_PARITY_GRID],
+)
+def test_auto_source_is_byte_identical_to_legacy(case):
+    """Every migrated tile-free automatic plan reproduces legacy source."""
+
+    name, build, result_shape, bindings = case
+    comparison = compare_generated_sources(
+        build(),
+        result_shape,
+        bindings,
+        compile_options=scheduled_options(Schedule()),
+    )
+    assert comparison.identical, f"{name} auto schedule diverged from legacy"
+
+
+def test_auto_artifact_carries_the_verified_auto_plan():
+    """The strangler artifact owns the auto plan and its stage records."""
+
+    options = scheduled_options(Schedule())
+    context = CompilationContext(options)
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=options,
+        compilation_context=context,
+    )
+    scheduled = kernel.schedule
+    assert scheduled is not None
+    assert scheduled.plan.provenance == "auto"
+    assert scheduled.plan.tiles == ()
+    assert scheduled.plan.workspace is None
+    assert len(scheduled.plan.loop_order) == 3
+    assert all(entry.tile is None for entry in scheduled.loops)
+    assert all(entry.part is LoopPart.LOGICAL for entry in scheduled.loops)
+    stages = [record.stage_id for record in context.stage_run_records]
+    assert stages == [
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+        CompilerStageId.LOOPIR_SCHEDULE_APPLICATION,
+        CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
+        CompilerStageId.LLIR_TO_CPP_GENERATION,
+    ]
+    # Erasure strips schedule state and returns the base semantics.
+    from scorch.compiler.loopir.printer import canonical_program_dump
+    from scorch.compiler.loopir.schedule_passes import erase_schedule
+
+    assert canonical_program_dump(
+        erase_schedule(scheduled.program)
+    ) == canonical_program_dump(scheduled.base_program)
+
+
+def test_spmm_auto_shadow_execution():
+    """The compiled automatic SpMM matches legacy bitwise and Torch numerically."""
+
+    torch.manual_seed(2609)
+    a = torch.randn(4, 5)
+    sparse_a = a.clone()
+    sparse_a[sparse_a.abs() < 0.6] = 0.0
+    b = torch.randn(5, 6)
+    assert_scheduled_shadow(
+        build_spmm(),
+        Schedule(),
+        (4, 6),
+        (csr_stensor(sparse_a, "A"), dense_stensor(b, "B")),
+        sparse_a @ b,
+    )
+
+
+def test_dense_add_auto_shadow_execution():
+    """The compiled automatic elementwise kernel matches legacy bitwise."""
+
+    torch.manual_seed(2610)
+    a = torch.randn(4, 5)
+    b = torch.randn(4, 5)
+    assert_scheduled_shadow(
+        build_dense_add_2d(),
+        Schedule(),
+        (4, 5),
+        (dense_stensor(a, "A"), dense_stensor(b, "B")),
+        a + b,
+    )

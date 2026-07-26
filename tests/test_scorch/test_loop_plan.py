@@ -1,3 +1,4 @@
+import copy
 from dataclasses import FrozenInstanceError, replace
 from typing import Tuple, cast
 from unittest.mock import patch
@@ -40,6 +41,7 @@ from scorch.compiler.loop_plan import (
     verify_scheduled_cin,
 )
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
+from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.scheduler import (
     RelayoutSpec,
     Schedule,
@@ -1976,3 +1978,246 @@ def test_verification_is_pure_repeatable_and_diagnostics_are_nonsemantic() -> No
     assert hash(invalid) == invalid_hash
     assert analyze_cin(cin) == analysis_before
     assert canonical_cin_dump(cin) == source_dump
+
+
+# ---------------------------------------------------------------------------
+# The explicit automatic workspace-insertion fact
+# ---------------------------------------------------------------------------
+
+
+def _auto_plan(cin: ForAll) -> Tuple[ScheduledCIN, LoopPlan]:
+    scheduled = Scheduler.apply_schedule(cin, Schedule())
+    return scheduled, scheduled.verified_loop_plan
+
+
+def test_auto_plan_records_the_workspace_insertion_decision() -> None:
+    """The F2 identity path records the standalone workspace fact exactly."""
+
+    scheduled, plan = _auto_plan(_build_dense_matmul())
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    workspace = plan.workspace
+    assert workspace is not None
+    assert workspace.dense is True
+    assert workspace.reduction_loop == LoopRef(ids["j"])
+    assert workspace.axis_loops == (LoopRef(ids["k"]),)
+    assert len(plan.tiles) == 2
+
+    _, spmm_plan = _auto_plan(_build_spmm())
+    assert spmm_plan.workspace is None
+    assert spmm_plan.tiles == ()
+
+    sparse_scheduled, sparse_plan = _auto_plan(_build_sparse_output_reduction())
+    sparse_ids = _index_ids_by_name(sparse_scheduled.normalized_cin)
+    sparse_workspace = sparse_plan.workspace
+    assert sparse_workspace is not None
+    assert sparse_workspace.dense is False
+    assert sparse_workspace.reduction_loop == LoopRef(sparse_ids["j"])
+    assert sparse_workspace.axis_loops == (LoopRef(sparse_ids["i"]),)
+    assert sparse_plan.tiles == ()
+
+
+def test_auto_workspace_replay_consumes_the_recorded_fact() -> None:
+    """Replay materializes the recorded workspace without re-deriving policy."""
+
+    scheduled, plan = _auto_plan(_build_dense_matmul())
+    with patch.object(
+        Scheduler,
+        "should_insert_workspace",
+        side_effect=AssertionError("replay must not re-derive the workspace decision"),
+    ):
+        replayed = legacy_cin_working_copy(scheduled.normalized_cin, plan)
+    assert replayed.inserted_workspace
+
+    direct = Scheduler._auto_schedule_owned(
+        copy.deepcopy(scheduled.normalized_cin),
+        CompileOptions.from_environment(),
+    )
+    assert str(replayed) == str(direct)
+
+
+def test_root_workspace_auto_plan_records_the_replay_contract() -> None:
+    """A dense root-scope insertion whose tiles never materialize records None.
+
+    The private surgery inserts a pure-overhead root workspace (the Where
+    root makes the tiling heuristics bail, so no tiles are recorded); the
+    replayable plan contract deliberately omits it, exactly as the
+    established ScheduledCIN replay behavior does.  The surgery-versus-
+    replay divergence is a documented legacy observation, not new state.
+    """
+
+    scheduled, plan = _auto_plan(_build_root_reduction())
+    assert plan.workspace is None
+    assert plan.tiles == ()
+    replayed = legacy_cin_working_copy(scheduled.normalized_cin, plan)
+    assert not replayed.inserted_workspace
+
+    surgery = Scheduler._auto_schedule_owned(
+        copy.deepcopy(scheduled.normalized_cin),
+        CompileOptions.from_environment(),
+    )
+    assert surgery.inserted_workspace
+    assert str(replayed) != str(surgery)
+
+
+def test_auto_schedule_plan_originates_the_production_decisions() -> None:
+    """The F4 origination replays identically to the plan-free scheduler."""
+
+    for build in (_build_dense_matmul, _build_spmm):
+        for arm in (None, True, False):
+            scheduled = Scheduler.auto_schedule_plan(
+                build(),
+                regblock_enabled=arm,
+            )
+            plan = scheduled.verified_loop_plan
+            assert plan.provenance == "auto"
+            replayed = legacy_cin_working_copy(scheduled.normalized_cin, plan)
+            if arm is None:
+                direct = Scheduler.auto_schedule(build())
+            else:
+                direct = Scheduler._auto_schedule_regblock_arm(
+                    build(),
+                    enabled=arm,
+                    compile_options=CompileOptions.from_environment(),
+                )
+            assert str(replayed) == str(direct), (build.__name__, arm)
+
+    regblock = Scheduler.auto_schedule_plan(
+        _build_spmm(),
+        regblock_enabled=True,
+    )
+    regblock_plan = regblock.verified_loop_plan
+    assert regblock_plan.workspace is not None
+    assert len(regblock_plan.tiles) == 1
+    assert regblock_plan.tiles[0].placement.kind is PlacementKind.CHILD_OF
+
+
+def test_auto_schedule_plan_scalar_cin_records_the_empty_plan() -> None:
+    i = IndexVar("i")
+    result = TensorVar("C", fmt="d")
+    source = TensorVar("A", fmt="d")
+    result[i] = source[i]
+    loop_free = Scheduler.auto_schedule_plan(ForAll(i, result._assignment))
+    assert loop_free.verified_loop_plan.provenance == "auto"
+    assert len(loop_free.verified_loop_plan.loop_order) == 1
+
+
+def test_auto_workspace_fact_must_equal_the_derived_decision() -> None:
+    """Forged, dropped, or mutated workspace facts are rejected exactly."""
+
+    scheduled, plan = _auto_plan(_build_dense_matmul())
+    cin = scheduled.normalized_cin
+    ids = _index_ids_by_name(cin)
+    assert plan.workspace is not None
+
+    _assert_plan_rejected(
+        cin,
+        replace(plan, workspace=None),
+        InvalidSchedule,
+        "auto_workspace_decision",
+    )
+    _assert_plan_rejected(
+        cin,
+        replace(
+            plan,
+            workspace=replace(plan.workspace, reduction_loop=LoopRef(ids["i"])),
+        ),
+        InvalidSchedule,
+        "auto_workspace_decision",
+    )
+    _assert_plan_rejected(
+        cin,
+        replace(
+            plan,
+            workspace=replace(plan.workspace, axis_loops=(LoopRef(ids["i"]),)),
+        ),
+        InvalidSchedule,
+        "auto_workspace_decision",
+    )
+    _assert_plan_rejected(
+        cin,
+        replace(plan, workspace=replace(plan.workspace, dense=False)),
+        InvalidSchedule,
+        "auto_workspace_decision",
+    )
+
+    spmm_scheduled, spmm_plan = _auto_plan(_build_spmm())
+    spmm_ids = _index_ids_by_name(spmm_scheduled.normalized_cin)
+    assert spmm_plan.workspace is None
+    _assert_plan_rejected(
+        spmm_scheduled.normalized_cin,
+        replace(
+            spmm_plan,
+            workspace=WorkspaceInsertion(
+                reduction_loop=LoopRef(spmm_ids["j"]),
+                axis_loops=(LoopRef(spmm_ids["k"]),),
+                dense=True,
+            ),
+        ),
+        InvalidSchedule,
+        "auto_workspace_decision",
+    )
+
+
+def test_workspace_fact_is_an_automatic_decision_only() -> None:
+    scheduled = Scheduler.apply_schedule(
+        _build_dense_matmul(), Schedule(loop_order=("i", "j", "k"))
+    )
+    cin = scheduled.normalized_cin
+    ids = _index_ids_by_name(cin)
+    _assert_plan_rejected(
+        cin,
+        replace(
+            scheduled.verified_loop_plan,
+            workspace=WorkspaceInsertion(
+                reduction_loop=LoopRef(ids["j"]),
+                axis_loops=(LoopRef(ids["k"]),),
+                dense=True,
+            ),
+        ),
+        InvalidSchedule,
+        "workspace_provenance",
+    )
+
+
+def test_workspace_fact_structure_is_exact() -> None:
+    scheduled, plan = _auto_plan(_build_dense_matmul())
+    cin = scheduled.normalized_cin
+    assert plan.workspace is not None
+
+    with pytest.raises(VerificationError, match="exactly one axis"):
+        verify_loop_plan(
+            cin,
+            replace(
+                plan,
+                workspace=replace(
+                    plan.workspace,
+                    axis_loops=plan.workspace.axis_loops * 2,
+                ),
+            ),
+        )
+    with pytest.raises(VerificationError, match="non-empty tuple"):
+        verify_loop_plan(
+            cin,
+            replace(plan, workspace=replace(plan.workspace, axis_loops=())),
+        )
+    with pytest.raises(VerificationError, match="must be a bool"):
+        verify_loop_plan(
+            cin,
+            replace(
+                plan,
+                workspace=replace(plan.workspace, dense=cast(bool, 1)),
+            ),
+        )
+    with pytest.raises(VerificationError, match="WorkspaceInsertion or None"):
+        verify_loop_plan(
+            cin,
+            replace(plan, workspace=cast(WorkspaceInsertion, object())),
+        )
+    forged = replace(plan.workspace)
+    object.__setattr__(forged, "ghost", True)
+    with pytest.raises(VerificationError, match="invalid stored fields"):
+        verify_loop_plan(cin, replace(plan, workspace=forged))
+    deleted = replace(plan.workspace)
+    object.__delattr__(deleted, "dense")
+    with pytest.raises(VerificationError, match="invalid stored fields"):
+        verify_loop_plan(cin, replace(plan, workspace=deleted))
