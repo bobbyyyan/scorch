@@ -732,7 +732,7 @@ def test_resuming_ignores_non_schema_dataclass_state():
     assert LoopIRBuilder.resuming(program).new_tile_id() == TileId(0)
 
 
-@pytest.mark.parametrize("provenance", ["auto", "tuned", "fallback"])
+@pytest.mark.parametrize("provenance", ["tuned", "fallback", "prebuilt", "AUTO"])
 def test_apply_schedule_plan_provenance_gate(provenance):
     cin, (i, k, j) = build_matmul_ikj()
     lowering = lower(cin)
@@ -742,6 +742,68 @@ def test_apply_schedule_plan_provenance_gate(provenance):
         apply_schedule_plan,
         lowering.program,
         plan,
+    )
+
+
+def test_apply_schedule_plan_admits_the_tile_free_auto_family():
+    """A tile-free cost-model order is a migrated automatic plan now."""
+
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    plan = LoopPlan(loop_order=lowering.loop_index_ids, provenance="auto")
+    schedule = apply_schedule_plan(lowering.program, plan)
+    assert schedule.plan is plan
+    verify_program(schedule.program)
+
+
+def test_apply_schedule_plan_rejects_the_tiled_auto_family():
+    """Recorded heuristic tiles/workspace stay on the legacy path."""
+
+    from scorch.compiler.loop_plan import WorkspaceInsertion
+
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    order = lowering.loop_index_ids
+    tiled = LoopPlan(
+        loop_order=order,
+        tiles=(
+            LoopTile(
+                loop=LoopRef(j.index_id),
+                width=32,
+                placement=LoopPlacement(PlacementKind.OUTERMOST),
+                parallel=False,
+                kind="affine",
+                accumulation="direct",
+                unroll=True,
+            ),
+        ),
+        workspace=WorkspaceInsertion(
+            reduction_loop=LoopRef(k.index_id),
+            axis_loops=(LoopRef(j.index_id),),
+            dense=True,
+        ),
+        provenance="auto",
+    )
+    expect_code(
+        "unsupported_schedule_auto_family",
+        apply_schedule_plan,
+        lowering.program,
+        tiled,
+    )
+    workspace_only = LoopPlan(
+        loop_order=order,
+        workspace=WorkspaceInsertion(
+            reduction_loop=LoopRef(k.index_id),
+            axis_loops=(LoopRef(j.index_id),),
+            dense=False,
+        ),
+        provenance="auto",
+    )
+    expect_code(
+        "unsupported_schedule_auto_family",
+        apply_schedule_plan,
+        lowering.program,
+        workspace_only,
     )
 
 

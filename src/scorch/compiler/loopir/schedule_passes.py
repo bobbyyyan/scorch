@@ -2143,13 +2143,38 @@ def _check_plan_families(plan: LoopPlan) -> None:
     ``parallel_loop`` is admitted only when the final typed selection pass
     can prove a supported dense logical or affine-origin anchor and its race
     and work contracts.
+
+    Automatic plans are admitted for exactly the recorded tile-free family:
+    a cost-model loop order and nothing else.  The tiled automatic family
+    (heuristic strip-mines composed with the standalone workspace insertion,
+    including strip-mined reduction loops with a reduce-out consumer) has no
+    typed emission twin yet — the legacy explicit route itself rejects
+    reduction tiling, so those shapes exist only through the auto heuristics
+    and stay on the legacy path until their own measured migration.  Every
+    other provenance fails closed.
     """
 
+    if plan.provenance == "auto":
+        if (
+            plan.tiles
+            or plan.workspace is not None
+            or plan.panel_bounds
+            or plan.relayout is not None
+            or plan.result_tile is not None
+            or plan.parallel_loop is not None
+        ):
+            _fail(
+                "unsupported_schedule_auto_family",
+                "automatic plans are migrated for the tile-free cost-model "
+                "loop order only; the heuristic tile/workspace family stays "
+                "on the legacy path",
+            )
+        return
     if plan.provenance != "explicit":
         _fail(
             "unsupported_schedule_provenance",
             f"{plan.provenance!r} scheduling stays on the legacy path; only "
-            "explicit schedules are migrated",
+            "explicit and tile-free automatic schedules are migrated",
         )
     _check_heap_plan_family(plan)
     panel_tiles = [tile for tile in plan.tiles if tile.kind == "panel"]
