@@ -2120,6 +2120,45 @@ def test_auto_schedule_plan_scalar_cin_records_the_empty_plan() -> None:
     assert loop_free.verified_loop_plan.loop_order == ()
 
 
+def test_complete_auto_plan_helper_requires_exact_owned_sinks() -> None:
+    options = CompileOptions.from_environment()
+    with pytest.raises(TypeError, match="require_complete_plan must be an exact bool"):
+        Scheduler._apply_auto_order_owned(
+            _build_scalar_assignment(),
+            [],
+            options,
+            require_complete_plan=1,
+        )
+
+    normalized = normalize_cin(_build_dense_matmul())
+    with pytest.raises(TypeError, match="needs empty exact plan"):
+        Scheduler._apply_auto_order_owned(
+            normalized,
+            [],
+            options,
+            require_complete_plan=True,
+        )
+    with pytest.raises(TypeError, match="needs empty exact plan"):
+        Scheduler._apply_auto_order_owned(
+            normalized,
+            [],
+            options,
+            plan_tiles=[
+                LoopTile(
+                    loop=LoopRef(normalized.index_var.index_id),
+                    width=4,
+                    placement=LoopPlacement(PlacementKind.OUTERMOST),
+                    parallel=False,
+                    kind="affine",
+                    accumulation="direct",
+                    unroll=True,
+                )
+            ],
+            plan_workspace=[],
+            require_complete_plan=True,
+        )
+
+
 def test_auto_workspace_fact_must_equal_the_derived_decision() -> None:
     """Forged, dropped, or mutated workspace facts are rejected exactly."""
 
