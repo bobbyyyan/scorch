@@ -43,6 +43,7 @@ existing canonical stage identities.
 from __future__ import annotations
 
 import copy
+import hashlib
 import time
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -73,7 +74,13 @@ class LoopIRCompiledKernel:
     For scheduled compilations ``schedule`` retains the full scheduling
     artifact (base program, exact plan, scheduled program, provenance) and
     ``program_text``/``program_dump`` describe the scheduled program — the
-    artifact the target lowering consumed.
+    artifact the target lowering consumed.  ``request_dump`` and
+    ``request_identity`` are the canonical strangler request serialization
+    and its SHA-256 content key, computed at the compile/shadow request
+    boundary from the canonical normalized CIN, the canonical verified plan
+    (or the explicit unscheduled marker), the result shape, and the runtime
+    input bindings; no cache consumes them yet, and the release
+    source-derived cache is untouched.
     """
 
     lowering: LoopIRLoweringResult
@@ -82,6 +89,8 @@ class LoopIRCompiledKernel:
     llir_function: llir.Function
     cpp_source: str
     schedule: Optional[ScheduledLoopIR] = None
+    request_dump: str = ""
+    request_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -343,6 +352,21 @@ def _compile_normalized_cin_via_loopir(
         context.complete_stage(schedule_token)
         program = schedule.program
 
+    # The canonical strangler request identity, owned at this compile/shadow
+    # request boundary.  Derived only from canonical semantic content — the
+    # normalized CIN, the verified plan (or the unscheduled marker), the
+    # result shape, and the runtime bindings — inside the stages already
+    # recorded above; no new stage and no cache participate.
+    from ..loop_plan_identity import loopir_request_dump
+
+    request_dump = loopir_request_dump(
+        normalized,
+        plan,
+        tuple(result_shape),
+        tuple(input_bindings),
+    )
+    request_identity = hashlib.sha256(request_dump.encode("utf-8")).hexdigest()
+
     program_text = print_program(program)
     program_dump = canonical_program_dump(program)
 
@@ -370,6 +394,8 @@ def _compile_normalized_cin_via_loopir(
         llir_function=llir_function,
         cpp_source=cpp_source,
         schedule=schedule,
+        request_dump=request_dump,
+        request_identity=request_identity,
     )
 
 
